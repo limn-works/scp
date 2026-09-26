@@ -633,9 +633,17 @@ PYEOF
 # `server` is absent from this list although three CI commands name it: `default =
 # ["server"]` in the manifest of each of scp-ffi, scp-ffi-napi and scp-ffi-uniffi, so the
 # `cargo check` above already compiles every module that feature gates.
+#
+# `postgres-blob` and `s3-blob` reach scp-node and scp-relay only through the `cloud-blobs`
+# entry of each crate's `[features]` table, which the helper above does not read, so no
+# dependency declaration requests them and the third entry below names them. It copies the
+# `--features` string of the `rust-clippy` job's scp-transport cloud-backend command.
+# `cloud-blobs` itself gates no code in scp-node or scp-relay, so this list carries no
+# entry for either crate.
 EXTRA_FEATURE_CHECKS=(
     "scp-transport|quic,http3,udp,coap"
     "scp-transport|combined,local-cache"
+    "scp-transport|postgres-blob,s3-blob,startup,sqlite-blob,redb-blob"
     "scp-testing|sqlite"
 )
 

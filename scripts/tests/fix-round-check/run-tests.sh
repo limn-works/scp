@@ -339,8 +339,8 @@ gate_paths() {
 # answer from `scp-ffi`. It also holds one file under no crate directory, which case 9
 # changes.
 #
-# It holds a fourth manifest, `crates/scp-transport`, because two of the three entries in
-# the runner's EXTRA_FEATURE_CHECKS array name that package, and case 13 reads both
+# It holds a fourth manifest, `crates/scp-transport`, because three of the four entries in
+# the runner's EXTRA_FEATURE_CHECKS array name that package, and case 13 reads all three
 # `cargo check` commands they produce. It holds `bindings/python/scp_sdk/context.py` for
 # case 12, `Cargo.toml` for case 11 and `.github/workflows/ci.yml` for case 17, and the
 # fixture's base commit holds all three, so each case decides for itself whether its own
@@ -760,9 +760,9 @@ fixture_commit "$FIXTURE13" crates/scp-transport/src/lib.rs
 run_fixture "$FIXTURE13"
 rc=$(cat "$FIXTURE13.harness/rc.txt")
 if [[ $rc -eq 0 ]]; then
-    report "case 13 exits 0 when both transport compiles pass" 0 ""
+    report "case 13 exits 0 when every transport compile passes" 0 ""
 else
-    report "case 13 exits 0 when both transport compiles pass" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE13.harness/out.txt")"
+    report "case 13 exits 0 when every transport compile passes" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE13.harness/out.txt")"
 fi
 if grep -qF 'check -p scp-transport --all-targets --features quic,http3,udp,coap' "$FIXTURE13.harness/cargo.log"; then
     report "case 13 compiles the optional transports the workspace command never activates" 0 ""
@@ -773,6 +773,11 @@ if grep -qF 'check -p scp-transport --all-targets --features combined,local-cach
     report "case 13 compiles the blob-backend features the optional-feature test lane names" 0 ""
 else
     report "case 13 compiles the blob-backend features the optional-feature test lane names" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13.harness/cargo.log")"
+fi
+if grep -qF 'check -p scp-transport --all-targets --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob' "$FIXTURE13.harness/cargo.log"; then
+    report "case 13 compiles the two cloud blob backends that only the cloud-blobs feature tables request" 0 ""
+else
+    report "case 13 compiles the two cloud blob backends that only the cloud-blobs feature tables request" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13.harness/cargo.log")"
 fi
 
 # ── Case 14: the gate whose diff range holds no uncommitted edit ─────────────────────
