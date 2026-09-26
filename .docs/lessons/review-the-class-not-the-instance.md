@@ -6,4 +6,4 @@
 
 **Rule**: `CLAUDE.md` states this rule in the Agents section, below "Take every finding seriously", quoting Alec verbatim. Search every sibling site before writing the finding, and report the class as one finding naming each site.
 
-**Related**: the same incident produced the 2026-08-30 push cadence in the Change protocol of `CLAUDE.md`: one full gate run on the tree you are about to push, not one per commit. On 2026-09-26 the bullet "Quick local check before push, full gate set in CI" replaced that cadence, and the Change protocol records both rulings under that bullet.
+**Related**: the same incident produced the 2026-08-30 push cadence in the Change protocol of `CLAUDE.md`: one full gate run on the tree you are about to push, not one per commit. On 2026-09-26 the bullet "Quick local check before push, full gate set in CI" replaced that cadence.
