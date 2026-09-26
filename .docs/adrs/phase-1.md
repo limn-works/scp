@@ -681,14 +681,14 @@ Every message is a MessagePack map with a required `op` field (string) plus oper
 | Op | Fields | When |
 |----|--------|------|
 | `OK` | `ref: string?`, `blob_id: bin32?` | Success response. `blob_id` present only for PUBLISH. |
-| `ERR` | `ref: string?`, `code: u16`, `msg: string` | Error response. `msg` is for logging, not parsing. |
+| `ERR` | `ref: string?`, `code: u16`, `msg: string`, `last_cosigned_head: bin32?` | Error response. `msg` is for logging, not parsing. `last_cosigned_head` is present on `4050` alone. |
 | `BLOB` | `routing_id: bin32`, `blob_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32?`, `stored_at: u64`, `blob: bin` | Blob delivery (subscription, backfill, or query). `blob_id = SHA-256(blob)` — clients SHOULD verify. |
 | `EVENT` | `ref: string?`, `type: string`, type-specific fields | Protocol events: `backfill_complete` (with `routing_id`), `query_complete` (with `count` and `relay_proof: bin200?`). <!-- scp:include id="relay-proof-wire-fields" from=".docs/specs/09-security-model.md" -->`QUERY` carries an optional `proof_nonce`, 32 bytes the resolver drew freshly for that query, REQUIRED on a first contact, and the `query_complete` `EVENT` that ends the response carries an optional `relay_proof`, 200 bytes, which a relay that received a `proof_nonce` and can sign under the operator identity its community-relay-list entry declares MUST return, including on a response that carried no `BLOB`. **A resolver MUST NOT read a `relay_proof` whose nonce differs from the one it sent, and the proof covers the response and not the frame.**<!-- scp:end id="relay-proof-wire-fields" --> |
 | `PONG` | `ts: u64` | Keepalive response. |
 
 #### Error Codes
 
-**Client errors (4xxx):** `4000` INVALID_MESSAGE, `4001` UNKNOWN_OP, `4002` MISSING_FIELD, `4003` INVALID_FIELD, `4010` BLOB_TOO_LARGE, `4011` TTL_TOO_LONG, `4012` LIMIT_EXCEEDED, `4020` RATE_LIMITED (the code a publisher records as `EntryResult::Refused`, `03-identity.md` §3.10.10, which states what that variant carries and where each of its figures comes from), `4021` TOO_MANY_SUBSCRIPTIONS, `4040` DID_RECORD_REJECTED (a validating SCP-native relay rejected an operation at an identity-domain `routing_id`: a PUBLISH of a frame that failed the identifier-to-routing-id binding or chain verification, a frame the relay could place on no chain, any blob published to a `routing_id` that already holds a chain and that is not a frame passing every check that relay runs, or a DELETE of a stored frame whose chain verifies. **Amended 2026-09-10:** the code's name carries the retired identifier-record vocabulary, and this ADR names the wire constant as it ships rather than inventing one).
+**Client errors (4xxx):** `4000` INVALID_MESSAGE, `4001` UNKNOWN_OP, `4002` MISSING_FIELD, `4003` INVALID_FIELD, `4010` BLOB_TOO_LARGE, `4011` TTL_TOO_LONG, `4012` LIMIT_EXCEEDED, `4020` RATE_LIMITED (the code a publisher records as `EntryResult::Refused`, `03-identity.md` §3.10.10, which states what that variant carries and where each of its figures comes from), `4021` TOO_MANY_SUBSCRIPTIONS, `4040` DID_RECORD_REJECTED (a validating SCP-native relay rejected an operation at an identity-domain `routing_id`: a PUBLISH of a frame that failed the identifier-to-routing-id binding or chain verification, a frame the relay could place on no chain, any blob published to a `routing_id` that already holds a chain and that is not a frame passing every check that relay runs, or a DELETE of a stored frame whose chain verifies. **Amended 2026-09-10:** the code's name carries the retired identifier-record vocabulary, and this ADR names the wire constant as it ships rather than inventing one), and four witness refusals a relay sends on a PUBLISH it has already stored, whose conditions `09-security-model.md` §9.7.4.3 states: `4050` WITNESS_STALE, carrying `last_cosigned_head`; `4051` WITNESS_CAPACITY; `4052` WITNESS_NOT_DESIGNATED; and `4053` WITNESS_CLOCK.
 
 **Server errors (5xxx):** `5000` INTERNAL_ERROR, `5001` STORAGE_FULL, `5002` SHUTTING_DOWN.
 
@@ -733,7 +733,7 @@ pub enum ClientMessage {
 /// Relay-to-client operations
 pub enum RelayMessage {
     Ok { ref_id: Option<String>, blob_id: Option<[u8; 32]> },
-    Err { ref_id: Option<String>, code: u16, msg: String },
+    Err { ref_id: Option<String>, code: u16, msg: String, last_cosigned_head: Option<[u8; 32]> },
     Blob { routing_id: [u8; 32], blob_id: [u8; 32], recipient_hint: Option<[u8; 32]>, blob_ttl: Option<u32>, stored_at: u64, blob: Vec<u8> },
     Event { ref_id: Option<String>, event_type: String, relay_proof: Option<[u8; 200]> },
     Pong { ts: u64 },
