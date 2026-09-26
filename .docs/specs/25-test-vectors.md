@@ -12,7 +12,7 @@ python3.12 scripts/gen-test-vectors-p256.py
 
 The script uses nothing outside the Python standard library, and it self-gates before it prints a byte: it checks itself against `SHA-256("")`, the RFC 6979 Appendix A.2.5 P-256 nonce and signature, RFC 5869 Appendix A.1 for HKDF-SHA256, and this section's own curve-independent `DataProvenance` hash (Vector 35), and it computes every public key twice by two scalar multiplications sharing no arithmetic, and a third time through the `cryptography` package where that package imports. A mismatch raises before anything prints.
 
-**Identifier strings in the fixtures.** A vector pinned before `03-identity.md` §3.1 fixed the identifier's text form prints a fixture string of the shape `"did:dht:z6Mk…"` or `"did:key:…"` where a signed structure takes an identifier as UTF-8 bytes. That string is not the canonical form, and a parser rejects it with `IdentityError::NonCanonicalIdentifier` (§3.1). Such a vector pins the construction, the separator and the signature over the bytes it prints, and pins no identifier. Vector 57 of §25.29 pins the text form.
+**Identifier strings in the fixtures.** The vectors that print a fixture string of the shape `"did:dht:z6Mk…"` or `"did:key:…"` where a signed structure takes an identifier as UTF-8 bytes predate the change to the key-event-log identity. They are not current: a parser rejects such a string with `IdentityError::NonCanonicalIdentifier` (`03-identity.md` §3.1), and the P-256 slice regenerates those vectors with identifiers in the `scp:` text form. Vector 57 of §25.29 pins that form.
 
 **What a signature covers.** Every SCP signature here is an ECDSA signature over a 32-byte canonical hash, so the ECDSA message digest **is** that canonical hash and no second SHA-256 reaches it. The vectors run RFC 6979 with `h1` set to that same digest, because §9.5 fixes RFC 6979 with SHA-256 for a software signer and states no value for `h1` under a prehashed digest. An implementation that hashes the digest a second time reproduces none of the signature bytes below.
 
@@ -1818,7 +1818,7 @@ Signature, secondary key (311 bytes on the wire):
 
 Vectors 53 through 55 each extend Vector 41's identity at sequence 1, so each reveal consumes the commitment Vector 41's inception fixed over §25.2's tertiary key, and the standing root at each event's predecessor is Vector 41's one-member root, §25.2's reference key. Every indexed signature takes the raw form, and each vector prints the signature field as the concatenation of its groups' indexed signatures in the kind's group order (§9.7.4.2 R3). The generator derives each fresh key from `SHA-256` of the ASCII seed string it names, under §25.2's test-vector key label.
 
-**The snapshot order a `RootRecovery` pins here.** §9.7.4.2's definitions order a snapshot's root members by the root set's own list order and state no position for an entry the event drops. Vectors 54 and 55 place every `Current` entry first and each dropped entry after them, each dropped key `Superseded` because a successor takes its role, so these two vectors pin the bytes of that one encoding.
+**Snapshot order.** Vectors 54 and 55 list the `Current` entries first and each dropped entry after them, each dropped key `Superseded` because a successor takes its role, under the snapshot-order rule §9.7.4.2's definitions state.
 
 ### Vector 53: a `CommitmentRollover` group layout
 
