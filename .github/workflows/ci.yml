@@ -1000,13 +1000,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `macos-arm64-5core` is a GitHub-hosted larger runner the limn-works
-        # organization registered: 5 cores, 14 GB of memory, macOS 26 on Apple
-        # silicon, and 20 concurrent runners. GitHub's `macos-latest` gives a
-        # job 3 cores and macOS 15. Every macOS job in this file names the
-        # larger runner; build-matrix.yml and release.yml name their own
-        # labels and this change left both files alone.
-        os: [ubuntu-latest, macos-arm64-5core]
+        os: [ubuntu-latest, macos-latest]
         shard: [1, 2, 3, 4]
     steps:
       - name: Free disk space when the runner is short of it
@@ -1116,7 +1110,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-arm64-5core]
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -1751,7 +1745,7 @@ jobs:
       needs.changes.outputs.swift == 'true' ||
       needs.changes.outputs.rust == 'true'
     name: Bridge artifact / Swift XCFramework (macOS)
-    runs-on: macos-arm64-5core
+    runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
@@ -1797,7 +1791,7 @@ jobs:
       needs.changes.outputs.swift == 'true' ||
       needs.changes.outputs.rust == 'true'
     name: Bridge artifact / PyO3 module (macOS)
-    runs-on: macos-arm64-5core
+    runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
@@ -2342,7 +2336,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.swift == 'true'
     name: Swift / lint + format
-    runs-on: macos-arm64-5core
+    runs-on: macos-latest
     timeout-minutes: 30
     defaults:
       run:
@@ -2372,7 +2366,7 @@ jobs:
       needs.changes.outputs.swift == 'true' ||
       needs.changes.outputs.rust == 'true'
     name: Swift / build + test
-    runs-on: macos-arm64-5core
+    runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
@@ -2688,7 +2682,7 @@ jobs:
 
   # ── Bridge parity (Swift UniFFI, macOS) ────────────────────────────
   # Layer C extension: runs the same ADR-046 harness against the UniFFI
-  # Swift bindings. Pinned to macos-arm64-5core because UniFFI Swift ships
+  # Swift bindings. Pinned to macos-latest because UniFFI Swift ships
   # as an .xcframework that targets Apple platforms.
   bridge-parity-swift:
     # Jobs pyo3-module-macos and xcframework build the two bridges this harness
@@ -2702,7 +2696,7 @@ jobs:
       needs.changes.outputs.swift == 'true' ||
       needs.changes.outputs.rust == 'true'
     name: Cross-bridge runtime parity (UniFFI Swift)
-    runs-on: macos-arm64-5core
+    runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
