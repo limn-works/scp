@@ -72,14 +72,20 @@ nothing:
                job's note in place.
   unified-feature
                A table here paired scp-identity with job rust-test under a
-               comment claiming nothing enables `scp-identity/testing`.
-               crates/scp-testing/Cargo.toml declares a normal dependency
+               comment claiming nothing enables `scp-identity/testing`. At that
+               time crates/scp-testing/Cargo.toml declared a normal dependency
                `scp-identity = { path = "../scp-identity", features =
                ["testing"] }`, and one cargo invocation resolves one feature
                set per package, so that job's `cargo nextest run --workspace`
                built scp-identity with `testing` on and compiled its two
                `#[cfg(not(feature = "testing"))]` assertions out — while the
                check reading that table reported each one running by name.
+               That normal-dependency line is now the `testing` feature of the
+               same manifest, which that crate's own `[dev-dependencies]` turn
+               on, and crates/scp-runtime/Cargo.toml and
+               crates/scp-ffi/common/Cargo.toml each carry the same edge in
+               their `[dev-dependencies]`. A workspace build reads all three,
+               so the pairing this entry records stays rejected.
   filter-source
                A `changes` job publishes each output from a
                `steps.filter.outputs.<key>` expression, and dorny/paths-filter
@@ -438,10 +444,11 @@ SHIPPED_CONFIG_LANES = {
 #
 # Job fail-closed-pre-rotation selects each crate with `-p` and names its two
 # assertions in an `-E` filter. A workspace-wide command cannot serve as
-# scp-identity's lane: crates/scp-testing/Cargo.toml declares a normal
-# dependency `scp-identity = { path = "../scp-identity", features =
-# ["testing"] }`, and one cargo invocation resolves one feature set per
-# package, so every build that includes scp-testing compiles scp-identity's
+# scp-identity's lane: three manifests turn `scp-identity/testing` on, each in
+# its own `[dev-dependencies]` — crates/scp-testing/Cargo.toml,
+# crates/scp-runtime/Cargo.toml and crates/scp-ffi/common/Cargo.toml — and
+# one cargo invocation resolves one feature set per package, so a build reading
+# any one of them compiles scp-identity's
 # `#[cfg(not(feature = "testing"))]` assertions out. An earlier revision of
 # this table paired scp-identity with job rust-test under a comment claiming
 # nothing enables `scp-identity/testing`; command_unifies_testing below now
@@ -1717,10 +1724,11 @@ def command_enables_testing(tokens: list[str], package: str) -> bool:
 
 
 # Every dependency section a Cargo manifest may carry. testing_edge scans all
-# three in every manifest it reads: a dev-dependency joins feature unification
-# whenever cargo builds that manifest's own test targets, and counting it in a
-# dependency's manifest too errs toward reporting a gap rather than toward
-# passing one.
+# three in every manifest it reads, although a dev-dependency joins feature
+# unification only when cargo builds that manifest's own test targets. Its
+# callers use a found edge to REJECT a lane, so counting a dev section in a
+# crate the build reaches as a plain dependency errs toward reporting a gap
+# rather than toward passing one.
 DEPENDENCY_SECTIONS = ("dependencies", "dev-dependencies", "build-dependencies")
 
 
@@ -2110,25 +2118,37 @@ def check_shipped_assertion_readers() -> None:
 
 
 def write_unification_fixture(root: Path) -> None:
-    """Write a four-crate workspace holding each spelling of a manifest edge
+    """Write a five-crate workspace holding each spelling of a manifest edge
     that turns a sibling's `testing` feature on.
 
     leaf     declares the feature and no dependencies.
-    enabler  depends on leaf with `features = ["testing"]`, the edge
-             crates/scp-testing/Cargo.toml carries against scp-identity.
+    enabler  depends on leaf with `features = ["testing"]` — the
+             dependency-entry spelling that crates/scp-runtime/Cargo.toml and
+             crates/scp-ffi/common/Cargo.toml write against scp-identity in
+             their `[dev-dependencies]`; testing_edge reads the three
+             dependency sections identically.
+    implier  declares a feature naming `"leaf/testing"`, the spelling
+             crates/scp-identity/Cargo.toml's `testing` feature carries against
+             scp-dht.
     middle   depends on enabler and never names leaf.
     selfdev  dev-depends on itself with `features = ["testing"]`, the spelling
              crates/scp-dht/Cargo.toml uses to turn its own feature on in its
              tests.
     """
     (root / "Cargo.toml").write_text(
-        '[workspace]\nmembers = ["leaf", "enabler", "middle", "selfdev"]\n'
+        "[workspace]\n"
+        'members = ["leaf", "enabler", "implier", "middle", "selfdev"]\n'
     )
     bodies = {
         "leaf": "[features]\ntesting = []\n",
         "enabler": (
             "[dependencies]\n"
             'leaf = { path = "../leaf", features = ["testing"] }\n'
+        ),
+        "implier": (
+            '[features]\nhelpers = ["leaf/testing"]\n\n'
+            "[dependencies]\n"
+            'leaf = { path = "../leaf" }\n'
         ),
         "middle": '[dependencies]\nenabler = { path = "../enabler" }\n',
         "selfdev": (
@@ -2152,8 +2172,11 @@ def check_testing_unification_readers() -> None:
     manifest the command's text never mentions. A reader answering "no edge"
     to every question would re-green the pairing this file's unified-feature
     entry records: scp-identity paired with job rust-test, whose workspace
-    build reads crates/scp-testing/Cargo.toml and compiles both of that
-    crate's fail-closed assertions out.
+    build reads every manifest turning `scp-identity/testing` on — the
+    `[dev-dependencies]` of crates/scp-testing/Cargo.toml,
+    crates/scp-runtime/Cargo.toml and crates/scp-ffi/common/Cargo.toml — and
+    compiles both of scp-identity's
+    fail-closed assertions out.
     """
     workspace = split_command("cargo nextest run --workspace")
     with tempfile.TemporaryDirectory() as scratch:
@@ -2208,13 +2231,24 @@ def check_testing_unification_readers() -> None:
             command_unifies_testing(
                 split_command(
                     "cargo nextest run --workspace --exclude enabler "
-                    "--exclude middle"
+                    "--exclude implier --exclude middle"
                 ),
                 "leaf",
                 root,
             )
             is None,
-            "leaf and selfdev remain, and neither reaches enabler's manifest",
+            "leaf and selfdev remain, and neither reaches enabler's manifest "
+            "nor implier's feature table",
+        )
+        check(
+            "a feature-table value naming `leaf/testing` is an edge",
+            command_unifies_testing(
+                split_command("cargo test -p implier"), "leaf", root
+            )
+            is not None,
+            "implier's `helpers` feature names \"leaf/testing\", the spelling "
+            "crates/scp-identity/Cargo.toml's `testing` feature carries "
+            "against scp-dht",
         )
         check(
             "a -p package no workspace member declares is a finding, not a pass",
@@ -2228,13 +2262,27 @@ def check_testing_unification_readers() -> None:
     # This repository is the live fixture for the defect this reader exists to
     # catch: the edge is real, and so is the lane that avoids it.
     live_edge = command_unifies_testing(workspace, "scp-identity")
+    scp_testing_manifest = REPO / "crates" / "scp-testing" / "Cargo.toml"
+    # Two conjuncts, each able to go red on its own. The first asks whether a
+    # workspace build reads any manifest edge turning scp-identity/testing on.
+    # Which edge command_unifies_testing returns is an artifact of sorted-path
+    # order — crates/scp-ffi/common/Cargo.toml and crates/scp-runtime/Cargo.toml
+    # sort ahead of crates/scp-testing/Cargo.toml — so the second conjunct names
+    # the manifest this entry records by asking testing_edge, the one-manifest
+    # reader command_unifies_testing is built on, about that manifest alone.
+    # Whether scp-testing's own `testing` feature compiles src/helpers.rs is a
+    # fact of the build cargo resolves, not of manifest text, and job
+    # rust-test-optional-features checks it with
+    # `cargo check -p scp-testing --lib --features testing`.
+    scp_testing_edge = testing_edge(scp_testing_manifest, "scp-identity")
     check(
         "a workspace build turns scp-identity/testing on through scp-testing",
-        live_edge is not None and "scp-testing" in str(live_edge),
-        f"got {live_edge!r} — crates/scp-testing/Cargo.toml declares "
-        f'`scp-identity = {{ features = ["testing"] }}` as a normal '
-        f"dependency, and a reader that misses it re-greens pairing "
-        f"scp-identity's assertions with a workspace lane",
+        live_edge is not None and scp_testing_edge is not None,
+        f"got workspace edge {live_edge!r} and scp-testing edge "
+        f"{scp_testing_edge!r} — crates/scp-testing/Cargo.toml gives its "
+        f'`[dev-dependencies]` entry on scp-identity the feature "testing", and '
+        f"a reader that misses it re-greens pairing scp-identity's assertions "
+        f"with a workspace lane",
     )
     check(
         "a -p scp-identity build leaves scp-identity/testing off",
@@ -2339,11 +2387,23 @@ def check_shipped_build_assertions_run(jobs: dict) -> None:
     # least four tests in every feature configuration.
     #
     # A command carrying NO name filter is outside this criterion, and job
-    # rust-build-pyo3-production's `cargo test -p scp-ffi-common` is one: it
-    # runs every test the package compiles, so no filter can be written that
-    # empties on a flip, and it claims no `--no-tests=fail` tripwire.
-    # command_unifies_testing above is what holds that command's build to
-    # `testing` off.
+    # rust-test-napi-production's `cargo test -p scp-ffi-common` is one: it runs
+    # every test the package compiles, so no filter can be written that empties
+    # on a flip, and it claims no `--no-tests=fail` tripwire.
+    # command_unifies_testing above reads that command's build for a `testing`
+    # edge, and it reads it out of manifest TEXT, which means enumerating the
+    # spellings cargo accepts — a denylist, and one this repository has already
+    # watched fail to converge (.docs/lessons/
+    # ast-gate-checks-definition-not-name-resolution.md). Two spellings escape
+    # it today: `default = ["testing"]` and any other feature list naming
+    # `"testing"`, both written inside scp-ffi-common's own manifest, where the
+    # reader looks for a dependency entry on scp-ffi-common and for the string
+    # "scp-ffi-common/testing" and finds neither. So that reader is a fast
+    # secondary, not the guarantee. check_shipped_assertion_tripwires below
+    # states the guarantee: every package carrying shipped-build assertions is
+    # also run by a `--no-tests=fail` command that selects those assertions
+    # alone, which empties and exits 4 on any spelling because it reads the
+    # build cargo resolved rather than a manifest.
     all_tests = package_test_functions()
     for package, commands in sorted(executing.items()):
         tests = all_tests.get(package, {})
@@ -2386,6 +2446,80 @@ def check_shipped_build_assertions_run(jobs: dict) -> None:
                 f"no command in {named} selects it, so this fail-closed proof "
                 f"executes nowhere",
             )
+
+
+def check_shipped_assertion_tripwires(jobs: dict) -> None:
+    """Every package with shipped-build assertions is run by an empty-selection
+    tripwire: a `--no-tests=fail` command selecting those assertions alone.
+
+    CRITERION: for each package that shipped_build_assertions names, some job
+    either lane table pairs it with runs a command that carries
+    `--no-tests=fail`, carries a name filter this file models, selects at least
+    one of that package's shipped-build assertions, and selects no test that
+    survives a `testing` flip. Such a command decides the question from the
+    build cargo resolved: a shipped-build assertion compiles into a build
+    carrying no `testing` feature and out of every other build, so a build that
+    turned the feature on selects zero tests and nextest exits 4.
+
+    WHY THIS CHECK EXISTS BESIDE check_shipped_build_assertions_run. That check
+    asks whether a lane's command leaves `testing` off, and answers it with
+    command_enables_testing (the command's own `--features` text) and
+    command_unifies_testing (the manifests the build reads). The second reader
+    parses manifest text, so it answers correctly only for the spellings it
+    enumerates, and two spellings escape it — a package's own
+    `default = ["testing"]`, and any other feature of that package whose list
+    names `"testing"`, neither of which is a dependency entry on the package
+    nor the string `"<package>/testing"`. A tripwire cannot be escaped that
+    way, because it reads no manifest.
+
+    Four of the five packages shipped_build_assertions names already had one:
+    job rust-build-pyo3-production for scp-ffi, job
+    rust-build-uniffi-production for scp-ffi-uniffi, and job
+    fail-closed-pre-rotation for scp-identity and scp-node. scp-ffi-common had
+    only the unfiltered `cargo test -p scp-ffi-common` of job
+    rust-test-napi-production, which exits 0 over the package's un-gated tests
+    when both of its assertions compiled out. This check is what keeps the
+    command that closed that hole from being deleted again.
+    """
+    lanes: dict[str, set[str]] = {}
+    for job_id, packages in sorted(SHIPPED_CONFIG_LANES.items()):
+        for package in sorted(packages):
+            lanes.setdefault(package, set()).add(job_id)
+    for package, job_id in sorted(NON_BRIDGE_SHIPPED_ASSERTION_LANES.items()):
+        lanes.setdefault(package, set()).add(job_id)
+
+    all_tests = package_test_functions()
+    for package, assertions in sorted(shipped_build_assertions().items()):
+        tests = all_tests.get(package, {})
+        job_ids = sorted(lanes.get(package, set()))
+        # Looked up by key so a renamed job raises a KeyError here rather than
+        # leaving this check running over no commands and reporting a pass.
+        tripwires: list[str] = []
+        for job_id in job_ids:
+            for tokens in cargo_test_commands(jobs[job_id]):
+                if "--no-tests=fail" not in tokens:
+                    continue
+                if not command_covers_package(tokens, package):
+                    continue
+                patterns, unmodelled = command_filters(tokens)
+                if not patterns or unmodelled:
+                    continue
+                selected = {name for name in tests if command_selects(tokens, name)}
+                if not selected & set(assertions):
+                    continue
+                if any(not tests[name][1] for name in selected):
+                    continue
+                tripwires.append(" ".join(tokens))
+        check(
+            f"{package}'s shipped-build assertions run under an empty-selection tripwire",
+            bool(tripwires),
+            f"no command in {job_ids or ['(no lane named)']} carries "
+            f"`--no-tests=fail`, a name filter, and a selection holding "
+            f"{sorted(assertions)} and nothing that survives a `testing` flip, "
+            f"so a build that turned `{package}/testing` on by a spelling "
+            f"command_unifies_testing does not parse would compile every one of "
+            f"those assertions out and still exit 0",
+        )
 
 
 def check_filter_keys_agree(path: Path, doc: dict) -> None:
@@ -3236,6 +3370,7 @@ def main() -> int:
     check_shipped_assertion_readers()
     check_testing_unification_readers()
     check_shipped_build_assertions_run(jobs)
+    check_shipped_assertion_tripwires(jobs)
 
     print(
         "zero-test — a filtered test selection that matches nothing must exit non-zero"
