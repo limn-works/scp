@@ -592,8 +592,8 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 3. **`UNSUBSCRIBE { routing_id }`**
    - Stop receiving blobs for this `routing_id` on this connection.
 
-4. **`QUERY { routing_id, since?, limit?, proof_nonce? }`**
-   - One-shot query: return stored blobs for a `routing_id`, optionally filtered by `since` timestamp, with optional `limit`. **`since` filters over a blob's `stored_at` and the response follows this record's backfill ordering below, which is oldest first by ascending relay receipt timestamp**, so a caller paging a `routing_id` advances its cursor over the order the relay served in and skips no blob the relay has not yet served — which is the page walk `09-security-model.md` §9.7.4.2 R9 states for a resolver.
+4. **`QUERY { routing_id, since?, after_blob?, limit?, proof_nonce? }`**
+   - One-shot query: return stored blobs for a `routing_id`, optionally filtered by `since` timestamp, with optional `limit`, in this record's backfill ordering below. **`since` filters over a blob's `stored_at`. Where `after_blob` is present, the relay returns only the blobs whose pair (`stored_at`, `blob_id`) sorts strictly after the pair (`since`, `after_blob`)**, which is the cursor of the page walk `09-security-model.md` §9.7.4.2 R9 states for a resolver. A QUERY carrying `after_blob` without `since` is rejected with `4002` MISSING_FIELD.
    - <!-- scp:include id="relay-proof-wire-fields" from=".docs/specs/09-security-model.md" -->`QUERY` carries an optional `proof_nonce`, 32 bytes the resolver drew freshly for that query, REQUIRED on a first contact, and the `query_complete` `EVENT` that ends the response carries an optional `relay_proof`, 200 bytes, which a relay that received a `proof_nonce` and can sign under the operator identity its community-relay-list entry declares MUST return, including on a response that carried no `BLOB`. **A resolver MUST NOT read a `relay_proof` whose nonce differs from the one it sent, and the proof covers the response and not the frame.**<!-- scp:end id="relay-proof-wire-fields" --> (`09-security-model.md` §9.10.12, §9.7.4.2 R11).
    - Does not create a subscription.
 
@@ -646,7 +646,7 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 
 **Rationale:** Consistent with the envelope layer (ADR-002 uses `rmp-serde`). Native binary support eliminates Base64 overhead for encrypted blobs (~33% savings). MessagePack has mature libraries in all target languages. JSON text frames rejected — debuggability is solved by tooling, not wire format.
 
-**Backfill ordering:** Oldest-first (ascending relay receipt timestamp), which is the order the `since` filter of `QUERY` above advances a caller's cursor over. Enables incremental processing, natural stream transition from backfill to real-time, and gets at-risk (expiring) messages to clients first.
+**Backfill ordering:** ascending (`stored_at`, `blob_id`): oldest relay receipt first, and ascending `blob_id` among blobs one second holds. Enables incremental processing, natural stream transition from backfill to real-time, and gets at-risk (expiring) messages to clients first.
 
 **Connection URL:** `wss://<host>/scp/v1`. TLS 1.3 required (§9.13). URL path encodes protocol version — no in-band version negotiation. Relay returns HTTP 404 for unsupported versions.
 
@@ -669,7 +669,7 @@ Every message is a MessagePack map with a required `op` field (string) plus oper
 | `PUBLISH` | `routing_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32?`, `retain: bool?`, `blob: bin` | OK with `blob_id` |
 | `SUBSCRIBE` | `routing_id: bin32`, `since: u64?` | OK, then BLOB stream, then EVENT `backfill_complete` |
 | `UNSUBSCRIBE` | `routing_id: bin32` | OK |
-| `QUERY` | `routing_id: bin32`, `since: u64?`, `limit: u32?` (default 100, max 1000), `proof_nonce: bin32?` | BLOB stream, then EVENT `query_complete`. <!-- scp:include id="relay-proof-wire-fields" from=".docs/specs/09-security-model.md" -->`QUERY` carries an optional `proof_nonce`, 32 bytes the resolver drew freshly for that query, REQUIRED on a first contact, and the `query_complete` `EVENT` that ends the response carries an optional `relay_proof`, 200 bytes, which a relay that received a `proof_nonce` and can sign under the operator identity its community-relay-list entry declares MUST return, including on a response that carried no `BLOB`. **A resolver MUST NOT read a `relay_proof` whose nonce differs from the one it sent, and the proof covers the response and not the frame.**<!-- scp:end id="relay-proof-wire-fields" --> |
+| `QUERY` | `routing_id: bin32`, `since: u64?`, `after_blob: bin32?`, `limit: u32?` (default 100, max 1000), `proof_nonce: bin32?` | BLOB stream, then EVENT `query_complete`. <!-- scp:include id="relay-proof-wire-fields" from=".docs/specs/09-security-model.md" -->`QUERY` carries an optional `proof_nonce`, 32 bytes the resolver drew freshly for that query, REQUIRED on a first contact, and the `query_complete` `EVENT` that ends the response carries an optional `relay_proof`, 200 bytes, which a relay that received a `proof_nonce` and can sign under the operator identity its community-relay-list entry declares MUST return, including on a response that carried no `BLOB`. **A resolver MUST NOT read a `relay_proof` whose nonce differs from the one it sent, and the proof covers the response and not the frame.**<!-- scp:end id="relay-proof-wire-fields" --> |
 | `DELETE` | `blob_id: bin32` | OK (best-effort, does not confirm existence) |
 | `ACK` | `blob_id: bin32` | None (fire-and-forget) |
 | `PING` | `ts: u64` | PONG |
@@ -682,8 +682,8 @@ Every message is a MessagePack map with a required `op` field (string) plus oper
 |----|--------|------|
 | `OK` | `ref: string?`, `blob_id: bin32?` | Success response. `blob_id` present only for PUBLISH. |
 | `ERR` | `ref: string?`, `code: u16`, `msg: string` | Error response. `msg` is for logging, not parsing. |
-| `BLOB` | `routing_id: bin32`, `blob_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32?`, `stored_at: u64`, `relay_proof: bin200?`, `blob: bin` | Blob delivery (subscription, backfill, or query). `blob_id = SHA-256(blob)` — clients SHOULD verify. <!-- scp:include id="relay-proof-wire-fields" from=".docs/specs/09-security-model.md" -->`QUERY` carries an optional `proof_nonce`, 32 bytes the resolver drew freshly for that query, REQUIRED on a first contact, and the `query_complete` `EVENT` that ends the response carries an optional `relay_proof`, 200 bytes, which a relay that received a `proof_nonce` and can sign under the operator identity its community-relay-list entry declares MUST return, including on a response that carried no `BLOB`. **A resolver MUST NOT read a `relay_proof` whose nonce differs from the one it sent, and the proof covers the response and not the frame.**<!-- scp:end id="relay-proof-wire-fields" --> |
-| `EVENT` | `ref: string?`, `type: string`, type-specific fields | Protocol events: `backfill_complete` (with `routing_id`), `query_complete` (with `count`). |
+| `BLOB` | `routing_id: bin32`, `blob_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32?`, `stored_at: u64`, `blob: bin` | Blob delivery (subscription, backfill, or query). `blob_id = SHA-256(blob)` — clients SHOULD verify. |
+| `EVENT` | `ref: string?`, `type: string`, type-specific fields | Protocol events: `backfill_complete` (with `routing_id`), `query_complete` (with `count` and `relay_proof: bin200?`). <!-- scp:include id="relay-proof-wire-fields" from=".docs/specs/09-security-model.md" -->`QUERY` carries an optional `proof_nonce`, 32 bytes the resolver drew freshly for that query, REQUIRED on a first contact, and the `query_complete` `EVENT` that ends the response carries an optional `relay_proof`, 200 bytes, which a relay that received a `proof_nonce` and can sign under the operator identity its community-relay-list entry declares MUST return, including on a response that carried no `BLOB`. **A resolver MUST NOT read a `relay_proof` whose nonce differs from the one it sent, and the proof covers the response and not the frame.**<!-- scp:end id="relay-proof-wire-fields" --> |
 | `PONG` | `ts: u64` | Keepalive response. |
 
 #### Error Codes
@@ -724,7 +724,7 @@ pub enum ClientMessage {
     Publish { ref_id: Option<String>, routing_id: [u8; 32], recipient_hint: Option<[u8; 32]>, blob_ttl: Option<u32>, retain: Option<bool>, blob: Vec<u8> },
     Subscribe { ref_id: Option<String>, routing_id: [u8; 32], since: Option<u64> },
     Unsubscribe { ref_id: Option<String>, routing_id: [u8; 32] },
-    Query { ref_id: Option<String>, routing_id: [u8; 32], since: Option<u64>, limit: Option<u32>, proof_nonce: Option<[u8; 32]> },
+    Query { ref_id: Option<String>, routing_id: [u8; 32], since: Option<u64>, after_blob: Option<[u8; 32]>, limit: Option<u32>, proof_nonce: Option<[u8; 32]> },
     Delete { ref_id: Option<String>, blob_id: [u8; 32] },
     Ack { blob_id: [u8; 32] },
     Ping { ts: u64 },
@@ -734,8 +734,8 @@ pub enum ClientMessage {
 pub enum RelayMessage {
     Ok { ref_id: Option<String>, blob_id: Option<[u8; 32]> },
     Err { ref_id: Option<String>, code: u16, msg: String },
-    Blob { routing_id: [u8; 32], blob_id: [u8; 32], recipient_hint: Option<[u8; 32]>, blob_ttl: Option<u32>, stored_at: u64, relay_proof: Option<[u8; 200]>, blob: Vec<u8> },
-    Event { ref_id: Option<String>, event_type: String },
+    Blob { routing_id: [u8; 32], blob_id: [u8; 32], recipient_hint: Option<[u8; 32]>, blob_ttl: Option<u32>, stored_at: u64, blob: Vec<u8> },
+    Event { ref_id: Option<String>, event_type: String, relay_proof: Option<[u8; 200]> },
     Pong { ts: u64 },
 }
 ```
