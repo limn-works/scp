@@ -4,6 +4,8 @@
 
 An identity's identifier is the digest of its inception event's signed preimage, and it encodes no key (`09-security-model.md` §9.7.4.2 R13). It is not a username, not an email, and not an account on someone's server.
 
+**The identifier's text form is `scp:` followed by the RFC 4648 base32 encoding of its 32 bytes, in lowercase and without padding**, which is 52 base32 characters and 56 characters in all. **That form is the one canonical form, and a parser MUST reject every other string with `IdentityError::NonCanonicalIdentifier`**, uppercase or padded base32 and a DID string included (§3.10.10). Every field that carries an identifier as a string carries this form: every signed structure `09-security-model.md` §9.5.2 enumerates, a UCAN's `iss` and `aud`, a context's membership records, and the runtime's keys. Vector 57 of `25-test-vectors.md` §25.29 pins the encoding.
+
 The identifier never changes. A root change installs a fresh root set under the same identifier, so a relying party re-verifies key continuity against that set rather than reading a rename (`09-security-model.md` §9.11).
 
 The identity publishes no W3C Decentralized Identifiers document. Key material and each key's condition live in the key-event log, and transport and service metadata live in the service record (`18-addressability-and-deployment.md` §18.2.2A, §3.10.13).
@@ -89,7 +91,7 @@ Identity link attestations are sub-classified into two classes based on when and
 
 **Class 2: Reference.** The proof is a live external resource that consumers must verify themselves. Verification methods: `SignedPost`, `DnsRecord`.
 
-- The user places their identifier, in the textual form `09-security-model.md` §9.7.4.2 R13 defers, in an externally-visible location: a profile bio, a DNS TXT record, or a public post.
+- The user places their identifier, in the text form §3.1 fixes, in an externally-visible location: a profile bio, a DNS TXT record, or a public post.
 - The attestation's `proof` field points to the resource URL or record location. No cryptographic proof of ownership exists at creation time, so the proof is the continued presence of that identifier in the external resource.
 - **Zero trust until verified.** A Reference attestation carries no trust weight on its own. Consumers MUST fetch the proof URL or query the DNS record and confirm the identifier is present before granting any trust weight. An unverified Reference attestation is equivalent to no attestation.
 - Verification is consumer-side, cached with a 1-hour TTL (§3.5.4). Consumers that cannot verify (offline, rate-limited, proof URL inaccessible) MUST treat the attestation as unverified.
@@ -148,7 +150,7 @@ The following 16 platforms are supported for identity link attestations. New pro
 
 **Class 2 (Reference) creation flow:**
 
-1. The user places their identifier, in the textual form `09-security-model.md` §9.7.4.2 R13 defers, in the platform-specific location: a profile bio or a DNS TXT record.
+1. The user places their identifier, in the text form §3.1 fixes, in the platform-specific location: a profile bio or a DNS TXT record.
 2. The SDK constructs the proof pointer: for `SignedPost`, `{ "post_url": "<url>", "nonce": "<random_hex>", "posted_at": <unix_s> }`; for `DnsRecord`, `{ "domain": "<domain>", "record_name": "_scp-verify" }`.
 3. The SDK signs the full `IdentityLinkAttestation` envelope with the identity's `#active` key.
 4. The attestation is published. It carries zero trust weight until a consumer fetches and verifies the proof.
@@ -676,7 +678,7 @@ Resolution is the trust root for the whole protocol: where an attacker can subst
 
 **A derivation that two independent parties must reproduce byte for byte consumes the identifier's 32 raw digest bytes** (`09-security-model.md` §9.7.4.2 R13). The `derived_context_id` of §5.15.8 is one such derivation. A fixed-length digest admits exactly one encoding, so two honest parties cannot split onto divergent values, and the length-prefix discipline of `09-security-model.md` §9.5.1 keeps the field boundaries unambiguous whatever the neighbouring fields carry. **A string that is not the canonical form of an inception-derived identifier is rejected at a fail-loud admission gate, with `IdentityError::NonCanonicalIdentifier` (§3.10.10), and never silently coerced**, at every gate that takes an identifier from outside the SDK: without that gate three conforming implementations hash, hex-decode, or left-pad the same bad input, each derives a different value, and the cross-party check fires at the peer while the party holding the bad input believes its identifier valid.
 
-**A preimage that takes the identifier as UTF-8 bytes is not yet computable**, because R13 defers the identifier's textual form. `09-security-model.md` §9.5.2 enumerates every signed structure that waits on it, and a reader MUST NOT treat one of those preimages as computable until a later revision of R13 fixes the encoding.
+**A preimage that takes the identifier as UTF-8 bytes takes its text form** (§3.1), and `09-security-model.md` §9.5.2 enumerates those preimages.
 
 ## 3.9 Key Lifecycle
 
@@ -728,9 +730,9 @@ On appending a key event the owner builds the chain from the inception event to 
 
 ### 3.10.6 Anti-Segmentation Invariant
 
-**Publishing to the fallback set is a MUST.** An identity that published only to relays of its own would be resolvable only by a party that already holds its service record, because a first-contact reader knows no relay of that identity to query, so identities would partition into islands reachable by their existing contacts and by nobody else. **A publish cycle that no relay in the fallback set accepted MUST therefore be reported to the caller as a failed publication**, never as a success. Acceptance and not reachability is the term, because a relay that answers a publisher and refuses the write stores nothing, and `09-security-model.md` §9.7.4.2 R10 gates confirmed publication on acceptance by at least one fallback-set entry. **An acceptance records that the entry stored the bytes and never that the entry still holds them at a later moment**, because a relay may stop holding what it once held on terms its operator declares (`09-security-model.md` §9.7.4.2 R9). What the controller runs against a later displacement is R10's self-observation cadence, whose arms decide which entries carry a publication and what each one publishes (§3.10.5). The ceremony that destroys spent keys rests on the other half of R10's confirmed publication, the controller's durable retention of the signed event, which no displacement at any relay reaches.
+**Publishing to the fallback set is a MUST.** An identity that published only to relays of its own would be resolvable only by a party that already holds its service record, because a first-contact reader knows no relay of that identity to query, so identities would partition into islands reachable by their existing contacts and by nobody else. **A publish cycle that no relay in the fallback set accepted MUST therefore be reported to the caller as a failed publication**, never as a success. Acceptance and not reachability is the term, and **an entry whose result is `Accepted` or `WitnessRefused` accepted the write** (§3.10.10), because a relay that answers a publisher and refuses the write stores nothing, while a witness refusal follows a stored write, and `09-security-model.md` §9.7.4.2 R10 gates confirmed publication on acceptance by at least one fallback-set entry. **An acceptance records that the entry stored the bytes and never that the entry still holds them at a later moment**, because a relay may stop holding what it once held on terms its operator declares (`09-security-model.md` §9.7.4.2 R9). What the controller runs against a later displacement is R10's self-observation cadence, whose arms decide which entries carry a publication and what each one publishes (§3.10.5). The ceremony that destroys spent keys rests on the other half of R10's confirmed publication, the controller's durable retention of the signed event, which no displacement at any relay reaches.
 
-**A refusal is never a verdict about the identity**, which `09-security-model.md` §9.7.4.2 R9 states with the recourse it names. The recourse is mechanical here because the fallback set comes from the shipped community relay list rather than from relays the identity itself chose (`18-addressability-and-deployment.md` §18.5.1). **Where every entry of the fallback set refuses**, the SDK reports the failed publication with the ceiling that entry declared and the retry interval the publisher's own counter measured, and surfaces the entries to the controller. **The two figures are the ones `EntryResult::Refused` carries** (§3.10.10), and each has its own source: an entry declares `rate_limit_publish` in the `relay_config` object it publishes at `.well-known/scp`, and no entry sends a retry interval at any point of the exchange, because ADR-004's `ERR` message carries `ref`, `code` and `msg`. A controller holding a signed reveal-authorized event retains it and resumes the ceremony from `PublishSent` when an entry accepts (`09-security-model.md` §9.7.4.2 R10).
+**A refusal is never a verdict about the identity**, which `09-security-model.md` §9.7.4.2 R9 states with the recourse it names. The recourse is mechanical here because the fallback set comes from the shipped community relay list rather than from relays the identity itself chose (`18-addressability-and-deployment.md` §18.5.1). **Where every entry of the fallback set refuses**, the SDK reports the failed publication with the ceiling that entry declared and the retry interval the publisher's own counter measured, and surfaces the entries to the controller. **The two figures are the ones `EntryResult::Refused` carries** (§3.10.10), and each has its own source: an entry declares `rate_limit_publish` in the `relay_config` object it publishes at `.well-known/scp`, and no entry sends a retry interval at any point of the exchange, because ADR-004's `ERR` message carries no ceiling and no interval. A controller holding a signed reveal-authorized event retains it and resumes the ceremony from `PublishSent` when an entry accepts (`09-security-model.md` §9.7.4.2 R10).
 
 **The three MUSTs above read `PublishOutcome`'s per-entry list**, which §3.10.10 declares along with the variants an entry's result takes and the rule that picks one where a cycle sent an entry several frames. A reader of this section therefore learns from that section what a mixed cycle reports, and takes no reading of its own: without one declared rule, an entry that stored the first three frames of a five-frame chain and refused the fourth read as accepted under one binding and as refused under another, and the accepting reading reported a confirmed publication for a chain no relay holds whole.
 
@@ -762,7 +764,7 @@ A relay operator that answers a resolution learns that the resolver's network ad
 
 ### 3.10.10 IdentityBackend, the Resolution Trait
 
-**`IdentityBackend` carries six methods and no others**, and ADR-063, the inception-derived key-event-log identity substrate, names that seam. **`IdentityBackend::resolve` takes the identifier's 32 raw digest bytes and returns a `ResolutionOutcome`**, which carries key state and no document. **`IdentityBackend::read_service_record` performs the service-record read** every resolution's relay discovery depends on (§3.10.1); it returns a `ServiceRecordVerdict`, whose four variants are `Adopted` carrying the record, `Rejected{cause}` carrying why the reader refused it, `Absent`, and `Inconclusive` where the reader holds no accepted record and cannot meet the first-contact floor on its `scp:svc:` query (§3.10.13). **`publish` and `publish_service_record` each return a `PublishOutcome`, defined below beside the other types the trait returns**: a publish cycle addresses every entry of the publication set §3.10.5 names, so its result is a per-entry list and a single error variant carrying one scope cannot express it. **`resolve` performs the service-record read itself**, through `read_service_record`, at the point §3.10.4 step 2 names, and the backend holds the accepted copy, so a caller never sequences two calls to resolve an identifier and calls `read_service_record` only to read the record's own entries. **`read_policy` returns the `DeclaredWritePolicy` one entry declares, and `None` where that entry declares none**, which is what `publish` segments the chain against; and **`fallback_set` returns the entries `read_policy` takes**, because no other method returns one. Every type name and every variant name below is name-bound under the criterion `09-security-model.md` §9.7.4.2's definitions state. `.docs/architecture.md` cites this section for the method set and states which crate implements the seam. **This section also declares one operation on the identity handle, `observe_self`, which runs one pass of the self-observation cadence `09-security-model.md` §9.7.4.2 R10 states and returns one `EntryObservation` for every entry of the publication set**: how far the SDK reached that entry and, for an entry it read to exhaustion, one `ChainObservation` per chain the entry served. **That operation sits on the identity handle and never on `IdentityBackend`**, because the duty compares what an entry served against the controller's own retained log and no method of that trait returns that log, and because a caller that installs a backend of its own through `IdentityBackendSlot::Custom` reaches a cadence the SDK runs above the trait.
+**`IdentityBackend` carries six methods and no others**, and ADR-063, the inception-derived key-event-log identity substrate, names that seam. **`IdentityBackend::resolve` takes the identifier's 32 raw digest bytes and returns a `ResolutionOutcome`**, which carries key state and no document. **`IdentityBackend::read_service_record` performs the service-record read** every resolution's relay discovery depends on (§3.10.1); it returns a `ServiceRecordVerdict`, whose four variants are `Adopted` carrying the record, `Rejected{cause}` carrying why the reader refused it, `Absent`, and `Inconclusive` where the reader holds no accepted record and cannot meet the first-contact floor on its `scp:svc:` query (§3.10.13). **`publish` and `publish_service_record` each return a `PublishOutcome`, defined below beside the other types the trait returns**: a publish cycle addresses every entry of the publication set §3.10.5 names, so its result is a per-entry list and a single error variant carrying one scope cannot express it. **`resolve` performs the service-record read itself**, through `read_service_record`, at the point §3.10.4 step 2 names, and the backend holds the accepted copy, so a caller never sequences two calls to resolve an identifier and calls `read_service_record` only to read the record's own entries. **`read_policy` returns the `DeclaredWritePolicy` one entry declares, and `None` where that entry declares none**, which is what `publish` segments the chain against; and **`fallback_set` returns the entries `read_policy` takes**, because no other method returns one. Every type name and every variant name below is name-bound under the criterion `09-security-model.md` §9.7.4.2's definitions state. `.docs/architecture.md` cites this section for the method set and states which crate implements the seam. **This section also declares the identity handle's write API below, and one further operation on that handle, `observe_self`, which runs one pass of the self-observation cadence `09-security-model.md` §9.7.4.2 R10 states and returns one `EntryObservation` for every entry of the publication set**: how far the SDK reached that entry and, for an entry it read to exhaustion, one `ChainObservation` per chain the entry served. **That operation sits on the identity handle and never on `IdentityBackend`**, because the duty compares what an entry served against the controller's own retained log and no method of that trait returns that log, and because a caller that installs a backend of its own through `IdentityBackendSlot::Custom` reaches a cadence the SDK runs above the trait.
 
 ```rust
 impl<S: Storage> Identity<S> {
@@ -775,6 +777,31 @@ impl<S: Storage> Identity<S> {
 }
 ```
 
+**The write API is one method per consequential act on the identity handle, and each returns the `PublishOutcome` of the publish cycle that carries the event it signed.** `Identity::create` signs and publishes the inception event and returns the handle beside that outcome. `rotate_active` signs a `KeyState` that installs a fresh `#active` key and drops the replaced one as `Superseded`. `set_witnesses` signs a `KeyState` that names the witness set and its witnessing interval. `mark_compromised` signs a `KeyState` that drops each named key as `Compromised{from: N}`, where N is that event's own sequence; a `KeyState` drops no root member (`09-security-model.md` §9.7.4.2 R3), so the list names the `#active` key and the same event installs a fresh one, and a compromised root member leaves the root set under `recovery().begin(RecoveryKind::RootRecovery)`. `09-security-model.md` §9.7.4.2 R10 declares `Recovery::begin` and `RecoveryKind`, which compose and sign the reveal-authorized events.
+
+```rust
+impl<S: EncryptedStorage> Identity<S> {
+    pub fn create(config: IdentityConfig<S>)
+        -> impl Future<Output = Result<(Identity<S>, PublishOutcome), IdentityError>> + Send;
+
+    pub fn rotate_active(&self)
+        -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
+
+    pub fn set_witnesses(&self, witnesses: Vec<WitnessDesignation>, witnessing_interval: u32)
+        -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
+
+    pub fn mark_compromised(&self, keys: Vec<KeyId>)
+        -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
+}
+
+/// One designated witness: the operator identifier its community-relay-list
+/// entry declares (`09-security-model.md` §9.7.4.2 definitions).
+pub struct WitnessDesignation { pub operator: [u8; 32] }
+
+/// One key the key state names, by its 33-byte SEC1 compressed point.
+pub struct KeyId { pub key: [u8; 33] }
+```
+
 The one unit a section outside this one reproduces, delimited here so it reproduces bytes rather than a paraphrase:
 
 - <!-- scp:fragment id="identity-backend-methods" -->`IdentityBackend` carries six methods and no others, each naming the backend as its receiver: `resolve`, `publish`, `read_service_record`, `publish_service_record`, `read_policy` and `fallback_set`.<!-- scp:end id="identity-backend-methods" -->
@@ -784,9 +811,8 @@ The one unit a section outside this one reproduces, delimited here so it reprodu
 /// Key-state resolution across the SCP relay network (§3.10.4).
 pub trait IdentityBackend: Send + Sync {
     /// `identifier` is the 32 raw digest bytes of the inception-derived
-    /// identifier (`09-security-model.md` §9.7.4.2 R13), never a textual form:
-    /// R13 defers that form, and every derivation this trait performs consumes
-    /// the digest.
+    /// identifier (`09-security-model.md` §9.7.4.2 R13), never its text form,
+    /// because every derivation this trait performs consumes the digest.
     fn resolve(&self, identifier: &[u8; 32])
         -> impl Future<Output = Result<ResolutionOutcome, IdentityError>> + Send;
 
@@ -842,7 +868,7 @@ pub trait IdentityBackend: Send + Sync {
 }
 
 /// The error half of this trait's six methods and of the three recovery entry
-/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries nine
+/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries twelve
 /// variants and no others. A refusal the protocol mandates carries one of these
 /// variants, so four bindings mint one code rather than four and a caller tells
 /// a custody choice from a network condition. **The identity half's one refusal reaches a caller through
@@ -881,7 +907,7 @@ pub enum IdentityError {
     /// enough to return (§3.10.4).
     NoRelayReachable,
     /// SCP-IDENT-1106. A string reached an admission gate that is not the
-    /// canonical form of an inception-derived identifier (§3.8.1).
+    /// canonical form of an inception-derived identifier (§3.1).
     NonCanonicalIdentifier,
     /// SCP-IDENT-1107. `abort_recovery` found the signed event in the device's
     /// own store, so it refused to clear the handle; `resume_recovery`
@@ -896,6 +922,15 @@ pub enum IdentityError {
     /// `NoFallbackSourceReachable`, which names a relay the SDK could not
     /// reach.
     StorePartiallyUnreadable,
+    /// SCP-IDENT-1109. A passkey gesture was cancelled or failed while the SDK
+    /// signed a key event (`09-security-model.md` §9.7.4.2 R10).
+    UserVerificationDeclined,
+    /// SCP-IDENT-1110. `resume_recovery` found a handle and no composed
+    /// preimage in this SDK's own store (`09-security-model.md` §9.7.4.2 R10).
+    RecoveryPreimageMissing,
+    /// SCP-IDENT-1111. The custody backend returned an error while the SDK
+    /// signed a key event (`09-security-model.md` §9.7.4.2 R10).
+    CustodySigningFailed,
 }
 
 /// One relay entry's declared write policy, as that entry publishes it at
@@ -938,7 +973,8 @@ pub struct DeclaredWritePolicy {
 /// alone intersects `per_entry` with `fallback_set`.
 pub struct PublishOutcome {
     pub per_entry: Vec<EntryOutcome>,
-    /// False where no designated witness accepted the head this cycle. The SDK
+    /// False where no designated witness accepted the head this cycle, which
+    /// includes a cycle whose witnesses each answered `WitnessRefused`. The SDK
     /// reports such a cycle as degraded and never as a failure, which is the
     /// third MUST of §3.10.6 and the one a value on an error arm cannot carry.
     pub witnessed: bool,
@@ -961,14 +997,14 @@ pub struct EntryOutcome {
 }
 
 /// What one entry answered. Every SDK binding carries the type name and all
-/// five variant names verbatim.
+/// six variant names verbatim.
 pub enum EntryResult {
     /// The entry stored the write.
     Accepted,
     /// The entry answered ADR-004's `4020` RATE_LIMITED. **This variant
     /// carries the rate-limit payload itself and reads no `scope` and no
-    /// `value` off the wire**, because ADR-004's `ERR` message carries `ref`,
-    /// `code` and `msg` and carries neither field. The publisher fills the
+    /// `value` off the wire**, because ADR-004's `ERR` message carries neither
+    /// field. The publisher fills the
     /// payload from what it already holds, and each figure has its own source:
     /// the ceiling is the `rate_limit_publish` term that entry declared and
     /// `read_policy` returned, and the retry interval is the wait the
@@ -991,6 +1027,11 @@ pub enum EntryResult {
     /// The publisher sent the entry nothing (§3.10.5), so the entry sent no
     /// code.
     NotSent { reason: NotSentReason },
+    /// The entry stored the write and its witness refused to cosign, with one
+    /// of the codes `09-security-model.md` §9.7.4.3 states, `4050` through
+    /// `4053`. `last_cosigned_head` carries the digest a `4050` answer carries
+    /// and is absent otherwise. §3.10.6 counts this variant as an acceptance.
+    WitnessRefused { code: u16, last_cosigned_head: Option<[u8; 32]> },
 }
 
 /// Why the publisher sent an entry nothing.
@@ -1359,7 +1400,7 @@ signature = P256_ECDSA_sign(private_key, signed_bytes)   // RFC 6979 nonce, low-
 | 4 | `audience` | 4-byte BE length prefix + UTF-8 bytes |
 | 5 | `signed_at` | 8-byte big-endian u64 |
 
-**This preimage takes the identifier as UTF-8 bytes, so it waits on the textual form `09-security-model.md` §9.7.4.2 R13 defers**, and `09-security-model.md` §9.5.2 enumerates every signed structure that waits on it, this one included. The domain separator `"SCP-DID-AUTH-V1:"` prevents cross-protocol signature reuse. The SHA-256 wrap aligns with the majority SCP signing pattern (InnerEnvelope, BroadcastEnvelope, sender keys, access keys, sync structures, claims). The `did` and `signing_key_id` fields bind the signature to the signer's identifier and to the role that produced it, so a relying party cannot be shown a signature transplanted from another identity or presented under a role that did not sign.
+**This preimage takes the identifier as UTF-8 bytes in the text form §3.1 fixes**, and `09-security-model.md` §9.5.2 enumerates it among the preimages that take that form. The domain separator `"SCP-DID-AUTH-V1:"` prevents cross-protocol signature reuse. The SHA-256 wrap aligns with the majority SCP signing pattern (InnerEnvelope, BroadcastEnvelope, sender keys, access keys, sync structures, claims). The `did` and `signing_key_id` fields bind the signature to the signer's identifier and to the role that produced it, so a relying party cannot be shown a signature transplanted from another identity or presented under a role that did not sign.
 
 **Signing key and signing identity:**
 
@@ -1440,7 +1481,7 @@ The relying party verifies a response:
 ```json
 {
   "protocol": "scpid/1.0",
-  "did": "<the signer's identifier, in the textual form 09-security-model.md §9.7.4.2 R13 defers>",
+  "did": "<the signer's identifier, in the text form 03 §3.1 fixes>",
   "signing_key_id": "#active",
   "nonce": "<64 hex chars>",
   "audience": "https://app.example.com",
@@ -1485,7 +1526,7 @@ An SCP-native app will typically use **context membership** for protocol operati
 
 ### 3.11.8 SDK API Surface
 
-The SDK provides functions for all three protocol roles. **The three signatures below take and return the identifier's 32 raw digest bytes and never a textual form**, because `09-security-model.md` §9.7.4.2 R13 defers that form and §9.5.2 counts the `"SCP-DID-AUTH-V1:"` challenge of §3.11.3 among the preimages waiting on it; a binding that invented an encoding would give one identity a different string per binding. SCPID operations use `ScpIdError` rather than `IdentityError`, which keeps protocol-level authentication errors separate from the identity layer's own concerns, resolution and key management. This avoids polluting `scp-identity`'s error type with SCPID-specific variants.
+The SDK provides functions for all three protocol roles. **The three signatures below take and return the identifier's 32 raw digest bytes and never its text form**, because the SDK encodes the text form of §3.1 itself where the `"SCP-DID-AUTH-V1:"` challenge of §3.11.3 needs it, so no binding encodes one of its own. SCPID operations use `ScpIdError` rather than `IdentityError`, which keeps protocol-level authentication errors separate from the identity layer's own concerns, resolution and key management. This avoids polluting `scp-identity`'s error type with SCPID-specific variants.
 
 **Challenge generation (relying party):**
 
@@ -1559,8 +1600,8 @@ A service that wants to accept SCP identity authentication without running SCP s
 
 2. **Reading the key from the key state.** The key state lists every key `Current` at the adopted position, by role and by condition, and lists no other key (`09-security-model.md` §9.7.4.2 definitions). Match `signing_key_id` to the role the key state names, confirm the key state lists that key `Current`, and read its 33-byte SEC1 compressed P-256 public key. A relying party needing an earlier key's condition replays the log instead (`09-security-model.md` §9.7.4.2 R8). It parses no identity document and needs none, because the protocol publishes an identity's keys in the key-event log alone (ADR-063, the inception-derived key-event-log identity substrate).
 
-3. **Signature verification.** Reconstruct `signed_bytes` per §3.11.3, whose preimage takes the identifier as UTF-8 bytes and so waits on the textual form `09-security-model.md` §9.7.4.2 R13 defers: concatenate the domain separator `"SCP-DID-AUTH-V1:"`, length-prefixed identifier, length-prefixed `signing_key_id`, raw 32-byte `nonce`, length-prefixed `audience`, and 8-byte big-endian `signed_at`. Compute SHA-256 of the concatenation. Verify the P-256 ECDSA signature over the resulting 32-byte hash, rejecting a high-`s` value (`09-security-model.md` §9.5). Standard libraries: `ring` and `p256` (Rust), the Web Crypto API's `ECDSA` with `P-256` (JS), `cryptography` (Python), and CryptoKit's `P256.Signing` (Swift).
+3. **Signature verification.** Reconstruct `signed_bytes` per §3.11.3, whose preimage takes the identifier as UTF-8 bytes in the text form §3.1 fixes: concatenate the domain separator `"SCP-DID-AUTH-V1:"`, length-prefixed identifier, length-prefixed `signing_key_id`, raw 32-byte `nonce`, length-prefixed `audience`, and 8-byte big-endian `signed_at`. Compute SHA-256 of the concatenation. Verify the P-256 ECDSA signature over the resulting 32-byte hash, rejecting a high-`s` value (`09-security-model.md` §9.5). Standard libraries: `ring` and `p256` (Rust), the Web Crypto API's `ECDSA` with `P-256` (JS), `cryptography` (Python), and CryptoKit's `P256.Signing` (Swift).
 
 4. **Nonce management.** Store issued nonces with their `expires_at`. Reject duplicates. Prune expired entries. For distributed deployments, use a strongly-consistent store or HMAC-based nonce generation (§3.11.6).
 
-No SCP SDK, no MLS, and no context management. The verification path is: two relay QUERYs, the chain verification of §9.6.1, one JSON parse, one SHA-256, and one P-256 verify, once R13 fixes the textual form step 3 waits on.
+No SCP SDK, no MLS, and no context management. The verification path is: two relay QUERYs, the chain verification of §9.6.1, one JSON parse, one SHA-256, and one P-256 verify.
