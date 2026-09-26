@@ -459,18 +459,20 @@
       "gate": "gate-reachability-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-identity/src/resolver.rs"
       ],
-      "description": "Implement the IdentityBackend trait (§3.10.10), the protocol's one resolution entry point. resolve takes the identifier's 32 raw digest bytes and returns a ResolutionOutcome carrying a verdict, key state, and sources. The resolver queries the identity's own relays and the fallback set in parallel, with per-relay 10-second timeouts, and counts a response only where it verified that chain. Fork precedence ranks two diverging chains (§9.7.4.2 R6).",
+      "description": "Implement the IdentityBackend trait (§3.10.10), the protocol's one resolution entry point. resolve takes the identifier's 32 raw digest bytes and returns a ResolutionOutcome carrying a verdict, key state, and sources. The resolver queries the identity's own relays and the fallback set in parallel, with per-relay 10-second timeouts, and counts a response only where it verified that chain. Fork precedence ranks two diverging chains (§9.7.4.2 R6). The resolver settles and counts only the sources its page walk read to exhaustion (§3.10.4 steps 4 and 5).",
       "acceptanceCriteria": [
         "IdentityBackend::resolve(&self, identifier: &[u8; 32]) -> Result<ResolutionOutcome, IdentityError> (§3.10.10)",
         "ResolutionOutcome carries verdict, key_state, and sources; key_state is present on Confirmed and Adopted alone",
-        "ResolutionSources carries relays_reached, declared, proven, and head_provenance, with `declared` and `proven` holding 33-byte SEC1 compressed operator keys because R11's first-contact floor counts keys and never declared operator identifiers (`03-identity.md` §3.10.10, `09-security-model.md` §9.7.4.2 R11)",
+        "ResolutionSources carries relays_reached, unexhausted, declared, proven, and head_provenance, with `declared` and `proven` holding 33-byte SEC1 compressed operator keys because R11's first-contact floor counts keys and never declared operator identifiers (`03-identity.md` §3.10.10, `09-security-model.md` §9.7.4.2 R11)",
         "The resolver queries both relay sets concurrently via tokio::join! (§3.10.4 step 2)",
         "The resolver decodes each response, recomputes its identifier from the inception event, and verifies every later event (§3.10.4)",
         "A response failing any of those three checks is discarded",
+        "The resolver settles chains only from sources the page walk read to exhaustion, and a source it did not exhaust yields `Inconclusive{MissingEvents}`, except that a source holding two rank-1 suffixes may yield `Contested{Rank1Terminal}`: a test per case (§3.10.4 step 4, `09-security-model.md` §9.7.4.2 R9)",
+        "The first-contact floor counts a relay only where the walk read it to exhaustion, it served a chain that survived step 3, and its proof verified; `unexhausted` lists every relay the walk did not exhaust, and `proven` holds no key from such a relay: a test asserts all three (§3.10.4 step 5, §3.10.10)",
         "A prefix chain loses to the longer chain (§3.10.4 step 4)",
         "Fork precedence ranks two diverging chains; a tie returns Contested (§9.7.4.2 R6, R7)",
         "A head below the accepted sequence returns Discarded{accepted_head} (§9.7.4.2 R12)",
@@ -498,6 +500,10 @@
         {
           "file": ".docs/specs/03-identity.md",
           "section": "### 3.10.4 Resolution Protocol"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
         }
       ],
       "details": {

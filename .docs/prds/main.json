@@ -283,6 +283,25 @@
         "SCP-303",
         "SCP-304"
       ]
+    },
+    {
+      "id": "gate-kel",
+      "name": "Key-event-log identity substrate (ADR-063)",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-305",
+        "SCP-306",
+        "SCP-307",
+        "SCP-308",
+        "SCP-309",
+        "SCP-310",
+        "SCP-311",
+        "SCP-312",
+        "SCP-313",
+        "SCP-314",
+        "SCP-315"
+      ]
     }
   ],
   "stories": [
@@ -603,14 +622,14 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-identity/src/lib.rs",
         "crates/scp-identity/src/dht.rs",
         "crates/scp-identity/src/config.rs",
         "crates/scp-did/src/document.rs"
       ],
-      "description": "Implement identity creation in the scp-identity crate, over the wasm-safe identity data model in scp-did. The module handles creation, verification, and key-state management. An identity's first key event is its inception event, and the identifier is SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage) — 32 raw digest bytes that encode no key, which is what makes the identifier self-certifying (security spec §9.7.4.2 R13). The module abstracts the identity backend behind the `IdentityBackend` seam `03-identity.md` §3.10.10 states, which carries six methods; that section names them and this story states no list of its own, because a second list drifts from the declaration it copies. The shipped crate carries `generate_ephemeral_ed25519_seed`, which names the superseded curve; the code workstream that moves the key material to P-256 renames it, and this story names it as it ships today rather than inventing a name no author chose (ADR-054). Creation takes two custody providers: key_custody holds the operational keys, and pre_rotation_custody holds the pre-rotation key, because §9.7.4.1 item 3 forbids the operational provider from holding the recovery key. No production PreRotationCustody backend exists, so every creation path fails closed with IdentityError::NoPreRotationBackend (SCP-IDENT-1059), which §9.7.4.1 item 3a requires; ADR-062 §Decision 6 gates the mint path behind the testing feature. Publication and resolution are SCP-007; rotation is SCP-008.",
+      "description": "Implement identity creation in the scp-identity crate, over the wasm-safe identity data model in scp-did. The module handles creation, verification, and key-state management. An identity's first key event is its inception event, and the identifier is SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage) — 32 raw digest bytes that encode no key, which is what makes the identifier self-certifying (security spec §9.7.4.2 R13). The module abstracts the identity backend behind the `IdentityBackend` seam `03-identity.md` §3.10.10 states, which carries six methods; that section names them and this story states no list of its own, because a second list drifts from the declaration it copies. The shipped crate carries `generate_ephemeral_ed25519_seed`, which names the superseded curve; the code workstream that moves the key material to P-256 renames it, and this story names it as it ships today rather than inventing a name no author chose (ADR-054). Creation takes two custody providers: key_custody holds the operational keys, and pre_rotation_custody holds the pre-rotation key, because §9.7.4.1 item 3 forbids the operational provider from holding the recovery key. Where no substrate satisfies §9.7.4.1 item 3a's independent-residence requirement, every creation path fails closed with IdentityError::NoIndependentSubstrate (SCP-IDENT-1100, `03-identity.md` §3.10.10). Publication and resolution are SCP-007; rotation is SCP-008.",
       "acceptanceCriteria": [
         "The identity-creation path takes key_custody and pre_rotation_custody, returns Result<(ScpIdentity, KeyEvent, PreRotationKeyHandle), IdentityError>, and generates the root member (#0) and the Active Signing Key (#active) as ECDSA P-256 keypairs in key_custody (§9.5, §9.7.4.2 definitions)",
         "The identity-creation path draws the pre-rotation seed from key_custody.generate_ephemeral_ed25519_seed(), hands it to pre_rotation_custody.store_committed_pre_rotation_key, and never writes the pre-rotation private key into key_custody — §9.7.4.1 item 3 (storage isolation) forbids the operational provider from holding it",
@@ -621,7 +640,7 @@
         "verify_did(identifier, inception_event) -> bool recomputes SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage) and compares it to the identifier (§9.7.4.2 R2 — local, no network call)",
         "The identity backend seam is `IdentityBackend`, carrying the six methods `03-identity.md` §3.10.10 names and no others — `resolve`, `publish`, `read_service_record`, `publish_service_record`, `read_policy` and `fallback_set`",
         "ScpIdentity declares exactly four public fields: identity_key (KeyHandle), active_signing_key (KeyHandle), pre_rotation_commitment ([u8; 32]), identifier ([u8; 32])",
-        "Every identity-creation entry point that supplies its own pre-rotation custody — Identity::create, Identity::create_ephemeral, the scp-node identity resolvers, and the identity_create paths of the PyO3, napi-rs, and UniFFI bridges — returns IdentityError::NoPreRotationBackend on a build without the testing feature, and the three bridges surface it as error code SCP-IDENT-1059, because no production PreRotationCustody backend exists — §9.7.4.1 item 3a requires the typed error and forbids any dev stand-in",
+        "Every identity-creation entry point — Identity::create, the scp-node identity resolvers, and the identity_create paths of the PyO3, napi-rs, and UniFFI bridges — returns IdentityError::NoIndependentSubstrate where no substrate satisfying §9.7.4.1 item 3a is available, and the three bridges surface it as error code SCP-IDENT-1100; a test drives each entry point with no such substrate and asserts that code (`03-identity.md` §3.10.10)",
         "An identity publishes no W3C DID Core document: key material and each key's condition live in the key-event log, and every transport and service field is a service-record entry",
         "All public items have /// doc comments",
         "Unit tests for create, verify_did, and key-state construction",
@@ -634,12 +653,12 @@
         "Implement the relay-network IdentityBackend in crates/scp-identity/src/dht.rs, with the identity-creation path signing the inception event under the root member it installs",
         "Implement verify_did in crates/scp-identity/src/dht.rs — recompute the identifier from the inception preimage and compare",
         "Implement the key-state snapshot in crates/scp-did/src/document.rs — standing root, operational roles, standing commitment, witness set, designation, delegator",
-        "Add the IdentityError::NoPreRotationBackend variant and the SCP-IDENT-1059 error code, and return them from every production creation path on a build without the testing feature",
+        "Add the IdentityError::NoIndependentSubstrate variant (SCP-IDENT-1100) and return it from every creation path where no substrate satisfies §9.7.4.1 item 3a",
         "Add the P-256 and SHA-256 dependencies the inception preimage and its signature need",
         "Write unit tests for the identity-creation path covering the two keypairs, the cold-stored pre-rotation key, the identifier derivation, and the key-state snapshot",
         "Write unit tests for verify_did with valid and invalid inception events",
         "Write unit tests for key-state serialization and deserialization",
-        "Write unit tests asserting that creation fails closed with NoPreRotationBackend on a build without the testing feature"
+        "Write unit tests asserting that creation fails closed with NoIndependentSubstrate where no substrate satisfies §9.7.4.1 item 3a"
       ],
       "blockedBy": [
         "SCP-001"
@@ -656,11 +675,15 @@
         {
           "file": ".docs/adrs/ADR-063-inception-derived-identity-key-event-log.md",
           "section": "### The identity form"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
         }
       ],
       "details": {
         "scpIdentityStruct": "```rust\npub struct ScpIdentity {\n    /// The root member (`#0`). Signs establishment events and nothing else,\n    /// so it stays cold. Held in highest-security custody (Secure Enclave,\n    /// HSM). NEVER used for MLS, envelopes, or UCANs.\n    pub identity_key: KeyHandle,\n\n    /// Current Active Signing Key (`#active`), the identity's one operational\n    /// role: MLS KeyPackage attestations, inner-envelope signatures, UCAN\n    /// issuance. A `KeyState` event the root signs rotates it, and the\n    /// identifier never changes.\n    pub active_signing_key: KeyHandle,\n\n    /// SHA-256(\"SCP-PREROTATION-COMMITMENT-V1:\" || next public key), fixed by\n    /// the inception event. Its private half lives in a separate\n    /// PreRotationCustody instance (§9.7.4.1 item 3).\n    pub pre_rotation_commitment: [u8; 32],\n\n    /// SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage), 32 raw digest\n    /// bytes. Its textual form is deferred (§9.7.4.2 R13).\n    pub identifier: [u8; 32],\n}\n```",
-        "preRotationFailClosed": "Security spec §9.7.4.1 item 3a states: \"If no substrate satisfying this recovery-authority-residence requirement is available, identity creation MUST fail closed with a typed error.\" ADR-062 §Decision 6 severed InMemoryPreRotationCustody behind the testing feature, so a shipped build carries no PreRotationCustody backend. Every production creation path therefore returns IdentityError::NoPreRotationBackend, which the PyO3, napi-rs, and UniFFI bridges surface as SCP-IDENT-1059. A durable pre-rotation backend is tracked by issue #1729 and RFC #2130."
+        "preRotationFailClosed": "Security spec §9.7.4.1 item 3a states that where no substrate satisfying the independent-residence requirement is available, identity creation MUST fail closed with `IdentityError::NoIndependentSubstrate`, which `03-identity.md` §3.10.10 numbers SCP-IDENT-1100. The PyO3, napi-rs, and UniFFI bridges surface that code."
       }
     },
     {
@@ -669,30 +692,37 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-core/src/identity/dht.rs",
         "crates/scp-core/src/identity/cache.rs"
       ],
-      "description": "Implement publishing an identity's key-event log to SCP relays and resolving it back, with caching, staleness detection, and automatic republishing. A publisher splits the chain into frame-sized segments and publishes them to the identity's own relays and to the fallback set (§3.10.5). A validating relay honors the PUBLISH's `retain` flag and gives the record no TTL; §9.7.4.2 R9 states that a relay may stop holding what it once held on terms its operator declares, and §9.7.4.2 R10 states the cadence that re-publishes where an entry no longer holds the record. The cycle keeps alive the copies a transport that cannot validate stores as opaque blobs under the shared TTL (§9.10.12).",
+      "description": "Implement publishing an identity's key-event log to SCP relays and resolving it back, with caching, staleness detection, and automatic republishing. A publisher splits the chain into frame-sized segments and publishes them to the identity's own relays and to the fallback set (§3.10.5). A validating relay honors the PUBLISH's `retain` flag and gives the record no TTL; §9.7.4.2 R9 states that a relay may stop holding what it once held on terms its operator declares, and §9.7.4.2 R10 states the cadence that re-publishes where an entry no longer holds the record. The cycle keeps alive the copies a transport that cannot validate stores as opaque blobs under the shared TTL (§9.10.12). This story owns the self-observation cadence of §9.7.4.2 R10 and the `observe_self` operation `03-identity.md` §3.10.10 declares on the identity handle; SCP-008 composes the events that cadence re-publishes, and SCP-305 carries the recovery entry points.",
       "acceptanceCriteria": [
         "IdentityBackend::publish splits the chain into frame-sized segments and publishes them to both relay sets in sequence order (§3.10.5)",
         "The root signs every establishment event and an operational key signs none (§9.7.4.2)",
         "An event's sequence is its predecessor's plus one, and the inception event's is zero (§9.7.4.2)",
-        "Idempotent: a frame whose event digests all match the chain's leaves what the relay holds unchanged, which is a relay's own write rule and which ADR-065, the relay ADR, pending, states",
+        "Idempotent: a frame whose event digests all match the chain's leaves what the relay holds unchanged, which is a relay's own write rule and which ADR-065, the relay ADR, pending, states; the tag `archive/kel-combined-pre-split` preserves the combined text",
         "A PUBLISH at the `scp:did:` kind sets `retain: true` and a validating relay gives the record no TTL (§9.10.12)",
         "Failure handling: exponential backoff on publish failure: 30s, 1m, 2m, 4m, 8m, 16m, capped at 30m",
         "Each retry re-reads the fallback set from the shipped community relay list (§18.5.1)",
         "After 6 consecutive failures, emit a publish-degraded warning to the application layer",
-        "The self-observation cadence starts when identity is loaded (Identity::load or Identity::create) and stops when identity is unloaded or SDK shuts down, and it decides all five relations a chain an entry serves can hold to the controller's own retained log — absent, identical, superseded, extending and diverged — publishing under the first, the third and the fifth, publishing nothing under the second and the fourth, and alerting the human at maximum severity under the fourth and the fifth; an entry that answered with frames chaining to nothing, or whose read the fetch bound stopped before any chain closed from an inception event to a head, takes the first relation's act, and R10's served-nothing sentence alerts at maximum severity and names that entry, which the first relation itself does not (`09-security-model.md` §9.7.4.2 R10)",
-        "Republish task is a background tokio task the identity module owns",
+        "The self-observation cadence starts when an identity is loaded (Identity::load or Identity::create) and stops when that identity is unloaded or the SDK shuts down, and the SDK runs exactly one cadence loop per loaded identity: a test loads one identity, counts the cadence tasks the identity module spawned for it, and asserts one (`09-security-model.md` §9.7.4.2 R10)",
+        "Each cadence pass fetches from every entry of the publication set `03-identity.md` §3.10.5 names, on every launch and at least once per witnessing interval, and `Identity::observe_self` returns one `EntryObservation` per entry of that set, each entry exactly once (`03-identity.md` §3.10.10)",
+        "An entry that answers nothing yields `EntryReach::Unreachable`: a test serves no answer from one entry and asserts that observation, an alert, and no PUBLISH to that entry (`09-security-model.md` §9.7.4.2 R10)",
+        "An entry the page walk did not read to exhaustion yields `EntryReach::Unexhausted`: a test stops the walk at the fetch bound and asserts that observation, an alert naming the entry, and no PUBLISH to it (`09-security-model.md` §9.7.4.2 R10)",
+        "An empty entry yields one `ChainObservation` whose `relation` is `Absent`, whose `alerted` is false, and whose `republished` is present, after the SDK re-published its chain from the inception event and its service record; an entry whose frames chain to nothing yields the same observation with `alerted` true: a test serves each case and asserts both (`09-security-model.md` §9.7.4.2 R10)",
+        "Two chains at one entry yield two observations: a test serves the controller's own head and a second chain forking from it at one entry, and asserts `EntryReach::Answered` carries two `ChainObservation` values, the first `Identical` and the second `Diverged` with `alerted` true (`09-security-model.md` §9.7.4.2 R10)",
+        "The superseded arm re-publishes and the identical arm does not: a test serves from one entry a head the controller's own log supersedes and from a second entry the controller's own head, and asserts one re-PUBLISH to the first entry, starting at the first event that entry does not hold, and none to the second (`09-security-model.md` §9.7.4.2 R10)",
+        "An entry whose declared `max_blob_size` admits no segment of the chain receives no PUBLISH and appears in `PublishOutcome::per_entry` as `EntryResult::NotSent { reason: SegmentTooLarge }`: a test declares a ceiling below one frame's fixed prefix plus one event and asserts both (`03-identity.md` §3.10.5)",
+        "The cadence is a background tokio task the identity module owns, and no second republication task exists (`09-security-model.md` §9.7.4.2 R10)",
         "On SDK initialization the self-observation cadence runs one pass immediately for every persisted active identity, over every entry of that identity's publication set, and publishes under the relations R10 names and under no unconditional startup republish (`09-security-model.md` §9.7.4.2 R10)",
         "resolve(identifier) returns a ResolutionOutcome from the SCP relay network, the one resolution layer (§3.10.4)",
         "resolve recomputes the identifier from the inception event and discards a differing response (§9.7.4.2 R2)",
         "resolve verifies every later event under the standing root and discards a defective chain (§9.7.4.2 R3)",
         "resolve derives the key state from the latest state-carrying event at or before the adopted head (§9.7.4.2 R8)",
         "resolve caches results: 24-hour refresh for active contacts, 7-day for inactive (§9.10.7)",
-        "Stale resolution carries the staleness the `ResolutionOutcome` `03-identity.md` §3.10.10 declares, through that type's own staleness field, and names no type of its own",
+        "`ResolutionOutcome` carries no staleness field (`03-identity.md` §3.10.10): where every relay fails and a cached key state under seven days old exists, resolve returns `Confirmed` carrying the cached head, with an empty `relays_reached`, an empty `proven`, and the `head_provenance` an earlier resolution recorded; a test asserts all four (`03-identity.md` §3.10.4)",
         "Stale results trigger an SDK warning log",
         "Unit tests for publish and resolve against an in-memory relay mock",
         "Unit tests for cache TTL behavior (24h active, 7d inactive)",
@@ -701,18 +731,16 @@
       ],
       "actionItems": [
         "Implement IdentityBackend::publish in dht.rs — split the chain into frame-sized segments, publish to both relay sets in sequence order with `retain: true`",
-        "Implement the self-observation cadence as a background tokio task that fetches from every fallback-set entry and takes the act R10 names for the relation that entry's head holds to the controller's own retained log",
+        "Implement the self-observation cadence as the one background tokio task that fetches from every entry of the publication set and produces what `Identity::observe_self` returns: one `EntryObservation` per entry, and one `ChainObservation` per chain an answered entry served",
         "Implement exponential backoff for publish failures (30s, 1m, 2m, 4m, 8m, 16m, cap 30m)",
         "Implement the publish-degraded warning after six consecutive failures",
-        "Implement startup republish on identity load",
+        "Run one cadence pass on identity load",
         "Implement resolve in dht.rs over multi-relay QUERY",
         "Implement identifier recomputation (R2), event verification under the standing root (R3), and key-state derivation (R8)",
         "Implement resolution cache in cache.rs with TTL-based expiry (24h active, 7d inactive)",
-        "Implement Staleness enum and staleness indicator in resolution results",
-        "Implement head-sequence comparison for cache freshness",
         "Implement head-sequence comparison for cache freshness",
         "Write tests for cache TTL and staleness detection",
-        "Write tests for republishing lifecycle (start on load, stop on unload)"
+        "Write tests for the cadence lifecycle (start on load, stop on unload, one loop), for each `EntryReach`, and for each relation the acceptance criteria name"
       ],
       "blockedBy": [
         "SCP-006"
@@ -721,12 +749,24 @@
         {
           "file": ".docs/specs/03-identity.md",
           "section": "### 3.10.5 Publishing Protocol"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.4 Resolution Protocol"
         }
       ],
       "details": {
         "republishStrategy": "A validating relay stores a `retain` PUBLISH and gives it no TTL, which §9.10.12 states, so no republication cycle makes the record permanent there; §9.7.4.2 R9 states that a relay may stop holding what it once held on terms its operator declares, and §9.7.4.2 R10 states which of the five relations an entry's head can hold to the controller's own retained log carry a publication and what each one publishes. A transport that cannot validate stores the frame as an opaque blob under the shared blob TTL, and the cycle keeps that copy alive.",
         "cacheStrategy": "Resolution cache — TTL-based, 24h active / 7d inactive, head-sequence comparison for staleness (§9.10.7)",
-        "stalenessIndicator": "A cached result the resolver has not refreshed within its window carries a staleness indicator. Callers SHOULD treat a stale result as valid but degraded. UCAN validation and MLS credential verification SHOULD resolve fresh first, and §9.7.1 check 2 bounds how stale a key state may be when it satisfies an attestation's current-key check."
+        "stalenessIndicator": "`ResolutionOutcome` carries no staleness field. The cached return `03-identity.md` §3.10.4 states comes back `Confirmed` with an empty `relays_reached`. UCAN validation and MLS credential verification SHOULD resolve fresh first, and §9.7.1 check 2 bounds how stale a key state may be when it satisfies an attestation's current-key check."
       },
       "result": "Implemented identity publish/resolve, DhtClient trait abstraction, InMemoryDhtClient for testing, DidCache with TTL-based staleness detection (24h active/7d inactive), RepublishManager with exponential backoff. 40 new tests.",
       "republishStrategy": "A validating relay stores a `retain` PUBLISH and gives it no TTL, which §9.10.12 states, so no republication cycle makes the record permanent there; §9.7.4.2 R10 states the self-observation cadence that re-publishes where an entry no longer holds the record. The retry schedule this story's acceptance criteria name is the implementation's own and states no protocol rule, because a story is downstream of a spec."
@@ -743,7 +783,7 @@
         "crates/scp-identity/src/republish.rs",
         "crates/scp-identity/src/key_state.rs"
       ],
-      "description": "Implement the key-event-log rotation and recovery kinds. Under ADR-063, the inception-derived key-event-log identity substrate, the identifier is the digest of the inception event and never changes (`09-security-model.md` §9.7.4.2 R13), so there is no migration and no migration proof: `\"SCP-MIGRATION-V1:\"` is registered as retired in §9.18.2's separator registry. Every change to an identity's keys is an event appended to its one chain. This story implements the three event kinds a controller signs and the ceremony §9.7.4.2 R10 orders. (1) A `KeyState` event installs a fresh `#active` key under the standing root and changes no commitment; the key state carries the keys that are current and no history, so the replaced key leaves the list with a condition entry and a verifier derives any earlier key's condition by replaying the log (§9.7.4.2 R8). (2) A `CommitmentRollover` reveals the standing commitment under the standing root and fixes the next one, which is what a controller signs on suspicion of a copied pre-rotation key. (3) A `RootRecovery` at either `standing_root` value installs a fresh root set K' under a reveal, which is what a controller signs when it must retire or has lost its root. R10's situation table decides which of the three a controller signs. The two reveal-authorized kinds carry the ceremony duties R10 states: the persist of the `RecoveryHandle` precedes the signature, the controller durably retains the signed event before it destroys the spent keys, and confirmed publication is that retention together with acceptance by at least one entry of the fallback set.",
+      "description": "Implement the key-event-log rotation and recovery kinds. Under ADR-063, the inception-derived key-event-log identity substrate, the identifier is the digest of the inception event and never changes (`09-security-model.md` §9.7.4.2 R13), so there is no migration and no migration proof: `\"SCP-MIGRATION-V1:\"` is registered as retired in §9.18.2's separator registry. Every change to an identity's keys is an event appended to its one chain. This story implements the three event kinds a controller signs and the ceremony §9.7.4.2 R10 orders. (1) A `KeyState` event installs a fresh `#active` key under the standing root and changes no commitment; the key state carries the keys that are current and no history, so the replaced key leaves the list with a condition entry and a verifier derives any earlier key's condition by replaying the log (§9.7.4.2 R8). (2) A `CommitmentRollover` reveals the standing commitment under the standing root and fixes the next one, which is what a controller signs on suspicion of a copied pre-rotation key. (3) A `RootRecovery` at either `standing_root` value installs a fresh root set K' under a reveal, which is what a controller signs when it must retire or has lost its root. R10's situation table decides which of the three a controller signs. The two reveal-authorized kinds carry the ceremony duties R10 states: the persist of the `RecoveryHandle` precedes the signature, the controller durably retains the signed event before it destroys the spent keys, and confirmed publication is that retention together with acceptance by at least one entry of the fallback set. The self-observation cadence that adopts or withholds a served chain is SCP-007's, and the recovery entry points are SCP-305's; this story owns the extending arm's fork, which the controller composes from the adopted log.",
       "acceptanceCriteria": [
         "rotate_active_key(identity, key_custody) -> Identity generates a fresh P-256 keypair, appends a `KeyState` event at the predecessor's sequence plus one that lists the new key `Current` in the `#active` role and lists the replaced key with a condition entry, and signs that event under a threshold of the standing root and never under the replaced active key (`09-security-model.md` §9.7.4.2 R3, R8).",
         "A `KeyState` event changes no commitment: a test asserts that an event whose standing commitment differs from its predecessor's is rejected at verification with the R1 defect, because a commitment changes only in a reveal-authorized event (`09-security-model.md` §9.7.4.2 R1).",
@@ -752,20 +792,23 @@
         "rotate_active_key publishes the extended chain through `IdentityBackend::publish` and returns its `PublishOutcome`; a cycle no fallback-set entry accepted returns a per-entry list carrying `Refused` or `Failed` at each such entry and no error variant, because `IdentityError` carries no rate-limit variant, and the caller reports a failed publication (`03-identity.md` §3.10.5, §3.10.6, §3.10.10).",
         "compose_commitment_rollover(identity, pre_rotation_custody, key_custody) -> CommitmentRollover reveals the standing commitment at the index the commitment list names, fixes the next commitment list and next threshold inside the same event, and carries the reveal group's signer index list; a test asserts a revealed key whose commitment is not the standing list's member at the named index is rejected with the R3 defect (`09-security-model.md` §9.7.4.2 R1, R3).",
         "compose_root_recovery(identity, standing_root, pre_rotation_custody, key_custody) -> RootRecovery installs a fresh root set K' and its threshold under a reveal, and carries the standing-root signature group at `standing_root: CoSigns` and omits it at `standing_root: Lost`; a test asserts the SDK refuses to sign `standing_root: Lost` with `IdentityError::RootThresholdHeld` while it holds a threshold of the standing root (`09-security-model.md` §9.7.4.2 R3, `03-identity.md` §3.10.10).",
-        "The ceremony persists before it signs: a test drives each reveal-authorized kind, asserts the `RecoveryHandle` reaches every store of the running profile's store set before the signature, and asserts a controller that crashes between the two resumes from that handle rather than composing a fresh next set (`09-security-model.md` §9.7.4.2 R10).",
+        "The ceremony order holds: a test drives each reveal-authorized kind and asserts that the display confirmation precedes the `Composed` handle write, that the `RecoveryHandle` reaches every member of the store set, which is keyed on the pre-rotation credential, before the signature, and that a controller that crashes between the two resumes from that handle rather than composing a fresh next set (`09-security-model.md` §9.7.4.2 R10).",
         "One reveal at a time: a test asserts the SDK refuses with `IdentityError::RevealAlreadyPending` while it can observe an unpublished reveal-authorized event or a pending `RecoveryHandle` for that identity in any store of the set, and asserts a `resume_recovery` that completes removes the handle from every one of those stores (`09-security-model.md` §9.7.4.2 R10).",
         "The controller durably retains the signed event byte for byte before it destroys the spent keys, and destroys every key the reveal revealed and no unexposed member the superseding list re-commits; a test asserts both (`09-security-model.md` §9.7.4.2 R5, R10, §9.7.4.1 item 8).",
-        "The self-observation cadence fetches from every entry of the publication set and publishes under three of the five relations R10 names: a test advances a paused clock by one witnessing interval, serves from the first entry a head the controller's own log supersedes and serves nothing from a second, and asserts the SDK fetched from both, re-PUBLISHed to the first from the first event that entry does not hold, and re-PUBLISHed its chain from the inception event and its service record to the second (`09-security-model.md` §9.7.4.2 R10).",
+        "A device lagging one honest `CommitmentRollover` adopts it and wins at rank 1: a test builds a controller whose second device's retained log ends one event below a `CommitmentRollover` the controller signed on its first device, serves that rollover and a thief's `RootRecovery{Lost}` above it, and asserts that the second device adopts the rollover, withholds the `{Lost}` event, composes its fork at that event's predecessor from the adopted key state, and that R6 ranks the fork 1 against the thief's suffix at rank 2 (`09-security-model.md` §9.7.4.2 R6, R10).",
+        "An SDK that reaches some members of a non-empty store set and not every member refuses to compose with `IdentityError::StorePartiallyUnreadable`, and an SDK that reaches no member refuses with the same error: one test per case asserts the error and that no event was signed (`09-security-model.md` §9.7.4.2 R10).",
+        "A member that answers bytes the SDK cannot decode as a `RecoveryHandle` counts as unreached: a test serves such bytes from one member and asserts `IdentityError::StorePartiallyUnreadable` (`09-security-model.md` §9.7.4.2 R10).",
+        "A `Browser` SDK under a platform account that syncs the credential composes no reveal: a test runs the `Browser` profile with a syncing platform account and asserts `IdentityError::StorePartiallyUnreadable` and no signature (`09-security-model.md` §9.7.4.2 R10).",
+        "A `largeBlob` store joins the store set only after a write lands at the credential's designation, and a write that does not land removes that member alone: a test fails the write and asserts that the next compose reads the platform-account member and not the `largeBlob` member (`09-security-model.md` §9.7.4.2 R10).",
         "No unwrap() or expect() in library code."
       ],
       "actionItems": [
         "Implement rotate_active_key in the identity backend: generate a fresh P-256 keypair, build the `KeyState` snapshot listing it `Current` in the `#active` role and the replaced key with a condition entry, sign the twelve-field preimage under a threshold of the standing root, and publish the extended chain through `IdentityBackend::publish`.",
         "Implement compose_commitment_rollover: read the standing commitment and the current key list from the log the controller durably retains, reveal at the named index, fix the next commitment list and next threshold in the same event, and sign the reveal group plus the standing-root group.",
         "Implement compose_root_recovery for both `standing_root` values: generate K' and the operational keys under the device boundary §9.7.4.1 states, carry the standing-root group at `CoSigns` and omit it at `Lost`, and refuse `Lost` with `IdentityError::RootThresholdHeld` where the SDK holds a threshold of the standing root.",
-        "Implement the ceremony order of §9.7.4.2 R10: read from the retained log, generate the next set, persist the `RecoveryHandle` into every store of the profile's store set, sign, publish, retain, destroy — with the persist before the signature.",
-        "Implement the one-reveal-at-a-time rule: write the pending handle and the signed event into every store before signing, read every store before composing, and remove the handle from every store on abort and on a completing resume.",
-        "Implement the self-observation cadence: fetch the identity's own log from every fallback-set entry no less often than the witnessing interval and on every launch, and publish under the absent, superseded and diverged relations alone (`09-security-model.md` §9.7.4.2 R10).",
-        "Write tests for rotation (identifier and root-set invariance, the one-current-key rule, the unchanged commitment), for each reveal-authorized kind (commitment match at the named index, the `Lost` refusal), for the ceremony (persist before signature, crash resume, handle removal), and for the re-publication cadence."
+        "Implement the ceremony order of §9.7.4.2 R10: read from the retained log, generate the next set, compose, confirm on a display, persist the preimage, persist the `RecoveryHandle` at `Composed` into every member of the store set, sign, persist the signed event into the SDK's own store, publish, confirm, retain, destroy, and remove the handle from every member.",
+        "Implement the one-reveal-at-a-time rule and the store set: read every member before composing, refuse with `StorePartiallyUnreadable` where any member of a non-empty set is unreached, admit a `largeBlob` member only after a write lands, and remove it alone when a write fails.",
+        "Write tests for rotation (identifier and root-set invariance, the one-current-key rule, the unchanged commitment), for each reveal-authorized kind (commitment match at the named index, the `Lost` refusal), for the ceremony order, for the store-set refusals, and for the lagging-device fork."
       ],
       "blockedBy": [
         "SCP-007"
@@ -10605,6 +10648,488 @@
         "enforcementFiles": "This story touches two protected enforcement files, and in each case only by adding coverage: a new `attestation_summaries` operation row in .docs/standards/sdk-capability-matrix.json and a new `(\"Trust\", \"attestation_summaries\")` entry in the ALIASES table of scripts/check-sdk-coverage.py. CLAUDE.md permits adding a new operation, which widens what the check covers. If an implementer finds they need to flip an existing cell to false, add an exemption, or narrow an existing ALIASES entry, they MUST stop and get a human to approve it — this story authorizes none of those.",
         "outOfScope": "Layer 4 of the trust model (endorsements, challenge results, consequence structures) stays out of `TrustEvaluation`; `aggregate_trust_input` returns the raw `TrustInput` those consumers read. `ParticipationFacts` gains no field and loses none, and `attestation_count` keeps its §7.3.2 verifier-relative meaning. The story adds no ingest path: an attestation reaches the store only through the existing verify-on-ingest helper, which still refuses to persist an entry that fails verification."
       }
+    },
+    {
+      "id": "SCP-305",
+      "title": "Implement the recovery entry points: identity.recovery(), load_pending_recovery, resume_recovery and abort_recovery",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-identity/src/recovery.rs",
+        "crates/scp-identity/src/lib.rs"
+      ],
+      "description": "Implement the ceremony's three entry points on the `Recovery` type that `09-security-model.md` §9.7.4.2 R10 declares, obtained through `identity.recovery()` over the identity's own persistence, custody and backend slots. `RecoveryPhase` has four values, `Composed`, `Signed`, `PublishSent` and `Confirmed`, and the ceremony removes the handle from every member of the store set once, after the spent keys are destroyed at `Confirmed`. `abort_recovery` refuses with `IdentityError::SignedRevealUnpublished` (SCP-IDENT-1107, `03-identity.md` §3.10.10) where the device's own store holds the signed event, and clears the handle otherwise. The ceremony's event composition is SCP-008; the bridge exports are SCP-314.",
+      "acceptanceCriteria": [
+        "`RecoveryPhase` declares exactly four variants, `Composed`, `Signed`, `PublishSent` and `Confirmed`, and `grep -rn 'Submitted' crates/scp-identity/src` prints nothing (`09-security-model.md` §9.7.4.2 R10)",
+        "`Identity::recovery(&self) -> Recovery<S>` builds the `Recovery` over the identity's own persistence, custody and backend slots, and `Recovery` has no public constructor and no public field: a trybuild compile-fail test asserts that a struct literal of `Recovery` outside the crate does not compile (`09-security-model.md` §9.7.4.2 R10)",
+        "The ceremony writes the handle at each of the four phases into every member of the store set: a test injects a crash after each phase's write and asserts that `load_pending_recovery` returns the handle at that phase (`09-security-model.md` §9.7.4.2 R10)",
+        "`resume_recovery` re-enters the ceremony order at the phase the handle names and performs no step the order has passed: a test crashes after the `Signed` write and asserts the resumed ceremony signs no new event and publishes the signed event from the SDK's own store (`09-security-model.md` §9.7.4.2 R10)",
+        "The ceremony removes the handle once, after the spent keys are destroyed at `Confirmed`: a test asserts the handle is present in every member until destruction and absent from every member after it (`09-security-model.md` §9.7.4.2 R10)",
+        "`abort_recovery` returns `IdentityError::SignedRevealUnpublished` where the device's own store holds the signed event under the handle's digest, and leaves the handle in every member: a test asserts both (`09-security-model.md` §9.7.4.2 R10, `03-identity.md` §3.10.10)",
+        "`abort_recovery` removes the handle from every member where the device's own store holds no signed event, after which `load_pending_recovery` returns `None`: one test aborts at `Composed` and a second aborts on a second device that holds no signed event (`09-security-model.md` §9.7.4.2 R10)",
+        "`abort_recovery` returns a `RemovalOutcome` carrying one `StoreRemoval` per member reached, and a removal that does not land yields `removed: false` and a surfaced condition: a test fails one member's removal and asserts both (`09-security-model.md` §9.7.4.2 R10)",
+        "`resume_recovery` on an SDK whose own store holds no preimage under the handle's digest signs nothing, publishes nothing, and surfaces the condition: a test asserts all three (`09-security-model.md` §9.7.4.2 R10)",
+        "No unwrap() or expect() in library code"
+      ],
+      "actionItems": [
+        "Declare `RecoveryPhase`, `RecoveryHandle`, `CredentialStore`, `StoreRemoval`, `RemovalOutcome`, `RecoveryCompletion` and `Recovery` as §9.7.4.2 R10 declares them.",
+        "Add `Identity::recovery` and build `Recovery` from the identity's own slots.",
+        "Implement `load_pending_recovery` over every member of the store set.",
+        "Implement `resume_recovery` as re-entry into the ceremony order at the handle's phase.",
+        "Implement `abort_recovery` with the `SignedRevealUnpublished` refusal and the per-member removal.",
+        "Write crash-injection tests at every phase and the abort and resume tests the acceptance criteria name."
+      ],
+      "blockedBy": [
+        "SCP-008"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-306",
+      "title": "Set PendingReverify on a Contested verdict for an identifier the SDK already holds a standing for",
+      "gate": "gate-kel",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-identity/src/continuity.rs"
+      ],
+      "description": "Implement the third trigger `09-security-model.md` §9.11 states: a `Contested` verdict on an identifier the SDK already holds a standing for sets `PendingReverify`. §9.6.4 assigns the standing where the first resolution of an identifier returns `Contested`, and §9.11's gate list states what `PendingReverify` withholds. Resolution is SCP-241.",
+      "acceptanceCriteria": [
+        "A resolution returning `Contested` for an identifier whose standing is `Verified` sets `PendingReverify`: a test asserts it (`09-security-model.md` §9.11)",
+        "A resolution returning `Contested` for an identifier whose standing is `Unresolved` sets `PendingReverify`: a test asserts it (`09-security-model.md` §9.11)",
+        "A first resolution returning `Contested` sets `PendingReverify` and records no root-install digest: a test asserts both (`09-security-model.md` §9.6.4)",
+        "While the identity stays `Contested`, no user act clears the standing: a test completes a fingerprint comparison for that identifier and asserts the standing is still `PendingReverify` (`09-security-model.md` §9.11)",
+        "After the verdict the Add gate refuses a new leaf for that identifier: a test asserts the refusal (`09-security-model.md` §9.11)",
+        "No unwrap() or expect() in library code"
+      ],
+      "actionItems": [
+        "Map a `Contested` verdict to `PendingReverify` in the standing update for a known identifier.",
+        "Write the tests the acceptance criteria name."
+      ],
+      "blockedBy": [
+        "SCP-241"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "## 9.11 Key Continuity Verification"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.6.4 First-Contact Trust Bootstrapping"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-307",
+      "title": "Move every SCP key to P-256: scp-crypto verification, KeyCustody, MLS ciphersuite 2, HPKE DHKEM(P-256) and UCAN ES256",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-crypto/src/p256.rs",
+        "crates/scp-crypto/src/lib.rs",
+        "crates/scp-platform/src/key_custody.rs",
+        "crates/scp-mls/src/lib.rs"
+      ],
+      "description": "Architecture slice S0 of the key-event-log identity substrate. ADR-063 moves every SCP key to ECDSA over NIST P-256 with SHA-256, and `09-security-model.md` §9.5 states the encoding and verification rules. This story adds P-256 to the wasm-safe `scp-crypto` crate and to `KeyCustody`, and moves MLS to RFC 9420 ciphersuite 2, HPKE to DHKEM(P-256), and UCAN to ES256. The key-event preimage types are SCP-308.",
+      "acceptanceCriteria": [
+        "`scp-crypto` verifies an ECDSA P-256/SHA-256 signature carried as 64 bytes of raw `r‖s`, each a 32-byte big-endian integer, and rejects any other length (`09-security-model.md` §9.5)",
+        "`scp-crypto` rejects a signature whose `s` exceeds half the group order: a test flips a valid signature to `(r, n − s)` and asserts rejection (`09-security-model.md` §9.5)",
+        "`scp-crypto` rejects a public key that is not a point on P-256, and rejects the point at infinity: one test per case (`09-security-model.md` §9.5)",
+        "`scp-crypto` converts a DER-encoded ECDSA signature to the 64-byte raw form and rejects DER that is not canonical: a test per case",
+        "Signing derives the per-signature nonce under RFC 6979 with SHA-256: a known-answer test reproduces the P-256 signatures Vectors 41 and 42 of `25-test-vectors.md` §25.26 carry (`09-security-model.md` §9.5)",
+        "`KeyCustody` generates, holds and signs with P-256 keys, and `grep -rn -i 'ed25519' crates/scp-platform/src` prints nothing",
+        "MLS groups use RFC 9420 ciphersuite 2, HPKE uses DHKEM(P-256) under RFC 9180 Base mode, and a UCAN carries an ES256 signature: one round-trip test per protocol (`09-security-model.md` §9.5)",
+        "`cargo check -p scp-crypto --target wasm32-unknown-unknown` exits 0",
+        "No unwrap() or expect() in library code"
+      ],
+      "actionItems": [
+        "Add P-256 verification, low-s, point validation, DER-to-raw conversion and SHA-256 to `scp-crypto`.",
+        "Move `KeyCustody` key generation and signing to P-256 in every backend.",
+        "Move MLS, HPKE and UCAN to their P-256 suites.",
+        "Write the known-answer and negative tests the acceptance criteria name."
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "## 9.5 Cryptographic Primitive Specification"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.18.1 Cryptographic Primitives"
+        },
+        {
+          "file": ".docs/adrs/ADR-063-inception-derived-identity-key-event-log.md",
+          "section": "### The curve and the root's custody"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-308",
+      "title": "Implement the key-event data model, preimage encoding, identifier derivation and routing derivations",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-did/src/lib.rs",
+        "crates/scp-kel/src/preimage.rs",
+        "crates/scp-kel/src/routing.rs",
+        "crates/scp-kel/src/lib.rs"
+      ],
+      "description": "Architecture slice S1. The key-event data model (`Identifier`, `KeyState`, `KeyEntry`, `StandingCommitment` and the name-bound enumerations) lives in the wasm-safe `scp-did` crate, and the preimage encoding, the identifier derivation and the four routing derivations live in the wasm-safe `scp-kel` leaf crate ADR-063's implementation constraints require. `09-security-model.md` §9.7.4.2's definitions and R13 state every byte. Signature verification is SCP-309.",
+      "acceptanceCriteria": [
+        "`encode_preimage` reproduces the preimage bytes of Vectors 41, 42, 50 and 51 of `25-test-vectors.md` §25.26 byte for byte (`09-security-model.md` §9.7.4.2 definitions)",
+        "`event_digest` computes `SHA-256(\"SCP-KEL-EVENT-V1:\" ‖ preimage)` and `derive_identifier` computes `SHA-256(\"SCP-KEL-ID-V1:\" ‖ inception_signed_preimage)` with the identifier and predecessor-digest fields all-zero: known-answer tests over Vectors 41 and 42 (`09-security-model.md` §9.7.4.2 R13)",
+        "The four routing derivations compute `SHA-256(\"scp:did:\" ‖ id)`, `SHA-256(\"scp:wit:\" ‖ id)`, `SHA-256(\"scp:wcf:\" ‖ id)` and `SHA-256(\"scp:svc:\" ‖ id)` over the identifier's 32 raw bytes: a known-answer test per derivation (`09-security-model.md` §9.7.4.2 R13)",
+        "The pre-rotation commitment reproduces Vector 47 of `25-test-vectors.md` §25.28 byte for byte",
+        "`decode_event` rejects a preimage whose declared lengths run past its buffer and sizes no allocation from a count before reading that many elements: a test per bound (`09-security-model.md` §9.7.4.2 definitions)",
+        "A native-versus-wasm32 known-answer test asserts that every vector above encodes to identical bytes on both targets (ADR-063, implementation constraints)",
+        "`cargo tree -p scp-kel` lists no tokio and no async runtime crate",
+        "No unwrap() or expect() in library code"
+      ],
+      "actionItems": [
+        "Create the `scp-kel` crate and move the data model into `scp-did`, deleting `document.rs`.",
+        "Implement the preimage encoding, the digest, the identifier derivation, the commitment and the routing derivations.",
+        "Write the known-answer tests and the native-versus-wasm32 parity test."
+      ],
+      "blockedBy": [
+        "SCP-307"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        },
+        {
+          "file": ".docs/specs/25-test-vectors.md",
+          "section": "## 25.26 Key-Event Preimage and Indexed-Signature Vectors (§9.7.4.2 definitions, §9.5)"
+        },
+        {
+          "file": ".docs/adrs/ADR-063-inception-derived-identity-key-event-log.md",
+          "section": "### Implementation constraints"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-309",
+      "title": "Implement indexed-signature verification, chain validation and key-state replay",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-kel/src/signature.rs",
+        "crates/scp-kel/src/validate.rs",
+        "crates/scp-kel/src/replay.rs",
+        "fuzz/fuzz_targets/kel_decode_event.rs",
+        "fuzz/fuzz_targets/kel_client_data.rs"
+      ],
+      "description": "Architecture slice S2. `verify_indexed` verifies a root signature group in either signature form, raw or WebAuthn assertion, and the WebAuthn form needs a client-data JSON parser that rejects a duplicate key, because `serde_json` keeps the last duplicate. `validate_chain` applies R1 through R4 and returns `Valid`, `AuthorDefect` or `CopyDefect`, and `replay` derives the key state under R8. `09-security-model.md` §9.7.4.2 states each rule. Ranking is SCP-310.",
+      "acceptanceCriteria": [
+        "`verify_indexed` verifies Vectors 41 and 42 of `25-test-vectors.md` §25.26 and checks, for the assertion form, the challenge, the UP and UV flags and low-s: one negative test per check (`09-security-model.md` §9.7.4.2 definitions)",
+        "The client-data JSON parser rejects a document carrying a duplicate key: a test feeds `{\"challenge\":\"a\",\"challenge\":\"b\"}` and asserts rejection",
+        "`validate_chain` returns `AuthorDefect` or `CopyDefect` for every defect R3 lists, with one negative fixture per defect, and returns `Valid` for Vectors 41, 42, 50 and 51 (`09-security-model.md` §9.7.4.2 R3)",
+        "`replay` derives the key state from the latest state-carrying event at or before the head, and a `RootRecovery` replaces the whole key state: a test per case (`09-security-model.md` §9.7.4.2 R8)",
+        "Two fuzz targets, one over `decode_event` and one over the client-data parser, build with `cd fuzz && cargo fuzz build` and each runs 60 seconds without a crash",
+        "No unwrap() or expect() in library code"
+      ],
+      "actionItems": [
+        "Implement `verify_indexed` for both signature forms and the strict client-data parser.",
+        "Implement `validate_chain` over R1 through R4 and `replay` under R8.",
+        "Write one negative fixture per R3 defect and add the two fuzz targets."
+      ],
+      "blockedBy": [
+        "SCP-308"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "## 9.5 Cryptographic Primitive Specification"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-310",
+      "title": "Implement fork ranking, retention and verdict classification",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-kel/src/rank.rs",
+        "crates/scp-kel/src/retention.rs",
+        "crates/scp-kel/src/verdict.rs",
+        "crates/scp-kel/src/relation.rs"
+      ],
+      "description": "Architecture slice S3. `rank_suffix` implements R6, `resolve_set` compares chains pairwise, `RetentionSet::admit` applies R9's count bound, byte bound and eviction rank, `classify` applies R11, R12 and R14 and yields a verdict only from an exhausted source apart from R9's rank-1 early stop, and `classify_relation` decides R10's relation over a chain's valid prefix. `09-security-model.md` §9.7.4.2 states each rule.",
+      "acceptanceCriteria": [
+        "A property test asserts that a suffix's rank does not change when the suffix is extended (`09-security-model.md` §9.7.4.2 R6)",
+        "A property test asserts that `resolve_set` returns the same outcome for every order of its input chains (`09-security-model.md` §9.7.4.2 R6, R7)",
+        "A property test asserts that a relay's accepted chain is independent of the order its frames arrived in, except where no chain wins every pairwise comparison, in which case the relay keeps the chain it held first (`09-security-model.md` §9.7.4.2 R9)",
+        "A property test asserts that `RetentionSet::admit` never evicts a rank-1 suffix (`09-security-model.md` §9.7.4.2 R9)",
+        "`classify` returns `Inconclusive{MissingEvents}` for a complete chain read from an unexhausted source, and returns `Contested{Rank1Terminal}` from an unexhausted source holding two rank-1 suffixes: a test per case (`09-security-model.md` §9.7.4.2 R9)",
+        "The five worked examples of `09-security-model.md` §9.7.4.2 each run as a test that reproduces the outcome the table row they trace names",
+        "No unwrap() or expect() in library code"
+      ],
+      "actionItems": [
+        "Implement `rank_suffix`, `resolve_set`, `RetentionSet::admit`, `classify` and `classify_relation`.",
+        "Write the property tests and the five worked-example tests."
+      ],
+      "blockedBy": [
+        "SCP-309"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-311",
+      "title": "Implement the custody traits, the passkey callbacks, and the headless backup methods",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-platform/src/credential_signer.rs",
+        "crates/scp-platform/src/recovery_handle_store.rs",
+        "crates/scp-platform/src/headless_backup.rs",
+        "crates/scp-client-wasm/src/credentials.rs"
+      ],
+      "description": "Architecture slice S8. A root or pre-rotation key held in a passkey signs through a `CredentialSigner` trait whose implementation each platform supplies through a host callback, and the store set R10 names is reached through a `RecoveryHandleStore` trait. The headless profile offers the three copyable methods `09-security-model.md` §9.7.4.1 names. §9.7.4.1 states which method conforms on which profile.",
+      "acceptanceCriteria": [
+        "`CredentialSigner` returns a WebAuthn assertion whose client-data challenge is the event digest, on Swift through `ASAuthorization`, on Kotlin through Credential Manager, and in the browser through `navigator.credentials`: one test per platform against a platform fake (`09-security-model.md` §9.7.4.1 item 4)",
+        "`RecoveryHandleStore` reads and writes the platform-account member and the `largeBlob` member of the store set, and reports a `largeBlob` write that does not land: a test per member (`09-security-model.md` §9.7.4.2 R10)",
+        "The encrypted offline backup uses AES-256-GCM under an Argon2id key with the one parameterization `17-persistence-and-storage.md` §17.8 states, and an auto-generated passphrase carries at least 128 bits of entropy: a known-answer test and an entropy test (`09-security-model.md` §9.7.4.1 item 4)",
+        "The Shamir method splits a key 3-of-5 over GF(2^8) into 34-byte shares, and any three shares reconstruct it: a property test (`09-security-model.md` §9.7.4.1 item 4)",
+        "The paper method encodes a key as a 24-word BIP39 mnemonic and decodes it back: a known-answer test (`09-security-model.md` §9.7.4.1 item 4)",
+        "The SDK offers each method only on the profiles the method-by-profile table marks as conforming: a test per table row (`09-security-model.md` §9.7.4.1 item 4)",
+        "No unwrap() or expect() in library code"
+      ],
+      "actionItems": [
+        "Declare `CredentialSigner` and `RecoveryHandleStore` in `scp-platform`.",
+        "Wire the Swift, Kotlin and browser host callbacks.",
+        "Implement the three headless backup methods.",
+        "Write the tests the acceptance criteria name."
+      ],
+      "blockedBy": [
+        "SCP-307"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.1 Pre-Rotation Key Custody"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.8 Platform-Specific Key Custody"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-312",
+      "title": "Implement the key-event write API on the identity handle",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-identity/src/write.rs",
+        "crates/scp-identity/src/lib.rs"
+      ],
+      "description": "The write API: one operation on the identity handle for each event R10's situation table names — a `KeyState` naming a fresh witness set, a `CommitmentRollover`, a `CommitmentRollover` declaring abandonment, a `RootRecovery{CoSigns}` and a `RootRecovery{Lost}` — together with the `KeyState` that rotates `#active` and the value `Identity::create` returns. `03-identity.md` §3.10.10 declares no signature for these operations yet, and the plan of record lists that declaration among the design decisions still to make, so this story cannot start until that section declares them. SCP-008 implements the event composition these operations call.",
+      "acceptanceCriteria": [
+        "`03-identity.md` §3.10.10 declares one signature per operation this story names, and each operation in `crates/scp-identity/src/write.rs` matches its declared signature: `grep` of each declared name in that file returns a definition",
+        "Each operation signs the event R10's situation table names for its row, under the signatures R3 requires for that kind: one test per row (`09-security-model.md` §9.7.4.2 R3, R10)",
+        "The operation that names a fresh witness set signs a `KeyState` under the standing root and changes no commitment: a test asserts both (`09-security-model.md` §9.7.4.2 R1, R10)",
+        "Each operation publishes through `IdentityBackend::publish` and returns its `PublishOutcome`: a test asserts the per-entry list (`03-identity.md` §3.10.10)",
+        "No unwrap() or expect() in library code"
+      ],
+      "actionItems": [
+        "Implement one operation per declared signature over SCP-008's composition.",
+        "Write one test per R10 situation row."
+      ],
+      "blockedBy": [
+        "SCP-008"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-313",
+      "title": "Wire the identity and recovery operations through Supervisor dispatch methods and pipeline assertions",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/supervisor/identity.rs",
+        "crates/scp-runtime/tests/pipeline_wiring.rs"
+      ],
+      "description": "Architecture slice S10. Identity is not per-context, so the Supervisor reaches an injected `IdentityService` through direct dispatch methods rather than through a context actor's mailbox. A change to the local `#active` key fans out as an MLS Update to every context actor, and the self-observation cadence runs as a Supervisor task on the injected clock. This satisfies the integration checklist's first and fourth checks for every operation `03-identity.md` §3.10.10 and `09-security-model.md` §9.7.4.2 R10 declare.",
+      "acceptanceCriteria": [
+        "The Supervisor exposes `dispatch_identity_create`, `dispatch_identity_resolve`, `dispatch_identity_publish`, `dispatch_identity_read_service_record`, `dispatch_identity_publish_service_record`, `dispatch_identity_observe_self`, `dispatch_recovery_load_pending`, `dispatch_recovery_resume` and `dispatch_recovery_abort`, each reaching the `IdentityService` method of the same operation: `pipeline_wiring.rs` carries one assertion per method",
+        "A change to the local `#active` key sends an MLS Update to every context actor: a pipeline assertion covers the fan-out (`09-security-model.md` §9.7.4.2 R8)",
+        "The self-observation cadence runs once at launch and then at least once per witnessing interval on the injected clock: a test advances a paused clock and asserts the pass count, and a pipeline assertion covers the tick (`09-security-model.md` §9.7.4.2 R10)",
+        "`IdentityBackedDidResolver` is absent from `crates/scp-ffi`: `grep -rn 'IdentityBackedDidResolver' crates/scp-ffi` prints nothing",
+        "No unwrap() or expect() in library code"
+      ],
+      "actionItems": [
+        "Add the dispatch methods over an injected `IdentityService`.",
+        "Add the key-change fan-out and the cadence task.",
+        "Add one pipeline assertion per dispatch method, plus the tick and the fan-out."
+      ],
+      "blockedBy": [
+        "SCP-305",
+        "SCP-312"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-actor-per-context.md",
+          "section": "### 2. Supervisor is a plain struct, not an actor"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-314",
+      "title": "Export the identity and recovery operations from all three bridges and wrap them in every SDK",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/uniffi/src/identity.rs",
+        "crates/scp-ffi/napi/src/identity.rs",
+        "bindings/python/scp_sdk/identity.py",
+        "bindings/typescript/src/identity.ts",
+        "bindings/swift/Sources/SCP/Identity.swift",
+        "bindings/kotlin/src/main/kotlin/works/limn/scp/Identity.kt"
+      ],
+      "description": "Architecture slice S11. PyO3, UniFFI and napi export identical identity and recovery functions, and each SDK wraps them under the names the shared scaffold's naming table gives, including `identity.recovery()` and `observe_self`. Every name-bound enumeration keeps the spec's PascalCase in every language. This satisfies the integration checklist's second, third and fifth checks.",
+      "acceptanceCriteria": [
+        "PyO3, UniFFI and napi each export `identity_create`, `identity_resolve`, `identity_publish`, `identity_read_service_record`, `identity_publish_service_record`, `identity_read_policy`, `identity_fallback_set`, `identity_observe_self` and the `recovery_*` functions: `ffi_conformance.rs` asserts each export on each bridge",
+        "Each SDK wraps each export under the name the shared scaffold's naming table gives: a test per SDK calls each wrapper",
+        "`EntryReach`, `ChainRelation`, `ExtendingAct`, `EntryResult`, `NotSentReason`, `RecoveryPhase` and `ResolutionVerdict` carry their spec variant names verbatim in every SDK: a conformance test compares the variant names across the five languages (`03-identity.md` §3.10.10)",
+        "One conformance fixture of identity operations replays in Rust, Python, TypeScript, Swift and Kotlin with identical results",
+        "The SDK capability matrix lists every operation above for every SDK",
+        "The agent-key exports, `identity_migrate`, the DID-document classes and the FFI DHT client are absent from all three bridges: a grep per name prints nothing"
+      ],
+      "actionItems": [
+        "Add the bridge exports and the SDK wrappers.",
+        "Update the capability matrix, `ffi_conformance.rs` and `bridge-aliases.json` with the new operations.",
+        "Add the cross-language conformance fixture."
+      ],
+      "blockedBy": [
+        "SCP-313",
+        "SCP-311"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        },
+        {
+          "file": ".docs/scaffold/shared.md",
+          "section": "## Cross-Language Naming"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-315",
+      "title": "Cut every identity path over to the key-event log and delete did:dht",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-dht",
+        "crates/scp-identity/src/dht.rs",
+        "crates/scp-did/src/document.rs",
+        "crates/scp-protocol/src/envelope/did_record.rs"
+      ],
+      "description": "Architecture slice S12. Each identity path switches to the key-event log and deletes the legacy symbol it replaces in the same pull request, with no dual mode and no fallback. ADR-063 states that did:dht is not SCP's method and that the Mainline distributed hash table is removed. A capability with no real backend returns a typed error, and no stand-in reaches a production path.",
+      "acceptanceCriteria": [
+        "The `scp-dht` crate is deleted, and `grep -rn 'scp-dht\\|scp_dht' Cargo.toml crates/*/Cargo.toml` prints nothing (ADR-063, what the identifier replaces)",
+        "`DualLayerResolver`, `RepublishManager`, `DidRecordV1` and `DidSlotRegistry` are absent: `grep -rn` for each name under `crates/` prints nothing",
+        "`crates/scp-did/src/document.rs` is deleted",
+        "`scripts/check-shipped-feature-graph.sh` exits 0, which proves no in-memory backend reaches a shipped artifact",
+        "The full workspace test suite passes after the deletion"
+      ],
+      "actionItems": [
+        "Switch each path to the key-event log and delete the legacy symbol in the same pull request.",
+        "Run the shipped-feature-graph gate and the full test suite."
+      ],
+      "blockedBy": [
+        "SCP-314"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/ADR-063-inception-derived-identity-key-event-log.md",
+          "section": "### What the identifier replaces"
+        },
+        {
+          "file": ".docs/adrs/ADR-063-inception-derived-identity-key-event-log.md",
+          "section": "### Implementation constraints"
+        }
+      ],
+      "details": {}
     }
   ]
 }

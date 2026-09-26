@@ -57,6 +57,27 @@
       "stories": [
         "SCP-RELAYRES-008"
       ]
+    },
+    {
+      "id": "gate-relayres-9",
+      "name": "Pair-cursor page walk (after_blob, query_complete relay proof)",
+      "stories": [
+        "SCP-RELAYRES-009"
+      ]
+    },
+    {
+      "id": "gate-relayres-10",
+      "name": "Validating relay key-event store (KelRegistry, retain, relay proof)",
+      "stories": [
+        "SCP-RELAYRES-010"
+      ]
+    },
+    {
+      "id": "gate-relayres-11",
+      "name": "Witness (one check, durable state, scp:wit: and scp:wcf: publication)",
+      "stories": [
+        "SCP-RELAYRES-011"
+      ]
     }
   ],
   "stories": [
@@ -345,6 +366,8 @@
         "Flood does not displace the genuine chain at the resolver (four variants): a test asserts that with a relay holding the genuine chain alongside each of a junk frame, a frame whose first event extends nothing the relay holds, a non-frame opaque blob, and pre-seeded junk, the resolver's own verification discards every one and the genuine record still resolves (§3.10.8, §3.10.4 step 3b). The test asserts nothing about what the relay stores or refuses: the write rule that decides which frames a routing id holds is the relay ADR's, and §3.10.8 states the one cost this half carries, which is that a discarded byte is a byte the fetch bound counted (`09-security-model.md` §9.7.4.2 R9).",
         "Self-record publish through the fallback set: a test constructs a node with no relay of its own, publishes its OWN key-event record to the fallback set via the real RelayPublisher, and asserts it resolves its own identifier back via the real querier from two entries under distinct operator keys (self-resolution requires the write half — completing SCP-CAPINJECT-001 A2).",
         "Peer-record resolution: the same test (or a sibling) asserts that node resolves a PEER's identifier published to a relay — confirming the ADR-062 A2↔A4 sequencing note that peer resolution comes online with relay resolution (§3.10.2, §3.10.4).",
+        "Padding past the fetch bound yields no adoption: a test pads a relay's routing id with valid frames past `MAX_RETAINED_BYTES` and asserts that a first-contact resolution returns `Inconclusive` from that source and adopts no head (`09-security-model.md` §9.7.4.2 R9, R11).",
+        "A burst cannot roll a resolver back: a test publishes a `KeyState` rotation, then stores a burst of 1,000 frames at one relay within one second, and asserts that the resolution returns the rotated key state or `Inconclusive`, and never the key state before the rotation (`09-security-model.md` §9.7.4.2 R9, R12).",
         "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
         "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
       ],
@@ -368,6 +391,10 @@
         {
           "file": ".docs/specs/03-identity.md",
           "section": "### 3.10.6 Anti-Segmentation Invariant"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
         }
       ],
       "details": {
@@ -555,6 +582,158 @@
         "delivered_by_004": "Two acceptance criteria carried by an earlier revision of this story were delivered by SCP-RELAYRES-004 and have been REMOVED here so nobody re-implements them. (1) \"The signed key event is an OUTPUT of signing, not a storage read-back\" — the signing step returns a `republish::RepublishEntry` and `IdentityBackend::publish` returns a `PublishOutcome` (`03-identity.md` §3.10.10). (2) \"`self_did_republish_entry` no longer reconstructs the triple from a read-back\" — the function no longer exists (`grep -n 'self_did_republish_entry' crates/` returns 0) and `grep -rn '\\.resolve(' crates/scp-node/src/self_host.rs` returns 0; the republish cycle reads the node's published-record slot directly, covered by `republishing_survives_a_read_back_miss_at_startup` (crates/scp-node/src/self_host.rs).",
         "retracted_premise": "That earlier revision stated as root cause that the publish path \"returns `Result<(), IdentityError>` — so no caller can build the `KeyEventRecordV2` frame the relay leg needs\" and that \"`self_did_republish_entry` ... has to reconstruct the triple by resolving the node's own record back off the network\". Both statements are FALSE against current code and are retracted. The genuine remaining root cause is narrower: the node's publish path gates publication on a retired transport mode, so a node whose mode is off publishes nothing anywhere and has no signed record at all."
       }
+    },
+    {
+      "id": "SCP-RELAYRES-009",
+      "title": "Page a routing id by the (stored_at, blob_id) cursor, and read 250 blobs at one stored_at at limit 100",
+      "gate": "gate-relayres-9",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-relay-client/src/lib.rs",
+        "crates/scp-transport/src/native/protocol.rs",
+        "crates/scp-identity/src/resolver.rs",
+        "crates/scp-testing/tests/integration/relay_did_resolution.rs"
+      ],
+      "description": "ADR-004, the SCP native relay protocol, gives QUERY an `after_blob` field and orders backfill by ascending (`stored_at`, `blob_id`), and `09-security-model.md` §9.7.4.2 R9's page walk reads that pair as its cursor and calls a source exhausted when a page returns no frame. The relay proof rides on the `query_complete` event, so the exhausting page is proven (§9.10.12). This story implements the field on both sides and the walk, and proves that no blob one second holds is skipped.",
+      "acceptanceCriteria": [
+        "`ClientMessage::Query` carries `after_blob: Option<[u8; 32]>`, and a relay returns only the blobs whose (`stored_at`, `blob_id`) pair sorts strictly after (`since`, `after_blob`): a test per boundary (ADR-004)",
+        "A QUERY carrying `after_blob` without `since` receives `ERR` `4002` MISSING_FIELD: a test asserts it (ADR-004)",
+        "A relay serves a query and a backfill in ascending (`stored_at`, `blob_id`) order: a test stores blobs out of that order and asserts the served order (ADR-004)",
+        "With 250 blobs stored at one `stored_at` and `limit` 100, the resolver's page walk issues QUERYs until a page returns no blob and reads each of the 250 exactly once: a test asserts the count and the absence of duplicates (`09-security-model.md` §9.7.4.2 R9)",
+        "`RelayMessage::Event` for `query_complete` carries the `relay_proof`, `RelayMessage::Blob` carries none, and the resolver verifies the proof on a page that returned no blob: a test asserts all three (`09-security-model.md` §9.10.12)",
+        "No unwrap() or expect() in library code"
+      ],
+      "actionItems": [
+        "Add `after_blob` to the wire codec and the relay's query handler, and order backfill by the pair.",
+        "Move `relay_proof` from `Blob` to the `query_complete` event.",
+        "Implement the resolver's page walk over the pair cursor.",
+        "Write the 250-blob test and the boundary tests."
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Relay Key-Event Record Frame"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-RELAYRES-010",
+      "title": "Implement the validating relay's key-event store: retain duties, KelRegistry admission and accepted chain, and the relay proof",
+      "gate": "gate-relayres-10",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/relay/key_event_validation.rs",
+        "crates/scp-transport/src/relay/kel_registry.rs",
+        "crates/scp-transport/src/storage/mod.rs",
+        "crates/scp-transport/src/relay/query.rs",
+        "crates/scp-transport/Cargo.toml"
+      ],
+      "description": "Architecture slice S5. A validating relay executes the duties `09-security-model.md` §9.10.12 and §9.7.4.2 assign to it: the `retain` duty and its three refusals, the admission precondition R10's diverged arm depends on, and the accepted-chain rule of R9. Every listed relay signs a relay proof of control over each QUERY response. ADR-063 lists these sites by party under its heading *The relay's storage policy moved to the relay ADR on 2026-09-21*; what a relay keeps, reclaims or charges for is ADR-065's, the relay ADR, pending; the tag `archive/kel-combined-pre-split` preserves the combined text. `key_event_validation.rs` replaces `did_record_validation.rs`, and `KelRegistry` replaces `DidSlotRegistry`.",
+      "acceptanceCriteria": [
+        "A validating relay rejects a PUBLISH at a retained kind that does not set `retain`, rejects `retain` on any other kind, and rejects a PUBLISH carrying both `retain` and `blob_ttl`: one test per refusal (`09-security-model.md` §9.10.12)",
+        "A relay that does not validate rejects a PUBLISH carrying `retain: true`: a test asserts it (`09-security-model.md` §9.10.12)",
+        "`BlobStorage::store` persists the `retain` flag in every storage backend, and purge skips every retained record: one test per backend",
+        "`KelRegistry` admits a frame whose first event is an inception event recomputing to the routing id's identifier, or whose predecessor digest names an event it holds, and rejects every other frame: a test per case (`09-security-model.md` §9.7.4.2 R10)",
+        "`KelRegistry` keys events by preimage digest, so a byte-different copy of an event it holds leaves the held copy in place: a test asserts it (`09-security-model.md` §9.7.4.2 R9)",
+        "After each accepted frame the relay holds as accepted the chain that wins every pairwise R6 comparison, and where no chain wins every comparison it keeps the chain it held first: a test per case (`09-security-model.md` §9.7.4.2 R9)",
+        "The relay serves frames in receipt order, whichever chain it holds as accepted: a test asserts the served order after a rank-1 chain displaces an earlier one (`09-security-model.md` §9.7.4.2 R9)",
+        "The QUERY handler signs a `RelayProof` under the operator key over the response's blob bytes, a response with no blob included, and attaches it to `query_complete`: a known-answer test reproduces Vector 44 of `25-test-vectors.md` §25.27 (`09-security-model.md` §9.10.12)",
+        "`cargo tree -p scp-transport` lists no `scp-identity`",
+        "No unwrap() or expect() in library code"
+      ],
+      "actionItems": [
+        "Replace `did_record_validation.rs` with `key_event_validation.rs` and `DidSlotRegistry` with `KelRegistry`.",
+        "Persist `retain` in every `BlobStorage` backend and skip retained records on purge.",
+        "Recompute the accepted chain by R6 after each accepted frame.",
+        "Sign and attach the relay proof on `query_complete`.",
+        "Remove the `scp-identity` dependency from `scp-transport`."
+      ],
+      "blockedBy": [
+        "SCP-310",
+        "SCP-RELAYRES-009"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Relay Key-Event Record Frame"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
+        },
+        {
+          "file": ".docs/adrs/ADR-063-inception-derived-identity-key-event-log.md",
+          "section": "### The relay's storage policy moved to the relay ADR on 2026-09-21"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-RELAYRES-011",
+      "title": "Implement the witness: the one check, durable per-subject state, seeding, and publication of cosigned heads and conflict statements",
+      "gate": "gate-relayres-11",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/witness/mod.rs",
+        "crates/scp-transport/src/witness/store.rs",
+        "crates/scp-kel/src/witness.rs"
+      ],
+      "description": "Architecture slice S6. A witness runs the one check `09-security-model.md` §9.7.4.3 states, persists its per-subject record before it releases a cosignature, seeds under case 1, and publishes each cosigned head at the subject's `scp:wit:` address and each conflict statement at `scp:wcf:`. §9.7.4.3 does not yet state the wire on which a controller submits a chain and a witness refuses it, and the plan of record lists that wire among the design decisions still to make, so this story cannot complete until that section states it.",
+      "acceptanceCriteria": [
+        "The witness persists its per-subject record before it releases the cosignature that record accounts for: a test injects a crash between the persist and the release and asserts the restarted witness holds the record (`09-security-model.md` §9.7.4.3)",
+        "The one check cosigns a chain carrying the last cosigned digest at that sequence, refuses a proper prefix naming staleness with its last cosigned head and no conflict statement, and refuses a chain carrying a different event at that sequence with a conflict statement: one test per case (`09-security-model.md` §9.7.4.3)",
+        "A witness whose store fails to read a subject's record refuses, reports the condition and does not re-seed, and a witness whose store holds no record for a subject seeds under case 1: a test per case (`09-security-model.md` §9.7.4.3)",
+        "The first head after a seed sets `seed` to `0x01` and every later head sets `0x00`: a known-answer test reproduces Vector 43 of `25-test-vectors.md` §25.27",
+        "The conflict statement reproduces Vector 45, and `is_fault_proof` accepts Vector 46's pair and rejects a pair in which either head sets `seed`: known-answer and negative tests (`09-security-model.md` §9.7.4.3)",
+        "The witness publishes each cosigned head at `SHA-256(\"scp:wit:\" ‖ subject)` and each conflict statement at `SHA-256(\"scp:wcf:\" ‖ subject)`, in the frames §9.10.12 states and with `retain: true`: a test per object",
+        "A witness at `MAX_SUBJECTS_PER_WITNESS` refuses a new subject and names capacity, and evicts a subject only where a chain extending its last cosigned head reaches a key state that no longer names it: a test per case (`09-security-model.md` §9.7.4.3)",
+        "`09-security-model.md` §9.7.4.3 states the submission and refusal wire, and the witness's request and response types match it field for field",
+        "No unrecoverable panic path: no unwrap() or expect() in library code"
+      ],
+      "actionItems": [
+        "Implement `Witness<W: WitnessStore>` with the one check, the durable record and case-1 seeding.",
+        "Publish cosigned heads and conflict statements in their frames with `retain: true`.",
+        "Implement the submission and refusal wire once §9.7.4.3 states it.",
+        "Write the known-answer and crash tests the acceptance criteria name."
+      ],
+      "blockedBy": [
+        "SCP-RELAYRES-010"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.3 Witness and Watcher Layer (Layer B)"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Relay Key-Event Record Frame"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        }
+      ],
+      "details": {}
     }
   ]
 }
