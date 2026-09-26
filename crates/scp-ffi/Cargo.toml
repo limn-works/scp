@@ -18,7 +18,21 @@ default = ["server"]
 # extension-module suppresses Python symbol linking — required for cdylib
 # but incompatible with test binaries. Maturin passes this explicitly.
 # cargo test runs WITHOUT it, so auto-initialize can embed Python.
-extension-module = ["pyo3/extension-module"]
+#
+# `pyo3/abi3-py310` rides along with it, and rides along with nothing else, because
+# `extension-module` marks the one configuration whose output a wheel carries.
+# Without abi3 the cdylib exports a version-specific ABI tag, so each maturin run
+# emits a wheel that installs on the single CPython it was built against, and the
+# five-target matrix in `.github/workflows/build-matrix.yml` publishes cp312 wheels
+# while `bindings/python/pyproject.toml` declares `requires-python = ">=3.10"` and
+# classifiers for 3.10 through 3.13 — a `pip install` on 3.10, 3.11 or 3.13 then
+# matches no wheel and falls back to compiling the Rust workspace from the sdist.
+# `abi3-py310` builds against CPython's stable ABI, so one wheel per platform
+# installs on 3.10 and every later CPython, which is what that metadata promises.
+# Attaching it here rather than to the dependency line keeps `cargo test` on the
+# version-specific ABI, where `pyo3/auto-initialize` embeds the interpreter the
+# test host already has.
+extension-module = ["pyo3/extension-module", "pyo3/abi3-py310"]
 # Compile OpenSSL from source into SQLCipher rather than linking the host's
 # libcrypto. The PyPI wheel selects this through `[tool.maturin] features` in
 # `bindings/python/pyproject.toml`; every other shipped artifact leaves it off. See
