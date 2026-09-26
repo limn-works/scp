@@ -709,10 +709,10 @@ An identity's key-event log rides in the key-event record frame `09-security-mod
 The resolution protocol runs seven steps.
 
 1. **Compute the routing id**, `SHA-256("scp:did:" ‖ identifier_bytes)`.
-2. **QUERY in parallel** on the identity's own relays and on the fallback set. The identity's own relays come from the service-record copy the backend holds; `resolve` refreshes that copy through `read_service_record` where it holds none or where the copy is past §9.10.7's caching bound, and where that read returns any `ServiceRecordVerdict` other than `Adopted` — `Rejected`, `Absent` or `Inconclusive` — this step queries the fallback set alone. **One source serves a chain as an ordered sequence of frames, so one QUERY does not necessarily return a whole chain**: the resolver pages the routing id, takes every frame each page returns, and assembles frames into chains itself by predecessor digest. **The walk reads the cursor and the order `09-security-model.md` §9.7.4.2 R9 states**, which are the `since` filter over `stored_at` and the oldest-first backfill order of ADR-004, the SCP native relay protocol, so this step states no cursor of its own and states no serving order, and that section's fetch bound stops the walk at `MAX_RETAINED_BYTES` over every byte the resolver read for one identifier from one source in one resolution. A resolver holding no accepted baseline MUST set `proof_nonce` on every query of that walk, including every page it re-issues, to 32 bytes it drew freshly for that query (`09-security-model.md` §9.10.12); a relay answers with a proof only where the query carried one, and step 5 counts an operator proven only while every page it served carried a proof the resolver verified. A resolver holding a baseline MAY omit the field. The two sets go out together and never one after the other: a resolver holding no service record knows no relay of the identity's own, and a resolver holding one still needs a relay outside that list to reach R11's second operator.
+2. **QUERY in parallel** on the identity's own relays and on the fallback set. The identity's own relays come from the service-record copy the backend holds; `resolve` refreshes that copy through `read_service_record` where it holds none or where the copy is past §9.10.7's caching bound, and where that read returns any `ServiceRecordVerdict` other than `Adopted` — `Rejected`, `Absent` or `Inconclusive` — this step queries the fallback set alone. **One source serves a chain as an ordered sequence of frames, so one QUERY does not necessarily return a whole chain**: the resolver pages the routing id, takes every frame each page returns, and assembles frames into chains itself by predecessor digest. **The walk's cursor, its exhaustion condition and its fetch bound are `09-security-model.md` §9.7.4.2 R9's**, and this step states none of its own. A resolver holding no accepted baseline MUST set `proof_nonce` on every query of that walk, including every page it re-issues, to 32 bytes it drew freshly for that query (`09-security-model.md` §9.10.12); a relay answers with a proof only where the query carried one, and step 5 counts an operator proven only while every page it served carried a proof the resolver verified. A resolver holding a baseline MAY omit the field. The two sets go out together and never one after the other: a resolver holding no service record knows no relay of the identity's own, and a resolver holding one still needs a relay outside that list to reach R11's second operator.
 3. **For each response**: (a) decode the frame and assemble the chain segments the relay served, trusting no framing byte; (b) recompute the identifier from the inception event and discard the response where it differs (`09-security-model.md` §9.7.4.2 R2); (c) verify every event under R3, applying that rule's criterion — whether a relay holding no key could have produced the defect — and never its indicator lists on their own, so the resolver discards the copy and treats the position as unserved where a keyless relay could have produced the defect, and rejects the chain at that event where it could not; (d) where the response carried a relay proof, apply the five checks `09-security-model.md` §9.7.4.2's definitions state and record whether this relay counts as a proven source.
-4. **Settle the surviving chains.** Where one chain is a prefix of another, take the longer, and discard a head of the accepted chain at a strictly lower sequence without changing accepted state (`09-security-model.md` §9.7.4.2 R12). Where two chains diverge from a shared prefix, apply fork precedence (R6) and return `Contested` where it ties (R7).
-5. **Satisfy the first-contact floor** where the resolver holds no accepted baseline, **counting a relay only where it both served a chain that survived step 3 and step 3d recorded it as a proven source**, and counting distinct 33-byte operator keys rather than declared operator identifiers (`09-security-model.md` §9.7.4.2 R11). A relay that answered with an empty response failed nothing and served nothing, so it counts toward neither number. Otherwise the resolver returns `Inconclusive{SingleSource}` and adopts no head, and that payload separates the relays reached, the operators proven, and the proofs its own clock rejected (`09-security-model.md` §9.7.4.2 R11). A resolver holding an accepted baseline resolves against one relay and this step does not bind it.
+4. **Settle the surviving chains from the sources the walk read to exhaustion.** A source the walk did not exhaust yields `Inconclusive{MissingEvents}`, and R9's rank-1 early stop is the one exception (`09-security-model.md` §9.7.4.2 R9). Where one chain is a prefix of another, take the longer, and discard a head of the accepted chain at a strictly lower sequence without changing accepted state (`09-security-model.md` §9.7.4.2 R12). Where two chains diverge from a shared prefix, apply fork precedence (R6) and return `Contested` where it ties (R7).
+5. **Satisfy the first-contact floor** where the resolver holds no accepted baseline, **counting a relay only where the walk read it to exhaustion, it served a chain that survived step 3, and step 3d recorded it as a proven source**, and counting distinct 33-byte operator keys rather than declared operator identifiers (`09-security-model.md` §9.7.4.2 R11). A relay that answered with an empty response failed nothing and served nothing, so it counts toward neither number. Otherwise the resolver returns `Inconclusive{SingleSource}` and adopts no head, and that payload separates the relays reached, the operators proven, and the proofs its own clock rejected (`09-security-model.md` §9.7.4.2 R11). A resolver holding an accepted baseline resolves against one relay and this step does not bind it.
 6. **Optionally read cosigned heads as evidence**, by querying `SHA-256("scp:wit:" ‖ identifier_bytes)`; a resolver that skips it returns the same key state (`09-security-model.md` §9.7.4.3).
 7. **Derive the key state** from the latest state-carrying event at or before the adopted head (`09-security-model.md` §9.7.4.2 R8) and cache it under the §9.10.7 caching policy. Resolution yields key state, and the service record settles under its own rules at its own address (§3.10.13).
 
@@ -722,11 +722,9 @@ The resolution protocol runs seven steps.
 
 ### 3.10.5 Publishing Protocol
 
-On appending a key event the owner builds the chain from the inception event to the new head, hands that chain to `publish` (§3.10.10), and submits the new head to its witness set. **`publish` and `publish_service_record` each address the publication set, which is the union of the entries the identity's own accepted service record names and the fallback set** (`09-security-model.md` §9.7.4.2 definitions state the fallback set, and §3.10.13 states the record). **A publisher that holds no accepted service record of its own holds a publication set equal to the fallback set**, which is the case at an identity's first publish. **R10's self-observation cadence fetches over that same set**, and `PublishOutcome` carries one entry per member of it (§3.10.10). Without the union the first of the two relay sets §3.10.1 makes a resolver query would be empty for the life of every identity, and step 3 of §3.2.1 would name an act no method performs. **The backend segments per entry**: it reads each entry's declared `max_blob_size` through `read_policy` and splits the chain into contiguous segments each fitting one frame at that entry, then publishes those frames to that entry in sequence order. `18-addressability-and-deployment.md` §18.3.3 states that the value is the relay's own, so one segmentation for the whole publication set costs the publisher every entry that declares a smaller frame. **Where that entry's declared `max_blob_size` admits no segment of the chain** — a segment carries at least one whole event, so a ceiling below one frame's fixed prefix plus one maximal event admits none — **the publisher sends nothing to that entry and records `EntryResult::Failed { code: 4010 }` for it**, which is the wire code ADR-004, the SCP native relay protocol, gives a blob too large and the answer that entry would have sent. **The publisher records that answer without sending**, because a frame it cannot cut is a frame it cannot offer, and `PublishOutcome` names every entry of the publication set exactly once, so the entry reaches a variant rather than a gap (§3.10.10). **The publisher's remedy for a rejected segment is to publish from the first segment that entry does not hold**, which it learns by querying the routing id rather than from its own memory of an acknowledgement. Submission to a witness gates nothing: the event takes effect at each relying party the moment that party resolves the extended chain, and an identity that designates no witness skips that step (`09-security-model.md` §9.7.4.2 R10, §9.7.4.3). **Appending a key event is not the only publication.** On every self-observation cadence the SDK fetches its own identity's log from every entry of the publication set, and `09-security-model.md` §9.7.4.2 R10 states which relation between a chain that entry serves and the controller's own retained log carries a publication and what each one publishes. **The cadence carries no unconditional republication**: publishing bytes an entry already holds changes nothing that entry serves, so it costs the publisher a rate-limit allowance and buys the identity nothing.
+On appending a key event the owner builds the chain from the inception event to the new head, hands that chain to `publish` (§3.10.10), and submits the new head to its witness set. **`publish` and `publish_service_record` each address the publication set, which is the union of the entries the identity's own accepted service record names and the fallback set** (`09-security-model.md` §9.7.4.2 definitions state the fallback set, and §3.10.13 states the record). **A publisher that holds no accepted service record of its own holds a publication set equal to the fallback set**, which is the case at an identity's first publish. **R10's self-observation cadence fetches over that same set**, and `PublishOutcome` carries one entry per member of it (§3.10.10). Without the union the first of the two relay sets §3.10.1 makes a resolver query would be empty for the life of every identity, and step 3 of §3.2.1 would name an act no method performs. **The backend segments per entry**: it reads each entry's declared `max_blob_size` through `read_policy` and splits the chain into contiguous segments each fitting one frame at that entry, then publishes those frames to that entry in sequence order. `18-addressability-and-deployment.md` §18.3.3 states that the value is the relay's own, so one segmentation for the whole publication set costs the publisher every entry that declares a smaller frame. **Where that entry's declared `max_blob_size` admits no segment of the chain** — a segment carries at least one whole event, so a ceiling below one frame's fixed prefix plus one maximal event admits none — **the publisher sends nothing to that entry and records `EntryResult::NotSent { reason: SegmentTooLarge }` for it**, because `PublishOutcome` names every entry of the publication set exactly once (§3.10.10). **The publisher's remedy for a rejected segment is to publish from the first segment that entry does not hold**, which it learns by querying the routing id rather than from its own memory of an acknowledgement. Submission to a witness gates nothing: the event takes effect at each relying party the moment that party resolves the extended chain, and an identity that designates no witness skips that step (`09-security-model.md` §9.7.4.2 R10, §9.7.4.3). **Appending a key event is not the only publication**: `09-security-model.md` §9.7.4.2 R10's self-observation cadence re-reads every entry of the publication set and states which relation carries a publication and what each one publishes.
 
-**Publishing once does not leave an entry current.** `09-security-model.md` §9.7.4.2 R10 states the cadence at which the SDK re-reads its own identity's log from every entry of the publication set, and states which of the five relations a chain that entry serves can hold to the controller's log carry a publication and what each one publishes, so an implementer of this section wires that cadence rather than treating a confirmed publish cycle as the end of the obligation.
-
-**A PUBLISH carrying a key-event record, a service record, a cosigned head or a conflict statement sets the wire's `retain` flag**, which is REQUIRED true at those four kinds (`09-security-model.md` §9.10.12). A validating relay retains all four and gives none of them a TTL, which `09-security-model.md` §9.10.12 states and which the flag declares, so no republication cycle makes any of them permanent and the six-day cycle is deleted for all four. **A relay may stop holding such a record on terms its operator declares** (`09-security-model.md` §9.7.4.2 R9), and R10's self-observation cadence is what returns it. A relay that does not validate rejects a PUBLISH carrying the flag, because it holds the address digest and never the preimage and can scope no retention.
+**A PUBLISH carrying a key-event record, a service record, a cosigned head or a conflict statement sets the wire's `retain` flag**, and `09-security-model.md` §9.10.12 states what a validating relay and a relay that does not validate each do with that flag. **A relay may stop holding such a record on terms its operator declares** (`09-security-model.md` §9.7.4.2 R9), and R10's self-observation cadence is what returns it.
 
 ### 3.10.6 Anti-Segmentation Invariant
 
@@ -764,7 +762,7 @@ A relay operator that answers a resolution learns that the resolver's network ad
 
 ### 3.10.10 IdentityBackend, the Resolution Trait
 
-**`IdentityBackend` carries six methods and no others**, and ADR-063, the inception-derived key-event-log identity substrate, names that seam. **`IdentityBackend::resolve` takes the identifier's 32 raw digest bytes and returns a `ResolutionOutcome`**, which carries key state and no document. **`IdentityBackend::read_service_record` performs the service-record read** every resolution's relay discovery depends on (§3.10.1); it returns a `ServiceRecordVerdict`, whose four variants are `Adopted` carrying the record, `Rejected{cause}` carrying why the reader refused it, `Absent`, and `Inconclusive` where the reader holds no accepted record and cannot meet the first-contact floor on its `scp:svc:` query (§3.10.13). **`publish` and `publish_service_record` each return a `PublishOutcome`, defined below beside the other types the trait returns**: a publish cycle addresses every entry of the publication set §3.10.5 names, so its result is a per-entry list and a single error variant carrying one scope cannot express it. **`resolve` performs the service-record read itself**, through `read_service_record`, at the point §3.10.4 step 2 names, and the backend holds the accepted copy, so a caller never sequences two calls to resolve an identifier and calls `read_service_record` only to read the record's own entries. **`read_policy` returns the `DeclaredWritePolicy` one entry declares, and `None` where that entry declares none**, which is what `publish` segments the chain against; and **`fallback_set` returns the entries `read_policy` takes**, because no other method returns one. Every type name and every variant name below is name-bound under the criterion `09-security-model.md` §9.7.4.2's definitions state. `.docs/architecture.md` cites this section for the method set and states which crate implements the seam. **This section also declares one operation on the identity handle, `observe_self`, which runs the self-observation cadence `09-security-model.md` §9.7.4.2 R10 states and returns one `EntryObservation` for every entry of the publication set**: the entry, the relation the SDK decided for the chain that entry served, and the act the arm took. **That operation sits on the identity handle and never on `IdentityBackend`**, because the duty compares what an entry served against the controller's own retained log and no method of that trait returns that log, and because a caller that installs a backend of its own through `IdentityBackendSlot::Custom` reaches a cadence the SDK runs above the trait.
+**`IdentityBackend` carries six methods and no others**, and ADR-063, the inception-derived key-event-log identity substrate, names that seam. **`IdentityBackend::resolve` takes the identifier's 32 raw digest bytes and returns a `ResolutionOutcome`**, which carries key state and no document. **`IdentityBackend::read_service_record` performs the service-record read** every resolution's relay discovery depends on (§3.10.1); it returns a `ServiceRecordVerdict`, whose four variants are `Adopted` carrying the record, `Rejected{cause}` carrying why the reader refused it, `Absent`, and `Inconclusive` where the reader holds no accepted record and cannot meet the first-contact floor on its `scp:svc:` query (§3.10.13). **`publish` and `publish_service_record` each return a `PublishOutcome`, defined below beside the other types the trait returns**: a publish cycle addresses every entry of the publication set §3.10.5 names, so its result is a per-entry list and a single error variant carrying one scope cannot express it. **`resolve` performs the service-record read itself**, through `read_service_record`, at the point §3.10.4 step 2 names, and the backend holds the accepted copy, so a caller never sequences two calls to resolve an identifier and calls `read_service_record` only to read the record's own entries. **`read_policy` returns the `DeclaredWritePolicy` one entry declares, and `None` where that entry declares none**, which is what `publish` segments the chain against; and **`fallback_set` returns the entries `read_policy` takes**, because no other method returns one. Every type name and every variant name below is name-bound under the criterion `09-security-model.md` §9.7.4.2's definitions state. `.docs/architecture.md` cites this section for the method set and states which crate implements the seam. **This section also declares one operation on the identity handle, `observe_self`, which runs one pass of the self-observation cadence `09-security-model.md` §9.7.4.2 R10 states and returns one `EntryObservation` for every entry of the publication set**: how far the SDK reached that entry and, for an entry it read to exhaustion, one `ChainObservation` per chain the entry served. **That operation sits on the identity handle and never on `IdentityBackend`**, because the duty compares what an entry served against the controller's own retained log and no method of that trait returns that log, and because a caller that installs a backend of its own through `IdentityBackendSlot::Custom` reaches a cadence the SDK runs above the trait.
 
 ```rust
 impl<S: Storage> Identity<S> {
@@ -773,7 +771,7 @@ impl<S: Storage> Identity<S> {
     /// publication set §3.10.5 names. Asynchronous, because it fetches from
     /// every entry and may publish to some of them.
     pub fn observe_self(&self)
-        -> impl Future<Output = Result<SelfObservation, IdentityError>> + Send;
+        -> impl Future<Output = Result<Vec<EntryObservation>, IdentityError>> + Send;
 }
 ```
 
@@ -801,12 +799,10 @@ pub trait IdentityBackend: Send + Sync {
     /// the backend segments them per entry against that entry's declared
     /// `max_blob_size` (`18-addressability-and-deployment.md` §18.3.3): the
     /// value is each relay's own, so a caller that pre-cut one frame slice for
-    /// the whole set would lose every entry declaring a smaller frame. **Where
+    /// the whole set would lose every entry declaring a smaller frame. Where
     /// an entry's declared ceiling admits no segment of the chain the publisher
     /// sends nothing to that entry and records
-    /// `EntryResult::Failed { code: 4010 }` for it** (§3.10.5), because a frame
-    /// it cannot cut is a frame it cannot offer and every entry reaches a
-    /// variant rather than a gap.
+    /// `EntryResult::NotSent { reason: SegmentTooLarge }` for it (§3.10.5).
     fn publish(&self, identifier: &[u8; 32], chain: &[Vec<u8>])
         -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
 
@@ -846,18 +842,16 @@ pub trait IdentityBackend: Send + Sync {
 }
 
 /// The error half of this trait's six methods and of the three recovery entry
-/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries eight
+/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries nine
 /// variants and no others. A refusal the protocol mandates carries one of these
 /// variants, so four bindings mint one code rather than four and a caller tells
-/// a custody choice from a network condition. Five of the variants reach a
-/// caller through the ceremony alone, so a sentence naming one caller sizes the
-/// surface wrongly. **The identity half's one refusal reaches a caller through
+/// a custody choice from a network condition. **The identity half's one refusal reaches a caller through
 /// `EntryResult::Refused` alone**, because a refusal is what one entry answered
 /// and a publish cycle returns one `PublishOutcome` naming every entry of the
 /// publication set exactly once: an error variant carrying one ceiling for a
 /// cycle that read three ceilings discards two of them, and a caller holding
 /// that error reads no per-entry list, which is the list §3.10.6's three MUSTs
-/// read. `SCP-IDENT-1107` is free.
+/// read.
 ///
 /// The codes take `SCP-IDENT-1100` through `SCP-IDENT-1199`, the first free
 /// hundred-block of the `SCP-IDENT-` range `.docs/standards/sdk-common.md`
@@ -875,20 +869,10 @@ pub enum IdentityError {
     /// SCP-IDENT-1102. The SDK can reach no source in the fallback set, so it
     /// refuses to compose a reveal-authorized event (§9.7.4.2 R10).
     NoFallbackSourceReachable,
-    /// SCP-IDENT-1103. The SDK can observe, in a store of the credential-keyed
-    /// store set, another unpublished reveal-authorized event or a pending
-    /// `RecoveryHandle` for this identity. `load_pending_recovery` reads every
-    /// store of that set and returns a handle at every phase from `Composed`
-    /// through `Confirmed`, and returns nothing at `Submitted`.
-    /// `abort_recovery` reaches a handle over that same range and deletes it
-    /// from every store it was written to; `resume_recovery` deletes it the
-    /// same way once the ceremony completes at `Confirmed` plus destruction of
-    /// the spent keys, which is the one removal point the ceremony order names
-    /// for every identity alike, so no finished ceremony leaves an object that
-    /// raises this error. `resume_recovery` re-enters that ordered list at the
-    /// phase the handle it read names and performs no step the list has passed,
-    /// so it writes no handle back into a store the removal has cleared
-    /// (`09-security-model.md` §9.7.4.2 R10).
+    /// SCP-IDENT-1103. The SDK can observe, in a member of the store set, an
+    /// unpublished reveal-authorized event or a pending `RecoveryHandle` for
+    /// this identity (`09-security-model.md` §9.7.4.2 R10, which states the
+    /// ceremony's one removal point).
     RevealAlreadyPending,
     /// SCP-IDENT-1104. The verifier could not persist a contested verdict, its
     /// retained suffixes, or the accepted-head baseline (§9.7.4.2 R14).
@@ -899,12 +883,14 @@ pub enum IdentityError {
     /// SCP-IDENT-1106. A string reached an admission gate that is not the
     /// canonical form of an inception-derived identifier (§3.8.1).
     NonCanonicalIdentifier,
-    /// SCP-IDENT-1108. The SDK reached some members of the credential-keyed
-    /// store set and not every member, so it refused to compose a
-    /// reveal-authorized event rather than compose against a partial view: a
-    /// partial read is indistinguishable to the SDK from an empty one, and an
-    /// empty one is what the one-reveal-at-a-time rule treats as no pending
-    /// reveal (`09-security-model.md` §9.7.4.2 R10). The condition is routine
+    /// SCP-IDENT-1107. `abort_recovery` found the signed event in the device's
+    /// own store, so it refused to clear the handle; `resume_recovery`
+    /// completes the ceremony (`09-security-model.md` §9.7.4.2 R10).
+    SignedRevealUnpublished,
+    /// SCP-IDENT-1108. The SDK did not reach every member of a non-empty store
+    /// set, whether it reached some members or none, so it refused to compose
+    /// a reveal-authorized event (`09-security-model.md` §9.7.4.2 R10). The
+    /// condition is routine
     /// on a laptop whose pre-rotation authenticator is absent from its port,
     /// so a caller routes on this code rather than on
     /// `NoFallbackSourceReachable`, which names a relay the SDK could not
@@ -975,7 +961,7 @@ pub struct EntryOutcome {
 }
 
 /// What one entry answered. Every SDK binding carries the type name and all
-/// four variant names verbatim.
+/// five variant names verbatim.
 pub enum EntryResult {
     /// The entry stored the write.
     Accepted,
@@ -1002,47 +988,69 @@ pub enum EntryResult {
     Failed { code: u16 },
     /// The entry answered nothing.
     Unreachable,
+    /// The publisher sent the entry nothing (§3.10.5), so the entry sent no
+    /// code.
+    NotSent { reason: NotSentReason },
 }
 
-/// The relation the SDK decided between the chain one entry served and the
-/// controller's own retained log, on the self-observation cadence
-/// `09-security-model.md` §9.7.4.2 R10 states. The five variants are the five
-/// names that rule spells, and the rule states which chain each relation is
-/// decided over and what act each arm takes.
-pub enum ChainRelation { Absent, Identical, Superseded, Extending, Diverged }
-
-/// The act the arm took at one entry. Each variant names an act
-/// `09-security-model.md` §9.7.4.2 R10's arms state, and that rule states which
-/// arm takes which.
-pub enum ObservedAct {
-    /// The identical arm, and the extending arm where the SDK withheld nothing
-    /// and published nothing.
-    NoPublish,
-    /// The absent arm: the chain from the inception event and the service
-    /// record.
-    RepublishedFromInception,
-    /// The superseded and diverged arms: from the first event that entry does
-    /// not hold on the chain the controller authored.
-    RepublishedFromFirstUnheldEvent,
-    /// The extending arm: the SDK adopted the served chain into its retained
-    /// log.
-    Adopted,
-    /// The extending arm's withhold: the SDK adopted nothing and alerted.
-    WithheldAdoption,
+/// Why the publisher sent an entry nothing.
+pub enum NotSentReason {
+    /// The entry's declared `max_blob_size` admits no segment of the chain.
+    SegmentTooLarge,
 }
 
-/// What the cadence observed at one entry, in the shape `EntryOutcome` uses for
-/// a publish cycle.
+/// What one pass of the self-observation cadence observed at one entry of the
+/// publication set. `observe_self` returns one per entry, exactly once.
 pub struct EntryObservation {
     pub entry: String,
-    pub relation: ChainRelation,
-    pub act: ObservedAct,
+    pub reach: EntryReach,
 }
 
-/// What one run of the self-observation cadence observed: one entry of the
-/// publication set per member, exactly once.
-pub struct SelfObservation {
-    pub per_entry: Vec<EntryObservation>,
+/// How far the SDK reached one entry, and the act `09-security-model.md`
+/// §9.7.4.2 R10 names for each reach.
+pub enum EntryReach {
+    /// The entry answered nothing. The SDK alerted and published nothing.
+    Unreachable,
+    /// The SDK stopped before R9's page walk read the entry to exhaustion.
+    /// The SDK alerted, named the entry, and published nothing.
+    Unexhausted,
+    /// The page walk read the entry to exhaustion: one observation per chain
+    /// the entry served. An empty entry, and an entry whose frames chain to
+    /// nothing, each yield one observation whose `relation` is `Absent`.
+    Answered(Vec<ChainObservation>),
+}
+
+/// The relation the SDK decided for one chain an answered entry served, and
+/// what it did about it.
+pub struct ChainObservation {
+    /// The head digest of the chain's valid prefix; absent under `Absent`.
+    pub head: Option<[u8; 32]>,
+    pub relation: ChainRelation,
+    /// The entry's answer to the re-publication the relation's arm sent;
+    /// absent where the arm publishes nothing.
+    pub republished: Option<EntryResult>,
+    /// True where R10 obliged an alert for this chain.
+    pub alerted: bool,
+}
+
+/// The five relations `09-security-model.md` §9.7.4.2 R10 names, which that
+/// rule decides over each chain's valid prefix.
+pub enum ChainRelation {
+    Absent,
+    Identical,
+    Superseded,
+    Extending(ExtendingAct),
+    Diverged,
+}
+
+/// What the extending arm did with the served chain.
+pub enum ExtendingAct {
+    /// The chain carried no `RootRecovery{Lost}` the SDK did not author, and
+    /// the SDK adopted the whole valid prefix.
+    Adopted,
+    /// The SDK adopted the prefix before the first such event and withheld
+    /// that event and every event past it.
+    Withheld,
 }
 
 /// Every resolution returns one of the six verdicts of
@@ -1067,6 +1075,10 @@ pub struct ResolutionOutcome {
 /// 32-byte declared operator identifiers.
 pub struct ResolutionSources {
     pub relays_reached: Vec<String>,
+    /// The relays the resolver reached and did not read to exhaustion
+    /// (`09-security-model.md` §9.7.4.2 R9's page walk). R11's floor counts
+    /// none of them.
+    pub unexhausted: Vec<String>,
     /// The operator key the shipped community relay list
     /// (`18-addressability-and-deployment.md` §18.5.1) declares for each entry
     /// the resolver reached. That list is the field's source: no method of
@@ -1076,7 +1088,8 @@ pub struct ResolutionSources {
     pub declared: Vec<[u8; 33]>,
     /// The operator key each verified relay proof of control verified under,
     /// checked by the five checks `09-security-model.md` §9.7.4.2's
-    /// definitions state. R11's floor counts the distinct values here.
+    /// definitions state, for a source the walk read to exhaustion alone.
+    /// R11's floor counts the distinct values here.
     pub proven: Vec<[u8; 33]>,
     /// The record the party assigned from the source it used for the head it
     /// adopted. On the cached return §3.10.4 states — every relay failed and a
