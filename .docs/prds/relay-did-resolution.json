@@ -698,7 +698,7 @@
         "crates/scp-transport/src/witness/store.rs",
         "crates/scp-kel/src/witness.rs"
       ],
-      "description": "Architecture slice S6. A witness runs the one check `09-security-model.md` §9.7.4.3 states, persists its per-subject record before it releases a cosignature, seeds under case 1, and publishes each cosigned head at the subject's `scp:wit:` address and each conflict statement at `scp:wcf:`. §9.7.4.3 does not yet state the wire on which a controller submits a chain and a witness refuses it, and the plan of record lists that wire among the design decisions still to make, so this story cannot complete until that section states it.",
+      "description": "Architecture slice S6. A witness runs the one check `09-security-model.md` §9.7.4.3 states, persists its per-subject record before it releases a cosignature, seeds under case 1, and publishes each cosigned head at the subject's `scp:wit:` address and each conflict statement at `scp:wcf:`. A controller submits by publishing its key-event frames to the witness's relay, and the relay answers a refusal with ADR-004's `ERR` carrying one of the codes §9.7.4.3 states.",
       "acceptanceCriteria": [
         "The witness persists its per-subject record before it releases the cosignature that record accounts for: a test injects a crash between the persist and the release and asserts the restarted witness holds the record (`09-security-model.md` §9.7.4.3)",
         "The one check cosigns a chain carrying the last cosigned digest at that sequence, refuses a proper prefix naming staleness with its last cosigned head and no conflict statement, and refuses a chain carrying a different event at that sequence with a conflict statement: one test per case (`09-security-model.md` §9.7.4.3)",
@@ -707,13 +707,13 @@
         "The conflict statement reproduces Vector 45, and `is_fault_proof` accepts Vector 46's pair and rejects a pair in which either head sets `seed`: known-answer and negative tests (`09-security-model.md` §9.7.4.3)",
         "The witness publishes each cosigned head at `SHA-256(\"scp:wit:\" ‖ subject)` and each conflict statement at `SHA-256(\"scp:wcf:\" ‖ subject)`, in the frames §9.10.12 states and with `retain: true`: a test per object",
         "A witness at `MAX_SUBJECTS_PER_WITNESS` refuses a new subject and names capacity, and evicts a subject only where a chain extending its last cosigned head reaches a key state that no longer names it: a test per case (`09-security-model.md` §9.7.4.3)",
-        "`09-security-model.md` §9.7.4.3 states the submission and refusal wire, and the witness's request and response types match it field for field",
+        "A PUBLISH the witness cosigns receives `OK` and a cosigned head at `scp:wit:`; a proper prefix and a conflicting chain each receive `ERR` `4050` WITNESS_STALE carrying `last_cosigned_head`, the second also producing a conflict statement at `scp:wcf:`; a relay at capacity answers `4051`, a key state not naming the witness `4052`, a stored `observed_at` past the skew tolerance `4053`, and a store that fails to read `5000`: one test per code (`09-security-model.md` §9.7.4.3, ADR-004)",
         "No unrecoverable panic path: no unwrap() or expect() in library code"
       ],
       "actionItems": [
         "Implement `Witness<W: WitnessStore>` with the one check, the durable record and case-1 seeding.",
         "Publish cosigned heads and conflict statements in their frames with `retain: true`.",
-        "Implement the submission and refusal wire once §9.7.4.3 states it.",
+        "Answer each refusal with the `ERR` code §9.7.4.3 states, after the relay stored the frame.",
         "Write the known-answer and crash tests the acceptance criteria name."
       ],
       "blockedBy": [
@@ -731,6 +731,10 @@
         {
           "file": ".docs/specs/09-security-model.md",
           "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
         }
       ],
       "details": {}
