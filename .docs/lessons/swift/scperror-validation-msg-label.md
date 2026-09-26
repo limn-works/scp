@@ -1,6 +1,5 @@
 # `ScpError.Validation` uses `msg:` not `message:`
 
-**Date:** 2026-05-03
 **Story:** PR #1725 (PR-D MCP allowlist migration)
 **Severity:** Blocking for Swift CI build job
 
@@ -53,9 +52,9 @@ every call uses `msg:`. The same rule applies to any UniFFI-generated
 case whose Rust field name differs from the Swift idiom — when in doubt,
 read `Sources/SCP/Internal/ScpBindings.swift` for the literal labels.
 
-## Discovered
+## How it reaches CI
 
-PR #1725 commit `ca581dac8` shipped with `message:` in
-`bindings/swift/Sources/SCP/Scp.swift:615` (the new
-`mcpDisableStdioAllowlist` ceremony throw). The Swift CI job failed with
-the exact label-mismatch error above; fixed in `414913369`.
+A throw written with `message:` compiles nowhere, so the Swift CI job reports the
+label-mismatch error above rather than shipping the defect. It reached CI once through the
+`mcpDisableStdioAllowlist` ceremony throw in `bindings/swift/Sources/SCP/Scp.swift`, which
+an author wrote with the Swift-idiomatic label instead of the generated one.

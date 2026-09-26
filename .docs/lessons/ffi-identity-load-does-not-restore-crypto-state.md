@@ -1,6 +1,5 @@
 # FFI Identity Load Does Not Restore Crypto State
 
-**Date:** 2026-03-01
 **Source:** SCP-214 review of `crates/scp-ffi/src/identity.rs`
 
 ## The Bug

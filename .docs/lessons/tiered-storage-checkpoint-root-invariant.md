@@ -1,6 +1,5 @@
 # Tiered Storage: Checkpoint Root Must Span All Tiers
 
-**Date:** 2026-02-27
 **Source:** SCP-127 security review of `crates/scp-core/src/event_log/tiered_storage.rs`
 
 ## The Bug
@@ -23,7 +22,7 @@ When a tiered system captures a Merkle root for cold proof verification, the roo
 
 When testing tiered/partitioned data with cryptographic verification, always test the verification path across at least 2 partition operations. A single operation often looks correct because the captured state still matches the full state. The invariant breaks only when state is captured from a *subset* after the first partition.
 
-## Resolution (2026-02-27)
+## Resolution
 
 Both issues were fixed in the same commit:
 

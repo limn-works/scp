@@ -856,7 +856,15 @@ mod tests {
         // Category A action signed by agent key -> rejected.
         let result = enforce_inner_envelope_category_a(&envelope, "did_document");
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let rejection = result.unwrap_err();
+        // ADR-039 enforcement-stack layer 3 rejects AND records, so a rejection
+        // carries a conformant violation record built from a signature this
+        // verification point observed — not only a message.
+        assert!(
+            rejection.recorded_violation().is_some(),
+            "a rejection must carry a violation record, got {rejection:?}"
+        );
+        let err = EnvelopeError::from(rejection);
         assert!(
             matches!(err, EnvelopeError::CategoryAViolation(_)),
             "expected CategoryAViolation, got {err:?}"

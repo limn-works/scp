@@ -1,0 +1,10 @@
+# The shape fuzz.yml carried: a per-leg `key` and no `shared-key`.
+name: Bad
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-${{ matrix.target }}

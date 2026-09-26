@@ -86,7 +86,7 @@ const MAX_REGISTRATIONS_PER_CONNECTION: usize = 64;
 const BRIDGE_REGISTER_REPLAY_WINDOW_SECS: u64 = 60;
 
 // Identity functions imported from scp-identity to avoid cross-crate duplication.
-use scp_identity::{did_from_ed25519_public_key, resolution::did_routing_id};
+use scp_identity::did_key_routing_id;
 
 // ---------------------------------------------------------------------------
 // BridgeRegistration — self-hosted relay registers with a bridge
@@ -235,9 +235,12 @@ pub fn verify_bridge_registration(
             BridgeAuthError::InvalidSignature(format!("signature verification failed: {e}"))
         })?;
 
-    // Step 3: Verify routing_id == SHA-256("scp:did:" || did_string).
-    let did_string = did_from_ed25519_public_key(&registration.public_key);
-    let derived_routing_id = did_routing_id(&did_string);
+    // Step 3: Verify the claimed routing_id is the one this key binds to.
+    // Derived through the ONE shared key→routing_id function (§3.10.2), never
+    // re-inlined here: a bridge admitted at a routing_id the relay's DID-record
+    // gates compute differently would be a registration for an address nobody
+    // else agrees is this DID's.
+    let derived_routing_id = did_key_routing_id(&registration.public_key);
     if derived_routing_id != registration.routing_id {
         return Err(BridgeAuthError::RoutingIdMismatch {
             claimed: registration.routing_id,
@@ -564,6 +567,10 @@ pub fn is_bridge_url(url: &str) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use ed25519_dalek::{Signer, SigningKey};
+    // Independent oracle for the routing-ID derivation: recomposed here from
+    // the raw key rather than calling the shared `did_key_routing_id`, so a bug
+    // in that helper cannot make production and assertion vacuously agree.
+    use scp_identity::{did_from_ed25519_public_key, did_routing_id};
 
     use super::*;
 

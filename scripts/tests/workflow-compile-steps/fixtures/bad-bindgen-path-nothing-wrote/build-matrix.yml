@@ -1,0 +1,13 @@
+# The shape the Android job of build-matrix.yml carried: a cross-target release build,
+# then a bare `cargo run` reading a host release path that no step wrote.
+name: Bad
+on: push
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo build --release --target aarch64-linux-android -p scp-ffi-uniffi
+      - run: |
+          cargo run -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
+            --library target/release/libscp_ffi_uniffi.so \
+            --language kotlin

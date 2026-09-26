@@ -777,7 +777,7 @@ class CoroutineBridgeTest {
                     assertFailsWith<BridgeException> {
                         bridge.broadcast.publishAsset(1L, asset = asset)
                     }
-                assertEquals("SCP-IDENT-1060", exception.code)
+                assertEquals("SCP-IDENT-1063", exception.code)
             }
     }
 

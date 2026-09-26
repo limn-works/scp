@@ -1,0 +1,24 @@
+---
+name: relaypublisher-didrecordv1-contract
+description: SCP-RELAYRES-004 RelayPublisher::publish(&DidRecordV1) review — bare-bytes footgun killed, but routing_id param still lets frame/routing mismatch
+metadata:
+  type: project
+---
+
+Reviewed the SCP-RELAYRES-004 change swapping `RelayPublisher::publish(routing_id, blob_ttl, blob: &[u8])` → `publish(routing_id, blob_ttl, record: &DidRecordV1)` (crates/scp-identity/src/republish.rs trait; prod impl crates/scp-transport/src/native/relay_publisher.rs `TransportRelayPublisher`; InMemory double + heal at resolver.rs).
+
+**Verdict: the bare-bytes footgun IS killed.** `DidRecordV1` (scp-protocol/src/envelope/did_record.rs) has private fields + sole validating ctor `try_new(public_key, seq, signature, value)`; the trait takes `&DidRecordV1`, so unframed `document_bytes` (dropping BEP44 sig/seq) is unrepresentable at the publish boundary. InMemory double records the exact `encode()`d frame the prod impl sends — the double can't diverge from ship.
+
+**Residual finding (same footgun class, not yet closed):** `routing_id: &[u8;32]` is a pure function of `record.public_key()` (routing_id = SHA-256("scp:did:" ‖ did:dht:z-base32(pk))), yet passed as an independent param. Same type as `record.public_key()` → transposition not type-caught; and both prod callers derive routing_id from a `did`/`entry.did` String while the frame's pk comes from a separate `public_key` field/arg (RepublishEntry carries BOTH did AND public_key independently; heal takes them as separate args). So a valid frame can land at the wrong routing_id. **Recommendation: derive routing_id inside publish from record.public_key() and drop the param** — closes the mismatch the same way &DidRecordV1 closed bare-bytes. Sound because the whole relay-republish/BEP44 path is did:dht-specific.
+
+`&DidRecordV1` is the right choice; a `RelayPublishRecord{record,blob_ttl}` wrapper would be over-engineering (blob_ttl is free policy, no invariant to enforce).
+
+**REVISION LANDED & VERIFIED (2026-08-03):** backend dropped the `routing_id` param entirely — trait is now `publish(blob_ttl, record: &DidRecordV1)`. Routing_id derived inside all 3 impls (Transport/InMemory/AlwaysFail) via new pub `scp_identity::republish::did_record_routing_id(record) = did_routing_id(did_from_ed25519_public_key(record.public_key()))`. This is BYTE-IDENTICAL to the relay-side binding gate (`did_record_validation.rs` BindingMismatch reject) and `did_slot.rs` — so a self-published frame passes the validating relay's admission check by construction. Mismatch now unrepresentable. CONTRACT APPROVED.
+
+**PASS 3 @781297f29 (2026-08-08):** both prior MINORs CLOSED — the 3 inlined composition copies now all call `did_record_routing_id`, and the stale "with the given routing ID" doc is corrected. New findings, all *around* the (sound) contract:
+
+- **The two-source-of-truth defect MOVED UP, not away.** The frame's key now determines the publish address, but `RepublishEntry` (republish.rs:417) still carries `did` AND `public_key` as independent pub fields, and `HealingPublisher::heal` (resolver.rs:197) still takes `did: &str` + `public_key: &[u8;32]` as separate args with the binding stated only in a doc line. Address is now argument N while all telemetry/task-keys are argument 1. Not a live bug (both prod callers derive one from the other) but the identical unrepresentability gap the diff just closed one layer down. **Tell:** two tests (republish.rs:1077, resolver.rs:1681) carry a hand-written "Consistent identity: DID derived from the public key" comment — manual compliance with a binding the type doesn't enforce. Fix: drop the `did` field/param, derive via `did_from_ed25519_public_key`.
+- **`heal` is 6 positional params and now builds a `DidRecordV1` internally** — hoist the record to the signature (collapses 4 params into the already-validated type). Agent-first tenet: flat validated object > 6 positionals.
+- **`bound_relay_count() > 0` (self_host.rs:1588) is a leaky one-shot activation predicate.** `TransportRelayPublisher::publish` already fails closed + backs off when unbound, so the gate buys nothing and permanently freezes the relay arm off; a later `bind()` can't wake it. The 20-line "re-drive this after binding" disclosure block IS the scar tissue. Deleting the gate deletes the hazard, the doc block, and the accessor.
+- READ/WRITE multi-relay composition models diverge (querier composes externally over `relay_urls: &[String]`; publisher composes internally over its bound map). Pre-existing, but both halves await the SAME #482 binding — that's the moment to unify.
+- `did_record_routing_id` lives in `republish` (a background-loop module) with 3 non-republish consumers, and is NOT root-re-exported while its sibling `did_routing_id` IS (lib.rs:53) — asymmetric import paths for the two halves of one "single source of truth."

@@ -1,13 +1,13 @@
 //! Global runtime registry mapping context IDs to live `scp-core` objects.
 //!
 //! The FFI bridge functions accept `context_id: &str` parameters but need
-//! access to both the shared [`ContextManager`] (for lifecycle, membership,
+//! access to both the shared [`Supervisor`](scp_core::context::supervisor::Supervisor) (for lifecycle, membership,
 //! governance, and messaging operations) and per-context FFI-specific state
 //! (outlet registries, event logs, UCAN state, message channels).
 //!
 //! # Architecture (post-#386 rewrite)
 //!
-//! Context lifecycle is delegated to a shared [`ContextManager`] which holds
+//! Context lifecycle is delegated to a shared [`Supervisor`](scp_core::context::supervisor::Supervisor) which holds
 //! the canonical membership, role, governance, broadcast, and TTL state.
 //! Per-context FFI-specific state (outlet registries, event logs, UCAN
 //! revocation/nonce tracking, outlet handlers, message channels) lives in
@@ -37,7 +37,7 @@
 //! 1. `py_context_create` delegates to `ContextManager::create_context`, then
 //!    registers FFI-specific state via [`register_ffi_state`].
 //! 2. Bridge functions call [`with_ffi_state`] for FFI-specific state and
-//!    [`context_manager`] for the shared `ContextManager`.
+//!    [`supervisor`] for the shared `Supervisor`.
 //! 3. `py_context_close` delegates to `ContextManager::close_context`, then
 //!    removes FFI state via [`remove_ffi_state`].
 //!
@@ -152,10 +152,10 @@ pub type OutletHandler =
 // ContextManager (shared, process-global)
 // ---------------------------------------------------------------------------
 
-/// Returns a reference to the shared [`ContextManager`] from the given
+/// Returns a reference to the shared [`Supervisor`](scp_core::context::supervisor::Supervisor) from the given
 /// bridge instance.
 ///
-/// Delegates to [`PyBridgeInstance::core`] → [`CoreFields::try_context_manager`].
+/// Delegates to [`PyBridgeInstance::core`] → [`CoreFields::try_supervisor`](scp_ffi_common::bridge_instance::CoreFields::try_supervisor).
 ///
 /// # Errors
 ///
@@ -669,10 +669,10 @@ impl PyBridgeInstance {
         &self.identity_registry
     }
 
-    /// Returns a reference to the attached [`ContextManager`], if any.
+    /// Returns a reference to the attached [`Supervisor`](scp_core::context::supervisor::Supervisor), if any.
     ///
     /// Convenience accessor that delegates to
-    /// [`CoreFields::try_context_manager`]. Returns `None` until
+    /// [`CoreFields::try_supervisor`](scp_ffi_common::bridge_instance::CoreFields::try_supervisor). Returns `None` until
     /// `init_context_manager` (or one of its variants) has been called.
     #[must_use]
     pub fn try_supervisor(&self) -> Option<&Arc<scp_core::context::supervisor::Supervisor>> {
@@ -860,7 +860,7 @@ impl Drop for PyBridgeInstance {
 // ContextManager initialization
 // ---------------------------------------------------------------------------
 
-/// Initializes the global [`ContextManager`] with production providers.
+/// Initializes the bridge instance's [`Supervisor`](scp_core::context::supervisor::Supervisor) with production providers.
 ///
 /// Uses `NodeMlsFactory` (real OpenMLS-backed encryption, sender keys, and
 /// group management — ported from NAPI bridge #1305, closes #1324),
@@ -923,7 +923,7 @@ pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) {
     bi.core.set_supervisor(supervisor_arc);
 }
 
-/// Initializes the global [`ContextManager`] with custom providers.
+/// Initializes the bridge instance's [`Supervisor`](scp_core::context::supervisor::Supervisor) with custom providers.
 ///
 /// Allows injecting real or custom provider implementations. If the manager
 /// is already initialized, this is a no-op (first call wins).
@@ -956,7 +956,7 @@ pub fn init_context_manager_with(
     bi.core.set_supervisor(supervisor_arc);
 }
 
-/// Initializes the given bridge instance's [`ContextManager`] with a
+/// Initializes the given bridge instance's [`Supervisor`](scp_core::context::supervisor::Supervisor) with a
 /// `LocalTransportProvider`.
 ///
 /// Identical to [`init_context_manager`] except the transport provider is
@@ -1207,7 +1207,7 @@ pub(crate) fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn Context
 /// Every production supervisor built here enables this channel so that local
 /// context events can be consumed by external sinks — notably the node's
 /// outbound webhook dispatcher (spec §12.10.5), wired in
-/// [`crate::server::node_start_in_memory`]/`node_start_local`. Lagging consumers
+/// [`PyScp::node_start_in_memory`](crate::scp::PyScp::node_start_in_memory)/`node_start_local`. Lagging consumers
 /// drop the oldest events (logged, never panics); `1024` is the documented
 /// default shared across all three FFI bridges.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -1285,12 +1285,12 @@ fn build_supervisor(
     )
 }
 
-/// Builds the bridge's [`DurableProviders`] — the durable saga journal + the
+/// Builds the bridge's [`DurableProviders`](scp_core::context::supervisor::supervisor::DurableProviders) — the durable saga journal + the
 /// `OpenMLS` `mls_storage` view bound into one same-backend-by-construction
 /// value — from this bridge instance's single chosen [`StorageProvider`]
 /// (spec §17.6 / §17.16 / ADR-049).
 ///
-/// [`DurableProviders::from_handle`] derives BOTH halves from the one
+/// [`DurableProviders::from_handle`](scp_core::context::supervisor::supervisor::DurableProviders::from_handle) derives BOTH halves from the one
 /// `Arc<StorageProvider>` taken from `bi.storage_provider()`, so the journal,
 /// the `OpenMLS` view, persistence, and the event log all read/write one
 /// backend — a caller cannot wire the journal to a divergent store.
@@ -1300,7 +1300,7 @@ fn build_supervisor(
 ///
 /// # Errors
 ///
-/// Returns [`ScpPyError::ContextError`] with [`error_codes::STORAGE_8000`] when
+/// Returns [`ScpPyError::ContextError`] with [`error_codes::STORAGE_8000`](scp_ffi_common::error_codes::STORAGE_8000) when
 /// no storage provider is set — the storage-before-supervisor precondition. The
 /// runtime never defaults storage; no fabrication, no default.
 fn durable_providers_from_bi(
@@ -1448,7 +1448,7 @@ use scp_core::context::NotConfiguredTransportProvider;
 /// Resolves the registry via the typed `ffi_bridge_state` field on the
 /// passed [`PyBridgeInstance`].
 ///
-/// Stores state that is NOT managed by [`ContextManager`]: outlet registries,
+/// Stores state that the [`Supervisor`](scp_core::context::supervisor::Supervisor) does not manage: outlet registries,
 /// event logs, UCAN revocation/nonce tracking, outlet handlers, and message
 /// channels. Context lifecycle state (membership, roles, governance,
 /// broadcast, TTL) lives in the `ContextManager`.
@@ -1456,7 +1456,7 @@ pub(crate) fn ffi_state_registry(bi: &PyBridgeInstance) -> &DashMap<String, FfiB
     bi.ffi_bridge_state.as_ref()
 }
 
-/// Per-context FFI-specific state that does NOT duplicate [`ContextManager`].
+/// Per-context FFI-specific state that does NOT duplicate the [`Supervisor`](scp_core::context::supervisor::Supervisor).
 ///
 /// Contains subsystem state used by `outlets.rs`, `ucan.rs`, `event_log.rs`,
 /// and `mcp.rs`, plus FFI-specific message channel and outlet handler state.

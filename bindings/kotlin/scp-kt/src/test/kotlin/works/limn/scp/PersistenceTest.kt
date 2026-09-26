@@ -55,11 +55,14 @@ class PersistenceTest {
         /**
          * Error code the UniFFI bridge raises when a durable storage backend
          * cannot be opened — `StorageInitError::SqliteOpen` converted to
-         * `ScpError::Context` in `crates/scp-ffi/uniffi/src/runtime.rs`. Spec
-         * §17.6 makes a failed durable-backend open terminal, so this code is
-         * the observable proof that no in-memory downgrade happened.
+         * `ScpError::Validation` in `crates/scp-ffi/uniffi/src/runtime.rs`, the
+         * same code the `PyO3` and NAPI bridges report for that same failure.
+         * The number is 8004 rather than 8001 because `AndroidStorage` in
+         * `scp-kt-android` already owns 8001–8003. Spec §17.6 makes a failed
+         * durable-backend open terminal, so this code is the observable proof
+         * that no in-memory downgrade happened.
          */
-        private const val STORAGE_OPEN_FAILED_CODE = "SCP-CTX-2000"
+        private const val STORAGE_OPEN_FAILED_CODE = "SCP-STORAGE-8004"
 
         private var nativeAvailable = false
         private var skipReason = ""
@@ -193,21 +196,21 @@ class PersistenceTest {
             // fails at the `PRAGMA key` / WAL-mode step because `SQLCipher`
             // rejects the key as "file is not a database". The UniFFI bridge
             // converts that `StorageInitError::SqliteOpen` to
-            // `ScpError::Context` with code `SCP-CTX-2000`
+            // `ScpError::Validation` with code `SCP-STORAGE-8004`
             // (`crates/scp-ffi/uniffi/src/runtime.rs`, the
             // `From<StorageInitError> for ScpError` impl), which the generated
-            // Kotlin surfaces as `ScpException.Context`. Main's 9fa80e13c
+            // Kotlin surfaces as `ScpException.Validation`. Main's 9fa80e13c
             // replaced the former silent fallback to in-memory (split-brain
             // where writes silently vanished) with hard-error propagation.
             val wrongKey = ByteArray(32) { 0x11 }
             val rejected =
-                assertFailsWith<ScpException.Context> {
+                assertFailsWith<ScpException.Validation> {
                     SCP.withSqlite(dir.toFile(), wrongKey)
                 }
             assertEquals(
                 STORAGE_OPEN_FAILED_CODE,
                 rejected.code,
-                "a rejected SQLCipher key must surface as SCP-CTX-2000, not a downgrade to in-memory",
+                "a rejected SQLCipher key is a storage-open failure, not a context failure",
             )
 
             // Third open with the correct key — must still succeed, proving
@@ -229,11 +232,12 @@ class PersistenceTest {
                 "passphrase construction must create scp.db at ${dbPath.pathString}",
             )
 
-            // `SqliteStorage` takes an advisory lock on `scp.db.lock` and holds
-            // it for the instance's lifetime, so the first instance must
-            // release the database before a second instance opens the same
-            // directory. The sibling test `withSqlite reopens the same dir plus
-            // key across two constructions` shuts down for the same reason.
+            // `SqliteStorage` holds a process-exclusive advisory lock on
+            // `scp.db.lock` for its lifetime, so close the first handle before
+            // the second construction. Leaving it open tested lock exclusion,
+            // not the passphrase round trip this test is named for. The sibling
+            // test `withSqlite reopens the same dir plus key across two
+            // constructions` shuts down for the same reason.
             scp1.shutdown(bridge(), 1.seconds)
 
             // Reopen with the SAME passphrase — must succeed (salt sidecar
@@ -251,19 +255,21 @@ class PersistenceTest {
             val scp1 = SCP.withSqlite(dir.toFile(), passphrase = "the-right-one")
             // Release the advisory lock on `scp.db.lock` first, so the reopen
             // below fails on the WRONG PASSPHRASE and not on a still-held lock.
-            // Without this shutdown the assertion passes for the wrong reason.
+            // While the first handle stayed open, that lock rejected the second
+            // construction, so the wrong passphrase decided nothing and this
+            // test proved only that two handles cannot coexist.
             scp1.shutdown(bridge(), 1.seconds)
 
             // Reopen with the WRONG passphrase must fail closed — never
             // silently open a fresh DB (spec §17.6).
             val rejected =
-                assertFailsWith<ScpException.Context> {
+                assertFailsWith<ScpException.Validation> {
                     SCP.withSqlite(dir.toFile(), passphrase = "the-WRONG-one")
                 }
             assertEquals(
                 STORAGE_OPEN_FAILED_CODE,
                 rejected.code,
-                "a rejected passphrase must surface as SCP-CTX-2000, not a downgrade to a fresh DB",
+                "a rejected passphrase is a storage-open failure, not a context failure",
             )
         }
 }

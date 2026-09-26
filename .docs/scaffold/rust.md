@@ -44,17 +44,16 @@ crates/
       trait.rs              # ADR-005: TransportAdapter trait
       manager.rs            # ADR-012: Multi-transport routing
       native/               # ADR-004: SCP native relay
-        blob_store.rs       # BlobStore trait (§16.4.1) — relay storage abstraction
+        storage.rs          # BlobStorage trait (§17.1) — relay storage abstraction
   scp-testing/              # §16: Network simulation test harness (dev-dependency only)
     Cargo.toml
     src/
       lib.rs
       clock.rs              # SimulatedClock (§16.3)
-      relay/                # InMemoryRelay, InMemoryBlobStore, BehaviorMode
+      relay/                # InMemoryRelay, BehaviorMode, SubscriptionRegistry
         mod.rs
-        blob_store.rs       # InMemoryBlobStore (§16.4.2)
-        behavior.rs         # BehaviorMode enum, fault injection configs (§16.4.4)
-        subscription.rs     # SubscriptionRegistry (§16.4.5)
+        behavior.rs         # BehaviorMode enum, fault injection configs (§16.4.3)
+        subscription.rs     # SubscriptionRegistry (§16.4.4)
       transport.rs          # InMemoryTransport — TransportAdapter impl (§16.5)
       simulator/            # NetworkSimulator, topology, fault injection
         mod.rs              # NetworkSimulator (§16.8)

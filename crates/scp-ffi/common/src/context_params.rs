@@ -98,7 +98,13 @@ pub struct CommonContextParams {
     /// Used by `PyO3` bridge; others leave empty.
     pub roles: Vec<(String, Vec<String>)>,
 
-    /// Initial outlet names. Used by `PyO3` bridge; others leave empty.
+    /// Initial outlet names.
+    ///
+    /// A non-empty value is REFUSED: a name cannot carry the operator DID,
+    /// schemas, implementation hash, and operator signature a §5.4.1
+    /// `OutletRegistration` requires, and the creator installs
+    /// `ContextParams.outlets` straight into the live authorization registry.
+    /// See [`build_outlets`] for the refusal and what to call instead.
     pub outlets: Vec<String>,
 
     /// Optional template identifier (spec §5.14). Used by `PyO3` bridge.
@@ -171,7 +177,7 @@ pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParam
         ceiling_policy,
         promotion_policy,
         roles: build_roles(&params.roles)?,
-        outlets: build_outlets(&params.outlets),
+        outlets: build_outlets(&params.outlets)?,
         ttl,
         memory_scope,
         governance,
@@ -313,31 +319,40 @@ fn build_roles(roles: &[(String, Vec<String>)]) -> Result<Vec<RoleDefinition>, S
         .collect()
 }
 
-/// Converts outlet name strings into core `OutletRegistration` values with
-/// placeholder schemas and metadata (matching the existing `PyO3` bridge
-/// behavior for bridge-level outlet declarations).
-fn build_outlets(outlets: &[String]) -> Vec<OutletRegistration> {
-    outlets
-        .iter()
-        .map(|name| OutletRegistration {
-            outlet_id: name.clone(),
-            kind: scp_core::context::outlets::OutletKind::default(),
-            name: name.clone(),
-            description: String::new(),
-            schema: scp_core::context::outlets::OutletSchema {
-                input_schema: serde_json::Value::Object(serde_json::Map::default()),
-                output_schema: serde_json::Value::Object(serde_json::Map::default()),
-                aggregate_schema: None,
-            },
-            implementation_hash: [0u8; 32],
-            test_vectors: vec![],
-            operator_did: scp_did::DID("did:key:placeholder".to_owned()),
-            cost: None,
-            message_catalog: Vec::new(),
-            registered_at: 0,
-            signature: Vec::new(),
-        })
-        .collect()
+/// Refuses a name-only genesis outlet declaration, and accepts an empty one.
+///
+/// `CommonContextParams::outlets` carries one string per outlet. A §5.4.1
+/// `OutletRegistration` carries an operator DID, an input schema, an output
+/// schema, an implementation hash, and the operator's signature over the
+/// canonical digest — none of which a name can supply. This function used to
+/// fabricate them: `did:key:placeholder` for the operator, `{}` for both
+/// schemas, 32 zero bytes for the implementation hash, and an empty signature.
+///
+/// Those fabricated values reached no live state while
+/// `state::fresh_governance_state` hard-set `registered_outlets` to an empty
+/// vec. GitHub #2020 made the creator seed the live registry from
+/// `ContextParams.outlets`, at which point a bridge caller passing an outlet
+/// name would install a registration naming an unresolvable operator into the
+/// registry that authorizes outlet invocation, and would append an event-log
+/// leaf asserting that an operator registered it. A fabricated grant that reads
+/// as a real one is worse than no grant, because a reader cannot detect it, so
+/// this path fails closed instead (GitHub #2250).
+///
+/// # Errors
+///
+/// Returns an error naming the fields the bridge surface cannot carry when
+/// `outlets` is non-empty.
+fn build_outlets(outlets: &[String]) -> Result<Vec<OutletRegistration>, String> {
+    if let Some(first) = outlets.first() {
+        return Err(format!(
+            "cannot declare genesis outlet {first:?}: the bridge's outlet parameter carries \
+             names only, and a §5.4.1 OutletRegistration also requires an operator DID, an \
+             input schema, an output schema, an implementation hash, and the operator's \
+             signature. Create the context with no outlets and register each one through the \
+             outlet-registration governance action, which carries the full registration."
+        ));
+    }
+    Ok(Vec::new())
 }
 
 // ---------------------------------------------------------------------------
@@ -570,14 +585,37 @@ mod tests {
         assert_eq!(ctx.roles[0].name, "admin");
     }
 
+    /// A name-only genesis outlet declaration is refused rather than fabricated
+    /// (GitHub #2250). Before the refusal this call returned one
+    /// `OutletRegistration` whose operator DID was the literal
+    /// `did:key:placeholder`, whose schemas were both `{}`, and whose signature
+    /// was empty — values the creator now installs into the live authorization
+    /// registry.
     #[test]
-    fn outlets_converted() {
-        let ctx = build_ok(&CommonContextParams {
+    fn name_only_genesis_outlet_declaration_is_refused() {
+        let err = build_err(&CommonContextParams {
             outlets: vec!["calculator".to_owned()],
             ..Default::default()
         });
-        assert_eq!(ctx.outlets.len(), 1);
-        assert_eq!(ctx.outlets[0].name, "calculator");
+        assert!(
+            err.contains("calculator"),
+            "the refusal names the outlet it refused, got {err}"
+        );
+        assert!(
+            err.contains("operator DID"),
+            "the refusal names a field the bridge surface cannot carry, got {err}"
+        );
+    }
+
+    /// An empty outlet list is the only accepted value, and it produces an empty
+    /// genesis declaration rather than an error.
+    #[test]
+    fn empty_outlet_declaration_is_accepted() {
+        let ctx = build_ok(&CommonContextParams {
+            outlets: Vec::new(),
+            ..Default::default()
+        });
+        assert!(ctx.outlets.is_empty());
     }
 
     #[test]

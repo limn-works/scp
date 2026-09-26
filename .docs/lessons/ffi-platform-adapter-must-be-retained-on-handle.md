@@ -5,7 +5,7 @@ perform a one-shot operation (DID creation, key generation), that adapter must b
 handle struct — not dropped at scope exit — if any subsequent operation on that handle needs the same
 provider.
 
-**Context (SCP-214 review, 2026-03-01)**: `identity_create_platform` in
+**Context (the SCP-214 review)**: `identity_create_platform` in
 `crates/scp-ffi/uniffi/src/bridge.rs` creates a `KeyCustodyProviderAdapter` wrapping the injected
 `KeyCustodyProvider` callback, calls `dht.create(&adapter)` to create the DID, then returns an
 `Identity` struct with `in_memory_custody: None`. The adapter is dropped at the end of the function.

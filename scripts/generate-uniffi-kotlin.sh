@@ -74,15 +74,21 @@ if [[ ! -f "$LIB_FILE" ]]; then
     exit 1
 fi
 
-# Step 2: Build the uniffi-bindgen binary from the crate.
-echo "==> Building uniffi-bindgen tool..."
+# Step 2: Build the uniffi-bindgen binary from the crate, under the profile step 1
+# used. Cargo shares no artifact between target/debug and target/release, so a
+# `--release` step 1 followed by a dev-profile bindgen build compiles the crate graph
+# a second time; passing the same profile here compiles the bindgen binary alone.
+echo "==> Building uniffi-bindgen tool ($PROFILE)..."
 BINDGEN_ARGS=(build --manifest-path "$UNIFFI_CRATE_DIR/Cargo.toml" --bin uniffi-bindgen)
+if [[ "$PROFILE" == "release" ]]; then
+    BINDGEN_ARGS+=(--release)
+fi
 if [[ -n "$FEATURES" ]]; then
     BINDGEN_ARGS+=(--features "$FEATURES")
 fi
 cargo "${BINDGEN_ARGS[@]}"
 
-BINDGEN_BIN="$REPO_ROOT/target/debug/uniffi-bindgen"
+BINDGEN_BIN="$LIB_DIR/uniffi-bindgen"
 if [[ ! -f "$BINDGEN_BIN" ]]; then
     echo "ERROR: uniffi-bindgen binary not found at $BINDGEN_BIN" >&2
     exit 1

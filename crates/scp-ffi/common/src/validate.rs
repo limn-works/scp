@@ -779,7 +779,7 @@ pub fn validate_governance_action_strings(
     Ok(())
 }
 
-/// Validates string fields inside an [`EconomicPolicy`].
+/// Validates string fields inside an [`EconomicPolicy`](scp_protocol::economy::EconomicPolicy).
 fn validate_economic_policy_strings(
     policy: &scp_protocol::economy::types::EconomicPolicy,
 ) -> Result<(), ValidationError> {
@@ -789,7 +789,7 @@ fn validate_economic_policy_strings(
     Ok(())
 }
 
-/// Validates user-controlled string fields inside a [`ContextParams`].
+/// Validates user-controlled string fields inside a [`ContextParams`](scp_protocol::context::ContextParams).
 ///
 /// Checks role names in role definitions and payment adapter refs in
 /// economic policy. Outlet registration names/descriptions are also validated.

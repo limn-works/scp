@@ -183,15 +183,11 @@
         },
         {
           "name": "verify_attestation",
-          "python": false,
-          "typescript": false,
+          "python": true,
+          "typescript": true,
           "kotlin": true,
-          "swift": false,
-          "exemptions": {
-            "python": "bridge does not export verify_link_attestation",
-            "typescript": "bridge does not export verify_link_attestation",
-            "swift": "UniFFI bridge does not export verify_link_attestation"
-          }
+          "swift": true,
+          "notes": "Identity-link attestation verification per spec §3.5.4. GitHub issue #2335 finding 2 recorded a fail-open here: each bridge verified a caller-supplied attestation against a caller-supplied key, so an attacker who supplied both received true. §3.5.4 step 1 resolves an issuer's DID document and takes a signing key from it, which needs a per-instance DID resolver, and phase D (#1695) deleted every process-wide default bridge instance. So each bridge carries a per-instance method (PyScp::verify_identity_link_attestation, Scp::identity_verify_link_attestation on NAPI and UniFFI) that acquires that resolver and hands every remaining decision to one shared flow, scp_ffi_common::attestation::verify_link_attestation. That flow runs §3.5.4 steps 1 through 5. All four SDK wrappers route to that per-instance method: Python SCP.verify_identity_link_attestation, TypeScript SCP.identityVerifyLinkAttestation (bindings/typescript/src/scp.ts and bindings/typescript/src/internal/native.ts), Kotlin Scp.identityVerifyLinkAttestation forwarding to inner, and Swift SCP.identityVerifyLinkAttestation forwarding to inner, which Identity.verifyLinkAttestation calls. A module-scope free function of the same foreign name stays exported on all three bridges and DECLINES with a typed SCP-IDENT-1060, never a silent verify-valid, so a caller who reaches it by name learns that it performs no §3.5.4 step 1. Each method takes a third argument, reference_proof, carrying a caller's own class 2 fetch outcome: \"confirmed\" reports that a caller fetched the resource evidence.proof names and found this issuer's DID in it (§3.5.4 Class 2 step 2), and \"not_fetched\" raises SCP-IDENT-1062 for a class 2 (signed_post / dns_record) attestation, which §3.5.4 Class 2 step 3 leaves unverified. A class 1 (did_control) attestation ignores that argument, and any string outside those two values raises SCP-IDENT-1044. One condition still raises rather than returning a verdict on every SDK: SCP-IDENT-1061, when an issuer publishes an AttestationRevocations service endpoint (§3.5.2) that no bridge fetches."
         }
       ]
     },

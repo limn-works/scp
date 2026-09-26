@@ -2747,6 +2747,60 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func identityRemoveLinkAttestation(did: String, attestationId: String)  -> Bool
     
     /**
+     * Verifies an identity link attestation per spec §3.5.4.
+     *
+     * Acquires this instance's validating DID resolver, then hands every
+     * remaining decision to the one shared flow all three bridges run,
+     * `scp_ffi_common::attestation::verify_link_attestation`. That flow
+     * resolves an issuer's DID document (§3.5.4 step 1), fails closed when
+     * that document publishes an `AttestationRevocations` service endpoint
+     * (§3.5.2), and runs structural validation, document-to-issuer binding,
+     * signature under an `#active` or `#agent` key that document publishes
+     * (steps 1–2), `revocation_status` (step 3), `expires_at` (step 4), and
+     * evidence freshness (step 5, which degrades rather than rejects).
+     *
+     * A module-level `identity_verify_link_attestation` free function remains
+     * exported and declines with `SCP-IDENT-1060`: it reaches no bridge
+     * instance, so it cannot perform §3.5.4 step 1.
+     *
+     * # Arguments
+     *
+     * * `attestation_json` — JSON string of an `IdentityLinkAttestation`.
+     * * `issuer_public_key_hex` — Hex-encoded 32-byte Ed25519 public key that
+     * a caller asserts belongs to this issuer. This method checks that
+     * assertion against an issuer's resolved DID document; it never uses
+     * this key as a substitute for that document.
+     * * `reference_proof` — What this caller did about a class 2
+     * (`signed_post` / `dns_record`) proof resource, per spec §3.5.4 Class 2
+     * step 2. `"confirmed"` reports that this caller fetched the resource
+     * `evidence.proof` names and found this issuer's DID in it, which yields
+     * a `true` or a `false`. `"not_fetched"` reports that this caller
+     * fetched nothing, which raises `SCP-IDENT-1062` for a class 2
+     * attestation. A class 1 (`did_control`) attestation ignores this
+     * argument. Any other string raises `SCP-IDENT-1044`.
+     *
+     * # Returns
+     *
+     * `true` when §3.5.4 steps 1 through 5 pass and a key a caller named is
+     * one an issuer's document publishes. `false` when a check rejects — a bad
+     * signature, a revoked or expired attestation, or a key an issuer's
+     * document does not publish. Stale evidence returns `true`, because
+     * §3.5.4 step 5 degrades rather than rejects. Every rejection reason
+     * reaches `tracing` at `info` level.
+     *
+     * # Errors
+     *
+     * Returns `SCP-IDENT-1044` when the JSON or the hex key is malformed,
+     * `SCP-IDENT-1060` when an issuer's DID document cannot be resolved,
+     * `SCP-IDENT-1061` when an issuer publishes an attestation revocation
+     * list this bridge does not fetch, and `SCP-IDENT-1062` for a Class 2
+     * (`signed_post` / `dns_record`) attestation whose external proof
+     * resource this bridge does not fetch. None of those four conditions is
+     * reported as `false`, because `false` on this surface reads as "forged".
+     */
+    func identityVerifyLinkAttestation(attestationJson: String, issuerPublicKeyHex: String, referenceProof: String) async throws  -> Bool
+    
+    /**
      * Returns the monotonic identifier for this instance.
      */
     func instanceId()  -> UInt64
@@ -5628,6 +5682,75 @@ open func identityRemoveLinkAttestation(did: String, attestationId: String) -> B
         FfiConverterString.lower(attestationId),$0
     )
 })
+}
+    
+    /**
+     * Verifies an identity link attestation per spec §3.5.4.
+     *
+     * Acquires this instance's validating DID resolver, then hands every
+     * remaining decision to the one shared flow all three bridges run,
+     * `scp_ffi_common::attestation::verify_link_attestation`. That flow
+     * resolves an issuer's DID document (§3.5.4 step 1), fails closed when
+     * that document publishes an `AttestationRevocations` service endpoint
+     * (§3.5.2), and runs structural validation, document-to-issuer binding,
+     * signature under an `#active` or `#agent` key that document publishes
+     * (steps 1–2), `revocation_status` (step 3), `expires_at` (step 4), and
+     * evidence freshness (step 5, which degrades rather than rejects).
+     *
+     * A module-level `identity_verify_link_attestation` free function remains
+     * exported and declines with `SCP-IDENT-1060`: it reaches no bridge
+     * instance, so it cannot perform §3.5.4 step 1.
+     *
+     * # Arguments
+     *
+     * * `attestation_json` — JSON string of an `IdentityLinkAttestation`.
+     * * `issuer_public_key_hex` — Hex-encoded 32-byte Ed25519 public key that
+     * a caller asserts belongs to this issuer. This method checks that
+     * assertion against an issuer's resolved DID document; it never uses
+     * this key as a substitute for that document.
+     * * `reference_proof` — What this caller did about a class 2
+     * (`signed_post` / `dns_record`) proof resource, per spec §3.5.4 Class 2
+     * step 2. `"confirmed"` reports that this caller fetched the resource
+     * `evidence.proof` names and found this issuer's DID in it, which yields
+     * a `true` or a `false`. `"not_fetched"` reports that this caller
+     * fetched nothing, which raises `SCP-IDENT-1062` for a class 2
+     * attestation. A class 1 (`did_control`) attestation ignores this
+     * argument. Any other string raises `SCP-IDENT-1044`.
+     *
+     * # Returns
+     *
+     * `true` when §3.5.4 steps 1 through 5 pass and a key a caller named is
+     * one an issuer's document publishes. `false` when a check rejects — a bad
+     * signature, a revoked or expired attestation, or a key an issuer's
+     * document does not publish. Stale evidence returns `true`, because
+     * §3.5.4 step 5 degrades rather than rejects. Every rejection reason
+     * reaches `tracing` at `info` level.
+     *
+     * # Errors
+     *
+     * Returns `SCP-IDENT-1044` when the JSON or the hex key is malformed,
+     * `SCP-IDENT-1060` when an issuer's DID document cannot be resolved,
+     * `SCP-IDENT-1061` when an issuer publishes an attestation revocation
+     * list this bridge does not fetch, and `SCP-IDENT-1062` for a Class 2
+     * (`signed_post` / `dns_record`) attestation whose external proof
+     * resource this bridge does not fetch. None of those four conditions is
+     * reported as `false`, because `false` on this surface reads as "forged".
+     */
+open func identityVerifyLinkAttestation(attestationJson: String, issuerPublicKeyHex: String, referenceProof: String)async throws  -> Bool  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_identity_verify_link_attestation(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(attestationJson),FfiConverterString.lower(issuerPublicKeyHex),FfiConverterString.lower(referenceProof)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
     
     /**
@@ -16905,19 +17028,30 @@ public func identityVerifyDeviceAttestation(did: String, tokenBase64: String)asy
         )
 }
 /**
- * Verifies the Ed25519 signature on an identity link attestation.
+ * Declines identity link attestation verification at module scope, fail
+ * closed (`SCP-IDENT-1060`).
  *
- * Signature verification is a pure function and does not require
- * in-memory custody — only the issuer's Ed25519 public key. ADR-048 §1:
- * pure helper, no per-instance state.
+ * This function was documented as a pure helper needing only an issuer's
+ * Ed25519 public key. GitHub issue #2335 finding 2 falsified that premise:
+ * spec §3.5.4 step 1 resolves an issuer's DID document and takes a signing key
+ * from it, so a key a caller supplies is an assertion to check rather than a
+ * source of truth. Checking it needs a per-instance DID resolver, and phase D
+ * (pull request #1695) deleted every process-wide default bridge instance, so
+ * a free function reaches none.
  *
- * See spec §3.5.1.
+ * Callers move to `Scp::identity_verify_link_attestation`, which resolves an
+ * issuer's document and runs every §3.5.4 step.
+ *
+ * # Errors
+ *
+ * Always returns `SCP-IDENT-1060`.
  */
-public func identityVerifyLinkAttestation(attestationJson: String, issuerPublicKeyHex: String)throws  -> Bool  {
+public func identityVerifyLinkAttestation(attestationJson: String, issuerPublicKeyHex: String, referenceProof: String)throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_func_identity_verify_link_attestation(
         FfiConverterString.lower(attestationJson),
-        FfiConverterString.lower(issuerPublicKeyHex),$0
+        FfiConverterString.lower(issuerPublicKeyHex),
+        FfiConverterString.lower(referenceProof),$0
     )
 })
 }
@@ -17454,7 +17588,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_verify_device_attestation() != 44196) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_verify_link_attestation() != 14133) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_identity_verify_link_attestation() != 23148) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_media_activate_session() != 44695) {
@@ -17887,6 +18021,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove_link_attestation() != 51771) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_verify_link_attestation() != 22591) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_instance_id() != 43175) {

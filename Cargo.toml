@@ -94,7 +94,17 @@ hmac = "0.12"
 sha2 = "0.10"
 hkdf = "0.12"
 uuid = { version = "1", features = ["v4", "v7"] }
-openmls = { version = "0.8", features = ["libcrux-provider"] }
+# No `libcrux-provider`. That feature does one thing — add the optional dependency
+# `openmls_libcrux_crypto` (openmls 0.8.1 Cargo.toml, `[features] libcrux-provider`) — and
+# openmls itself names that crate only under `#[cfg(test)]` and
+# `#[cfg(feature = "libcrux-provider")]`. No file in this repository names libcrux, and
+# every SCP call site takes a provider: `scp-runtime`'s `ScpMlsProvider` wraps
+# `openmls_rust_crypto::RustCrypto` (crates/scp-runtime/src/crypto/mls/storage.rs) and
+# `scp-mls`'s `InMemoryMlsProvider` aliases `openmls_rust_crypto::OpenMlsRustCrypto`
+# (crates/scp-mls/src/lib.rs). Enabling it compiled 23 libcrux crates, 2 hax crates,
+# `openmls_libcrux_crypto` and `hpke-rs-libcrux` into every build, and carried eleven
+# RUSTSEC advisories that `deny.toml` had to ignore.
+openmls = { version = "0.8" }
 openmls_traits = "0.5"
 openmls_basic_credential = "0.5"
 openmls_rust_crypto = "0.5"
@@ -150,6 +160,20 @@ wasm-bindgen-test = "0.3"
 js-sys = "0.3"
 web-sys = "0.3"
 serde-wasm-bindgen = "0.6"
+
+# CRITERION: an intra-doc link that resolves to nothing is an error in every member
+# of this workspace, on every `cargo doc` cargo runs for it.
+# Cargo applies a lint level per package and a member receives this table only
+# through its own `[lints] workspace = true`, so `check_rustdoc_lint_reaches_every_member`
+# in scripts/tests/ci-gate/ci_gate_selftest.py reads every `[workspace] members` entry
+# above and fails when one omits that line. The level is `forbid` because rustc honours
+# a source-level `#![allow(rustdoc::broken_intra_doc_links)]` against a `deny` and
+# rejects one against a `forbid`, so no crate can lower the level from inside its own
+# source. Before this table, `crates/scp-runtime/src/lib.rs` alone declared the lint as
+# a crate attribute, and job rust-doc in .github/workflows/ci.yml exited 0 over 271
+# unresolved intra-doc links in the other crate directories.
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

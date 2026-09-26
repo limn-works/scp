@@ -1,6 +1,6 @@
 # FFI Global Registry: Single-Tenant Limitation (RED-017)
 
-> **ADR-055 (2026-06-29):** the WASM bridge was removed; references below to a fourth WASM/wasm-bindgen bridge (and `WasmContextHandle`) are historical. The three bridges are PyO3, NAPI, UniFFI; the browser is a remote thin client. The per-instance lesson below remains evergreen — and the PyO3 single-tenant gap it describes has since been closed (PyO3 now uses per-instance `BridgeInstance` state, not process-global registries).
+> **ADR-055 (2026-06-29):** the WASM bridge was removed; references below to a fourth WASM/wasm-bindgen bridge (and `WasmContextHandle`) are historical. The three bridges are PyO3, NAPI, and UniFFI. ADR-057 later gave the browser an in-process client over `crates/scp-client-wasm`, which exposes a wasm-bindgen surface rather than a fourth FFI bridge. The per-instance lesson below remains evergreen — and the PyO3 single-tenant gap it describes has since been closed (PyO3 now uses per-instance `BridgeInstance` state, not process-global registries).
 
 ## Problem
 

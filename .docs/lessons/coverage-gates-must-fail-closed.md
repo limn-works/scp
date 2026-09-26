@@ -1,7 +1,6 @@
 # Coverage Gates Must Fail Closed, and Must Not Match Symbols by Suffix/Substring
 
-**Date:** 2026-06-20
-**Source:** branch `fix/sdk-coverage-fail-closed-and-parity` — rewrite of `scripts/check-sdk-coverage.py`
+**Source:** `scripts/check-sdk-coverage.py`, the SDK capability-coverage gate.
 
 ## The Rule
 

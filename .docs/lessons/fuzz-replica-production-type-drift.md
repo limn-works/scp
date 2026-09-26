@@ -1,7 +1,6 @@
 # Fuzz targets that replicate private production functions drift silently
 
-**Date:** 2026-04-15
-**Source:** Round 1 review of fuzzing infrastructure — three HIGH bugs in `fuzz_validate_ucan_deep`
+**Source:** three defects in the fuzz target `fuzz_validate_ucan_deep`
 
 ## What happened
 

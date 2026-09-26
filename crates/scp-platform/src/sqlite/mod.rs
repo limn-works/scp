@@ -268,7 +268,7 @@ impl SqliteStorage {
     /// SCP instance" (observed on Python / TS persistence tests).
     ///
     /// Poisoned mutex → best-effort: recover the guard via
-    /// [`PoisonError::into_inner`] and still release the lock. A
+    /// [`PoisonError::into_inner`](std::sync::PoisonError::into_inner) and still release the lock. A
     /// poisoned lock-file mutex would otherwise silently skip the
     /// release, leaving the advisory lock held until the
     /// `SqliteStorage` is finally dropped. Since the only other

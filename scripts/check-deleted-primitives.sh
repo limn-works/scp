@@ -114,6 +114,15 @@ BAN_ENTRIES=(
     "QueryStateView|crates/scp-runtime|*.rs|Actor-per-context refactor deleted the transitional mutation/query borrow adapters (ADR-049)"
     "RwLock<ContextInner>|crates/scp-runtime|*.rs|ADR-049 §Decision 12: ContextHandle's read-path RwLock<ContextInner> was replaced by lock-free Arc<ArcSwap<ContextState>>; the RwLock<ContextInner> shape must not reappear"
     "pending_joins|crates/scp-runtime/src/crypto|*.rs|ADR-049 2F-residual deleted the legacy single-slot Welcome-join primitive (prepare_key_package_for_join + NodeMlsFactory::join_from_welcome); joins flow through the KeyPackageStoreActor reserve/confirm protocol"
+    # The two definition-shaped tokens below ban re-defining the deleted
+    # single-slot join methods themselves, completing the pending_joins ban
+    # above. Both are shaped to skip the LIVE join surface: the production
+    # trait/impl/mock methods are 'async fn join_from_welcome(' (no 'pub'),
+    # and the scp-testing harness wrapper is 'pub async fn' outside this
+    # scope, so neither matches 'pub fn join_from_welcome('. The name
+    # prepare_key_package_for_join has zero live definitions in any form.
+    "fn prepare_key_package_for_join|crates/scp-runtime|*.rs|ADR-049 2F-residual deleted the legacy prepare_key_package_for_join provider method; joiners reserve KeyPackages via the KeyPackageStoreActor reserve/confirm protocol"
+    "pub fn join_from_welcome\\(|crates/scp-runtime|*.rs|ADR-049 2F-residual deleted the legacy synchronous NodeMlsFactory::join_from_welcome provider method; every join flows through the async MlsBackend::join_from_welcome fused-confirm primitive"
     # #2148 (birth-into-actor): the six provider-dissolution symbols
     # (take_crypto_state / with_context / create_group_into_slot method defs, and
     # the contexts / taken_context_ids / broadcast_keys fields) are NOT banned

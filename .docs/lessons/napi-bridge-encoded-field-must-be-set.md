@@ -1,6 +1,5 @@
 # NAPI Bridge: Opaque Handle Fields Must Be Populated Even in Stubs
 
-**Date:** 2026-03-01
 **Source:** SCP-219 fix — `crates/scp-ffi/napi/src/ucan.rs`
 
 ## The Bug

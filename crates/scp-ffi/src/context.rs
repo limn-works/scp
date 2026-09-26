@@ -1156,7 +1156,7 @@ fn resolve_future(
 /// TLS-serialized bytes suitable for passing to
 /// `ContextManager::join_context`.
 ///
-/// Uses [`generate_key_package_with_context_params`] with `None` so the leaf
+/// Uses [`generate_key_package_with_context_params`](scp_core::crypto::mls::group::generate_key_package_with_context_params) with `None` so the leaf
 /// **declares the `0xFF02` (`scp_context_params`) capability** — mandatory to
 /// be added to an encrypted context group (`valn0502`, §5.13.3). The base
 /// `generate_key_package` (which declares no SCP capabilities) produces a KP
@@ -1196,8 +1196,8 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, crate::error::Sc
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Drains events from the [`ContextManager`]'s receive buffer and delivers
-/// them to the FFI bridge's receive channel via [`deliver_message`].
+/// Drains events from the [`Supervisor`](scp_core::context::supervisor::Supervisor)'s receive buffer and delivers
+/// them to the FFI bridge's receive channel via `deliver_message`.
 ///
 /// This is the bridge between the `ContextManager`'s internal event buffer
 /// (`ReceiveBuffer`) and the `PyO3` bridge's `tokio::sync::mpsc` channel that
@@ -1211,7 +1211,7 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, crate::error::Sc
 /// - `py_context_join` (produces `MemberJoined`)
 /// - `py_context_leave` (produces `MemberLeft`)
 ///
-/// Events are converted from [`ContextEvent`] to [`PyMessage`]:
+/// Events are converted from [`ContextEvent`](scp_core::context::membership::ContextEvent) to [`PyMessage`]:
 /// - `MessageSent` -> payload is the message bytes, `sender_did` is the sender.
 /// - `MemberJoined` -> payload is `"member_joined:{did}:{role}"`.
 /// - `MemberLeft` -> payload is `"member_left:{did}"`.
@@ -1222,7 +1222,7 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, crate::error::Sc
 /// called), events are silently discarded. This is intentional: the channel
 /// is demand-driven, and events before subscription are lost (consistent
 /// with the subscription model in `TransportAdapter::subscribe`).
-/// Converts a [`ContextEvent`] into the `(sender_did, payload, timestamp)` triple
+/// Converts a [`ContextEvent`](scp_core::context::membership::ContextEvent) into the `(sender_did, payload, timestamp)` triple
 /// used by the `PyO3` bridge event delivery pipeline.
 #[allow(clippy::cast_precision_loss)]
 #[allow(clippy::too_many_lines)]
@@ -1382,7 +1382,7 @@ fn drain_and_deliver(bi: &crate::runtime::PyBridgeInstance, context_id: &str) {
 /// through pre-captured channel handles, instead of resolving the channel
 /// via the FFI state registry.
 ///
-/// Used by [`Self::context_close`] (the close teardown): on a successful
+/// Used by [`PyScp::context_close`](crate::scp::PyScp::context_close) (the close teardown): on a successful
 /// close the FFI bridge state is removed (so bridge outlet dispatch fails
 /// closed for the id — defense in depth; close itself is non-terminal for
 /// the supervisor actor and does not despawn it), but the `SystemClose`
@@ -1426,7 +1426,7 @@ fn drain_and_deliver_via_sender(
 // ContextManager delegation helpers
 // ---------------------------------------------------------------------------
 
-/// Builds scp-core [`ContextParams`] from a [`PyContextParams`].
+/// Builds scp-core [`ContextParams`](scp_core::context::ContextParams) from a [`PyContextParams`].
 ///
 /// Delegates to the shared [`scp_ffi_common::context_params::build_context_params`]
 /// builder, which centralizes all parameter parsing and validation logic

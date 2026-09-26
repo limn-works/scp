@@ -170,7 +170,7 @@ pub mod trust {
     pub use scp_protocol::trust::attestation::{
         Attestation, AttestationEvidence, AttestationRevocationChecker, AttestorInfo,
         DidPublicKeyResolver, FreshnessStatus, IdentityDidPublicKeyResolver, RevocationStatus,
-        ThresholdRequirement, ThresholdResult, canonical_attestation_bytes,
+        ThresholdCheckInput, ThresholdRequirement, ThresholdResult, canonical_attestation_bytes,
         check_attestation_freshness, check_threshold_attestation, verify_attestation,
         verify_attestation_with_revocation,
     };
@@ -195,7 +195,8 @@ pub mod trust {
         compute_participation_record, verify_participation_requirements,
     };
     pub use scp_protocol::trust::sybil::{
-        ContextSybilPolicy, RequiredSignal, SybilResistanceError, evaluate_sybil_resistance,
+        ContextSybilPolicy, EndorsementEvidence, RequiredSignal, SybilResistanceError,
+        evaluate_sybil_resistance,
     };
 }
 

@@ -59,6 +59,7 @@ use crate::heartbeat::{HeartbeatConfig, HeartbeatMonitor};
 use crate::profile::TransportProfile;
 use crate::relay::connection::{SourcedRelayUrl, validate_relay_url};
 use crate::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
+use scp_relay_client::{relay_error_text, sanitize_relay_text};
 
 /// A boxed, pinned, `Send`-safe future -- the return type for all
 /// [`TransportAdapter`] methods to ensure the trait is dyn-compatible.
@@ -507,9 +508,9 @@ impl TransportAdapter for NativeRelayAdapter {
                     blob_id: Some(id), ..
                 } => Ok(BlobId::new(id)),
                 RelayMessage::Ok { blob_id: None, .. } => Ok(BlobId::from_sha256(&routing_id_vec)),
-                RelayMessage::Err { code, msg, .. } => Err(TransportError::SendFailed(format!(
-                    "relay error {code}: {msg}"
-                ))),
+                RelayMessage::Err { code, msg, .. } => {
+                    Err(TransportError::SendFailed(relay_error_text(code, &msg)))
+                }
                 _ => Err(TransportError::ProtocolError(
                     "unexpected response to PUBLISH".to_string(),
                 )),
@@ -569,9 +570,9 @@ impl TransportAdapter for NativeRelayAdapter {
             let response = self.client.send_request(msg).await?;
 
             match response {
-                RelayMessage::Err { code, msg, .. } => Err(TransportError::SendFailed(format!(
-                    "relay error {code}: {msg}"
-                ))),
+                RelayMessage::Err { code, msg, .. } => {
+                    Err(TransportError::SendFailed(relay_error_text(code, &msg)))
+                }
                 // Best-effort: treat all non-error responses as success.
                 _ => Ok(()),
             }
@@ -693,11 +694,11 @@ fn relay_message_to_event(msg: RelayMessage) -> Option<TransportEvent> {
         RelayMessage::Err { code, msg, .. } => {
             if code == scp_relay_client::code::SHUTTING_DOWN {
                 Some(TransportEvent::Terminated {
-                    reason: format!("relay shutting down: {msg}"),
+                    reason: format!("relay shutting down: {}", sanitize_relay_text(&msg)),
                 })
             } else {
                 Some(TransportEvent::Error(TransportError::ProtocolError(
-                    format!("relay error {code}: {msg}"),
+                    relay_error_text(code, &msg),
                 )))
             }
         }

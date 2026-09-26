@@ -1,7 +1,6 @@
 # Cross-SDK timestamp integer coercion — guard NaN, Infinity, and signed/unsigned drift
 
-**Date:** 2026-04-14
-**Source:** PRs #1638 and #1642 — `verifiedAt` / `revokedAt` integer enforcement
+**Source:** `verifiedAt` / `revokedAt` integer enforcement
 
 ## The invariant
 

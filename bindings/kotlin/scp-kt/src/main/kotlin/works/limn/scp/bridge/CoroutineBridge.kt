@@ -2608,7 +2608,7 @@ class BroadcastBridgeOps internal constructor(
         explicit ?: defaultIdentityHandle ?: throw BridgeException(
             "identityHandle is required: pass it explicitly or set " +
                 "BroadcastBridgeOps.defaultIdentityHandle",
-            "SCP-IDENT-1060",
+            "SCP-IDENT-1063",
         )
 }
 

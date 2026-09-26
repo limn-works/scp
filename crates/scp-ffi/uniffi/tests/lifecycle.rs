@@ -10,6 +10,13 @@
 //! cargo test -p scp-ffi-uniffi --test lifecycle --features testing
 //! ```
 
+// Every test here builds an `Scp` through `Scp::new_in_memory_for_test`, which
+// an integration test can name only when the `testing` feature is on: an
+// integration binary compiles the library without `test` cfg, and that
+// constructor is gated `#[cfg(any(test, feature = "testing"))]`. Without this
+// crate-level gate the default-feature build of this target fails to compile,
+// which is what the "Run with" line above asks the reader to prevent by hand.
+#![cfg(feature = "testing")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use scp_ffi_uniffi::Scp;

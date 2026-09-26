@@ -87,7 +87,7 @@ use crate::serde_util::serde_hash_32;
 /// for slugs (the slug field is a class-prefixed catalog key in
 /// canonical form).
 ///
-/// This newtype is **shared** with [`MessageTemplate::try_new`] in
+/// This newtype is **shared** with [`MessageTemplate::try_new`](crate::context::outlets::message_catalog::MessageTemplate::try_new) in
 /// SCP-OUT-040 — both validation paths produce the same constraint. Defined
 /// here (SCP-OUT-024) so the catalog-key invariant precedes the catalog
 /// itself in the dependency graph.
@@ -1511,8 +1511,10 @@ mod tests {
     #[test]
     fn retry_policy_has_four_variants() {
         // AC-2: enum RetryPolicy has variants Never, Immediate, After,
-        // WithBackoff.
-        let _v: [RetryPolicy; 4] = [
+        // WithBackoff. A wildcard-free match stops compiling when a fifth
+        // variant appears; an earlier fixed-length array alone admitted any
+        // number of variants.
+        for policy in [
             RetryPolicy::Never,
             RetryPolicy::Immediate,
             RetryPolicy::After {
@@ -1522,7 +1524,14 @@ mod tests {
                 min: Duration::from_secs(1),
                 max: Duration::from_mins(1),
             },
-        ];
+        ] {
+            match policy {
+                RetryPolicy::Never
+                | RetryPolicy::Immediate
+                | RetryPolicy::After { .. }
+                | RetryPolicy::WithBackoff { .. } => {}
+            }
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! The `PyO3`, napi-rs, and `UniFFI` bridges each adapt a caller-supplied
 //! `KeyCustodyProvider` (a Python object / JS callback record / `UniFFI`
-//! callback interface) to scp-platform's [`KeyCustody`] trait. The provider
+//! callback interface) to scp-platform's [`KeyCustody`](scp_platform::KeyCustody) trait. The provider
 //! protocol speaks in raw byte arrays and opaque key-id strings; the adapters
 //! must translate those into the typed [`KeyHandle`] / [`PseudonymKeypair`] /
 //! `[u8; 32]` surface. That translation — and the error messages it produces on

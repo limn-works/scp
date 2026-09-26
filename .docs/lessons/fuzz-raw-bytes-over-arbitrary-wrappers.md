@@ -1,6 +1,5 @@
 # Fuzz parser targets with raw bytes + dicts, not `Arbitrary` wrappers
 
-**Date:** 2026-04-15
 **Source:** ADR-045 (Fuzzing Infrastructure) — design rationale; `fuzz/.claude/CLAUDE.md`
 
 ## The principle

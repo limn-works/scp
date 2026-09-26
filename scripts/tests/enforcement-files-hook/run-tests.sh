@@ -87,6 +87,27 @@ check 2 "sed --in-place"        "$(bash_payload "sed --in-place s/a/b/ $B")"
 check 2 "sed -n -i '' (reorder)" "$(bash_payload "sed -n -i '' 1p $B")"
 check 2 "sed -ni (combined)"    "$(bash_payload "sed -ni 1p $B")"
 
+# A verdict must not depend on how long a command is. The hook piped
+# `$command_str` into `grep -q` under `set -o pipefail`: grep exited at its
+# first match, `echo` died of SIGPIPE and returned 141, and pipefail handed 141
+# to the `if`, which ALLOWED the write. Measured against the hook before its
+# fix: `tee scripts/bridge-aliases.json < /dev/null`, 43 bytes, exited 2, and
+# `tee scripts/bridge-aliases.json` followed by a heredoc bringing that command
+# to 166,933 bytes exited 0. Each case below pads a write past a 64 KB pipe
+# buffer, leaving its write verb on a first line, and asserts a block.
+PAD="$(python3.12 -c 'print("\n".join("# padding %d - widens this command past a pipe buffer" % i for i in range(3000)))')"
+echo "== Bash branch: a padded write must still BLOCK (exit 2) =="
+check 2 "tee + padded heredoc"  "$(bash_payload "tee $B <<'EOF'
+$PAD
+EOF")"
+check 2 "padded heredoc + redirect" "$(bash_payload "cat <<'EOF' > $B
+$PAD
+EOF")"
+check 2 "sed -i after padding"  "$(bash_payload ": <<'EOF'
+$PAD
+EOF
+sed -i s/a/b/ $H")"
+
 echo "== Bash branch: reads must ALLOW (exit 0) =="
 check 0 "cat read"              "$(bash_payload "cat $B")"
 check 0 "grep read"             "$(bash_payload "grep foo $B")"
