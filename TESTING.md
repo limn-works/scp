@@ -77,7 +77,7 @@ Production builds for iOS and Android must **never** enable `testing`.
 
 ## Lint and Format
 
-Run all checks before pushing -- CI enforces these:
+Before pushing, run the rows for the languages your change touches, scoping the Rust lint to the crates the change touches. CI runs every row on the pushed head:
 
 | Language | Format | Lint |
 |----------|--------|------|
