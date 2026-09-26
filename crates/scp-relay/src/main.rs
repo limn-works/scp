@@ -11,14 +11,11 @@
 //! ## Storage backend selection
 //!
 //! The relay selects a blob storage backend via the `SCP_RELAY_STORAGE_BACKEND`
-//! environment variable. The variable has no default: §17.17.1 of the
-//! persistence spec (SCP-CAPSEL-8000) forbids a relay from picking a backend
-//! for the operator, so the relay exits with code 1 when the variable is unset.
-//! Valid values:
+//! environment variable. Valid values:
 //!
 //! | Value      | Backend    | Config env vars                              | Compiled in by |
 //! |------------|------------|----------------------------------------------|---------|
-//! | `sqlite`   | `SQLite`     | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.db`) | always |
+//! | `sqlite`   | `SQLite`     | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.db`) | always; the default value |
 //! | `redb`     | redb       | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.redb`) | always |
 //! | `postgres` | `PostgreSQL` | `SCP_RELAY_DATABASE_URL` (required)           | `cloud-blobs` |
 //! | `s3`       | S3-compat  | `SCP_RELAY_S3_BUCKET` (required) + AWS env    | `cloud-blobs` |

@@ -144,13 +144,13 @@ SCP provides two binary entrypoints for local development and testing:
 
 ```sh
 # Bare relay — listens on 0.0.0.0:9000
-SCP_RELAY_STORAGE_BACKEND=sqlite cargo run --release -p scp-relay
+cargo run --release -p scp-relay
 
 # Full application node — requires SCP_NODE_DOMAIN
-SCP_NODE_DOMAIN=localhost SCP_RELAY_STORAGE_BACKEND=sqlite cargo run --release -p scp-node
+SCP_NODE_DOMAIN=localhost cargo run --release -p scp-node
 
 # Relay-only mode via scp-node
-SCP_RELAY_STORAGE_BACKEND=sqlite cargo run --release -p scp-node -- --relay-only
+cargo run --release -p scp-node -- --relay-only
 ```
 
 #### With Docker
