@@ -1724,8 +1724,10 @@ jobs:
   # skipped for a change that breaks the build. It compiles in debug and on one
   # target, so it is not the release matrix: it exercises neither the
   # manylinux_2_28 container and its `dnf install -y perl` step, nor NASM on
-  # Windows, nor the aarch64 cross image. Run build-matrix.yml through
-  # `workflow_dispatch` to exercise those before cutting a tag.
+  # Windows, nor the aarch64 cross image. build-matrix.yml has no
+  # `workflow_dispatch` of its own; run release.yml through `workflow_dispatch`
+  # with `dry-run: true`, which calls build-matrix.yml, to exercise those before
+  # cutting a tag.
   python-wheel-build:
     needs: check-draft
     name: Python / wheel (vendored OpenSSL)

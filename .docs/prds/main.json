@@ -2372,7 +2372,7 @@
         "Runtime shutdown is handled on module finalization (Python interpreter exit). The `Runtime` is dropped, which waits for in-flight tasks to complete (with a 5-second timeout).",
         "`maturin develop` builds the extension in-place for development.",
         "`maturin build --release` produces optimized wheels.",
-        "CI builds wheels for Linux (manylinux2014 x86_64 + aarch64), macOS (universal2), Windows (x86_64).",
+        "CI builds wheels for Linux (manylinux_2_28 x86_64 + aarch64), macOS (universal2), Windows (x86_64).",
         "`maturin publish` uploads built wheels to PyPI for `pip install scp-python` distribution.",
         "FFI safety: The tokio runtime MUST NEVER block on Python GIL acquisition. All GIL-requiring operations are dispatched via `Python::with_gil()` from non-async contexts or use PyO3's native async machinery which handles GIL release automatically.",
         "Shutdown ordering: Python cleanup (GC, __del__, atexit handlers) completes BEFORE the Rust tokio runtime is dropped. Module finalization respects this ordering to prevent use-after-free of Rust objects from Python destructor callbacks."
@@ -7590,7 +7590,7 @@
       ],
       "description": "Implement the binary artifact build, sign, and distribute workflow for all SDK packages. The conformance gate (100% pass) is a prerequisite — no release without it. Covers: build matrix (Linux x86_64/aarch64, macOS universal2, Windows x86_64), artifact signing per platform, distribution to all 8 package registries, version pinning to scp-core, and the 7-step release checklist.",
       "acceptanceCriteria": [
-        "Build matrix: Linux (x86_64, aarch64) produces manylinux2014 wheels and .so; macOS (universal2) produces wheels, .dylib, .xcframework; Windows (x86_64) produces wheels and .dll",
+        "Build matrix: Linux (x86_64, aarch64) produces manylinux_2_28 wheels and .so; macOS (universal2) produces wheels, .dylib, .xcframework; Windows (x86_64) produces wheels and .dll",
         "Distribution channels: Rust (crates.io source crate), Python (PyPI maturin wheel), TypeScript Node/Bun (@limn-works/scp-ts npm napi-rs addon; browser clients are remote thin clients to a node per ADR-055), Swift (SPM XCFramework), Kotlin (Maven Central AAR), Go (Go modules source + .so), C# (NuGet native runtime pack), Java (Maven Central JAR with natives)",
         "All SDK packages pin to the exact scp-core version they were built against. Core version encoded in package metadata (Python wheel metadata, npm engines, Swift Package.swift)",
         "Signing: Rust crates verified by crates.io checksums; platform packages use native signing (Apple codesigning for .xcframework, Authenticode for .dll, GPG for Maven); PyPI uses Trusted Publishers (GitHub Actions OIDC)",
@@ -7604,7 +7604,7 @@
       "actionItems": [
         "Create `.github/workflows/build-matrix.yml` with cross-platform build jobs for all 3 OS targets and architectures",
         "Create `.github/workflows/release.yml` with the 7-step release workflow: conformance gate, changelog check, version tag, build, sign, publish, GitHub Release",
-        "Configure maturin-action for Python wheel builds (manylinux2014, macOS universal2, Windows)",
+        "Configure maturin-action for Python wheel builds (manylinux_2_28, macOS universal2, Windows)",
         "Configure napi-rs build for npm native addon",
         "Configure XCFramework build for Swift Package Manager",
         "Configure Maven publishing for Kotlin and Java",
@@ -7629,7 +7629,7 @@
         }
       ],
       "details": {
-        "Build matrix": "Linux: x86_64 + aarch64 (manylinux2014 wheels, .so). macOS: universal2 (x86_64 + arm64) (wheels, .dylib, .xcframework). Windows: x86_64 (wheels, .dll).",
+        "Build matrix": "Linux: x86_64 + aarch64 (manylinux_2_28 wheels, .so). macOS: universal2 (x86_64 + arm64) (wheels, .dylib, .xcframework). Windows: x86_64 (wheels, .dll).",
         "Distribution channels": "Rust: crates.io. Python: PyPI. TypeScript browser: npm (@limn-works/scp-ts). TypeScript Node/Bun: npm (@limn-works/scp-ts-node). Swift: SPM. Kotlin: Maven Central. Go: Go modules. C#: NuGet. Java: Maven Central.",
         "Signing requirements": "Rust: crates.io checksums. macOS/iOS: Apple codesigning. Windows: Authenticode. Maven: GPG. PyPI: Trusted Publishers (GitHub Actions OIDC).",
         "Versioning policy": "All SDKs follow SemVer 2.0. Major: breaking API changes. Minor: new features, backwards-compatible. Patch: bug fixes, security patches. All SDK packages share the same major.minor version; patch versions may differ. Rust core version is source of truth. During 0.x, minor bumps may break. API unstable until 1.0."

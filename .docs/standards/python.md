@@ -239,7 +239,7 @@ maturin builds binary wheels with the Rust extension embedded. Users install wit
 
 | Platform | Architecture | Wheel tag |
 |----------|-------------|-----------|
-| Linux | x86_64 | manylinux2014_x86_64 |
-| Linux | aarch64 | manylinux2014_aarch64 |
+| Linux | x86_64 | manylinux_2_28_x86_64 |
+| Linux | aarch64 | manylinux_2_28_aarch64 |
 | macOS | universal2 | macosx_11_0_universal2 |
 | Windows | x86_64 | win_amd64 |
