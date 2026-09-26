@@ -867,6 +867,12 @@ pub enum EventType {
     // visible in the event log"). Parameters live in EventPayload.
     AppBound,                     // §8 app bound to context; payload: app_did, app_name, app_version, capabilities
     AppUnbound,                   // §8 app unbound from context; payload: app_did
+    // Cross-context outlet-call saga leaves (§6.2.4 "Dual event-log recording";
+    // the Scope note of exclusion 2 in the unification amendment below). The
+    // saga appends both within its MLS-Commit phase, so both are convergent
+    // commit-ordered durable leaves.
+    CrossContextOutletInvoked,    // §6.2.4 caller-side record; payload: target context_id, nonce
+    CrossContextDivergenceMarker, // §6.2.4 one-sided saga commit; payload: committed side, SagaId, nonce, committed-side event id
     // Bridge lifecycle leaves (§12.2.1 step 3; §12.2.2; ADR-023 acceptance
     // criterion 2, "Registration is a context event in the Merkle log").
     // Payload: a `BridgeRegistrationEvent` (§12.12.2) serialized as MessagePack
@@ -886,13 +892,10 @@ pub enum EventType {
     // §12.10.6 step 1 obliges a bridge node to retain the lifecycle payloads
     // of every bridge it operates whatever the context's pruning policy sets.
     // A bridge node reads bridge
-    // admission from this group of leaves for that bridge_id, from the leaves
-    // of that same log that record whether governance has withdrawn the
-    // bridge operator's authority to act as a member of the context, and from
-    // no other input (§12.10.6 step 1). §12.10.6 step 1 states that clause as
-    // a property of the operator's authority rather than as a list of leaf
-    // names, so a member-governance leaf this ADR adds later fails that clause
-    // when it records a withdrawal. That criterion scans EVERY one of the
+    // admission from this group of leaves for that bridge_id, from the
+    // MemberJoined and MemberLeft leaves of that same log whose subject_did
+    // names the bridge operator, and from no other input (§12.10.6 step 1).
+    // That criterion scans EVERY one of the
     // bridge's leaves for a BridgeRevoked leaf, which is terminal, and reads
     // the LAST leaf only to decide whether a suspension still stands; a
     // BridgeReactivated leaf appended after a BridgeRevoked leaf readmits
