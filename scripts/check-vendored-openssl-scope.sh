@@ -251,23 +251,11 @@ feature_list_is_wellformed() {
 #   the flags an entry may not, so a flag nobody has thought of is refused by the
 #   same branch as one that is.
 #
-#   WHY THE GATE BUILDS THE COMMAND. An earlier revision spliced the whole
-#   feature-argument string into `cargo tree` unquoted, so an entry could carry
-#   any cargo argument. An adversarial review wrote
-#   `scp-ffi|--features scp-platform/vendored-openssl --depth 0` into the
-#   `ARTIFACTS` array: `--depth 0` truncates the tree to its root line, the
-#   occurrence count came back zero, and this gate printed `ok` for a bridge
-#   cdylib that genuinely reached `openssl-src` — the cdylib
-#   `.github/workflows/build-matrix.yml` uploads and `.github/workflows/release.yml`
-#   signs. The sibling gate resisted the same entry only because it proves
-#   PRESENCE, so a truncated tree hands it an empty resolution its non-empty guard
-#   rejects; this gate proves ABSENCE, and a truncated tree hands an absence proof
-#   exactly the answer it is looking for.
-#
-#   The repair is that data stops being argv. `run_gate` builds the argument list
-#   from the fields this reader validates, so no substring of an entry is ever
-#   word-split into a command, and a resolver flag cannot reach cargo through the
-#   array at all.
+#   WHY THE GATE BUILDS THE COMMAND. An entry spliced into `cargo tree` unquoted
+#   could carry any cargo argument, and `--depth 0` truncates a tree to its root
+#   line, which hands an absence proof a count of zero. `run_gate` builds the
+#   argument list from the fields this reader validates, so no substring of an
+#   entry is ever word-split into a command.
 cargo_arguments_for() {
   local raw="$1" token expect_list=0
   # The only word-splitting in this gate, and every token it produces is checked
@@ -513,9 +501,8 @@ run_fixtures() {
   expect "a gate naming two wheels FAILS rather than comparing against the first" "FAIL" "$rc"
 
   # (entry-whitelist) the four token shapes an entry may carry, and the refusal of
-  # everything else. `--depth 0` is the flag an adversarial review wrote into the
-  # ARTIFACTS array to truncate a tree to its root, which made this gate print ok
-  # for a bridge cdylib that reached openssl-src.
+  # everything else. `--depth 0` truncates a tree to its root, which would make
+  # an absence proof count zero for a bridge cdylib that reached openssl-src.
   out="$(cargo_arguments_for "--no-default-features --features server")"; rc=$?
   expect "(entry-whitelist) a two-flag entry is built" "PASS" "$rc"
   same_string "$out" "$(printf '%s\n' '--no-default-features' '--features' 'server')"; rc=$?

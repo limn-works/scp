@@ -303,10 +303,7 @@ EOF
 # holds, so the spelling of this assignment decides nothing about what that gate
 # reads: a second `ARTIFACTS=(` assignment, an `ARTIFACTS+=(` appender, a line
 # continuation, and a shell expansion all reach it, because bash expanded each one
-# before the mode wrote a line. An earlier revision of that gate parsed this file's
-# source text for an `ARTIFACTS=(` opener and read to the first `)`, and three
-# review rounds each found another spelling that parser did not see while bash held
-# the entries.
+# before the mode wrote a line.
 ARTIFACTS=(
   "scp-ffi|--no-default-features --features server"
   "scp-ffi-napi|--no-default-features --features server"
@@ -1126,16 +1123,11 @@ assert_every_cargo_tree_resolves_every_target() {
 #   each MATURIN_PROJECT_FILES file, beside that file's path.
 #
 #   `scripts/check-vendored-openssl-scope.sh` reads both lists through these two
-#   modes, so the modes are the interface between the two gates. That gate used to
-#   parse this file's source text instead: it searched for an `ARTIFACTS=(` opener
-#   and read the lines up to the first `)` at column 0. Three review rounds each
-#   found another way to write the assignment that the parser did not see, and each
-#   one left bash holding entries the parser never reported while that gate printed
-#   PASS. The two planted copies below close that class: bash expands every
-#   spelling before either mode writes a line, so a copy of this file carrying an
-#   appended `ARTIFACTS+=(` writes the appended entry, and a copy carrying a second
-#   `ARTIFACTS=(` assignment writes the replacement rather than the block this file
-#   holds.
+#   modes, so the modes are the interface between the two gates. Bash expands
+#   every spelling of an assignment before either mode writes a line, so a copy of
+#   this file carrying an appended `ARTIFACTS+=(` writes the appended entry, and a
+#   copy carrying a second `ARTIFACTS=(` assignment writes the replacement rather
+#   than the block this file holds. The two planted copies below prove both.
 #
 #   Each plant copies this file rather than writing a small stand-in, so the
 #   fixture states what a caller gets from THIS gate, including the `cd` it runs
