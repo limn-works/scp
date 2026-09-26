@@ -9,7 +9,8 @@
 # the configuration maturin builds the PyPI wheel with, on every target triple the
 # `python-wheels` job of `.github/workflows/build-matrix.yml` builds that wheel
 # for; and `openssl-src` appears in the dependency graph of no other configuration
-# this repository ships, resolved over every target triple.
+# this repository ships, and in the graph of no workspace member or
+# dev-dependency at its default features, resolved over every target triple.
 #
 # "No other configuration" is two resolutions, and each one covers what the other
 # cannot:
@@ -20,11 +21,24 @@
 #     bridge cdylibs. The comparison against the wheel reads the whole
 #     `<package>|<feature arguments>` entry, because three entries build package
 #     `scp-ffi`;
-#   * the bare default-members build, which is what `cargo build` with no `-p`
-#     compiles. Cargo decides which packages that resolution holds, so every
-#     default member — each `[[bin]]`, each bridge `cdylib`, each package added
-#     later — is in it whether or not an `ARTIFACTS` entry names it, and deleting
-#     entries from that array uncovers no default member.
+#   * the whole-workspace build with dev-dependencies: `cargo tree --workspace`,
+#     every member at its default features, dev units included. Cargo decides
+#     which packages that resolution holds, so every member — each `[[bin]]`, each
+#     bridge `cdylib`, a member outside `default-members` such as scp-testing, each
+#     package added later — is in it whether or not an `ARTIFACTS` entry names it,
+#     and deleting entries from that array uncovers no member. It is a superset of
+#     the bare default-members build, because adding roots and dev units only adds
+#     features.
+#
+# The presence proof depends on that second resolution. `cargo metadata` takes no
+# `-p`: it unifies features across every member and every dev-dependency, so an
+# `openssl-sys -> openssl-src` edge in its graph can come from any member. When the
+# whole-workspace resolution reaches no `openssl-src`, no member and no
+# dev-dependency selects the vendored build on its own, and the `openssl-src` edge
+# the presence walk finds comes from the features the wheel's configuration names.
+# The walk's path from the wheel's package down to `openssl-sys` is still read
+# from the unified graph, so an optional edge on that path that only another
+# member's feature selection switches on is counted too.
 #
 # Both absence resolutions name `--target all`, the union over every triple, which
 # is the correct over-approximation for a proof that a crate is ABSENT, and which
@@ -338,15 +352,17 @@ vendor_crate_occurrences() {
   tree_count "$tree"
 }
 
-# default_members_occurrences
+# workspace_occurrences
 #   Emit the number of times the vendored crate appears in the dependency graph of
-#   the bare default-members build over every target triple. FAILS when cargo
-#   resolved no graph.
-default_members_occurrences() {
+#   every workspace member at its default features, dev-dependencies included,
+#   over every target triple. FAILS when cargo resolved no graph. Dev edges stay
+#   in because `cargo metadata`, which the presence half reads, unifies the
+#   features a dev-dependency selects; see the header.
+workspace_occurrences() {
   local tree cargo_rc=0
-  tree="$(cargo tree -e no-dev --target all --prefix none --format '{p}')" || cargo_rc=$?
+  tree="$(cargo tree --workspace --target all --prefix none --format '{p}')" || cargo_rc=$?
   if [[ "$cargo_rc" -ne 0 ]]; then
-    echo "cargo tree exited $cargo_rc for the default-members build" >&2
+    echo "cargo tree exited $cargo_rc for the whole-workspace build" >&2
     return 1
   fi
   tree_count "$tree"
@@ -368,7 +384,13 @@ wheel_triples() {
 #   graph cargo resolves for the one triple. `cargo metadata` resolves the whole
 #   workspace, so each feature the configuration names is passed as
 #   `<package>/<feature>`, which selects it on that package alone. FAILS when
-#   cargo exits non-zero or the JSON names no single such package.
+#   cargo exits non-zero or the JSON names no single such package, and FAILS on
+#   `--all-features`, which `cargo metadata` applies to every member and which no
+#   `<package>/<feature>` spelling scopes to the one package.
+#
+#   The unified graph alone does not prove the wheel's own build vendors: another
+#   member or a dev-dependency can put the edge there. `run_gate` pairs this count
+#   with workspace_occurrences, which fails the gate whenever one does.
 #
 #   Only stdout is parsed. Cargo writes a warning to stderr and still exits 0, and
 #   a warning in front of the JSON would fail the parse on a tree that satisfies
@@ -391,6 +413,9 @@ wheel_reach_count() {
       done
     elif [[ "$argument" == "--features" ]]; then
       next_is_list=1
+    elif [[ "$argument" == "--all-features" ]]; then
+      echo "the wheel's configuration names --all-features, which cargo metadata applies to every workspace member rather than to '$pkg'; name the wheel's features" >&2
+      return 1
     else
       args+=("$argument")
     fi
@@ -566,9 +591,9 @@ run_fixtures() {
   expect "a graph naming the vendored crate is counted" "PASS" "$rc"
   same_string "$out" "1"; rc=$?
   expect "that count is the number of $VENDOR_CRATE lines the graph holds, and cargo's stderr is not read as graph" "PASS" "$rc"
-  out="$(default_members_occurrences 2>/dev/null)"; rc=$?
+  out="$(workspace_occurrences 2>/dev/null)"; rc=$?
   same_string "$out" "1"; rc=$?
-  expect "the default-members counter counts the same graph" "PASS" "$rc"
+  expect "the whole-workspace counter counts the same graph" "PASS" "$rc"
   PATH="$saved_path"
 
   printf '%s\n' '#!/bin/sh' 'echo "scp-node v0.1.0"' > "$dir/fakebin/cargo"
@@ -582,8 +607,8 @@ run_fixtures() {
   PATH="$dir/fakebin:$saved_path"
   vendor_crate_occurrences "scp-node" "" >/dev/null 2>&1; rc=$?
   expect "a cargo tree that exits non-zero FAILS rather than counting zero" "FAIL" "$rc"
-  default_members_occurrences >/dev/null 2>&1; rc=$?
-  expect "the default-members counter FAILS on the same refusal" "FAIL" "$rc"
+  workspace_occurrences >/dev/null 2>&1; rc=$?
+  expect "the whole-workspace counter FAILS on the same refusal" "FAIL" "$rc"
   wheel_reach_count "scp-ffi" "" "x86_64-unknown-linux-gnu" >/dev/null 2>&1; rc=$?
   expect "a cargo metadata that exits non-zero FAILS the wheel counter" "FAIL" "$rc"
   PATH="$saved_path"
@@ -599,9 +624,14 @@ run_fixtures() {
   ARGV_DUMP="$dir/argv.txt" vendor_crate_occurrences "scp-ffi" "$(cargo_arguments_for '--no-default-features --features a,b')" >/dev/null 2>&1
   same_string "$(cat "$dir/argv.txt")" "$(printf '%s\n' tree -p scp-ffi --no-default-features --features a,b -e no-dev --target all --prefix none --format '{p}')"; rc=$?
   expect "(argv) the package counter resolves every triple, and the feature list reaches cargo as ONE argument" "PASS" "$rc"
-  ARGV_DUMP="$dir/argv.txt" default_members_occurrences >/dev/null 2>&1
-  same_string "$(cat "$dir/argv.txt")" "$(printf '%s\n' tree -e no-dev --target all --prefix none --format '{p}')"; rc=$?
-  expect "(argv) the default-members counter selects no package and resolves every triple" "PASS" "$rc"
+  ARGV_DUMP="$dir/argv.txt" workspace_occurrences >/dev/null 2>&1
+  same_string "$(cat "$dir/argv.txt")" "$(printf '%s\n' tree --workspace --target all --prefix none --format '{p}')"; rc=$?
+  expect "(argv) the whole-workspace counter selects every member, keeps dev edges, and resolves every triple" "PASS" "$rc"
+  rm -f "$dir/argv.txt"
+  ARGV_DUMP="$dir/argv.txt" wheel_reach_count "scp-ffi" "$(cargo_arguments_for '--all-features')" "aarch64-apple-darwin" >/dev/null 2>&1; rc=$?
+  expect "(argv) the wheel counter FAILS on --all-features, which cargo metadata would apply to every member" "FAIL" "$rc"
+  if [[ -f "$dir/argv.txt" ]]; then rc=1; else rc=0; fi
+  expect "(argv) and runs no cargo metadata for it" "PASS" "$rc"
   ARGV_DUMP="$dir/argv.txt" wheel_reach_count "scp-ffi" "$(cargo_arguments_for '--features extension-module,dep/x')" "aarch64-apple-darwin" >/dev/null 2>&1
   same_string "$(cat "$dir/argv.txt")" "$(printf '%s\n' metadata --format-version 1 --filter-platform aarch64-apple-darwin --features scp-ffi/extension-module --features dep/x)"; rc=$?
   expect "(argv) the wheel counter names the triple and selects each feature on the wheel's package" "PASS" "$rc"
@@ -635,9 +665,12 @@ run_fixtures() {
   # run_gate end to end, against a planted gate, a planted wheel matrix, and a
   # cargo that answers both counters from the arguments it receives: the tree
   # reaches openssl-src when the arguments name vendored-openssl or name a package
-  # in $FAKE_VENDORS, and the bare default-members tree reaches it when
-  # $FAKE_BARE_VENDORS is set; the metadata graph reaches it when the arguments
-  # name vendored-openssl on a triple other than $FAKE_DROPPED_TRIPLE.
+  # in $FAKE_VENDORS, and the whole-workspace tree reaches it when
+  # $FAKE_BARE_VENDORS is set and the arguments keep dev edges, because the
+  # selection it stands for can sit in a dev-dependency; the metadata graph reaches it when the arguments
+  # name vendored-openssl on a triple other than $FAKE_DROPPED_TRIPLE, or on any
+  # such triple when $FAKE_UNIFIED is set, which is how `cargo metadata` answers
+  # when another member or a dev-dependency selects the vendored build.
   local gate_file scenario_out
   gate_file="$dir/scenario-gate.sh"
   printf '%s\n' 'jobs:' '  python-wheels:' '    strategy:' '      matrix:' '        include:' \
@@ -650,7 +683,7 @@ run_fixtures() {
     '  case "$*" in' \
     "    *\"--filter-platform \$FAKE_DROPPED_TRIPLE \"*) cat '$dir/reach-no.json' ;;" \
     "    *vendored-openssl*) cat '$dir/reach-yes.json' ;;" \
-    "    *) cat '$dir/reach-no.json' ;;" \
+    "    *) if [ -n \"\$FAKE_UNIFIED\" ]; then cat '$dir/reach-yes.json'; else cat '$dir/reach-no.json'; fi ;;" \
     '  esac' \
     '  exit 0' \
     'fi' \
@@ -658,7 +691,7 @@ run_fixtures() {
     'case " $* " in' \
     "  *vendored-openssl*) echo \"${VENDOR_CRATE} v300.5.1+3.5.1\" ;;" \
     "  *\" -p \"*) for p in \$FAKE_VENDORS; do case \" \$* \" in *\" -p \$p \"*) echo \"${VENDOR_CRATE} v300.5.1+3.5.1\" ;; esac; done ;;" \
-    "  *) [ -n \"\$FAKE_BARE_VENDORS\" ] && echo \"${VENDOR_CRATE} v300.5.1+3.5.1\" ;;" \
+    "  *\" --workspace \"*) case \" \$* \" in *no-dev*) ;; *) [ -n \"\$FAKE_BARE_VENDORS\" ] && echo \"${VENDOR_CRATE} v300.5.1+3.5.1\" ;; esac ;;" \
     'esac' \
     'exit 0' > "$dir/fakebin/cargo"
   chmod +x "$dir/fakebin/cargo"
@@ -696,14 +729,27 @@ run_fixtures() {
   expect "(absent-reaches) it names scp-relay as well" "PASS" "$rc"
 
   # (coverage) every entry but the wheel deleted from ARTIFACTS, and a default
-  # member vendors: the default-members resolution still sees it.
+  # member vendors: the whole-workspace resolution still sees it.
   plant_gate "$gate_file" "$wheel_ok" "scp-ffi|--features extension-module,vendored-openssl"
-  FAKE_DROPPED_TRIPLE=none FAKE_VENDORS="" FAKE_BARE_VENDORS=1 scenario "(coverage) run_gate FAILS when a default member no ARTIFACTS entry names reaches $VENDOR_CRATE" "FAIL"
-  printf '%s\n' "$scenario_out" | grep -qF "FAIL — the default-members build reaches $VENDOR_CRATE."; rc=$?
-  expect "(coverage) it names the default-members build" "PASS" "$rc"
+  FAKE_DROPPED_TRIPLE=none FAKE_VENDORS="" FAKE_BARE_VENDORS=1 scenario "(coverage) run_gate FAILS when a member no ARTIFACTS entry names reaches $VENDOR_CRATE" "FAIL"
+  printf '%s\n' "$scenario_out" | grep -qF "FAIL — the whole-workspace build reaches $VENDOR_CRATE."; rc=$?
+  expect "(coverage) it names the whole-workspace build" "PASS" "$rc"
+
+  # (unified) the wheel drops vendored-openssl while scp-testing, or a
+  # dev-dependency, selects it: `cargo metadata` still shows the edge from
+  # scp-ffi on every triple, so the presence half passes, and the whole-workspace
+  # resolution is what fails the gate.
+  plant_gate "$gate_file" "$(printf 'bindings/python/pyproject.toml\tscp-ffi|--features extension-module')" \
+    "scp-node|" "scp-ffi|--features extension-module"
+  FAKE_UNIFIED=1 FAKE_DROPPED_TRIPLE=none FAKE_VENDORS="" FAKE_BARE_VENDORS=1 scenario "(unified) run_gate FAILS when the wheel selects no vendored build and another member's selection unifies into the metadata graph" "FAIL"
+  printf '%s\n' "$scenario_out" | grep -qF "ok   — x86_64-unknown-linux-gnu reaches $VENDOR_CRATE"; rc=$?
+  expect "(unified) the presence half alone passes that tree, which is why the workspace resolution exists" "PASS" "$rc"
+  printf '%s\n' "$scenario_out" | grep -qF "FAIL — the whole-workspace build reaches $VENDOR_CRATE."; rc=$?
+  expect "(unified) the whole-workspace build names the member's selection" "PASS" "$rc"
 
   # (per-triple) the vendored build survives on the runner's triple and is gone on
   # the Windows wheel.
+  plant_gate "$gate_file" "$wheel_ok" "scp-ffi|--features extension-module,vendored-openssl"
   FAKE_DROPPED_TRIPLE=x86_64-pc-windows-msvc FAKE_VENDORS="" FAKE_BARE_VENDORS="" scenario "(per-triple) run_gate FAILS when one wheel triple reaches no $VENDOR_CRATE" "FAIL"
   printf '%s\n' "$scenario_out" | grep -qF "FAIL — x86_64-pc-windows-msvc reaches no $VENDOR_CRATE"; rc=$?
   expect "(per-triple) it names that triple" "PASS" "$rc"
@@ -795,13 +841,16 @@ run_gate() {
       failures=$((failures + 1))
     fi
   done
-  if ! count="$(default_members_occurrences)"; then
-    echo "    FAIL — cargo resolved no graph for the default-members build; the stderr above names why."
+  if ! count="$(workspace_occurrences)"; then
+    echo "    FAIL — cargo resolved no graph for the whole-workspace build; the stderr above names why."
     failures=$((failures + 1))
   elif [[ "$count" -eq 0 ]]; then
-    echo "    ok   — the default-members build, which holds every default workspace member"
+    echo "    ok   — the whole-workspace build, which holds every member and every dev-dependency"
   else
-    echo "    FAIL — the default-members build reaches $VENDOR_CRATE."
+    echo "    FAIL — the whole-workspace build reaches $VENDOR_CRATE. A member or a"
+    echo "           dev-dependency selects the vendored build on its own, which also"
+    echo "           lets the wheel's presence count above pass without the wheel's"
+    echo "           own features."
     failures=$((failures + 1))
   fi
   echo
