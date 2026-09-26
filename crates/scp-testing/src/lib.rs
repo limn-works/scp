@@ -78,8 +78,8 @@ pub mod fullstack;
 // `scp-identity` differently from each other and recompile seven shared crates. Behind
 // the feature, the integration tests that use the module still get it — this crate's own
 // `[dev-dependencies]` turn the feature on — and no other build carries it. The feature
-// list names both nullifier features, which ADR-062 §Decision 1 permits only in a list
-// named `testing` or on a dev-dependency edge.
+// list names `scp-dht/testing`, which ADR-062 §Decision 1 permits "only in `testing`
+// features and dev-dependencies"; the ADR states that rule for `scp-dht/testing` alone.
 #[cfg(feature = "testing")]
 pub mod helpers;
 pub mod presets;
