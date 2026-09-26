@@ -119,7 +119,6 @@ ALLOWLIST=(
     SYSTEM_REGISTRY                 # why: protocol system-action registry — frozen lookup table of compile-time-known system actions.
 
     # ID generators (safe — monotonic counters, no shared mutable state)
-    EVENT_COUNTER                   # why: monotonic `AtomicU64` for webhook event IDs; no shared state, safe across instances.
     INSTANCE_ID_COUNTER             # why: monotonic `AtomicU64` used to assign each `*BridgeInstance` a unique u64 identifier at construction.
     NEXT_HANDLE                     # why: test-clock monotonic handle allocator — AtomicU64, no cross-instance coupling.
     NEXT_OWNER_ID                   # why: relay subscription owner-id allocator — AtomicU64, no cross-instance coupling.

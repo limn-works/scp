@@ -224,21 +224,6 @@ pub struct NodeState {
     /// the critical section is a single `Option` copy with no `.await`.
     pub(crate) default_site_routing_id: std::sync::RwLock<Option<[u8; 32]>>,
 
-    /// Shared state for bridge shadow operations.
-    ///
-    /// Holds per-context shadow registries and sender key stores for the
-    /// bridge shadow creation endpoint (`POST /v1/scp/bridge/shadow`).
-    /// See SCP-BCH-002.
-    pub(crate) bridge_state: Arc<crate::bridge_handlers::BridgeState>,
-
-    /// Production bridge lookup for bridge auth middleware (spec section 12.10.2).
-    ///
-    /// When `Some`, the bridge router is wrapped with [`bridge_auth_middleware`](crate::bridge_auth::bridge_auth_middleware)
-    /// and [`webhook_auth_middleware`](crate::bridge_auth::webhook_auth_middleware) using this lookup. When `None` (e.g., in
-    /// tests or when bridges are not configured), the bridge router is mounted
-    /// without authentication.
-    pub(crate) bridge_lookup: Option<Arc<dyn crate::bridge_auth::BridgeLookup>>,
-
     /// Shared PUBLISH rate limiter from the relay server.
     ///
     /// Cloned from the WebSocket relay so the QUIC listener enforces the same
@@ -582,17 +567,6 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         crate::projection::broadcast_projection_router(Arc::clone(&self.state))
     }
 
-    /// Returns an axum [`Router`] serving bridge endpoints.
-    ///
-    /// Includes `POST /v1/scp/bridge/shadow` for shadow identity creation.
-    /// Requires bridge authentication middleware to be applied by the caller.
-    ///
-    /// See SCP-BCH-002 and spec section 12.10.
-    #[must_use = "returns the bridge router, which must be mounted into an axum application"]
-    pub fn bridge_router(&self) -> Router {
-        crate::bridge_handlers::bridge_router(Arc::clone(&self.state.bridge_state))
-    }
-
     /// Returns the dev API router if the dev API is enabled.
     ///
     /// Returns `Some(Router)` when `NodeConfig::local_api` was set (i.e., a
@@ -681,10 +655,9 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
     /// [`PublicSurface::Full`](crate::PublicSurface::Full) is identical to
     /// [`serve`](Self::serve). [`PublicSurface::SelfHost`](crate::PublicSurface::SelfHost)
     /// exposes ONLY the read-only website projection surface on the public
-    /// bind — the relay upgrade (`/scp/v1`) and bridge routes
-    /// (`/v1/scp/bridge/*`) are not mounted, so anonymous internet clients
-    /// cannot reach the node's loopback relay or bridge through the public
-    /// listener (§10.12.8).
+    /// bind — the relay upgrade (`/scp/v1`) is not mounted, so anonymous
+    /// internet clients cannot reach the node's loopback relay or bridge
+    /// through the public listener (§10.12.8).
     ///
     /// TLS termination, the dev API listener, and the HTTP/3 listener behave
     /// exactly as in [`serve`](Self::serve); the only difference is which SCP
@@ -816,43 +789,6 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
 // Dev API spawning (extracted for clippy::too_many_lines)
 // ---------------------------------------------------------------------------
 
-/// Builds the bridge and webhook routers with appropriate auth middleware.
-///
-/// JWT-authenticated bridge routes use `bridge_auth_middleware_dyn` (Bearer
-/// token). The webhook route uses `webhook_auth_middleware_dyn`
-/// (`X-SCP-Signature` header). When no `BridgeLookup` is configured (dev
-/// mode), both are mounted without authentication.
-///
-/// See spec section 12.10.2.
-pub(crate) fn build_bridge_routers(
-    bridge_state: &Arc<crate::bridge_handlers::BridgeState>,
-    bridge_lookup: Option<&Arc<dyn crate::bridge_auth::BridgeLookup>>,
-) -> (Router, Router) {
-    let bridge = {
-        let base = crate::bridge_handlers::bridge_router(Arc::clone(bridge_state));
-        if let Some(lookup) = bridge_lookup {
-            base.layer(axum::middleware::from_fn_with_state(
-                Arc::clone(lookup),
-                crate::bridge_auth::bridge_auth_middleware_dyn,
-            ))
-        } else {
-            base
-        }
-    };
-    let bridge_webhook = {
-        let base = crate::bridge_handlers::bridge_webhook_router(Arc::clone(bridge_state));
-        if let Some(lookup) = bridge_lookup {
-            base.layer(axum::middleware::from_fn_with_state(
-                Arc::clone(lookup),
-                crate::bridge_auth::webhook_auth_middleware_dyn,
-            ))
-        } else {
-            base
-        }
-    };
-    (bridge, bridge_webhook)
-}
-
 /// Builds the merged axum router for `serve()`, combining SCP protocol
 /// routes (well-known, relay, projection, ACME challenges) with the
 /// application router. Extracted from `serve()` for clippy line limits.
@@ -870,16 +806,12 @@ pub(crate) fn build_merged_router(
     well_known: Router,
     relay_rt: Router,
     projection: Router,
-    bridge: Router,
-    bridge_webhook: Router,
     state: &Arc<NodeState>,
 ) -> Router {
     let merged = app_router
         .merge(well_known)
         .merge(relay_rt)
-        .merge(projection)
-        .merge(bridge)
-        .merge(bridge_webhook);
+        .merge(projection);
 
     finalize_router(merged, state)
 }
@@ -890,15 +822,14 @@ pub(crate) fn build_merged_router(
 /// `.well-known/scp`, the broadcast projection endpoints (`/scp/broadcast/*`,
 /// including `/feed`, `/messages`, and `/site/*`), any configured ACME
 /// challenge routes, and the virtual-host fallback. It deliberately does NOT
-/// merge the relay upgrade router (`/scp/v1`) nor the bridge routers
-/// (`/v1/scp/bridge/*`).
+/// merge the relay upgrade router (`/scp/v1`).
 ///
 /// This is the security seam for §10.12.8: in self-host mode the node's own
 /// loopback relay is reached in-process over `127.0.0.1` (the relay's listener
 /// stays loopback), so the relay upgrade/bridge must never be exposed on the
-/// public bind. An external client hitting `/scp/v1` or `/v1/scp/bridge/*` on
-/// the self-host public listener therefore falls through to the virtual-host
-/// fallback and receives 404 (no registered hostname matches those paths),
+/// public bind. An external client hitting `/scp/v1` on the self-host public
+/// listener therefore falls through to the virtual-host fallback and receives
+/// 404 (no registered hostname matches that path),
 /// while the website projection routes serve normally.
 ///
 /// **Caller note:** whatever `app_router` is passed IS exposed on the public
@@ -1208,8 +1139,6 @@ mod tests {
             acme_challenges: None,
             hostname_index: RwLock::new(HashMap::new()),
             default_site_routing_id: std::sync::RwLock::new(None),
-            bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
-            bridge_lookup: None,
             #[cfg(feature = "quic")]
             publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(100),
             #[cfg(feature = "quic")]
@@ -1407,8 +1336,6 @@ mod vhost_tests {
             acme_challenges: None,
             hostname_index: RwLock::new(hostname_index),
             default_site_routing_id: std::sync::RwLock::new(None),
-            bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
-            bridge_lookup: None,
             #[cfg(feature = "quic")]
             publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(100),
             #[cfg(feature = "quic")]
