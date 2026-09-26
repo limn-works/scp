@@ -72,11 +72,11 @@ jobs:
   # ===========================================================================
   conformance:
     name: "Step 1: Conformance tests"
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: useblacksmith/checkout@v1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -126,11 +126,11 @@ jobs:
   # ===========================================================================
   changelog:
     name: "Step 2: Verify changelog"
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: useblacksmith/checkout@v1
 
       - name: Check CHANGELOG.md exists and mentions version
         run: |
@@ -153,13 +153,13 @@ jobs:
   version-tags:
     name: "Step 3: Create version tags"
     needs: [conformance, changelog]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     outputs:
       core-tag: ${{ steps.tags.outputs.core-tag }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: useblacksmith/checkout@v1
         with:
           fetch-depth: 0  # Full history for tag operations
 
@@ -229,7 +229,7 @@ jobs:
   sign-apple:
     name: "Step 5a: Apple codesigning"
     needs: [build]
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 45
     steps:
       - name: Download XCFramework
@@ -296,7 +296,7 @@ jobs:
   sign-windows:
     name: "Step 5b: Authenticode signing"
     needs: [build]
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     timeout-minutes: 45
     steps:
       - name: Download Windows artifacts
@@ -374,7 +374,7 @@ jobs:
   sign-maven:
     name: "Step 5c: GPG sign Maven artifacts"
     needs: [build]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Download Kotlin AAR artifacts
@@ -396,7 +396,7 @@ jobs:
       # reach an artifact named `maven-signed`. A checkout supplies this script,
       # which the download step above does not.
       - name: Check out this repository
-        uses: actions/checkout@v5
+        uses: useblacksmith/checkout@v1
         with:
           path: repo
 
@@ -439,14 +439,14 @@ jobs:
     name: "Step 6a: Publish to crates.io"
     needs: [sign-apple, sign-windows, sign-maven]
     if: ${{ !inputs.dry-run }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Free disk space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
 
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: useblacksmith/checkout@v1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -597,7 +597,7 @@ jobs:
     name: "Step 6b: Publish to PyPI"
     needs: [sign-apple, sign-windows, sign-maven]
     if: ${{ !inputs.dry-run }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     # Uses Trusted Publishers (OIDC) — no token required
     environment:
@@ -626,11 +626,11 @@ jobs:
     name: "Step 6c: Publish to npm"
     needs: [sign-apple, sign-windows, sign-maven]
     if: ${{ !inputs.dry-run }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: useblacksmith/checkout@v1
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -735,11 +735,11 @@ jobs:
     name: "Step 6d: Publish to Maven Central"
     needs: [sign-apple, sign-windows, sign-maven]
     if: ${{ !inputs.dry-run }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: useblacksmith/checkout@v1
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -793,7 +793,7 @@ jobs:
     name: "Step 6f: Publish Swift Package (SPM)"
     needs: [sign-apple]
     if: ${{ !inputs.dry-run }}
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 30
     outputs:
       xcframework-zip: ScpFFI-${{ inputs.version }}.xcframework.zip
@@ -881,11 +881,11 @@ jobs:
       - publish-maven
       - publish-spm
     if: ${{ !inputs.dry-run }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: useblacksmith/checkout@v1
 
       - name: Download all release artifacts
         uses: actions/download-artifact@v4
@@ -961,7 +961,7 @@ jobs:
     name: "Dry-run summary"
     needs: [build]
     if: ${{ inputs.dry-run }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - name: Download build artifacts

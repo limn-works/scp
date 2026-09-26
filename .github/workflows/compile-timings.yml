@@ -42,14 +42,14 @@ env:
 jobs:
   timings:
     name: Cold compile timings (ubuntu-latest)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     steps:
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:

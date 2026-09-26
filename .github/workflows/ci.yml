@@ -120,7 +120,7 @@ jobs:
       github.event_name == 'push' ||
       github.event_name == 'merge_group' ||
       github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - run: echo "Not a draft PR, proceeding"
@@ -129,7 +129,7 @@ jobs:
   # haven't been touched, but still report "success" to branch protection.
   changes:
     needs: check-draft
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     # `rust-toolchain.toml` selects the compiler for every lane below, not only the Rust
     # one: `python-test` runs `maturin develop`, `typescript-check` runs
     # `cargo build -p scp-ffi-napi`, the two wasm jobs run `wasm-pack build`, `kotlin-test`
@@ -161,7 +161,7 @@ jobs:
       # instead, and the `fuzz` filter's `fuzz/**` entry already covers that file.
       fuzz: ${{ steps.filter.outputs.fuzz }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -331,10 +331,10 @@ jobs:
   error-codes:
     needs: check-draft
     name: Error code conformance
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - run: bash scripts/check-error-codes.sh
 
   # ── Fail-closed pre-rotation (ADR-062 §Decision 6 / SCP-CAPINJECT-006) ──
@@ -349,10 +349,10 @@ jobs:
   fail-closed-pre-rotation:
     needs: check-draft
     name: Fail-closed pre-rotation (SCP-IDENT-1059)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
@@ -404,10 +404,10 @@ jobs:
   shipped-feature-graph:
     needs: check-draft
     name: Shipped-feature-graph (G1 prove-absence)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -421,10 +421,10 @@ jobs:
     needs: check-draft
     if: github.event_name == 'pull_request'
     name: Cross-layer check
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
         with:
           fetch-depth: 0
       - name: Fetch base branch
@@ -455,10 +455,10 @@ jobs:
   bridge-symmetry:
     needs: check-draft
     name: Bridge symmetry
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -475,10 +475,10 @@ jobs:
   sdk-coverage:
     needs: check-draft
     name: SDK capability matrix
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -498,10 +498,10 @@ jobs:
   protocol-sync:
     needs: check-draft
     name: Protocol sync check
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -512,10 +512,10 @@ jobs:
   pyi-generated:
     needs: check-draft
     name: Python stub signature parity
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -536,10 +536,10 @@ jobs:
   construction-pattern:
     needs: check-draft
     name: Construction pattern (ADR-052)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -548,10 +548,10 @@ jobs:
   protocol-deps:
     needs: check-draft
     name: Protocol deps check
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@stable
       - run: bash scripts/check-protocol-deps.sh
       - run: bash scripts/check-no-shim-reexports.sh
@@ -560,10 +560,10 @@ jobs:
   bridge-globals:
     needs: check-draft
     name: FFI / no-bridge-globals + OnceLock ratchet
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -572,19 +572,19 @@ jobs:
   fallback-registry:
     needs: check-draft
     name: FFI / no-fallback-registry regression
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - run: bash scripts/check-no-fallback-registry.sh
 
   handle-affinity:
     needs: check-draft
     name: FFI / handle-affinity check
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - run: bash scripts/check-handle-affinity.sh
 
   # ── Toolchain wiring ───────────────────────────────────────────────
@@ -605,10 +605,10 @@ jobs:
   toolchain-wiring:
     needs: check-draft
     name: enforcement / toolchain wiring
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       # The mise check parses `.mise.toml` with `tomllib`, which the Python standard
       # library has held since 3.11, and it fails when no interpreter on PATH imports it.
       - uses: actions/setup-python@v5
@@ -661,10 +661,10 @@ jobs:
     needs: check-draft
     if: github.event_name == 'pull_request'
     name: enforcement / fix-round-check runner
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
         with:
           fetch-depth: 0
       # check-cross-layer.sh diffs against origin/$GITHUB_BASE_REF, and against
@@ -712,19 +712,19 @@ jobs:
   no-mutable-globals-rust:
     needs: check-draft
     name: enforcement / no-mutable-globals (rust workspace)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - run: bash scripts/check-no-mutable-globals.sh
 
   no-mutable-globals-python:
     needs: check-draft
     name: enforcement / no-mutable-module-globals (python sdk)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -733,19 +733,19 @@ jobs:
   no-mutable-globals-ts:
     needs: check-draft
     name: enforcement / no-mutable-globals (typescript sdk)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - run: bash scripts/check-no-ts-mutable-globals.sh
 
   no-mutable-globals-kotlin:
     needs: check-draft
     name: enforcement / no-mutable-globals (kotlin sdk)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - run: bash scripts/check-no-kotlin-mutable-globals.sh
 
   # Swift `no_static_var` / `no_static_lazy_var` custom rules live inside
@@ -761,10 +761,10 @@ jobs:
   block-in-place:
     needs: check-draft
     name: Actor / block-in-place AST check + ratchet
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -782,10 +782,10 @@ jobs:
   doc-citations:
     needs: check-draft
     name: Docs / spec citations resolve
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -805,10 +805,10 @@ jobs:
   agent-verdict-criterion:
     needs: check-draft
     name: Agents / every definition states a verdict criterion
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - name: Real check
         run: bash scripts/check-agent-verdict-criterion.sh
       # The cases run after the real check and plant each way the section can break,
@@ -819,28 +819,28 @@ jobs:
   deleted-primitives:
     needs: check-draft
     name: Actor / deleted primitives ban
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - run: bash scripts/check-deleted-primitives.sh
 
   handler-no-panic:
     needs: check-draft
     name: Actor / handler panic-family ban (ADR-049 §10)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - run: bash scripts/check-handler-no-panic.sh
 
   no-panic-abort:
     needs: check-draft
     name: FFI / no panic=abort in cdylib profiles
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       # Self-test MUST run first: it plants panic = "abort" in a scratch
       # manifest (must be DETECTED) and confirms benign lines
       # (panic = "unwind" / the clippy lint panic = "deny" / a comment) are
@@ -853,10 +853,10 @@ jobs:
   saga-gating-granularity:
     needs: check-draft
     name: Actor / saga gating granularity (ADR-049 §3a)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       # Self-test MUST run first: it plants an instance-wide AtomicBool saga
       # guard + a fake FFI saga export (must FAIL), correct per-set gating
       # (must PASS), and a no-gating-at-all supervisor (must FAIL) — proving
@@ -869,10 +869,10 @@ jobs:
   bridge-instance-lifecycle:
     needs: check-draft
     name: Actor / BridgeInstance lifecycle drift
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -882,10 +882,10 @@ jobs:
   wasm-protocol:
     needs: check-draft
     name: WASM / protocol
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -904,10 +904,10 @@ jobs:
   wasm-test:
     needs: check-draft
     name: WASM / test
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -940,10 +940,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     name: Rust / fmt
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -953,7 +953,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     name: Rust / clippy
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Free disk space when the runner is short of it
@@ -970,7 +970,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -1048,7 +1048,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [blacksmith-4vcpu-ubuntu-2404, blacksmith-6vcpu-macos-latest]
         shard: [1, 2, 3, 4]
     steps:
       - name: Free disk space when the runner is short of it
@@ -1158,7 +1158,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [blacksmith-4vcpu-ubuntu-2404, blacksmith-6vcpu-macos-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -1211,7 +1211,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     name: Rust / test (napi production config)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Free disk space when the runner is short of it
@@ -1228,7 +1228,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
@@ -1275,7 +1275,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     name: Rust / build + fail-closed test (pyo3 production config)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Free disk space when the runner is short of it
@@ -1292,7 +1292,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: actions/setup-python@v5
@@ -1357,7 +1357,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     name: Rust / build + fail-closed test (uniffi production config)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Free disk space when the runner is short of it
@@ -1374,7 +1374,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
@@ -1455,7 +1455,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     name: Rust / doc
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Free disk space when the runner is short of it
@@ -1472,7 +1472,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
@@ -1527,10 +1527,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     name: Rust / deny
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   # ── Container image ─────────────────────────────────────────────────
@@ -1548,7 +1548,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     name: Docker / relay and node image
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     steps:
       # The builder stage measures about 6 GB — 2 GB of it the pin's cross-compilation
@@ -1568,9 +1568,10 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: useblacksmith/checkout@v1
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@v1
+      - uses: useblacksmith/build-push-action@v2
         with:
           context: .
           push: false
@@ -1579,21 +1580,19 @@ jobs:
           # would evict entries from the 10 GB budget the ~18 `Swatinem/rust-cache` steps
           # in this workflow share. `ignore-error` so a cache-service failure cannot fail
           # the build check: this job answers whether the image builds.
-          cache-from: type=gha,scope=docker-image
-          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=docker-image,ignore-error=true' || '' }}
 
   # ── Python ──────────────────────────────────────────────────────────
   python-lint:
     needs: changes
     if: needs.changes.outputs.python == 'true'
     name: Python / lint
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     defaults:
       run:
         working-directory: bindings/python
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -1631,7 +1630,7 @@ jobs:
       needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.rust == 'true'
     name: Python / test
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Free disk space when the runner is short of it
@@ -1648,7 +1647,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -1693,7 +1692,7 @@ jobs:
       needs.changes.outputs.typescript == 'true' ||
       needs.changes.outputs.rust == 'true'
     name: TypeScript / check + lint + test
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Free disk space when the runner is short of it
@@ -1710,7 +1709,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: oven-sh/setup-bun@v2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -1764,7 +1763,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.typescript-wasm == 'true'
     name: TypeScript-wasm / build + check + lint + guards + test
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - name: Free disk space when the runner is short of it
@@ -1781,7 +1780,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: oven-sh/setup-bun@v2
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -1836,7 +1835,7 @@ jobs:
       needs.changes.outputs.scaffold-typescript-web == 'true' ||
       needs.changes.outputs.typescript-wasm == 'true'
     name: TypeScript-web scaffold / build wasm dep + check + lint + build
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - name: Free disk space when the runner is short of it
@@ -1853,7 +1852,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: oven-sh/setup-bun@v2
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -1888,7 +1887,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.kotlin == 'true'
     name: Kotlin / lint + format
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     defaults:
       run:
@@ -1909,7 +1908,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: actions/setup-java@v4
         with:
           distribution: zulu
@@ -1976,7 +1975,7 @@ jobs:
       needs.changes.outputs.kotlin == 'true' ||
       needs.changes.outputs.rust == 'true'
     name: Kotlin / test
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Free disk space when the runner is short of it
@@ -1993,7 +1992,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: actions/setup-java@v4
         with:
           distribution: zulu
@@ -2064,7 +2063,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.swift == 'true'
     name: Swift / lint + format
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 30
     defaults:
       run:
@@ -2092,7 +2091,7 @@ jobs:
       needs.changes.outputs.swift == 'true' ||
       needs.changes.outputs.rust == 'true'
     name: Swift / build + test
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
@@ -2122,10 +2121,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.fuzz == 'true'
     name: Fuzz / build check
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "fuzz -> target"
@@ -2152,7 +2151,7 @@ jobs:
       needs.changes.outputs.typescript == 'true' ||
       needs.changes.outputs.rust == 'true'
     name: Cross-bridge runtime parity
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Free disk space when the runner is short of it
@@ -2169,7 +2168,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - name: Check for unresolved issue placeholders
         # Runs immediately after checkout — a 1-second grep should not wait
         # on ~10 minutes of toolchain setup and native builds below.
@@ -2264,7 +2263,7 @@ jobs:
       needs.changes.outputs.kotlin == 'true' ||
       needs.changes.outputs.rust == 'true'
     name: Cross-bridge runtime parity (UniFFI Kotlin)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Free disk space when the runner is short of it
@@ -2281,7 +2280,7 @@ jobs:
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h /
           fi
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -2357,7 +2356,7 @@ jobs:
       needs.changes.outputs.swift == 'true' ||
       needs.changes.outputs.rust == 'true'
     name: Cross-bridge runtime parity (UniFFI Swift)
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
@@ -2421,10 +2420,10 @@ jobs:
   ci-workflow-selftest:
     needs: check-draft
     name: CI workflow / self-test
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -2526,10 +2525,10 @@ jobs:
       - bridge-parity-kotlin
       - bridge-parity-swift
       - ci-workflow-selftest
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: useblacksmith/checkout@v1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

@@ -43,15 +43,15 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: blacksmith-4vcpu-ubuntu-2404
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: blacksmith-4vcpu-ubuntu-2404
           - target: x86_64-apple-darwin
-            runner: macos-latest
+            runner: blacksmith-6vcpu-macos-latest
           - target: aarch64-apple-darwin
-            runner: macos-latest
+            runner: blacksmith-6vcpu-macos-latest
           - target: x86_64-pc-windows-msvc
-            runner: windows-latest
+            runner: blacksmith-4vcpu-windows-2025
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -141,19 +141,19 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: blacksmith-4vcpu-ubuntu-2404
             manylinux: manylinux2014
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: blacksmith-4vcpu-ubuntu-2404
             manylinux: manylinux2014
           - target: x86_64-apple-darwin
-            runner: macos-latest
+            runner: blacksmith-6vcpu-macos-latest
             manylinux: auto
           - target: aarch64-apple-darwin
-            runner: macos-latest
+            runner: blacksmith-6vcpu-macos-latest
             manylinux: auto
           - target: x86_64-pc-windows-msvc
-            runner: windows-latest
+            runner: blacksmith-4vcpu-windows-2025
             manylinux: auto
     steps:
       - name: Checkout
@@ -179,11 +179,11 @@ jobs:
 
   python-sdist:
     name: Python sdist
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: useblacksmith/checkout@v1
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1
@@ -215,19 +215,19 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: blacksmith-4vcpu-ubuntu-2404
             npm-platform: linux-x64-gnu
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: blacksmith-4vcpu-ubuntu-2404
             npm-platform: linux-arm64-gnu
           - target: x86_64-apple-darwin
-            runner: macos-latest
+            runner: blacksmith-6vcpu-macos-latest
             npm-platform: darwin-x64
           - target: aarch64-apple-darwin
-            runner: macos-latest
+            runner: blacksmith-6vcpu-macos-latest
             npm-platform: darwin-arm64
           - target: x86_64-pc-windows-msvc
-            runner: windows-latest
+            runner: blacksmith-4vcpu-windows-2025
             npm-platform: win32-x64-msvc
     steps:
       - name: Checkout
@@ -289,7 +289,7 @@ jobs:
   swift-xcframework:
     name: Swift XCFramework
     # Pinned: Package.swift requires swift-tools-version 6.2; macos-latest (macOS 15) only ships 6.1
-    runs-on: macos-26
+    runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 90
     steps:
       - name: Checkout
@@ -397,11 +397,11 @@ jobs:
   # ---------------------------------------------------------------------------
   kotlin-aar:
     name: Kotlin AAR
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: useblacksmith/checkout@v1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -498,19 +498,19 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: blacksmith-4vcpu-ubuntu-2404
             lib-ext: so
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: blacksmith-4vcpu-ubuntu-2404
             lib-ext: so
           - target: x86_64-apple-darwin
-            runner: macos-latest
+            runner: blacksmith-6vcpu-macos-latest
             lib-ext: dylib
           - target: aarch64-apple-darwin
-            runner: macos-latest
+            runner: blacksmith-6vcpu-macos-latest
             lib-ext: dylib
           - target: x86_64-pc-windows-msvc
-            runner: windows-latest
+            runner: blacksmith-4vcpu-windows-2025
             lib-ext: dll
     steps:
       - name: Checkout
@@ -549,7 +549,7 @@ jobs:
   # ---------------------------------------------------------------------------
   aggregate:
     name: Aggregate artifacts
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     needs:
       - rust
