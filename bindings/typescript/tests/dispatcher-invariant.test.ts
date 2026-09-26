@@ -392,7 +392,6 @@ describe("dispatcher invariant (ADR-048 §1 + §7)", () => {
     expect(classMethods.has("identityCreate")).toBe(true);
     expect(classMethods.has("contextCreate")).toBe(true);
     expect(classMethods.has("scpidSign")).toBe(true);
-    expect(classMethods.has("bridgeCreateShadow")).toBe(true);
     expect(classMethods.has("instanceId")).toBe(true);
 
     expect(freeFns.has("discoveryParseAddress")).toBe(true);
@@ -401,8 +400,6 @@ describe("dispatcher invariant (ADR-048 §1 + §7)", () => {
     expect(freeFns.has("validateAgainstTemplate")).toBe(true);
     expect(freeFns.has("validateContextParams")).toBe(true);
     expect(freeFns.has("contextDiscover")).toBe(true);
-    expect(freeFns.has("bridgeRegister")).toBe(true);
-    expect(freeFns.has("bridgeEvaluateTrust")).toBe(true);
     expect(freeFns.has("scpVersion")).toBe(true);
   });
 

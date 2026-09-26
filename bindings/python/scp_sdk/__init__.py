@@ -46,12 +46,6 @@ from scp_sdk.auth import (
     ScpIdChallenge,
     ScpIdResponse,
 )
-from scp_sdk.bridge import (
-    bridge_provenance_tier,
-)
-from scp_sdk.bridge import (
-    register as bridge_register,
-)
 from scp_sdk.context import (
     AssetEntry,
     BatchPublishResult,
@@ -206,7 +200,6 @@ from scp_sdk.trust import (
     verify_participation_requirements,
 )
 from scp_sdk.types import (
-    BridgeMode,
     Capability,
     CeilingPolicy,
     ContextMode,
@@ -218,7 +211,6 @@ from scp_sdk.types import (
     PromotionPolicy,
     Provenance,
     ProvenanceQuality,
-    ShadowStatus,
     SourceType,
 )
 from scp_sdk.ucan import UcanToken
@@ -238,7 +230,6 @@ __all__ = [
     "AttestorInfo",
     "BatchPublishResult",
     "BehavioralRecord",
-    "BridgeMode",
     "CachedAttestation",
     "CachedAttestationEnvelope",
     "Capability",
@@ -313,7 +304,6 @@ __all__ = [
     "ScpIdResponse",
     "Sealed",
     "SealedInvitation",
-    "ShadowStatus",
     "SignedCheckpoint",
     "SiteConfig",
     "SourceType",
@@ -336,8 +326,6 @@ __all__ = [
     "VerificationLevel",
     "__version__",
     "auto_accept_blocked",
-    "bridge_provenance_tier",
-    "bridge_register",
     "check_capability_requirements",
     "check_media_capability",
     "check_policy_lock",

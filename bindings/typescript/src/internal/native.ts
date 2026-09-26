@@ -22,7 +22,6 @@
 
 import { createRequire } from "node:module";
 
-import type { BridgeMode, ShadowStatus } from "../bridge";
 import { TransportError } from "../errors";
 import { __getNativeScp, type SCP } from "../scp";
 import type {
@@ -1268,87 +1267,6 @@ export function createNativeBridge(scp: SCP): Bridge {
         // The NAPI bridge signs the checkpoint in-process; surface the Ed25519
         // signature (hex). See the `Checkpoint` type doc.
         signature: raw.signature,
-      };
-    },
-
-    // Bridge Connector — `bridgeRegister` and `bridgeEvaluateTrust` are
-    // module-level NAPI free fns in bridge_connector.rs and dispatch
-    // through `addon.X`. `bridgeCreateShadow` is on the SCP class
-    // (scp.rs:3727) and dispatches through `native.X`. The dispatcher
-    // routing rule above governs.
-    bridgeRegister(
-      contextId: string,
-      operatorDid: string,
-      governanceDid: string,
-      platform: string,
-      mode: BridgeMode,
-    ) {
-      // napi-rs #[napi(object)] returns camelCase keys; Bridge interface expects snake_case.
-      const raw = (
-        addon.bridgeRegister as (
-          c: string,
-          o: string,
-          g: string,
-          p: string,
-          m: BridgeMode,
-        ) => {
-          bridgeId: string;
-          operatorDid: string;
-          platform: string;
-          mode: string;
-          status: string;
-          contextId: string;
-        }
-      )(contextId, operatorDid, governanceDid, platform, mode);
-      return {
-        bridge_id: raw.bridgeId,
-        operator_did: raw.operatorDid,
-        platform: raw.platform,
-        mode: raw.mode as BridgeMode,
-        status: raw.status,
-        context_id: raw.contextId,
-      };
-    },
-
-    bridgeEvaluateTrust(
-      isBridged: boolean,
-      isNativeTransport: boolean,
-      shadowStatus: ShadowStatus,
-    ) {
-      return (addon.bridgeEvaluateTrust as (b: boolean, n: boolean, s: ShadowStatus) => number)(
-        isBridged,
-        isNativeTransport,
-        shadowStatus,
-      );
-    },
-
-    bridgeCreateShadow(
-      bridgeId: string,
-      platformHandle: string,
-      bridgeMode: BridgeMode,
-      contextId: string | undefined,
-    ) {
-      // napi-rs #[napi(object)] returns camelCase keys; Bridge interface expects snake_case.
-      const raw = (
-        native.bridgeCreateShadow as (
-          b: string,
-          p: string,
-          m: BridgeMode,
-          c: string | undefined,
-        ) => {
-          shadowId: string;
-          platformHandle: string;
-          bridgeId: string;
-          attributedRole: string;
-          provenanceStatus: string;
-        }
-      )(bridgeId, platformHandle, bridgeMode, contextId);
-      return {
-        shadow_id: raw.shadowId,
-        platform_handle: raw.platformHandle,
-        bridge_id: raw.bridgeId,
-        attributed_role: raw.attributedRole,
-        provenance_status: raw.provenanceStatus as ShadowStatus,
       };
     },
 

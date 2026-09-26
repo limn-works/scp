@@ -41,8 +41,6 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import works.limn.scp.AssetEntry
 import works.limn.scp.BatchPublishResult
-import works.limn.scp.BridgeConnectorBindings
-import works.limn.scp.BridgeConnectorBridge
 import works.limn.scp.ConsequenceConfig
 import works.limn.scp.ConsequenceRule
 import works.limn.scp.DiscoveryBindings
@@ -1274,7 +1272,6 @@ interface NativeBindings :
  * @property provenance Provenance evaluation, attachment, and chain depth bindings.
  * @property sync Sync/offline classification bindings.
  * @property discovery Address parsing, query creation, and normalization bindings.
- * @property bridgeConnector Bridge connector trust, registration, and shadow bindings.
  * @property identityAdvanced Agent key, migration, and device attestation bindings.
  * @property identityAttestation Identity link attestation CRUD bindings (§3.5).
  * @property scpId SCPID DID authentication bindings (spec section 3.11).
@@ -1286,7 +1283,6 @@ data class ExtendedBindings(
     val provenance: ProvenanceBindings? = null,
     val sync: SyncBindings? = null,
     val discovery: DiscoveryBindings? = null,
-    val bridgeConnector: BridgeConnectorBindings? = null,
     val identityAdvanced: IdentityAdvancedBindings? = null,
     val scpId: ScpIdBindings? = null,
     val metadata: MetadataBindings? = null,
@@ -1372,12 +1368,6 @@ class CoroutineBridge(
     /** Discovery operations — FFI on IO. Null if bindings not provided. */
     val discovery: DiscoveryBridge? =
         extendedBindings?.discovery?.let { DiscoveryBridge(it, this) }
-
-    /** Bridge connector operations — FFI on IO. Null if bindings not provided. */
-    val bridgeConnector: BridgeConnectorBridge? =
-        extendedBindings?.bridgeConnector?.let {
-            BridgeConnectorBridge(it, this)
-        }
 
     /** Advanced identity operations — FFI on IO. Null if bindings not provided. */
     val identityAdvanced: IdentityAdvancedBridge? =
