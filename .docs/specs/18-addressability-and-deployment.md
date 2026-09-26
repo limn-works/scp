@@ -78,7 +78,7 @@ An HTTP-accessible JSON document at `https://<domain>/.well-known/scp` that enab
 ```json
 {
   "version": 1,
-  "did": "<the operator's identifier, in the textual form 09 §9.7.4.2 R13 defers>",
+  "did": "<the operator's identifier, in the text form 03 §3.1 fixes>",
   "relay": "wss://relay.example.com/scp/v1",
   "contexts": [
     {
@@ -102,7 +102,7 @@ An HTTP-accessible JSON document at `https://<domain>/.well-known/scp` that enab
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `version` | integer | Yes | Protocol version. Currently `1`. |
-| `did` | string | Yes | The operator's inception-derived identifier. **This field's encoding is the identifier's textual form**, which `09-security-model.md` §9.7.4.2 R13 defers. Enables the verification chain of §18.3.2. |
+| `did` | string | Yes | The operator's inception-derived identifier. **This field's encoding is the identifier's text form**, which `03-identity.md` §3.1 fixes. Enables the verification chain of §18.3.2. |
 | `relay` | string | Yes | Primary relay URL (`wss://` scheme, `/scp/v1` path). |
 | `contexts` | array | No | Publicly listed contexts. See constraints below. |
 | `handles` | object | No | Map of local-part → resolution record for domain handles (§22.6.1). |
@@ -636,11 +636,11 @@ Returns the most recent messages in the broadcast context, decrypted and seriali
 ```json
 {
   "context_id": "<hex>",
-  "author_did": "<the author's identifier, in the textual form 09 §9.7.4.2 R13 defers>",
+  "author_did": "<the author's identifier, in the text form 03 §3.1 fixes>",
   "messages": [
     {
       "id": "<blob_id_hex>",
-      "author_did": "<the author's identifier, in the textual form 09 §9.7.4.2 R13 defers>",
+      "author_did": "<the author's identifier, in the text form 03 §3.1 fixes>",
       "key_epoch": 42,
       "published_at": "2025-01-15T10:30:00Z",
       "content": "<base64-encoded decrypted content>"
@@ -670,7 +670,7 @@ Returns a single decrypted message:
 ```json
 {
   "id": "<blob_id_hex>",
-  "author_did": "<the author's identifier, in the textual form 09 §9.7.4.2 R13 defers>",
+  "author_did": "<the author's identifier, in the text form 03 §3.1 fixes>",
   "key_epoch": 42,
   "published_at": "2025-01-15T10:30:00Z",
   "content": "<base64-encoded decrypted content>"

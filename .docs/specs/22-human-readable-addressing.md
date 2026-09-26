@@ -473,7 +473,7 @@ The `.well-known/scp` document format (§18.3.1) is extended with an optional `h
 ```json
 {
   "version": 1,
-  "did": "<the operator's identifier, in the textual form 09 §9.7.4.2 R13 defers>",
+  "did": "<the operator's identifier, in the text form 03 §3.1 fixes>",
   "relay": "wss://relay.example.com/scp/v1",
   "handles": {
     "alice": {

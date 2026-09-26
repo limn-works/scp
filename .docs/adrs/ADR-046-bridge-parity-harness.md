@@ -152,10 +152,10 @@ crypto-generated identifiers on `identity_create_deterministic` and
 key must be a 33-byte base64 SEC1 compressed P-256 point, the signature
 must be 64-byte base64 — but we do not require cross-bridge byte equality.
 **Amended 2026-09-10:** the comparator pinned a textual identifier
-pattern and a 32-byte key. ADR-063, inception-derived self-certifying
-identity over a key-event log, defers the identifier's textual form, so
-no shape assertion pins one, and its §The curve and the root's custody
-sets the key width.
+pattern and a 32-byte key. `03-identity.md` §3.1 fixes the identifier's text form, which no shape
+assertion pins, and ADR-063, inception-derived self-certifying identity
+over a key-event log, sets the key width under its §The curve and the
+root's custody.
 
 This trades off a class of findings (bit-exact crypto divergence) for
 shipping the harness now. When a bridge-wide `seed` parameter lands, flip

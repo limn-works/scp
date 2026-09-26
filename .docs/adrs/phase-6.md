@@ -501,7 +501,7 @@ bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/ 
 
 **Status:** Decided
 
-**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, made resolution return a key state, and `09-security-model.md` §9.7.4.2 R13 defers the identifier's textual form, so no example here prints one.
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, made resolution return a key state, and an example here writes a named placeholder where an identifier's text form (`03-identity.md` §3.1) would stand.
 
 ### Context
 

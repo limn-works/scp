@@ -2204,7 +2204,7 @@ A **standing pair** is the `bilateral-persistent` context two identities create 
 derived_context_id   = SHA-256( "standing:" || id_lo || id_hi )
 standing_context_id  = "standing-" || hex( derived_context_id )
 ```
-`id_lo` and `id_hi` are the two participants' identifiers, each a fixed-length 32-byte field carrying no length prefix, ordered by unsigned byte comparison (`09-security-model.md` §9.7.4.2 R13, §9.5.1). `hex(...)` is lowercase hex of the 32-byte digest; the raw 32-byte digest is `derived_context_id: [u8;32]`. Both parties order one pair one way, so `derive(A,B) == derive(B,A)` and no party "allocates" the id. **The preimage is computable today**, because it consumes the 32 raw digest bytes and never the textual form R13 defers, and `09-security-model.md` §9.5.2 says so.
+`id_lo` and `id_hi` are the two participants' identifiers, each a fixed-length 32-byte field carrying no length prefix, ordered by unsigned byte comparison (`09-security-model.md` §9.7.4.2 R13, §9.5.1). `hex(...)` is lowercase hex of the 32-byte digest; the raw 32-byte digest is `derived_context_id: [u8;32]`. Both parties order one pair one way, so `derive(A,B) == derive(B,A)` and no party "allocates" the id. **The preimage is computable today**, because it consumes the 32 raw digest bytes and never the text form, and `09-security-model.md` §9.5.2 says so.
 
 **Injectivity invariant (load-bearing, unconditional by construction).** Both fields are 32 bytes wide, so the preimage re-parses uniquely back into the ordered pair `(id_lo, id_hi)` and no attacker can shift a boundary to forge a colliding pair.
 

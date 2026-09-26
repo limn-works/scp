@@ -151,7 +151,7 @@ Core properties:
 
 ### 11.2.4 Why not `did:scp`
 
-**A `did:scp` method facade over the key-event log is deferred, not rejected.** Alec ruled on 2026-08-30 — "punt, be ready, don't foreclose" — and ADR-063 records the ruling: SCP does not depend on a DID string, and the identifier's own textual form is what a later revision of `09-security-model.md` §9.7.4.2 fixes. The interoperability argument that once favored keeping the did:dht string is gone with the string, so the open question is whether a W3C DID Core facade buys SCP anything, and no artifact answers it yet.
+**A `did:scp` method facade over the key-event log is deferred, not rejected.** Alec ruled on 2026-08-30 — "punt, be ready, don't foreclose" — and ADR-063 records the ruling: SCP does not depend on a DID string, and `03-identity.md` §3.1 fixes the identifier's own text form. The interoperability argument that once favored keeping the did:dht string is gone with the string, so the open question is whether a W3C DID Core facade buys SCP anything, and no artifact answers it yet.
 ### 11.2.5 KERI, the model for the key-event log
 
 **KERI is the protocol SCP's identity substrate is modelled on, and ADR-063 carries the comparison.** KERI — Key Event Receipt Infrastructure — establishes control authority over a self-certifying identifier by replaying that identifier's own append-only log of key events, with no registry, no ledger, and no dependency on any other infrastructure. ADR-063, the inception-derived key-event-log identity substrate, states in its "Relationship to KERI" section what SCP adopts as KERI states it, what SCP adapts and why, and what SCP owns because KERI does not reach it.

@@ -531,7 +531,7 @@ scp:capability:{kebab-case-name}/v{integer}
 
 SDKs MUST reject any `scp:capability:*` URI not present in the signed protocol registry. The prefix is reserved — no agent, context, or outlet may define new URIs under this prefix. Capabilities are atomic: exact string equality for matching. No deeper nesting is permitted.
 
-**Identifier-scoped custom capabilities** take the definer's identifier as the authority, and this spec prints no such URI because `09-security-model.md` §9.7.4.2 R13 defers the identifier's textual form. Trust in such a capability is trust in its definer. They follow the same versioning and kebab-case naming rules as protocol capabilities.
+**Identifier-scoped custom capabilities** take the definer's identifier as the authority, written in the text form `03-identity.md` §3.1 fixes. Trust in such a capability is trust in its definer. They follow the same versioning and kebab-case naming rules as protocol capabilities.
 
 **System capabilities** describe protocol-level node roles (not challenge-testable):
 

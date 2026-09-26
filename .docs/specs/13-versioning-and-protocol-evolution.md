@@ -93,7 +93,7 @@ The `.well-known/scp` document (§18.3) already has a `version` field (currently
 {
   "version": 1,
   "protocol_version": "1.0",
-  "did": "<the operator's identifier, in the textual form 09 §9.7.4.2 R13 defers>",
+  "did": "<the operator's identifier, in the text form 03 §3.1 fixes>",
   "relay": "wss://relay.example.com/scp/v1",
   ...
 }
@@ -228,7 +228,7 @@ scp:ext:{kebab-case-name}/v{integer}
 
 Examples: `scp:ext:broadcast-projection/v1`, `scp:ext:media-signaling/v1`, `scp:ext:coap-transport/v1`.
 
-The `scp:ext:` prefix is reserved for protocol-defined extensions. A third-party extension uses a URI scoped to its definer's identifier, and this spec prints no such URI because `09-security-model.md` §9.7.4.2 R13 defers the identifier's textual form.
+The `scp:ext:` prefix is reserved for protocol-defined extensions. A third-party extension uses a URI scoped to its definer's identifier, written in the text form `03-identity.md` §3.1 fixes.
 
 ### 13.7.2 Extension Advertisement
 
