@@ -1392,7 +1392,7 @@ A conflict statement is portable evidence that two chains for one subject were o
 
 **The residue the predicate leaves, stated rather than repaired.** A witness operator that sets `seed` on every head it ever releases satisfies "neither head setting `seed`" on no pair of its heads, so no fault proof exists against it however many baselines it equivocates on. No rule refuses a head carrying the byte, no rule caps the seeds one witness declares, and no verdict reads the count, exactly as no party checks a declared `standing_root: Lost` under R3. What a reader holds instead is visibility: a witness that sets the byte on every head releases a stream of heads none of which carries another's digest, which any party holding two of them sees. The second residue is the false positive the disjunction admits: an operator restoring a backup releases two heads at one sequence under two `previous_cosigned_digest` values, and the predicate attributes an equivocation to an operator whose store, rather than whose conduct, produced the pair.
 
-One party would act on the fault proof, and this spec names no such party. The community relay list is curated outside the protocol, and nothing in the protocol detects a curation breach. An SDK MUST surface the fault proofs it holds.
+One party would act on the fault proof, and this spec names no such party. Limn curates the community relay list outside the protocol, and nothing in the protocol detects a curation breach. An SDK MUST surface the fault proofs it holds.
 
 A badly curated list, or several entries secretly under one operator, is a supply-chain risk no protocol check covers, of the class a compromised browser root store belongs to.
 
