@@ -38,7 +38,12 @@
 # the presence walk finds comes from the features the wheel's configuration names.
 # The walk's path from the wheel's package down to `openssl-sys` is still read
 # from the unified graph, so an optional edge on that path that only another
-# member's feature selection switches on is counted too.
+# member's feature selection switches on is counted too. `run_gate` therefore
+# also resolves the wheel's package alone with `cargo tree -p … --target all` and
+# fails when that resolution reaches no `openssl-src`. That check is exact about
+# features and loose about triples, and the per-triple walk is the reverse, so
+# one gap remains: a triple where only the unified graph reaches `openssl-src`
+# passes whenever the wheel's own features reach it on some other triple.
 #
 # Both absence resolutions name `--target all`, the union over every triple, which
 # is the correct over-approximation for a proof that a crate is ABSENT, and which
@@ -58,8 +63,10 @@
 #     `<maturin project file><TAB><package>|<feature arguments>` line per
 #     pyproject.toml a maturin step can read. `run_gate` fails unless exactly one
 #     such line came back.
-#   * The wheel's triples are the `- target:` values of the `python-wheels` job's
-#     matrix in `.github/workflows/build-matrix.yml`, the job that builds the wheel.
+#   * The wheel's triples are the `target:` values of the items of the
+#     `python-wheels` job's matrix `include:` list in
+#     `.github/workflows/build-matrix.yml`, the job that builds the wheel. An item
+#     that yields no bare triple fails the gate.
 #
 # This gate asks the owner gate to print its lists rather than parsing that file's
 # source text, because bash expands every spelling of an array assignment and a
@@ -118,29 +125,60 @@ FEATURE_GRAPH_GATE="scripts/check-shipped-feature-graph.sh"
 WHEEL_MATRIX_FILE=".github/workflows/build-matrix.yml"
 WHEEL_JOB="python-wheels"
 
-# The program behind wheel_triples: it prints the `- target:` values of the matrix
-# of the job named on argv[2] in the workflow file on argv[1]. A job begins at a
-# two-space-indented key and ends at the next one. An answer naming no triple
-# fails, because "the wheel ships for no target" and "the reader stopped working"
-# must not print the same verdict.
+# The program behind wheel_triples: it prints the `target:` value of every item of
+# the one `include:` list inside the job named on argv[2] in the workflow file on
+# argv[1]. A job begins at a two-space-indented key and ends at the next one or at
+# a column-zero key. The criterion is that every include item yields one bare
+# triple. An item naming no `target:` key, naming two, or naming one whose value
+# is quoted, commented, or an expression FAILS, and so does a job holding zero
+# `include:` keys or two, so a matrix leg this reader cannot read stops the gate
+# instead of dropping out of the per-triple presence proof.
 read -r -d '' WHEEL_TRIPLES_PROGRAM <<'PYTHON' || true
 import re
 import sys
 
 path, job = sys.argv[1], sys.argv[2]
-inside = False
-triples = []
 with open(path, encoding="utf-8") as workflow:
-    for line in workflow:
-        header = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
-        if header:
-            inside = header.group(1) == job
-            continue
-        target = re.match(r"^\s*- target:\s*([A-Za-z0-9_.-]+)\s*$", line)
-        if inside and target:
-            triples.append(target.group(1))
-if not triples:
-    sys.exit(f"{path} names no '- target:' in the matrix of job '{job}'")
+    lines = workflow.read().splitlines()
+body, inside = [], False
+for line in lines:
+    header = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
+    if header or re.match(r"^\S", line):
+        inside = bool(header) and header.group(1) == job
+        continue
+    if inside:
+        body.append(line)
+starts = [i for i, line in enumerate(body) if re.match(r"^\s*include:\s*$", line)]
+if len(starts) != 1:
+    sys.exit(f"{path} job '{job}' holds {len(starts)} 'include:' keys; this gate reads exactly one matrix include list")
+base = len(body[starts[0]]) - len(body[starts[0]].lstrip())
+items, item_indent = [], None
+for line in body[starts[0] + 1:]:
+    if not line.strip() or line.lstrip().startswith("#"):
+        continue
+    indent = len(line) - len(line.lstrip())
+    if indent <= base:
+        break
+    if item_indent is None:
+        item_indent = indent
+    if indent == item_indent:
+        if not line.lstrip().startswith("- "):
+            sys.exit(f"{path} job '{job}': '{line.strip()}' sits at list-item depth without '- '")
+        items.append([])
+    elif indent < item_indent:
+        sys.exit(f"{path} job '{job}': '{line.strip()}' is indented between the include key and its items")
+    items[-1].append(line)
+if not items:
+    sys.exit(f"{path} job '{job}' has an empty matrix include list")
+triples = []
+for item in items:
+    keys = [line for line in item if re.match(r"^\s*(- )?['\"]?target['\"]?\s*:", line)]
+    if len(keys) != 1:
+        sys.exit(f"{path} job '{job}': the include item starting '{item[0].strip()}' names {len(keys)} 'target:' keys, not one")
+    value = re.match(r"^\s*(- )?target:\s*([A-Za-z0-9_.-]+)\s*$", keys[0])
+    if not value:
+        sys.exit(f"{path} job '{job}': '{keys[0].strip()}' is not 'target: <bare triple>'")
+    triples.append(value.group(2))
 print("\n".join(triples))
 PYTHON
 
@@ -214,8 +252,10 @@ feature_graph_gate_prints() {
 #   feature_graph_gate_prints fails on.
 #
 #   This reader applies no entry-count floor. `run_gate` checks every
-#   configuration this returns, so the list is its own coverage floor for what it
-#   names, and `default_member_binary_packages` below decides what it must name.
+#   configuration this returns, and workspace_occurrences resolves every
+#   workspace member at its default features whether or not an entry names it.
+#   A feature selection that no entry names, such as a `--features server`
+#   bridge build removed from the array, is covered by neither.
 shipped_configurations() {
   local file="$1"
   feature_graph_gate_prints "$file" --print-artifacts || return 1
@@ -370,7 +410,8 @@ workspace_occurrences() {
 
 # wheel_triples <workflow-file>
 #   Emit one target triple per line: the triples the wheel job's matrix builds.
-#   FAILS when no interpreter is on PATH or the matrix names no triple.
+#   FAILS when no interpreter is on PATH, or when any item of the job's matrix
+#   `include:` list yields no single bare triple.
 wheel_triples() {
   if [[ -z "$SCOPE_JSON_READER" ]]; then
     echo "no python3.12, python3, or python on PATH, so this gate cannot read the wheel's target triples" >&2
@@ -390,7 +431,9 @@ wheel_triples() {
 #
 #   The unified graph alone does not prove the wheel's own build vendors: another
 #   member or a dev-dependency can put the edge there. `run_gate` pairs this count
-#   with workspace_occurrences, which fails the gate whenever one does.
+#   with workspace_occurrences, which fails the gate whenever one does, and with
+#   vendor_crate_occurrences on the wheel's package alone, which fails it when the
+#   wheel's own features reach no openssl-src.
 #
 #   Only stdout is parsed. Cargo writes a warning to stderr and still exits 0, and
 #   a warning in front of the JSON would fail the parse on a tree that satisfies
@@ -574,6 +617,30 @@ run_fixtures() {
     '          - target: aarch64-apple-ios' > "$dir/nowheel.yml"
   wheel_triples "$dir/nowheel.yml" >/dev/null 2>&1; rc=$?
   expect "(triples) a workflow whose wheel job names no triple FAILS" "FAIL" "$rc"
+  # (triples-leg) one leg among several that the reader cannot read FAILS the
+  # reader, rather than dropping that triple out of the presence proof.
+  local leg_label leg_lines
+  for leg_label in "a quoted value" "a trailing comment" "no target key" "two target keys"; do
+    case "$leg_label" in
+      "a quoted value") leg_lines='          - target: "x86_64-pc-windows-msvc"' ;;
+      "a trailing comment") leg_lines='          - target: x86_64-pc-windows-msvc  # MSVC' ;;
+      "no target key") leg_lines='          - runner: windows-latest' ;;
+      "two target keys") leg_lines=$(printf '%s\n' '          - target: x86_64-pc-windows-msvc' '            target: aarch64-pc-windows-msvc') ;;
+    esac
+    printf '%s\n' 'jobs:' '  python-wheels:' '    strategy:' '      matrix:' '        include:' \
+      '          - target: x86_64-unknown-linux-gnu' "$leg_lines" '    steps:' > "$dir/leg.yml"
+    wheel_triples "$dir/leg.yml" >/dev/null 2>&1; rc=$?
+    expect "(triples-leg) a wheel leg written with $leg_label FAILS the reader" "FAIL" "$rc"
+  done
+  printf '%s\n' 'jobs:' '  python-wheels:' '    strategy:' '      matrix:' '        include:' \
+    '          - target: x86_64-unknown-linux-gnu' '            runner: ubuntu-latest' '' \
+    '          # a comment between legs' '          - target: aarch64-apple-darwin' '            runner: macos-latest' \
+    '          - runner: windows-latest' '            target: x86_64-pc-windows-msvc' \
+    '    steps:' '      - with:' '          target: ${{ matrix.target }}' > "$dir/leg.yml"
+  out="$(wheel_triples "$dir/leg.yml")"; rc=$?
+  expect "(triples-leg) legs separated by a blank line and a comment, and a leg whose first key is not target, are read" "PASS" "$rc"
+  same_string "$out" "$(printf '%s\n' x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc)"; rc=$?
+  expect "(triples-leg) and yield one triple per leg, ignoring the step's 'target:' input" "PASS" "$rc"
 
   # The counters run against a `cargo` on PATH that prints a chosen answer or
   # refuses to resolve one. Each proves a present crate is counted, an absent one
@@ -689,7 +756,7 @@ run_fixtures() {
     'fi' \
     'echo "the-package v0.1.0"' \
     'case " $* " in' \
-    "  *vendored-openssl*) echo \"${VENDOR_CRATE} v300.5.1+3.5.1\" ;;" \
+    "  *vendored-openssl*) [ -n \"\$FAKE_WHEEL_TREE_EMPTY\" ] || echo \"${VENDOR_CRATE} v300.5.1+3.5.1\" ;;" \
     "  *\" -p \"*) for p in \$FAKE_VENDORS; do case \" \$* \" in *\" -p \$p \"*) echo \"${VENDOR_CRATE} v300.5.1+3.5.1\" ;; esac; done ;;" \
     "  *\" --workspace \"*) case \" \$* \" in *no-dev*) ;; *) [ -n \"\$FAKE_BARE_VENDORS\" ] && echo \"${VENDOR_CRATE} v300.5.1+3.5.1\" ;; esac ;;" \
     'esac' \
@@ -756,6 +823,20 @@ run_fixtures() {
   printf '%s\n' "$scenario_out" | grep -qF "ok   — x86_64-unknown-linux-gnu reaches $VENDOR_CRATE"; rc=$?
   expect "(per-triple) and passes the triple that kept it" "PASS" "$rc"
 
+  # (scoped) the wheel's entry still names vendored-openssl and the unified
+  # metadata graph reaches openssl-src on every triple, but the wheel's package
+  # resolved alone reaches none, as when scp-ffi stops enabling scp-platform/sqlite
+  # while scp-node still does. No member selects the vendored build at default
+  # features, so the whole-workspace resolution stays at zero.
+  plant_gate "$gate_file" "$wheel_ok" "scp-node|" "scp-ffi|--features extension-module,vendored-openssl"
+  FAKE_WHEEL_TREE_EMPTY=1 FAKE_DROPPED_TRIPLE=none FAKE_VENDORS="" FAKE_BARE_VENDORS="" scenario "(scoped) run_gate FAILS when only the unified graph carries the wheel's openssl-src edge" "FAIL"
+  printf '%s\n' "$scenario_out" | grep -qF "ok   — x86_64-pc-windows-msvc reaches $VENDOR_CRATE"; rc=$?
+  expect "(scoped) the per-triple walk alone passes that tree" "PASS" "$rc"
+  printf '%s\n' "$scenario_out" | grep -qF "resolved alone, reaches no"; rc=$?
+  expect "(scoped) the resolution of the wheel's package alone names the failure" "PASS" "$rc"
+  printf '%s\n' "$scenario_out" | grep -qF "ok   — the whole-workspace build"; rc=$?
+  expect "(scoped) and the whole-workspace resolution passes it, so only the scoped check catches it" "PASS" "$rc"
+
   if [[ "$fixture_failures" -eq 0 ]]; then
     echo "   FIXTURES: all behavioural proofs passed."
     return 0
@@ -818,6 +899,21 @@ run_gate() {
       failures=$((failures + 1))
     fi
   done <<<"$triples"
+  # The per-triple counts read the workspace-unified graph, where another member's
+  # features can switch on an edge from the wheel's package. `cargo tree -p`
+  # resolves the wheel's package alone, so a count of zero here means the wheel's
+  # own features select no openssl-src on any triple.
+  if ! count="$(vendor_crate_occurrences "$pkg" "$built")"; then
+    echo "    FAIL — cargo resolved no graph for the wheel's package alone; the stderr above names why."
+    failures=$((failures + 1))
+  elif [[ "$count" -gt 0 ]]; then
+    echo "    ok   — $pkg [${feature_args:-default features}], resolved alone, reaches $VENDOR_CRATE"
+  else
+    echo "    FAIL — $pkg [${feature_args:-default features}], resolved alone, reaches no"
+    echo "           $VENDOR_CRATE on any triple; each per-triple count above came from"
+    echo "           another member's features in the unified cargo metadata graph."
+    failures=$((failures + 1))
+  fi
   echo
 
   echo "--> every other shipped configuration, resolved over every target triple, reaches no $VENDOR_CRATE"

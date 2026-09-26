@@ -184,8 +184,10 @@ cd "$REPO_ROOT"
 # this allowlist is the hand-maintained set of what is PERMITTED. An allowlist
 # covering every artifact says nothing about which artifact resolves which row, so
 # `scripts/check-vendored-openssl-scope.sh` decides that for the vendored-OpenSSL
-# rows: it reads the ARTIFACTS array below and fails unless exactly one entry
-# selects `vendored-openssl` and that entry builds the wheel's package.
+# rows: it reads the ARTIFACTS array below, resolves the graph of every entry
+# other than the wheel's and of the whole workspace and fails on any `openssl-src`
+# they reach, and fails unless the wheel's configuration reaches `openssl-src`
+# on every target triple the wheel ships for.
 # ---------------------------------------------------------------------------
 PERMITTED_ALLOWLIST="$(cat <<'EOF'
 scp-client-wasm/default
