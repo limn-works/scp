@@ -1127,6 +1127,16 @@ jobs:
           # SqliteStorage Arc past the test's reopen). That is unrelated to this
           # journal swap and is left to its own focused fix.
           cargo nextest run -p scp-testing --features sqlite --test saga_bridge_journal_swap
+          # crates/scp-testing/src/lib.rs compiles `pub mod helpers` only under
+          # this crate's `testing` feature, and that feature's list must name
+          # every feature helpers.rs needs, because the one build that turns it
+          # on, this crate's own test build, also unifies its dev-dependency
+          # features and would hide a missing entry. `--lib` builds no test
+          # target, so cargo resolves no dev-dependency feature: the first
+          # command fails if the module compiles without the feature, and the
+          # second fails if the feature cannot compile the module on its own.
+          cargo check -p scp-testing --lib
+          cargo check -p scp-testing --lib --features testing
 
   # Exercises the napi bridge in its PRODUCTION configuration: default features
   # (`server` on) but WITHOUT `testing` / `scp-core/testing` /
