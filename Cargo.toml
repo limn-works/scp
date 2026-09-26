@@ -53,10 +53,9 @@ members = [
 # crate's own test targets. ADR-062 §Decision 1 states its invariant for one
 # feature: "`scp-dht/testing` MUST NOT appear in any **default / non-testing**
 # feature list — only in `testing` features and dev-dependencies." It states no
-# such rule for `scp-identity/testing` or `scp-node/allow_unencrypted_storage`;
-# moving those two off the normal edges is this manifest's choice, not the ADR's,
-# and the normal `scp-core` and `scp-platform` edges above show the ADR does not
-# forbid a nullifier feature on a normal edge of this crate.
+# such rule for `scp-identity/testing` or `scp-node/allow_unencrypted_storage`,
+# so moving those two off the normal edges is this manifest's choice, not a rule
+# the ADR states.
 #
 # This paragraph claims nothing about the rest of the workspace, where each of
 # the three has its own routes: `crates/scp-ffi/Cargo.toml`'s `testing` feature
