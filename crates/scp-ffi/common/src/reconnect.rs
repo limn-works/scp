@@ -1,7 +1,7 @@
 //! Relay-backed reconnection driver (ADR-029).
 //!
 //! After the ADR-049 actor refactor, the per-context actor's
-//! [`ContextTransportProvider`] is **send-only** — it has no
+//! [`ContextTransportProvider`](scp_core::context::ContextTransportProvider) is **send-only** — it has no
 //! message-retrieval surface. Buffered-message retrieval (relay
 //! SUBSCRIBE / QUERY-since) is owned by
 //! [`scp_transport::TransportManager`] at the FFI/SDK relay-client layer.

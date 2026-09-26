@@ -1884,6 +1884,30 @@ pub enum BroadcastCommand {
         /// Oneshot reply channel. See [`BroadcastAdmissionReply`].
         reply: BroadcastAdmissionReply,
     },
+
+    /// Register a DID as a broadcast author on an existing broadcast context,
+    /// bypassing the normal governance round-trip.
+    ///
+    /// Single-node integration tests that need a multi-author broadcast context
+    /// cannot drive genuine governance (the bridge key-resolver only sees one
+    /// actor's custody). This command lets such tests populate the author
+    /// registry mirroring the author-publish/add path, so multi-author counter
+    /// and KEA-leaf tests can exercise their real fan-out instead of being
+    /// limited to the creator-only case.
+    ///
+    /// Mirrors [`MessagingCommand::SeedPeerPseudonym`] — same rationale, same
+    /// gating. Gated behind the `testing` feature — never compiled into
+    /// production builds, never reachable from any FFI bridge.
+    #[cfg(feature = "testing")]
+    SeedBroadcastAuthor {
+        /// Context identifier string.
+        context_id: String,
+        /// The DID to register as an additional broadcast author.
+        author_did: scp_did::DID,
+        /// Oneshot reply channel. Replies `Ok(())` once the author is
+        /// registered, or `Err` if the context is unknown or not broadcast.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
 }
 
 /// Reply-channel type alias for
@@ -2951,6 +2975,21 @@ pub enum QueriesCommand {
         /// Current Unix time (seconds) — caller supplies to keep the
         /// handler pure / deterministic.
         now_secs: u64,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<u64, ContextError>>,
+    },
+    /// The context's `checkpoint_events_since` counter (testing).
+    ///
+    /// §9.9.3 of the security-model spec compares members' Merkle roots at an
+    /// equal event count, so every durable leaf a helper appends must credit
+    /// this counter exactly once. Integration tests read the counter through
+    /// this variant and compare its delta against the event-log delta; a
+    /// leaf-count assertion alone cannot detect a missed or doubled credit.
+    /// Replies `Err(ContextNotRegistered)` when the context has no actor.
+    #[cfg(feature = "testing")]
+    CheckpointEventsSince {
+        /// Context identifier string.
+        context_id: String,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<u64, ContextError>>,
     },

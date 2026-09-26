@@ -164,7 +164,7 @@ pub struct NodeState {
     pub(crate) tls_config: Option<Arc<rustls::ServerConfig>>,
     /// The TLS certificate resolver for ACME hot-reload.
     ///
-    /// When `Some`, the ACME renewal loop can call [`CertResolver::update`]
+    /// When `Some`, the ACME renewal loop can call [`CertResolver::update`](crate::tls::CertResolver::update)
     /// to hot-swap certificates without restarting the server.
     /// When `None` (no-domain mode), ACME is not active.
     ///
@@ -233,8 +233,8 @@ pub struct NodeState {
 
     /// Production bridge lookup for bridge auth middleware (spec section 12.10.2).
     ///
-    /// When `Some`, the bridge router is wrapped with [`bridge_auth_middleware`]
-    /// and [`webhook_auth_middleware`] using this lookup. When `None` (e.g., in
+    /// When `Some`, the bridge router is wrapped with [`bridge_auth_middleware`](crate::bridge_auth::bridge_auth_middleware)
+    /// and [`webhook_auth_middleware`](crate::bridge_auth::webhook_auth_middleware) using this lookup. When `None` (e.g., in
     /// tests or when bridges are not configured), the bridge router is mounted
     /// without authentication.
     pub(crate) bridge_lookup: Option<Arc<dyn crate::bridge_auth::BridgeLookup>>,

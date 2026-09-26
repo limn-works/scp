@@ -40,7 +40,14 @@ scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2", features =
 arc-swap = { workspace = true }
 axum = { workspace = true, features = ["ws"] }
 ed25519-dalek = { workspace = true }
-instant-acme = "0.8"
+# default-features disabled for the same reason the `quinn` note below gives. instant-acme's
+# default feature set is `["aws-lc-rs", "hyper-rustls"]`, and its `aws-lc-rs` feature turns on
+# `rcgen/aws_lc_rs` and `hyper-rustls/aws-lc-rs` as well as `dep:aws-lc-rs`, so a crate that
+# every other TLS dependency here pins to ring was pulling aws-lc-rs and its `aws-lc-sys` C
+# build in through the ACME client. `ring` forwards to `rcgen/ring` and `hyper-rustls/ring`
+# the same way and enables `dep:rcgen`, so the resolved dependency set is the one below
+# minus aws-lc.
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
 rcgen = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # default-features disabled to avoid quinn's `platform-verifier` feature, which

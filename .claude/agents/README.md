@@ -8,11 +8,13 @@ An agent file must say, in one sentence, what the agent has to confirm before it
 
 An agent handed a checklist and no criterion completes the checklist and reports success. That is how `let _ = function_name;` came to satisfy a string-search test while calling nothing.
 
-When you write or edit an agent definition, satisfy both requirements:
-1. State the criterion in the file, in one sentence the agent can quote back. "INCOMPLETE if any acceptance criterion has no code behind it" is a criterion. "Check for stubs, check for `None`, check the matrix" is a recipe.
-2. Mark the recipe as a recipe. Write "these dimensions are where gaps usually hide, not the definition of a gap," so an agent that exhausts the list still knows it has not yet met the criterion.
+Every definition in this directory carries both requirements in a `## Verdict criterion` section, placed directly under the frontmatter and above every other section, so an agent reading the file top-down meets the criterion before the recipe. The section holds two labelled lines:
+1. `**Criterion:**` — the criterion, in one sentence the agent can quote back. "INCOMPLETE if any acceptance criterion has no code behind it" is a criterion. "Check for stubs, check for `None`, check the matrix" is a recipe.
+2. `**Indicators, not the criterion.**` — the sentence that labels the rest of the file as the place to look. Write "these dimensions are where gaps usually hide, not the definition of a gap," so an agent that exhausts the list still knows it has not yet met the criterion.
 
-Every agent definition also follows `.docs/standards/concrete-prose.md`, which governs all prose in this repository.
+`scripts/check-agent-verdict-criterion.sh` fails the build when a definition omits the section, buries it under another section, drops either label, or leaves a label with no sentence after it. The gate reads that structure and never the meaning of the sentences, so a reviewer still applies the test in the paragraph above: a criterion states what decides the verdict, and a recipe states where to look. A `**Criterion:**` line that lists dimensions passes the gate and fails the review.
+
+Write every agent definition to `.docs/standards/concrete-prose.md`, the writing standard that governs all prose in this repository, and rewrite to it every sentence you edit in one.
 
 Every review agent also follows "Review the class, not the instance" in the Agents section of `CLAUDE.md`: it searches the sibling sites before it writes a finding and reports every site it found as one finding. That statement in `CLAUDE.md` is the authoritative one, so no agent definition repeats it.
 

@@ -375,7 +375,7 @@ pub(crate) fn economy_antispam_escalated_cost_on(
 /// Per-bridge-instance implementation of `economy_verify_payment_receipts`.
 ///
 /// Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
-/// dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the supervisor,
+/// dispatches an [`EconomyCommand::VerifyPaymentReceipts`](scp_core::context::actor::commands::EconomyCommand::VerifyPaymentReceipts) to the supervisor,
 /// returning a JSON `{"all_valid": <bool>, "results": [...]}` document with one
 /// entry per receipt. Mirrors the `PyO3` reference bridge exactly. Maximum
 /// 10,000 receipts per call.

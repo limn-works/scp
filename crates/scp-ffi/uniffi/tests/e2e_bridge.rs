@@ -20,6 +20,8 @@
     clippy::items_after_statements
 )]
 
+use std::sync::Arc;
+
 use scp_ffi_uniffi::{
     // Types
     CeilingPolicy,
@@ -515,13 +517,91 @@ async fn context_send_message() {
         .await
         .unwrap();
 
-    // Send a message (no real recipient, just validates the API path)
-    let result = scp
-        .context_send(handle, alice, b"Hello, world!".to_vec(), None)
-        .await;
-    // Send may succeed or fail depending on crypto provider wiring.
-    // The important thing is it doesn't panic.
-    let _ = result;
+    // Alice is a member of her own context and holds its group key, so this
+    // send must succeed. An earlier version bound that result to `_`, which
+    // passed whether this bridge encrypted her payload or returned an
+    // error.
+    scp.context_send(handle, alice, b"Hello, world!".to_vec(), None)
+        .await
+        .expect("context_send should succeed for a context creator");
+}
+
+/// `invite_member` seals a real bundle for an invitee this same `Scp` minted.
+///
+/// The Kotlin suite asserts the same outcome through the generated bindings
+/// (`bindings/kotlin/scp-kt/src/test/kotlin/works/limn/scp/JoinFromWelcomeTest.kt`),
+/// and `cargo nextest run --workspace` runs no Kotlin. This test therefore
+/// carries the claim: sealing resolves the invitee's `#active` key from a DID
+/// document, and `identity_create` publishes that document into the same DHT
+/// client the per-instance resolver reads. Were that publish to stop happening,
+/// the invite would fail at the `#active`-key resolution seam and this test
+/// would report it, rather than a Kotlin job that CI does not run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invite_member_seals_for_a_locally_minted_invitee() {
+    use scp_ffi_uniffi::bridge::InviteMemberOutcome;
+
+    let scp = Scp::new_in_memory_for_test();
+    let creator = scp
+        .identity_create("in_memory".to_owned(), None)
+        .await
+        .unwrap();
+    let invitee = scp
+        .identity_create("in_memory".to_owned(), None)
+        .await
+        .unwrap();
+    let creator_did = creator.did();
+
+    // The invite routes through the actor's governance gate, which enforces
+    // the proposer's `governance:propose` capability and nothing else, so the
+    // ceiling must carry it. This is the ceiling the Kotlin suite's
+    // `makeInviteParams()` builds.
+    let mut params = full_capability_params();
+    params.ceiling.push("governance:propose".to_owned());
+    params.ceiling.push("governance:vote".to_owned());
+    let handle = scp
+        .context_create(Arc::clone(&creator), params)
+        .await
+        .unwrap();
+    let context_id = handle.context_id();
+
+    let reservation = scp
+        .reserve_key_package(Arc::clone(&invitee))
+        .await
+        .expect("reserve_key_package should mint a single-use KeyPackage");
+
+    let outcome = scp
+        .invite_member(
+            creator,
+            context_id.clone(),
+            invitee.did(),
+            reservation.key_package_public,
+            Vec::new(),
+        )
+        .await
+        .expect("invite_member should seal for an invitee this instance minted");
+
+    let InviteMemberOutcome::Sealed { bundle, delivered } = outcome;
+    assert_eq!(
+        bundle.context_id, context_id,
+        "the sealed bundle names the context the creator invited into"
+    );
+    assert_eq!(
+        bundle.creator_did, creator_did,
+        "the sealed bundle names the creator who signed it"
+    );
+    assert_eq!(
+        bundle.enc.len(),
+        32,
+        "RFC 9180 HPKE encapsulates a 32-byte key"
+    );
+    assert!(
+        !bundle.ciphertext.is_empty(),
+        "HPKE sealing produces a ciphertext"
+    );
+    assert!(
+        !delivered,
+        "no relay URL was supplied, so the caller delivers the bundle itself"
+    );
 }
 
 #[tokio::test]
@@ -548,19 +628,44 @@ async fn context_close_lifecycle() {
 }
 
 #[tokio::test]
-async fn context_drain_events_returns_vec() {
+async fn context_drain_events_returns_the_join_events() {
     let scp = Scp::new_in_memory_for_test();
     let alice = scp
         .identity_create("in_memory".to_owned(), None)
         .await
         .unwrap();
-    let handle = scp
-        .context_create(alice, default_encrypted_params())
+    let bob = scp
+        .identity_create("in_memory".to_owned(), None)
         .await
         .unwrap();
-    let events = scp.context_drain_events(handle).await;
-    // Events may be empty but should not panic
-    assert!(events.is_empty() || !events.is_empty());
+    let bob_did = bob.did();
+    let handle = scp
+        .context_create(alice, full_capability_params())
+        .await
+        .unwrap();
+    scp.context_join(Arc::clone(&handle), bob, None)
+        .await
+        .expect("context_join should succeed");
+
+    let events = scp.context_drain_events(Arc::clone(&handle)).await;
+
+    // Admitting a member buffers `MemberJoined` and `WelcomeGenerated`. An
+    // earlier assertion here read `events.is_empty() || !events.is_empty()`,
+    // which every value satisfies.
+    assert!(
+        events
+            .iter()
+            .any(|e| e.contains("MemberJoined") && e.contains(&bob_did)),
+        "drained events must carry MemberJoined naming whichever DID joined, got: {events:?}"
+    );
+
+    // Draining removes what it returned, so a second call over one buffer
+    // returns nothing.
+    let second = scp.context_drain_events(handle).await;
+    assert!(
+        second.is_empty(),
+        "a second drain must return nothing, got: {second:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -610,13 +715,21 @@ async fn context_ttl_operations() {
     // Reset TTL timer (should not panic)
     scp.context_reset_ttl_timer(handle.clone(), 7200).await;
 
-    // Propose TTL extension (may fail if governance requires it, that's OK)
-    let _ = scp
+    // Alice is sole admin of this context, so her extension proposal carries
+    // and applies. An earlier version bound both results to `_`, which passed
+    // whether this bridge reached its supervisor or returned an error.
+    let extended = scp
         .context_propose_ttl_extension(handle.clone(), alice_did, 14400)
-        .await;
+        .await
+        .expect("a sole admin may propose a TTL extension");
+    assert!(
+        extended,
+        "a single-admin proposal must apply immediately rather than await a vote"
+    );
 
-    // Handle TTL expiry
-    let _ = scp.context_handle_ttl_expiry(handle).await;
+    scp.context_handle_ttl_expiry(handle)
+        .await
+        .expect("handling expiry on a live context must succeed");
 }
 
 // ---------------------------------------------------------------------------
@@ -670,13 +783,19 @@ async fn broadcast_lifecycle() {
         .await
         .unwrap();
 
-    // Check admission mode
-    let admission = scp.broadcast_admission(handle.clone()).await;
-    let _ = admission;
-
-    // Check subscriber count
-    let count = scp.broadcast_subscriber_count(handle.clone()).await;
-    let _ = count;
+    // This context was created without broadcast, so it carries no broadcast
+    // state: both queries answer `None` rather than a fabricated default. An
+    // earlier version bound both to `_`, which passed for every value.
+    assert_eq!(
+        scp.broadcast_admission(handle.clone()).await,
+        None,
+        "a context created without broadcast has no admission mode"
+    );
+    assert_eq!(
+        scp.broadcast_subscriber_count(handle.clone()).await,
+        None,
+        "a context created without broadcast has no subscriber count"
+    );
 
     // Check is_subscriber
     let is_sub = scp
@@ -766,10 +885,12 @@ async fn ucan_mint_and_revoke() {
     let caps = token.capabilities();
     assert!(!caps.is_empty(), "Capabilities should be non-empty");
 
-    // Revoke the token (revoker is the context creator).
-    let revoke_result = scp.ucan_revoke(handle, token.encoded(), alice.did()).await;
-    // Revocation may succeed or fail based on implementation, but should not panic.
-    let _ = revoke_result;
+    // Alice is both issuer of this token and creator of this context, so
+    // `BridgeRevocationAuthorizer` accepts her. An earlier version bound that
+    // result to `_`, which passed whether revocation ran or failed.
+    scp.ucan_revoke(handle, token.encoded(), alice.did())
+        .await
+        .expect("a context creator may revoke a token she issued");
 }
 
 // ---------------------------------------------------------------------------
@@ -783,14 +904,33 @@ async fn event_log_query_returns_events() {
         .identity_create("in_memory".to_owned(), None)
         .await
         .unwrap();
+    let alice_did = alice.did();
     let handle = scp
         .context_create(alice, default_encrypted_params())
         .await
         .unwrap();
 
     let events = scp.event_log_query(handle, None).await.unwrap();
-    // May return empty vec for a fresh context
-    assert!(events.is_empty() || !events.is_empty());
+
+    // `create_context` appends `ContextCreated` at step 7, so a freshly
+    // created context already holds one event. An earlier assertion here read
+    // `events.is_empty() || !events.is_empty()`, which every value satisfies.
+    let created = events
+        .iter()
+        .find(|event| event.event_type == "ContextCreated")
+        .unwrap_or_else(|| {
+            panic!(
+                "event_log_query must return a ContextCreated event, got: {:?}",
+                events
+                    .iter()
+                    .map(|e| e.event_type.clone())
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        created.actor_did, alice_did,
+        "ContextCreated must name whichever identity created this context as actor"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1170,9 +1310,13 @@ async fn invalid_did_rejected_at_bridge_boundary() {
         .await
         .unwrap();
 
-    // Empty DID should fail validation or return false
-    let result = scp.context_is_member(handle, String::new()).await;
-    let _ = result;
+    // An empty DID names no member, so this membership query answers
+    // `false`. An earlier version bound that result to `_`, which passed even
+    // when this bridge answered `true` for an empty DID.
+    assert!(
+        !scp.context_is_member(handle, String::new()).await,
+        "an empty DID must never be reported as a member"
+    );
 }
 
 // ---------------------------------------------------------------------------

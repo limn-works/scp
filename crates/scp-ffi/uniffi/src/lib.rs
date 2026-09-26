@@ -210,7 +210,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Global count of live opaque FFI handle objects.
 ///
 /// Incremented in each opaque type's constructor and decremented in `Drop`.
-/// Used by [`scp_shutdown`] to block runtime teardown until all handles
+/// Used by [`Scp::shutdown`](crate::scp::Scp::shutdown) to block runtime teardown until all handles
 /// are released.
 pub(crate) static HANDLE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -632,14 +632,13 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 4);
     }
 
+    /// `"platform"` and `"software"` are production custody kinds, so both
+    /// parse in every build. `"in_memory"` names the `InMemoryKeyCustody`
+    /// nullifier, so its arm is asserted per build configuration below.
     #[test]
     fn parse_custody_method_accepts_known_values() {
         use crate::bridge::parse_custody_method;
 
-        assert!(matches!(
-            parse_custody_method("in_memory"),
-            Ok(bridge::CustodyMethod::InMemory)
-        ));
         assert!(matches!(
             parse_custody_method("platform"),
             Ok(bridge::CustodyMethod::Platform)
@@ -648,6 +647,43 @@ mod tests {
             parse_custody_method("software"),
             Ok(bridge::CustodyMethod::Software)
         ));
+    }
+
+    /// A `testing` build admits `"in_memory"`, because that feature is the sole
+    /// activation path for the `InMemoryKeyCustody` nullifier backing it
+    /// (ADR-062, capability injection and prove-absent dev backends,
+    /// §Decision 6).
+    #[cfg(feature = "testing")]
+    #[test]
+    fn parse_custody_method_accepts_in_memory_under_testing() {
+        use crate::bridge::parse_custody_method;
+
+        assert!(matches!(
+            parse_custody_method("in_memory"),
+            Ok(bridge::CustodyMethod::InMemory)
+        ));
+    }
+
+    /// A shipped (no-`testing`) build rejects `"in_memory"` at the boundary with
+    /// `SCP-IDENT-1008` rather than admitting a custody kind whose only backing
+    /// implementation the feature severs. This is the shipped half of the
+    /// severance. Job rust-build-uniffi-production names this test in its `-E`
+    /// filter and runs it against `--features server`, which is the
+    /// configuration a released Swift/Kotlin SDK compiles.
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn parse_custody_method_rejects_in_memory_on_a_shipped_build() {
+        use crate::bridge::parse_custody_method;
+
+        match parse_custody_method("in_memory") {
+            Err(ScpError::Identity { code, msg }) => assert_eq!(
+                code,
+                scp_ffi_common::error_codes::IDENT_1008,
+                "expected the custody-unavailable code SCP-IDENT-1008, got code \
+                 {code} with message: {msg}"
+            ),
+            other => panic!("a shipped build must reject \"in_memory\" custody, got: {other:?}"),
+        }
     }
 
     #[test]

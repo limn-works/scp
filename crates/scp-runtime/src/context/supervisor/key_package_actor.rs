@@ -57,13 +57,12 @@
 //!    is rejected durably at the crypto layer. `ConfirmConsume` thus exercises
 //!    two independent keyings — the reservation-id tombstone here and the
 //!    init-key marker in the backend.
-//!    This backstop covers every join that flows through
-//!    `MlsBackend::join_from_welcome` (the fused-confirm path); the legacy
-//!    `NodeMlsFactory::join_from_welcome` calls `group::join_group_from_bytes`
-//!    directly and is production-unreachable (it is `#[cfg(any(test, feature =
-//!    "testing"))]`-gated), slated for deletion when the spawn-from-Welcome
-//!    entrypoint lands — so there is no LIVE production gap, only a test/feature-
-//!    gated path that will be removed.
+//!    This backstop covers every join because `MlsBackend::join_from_welcome`
+//!    (the fused-confirm path) is the only join primitive: the ADR-049 §9(b)
+//!    2F-residual slice deleted the legacy single-slot
+//!    `NodeMlsFactory::join_from_welcome` path, which called
+//!    `group::join_group_from_bytes` directly, and
+//!    `scripts/check-deleted-primitives.sh` rejects its reintroduction.
 //!
 //! The KP private signer-state lives ENTIRELY inside the opaque
 //! [`SignerState`](crate::crypto::mls::backend::SignerState) blob returned by
@@ -73,9 +72,8 @@
 //! for that material; deleting the KP record on consume/cancel makes a
 //! replayed join from the journal impossible (the signer-state is gone), and
 //! the consumed-init-key set makes a replay of any surviving bytes through
-//! `MlsBackend::join_from_welcome` impossible at the crypto layer (the legacy
-//! provider join path is production-unreachable — test/feature-gated, slated for
-//! deletion — see anchor 3 above).
+//! `MlsBackend::join_from_welcome` impossible at the crypto layer (the only
+//! join primitive — see anchor 3 above).
 //!
 //! ## Anchor independence vs. shared durable substrate
 //!

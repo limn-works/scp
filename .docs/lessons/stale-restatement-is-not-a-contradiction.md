@@ -51,7 +51,7 @@ establishes that the identifier is absent, and establishes nothing about whether
 protocol covers `#0`'s custody.
 
 **4. What owns the custody choice.** `ScpKeyCustodyAttestation`
-(`crates/scp-did/src/attestation.rs:41`) declares five fields:
+(`crates/scp-did/src/attestation.rs:49`) declares five fields:
 `active_key_custody: KeyCustodyModel` (line 43), `agent_key_custody:
 Option<KeyCustodyModel>` (line 47), `platform: Platform` (line 50),
 `platform_attestation: Option<PlatformAttestation>` (line 55), and `created_at: u64`

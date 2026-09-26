@@ -972,7 +972,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       );
     });
 
-    it("scp.identityVerifyLinkAttestation accepts a freshly-minted attestation", async () => {
+    it("scp.identityVerifyLinkAttestation verifies through this instance's resolver", async () => {
       const identity = await scp.identityCreate("in_memory");
       const attestationJson = await scp.identityCreateLinkAttestation(
         identity.did,
@@ -981,26 +981,57 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         "https://example.com/proof-carol",
         "dns_record",
       );
-      // The resolver needs the issuer's public key hex. We extract it
-      // from the DID document — the first verification method's
-      // publicKeyMultibase encodes the key in base58btc ("z" prefix).
-      const doc = (await scp.identityResolve(identity.did)) as {
-        verificationMethods: Array<{ publicKeyMultibase: string }>;
-      };
-      const multibase = doc.verificationMethods[0]?.publicKeyMultibase;
-      expect(multibase).toBeDefined();
-      // `scp.identityVerifyLinkAttestation` expects hex (not multibase).
-      // Rather than re-derive the hex form here, we verify that
-      // passing a *malformed* key hex rejects — which at least pins
-      // the surface. A happy-path verify requires the issuer public
-      // key hex, which is not exposed on the DID doc directly.
+      // GitHub issue #2335 finding 2: spec §3.5.4 step 1 resolves an issuer's
+      // DID document and takes a signing key from it, so a key a caller
+      // supplies is an assertion to check rather than a source of truth.
+      // Checking it needs a per-instance DID resolver, so this SCP method
+      // routes to the NAPI `Scp` class method rather than to a module-level
+      // free fn, which reaches no bridge instance and declines with
+      // SCP-IDENT-1060.
+      //
+      // An all-zero key is a key no DID document publishes, so this call
+      // reaches a real §3.5.4 decision rather than the SCP-IDENT-1060 an
+      // instance-less route returns. Whichever way that decision lands —
+      // `false` for an unpublished key, or a raise naming a §3.5.4 condition —
+      // SCP-IDENT-1060 no longer appears.
+      let verifyErr: unknown;
+      let verified: boolean | undefined;
+      try {
+        verified = await scp.identityVerifyLinkAttestation(
+          attestationJson,
+          "00".repeat(32),
+          "confirmed",
+        );
+      } catch (e) {
+        verifyErr = e;
+      }
+      if (verifyErr !== undefined) {
+        expect((verifyErr as Error).message).not.toContain("SCP-IDENT-1060");
+      } else {
+        expect(verified).toBe(false);
+      }
+    });
+
+    it("scp.identityVerifyLinkAttestation rejects an unknown referenceProof value", async () => {
+      const identity = await scp.identityCreate("in_memory");
+      const attestationJson = await scp.identityCreateLinkAttestation(
+        identity.did,
+        "github.com",
+        "dave",
+        "https://example.com/proof-dave",
+        "dns_record",
+      );
+      // A `referenceProof` outside "confirmed" and "not_fetched" selects no
+      // default: one shared parser in scp-ffi-common raises SCP-IDENT-1044,
+      // so a typo never lands a caller on a silent "not_fetched" verdict.
       let verifyErr: unknown;
       try {
-        await scp.identityVerifyLinkAttestation(attestationJson, "not-hex");
+        await scp.identityVerifyLinkAttestation(attestationJson, "00".repeat(32), "Confirmed");
       } catch (e) {
         verifyErr = e;
       }
       expect(verifyErr).toBeInstanceOf(Error);
+      expect((verifyErr as Error).message).toContain("SCP-IDENT-1044");
     });
   });
 

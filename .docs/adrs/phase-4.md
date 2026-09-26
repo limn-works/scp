@@ -185,10 +185,14 @@ pub struct TrustInput {
    - Warning count -> role demotion.
    - Returns list of triggered consequences with the triggering evidence.
 
-7. **`check_threshold_attestation(attestation_type, attestors, requirement) -> ThresholdResult`**
-   - Counts attestations of the given type from the attestor set.
+7. **`check_threshold_attestation(&ThresholdCheckInput) -> ThresholdResult`**
+   - `ThresholdCheckInput` carries an attestation type, an attestor set, a threshold requirement, a subject DID, a `DidPublicKeyResolver`, a `Clock`, and an optional external revocation checker.
+   - Admits an attestor only when that attestor's carried attestation answers a required type, names a given subject, names that attestor as its own issuer, and passes `verify_attestation_with_revocation`.
+   - Deduplicates admitted attestors by DID, per spec §7.3.5 rule 1: "Attestors MUST have distinct DIDs. Multiple attestations from the same DID count as one attestation regardless of quantity." Deduplication runs after verification, so a rejected duplicate never consumes a slot.
    - Verifies independence: shared context memberships and mutual endorsements reduce independence score.
    - Returns whether the N-of-M threshold is met with sufficient independence.
+
+   A prior revision of this ADR recorded three positional parameters — `(attestation_type, attestors, requirement)` — which admitted no subject, no issuer binding, and no signature check. Spec §7.3.5 rule 1 states distinct DIDs as REQUIRED, and that signature could not satisfy that rule, so N copies of one attestor yielded a full count and a maximum independence score. GitHub issue #2335 finding 9 recorded that gap; a named-field record above replaces those three parameters so no call path can skip a rule.
 
 8. **`check_attestation_freshness(attestation) -> FreshnessStatus`**
    - Evaluates renewal interval. Stale attestations (past renewal interval but not expired) are degraded, not revoked.
@@ -351,6 +355,16 @@ pub struct RelayDeletionRequest {
 | `close.rs` | Close orchestration per `ContextCloseReason`, summary verification window, key destruction sequencing |
 
 **Estimated functions:** ~15 public functions, ~10 internal helpers.
+
+---
+
+### Amendment (2026-08-25): a hardware destruction claim rates as software-only without a verified proof
+
+Alec ruled that a hardware-backed declaration reads as software-backed unless a verified platform attestation proof accompanies it. §27.4.6 of the attestations spec (`.docs/specs/27-attestations.md`) quotes the three statements he wrote, names the binary an agent posed to him, and states the ruling in four clauses; the sentence before this one is that section's statement of what he decided and is not his wording. §9.15 of the security spec assigns a confidence rating to the method those clauses produce. This ADR states no reading rule of its own.
+
+The ruling governs acceptance criterion 7 above. Its ordering sentence — "Hardware-attested (Secure Enclave/Keystore) > software-only > no attestation" — orders the levels a consumer reads, and the Rationale above states that a level reaches other members: "higher assurance levels are visible to other participants." A `KeyDestructionLevel::HardwareAttested` value a member shows another participant therefore ranks at software-only unless a verification of an accompanying platform attestation proof returns a pass. Criterion 7's remaining sentences stand unchanged: the level is metadata recorded in the close event, and no gate reads it.
+
+No SCP implementation verifies a destruction platform proof today, and the signing preimage of the published record leaves the proof outside the signed bytes, so every hardware level a member publishes ranks at software-only. Open question OQ-8 of the attestations spec asks a human whether the proof enters that signed scope, and open questions OQ-2 and OQ-29 of the same spec ask what a verification of it would check. The close path records `KeyDestructionLevel::SoftwareOnly` from the disposal outcome it observed, which is the level the ruling produces for that path either way.
 
 ---
 
