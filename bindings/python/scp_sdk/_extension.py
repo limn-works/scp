@@ -118,6 +118,14 @@ def native_module() -> Any:
     import :mod:`scp_sdk` and reach a meaningful error the first time it uses
     the bridge.
 
+    The import names :data:`EXTENSION_MODULE`, the package-scoped module that
+    :func:`extension_is_installed` probes. A bare ``import _scp_core`` would
+    search all of ``sys.path`` whenever the package's own extension is absent,
+    so a stray top-level ``_scp_core`` — an old ``maturin build`` output in the
+    working directory or on ``PYTHONPATH`` — would load in its place, and a
+    stray one that failed to ``dlopen`` would be reported as an absence because
+    the probe never looked at it.
+
     Raises:
         ScpError: ``SCP-UNKNOWN-0001`` when the extension is not installed,
             ``SCP-UNKNOWN-0002`` when the extension is installed and failed to
@@ -126,12 +134,12 @@ def native_module() -> Any:
             on the second.
     """
     try:
-        import _scp_core  # type: ignore[import-not-found]
+        import scp_sdk._scp_core as native  # type: ignore[import-not-found]
     except ImportError as exc:
         reject_load_failure(exc)
         raise ScpError(
-            "The _scp_core extension module is not installed. "
+            f"The {EXTENSION_MODULE} extension module is not installed. "
             "Install scp-python with: pip install scp-python",
             code="SCP-UNKNOWN-0001",
         ) from exc
-    return _scp_core
+    return native

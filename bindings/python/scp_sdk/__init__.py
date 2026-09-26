@@ -32,10 +32,12 @@ import sys
 
 from scp_sdk._extension import reject_load_failure as _reject_load_failure
 
-# Register the native extension under its bare name so that function-scoped
-# ``import _scp_core`` (used throughout the SDK) resolves correctly.  Maturin
-# installs the extension as ``scp_sdk._scp_core`` (see pyproject.toml
-# module-name), but every call-site does a bare ``import _scp_core``.
+# Register the native extension under its bare name ``_scp_core`` as well as
+# its package name. Maturin installs the extension as ``scp_sdk._scp_core``
+# (see pyproject.toml module-name), and every SDK accessor imports it by that
+# name through ``scp_sdk._extension.native_module``; the bare-name alias serves
+# callers outside the package, such as ``pytest.importorskip("_scp_core")`` in
+# the test suite. The alias is set only when the package's own module loaded.
 #
 # An absent extension is swallowed, so a pure-Python or mocked environment
 # still imports the package. A present extension that failed to load raises

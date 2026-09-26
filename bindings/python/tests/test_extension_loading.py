@@ -9,7 +9,7 @@ path, and in the `scp_sdk` package directory for a file another interpreter buil
 and raises `SCP-UNKNOWN-0002` for a load failure so the guards let it through.
 
 These tests import no native symbol: they drive the separation with
-`sys.modules["_scp_core"] = None`, which makes `import _scp_core` raise
+`sys.modules["scp_sdk._scp_core"] = None`, which makes the loader's import raise
 `ImportError` whether or not the compiled extension exists in this environment.
 """
 
@@ -54,14 +54,35 @@ BRIDGE_ACCESSORS = [
 
 @pytest.fixture
 def blocked_import(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make a bare ``import _scp_core`` raise ``ImportError``.
+    """Make the loader's ``import scp_sdk._scp_core`` raise ``ImportError``.
 
     ``None`` in ``sys.modules`` is the documented way to make an import fail
     without touching the filesystem, so this reproduces a ``dlopen`` failure and
     an absent extension alike — which is the point: the exception is identical and
     only :func:`scp_sdk._extension.extension_is_installed` tells them apart.
     """
-    monkeypatch.setitem(sys.modules, "_scp_core", None)
+    monkeypatch.setitem(sys.modules, _extension.EXTENSION_MODULE, None)
+
+
+def test_a_top_level_scp_core_on_the_path_never_stands_in_for_the_package_module(
+    blocked_import: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With the package's extension absent, a stray top-level ``_scp_core`` is not loaded.
+
+    A bare ``import _scp_core`` searches all of ``sys.path`` once
+    ``scp_sdk/__init__.py`` has registered no alias, so an old build left in the
+    working directory or on ``PYTHONPATH`` would load in place of the package's
+    module, which the probe never examined. The loader must instead report the
+    absence the probe reports.
+    """
+    (tmp_path / "_scp_core.py").write_text("STRAY_BUILD = True\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "_scp_core", raising=False)
+    monkeypatch.setattr(_extension, "extension_is_installed", lambda: False)
+    with pytest.raises(ScpError) as caught:
+        _extension.native_module()
+    assert caught.value.code == "SCP-UNKNOWN-0001"
+    assert "_scp_core" not in sys.modules
 
 
 def test_absent_extension_raises_the_absence_code(
