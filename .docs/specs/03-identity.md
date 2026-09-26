@@ -777,20 +777,17 @@ impl<S: Storage> Identity<S> {
 }
 ```
 
-**The write API is one method per consequential act on the identity handle, and each returns the `PublishOutcome` of the publish cycle that carries the event it signed.** `Identity::create` signs and publishes the inception event and returns the handle beside that outcome. `rotate_active` signs a `KeyState` that installs a fresh `#active` key and drops the replaced one as `Superseded`. `set_witnesses` signs a `KeyState` that names the witness set and its witnessing interval. `mark_compromised` signs a `KeyState` that drops each named key as `Compromised{from: N}`, where N is that event's own sequence; a `KeyState` drops no root member (`09-security-model.md` §9.7.4.2 R3), so the list names the `#active` key and the same event installs a fresh one, and a compromised root member leaves the root set under `recovery().begin(RecoveryKind::RootRecovery)`. `09-security-model.md` §9.7.4.2 R10 declares `Recovery::begin` and `RecoveryKind`, which compose and sign the reveal-authorized events.
+**The write API is one method per consequential act on the identity handle, and each returns the `PublishOutcome` of the publish cycle that carries the event it signed.** `Identity::create` signs and publishes the inception event and returns the handle beside that outcome. `rotate_active` signs a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` signs a `KeyState` that names the witness set and its witnessing interval. A compromised root member leaves the root set under `recovery().begin(RecoveryKind::RootRecovery)`, because a `KeyState` drops no root member (`09-security-model.md` §9.7.4.2 R3). `09-security-model.md` §9.7.4.2 R10 declares `Recovery::begin` and `RecoveryKind`, which compose and sign the reveal-authorized events.
 
 ```rust
 impl<S: EncryptedStorage> Identity<S> {
     pub fn create(config: IdentityConfig<S>)
         -> impl Future<Output = Result<(Identity<S>, PublishOutcome), IdentityError>> + Send;
 
-    pub fn rotate_active(&self)
+    pub fn rotate_active(&self, reason: RotationReason)
         -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
 
     pub fn set_witnesses(&self, witnesses: Vec<WitnessDesignation>, witnessing_interval: u32)
-        -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
-
-    pub fn mark_compromised(&self, keys: Vec<KeyId>)
         -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
 }
 
@@ -798,8 +795,9 @@ impl<S: EncryptedStorage> Identity<S> {
 /// entry declares (`09-security-model.md` §9.7.4.2 definitions).
 pub struct WitnessDesignation { pub operator: [u8; 32] }
 
-/// One key the key state names, by its 33-byte SEC1 compressed point.
-pub struct KeyId { pub key: [u8; 33] }
+/// Why `rotate_active` replaces the `#active` key, which decides the replaced
+/// key's condition.
+pub enum RotationReason { Routine, Compromised }
 ```
 
 The one unit a section outside this one reproduces, delimited here so it reproduces bytes rather than a paraphrase:

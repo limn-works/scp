@@ -10988,18 +10988,18 @@
         "crates/scp-identity/src/write.rs",
         "crates/scp-identity/src/lib.rs"
       ],
-      "description": "The write API `03-identity.md` §3.10.10 declares: `Identity::create`, which returns the handle beside the inception cycle's `PublishOutcome`, and `rotate_active`, `set_witnesses` and `mark_compromised`, each of which signs a `KeyState` and returns its cycle's `PublishOutcome`. The reveal-authorized events go through `Recovery::begin`, which SCP-305 implements, and SCP-008 implements the event composition these operations call.",
+      "description": "The write API `03-identity.md` §3.10.10 declares: `Identity::create`, which returns the handle beside the inception cycle's `PublishOutcome`, and `rotate_active` and `set_witnesses`, each of which signs a `KeyState` and returns its cycle's `PublishOutcome`. The reveal-authorized events go through `Recovery::begin`, which SCP-305 implements, and SCP-008 implements the event composition these operations call.",
       "acceptanceCriteria": [
-        "`Identity<S>` declares `create`, `rotate_active`, `set_witnesses` and `mark_compromised` with the signatures `03-identity.md` §3.10.10 declares, and each non-constructor returns `Result<PublishOutcome, IdentityError>`: a compile test calls each",
-        "`rotate_active` signs a `KeyState` under the standing root that installs a fresh `#active` key and drops the replaced key as `Superseded`: a test asserts both entries (`03-identity.md` §3.10.10, `09-security-model.md` §9.7.4.2 R8)",
+        "`Identity<S>` declares `create`, `rotate_active` and `set_witnesses` with the signatures `03-identity.md` §3.10.10 declares, and each non-constructor returns `Result<PublishOutcome, IdentityError>`: a compile test calls each",
+        "`rotate_active(RotationReason::Routine)` signs a `KeyState` under the standing root that installs a fresh `#active` key and drops the replaced key as `Superseded`, and `rotate_active(RotationReason::Compromised)` drops it as `Compromised{from: N}` with N equal to that event's own sequence: a test per reason asserts the replaced key's entry (`03-identity.md` §3.10.10, `09-security-model.md` §9.7.4.2 R8)",
+        "A `KeyState` the write API signs lists the entries it keeps `Current` in their existing order and then the entries it drops in their existing order: a test decodes the rotated snapshot and asserts that order (`09-security-model.md` §9.7.4.2 definitions)",
         "`set_witnesses` signs a `KeyState` naming the given witness set and witnessing interval and changes no commitment: a test asserts the snapshot fields and the unchanged commitment (`09-security-model.md` §9.7.4.2 R1)",
-        "`mark_compromised` signs a `KeyState` that drops the named `#active` key as `Compromised{from: N}` with N equal to that event's own sequence, and installs a fresh `#active` key in the same event: a test asserts both (`03-identity.md` §3.10.10)",
         "A cancelled or failed passkey gesture returns `IdentityError::UserVerificationDeclined` (SCP-IDENT-1109), and a custody backend error while signing returns `IdentityError::CustodySigningFailed` (SCP-IDENT-1111), each signing nothing: a test per case (`03-identity.md` §3.10.10)",
         "Each operation publishes through `IdentityBackend::publish` and returns its `PublishOutcome`: a test asserts the per-entry list (`03-identity.md` §3.10.10)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
-        "Implement `create`, `rotate_active`, `set_witnesses` and `mark_compromised` over SCP-008's composition.",
+        "Implement `create`, `rotate_active` and `set_witnesses` over SCP-008's composition.",
         "Map a declined gesture and a custody error to their `IdentityError` variants.",
         "Write one test per acceptance criterion."
       ],
@@ -11080,9 +11080,9 @@
       ],
       "description": "Architecture slice S11. PyO3, UniFFI and napi export identical identity and recovery functions, and each SDK wraps them under the names the shared scaffold's naming table gives, including `identity.recovery()` and `observe_self`. Every name-bound enumeration keeps the spec's PascalCase in every language. This satisfies the integration checklist's second, third and fifth checks.",
       "acceptanceCriteria": [
-        "PyO3, UniFFI and napi each export `identity_create`, `identity_resolve`, `identity_publish`, `identity_read_service_record`, `identity_publish_service_record`, `identity_read_policy`, `identity_fallback_set`, `identity_observe_self`, `identity_rotate_active`, `identity_set_witnesses`, `identity_mark_compromised` and the `recovery_*` functions, `recovery_begin` included: `ffi_conformance.rs` asserts each export on each bridge",
+        "PyO3, UniFFI and napi each export `identity_create`, `identity_resolve`, `identity_publish`, `identity_read_service_record`, `identity_publish_service_record`, `identity_read_policy`, `identity_fallback_set`, `identity_observe_self`, `identity_rotate_active`, `identity_set_witnesses` and the `recovery_*` functions, `recovery_begin` included: `ffi_conformance.rs` asserts each export on each bridge",
         "Each SDK wraps each export under the name the shared scaffold's naming table gives: a test per SDK calls each wrapper",
-        "`EntryReach`, `ChainRelation`, `ExtendingAct`, `EntryResult`, `NotSentReason`, `RecoveryPhase`, `RecoveryKind` and `ResolutionVerdict` carry their spec variant names verbatim in every SDK: a conformance test compares the variant names across the five languages (`03-identity.md` §3.10.10)",
+        "`EntryReach`, `ChainRelation`, `ExtendingAct`, `EntryResult`, `NotSentReason`, `RecoveryPhase`, `RecoveryKind`, `RotationReason` and `ResolutionVerdict` carry their spec variant names verbatim in every SDK: a conformance test compares the variant names across the five languages (`03-identity.md` §3.10.10)",
         "One conformance fixture of identity operations replays in Rust, Python, TypeScript, Swift and Kotlin with identical results",
         "The SDK capability matrix lists every operation above for every SDK",
         "The agent-key exports, `identity_migrate`, the DID-document classes and the FFI DHT client are absent from all three bridges: a grep per name prints nothing"
