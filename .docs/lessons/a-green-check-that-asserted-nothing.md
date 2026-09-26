@@ -333,8 +333,8 @@ assertion also selects a test that a `testing` flip leaves compiled.
 **16. A check whose condition its own hard-coded input makes constant.** A fix agent
 gave `check_testing_unification_readers` in `scripts/tests/ci-gate/ci_gate_selftest.py` a
 control named "the live workspace command resolves every package it selects", whose
-condition read `live_unresolved is None`. `command_build_manifests` returns that finding
-only from the branch it takes for a command naming neither `--workspace` nor `--all`, and
+condition read `live_unresolved is None`. `command_build_manifests`, a helper that branch
+added and a later round deleted, returned that finding only from the branch it took for a command naming neither `--workspace` nor `--all`, and
 the command under test was the literal `cargo nextest run --workspace`, so the condition
 held on every state this repository can reach. No edit to the readers, to any manifest,
 or to `[workspace] members` could turn it red. The control printed one green line and
@@ -344,11 +344,12 @@ evaluates the same way whatever the inputs are, which no amount of iterating fix
 the path a value takes from the literal input to the condition: when every path ends at
 the same answer, the check tests the literal and not the repository. Either hand the
 check an input that can produce the other answer, or fold the constant conjunct into a
-check that can go red and let a fixture control carry the property — the fix here
-folded `live_unresolved is None` into the positive control below it, which names a
-manifest it expects in the edge map, and left the two `cargo test -p ghost` fixture
-controls to prove that `command_unifies_testing` and `command_testing_edges` each report
-an unresolvable selection.
+check that can go red and let a fixture control carry the property. The fix here dropped
+the constant conjunct, and the live control now asks two questions that can each go red:
+whether a workspace build reads any edge turning `scp-identity/testing` on, and whether
+`testing_edge` finds that edge in `crates/scp-testing/Cargo.toml`. The
+`cargo test -p ghost` fixture control proves that `command_unifies_testing` reports an
+unresolvable selection.
 
 ## Tests holding these closed
 
