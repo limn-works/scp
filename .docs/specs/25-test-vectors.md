@@ -12,7 +12,7 @@ python3.12 scripts/gen-test-vectors-p256.py
 
 The script uses nothing outside the Python standard library, and it self-gates before it prints a byte: it checks itself against `SHA-256("")`, the RFC 6979 Appendix A.2.5 P-256 nonce and signature, RFC 5869 Appendix A.1 for HKDF-SHA256, and this section's own curve-independent `DataProvenance` hash (Vector 35), and it computes every public key twice by two scalar multiplications sharing no arithmetic, and a third time through the `cryptography` package where that package imports. A mismatch raises before anything prints.
 
-**Identifier strings in the fixtures, recorded 2026-09-10.** A vector that pins bytes over an identifier's textual form prints a fixture string of the shape `"did:dht:z6Mk…"`. That string is a fixture and states nothing about SCP's identifier: the identifier is the 32-byte digest of an inception event (`09-security-model.md` §9.7.4.2 R13), and the routing derivations, both continuity-fingerprint forms and §25.26's key-event vectors consume those 32 bytes. **The fixture strings carry that shape because the generator emitted it when the vectors were pinned, and the shape carries no meaning**: R13 defers the textual form, so such a vector pins the construction, the separator and the signature over the bytes it prints, and pins no textual form. `09-security-model.md` §9.5.2 enumerates the sixteen preimages that wait on R13. The generator regenerates each fixture string and every digest below it when a later revision of R13 fixes the encoding.
+**Identifier strings in the fixtures.** A vector pinned before `03-identity.md` §3.1 fixed the identifier's text form prints a fixture string of the shape `"did:dht:z6Mk…"` or `"did:key:…"` where a signed structure takes an identifier as UTF-8 bytes. That string is not the canonical form, and a parser rejects it with `IdentityError::NonCanonicalIdentifier` (§3.1). Such a vector pins the construction, the separator and the signature over the bytes it prints, and pins no identifier. Vector 57 of §25.29 pins the text form.
 
 **What a signature covers.** Every SCP signature here is an ECDSA signature over a 32-byte canonical hash, so the ECDSA message digest **is** that canonical hash and no second SHA-256 reaches it. The vectors run RFC 6979 with `h1` set to that same digest, because §9.5 fixes RFC 6979 with SHA-256 for a software signer and states no value for `h1` under a prehashed digest. An implementation that hashes the digest a second time reproduces none of the signature bytes below.
 
@@ -449,7 +449,7 @@ Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log
 
 **MessagePack layout of a signed `Event`.** The seven fields serialize positionally, so an implementer reproduces the bytes without reading Rust: a 7-element array holding the `EventType` variant **name** as a string, the actor DID as a string, the timestamp as an unsigned integer, the sequence as an unsigned integer, the one-element `EventPayload` array holding the payload as a MessagePack binary, the 32-byte `prev_hash` as a 32-element array of unsigned integers, and the 64-byte signature as a MessagePack binary. The signed value is `SHA-256("SCP-EVENT-V1:" || BE16(event_type_tag) || BE32(len(actor_did)) || actor_did || BE64(timestamp) || BE64(sequence) || BE32(len(payload)) || payload || prev_hash)`.
 
-**The actor DID is an opaque UTF-8 string here.** §9.7.4.2 R13 of the security-model spec fixes the identifier as `SHA-256("SCP-KEL-ID-V1:" || inception_signed_preimage)` and defers the identifier's textual form to a later revision, so no vector prints an identifier in the form a DID string would take. This vector therefore states its actor DID as a literal fixture string rather than deriving one from the signing key, and pins the typed-leaf preimage and the RFC 6962 root, which is what it exists to pin.
+**The actor DID is an opaque UTF-8 string here.** This vector states its actor DID as a literal fixture string, which §25.1's note on fixture strings covers, rather than deriving one from the signing key, and pins the typed-leaf preimage and the RFC 6962 root, which is what it exists to pin.
 
 ```
 Signing key: the §25.2 reference P-256 key (seed 0x9d61b1…7f60)
@@ -1812,4 +1812,194 @@ Canonical hash:
 Signature, secondary key (311 bytes on the wire):
   5ba64b72652d546603a529bf03ab548699269a77ee215b31edf0597cf258b3c3
   775b5d1cf03291277d994e85bd0bdc99497e002f426d2d00351d186d001a1cc4
+```
+
+## 25.29 Reveal-Authorized Event, Ranking and Identifier Text-Form Vectors (§9.7.4.2 definitions, R3, R6, `03-identity.md` §3.1)
+
+Vectors 53 through 55 each extend Vector 41's identity at sequence 1, so each reveal consumes the commitment Vector 41's inception fixed over §25.2's tertiary key, and the standing root at each event's predecessor is Vector 41's one-member root, §25.2's reference key. Every indexed signature takes the raw form, and each vector prints the signature field as the concatenation of its groups' indexed signatures in the kind's group order (§9.7.4.2 R3). The generator derives each fresh key from `SHA-256` of the ASCII seed string it names, under §25.2's test-vector key label.
+
+**The snapshot order a `RootRecovery` pins here.** §9.7.4.2's definitions order a snapshot's root members by the root set's own list order and state no position for an entry the event drops. Vectors 54 and 55 place every `Current` entry first and each dropped entry after them, each dropped key `Superseded` because a successor takes its role, so these two vectors pin the bytes of that one encoding.
+
+### Vector 53: a `CommitmentRollover` group layout
+
+The reveal group names next-set member 0 and the standing-root group names root member 0. Fields 5, 9, 10 and 11 carry their sentinels, and field 12 fixes one fresh commitment with next threshold 1.
+
+```
+identifier:            (Vector 41)
+  2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32
+predecessor_digest:    (Vector 41's preimage digest)
+  d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7
+consumed commitment:
+  421be508c6ed135a9737895007e5ba16f9542e1b3440f6d00a515de80a3e43eb
+revealed key (§25.2 tertiary):
+  026fc6523b7b1e22ff3fbce8740cfbb7cbc816501864bf40f683db69c860d1a6
+  70
+next member (seed "scp-25-rollover-next"):
+  03ee6e62fa15e0a591f1e65ecc6ca860dbb683f84f2a97a8a312eb7515ecee1d
+  69
+next commitment:
+  bf945a74e57e4b861cdba9a78df32004adc443e983e957b9aa9749ade24be4bd
+
+Preimage (203 bytes):
+  5343502d4b454c2d4556454e542d56313a032c0f7f4478be94db0078311ef51b
+  a3cc9934362b0f154dcbf9c597572e46cf320000000000000001d8ba4ebad526
+  57208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7000000000100
+  00000001000000000101000000010100000001026fc6523b7b1e22ff3fbce874
+  0cfbb7cbc816501864bf40f683db69c860d1a670000000000000000000000000
+  0100000001bf945a74e57e4b861cdba9a78df32004adc443e983e957b9aa9749
+  ade24be4bd010100000001
+Preimage digest:
+  670fffd52753cd541d6b2dc9fa0a47a6acd54ca70e00d4779213e5f4fa87207c
+
+Reveal group, member 0, signed by the revealed key:
+  ca0ac8b06c44b3721decf7ba5035e7a5232c865476ec4967da08da3e8a44b4d8
+  09d1a3403c5d5b55d7e9e7b53a4e9f7e8f678532d7beefc327e2a90afce24916
+Standing-root group, member 0, signed by §25.2's reference key:
+  bd3714633522f09068db59c29cb9656ce8eb9f86cce7edbcdb7df496c73b2509
+  21b9e75382aa400899ff1b35866f67a1c7a6bdcc71c1773cc63ead696700cd58
+Signature field (128 bytes):
+  ca0ac8b06c44b3721decf7ba5035e7a5232c865476ec4967da08da3e8a44b4d8
+  09d1a3403c5d5b55d7e9e7b53a4e9f7e8f678532d7beefc327e2a90afce24916
+  bd3714633522f09068db59c29cb9656ce8eb9f86cce7edbcdb7df496c73b2509
+  21b9e75382aa400899ff1b35866f67a1c7a6bdcc71c1773cc63ead696700cd58
+```
+
+### Vector 54: a `RootRecovery{CoSigns}` group layout
+
+`standing_root` is `0x01`, and the event carries three groups: the reveal, the installed set K′, then the standing root. K′ is one member with threshold 1, and the snapshot names K′ and a fresh `#active` key `Current`, then the reference key and §25.2's secondary key `Superseded`.
+
+```
+installed K' member (seed "scp-25-recovery-cosigns-root"):
+  034c3e84e8da62f05b0a280d5a0426e24bde13c6fa023c567333bece3bc1497c
+  53
+#active (seed "scp-25-recovery-cosigns-active"):
+  026188be77992cb98024f995da162f844f534e4a7f8fca8dc7b1d0cb4b54ce4c
+  64
+next member (seed "scp-25-recovery-cosigns-next"):
+  032db2d680227fbd761d8e3f87a26af33e657b5d751c697af942914856f6bc7d
+  d2
+next commitment:
+  41def207e7438655edf2766aa2fe0c96ef5f898233fb5ba16c56a3f7765aa8bd
+key-state snapshot: 261 bytes
+
+Preimage (507 bytes):
+  5343502d4b454c2d4556454e542d56313a042c0f7f4478be94db0078311ef51b
+  a3cc9934362b0f154dcbf9c597572e46cf320000000000000001d8ba4ebad526
+  57208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7010000000100
+  0000000100000000010000000001010000000101000000010100000001026fc6
+  523b7b1e22ff3fbce8740cfbb7cbc816501864bf40f683db69c860d1a6700000
+  0001034c3e84e8da62f05b0a280d5a0426e24bde13c6fa023c567333bece3bc1
+  497c53000000010000000100000004034c3e84e8da62f05b0a280d5a0426e24b
+  de13c6fa023c567333bece3bc1497c53010100000000000000000101026188be
+  77992cb98024f995da162f844f534e4a7f8fca8dc7b1d0cb4b54ce4c64020100
+  000000000000000101033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c
+  2295b1517883d47f30270102000000000000000001010223702a648232f2d007
+  13de9289753c2fbd4c4efa7e1e33905e3723a412b20aea020200000000000000
+  000101000000019d94df95bc0a13f1963f484414c320354c73c75bb86e96559e
+  97765f5bc2d31300000e10020000000000000000000000000000000000000000
+  00000000000000000000000000000000010000000141def207e7438655edf276
+  6aa2fe0c96ef5f898233fb5ba16c56a3f7765aa8bd010100000001
+Preimage digest:
+  f7e86d11b213d51e79c61e040268f5cb83deb0e995a888a65afce9a6e6108c38
+
+Reveal group, signed by the revealed key:
+  204c74ab4383ec683537666c4ce57caebf914ac76a9d380a21d2d961bd3efe21
+  1e0e595901be6599c1f92da4c6a364c81daef87e55b297eef68b9a571de12e5d
+K' group, signed by the installed member:
+  78021d7367db675090416cb6d3536562230f10ae4eaf044eb08bdde1f3a1126e
+  4f22c6960e73a527b9c74bb7e27d4a6ab54d2f14a99419cea6e20d1b6bd1c3e6
+Standing-root group, signed by §25.2's reference key:
+  c229bc09518a2d95af6a51939d0ff57e16ba4cfa317fe8fa24e37d3dc91bc688
+  43bb5b6b587f38ead74215bdcb3f7d0982d32a1ef2948df40914a6695eb833d9
+Signature field (192 bytes):
+  204c74ab4383ec683537666c4ce57caebf914ac76a9d380a21d2d961bd3efe21
+  1e0e595901be6599c1f92da4c6a364c81daef87e55b297eef68b9a571de12e5d
+  78021d7367db675090416cb6d3536562230f10ae4eaf044eb08bdde1f3a1126e
+  4f22c6960e73a527b9c74bb7e27d4a6ab54d2f14a99419cea6e20d1b6bd1c3e6
+  c229bc09518a2d95af6a51939d0ff57e16ba4cfa317fe8fa24e37d3dc91bc688
+  43bb5b6b587f38ead74215bdcb3f7d0982d32a1ef2948df40914a6695eb833d9
+```
+
+### Vector 55: a `RootRecovery{Lost}` group layout
+
+`standing_root` is `0x02`, and the event carries two groups: the reveal, then the installed set K′. No standing-root signature appears, and the event names no index for one.
+
+```
+installed K' member (seed "scp-25-recovery-lost-root"):
+  026bf1355bb40ab86b1f3d2e776e08da67e754a5dfeeb706b67d7483d09451c4
+  ce
+#active (seed "scp-25-recovery-lost-active"):
+  03b7fe460356f0d94ff2bb085ed16157ae327b7769f2823ca829077110f05fb4
+  a5
+next member (seed "scp-25-recovery-lost-next"):
+  0236aae02ccf08079a78e9b4018a124e3abc50b458459957968a4c6fb4ebc911
+  b3
+next commitment:
+  cb05862aec3a89bd73c5e2d10a61d6483d945c72036bdf62dd880a9ff7d4d6f0
+
+Preimage (497 bytes):
+  5343502d4b454c2d4556454e542d56313a042c0f7f4478be94db0078311ef51b
+  a3cc9934362b0f154dcbf9c597572e46cf320000000000000001d8ba4ebad526
+  57208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7020000000100
+  00000001000000000101000000010100000001026fc6523b7b1e22ff3fbce874
+  0cfbb7cbc816501864bf40f683db69c860d1a67000000001026bf1355bb40ab8
+  6b1f3d2e776e08da67e754a5dfeeb706b67d7483d09451c4ce00000001000000
+  0100000004026bf1355bb40ab86b1f3d2e776e08da67e754a5dfeeb706b67d74
+  83d09451c4ce01010000000000000000010103b7fe460356f0d94ff2bb085ed1
+  6157ae327b7769f2823ca829077110f05fb4a502010000000000000000010103
+  3b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
+  0102000000000000000001010223702a648232f2d00713de9289753c2fbd4c4e
+  fa7e1e33905e3723a412b20aea020200000000000000000101000000019d94df
+  95bc0a13f1963f484414c320354c73c75bb86e96559e97765f5bc2d31300000e
+  1002000000000000000000000000000000000000000000000000000000000000
+  0000000000000100000001cb05862aec3a89bd73c5e2d10a61d6483d945c7203
+  6bdf62dd880a9ff7d4d6f0010100000001
+Preimage digest:
+  8333507374ce3cee1373f18feadc407cc61dc31eabd93fe61c8569986b9c1849
+
+Reveal group, signed by the revealed key:
+  ce66db7b17acff6ea1c3501cd0380b0e011af13ebef9da42d4a5ce934506edfe
+  12fafa63880841e9a3ec7c142944a1c6f1b805257c5ac92a46e74912fa035b6d
+K' group, signed by the installed member:
+  7e9cb3011690ef40c1a3502350f2e2f05a40c0be0fe388b9482aca92f04b9b17
+  0536c755a6468d57c12d68de76f970e7e16e615de6ce68f7825edf337ad13842
+Signature field (128 bytes):
+  ce66db7b17acff6ea1c3501cd0380b0e011af13ebef9da42d4a5ce934506edfe
+  12fafa63880841e9a3ec7c142944a1c6f1b805257c5ac92a46e74912fa035b6d
+  7e9cb3011690ef40c1a3502350f2e2f05a40c0be0fe388b9482aca92f04b9b17
+  0536c755a6468d57c12d68de76f970e7e16e615de6ce68f7825edf337ad13842
+```
+
+### Vector 56: R6 ranks a rank-1 suffix above a rank-2 suffix
+
+A verifier holding Vector 41's inception event receives Vector 54 and Vector 55, two suffixes that diverge from that event. Each suffix's first event reveals the commitment standing at the shared prefix. Vector 54's first event carries a root signature that verifies against the root standing at its predecessor, so R6 ranks that suffix 1. Vector 55's first event carries none, so R6 ranks that suffix 2. The lower rank number wins, and the winning suffix supersedes the losing one in its entirety.
+
+```
+shared prefix head:
+  d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7
+standing commitment at the shared prefix:
+  421be508c6ed135a9737895007e5ba16f9542e1b3440f6d00a515de80a3e43eb
+suffix A head (Vector 54):
+  f7e86d11b213d51e79c61e040268f5cb83deb0e995a888a65afce9a6e6108c38
+suffix A rank: 1
+suffix B head (Vector 55):
+  8333507374ce3cee1373f18feadc407cc61dc31eabd93fe61c8569986b9c1849
+suffix B rank: 2
+winner:
+  f7e86d11b213d51e79c61e040268f5cb83deb0e995a888a65afce9a6e6108c38
+```
+
+### Vector 57: the identifier's text form
+
+`03-identity.md` §3.1 fixes the text form as `scp:` followed by the RFC 4648 base32 encoding of the identifier's 32 bytes, lowercase and without padding. A parser rejects the two variants below with `IdentityError::NonCanonicalIdentifier`.
+
+```
+identifier (Vector 41):
+  2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32
+text form (56 characters):
+  scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za
+rejected, uppercase:
+  scp:FQHX6RDYX2KNWADYGEPPKG5DZSMTINRLB4KU3S7ZYWLVOLSGZ4ZA
+rejected, padded:
+  scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za====
 ```

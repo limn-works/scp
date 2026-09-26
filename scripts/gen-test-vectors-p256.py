@@ -2172,6 +2172,247 @@ def emit_commitment_and_service_record() -> None:
     emit("vector_48.object_bytes", len(fields) + 64)
 
 
+# --- §25.29 reveal-authorized events, one R6 ranking, and the text form ---
+#
+# Every event below extends Vector 41's identity at sequence 1, so the standing
+# commitment each reveal consumes is the one Vector 41's inception fixed, over
+# the tertiary reference key (§25.2), and the standing root at each event's
+# predecessor is Vector 41's one-member root, the reference key.
+
+KIND_COMMITMENT_ROLLOVER = 0x03
+KIND_ROOT_RECOVERY = 0x04
+STANDING_ROOT_COSIGNS = 0x01
+STANDING_ROOT_LOST = 0x02
+CONDITION_SUPERSEDED = 0x02
+FORM_RAW = 0x01
+
+ROLLOVER_NEXT_KEY = keypair_from_seed(
+    sha256(b"scp-25-rollover-next"), TEST_VECTOR_KEY_LABEL, "rollover next member"
+)
+COSIGNS_ROOT_KEY = keypair_from_seed(
+    sha256(b"scp-25-recovery-cosigns-root"), TEST_VECTOR_KEY_LABEL, "CoSigns K' member"
+)
+COSIGNS_ACTIVE_KEY = keypair_from_seed(
+    sha256(b"scp-25-recovery-cosigns-active"), TEST_VECTOR_KEY_LABEL, "CoSigns #active"
+)
+COSIGNS_NEXT_KEY = keypair_from_seed(
+    sha256(b"scp-25-recovery-cosigns-next"), TEST_VECTOR_KEY_LABEL, "CoSigns next member"
+)
+LOST_ROOT_KEY = keypair_from_seed(
+    sha256(b"scp-25-recovery-lost-root"), TEST_VECTOR_KEY_LABEL, "Lost K' member"
+)
+LOST_ACTIVE_KEY = keypair_from_seed(
+    sha256(b"scp-25-recovery-lost-active"), TEST_VECTOR_KEY_LABEL, "Lost #active"
+)
+LOST_NEXT_KEY = keypair_from_seed(
+    sha256(b"scp-25-recovery-lost-next"), TEST_VECTOR_KEY_LABEL, "Lost next member"
+)
+
+
+def one_member_group() -> bytes:
+    """A signer index list naming member 0, or a form list naming the raw form."""
+    return u32(1) + u8(0)
+
+
+def one_raw_form() -> bytes:
+    return u32(1) + u8(FORM_RAW)
+
+
+def commitment_continuation(next_key: KeyPair) -> bytes:
+    return (
+        u8(CONTINUATION_COMMITMENT)
+        + u32(1)
+        + fixed_field(sha256(PREROTATION_SEPARATOR + next_key.compressed))
+        + u8(CUSTODY_PASSKEY)
+        + u8(KEY_ALGORITHM_ECDSA_P256_SHA256)
+        + u32(1)
+    )
+
+
+def rollover_preimage(identifier: bytes, predecessor: bytes) -> bytes:
+    """A `CommitmentRollover`: the reveal group, then the standing-root group."""
+    return (
+        KEL_EVENT_SEPARATOR
+        + u8(KIND_COMMITMENT_ROLLOVER)  # 1
+        + fixed_field(identifier)  # 2
+        + u64(1)  # 3
+        + fixed_field(predecessor)  # 4
+        + u8(0)  # 5. standing_root: sentinel
+        + one_member_group()  # 6. reveal group's index list
+        + one_member_group()  # 6. standing-root group's index list
+        + one_raw_form()  # 7. reveal group's form list
+        + one_raw_form()  # 7. standing-root group's form list
+        + u32(1)
+        + fixed_field(REF_KEY_3.compressed)  # 8. the revealed key
+        + u32(0)  # 9. installed root set: composite sentinel
+        + u32(0)  # 10. key-state snapshot: sentinel
+        + u32(0)  # 11. key-event seals: sentinel
+        + commitment_continuation(ROLLOVER_NEXT_KEY)  # 12
+    )
+
+
+def recovery_key_state(root: KeyPair, active: KeyPair) -> bytes:
+    """The post-recovery snapshot: the current entries first, then one entry
+    per key the event drops, each `Superseded` because a successor takes its role."""
+    return (
+        u32(1)  # root threshold
+        + u32(4)  # key count
+        + key_state_entry(root.compressed, ROLE_ROOT, CONDITION_CURRENT)
+        + key_state_entry(active.compressed, ROLE_ACTIVE, CONDITION_CURRENT)
+        + key_state_entry(REF_KEY_1.compressed, ROLE_ROOT, CONDITION_SUPERSEDED)
+        + key_state_entry(REF_KEY_2.compressed, ROLE_ACTIVE, CONDITION_SUPERSEDED)
+        + u32(1)
+        + fixed_field(VECTOR_WITNESS_OPERATOR)
+        + u32(VECTOR_WITNESSING_INTERVAL)
+        + u8(ROLE_ACTIVE)
+        + fixed_field(ZERO32)
+    )
+
+
+def recovery_preimage(
+    identifier: bytes,
+    predecessor: bytes,
+    standing_root: int,
+    root: KeyPair,
+    active: KeyPair,
+    next_key: KeyPair,
+) -> bytes:
+    """A `RootRecovery`: the reveal group, the K' group, and under `CoSigns`
+    the standing-root group."""
+    groups = 3 if standing_root == STANDING_ROOT_COSIGNS else 2
+    return (
+        KEL_EVENT_SEPARATOR
+        + u8(KIND_ROOT_RECOVERY)  # 1
+        + fixed_field(identifier)  # 2
+        + u64(1)  # 3
+        + fixed_field(predecessor)  # 4
+        + u8(standing_root)  # 5
+        + one_member_group() * groups  # 6. one index list per group
+        + one_raw_form() * groups  # 7. one form list per group
+        + u32(1)
+        + fixed_field(REF_KEY_3.compressed)  # 8. the revealed key
+        + u32(1)
+        + fixed_field(root.compressed)
+        + u32(1)  # 9. installed root set K' and its threshold
+        + recovery_key_state(root, active)  # 10
+        + u32(0)  # 11. key-event seals: sentinel
+        + commitment_continuation(next_key)  # 12
+    )
+
+
+def sign_group(key: KeyPair, digest: bytes, label: str) -> bytes:
+    sig = ecdsa_sign(key.d, digest)
+    assert ecdsa_verify(key.point, digest, sig), label
+    if _HAVE_CRYPTOGRAPHY:
+        _verify_with_cryptography(key, digest, sig, label)
+    assert int.from_bytes(sig[32:], "big") * 2 <= N, f"{label}: high-s"
+    return sig
+
+
+def rank_first_reveal(digest: bytes, signatures: list[bytes], root_group_index: int | None) -> int:
+    """R6 over a suffix whose first event reveals the standing commitment: rank 1
+    where that event carries a root signature verifying against the root standing
+    at its predecessor, which is Vector 41's reference key, and rank 2 otherwise."""
+    if root_group_index is None:
+        return 2
+    return 1 if ecdsa_verify(REF_KEY_1.point, digest, signatures[root_group_index]) else 2
+
+
+def scp_text_form(identifier: bytes) -> str:
+    return "scp:" + base64.b32encode(identifier).decode().rstrip("=").lower()
+
+
+def emit_reveal_ranking_and_text_form() -> None:
+    section("§25.29 Reveal-authorized events, an R6 ranking, and the identifier's text form")
+    identifier = INCEPTION_IDENTIFIER
+    predecessor = INCEPTION_DIGEST
+    standing = sha256(PREROTATION_SEPARATOR + REF_KEY_3.compressed)
+
+    # --- Vector 53: a `CommitmentRollover`. ---
+    pre53 = rollover_preimage(identifier, predecessor)
+    d53 = sha256(pre53)
+    reveal53 = sign_group(REF_KEY_3, d53, "vector_53.reveal")
+    root53 = sign_group(REF_KEY_1, d53, "vector_53.standing_root")
+    emit_hex("vector_53.identifier", identifier)
+    emit_hex("vector_53.predecessor_digest", predecessor)
+    emit_hex("vector_53.consumed_commitment", standing)
+    emit_hex("vector_53.revealed_key", REF_KEY_3.compressed)
+    emit_hex("vector_53.next_key", ROLLOVER_NEXT_KEY.compressed)
+    emit_hex("vector_53.next_commitment", sha256(PREROTATION_SEPARATOR + ROLLOVER_NEXT_KEY.compressed))
+    emit("vector_53.preimage_len", len(pre53))
+    emit_hex("vector_53.preimage", pre53)
+    emit_hex("vector_53.preimage_digest", d53)
+    emit_hex("vector_53.reveal_signature", reveal53)
+    emit_hex("vector_53.standing_root_signature", root53)
+    emit("vector_53.signature_field_len", len(reveal53 + root53))
+    emit_hex("vector_53.signature_field", reveal53 + root53)
+
+    # --- Vector 54: a `RootRecovery{CoSigns}`. ---
+    pre54 = recovery_preimage(identifier, predecessor, STANDING_ROOT_COSIGNS,
+                              COSIGNS_ROOT_KEY, COSIGNS_ACTIVE_KEY, COSIGNS_NEXT_KEY)
+    d54 = sha256(pre54)
+    sigs54 = [
+        sign_group(REF_KEY_3, d54, "vector_54.reveal"),
+        sign_group(COSIGNS_ROOT_KEY, d54, "vector_54.installed_root"),
+        sign_group(REF_KEY_1, d54, "vector_54.standing_root"),
+    ]
+    emit_hex("vector_54.installed_root_key", COSIGNS_ROOT_KEY.compressed)
+    emit_hex("vector_54.active_key", COSIGNS_ACTIVE_KEY.compressed)
+    emit_hex("vector_54.next_key", COSIGNS_NEXT_KEY.compressed)
+    emit_hex("vector_54.next_commitment", sha256(PREROTATION_SEPARATOR + COSIGNS_NEXT_KEY.compressed))
+    emit("vector_54.key_state_bytes", len(recovery_key_state(COSIGNS_ROOT_KEY, COSIGNS_ACTIVE_KEY)))
+    emit("vector_54.preimage_len", len(pre54))
+    emit_hex("vector_54.preimage", pre54)
+    emit_hex("vector_54.preimage_digest", d54)
+    emit_hex("vector_54.reveal_signature", sigs54[0])
+    emit_hex("vector_54.installed_root_signature", sigs54[1])
+    emit_hex("vector_54.standing_root_signature", sigs54[2])
+    emit("vector_54.signature_field_len", len(b"".join(sigs54)))
+    emit_hex("vector_54.signature_field", b"".join(sigs54))
+
+    # --- Vector 55: a `RootRecovery{Lost}`. ---
+    pre55 = recovery_preimage(identifier, predecessor, STANDING_ROOT_LOST,
+                              LOST_ROOT_KEY, LOST_ACTIVE_KEY, LOST_NEXT_KEY)
+    d55 = sha256(pre55)
+    sigs55 = [
+        sign_group(REF_KEY_3, d55, "vector_55.reveal"),
+        sign_group(LOST_ROOT_KEY, d55, "vector_55.installed_root"),
+    ]
+    emit_hex("vector_55.installed_root_key", LOST_ROOT_KEY.compressed)
+    emit_hex("vector_55.active_key", LOST_ACTIVE_KEY.compressed)
+    emit_hex("vector_55.next_key", LOST_NEXT_KEY.compressed)
+    emit_hex("vector_55.next_commitment", sha256(PREROTATION_SEPARATOR + LOST_NEXT_KEY.compressed))
+    emit("vector_55.preimage_len", len(pre55))
+    emit_hex("vector_55.preimage", pre55)
+    emit_hex("vector_55.preimage_digest", d55)
+    emit_hex("vector_55.reveal_signature", sigs55[0])
+    emit_hex("vector_55.installed_root_signature", sigs55[1])
+    emit("vector_55.signature_field_len", len(b"".join(sigs55)))
+    emit_hex("vector_55.signature_field", b"".join(sigs55))
+
+    # --- Vector 56: R6 ranks Vector 54's suffix 1 and Vector 55's suffix 2. ---
+    rank54 = rank_first_reveal(d54, sigs54, 2)
+    rank55 = rank_first_reveal(d55, sigs55, None)
+    assert (rank54, rank55) == (1, 2), (rank54, rank55)
+    emit_hex("vector_56.shared_prefix_head", predecessor)
+    emit_hex("vector_56.standing_commitment", standing)
+    emit_hex("vector_56.suffix_a_head", d54)
+    emit("vector_56.suffix_a_rank", rank54)
+    emit_hex("vector_56.suffix_b_head", d55)
+    emit("vector_56.suffix_b_rank", rank55)
+    emit_hex("vector_56.winner", d54)
+
+    # --- Vector 57: the identifier's text form. ---
+    text = scp_text_form(identifier)
+    assert len(text) == 56 and text == text.lower() and "=" not in text
+    assert base64.b32decode(text[4:].upper() + "====") == identifier
+    emit_hex("vector_57.identifier", identifier)
+    emit("vector_57.text_form", text)
+    emit("vector_57.text_form_len", len(text))
+    emit("vector_57.rejected_uppercase", "scp:" + text[4:].upper())
+    emit("vector_57.rejected_padded", text + "====")
+
+
 def main() -> int:
     self_test()
     _LINES.append("SCP §25 test vectors — ECDSA on NIST P-256, RFC 6979, SHA-256")
@@ -2200,6 +2441,7 @@ def main() -> int:
     emit_context_export_preimage()
     emit_witness_and_relay_objects()
     emit_commitment_and_service_record()
+    emit_reveal_ranking_and_text_form()
     print("\n".join(_LINES))
     return 0
 
