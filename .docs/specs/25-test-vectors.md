@@ -500,29 +500,6 @@ Fingerprint: SHA-256("SCP-KEY-CONTINUITY-V1:" || root_key || active_key || senti
 
 The sentinel value MUST equal `SHA-256(b"SCP-ABSENT-AGENT-KEY")`. This is a domain-derived constant, not a magic number. Implementations MUST precompute this value and verify it matches their SHA-256 implementation.
 
-## 25.10 Claim Validation Vectors (§12.3)
-
-Domain: `"SCP-CLAIM-V1:"`
-
-### Vector 22: Shadow Claim Hash
-
-```
-Input:
-  shadow_id:    "shadow-alice-x-12345"
-  claimant_did: "did:dht:z6MkClaim"
-  context_id:   "bridge-test-context"
-  timestamp:    1700000000
-
-Canonical hash input:
-  "SCP-CLAIM-V1:"                              (14 bytes)
-  || BE32(20) || "shadow-alice-x-12345"         (4 + 20 = 24 bytes)
-  || BE32(17) || "did:dht:z6MkClaim"           (4 + 17 = 21 bytes)
-  || BE32(19) || "bridge-test-context"          (4 + 19 = 23 bytes)
-  || BE64(1700000000)                           (8 bytes)
-
-Total: 14 + 24 + 21 + 23 + 8 = 90 bytes
-```
-
 ## 25.11 Proposal ID Vectors (§6.4)
 
 Domain: `"SCP-PROPOSAL-V1:"`

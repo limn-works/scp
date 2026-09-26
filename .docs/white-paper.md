@@ -13,7 +13,7 @@ Frontier language models now produce functional applications from brief specific
 
 This paper presents the Shared Context Protocol (SCP), an open protocol providing cryptographic identity (DID [10]), governed interaction spaces (contexts), end-to-end encryption as access control (MLS [2]), capability-based authorization (UCAN [12]), and verifiable provenance. All interaction occurs within contexts — bounded, encrypted, governed spaces where membership is enforced by cryptography. The protocol is designed for a world where autonomous agents are the primary actors: every agent traces to a human identity through cryptographic binding, agents are isolated per context at the protocol level, and behavioral records replace reputation scores as the primary trust input.
 
-Key properties: no operator dependency (the protocol functions if its creators disappear), transport independence (17 adapter specifications across 3 tiers), human accountability for all autonomous agents, and context isolation as the security boundary. The protocol is designed to be complementary to existing platforms and tool-level protocols — bridge connectors, transport adapters, and identity attestations enable harmonious interoperation with established distribution networks. The reference implementation is in Rust with bindings for Python, Swift, Kotlin, TypeScript, and WebAssembly. The specification is published under CC-BY 4.0; the SDK is published under Apache 2.0.
+Key properties: no operator dependency (the protocol functions if its creators disappear), transport independence (17 adapter specifications across 3 tiers), human accountability for all autonomous agents, and context isolation as the security boundary. The protocol is designed to be complementary to existing platforms and tool-level protocols — transport adapters and identity attestations enable harmonious interoperation with established distribution networks. The reference implementation is in Rust with bindings for Python, Swift, Kotlin, TypeScript, and WebAssembly. The specification is published under CC-BY 4.0; the SDK is published under Apache 2.0.
 
 ---
 
@@ -41,7 +41,7 @@ SCP fills this gap. It is a social-level protocol: identity, trust, governed int
 
 The protocol is designed to be what agents reach for first when building connected software. This is by design. The SDK is organized around approximately ten conceptual operations — identity, context lifecycle, messaging, outlets, trust, capabilities, provenance, discovery, transport, and sync — with cryptographic complexity handled invisibly. Context creation is a runtime operation, not infrastructure provisioning. An agent that needs to build a collaborative application imports one SDK and calls `Context.create()`. The alternative is reimplementing identity, key management, encryption, authorization, and transport from scratch for every application. The protocol minimizes the barrier to correct-by-construction connected software.
 
-Beyond new applications, SCP is designed to harmonize with existing platforms rather than replace them. Bridge connectors translate between SCP and external platforms at the protocol level, transport adapters run on any delivery infrastructure, and identity attestations link SCP identities to existing platform accounts. The protocol complements existing distribution networks by providing the open social infrastructure they do not.
+Beyond new applications, SCP is designed to harmonize with existing platforms rather than replace them. Transport adapters run on any delivery infrastructure, and identity attestations link SCP identities to existing platform accounts. The protocol complements existing distribution networks by providing the open social infrastructure they do not.
 
 ### 1.3 Design Principles
 
@@ -355,7 +355,7 @@ The enforcement stack has five layers: custody separation (hardware vs. software
 
 Users can publish cryptographic attestations binding external platform identities to their DID. An attestation says: "The human behind `did:dht:z6Mk...` is the same human behind `@alice` on X." The attestation is non-transferable (bound to a specific DID and external identity), user-initiated, independently verifiable, revocable, and discoverable.
 
-Attestations enable social graph import (resolving existing contacts who have joined SCP), shadow identity claiming (merging bridge-created representations with native identities), and cross-platform reputation continuity.
+Attestations enable social graph import (resolving existing contacts who have joined SCP) and cross-platform reputation continuity.
 
 ---
 
@@ -452,7 +452,7 @@ Under the shared-DID model, intra-DID delegation uses self-delegation UCANs wher
 
 ### 7.2 Capability Categories
 
-Standard capability categories include messaging, outlet invocation, media (voice, video, screen sharing), bridging, outlet interfaces, and child context creation. Every action is checked against the context's capability ceiling, the agent's role permissions, and the token's validity.
+Standard capability categories include messaging, outlet invocation, media (voice, video, screen sharing), outlet interfaces, and child context creation. Every action is checked against the context's capability ceiling, the agent's role permissions, and the token's validity.
 
 ### 7.3 Economic Governance
 
@@ -536,7 +536,7 @@ SCP is online-first — designed for always-connected agents — but deployable 
 
 The deployment spectrum ranges from phones (full participants when online, relays for offline delivery), through laptops (persistent daemons, potential personal relays), agent workstations (dedicated always-on hardware — natural SCP nodes), personal servers (power users), to managed infrastructure (convenience and high availability). All points on the spectrum are simultaneously valid; a user can operate at multiple points at once.
 
-The agent workstation tier is architecturally significant. As autonomous agents become mainstream, users are acquiring dedicated always-on hardware to run them. SCP infrastructure — relays, context hosting, bridge connectors — is marginal additional load on hardware already running continuously, providing a natural deployment point for personal relay processes. The protocol is designed for the online case and tolerates offline periods, rather than the reverse: the protocol assumes agents are running and connected, and optimizes for that case. Offline tolerance exists (Section 9.5) but is the exception, not the design center.
+The agent workstation tier is architecturally significant. As autonomous agents become mainstream, users are acquiring dedicated always-on hardware to run them. SCP infrastructure — relays, context hosting — is marginal additional load on hardware already running continuously, providing a natural deployment point for personal relay processes. The protocol is designed for the online case and tolerates offline periods, rather than the reverse: the protocol assumes agents are running and connected, and optimizes for that case. Offline tolerance exists (Section 9.5) but is the exception, not the design center.
 
 ### 9.5 Offline Strategy
 
@@ -580,7 +580,7 @@ Each mechanism is independently useful. Remove any layer and the rest continue f
 
 SCP's threat model enumerates specific adversaries: malicious relay operators (can delay or drop but not read), compromised agents (damage contained to their context), compromised agent keys (mitigated by Category A restrictions and independent rotation), sybil attackers (expensive to sustain depth), insider threats (granular revocation, cross-context containment), context spoofers (contexts are cryptographic entities, not names), and governance captors (transparent event logs, exit as veto).
 
-The protocol distinguishes between what it defends against (confidentiality breach, capability escalation, unauthorized access) and what it makes legible (insider misbehavior, governance disputes, bridge operator malfeasance). Some attacks are detectable and attributable but not preventable at the protocol level — the protocol makes the attacker identifiable and the damage measurable, enabling governance response.
+The protocol distinguishes between what it defends against (confidentiality breach, capability escalation, unauthorized access) and what it makes legible (insider misbehavior, governance disputes). Some attacks are detectable and attributable but not preventable at the protocol level — the protocol makes the attacker identifiable and the damage measurable, enabling governance response.
 
 ### 11.2 Security Properties
 
@@ -761,8 +761,6 @@ The security analysis (Section 11) addresses specific residual attack surfaces �
 
 **Governance model complexity.** Pluggable governance is powerful but each model has its own tradeoffs. Single-admin is simple but centralized; voting is democratic but slow; consensus is thorough but can deadlock. The protocol provides the interface; choosing the right model for a given context is a social problem, not a protocol problem.
 
-**Bridge fidelity.** Platform bridge connectors (Section 12 of the specification) depend on external platforms' willingness or API availability. Relay-mode and puppet-mode bridges are inherently lower fidelity than native SCP communication, and shadow identities carry weaker trust properties than native identities.
-
 ### 14.3 Standardization Path
 
 The current specification is self-published under CC-BY 4.0. The near-term path includes extraction of a standalone protocol specification document (implementation-agnostic, suitable for independent implementation), language-neutral test vectors, and a protocol evolution mechanism. The long-term trajectory follows AT Protocol's [16] model: IETF submission for core cryptographic subsystems once they have sufficient independent review and implementation experience.
@@ -861,10 +859,6 @@ Constants are organized into three tiers per ADR-043.
 **Attestation.** A signed claim by an identity about something — identity links, capability delegations, endorsements, outlet integrity, participation records.
 
 **Context (with discovery tools).** A standard SCP context with open join policies and standardized discovery tools. Provides searchable registries for agents, contexts, and handles.
-
-**Bridge Connector.** A protocol entity that translates between an external platform's protocol and SCP's protocol semantics. Operated by accountable identities.
-
-**Shadow Identity.** A protocol-level representation of an entity from an external platform, created by a bridge connector. Claimable by the real user via identity attestation.
 
 **Signing Key ID.** A field on every signed message identifying which verification method (`#active` or `#agent`) produced the signature. Provides structural action provenance.
 

@@ -1596,7 +1596,7 @@ Anyone can define capabilities under their own DID. Authority is the definer's i
 scp:system:{kebab-case-name}
 ```
 
-Protocol-level feature flags for node roles. Not challenge-testable — these describe what a node does, not what an agent can prove. Initial set: `mls-group-management`, `key-rotation`, `governance-participation`, `relay-operation`, `bridge-operation`.
+Protocol-level feature flags for node roles. Not challenge-testable — these describe what a node does, not what an agent can prove. Initial set: `mls-group-management`, `key-rotation`, `governance-participation`, `relay-operation`.
 
 **Anti-spoofing model:**
 

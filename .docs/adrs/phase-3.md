@@ -333,7 +333,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
      messages — each message is delivered to exactly one consumer.
 
    This matches the detail level of the TypeScript (ADR-019: `onMessage`/`onError`/`onComplete`
-   callbacks → async generator), Swift (ADR-023: `AsyncStream<Message>` with
+   callbacks → async generator), Swift (ADR-026: `AsyncStream<Message>` with
    `continuation.yield`/`finish`), and Kotlin (ADR-027: `callbackFlow`/`awaitClose`) receive
    specifications.
 

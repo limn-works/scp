@@ -50,8 +50,8 @@ site projection** machinery:
    origin-root mount reuses the **same content handler** as the canonical path, so
    `ContentPath` traversal protection, decryption, `ETag`, `Cache-Control`, and CSP
    apply identically. It routes only to the single designated default site and
-   **never** re-exposes the relay upgrade (`/scp/v1`) or bridge routes
-   (`/v1/scp/bridge/*`), which are not mounted on the self-host public surface.
+   **never** re-exposes the relay upgrade (`/scp/v1`), which is not mounted on the
+   self-host public surface.
 
    `routing_id = SHA-256(context_id)` (no domain separator —
    `crates/scp-protocol/src/context/mod.rs:122` `broadcast_routing_id`).

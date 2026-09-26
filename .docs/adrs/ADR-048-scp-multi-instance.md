@@ -49,7 +49,7 @@ Detection heuristic during code review: if a `&self` method body never reference
 
 **SDK wrapper layer is governed by §7, not §1.** Each SDK (Python, TypeScript, Swift, Kotlin) chooses whether to surface a pure helper as an `SCP` class method or as a module-level export based on its own language idiom. §1 governs the FFI Rust source; §7 governs the language-specific wrapper layer above it.
 
-The class is named after the protocol, not after internal plumbing. This matches the prevailing SDK convention (`OpenAI()`, `Anthropic()`, `Stripe()`) and avoids the collisions that `Node`, `Bridge`, or `Client` would create with existing application-layer classes (`server.py:125`, `server.ts:223`, `BridgeConnector` in spec §12).
+The class is named after the protocol, not after internal plumbing. This matches the prevailing SDK convention (`OpenAI()`, `Anthropic()`, `Stripe()`) and avoids the collisions that `Node`, `Bridge`, or `Client` would create with existing application-layer classes (`server.py:125`, `server.ts:223`).
 
 ### 2. `BridgeInstance` splits into three per-bridge concrete structs behind a shared trait
 

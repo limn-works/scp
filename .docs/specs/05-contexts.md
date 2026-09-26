@@ -56,7 +56,6 @@ Every context declares a capability ceiling at creation: the maximum set of thin
 - **`media:voice`** — real-time voice communication (§10.9.1)
 - **`media:video`** — real-time video communication (§10.9.1)
 - **`media:screen_share`** — screen sharing (§10.9.1)
-- **`bridging`** — bridge connector participation (§12)
 - **`outlet:interface`** — cross-context outlet interface exposure (§6.2)
 - **`context:child:create`** — creating child contexts (§5.13)
 - **`member:ban`** — governance-level member removal (ban/unban). Gates whether governance can execute `RevokeAccess` / `RestoreAccess` against members (§5.9). Without this capability in the ceiling, governance cannot ban members regardless of governance model.
@@ -94,7 +93,6 @@ The following is the complete enumeration of the **built-in** capability categor
 | `media:voice` | Real-time voice communication (§10.9.1) | Role permission |
 | `media:video` | Real-time video communication (§10.9.1) | Role permission |
 | `media:screen_share` | Screen sharing (§10.9.1) | Role permission |
-| `bridging` | Bridge connector participation (§12) | Role permission + governance |
 | `outlet:interface` | Cross-context outlet interface exposure (§6.2) | Role permission |
 | `context:child:create` | Create child contexts (§5.13) | Role permission |
 | `governance:propose` | Submit governance proposals (§5.9) | Role permission |
@@ -116,7 +114,7 @@ A ceiling entry is **exactly one** of the following well-formed shapes:
 
 There is **no implicit or silent wildcard.** A wildcard must be written explicitly as `:*`.
 
-**No privileged-built-in collision.** A custom entry (shape 2 or shape 3 above) is valid only if it does not name a built-in capability under **any** spelling. A custom entry's string MUST NOT denote a built-in capability — neither a built-in's user-facing colon form (e.g. `outlet:query:*`, `outlet:call:*`, `outlet:call:{outlet_id}`, `bridging`, `messages:read`) nor its canonical UCAN form (e.g. `outlet_query:*`, `outlet_call:*`, `bridging:*`, `context_child:create`), including the parameterized `outlet_query:{outlet_id}` / `outlet_call:{outlet_id}` families for any concrete `outlet_id`. A custom entry that names a built-in under any spelling MUST be rejected at context creation with `InvalidCeilingCategory` (e.g. a custom whose string is `bridging:*` — which denotes the `bridging` built-in — is rejected). This is enforced by **canonical resolution**, not by a denylist of forbidden spellings: an entry is admitted as a custom only if resolving its string through the protocol's single canonical capability parser (`Capability::new`, defined in code at `crates/scp-protocol/src/context/roles.rs`) does **not** yield a built-in capability. Because that parser is the sole authority on which strings denote built-ins — recognizing every built-in in both colon and UCAN spelling, and the parameterized `outlet_query:{outlet_id}` / `outlet_call:{outlet_id}` families for any id — the rule is **closed by construction**: it covers every built-in spelling uniformly and extends automatically to any built-in added later, with no spelling enumeration to maintain. Resolution is applied at the point a custom is admitted, rather than testing only the entry's projected UCAN string, because the masquerade it prevents — a custom that is a distinct ceiling entry yet presents a built-in's privilege when the ceiling is consumed for capability minting — arises specifically from a `Capability` custom value (including one materialized directly from an untrusted, deserialized ceiling that never passed through the colon parser at create time). The clause is stated here as the authoritative, normative invariant so the validator can cite §5.3.1.1 and a custom capability can never masquerade as a privileged built-in.
+**No privileged-built-in collision.** A custom entry (shape 2 or shape 3 above) is valid only if it does not name a built-in capability under **any** spelling. A custom entry's string MUST NOT denote a built-in capability — neither a built-in's user-facing colon form (e.g. `outlet:query:*`, `outlet:call:*`, `outlet:call:{outlet_id}`, `messages:read`) nor its canonical UCAN form (e.g. `outlet_query:*`, `outlet_call:*`, `context_child:create`), including the parameterized `outlet_query:{outlet_id}` / `outlet_call:{outlet_id}` families for any concrete `outlet_id`. A custom entry that names a built-in under any spelling MUST be rejected at context creation with `InvalidCeilingCategory` (e.g. a custom whose string is `outlet_call:*` — which denotes the `outlet:call:*` built-in — is rejected). This is enforced by **canonical resolution**, not by a denylist of forbidden spellings: an entry is admitted as a custom only if resolving its string through the protocol's single canonical capability parser (`Capability::new`, defined in code at `crates/scp-protocol/src/context/roles.rs`) does **not** yield a built-in capability. Because that parser is the sole authority on which strings denote built-ins — recognizing every built-in in both colon and UCAN spelling, and the parameterized `outlet_query:{outlet_id}` / `outlet_call:{outlet_id}` families for any id — the rule is **closed by construction**: it covers every built-in spelling uniformly and extends automatically to any built-in added later, with no spelling enumeration to maintain. Resolution is applied at the point a custom is admitted, rather than testing only the entry's projected UCAN string, because the masquerade it prevents — a custom that is a distinct ceiling entry yet presents a built-in's privilege when the ceiling is consumed for capability minting — arises specifically from a `Capability` custom value (including one materialized directly from an untrusted, deserialized ceiling that never passed through the colon parser at create time). The clause is stated here as the authoritative, normative invariant so the validator can cite §5.3.1.1 and a custom capability can never masquerade as a privileged built-in.
 
 **No built-in-resource wildcard shadow.** A custom **shape-3 wildcard** `{resource}:*` is additionally invalid when `{resource}` is the **resource token of any built-in capability** — i.e. the `{resource}` projection (the segment before the colon in a built-in's canonical UCAN form) of any built-in (e.g. `member`, `messages`, `media`, `outlet_query`, `outlet_call`, `role`, `governance`, `context`, `metadata`). This set is defined by the built-in capabilities themselves — the resource token of each built-in — and is **generated** from them, never a hand-maintained enumeration, so it extends automatically as built-ins are added and cannot drift from the actual built-in set. Canonical resolution alone does not catch this case: a string such as `member:*` does **not** resolve to a built-in (there is no `member:*` built-in — only `member:invite`, `member:remove`, `member:ban`), so `Capability::new("member:*")` keeps it a `Custom` and the no-collision rule above admits it. Yet because ceiling wildcard coverage treats a stored `{resource}:*` entry as covering **every** action under `{resource}`, an admitted `member:*` would silently grant the privileged built-in actions in that family (e.g. `member:ban`, which gates the governance `Revoke` action — see §7) when the ceiling is consumed for capability minting. Such a custom wildcard MUST therefore be rejected at validation with `InvalidCeilingCategory`. This is **closed by construction** over the built-in resource-token set (the same `{resource}` projection that ceiling wildcard coverage matches against), not a hardcoded denylist, so it extends automatically to any built-in added later — consistent with the "no silent wildcard / a custom can never present built-in privilege" invariant above. A custom **non-wildcard** action under a built-in resource (shape 2 — e.g. `member:promote`, `messages:archive`) remains **valid**: it grants only itself via exact match and never the built-in actions. A custom wildcard over a **non-built-in** resource (e.g. `payments:*`, `a-b-c:*`) likewise remains **valid**.
 
@@ -723,7 +721,6 @@ Context metadata follows a two-tier visibility model that balances legibility (i
 - Promotion policy (`no_promotion` or `promotable`), if context has a TTL (§5.10)
 - Memory scope (§5.11)
 - Context mode (`Encrypted` or `Broadcast`, §5.14)
-- Active bridges: `Vec<BridgeMetadata>` where each entry describes an active bridge connector registered with the context (§12.2). Bridge metadata is structural because bridge presence materially affects trust evaluation and privacy — a participant cannot give informed consent without knowing that content may flow to an external platform. Bridge metadata is updated whenever a bridge is registered, revoked, or suspended.
 - Metadata visibility policy itself (so prospective members know what's hidden)
 
 Structural fields are always public regardless of `MetadataVisibilityPolicy`. These are the parameters a prospective member needs to evaluate whether to join — hiding them would undermine informed consent.
@@ -760,34 +757,6 @@ pub struct MetadataVisibilityPolicy {
     pub economic_policy: FieldVisibility,
     pub outlet_interface_count: FieldVisibility,
     pub child_context_info: FieldVisibility,
-}
-
-/// Metadata for an active bridge connector (§12.2).
-/// Structural field — always visible before joining.
-pub struct BridgeMetadata {
-    /// External platform name (e.g., "discord", "slack", "x").
-    pub platform: String,
-    /// DID of the bridge operator — the human accountable for
-    /// bridge behavior (§12.2).
-    pub bridge_did: DID,
-    /// Capabilities the bridge exercises in this context.
-    /// Subset of: "relay_messages", "create_shadows",
-    /// "attest_identities", "forward_presence".
-    pub capabilities: Vec<String>,
-    /// Directionality of the bridge.
-    pub mode: BridgeDirectionality,
-}
-
-/// Whether the bridge relays content in both directions or one.
-pub enum BridgeDirectionality {
-    /// Platform-to-SCP and SCP-to-platform.
-    Full,
-    /// Platform-to-SCP only (external content enters SCP,
-    /// but SCP messages are not forwarded to the platform).
-    ReadOnly,
-    /// SCP-to-platform only (SCP messages are forwarded to the
-    /// platform, but no external content enters SCP).
-    WriteOnly,
 }
 ```
 

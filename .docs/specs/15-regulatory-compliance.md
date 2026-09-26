@@ -2,7 +2,7 @@
 
 The protocol is designed compliance-first and privacy-first. These are core ethos, not afterthoughts.
 
-**Obligations fall on protocol users.** SCP is an open protocol specification, not a service. The protocol does not process data, host content, or operate infrastructure. Entities that build on SCP — app developers, relay operators, managed infrastructure providers, bridge operators — bear the regulatory obligations appropriate to their role. The protocol provides the tools to meet those obligations.
+**Obligations fall on protocol users.** SCP is an open protocol specification, not a service. The protocol does not process data, host content, or operate infrastructure. Entities that build on SCP — app developers, relay operators, managed infrastructure providers — bear the regulatory obligations appropriate to their role. The protocol provides the tools to meet those obligations.
 
 **Privacy by design:**
 

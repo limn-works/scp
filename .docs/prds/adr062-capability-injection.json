@@ -24,13 +24,6 @@
       ]
     },
     {
-      "id": "gate-capinject-9",
-      "name": "E2 credentials real backend + seam (Slice 9, Unit 3)",
-      "stories": [
-        "SCP-CAPINJECT-009"
-      ]
-    },
-    {
       "id": "gate-capinject-10",
       "name": "E3 blob impl-Default removal + explicit selection (Slice 10, Unit 3)",
       "stories": [
@@ -323,60 +316,6 @@
         "scopeException": "switch deletion + cfg-rename + edge-severance + phantom-retype + G1 are atomic",
         "note": "pre-rotation NULLIFIER severed here (test-harness-only, fail-closed production create with a typed IdentityError); only the real BACKEND is out of scope (RFC #2130 / #1729). G1 allowlists ZERO nullifiers, no exceptions (PR #2132). Non-committing create = #1553.",
         "verified_on_main": "Verified AC-by-AC against origin/main. AC[0]: `grep -c allow_in_memory_custody crates/ .github/` = 0. AC[1]: the shipped (no-`testing`) build carries `#[cfg(not(feature = \"testing\"))]` reject arms in crates/scp-ffi/src/identity.rs and crates/scp-ffi/napi/src/scp.rs. AC[4]: crates/scp-identity/src/lib.rs:164/182 defines the typed 'no production pre-rotation custody backend available' error. AC[6]/AC[7]/AC[8]: scripts/check-shipped-feature-graph.sh exists and is executable, its `PERMITTED_ALLOWLIST` carries durability-only rows (`scp-platform/in-memory-push`, `scp-platform/in-memory-storage`) and real-backend rows (`scp-platform/sqlite`, `scp-platform/encrypting`, `scp-dht/production-dht`, `scp-transport/s3-blob` among them) and ZERO nullifier rows, which its `assert_allowlist_has_no_nullifier` fixture re-checks against every `NULLIFIER_CONTROL_FEATURES` name, and its own fixture harness asserts the three behaviours — a novel unlisted feature is REJECTED, a trimmed allowlist is REJECTED, and a clean subset is ACCEPTED — plus a nullifier-leak positive control. The script is named in the CLAUDE.md enforcement-files list and wired into .github/workflows/ci.yml."
-      }
-    },
-    {
-      "id": "SCP-CAPINJECT-009",
-      "title": "E2 credentials: delete the impl Default (live SCP-CAPSEL-8000/8011 fix), introduce the FfiCredentialStore enum seam + a real durable backend, demote InMemoryCredentialStore to test-harness-only",
-      "gate": "gate-capinject-9",
-      "priority": "P0",
-      "severity": "critical",
-      "status": "done",
-      "files": [
-        "crates/scp-runtime/src/bridge/credentials.rs",
-        "crates/scp-ffi/common/src/credentials.rs",
-        "crates/scp-ffi/common/src/lib.rs",
-        "crates/scp-ffi/napi/src/runtime.rs",
-        "crates/scp-ffi/src/runtime.rs",
-        ".docs/standards/sdk-capability-matrix.json"
-      ],
-      "description": "ADR-062 Slice 9 (Unit 3, E2 HIGH; §Decision 5). The `impl Default for InMemoryCredentialStore` (credentials.rs:556) wired on shipped NAPI+PyO3 (napi/runtime.rs:313) is a LIVE SCP-CAPSEL-8000/8011 violation (a default selection) — its removal is not deferrable. `BridgeCredentialStore` is RPITIT -> introduce an `enum FfiCredentialStore { Durable(<real durable backend>), #[cfg(feature = \"testing\")] InMemory(InMemoryCredentialStore) }`, DELETE the `impl Default`, require an explicit selection at the bridge construction boundary, and ship a real durable credential store (persisted bridge tokens). InMemoryCredentialStore -> test-harness-only. Classified durability-only (RAM-only tokens are re-obtainable by re-auth); the selection-boundary fix is the security-relevant part. Add the credentials-backend row to the capability matrix. Independent of the DHT/pre-rotation work (blockedBy []); gate-sequenced after Unit 1/2 but the impl-Default removal is a live fix and can land as soon as scheduled. Scope exception: the seam + durable backend + Default removal are one selection-boundary change.",
-      "acceptanceCriteria": [
-        "The `impl Default` is deleted (live SCP-CAPSEL-8000/8011 fix): `grep -n 'impl Default for InMemoryCredentialStore\\|impl Default for BridgeCredentialStore' crates/scp-runtime/src/bridge/credentials.rs` returns 0.",
-        "An `enum FfiCredentialStore` seam exists with a real Durable arm + a test-harness InMemory arm: `grep -n 'enum FfiCredentialStore' crates/scp-ffi/common/src/credentials.rs` matches with a `Durable` arm and an `InMemory` arm gated `#[cfg(feature = \"testing\")]`.",
-        "The bridge requires an explicit credential-store selection (no default): outside `#[cfg(feature = \"testing\")]`, `grep -rn 'InMemoryCredentialStore' crates/scp-ffi/napi/src/runtime.rs crates/scp-ffi/src/runtime.rs` returns 0, and a real durable backend is selected at construction (grep the construction site).",
-        "A real durable credential store persists tokens across restart: a test writes a bridge token, drops+reconstructs the store from the durable backend, and reads the token back (proving it is not RAM-only).",
-        ".docs/standards/sdk-capability-matrix.json has a credentials-backend row; `python3.12 scripts/check-sdk-coverage.py` exits 0.",
-        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
-        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
-      ],
-      "actionItems": [
-        "Delete the impl Default in credentials.rs; add the FfiCredentialStore enum seam (Durable + `#[cfg] InMemory`); require explicit selection at the bridge boundary.",
-        "Implement a real durable credential store (persisted bridge tokens); demote InMemoryCredentialStore to test-harness-only.",
-        "Add the credentials-backend row to the capability matrix; write the persistence + selection tests; run full CI + review roster."
-      ],
-      "blockedBy": [],
-      "sources": [
-        {
-          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
-          "section": "### 5. Credentials (E2), blob (E3), relay-publisher default (E4) — classified + storied now (live SCP-CAPSEL fixes)"
-        },
-        {
-          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
-          "section": "## Capability classification (§17.17.2 SCP-CAPSEL-8010 — mandatory before ship)"
-        },
-        {
-          "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "### 17.17.2 Security Classification of Development Arms"
-        }
-      ],
-      "details": {
-        "phase": "2",
-        "adr": "ADR-062",
-        "unit": "3",
-        "slice": "Slice 9 (E2 credentials)",
-        "scopeException": "seam + durable backend + Default removal are one selection-boundary change",
-        "verified_on_main": "Verified AC-by-AC against origin/main. AC[0]: `grep -c 'impl Default for InMemoryCredentialStore|impl Default for BridgeCredentialStore' crates/scp-runtime/src/bridge/credentials.rs` = 0. AC[1]: `pub enum FfiCredentialStore` at crates/scp-ffi/common/src/credentials.rs:45 with a `Durable(Arc<dyn DurableCredentialBackend>)` arm and an `InMemory` arm gated `#[cfg(feature = \"testing\")]`. AC[3]: `bridge_credential_survives_store_drop_and_reopen` (crates/scp-runtime/src/store/credentials.rs) opens a real on-disk SqliteStorage, writes the credential + root key, DROPS the store and its Arc, reopens at the same path/key, and asserts the ciphertext and root key are byte-identical — proving it is not RAM-only."
       }
     },
     {

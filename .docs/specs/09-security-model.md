@@ -41,8 +41,6 @@ Per-field limits are defined where each field is specified: context names and de
 
 **Agent slot rental.** Someone with a trusted identity operating agents on another's instructions. Mitigation: one agent per context limits the value; earned capacity means new identities can't immediately scale; fleet coherence signals may detect behavior inconsistent with a single human's intent. Partially mitigated, not fully solved.
 
-**Malicious bridge operator.** A bridge operator (§12) who fabricates shadow messages, drops messages, injects false attestations, or correlates activity across contexts. Note: bridge connectors (translation infrastructure) are not MLS group members, but the bridge operator's DID IS an MLS group member admitted through context governance (§12.6.1) — the operator can read all MLS-encrypted messages. This is an inherent property of bidirectional bridging, which is why bridge admission is a governance decision visible in context metadata (§5.7). Mitigation: bridge provenance (§12.5) makes bridge-originated content distinguishable; bridge registration is per-context (§12.6) limiting correlation; context governance can revoke a bridge at any time (§12.2); attestation freshness checks (§7.4.4) limit false attestation lifetime. See §12.6.2 for the complete bridge threat model.
-
 ### 9.2.1 Outlet Interface Abuse Vectors and Mitigations
 
 Information crosses context boundaries through two protocol-level mechanisms: outlet interfaces (§6.2) for asymmetric, structured interactions and multi-parent child contexts (§5.13) for symmetric collaboration. All inter-agent coordination flows through these governed mechanisms. Outlet interfaces concentrate structured cross-context data flow on a single, auditable surface. The following abuse patterns target that surface specifically. Nesting-related security properties are addressed in §5.13.1 (ceiling inheritance), §5.13.2 (eligibility enforcement), and §5.13.5 (lifecycle coupling).
@@ -1825,7 +1823,7 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash, sign
 | `"SCP-EXPORT-ENTRY:"` | Context export chain hash | §5.13 |
 | `"SCP-OUTLET-REGISTRATION-V2:"` | Outlet registration integrity hash | §6.2 |
 | `"SCP-KEY-DESTRUCTION-V1:"` | Key destruction proof | §9.15 |
-| `"SCP-CLAIM-V1:"` | Shadow identity claim validation | §12.3 |
+| `"SCP-CLAIM-V1:"` | Retired (bridge connectors cut 2026-09-26); reserved, never reuse | ADR-023 |
 | `"SCP-RECEIPT-V1:"` | Payment receipt signing | §19.15.5 |
 | `"SCP-HANDLE-OUTLET-V1:"` | Handle and scope outlet request signing | §22.3.1, §22.3.5 |
 | `"SCP-CHALLENGE-REQ-V1:"` | Trust challenge request signing | §7.4 |
@@ -1874,7 +1872,7 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 |-------|------|----------|----------------|
 | `"scp-private-state-salt-v1"` | HKDF salt domain | Private state routing ID derivation — actual salt is `SHA-256("scp-private-state-salt-v1")` | §3.7 |
 | `"scp-private-state-v1"` | HKDF info prefix | Private state routing ID derivation — full info is `"scp-private-state-v1" \|\| did_string` | §3.7 |
-| `"scp-bridge-credential-v1"` | HKDF info | Bridge credential encryption key derivation | §12 |
+| `"scp-bridge-credential-v1"` | HKDF info | Retired (bridge connectors cut 2026-09-26); reserved, never reuse | ADR-023 |
 | `"scp-participation-statement-v1"` | HKDF info | Context-specific participation signing key derivation | §7.3 |
 
 **HMAC domain separators** — used in HMAC-SHA-256 for pseudonym key derivation:
@@ -2016,12 +2014,6 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | Reconnect overlap | 5s | Overlap window during relay reconnection for gap-filling | §10.5 |
 | Relay timestamp deviation threshold | 60s | Maximum acceptable clock skew between client and relay | §10.5 |
 | Max blob size | 262,144 bytes (256 KiB) | Maximum blob payload size on relay (matches largest padding bucket) | §10.5 |
-
-#### 9.18.12 Bridge
-
-| Constant | Value | Notes | Spec Reference |
-|----------|-------|-------|----------------|
-| Max shadows per bridge | 10,000 | Maximum shadow identities per bridge connector | §12.3 |
 
 #### 9.18.13 Discovery and Addressing
 

@@ -896,7 +896,7 @@ No existing protocol combines all of the following. This is SCP's novel contribu
 - **Capability:** UCAN-based authorization with delegation chains, time-bounding, and revocation; context-level economic governance with spending UCANs
 - **Encryption:** MLS group keys as the membership mechanism (encryption-as-access-control); sender-side key layers enabling per-sender blocking without group disruption
 - **Governance:** 30 governance action types with pluggable engines; context-bound participation rules enforced cryptographically
-- **Provenance:** Protocol-level bridge connectors with provenance-tracked content attribution; non-fungible cross-platform identity attestations with shadow identity claiming
+- **Provenance:** Non-fungible cross-platform identity attestations
 - **Agents:** First-class protocol participants with formalized trust semantics; one-agent-per-person-per-context constraints; context-bound agents that cannot cross at the protocol level; trust as identity + capability pairs applied to autonomous agents
 
 All of this framed as infrastructure for generated and ephemeral apps — not a closed application, but an open protocol layer.
