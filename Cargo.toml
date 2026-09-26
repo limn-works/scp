@@ -41,14 +41,26 @@ members = [
 # `#[cfg(feature = "testing")]` in scp-runtime; `simulator/identity.rs` calls
 # `ProtocolRepository::new_for_testing`; and `builder.rs`, `fullstack/node.rs`
 # and `simulator/mod.rs` name `scp_platform::testing` and
-# `scp_platform::in_memory`. Its `scp-identity`, `scp-dht` and `scp-node` edges
-# carry no such feature:
-# `helpers.rs` is the only module naming `scp_identity` and `scp_dht`, `lib.rs`
-# compiles it under this crate's `helpers` feature, and that feature names
-# `scp-identity/testing` and `scp-dht/testing`; `scp-node/allow_unencrypted_storage`
-# rides on a `[dev-dependencies]` entry, because only this crate's own integration
-# tests call the `Node::start_for_testing` it gates. Only `crates/scp-testing`'s own
-# `[dev-dependencies]` turn `helpers` on, so no other build resolves any of the three.
+# `scp_platform::in_memory`. Its `scp-identity`, `scp-dht` and `scp-node`
+# `[dependencies]` edges carry no such feature: `helpers.rs` is the only module
+# naming `scp_identity` and `scp_dht`, `lib.rs` compiles it under this crate's
+# `helpers` feature, and only this crate's own integration tests call the
+# `Node::start_for_testing` that `scp-node/allow_unencrypted_storage` gates. All
+# three features ride on `[dev-dependencies]` entries of
+# `crates/scp-testing/Cargo.toml` instead, which cargo resolves only when it
+# builds that crate's own test targets — ADR-062 §Decision 1 permits a nullifier
+# feature there or in a feature list named `testing` and nowhere else.
+#
+# This paragraph claims nothing about the rest of the workspace, where each of
+# the three has its own routes: `crates/scp-ffi/Cargo.toml`'s `testing` feature
+# names `scp-dht/testing`; the `[dev-dependencies]` entries of
+# `crates/scp-runtime/Cargo.toml` and `crates/scp-ffi/common/Cargo.toml` name
+# `scp-identity/testing`; and `crates/scp-node/Cargo.toml`'s `testing` feature
+# names `allow_unencrypted_storage`, which `crates/scp-ffi/common/Cargo.toml`
+# reaches through `scp-node?/testing`. What proves no SHIPPED artifact resolves
+# any of them is `scripts/check-shipped-feature-graph.sh`, which resolves each
+# shipped configuration with `cargo tree -e features,no-dev` and fails on any
+# resolved feature its allowlist does not name.
 # Resolver 2 unifies normal-dependency features across every package one
 # invocation builds, so a workspace-wide `cargo build` still resolves
 # `scp-platform/testing` for every member, both through the `scp-platform` edge

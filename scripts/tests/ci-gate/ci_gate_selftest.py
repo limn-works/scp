@@ -444,10 +444,9 @@ SHIPPED_CONFIG_LANES = {
 #
 # Job fail-closed-pre-rotation selects each crate with `-p` and names its two
 # assertions in an `-E` filter. A workspace-wide command cannot serve as
-# scp-identity's lane: three manifests turn `scp-identity/testing` on —
-# crates/scp-testing/Cargo.toml, whose `helpers` feature names it and whose own
-# `[dev-dependencies]` turn `helpers` on, and the `[dev-dependencies]` entries
-# of crates/scp-runtime/Cargo.toml and crates/scp-ffi/common/Cargo.toml — and
+# scp-identity's lane: three manifests turn `scp-identity/testing` on, each in
+# its own `[dev-dependencies]` — crates/scp-testing/Cargo.toml,
+# crates/scp-runtime/Cargo.toml and crates/scp-ffi/common/Cargo.toml — and
 # one cargo invocation resolves one feature set per package, so a build reading
 # any one of them compiles scp-identity's
 # `#[cfg(not(feature = "testing"))]` assertions out. An earlier revision of
@@ -2302,8 +2301,8 @@ def write_unification_fixture(root: Path) -> None:
              their `[dev-dependencies]`; testing_edge reads the three
              dependency sections identically.
     implier  declares a feature naming `"leaf/testing"`, the spelling
-             crates/scp-testing/Cargo.toml's `helpers` feature carries against
-             scp-identity. It sorts after enabler, so a reader that returns one
+             crates/scp-identity/Cargo.toml's `testing` feature carries against
+             scp-dht. It sorts after enabler, so a reader that returns one
              edge returns enabler's and never names this one — which is why the
              live positive control below reads command_testing_edges. No
              manifest here turns `implier/helpers` on, which is what
@@ -2369,10 +2368,10 @@ def check_testing_unification_readers() -> None:
     manifest the command's text never mentions. A reader answering "no edge"
     to every question would re-green the pairing this file's unified-feature
     entry records: scp-identity paired with job rust-test, whose workspace
-    build reads every manifest turning `scp-identity/testing` on —
-    crates/scp-testing/Cargo.toml's `helpers` feature and the
-    `[dev-dependencies]` of crates/scp-runtime/Cargo.toml and
-    crates/scp-ffi/common/Cargo.toml — and compiles both of scp-identity's
+    build reads every manifest turning `scp-identity/testing` on — the
+    `[dev-dependencies]` of crates/scp-testing/Cargo.toml,
+    crates/scp-runtime/Cargo.toml and crates/scp-ffi/common/Cargo.toml — and
+    compiles both of scp-identity's
     fail-closed assertions out.
     """
     workspace = split_command("cargo nextest run --workspace")
@@ -2444,7 +2443,8 @@ def check_testing_unification_readers() -> None:
             )
             is not None,
             "implier's `helpers` feature names \"leaf/testing\", the spelling "
-            "crates/scp-testing/Cargo.toml carries against scp-identity",
+            "crates/scp-identity/Cargo.toml's `testing` feature carries "
+            "against scp-dht",
         )
         check(
             "command_testing_edges names every edge, not the first in sort order",
@@ -2541,13 +2541,16 @@ def check_testing_unification_readers() -> None:
         "scp-testing", "helpers", workspace
     )
     # Two facts make the premise true, and testing_edge answers only the first:
-    # crates/scp-testing/Cargo.toml's `helpers` feature names
-    # "scp-identity/testing", and a manifest in this build turns `helpers` on.
-    # testing_edge counts a feature-table value unconditionally (see its
+    # crates/scp-testing/Cargo.toml's `[dev-dependencies]` give its scp-identity
+    # entry `features = ["testing"]`, and that same table turns this crate's
+    # `helpers` feature on. The second fact is what gives the first one a reason
+    # to exist: `helpers` compiles src/helpers.rs, the only module in this crate
+    # naming the two `DidDht` constructors that `scp-identity/testing` gates.
+    # testing_edge counts a dependency entry unconditionally (see its
     # docstring), so on the first fact alone this control would stay green after
     # someone deleted the self dev-dependency at crates/scp-testing/Cargo.toml
-    # that enables `helpers` — it would read the surviving string and report a
-    # property the workspace no longer has.
+    # that enables `helpers` — it would read the surviving entry and attest a
+    # feature edge no module in the build consumes.
     #
     # command_testing_edges and unconditional_feature_activators each hand their
     # unresolvable-`-p` finding to every caller, and this caller reports both as
@@ -2569,8 +2572,8 @@ def check_testing_unification_readers() -> None:
         f"{helpers_unresolved!r}, edges "
         f"{sorted(str(manifest) for manifest in live_edges)} and "
         f"`helpers` activators {sorted(helpers_activators.values())} — "
-        f"crates/scp-testing/Cargo.toml gives its `helpers` feature the value "
-        f'"scp-identity/testing" AND its own `[dev-dependencies]` turn '
+        f"crates/scp-testing/Cargo.toml gives its `[dev-dependencies]` entry on "
+        f'scp-identity the feature "testing" AND that same table turns '
         f"`helpers` on, and a reader that misses either half re-greens pairing "
         f"scp-identity's assertions with a workspace lane. This control names "
         f"the manifest rather than reading whichever edge sorts first, because "

@@ -104,8 +104,10 @@ scp-dht = { path = "../scp-dht", features = ["testing"] }
 # `scp-identity/testing`, because that feature reaches every bridge test build
 # through `scp-ffi/testing → scp-core/testing → scp-runtime/testing`. The feature
 # rides on this dev-dependency edge instead, which only this crate's own test build
-# activates. A `--workspace` run gets the feature anyway, through `scp-testing`'s
-# self dev-dependency; this line is what makes
+# activates. A `--workspace` run gets the feature anyway, through this line and
+# through the matching `[dev-dependencies]` entries of
+# crates/scp-ffi/common/Cargo.toml and crates/scp-testing/Cargo.toml; this line is
+# what makes
 # `cargo nextest run -p scp-runtime --features testing` pass.
 # `scripts/check-shipped-feature-graph.sh`, the shipped-artifact feature-graph gate,
 # is what keeps `scp-identity/testing` out of every shipped artifact. That gate

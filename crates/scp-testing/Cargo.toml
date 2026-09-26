@@ -14,20 +14,25 @@ sqlite = ["scp-platform/sqlite"]
 filesystem = ["scp-platform/filesystem"]
 sync = ["scp-platform/sync"]
 combined = ["scp-transport/combined"]
-# Compiles `helpers`, the only module here that names `scp_identity` or `scp_dht`. Both
-# nullifier features exist for that module alone: `scp-identity/testing` compiles the two
+# Compiles `helpers`, the only module here that names `scp_identity` or `scp_dht`. The list
+# is empty because ADR-062, capability injection and prove-absent dev backends, permits a
+# nullifier feature in a `testing` feature list or in a `[dev-dependencies]` entry and
+# nowhere else, and this list is named `helpers`. The two features that module needs ride
+# on the `[dev-dependencies]` entries below: `scp-identity/testing` compiles the two
 # `DidDht` constructors it calls (both `#[cfg(any(test, feature = "testing"))]`), and
 # `scp-dht/testing` compiles the `InMemoryDhtClient` its `TestDidDht` alias names (the
-# §17.17.3 resolve nullifier). `[dev-dependencies]` below turns this feature on for this
-# crate's own test build, which is where the module's consumers live; a build that takes
-# this crate as a normal dependency never builds those dev-dependencies, so it resolves
-# both sibling crates without their nullifier features.
-helpers = ["scp-identity/testing", "scp-dht/testing"]
+# §17.17.3 resolve nullifier). Cargo's resolver 2 unifies a dev-dependency's features into
+# the library whenever the invocation builds this crate's test targets, so
+# `cargo test -p scp-testing` and `cargo test --workspace` compile the module against both
+# features. A build that takes this crate as a normal dependency builds no dev-dependency,
+# leaves this feature off, and resolves both sibling crates without their nullifier
+# features.
+helpers = []
 
 [dependencies]
 async-trait = { workspace = true }
 scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage", "testing"] }
-# Default features. `scp-identity/testing` rides on this crate's own `helpers` feature
+# Default features. `scp-identity/testing` rides on the `[dev-dependencies]` entry below
 # instead, because this was the only line in the workspace that enabled it, and as a normal
 # dependency edge it reached every build that pulls this crate — `scp-ffi`'s `testing`
 # feature among them.
@@ -39,8 +44,8 @@ scp-identity = { path = "../scp-identity" }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 # Default features. `scp-dht/testing` gates `InMemoryDhtClient`, the §17.17.3 resolve
 # nullifier, and `helpers.rs` is the only module here that names it, so the feature rides
-# on this crate's own `helpers` feature (ADR-062 §Decision 1 keeps it out of every
-# non-testing feature list).
+# on the `[dev-dependencies]` entry below — the location ADR-062 §Decision 1 names for this
+# crate, and one of the two locations it permits for that feature anywhere.
 scp-dht = { path = "../scp-dht" }
 scp-clock = { path = "../scp-clock" }
 scp-did = { path = "../scp-did" }
@@ -73,6 +78,8 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 # This crate, naming itself, to turn `helpers` on for its own test build and for no other.
+# This entry compiles the module; the `scp-identity` and `scp-dht` entries below carry the
+# two features the module's code needs.
 # `tests/integration/sdk_usability.rs` and `tests/integration/node.rs` are the module's only
 # consumers in the workspace. A `cargo test` or `cargo nextest` build of this crate unifies
 # dev-dependency features into the library, so the module compiles there; a build that takes
@@ -96,7 +103,25 @@ scp-relay-client = { path = "../scp-relay-client" }
 scp-runtime = { path = "../scp-runtime", features = ["testing"] }
 scp-protocol = { path = "../scp-protocol" }
 scp-clock = { path = "../scp-clock" }
-scp-identity = { path = "../scp-identity" }
+# `src/helpers.rs` calls `DidDht::with_in_memory_custody` and `DidDht::create_in_memory`,
+# which crates/scp-identity/src/dht.rs compiles under
+# `#[cfg(any(test, feature = "testing"))]`. The feature rides on this dev-dependency entry
+# rather than on the `helpers` feature list above for two reasons. First,
+# crates/scp-identity/Cargo.toml:55 writes `testing = ["scp-platform/testing",
+# "scp-dht/testing"]`, so naming `scp-identity/testing` in a list called `helpers` would
+# pull `scp-dht/testing` into a feature list not named `testing`, which ADR-062, capability
+# injection and prove-absent dev backends, forbids in §Decision 1: "`scp-dht/testing` MUST
+# NOT appear in any default / non-testing feature list — only in `testing` features and
+# dev-dependencies". Second, a `[dependencies]` edge carrying the feature reaches every
+# build that pulls this crate, which is the recompilation this branch removes.
+scp-identity = { path = "../scp-identity", features = ["testing"] }
+# `src/helpers.rs` names `InMemoryDhtClient` — the §17.17.3 resolve nullifier — in its
+# `TestDidDht` alias, and crates/scp-dht/src/lib.rs compiles that type under `testing`.
+# `scp-identity/testing` above already carries `scp-dht/testing`; this entry states the
+# edge the module's own `use scp_dht::InMemoryDhtClient` line declares, and ADR-062
+# §Decision 1 names `scp-testing` as one of the three crates that list the feature here,
+# alongside `scp-node` and `scp-runtime`.
+scp-dht = { path = "../scp-dht", features = ["testing"] }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 scp-transport = { path = "../scp-transport" }
 scp-ffi-common = { path = "../scp-ffi/common", features = ["resolvers"] }

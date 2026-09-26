@@ -113,8 +113,9 @@ scp-event-log = { path = "../../scp-event-log" }
 # under its own `testing` feature. This crate's `testing` feature does NOT forward
 # `scp-identity/testing`, because that feature reaches every bridge test build; the
 # feature rides on this dev-dependency edge instead, which only this crate's own
-# test build activates. A `--workspace` run gets the feature anyway, through
-# `scp-testing`'s self dev-dependency; this line is what makes
+# test build activates. A `--workspace` run gets the feature anyway, through this line
+# and through the matching `[dev-dependencies]` entries of
+# crates/scp-runtime/Cargo.toml and crates/scp-testing/Cargo.toml; this line is what makes
 # `cargo nextest run -p scp-ffi-common --features testing` compile.
 # `scripts/check-shipped-feature-graph.sh`, the shipped-artifact feature-graph gate,
 # is what keeps `scp-identity/testing` out of every shipped artifact. That gate

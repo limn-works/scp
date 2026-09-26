@@ -77,7 +77,9 @@ pub mod fullstack;
 // how the maturin and XCFramework builds of the `bridge-parity-swift` job came to resolve
 // `scp-identity` differently from each other and recompile seven shared crates. Behind
 // the feature, the integration tests that use the module still get it — this crate's own
-// `[dev-dependencies]` turn the feature on — and no other build carries it.
+// `[dev-dependencies]` turn the feature on and carry both nullifier features, which
+// ADR-062 §Decision 1 permits only there or in a list named `testing` — and no other
+// build carries it.
 #[cfg(feature = "helpers")]
 pub mod helpers;
 pub mod presets;
