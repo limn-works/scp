@@ -201,15 +201,6 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 1
 fi
 
-# The host triple the real compiler reports. The stub `rustc` below answers `-vV` with
-# it, because `scripts/check-vendored-openssl-scope.sh` resolves the wheel's graph on the
-# target `rustc -vV` names as `host:`, and case 3 runs that gate against this repository.
-HOST_TRIPLE=$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')
-if [[ -z $HOST_TRIPLE ]]; then
-    printf 'run-tests: rustc -vV named no host triple, and the stub rustc reports it to the gates case 3 runs, so no case ran.\n' >&2
-    exit 1
-fi
-
 FAILURES=0
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -272,9 +263,6 @@ EOF
     cat > "$dir/bin/rustc" <<EOF
 #!/usr/bin/env bash
 printf 'rustc %s (0000000000 2020-01-01)\n' "$rustc_version"
-if [[ \${1:-} == -vV ]]; then
-    printf 'host: %s\n' "$HOST_TRIPLE"
-fi
 EOF
 
     cat > "$dir/bin/rustup" <<'EOF'
@@ -291,6 +279,10 @@ case "\$1" in
     check) exit $cargo_check_rc ;;
     fmt) exit $cargo_fmt_rc ;;
     metadata)
+        # A \`--filter-platform\` call is the per-triple resolution
+        # \`scripts/check-vendored-openssl-scope.sh\` reads for the wheel, and it is delegated
+        # for the reason \`cargo tree\` is: it resolves the graph and builds nothing.
+        case " \$* " in *" --filter-platform "*) ;; *)
         # The runner reads two things out of this answer: the target directory its summary
         # names, and the dependency declarations its compile step derives a feature set
         # from. A case that wants the second writes its own JSON to metadata.json beside
@@ -302,6 +294,8 @@ case "\$1" in
             printf '{"version":1,"target_directory":"$dir/stub-target-dir"}\n'
         fi
         exit 0
+        ;;
+        esac
         ;;
 esac
 # Delegating means removing this directory from PATH first. The cargo on PATH here is a
@@ -471,16 +465,6 @@ else
 fi
 
 # ── Case 3: the control ──────────────────────────────────────────────────────────────
-# The stub's default `cargo metadata` answer lists no package, and
-# `scripts/check-vendored-openssl-scope.sh` enumerates the binaries this workspace ships
-# out of that answer and fails when it names none. Case 3 answers with this repository's
-# own `--no-deps` metadata, read here from the real cargo before any stub leads PATH.
-mkdir -p "$WORK/passing"
-if ! cargo metadata --no-deps --format-version 1 --offline > "$WORK/passing/metadata.json" 2>"$WORK/passing/metadata.err"; then
-    printf 'run-tests: cargo metadata failed against this repository, so case 3 has no package list to answer with:\n' >&2
-    cat "$WORK/passing/metadata.err" >&2
-    exit 1
-fi
 run_case passing "$PIN_CHANNEL" 0
 rc=$(cat "$WORK/passing/rc.txt")
 if [[ $rc -eq 0 ]]; then
