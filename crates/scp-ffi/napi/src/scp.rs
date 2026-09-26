@@ -533,14 +533,14 @@ impl Scp {
                         code: codes::VALID_7009.to_owned(),
                     }));
                 }
-                // Open the key file first, so a caller who set no
+                // Resolve the environment first, so a caller who set no
                 // `SCP_KEY_PASSPHRASE` reads that rather than a pre-rotation
-                // message they cannot act on. The `PyO3` reference bridge
-                // orders its `"file"` path the same way.
-                let file_custody = scp_ffi_common::custody_file::open_default_file_custody()
+                // message they cannot act on. Resolution touches no file, so
+                // the shipped build below fails closed without leaving a key
+                // file bound to whatever passphrase happened to be set. The
+                // `PyO3` reference bridge orders its `"file"` path the same way.
+                let file_inputs = scp_ffi_common::custody_file::resolve_file_custody_inputs()
                     .map_err(|e| NapiError::from(crate::identity::file_custody_error(&e)))?;
-                let key_custody =
-                    Arc::new(crate::custody::NapiKeyCustody::File(Box::new(file_custody)));
 
                 // Pre-rotation is mandatory at creation (spec §9.7.4.1 §3),
                 // and the only `PreRotationCustody` implementation is the
@@ -549,12 +549,17 @@ impl Scp {
                 // reference bridge answers its `"file"` path the same way.
                 #[cfg(not(feature = "testing"))]
                 {
-                    let _ = key_custody;
+                    let _ = file_inputs;
                     Err(NapiError::from(crate::identity::no_pre_rotation_backend()))
                 }
 
                 #[cfg(feature = "testing")]
                 {
+                    let file_custody = file_inputs
+                        .open()
+                        .map_err(|e| NapiError::from(crate::identity::file_custody_error(&e)))?;
+                    let key_custody =
+                        Arc::new(crate::custody::NapiKeyCustody::File(Box::new(file_custody)));
                     let pre_rotation_custody =
                         Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
                     let dht = crate::identity::shared_did_method()?;
@@ -729,14 +734,10 @@ impl Scp {
             // accepts `"file"`, so a method without this arm reports a caller's
             // valid custody name as a bridge bug.
             "file" => {
-                // Open the key file first, so a caller who set no
-                // `SCP_KEY_PASSPHRASE` reads that rather than a pre-rotation
-                // message they cannot act on. `identity_create` orders its
-                // `"file"` path the same way.
-                let file_custody = scp_ffi_common::custody_file::open_default_file_custody()
+                // Resolve the environment first, without touching any file.
+                // `identity_create` orders its `"file"` path the same way.
+                let file_inputs = scp_ffi_common::custody_file::resolve_file_custody_inputs()
                     .map_err(|e| NapiError::from(crate::identity::file_custody_error(&e)))?;
-                let key_custody =
-                    Arc::new(crate::custody::NapiKeyCustody::File(Box::new(file_custody)));
 
                 // Pre-rotation is mandatory at creation (spec §9.7.4.1 §3),
                 // and the only `PreRotationCustody` implementation is the
@@ -745,12 +746,17 @@ impl Scp {
                 // its `"file"` agent-key path the same way.
                 #[cfg(not(feature = "testing"))]
                 {
-                    let _ = key_custody;
+                    let _ = file_inputs;
                     Err(NapiError::from(crate::identity::no_pre_rotation_backend()))
                 }
 
                 #[cfg(feature = "testing")]
                 {
+                    let file_custody = file_inputs
+                        .open()
+                        .map_err(|e| NapiError::from(crate::identity::file_custody_error(&e)))?;
+                    let key_custody =
+                        Arc::new(crate::custody::NapiKeyCustody::File(Box::new(file_custody)));
                     let pre_rotation_custody =
                         Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
                     let dht = crate::identity::shared_did_method()?;

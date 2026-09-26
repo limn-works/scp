@@ -132,7 +132,7 @@ pub(crate) fn file_custody_error(
 ) -> ScpNapiError {
     use scp_ffi_common::custody_file::FileCustodyError as E;
     match error {
-        E::HomeUnset | E::PassphraseUnset => ScpNapiError::Validation {
+        E::HomeUnset | E::HomeNotAbsolute { .. } | E::PassphraseUnset => ScpNapiError::Validation {
             message: error.to_string(),
             code: codes::VALID_7001.to_owned(),
         },
