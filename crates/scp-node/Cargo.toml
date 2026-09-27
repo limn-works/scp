@@ -132,9 +132,9 @@ allow_unencrypted_storage = ["scp-core/allow_unencrypted_storage"]
 testing = ["scp-dht/testing", "scp-platform/testing", "allow_unencrypted_storage"]
 # The PostgreSQL and S3 blob backends, off by default so a default build links
 # neither the `sqlx` PostgreSQL client nor the AWS S3 client. In `--relay-only`
-# and persistent full-node mode, a build that compiled neither backend rejects
-# `SCP_RELAY_STORAGE_BACKEND=postgres` and `=s3` with an error naming this
-# feature, and never opens another backend in their place. Cargo unifies
+# and persistent full-node mode, a build that did not compile the selected
+# backend rejects `SCP_RELAY_STORAGE_BACKEND=postgres` or `=s3` with an error
+# naming this feature, and never opens another backend in its place. Cargo unifies
 # scp-transport's features across one invocation, so `scp-relay`'s `cloud-blobs`
 # in the same invocation also compiles both backends here. `--self-host` rejects
 # both values in every build, and so does `--ephemeral` in the `testing` build
