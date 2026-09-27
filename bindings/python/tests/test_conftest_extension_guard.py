@@ -169,6 +169,27 @@ def test_fixture_teardown_uses_the_synchronous_shutdown_path(
     )
 
 
+def test_fixture_fails_on_a_package_import_error_instead_of_skipping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``ImportError`` from ``from scp_sdk import SCP`` fails the `scp` fixture.
+
+    An absent extension no longer raises ``ImportError`` from that import, so the
+    only cause left is a defect in the pure-Python package. Removing the ``SCP``
+    attribute makes ``from scp_sdk import SCP`` raise ``ImportError`` the way a
+    renamed symbol does. A fixture that caught it would raise
+    ``pytest.skip.Exception``, which pytest reports as a skip rather than a
+    failure, so this test catches that exception and fails on it explicitly.
+    """
+    monkeypatch.delattr(scp_sdk, "SCP")
+    fixture_body = conftest.scp.__wrapped__  # type: ignore[attr-defined]
+    try:
+        with pytest.raises(ImportError):
+            next(fixture_body())
+    except pytest.skip.Exception as skipped:
+        pytest.fail(f"the scp fixture skipped over a package ImportError: {skipped}")
+
+
 def _raise(exc: BaseException) -> Any:
     raise exc
 

@@ -98,18 +98,15 @@ def scp() -> Iterator:
     matching :meth:`scp_sdk.SCP.__exit__` — so tokio-side resources are
     released deterministically.
     """
-    # Skip entire fixture if native extension is unavailable. Tests that
-    # use only pure-Python paths (e.g. test_types.py) don't depend on the
-    # fixture and remain unaffected.
-    #
-    # Only an ``ImportError`` skips here. ``scp_sdk/__init__.py`` raises
-    # ``SCP-VALID-7082`` — an ``ScpError``, not an ``ImportError`` — when the
-    # extension file is present and fails to load, so that cause propagates out
-    # of this fixture and fails the test instead of skipping it.
-    try:
-        from scp_sdk import SCP
-    except ImportError:
-        pytest.skip("scp_sdk not importable — run maturin develop first")
+    # This import is not guarded. ``scp_sdk`` imports without the native
+    # extension, because every SDK module loads the extension lazily through
+    # ``scp_sdk._extension.native_module``, and ``scp_sdk/__init__.py`` raises
+    # ``SCP-VALID-7082`` when the extension file is present and fails to load.
+    # So an ``ImportError`` here can only come from a defect in the pure-Python
+    # package, such as a from-import of a renamed symbol, and that defect fails
+    # the test. An absent extension reaches the ``extension_is_absent`` check
+    # below as ``SCP-VALID-7081`` and skips there.
+    from scp_sdk import SCP
 
     try:
         instance = SCP(storage={"type": "in_memory"})

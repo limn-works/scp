@@ -348,11 +348,16 @@ def _count_extension_imports(source: str) -> int:
     """Count the statements in ``source`` that import the extension.
 
     Walks the parsed syntax tree rather than matching the source text, so the
-    count covers every spelling an author can write: ``import _scp_core``,
+    count covers every import-statement spelling: ``import _scp_core``,
     ``from scp_sdk import _scp_core``, ``from . import _scp_core``,
     ``import scp_sdk._scp_core`` and ``from scp_sdk._scp_core import SCP``. A
     pattern over the text counts the one spelling its author wrote it for and
     passes every other spelling, which is the hole this function closes.
+
+    The walk reads ``ast.Import`` and ``ast.ImportFrom`` nodes only. It does not
+    count a call such as ``importlib.import_module("scp_sdk._scp_core")`` or
+    ``__import__("scp_sdk._scp_core")``, because the module name in such a call
+    can be any expression and no syntax-tree walk decides its value.
     """
     total = 0
     for node in ast.walk(ast.parse(source)):
@@ -379,8 +384,11 @@ def test_the_loader_is_the_only_sdk_module_that_imports_the_extension() -> None:
     anyone lists it.
 
     This assertion reads the package's source instead of its list, and compares
-    the whole per-file count against the mapping, so a new importer fails the
-    assertion whichever spelling it uses and whichever file it sits in.
+    the whole per-file count against the mapping, so a new importer that writes
+    an import statement fails the assertion whichever file it sits in. A module
+    that reaches the extension through ``importlib.import_module`` or
+    ``__import__`` passes this assertion, because `_count_extension_imports`
+    counts import statements only.
     """
     package_directory = Path(_extension.__file__).parent
     counts = {
