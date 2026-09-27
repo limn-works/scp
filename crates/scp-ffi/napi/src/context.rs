@@ -6822,6 +6822,46 @@ mod tests {
             .expect("a repeated close must stay idempotent");
     }
 
+    /// `outlet_stream_open_on` gates on the live lifecycle before the UCAN
+    /// pipeline reads the role state, so a context no actor serves refuses with
+    /// the withheld text and `SCP-OUTLET-6005`. Reaching the UCAN pipeline
+    /// first told an unauthorized caller that no actor serves the context, and
+    /// named it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_open_withholds_an_absent_actor_before_authorization() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-stream-open-no-actor-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiStreamOpenNoActor";
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+
+        let err = crate::outlet_stream::outlet_stream_open_on(
+            &bi,
+            &handle,
+            "probe-outlet".to_owned(),
+            "{}".to_owned(),
+            creator.to_owned(),
+            "bogus.jwt.token".to_owned(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("no supervisor actor must refuse the stream open");
+        let text = err.to_string();
+        assert!(
+            text.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                && text.contains(codes::OUTLET_6005),
+            "the refusal must come from the lifecycle gate: {text}"
+        );
+        assert!(
+            !text.contains(&ctx_id) && !text.contains("no live supervisor role state"),
+            "the refusal must not report the absent actor or echo the id: {text}"
+        );
+    }
+
     /// A close refuses a context the supervisor holds in its §5.9 cooperative
     /// closing window and releases none of that context's bridge state.
     ///

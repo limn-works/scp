@@ -20878,6 +20878,22 @@ mod tests {
                 .map(drop),
             ),
             (
+                "stream_open",
+                codes::OUTLET_6005,
+                rt.block_on(scp.outlet_stream_open(
+                    Arc::clone(&dead),
+                    "probe-outlet".to_owned(),
+                    "{}".to_owned(),
+                    identity.did(),
+                    junk_token.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                ))
+                .map(drop),
+            ),
+            (
                 "verify",
                 codes::OUTLET_6007,
                 rt.block_on(scp.outlet_verify(Arc::clone(&dead), "probe-outlet".to_owned()))
@@ -20934,8 +20950,8 @@ mod tests {
                         "{entry_point} must refuse at the lifecycle gate: {msg}"
                     );
                     assert!(
-                        !msg.contains("Active"),
-                        "{entry_point} refusal must withhold the lifecycle state: {msg}"
+                        !msg.contains("Active") && !msg.contains(&dead.context_id()),
+                        "{entry_point} refusal must withhold the lifecycle state and the id: {msg}"
                     );
                 }
                 other => panic!("{entry_point} must refuse with an Outlet error, got: {other:?}"),

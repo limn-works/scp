@@ -3205,6 +3205,43 @@ mod tests {
         crate::runtime::remove_context(&scp.inner, &ctx_id);
     }
 
+    /// `outlet_stream_open` gates on the live lifecycle before the UCAN
+    /// pipeline reads the role state, so a context no actor serves refuses with
+    /// the withheld text and `SCP-OUTLET-6005`, the same answer a `Closing` or
+    /// `Expired` context gets. Reaching `validate_outlet_ucan` first told an
+    /// unauthorized caller that no actor serves the context, and named it.
+    #[test]
+    fn stream_open_withholds_an_absent_actor_before_authorization() {
+        let creator = "did:dht:z6MkStreamOpenNoActor";
+        let (scp, ctx_id) = scp_without_supervisor_context("stream-open-no-actor", creator);
+
+        let err = Python::with_gil(|py| {
+            scp.outlet_stream_open(
+                &ctx_id,
+                "some-outlet",
+                &PyDict::new(py),
+                creator,
+                "bogus.jwt.token",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect_err("no supervisor actor must refuse the stream open")
+            .to_string()
+        });
+        assert!(
+            err.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                && err.contains("SCP-OUTLET-6005"),
+            "the refusal must come from the lifecycle gate: {err}"
+        );
+        assert!(
+            !err.contains(&ctx_id) && !err.contains("no live supervisor role state"),
+            "the refusal must not report the absent actor or echo the id: {err}"
+        );
+        crate::runtime::remove_context(&scp.inner, &ctx_id);
+    }
+
     /// `resolve_context_signing_key` resolves the SUPERVISOR's `creator_did`.
     /// The fixture registers FFI state under one DID and creates the supervisor
     /// context under another, so the DID named in the refusal identifies which

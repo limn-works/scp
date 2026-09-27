@@ -1137,11 +1137,12 @@ impl UniffiBridgeInstance {
     /// and withholds the lifecycle state from the refusal.
     ///
     /// Every UCAN entry point, every outlet entry point that authorizes a
-    /// caller against the context except `outlet_stream_open`, and the MCP
-    /// provider's `validate_capability` gate through this form, because each
-    /// one runs the gate before it authorizes the caller. The runtime refuses
-    /// a non-`Active` context when `outlet_stream_open` opens the stream, with
-    /// the state-free `SCP-OUTLET-6101`. The outlet entry points that
+    /// caller against the context, and the MCP provider's
+    /// `validate_capability` gate through this form, because each one runs
+    /// the gate before it authorizes the caller. `outlet_stream_open` gates
+    /// here before its UCAN pipeline reads `live_role_state`, whose refusal
+    /// for a context no actor serves names the context. The outlet entry
+    /// points that
     /// authorize nothing against the context carry no gate:
     /// `outlet_session_close`, `outlet_interface_revoke`, and the calls that
     /// act on a stream `outlet_stream_open` already opened. The outlet PRD's

@@ -407,6 +407,20 @@ fn outlet_stream_open_impl(
     }
     let input_json = crate::types::py_dict_to_json(input)?;
 
+    // The supervisor actor answers the lifecycle question before the UCAN
+    // pipeline reads the live role state, so a context no actor serves refuses
+    // with the same withheld text as every other non-`Active` state — see
+    // `crate::runtime::require_active_context_before_authz`.
+    crate::runtime::require_active_context_before_authz(
+        bi,
+        context_id,
+        "open outlet stream in context",
+        |message| ScpPyError::ContextError {
+            message,
+            code: scp_ffi_common::error_codes::OUTLET_6005.to_owned(),
+        },
+    )?;
+
     // Primary authorization: the full 11-step ADR-016 UCAN pipeline over the
     // bridge-owned per-context UCAN state — IDENTICAL to `outlet_invoke_impl`.
     // The stream is validated ONCE at open (§5.4.5 "UCAN check locus");
