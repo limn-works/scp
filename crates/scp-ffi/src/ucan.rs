@@ -289,6 +289,11 @@ impl crate::scp::PyScp {
     /// invalid Ed25519 signature, broken delegation chain, expired token,
     /// insufficient capabilities, revoked token, nonce replay, etc.
     ///
+    /// Raises `ContextError` with `SCP-CTX-2023` when the context's supervisor
+    /// actor reports any state other than `Active`, when no actor serves the
+    /// context, or when its state read fails; the message withholds the
+    /// lifecycle state.
+    ///
     /// See ADR-016 §5 for the full 11-step validation specification.
     #[pyo3(signature = (context_id, token, capability, presenting_agent_did, proof_tokens=None))]
     #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>> for method arguments.
@@ -420,10 +425,15 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ValidationError` only for malformed FFI inputs (invalid
+    /// Raises `ValidationError` for malformed FFI inputs (invalid
     /// `context_id`/`token`/`capability`/`did` strings) or an unparseable
     /// token / capability URI. Capability/signature/expiry failures are
     /// reported via the returned booleans, not as exceptions.
+    ///
+    /// Raises `ContextError` with `SCP-CTX-2023` when the context's supervisor
+    /// actor reports any state other than `Active`, when no actor serves the
+    /// context, or when its state read fails; the message withholds the
+    /// lifecycle state.
     ///
     /// See ADR-016 §5 and `CapabilityValidation` in scp-core.
     #[pyo3(signature = (context_id, token, capability, presenting_agent_did, proof_tokens=None))]
@@ -547,6 +557,11 @@ impl crate::scp::PyScp {
     /// Raises `UcanError` if minting fails: capabilities outside the context
     /// ceiling, issuer not authorized, signing fails, etc.
     ///
+    /// Raises `ContextError` with `SCP-CTX-2023` when the context's supervisor
+    /// actor reports any state other than `Active`, when no actor serves the
+    /// context, or when its state read fails; the message withholds the
+    /// lifecycle state.
+    ///
     /// See ADR-013 §6 and SCP-214 criterion 7.
     #[pyo3(signature = (context_id, member_did, capabilities, proofs=None))]
     #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec/Option<Vec> for method arguments.
@@ -655,6 +670,11 @@ impl crate::scp::PyScp {
     ///
     /// Raises `UcanError` if delegation fails: delegator not matching parent
     /// audience, capabilities wider than parent, signing failure, etc.
+    ///
+    /// Raises `ContextError` with `SCP-CTX-2023` when the context's supervisor
+    /// actor reports any state other than `Active`, when no actor serves the
+    /// context, or when its state read fails; the message withholds the
+    /// lifecycle state.
     ///
     /// See ADR-016 criterion 4 and SCP-214 criterion 8.
     // PyO3 requires owned types for method arguments.
@@ -770,8 +790,13 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `UcanError` if revocation fails: unauthorized revoker, context not
-    /// found, malformed token, or event log append failure.
+    /// Raises `UcanError` if revocation fails: unauthorized revoker, malformed
+    /// token, or event log append failure.
+    ///
+    /// Raises `ContextError` with `SCP-CTX-2023` when the context's supervisor
+    /// actor reports any state other than `Active`, when no actor serves the
+    /// context, or when its state read fails; the message withholds the
+    /// lifecycle state.
     ///
     /// See ADR-016 acceptance criterion 5. Closes #499.
     pub fn ucan_revoke(&self, context_id: &str, token: &str, revoker_did: &str) -> PyResult<()> {
