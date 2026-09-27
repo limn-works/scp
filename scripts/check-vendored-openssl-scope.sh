@@ -101,8 +101,12 @@
 #     reason they install `libssl3`. Vendoring into these two breaks an operator
 #     procedure this repository documents.
 #   * `scp-core` and the six FFI-bridge configurations take their crypto from the
-#     build host, which is what they do on `main` today: the host's libcrypto on a
-#     Linux host, CommonCrypto on an Apple host building an Apple target, and, on a
+#     build host, which is what they do on `main` today: for a Linux or Android
+#     target, a dynamic link to `crypto` that the linker resolves in the target's
+#     library path, which a native Linux build satisfies with the host's libcrypto
+#     and which the aarch64 Linux `index.node` leg and the Android AAR legs of
+#     `.github/workflows/build-matrix.yml` cannot satisfy, because neither installs
+#     a libcrypto for its target; CommonCrypto on an Apple host building an Apple target, and, on a
 #     Windows host building a Windows target, the OpenSSL installation OPENSSL_DIR
 #     names, without which libsqlite3-sys panics and the build fails. This gate holds
 #     that state so that a workspace-wide feature edit cannot change it as a side

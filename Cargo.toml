@@ -149,8 +149,10 @@ unicode-normalization = "0.1"
 arc-swap = "1"
 futures = "0.3"
 # SQLCipher compiles from the bundled amalgamation and takes its crypto from the
-# build host. libsqlite3-sys 0.30 links the host's libcrypto on a Linux host; on an
-# Apple host building an Apple target it builds against CommonCrypto from the
+# build host. For a Linux or Android target libsqlite3-sys 0.30 emits a dynamic link
+# to `crypto`, which the linker resolves in that target's library path: the build
+# host's libcrypto for a native Linux build, and no library at all for a cross build
+# whose sysroot holds no libcrypto. On an Apple host building an Apple target it builds against CommonCrypto from the
 # Security framework unless OPENSSL_DIR is set; on a Windows host building a Windows
 # target its build script panics unless OPENSSL_DIR (or both OPENSSL_LIB_DIR and
 # OPENSSL_INCLUDE_DIR) names an OpenSSL installation.
