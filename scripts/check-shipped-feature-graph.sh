@@ -1473,10 +1473,20 @@ maturin_project_files_named_by_shipping_lines() {
 # absent table and derived `scp-ffi|`, an ARTIFACTS entry this gate already holds,
 # so `assert_wheel_feature_selection_is_gated` accepted a wheel compiling
 # `testing`. Naming one more forbidden spelling per review round is the
-# non-convergent enforcement CLAUDE.md forbids under "Guard against
-# over-engineering and non-convergent enforcement"; a parser closed by
+# non-convergent enforcement `.claude/agents/README.md` forbids under "Guard
+# against over-engineering and non-convergent enforcement"; a parser closed by
 # construction is the convergent answer, and this repository already reads
 # `.mise.toml` this way in `scripts/check-toolchain-wiring.sh`.
+#
+# The keys of the table are a positive whitelist, closed by construction.
+# maturin passes more of that table to cargo than the feature keys:
+# `rustc-args` reaches rustc (`--cfg feature="testing"` compiles `testing` code
+# that cargo's feature resolution never sees), `config` overrides cargo
+# configuration, and `profile`, `target`, `unstable-flags` and more change the
+# build. The program therefore fails on any key outside MATURIN_KEYS: the four it
+# interprets, and `module-name`, `python-source`, `python-packages`, `include`
+# and `exclude`, which place files in the wheel and select no compilation. A key
+# maturin adds later fails here until someone classifies it into that set.
 #
 # The program reads the `[package] name` of the manifest out of the same parser,
 # because a Cargo.toml is a TOML document and `[ "package" ]` names the same table
@@ -1512,6 +1522,14 @@ tool = document.get("tool")
 table = tool.get("maturin", {}) if isinstance(tool, dict) else {}
 if not isinstance(table, dict):
     fail(f"{project_file}: [tool.maturin] is not a table")
+
+MATURIN_KEYS = {
+    "all-features", "no-default-features", "features", "manifest-path",
+    "module-name", "python-source", "python-packages", "include", "exclude",
+}
+unclassified = sorted(set(table) - MATURIN_KEYS)
+if unclassified:
+    fail(f"{project_file}: [tool.maturin] names key(s) this reader does not classify: {', '.join(unclassified)}")
 
 args = []
 
@@ -2071,9 +2089,6 @@ TREE
     "manifest-path = \"$wheel_manifest\"" \
     'module-name = "scp_sdk._scp_core"' \
     '' \
-    '[tool.maturin.sub]' \
-    'features = ["not-read-from-a-subtable"]' \
-    '' \
     '[tool.other]' \
     'features = ["not-read-from-another-table"]' > "$wheel_file"
   wheel_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
@@ -2204,6 +2219,22 @@ TREE
   same_string "$wheel_entry" "scp-ffi|--features extension-module"; rc=$?
   expect "(wheel-drift) that entry comes from the live key, so a commented-out key decides nothing" "PASS" "$rc"
 
+  # A key outside the whitelist fails, whether it passes rustc a cfg, overrides
+  # cargo configuration, or is a subtable this reader would otherwise not read.
+  printf '%s\n' '[tool.maturin]' 'features = ["extension-module"]' 'rustc-args = ["--cfg", "feature=\"testing\""]' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
+  expect "(wheel-drift, keys) a rustc-args key FAILS" "FAIL" "$rc"
+  printf '%s\n' '[tool.maturin]' 'features = ["extension-module"]' 'config = ["build.rustflags=[]"]' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
+  expect "(wheel-drift, keys) a config key FAILS" "FAIL" "$rc"
+  printf '%s\n' '[tool.maturin]' 'features = ["extension-module"]' "manifest-path = \"$wheel_manifest\"" '[tool.maturin.sub]' 'features = ["testing"]' > "$wheel_file"
+  maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
+  expect "(wheel-drift, keys) a subtable of [tool.maturin] FAILS" "FAIL" "$rc"
+  # The same file with only whitelisted keys derives, so the three above fail on
+  # the key and on nothing else.
+  printf '%s\n' '[tool.maturin]' 'features = ["extension-module"]' "manifest-path = \"$wheel_manifest\"" 'python-source = "."' 'include = []' > "$wheel_file"
+  maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
+  expect "(wheel-drift, keys) whitelisted keys alone derive an entry" "PASS" "$rc"
   printf '%s\n' '[tool.maturin]' 'features = ["extension-module"]' 'manifest-path = "nowhere/Cargo.toml"' > "$wheel_file"
   maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
   expect "(wheel-drift) a manifest-path naming no file FAILS" "FAIL" "$rc"
