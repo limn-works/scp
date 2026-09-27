@@ -716,9 +716,18 @@ fn env_flag_is_truthy(value: Option<&str>) -> bool {
 /// check, an operator who selected `postgres` or `s3` would get a `SQLite`
 /// store in its place. Every other value leaves `--self-host` on `SQLite`, as
 /// it ran before `cloud-blobs` existed.
+///
+/// The value is parsed by [`startup::BackendChoice::parse`], the parse
+/// `storage_from_env` runs, so the two cannot disagree about which values name
+/// a cloud backend.
 fn self_host_backend_conflict(selected: Option<&str>) -> Option<String> {
     let value = selected?;
-    if !matches!(value.to_lowercase().as_str(), "postgres" | "s3") {
+    let cloud = match startup::BackendChoice::parse(value) {
+        Ok(choice) => choice.is_cloud(),
+        Err(startup::BackendSelectionError::NotCompiled { .. }) => true,
+        Err(startup::BackendSelectionError::Unknown { .. }) => false,
+    };
+    if !cloud {
         return None;
     }
     Some(format!(
