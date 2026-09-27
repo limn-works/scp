@@ -283,7 +283,8 @@ EOF
 # `scp-ffi|--features extension-module,vendored-openssl` entry below is the
 # wheel's configuration, and `scripts/check-vendored-openssl-scope.sh` holds
 # the complementary property this gate does not read — that `openssl-src`
-# reaches the wheel and reaches no other shipped artifact.
+# reaches the wheel's configuration, which the sdist shares, and reaches no other
+# shipped configuration.
 #
 # uniffi-bindgen (the third workspace `[[bin]]`, in `crates/scp-ffi/uniffi`) is
 # deliberately NOT a separate ARTIFACTS entry: it is a build-time code-generation
@@ -2310,8 +2311,8 @@ TREE
 main() {
   # The two print modes hand this gate's own declarations to
   # `scripts/check-vendored-openssl-scope.sh`, which holds the complementary
-  # property that `openssl-src` reaches the PyPI wheel and no other shipped
-  # artifact. `--print-artifacts` writes the ARTIFACTS array as bash holds it, and
+  # property that `openssl-src` reaches the PyPI wheel's configuration, which the
+  # sdist shares, and no other shipped configuration. `--print-artifacts` writes the ARTIFACTS array as bash holds it, and
   # `--print-wheel-entries` writes the configuration each MATURIN_PROJECT_FILES
   # file makes maturin build, beside the file it read. Each mode writes its lines
   # and exits, because a caller asking what this gate declares is not asking this

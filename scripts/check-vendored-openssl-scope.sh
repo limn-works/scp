@@ -69,14 +69,15 @@ print("\n".join(out))
 PYTHON
 
 # is_feature_selection <entry arguments>: succeed when every token is
-# --no-default-features, --all-features, or --features <list>. A resolver flag such
-# as `--prune openssl-src` would otherwise empty the graph this gate counts.
+# --no-default-features, --all-features, or --features <value>. A resolver flag such
+# as `--prune openssl-src` would otherwise empty the graph this gate counts, so a
+# flag-shaped token fails in the value slot too. The value's feature-name grammar is
+# cargo's to check: a malformed list fails `cargo tree`, and the count then fails.
 is_feature_selection() {
-  local token want_list=0 name='[A-Za-z0-9_.+][A-Za-z0-9_.+-]*' list_re
-  list_re="^${name}(/${name})?(,${name}(/${name})?)*$"
+  local token want_list=0
   for token in $1; do
     if [[ "$want_list" -eq 1 ]]; then
-      [[ "$token" =~ $list_re ]] || { echo "not a cargo feature list: '$token'" >&2; return 1; }
+      [[ "$token" != -* ]] || { echo "a shipped configuration names a flag where a feature list belongs: '$token'" >&2; return 1; }
       want_list=0
     elif [[ "$token" == "--features" ]]; then want_list=1
     elif [[ "$token" != "--no-default-features" && "$token" != "--all-features" ]]; then
@@ -166,6 +167,8 @@ run_fixtures() {
   local dir out saved_path="$PATH" wheel
   dir="$(mktemp -d)"; mkdir -p "$dir/bin"
   is_feature_selection '--features server --prune openssl-src' 2>/dev/null; expect "an entry carrying a resolver flag FAILS" FAIL $?
+  is_feature_selection '--features --prune=openssl-src' 2>/dev/null; expect "a resolver flag in the feature-list slot FAILS" FAIL $?
+  is_feature_selection '--no-default-features --features extension-module,scp-platform/vendored-openssl' 2>/dev/null; expect "a feature selection PASSES" PASS $?
   printf '%s\n' 'jobs: {python-wheels: {strategy: {matrix: {include: [{target: universal2-apple-darwin}, {target: x86_64-pc-windows-msvc}]}}}}' > "$dir/m.yml"
   out="$(python3.12 -c "$WHEEL_TRIPLES_PROGRAM" "$dir/m.yml" python-wheels | paste -sd' ' -)"
   same "$out" "x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc"; expect "universal2 reads as both darwin triples" PASS $?
@@ -213,7 +216,7 @@ run_fixtures() {
   echo "   FIXTURES: $fixture_failures failed."; return 1
 }
 
-echo "==> vendored-OpenSSL scope: $VENDOR_CRATE reaches the PyPI wheel and nothing else this repository ships"
+echo "==> vendored-OpenSSL scope: $VENDOR_CRATE reaches the PyPI wheel's configuration and no other configuration this repository ships"
 run_fixtures || exit 1
 [[ "${1:-}" == "--self-test" ]] && exit 0
 run_gate

@@ -49,16 +49,16 @@ rustup manages Rust, and mise manages every other tool (see `.mise.toml`):
 cargo build --workspace
 
 # Python binding
-cd bindings/python && maturin develop --release
+(cd bindings/python && maturin develop --release)
 
 # TypeScript binding
-cd bindings/typescript && bun install && bun run build
+(cd bindings/typescript && bun install && bun run build)
 
 # Kotlin binding
-cd bindings/kotlin && ./gradlew assembleRelease
+(cd bindings/kotlin && ./gradlew assembleRelease)
 
 # Swift binding
-cd bindings/swift && swift build
+(cd bindings/swift && swift build)
 ```
 
 ## Test

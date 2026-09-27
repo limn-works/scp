@@ -850,7 +850,9 @@ GATES_NOT_RUN=(
 if ! "$PYTHON" -c 'import yaml' >/dev/null 2>&1; then
     printf 'fix-round-check: %s cannot import yaml, which scripts/check-workflow-compile-steps.py parses every workflow file with, so that gate fails below for the missing library. Install it with: pip install '"'"'pyyaml>=6,<7'"'"'\n' "$PYTHON" >&2
 fi
-if ! python3.12 -c 'import yaml' >/dev/null 2>&1; then
+if ! command -v python3.12 >/dev/null 2>&1; then
+    printf 'fix-round-check: python3.12 is not on PATH, and scripts/check-vendored-openssl-scope.sh runs it to read the python-wheels matrix of .github/workflows/build-matrix.yml, so that gate fails below for the missing interpreter. Install Python 3.12 (mise installs it for this repository).\n' >&2
+elif ! python3.12 -c 'import yaml' >/dev/null 2>&1; then
     printf 'fix-round-check: python3.12 cannot import yaml, which scripts/check-vendored-openssl-scope.sh reads the python-wheels matrix of .github/workflows/build-matrix.yml with, so that gate fails below for the missing library. Install it with: python3.12 -m pip install '"'"'pyyaml>=6,<7'"'"'\n' >&2
 fi
 
