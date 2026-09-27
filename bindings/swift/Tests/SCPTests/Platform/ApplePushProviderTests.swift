@@ -14,9 +14,11 @@
 // throws for that payload: `invalidPayload` for bytes that are not a JSON
 // object, `opaquePayloadViolation` for every other rejection.
 //
-// `register()` reaches APNs, and a `swift test` host holds no APNs entitlement
-// and receives no device token, so no case here calls it. Acceptance criterion 7
-// assigns `register()` to the physical-device lane.
+// `register()` reaches APNs through the shared application, and a `swift test`
+// host holds no APNs entitlement and receives no device token. The callback
+// cases therefore build the provider with a registration trigger that does
+// nothing and deliver the AppDelegate callbacks themselves. Acceptance
+// criterion 7 assigns a real APNs registration to the physical-device lane.
 
 #if os(iOS) || os(macOS)
 
@@ -64,13 +66,27 @@
     }
 
     struct ApplePushProviderPayloadTests {
-        @Test("handleNotification returns the payload bytes for a silent push")
+        @Test("handleNotification returns the fixed wake signal for a silent push")
         func handleNotificationAcceptsOpaquePayload() async throws {
             let provider = ApplePushProvider()
             let bytes = try opaquePayload()
 
             let signal = try await provider.handleNotification(payload: bytes)
-            #expect(signal == bytes)
+            #expect(signal == Data(#"{"aps":{"content-available":1}}"#.utf8))
+        }
+
+        @Test("handleNotification returns the fixed wake signal, not relay bytes that parse to it")
+        func handleNotificationDiscardsAcceptedPayloadBytes() async throws {
+            // Trailing whitespace is legal JSON, so these bytes parse to the one
+            // payload §10.7 permits while carrying 100 bytes the relay chose.
+            // Returning the received bytes would hand those bytes to the SCP
+            // engine.
+            let provider = ApplePushProvider()
+            let bytes = try opaquePayload() + Data(String(repeating: " ", count: 100).utf8)
+
+            let signal = try await provider.handleNotification(payload: bytes)
+            #expect(signal != bytes)
+            #expect(signal == Data(#"{"aps":{"content-available":1}}"#.utf8))
         }
 
         @Test("handleNotification rejects a second top-level field")
@@ -164,7 +180,7 @@
             //
             // Trailing whitespace is legal JSON, so these bytes break no rule
             // but the size rule: without the size guard they parse as the one
-            // payload §10.7 permits and the call returns them.
+            // payload §10.7 permits and the call accepts them.
             let provider = ApplePushProvider()
             let bytes = try opaquePayload() + Data(String(repeating: " ", count: 5000).utf8)
             #expect(bytes.count > 4096)
@@ -175,33 +191,70 @@
         }
     }
 
+    /// Start `register()` on `provider` and return once the call is suspended
+    /// on its continuation, or record an issue when it never suspends.
+    private func startRegistration(
+        _ provider: ApplePushProvider,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) async -> Task<Data, Error> {
+        let registration = Task { try await provider.register() }
+        var yields = 0
+        while yields < 10000, await !provider.hasPendingRegistration {
+            await Task.yield()
+            yields += 1
+        }
+        #expect(await provider.hasPendingRegistration, "register() never suspended", sourceLocation: sourceLocation)
+        return registration
+    }
+
     struct ApplePushRegistrationCallbackTests {
-        @Test("tokenDidRegister with no registration in flight changes nothing")
-        func tokenDidRegisterWithoutPendingRegistration() async throws {
-            // An AppDelegate forwards every APNs lifecycle event, including one
-            // that arrives when no `register()` call is suspended. Resuming a
-            // continuation twice traps, so this case pins that a token arriving
-            // outside a registration resumes nothing, and that a later payload
-            // still validates.
-            let provider = ApplePushProvider()
+        // An AppDelegate forwards every APNs lifecycle event, including a second
+        // token or a failure that arrives after one `register()` call already
+        // resumed. Resuming a continuation twice traps the app, so each callback
+        // clears the pending continuation before it resumes that continuation.
+        // Each case below suspends a real `register()` call, delivers one
+        // callback, and requires that no continuation stays pending; the second
+        // callback then traps the test process when the first one left the
+        // continuation set.
+
+        @Test("tokenDidRegister resumes a suspended register() once and clears it")
+        func tokenDidRegisterResumesPendingRegistrationOnce() async throws {
+            let provider = ApplePushProvider(requestRemoteNotifications: {})
+            let registration = await startRegistration(provider)
 
             await provider.tokenDidRegister(Data([0x01, 0x02]))
+            #expect(await !provider.hasPendingRegistration)
             await provider.tokenDidRegister(Data([0x03, 0x04]))
 
-            let bytes = try opaquePayload()
-            let signal = try await provider.handleNotification(payload: bytes)
-            #expect(signal == bytes)
+            #expect(try await registration.value == Data([0x01, 0x02]))
         }
 
-        @Test("registrationDidFail with no registration in flight changes nothing")
-        func registrationDidFailWithoutPendingRegistration() async throws {
-            let provider = ApplePushProvider()
+        @Test("registrationDidFail resumes a suspended register() once and clears it")
+        func registrationDidFailResumesPendingRegistrationOnce() async {
+            let provider = ApplePushProvider(requestRemoteNotifications: {})
+            let registration = await startRegistration(provider)
 
-            await provider.registrationDidFail(PushError.registrationFailed("no registration ran"))
+            await provider.registrationDidFail(PushError.invalidPayload("first failure"))
+            #expect(await !provider.hasPendingRegistration)
+            await provider.registrationDidFail(PushError.invalidPayload("second failure"))
 
-            let bytes = try opaquePayload()
-            let signal = try await provider.handleNotification(payload: bytes)
-            #expect(signal == bytes)
+            do {
+                _ = try await registration.value
+                Issue.record("register() returned a token after registrationDidFail")
+            } catch let PushError.registrationFailed(message) {
+                #expect(message.contains("first failure"))
+            } catch {
+                Issue.record("caught \(error), which is not PushError.registrationFailed")
+            }
+        }
+
+        @Test("tokenDidRegister with no registration in flight leaves none pending")
+        func tokenDidRegisterWithoutPendingRegistration() async {
+            let provider = ApplePushProvider(requestRemoteNotifications: {})
+
+            await provider.tokenDidRegister(Data([0x01, 0x02]))
+
+            #expect(await !provider.hasPendingRegistration)
         }
     }
 

@@ -128,13 +128,50 @@
         /// or ``registrationDidFail(_:)``. After consumption it is set back to `nil`.
         private var tokenContinuation: CheckedContinuation<Data, Error>?
 
+        /// Asks the platform to start APNs registration. ``register()`` calls it
+        /// on the main actor before it suspends.
+        private let requestRemoteNotifications: @MainActor @Sendable () -> Void
+
+        /// The wake signal ``handleNotification(payload:)`` returns for every
+        /// payload it accepts: the UTF-8 bytes of `{"aps":{"content-available":1}}`.
+        ///
+        /// The method returns this constant, not the received bytes, because
+        /// bytes that parse to the permitted object can still carry
+        /// relay-chosen content, such as trailing whitespace or a duplicate key
+        /// that the parser collapses into one.
+        static let wakeSignal = Data(#"{"aps":{"content-available":1}}"#.utf8)
+
+        /// `true` while a ``register()`` call is suspended waiting for
+        /// ``tokenDidRegister(_:)`` or ``registrationDidFail(_:)``.
+        var hasPendingRegistration: Bool {
+            tokenContinuation != nil
+        }
+
         // MARK: Initialiser
 
-        /// Creates a new `ApplePushProvider`.
+        /// Creates a new `ApplePushProvider` that registers through the shared
+        /// application's `registerForRemoteNotifications()`.
         ///
         /// ADR-025 has `ApplePlatformAdapter.make()` call this initialiser once.
         /// That factory does not exist yet.
-        public init() {}
+        public init() {
+            requestRemoteNotifications = {
+                #if canImport(UIKit)
+                    UIApplication.shared.registerForRemoteNotifications()
+                #elseif canImport(AppKit)
+                    NSApplication.shared.registerForRemoteNotifications()
+                #endif
+            }
+        }
+
+        /// Creates an `ApplePushProvider` that calls `requestRemoteNotifications`
+        /// in place of the shared application's `registerForRemoteNotifications()`.
+        /// A `swift test` host holds no APNs entitlement, so the callback tests
+        /// pass a closure that does nothing, suspend ``register()``, and drive
+        /// the AppDelegate callbacks themselves.
+        init(requestRemoteNotifications: @escaping @MainActor @Sendable () -> Void) {
+            self.requestRemoteNotifications = requestRemoteNotifications
+        }
 
         // MARK: APNs registration and payload handling
 
@@ -161,12 +198,9 @@
             }
 
             // Trigger registration on the main thread before suspending.
+            let request = requestRemoteNotifications
             Task { @MainActor in
-                #if canImport(UIKit)
-                    UIApplication.shared.registerForRemoteNotifications()
-                #elseif canImport(AppKit)
-                    NSApplication.shared.registerForRemoteNotifications()
-                #endif
+                request()
             }
 
             // Start a 30-second timeout that calls back into the actor on expiry.
@@ -209,14 +243,14 @@
         /// format required by §10.7. Any additional field in the payload — at the top level
         /// or nested inside `aps` — is rejected with ``PushError/opaquePayloadViolation``.
         ///
-        /// When the payload is valid, the method returns the raw payload bytes as the wake
-        /// signal. The SCP engine uses the wake signal to trigger a relay pull for pending
-        /// encrypted envelopes. No context ID, sender DID, or message count is extracted
-        /// from the payload — there is nothing to extract.
+        /// When the payload is valid, the method returns ``wakeSignal``, a fixed byte
+        /// string, and never the received bytes, so no relay-chosen byte reaches the
+        /// SCP engine. The SCP engine uses the wake signal to trigger a relay pull for
+        /// pending encrypted envelopes. The permitted payload carries no context ID,
+        /// sender identifier, or message count, so the wake signal carries none.
         ///
         /// - Parameter payload: The raw JSON bytes delivered by APNs.
-        /// - Returns: The raw `payload` bytes as the wake signal, passed opaquely to the
-        ///   SCP engine.
+        /// - Returns: ``wakeSignal``, the UTF-8 bytes of `{"aps":{"content-available":1}}`.
         ///
         /// - Throws:
         ///   - ``PushError/invalidPayload(_:)`` if the bytes cannot be parsed as JSON or the
@@ -225,9 +259,7 @@
         ///     other than `aps.content-available`.
         public func handleNotification(payload: Data) throws -> Data {
             try validateOpaquePayload(payload)
-            // The payload bytes are returned as the wake signal. The content is opaque —
-            // the engine fetches pending envelopes from the relay upon receipt.
-            return payload
+            return Self.wakeSignal
         }
 
         // MARK: AppDelegate callbacks

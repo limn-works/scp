@@ -531,7 +531,9 @@ pub trait PushProvider: Send + Sync {
 
     /// Handle an incoming push notification `payload`.
     ///
-    /// Returns wake signal bytes indicating which context has new messages.
+    /// Returns wake signal bytes. §10.7 of the infrastructure spec forbids a
+    /// context ID in the push payload, so the wake signal names no context,
+    /// and the engine answers it by pulling pending envelopes from its relays.
     async fn handle_notification(&self, payload: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 }
 

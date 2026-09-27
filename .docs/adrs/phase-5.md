@@ -475,7 +475,8 @@ service.generateKey { keyId, error in
     // DeviceAttestationProvider.attest(challenge:deviceId:); the adapter hashes no identifier.
     let clientDataHash = challenge
     service.attestKey(keyId, clientDataHash: clientDataHash) { attestation, error in
-        // attestation: Data — strip attStmt.receipt, then publish in an ScpDeviceAttestation entry
+        // attestation: Data — return the raw attestation object; the Rust core strips
+        // attStmt.receipt and publishes it in an ScpDeviceAttestation entry
     }
 }
 
@@ -553,7 +554,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 
 4. **`ApplePushProvider` — APNs:**
    - `register() -> Data`: Registers with APNs via `registerForRemoteNotifications()`. Returns the APNs device token bytes, because the UniFFI `PushProvider` callback returns token bytes. Throws `PushError.registrationFailed(String)` if APNs registration fails. (Amended 2026-09-27; this criterion previously returned a `PushToken` hex string and threw `PlatformError.pushRegistrationFailed(String)`.)
-   - `handleNotification(payload: Data) -> Data`: Processes an incoming silent push notification. Verifies the payload is `{"aps": {"content-available": 1}}`. Returns the validated payload bytes as the wake signal, because the UniFFI `PushProvider` callback returns wake signal bytes and the payload carries no context ID. Throws `PushError.opaquePayloadViolation(String)` for a payload containing any field other than `aps.content-available`, and `PushError.invalidPayload(String)` for bytes that are not a JSON object. (Amended 2026-09-27; this criterion previously returned `WakeSignal.wake`.)
+   - `handleNotification(payload: Data) -> Data`: Processes an incoming silent push notification. Verifies the payload is `{"aps": {"content-available": 1}}`. Returns the fixed UTF-8 bytes `{"aps":{"content-available":1}}` as the wake signal, because the UniFFI `PushProvider` callback returns wake signal bytes and the permitted payload carries no context ID. The adapter never returns the received bytes, because bytes that parse to the permitted object can still carry bytes the relay chose, such as trailing whitespace. Throws `PushError.opaquePayloadViolation(String)` for a payload containing any field other than `aps.content-available`, and `PushError.invalidPayload(String)` for bytes that are not a JSON object. (Amended 2026-09-27; this criterion previously returned `WakeSignal.wake`.)
    - The relay MUST send only `{"aps": {"content-available": 1}}` payloads. The adapter enforces opacity on receipt. No context ID, sender identifier, or message count is acceptable in the payload.
    - `ApplePushProvider` conforms to the UniFFI `PushProvider` protocol, as the Decision requires, and every method of that conformance throws only `ScpError`. UniFFI panics on the Rust side when a callback throws a type the callback does not declare, so a conformance that let a `PushError` cross the callback would turn each rejected payload into a panic; the conformance translates each `PushError` case to an `ScpError`, as `AttestationError.scpError` does for `AppleDeviceAttestation`. The shipped actor does not meet this bullet yet: it declares no conformance, names its registration method `register()` where the protocol names `registerPush()`, and throws `PushError`. `AppleStorage` and `AppleKeyCustody` have the same gap against the `StorageProvider` and `KeyCustodyProvider` protocols, and GitHub issue #2492 tracks all three. No Rust code holds or calls a `PushProvider` yet. (Amended 2026-09-27.)
    - APNs registration uses the `.alert` notification category with `UNAuthorizationOptions.alert` only for system notification permission; the actual push payload remains silent.
