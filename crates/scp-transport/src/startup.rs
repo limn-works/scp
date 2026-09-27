@@ -421,8 +421,11 @@ pub fn storage_backend_var() -> Option<String> {
 ///
 /// A value that is not valid UTF-8 is still a value the operator set, so it
 /// returns that value decoded lossily rather than `None`. The decoded value
-/// carries a U+FFFD replacement character, so it names no backend, and every
-/// caller rejects it as unknown instead of opening the default store.
+/// carries a U+FFFD replacement character, so it names no backend, and
+/// `storage_from_env` and `check_storage_selection_from_env` reject it as
+/// unknown instead of opening the default store. `scp-node --self-host`
+/// rejects only the backends [`backend_binary_feature`] names, so it runs on
+/// `SQLite` for this value, as it does for every value it does not reject.
 fn storage_backend_value(read: Result<String, env::VarError>) -> Option<String> {
     match read {
         Ok(value) => Some(value),
@@ -774,8 +777,9 @@ mod tests {
     /// Only an unset `SCP_RELAY_STORAGE_BACKEND` selects the default. A value
     /// that is not valid UTF-8 is a value the operator set: it reaches the
     /// callers as a string that names no backend, so `storage_from_env` and
-    /// `check_storage_selection_from_env` reject it as unknown and `--self-host`
-    /// rejects it too, instead of all three opening `sqlite`.
+    /// `check_storage_selection_from_env` reject it as unknown instead of
+    /// opening `sqlite`. `scp-node --self-host` rejects only the backends
+    /// `backend_binary_feature` names, so this value leaves it on `SQLite`.
     #[cfg(unix)]
     #[test]
     fn only_an_unset_variable_selects_the_default_backend() {

@@ -21,8 +21,10 @@ use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::{Command, Output};
 
-/// The `SCP_RELAY_STORAGE_BACKEND` values every node mode must reject: the two
-/// cloud backends, and on Unix a value that is not valid UTF-8.
+/// The `SCP_RELAY_STORAGE_BACKEND` values the persistent full node must
+/// reject: the two cloud backends, and on Unix a value that is not valid UTF-8.
+/// `--self-host` rejects only the two cloud backends, which
+/// `self_host_rejects_a_cloud_backend_before_writing_storage` checks.
 ///
 /// The non-UTF-8 value is a value the operator set, so it must be rejected as
 /// unknown rather than read as unset, which would select `sqlite`.
