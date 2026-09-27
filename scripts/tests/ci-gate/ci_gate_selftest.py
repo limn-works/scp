@@ -144,6 +144,10 @@ nothing:
                needs — would skip the NAPI half of the parity harness on every
                change confined to bindings/python. A diff of either job alone
                shows nothing.
+  retention    The four bridge producers uploaded with `retention-days: 1`, and
+               "Re-run failed jobs" re-runs a failed consumer without its
+               producer, so a consumer re-run a day after its run started
+               failed its download while GitHub still offered the re-run.
   lint-scope   One crate declared the lint the two rustdoc jobs exist to fire:
                crates/scp-runtime/src/lib.rs carried
                `#![deny(rustdoc::broken_intra_doc_links)]` and none of the other
@@ -3683,6 +3687,73 @@ def check_artifact_name_control(
     )
 
 
+# GitHub permits re-running a workflow run, or its failed jobs, for 30 days after the
+# run starts. A re-run of failed jobs leaves a producer that passed alone, so its
+# consumers download the copy the first attempt uploaded.
+RERUN_WINDOW_DAYS = 30
+
+
+def shared_uploads_expiring_inside_the_rerun_window(doc: dict) -> list[str]:
+    """Return every job:artifact pair whose shared upload expires before re-runs end.
+
+    CRITERION: an `actions/upload-artifact` step in ci.yml whose artifact name a job
+    in ci.yml downloads sets `retention-days` to at least RERUN_WINDOW_DAYS.
+
+    WHY: "Re-run failed jobs" re-runs the failed consumer and not the producer that
+    passed, so the consumer's download reads the first attempt's upload. An upload
+    that expired first fails that download, and the consumer fails over a binary it
+    could have tested. An omitted `retention-days` falls back to a repository
+    setting this file cannot read, so this check reports an omission too.
+    """
+    downloaded = {
+        (step.get("with") or {}).get("name")
+        for job in doc["jobs"].values()
+        for step in job.get("steps") or []
+        if str(step.get("uses") or "").startswith("actions/download-artifact")
+    }
+    short: list[str] = []
+    for job_id, job in sorted(doc["jobs"].items()):
+        for step in job.get("steps") or []:
+            if not str(step.get("uses") or "").startswith("actions/upload-artifact"):
+                continue
+            inputs = step.get("with") or {}
+            if inputs.get("name") not in downloaded:
+                continue
+            days = inputs.get("retention-days")
+            if not isinstance(days, int) or days < RERUN_WINDOW_DAYS:
+                short.append(f"{job_id}:{inputs.get('name')} ({days!r} days)")
+    return short
+
+
+def check_shared_uploads_outlive_the_rerun_window(doc: dict) -> None:
+    short = shared_uploads_expiring_inside_the_rerun_window(doc)
+    check(
+        f"ci.yml: every downloaded artifact is kept {RERUN_WINDOW_DAYS} days",
+        not short,
+        f"{short} expire while GitHub still offers 'Re-run failed jobs', so a "
+        f"consumer re-run after they expire fails its download",
+    )
+    # Control: every shared upload, lowered to one day in turn, is reported.
+    for job_id, job in doc["jobs"].items():
+        for index, step in enumerate(job.get("steps") or []):
+            inputs = step.get("with") or {}
+            if not str(step.get("uses") or "").startswith("actions/upload-artifact"):
+                continue
+            if not artifact_consumers(doc, inputs.get("name")):
+                continue
+            mutated = copy.deepcopy(doc)
+            mutated["jobs"][job_id]["steps"][index]["with"]["retention-days"] = 1
+            label = f"{job_id}:{inputs.get('name')}"
+            check(
+                f"lowering {label} to one day of retention is reported",
+                any(
+                    gap.startswith(label + " ")
+                    for gap in shared_uploads_expiring_inside_the_rerun_window(mutated)
+                ),
+                f"a ci.yml keeping {label} for one day went unreported",
+            )
+
+
 def a_producer_and_an_unguarded_consumer(
     doc: dict, artifact: str, upload_path: str, test_command: str
 ) -> dict:
@@ -3874,6 +3945,9 @@ def main() -> int:
                 check_napi_assertion_control(
                     workflow, napi_artifacts, napi_job, napi_fragment, napi_label
                 )
+
+    print("retention — a downloaded artifact outlives the re-run window")
+    check_shared_uploads_outlive_the_rerun_window(workflow)
 
     print("needs-condition — a job's dependencies run wherever the job does")
     check_dependency_conditions(workflow)

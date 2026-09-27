@@ -1684,6 +1684,12 @@ jobs:
   # and publishes an empty artifact, which reaches a consumer as a missing file rather
   # than as a failed producer — the shape `.github/workflows/release.yml` hit when a
   # signing job published an artifact named as signed that held nothing.
+  #
+  # Each upload names `retention-days: 30` because GitHub offers "Re-run failed jobs"
+  # for 30 days after a run starts, and that re-run skips a producer that passed, so
+  # the re-run consumer downloads the first attempt's upload. An upload that expired
+  # sooner would fail that download. scripts/tests/ci-gate/ci_gate_selftest.py
+  # reports a downloaded artifact kept for fewer days.
   pyo3-module:
     needs: changes
     # The union of the three consumers' conditions: python-test reads
@@ -1758,7 +1764,7 @@ jobs:
           # the standard library and `scp_sdk` alone.
           name: pyo3-module-linux
           path: bindings/python/scp_sdk/_scp_core*.so
-          retention-days: 1
+          retention-days: 30
           if-no-files-found: error
 
   napi-addon:
@@ -1813,7 +1819,7 @@ jobs:
         with:
           name: napi-addon-linux
           path: target/release/libscp_ffi_napi.so
-          retention-days: 1
+          retention-days: 30
           if-no-files-found: error
 
   xcframework:
@@ -1857,7 +1863,7 @@ jobs:
             bindings/swift/ScpFFI.xcframework
             bindings/swift/Headers
             bindings/swift/Sources/SCP/Internal/ScpBindings.swift
-          retention-days: 1
+          retention-days: 30
           if-no-files-found: error
 
   pyo3-module-macos:
@@ -1898,7 +1904,7 @@ jobs:
         with:
           name: pyo3-module-macos
           path: bindings/python/scp_sdk/_scp_core*.so
-          retention-days: 1
+          retention-days: 30
           if-no-files-found: error
 
   # ── Python ──────────────────────────────────────────────────────────
