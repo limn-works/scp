@@ -963,8 +963,14 @@ mod tests {
     fn device_attestation_callback_scp_error_lifts_to_an_error_value() {
         use uniffi::{LiftReturn, LowerError};
         for (code, msg) in [
-            (codes::ATTEST_9019, "DCAppAttestService.isSupported is false"),
-            (codes::ATTEST_9025, "generateKey returned neither keyId nor error"),
+            (
+                codes::ATTEST_9019,
+                "DCAppAttestService.isSupported is false",
+            ),
+            (
+                codes::ATTEST_9025,
+                "generateKey returned neither keyId nor error",
+            ),
         ] {
             let thrown = ScpError::Identity {
                 msg: msg.to_owned(),
