@@ -3,7 +3,7 @@
 // Kotlin JUnit 5 port of the Rust `storage_conformance!()` macro (SCP-PERSIST-030).
 // Exercises all 13 conformance cases against two StorageProvider test doubles:
 //
-// 1. InMemoryStorageProvider  — ConcurrentHashMap-backed, validates interface contract
+// 1. InMemoryStorageProvider  — lock-guarded TreeMap, validates interface contract
 // 2. SqliteStorageProvider    — org.xerial:sqlite-jdbc on JVM, validates the SQL paths
 //                               (schema, LIKE escaping, ORDER BY, WITHOUT ROWID)
 //
