@@ -17,8 +17,8 @@ cargo nextest run --workspace
 # or
 cargo test --workspace
 
-# Doc tests. The two cloud-blobs features compile the PostgreSQL and S3 blob
-# backends, whose doctests no default feature compiles.
+# Doc tests. The two cloud-blobs features compile the PostgreSQL blob backend,
+# whose doctest no default feature compiles.
 cargo test --workspace --doc --features scp-node/cloud-blobs,scp-relay/cloud-blobs
 ```
 

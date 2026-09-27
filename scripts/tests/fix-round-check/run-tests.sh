@@ -809,7 +809,10 @@ fi
 # rustdoc needs only the backend modules compiled; this script mirrors no rustdoc command.
 #
 # The mutations it kills: deleting either the scp-node or the scp-relay entry from
-# EXTRA_FEATURE_CHECKS, or merging the two into one two-package check.
+# EXTRA_FEATURE_CHECKS (the two positive assertions), and a runner that issues one cargo
+# command turning on cloud-blobs for both packages (the negative assertion). Today's runner
+# passes one `-p` per EXTRA_FEATURE_CHECKS entry, so only a rewrite of that loop can emit
+# such a command; the three probe logs below prove the negative assertion goes red on it.
 FIXTURE13B="$WORK/binary-cloud-blobs"
 build_fixture "$FIXTURE13B"
 for crate in scp-node scp-relay; do
@@ -835,7 +838,24 @@ for expected in \
         report "case 13b runs \`$expected\`" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13B.harness/cargo.log")"
     fi
 done
-if grep -qE -- '-p scp-node -p scp-relay [^|]*cloud-blobs' "$FIXTURE13B.harness/cargo.log"; then
+# A joint check is any one cargo invocation that names both packages and `cloud-blobs`,
+# whatever the order of its `-p` flags and wherever its `--features` sits.
+joint_cloud_blobs_check() {
+    awk 'index($0, "scp-node") && index($0, "scp-relay") && index($0, "cloud-blobs") { found = 1 } END { exit !found }' "$1"
+}
+JOINT_PROBE="$WORK/joint-cloud-blobs-probe.log"
+for mutant in \
+    'check -p scp-node -p scp-relay --all-targets --features cloud-blobs' \
+    'check -p scp-relay -p scp-node --all-targets --features scp-node/cloud-blobs,scp-relay/cloud-blobs' \
+    'check --features cloud-blobs -p scp-node -p scp-relay --all-targets'; do
+    printf 'check -p scp-node --all-targets\n%s\n' "$mutant" > "$JOINT_PROBE"
+    if joint_cloud_blobs_check "$JOINT_PROBE"; then
+        report "case 13b's joint-check detector rejects \`$mutant\`" 0 ""
+    else
+        report "case 13b's joint-check detector rejects \`$mutant\`" 1 "the detector passed a log whose second line is that joint check"
+    fi
+done
+if joint_cloud_blobs_check "$FIXTURE13B.harness/cargo.log"; then
     report "case 13b starts no check that turns on cloud-blobs for both binaries at once" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13B.harness/cargo.log")"
 else
     report "case 13b starts no check that turns on cloud-blobs for both binaries at once" 0 ""
