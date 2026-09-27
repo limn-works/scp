@@ -308,13 +308,22 @@ def _is_absence_reason(reason: ast.expr | None, source: str = "") -> bool:
     )
 
 
+#: The repository root: ``bindings/python/tests/conftest.py`` sits three levels below it.
+_REPO_ROOT = Path(conftest.__file__).resolve().parents[3]
+
+
 def _scanned_test_files() -> list[Path]:
-    return sorted(Path(conftest.__file__).parent.rglob("*.py"))
+    """Every Python test file that imports the SDK: ``bindings/python/tests``
+    and the repository-root ``tests/`` directory, which holds
+    ``tests/integration/phase3_integration_test.py``."""
+    roots = (Path(conftest.__file__).resolve().parent, _REPO_ROOT / "tests")
+    return sorted(path for root in roots for path in root.rglob("*.py"))
 
 
 def test_every_module_level_skip_takes_its_reason_from_the_absence_check() -> None:
-    """CRITERION: every skip site under `bindings/python/tests` that can gate a
-    module or a test on the native extension — `pytest.skip(...,
+    """CRITERION: every skip site in a Python test file that imports the SDK —
+    under `bindings/python/tests` or the repository-root `tests/` — that can
+    gate a module or a test on the native extension — `pytest.skip(...,
     allow_module_level=True)`, a `skipif` marker, `pytest.importorskip` — takes
     its reason from `skip_reason_if_extension_absent`, so no module or test
     skips over a present extension that failed to load or lacks an export it
@@ -323,14 +332,26 @@ def test_every_module_level_skip_takes_its_reason_from_the_absence_check() -> No
     for path in _scanned_test_files():
         source = path.read_text()
         if not all(_is_absence_reason(r, source) for r in _skip_site_reasons(source)):
-            offenders.append(str(path.relative_to(Path(conftest.__file__).parent)))
+            offenders.append(path.relative_to(_REPO_ROOT).as_posix())
     assert offenders == []
+
+
+def test_the_skip_scan_reads_the_repository_root_tests() -> None:
+    """The scan's file set includes the Phase 3 integration test, which sits
+    outside `bindings/python/tests` and gates its real-bridge class on a
+    `skipif` marker."""
+    scanned = {path.relative_to(_REPO_ROOT).as_posix() for path in _scanned_test_files()}
+    assert "tests/integration/phase3_integration_test.py" in scanned
 
 
 def test_the_skip_scan_reads_the_bridge_parity_package() -> None:
     """The scan's file set includes the subpackage the bridge-parity jobs run."""
-    tests_dir = Path(conftest.__file__).parent
-    scanned = {path.relative_to(tests_dir).parts[0] for path in _scanned_test_files()}
+    tests_dir = Path(conftest.__file__).resolve().parent
+    scanned = {
+        path.relative_to(tests_dir).parts[0]
+        for path in _scanned_test_files()
+        if path.is_relative_to(tests_dir)
+    }
     assert "bridge_parity" in scanned
 
 

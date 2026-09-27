@@ -421,22 +421,28 @@ def _count_bare_name_imports(source: str) -> int:
 
 
 def test_no_sdk_or_test_file_imports_the_extension_by_its_bare_name() -> None:
-    """CRITERION: no file under ``scp_sdk/`` or ``tests/`` imports ``_scp_core``
-    by its bare name.
+    """CRITERION: no file under ``bindings/python/scp_sdk/``,
+    ``bindings/python/tests/``, or the repository-root ``tests/`` imports
+    ``_scp_core`` by its bare name.
 
     The scan above reads ``scp_sdk/`` only. A test that writes
     ``import _scp_core`` inside its body passes collection and then raises
     ``ModuleNotFoundError`` on a runner that has the extension, so this scan
-    reads the test directory as well.
+    reads both test directories as well. The repository-root ``tests/``
+    directory holds ``tests/integration/phase3_integration_test.py``, whose
+    former bare-name guard skipped its real-bridge class over a working build.
     """
-    python_root = Path(_extension.__file__).parent.parent
+    python_root = Path(_extension.__file__).resolve().parent.parent
+    repo_root = python_root.parent.parent
+    directories = (python_root / "scp_sdk", python_root / "tests", repo_root / "tests")
     offenders = {
-        path.relative_to(python_root).as_posix(): count
-        for directory in ("scp_sdk", "tests")
-        for path in (python_root / directory).rglob("*.py")
+        path.relative_to(repo_root).as_posix(): count
+        for directory in directories
+        for path in directory.rglob("*.py")
         if (count := _count_bare_name_imports(path.read_text()))
     }
     assert offenders == {}
+    assert (repo_root / "tests" / "integration" / "phase3_integration_test.py").is_file()
 
 
 @pytest.mark.parametrize(

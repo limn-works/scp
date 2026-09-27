@@ -35,7 +35,10 @@ from scp_sdk._extension import reject_load_failure as _reject_load_failure
 # pyproject.toml module-name), and every SDK accessor reaches it by that name
 # through ``scp_sdk._extension.native_module``. The package registers no
 # bare-name ``_scp_core`` alias in ``sys.modules``, because no code in this
-# repository imports the bare name.
+# repository imports the bare name:
+# ``test_no_sdk_or_test_file_imports_the_extension_by_its_bare_name`` in
+# ``bindings/python/tests/test_extension_loading.py`` scans ``scp_sdk/``, the
+# SDK's ``tests/``, and the repository-root ``tests/`` for one.
 #
 # An absent extension is swallowed, so a pure-Python or mocked environment
 # still imports the package. A present extension that failed to load raises

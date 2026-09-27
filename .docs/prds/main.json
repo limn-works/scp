@@ -9331,7 +9331,7 @@
         "`crates/scp-ffi/src/event_log.rs` delegates to real `scp-core` event log query, proof, and checkpoint functions (no `Err(\"not implemented\")`)",
         "All 9 MCP bridge functions (`py_mcp_serve`, `py_mcp_client_connect_stdio`, etc.) are registered in the `#[pymodule]` in `lib.rs`",
         "`crates/scp-ffi/src/mcp.rs` exists and delegates to real `scp-mcp` crate functions",
-        "`python -c \"from _scp_core import py_mcp_serve\"` does not raise `ImportError`",
+        "`python -c \"from scp_sdk._scp_core import SCP; SCP.py_mcp_serve\"` does not raise",
         "Phase 3 integration test (`tests/integration/phase3_integration_test.py`) passes without `MagicMock` for the bridge layer — real bridge calls succeed for all 16 test methods",
         "No `\"not implemented\"` strings remain in any `crates/scp-ffi/src/*.rs` file"
       ],
