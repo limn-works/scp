@@ -6854,13 +6854,13 @@ mod tests {
         crate::runtime::init_supervisor_for_test_on(&bi);
         let ctx_id = format!("napi-closing-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiClosingCreator";
-        test_dispatch_create_context(
-            &bi,
-            &ctx_id,
-            ContextParams::default(),
-            DID(creator.to_owned()),
-        )
-        .await;
+        // The creator needs `context:close` for the supervisor's close to run.
+        let mut params = ContextParams::default();
+        params.ceiling.push(
+            scp_core::context::roles::Capability::new("context:close")
+                .expect("context:close parses"),
+        );
+        test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
         crate::runtime::register_test_context(&bi, &ctx_id);
         let handle = active_handle_for(&bi, &ctx_id, creator);
 

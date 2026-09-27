@@ -1392,6 +1392,7 @@ mod tests {
         let scp = crate::scp::PyScp::new_in_memory_for_test();
         let bi = &*scp.inner;
         let ctx_id = format!("ucan-no-bridge-state-{}", uuid::Uuid::new_v4());
+        crate::runtime::init_context_manager_for_test(bi);
         crate::runtime::create_supervisor_context_for_test(
             bi,
             &ctx_id,
