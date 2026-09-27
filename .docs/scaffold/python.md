@@ -71,9 +71,10 @@ manifest-path = "../../crates/scp-ffi/Cargo.toml"
 # `pyo3/extension-module`, and `vendored-openssl` forwards
 # `scp-platform/vendored-openssl`, which compiles OpenSSL from source into
 # SQLCipher because a `pip install` runs no linker and the wheel installs onto a
-# machine whose OpenSSL the build never saw. This is the one shipped artifact
-# that vendors OpenSSL; `scripts/check-vendored-openssl-scope.sh` fails when a
-# second one does.
+# machine whose OpenSSL the build never saw. This table is the one shipped
+# configuration that vendors OpenSSL: the wheel builds from it, and so does the
+# sdist on the installing machine. `scripts/check-vendored-openssl-scope.sh`
+# fails when any second shipped artifact selects that feature.
 features = ["extension-module", "vendored-openssl"]
 
 [tool.ruff]

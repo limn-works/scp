@@ -79,7 +79,9 @@ A single multi-threaded tokio runtime (`RUNTIME`, an `OnceLock<Runtime>` in
 # Full build (produces the scp_sdk._scp_core extension module). Run it from
 # bindings/python: its pyproject.toml holds the [tool.maturin] table (module name,
 # features, manifest path); this crate carries none, so maturin run here builds a
-# top-level `_scp_core` without `extension-module`.
+# top-level `_scp_core` without `extension-module`. That table selects
+# `vendored-openssl`, so the build compiles OpenSSL and needs a full perl, plus
+# make on Linux and macOS (bindings/python/README.md §Requirements).
 (cd bindings/python && maturin develop --release)
 
 # Type-check only (no Python linkage)

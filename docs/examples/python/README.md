@@ -5,7 +5,9 @@ context lifecycle, messaging, and tool invocation.
 
 ## Prerequisites
 
-1. **Rust toolchain** (for building the native extension):
+1. **Rust toolchain, a full perl, and make on Linux and macOS**: step 3 compiles
+   the native extension and the OpenSSL its SQLCipher links (see
+   `bindings/python/README.md` §Requirements):
    ```bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    ```

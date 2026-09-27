@@ -172,7 +172,7 @@
 # `scripts/check-workflow-compile-steps.py` reads every workflow file with and
 # `scripts/check-vendored-openssl-scope.sh` reads the python-wheels matrix with, the ruff
 # `scripts/check-pyi-generated.sh` runs,
-# the jq `scripts/check-bridge-symmetry.sh` requires, a Rust toolchain for the thirty-one
+# the jq `scripts/check-bridge-symmetry.sh` requires, a Rust toolchain for the
 # `cargo tree` resolutions three gates run, and the base ref `scripts/check-cross-layer.sh`
 # diffs against. A developer runs the same command by hand.
 #
@@ -228,7 +228,7 @@ trap 'rm -rf "$WORK"' EXIT
 # one case sat in it for 87 minutes behind another worktree's `cargo clippy --workspace`
 # until a 2400-second bound killed the run after case 1.
 #
-# `cargo tree` stays delegated, so the thirty-one resolutions inside
+# `cargo tree` stays delegated, so the `cargo tree` resolutions inside
 # `scripts/check-shipped-feature-graph.sh`, `scripts/check-protocol-deps.sh` and
 # `scripts/check-vendored-openssl-scope.sh` read this repository and case 3 fails when any
 # of the three gates rejects the tree. `cargo tree` takes no build lock: measured at 12.9

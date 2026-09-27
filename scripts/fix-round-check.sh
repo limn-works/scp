@@ -774,9 +774,10 @@ run_step format cargo fmt --all -- --check
 # unnoticed.
 #
 # THREE GATES STAY IN THE LIST ALTHOUGH THEY START CARGO. `scripts/check-shipped-feature-
-# graph.sh` runs eleven `cargo tree` resolutions, `scripts/check-protocol-deps.sh` runs
-# one, and `scripts/check-vendored-openssl-scope.sh` runs one per wheel triple, one per
-# other shipped configuration and one per workspace root (nineteen when it joined), and
+# graph.sh` runs three `cargo tree` resolutions per entry of its ARTIFACTS list plus its
+# default-members and fixture resolutions, `scripts/check-protocol-deps.sh` runs one, and
+# `scripts/check-vendored-openssl-scope.sh` runs one per wheel triple, one per other
+# shipped configuration and one per workspace root, and
 # `cargo tree` compiles nothing and takes no build lock: a 2026-09-13 run measured the
 # first two at 12.9 seconds and 391 ms while another worktree held that lock. A workspace
 # root with no Cargo.lock sends the vendored-OpenSSL gate to the crates.io index.

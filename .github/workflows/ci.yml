@@ -686,7 +686,7 @@ jobs:
   # parse with, the PyYAML check-workflow-compile-steps.py reads every workflow
   # file with and check-vendored-openssl-scope.sh reads the python-wheels matrix
   # with, the ruff check-pyi-generated.sh runs, the jq check-bridge-symmetry.sh
-  # requires, a Rust toolchain for the thirty-one `cargo tree` resolutions
+  # requires, a Rust toolchain for the `cargo tree` resolutions
   # check-shipped-feature-graph.sh, check-protocol-deps.sh and
   # check-vendored-openssl-scope.sh run, and the base ref check-cross-layer.sh diffs against. No step here
   # compiles a crate: the suite replaces `cargo check` and `cargo fmt` with
@@ -728,7 +728,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq
       - uses: dtolnay/rust-toolchain@stable
       # This job reads the `workspace-debug` cache group for its registry alone,
-      # the way job shipped-feature-graph does: the thirty-one `cargo tree`
+      # the way job shipped-feature-graph does: the `cargo tree`
       # resolutions the suite drives download the index and the `.crate` files,
       # and no step here compiles a crate into `target/debug`. `save-if: false`
       # keeps job rust-test the group's one writer, which is the shape the
