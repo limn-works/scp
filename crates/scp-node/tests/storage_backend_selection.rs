@@ -1,5 +1,6 @@
-//! A `scp-node` built without `cloud-blobs` rejects `SCP_RELAY_STORAGE_BACKEND`
-//! values `postgres` and `s3` instead of opening another blob store, and
+//! A `scp-node` rejects `SCP_RELAY_STORAGE_BACKEND` values `postgres` and `s3`
+//! that it cannot serve (a build without `cloud-blobs`, or a missing URL or
+//! bucket) instead of opening another blob store, and
 //! `--self-host`, which opens only `SQLite`, rejects both in every build.
 
 #![allow(clippy::expect_used, clippy::panic)]
@@ -36,12 +37,22 @@ fn output_within_deadline(command: &mut Command) -> Output {
     child.wait_with_output().expect("collect scp-node output")
 }
 
-/// A persistent full node built without `cloud-blobs` exits non-zero on
-/// `postgres` and `s3`, names the feature, and opens no `SQLite` blob store.
-#[cfg(not(feature = "cloud-blobs"))]
+/// A persistent full node exits non-zero on `postgres` without
+/// `SCP_RELAY_DATABASE_URL` and on `s3` without `SCP_RELAY_S3_BUCKET`, and
+/// opens no `SQLite` blob store in their place. A build that compiled the arm
+/// names the missing variable; a build without `cloud-blobs` names the feature.
+///
+/// Which of the two errors to expect is read from the `scp-transport` this test
+/// links, and not from this package's own `cloud-blobs` feature: cargo unifies
+/// `scp-transport`'s features across every package one invocation builds, so
+/// `scp-relay`'s `cloud-blobs` alone compiles the arms into this binary too.
 #[test]
-fn a_cloud_backend_without_cloud_blobs_is_rejected_naming_the_feature() {
-    for backend in ["postgres", "s3"] {
+fn a_cloud_backend_fails_closed() {
+    let compiled = scp_transport::startup::valid_backends();
+    for (backend, required_var) in [
+        ("postgres", "SCP_RELAY_DATABASE_URL"),
+        ("s3", "SCP_RELAY_S3_BUCKET"),
+    ] {
         let tmp = tempfile::tempdir().expect("tempdir");
         let blob_db = tmp.path().join("blobs.db");
         let output = output_within_deadline(
@@ -52,20 +63,25 @@ fn a_cloud_backend_without_cloud_blobs_is_rejected_naming_the_feature() {
                 .env("SCP_STORAGE_PATH", tmp.path().join("node-storage"))
                 .env("SCP_RELAY_STORAGE_PATH", &blob_db)
                 .env("SCP_RELAY_STORAGE_BACKEND", backend)
+                .env_remove(required_var)
                 .env_remove("SCP_NODE_DHT_MODE")
                 .env_remove("SCP_STORAGE_KEY")
                 .env_remove("RUST_LOG"),
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "{backend}: {stderr}");
-        assert!(
-            stderr.contains(&format!("'{backend}' is not compiled into this binary")),
-            "{backend}: {stderr}"
-        );
-        assert!(
-            stderr.contains("--features cloud-blobs"),
-            "{backend}: {stderr}"
-        );
+        if compiled.split(", ").any(|name| name == backend) {
+            assert!(stderr.contains(required_var), "{backend}: {stderr}");
+        } else {
+            assert!(
+                stderr.contains(&format!("'{backend}' is not compiled into this binary")),
+                "{backend}: {stderr}"
+            );
+            assert!(
+                stderr.contains("--features cloud-blobs"),
+                "{backend}: {stderr}"
+            );
+        }
         assert!(!blob_db.exists(), "{backend} opened {}", blob_db.display());
     }
 }

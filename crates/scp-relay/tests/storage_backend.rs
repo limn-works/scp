@@ -8,8 +8,8 @@
 //! - Invalid backend names produce a non-zero exit and descriptive error (AC 9)
 //! - `postgres` without `SCP_RELAY_DATABASE_URL` produces a non-zero exit (AC 10)
 //! - `s3` without `SCP_RELAY_S3_BUCKET` produces a non-zero exit (AC 6)
-//! - a build without `cloud-blobs` rejects `postgres` and `s3`, names the
-//!   feature, and opens no other store
+//! - a build without `cloud-blobs` rejects `postgres` and `s3` instead, names
+//!   the feature, and opens no other store
 
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -38,24 +38,34 @@ fn output_within_deadline(command: &mut Command) -> Output {
     child.wait_with_output().expect("collect scp-relay output")
 }
 
-/// A relay built without `cloud-blobs` rejects `postgres` and `s3` with an
-/// error naming the feature, exits non-zero, and opens no `SQLite` store in
-/// their place.
-#[cfg(not(feature = "cloud-blobs"))]
-#[test]
-fn a_cloud_backend_without_cloud_blobs_is_rejected_naming_the_feature() {
-    for backend in ["postgres", "s3"] {
-        let tmp = tempfile::tempdir().expect("failed to create tempdir");
-        let db_path = tmp.path().join("must-not-exist.db");
-        let output = output_within_deadline(
-            Command::new(relay_bin())
-                .env("SCP_RELAY_STORAGE_BACKEND", backend)
-                .env("SCP_RELAY_STORAGE_PATH", &db_path)
-                .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
-                .env_remove("RUST_LOG"),
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(!output.status.success(), "{backend}: {stderr}");
+/// Asserts that `scp-relay` exits non-zero on `SCP_RELAY_STORAGE_BACKEND=backend`
+/// with `required_var` unset, and opens no `SQLite` store in its place.
+///
+/// The expected error follows what the binary compiled, read from the
+/// `scp-transport` this test links, and not from this package's own
+/// `cloud-blobs` feature: cargo unifies `scp-transport`'s features across every
+/// package one invocation builds, so `scp-node`'s `cloud-blobs` alone compiles
+/// the arm into this binary too. A build with the arm names `required_var`; a
+/// build without it names the missing `cloud-blobs` feature.
+fn assert_cloud_backend_fails_closed(backend: &str, required_var: &str) {
+    let compiled = scp_transport::startup::valid_backends()
+        .split(", ")
+        .any(|name| name == backend);
+    let tmp = tempfile::tempdir().expect("failed to create tempdir");
+    let db_path = tmp.path().join("must-not-exist.db");
+    let output = output_within_deadline(
+        Command::new(relay_bin())
+            .env("SCP_RELAY_STORAGE_BACKEND", backend)
+            .env("SCP_RELAY_STORAGE_PATH", &db_path)
+            .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+            .env_remove(required_var)
+            .env_remove("RUST_LOG"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{backend}: {stderr}");
+    if compiled {
+        assert!(stderr.contains(required_var), "{backend}: {stderr}");
+    } else {
         assert!(
             stderr.contains(&format!("'{backend}' is not compiled into this binary")),
             "{backend}: {stderr}"
@@ -64,8 +74,8 @@ fn a_cloud_backend_without_cloud_blobs_is_rejected_naming_the_feature() {
             stderr.contains("--features cloud-blobs"),
             "{backend}: {stderr}"
         );
-        assert!(!db_path.exists(), "{backend} opened {}", db_path.display());
     }
+    assert!(!db_path.exists(), "{backend} opened {}", db_path.display());
 }
 
 /// Returns the path to the compiled `scp-relay` binary.
@@ -111,51 +121,19 @@ fn invalid_backend_exits_with_error() {
 }
 
 /// AC 10: Selecting `postgres` without `SCP_RELAY_DATABASE_URL` exits with
-/// a descriptive error. Only a `cloud-blobs` build compiles the postgres arm.
-#[cfg(feature = "cloud-blobs")]
+/// an error naming that variable, or, in a build without `cloud-blobs`, with
+/// an error naming the feature.
 #[test]
 fn postgres_without_url_exits_with_error() {
-    let output = output_within_deadline(
-        Command::new(relay_bin())
-            .env("SCP_RELAY_STORAGE_BACKEND", "postgres")
-            .env_remove("SCP_RELAY_DATABASE_URL")
-            .env_remove("RUST_LOG"),
-    );
-
-    assert!(
-        !output.status.success(),
-        "expected non-zero exit when postgres URL is missing"
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("SCP_RELAY_DATABASE_URL"),
-        "error should mention the required env var; got: {stderr}"
-    );
+    assert_cloud_backend_fails_closed("postgres", "SCP_RELAY_DATABASE_URL");
 }
 
-/// AC 6: Selecting `s3` without `SCP_RELAY_S3_BUCKET` exits with a
-/// descriptive error. Only a `cloud-blobs` build compiles the s3 arm.
-#[cfg(feature = "cloud-blobs")]
+/// AC 6: Selecting `s3` without `SCP_RELAY_S3_BUCKET` exits with an error
+/// naming that variable, or, in a build without `cloud-blobs`, with an error
+/// naming the feature.
 #[test]
 fn s3_without_bucket_exits_with_error() {
-    let output = output_within_deadline(
-        Command::new(relay_bin())
-            .env("SCP_RELAY_STORAGE_BACKEND", "s3")
-            .env_remove("SCP_RELAY_S3_BUCKET")
-            .env_remove("RUST_LOG"),
-    );
-
-    assert!(
-        !output.status.success(),
-        "expected non-zero exit when S3 bucket is missing"
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("SCP_RELAY_S3_BUCKET"),
-        "error should mention the required env var; got: {stderr}"
-    );
+    assert_cloud_backend_fails_closed("s3", "SCP_RELAY_S3_BUCKET");
 }
 
 /// AC 8: `SQLite` blob persistence across reopens.
