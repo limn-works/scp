@@ -14,15 +14,34 @@
 # `openssl-sys`. `scripts/check-shipped-feature-graph.sh` exempts that one function
 # by name from its rule that every `cargo tree` under scripts/ names `--target all`.
 # Absence: `--target all` for every entry that gate's `--print-artifacts` writes
-# except the wheel's (`--print-wheel-entries`), for the root workspace, and for
-# `templates/personal-relay/Cargo.toml`, which declares its own `[workspace]`.
+# except the wheel's (`--print-wheel-entries`), and `--workspace` for every tracked
+# Cargo.toml that declares a `workspace` table, which is the root workspace and each
+# separately-workspaced template or scaffold (`templates/personal-relay` among
+# them), so a new workspace root is resolved without anyone listing it. The one
+# exclusion is NOT_SHIPPED_ROOTS below.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 VENDOR_CRATE="openssl-src"
 FEATURE_GRAPH_GATE="scripts/check-shipped-feature-graph.sh"
 WHEEL_MATRIX_FILE=".github/workflows/build-matrix.yml"
-PERSONAL_RELAY_MANIFEST="templates/personal-relay/Cargo.toml"
+# `fuzz/Cargo.toml` builds libFuzzer harnesses that no release or template ships,
+# and it resolves only under the nightly `fuzz/rust-toolchain.toml` pins.
+NOT_SHIPPED_ROOTS="fuzz/Cargo.toml"
+
+# Prints each manifest path, one per stdin line, whose TOML document holds a `workspace`
+# table. tomllib decides, so `[workspace]`, `[ "workspace" ]` and
+# `workspace = {}` all count, and an unparseable manifest fails the run.
+read -r -d '' WORKSPACE_ROOTS_PROGRAM <<'PYTHON' || true
+import sys, tomllib
+for path in sys.stdin.read().splitlines():
+    try:
+        doc = tomllib.load(open(path, "rb"))
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        sys.exit(f"{path}: {error}")
+    if "workspace" in doc:
+        print(path)
+PYTHON
 
 # Prints the wheel triples of job argv[2] in workflow argv[1], reading maturin's
 # `universal2-apple-darwin` as both darwin triples. It fails on a duplicated key, on
@@ -123,10 +142,13 @@ run_gate() {
     fi
     report "$entry" "$n" none || failures=$((failures + 1))
   done <<<"$line"
-  n="$(all_target_occurrences --workspace)" || n=""
-  report "the root workspace" "$n" none || failures=$((failures + 1))
-  n="$(all_target_occurrences --manifest-path "$PERSONAL_RELAY_MANIFEST" --workspace)" || n=""
-  report "$PERSONAL_RELAY_MANIFEST" "$n" none || failures=$((failures + 1))
+  line="$(git ls-files -- 'Cargo.toml' '*/Cargo.toml' | python3.12 -c "$WORKSPACE_ROOTS_PROGRAM")" || return 1
+  [[ -n "$line" ]] || { echo "FAIL — no tracked Cargo.toml declares a workspace"; return 1; }
+  while IFS= read -r entry; do
+    [[ " $NOT_SHIPPED_ROOTS " == *" $entry "* ]] && continue
+    n="$(all_target_occurrences --manifest-path "$entry" --workspace)" || n=""
+    report "the $entry workspace" "$n" none || failures=$((failures + 1))
+  done <<<"$line"
   [[ "$failures" -eq 0 ]] && echo "PASS — $VENDOR_CRATE reaches the wheel on every triple and nothing else shipped." && return 0
   echo "FAIL — $failures resolution(s). Select the vendored build through scp-ffi/vendored-openssl on the wheel alone."
   return 1
@@ -178,6 +200,14 @@ run_fixtures() {
   FAKE_VENDORS=scp-node scenario "(absence) run_gate FAILS when another shipped configuration reaches $VENDOR_CRATE" FAIL
   printf '%s\n' "$out" | grep -F "FAIL — scp-node| reaches 1" >/dev/null; expect "(absence) it names scp-node" PASS $?
   FAKE_VENDORS=--workspace scenario "(absence) run_gate FAILS when a workspace resolution reaches $VENDOR_CRATE" FAIL
+  FAKE_VENDORS=scaffolds/relay/Cargo.toml scenario "(absence) run_gate resolves a workspace root no list names" FAIL
+  printf '%s\n' "$out" | grep -F "FAIL — the scaffolds/relay/Cargo.toml workspace reaches 1" >/dev/null; expect "(absence) it names that root" PASS $?
+  grep -F -- "--manifest-path fuzz/Cargo.toml" "$ARGV_LOG" >/dev/null; expect "(absence) the not-shipped fuzz root is not resolved" FAIL $?
+  printf '%s\n' '[ "workspace" ]' > "$dir/a.toml"; printf '%s\n' '[package]' 'name = "x"' > "$dir/b.toml"
+  out="$(printf '%s\n' "$dir/a.toml" "$dir/b.toml" | python3.12 -c "$WORKSPACE_ROOTS_PROGRAM")"
+  same "$out" "$dir/a.toml"; expect "a quoted [ \"workspace\" ] header counts as a root and a package alone does not" PASS $?
+  printf '%s\n' '[workspace' > "$dir/c.toml"
+  echo "$dir/c.toml" | python3.12 -c "$WORKSPACE_ROOTS_PROGRAM" >/dev/null 2>&1; expect "an unparseable manifest FAILS" FAIL $?
   PATH="$saved_path"; rm -rf "$dir"
   [[ "$fixture_failures" -eq 0 ]] && echo "   FIXTURES: all passed." && return 0
   echo "   FIXTURES: $fixture_failures failed."; return 1

@@ -210,12 +210,12 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 1
 fi
 
-# `timeout` bounds the `cargo metadata` call below and each of the 30 gates, so 31 call
+# `timeout` bounds the `cargo metadata` call below and each of the 31 gates, so 32 call
 # sites depend on it. macOS ships neither `timeout` nor `gtimeout`, Homebrew's coreutils
 # supplies both names, and `.mise.toml` provisions neither, so a checkout that installed
 # only the prerequisites README.md lists has no such program. Without this guard every gate
-# would exit 127, and the run would print 30 blocks reading "timeout: command not found"
-# and report 30 enforcement violations that do not exist.
+# would exit 127, and the run would print 31 blocks reading "timeout: command not found"
+# and report 31 enforcement violations that do not exist.
 TIMEOUT=timeout
 command -v "$TIMEOUT" >/dev/null 2>&1 || TIMEOUT=gtimeout
 if ! command -v "$TIMEOUT" >/dev/null 2>&1; then
@@ -490,7 +490,7 @@ UNRUN_LANES=(
     "bindings/kotlin/|ktlint, detekt and the Gradle test task, which the kotlin-lint and kotlin-test jobs of .github/workflows/ci.yml run"
     "bindings/swift/|SwiftLint, SwiftFormat and swift build, which the swift-lint and swift-build-test jobs of .github/workflows/ci.yml run"
     "fuzz/|cargo check inside fuzz/ on the nightly fuzz/rust-toolchain.toml names, which the fuzz-build job of .github/workflows/ci.yml runs"
-    ".github/|scripts/tests/ci-gate/run-tests.sh, which the ci-workflow-selftest job of .github/workflows/ci.yml runs and whose ci_gate_selftest.py asserts the job structure this repository's own workflow files declare, and scripts/tests/fix-round-check/run-tests.sh, which the fix-round-check-selftest job runs and whose case 23 reads .github/workflows/ci.yml itself, so adding a suite invocation to that file turns that case red. Those two are every suite a change under .github/ can turn red: every other suite the ci-workflow-selftest, toolchain-wiring and workflow-compile-steps jobs run feeds its gate a workflow file its own fixture wrote. Three gates this run did start read a workflow file, each for rules of its own and none as coverage of a workflow edit: scripts/check-workflow-compile-steps.py reads every workflow for its cache-group and bindgen rules, scripts/check-toolchain-wiring.sh reads them for its container-build and paths-filter rules, and scripts/check-shipped-feature-graph.sh reads build-matrix.yml and release.yml for the cargo invocations that ship an artifact"
+    ".github/|scripts/tests/ci-gate/run-tests.sh, which the ci-workflow-selftest job of .github/workflows/ci.yml runs and whose ci_gate_selftest.py asserts the job structure this repository's own workflow files declare, and scripts/tests/fix-round-check/run-tests.sh, which the fix-round-check-selftest job runs and whose case 23 reads .github/workflows/ci.yml itself, so adding a suite invocation to that file turns that case red. Those two are every suite a change under .github/ can turn red: every other suite the ci-workflow-selftest, toolchain-wiring and workflow-compile-steps jobs run feeds its gate a workflow file its own fixture wrote. Four gates this run did start read a workflow file, each for rules of its own and none as coverage of a workflow edit: scripts/check-workflow-compile-steps.py reads every workflow for its cache-group and bindgen rules, scripts/check-toolchain-wiring.sh reads them for its container-build and paths-filter rules, scripts/check-shipped-feature-graph.sh reads build-matrix.yml and release.yml for the cargo invocations that ship an artifact, and scripts/check-vendored-openssl-scope.sh reads the python-wheels matrix of build-matrix.yml for the triples the wheel ships for"
     "scripts/|the eleven suites that .github/workflows/ci.yml runs over this directory: scripts/tests/cross-layer/run-tests.sh in the cross-layer job, scripts/tests/bridge-symmetry/run-tests.sh in the bridge-symmetry job, scripts/test_check_sdk_coverage.py and scripts/tests/call-invariants/ in the sdk-coverage job, scripts/tests/toolchain-wiring/run-tests.sh, scripts/tests/pre-commit-merge/run-tests.sh and scripts/tests/workflow-compile-steps/run-tests.sh in the toolchain-wiring job, scripts/tests/fix-round-check/run-tests.sh in the fix-round-check-selftest job, scripts/tests/agent-verdict-criterion/run-tests.sh in the agent-verdict-criterion job, and scripts/tests/ci-gate/run-tests.sh and scripts/tests/signing-guard/run-tests.sh in the ci-workflow-selftest job. Running a gate below against this repository's own files is not running that gate's fixture suite, which is the program that proves the gate still rejects what it exists to reject"
 )
 
@@ -763,20 +763,23 @@ run_step format cargo fmt --all -- --check
 #
 # THE CRITERION for this list: running the script compiles nothing, links nothing, runs no
 # program cargo produced, and takes no lock on the shared target directory, so its whole
-# cost is reading repository files and, for one gate, resolving a dependency graph. Every
+# cost is reading repository files and, for three gates, resolving dependency graphs. Every
 # gate that compiles or links belongs to CI, which runs it on the pushed head.
 #
-# WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 31 files named
-# `check-*`. This list names 30 of them, and GATES_NOT_RUN below names the other one with
+# WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 32 files named
+# `check-*`. This list names 31 of them, and GATES_NOT_RUN below names the other one with
 # the reason it is absent. Neither count is load-bearing: the loop below globs
 # `scripts/check-*` off the disk and fails the run on any file neither array names, so a
 # gate this repository gains and this list does not reports itself instead of going
 # unnoticed.
 #
-# TWO GATES STAY IN THE LIST ALTHOUGH THEY START CARGO. `scripts/check-shipped-feature-
-# graph.sh` runs eleven `cargo tree` resolutions and `scripts/check-protocol-deps.sh` runs
-# one, and `cargo tree` compiles nothing and takes no build lock: a 2026-09-13 run
-# measured them at 12.9 seconds and 391 ms while another worktree held that lock.
+# THREE GATES STAY IN THE LIST ALTHOUGH THEY START CARGO. `scripts/check-shipped-feature-
+# graph.sh` runs eleven `cargo tree` resolutions, `scripts/check-protocol-deps.sh` runs
+# one, and `scripts/check-vendored-openssl-scope.sh` runs one per wheel triple, one per
+# other shipped configuration and one per workspace root (nineteen when it joined), and
+# `cargo tree` compiles nothing and takes no build lock: a 2026-09-13 run measured the
+# first two at 12.9 seconds and 391 ms while another worktree held that lock. A workspace
+# root with no Cargo.lock sends the vendored-OpenSSL gate to the crates.io index.
 #
 # Measured on 2026-09-13, one run each, in the order below: 47 seconds for the 28 this
 # list held that day. `scripts/check-workflow-compile-steps.py` joined it afterwards: the
@@ -786,6 +789,8 @@ run_step format cargo fmt --all -- --check
 # job once, for a `Swatinem/rust-cache` step that named no cache group.
 # `scripts/check-doc-includes.py` joined after that: the `doc-includes` job of
 # `.github/workflows/ci.yml` runs it, and it reads only `.docs/` with the standard library.
+# `scripts/check-vendored-openssl-scope.sh` joined with the `vendored-openssl-scope` job,
+# under the cargo exception above.
 GATES=(
     scripts/check-agent-verdict-criterion.sh
     scripts/check-block-in-place.py
@@ -835,13 +840,18 @@ GATES_NOT_RUN=(
     scripts/check-resolved-rustc.sh
 )
 
-# `scripts/check-workflow-compile-steps.py` imports PyYAML, which the standard library does
-# not carry, so an interpreter without it fails that gate for a missing library rather than
-# for a workflow defect. The run still counts the failure, because a gate that did not
-# execute proved nothing; this line names the cause so a reader installs the library
-# instead of reading a traceback as an enforcement violation.
+# `scripts/check-workflow-compile-steps.py`, which this script runs under $PYTHON, and
+# `scripts/check-vendored-openssl-scope.sh`, which runs python3.12 itself, import PyYAML,
+# which the standard library does not carry, so an interpreter without it fails those
+# gates for a missing library rather than for a workflow or scope defect. The run still
+# counts the failure, because a gate that did not execute proved nothing; these lines name
+# the cause so a reader installs the library instead of reading a traceback as an
+# enforcement violation.
 if ! "$PYTHON" -c 'import yaml' >/dev/null 2>&1; then
     printf 'fix-round-check: %s cannot import yaml, which scripts/check-workflow-compile-steps.py parses every workflow file with, so that gate fails below for the missing library. Install it with: pip install '"'"'pyyaml>=6,<7'"'"'\n' "$PYTHON" >&2
+fi
+if ! python3.12 -c 'import yaml' >/dev/null 2>&1; then
+    printf 'fix-round-check: python3.12 cannot import yaml, which scripts/check-vendored-openssl-scope.sh reads the python-wheels matrix of .github/workflows/build-matrix.yml with, so that gate fails below for the missing library. Install it with: python3.12 -m pip install '"'"'pyyaml>=6,<7'"'"'\n' >&2
 fi
 
 gates_t0=$(date +%s)
@@ -875,7 +885,7 @@ for g in "${GATES[@]}"; do
         *) runner=(bash "$g") ;;
     esac
     # Each gate carries a 300-second bound for the same reason the metadata call above
-    # carries a 60-second one: two of these gates start `cargo tree`, neither passes
+    # carries a 60-second one: three of these gates start `cargo tree`, none passes
     # `--offline`, and a cargo command on this machine can sit in a queue for half an hour.
     # A gate that does not finish proved nothing, so the run reports that rather than
     # waiting. The bound is 300 seconds rather than 60 because the slowest gate measured on
