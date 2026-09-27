@@ -4582,7 +4582,7 @@
       "status": "done",
       "files": [
         "bindings/typescript/src/index.ts",
-        "bindings/typescript/src/bridge.ts",
+        "bindings/typescript/src/internal/bridge.ts",
         "bindings/typescript/package.json",
         "bindings/typescript/tsup.config.ts"
       ],
@@ -4600,7 +4600,7 @@
       "actionItems": [
         "Create bindings/typescript/package.json with @limn-works/scp-ts package configuration",
         "Create bindings/typescript/tsup.config.ts for dual ESM/CJS output",
-        "Create bindings/typescript/src/bridge.ts exposing the napi backend",
+        "Create bindings/typescript/src/internal/bridge.ts exposing the napi backend",
         "Create bindings/typescript/src/index.ts with public API re-exports",
         "Implement Identity module wrapping bridge calls",
         "Implement Context module wrapping bridge calls",

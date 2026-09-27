@@ -322,7 +322,7 @@ The clippy rule lands in commit 13 of the ADR-049 ladder (Phase 3 of the post-re
 
 ### 12a. Event-channel observer surface
 
-The `Supervisor` owns a `broadcast::Sender<(String, ContextEvent)>` in a `OnceLock` (`event_tx`). `Supervisor::subscribe_events()` is the public, read-only observer surface: it returns `Some(broadcast::Receiver)` when the channel is enabled, `None` otherwise. The per-context actors emit `(context_id, ContextEvent)` onto this sender via emit_event_into` (payloads stripped of plaintext first — see `strip_event_payload`).
+The `Supervisor` owns a `broadcast::Sender<(String, ContextEvent)>` in a `OnceLock` (`event_tx`). `Supervisor::subscribe_events()` is the public, read-only observer surface: it returns `Some(broadcast::Receiver)` when the channel is enabled, `None` otherwise. The per-context actors emit `(context_id, ContextEvent)` onto this sender via `emit_event_into` (payloads stripped of plaintext first — see `strip_event_payload`).
 
 This is lock-free-read-compliant under §Decision 12: A subscriber calls `subscribe()` **once, when it starts**, not on a per-command read path. The `RwLock`-per-acquire cost that Decision 12 forbids is a hot-path concern — `subscribe_events()` is cold (one call per subscriber), so it does not apply. The emit path itself touches only the `OnceLock`-resident sender (`broadcast::Sender::send` is lock-free for the fast path), consistent with the allowed read primitives.
 
