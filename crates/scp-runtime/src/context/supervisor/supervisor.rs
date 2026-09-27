@@ -11741,6 +11741,64 @@ impl Supervisor {
         }
     }
 
+    /// Reads the context's role state and reports an actor this call could not
+    /// reach as an error rather than as an absent context.
+    ///
+    /// [`Self::get_role_state`] answers `None` both when the supervisor serves
+    /// no context for the id and when a saturated or wedged actor misses
+    /// [`SEND_TIMEOUT`](crate::context::actor::SEND_TIMEOUT) or
+    /// [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT). The FFI
+    /// bridges authorize against role state and must tell a caller to retry a
+    /// busy context instead of telling it the context does not exist, so they
+    /// read this form.
+    ///
+    /// `Ok(None)` has the meaning [`Self::read_context_state_checked`] gives
+    /// it: no actor, no poison flag, and no crash-window record for the id.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ActorBusy`] when an actor is registered and the
+    ///   mailbox send failed or timed out, the actor did not answer within
+    ///   `REPLY_TIMEOUT`, or an actor registered for the id between this
+    ///   read's two lookups.
+    /// - [`ContextError::ContextPoisoned`] for a context the crash watchdog
+    ///   poisoned and despawned (ADR-049 §10).
+    /// - [`ContextError::ActorCrashed`] for a context that is mid-respawn or
+    ///   whose last respawn failed (ADR-049 §10).
+    /// - Whatever error the `GetRoleState` handler itself returned.
+    pub async fn get_role_state_checked(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<scp_protocol::context::roles::ContextRoleState>, ContextError> {
+        let Some(actor) = self.lookup(context_id) else {
+            // No actor: classify the miss the way the lifecycle read does, so
+            // a poisoned or crashed context never reads as absent.
+            return match self.read_context_state_checked(context_id).await? {
+                None => Ok(None),
+                Some(scp_protocol::context::ContextState::Poisoned) => {
+                    Err(ContextError::ContextPoisoned(context_id.to_owned()))
+                }
+                Some(_) => Err(ContextError::ActorBusy(format!(
+                    "context '{context_id}' registered its actor while its role state was \
+                     being read; retry"
+                ))),
+            };
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = ContextCommand::Queries(QueriesCommand::GetRoleState {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        });
+        Self::dispatch_via_mailbox(&actor, cmd).await?;
+        match bounded_reply_await(rx).await {
+            Ok(answer) => answer,
+            Err(reply_error) => Err(ContextError::ActorBusy(format!(
+                "context '{context_id}' has a live actor that did not answer a role-state \
+                 read: {reply_error:?}"
+            ))),
+        }
+    }
+
     /// Drains and returns every event currently buffered for
     /// `context_id` via the actor mailbox.
     ///
@@ -23424,6 +23482,49 @@ mod tests {
         assert!(
             matches!(absent, Ok(None)),
             "an id with no actor and no crash-window record must read as Ok(None), got {absent:?}"
+        );
+    }
+
+    /// [`Supervisor::get_role_state_checked`] reports an unreachable actor as
+    /// `ActorBusy`, a crashed context as `ActorCrashed`, and a poisoned context
+    /// as `ContextPoisoned`, and answers `Ok(None)` only for an id the
+    /// supervisor never served. [`Supervisor::get_role_state`] folds all four
+    /// into `None`, so an FFI bridge authorizing against it told a caller that
+    /// a merely saturated context does not exist.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_checked_role_state_read_tells_a_busy_or_crashed_context_from_an_absent_one() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+
+        sup.test_make_actor_unreachable("ctx-role-unreachable");
+        assert!(sup.get_role_state("ctx-role-unreachable").await.is_none());
+        let busy = sup.get_role_state_checked("ctx-role-unreachable").await;
+        assert!(
+            matches!(busy, Err(ContextError::ActorBusy(_))),
+            "an unreachable actor must read as ActorBusy, got {busy:?}"
+        );
+
+        sup.test_hold_context_mid_respawn("ctx-role-mid-respawn")
+            .await;
+        let crashed = sup.get_role_state_checked("ctx-role-mid-respawn").await;
+        assert!(
+            matches!(crashed, Err(ContextError::ActorCrashed(_))),
+            "a context mid-respawn must read as ActorCrashed, got {crashed:?}"
+        );
+
+        sup.test_poison_context("ctx-role-poisoned").await;
+        let poisoned = sup.get_role_state_checked("ctx-role-poisoned").await;
+        assert!(
+            matches!(poisoned, Err(ContextError::ContextPoisoned(_))),
+            "a poisoned context must read as ContextPoisoned, got {poisoned:?}"
+        );
+
+        let absent = sup.get_role_state_checked("never-existed").await;
+        assert!(
+            matches!(absent, Ok(None)),
+            "an id the supervisor never served must read as Ok(None), got {absent:?}"
         );
     }
 

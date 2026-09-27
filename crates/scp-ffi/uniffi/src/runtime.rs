@@ -1004,16 +1004,18 @@ impl UniffiBridgeInstance {
     /// # Errors
     ///
     /// Returns any error [`UniffiBridgeInstance::context_manager_or_error`]
-    /// returns, or `ScpError::Context` when the supervisor holds no role state
-    /// for `context_id`.
+    /// returns, `ScpError::Context` when the supervisor holds no role state
+    /// for `context_id`, or the converted `ActorBusy`, `ActorCrashed`, or
+    /// `ContextPoisoned` error when the context's actor is saturated, wedged,
+    /// mid-respawn, or poisoned.
     pub async fn live_role_state(
         &self,
         context_id: &str,
     ) -> Result<scp_core::context::roles::ContextRoleState, crate::ScpError> {
         let supervisor = self.context_manager_or_error()?;
         supervisor
-            .get_role_state(context_id)
-            .await
+            .get_role_state_checked(context_id)
+            .await?
             .ok_or_else(|| crate::ScpError::Context {
                 msg: format!(
                     "context '{context_id}' has no live supervisor role state — refusing to \

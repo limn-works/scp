@@ -1728,8 +1728,11 @@ where
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` when the supervisor is unavailable, when
-/// the tokio bridge fails (see [`block_on_supervisor_query`]), or when the
-/// supervisor holds no role state for `context_id`.
+/// the sync-to-async bridge to the supervisor fails (the shared tokio runtime
+/// is absent, or a private current-thread runtime fails to build or answer), or when the
+/// supervisor holds no role state for `context_id`. Returns the converted
+/// `ActorBusy`, `ActorCrashed`, or `ContextPoisoned` error when the context's
+/// actor is saturated, wedged, mid-respawn, or poisoned.
 pub fn live_role_state(
     bi: &PyBridgeInstance,
     context_id: &str,
@@ -1738,7 +1741,11 @@ pub fn live_role_state(
     let ctx = context_id.to_owned();
     // `SCP-CTX-2023` is the context-state fault code the NAPI and `UniFFI`
     // bridges attach to this same refusal, so every SDK branches on one code.
-    block_on_supervisor_query(async move { sup.get_role_state(&ctx).await })?.ok_or_else(|| {
+    // A busy, crashed, or poisoned actor surfaces as its own `ContextError`
+    // (`ActorBusy`, `ActorCrashed`, `ContextPoisoned`), never as an absent
+    // context, so a caller knows to retry.
+    block_on_supervisor_query(async move { sup.get_role_state_checked(&ctx).await })??
+    .ok_or_else(|| {
         ScpPyError::ContextError {
             message: format!(
                 "context '{context_id}' has no live supervisor role state — refusing to \
@@ -1771,7 +1778,8 @@ pub fn live_role_state(
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` when the supervisor is unavailable, when
-/// the tokio bridge fails (see [`block_on_supervisor_query`]), or when the
+/// the sync-to-async bridge to the supervisor fails (the shared tokio runtime
+/// is absent, or a private current-thread runtime fails to build or answer), or when the
 /// supervisor reports no state for `context_id`.
 pub fn live_context_state(
     bi: &PyBridgeInstance,
@@ -1859,7 +1867,8 @@ where
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` when the supervisor is unavailable, when
-/// the tokio bridge fails (see [`block_on_supervisor_query`]), when an actor
+/// the sync-to-async bridge to the supervisor fails (the shared tokio runtime
+/// is absent, or a private current-thread runtime fails to build or answer), when an actor
 /// serves `context_id` but did not answer the state read, and when the crash
 /// watchdog despawned `context_id`'s actor for a respawn it has not finished or
 /// its last respawn failed (ADR-049 §10).
@@ -3730,6 +3739,30 @@ mod tests {
         assert!(
             format!("{err:?}").contains("no live supervisor role state"),
             "the refusal must name the absent supervisor role state: {err:?}"
+        );
+    }
+
+    /// `live_role_state` reports a context whose actor does not answer as
+    /// `ActorBusy` (`SCP-CTX-2130`), not as a context with no role state
+    /// (`SCP-CTX-2023`), so a caller retries a saturated context instead of
+    /// treating it as gone.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn live_role_state_reports_an_unreachable_actor_as_busy_not_absent() {
+        let (bi, ctx_id) =
+            live_state_fixture("live-role-busy", "did:dht:z6MkLiveRoleBusy", &[]);
+        live_role_state(&bi, &ctx_id).expect("the fixture's actor answers");
+        supervisor(&bi)
+            .expect("supervisor")
+            .test_make_actor_unreachable(&ctx_id);
+
+        let err = format!(
+            "{:?}",
+            live_role_state(&bi, &ctx_id).expect_err("an unreachable actor must refuse")
+        );
+        assert!(
+            err.contains("SCP-CTX-2130") && !err.contains("no live supervisor role state"),
+            "an unreachable actor must read as busy, not absent: {err}"
         );
     }
 

@@ -238,9 +238,10 @@ public actor Context {
             // string, must never present as a live/usable context. Per ADR-049
             // §10 this cached getter is best-effort and fails safe to a
             // non-active state. While it reads anything but `.active`, `send`,
-            // `join`, `leave`, `messages`, and the economic-policy calls throw
-            // without calling the bridge; `close()` calls the bridge, which
-            // reads the supervisor.
+            // `join`, `leave`, `messages`, the economic-policy calls, and the
+            // governance and outlet methods that check it throw without calling
+            // the bridge; `close()` and the streaming outlet `invoke` call the
+            // bridge, which reads the supervisor.
             state = Context.mapStateString((try? handle.state()) ?? "poisoned")
         }
     }
@@ -251,9 +252,12 @@ public actor Context {
     /// rather than ``ContextState/active``: per ADR-049 §10 the cached
     /// ``state`` getter is best-effort, and an unknown context must never be
     /// reported as live. While the cached value is not ``ContextState/active``,
-    /// `send`, `join`, `leave`, `messages`, `setEconomicPolicy`, and
-    /// `getEconomicPolicy` throw a local context error without calling the
-    /// bridge, and only `close()` reaches the bridge. While it is
+    /// `send`, `join`, `leave`, `messages`, `setEconomicPolicy`,
+    /// `getEconomicPolicy`, and every method in `Governance.swift` and
+    /// `Outlets.swift` that checks this value throw a local context error
+    /// without calling the bridge. `close()` and the streaming outlet
+    /// `invoke` (`Outlets+Streaming.swift`) do not check it and reach the
+    /// bridge, which reads the supervisor. While it is
     /// ``ContextState/active``, each operation reaches the bridge, which reads
     /// the supervisor and refuses a crashed or poisoned context: an operation
     /// the bridge gates on the lifecycle state refuses with its own error

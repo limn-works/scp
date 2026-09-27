@@ -20299,6 +20299,37 @@ mod tests {
         );
     }
 
+    /// `live_role_state` reports a context whose actor does not answer as
+    /// `ActorBusy` (`SCP-CTX-2130`), not as a context with no role state
+    /// (`SCP-CTX-2023`), so a caller retries a saturated context instead of
+    /// treating it as gone.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn live_role_state_reports_an_unreachable_actor_as_busy_not_absent() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        rt.block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create initializes the supervisor");
+        let ctx_id = scp_ffi_common::generate_context_id();
+        scp.inner
+            .context_manager_or_error()
+            .expect("the supervisor is initialized")
+            .test_make_actor_unreachable(&ctx_id);
+
+        let err = format!(
+            "{:?}",
+            rt.block_on(scp.inner.live_role_state(&ctx_id))
+                .expect_err("an unreachable actor must refuse")
+        );
+        assert!(
+            err.contains("2130") && !err.contains("no live supervisor role state"),
+            "an unreachable actor must read as busy, not absent: {err}"
+        );
+    }
+
     /// A readmit that clears the release mark before the close's removal takes
     /// the registry shard lock leaves the readmitted context's state in place;
     /// while the mark stands, the removal takes the state.

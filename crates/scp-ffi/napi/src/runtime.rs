@@ -1929,41 +1929,23 @@ pub fn remove_context(bi: &NapiBridgeInstance, context_id: &str) {
 ///
 /// # Errors
 ///
-/// Returns [`ScpNapiError::Context`] when the supervisor is unavailable, when
-/// the query shim fails or drops its reply, or when the supervisor holds no
-/// role state for `context_id`.
+/// Returns [`ScpNapiError::Context`] when the supervisor is unavailable or
+/// holds no role state for `context_id`, and the converted `ActorBusy`,
+/// `ActorCrashed`, or `ContextPoisoned` error when the context's actor is
+/// saturated, wedged, mid-respawn, or poisoned.
 pub async fn live_role_state(
     bi: &NapiBridgeInstance,
     context_id: &str,
 ) -> Result<ContextRoleState, ScpNapiError> {
-    use scp_core::context::actor::commands::QueriesCommand;
     let sup = supervisor(bi).map_err(|e| ScpNapiError::Context {
         message: e.to_string(),
         code: codes::CTX_2000.to_owned(),
     })?;
-    let sup = Arc::clone(sup);
-    // Route through the ADR-049 query shim. The handler returns `Ok(None)` when
-    // the context is unknown, and an unknown context fails the read closed.
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let cmd = QueriesCommand::GetRoleState {
-        context_id: context_id.to_owned(),
-        reply: tx,
-    };
-    sup.dispatch_query(cmd)
-        .await
-        .map_err(|e| ScpNapiError::Context {
-            message: format!("supervisor dispatch_query failed: {e}"),
-            code: codes::CTX_2000.to_owned(),
-        })?;
-    rx.await
-        .map_err(|e| ScpNapiError::Context {
-            message: format!("query shim reply dropped: {e}"),
-            code: codes::CTX_2000.to_owned(),
-        })?
-        .map_err(|e| ScpNapiError::Context {
-            message: e.to_string(),
-            code: codes::CTX_2000.to_owned(),
-        })?
+    // The checked read bounds the reply by `REPLY_TIMEOUT` and reports a busy,
+    // crashed, or poisoned actor as its own `ContextError`, never as an absent
+    // context. An unknown context fails the read closed.
+    sup.get_role_state_checked(context_id)
+        .await?
         .ok_or_else(|| ScpNapiError::Context {
             message: format!(
                 "context '{context_id}' has no live supervisor role state -- refusing to \
