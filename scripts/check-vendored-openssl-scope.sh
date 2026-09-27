@@ -317,9 +317,17 @@ feature_list_is_wellformed() {
 #   passes each feature list to `cargo tree` as one argument, so both need the
 #   entry's fields rather than its text. A token outside the four shapes is a
 #   token this reader cannot place, and it FAILS rather than being dropped or
-#   passed through. The `ARTIFACTS` array itself lives in the owner gate, a
-#   hook-protected enforcement file, which splices the same entries into its own
-#   `cargo tree` calls; this reader adds no trust boundary the owner lacks.
+#   passed through.
+#
+#   WHY THE WHITELIST IS NOT REDUNDANT WITH THE OWNER GATE. The owner gate splices
+#   each entry into its own `cargo tree` calls without checking its tokens, and it
+#   reads only SCP-crate features, so an entry carrying `--prune openssl-src`
+#   leaves the owner's verdict unchanged: openssl-src and everything below it are
+#   not SCP crates. The same entry spliced into vendor_crate_occurrences would
+#   remove openssl-src from the graph this gate counts, and a count of zero is the
+#   verdict the absence half passes on. This reader is the only place where such a
+#   token is refused; the `--depth 0` fixtures in run_fixtures fail if it stops
+#   refusing a resolver flag.
 cargo_arguments_for() {
   local raw="$1" token expect_list=0
   # The only word-splitting in this gate, and every token it produces is checked
