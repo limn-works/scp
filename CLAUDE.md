@@ -145,8 +145,9 @@ feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability
 and real-backend features, ZERO nullifier exceptions),
 check-vendored-openssl-scope.sh (the one gate holding OpenSSL's static link to the
 PyPI wheel; every other shipped artifact — the scp-node and scp-relay binaries and
-the three FFI bridges — links the host's libcrypto, which is how an operator patches
-OpenSSL by upgrading the runtime container's libssl3),
+the three FFI bridges — links the host's libcrypto on a non-Apple target, which is how
+an operator patches OpenSSL by upgrading the runtime container's libssl3, and uses
+CommonCrypto from the Security framework on an Apple target),
 check-toolchain-wiring.sh (every container build asserts which compiler it resolved;
 the changes job of every paths-filtered workflow routes a pin change to every lane that
 compiles on it, and ci.yml routes every root-level file and every cargo configuration

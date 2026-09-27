@@ -82,6 +82,10 @@
 # `scp-platform/vendored-openssl` and from there adds
 # `rusqlite/bundled-sqlcipher-vendored-openssl`. Drop that name and the wheel
 # silently reverts to linking whatever libcrypto the build host happened to have.
+# On an Apple triple the build without it links no libcrypto: libsqlite3-sys
+# builds SQLCipher against CommonCrypto from the Security framework unless
+# OPENSSL_DIR is set. This gate still requires the vendored build on every wheel
+# triple, the two darwin triples included.
 #
 # Every other shipped configuration must not get it. A vendored OpenSSL changes
 # patch level only when someone bumps `Cargo.lock`. `Rust / deny` resolves every
@@ -95,7 +99,8 @@
 #     reason they install `libssl3`. Vendoring into these two breaks an operator
 #     procedure this repository documents.
 #   * `scp-core` and the six FFI-bridge configurations link the libcrypto their
-#     build host supplies, which is what they do on `main` today. This gate holds
+#     build host supplies on a non-Apple target and CommonCrypto on an Apple
+#     target, which is what they do on `main` today. This gate holds
 #     that state so that a workspace-wide feature edit cannot change it as a side
 #     effect. This gate does not decide whether a prebuilt `index.node` or
 #     XCFramework that `.github/workflows/release.yml` publishes should vendor
