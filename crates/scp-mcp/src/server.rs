@@ -1221,12 +1221,20 @@ impl<P: ContextProvider> McpServer<P> {
     /// that inherited a subscription registry would receive updates it never
     /// asked for.
     ///
+    /// `served_contexts` is cleared too: it records which contexts sit in
+    /// *this* client's cached lists, so a context the previous client listed
+    /// must not produce a removal notice for a client that never listed it.
+    ///
     /// `event_source_wired` is deliberately *not* reset: it describes the
     /// server's wiring, not the session.
     pub fn reset_session(&mut self) {
         self.subscriptions.clear();
         self.initialized = false;
         self.client_capabilities = None;
+        self.served_contexts
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// Creates a `notifications/tools/list_changed` notification.
@@ -3159,6 +3167,27 @@ mod tests {
                     .iter()
                     .any(|n| n.method == protocol::METHOD_RESOURCES_LIST_CHANGED),
             "got: {notifs:?}"
+        );
+    }
+
+    /// The contexts a previous session listed belong to that session's cache.
+    /// After `reset_session`, a client that never listed the context must not
+    /// be told about its removal.
+    #[test]
+    fn removal_of_context_listed_by_previous_session_is_silent() {
+        let mut server = subscribing_server(MockProvider::default());
+        let list = make_request(protocol::METHOD_TOOLS_LIST, None);
+        assert!(server.handle_request(&list).unwrap().error.is_none());
+
+        server.reset_session();
+        let init = make_request(METHOD_INITIALIZE, Some(init_params()));
+        assert!(server.handle_request(&init).unwrap().error.is_none());
+        server.provider.contexts.retain(|c| c != "ctx_b");
+
+        let notifs = server.notifications_for_event("ctx_b", &ContextEvent::Expired);
+        assert!(
+            notifs.is_empty(),
+            "the new session never listed ctx_b, so its removal must be silent; got: {notifs:?}"
         );
     }
 
