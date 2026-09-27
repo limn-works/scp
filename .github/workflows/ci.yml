@@ -800,7 +800,7 @@ jobs:
 
   # Every agent definition in `.claude/agents/` opens with a `## Verdict criterion`
   # section carrying a `**Criterion:**` line and an `**Indicators, not the criterion.**`
-  # line, so the "Agent prompts" rule of AGENTS.md describes the tree
+  # line, so the "Write every agent prompt as a contract" rule of AGENTS.md describes the tree
   # instead of asserting a state nobody produced. It runs on every pull request, without
   # a paths filter, because the `ci` aggregator counts a skipped job as a pass.
   agent-verdict-criterion:

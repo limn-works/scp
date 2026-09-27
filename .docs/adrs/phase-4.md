@@ -1515,7 +1515,7 @@ This is the only structural shape that respects the "one implementation" invaria
 - **Closes the security-divergence class by construction.** A browser client cannot present a weaker validation surface than the node, because it performs no validation locally — the node is the single enforcement point. The recurring "WASM is the weaker bridge" finding cannot recur.
 - **"No DOA decisions" (AGENTS.md).** ADR-034 was a structure that needed replacing; the remote-thin-client model is the permanent commitment, because it has no per-feature recurring cost and no structurally-unreachable corners.
 - **"Simple over complex" without sacrificing capability.** Browser clients reach the full protocol surface — including the timer-, saga-, and recovery-driven behavior that had *no* WASM analogue — by talking to a node that has all of it. The constrained target gains capability by going remote, not loses it.
-- **Pre-release timing.** No deployed clients, no data, no migration: the cut is purely additive-by-subtraction with no compatibility surface (AGENTS.md pre-release tenet).
+- **Pre-release timing.** No deployed clients, no data, no migration: the cut is purely additive-by-subtraction with no compatibility surface (CLAUDE.md pre-release tenet).
 
 ### Alternatives Considered
 

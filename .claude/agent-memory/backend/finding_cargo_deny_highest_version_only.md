@@ -36,4 +36,4 @@ advisory as "cleared" on the strength of a green `cargo deny` alone.
 Also note: local `cargo-deny 0.19.0` did not detect RUSTSEC-2026-0253 **at
 all** (informational `unsound` advisory). Always match the CI binary version —
 download it from the cargo-deny GitHub releases rather than trusting the
-locally-installed one (`.docs/lessons/local-cargo-deny-sees-fewer-advisories-than-ci.md`).
+locally-installed one (`.docs/lessons/an-advisory-ignore-is-a-claim-to-recheck.md` §A local run is a lower bound on what CI reports).
