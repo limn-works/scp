@@ -108,7 +108,7 @@ impl Config {
             .unwrap_or(false);
 
         let storage_path = match non_empty_env("SCP_RELAY_STORAGE_PATH") {
-            Some(path) => PathBuf::from(path),
+            Some(path) => explicit_storage_path(path)?,
             None => default_storage_path(
                 std::env::var_os("XDG_DATA_HOME").as_deref(),
                 std::env::var_os("HOME").as_deref(),
@@ -145,6 +145,25 @@ impl Config {
 /// Returns `Some(value)` if the env var exists and is non-empty, `None` otherwise.
 fn non_empty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// Accepts an operator-named `SCP_RELAY_STORAGE_PATH` only when it is
+/// absolute.
+///
+/// A relative path resolves against the working directory, so a relay started
+/// from two working directories would open two stores and leave the first
+/// store's blobs unread without an error. `scp-transport`'s `storage_path`
+/// refuses the same variable for the same reason.
+fn explicit_storage_path(raw: String) -> Result<PathBuf, String> {
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err(format!(
+            "SCP_RELAY_STORAGE_PATH='{}' is relative, and a relative path opens a different \
+             store for every working directory the relay starts in. Name an absolute path.",
+            path.display()
+        ));
+    }
+    Ok(path)
 }
 
 /// Default storage path following the XDG Base Directory Specification, over
@@ -214,6 +233,25 @@ mod tests {
         assert_eq!(
             default_storage_path(Some(OsStr::new("/data")), home),
             Ok(PathBuf::from("/data/scp/personal-relay"))
+        );
+    }
+
+    /// An operator-named relative `SCP_RELAY_STORAGE_PATH` is rejected and an
+    /// absolute one is kept as given.
+    ///
+    /// Returning `PathBuf::from(raw)` without the `is_absolute` check makes the
+    /// relative cases return `Ok`, so that regression fails this test.
+    #[test]
+    fn explicit_storage_path_rejects_a_relative_path() {
+        for relative in ["data/relay", "relay.db", "./relay", "../relay"] {
+            let err = explicit_storage_path(relative.to_owned())
+                .expect_err("a relative SCP_RELAY_STORAGE_PATH must be rejected");
+            assert!(err.contains("SCP_RELAY_STORAGE_PATH"), "{err}");
+            assert!(err.contains(relative), "{err}");
+        }
+        assert_eq!(
+            explicit_storage_path("/var/lib/scp/relay".to_owned()),
+            Ok(PathBuf::from("/var/lib/scp/relay"))
         );
     }
 }
