@@ -21,6 +21,14 @@
 //! | `s3`       | S3-compat  | `SCP_RELAY_S3_BUCKET` (required) + AWS env    | |
 //! | `memory`   | In-memory  | —                                             | |
 //!
+//! The `postgres` row exists only in a binary whose cargo invocation compiled
+//! scp-transport's `postgres-blob` feature, and the `s3` row only with its
+//! `s3-blob` feature. This crate's `cloud-blobs` feature enables both, and so
+//! does `scp-node/cloud-blobs` in an invocation that builds both packages,
+//! because Cargo unifies features across one invocation. A binary whose build
+//! did not compile the selected backend exits on that value with an error
+//! naming the missing feature.
+//!
 //! See §10.5 of the SCP infrastructure spec.
 
 use std::net::SocketAddr;
@@ -43,7 +51,8 @@ async fn main() {
 
     startup::init_tracing();
 
-    let (handle, _local_addr, _storage) = startup::start_relay_from_env().await;
+    let backend = startup::backend_choice_from_env("cloud-blobs");
+    let (handle, _local_addr, _storage) = startup::start_relay_from_env(backend).await;
 
     // Start Prometheus metrics HTTP server on a separate port (#1467).
     let metrics_port = startup::env_or("SCP_RELAY_METRICS_PORT", 9001u16);

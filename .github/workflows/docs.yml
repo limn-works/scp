@@ -42,7 +42,8 @@ on:
     # which is why PR #2274's failing `Rust API docs (rustdoc)` job (run
     # 30878568409, attempt 1, never re-run) did not block its merge and three
     # broken intra-doc links rode `main` for ten days. Job rust-doc in ci.yml now
-    # runs `cargo doc --document-private-items` under the same feature set, so
+    # runs `cargo doc --document-private-items` under every feature rust-docs
+    # below enables, so
     # the required check itself fails on a broken intra-doc link, which is the
     # class that rode `main`. This trigger shortens time-to-detection for the
     # three doc builds ci.yml does not run: the sphinx, typedoc and Dokka jobs
@@ -168,9 +169,14 @@ jobs:
         # through `Arc<Scp>` when the feature is off, producing rustdoc
         # resolution errors. Enable the feature here to mirror the full
         # runtime surface used by CI/tests.
+        # `scp-node/cloud-blobs` and `scp-relay/cloud-blobs` compile
+        # `crates/scp-transport/src/native/postgres_blob.rs` and `s3_blob.rs`,
+        # which no other workspace member's dependency declaration enables.
+        # Without them this job uploads a `docs-rust` artifact with no page for
+        # the PostgreSQL or S3 blob store.
         run: |
           cargo doc --workspace --no-deps --document-private-items \
-            --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
+            --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-node/cloud-blobs,scp-relay/cloud-blobs
       - uses: actions/upload-artifact@v4
         with:
           name: docs-rust
