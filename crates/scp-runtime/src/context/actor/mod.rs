@@ -456,7 +456,7 @@ impl ContextActor {
                         // lingers in `actors` with a closed mailbox, so a
                         // lifecycle read reaches no actor (the checked read
                         // reports `ActorBusy`, the Option form `None`) instead
-                        // of the absent answer an expired context gives, and
+                        // of the absent answer a completed expiry gives, and
                         // the context id cannot be re-created.
                         // `despawn_actor` removes our OWN registry entry
                         // (`&self.context_id`) under the supervisor write lock;

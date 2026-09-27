@@ -2734,8 +2734,10 @@ pub enum QueriesCommand {
     /// `Supervisor::lookup(id).is_some()` proves only that an actor
     /// EXISTS — this query is the only way to observe the live-vs-terminal
     /// lifecycle distinction without a `per-context-state Mutex`. A TTL
-    /// expiry despawns the actor once `Expired` is durable, so an expired
-    /// context never answers this command and reads as absent.
+    /// expiry despawns the actor once its cleanup completes and `Expired` is
+    /// durable, so a context whose expiry completed never answers this
+    /// command and reads as absent. While an incomplete expiry is retrying,
+    /// the actor stays registered and answers `Expired`.
     ///
     /// `Ok(state)` always — the actor only receives this command when it
     /// owns the named context, so the reply is unconditional. Unknown

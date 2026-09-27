@@ -372,9 +372,10 @@ impl SupervisorHandle {
     /// despawn the actor, so `Some(state)` reflects the live lifecycle
     /// state — `Active` / `Creating` vs a terminal state such as `Closed` —
     /// and a context the crash watchdog poisoned reads `Some(Poisoned)`
-    /// (ADR-049 §10). A TTL expiry does despawn the actor once the `Expired`
-    /// state is durable, so an expired context reads `None`, never
-    /// `Some(Expired)`.
+    /// (ADR-049 §10). A TTL expiry does despawn the actor once its cleanup
+    /// completes and the `Expired` state is durable, so a context whose
+    /// expiry completed reads `None`. While an incomplete expiry is retrying,
+    /// the actor stays registered and reads `Some(Expired)`.
     ///
     /// `None` does not mean the context is absent. It covers an id no actor
     /// serves and also an actor this call could not reach: a busy or
