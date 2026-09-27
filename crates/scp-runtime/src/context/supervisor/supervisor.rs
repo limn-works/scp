@@ -23348,6 +23348,112 @@ mod tests {
         assert_eq!(window.crash_count(), 1, "the crash history must be kept");
     }
 
+    /// `Supervisor::import_context` over a replaceable actor marks the replace
+    /// gap on its own production path, and its `ImportContext` arm clears the
+    /// mark once the imported actor registers. The test above drives
+    /// `despawn_for_replace` and `end_replace_window` by hand, so it stays
+    /// green when `lifecycle_helpers::import_context` calls `despawn_actor`
+    /// instead or when the arm stops calling `end_replace_window`; this one
+    /// goes red in either case.
+    ///
+    /// The test holds `write_lock`, which `despawn_actor` takes after
+    /// `despawn_for_replace` sets the mark, so the import stops at the start
+    /// of the gap and the mark stays observable. The owning member's
+    /// key-package store is resolved first so `build_actor_deps` takes no
+    /// `write_lock` before that point.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn import_over_replaceable_actor_marks_and_ends_the_replace_gap() {
+        // `TestEventLog` refuses `import_event_log_data`; the import needs a
+        // provider that takes the export's event-log bytes.
+        let sup = supervisor_with_providers_and_event_log(Box::new(
+            crate::context::providers::event_log::MerkleEventLogProvider::new(),
+        ));
+        let ctx_id_bytes = [0xCAu8; 32];
+        let deps = test_actor_deps(&sup).await;
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:replace-admin".to_owned()),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .expect("drive the prior context to Active");
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Closing)
+            .expect("drive the prior context to Closing, which an import may replace");
+        sup.spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers the prior context");
+        let ctx_key = hex::encode(ctx_id_bytes);
+
+        let owning_member = "did:key:aaa-replace-gap-owning-member";
+        sup.key_package_store_for(&DID(owning_member.to_owned()))
+            .await
+            .expect("kp store resolves with providers");
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let export = signed_import_export_with_member(
+            &ctx_key,
+            "did:key:replace-gap-creator",
+            owning_member,
+            &signing_key,
+        )
+        .await;
+
+        let write_guard = sup.write_lock.lock().await;
+        let import = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move { sup.import_context(export, &verifying_key, None).await })
+        };
+        let marked = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if sup
+                    .crash_windows
+                    .get(&ctx_key)
+                    .is_some_and(|window| window.is_respawning())
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            marked.is_ok(),
+            "import_context must mark the replace gap before it despawns the prior actor"
+        );
+        // Stand in for the despawn the held `write_lock` is blocking, so the
+        // read below lands in the gap the production marker covers. The
+        // import's own `despawn_actor` then finds the slot empty.
+        sup.actors.remove(&ctx_key);
+        let in_gap = sup.read_context_state_checked(&ctx_key).await;
+        assert!(
+            matches!(in_gap, Err(ContextError::ActorCrashed(_))),
+            "a context in the import-replace gap must read as ActorCrashed, got {in_gap:?}"
+        );
+        drop(write_guard);
+
+        import
+            .await
+            .expect("import task must not panic")
+            .expect("an import over a Closing context succeeds");
+        assert!(
+            !sup.crash_windows.contains_key(&ctx_key),
+            "the ImportContext arm must end the replace gap and reap the window it created"
+        );
+        assert!(
+            sup.despawn_actor(&ctx_key).await,
+            "the imported actor must be registered"
+        );
+        let after = sup.read_context_state_checked(&ctx_key).await;
+        assert!(
+            matches!(after, Ok(None)),
+            "with the gap ended, a despawned context must read as absent, got {after:?}"
+        );
+    }
+
     /// The transient respawn marker must NOT leave a lingering crash-window
     /// record on a terminal-skip: a clean terminal context (no crash history)
     /// whose respawn is skipped must end with NO `crash_windows` entry,
