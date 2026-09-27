@@ -5273,10 +5273,17 @@ impl Supervisor {
     ) -> Result<(), ContextError> {
         // Clear the window first so the single retry starts from a clean
         // budget. `entry().or_default()` then `clear()` resets both the
-        // deque and the sticky flag.
+        // deque and the sticky flag. The same guard sets the respawn marker:
+        // `respawn_from_snapshot` sets it only after it acquires
+        // `bootstrap_spawn_lock`, and until then this context has no actor
+        // and no poison flag. Without the marker,
+        // `read_context_state_checked` reports that wait as `Ok(None)`, the
+        // answer on which the FFI bridges' `context_close` skips its
+        // `ContextClose` check and releases the context's bridge state.
         {
             let mut entry = self.crash_windows.entry(ctx_id.to_owned()).or_default();
             entry.clear();
+            entry.mark_respawning();
         }
         self.respawn_from_snapshot(ctx_id, owning_did).await
     }
@@ -10819,7 +10826,9 @@ impl Supervisor {
     ///   did not answer within `REPLY_TIMEOUT`.
     /// - [`ContextError::ActorCrashed`] when no actor is registered for
     ///   `context_id` because the crash watchdog despawned it and has not yet
-    ///   re-registered the replacement, because an import despawned it and
+    ///   re-registered the replacement, because an operator's `clear_poison`
+    ///   cleared its poison flag and has not yet respawned it, because an
+    ///   import despawned it and
     ///   has not yet registered the imported actor, or because its last
     ///   respawn failed and the context is not yet poisoned (ADR-049 §10).
     /// - Whatever error the `ReadContextState` handler itself returned.
@@ -21503,6 +21512,58 @@ mod tests {
         assert!(
             !matches!(result, Err(ContextError::ContextPoisoned(_))),
             "after clear_poison, dispatch must NOT surface ContextPoisoned"
+        );
+    }
+
+    /// While `clear_poison` waits on `bootstrap_spawn_lock`, the context has
+    /// no actor and no poison flag. The checked lifecycle read must report
+    /// that wait as `ActorCrashed`, never as `Ok(None)`: the FFI bridges'
+    /// `context_close` treats `Ok(None)` as "already closed" and skips the
+    /// `ContextClose` check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_poison_wait_for_the_spawn_lock_reads_as_crashed_not_absent() {
+        let clock = Arc::new(TestClock::new(1_700_000_000));
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let ctx_key = hex::encode([0xDDu8; 32]);
+        let owning = DID(format!("did:scp:{ctx_key}"));
+        sup.crash_windows.entry(ctx_key.clone()).or_default().poisoned = true;
+        assert!(
+            matches!(
+                sup.read_context_state_checked(&ctx_key).await,
+                Ok(Some(scp_protocol::context::ContextState::Poisoned))
+            ),
+            "a poisoned context with no actor reads as Poisoned"
+        );
+
+        // Another lifecycle operation holds the global spawn lock.
+        let spawn_guard = sup.bootstrap_spawn_lock.lock().await;
+        let task = {
+            let sup = Arc::clone(&sup);
+            let ctx_key = ctx_key.clone();
+            tokio::spawn(async move { sup.clear_poison(&ctx_key, &owning).await })
+        };
+        let cleared = wait_until(std::time::Duration::from_secs(5), || {
+            !sup.is_context_poisoned(&ctx_key)
+        })
+        .await;
+        assert!(
+            cleared,
+            "clear_poison must clear the poison flag before it takes the lock"
+        );
+
+        let read = sup.read_context_state_checked(&ctx_key).await;
+        assert!(
+            matches!(read, Err(ContextError::ActorCrashed(_))),
+            "the clear_poison wait must read as ActorCrashed, got {read:?}"
+        );
+
+        drop(spawn_guard);
+        let respawn = task.await.expect("clear_poison task must not panic");
+        assert!(
+            matches!(respawn, Err(ContextError::ActorCrashed(_))),
+            "the respawn with no snapshot fails, got {respawn:?}"
         );
     }
 
