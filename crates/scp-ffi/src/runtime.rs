@@ -1782,7 +1782,7 @@ pub fn live_context_state(
 /// that took longer than the reply timeout — reads as an error, never as
 /// `Ok(None)`. `Supervisor::read_context_state` folds that outcome into
 /// `None`; this function calls `Supervisor::read_context_state_checked`, which
-/// keeps the two apart, because [`crate::context::PyScp::context_close`] reads
+/// keeps the two apart, because [`crate::scp::PyScp::context_close`] reads
 /// `None` as proof that the close already happened and skips the supervisor
 /// dispatch that carries the only `ContextClose` capability check.
 ///

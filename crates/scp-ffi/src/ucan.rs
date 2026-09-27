@@ -1083,6 +1083,7 @@ mod tests {
     /// Registers a context owned by [`REVOKE_CREATOR_DID`] on a fresh bridge
     /// instance, and returns that instance with its context ID.
     fn revocable_context() -> (crate::scp::PyScp, String) {
+        crate::init_runtime().ok();
         let scp = crate::scp::PyScp::new_in_memory_for_test();
         let context_id = format!("ctx-revoke-{}", uuid::Uuid::new_v4());
         crate::runtime::register_context(&scp.inner, &context_id, REVOKE_CREATOR_DID, &[])
