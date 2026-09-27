@@ -23895,6 +23895,94 @@ mod tests {
         );
     }
 
+    /// `ucan_validate`, `ucan_evaluate`, and `ucan_delegate` compare a token's
+    /// grants against the ceiling the supervisor holds for the handle's
+    /// context.
+    ///
+    /// One creator owns two contexts: `wide` holds `messages:write` and
+    /// `narrow` omits it. A `messages:write` token minted in `wide` passes each
+    /// call there and fails the ceiling check in `narrow`. An edit that hands
+    /// the core an empty, default, or other context's ceiling passes one of the
+    /// two halves and fails the other.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() {
+        let rt = runtime();
+        let scp = scp_test();
+        let owner = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let holder = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let context_with = |ceiling: &[&str]| {
+            rt.block_on(scp.context_create(
+                Arc::clone(&owner),
+                ContextParams {
+                    ceiling: Some(ceiling.iter().map(|c| (*c).to_owned()).collect()),
+                    ..encrypted_join_test_params()
+                },
+            ))
+            .expect("context_create should succeed")
+        };
+        let wide = context_with(&["messages:read", "messages:write"]);
+        let narrow = context_with(&["messages:read"]);
+
+        let token = rt
+            .block_on(scp.ucan_mint(
+                Arc::clone(&wide),
+                holder.did(),
+                vec!["messages:write".to_owned()],
+                None,
+            ))
+            .expect("a mint inside the wide ceiling must succeed")
+            .encoded();
+
+        for (handle, inside) in [(&wide, true), (&narrow, false)] {
+            let evaluation = rt
+                .block_on(scp.ucan_evaluate(
+                    Arc::clone(handle),
+                    token.clone(),
+                    Some("messages:write".to_owned()),
+                    holder.did(),
+                    None,
+                ))
+                .expect("evaluate");
+            assert_eq!(
+                evaluation.within_ceiling, inside,
+                "evaluate must report the supervisor ceiling of the handle's context"
+            );
+            let delegation = rt
+                .block_on(scp.ucan_delegate(
+                    Arc::clone(handle),
+                    holder.did(),
+                    "did:dht:z6MkUniffiLiveCeilingDelegatee".to_owned(),
+                    token.clone(),
+                    vec!["messages:write".to_owned()],
+                ))
+                .map(drop);
+            let validation = rt.block_on(scp.ucan_validate(
+                Arc::clone(handle),
+                token.clone(),
+                "messages:write".to_owned(),
+                holder.did(),
+                None,
+            ));
+            if inside {
+                delegation.expect("a delegation inside the wide ceiling must succeed");
+                validation.expect("a validation inside the wide ceiling must succeed");
+            } else {
+                for (call, result) in [("delegation", delegation), ("validation", validation)] {
+                    let err = result.expect_err("the narrow supervisor ceiling must refuse");
+                    assert!(
+                        err.to_string().to_lowercase().contains("ceiling"),
+                        "the {call} refusal must be the ceiling check: {err}"
+                    );
+                }
+            }
+        }
+    }
+
     /// `mcp_client_connect_stdio` must reject empty command list.
     #[tokio::test]
     async fn mcp_client_connect_stdio_rejects_empty_command() {

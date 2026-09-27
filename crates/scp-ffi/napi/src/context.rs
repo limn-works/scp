@@ -7154,6 +7154,109 @@ mod tests {
         .expect("a mint inside the supervisor's ceiling must succeed");
     }
 
+    /// `ucan_validate_on`, `ucan_evaluate_on`, and `ucan_delegate_on` compare a
+    /// token's grants against the ceiling the supervisor holds for the handle's
+    /// context.
+    ///
+    /// One creator owns two contexts: `wide` holds `messages:write` and
+    /// `narrow` omits it. A `messages:write` token minted in `wide` passes each
+    /// call there and fails the ceiling check in `narrow`. An edit that hands
+    /// the core an empty, default, or other context's ceiling passes one of the
+    /// two halves and fails the other.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let owner = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let holder = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let owner_did = owner.inner.did.clone();
+        let holder_did = holder.inner.did.clone();
+        let delegatee = "did:dht:z6MkNapiLiveCeilingDelegatee".to_owned();
+        let mut handles = Vec::new();
+        for (label, ceiling) in [
+            ("wide", &["messages:read", "messages:write"][..]),
+            ("narrow", &["messages:read"][..]),
+        ] {
+            let ctx_id = format!("napi-{label}-live-ceiling-{}", uuid::Uuid::new_v4());
+            crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, &owner_did, ceiling)
+                .await;
+            crate::runtime::register_test_context(&bi, &ctx_id);
+            handles.push(active_handle_for(&bi, &ctx_id, &owner_did));
+        }
+        let (wide, narrow) = (&handles[0], &handles[1]);
+
+        let token = crate::ucan::ucan_mint_on(
+            &bi,
+            wide,
+            holder_did.clone(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        .expect("a mint inside the wide ceiling must succeed")
+        .encoded();
+
+        for (handle, inside) in [(wide, true), (narrow, false)] {
+            let evaluation = crate::ucan::ucan_evaluate_on(
+                &bi,
+                handle,
+                token.clone(),
+                Some("messages:write".to_owned()),
+                holder_did.clone(),
+                None,
+            )
+            .await
+            .expect("evaluate");
+            assert_eq!(
+                evaluation.within_ceiling, inside,
+                "evaluate must report the supervisor ceiling of the handle's context"
+            );
+
+            let delegation = crate::ucan::ucan_delegate_on(
+                &bi,
+                handle,
+                holder_did.clone(),
+                delegatee.clone(),
+                token.clone(),
+                vec!["messages:write".to_owned()],
+            )
+            .await;
+            let validation = crate::ucan::ucan_validate_on(
+                &bi,
+                handle,
+                token.clone(),
+                "messages:write".to_owned(),
+                holder_did.clone(),
+                None,
+            )
+            .await;
+            if inside {
+                delegation.expect("a delegation inside the wide ceiling must succeed");
+                validation.expect("a validation inside the wide ceiling must succeed");
+            } else {
+                for (call, err) in [
+                    ("delegation", delegation.err()),
+                    ("validation", validation.err()),
+                ] {
+                    let err = err.unwrap_or_else(|| {
+                        panic!("the narrow supervisor ceiling must refuse the {call}")
+                    });
+                    assert!(
+                        err.to_string().to_lowercase().contains("ceiling"),
+                        "the {call} refusal must be the ceiling check: {err}"
+                    );
+                }
+            }
+        }
+    }
+
     /// `outlet_register_on` refuses the creator when the supervisor ceiling
     /// omits `outlet:register`, although the handle's ceiling carries it, and
     /// admits the creator once the supervisor ceiling carries it.

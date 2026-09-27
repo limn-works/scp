@@ -3580,6 +3580,111 @@ fn cross_context_invoke_admits_a_supervisor_only_capability_holder() {
     });
 }
 
+/// `ucan_validate`, `ucan_evaluate`, and `ucan_delegate` compare a token's
+/// grants against the ceiling the SUPERVISOR holds for the context named in the
+/// call.
+///
+/// One creator owns two contexts: `wide` holds `messages:write` and `narrow`
+/// omits it. A `messages:write` token minted in `wide` passes each call there
+/// and fails the ceiling check in `narrow`. An edit that hands the core an
+/// empty, default, or other context's ceiling passes one of the two halves
+/// and fails the other.
+#[cfg(feature = "testing")]
+#[test]
+fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() {
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let owner = published_identity_did(py, &scp);
+        let holder = published_identity_did(py, &scp);
+        let delegatee = published_identity_did(py, &scp);
+        let bi = scp.bridge_instance();
+        runtime::init_context_manager_for_test(bi);
+
+        let wide = random_context_id();
+        let narrow = random_context_id();
+        let rt = test_runtime();
+        let supervisor = runtime::supervisor(bi).unwrap().clone();
+        for (ctx, ceiling) in [
+            (&wide, &["messages:read", "messages:write"][..]),
+            (&narrow, &["messages:read"][..]),
+        ] {
+            runtime::register_context(bi, ctx, &owner, &[]).unwrap();
+            let params = scp_core::context::ContextParams {
+                ceiling: ceiling
+                    .iter()
+                    .map(|c| scp_core::context::roles::Capability::new(c).unwrap())
+                    .collect(),
+                ..scp_core::context::ContextParams::default()
+            };
+            let (sup, id, creator) = (
+                supervisor.clone(),
+                ctx.clone(),
+                scp_did::DID(owner.clone()),
+            );
+            rt.block_on(async move { sup.create_context(id, params, creator, None).await })
+                .unwrap();
+        }
+        let creator = scp_did::DID(owner.clone());
+        let sup = supervisor.clone();
+        rt.block_on(async move { sup.register_local_did(creator).await })
+            .unwrap();
+
+        let token = scp
+            .ucan_mint(&wide, &holder, vec!["messages:write".to_owned()], None)
+            .expect("a mint inside the wide ceiling must succeed")
+            .encoded;
+
+        let in_wide = scp
+            .ucan_evaluate(&wide, &token, Some("messages:write"), &holder, None)
+            .unwrap();
+        let in_narrow = scp
+            .ucan_evaluate(&narrow, &token, Some("messages:write"), &holder, None)
+            .unwrap();
+        assert!(in_wide.within_ceiling, "evaluate must pass the wide ceiling");
+        assert!(
+            !in_narrow.within_ceiling,
+            "evaluate must report the narrow supervisor ceiling"
+        );
+
+        scp.ucan_delegate(
+            &wide,
+            &holder,
+            &delegatee,
+            &token,
+            vec!["messages:write".to_owned()],
+        )
+        .expect("a delegation inside the wide ceiling must succeed");
+        let delegate_err = scp
+            .ucan_delegate(
+                &narrow,
+                &holder,
+                &delegatee,
+                &token,
+                vec!["messages:write".to_owned()],
+            )
+            .expect_err("the narrow supervisor ceiling must refuse the delegation")
+            .to_string()
+            .to_lowercase();
+        assert!(
+            delegate_err.contains("ceiling"),
+            "the delegation refusal must be the ceiling check: {delegate_err}"
+        );
+
+        let validate_err = scp
+            .ucan_validate(&narrow, &token, "messages:write", &holder, None)
+            .expect_err("the narrow supervisor ceiling must refuse the validation")
+            .to_string()
+            .to_lowercase();
+        assert!(
+            validate_err.contains("ceiling"),
+            "the validation refusal must be the ceiling check: {validate_err}"
+        );
+        scp.ucan_validate(&wide, &token, "messages:write", &holder, None)
+            .expect("a validation inside the wide ceiling must succeed");
+    });
+}
+
 /// `ucan_mint` enforces the ceiling the SUPERVISOR holds, not one the bridge was
 /// registered with.
 ///

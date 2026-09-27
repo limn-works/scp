@@ -1318,10 +1318,11 @@ mod tests {
     // The absence tests below build a context no supervisor actor serves, so
     // each entry point refuses at `require_active_ucan_context`, the lifecycle
     // gate that runs before the live role-state read; the refusal carries
-    // `SCP-CTX-2023` and withholds the lifecycle state. They do not prove which
-    // ceiling value step 8 compares against; the e2e test
-    // `ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling`
-    // covers the supervisor's ceiling value for `ucan_mint` only.
+    // `SCP-CTX-2023` and withholds the lifecycle state.
+    // `every_ucan_entry_point_refuses_a_resident_actor_that_is_not_active`
+    // covers the gate's other arm: an actor that still holds role state but
+    // reports `Closing`. The `*_compares_against_the_supervisor_ceiling` tests
+    // prove which ceiling value step 8 compares against.
     // -----------------------------------------------------------------------
 
     /// Builds a `PyScp` whose context has FFI state but NO supervisor actor, so
@@ -1354,12 +1355,122 @@ mod tests {
                 && message.contains("SCP-CTX-2023"),
             "the refusal must come from the lifecycle gate: {message}"
         );
-        // The same context-state fault code the NAPI and UniFFI bridges attach.
-        assert!(
-            message.contains("SCP-CTX-2023"),
-            "the refusal must carry SCP-CTX-2023: {message}"
-        );
         crate::runtime::remove_context(&scp.inner, &ctx_id);
+    }
+
+    /// Drives `context_id`'s supervisor actor from `Active` to `Closing` through
+    /// the `CloseContext` dispatch the bridges' `context_close` sends. The actor
+    /// stays resident and keeps its role state.
+    #[allow(clippy::expect_used)] // A broken test fixture panics.
+    fn close_supervisor_context(bi: &crate::runtime::PyBridgeInstance, context_id: &str, creator: &str) {
+        use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+        let sup = std::sync::Arc::clone(crate::runtime::supervisor(bi).expect("supervisor"));
+        let rt = crate::runtime().expect("tokio runtime");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::CloseContext {
+            payload: Box::new(CloseContextPayload {
+                context_id: context_id.to_owned(),
+                params: scp_core::context::ContextParams::default(),
+                initiator_did: scp_did::DID(creator.to_owned()),
+            }),
+            reply: tx,
+        };
+        rt.block_on(async move {
+            sup.dispatch_lifecycle_command(cmd)
+                .await
+                .expect("close dispatch");
+            rx.await.expect("close reply").expect("close must succeed");
+        });
+    }
+
+    /// Every UCAN entry point refuses a context whose supervisor actor is still
+    /// resident and still answers `live_role_state`, but reports `Closing`.
+    ///
+    /// In this state only the lifecycle gate refuses: the role-state read
+    /// succeeds, so a gate weakened to an existence check (`Ok(Some(_))`) or
+    /// dropped from one entry point lets that entry point run against a context
+    /// the supervisor has stopped serving, and this test goes red. The same
+    /// five calls against a context no actor serves pin the gate's absent arm,
+    /// `ucan_mint` included.
+    #[test]
+    fn every_ucan_entry_point_refuses_a_resident_actor_that_is_not_active() {
+        let creator = "did:dht:z6MkUcanGateClosing";
+        crate::init_runtime().ok();
+        let closing = crate::scp::PyScp::new_in_memory_for_test();
+        let bi = &*closing.inner;
+        let ctx_id = format!("ucan-gate-closing-{}", uuid::Uuid::new_v4());
+        crate::runtime::register_context(bi, &ctx_id, creator, &[]).unwrap();
+        crate::runtime::create_supervisor_context_for_test(
+            bi,
+            &ctx_id,
+            creator,
+            &["messages:read", "messages:write", "context:close"],
+        );
+        close_supervisor_context(bi, &ctx_id, creator);
+        assert!(
+            matches!(
+                crate::runtime::read_live_context_state(bi, &ctx_id),
+                Ok(Some(scp_core::context::ContextState::Closing))
+            ),
+            "the fixture must leave the actor resident in Closing"
+        );
+        assert!(
+            crate::runtime::live_role_state(bi, &ctx_id).is_ok(),
+            "the fixture must leave the role state readable, so only the gate refuses"
+        );
+
+        let (absent, absent_ctx) =
+            scp_without_supervisor_context("ucan-gate-absent", "did:dht:z6MkUcanGateAbsent");
+
+        for (fixture, scp, ctx) in [("closing", &closing, &ctx_id), ("absent", &absent, &absent_ctx)] {
+            let refusals: [(&str, PyResult<()>); 5] = [
+                (
+                    "validate",
+                    scp.ucan_validate(ctx, "aaa.bbb.ccc", "messages:write", creator, None)
+                        .map(drop),
+                ),
+                (
+                    "evaluate",
+                    scp.ucan_evaluate(ctx, "aaa.bbb.ccc", Some("messages:write"), creator, None)
+                        .map(drop),
+                ),
+                (
+                    "mint",
+                    scp.ucan_mint(
+                        ctx,
+                        "did:dht:z6MkUcanGateAudience",
+                        vec!["messages:write".to_owned()],
+                        None,
+                    )
+                    .map(drop),
+                ),
+                (
+                    "delegate",
+                    scp.ucan_delegate(
+                        ctx,
+                        creator,
+                        "did:dht:z6MkUcanGateAudience",
+                        "aaa.bbb.ccc",
+                        vec!["messages:write".to_owned()],
+                    )
+                    .map(drop),
+                ),
+                ("revoke", scp.ucan_revoke(ctx, "aaa.bbb.ccc", creator)),
+            ];
+            for (entry_point, result) in refusals {
+                let message = format!(
+                    "{}",
+                    result.expect_err("a non-Active context must refuse every UCAN call")
+                );
+                assert!(
+                    message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                        && message.contains("SCP-CTX-2023"),
+                    "{entry_point} ({fixture}) must refuse at the lifecycle gate: {message}"
+                );
+            }
+        }
+        crate::runtime::remove_context(&absent.inner, &absent_ctx);
+        crate::runtime::remove_context(bi, &ctx_id);
     }
 
     /// `ucan_evaluate` reads the same two supervisor-owned inputs the enforcing
