@@ -5531,9 +5531,11 @@ impl Supervisor {
     /// the durable "dormant, needs operator recovery" signal that
     /// [`Self::lookup_miss_error`] / [`Self::is_context_poisoned`] /
     /// [`Self::read_context_state`] all read after the actor is despawned.
-    /// Only [`CrashWindow::clear`] (operator `clear_poison`),
-    /// [`Self::reset_crash_window`] (an explicit (re)create of the id), or a
-    /// process restart removes a poison.
+    /// Only [`CrashWindow::clear`] (operator `clear_poison`), a (re)create,
+    /// import, standing recreate, or Welcome join of the id whose bootstrap
+    /// registers an actor ([`Self::begin_bootstrap_window`]), or a process
+    /// restart removes a poison. A bootstrap that registers no actor puts
+    /// the poisoned window back.
     ///
     /// It is NOT called on the respawn path: a respawn's internal despawn
     /// must preserve the running crash count so the budget accumulates across
