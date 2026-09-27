@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ScpError, ValidationError } from "../src/errors";
 import {
+  checkedAddon,
   NATIVE_ADDON_ABSENT_CODE,
   NATIVE_ADDON_LOAD_FAILED_CODE,
   requireNativeAddon,
@@ -138,6 +139,27 @@ describe("SCP wrapper check of a loaded addon's exports", () => {
   test("an addon that exports the name returns it", () => {
     const fn = () => "ok";
     expect(requireAddonExport<typeof fn>({ SCP: fn }, "SCP")).toBe(fn);
+  });
+});
+
+describe("checkedAddon, the view createNativeBridge reads free functions through", () => {
+  test("a free function the addon lacks is a load failure, not a TypeError", () => {
+    const addon = checkedAddon(Object.freeze({ SCP: () => "ok" }));
+    let caught: unknown;
+    try {
+      (addon.broadcastOpenKey as () => unknown)();
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ScpError);
+    expect(caught).not.toBeInstanceOf(ValidationError);
+    expect((caught as ScpError).code).toBe(NATIVE_ADDON_LOAD_FAILED_CODE);
+    expect((caught as ScpError).message).toContain("broadcastOpenKey");
+  });
+
+  test("a free function the addon exports is returned unchanged", () => {
+    const fn = () => "ok";
+    expect(checkedAddon(Object.freeze({ scpVersion: fn })).scpVersion).toBe(fn);
   });
 });
 

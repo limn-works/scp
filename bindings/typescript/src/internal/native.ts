@@ -24,7 +24,7 @@ import { createRequire } from "node:module";
 
 import type { BridgeMode, ShadowStatus } from "../bridge";
 import { ScpError, TransportError, ValidationError } from "../errors";
-import { __getNativeScp, type SCP } from "../scp";
+import { __getNativeScp, requireAddonExport, type SCP } from "../scp";
 import type {
   BroadcastAdmissionPolicy,
   CapabilityValidation,
@@ -210,6 +210,25 @@ export function loadNativeAddon(): NativeAddon {
   return _nativeAddon;
 }
 
+/**
+ * Returns a view of `addon` whose every named read goes through
+ * {@link requireAddonExport}.
+ *
+ * `createNativeBridge` reads module-level free functions as `addon.X`. On a
+ * stale addon that loaded without `X`, a plain read returns `undefined` and
+ * the call throws a bare `TypeError`. Through this view the read throws
+ * `ScpError` `SCP-VALID-7082`, the code the Python SDK raises for the same
+ * condition.
+ *
+ * @internal
+ */
+export function checkedAddon(addon: NativeAddon): NativeAddon {
+  return new Proxy(addon, {
+    get: (target, name) =>
+      typeof name === "string" ? requireAddonExport(target, name) : Reflect.get(target, name),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Bridge factory
 // ---------------------------------------------------------------------------
@@ -230,7 +249,7 @@ export function loadNativeAddon(): NativeAddon {
  * @internal
  */
 export function createNativeBridge(scp: SCP): Bridge {
-  const addon = loadNativeAddon();
+  const addon = checkedAddon(loadNativeAddon());
   // Type-erased native handle — every NAPI `Scp` class method shares
   // the `async (...args) => unknown` shape after FFI monomorphization,
   // and routing requires dynamic lookup by camelCase method name.
