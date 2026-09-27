@@ -163,7 +163,7 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
     - `maturin publish` uploads to PyPI.
     - CI builds wheels for Linux (manylinux_2_28 x86_64 + aarch64), macOS (universal2), Windows (x86_64).
       The Linux floor is glibc 2.28, not manylinux2014's 2.17: the manylinux2014 image is CentOS 7, which can build neither `ring` (it needs glibc 2.18 and a newer gcc) nor the OpenSSL that `openssl-src` compiles into the wheel's SQLCipher.
-    - Users on a platform and CPython minor a wheel covers (CPython 3.10-3.13 on Linux x86_64 and aarch64 with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64) install with `pip install scp-python` — no Rust toolchain required. On any other platform with CPython 3.10-3.13, pip builds the sdist, which compiles OpenSSL and needs a Rust toolchain and a full perl, plus make on Linux and macOS. CPython 3.14 and newer cannot install: the locked PyO3 0.24 builds for CPython 3.13 at most, so `requires-python` stops below 3.14 and pip finds no version to install.
+    - Users on a platform and CPython minor a wheel covers (CPython 3.10-3.13 on Linux x86_64 and aarch64 with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64) install with `pip install scp-python` — no Rust toolchain required. On any other platform with CPython 3.10-3.13, pip builds the sdist, which compiles OpenSSL and needs a Rust toolchain and a full perl, plus make on Linux and macOS. CPython 3.14 and newer cannot install: the locked PyO3 0.24 builds for CPython 3.13 at most. `requires-python = ">=3.10,<3.14"` makes pip on 3.14 skip every release built from this pyproject. scp-python 0.1.0b2 and 0.1.0b3, which PyPI already serves, declare `>=3.10` with no ceiling, so while neither is yanked pip on 3.14 falls back to the 0.1.0b3 sdist, and that build fails in PyO3 0.24.
 
 ### Scope
 
@@ -209,7 +209,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
 
 ### Implementation
 
-- **Language:** Python 3.10+ (for `match` statements, `ParamSpec`, union type syntax)
+- **Language:** Python 3.10-3.13 (3.10 for `match` statements, `ParamSpec`, union type syntax)
 - **Package:** `scp_sdk` (published to PyPI as `scp-python`)
 - **Dependencies:** `_scp_core` (PyO3 extension, bundled in the wheel), no external runtime dependencies beyond asyncio (stdlib)
 - **Optional dependencies:** `scp-python[langchain]` for LangChain integration, `scp-python[mcp]` for MCP server (ADR-015)

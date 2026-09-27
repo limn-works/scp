@@ -27,8 +27,10 @@
 # parent, then run_gate. The pin
 # holds this file's text and not what it reads or runs: WHEEL_MATRIX_FILE, the
 # gate FEATURE_GRAPH_GATE names, and the environment bash runs in, where a
-# function exported into the environment, or a PATH entry, named cargo, bash or
-# grep replaces that command.
+# function exported into the environment, or a PATH entry, that carries the name
+# of any command this file runs replaces that command. Those commands include
+# cargo, bash and grep; python3.12, which runs the parsers that yield the wheel
+# triples and the workspace roots; and git, which lists the manifests.
 # Absence: `--target all` for every entry that gate's `--print-artifacts` writes
 # except the wheel's (`--print-wheel-entries`), which that list must name exactly
 # once beside at least one other entry, and `--workspace` for every

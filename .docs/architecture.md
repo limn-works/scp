@@ -893,7 +893,7 @@ The Python SDK is the most critical binding. The agent ecosystem is Python. If t
 **Design principles:**
 - Pythonic. async/await. Type hints. No Rust concepts leaking through.
 - `pip install scp-python` installs a wheel with the Rust binary embedded (via maturin/PyO3).
-- Users on a platform and CPython minor a wheel covers need no Rust toolchain. On any other platform with CPython 3.10-3.13, pip builds the sdist, which compiles OpenSSL and needs a Rust toolchain and a full perl, plus make on Linux and macOS. CPython 3.14 and newer cannot install: the locked PyO3 0.24 builds for CPython 3.13 at most, so `requires-python` stops below 3.14 and pip finds no version to install (ADR-013, `.docs/standards/python.md`).
+- Users on a platform and CPython minor a wheel covers need no Rust toolchain. On any other platform with CPython 3.10-3.13, pip builds the sdist, which compiles OpenSSL and needs a Rust toolchain and a full perl, plus make on Linux and macOS. CPython 3.14 and newer cannot install: the locked PyO3 0.24 builds for CPython 3.13 at most. `requires-python = ">=3.10,<3.14"` makes pip on 3.14 skip every release built from this pyproject. scp-python 0.1.0b2 and 0.1.0b3, which PyPI already serves, declare `>=3.10` with no ceiling, so while neither is yanked pip on 3.14 falls back to the 0.1.0b3 sdist, and that build fails in PyO3 0.24 (ADR-013, `.docs/standards/python.md`).
 
 **The 20-line agent:**
 

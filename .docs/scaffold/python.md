@@ -48,12 +48,17 @@ build-backend = "maturin"
 [project]
 name = "scp-python"
 description = "Shared Context Protocol SDK — identity, encryption, contexts, tools for AI agents"
-requires-python = ">=3.10"
+# The ceiling: the locked PyO3 0.24 builds for CPython 3.13 at most.
+requires-python = ">=3.10,<3.14"
 # license = TBD
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
     "Topic :: Security :: Cryptography",
 ]

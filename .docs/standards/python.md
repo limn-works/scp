@@ -6,7 +6,7 @@ Python conventions, toolchain, and CI for the SCP Python SDK. References `sdk-co
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| Python | 3.10+ | Minimum supported version, as ADR phase-3 and `requires-python = ">=3.10"` in `bindings/python/pyproject.toml` set it; wheels ship for CPython 3.10-3.13. `match`, `X \| Y` union syntax and `ParamSpec` (3.10) are available. PEP 695 type parameter syntax and `type X` statements (3.12) are not: write a type alias as `X: TypeAlias = ...`. Ruff's `target-version = "py310"` rejects the newer syntax, and CI job `python-wheel-build` imports every `scp_sdk` module under CPython 3.10, which rejects such syntax in any module. |
+| Python | 3.10-3.13 | Supported range, as ADR phase-3 and `requires-python = ">=3.10,<3.14"` in `bindings/python/pyproject.toml` set it; wheels ship for CPython 3.10-3.13, and §Platform Wheels says why 3.14 cannot install. `match`, `X \| Y` union syntax and `ParamSpec` (3.10) are available. PEP 695 type parameter syntax and `type X` statements (3.12) are not: write a type alias as `X: TypeAlias = ...`. Ruff's `target-version = "py310"` rejects the newer syntax, and CI job `python-wheel-build` imports every `scp_sdk` module under CPython 3.10, which rejects such syntax in any module. |
 | maturin | latest | Build tool for PyO3 Rust extension |
 | ruff | latest | Linter + formatter (replaces flake8, isort, black) |
 | mypy | latest | Static type checker (`--strict` mode) |
@@ -235,7 +235,7 @@ pytest bindings/python/tests/ -v --asyncio-mode=auto
 
 ## Platform Wheels
 
-maturin builds binary wheels with the Rust extension embedded. Users on a platform and CPython minor a wheel covers (CPython 3.10-3.13 on Linux x86_64 and aarch64 with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64) install with `pip install scp-python` — no Rust toolchain required. On any other platform with CPython 3.10-3.13, pip builds the sdist, which compiles OpenSSL and needs a Rust toolchain and a full perl, plus make on Linux and macOS. CPython 3.14 and newer cannot install: the locked PyO3 0.24 builds for CPython 3.13 at most, so `requires-python` stops below 3.14 and pip finds no version to install.
+maturin builds binary wheels with the Rust extension embedded. Users on a platform and CPython minor a wheel covers (CPython 3.10-3.13 on Linux x86_64 and aarch64 with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64) install with `pip install scp-python` — no Rust toolchain required. On any other platform with CPython 3.10-3.13, pip builds the sdist, which compiles OpenSSL and needs a Rust toolchain and a full perl, plus make on Linux and macOS. CPython 3.14 and newer cannot install: the locked PyO3 0.24 builds for CPython 3.13 at most. `requires-python = ">=3.10,<3.14"` makes pip on 3.14 skip every release built from this pyproject. scp-python 0.1.0b2 and 0.1.0b3, which PyPI already serves, declare `>=3.10` with no ceiling, so while neither is yanked pip on 3.14 falls back to the 0.1.0b3 sdist, and that build fails in PyO3 0.24.
 
 | Platform | Architecture | Wheel tag |
 |----------|-------------|-----------|
