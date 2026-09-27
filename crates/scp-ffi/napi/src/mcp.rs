@@ -373,8 +373,7 @@ impl McpNapiBridgeProvider {
 /// bridge has no synchronous path from `ContextProvider::invoke_outlet` to an
 /// outlet handler, so it reports the capability as absent rather than
 /// advertising tools it cannot run.
-const OUTLET_INVOCATION_UNAVAILABLE: &str =
-    "outlet invocation through the NAPI MCP server is unavailable: the bridge \
+const OUTLET_INVOCATION_UNAVAILABLE: &str = "outlet invocation through the NAPI MCP server is unavailable: the bridge \
      cannot execute an outlet from an MCP tools/call";
 
 impl ContextProvider for McpNapiBridgeProvider {

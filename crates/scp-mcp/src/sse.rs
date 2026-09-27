@@ -338,7 +338,9 @@ pub(crate) struct AppState<P: ContextProvider> {
 /// Replaces the stored eviction token with a fresh one for a newly admitted
 /// session and returns it.
 fn install_evict_token(slot: &std::sync::Mutex<CancellationToken>) -> CancellationToken {
-    let mut current = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut current = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     *current = CancellationToken::new();
     current.clone()
 }
