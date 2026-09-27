@@ -39,15 +39,27 @@ from tests.conftest import extension_is_absent
 
 
 def test_not_installed_error_is_absence() -> None:
-    """`SCP-UNKNOWN-0001` is the code `native_module` raises when absent."""
-    assert extension_is_absent(ScpError("not installed", code="SCP-UNKNOWN-0001"))
+    """`EXTENSION_ABSENT_CODE` is the code `native_module` raises when absent."""
+    assert extension_is_absent(ScpError("not installed", code=_extension.EXTENSION_ABSENT_CODE))
+
+
+def test_native_load_codes_are_the_registered_shared_codes() -> None:
+    """Both codes are registered in-range codes the ts-native SDK also throws.
+
+    `.docs/standards/sdk-common.md` registers `SCP-VALID-7081` and
+    `SCP-VALID-7082`, and `bindings/typescript/src/internal/native.ts` throws
+    the same literals, so a skip guard in either SDK keys on one registered
+    code per condition rather than on an unregistered sentinel.
+    """
+    assert _extension.EXTENSION_ABSENT_CODE == "SCP-VALID-7081"
+    assert _extension.EXTENSION_LOAD_FAILED_CODE == "SCP-VALID-7082"
 
 
 def test_absent_extension_classifies_as_absence(monkeypatch: pytest.MonkeyPatch) -> None:
     """With no extension file on the path, the import failure means absence.
 
     `reject_load_failure` returns, which lets `native_module` raise
-    `SCP-UNKNOWN-0001`, and the fixture skips on that.
+    `EXTENSION_ABSENT_CODE`, and the fixture skips on that.
     """
     monkeypatch.setattr(_extension, "extension_is_installed", lambda: False)
     assert (
@@ -71,14 +83,17 @@ def test_present_but_unloadable_extension_is_not_absence(monkeypatch: pytest.Mon
     ):
         with pytest.raises(ScpError) as caught:
             _extension.reject_load_failure(exc)
-        assert caught.value.code == "SCP-UNKNOWN-0002"
+        assert caught.value.code == _extension.EXTENSION_LOAD_FAILED_CODE
         assert not extension_is_absent(caught.value)
 
 
 def test_loaded_without_scp_class_is_not_absence() -> None:
     """`_native_cls` reports a partial build with the load-failure code."""
     assert not extension_is_absent(
-        ScpError("_scp_core loaded but does not export the SCP class", code="SCP-UNKNOWN-0002")
+        ScpError(
+            "_scp_core loaded but does not export the SCP class",
+            code=_extension.EXTENSION_LOAD_FAILED_CODE,
+        )
     )
 
 

@@ -6,7 +6,7 @@
  *
  * The native addon is loaded via `createRequire` from the platform-specific
  * optional dependency. If the package is not installed, loading fails with
- * a `TransportError` and an actionable message.
+ * a `ValidationError` (`SCP-VALID-7081`) and an actionable message.
  *
  * Since ADR-048 (Phase 4 PR 4), all calls route through the caller-
  * supplied {@link SCP} instance's class methods rather than module-level
@@ -23,7 +23,7 @@
 import { createRequire } from "node:module";
 
 import type { BridgeMode, ShadowStatus } from "../bridge";
-import { ScpError, TransportError } from "../errors";
+import { ScpError, TransportError, ValidationError } from "../errors";
 import { __getNativeScp, type SCP } from "../scp";
 import type {
   BroadcastAdmissionPolicy,
@@ -59,9 +59,11 @@ import { safeJsonParse } from "./json-utils";
 /**
  * Code the loader throws when no native addon is installed for this platform:
  * the platform has no addon package, or the package does not resolve. This is
- * the only load failure a caller may treat as absence.
+ * the only load failure a caller may treat as absence. The Python SDK raises
+ * the same code when no `_scp_core` extension file is present
+ * (`scp_sdk/_extension.py`); `.docs/standards/sdk-common.md` registers it.
  */
-export const NATIVE_ADDON_ABSENT_CODE = "SCP-TRANS-5001";
+export const NATIVE_ADDON_ABSENT_CODE = "SCP-VALID-7081";
 
 /**
  * Code the loader throws when the addon package resolves but loading it
@@ -71,7 +73,7 @@ export const NATIVE_ADDON_ABSENT_CODE = "SCP-TRANS-5001";
  * A caller must not treat it as absence: a skip guard that did would turn a
  * broken artifact into a run that executes zero native assertions.
  */
-export const NATIVE_ADDON_LOAD_FAILED_CODE = "SCP-UNKNOWN-0002";
+export const NATIVE_ADDON_LOAD_FAILED_CODE = "SCP-VALID-7082";
 
 // ---------------------------------------------------------------------------
 // Platform detection
@@ -99,7 +101,7 @@ function resolveNapiPackage(): string {
   const pkg = platformMap[key];
 
   if (pkg === undefined) {
-    throw new TransportError(
+    throw new ValidationError(
       `No native addon available for platform ${key}. ` +
         "Install the appropriate @limn-works/scp-ts-napi-* package for this platform.",
       NATIVE_ADDON_ABSENT_CODE,
@@ -138,7 +140,7 @@ let _nativeAddon: NativeAddon | null = null;
  * so a resolve failure is absence and a failure after a successful resolve is
  * a load failure.
  *
- * @throws {TransportError} `NATIVE_ADDON_ABSENT_CODE` when `packageName` does
+ * @throws {ValidationError} `NATIVE_ADDON_ABSENT_CODE` when `packageName` does
  *   not resolve.
  * @throws {ScpError} `NATIVE_ADDON_LOAD_FAILED_CODE` when `packageName`
  *   resolves and requiring it throws; the message carries the underlying
@@ -152,7 +154,7 @@ export function requireNativeAddon(
   try {
     resolved = req.resolve(packageName);
   } catch {
-    throw new TransportError(
+    throw new ValidationError(
       `Native addon ${packageName} is not installed. ` + `Install it with: bun add ${packageName}`,
       NATIVE_ADDON_ABSENT_CODE,
     );
@@ -182,7 +184,7 @@ export function requireNativeAddon(
  * loader — the cache discipline only holds because there is exactly one
  * loader. Adding a second loader anywhere in the SDK is a regression.
  *
- * @throws {TransportError} `NATIVE_ADDON_ABSENT_CODE` when no addon is
+ * @throws {ValidationError} `NATIVE_ADDON_ABSENT_CODE` when no addon is
  *   installed for this platform.
  * @throws {ScpError} `NATIVE_ADDON_LOAD_FAILED_CODE` when the addon is
  *   installed and failed to load.

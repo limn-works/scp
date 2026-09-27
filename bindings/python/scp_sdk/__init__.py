@@ -41,7 +41,7 @@ from scp_sdk._extension import reject_load_failure as _reject_load_failure
 #
 # An absent extension is swallowed, so a pure-Python or mocked environment
 # still imports the package. A present extension that failed to load raises
-# ``SCP-UNKNOWN-0002`` from here, because ``ImportError`` carries both causes
+# ``SCP-VALID-7082`` from here, because ``ImportError`` carries both causes
 # and reporting a load failure as absence lets every
 # ``except ImportError: pytest.skip(...)`` guard under ``bindings/python/tests``
 # skip the whole real-FFI suite over a broken artifact. ``ScpError`` is not an

@@ -45,6 +45,7 @@ import type { Identity } from "./identity";
 import { type BridgeContextHandle, getBridge, toCapabilityValidation } from "./internal/bridge";
 import {
   loadNativeAddon,
+  NATIVE_ADDON_ABSENT_CODE,
   NATIVE_ADDON_LOAD_FAILED_CODE,
   type NativeAddon as RawNativeAddon,
 } from "./internal/native";
@@ -163,13 +164,12 @@ interface NativeScpInstance {
  * Routes through the shared `loadNativeAddon` cache in
  * `internal/native.ts` so this module and the bridge factory share a
  * single frozen addon reference. The shared loader throws
- * `TransportError` (`SCP-TRANS-5001`) when the platform package is
- * missing, which this wrapper surfaces as `ValidationError`
- * (`SCP-VALID-7005`) — the public-API code SDK consumers see when they
- * call `new SCP(...)` — together with a runtime check. An installed addon
- * that failed to load passes through as the loader's `ScpError`
- * (`SCP-UNKNOWN-0002`), and an addon that loaded without the `SCP` class
- * throws the same code, so neither is reported as a missing package.
+ * `ValidationError` (`SCP-VALID-7081`) when the platform package is
+ * missing, which this wrapper rethrows under the same code with the
+ * reinstall instruction SDK consumers see when they call `new SCP(...)`.
+ * An installed addon that failed to load passes through as the loader's
+ * `ScpError` (`SCP-VALID-7082`), and an addon that loaded without the `SCP`
+ * class throws the same code, so neither is reported as a missing package.
  */
 function loadAddon(): NativeAddon {
   if (typeof process === "undefined" || !process.versions?.node) {
@@ -209,8 +209,8 @@ function nativeScp(): NativeScpCtor {
  * ADR-048 §1; `SCP` class methods that wrap them route through this
  * accessor instead of `this.#native[name]`.
  *
- * Throws `SCP-VALID-7005` if no addon is installed. Throws
- * `SCP-UNKNOWN-0002` if the addon is installed and failed to load, and
+ * Throws `SCP-VALID-7081` if no addon is installed. Throws
+ * `SCP-VALID-7082` if the addon is installed and failed to load, and
  * also if it loaded without the named function (e.g., a stale prebuilt
  * addon predating the §1 split).
  */
@@ -226,9 +226,10 @@ function nativeFreeFn<T>(name: keyof NativeAddon): T {
  * Maps an error `loadNativeAddon` threw to the error `loadAddon` throws.
  *
  * An installed addon that failed to load keeps the loader's
- * `SCP-UNKNOWN-0002`, so a caller can tell it apart from absence. Every
+ * `SCP-VALID-7082`, so a caller can tell it apart from absence. Every
  * other loader error — the platform package is missing — becomes
- * `ValidationError` (`SCP-VALID-7005`).
+ * `ValidationError` with the absence code `SCP-VALID-7081`, the code the
+ * loader and the Python SDK use for the same condition.
  *
  * @internal
  */
@@ -241,7 +242,7 @@ export function addonLoadError(cause: unknown): ScpError {
     `Native addon is not installed: ${underlying}. ` +
       "Ensure the matching @limn-works/scp-ts-napi-* platform package is " +
       "installed, then reinstall with `bun install`.",
-    "SCP-VALID-7005",
+    NATIVE_ADDON_ABSENT_CODE,
   );
 }
 
@@ -251,11 +252,11 @@ export function addonLoadError(cause: unknown): ScpError {
  * An addon that loaded without an export the SDK calls — the `SCP` class or
  * an ADR-048 §1 module-level free function — is installed and stale or
  * partially built, not absent. This function throws the loader's
- * load-failure code `SCP-UNKNOWN-0002`, the code the Python SDK raises when
+ * load-failure code `SCP-VALID-7082`, the code the Python SDK raises when
  * `_scp_core` loads without the `SCP` class, so no caller mistakes the
- * stale addon for the absence code `SCP-VALID-7005`.
+ * stale addon for the absence code `SCP-VALID-7081`.
  *
- * @throws {ScpError} `SCP-UNKNOWN-0002` when `addon[name]` is not a function.
+ * @throws {ScpError} `SCP-VALID-7082` when `addon[name]` is not a function.
  * @internal
  */
 export function requireAddonExport<T>(addon: NativeAddon, name: string): T {
@@ -625,9 +626,9 @@ export class SCP {
    * compile error. There is no default backend.
    *
    * @param options Constructor options; `options.storage` is required.
-   * @throws {ValidationError} If no NAPI addon is installed — code `SCP-VALID-7005`.
+   * @throws {ValidationError} If no NAPI addon is installed — code `SCP-VALID-7081`.
    * @throws {ScpError} If the NAPI addon is installed and failed to load, or
-   *   loaded without the `SCP` class — code `SCP-UNKNOWN-0002`.
+   *   loaded without the `SCP` class — code `SCP-VALID-7082`.
    */
   constructor(options: ScpOptions) {
     // Runtime fail-closed guard (spec §17.6): the TS type makes

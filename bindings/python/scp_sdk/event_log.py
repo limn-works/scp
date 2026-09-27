@@ -62,7 +62,7 @@ def _init_pyo3_log_bridge() -> None:
         # costs log lines and nothing else.
         #
         # A *present* extension that failed to load never reaches this
-        # swallow: ``scp_sdk/__init__.py`` raises ``SCP-UNKNOWN-0002`` for
+        # swallow: ``scp_sdk/__init__.py`` raises ``SCP-VALID-7082`` for
         # that cause while importing the package, which happens before
         # Python executes this module.
         pass

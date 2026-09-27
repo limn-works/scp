@@ -55,8 +55,9 @@ def _bridge() -> Any:
     takes an :class:`SCP` instance.
 
     Raises:
-        ScpError: ``SCP-UNKNOWN-0001`` when no extension is installed,
-            ``SCP-UNKNOWN-0002`` when one is installed and failed to load. A
+        ScpError: ``SCP-VALID-7081`` (a ``ValidationError``) when no extension
+            is installed, ``SCP-VALID-7082`` when one is installed and failed
+            to load. A
             bare ``import _scp_core`` here would instead raise
             ``ModuleNotFoundError`` for both causes, which every other entry
             point on this SDK does not.

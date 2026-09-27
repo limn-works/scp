@@ -55,7 +55,7 @@ from typing import (
     runtime_checkable,
 )
 
-from scp_sdk._extension import native_module
+from scp_sdk._extension import EXTENSION_LOAD_FAILED_CODE, native_module
 from scp_sdk.errors import ScpError, _coded_bridge_error
 from scp_sdk.types import CustodyType
 
@@ -346,14 +346,15 @@ def _native_cls() -> Any:
     cls = getattr(mod, "SCP", None)
     if cls is None:
         # The module loaded, so the extension is installed and this is a wrong
-        # or partial build. ``SCP-UNKNOWN-0002`` says so, and the ``scp``
-        # fixture in bindings/python/tests/conftest.py fails on that code
-        # instead of skipping, which ``SCP-UNKNOWN-0001`` would have done.
+        # or partial build. ``EXTENSION_LOAD_FAILED_CODE`` says so, and the
+        # ``scp`` fixture in bindings/python/tests/conftest.py fails on that
+        # code instead of skipping, which ``EXTENSION_ABSENT_CODE`` would have
+        # done.
         raise ScpError(
             "_scp_core loaded but does not export the SCP class — rebuild the "
             "native extension with `maturin develop --release` from "
             "bindings/python.",
-            code="SCP-UNKNOWN-0002",
+            code=EXTENSION_LOAD_FAILED_CODE,
         )
     return cls
 

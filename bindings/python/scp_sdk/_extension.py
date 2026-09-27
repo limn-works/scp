@@ -21,7 +21,7 @@ and answers for such a file.
 :func:`reject_load_failure` applies the separation. ``scp_sdk/__init__.py``
 swallows an absent extension, which lets a pure-Python environment import the
 package, and raises :class:`~scp_sdk.errors.ScpError` carrying
-``SCP-UNKNOWN-0002`` for a load failure. That error is not an ``ImportError``,
+:data:`EXTENSION_LOAD_FAILED_CODE` for a load failure. That error is not an ``ImportError``,
 so every ``except ImportError: pytest.skip(...)`` guard in
 ``bindings/python/tests`` lets it through and the job fails instead of exiting
 0 over zero executed assertions.
@@ -33,7 +33,7 @@ import importlib.util
 import os
 from typing import Any
 
-from scp_sdk.errors import ScpError
+from scp_sdk.errors import ScpError, ValidationError
 
 #: Import path maturin installs the compiled extension at (see pyproject.toml
 #: ``module-name``).
@@ -46,6 +46,19 @@ EXTENSION_MODULE = "scp_sdk._scp_core"
 #: — that list holds the suffixes the *running* interpreter imports, and a file
 #: built by another interpreter is exactly the file this module must still see.
 _EXTENSION_FILE_SUFFIXES = (".so", ".pyd", ".dylib")
+
+#: Code :func:`native_module` raises when no extension file is present. The
+#: ts-native SDK throws the same code when no napi addon package resolves
+#: (``bindings/typescript/src/internal/native.ts``), and
+#: ``.docs/standards/sdk-common.md`` registers it. It is the only load failure
+#: a test skip guard may treat as absence.
+EXTENSION_ABSENT_CODE = "SCP-VALID-7081"
+
+#: Code raised when an extension file is present and loading it failed, or it
+#: loaded without an export the SDK calls. The ts-native SDK throws the same
+#: code for the same condition, and ``.docs/standards/sdk-common.md`` registers
+#: it. A test skip guard must fail on it.
+EXTENSION_LOAD_FAILED_CODE = "SCP-VALID-7082"
 
 
 def extension_file_on_disk() -> bool:
@@ -97,7 +110,7 @@ def reject_load_failure(exc: ImportError) -> None:
         exc: The ``ImportError`` that importing the extension raised.
 
     Raises:
-        ScpError: ``SCP-UNKNOWN-0002`` when :func:`extension_is_installed`
+        ScpError: :data:`EXTENSION_LOAD_FAILED_CODE` when :func:`extension_is_installed`
             reports the extension file is present, which makes ``exc`` a load
             failure rather than an absence.
     """
@@ -107,7 +120,7 @@ def reject_load_failure(exc: ImportError) -> None:
         f"The {EXTENSION_MODULE} extension module is installed but failed to "
         f"load: {exc}. Rebuild it for this interpreter with "
         f"`maturin develop --release` from bindings/python.",
-        code="SCP-UNKNOWN-0002",
+        code=EXTENSION_LOAD_FAILED_CODE,
     ) from exc
 
 
@@ -127,9 +140,10 @@ def native_module() -> Any:
     the probe never looked at it.
 
     Raises:
-        ScpError: ``SCP-UNKNOWN-0001`` when the extension is not installed,
-            ``SCP-UNKNOWN-0002`` when the extension is installed and failed to
-            load. The two codes differ because the ``scp`` fixture in
+        ValidationError: :data:`EXTENSION_ABSENT_CODE` when the extension is
+            not installed.
+        ScpError: :data:`EXTENSION_LOAD_FAILED_CODE` when the extension is
+            installed and failed to load. The two codes differ because the ``scp`` fixture in
             ``bindings/python/tests/conftest.py`` skips on the first and fails
             on the second.
     """
@@ -137,9 +151,9 @@ def native_module() -> Any:
         import scp_sdk._scp_core as native  # type: ignore[import-not-found]
     except ImportError as exc:
         reject_load_failure(exc)
-        raise ScpError(
+        raise ValidationError(
             f"The {EXTENSION_MODULE} extension module is not installed. "
             "Install scp-python with: pip install scp-python",
-            code="SCP-UNKNOWN-0001",
+            code=EXTENSION_ABSENT_CODE,
         ) from exc
     return native

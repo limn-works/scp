@@ -6,7 +6,7 @@ exactly as it skips on a missing one — a job that downloaded a broken PyO3
 extension then exits 0 over zero executed assertions. `scp_sdk._extension`
 separates the causes by asking whether an extension file is present — on the import
 path, and in the `scp_sdk` package directory for a file another interpreter built —
-and raises `SCP-UNKNOWN-0002` for a load failure so the guards let it through.
+and raises `EXTENSION_LOAD_FAILED_CODE` for a load failure so the guards let it through.
 
 These tests import no native symbol: they drive the separation with
 `sys.modules["scp_sdk._scp_core"] = None`, which makes the loader's import raise
@@ -81,7 +81,7 @@ def test_a_top_level_scp_core_on_the_path_never_stands_in_for_the_package_module
     monkeypatch.setattr(_extension, "extension_is_installed", lambda: False)
     with pytest.raises(ScpError) as caught:
         _extension.native_module()
-    assert caught.value.code == "SCP-UNKNOWN-0001"
+    assert caught.value.code == _extension.EXTENSION_ABSENT_CODE
     assert "_scp_core" not in sys.modules
 
 
@@ -91,7 +91,7 @@ def test_absent_extension_raises_the_absence_code(
     monkeypatch.setattr(_extension, "extension_is_installed", lambda: False)
     with pytest.raises(ScpError) as caught:
         _extension.native_module()
-    assert caught.value.code == "SCP-UNKNOWN-0001"
+    assert caught.value.code == _extension.EXTENSION_ABSENT_CODE
 
 
 def test_present_extension_that_fails_to_load_raises_the_load_failure_code(
@@ -100,7 +100,7 @@ def test_present_extension_that_fails_to_load_raises_the_load_failure_code(
     monkeypatch.setattr(_extension, "extension_is_installed", lambda: True)
     with pytest.raises(ScpError) as caught:
         _extension.native_module()
-    assert caught.value.code == "SCP-UNKNOWN-0002"
+    assert caught.value.code == _extension.EXTENSION_LOAD_FAILED_CODE
 
 
 def test_load_failure_is_not_an_import_error(
@@ -130,7 +130,7 @@ def test_every_bridge_accessor_reports_a_load_failure_as_a_load_failure(
     module: Any = importlib.import_module(module_name)
     with pytest.raises(ScpError) as caught:
         getattr(module, accessor)()
-    assert caught.value.code == "SCP-UNKNOWN-0002"
+    assert caught.value.code == _extension.EXTENSION_LOAD_FAILED_CODE
 
 
 @pytest.mark.parametrize(("module_name", "accessor"), BRIDGE_ACCESSORS)
@@ -144,7 +144,7 @@ def test_every_bridge_accessor_reports_an_absence_as_an_absence(
     module: Any = importlib.import_module(module_name)
     with pytest.raises(ScpError) as caught:
         getattr(module, accessor)()
-    assert caught.value.code == "SCP-UNKNOWN-0001"
+    assert caught.value.code == _extension.EXTENSION_ABSENT_CODE
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +275,7 @@ def test_the_probe_reports_absence_when_neither_look_finds_a_file(
 def test_a_module_built_for_another_interpreter_raises_the_load_failure_code(
     blocked_import: None, package_directory: Path, unresolvable_module_name: str
 ) -> None:
-    """End to end: the scenario the finding named reaches `SCP-UNKNOWN-0002`.
+    """End to end: the scenario the finding named reaches `EXTENSION_LOAD_FAILED_CODE`.
 
     A PyO3 artifact built by one interpreter lands in a job running another.
     The `.so` is present, `import _scp_core` fails, and the code must report a
@@ -286,7 +286,7 @@ def test_a_module_built_for_another_interpreter_raises_the_load_failure_code(
     (package_directory / f"{leaf}.cpython-000-scp-test.so").write_bytes(b"")
     with pytest.raises(ScpError) as caught:
         _extension.native_module()
-    assert caught.value.code == "SCP-UNKNOWN-0002"
+    assert caught.value.code == _extension.EXTENSION_LOAD_FAILED_CODE
 
 
 # ---------------------------------------------------------------------------

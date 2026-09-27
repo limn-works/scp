@@ -1018,6 +1018,21 @@ pub const VALID_7076: &str = "SCP-VALID-7076";
 pub const VALID_7077: &str = "SCP-VALID-7077";
 /// Attestation validation error.
 pub const VALID_7080: &str = "SCP-VALID-7080";
+/// SDK-wrapper local guard: no native bridge is installed.
+///
+/// The Python SDK raises it when no `_scp_core` extension file is present
+/// (`scp_sdk/_extension.py`), and the ts-native SDK throws it when no napi addon
+/// package resolves for the platform (`src/internal/native.ts`). It is the only
+/// native-load failure a test skip guard may treat as absence. Never minted by an
+/// FFI bridge.
+pub const VALID_7081: &str = "SCP-VALID-7081";
+/// SDK-wrapper local guard: a native bridge is installed and failed to load.
+///
+/// The extension file or addon package is present, and loading it failed — a
+/// `dlopen` error, an ABI or architecture mismatch, a missing shared library — or
+/// it loaded without an export the SDK calls. Raised by the Python and ts-native
+/// SDK loaders, never minted by an FFI bridge. A test skip guard must fail on it.
+pub const VALID_7082: &str = "SCP-VALID-7082";
 /// Discovery announce validation error.
 pub const VALID_7090: &str = "SCP-VALID-7090";
 /// Discovery search validation error.

@@ -21,15 +21,17 @@ def extension_is_absent(exc: BaseException) -> bool:
     """Report whether one exception means the native extension is not installed.
 
     CRITERION: the exception is the :class:`scp_sdk.errors.ScpError` carrying
-    ``SCP-UNKNOWN-0001``. :func:`scp_sdk._extension.native_module` raises that
-    code for exactly one cause — no compiled extension file is present, which
+    :data:`scp_sdk._extension.EXTENSION_ABSENT_CODE` (``SCP-VALID-7081``).
+    :func:`scp_sdk._extension.native_module` raises that code for exactly one
+    cause — no compiled extension file is present, which
     :func:`scp_sdk._extension.extension_is_installed` decides by looking for
     the file without executing it, on the import path and in the ``scp_sdk``
     package directory alike. The second look is what sees a module another
     interpreter built, whose filename carries that interpreter's tag and so
     matches none of this one's ``importlib.machinery.EXTENSION_SUFFIXES``.
 
-    A *present* extension that fails to load raises ``SCP-UNKNOWN-0002``
+    A *present* extension that fails to load raises
+    :data:`scp_sdk._extension.EXTENSION_LOAD_FAILED_CODE` (``SCP-VALID-7082``)
     instead, and so does an extension that loads without exporting the ``SCP``
     class (``scp_sdk.scp._native_cls``). The exception type cannot make that
     separation, because Python raises ``ImportError`` for an absent module and
@@ -43,9 +45,10 @@ def extension_is_absent(exc: BaseException) -> bool:
     those would let a CI job that downloaded a broken extension exit 0 over
     zero executed assertions.
     """
+    from scp_sdk._extension import EXTENSION_ABSENT_CODE
     from scp_sdk.errors import ScpError
 
-    return isinstance(exc, ScpError) and exc.code == "SCP-UNKNOWN-0001"
+    return isinstance(exc, ScpError) and exc.code == EXTENSION_ABSENT_CODE
 
 
 @pytest.fixture
@@ -68,7 +71,7 @@ def scp() -> Iterator:
     # fixture and remain unaffected.
     #
     # Only an ``ImportError`` skips here. ``scp_sdk/__init__.py`` raises
-    # ``SCP-UNKNOWN-0002`` — an ``ScpError``, not an ``ImportError`` — when the
+    # ``SCP-VALID-7082`` — an ``ScpError``, not an ``ImportError`` — when the
     # extension file is present and fails to load, so that cause propagates out
     # of this fixture and fails the test instead of skipping it.
     try:

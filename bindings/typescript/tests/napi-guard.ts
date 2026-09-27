@@ -19,8 +19,11 @@ import { loadNativeAddon, NATIVE_ADDON_ABSENT_CODE } from "../src/internal/nativ
  * `error` otherwise.
  *
  * Call it from a guard's `catch`. The guard's own error does not decide the
- * outcome, because the `SCP` wrapper reports absence and a stale addon with one
- * code: this function asks the loader directly. When the loader itself throws
+ * outcome, because a guard catches whatever its setup threw — the `SCP`
+ * constructor, a method call, a check on an export — and that error need not
+ * come from the loader at all. This function asks the loader directly, so the
+ * loader, the one component that sees whether the package resolves, decides
+ * absence. When the loader itself throws
  * a code other than `NATIVE_ADDON_ABSENT_CODE`, that loader error is thrown,
  * since it names the load failure more precisely than `error` does.
  *
