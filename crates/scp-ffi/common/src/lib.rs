@@ -21,6 +21,38 @@ pub mod outlet_id;
 pub mod ucan_errors;
 pub mod validate;
 
+/// The refusal text a bridge's pre-authorization lifecycle gate reports after
+/// `cannot {verb}: `.
+///
+/// The outlet PRD's SCP-OUT-031 PR-2a note records that the raw lifecycle
+/// state never reaches an FFI caller before authorization. A lifecycle gate
+/// that runs before a bridge authorizes the caller, as the outlet and UCAN
+/// entry points need, therefore reports this one text for every non-`Active`
+/// state, for a context no actor serves, and for a state read that failed
+/// (`ActorCrashed` for a context mid-respawn or past a failed respawn,
+/// `ActorBusy` for an actor that did not answer).
+pub const CONTEXT_NOT_ACTIVE_WITHHELD: &str = "context is not active";
+
+/// Renders a lifecycle state as the lowercase name a bridge's lifecycle-gate
+/// refusal reports, such as `'closing'` in "cannot send in 'closing' state".
+///
+/// A bridge renders the state through this function so that an SDK matches
+/// one vocabulary whichever bridge it links.
+#[must_use]
+pub const fn context_state_str(state: &scp_protocol::context::ContextState) -> &'static str {
+    use scp_protocol::context::ContextState as S;
+    match state {
+        S::Creating => "creating",
+        S::Active => "active",
+        S::Closing => "closing",
+        S::Closed => "closed",
+        S::Expired => "expired",
+        S::MigratingOut => "migrating_out",
+        S::Tombstoned => "tombstoned",
+        S::Poisoned => "poisoned",
+    }
+}
+
 mod bridge_id;
 pub use bridge_id::generate_bridge_id;
 
