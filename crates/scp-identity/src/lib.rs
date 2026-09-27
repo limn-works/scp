@@ -180,7 +180,7 @@ pub enum IdentityError {
     /// there is no real backend, so identity creation FAILS CLOSED with this
     /// typed error rather than silently minting the nullifier — masking a
     /// missing production backend with a dev stand-in would ship a false
-    /// durability guarantee (CLAUDE.md builder tenet "No dev/test-only stand-ins
+    /// durability guarantee (AGENTS.md builder tenet "No dev/test-only stand-ins
     /// in production"). Absence is honest and detectable; a nullifier lies.
     ///
     /// A real, persistent pre-rotation backend is tracked by #1729 / RFC #2130.

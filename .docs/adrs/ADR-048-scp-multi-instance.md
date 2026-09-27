@@ -236,7 +236,7 @@ The registry currently has no live entries. The three bridges share the real eng
 - **Per-call `context: &Scp` parameter on every function.** Too invasive. Every FFI function would grow a first parameter. The SDK surface becomes unergonomic for the common single-instance case that accounts for the vast majority of usage.
 - **Serialization mutex around the global.** Fixes nothing. Multi-identity coexistence is still impossible; throughput is pessimized even in the single-instance case.
 - **Naming the SDK class after FFI internals (`Bridge`, `BridgeInstance`).** The user-facing class should carry the protocol name (`SCP`), not the internal plumbing vocabulary. Matches the SDK convention set by peers (`OpenAI`, `Anthropic`, `Stripe`). `BridgeInstance` remains the internal Rust type — it is the FFI bridge's instance, and that vocabulary is correct for contributors.
-- **`Box<dyn Any>` with per-bridge `clear_fn` callbacks (the Phase 4a pattern).** Replaced by per-bridge concrete structs behind a shared `BridgeInstanceCore` trait. Compile-time type safety over runtime downcasts, per the CLAUDE.md rule "enforce mechanically."
+- **`Box<dyn Any>` with per-bridge `clear_fn` callbacks (the Phase 4a pattern).** Replaced by per-bridge concrete structs behind a shared `BridgeInstanceCore` trait. Compile-time type safety over runtime downcasts, per the AGENTS.md rule "enforce mechanically."
 
 ## Notes
 

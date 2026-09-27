@@ -178,7 +178,7 @@ pub fn build_unsigned_attestation(
 /// deleted every process-wide default bridge instance, so a module-level free
 /// function reaches no per-instance DID resolver and cannot perform step 1.
 /// Verifying a caller-supplied key against a caller-supplied attestation would
-/// answer `true` for an attacker who supplies both, which CLAUDE.md's
+/// answer `true` for an attacker who supplies both, which AGENTS.md's
 /// "No dev/test-only stand-ins in production" tenet classifies as a security
 /// nullifier — a false guarantee, strictly worse than an honest absence. So
 /// each free function fails closed with this message and names its

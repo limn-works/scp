@@ -154,7 +154,7 @@ Convenience
 
 ## Crate-internal maps
 
-- `CLAUDE.md` (this crate) — agent-facing map for modifying the runtime.
+- `AGENTS.md` (this crate) — agent-facing map for modifying the runtime.
 - `src/context/README.md` — the `context/` module tree and command flow.
 - `src/crypto/mls/README.md` — the MLS subsystem.
 
