@@ -1,7 +1,7 @@
 // Fail-closed, key-lifecycle, and call-ordering tests for adapter
 // `AppleDeviceAttestation`.
 //
-// These tests pin four properties of `AppleDeviceAttestation`:
+// These tests pin five properties of `AppleDeviceAttestation`:
 //
 // 1. When `DCAppAttestService.isSupported` is `false`, `attest` and
 //    `assertRequest` throw `ScpError` code `SCP-ATTEST-9019`, the type the
@@ -23,7 +23,16 @@
 // 4. `attest` hands Apple the 32-byte `challenge` unchanged as
 //    `clientDataHash`, rejects any other length before it generates a key, and
 //    returns the raw attestation object; `assertRequest` hands Apple
-//    `requestHash` unchanged. ADR-025 acceptance criterion 3 fixes both.
+//    `requestHash` unchanged, rejecting any other length before it calls
+//    Apple. ADR-025 acceptance criterion 3 fixes both.
+// 5. `DCError.invalidKey` maps onto the three conditions `DCError.h` lists,
+//    each of which keeps or discards a key ID by its own rule, and a key
+//    generated to replace an attested key leaves the attested key in place
+//    until Apple attests the replacement. `AppAttestKeyLifecycleTests` pins
+//    each condition, `AppAttestKeyReplacementTests` pins the replacement,
+//    and `AppAttestIncompleteAnswerTests` pins the
+//    `SCP-ATTEST-9025` result of an App Attest answer that carries neither a
+//    value nor an error.
 //
 // See ADR-025 (Apple Platform Adapter) in `.docs/adrs/phase-5.md` and
 // `crates/scp-platform/src/traits.rs` `DeviceAttestation`.
@@ -122,6 +131,12 @@
         private var attestScript: [Result<Data, Error>]
         private var assertScript: [Result<Data, Error>]
         private var keyGenerationCallCount = 0
+        private var assertionKeyIds: [String] = []
+
+        /// The key ID of every `generateAssertion` call, in arrival order.
+        var assertedKeyIds: [String] {
+            lock.withLock { assertionKeyIds }
+        }
 
         /// How many times `generateKey` ran.
         var keyGenerationCount: Int {
@@ -158,10 +173,11 @@
         }
 
         override func generateAssertion(
-            _: String,
+            _ keyId: String,
             clientDataHash _: Data,
             completionHandler: @escaping (Data?, Error?) -> Void
         ) {
+            lock.withLock { assertionKeyIds.append(keyId) }
             answer(from: \.assertScript, to: completionHandler)
         }
 
@@ -400,7 +416,7 @@
 
     /// A `UserDefaults` that keeps every value in memory.
     ///
-    /// `AppleDeviceAttestation` reads, writes, and removes two string keys, so
+    /// `AppleDeviceAttestation` reads, writes, and removes three string keys, so
     /// overriding those three methods covers every call it makes. A real
     /// `UserDefaults(suiteName:)` would leave one
     /// `~/Library/Preferences/<suiteName>.plist` behind per test, because
@@ -626,10 +642,34 @@
             #expect(harness.defaults.string(forKey: Self.keyIdStorageKey) == ScriptedAppAttestService.generatedKeyId)
         }
 
+        @Test("attest keeps the key and reports serverUnavailable when the probe assertion cannot reach Apple")
+        func attestProbeServerUnavailableKeepsKey() async {
+            // A caller retries on SCP-ATTEST-9024, so an outage during the
+            // probe reports that code, and the kept key lets the retry succeed.
+            let harness = makeAdapter(
+                assertScript: [.failure(ScriptedAppAttestService.serverUnavailableError)],
+                attested: false
+            )
+
+            do throws(AttestationError) {
+                _ = try await harness.adapter.attestReportingAttestationError(
+                    challenge: Data(repeating: 0x01, count: 32),
+                    deviceId: Data([0x02])
+                )
+                Issue.record("attest returned bytes after attestKey answered invalidKey")
+            } catch {
+                if case .serverUnavailable = error {} else {
+                    Issue.record("attest threw \(error) instead of AttestationError.serverUnavailable")
+                }
+            }
+            #expect(harness.defaults.string(forKey: Self.keyIdStorageKey) == Self.storedKeyId)
+            #expect(harness.defaults.string(forKey: Self.attestedKeyIdStorageKey) == nil)
+        }
+
         @Test("attest keeps the key and reports serviceError when the probe assertion fails otherwise")
         func attestProbeFailureKeepsKey() async {
             let harness = makeAdapter(
-                assertScript: [.failure(ScriptedAppAttestService.serverUnavailableError)],
+                assertScript: [.failure(NSError(domain: "SCPTests", code: 1, userInfo: nil))],
                 attested: false
             )
 
@@ -894,6 +934,96 @@
         }
     }
 
+    /// Cases that pin what a failed replacement attestation leaves in place.
+    ///
+    /// A key generated to replace an attested key is stored apart from it
+    /// until Apple attests it, so `assertRequest` keeps naming the key an
+    /// earlier published attestation names whatever the replacement's
+    /// `attestKey` answers.
+    struct AppAttestKeyReplacementTests {
+        private static let keyIdStorageKey = "dev.limn.scp.appAttest.keyId"
+        private static let attestedKeyIdStorageKey = "dev.limn.scp.appAttest.attestedKeyId"
+        private static let replacementKeyIdStorageKey = "dev.limn.scp.appAttest.replacementKeyId"
+        private static let storedKeyId = Data(repeating: 0x06, count: 32).base64EncodedString()
+
+        @Test("a replacement attestation that cannot reach Apple leaves assertions on the attested key")
+        func failedReplacementKeepsAttestedKey() async throws {
+            let service = ScriptedAppAttestService(
+                attestScript: [.failure(ScriptedAppAttestService.serverUnavailableError), .success(Data([0xA2]))],
+                assertScript: [.success(Data([0xB1]))]
+            )
+            let defaults = InMemoryUserDefaults()
+            defaults.set(Self.storedKeyId, forKey: Self.keyIdStorageKey)
+            defaults.set(Self.storedKeyId, forKey: Self.attestedKeyIdStorageKey)
+            let adapter = AppleDeviceAttestation(service: service, defaults: defaults)
+
+            do throws(AttestationError) {
+                _ = try await adapter.attestReportingAttestationError(
+                    challenge: Data(repeating: 0x01, count: 32),
+                    deviceId: Data([0x02])
+                )
+                Issue.record("attest returned bytes while Apple's service was unavailable")
+            } catch {
+                if case .serverUnavailable = error {} else {
+                    Issue.record("attest threw \(error) instead of AttestationError.serverUnavailable")
+                }
+            }
+
+            // The attested key an earlier published attestation names stays the
+            // key assertions use, and the replacement waits for its retry.
+            #expect(defaults.string(forKey: Self.keyIdStorageKey) == Self.storedKeyId)
+            #expect(defaults.string(forKey: Self.attestedKeyIdStorageKey) == Self.storedKeyId)
+            #expect(defaults.string(forKey: Self.replacementKeyIdStorageKey) == ScriptedAppAttestService.generatedKeyId)
+            _ = try await adapter.assertRequestReportingAttestationError(requestHash: Data(repeating: 0xAB, count: 32))
+            #expect(service.assertedKeyIds == [Self.storedKeyId])
+
+            // The retry attests the same replacement key, which then becomes
+            // the key assertions use.
+            let bytes = try await adapter.attestReportingAttestationError(
+                challenge: Data(repeating: 0x01, count: 32),
+                deviceId: Data([0x02])
+            )
+            #expect(bytes == Data([0xA2]))
+            #expect(service.keyGenerationCount == 1)
+            #expect(defaults.string(forKey: Self.keyIdStorageKey) == ScriptedAppAttestService.generatedKeyId)
+            #expect(defaults.string(forKey: Self.attestedKeyIdStorageKey) == ScriptedAppAttestService.generatedKeyId)
+            #expect(defaults.string(forKey: Self.replacementKeyIdStorageKey) == nil)
+        }
+
+        @Test("a replacement key Apple's service rejects is discarded and the attested key stays")
+        func rejectedReplacementKeepsAttestedKey() async throws {
+            // `attestKey` and the probe assertion over the replacement both
+            // answer `invalidKey`, and a later assertion succeeds.
+            let service = ScriptedAppAttestService(
+                attestScript: [.failure(ScriptedAppAttestService.invalidKeyError)],
+                assertScript: [.failure(ScriptedAppAttestService.invalidKeyError), .success(Data([0xB1]))]
+            )
+            let defaults = InMemoryUserDefaults()
+            defaults.set(Self.storedKeyId, forKey: Self.keyIdStorageKey)
+            defaults.set(Self.storedKeyId, forKey: Self.attestedKeyIdStorageKey)
+            let adapter = AppleDeviceAttestation(service: service, defaults: defaults)
+
+            do throws(AttestationError) {
+                _ = try await adapter.attestReportingAttestationError(
+                    challenge: Data(repeating: 0x01, count: 32),
+                    deviceId: Data([0x02])
+                )
+                Issue.record("attest returned bytes for a key Apple's service rejected")
+            } catch {
+                if case .keyRejected = error {} else {
+                    Issue.record("attest threw \(error) instead of AttestationError.keyRejected")
+                }
+            }
+
+            #expect(defaults.string(forKey: Self.keyIdStorageKey) == Self.storedKeyId)
+            #expect(defaults.string(forKey: Self.attestedKeyIdStorageKey) == Self.storedKeyId)
+            #expect(defaults.string(forKey: Self.replacementKeyIdStorageKey) == nil)
+            let bytes = try await adapter.assertRequestReportingAttestationError(requestHash: Data(repeating: 0xAB, count: 32))
+            #expect(bytes == Data([0xB1]))
+            #expect(service.assertedKeyIds == [ScriptedAppAttestService.generatedKeyId, Self.storedKeyId])
+        }
+    }
+
     // MARK: - App Attest call ordering
 
     /// Cases that pin what happens when two callers reach App Attest at once.
@@ -1036,6 +1166,30 @@
             }
         }
 
+        @Test("assertRequest rejects a requestHash that is not 32 bytes before it calls Apple")
+        func assertRequestRejectsWrongLengthRequestHash() async throws {
+            for length in [0, 31, 33, 57] {
+                let service = RecordingAppAttestService()
+                let adapter = AppleDeviceAttestation(service: service, defaults: InMemoryUserDefaults())
+                _ = try await adapter.attestReportingAttestationError(
+                    challenge: Data(repeating: 0x01, count: 32),
+                    deviceId: Data([0x02])
+                )
+
+                do throws(ScpError) {
+                    _ = try await adapter.assertRequest(requestHash: Data(repeating: 0x01, count: length))
+                    Issue.record("assertRequest returned bytes for a \(length)-byte requestHash")
+                } catch {
+                    guard case let .Identity(_, code) = error else {
+                        Issue.record("assertRequest threw \(error) instead of ScpError.Identity")
+                        continue
+                    }
+                    #expect(code == "SCP-ATTEST-9026")
+                }
+                #expect(service.assertions.isEmpty)
+            }
+        }
+
         @Test("assertRequest hands Apple requestHash unchanged")
         func assertRequestForwardsRequestHash() async throws {
             let service = RecordingAppAttestService()
@@ -1104,6 +1258,117 @@
                 }
             }
             #expect(service.assertions.count == 1)
+        }
+    }
+
+    // MARK: - Incomplete App Attest answers
+
+    /// A `DCAppAttestService` whose completion handlers answer with neither a
+    /// value nor an error.
+    private final class SilentAppAttestService: DCAppAttestService, @unchecked Sendable {
+        /// A key ID `generateKey` hands back when `answersKeyGeneration` is set.
+        static let generatedKeyId = Data(repeating: 0x09, count: 32).base64EncodedString()
+
+        private let answersKeyGeneration: Bool
+
+        init(answersKeyGeneration: Bool) {
+            self.answersKeyGeneration = answersKeyGeneration
+            super.init()
+        }
+
+        override var isSupported: Bool {
+            true
+        }
+
+        override func generateKey(completionHandler: @escaping (String?, Error?) -> Void) {
+            completionHandler(answersKeyGeneration ? Self.generatedKeyId : nil, nil)
+        }
+
+        override func attestKey(
+            _: String,
+            clientDataHash _: Data,
+            completionHandler: @escaping (Data?, Error?) -> Void
+        ) {
+            completionHandler(nil, nil)
+        }
+
+        override func generateAssertion(
+            _: String,
+            clientDataHash _: Data,
+            completionHandler: @escaping (Data?, Error?) -> Void
+        ) {
+            completionHandler(nil, nil)
+        }
+    }
+
+    /// Cases that pin `SCP-ATTEST-9025`, which the adapter throws when an App
+    /// Attest completion handler answers with neither a value nor an error,
+    /// so the adapter returns no bytes and stores no key ID it did not receive.
+    struct AppAttestIncompleteAnswerTests {
+        private static let keyIdStorageKey = "dev.limn.scp.appAttest.keyId"
+        private static let attestedKeyIdStorageKey = "dev.limn.scp.appAttest.attestedKeyId"
+
+        /// Require that `error` is `ScpError.Identity` with code `SCP-ATTEST-9025`.
+        private func expectInternalError(_ error: ScpError, from method: String) {
+            guard case let .Identity(_, code) = error else {
+                Issue.record("\(method) threw \(error) instead of ScpError.Identity")
+                return
+            }
+            #expect(code == "SCP-ATTEST-9025")
+        }
+
+        @Test("attest throws SCP-ATTEST-9025 and stores no key ID when generateKey answers with nothing")
+        func attestRejectsEmptyKeyGeneration() async {
+            let defaults = InMemoryUserDefaults()
+            let adapter = AppleDeviceAttestation(
+                service: SilentAppAttestService(answersKeyGeneration: false),
+                defaults: defaults
+            )
+
+            do throws(ScpError) {
+                _ = try await adapter.attest(challenge: Data(repeating: 0x01, count: 32), deviceId: Data([0x02]))
+                Issue.record("attest returned bytes when generateKey answered with nothing")
+            } catch {
+                expectInternalError(error, from: "attest")
+            }
+            #expect(defaults.string(forKey: Self.keyIdStorageKey) == nil)
+        }
+
+        @Test("attest throws SCP-ATTEST-9025 and records no attestation when attestKey answers with nothing")
+        func attestRejectsEmptyAttestation() async {
+            let defaults = InMemoryUserDefaults()
+            let adapter = AppleDeviceAttestation(
+                service: SilentAppAttestService(answersKeyGeneration: true),
+                defaults: defaults
+            )
+
+            do throws(ScpError) {
+                _ = try await adapter.attest(challenge: Data(repeating: 0x01, count: 32), deviceId: Data([0x02]))
+                Issue.record("attest returned bytes when attestKey answered with nothing")
+            } catch {
+                expectInternalError(error, from: "attest")
+            }
+            #expect(defaults.string(forKey: Self.keyIdStorageKey) == SilentAppAttestService.generatedKeyId)
+            #expect(defaults.string(forKey: Self.attestedKeyIdStorageKey) == nil)
+        }
+
+        @Test("assertRequest throws SCP-ATTEST-9025 when generateAssertion answers with nothing")
+        func assertRequestRejectsEmptyAssertion() async {
+            let defaults = InMemoryUserDefaults()
+            defaults.set(SilentAppAttestService.generatedKeyId, forKey: Self.keyIdStorageKey)
+            defaults.set(SilentAppAttestService.generatedKeyId, forKey: Self.attestedKeyIdStorageKey)
+            let adapter = AppleDeviceAttestation(
+                service: SilentAppAttestService(answersKeyGeneration: true),
+                defaults: defaults
+            )
+
+            do throws(ScpError) {
+                _ = try await adapter.assertRequest(requestHash: Data(repeating: 0xAB, count: 32))
+                Issue.record("assertRequest returned bytes when generateAssertion answered with nothing")
+            } catch {
+                expectInternalError(error, from: "assertRequest")
+            }
+            #expect(defaults.string(forKey: Self.keyIdStorageKey) == SilentAppAttestService.generatedKeyId)
         }
     }
 

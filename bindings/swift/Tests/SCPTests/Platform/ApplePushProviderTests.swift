@@ -9,7 +9,9 @@
 // a message count would hand Apple metadata the protocol keeps encrypted.
 //
 // Each case below names the field it added, the value it changed, or the shape
-// it broke, and asserts the thrown case.
+// it broke, and requires the `PushError` case `handleNotification(payload:)`
+// throws for that payload: `invalidPayload` for bytes that are not a JSON
+// object, `opaquePayloadViolation` for every other rejection.
 //
 // `register()` reaches APNs, and a `swift test` host holds no APNs entitlement
 // and receives no device token, so no case here calls it. Acceptance criterion 7
@@ -31,6 +33,35 @@
         try payload(["aps": ["content-available": 1]])
     }
 
+    /// The `PushError` case a rejection test requires.
+    private enum RejectionCase {
+        case opaquePayloadViolation
+        case invalidPayload
+    }
+
+    /// Call `handleNotification(payload:)` and record an issue unless it
+    /// throws the `PushError` case `expected` names.
+    private func expectRejection(
+        _ provider: ApplePushProvider,
+        _ bytes: Data,
+        _ expected: RejectionCase,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) async {
+        do {
+            _ = try await provider.handleNotification(payload: bytes)
+            Issue.record("handleNotification accepted a payload it must reject", sourceLocation: sourceLocation)
+        } catch let error as PushError {
+            switch (expected, error) {
+            case (.opaquePayloadViolation, .opaquePayloadViolation), (.invalidPayload, .invalidPayload):
+                break
+            default:
+                Issue.record("expected PushError.\(expected), caught \(error)", sourceLocation: sourceLocation)
+            }
+        } catch {
+            Issue.record("caught \(error), which is not a PushError", sourceLocation: sourceLocation)
+        }
+    }
+
     struct ApplePushProviderPayloadTests {
         @Test("handleNotification returns the payload bytes for a silent push")
         func handleNotificationAcceptsOpaquePayload() async throws {
@@ -49,9 +80,7 @@
                 "contextId": "ctx-1"
             ])
 
-            await #expect(throws: PushError.self) {
-                try await provider.handleNotification(payload: bytes)
-            }
+            await expectRejection(provider, bytes, .opaquePayloadViolation)
         }
 
         @Test("handleNotification rejects a second field inside aps")
@@ -61,9 +90,7 @@
                 "aps": ["content-available": 1, "badge": 3]
             ])
 
-            await #expect(throws: PushError.self) {
-                try await provider.handleNotification(payload: bytes)
-            }
+            await expectRejection(provider, bytes, .opaquePayloadViolation)
         }
 
         @Test("handleNotification rejects a payload whose only field is not aps")
@@ -71,9 +98,7 @@
             let provider = ApplePushProvider()
             let bytes = try payload(["alert": ["content-available": 1]])
 
-            await #expect(throws: PushError.self) {
-                try await provider.handleNotification(payload: bytes)
-            }
+            await expectRejection(provider, bytes, .opaquePayloadViolation)
         }
 
         @Test("handleNotification rejects an aps value that is not an object")
@@ -81,9 +106,7 @@
             let provider = ApplePushProvider()
             let bytes = try payload(["aps": 1])
 
-            await #expect(throws: PushError.self) {
-                try await provider.handleNotification(payload: bytes)
-            }
+            await expectRejection(provider, bytes, .opaquePayloadViolation)
         }
 
         @Test("handleNotification rejects content-available holding boolean true")
@@ -95,9 +118,7 @@
             let provider = ApplePushProvider()
             let bytes = try payload(["aps": ["content-available": true]])
 
-            await #expect(throws: PushError.self) {
-                try await provider.handleNotification(payload: bytes)
-            }
+            await expectRejection(provider, bytes, .opaquePayloadViolation)
         }
 
         @Test("handleNotification rejects a content-available value other than 1")
@@ -105,31 +126,25 @@
             let provider = ApplePushProvider()
             let bytes = try payload(["aps": ["content-available": 0]])
 
-            await #expect(throws: PushError.self) {
-                try await provider.handleNotification(payload: bytes)
-            }
+            await expectRejection(provider, bytes, .opaquePayloadViolation)
         }
 
         @Test("handleNotification rejects a fractional content-available whose integer part is 1")
-        func handleNotificationRejectsFractionalContentAvailable() async throws {
+        func handleNotificationRejectsFractionalContentAvailable() async {
             // `NSNumber.intValue` truncates 1.5 to 1, so an implementation that
             // checks the CFNumber type and `intValue` alone would accept this
             // payload.
             let provider = ApplePushProvider()
             let bytes = Data(#"{"aps":{"content-available":1.5}}"#.utf8)
 
-            await #expect(throws: PushError.self) {
-                try await provider.handleNotification(payload: bytes)
-            }
+            await expectRejection(provider, bytes, .opaquePayloadViolation)
         }
 
         @Test("handleNotification rejects bytes that are not JSON")
-        func handleNotificationRejectsNonJson() async throws {
+        func handleNotificationRejectsNonJson() async {
             let provider = ApplePushProvider()
 
-            await #expect(throws: PushError.self) {
-                try await provider.handleNotification(payload: Data([0xFF, 0x00, 0xFE]))
-            }
+            await expectRejection(provider, Data([0xFF, 0x00, 0xFE]), .invalidPayload)
         }
 
         @Test("handleNotification rejects a JSON array")
@@ -137,9 +152,7 @@
             let provider = ApplePushProvider()
             let bytes = try JSONSerialization.data(withJSONObject: [["aps": 1]], options: [])
 
-            await #expect(throws: PushError.self) {
-                try await provider.handleNotification(payload: bytes)
-            }
+            await expectRejection(provider, bytes, .invalidPayload)
         }
 
         @Test("handleNotification rejects a payload above the 4 KB APNs maximum")
@@ -157,9 +170,7 @@
             let parsed = try JSONSerialization.jsonObject(with: bytes) as? [String: [String: Int]]
             #expect(parsed == ["aps": ["content-available": 1]])
 
-            await #expect(throws: PushError.self) {
-                try await provider.handleNotification(payload: bytes)
-            }
+            await expectRejection(provider, bytes, .opaquePayloadViolation)
         }
     }
 

@@ -67,8 +67,9 @@
         case serverUnavailable(String)
         /// An internal invariant was violated.
         case internalError(String)
-        /// The attestation challenge is not 32 bytes, so it is not the binding
-        /// digest of `09-security-model.md` §9.3.1 that App Attest takes as
+        /// The attestation `challenge` or the assertion `requestHash` is not 32
+        /// bytes, so it is not the binding digest `D` or the assertion digest
+        /// `A` of `09-security-model.md` §9.3.1 that App Attest takes as
         /// `clientDataHash`.
         case invalidChallenge(String)
     }
@@ -110,6 +111,14 @@
         /// holds a key ID rather than a flag, so a stale value cannot describe
         /// a key ID that replaced it.
         static let attestedAppAttestKeyId = "dev.limn.scp.appAttest.attestedKeyId"
+
+        /// `UserDefaults` key under which a key generated to replace an attested
+        /// key is persisted until Apple attests it.
+        ///
+        /// `appAttestKeyId` keeps naming the attested key until then, so an
+        /// `attestKey` failure on the replacement leaves `assertRequest` with
+        /// the key an earlier published attestation names.
+        static let replacementAppAttestKeyId = "dev.limn.scp.appAttest.replacementKeyId"
     }
 
     // ---------------------------------------------------------------------------
@@ -123,7 +132,9 @@
     /// Uses `DCAppAttestService` to generate a Secure Enclave-backed P-256 key
     /// and obtain an Apple-signed attestation certificate. The key ID is
     /// persisted in `UserDefaults`: assertions use the stored key, and an
-    /// attestation reuses it only while Apple has not attested it.
+    /// attestation reuses it only while Apple has not attested it. A key
+    /// generated to replace an attested key is stored apart from it, and it
+    /// becomes the stored key only after Apple attests it.
     ///
     /// Attestation steps (per ADR-025 acceptance criterion 3):
     /// 1. `generateKey` — creates a Secure Enclave key via App Attest service.
@@ -251,8 +262,11 @@
         ///
         /// On a real device with App Attest available:
         /// 1. Checks that `challenge` is 32 bytes, before any App Attest call.
-        /// 2. Retrieves the stored App Attest key ID while Apple has not
-        ///    attested it, or generates and stores a replacement key.
+        /// 2. Retrieves a stored replacement key ID, or the stored key ID while
+        ///    Apple has not attested it, or generates and stores a new key. A
+        ///    key generated while the stored key is attested is stored as the
+        ///    replacement, and it becomes the stored key only after Apple
+        ///    attests it.
         /// 3. Calls `DCAppAttestService.attestKey(_:clientDataHash:)` with
         ///    `challenge` as `clientDataHash`, unchanged.
         /// 4. Returns the raw CBOR attestation object Apple signed.
@@ -352,6 +366,8 @@
         /// - Returns: The raw CBOR assertion object Apple produced.
         /// - Throws: `AttestationError.unsupported` when
         ///   `DCAppAttestService.isSupported` is `false`.
+        ///   `AttestationError.invalidChallenge` when `requestHash` is not 32
+        ///   bytes; this method then calls no App Attest method.
         ///   `AttestationError.keyNotFound` when no key ID is stored, which
         ///   happens when no caller has called `attest` yet.
         ///   `AttestationError.keyNotAttested` when a key ID is stored and Apple
@@ -369,6 +385,12 @@
                 throw AttestationError.unsupported(
                     "DCAppAttestService.isSupported is false on this device, so App Attest cannot "
                         + "produce an assertion. This adapter mints no substitute token."
+                )
+            }
+            guard requestHash.count == 32 else {
+                throw AttestationError.invalidChallenge(
+                    "the assertion request hash is \(requestHash.count) bytes; App Attest takes the "
+                        + "32-byte assertion digest A of 09-security-model.md §9.3.1 as clientDataHash"
                 )
             }
 
@@ -456,6 +478,7 @@
         /// | --- | --- | --- | --- |
         /// | `attestKey` | probe assertion succeeds | already attested | kept, recorded |
         /// | `attestKey` | probe answers `invalidKey` | service rejected it | discarded |
+        /// | `attestKey` | probe answers `serverUnavailable` | unknown (`serverUnavailable`) | kept |
         /// | `attestKey` | probe fails otherwise | unknown (`serviceError`) | kept |
         /// | `generateAssertion` | no record | unattested key | kept |
         /// | `generateAssertion` | record | service rejected it | discarded |
@@ -514,6 +537,11 @@
                 )
             case let .failure(probeError) where (probeError as? DCError)?.code == .invalidKey:
                 return rejectKey(keyId, error)
+            case let .failure(probeError) where (probeError as? DCError)?.code == .serverUnavailable:
+                return .serverUnavailable(
+                    "attestKey answered invalidKey and the assertion that tells an attested key "
+                        + "from a rejected one could not reach Apple: \(probeError.localizedDescription)"
+                )
             case let .failure(probeError):
                 return .serviceError(
                     "attestKey answered invalidKey and the assertion that tells an attested key "
@@ -533,8 +561,9 @@
 
         // MARK: - Private helpers
 
-        /// Return the stored App Attest key ID while Apple has not attested it,
-        /// or generate and store a replacement key.
+        /// Return the key ID the next `attestKey` names: a stored replacement
+        /// key, else the stored key while Apple has not attested it, else a
+        /// newly generated key.
         ///
         /// A caller reaches this method through `callSerializer`, which is what
         /// makes concurrent callers generate one key rather than one each.
@@ -545,6 +574,9 @@
         /// - Returns: An App Attest key ID with no attestation record.
         /// - Throws: `AttestationError.serviceError` if `generateKey` fails.
         private func resolveKeyId() async throws -> String {
+            if let replacement = loadReplacementKeyId() {
+                return replacement
+            }
             if let stored = loadKeyId(), !isKeyAttested(stored) {
                 return stored
             }
@@ -589,11 +621,24 @@
             return defaults.string(forKey: StorageKey.appAttestKeyId)
         }
 
-        /// Persist an App Attest key ID to `UserDefaults`.
+        /// Load a replacement App Attest key ID Apple has not attested yet.
         ///
-        /// A freshly generated key carries no attestation, so this method also
-        /// removes any recorded attestation, which keeps a record left by a
-        /// previous key from describing this one.
+        /// Thread-safe: protected by `lock`.
+        private func loadReplacementKeyId() -> String? {
+            lock.lock()
+            defer { lock.unlock() }
+            return defaults.string(forKey: StorageKey.replacementAppAttestKeyId)
+        }
+
+        /// Persist a freshly generated App Attest key ID to `UserDefaults`.
+        ///
+        /// While the stored key carries an attestation record, this method
+        /// stores the new key ID as the replacement and leaves the attested key
+        /// and its record in place, so `assertRequest` keeps asserting with the
+        /// attested key until `markKeyAttested(_:)` promotes the replacement.
+        /// Otherwise it stores the new key ID as the stored key and removes any
+        /// recorded attestation, which keeps a record left by a previous key
+        /// from describing this one.
         ///
         /// Thread-safe: protected by `lock`.
         ///
@@ -602,22 +647,36 @@
         private func storeKeyId(_ keyId: String) {
             lock.lock()
             defer { lock.unlock() }
+            let stored = defaults.string(forKey: StorageKey.appAttestKeyId)
+            if let stored, defaults.string(forKey: StorageKey.attestedAppAttestKeyId) == stored {
+                defaults.set(keyId, forKey: StorageKey.replacementAppAttestKeyId)
+                return
+            }
             defaults.set(keyId, forKey: StorageKey.appAttestKeyId)
             defaults.removeObject(forKey: StorageKey.attestedAppAttestKeyId)
+            defaults.removeObject(forKey: StorageKey.replacementAppAttestKeyId)
         }
 
         /// Record that Apple attested `keyId`.
         ///
         /// Thread-safe: protected by `lock`.
         ///
-        /// - Parameter keyId: A key ID `attestKey` answered with an attestation.
-        ///   Recording it only while it is still this adapter's stored key ID
-        ///   keeps a concurrent regeneration's key ID from inheriting an
-        ///   attestation Apple granted to a key it replaced.
+        /// A replacement key Apple attested becomes the stored key, which
+        /// retires the key it replaced.
+        ///
+        /// - Parameter keyId: A key ID Apple attested. Recording it only while
+        ///   it is still this adapter's replacement or stored key ID keeps a
+        ///   concurrent regeneration's key ID from inheriting an attestation
+        ///   Apple granted to a key it replaced.
         private func markKeyAttested(_ keyId: String) {
             lock.lock()
             defer { lock.unlock() }
-            guard defaults.string(forKey: StorageKey.appAttestKeyId) == keyId else { return }
+            if defaults.string(forKey: StorageKey.replacementAppAttestKeyId) == keyId {
+                defaults.set(keyId, forKey: StorageKey.appAttestKeyId)
+                defaults.removeObject(forKey: StorageKey.replacementAppAttestKeyId)
+            } else if defaults.string(forKey: StorageKey.appAttestKeyId) != keyId {
+                return
+            }
             defaults.set(keyId, forKey: StorageKey.attestedAppAttestKeyId)
         }
 
@@ -634,17 +693,23 @@
             return defaults.string(forKey: StorageKey.attestedAppAttestKeyId) == keyId
         }
 
-        /// Remove a stored App Attest key ID and any attestation recorded for
-        /// it, unless another key ID replaced it.
+        /// Remove a replacement or stored App Attest key ID, and any
+        /// attestation recorded for a stored one, unless another key ID
+        /// replaced it.
         ///
         /// Thread-safe: protected by `lock`.
         ///
         /// - Parameter keyId: A key ID Apple's App Attest service rejected.
         ///   Removing only this value keeps a concurrent regeneration's key ID
-        ///   in place.
+        ///   in place, and removing a rejected replacement leaves the attested
+        ///   key it was meant to replace in place.
         private func forgetKeyId(_ keyId: String) {
             lock.lock()
             defer { lock.unlock() }
+            if defaults.string(forKey: StorageKey.replacementAppAttestKeyId) == keyId {
+                defaults.removeObject(forKey: StorageKey.replacementAppAttestKeyId)
+                return
+            }
             guard defaults.string(forKey: StorageKey.appAttestKeyId) == keyId else { return }
             defaults.removeObject(forKey: StorageKey.appAttestKeyId)
             defaults.removeObject(forKey: StorageKey.attestedAppAttestKeyId)
