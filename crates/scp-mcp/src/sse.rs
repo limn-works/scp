@@ -92,23 +92,35 @@ pub struct SseConfig {
     /// connection. Defaults to 3000 (3 seconds).
     pub retry_ms: u64,
 
-    /// Optional bearer token for authenticating SSE and message requests.
-    /// When `Some(token)`, all requests to `/sse` and `/message` must include
-    /// an `Authorization: Bearer <token>` header. Unauthenticated requests
-    /// receive HTTP 401 Unauthorized. When `None`, no authentication is
-    /// required (backwards compatible).
-    pub auth_token: Option<String>,
+    /// Bearer token every request to `/sse` and `/message` must present in an
+    /// `Authorization: Bearer <token>` header. A request without it, or with
+    /// any other token, receives HTTP 401 Unauthorized before it can reach the
+    /// single session slot.
+    ///
+    /// The field is a `String`, not an `Option`, so the transport has no
+    /// unauthenticated mode. Without the token, any process that can reach
+    /// `bind_addr` could claim the session and then read
+    /// `scp://{ctx}/members` and drive `tools/call` as the agent identity the
+    /// server was started for.
+    pub auth_token: String,
 }
 
 impl SseConfig {
-    /// Creates a new configuration with the given bind address.
+    /// Creates a new configuration with the given bind address and a fresh
+    /// 256-bit bearer token drawn from the operating system's CSPRNG.
+    ///
+    /// The caller hands [`auth_token`](Self::auth_token) to the MCP client it
+    /// intends to serve, or overwrites the field with a token that client
+    /// already holds.
     #[must_use]
-    pub const fn new(bind_addr: SocketAddr) -> Self {
+    pub fn new(bind_addr: SocketAddr) -> Self {
+        let mut token = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut token);
         Self {
             bind_addr,
             channel_capacity: 256,
             retry_ms: DEFAULT_RETRY_MS,
-            auth_token: None,
+            auth_token: hex::encode(token),
         }
     }
 }
@@ -322,14 +334,10 @@ fn router_with_pump<P: ContextProvider + 'static>(
         .route("/message", post(message_handler::<P>))
         .with_state(state);
 
-    let router = if let Some(ref token) = config.auth_token {
-        let expected = token.clone();
-        router.layer(middleware::from_fn(move |req, next| {
-            bearer_auth_middleware(req, next, expected.clone())
-        }))
-    } else {
-        router
-    };
+    let expected = config.auth_token.clone();
+    let router = router.layer(middleware::from_fn(move |req, next| {
+        bearer_auth_middleware(req, next, expected.clone())
+    }));
 
     (router, pump)
 }
@@ -445,16 +453,12 @@ async fn sse_handler<P: ContextProvider + 'static>(
     // first client's completed handshake and resource subscriptions, and would
     // receive the first client's JSON-RPC responses off the shared broadcast.
     //
-    // Admission note: any process that can reach the bind address can claim
-    // (or contend for) this single slot — with `SseConfig::auth_token` unset
-    // there is no authentication in front of it. An unauthenticated local
-    // process can therefore deny the legitimate client outright by looping
-    // connect->disconnect to seize the slot on each release (or simply by
-    // holding it): a single-session availability denial. That is the accepted
-    // cost of the deliberate single-session design — the attacker gains denial,
-    // never another session's decrypted content. Hardened deployments set
-    // `auth_token`, which the bearer middleware enforces before a request can
-    // touch the slot.
+    // Admission note: the bearer middleware that `router_with_pump` always
+    // installs rejects a request without `SseConfig::auth_token` before it
+    // reaches this slot. A process that holds the token owns the session: it
+    // can read `scp://{ctx}/members` and drive `tools/call` as the agent
+    // identity. The token is therefore the only thing that separates the
+    // intended client from any other process that can reach the bind address.
     let Ok(permit) = Arc::clone(&state.session_slot).try_acquire_owned() else {
         tracing::warn!("MCP SSE: refusing a second concurrent session");
         return (
@@ -1052,7 +1056,19 @@ mod tests {
         assert_eq!(config.bind_addr, addr);
         assert_eq!(config.channel_capacity, 256);
         assert_eq!(config.retry_ms, DEFAULT_RETRY_MS);
-        assert!(config.auth_token.is_none());
+        // 32 random bytes, hex-encoded.
+        assert_eq!(config.auth_token.len(), 64);
+        assert!(config.auth_token.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn sse_config_draws_a_distinct_token_per_config() {
+        let addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        assert_ne!(
+            SseConfig::new(addr).auth_token,
+            SseConfig::new(addr).auth_token,
+            "two servers must never share a bearer token"
+        );
     }
 
     #[tokio::test]
@@ -1251,25 +1267,9 @@ mod tests {
     async fn router_with_auth_builds_successfully() {
         let server = McpServer::new(MockProvider::default());
         let mut config = SseConfig::new("127.0.0.1:0".parse().unwrap());
-        config.auth_token = Some("secret-token".to_owned());
+        config.auth_token = "secret-token".to_owned();
         let (_router, pump) = router_with_pump(server, &config, None);
         assert!(pump.is_none(), "no event source means no pump");
-    }
-
-    #[tokio::test]
-    async fn router_without_auth_builds_successfully() {
-        let server = McpServer::new(MockProvider::default());
-        let config = SseConfig::new("127.0.0.1:0".parse().unwrap());
-        assert!(config.auth_token.is_none());
-        let (_router, pump) = router_with_pump(server, &config, None);
-        assert!(pump.is_none(), "no event source means no pump");
-    }
-
-    #[test]
-    fn sse_config_with_auth_token() {
-        let mut config = SseConfig::new("127.0.0.1:3000".parse().unwrap());
-        config.auth_token = Some("my-secret".to_owned());
-        assert_eq!(config.auth_token.as_deref(), Some("my-secret"));
     }
 
     // -- Auth middleware integration tests ------------------------------------
@@ -1278,15 +1278,14 @@ mod tests {
     fn auth_router() -> Router {
         let server = McpServer::new(MockProvider::default());
         let mut config = SseConfig::new("127.0.0.1:0".parse().unwrap());
-        config.auth_token = Some("test-secret".to_owned());
+        config.auth_token = "test-secret".to_owned();
         router_with_pump(server, &config, None).0
     }
 
-    /// Helper: build an unauthenticated router (`auth_token` = None).
-    fn noauth_router() -> Router {
-        let server = McpServer::new(MockProvider::default());
-        let config = SseConfig::new("127.0.0.1:0".parse().unwrap());
-        router_with_pump(server, &config, None).0
+    /// Helper: a request builder that presents the token `auth_router`
+    /// expects.
+    fn authed() -> axum::http::request::Builder {
+        Request::builder().header("Authorization", "Bearer test-secret")
     }
 
     // -- Single-session admission --------------------------------------------
@@ -1304,12 +1303,12 @@ mod tests {
     async fn second_concurrent_sse_session_is_refused() {
         use tower::ServiceExt;
 
-        let router = noauth_router();
+        let router = auth_router();
 
         // First client attaches and holds its stream open.
         let first = router
             .clone()
-            .oneshot(Request::builder().uri("/sse").body(Body::empty()).unwrap())
+            .oneshot(authed().uri("/sse").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
@@ -1317,7 +1316,7 @@ mod tests {
         // Second concurrent client is refused while the first is live.
         let second = router
             .clone()
-            .oneshot(Request::builder().uri("/sse").body(Body::empty()).unwrap())
+            .oneshot(authed().uri("/sse").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(
@@ -1332,7 +1331,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let third = router
-            .oneshot(Request::builder().uri("/sse").body(Body::empty()).unwrap())
+            .oneshot(authed().uri("/sse").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(
@@ -1493,19 +1492,27 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
+    /// The configuration every bridge builds (`SseConfig::new` on a loopback
+    /// address, no field overwritten) must reject a request that carries no
+    /// bearer token. Before the token became mandatory, `SseConfig::new` left
+    /// authentication off, no bridge turned it on, and any local process could
+    /// claim the session and act as the agent identity.
     #[tokio::test]
-    async fn noauth_allows_requests_without_header() {
-        let router = noauth_router();
-        // SSE endpoint should work without any auth header when auth is disabled
+    async fn default_config_rejects_unauthenticated_sse() {
+        let server = McpServer::new(MockProvider::default());
+        let config = SseConfig::new("127.0.0.1:0".parse().unwrap());
+        let router = router_with_pump(server, &config, None).0;
         let req = Request::builder().uri("/sse").body(Body::empty()).unwrap();
 
         let status = request_status(router, req).await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
-    async fn noauth_post_allows_requests_without_header() {
-        let router = noauth_router();
+    async fn default_config_rejects_unauthenticated_post() {
+        let server = McpServer::new(MockProvider::default());
+        let config = SseConfig::new("127.0.0.1:0".parse().unwrap());
+        let router = router_with_pump(server, &config, None).0;
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": METHOD_PING,
@@ -1521,9 +1528,7 @@ mod tests {
             .unwrap();
 
         let status = request_status(router, req).await;
-        // No auth configured, so the request reaches the handler and is refused
-        // only because no SSE session is attached.
-        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -1708,13 +1713,13 @@ mod tests {
     async fn new_admission_never_receives_prior_session_messages() {
         use tower::ServiceExt;
 
-        let router = noauth_router();
+        let router = auth_router();
 
         // Client A attaches and completes an initialize round-trip; its
         // JSON-RPC response goes out on the SSE broadcast.
         let first = router
             .clone()
-            .oneshot(Request::builder().uri("/sse").body(Body::empty()).unwrap())
+            .oneshot(authed().uri("/sse").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
@@ -1733,7 +1738,7 @@ mod tests {
         let post = router
             .clone()
             .oneshot(
-                Request::builder()
+                authed()
                     .method("POST")
                     .uri("/message")
                     .header("content-type", "application/json")
@@ -1755,7 +1760,7 @@ mod tests {
             let resp = router
                 .clone()
                 .oneshot(
-                    Request::builder()
+                    authed()
                         .uri("/sse")
                         .header("last-event-id", "0")
                         .body(Body::empty())
