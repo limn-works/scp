@@ -1,6 +1,6 @@
 # TypeScript SDK (`bindings/typescript/`)
 
-Use bun, never npm or npx. Follow `.docs/standards/typescript.md`.
+Use bun, never npm or npx. Follow `.docs/standards/typescript.md`. Biome handles lint and format; `bun run check` runs `tsc --noEmit`.
 
 ## Values crossing the napi-rs bridge
 

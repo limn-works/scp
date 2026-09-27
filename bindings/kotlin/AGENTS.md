@@ -1,6 +1,6 @@
 # Kotlin SDK (`scp-kt`) and Android adapter (`scp-kt-android`)
 
-`scp-kt` is a thin layer over the UniFFI-generated bindings: every SDK method delegates through `bridge/CoroutineBridge.kt` to exactly one UniFFI function, and no protocol logic lives in Kotlin (ADR-028, the Kotlin SDK). FFI calls run on `Dispatchers.IO`, CPU-bound mapping on `Dispatchers.Default`, and the SDK never uses `Dispatchers.Main`. `scp-kt-android` implements the UniFFI callback interfaces with Android's platform security stack (ADR-027, the Android platform adapter) and adds lifecycle and Compose helpers. Follow `.docs/standards/kotlin.md`. Run Gradle from `bindings/kotlin/` after `eval "$(mise env)"`.
+`scp-kt` is a thin layer over the UniFFI-generated bindings: every SDK method delegates through `bridge/CoroutineBridge.kt` to exactly one UniFFI function, and no protocol logic lives in Kotlin (ADR-028, the Kotlin SDK). FFI calls run on `Dispatchers.IO`, CPU-bound mapping on `Dispatchers.Default`, and the SDK never uses `Dispatchers.Main`. `scp-kt-android` implements the UniFFI callback interfaces with Android's platform security stack (ADR-027, the Android platform adapter) and adds lifecycle and Compose helpers. Follow `.docs/standards/kotlin.md`. mise supplies JDK 17 (zulu), Gradle 8.x, and Kotlin 2.x; run `eval "$(mise env)"`, then run Gradle from `bindings/kotlin/`.
 
 ## Build and generated code
 

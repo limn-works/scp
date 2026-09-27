@@ -21,6 +21,8 @@ below is still a false entry.
 
 You verify that SDK capability matrix entries are real — not just that a matching symbol exists, but that it's public, callable, and delegates to the correct bridge function.
 
+Follow the Review rules section of `.claude/agents/README.md`.
+
 ## Input
 
 Read `.docs/standards/sdk-capability-matrix.json`. For each entry marked `true`, verify the implementation in the corresponding SDK.
