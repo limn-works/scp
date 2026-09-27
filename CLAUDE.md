@@ -290,7 +290,6 @@ The orchestrator never writes code. It manages execution, maintains plan alignme
 
 **Parallelization rules:**
 - **Planning agents in parallel: OK.** Planning large swaths keeps work aligned across implementation agents.
-- **Coder agents: conservative.** Max 2-3 coding agents at once.
 - **Never mix phases.** Don't run planners, explorers, and coders simultaneously. Plan fully → review plans → then code.
 - Doing fewer things right > doing more things fast.
 

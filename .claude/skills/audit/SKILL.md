@@ -285,7 +285,6 @@ After all stages complete, produce a summary:
 
 ## Subagent Dispatch Strategy
 
-- **Max 3 concurrent agents** to avoid rate limits
 - Each agent gets one focused task (one spec section, one crate, one bridge)
 - Agents that will modify files or run tests: use worktree isolation
 - Read-only audit agents: no isolation needed
