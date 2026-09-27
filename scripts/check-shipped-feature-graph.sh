@@ -1106,9 +1106,14 @@ assert_every_pipeline_reader_consumes_its_input() {
 #   that function's `name() {` line and its closing `}` line, in the one file whose
 #   path equals TARGET_ALL_EXEMPT_FILE. A second definition of the function in that
 #   file cancels the exemption, and so does a body the range cannot close on a bare
-#   `}`: a line inside it that opens another function, or a line that starts with
-#   `}` and is not exactly `}` (an indented `  }`, `} >&2`, `} # ...`), because
-#   either shape lets the first bare `}` belong to a later construct. The function
+#   `}`: a line inside it that opens another function, or a line other than exactly
+#   `}` on which a closing `}` (at the line start or after `;` or `&`, the places
+#   bash accepts one) comes when the line has opened no brace group left of it
+#   that is still open (an opening `{` sits at the line start or after `;`, `&`,
+#   `|`, or `(`, followed by a space): an indented `  }`, `} >&2`, `} # ...`, an inline `  x; }`), because each of those
+#   can close the function early and let the first bare `}` belong to a later
+#   construct. A balanced one-line group such as `{ echo x; return 1; }` keeps the
+#   exemption, and a spelling this count misreads cancels it. The function
 #   resolves the wheel entry `--print-wheel-entries` writes and takes only a triple
 #   from its caller, so every call of it is the wheel's presence proof. Every other
 #   line, including a line elsewhere in that file and a same-named function in
@@ -1119,17 +1124,25 @@ TARGET_ALL_EXEMPT_FUNCTION="wheel_triple_occurrences"
 # target_all_exempt_range <file>
 #   Emit "<start> <end>", the line numbers of TARGET_ALL_EXEMPT_FUNCTION's
 #   `name() {` line and its first following `}` line, when the file defines that
-#   function exactly once and no line between them opens a function or starts with
-#   `}`; emit nothing otherwise, which leaves every line under the rule.
+#   function exactly once and no line between them opens a function or closes more
+#   command-position brace groups than it opens (read left to right); emit nothing
+#   otherwise, which leaves every line under the rule.
 target_all_exempt_range() {
-  local line n=0 defs=0 start="" end="" broken=0
+  local line n=0 defs=0 start="" end="" broken=0 rest depth
   local fn_def='^[[:space:]]*(function[[:space:]]+[A-Za-z_]|[A-Za-z_][A-Za-z0-9_:.-]*[[:space:]]*\(\))'
+  local brace_tok='(^|[;&])[[:space:]]*(\})|(^|[;&|(])[[:space:]]*\{[[:space:]]'
   while IFS= read -r line || [[ -n "$line" ]]; do
     n=$((n + 1))
     if [[ "$line" == "${TARGET_ALL_EXEMPT_FUNCTION}() {" ]]; then defs=$((defs + 1)); start=$n; end=""; continue; fi
     if [[ -n "$start" && -z "$end" ]]; then
-      if [[ "$line" == "}" ]]; then end=$n
-      elif [[ "$line" =~ ^[[:space:]]*\} || "$line" =~ $fn_def ]]; then broken=1; fi
+      if [[ "$line" == "}" ]]; then end=$n; continue; fi
+      if [[ "$line" =~ $fn_def ]]; then broken=1; fi
+      rest="$line"; depth=0
+      while [[ "$rest" =~ $brace_tok ]]; do
+        if [[ -n "${BASH_REMATCH[2]}" ]]; then depth=$((depth - 1)); else depth=$((depth + 1)); fi
+        if (( depth < 0 )); then broken=1; break; fi
+        rest="${rest#*"${BASH_REMATCH[0]}"}"
+      done
     fi
   done < "$1"
   if [[ "$defs" -eq 1 && -n "$end" && "$broken" -eq 0 ]]; then echo "$start $end"; fi
@@ -1209,9 +1222,15 @@ assert_target_all_exemption_names_one_site() {
   printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" 'function other {' "$per_triple" '}' '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
   ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
   expect "(target-all exemption) a function defined inside the named function cancels the exemption" "FAIL" "$rc"
-  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$per_triple" '  { true; }' '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$per_triple" '  { true; }' '  x || { echo "${e#*|}" >&2; return 1; }' '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
   ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
-  expect "(target-all exemption) a one-line brace group inside the named function keeps the exemption" "PASS" "$rc"
+  expect "(target-all exemption) one-line brace groups and a \${e#*|} expansion inside the named function keep the exemption" "PASS" "$rc"
+  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" '  local t="$1"; }' "$per_triple" '{ :' '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
+  expect "(target-all exemption) a body closed inline by '; }' does not stretch the exemption over a later brace group" "FAIL" "$rc"
+  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" '  local t="$1"; }; { :' "$per_triple" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
+  expect "(target-all exemption) a body closed inline with a group opened after it on the same line cancels the exemption" "FAIL" "$rc"
   rm -rf "$plant"
 }
 
@@ -1596,18 +1615,14 @@ if not isinstance(name, str) or not name:
 print(f"{name}|{' '.join(args)}")
 PYTHON
 
-# The first interpreter that ships `tomllib`, which the Python standard library
-# has held since 3.11. `maturin_artifact_entry` fails when no candidate imports
-# it, rather than deriving an entry some other way, and `--print-artifacts` needs
-# no interpreter at all, so a machine without Python still answers that mode.
+# python3.12, the one interpreter AGENTS.md §Toolchain names, and only when it
+# imports `tomllib`. `maturin_artifact_entry` fails when it does not, rather than
+# deriving an entry some other way, and `--print-artifacts` needs no interpreter
+# at all, so a machine without Python still answers that mode.
 MATURIN_TOML_READER=""
-for maturin_toml_candidate in python3.12 python3 python; do
-  if command -v "$maturin_toml_candidate" >/dev/null 2>&1 &&
-    "$maturin_toml_candidate" -c 'import tomllib' >/dev/null 2>&1; then
-    MATURIN_TOML_READER="$maturin_toml_candidate"
-    break
-  fi
-done
+if command -v python3.12 >/dev/null 2>&1 && python3.12 -c 'import tomllib' >/dev/null 2>&1; then
+  MATURIN_TOML_READER=python3.12
+fi
 
 # maturin_artifact_entry <pyproject.toml>
 #   Emit the ARTIFACTS entry (`<package>|<feature-args>`) the file's
@@ -1615,12 +1630,12 @@ done
 #   name` of the Cargo.toml the table's `manifest-path` names, resolved against
 #   the pyproject.toml's directory, or of the Cargo.toml beside the
 #   pyproject.toml when the table names none. FAILS (non-zero, reason on stderr)
-#   on anything MATURIN_ENTRY_PROGRAM above fails on, and when no interpreter on
+#   on anything MATURIN_ENTRY_PROGRAM above fails on, and when no python3.12 on
 #   PATH imports tomllib.
 maturin_artifact_entry() {
   local file="$1"
   if [[ -z "$MATURIN_TOML_READER" ]]; then
-    echo "no python3.12, python3, or python on PATH imports tomllib, so this gate cannot read $file. tomllib has been in the Python standard library since 3.11; install Python 3.12, which .mise.toml already names." >&2
+    echo "no python3.12 on PATH imports tomllib, so this gate cannot read $file. Install Python 3.12, which .mise.toml already names." >&2
     return 1
   fi
   "$MATURIN_TOML_READER" -c "$MATURIN_ENTRY_PROGRAM" "$file" || return 1
