@@ -106,16 +106,54 @@ def test_present_extension_that_fails_to_load_raises_the_load_failure_code(
 def test_load_failure_is_not_an_import_error(
     blocked_import: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The module-level `except ImportError: pytest.skip(...)` guards must not catch it.
-
-    Seven test modules under `bindings/python/tests` guard their imports that way.
-    An `ScpError` is not an `ImportError`, so a broken artifact reaches pytest as a
-    collection error instead of a silent skip.
-    """
+    """The loader's load-failure error is an `ScpError`, never an `ImportError`."""
     monkeypatch.setattr(_extension, "extension_is_installed", lambda: True)
     with pytest.raises(ScpError) as caught:
         _extension.native_module()
     assert not isinstance(caught.value, ImportError)
+
+
+@pytest.fixture
+def package_reimport(blocked_import: None, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Re-execute ``scp_sdk/__init__.py`` with the extension import blocked.
+
+    A real-FFI module guard runs ``from scp_sdk import _scp_core``, which reaches
+    the extension through the package's own ``try/except ImportError`` rather than
+    through :func:`scp_sdk._extension.native_module`. Removing the ``_scp_core``
+    attribute makes that ``from`` import load the submodule again, so the blocked
+    ``sys.modules`` entry raises inside the package's ``try`` block.
+    """
+    import scp_sdk
+
+    monkeypatch.delattr(scp_sdk, "_scp_core", raising=False)
+    monkeypatch.delitem(sys.modules, "_scp_core", raising=False)
+    return lambda: importlib.reload(scp_sdk)
+
+
+def test_package_import_raises_the_load_failure_code_for_a_present_extension(
+    package_reimport: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``import scp_sdk`` fails with ``SCP-VALID-7082`` over a present broken extension.
+
+    That error is not an ``ImportError``, so a module guard's
+    ``from scp_sdk import _scp_core`` reports a collection error instead of
+    skipping. A package that went back to ``except ImportError: pass`` would let
+    the guard's own import raise ``ImportError`` and skip.
+    """
+    monkeypatch.setattr(_extension, "extension_is_installed", lambda: True)
+    with pytest.raises(ScpError) as caught:
+        package_reimport()
+    assert caught.value.code == _extension.EXTENSION_LOAD_FAILED_CODE
+    assert not isinstance(caught.value, ImportError)
+
+
+def test_package_import_succeeds_without_an_extension(
+    package_reimport: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no extension file present, the pure-Python package still imports."""
+    monkeypatch.setattr(_extension, "extension_is_installed", lambda: False)
+    package_reimport()
+    assert "_scp_core" not in sys.modules
 
 
 @pytest.mark.parametrize(("module_name", "accessor"), BRIDGE_ACCESSORS)

@@ -21,17 +21,16 @@ import json
 
 import pytest
 
+from tests.conftest import skip_reason_if_extension_absent
+
 # ---------------------------------------------------------------------------
 # Skip entire module if the native extension is not available
 # ---------------------------------------------------------------------------
 
 try:
     from scp_sdk import _scp_core  # installed as scp_sdk._scp_core by maturin
-except (ImportError, AttributeError):
-    pytest.skip(
-        "Native _scp_core extension not available — run maturin develop first",
-        allow_module_level=True,
-    )
+except Exception as _exc:
+    pytest.skip(skip_reason_if_extension_absent(_exc), allow_module_level=True)
 
 from scp_sdk import SCP
 from scp_sdk.errors import ValidationError

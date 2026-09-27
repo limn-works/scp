@@ -26,7 +26,11 @@ imports and cannot themselves be skipped by a missing extension.
 
 from __future__ import annotations
 
+import ast
 import inspect
+import sys
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -163,3 +167,106 @@ def test_fixture_teardown_uses_the_synchronous_shutdown_path(
         "the teardown called the coroutine function SCP.shutdown, which builds a "
         "coroutine nothing runs and leaves the native instance alive"
     )
+
+
+def _raise(exc: BaseException) -> Any:
+    raise exc
+
+
+def test_module_guard_skips_only_when_the_loader_reports_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An absent extension is the one case a real-FFI module guard skips on."""
+    monkeypatch.setattr(
+        _extension,
+        "native_module",
+        lambda: _raise(ValidationError("not installed", code=_extension.EXTENSION_ABSENT_CODE)),
+    )
+    reason = conftest.skip_reason_if_extension_absent(ImportError("No module named '_scp_core'"))
+    assert "not installed" in reason
+
+
+def test_module_guard_raises_the_loader_error_for_a_present_unloadable_extension(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A present extension whose `dlopen` failed fails collection instead of skipping."""
+    monkeypatch.setitem(sys.modules, _extension.EXTENSION_MODULE, None)
+    monkeypatch.setattr(_extension, "extension_is_installed", lambda: True)
+    with pytest.raises(ScpError) as caught:
+        conftest.skip_reason_if_extension_absent(ImportError("undefined symbol"))
+    assert caught.value.code == _extension.EXTENSION_LOAD_FAILED_CODE
+
+
+@pytest.mark.parametrize(
+    "guard_error",
+    [
+        AttributeError("module '_scp_core' has no attribute 'SCP'"),
+        ScpError("built without testing", code=_extension.EXTENSION_LOAD_FAILED_CODE),
+        RuntimeError("panic in bridge init"),
+    ],
+)
+def test_module_guard_reraises_its_own_error_when_the_extension_loads(
+    monkeypatch: pytest.MonkeyPatch, guard_error: Exception
+) -> None:
+    """An extension that loads without an export the module calls fails collection.
+
+    The loader succeeds here, so the guard's error is not absence: a missing
+    `SCP` class, a missing `testing`-gated method, or a panic in the probe's
+    construction is re-raised. `.docs/standards/sdk-common.md` registers that
+    case under `SCP-VALID-7082` and says a skip guard fails on it.
+    """
+    monkeypatch.setattr(_extension, "native_module", lambda: object())
+    with pytest.raises(type(guard_error)) as caught:
+        conftest.skip_reason_if_extension_absent(guard_error)
+    assert caught.value is guard_error
+
+
+def _module_level_skip_reasons(source: str) -> list[ast.expr | None]:
+    """First argument of every ``pytest.skip(..., allow_module_level=True)`` call."""
+    reasons: list[ast.expr | None] = []
+    for node in ast.walk(ast.parse(source)):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "skip"
+            and any(
+                kw.arg == "allow_module_level"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is True
+                for kw in node.keywords
+            )
+        ):
+            reasons.append(node.args[0] if node.args else None)
+    return reasons
+
+
+def _is_absence_reason(reason: ast.expr | None) -> bool:
+    return (
+        isinstance(reason, ast.Call)
+        and isinstance(reason.func, ast.Name)
+        and reason.func.id == "skip_reason_if_extension_absent"
+    )
+
+
+def test_every_module_level_skip_takes_its_reason_from_the_absence_check() -> None:
+    """CRITERION: every module-level skip under `bindings/python/tests` takes its
+    reason from `skip_reason_if_extension_absent`, so no module skips over a
+    present extension that failed to load or lacks an export the module calls."""
+    offenders = [
+        path.name
+        for path in sorted(Path(conftest.__file__).parent.glob("*.py"))
+        if not all(_is_absence_reason(r) for r in _module_level_skip_reasons(path.read_text()))
+    ]
+    assert offenders == []
+
+
+def test_the_skip_scan_rejects_a_hand_written_reason() -> None:
+    """NEGATIVE CONTROL: the guard shape the absence check replaced fails the scan."""
+    source = (
+        "try:\n    from scp_sdk import _scp_core\n"
+        "except (ImportError, AttributeError):\n"
+        '    pytest.skip("not available", allow_module_level=True)\n'
+    )
+    reasons = _module_level_skip_reasons(source)
+    assert len(reasons) == 1
+    assert not _is_absence_reason(reasons[0])

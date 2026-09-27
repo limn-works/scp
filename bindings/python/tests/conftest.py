@@ -51,6 +51,38 @@ def extension_is_absent(exc: BaseException) -> bool:
     return isinstance(exc, ScpError) and exc.code == EXTENSION_ABSENT_CODE
 
 
+def skip_reason_if_extension_absent(error: BaseException) -> str:
+    """Return a skip reason when no native extension is installed; raise otherwise.
+
+    CRITERION: a real-FFI module guard skips its module when, and only when,
+    :func:`scp_sdk._extension.native_module` raises
+    :data:`scp_sdk._extension.EXTENSION_ABSENT_CODE`. Every other failure the
+    guard caught — an installed extension that fails to load, an extension
+    missing a class or ``testing``-gated method the module calls — fails the
+    module's collection, because skipping on it lets pytest exit 0 over zero
+    executed native assertions. ``bindings/typescript/tests/napi-guard.ts``
+    applies the same rule to the napi addon through ``skipReasonIfAddonAbsent``.
+
+    Call it from a module guard's ``except Exception`` block. The guard's own
+    error does not decide the outcome: this function asks the loader, the one
+    component that probes whether the extension file is present. When the
+    loader raises anything other than the absence code, that loader error is
+    raised; when the loader succeeds, ``error`` is re-raised.
+
+    Args:
+        error: The exception the guard caught.
+    """
+    from scp_sdk._extension import native_module
+
+    try:
+        native_module()
+    except Exception as load_error:
+        if extension_is_absent(load_error):
+            return f"native _scp_core extension not installed: {load_error}"
+        raise load_error from error
+    raise error
+
+
 @pytest.fixture
 def scp() -> Iterator:
     """Fresh ``scp_sdk.SCP`` wrapper per test.
