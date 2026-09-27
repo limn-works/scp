@@ -28,7 +28,7 @@ Add this to `~/.zshenv` for persistence.
 
 ## Toolchain
 
-rustup manages Rust, and mise manages every other tool (see `.mise.toml`):
+rustup manages Rust, and mise manages the tools below (see `.mise.toml`). Neither supplies what the Python binding's `maturin develop` needs to compile OpenSSL: a full perl, plus make on Linux and macOS. Install those from your system's package manager (see `bindings/python/README.md` §Requirements).
 
 | Tool | Version | Manager |
 |------|---------|---------|

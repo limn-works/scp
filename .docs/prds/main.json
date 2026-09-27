@@ -3454,7 +3454,7 @@
       ],
       "actionItems": [
         "Create `tests/integration/phase3_integration_test.py` with the 13-step end-to-end test.",
-        "Set up clean Python venv and verify `pip install scp-python` works without Rust toolchain.",
+        "Set up clean Python venv and verify `pip install scp-python` works without Rust toolchain on a platform a wheel covers.",
         "Test identity creation via Python SDK -> PyO3 bridge -> scp-core.",
         "Test context creation with outlets, UCAN minting, and ceiling enforcement.",
         "Test member join with role-scoped UCAN token delegation.",
