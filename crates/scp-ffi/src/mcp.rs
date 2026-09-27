@@ -4165,8 +4165,8 @@ mod tests {
     //
     // A direct unit assertion: the field type itself is `Weak`. When the
     // only strong reference is dropped, the provider's methods must not
-    // panic, must return safe defaults for the "optional" methods, and
-    // must return a clear error for the "required" methods.
+    // panic, every state read must fail with an error that names the
+    // dropped bridge, and `agent_role` must answer `None` ("unknown").
     // -----------------------------------------------------------------------
 
     /// Struct-level proof: the `bi` field is `Weak<PyBridgeInstance>`.

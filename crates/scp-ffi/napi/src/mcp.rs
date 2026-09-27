@@ -1225,7 +1225,7 @@ mod tests {
     /// the exact type `mcp_server_create_on` constructs.
     ///
     /// Returning the `Arc` matters: the provider holds a `Weak`, so dropping
-    /// the instance would make every provider method degrade.
+    /// the instance would make the provider's state reads fail.
     fn napi_mcp_fixture() -> (
         Arc<NapiBridgeInstance>,
         scp_mcp::server::McpServer<McpNapiBridgeProvider>,
