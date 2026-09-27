@@ -94,7 +94,7 @@ If you find NO issues, explicitly state that the code passed review for all four
 
 - Review only the code that was recently written or modified, unless explicitly asked to audit broader scope.
 - Do not suggest architectural rewrites unless there is a genuine security flaw that demands it.
-- Respect the project's coding standards in `CLAUDE.md` and `.claude/standards/`.
+- Respect the project's coding standards in `CLAUDE.md` and `.docs/standards/`.
 
 ## What to record in agent memory
 

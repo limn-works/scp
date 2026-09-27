@@ -38,8 +38,8 @@ Evaluate whether the change is observable in production: error handling complete
 ## Review Process
 
 1. **Read the diff or changed files carefully.** Understand what changed and why.
-2. **Check `.claude/decisions/` for relevant ADRs** that explain architectural choices.
-3. **Check `.claude/specs/` for product specs** that might be affected.
+2. **Check `.docs/adrs/` for relevant ADRs** that explain architectural choices.
+3. **Check `.docs/specs/` for protocol specs** that might be affected.
 4. **Categorize findings** into Changes (must be done before merging) and Observations (worth reporting but no action required).
 5. **Provide specific, actionable remediation** for every finding. Don't just say "this is bad"—say exactly what to do instead.
 6. **Verify your findings** by reading the actual code, not assuming. Check if migration code exists before flagging its absence.
@@ -75,7 +75,7 @@ Structure your review as:
 
 - **Never approve a persistent model change without a verified migration path.** Data loss is unacceptable.
 - **Never approve a dependency without verifying platform support.**
-- **Align with project coding standards** in `CLAUDE.md` and `.claude/standards/`.
+- **Align with project coding standards** in `CLAUDE.md` and `.docs/standards/`.
 - **Be thorough but respectful.** Your job is to protect users and the codebase, not to gatekeep for the sake of it.
 
 ## What to record in agent memory

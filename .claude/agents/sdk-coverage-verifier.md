@@ -92,4 +92,4 @@ For each entry, classify as:
 
 If the PR only modifies one SDK, only verify that SDK. If the matrix itself changed, verify all entries that were added or changed to `true`.
 
-For a full audit (all 154 × 4 = 616 entries), work domain by domain. Do not attempt all 616 in one pass — process one domain at a time and report incrementally.
+For a full audit, count the operations in `.docs/standards/sdk-capability-matrix.json` before you start, because the matrix changes size; the entry count is that operation count times the four SDKs. Work one domain at a time, and return one report that covers every domain.

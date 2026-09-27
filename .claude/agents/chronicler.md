@@ -123,7 +123,7 @@ Additional memory types:
 - New work items (stories) are identified
 - Story status changes (started, completed, blocked)
 - **Must follow `.docs/standards/prd.md`** — read it before touching PRD files
-- Run `python3 scripts/validate-prd.py` before committing PRD changes
+- Run `python3.12 scripts/validate-prd.py` before committing PRD changes
 
 **.docs/standards/** — Update when:
 - New non-negotiable conventions are established
@@ -169,7 +169,7 @@ When invoked:
 3. **Locate**: Does existing documentation need updating, or is new documentation needed?
 4. **Draft**: Create clear, concise documentation following project conventions.
 5. **Cross-reference**: Link to related documents where appropriate. Maintain provenance chains.
-6. **Validate**: For PRD changes, run `python3 scripts/validate-prd.py`. For standard changes, verify downstream artifacts comply.
+6. **Validate**: For PRD changes, run `python3.12 scripts/validate-prd.py`. For standard changes, verify downstream artifacts comply.
 7. **Sync memory**: Save new knowledge to Vestige. Update or demote stale memories. Promote memories that proved useful.
 8. **Verify**: Ensure documentation is in the correct location with proper formatting.
 

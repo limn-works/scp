@@ -33,10 +33,9 @@ needs the artifact that governs it.
 - Coding standards and patterns documentation
 
 ### Does Not Own
-- Feature implementation details
-- UI code and visual design
-- Persistence internals (queries, migrations)
-- Network implementation (API calls, auth flows)
+- Feature implementation details (the backend agent)
+- Cryptographic constructions (the cryptographer agent)
+- Public API shape review (the api-design-reviewer agent)
 
 ## Responsibilities
 
@@ -77,38 +76,14 @@ Spin up Architect when:
 
 ## Patterns & Conventions
 
-### Module Structure
-```
-[Module]/
-├── Protocols/          # Public contracts
-├── Implementation/     # Internal implementation
-├── Models/            # Module-specific types
-└── Tests/             # Module tests
-```
+### Crate Layout and Dependency Rules
+The Project Map in `CLAUDE.md` names every crate and binding, and `.docs/architecture.md` gives the crate layout and the SDK strategy. `scp-protocol` holds pure synchronous types and compiles for wasm32, so it depends on no async runtime. `scripts/check-protocol-deps.sh` rejects an async-runtime dependency in `scp-protocol`, and `scripts/check-cross-layer.sh` rejects a new public function in `scp-protocol` or `scp-runtime` that has no FFI bridge export. Read both before you propose a new dependency edge or public function.
 
-### Protocol Naming
-- Repository: `[Entity]Repository`
-- Service: `[Domain]Service`
-- Use case: `[Action][Entity]UseCase`
-
-### Dependency Rules
-```
-UI → Domain → Data
-         ↘ Network
-
-- UI depends on Domain protocols
-- Domain defines business logic
-- Data implements persistence
-- Network implements remote access
-- Data and Network don't depend on each other directly
-```
+### Construction and Naming
+Public construction entry points follow `.docs/standards/construction.md`, which enacts ADR-052, the unified construction pattern. Naming follows `.docs/standards/conventions.md` and the per-language standard.
 
 ### Decision Records
-When making architectural decisions:
-1. Document the context and problem
-2. List options considered
-3. State the decision and rationale
-4. Note consequences and trade-offs
+Record each architectural decision as an ADR in `.docs/adrs/`, under the phase file it belongs to or as a standalone `ADR-NNN-*.md` file. Each ADR states the context, the options considered with the reason each rejected option lost, the decision, and its consequences.
 
 ## Quality Gates
 

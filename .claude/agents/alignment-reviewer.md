@@ -29,11 +29,11 @@ Verify that every change:
 ## Project Context
 
 Read these artifacts to understand alignment context:
-- **Product vision**: `.claude/specs/product-vision.md`
-- **Design principles**: `.claude/specs/design-principles.md`
-- **Phase specs**: `.claude/specs/phase-*.md` (the roadmap)
-- **Current state**: `.claude/state/current.md`
-- **Relevant tickets**: `.claude/tickets/`
+- **Product thesis**: `.docs/thesis.md` and `.docs/specs/01-thesis.md`
+- **Design principles**: the protocol tenets and builder tenets in `CLAUDE.md`
+- **Roadmap**: `.docs/architecture.md` and the phase ADRs in `.docs/adrs/phase-*.md`
+- **Specs**: `.docs/specs/`
+- **Stories**: `.docs/prds/`, and the GitHub issue the change cites
 
 ## Review Dimensions
 
@@ -101,5 +101,5 @@ Is this creating debt that's worth it?
 - **Think in phases.** Always consider how this change affects future roadmap phases, not just the current milestone.
 - **Don't block on style.** Alignment is about product-level correctness, not code aesthetics.
 - **Flag silent scope changes.** If the implementation adds, removes, or reinterprets requirements without discussion, that's a finding.
-- **If no spec exists**, note this and evaluate against the product vision and design principles directly.
+- **If no spec exists**, note this and evaluate against the thesis and the tenets directly.
 - **Be honest about uncertainty.** If you can't determine alignment without more context, say so rather than guessing.

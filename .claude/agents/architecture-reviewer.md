@@ -32,8 +32,9 @@ Verify that every structural change:
 ## Project Context
 
 Read these artifacts to understand architectural context:
-- **ADRs**: `.claude/decisions/` (architectural decisions that must be followed)
-- **Standards**: `.claude/standards/`
+- **Architecture**: `.docs/architecture.md`
+- **ADRs**: `.docs/adrs/phase-*.md`, which hold decisions as `## ADR-NNN` headings, and the standalone `.docs/adrs/ADR-NNN-*.md` files
+- **Standards**: `.docs/standards/`
 
 Understand the architectural invariants from these files before reviewing.
 
@@ -109,7 +110,7 @@ Is the approach itself correct?
 
 ## Rules
 
-- **Read the ADRs.** Before reviewing, check `.claude/decisions/` for relevant decisions. Non-compliance with an ADR is always a finding.
+- **Read the ADRs.** Before reviewing, search `.docs/adrs/` for relevant decisions. Non-compliance with an ADR is always a finding.
 - **Check completeness rigorously.** The most common architectural bug is a change that's 90% done — an interface updated but not all implementations, a model changed but not its consumers.
 - **Evaluate the approach, not just the code.** Sometimes correct code implements the wrong approach. That's your finding.
 - **If no ADR applies**, evaluate against CLAUDE.md principles and the existing patterns in the codebase.
