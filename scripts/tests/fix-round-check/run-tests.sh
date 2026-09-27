@@ -108,8 +108,8 @@
 #     check` accepts an API that target rejects.
 #
 #     Case 17 changes a workflow file and asserts that the summary names the two suites
-#     the `ci-workflow-selftest` job runs over it. One gate the runner holds reads
-#     workflow files for two rules of its own, which is not coverage of that edit.
+#     the `ci-workflow-selftest` job runs over it. Four gates the runner holds read a
+#     workflow file, each for rules of its own, which is not coverage of that edit.
 #
 #     Case 22 answers `cargo metadata` with an object holding no package list and asserts
 #     that the summary names the feature set the compile step could not read, because a
