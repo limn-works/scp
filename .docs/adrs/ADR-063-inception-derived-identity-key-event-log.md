@@ -110,7 +110,7 @@ The split is what keeps the root cold across a transport change, which `03-ident
 
 **What the split buys.** This record depends on nothing in ADR-065, the relay ADR, pending, so it merges at `Accepted` while that record stays `Proposed` until its own review converges. **A verifier, a controller, a witness, an SDK or a relay executes every rule this record states, and these sites bind a relay, each naming its party:**
 
-- **a validating relay**: the no-TTL duty and the three refusals of `09-security-model.md` §9.10.12; the accepted-chain rule of §9.7.4.2 R9, under which the relay holds as accepted the chain that wins every pairwise R6 comparison and keeps the chain it held first on a tie; and the admission precondition §9.7.4.2 R10's diverged arm depends on, under which the relay admits a frame that opens with an inception event recomputing to the routing id's identifier, or whose predecessor digest names an event the relay holds;
+- **a validating relay**: the no-TTL duty and the three refusals of `09-security-model.md` §9.10.12; the accepted-chain rule of §9.7.4.2 R9, under which the relay holds as accepted the chain that wins every pairwise R6 comparison and keeps the chain it held first on a tie; the frame-admission rule of §9.7.4.2 R10; and the refusal of ADR-004's `DELETE` at a retained kind;
 - **a relay that does not validate**: the rejection of a PUBLISH carrying `retain: true` (§9.10.12);
 - **every listed relay**: the relay proof of control §9.7.4.2's definitions state, which R11 reads on every page of a first-contact walk.
 
