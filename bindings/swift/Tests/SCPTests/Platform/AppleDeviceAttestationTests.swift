@@ -132,10 +132,17 @@
         private var assertScript: [Result<Data, Error>]
         private var keyGenerationCallCount = 0
         private var assertionKeyIds: [String] = []
+        private var assertionClientDataHashes: [Data] = []
 
         /// The key ID of every `generateAssertion` call, in arrival order.
         var assertedKeyIds: [String] {
             lock.withLock { assertionKeyIds }
+        }
+
+        /// The `clientDataHash` of every `generateAssertion` call, in arrival
+        /// order.
+        var assertedClientDataHashes: [Data] {
+            lock.withLock { assertionClientDataHashes }
         }
 
         /// How many times `generateKey` ran.
@@ -174,10 +181,13 @@
 
         override func generateAssertion(
             _ keyId: String,
-            clientDataHash _: Data,
+            clientDataHash: Data,
             completionHandler: @escaping (Data?, Error?) -> Void
         ) {
-            lock.withLock { assertionKeyIds.append(keyId) }
+            lock.withLock {
+                assertionKeyIds.append(keyId)
+                assertionClientDataHashes.append(clientDataHash)
+            }
             answer(from: \.assertScript, to: completionHandler)
         }
 
@@ -237,10 +247,16 @@
         private var outstandingCalls = 0
         private var peakOutstandingCalls = 0
         private var keyGenerationCallCount = 0
+        private var attestKeyIds: [String] = []
 
         /// Most calls this double had outstanding at one moment.
         var peakConcurrency: Int {
             lock.withLock { peakOutstandingCalls }
+        }
+
+        /// The key ID of every `attestKey` call, in arrival order.
+        var attestedKeyIds: [String] {
+            lock.withLock { attestKeyIds }
         }
 
         init(attestScript: [Answer], assertScript: [Answer]) {
@@ -262,10 +278,11 @@
         }
 
         override func attestKey(
-            _: String,
+            _ keyId: String,
             clientDataHash _: Data,
             completionHandler: @escaping (Data?, Error?) -> Void
         ) {
+            lock.withLock { attestKeyIds.append(keyId) }
             answer(from: \.attestScript, to: completionHandler)
         }
 
@@ -310,8 +327,9 @@
     /// `clientDataHash` of every call, and can hold its first assertion until
     /// a case releases it.
     ///
-    /// Every other double here ignores `clientDataHash`, so none of them
-    /// notices a change to the bytes `attest` and `assertRequest` hand Apple.
+    /// `ScriptedAppAttestService` records the `clientDataHash` of assertions
+    /// only, and every other double ignores `clientDataHash`, so no other
+    /// double notices a change to the bytes `attest` hands Apple.
     private final class RecordingAppAttestService: DCAppAttestService, @unchecked Sendable {
         /// A key ID `generateKey` hands back.
         static let generatedKeyId = Data(repeating: 0x05, count: 32).base64EncodedString()
@@ -584,26 +602,37 @@
         private static let attestedKeyIdStorageKey = "dev.limn.scp.appAttest.attestedKeyId"
         private static let storedKeyId = Data(repeating: 0x06, count: 32).base64EncodedString()
 
+        /// The key-probe input `K` of `09-security-model.md` §9.3.1, written
+        /// out here instead of read from the adapter, so a change to the
+        /// adapter's probe bytes fails a case.
+        private static let keyProbeInput = Data(SHA256.hash(data: Data("SCP-APP-ATTEST-KEY-PROBE-V1".utf8)))
+
+        /// An adapter under test, the defaults store it writes to, and the
+        /// scripted service it calls.
+        private struct ScriptedHarness {
+            let adapter: AppleDeviceAttestation
+            let defaults: InMemoryUserDefaults
+            let service: ScriptedAppAttestService
+        }
+
         /// Build an adapter over a scripted service and a defaults store that
         /// already holds `storedKeyId`.
         private func makeAdapter(
             attestScript: [Result<Data, Error>] = [.failure(ScriptedAppAttestService.invalidKeyError)],
             assertScript: [Result<Data, Error>] = [.failure(ScriptedAppAttestService.invalidKeyError)],
             attested: Bool
-        ) -> (adapter: AppleDeviceAttestation, defaults: InMemoryUserDefaults) {
+        ) -> ScriptedHarness {
             let defaults = InMemoryUserDefaults()
             defaults.set(Self.storedKeyId, forKey: Self.keyIdStorageKey)
             if attested {
                 defaults.set(Self.storedKeyId, forKey: Self.attestedKeyIdStorageKey)
             }
-            let adapter = AppleDeviceAttestation(
-                service: ScriptedAppAttestService(
-                    attestScript: attestScript,
-                    assertScript: assertScript
-                ),
-                defaults: defaults
+            let service = ScriptedAppAttestService(
+                attestScript: attestScript,
+                assertScript: assertScript
             )
-            return (adapter, defaults)
+            let adapter = AppleDeviceAttestation(service: service, defaults: defaults)
+            return ScriptedHarness(adapter: adapter, defaults: defaults, service: service)
         }
 
         @Test("attest reports keyAlreadyAttested, keeps and records the key, when the probe assertion succeeds")
@@ -630,6 +659,11 @@
             }
             #expect(harness.defaults.string(forKey: Self.keyIdStorageKey) == Self.storedKeyId)
             #expect(harness.defaults.string(forKey: Self.attestedKeyIdStorageKey) == Self.storedKeyId)
+            // The probe signs the key-probe input K of 09-security-model.md
+            // §9.3.1, whose separator §9.18.2 registers, and never the
+            // attestation's challenge, which is the binding digest D.
+            #expect(harness.service.assertedClientDataHashes == [Self.keyProbeInput])
+            #expect(!harness.service.assertedClientDataHashes.contains(Data(repeating: 0x01, count: 32)))
 
             // The record makes the next attest generate a replacement key.
             let bytes = try await harness.adapter.attestReportingAttestationError(
@@ -662,6 +696,7 @@
             }
             #expect(harness.defaults.string(forKey: Self.keyIdStorageKey) == Self.storedKeyId)
             #expect(harness.defaults.string(forKey: Self.attestedKeyIdStorageKey) == nil)
+            #expect(harness.service.assertedClientDataHashes == [Self.keyProbeInput])
         }
 
         @Test("attest keeps the key and reports serviceError when the probe assertion fails otherwise")
@@ -684,6 +719,7 @@
             }
             #expect(harness.defaults.string(forKey: Self.keyIdStorageKey) == Self.storedKeyId)
             #expect(harness.defaults.string(forKey: Self.attestedKeyIdStorageKey) == nil)
+            #expect(harness.service.assertedClientDataHashes == [Self.keyProbeInput])
         }
 
         @Test("attest generates a replacement key when the stored key is attested")
@@ -1020,6 +1056,53 @@
             #expect(bytes == Data([0xB1]))
             #expect(service.assertedKeyIds == [ScriptedAppAttestService.generatedKeyId, Self.storedKeyId])
         }
+
+        @Test("a replacement key Apple already attested is discarded, and assertions stay on the attested key")
+        func alreadyAttestedReplacementKeepsAttestedKey() async throws {
+            // An earlier attest generated the replacement, Apple attested it,
+            // and that call never returned its attestation object, for
+            // example because the process ended first. So `attestKey` now
+            // answers `invalidKey`, and the probe assertion succeeds. No
+            // published attestation names the replacement.
+            let replacementKeyId = Data(repeating: 0x08, count: 32).base64EncodedString()
+            let service = ScriptedAppAttestService(
+                attestScript: [.failure(ScriptedAppAttestService.invalidKeyError), .success(Data([0xA3]))],
+                assertScript: [.success(Data([0xB0])), .success(Data([0xB1]))]
+            )
+            let defaults = InMemoryUserDefaults()
+            defaults.set(Self.storedKeyId, forKey: Self.keyIdStorageKey)
+            defaults.set(Self.storedKeyId, forKey: Self.attestedKeyIdStorageKey)
+            defaults.set(replacementKeyId, forKey: Self.replacementKeyIdStorageKey)
+            let adapter = AppleDeviceAttestation(service: service, defaults: defaults)
+
+            do throws(AttestationError) {
+                _ = try await adapter.attestReportingAttestationError(
+                    challenge: Data(repeating: 0x01, count: 32),
+                    deviceId: Data([0x02])
+                )
+                Issue.record("attest returned bytes for a key Apple already attested")
+            } catch {
+                if case .keyAlreadyAttested = error {} else {
+                    Issue.record("attest threw \(error) instead of AttestationError.keyAlreadyAttested")
+                }
+            }
+
+            #expect(defaults.string(forKey: Self.keyIdStorageKey) == Self.storedKeyId)
+            #expect(defaults.string(forKey: Self.attestedKeyIdStorageKey) == Self.storedKeyId)
+            #expect(defaults.string(forKey: Self.replacementKeyIdStorageKey) == nil)
+            let bytes = try await adapter.assertRequestReportingAttestationError(requestHash: Data(repeating: 0xAB, count: 32))
+            #expect(bytes == Data([0xB1]))
+            #expect(service.assertedKeyIds == [replacementKeyId, Self.storedKeyId])
+
+            // The next attest generates another replacement, which becomes
+            // the stored key only when an attestation naming it returns.
+            let attestation = try await adapter.attestReportingAttestationError(
+                challenge: Data(repeating: 0x02, count: 32),
+                deviceId: Data([0x02])
+            )
+            #expect(attestation == Data([0xA3]))
+            #expect(defaults.string(forKey: Self.keyIdStorageKey) == ScriptedAppAttestService.generatedKeyId)
+        }
     }
 
     // MARK: - App Attest call ordering
@@ -1056,9 +1139,16 @@
                 challenge: Data(repeating: 0x01, count: 32),
                 deviceId: Data([0x02])
             )
-            // Let a first caller reach `attestKey` before a second caller
-            // starts, so a second caller takes a second scripted answer.
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            // Wait until a first caller reaches `attestKey`, whose answer takes
+            // 200 ms, before a second caller starts, so a second caller takes
+            // a second scripted answer. Bounded, so a first caller that never
+            // reaches Apple fails this case instead of hanging the suite.
+            var waitedMilliseconds = 0
+            while service.attestedKeyIds.isEmpty, waitedMilliseconds < 10000 {
+                try? await Task.sleep(nanoseconds: 1_000_000)
+                waitedMilliseconds += 1
+            }
+            #expect(!service.attestedKeyIds.isEmpty, "the first attest never reached attestKey")
             async let second = adapter.attestReportingAttestationError(
                 challenge: Data(repeating: 0x03, count: 32),
                 deviceId: Data([0x04])
@@ -1116,6 +1206,46 @@
                 service.peakConcurrency == 1,
                 "App Attest saw \(service.peakConcurrency) outstanding calls at once"
             )
+        }
+
+        @Test("every adapter built with init() shares one lock and one serializer")
+        func standardAdaptersShareKeyState() {
+            // Every such adapter reads `UserDefaults.standard`, which the
+            // process shares, so its App Attest calls have to run in one order
+            // with every other such adapter's calls.
+            #expect(AppleDeviceAttestation().sharesKeyState(with: AppleDeviceAttestation()))
+        }
+
+        @Test("two adapters over one defaults store never hand Apple one key twice")
+        func adaptersSharingDefaultsAttestEachKeyOnce() async {
+            // Both adapters read the stored, unattested key. Unless they share
+            // one serializer, both hand Apple that key, which Apple attests
+            // once, and App Attest sees two outstanding calls.
+            let storedKeyId = Data(repeating: 0x06, count: 32).base64EncodedString()
+            let defaults = InMemoryUserDefaults()
+            defaults.set(storedKeyId, forKey: Self.keyIdStorageKey)
+            let service = OverlapDetectingAppAttestService(
+                attestScript: [.init(result: .success(Data([0xA1])), delay: 0.10)],
+                assertScript: [.init(result: .success(Data([0xB1])), delay: 0)]
+            )
+            let first = AppleDeviceAttestation(service: service, defaults: defaults)
+            let second = AppleDeviceAttestation(service: service, defaults: defaults, sharingKeyStateWith: first)
+
+            await withTaskGroup(of: Void.self) { group in
+                for adapter in [first, second] {
+                    group.addTask {
+                        _ = try? await adapter.attestReportingAttestationError(
+                            challenge: Data(repeating: 0x01, count: 32),
+                            deviceId: Data([0x02])
+                        )
+                    }
+                }
+            }
+
+            #expect(first.sharesKeyState(with: second))
+            #expect(service.peakConcurrency == 1)
+            #expect(service.attestedKeyIds.count == 2)
+            #expect(Set(service.attestedKeyIds).count == 2, "Apple was asked to attest one key twice")
         }
     }
 

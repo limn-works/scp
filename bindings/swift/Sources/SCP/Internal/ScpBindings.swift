@@ -14508,13 +14508,18 @@ public protocol DeviceAttestationProvider: AnyObject, Sendable {
     /**
      * Generate a per-request assertion proving key possession.
      *
-     * `request_hash` — SHA-256 hash of the request data being asserted.
-     * Apple: the 32-byte assertion digest `A` of `09-security-model.md`
-     * §9.3.1, which the adapter hands App Attest as `clientDataHash`
-     * unchanged and rejects when it is not 32 bytes.
+     * `request_hash` — the 32-byte assertion digest
+     * `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" || BE32(len(m)) || m)` of
+     * `09-security-model.md` §9.3.1 over the request bytes `m`, which the
+     * Rust caller passes on every platform, never `m` or `SHA-256(m)`.
+     * Apple: the adapter hands `A` to App Attest as `clientDataHash`
+     * unchanged and rejects it when it is not 32 bytes (ADR-025 acceptance
+     * criterion 3). Android: a Standard integrity token's `requestHash`
+     * carries the lowercase hexadecimal form of `A` (ADR-027 acceptance
+     * criterion 8).
      *
      * Returns the platform assertion object bytes (Apple: CBOR assertion;
-     * Android: integrity verdict).
+     * Android: Standard integrity token bytes).
      */
     func assertRequest(requestHash: Data) async throws  -> Data
     
