@@ -2078,8 +2078,25 @@ jobs:
         working-directory: bindings/typescript
         run: |
           bun -e '
+            import { createHash } from "node:crypto";
+            import { readFileSync } from "node:fs";
+            import { createRequire } from "node:module";
             import { loadNativeAddon } from "./src/internal/native.ts";
             import { SCP } from "./src/scp.ts";
+            // The file the loader resolves must be the downloaded artifact, byte
+            // for byte: a package bun installed from the registry, or one left by
+            // an earlier step, would pass every property check below.
+            const pkg = {
+              x64: "@limn-works/scp-ts-napi-linux-x64-gnu",
+              arm64: "@limn-works/scp-ts-napi-linux-arm64-gnu",
+            }[process.arch];
+            const loaderRequire = createRequire(process.cwd() + "/src/internal/native.ts");
+            const resolved = loaderRequire.resolve(pkg);
+            const digest = (path) => createHash("sha256").update(readFileSync(path)).digest("hex");
+            const downloaded = "../../target/release/libscp_ffi_napi.so";
+            if (digest(resolved) !== digest(downloaded)) {
+              throw new Error(resolved + " is not the downloaded addon " + downloaded);
+            }
             const addon = loadNativeAddon();
             const NativeScp = addon.SCP;
             if (typeof NativeScp !== "function") {
@@ -2573,6 +2590,9 @@ jobs:
               raise SystemExit('the native SCP class is missing ' + ', '.join(missing) + ', so this extension was built without the feature that method needs')
           print('PyO3 extension carries the gated methods')
           "
+      - name: Install TypeScript workspace deps
+        working-directory: bindings/typescript
+        run: bun install
       - name: Wire NAPI addon into node_modules
         run: |
           ARCH=$(uname -m)
@@ -2591,9 +2611,6 @@ jobs:
           fi
           cp "$LIB_FILE" "$PKG_DIR/index.node"
           echo '{"name":"'"$NAPI_PKG"'","version":"0.1.0","main":"index.node"}' > "$PKG_DIR/package.json"
-      - name: Install TypeScript workspace deps
-        working-directory: bindings/typescript
-        run: bun install
       # See the step of this name in job typescript-check for the skip-on-absence
       # defect it closes. This job drives the NAPI half of the parity harness through a
       # Bun child process, so an addon that does not load surfaces in this step.
@@ -2601,8 +2618,25 @@ jobs:
         working-directory: bindings/typescript
         run: |
           bun -e '
+            import { createHash } from "node:crypto";
+            import { readFileSync } from "node:fs";
+            import { createRequire } from "node:module";
             import { loadNativeAddon } from "./src/internal/native.ts";
             import { SCP } from "./src/scp.ts";
+            // The file the loader resolves must be the downloaded artifact, byte
+            // for byte: a package bun installed from the registry, or one left by
+            // an earlier step, would pass every property check below.
+            const pkg = {
+              x64: "@limn-works/scp-ts-napi-linux-x64-gnu",
+              arm64: "@limn-works/scp-ts-napi-linux-arm64-gnu",
+            }[process.arch];
+            const loaderRequire = createRequire(process.cwd() + "/src/internal/native.ts");
+            const resolved = loaderRequire.resolve(pkg);
+            const digest = (path) => createHash("sha256").update(readFileSync(path)).digest("hex");
+            const downloaded = "../../target/release/libscp_ffi_napi.so";
+            if (digest(resolved) !== digest(downloaded)) {
+              throw new Error(resolved + " is not the downloaded addon " + downloaded);
+            }
             const addon = loadNativeAddon();
             const NativeScp = addon.SCP;
             if (typeof NativeScp !== "function") {
