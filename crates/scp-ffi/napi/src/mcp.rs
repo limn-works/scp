@@ -680,8 +680,10 @@ async fn run_mcp_stdio_server(
 /// `subscribe_events()` returns `None` only for a supervisor built without the
 /// channel; every NAPI supervisor path enables it (see
 /// `crate::runtime::build_supervisor_arc`). With no supervisor or no channel
-/// the bundle is unwired: the server advertises `resources.subscribe: false`
-/// and rejects `resources/subscribe`, so the capability is honestly absent
+/// the bundle is unwired: the server advertises every capability the event
+/// pump backs as false (`resources.subscribe`, `resources.listChanged`,
+/// `tools.listChanged`), rejects `resources/subscribe`, and sends no
+/// `notifications/*/list_changed`, so those capabilities are honestly absent
 /// rather than accepted-and-never-delivered. Serving is not failed: the server
 /// still serves `resources/list|read`, from the actor when a supervisor is
 /// attached and from the bridge state when none is. Failing outright would

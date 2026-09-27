@@ -5486,11 +5486,13 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 /// `subscribe_events()` returns `None` only for a supervisor built without the
 /// channel; production supervisors always enable it (see
 /// `crate::runtime::build_supervisor`). With no supervisor or no channel the
-/// bundle is unwired: the server advertises `resources.subscribe: false` and
-/// rejects `resources/subscribe`, so the capability is honestly absent rather
-/// than accepted-and-never-delivered. A supervisor built without the channel
-/// degrades only this capability: the server still serves `tools/*` and
-/// `resources/list|read`. With no supervisor attached at all, the provider has
+/// bundle is unwired: the server advertises every capability the event pump
+/// backs as false (`resources.subscribe`, `resources.listChanged`,
+/// `tools.listChanged`), rejects `resources/subscribe`, and sends no
+/// `notifications/*/list_changed`, so those capabilities are honestly absent
+/// rather than accepted-and-never-delivered. A supervisor built without the
+/// channel removes only these pump-backed capabilities: the server still
+/// serves `tools/*` and `resources/list|read`. With no supervisor attached at all, the provider has
 /// no role state to read, because it asks the actor on every read, so the
 /// server serves no context: `tools/list` and `resources/list` return empty
 /// lists and `resources/read` answers "not a participant". Serving still

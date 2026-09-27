@@ -1395,12 +1395,14 @@ pub(crate) struct McpClientState {
 /// `subscribe_events()` returns `None` only for a supervisor built without the
 /// channel; production supervisors always enable it (see
 /// `crate::runtime::build_supervisor`). With no supervisor or no channel the
-/// bundle is unwired: the server advertises `resources.subscribe: false` and
-/// rejects `resources/subscribe`, so the capability is honestly absent rather
-/// than accepted-and-never-delivered. Absence degrades only this capability:
-/// the server still serves `tools/*` and `resources/list|read`. Serving is not
-/// failed outright, because that would deny working functionality over an
-/// optional feature.
+/// bundle is unwired: the server advertises every capability the event pump
+/// backs as false (`resources.subscribe`, `resources.listChanged`,
+/// `tools.listChanged`), rejects `resources/subscribe`, and sends no
+/// `notifications/*/list_changed`, so those capabilities are honestly absent
+/// rather than accepted-and-never-delivered. Absence removes only these
+/// pump-backed capabilities: the server still serves `tools/*` and
+/// `resources/list|read`. Serving is not failed outright, because that would
+/// deny working functionality over an optional feature.
 ///
 /// One call decides both halves: the server that advertises
 /// `resources.subscribe` and the pump that honours it, folded into one
@@ -4588,8 +4590,9 @@ mod tests {
         assert_eq!(format!("{bundle:?}"), "McpServerForTransport::Wired");
     }
 
-    /// A missing `Supervisor` degrades ONLY the subscription capability — it
-    /// must not fail MCP serving outright. Drives the production entry point:
+    /// A missing `Supervisor` removes only the pump-backed capabilities
+    /// (`resources.subscribe`, `resources.listChanged`, `tools.listChanged`)
+    /// — it must not fail MCP serving outright. Drives the production entry point:
     /// were `py_mcp_serve` to propagate the missing-supervisor error
     /// (`supervisor(bi)?`), the serve call would return `Err`. Then checks that
     /// `mcp_server_bundle`, the function `py_mcp_serve` builds its server with,
