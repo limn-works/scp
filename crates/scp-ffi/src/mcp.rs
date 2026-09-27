@@ -4336,10 +4336,22 @@ mod tests {
         })
         .unwrap();
 
-        let (count, root) = crate::runtime::supervisor(&bi)
+        let supervisor = crate::runtime::supervisor(&bi).unwrap();
+        let ctx_bytes = scp_core::context::state::context_id_to_bytes(&ctx_id);
+        let (count, root) = supervisor.event_log_summary(&ctx_bytes).unwrap();
+        // The summary matches a tree rebuilt from the actor's entries.
+        let entries = supervisor
+            .event_log_entries(&ctx_bytes)
             .unwrap()
-            .event_log_summary(&scp_core::context::state::context_id_to_bytes(&ctx_id))
-            .unwrap();
+            .unwrap_or_default();
+        let mut rebuilt = scp_event_log::EventLog::new(String::new());
+        for entry in &entries {
+            rebuilt.push_leaf_raw(scp_event_log::tree::leaf_hash(entry).unwrap());
+        }
+        assert_eq!(
+            (count, root),
+            (entries.len(), scp_event_log::tree::root(&rebuilt))
+        );
         let resource = pyo3_mcp_provider(&bi, &ctx_id, agent)
             .context_events(&ctx_id)
             .unwrap();
