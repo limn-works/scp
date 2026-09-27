@@ -108,7 +108,7 @@ cd "$REPO_ROOT"
 # Scan source files for SCP error code literals.
 # Matches patterns like "SCP-IDENT-1001", 'SCP-CTX-2001', `SCP-PERM-3001`
 # Excludes: .git, target, build, node_modules, .docs (specs/ADRs use codes in prose),
-#           sdk-common.md (the definition file itself), this script, CLAUDE.md files.
+#           sdk-common.md (the definition file itself), this script, AGENTS.md files.
 while IFS=: read -r file line_num content; do
     # Honour the inline `SCP-CODE-OK:` exemption marker. This is the only
     # mechanism by which a production-source line can carry a literal
@@ -146,7 +146,7 @@ done < <(
         --exclude-dir='node_modules' \
         --exclude='check-error-codes.sh' \
         --exclude='sdk-common.md' \
-        --exclude='CLAUDE.md' \
+        --exclude='AGENTS.md' \
         . 2>/dev/null || true
 )
 
@@ -294,7 +294,7 @@ done < <(
         --exclude-dir='node_modules' \
         --exclude='check-error-codes.sh' \
         --exclude='sdk-common.md' \
-        --exclude='CLAUDE.md' \
+        --exclude='AGENTS.md' \
         . 2>/dev/null || true
 )
 

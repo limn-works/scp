@@ -89,7 +89,7 @@ MARKER = "[no such section]"
 
 # Positive scope: the artifacts that govern work in this repository.
 SCOPE_DIRS = (".docs/standards", ".docs/lessons", ".claude/agents", ".docs/scaffold")
-SCOPE_FILES = ("CLAUDE.md", ".docs/architecture.md")
+SCOPE_FILES = ("AGENTS.md", ".docs/architecture.md")
 
 
 def spec_files(root: Path) -> dict[str, Path]:
