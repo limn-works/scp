@@ -406,7 +406,7 @@ static PROTOCOL_REGISTRY: LazyLock<HashMap<String, RegistryEntry>> = LazyLock::n
 // System registry (4 system capabilities)
 // ---------------------------------------------------------------------------
 
-/// The system capability registry: 5 protocol-level feature flags for node
+/// The system capability registry: 4 protocol-level feature flags for node
 /// roles, keyed by their full URI string.
 ///
 /// Per ADR-041 and §7.3.4.3.
@@ -576,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn system_registry_contains_exactly_5_entries() {
+    fn system_registry_contains_exactly_4_entries() {
         assert_eq!(SYSTEM_REGISTRY.len(), 4);
     }
 

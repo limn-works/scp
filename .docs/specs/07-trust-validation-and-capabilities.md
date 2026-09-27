@@ -542,7 +542,7 @@ Anyone can define capabilities under their own DID. Authority derives from the d
 scp:system:{kebab-case-name}
 ```
 
-System capabilities declare what a node does (e.g., relay operation, bridge operation), not what an agent can prove. They are not subject to challenge-response verification.
+System capabilities declare what a node does (e.g., relay operation), not what an agent can prove. They are not subject to challenge-response verification.
 
 #### 7.3.4.2 Anti-Spoofing
 
