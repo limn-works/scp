@@ -140,8 +140,19 @@
     ///
     /// `AppleDeviceAttestation` is `final` and conforms to `Sendable`. Internal
     /// mutable state (`generationTask`, `UserDefaults`) is protected by `NSLock`.
-    /// All async methods use `withCheckedThrowingContinuation` to bridge the
-    /// completion-handler APIs to structured concurrency.
+    /// `callSerializer`, an actor, runs every `attestKey` and
+    /// `generateAssertion` call one at a time in arrival order, and
+    /// `classify(_:keyId:operation:)` is correct only under that ordering.
+    /// `attestKey` and `generateAssertion` bridge to structured concurrency
+    /// through `withCheckedContinuation` and return a `Result` that `classify`
+    /// built; `generateKey` bridges through `withCheckedThrowingContinuation`.
+    ///
+    /// The lock and the serializer belong to one instance, while
+    /// `UserDefaults.standard` and `DCAppAttestService.shared`, which `init()`
+    /// reads, belong to the process. Two instances built with `init()`
+    /// therefore race on one stored key ID and one attestation record: each can
+    /// generate a key, and one can discard a key Apple attested for the other.
+    /// A host builds one `AppleDeviceAttestation` per process.
     ///
     /// See ADR-025 and `crates/scp-platform/src/traits.rs` `DeviceAttestation`.
     public final class AppleDeviceAttestation: DeviceAttestationProvider, @unchecked Sendable {
@@ -294,8 +305,15 @@
                 // credential ID against this 32-byte identifier, so the token
                 // carries it ahead of the attestation object. The check runs
                 // before `attestKey`, because Apple attests a key once.
+                // `generateAndStoreKey` stores only a 32-byte identifier, so a
+                // malformed value here was written by other code sharing these
+                // defaults; discarding it lets the next call generate a key
+                // instead of failing the same way on every call.
                 guard let keyIdBytes = Data(base64Encoded: keyId), keyIdBytes.count == 32 else {
-                    return .failure(.internalError("the App Attest key ID does not base64-decode to 32 bytes"))
+                    self.forgetKeyId(keyId)
+                    return .failure(.internalError(
+                        "the stored App Attest key ID does not base64-decode to 32 bytes; it was discarded"
+                    ))
                 }
                 return await self.requestAttestation(keyId: keyId, clientDataHash: clientDataHash)
                     .map { keyIdBytes + $0 }
@@ -603,6 +621,12 @@
                         ))
                     }
                 }
+            }
+            // Every key ID this adapter stores is one `attest` can carry as
+            // bytes 0–31 of its token, so a malformed key ID never reaches
+            // `UserDefaults`.
+            guard Data(base64Encoded: keyId)?.count == 32 else {
+                throw AttestationError.internalError("generateKey returned a key ID that does not base64-decode to 32 bytes")
             }
             storeKeyId(keyId)
             return keyId

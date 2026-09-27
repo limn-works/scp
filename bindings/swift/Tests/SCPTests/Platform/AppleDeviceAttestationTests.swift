@@ -157,6 +157,7 @@
         private var attestScript: [Result<Data, Error>]
         private var assertScript: [Result<Data, Error>]
         private var keyGenerationCallCount = 0
+        private let keyIdToGenerate: String
 
         /// How many times `generateKey` ran.
         var keyGenerationCount: Int {
@@ -165,10 +166,12 @@
 
         init(
             attestScript: [Result<Data, Error>] = [.failure(ScriptedAppAttestService.invalidKeyError)],
-            assertScript: [Result<Data, Error>] = [.failure(ScriptedAppAttestService.invalidKeyError)]
+            assertScript: [Result<Data, Error>] = [.failure(ScriptedAppAttestService.invalidKeyError)],
+            keyIdToGenerate: String = ScriptedAppAttestService.generatedKeyId
         ) {
             self.attestScript = attestScript
             self.assertScript = assertScript
+            self.keyIdToGenerate = keyIdToGenerate
             super.init()
         }
 
@@ -178,7 +181,7 @@
 
         override func generateKey(completionHandler: @escaping (String?, Error?) -> Void) {
             lock.withLock { keyGenerationCallCount += 1 }
-            completionHandler(Self.generatedKeyId, nil)
+            completionHandler(keyIdToGenerate, nil)
         }
 
         override func attestKey(
@@ -425,7 +428,7 @@
 
     /// A `UserDefaults` that keeps every value in memory.
     ///
-    /// `AppleDeviceAttestation` reads, writes, and removes one string key, so
+    /// `AppleDeviceAttestation` reads, writes, and removes two string keys, so
     /// overriding those three methods covers every call it makes. A real
     /// `UserDefaults(suiteName:)` would leave one
     /// `~/Library/Preferences/<suiteName>.plist` behind per test, because
@@ -523,8 +526,8 @@
             #expect(codes == expected.map { "SCP-ATTEST-\($0)" })
         }
 
-        @Test("a failed attest stores no App Attest key ID")
-        func failedAttestStoresNoKeyId() async {
+        @Test("an attest on a device without App Attest stores no App Attest key ID")
+        func unsupportedAttestStoresNoKeyId() async {
             let harness = makeUnsupportedAdapter()
             let adapter = harness.adapter
 
@@ -693,11 +696,16 @@
         func attestDiscardsRejectedKey() async {
             let harness = makeAdapter(attested: false)
 
-            await #expect(throws: AttestationError.self) {
+            do throws(AttestationError) {
                 _ = try await harness.adapter.attestReportingAttestationError(
                     challenge: Data([0x01]),
                     deviceId: Data([0x02])
                 )
+                Issue.record("attest returned bytes for a key Apple's service rejected")
+            } catch {
+                if case .keyRejected = error {} else {
+                    Issue.record("attest threw \(error) instead of AttestationError.keyRejected")
+                }
             }
 
             // No attestation exists for this key, so `invalidKey` from
@@ -710,10 +718,15 @@
         func assertRequestDiscardsRejectedKey() async {
             let harness = makeAdapter(attested: true)
 
-            await #expect(throws: AttestationError.self) {
+            do throws(AttestationError) {
                 _ = try await harness.adapter.assertRequestReportingAttestationError(
                     requestHash: Data(repeating: 0xAB, count: 32)
                 )
+                Issue.record("assertRequest returned bytes for a key Apple's service rejected")
+            } catch {
+                if case .keyRejected = error {} else {
+                    Issue.record("assertRequest threw \(error) instead of AttestationError.keyRejected")
+                }
             }
 
             // An attestation exists for this key, so `invalidKey` from
@@ -828,14 +841,12 @@
             #expect(service.keyGenerationCount == 1)
         }
 
-        @Test("a key ID that is not 32 base64-decoded bytes fails before Apple attests it")
-        func malformedKeyIdFailsBeforeAttestKey() async {
+        @Test("a stored key ID that is not 32 base64-decoded bytes fails before Apple attests it, and is discarded")
+        func malformedKeyIdFailsBeforeAttestKey() async throws {
             let defaults = InMemoryUserDefaults()
             defaults.set("not-a-32-byte-key-id", forKey: Self.keyIdStorageKey)
-            let adapter = AppleDeviceAttestation(
-                service: ScriptedAppAttestService(attestScript: [.success(Data([0x04]))]),
-                defaults: defaults
-            )
+            let service = ScriptedAppAttestService(attestScript: [.success(Data([0x04]))])
+            let adapter = AppleDeviceAttestation(service: service, defaults: defaults)
 
             do throws(AttestationError) {
                 _ = try await adapter.attestReportingAttestationError(challenge: Data([0x01]), deviceId: Data([0x02]))
@@ -849,15 +860,48 @@
             // A successful `attestKey` records its key as attested, so an empty
             // record shows this call never reached Apple.
             #expect(defaults.string(forKey: Self.attestedKeyIdStorageKey) == nil)
+            // Keeping the malformed value would fail every later `attest` the
+            // same way.
+            #expect(defaults.string(forKey: Self.keyIdStorageKey) == nil)
+
+            let bytes = try await adapter.attestReportingAttestationError(challenge: Data([0x01]), deviceId: Data([0x02]))
+            #expect(bytes == Data(repeating: 0x03, count: 32) + Data([0x04]))
+            #expect(service.keyGenerationCount == 1)
+        }
+
+        @Test("a generated key ID that is not 32 base64-decoded bytes is never stored")
+        func malformedGeneratedKeyIdIsNotStored() async {
+            let defaults = InMemoryUserDefaults()
+            let adapter = AppleDeviceAttestation(
+                service: ScriptedAppAttestService(
+                    attestScript: [.success(Data([0x04]))],
+                    keyIdToGenerate: "not-a-32-byte-key-id"
+                ),
+                defaults: defaults
+            )
+
+            do throws(AttestationError) {
+                _ = try await adapter.attestReportingAttestationError(challenge: Data([0x01]), deviceId: Data([0x02]))
+                Issue.record("attest returned a token for a key ID it cannot carry")
+            } catch {
+                if case .internalError = error {} else {
+                    Issue.record("attest threw \(error) instead of AttestationError.internalError")
+                }
+            }
+            #expect(defaults.string(forKey: Self.keyIdStorageKey) == nil)
+            #expect(defaults.string(forKey: Self.attestedKeyIdStorageKey) == nil)
         }
 
         @Test("a freshly generated key carries no attestation from a key it replaced")
         func generatedKeyCarriesNoStaleAttestation() async {
             let defaults = InMemoryUserDefaults()
-            // A record left by a previous key, which a generated key must not
-            // inherit: inheriting it would classify a rejected key as already
-            // attested and keep a dead key ID forever.
-            defaults.set("previous-key-id", forKey: Self.attestedKeyIdStorageKey)
+            // A record naming the very key ID `generateKey` is about to hand
+            // back, which a generated key must not inherit: inheriting it
+            // would classify Apple's rejection of that key as "already
+            // attested" and keep a dead key ID forever. A record naming any
+            // other key ID never matches, so only this value lets the case
+            // fail when `storeKeyId` stops clearing the record.
+            defaults.set(ScriptedAppAttestService.generatedKeyId, forKey: Self.attestedKeyIdStorageKey)
             let adapter = AppleDeviceAttestation(
                 service: ScriptedAppAttestService(),
                 defaults: defaults
@@ -1039,8 +1083,17 @@
             // The first assertion reaches Apple and waits there. Apple then
             // rejects that attested key, so the adapter discards its key ID.
             let first = Task { try await adapter.assertRequestReportingAttestationError(requestHash: Data(repeating: 0x01, count: 32)) }
+            // Bounded, so an assertion that fails before reaching Apple fails
+            // this case instead of hanging the suite.
+            var waitedMilliseconds = 0
             while !service.isHoldingAssertion {
+                guard waitedMilliseconds < 10000 else {
+                    Issue.record("the first assertion never reached generateAssertion")
+                    first.cancel()
+                    return
+                }
                 try await Task.sleep(nanoseconds: 1_000_000)
+                waitedMilliseconds += 1
             }
             // The second assertion arrives while the first is outstanding. An
             // adapter that read the key ID before queueing would hand Apple the
