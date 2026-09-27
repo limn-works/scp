@@ -165,11 +165,10 @@ jobs:
             manylinux: 2_28
             interpreter: python3.12
             before-script: "true"
-          - target: x86_64-apple-darwin
-            runner: macos-latest
-            manylinux: auto
-            interpreter: python
-          - target: aarch64-apple-darwin
+          # One universal2 wheel, as ADR phase-3 and `.docs/standards/python.md`
+          # name it: maturin compiles x86_64-apple-darwin and
+          # aarch64-apple-darwin and joins the two into one fat binary.
+          - target: universal2-apple-darwin
             runner: macos-latest
             manylinux: auto
             interpreter: python
@@ -190,8 +189,14 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@v1
 
+      # MACOSX_DEPLOYMENT_TARGET sets the macOS floor the universal2 wheel's tag
+      # names, `macosx_11_0_universal2` in `.docs/standards/python.md`; 11.0 is the
+      # first release that runs on arm64. rustc and the cc crate read it only when
+      # they compile for an Apple target, so the Linux and Windows legs ignore it.
       - name: Build wheel
         uses: PyO3/maturin-action@v1
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}

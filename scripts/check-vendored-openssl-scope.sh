@@ -65,7 +65,9 @@
 #     such line came back.
 #   * The wheel's triples are the `target:` values of the items of the
 #     `python-wheels` job's matrix `include:` list in
-#     `.github/workflows/build-matrix.yml`, the job that builds the wheel. An item
+#     `.github/workflows/build-matrix.yml`, the job that builds the wheel. The
+#     maturin target `universal2-apple-darwin` stands for the two triples maturin
+#     compiles for it, `x86_64-apple-darwin` and `aarch64-apple-darwin`. An item
 #     that yields no bare triple fails the gate, and so does a `matrix:` mapping
 #     holding any key beside `include:`.
 #
@@ -87,7 +89,7 @@
 # framework unless OPENSSL_DIR is set. On a Windows host building a Windows triple
 # the build without it does not finish: libsqlite3-sys panics unless OPENSSL_DIR
 # names an OpenSSL installation. This gate still requires the vendored build on every wheel
-# triple, the two darwin triples included.
+# triple, both halves of the universal2 darwin wheel included.
 #
 # Every other shipped configuration must not get it. A vendored OpenSSL changes
 # patch level only when someone bumps `Cargo.lock`. `Rust / deny` resolves every
@@ -174,12 +176,15 @@ if not isinstance(matrix, dict) or list(matrix) != ["include"]:
 items = matrix["include"]
 if not isinstance(items, list) or not items:
     sys.exit(f"{path} job '{job}' has an empty or non-list matrix include")
+# maturin's one target name that is not a rustc triple: it compiles both darwin
+# triples and joins them into one universal2 binary, so each half is a leg.
+UNIVERSAL2 = {"universal2-apple-darwin": ["x86_64-apple-darwin", "aarch64-apple-darwin"]}
 triples = []
 for item in items:
     target = item.get("target") if isinstance(item, dict) else None
     if not isinstance(target, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", target):
         sys.exit(f"{path} job '{job}': include item {item!r} names no bare 'target' triple")
-    triples.append(target)
+    triples.extend(UNIVERSAL2.get(target, [target]))
 print("\n".join(triples))
 PYTHON
 
@@ -610,6 +615,14 @@ run_fixtures() {
   expect "(triples) the wheel job's matrix is read" "PASS" "$rc"
   same_string "$out" "$(printf '%s\n' x86_64-unknown-linux-gnu x86_64-pc-windows-msvc)"; rc=$?
   expect "(triples) it yields that job's triples and none of another job's" "PASS" "$rc"
+  # (triples-universal2) maturin's universal2 target is two legs, one per triple
+  # maturin compiles for it, so the presence proof reads both darwin halves.
+  printf '%s\n' 'jobs:' '  python-wheels:' '    strategy:' '      matrix:' '        include:' \
+    '          - target: universal2-apple-darwin' '          - target: x86_64-pc-windows-msvc' > "$dir/universal2.yml"
+  out="$(wheel_triples "$dir/universal2.yml")"; rc=$?
+  expect "(triples-universal2) a universal2 wheel leg is read" "PASS" "$rc"
+  same_string "$out" "$(printf '%s\n' x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc)"; rc=$?
+  expect "(triples-universal2) it yields both darwin triples and no universal2 name" "PASS" "$rc"
   printf '%s\n' 'jobs:' '  bridges:' '    strategy:' '      matrix:' '        include:' \
     '          - target: aarch64-apple-ios' > "$dir/nowheel.yml"
   wheel_triples "$dir/nowheel.yml" >/dev/null 2>&1; rc=$?
