@@ -261,17 +261,17 @@ run_fixtures() {
   FAKE_BROKEN=1 all_target_occurrences --workspace >/dev/null 2>&1; expect "a cargo that exits non-zero FAILS rather than counting zero" FAIL $?
   mkdir -p "$dir/ws/own" "$dir/ws/bare"; printf '%s\n' '[[package]]' 'name = "a"' 'version = "1.0.0"' 'source = "registry+x"' > "$dir/ws/Cargo.lock"
   cp "$dir/ws/Cargo.lock" "$dir/ws/own/Cargo.lock"; : > "$ARGV_LOG"
-  git -C "$dir/ws" init -q && git -C "$dir/ws" add Cargo.lock own/Cargo.lock
-  (cd "$dir/ws" && workspace_occurrences bare/Cargo.toml && workspace_occurrences own/Cargo.toml) >/dev/null
+  (cd "$dir/ws" && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE && git init -q && git add Cargo.lock own/Cargo.lock)
+  (cd "$dir/ws" && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE && workspace_occurrences bare/Cargo.toml && workspace_occurrences own/Cargo.toml) >/dev/null
   same "$(cut -d' ' -f1-3 "$ARGV_LOG" | paste -sd'|' -)" "tree --manifest-path bare/Cargo.toml|tree --locked --manifest-path"
   expect "a root without a Cargo.lock resolves from a copy of the root one, and a root whose own git tracks resolves under --locked" PASS $?
   [[ ! -e "$dir/ws/bare/Cargo.lock" && -e "$dir/ws/own/Cargo.lock" ]]; expect "the copied Cargo.lock is removed and a root's own is kept" PASS $?
-  (cd "$dir/ws" && FAKE_DRIFT=bare/Cargo.lock workspace_occurrences bare/Cargo.toml) >/dev/null 2>&1
+  (cd "$dir/ws" && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE && FAKE_DRIFT=bare/Cargo.lock workspace_occurrences bare/Cargo.toml) >/dev/null 2>&1
   expect "a resolution that pins a registry package the root Cargo.lock does not FAILS" FAIL $?
   # An untracked stale lock pins a package the root Cargo.lock does not: read under
   # --locked it would fail the subset check, so a pass proves it was set aside.
   printf '%s\n' '[[package]]' 'name = "stale"' 'version = "0.0.1"' 'source = "registry+x"' > "$dir/ws/bare/Cargo.lock"
-  : > "$ARGV_LOG"; (cd "$dir/ws" && workspace_occurrences bare/Cargo.toml) >/dev/null 2>&1
+  : > "$ARGV_LOG"; (cd "$dir/ws" && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE && workspace_occurrences bare/Cargo.toml) >/dev/null 2>&1
   expect "a root holding an untracked Cargo.lock resolves from a copy of the root one, not from that lock" PASS $?
   same "$(cut -d' ' -f1-3 "$ARGV_LOG")" "tree --manifest-path bare/Cargo.toml"; expect "it resolves without --locked" PASS $?
   grep -qF '"stale"' "$dir/ws/bare/Cargo.lock"; expect "the untracked Cargo.lock is put back afterwards" PASS $?
