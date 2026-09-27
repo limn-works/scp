@@ -81,10 +81,12 @@
 # `vendored-openssl` in its `[tool.maturin] features` array, which reaches
 # `scp-platform/vendored-openssl` and from there adds
 # `rusqlite/bundled-sqlcipher-vendored-openssl`. Drop that name and the wheel
-# silently reverts to linking whatever libcrypto the build host happened to have.
-# On an Apple triple the build without it links no libcrypto: libsqlite3-sys
-# builds SQLCipher against CommonCrypto from the Security framework unless
-# OPENSSL_DIR is set. This gate still requires the vendored build on every wheel
+# silently reverts to taking its crypto from whatever the build host happened to have.
+# On an Apple host building an Apple triple the build without it links no
+# libcrypto: libsqlite3-sys builds SQLCipher against CommonCrypto from the Security
+# framework unless OPENSSL_DIR is set. On a Windows host building a Windows triple
+# the build without it does not finish: libsqlite3-sys panics unless OPENSSL_DIR
+# names an OpenSSL installation. This gate still requires the vendored build on every wheel
 # triple, the two darwin triples included.
 #
 # Every other shipped configuration must not get it. A vendored OpenSSL changes
@@ -98,9 +100,11 @@
 #     `templates/personal-relay/README.md` both name that dynamic link as the
 #     reason they install `libssl3`. Vendoring into these two breaks an operator
 #     procedure this repository documents.
-#   * `scp-core` and the six FFI-bridge configurations link the libcrypto their
-#     build host supplies on a non-Apple target and CommonCrypto on an Apple
-#     target, which is what they do on `main` today. This gate holds
+#   * `scp-core` and the six FFI-bridge configurations take their crypto from the
+#     build host, which is what they do on `main` today: the host's libcrypto on a
+#     Linux host, CommonCrypto on an Apple host building an Apple target, and, on a
+#     Windows host building a Windows target, the OpenSSL installation OPENSSL_DIR
+#     names, without which libsqlite3-sys panics and the build fails. This gate holds
 #     that state so that a workspace-wide feature edit cannot change it as a side
 #     effect. This gate does not decide whether a prebuilt `index.node` or
 #     XCFramework that `.github/workflows/release.yml` publishes should vendor
@@ -940,8 +944,8 @@ run_gate() {
     elif [[ "$count" -gt 0 ]]; then
       echo "    ok   — $triple reaches $VENDOR_CRATE"
     else
-      echo "    FAIL — $triple reaches no $VENDOR_CRATE, so the wheel built for it links"
-      echo "           whatever libcrypto its build host supplies. Name 'vendored-openssl' in"
+      echo "    FAIL — $triple reaches no $VENDOR_CRATE, so the wheel built for it takes"
+      echo "           its crypto from whatever its build host supplies. Name 'vendored-openssl' in"
       echo "           the [tool.maturin] features array of $wheel_file, and keep that"
       echo "           feature forwarding rusqlite/bundled-sqlcipher-vendored-openssl on"
       echo "           every target — see crates/scp-platform/Cargo.toml."

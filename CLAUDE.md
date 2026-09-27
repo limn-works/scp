@@ -145,9 +145,11 @@ feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability
 and real-backend features, ZERO nullifier exceptions),
 check-vendored-openssl-scope.sh (the one gate holding OpenSSL's static link to the
 PyPI wheel; every other shipped artifact — the scp-node and scp-relay binaries and
-the three FFI bridges — links the host's libcrypto on a non-Apple target, which is how
-an operator patches OpenSSL by upgrading the runtime container's libssl3, and uses
-CommonCrypto from the Security framework on an Apple target),
+the three FFI bridges — takes its crypto from the build host instead: on a Linux host
+it links the host's libcrypto, which is how an operator patches OpenSSL by upgrading
+the runtime container's libssl3; on an Apple host building an Apple target it uses
+CommonCrypto from the Security framework; on a Windows host building a Windows target
+libsqlite3-sys refuses to build unless OPENSSL_DIR names an OpenSSL installation),
 check-toolchain-wiring.sh (every container build asserts which compiler it resolved;
 the changes job of every paths-filtered workflow routes a pin change to every lane that
 compiles on it, and ci.yml routes every root-level file and every cargo configuration

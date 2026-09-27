@@ -50,8 +50,9 @@ apple = ["dep:rusqlite", "dep:hex", "dep:fs2"]
 # of the Argon2id parameterization. `fs2` provides advisory file locking for
 # the per-database salt sidecar (fail-closed on lock contention).
 sqlite = ["dep:rusqlite", "dep:hex", "dep:argon2", "dep:rand", "dep:fs2"]
-# Compile OpenSSL from source into SQLCipher instead of linking the host's
-# libcrypto. Exactly one shipped artifact selects this: the PyPI wheel, whose
+# Compile OpenSSL from source into SQLCipher instead of taking its crypto from
+# the build host (see the `rusqlite` comment in the workspace Cargo.toml for what
+# each host supplies). Exactly one shipped artifact selects this: the PyPI wheel, whose
 # `[tool.maturin] features` list in `bindings/python/pyproject.toml` names
 # `vendored-openssl`, which is the `scp-ffi` feature that forwards to this one,
 # because a wheel installs onto a machine whose OpenSSL this build never saw and
