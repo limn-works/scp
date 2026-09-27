@@ -10858,12 +10858,15 @@ impl Supervisor {
         &self,
         context_id: &str,
     ) -> Option<scp_protocol::context::ContextState> {
-        // An unreachable actor answers `Err` here. Every caller of this form
-        // reads `None` as "no live Active context": the standing
-        // get-or-create falls through to its create step, and the reconnect
-        // sweep skips the id. Neither skips an authorization check on `None`,
-        // so folding the error into it grants nothing. A caller that reads
-        // `None` as "the close already happened" calls
+        // A busy or crashed actor answers `Err` here. No caller of
+        // this form treats `None` as an authorization: each reads it as "no
+        // live Active context" and declines the Active-only work. The
+        // standing get-or-create falls through to its create step, the
+        // reconnect sweep skips the id, and the outlet-stream saga gates on
+        // all three bridges refuse the stream unless both states read
+        // `Some(Active)`. Folding the error into `None` therefore grants
+        // nothing. A new caller must hold the same property; a caller that
+        // reads `None` as "the close already happened" calls
         // `read_context_state_checked` instead.
         self.read_context_state_checked(context_id)
             .await

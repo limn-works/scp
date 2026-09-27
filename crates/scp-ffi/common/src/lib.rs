@@ -261,3 +261,49 @@ pub mod server;
 // in-memory nullifier arm is `testing`-gated. Unconditional so every bridge
 // shares one DHT type regardless of which feature set it enables.
 pub mod dht;
+
+#[cfg(test)]
+mod tests {
+    use super::{CONTEXT_NOT_ACTIVE_WITHHELD, context_state_str};
+    use scp_protocol::context::ContextState as S;
+
+    /// Every lifecycle state, in declaration order, paired with the name an
+    /// SDK decodes. `position` matches exhaustively, so adding a variant
+    /// stops this module compiling until the table names it.
+    const EXPECTED: [(S, &str); 8] = [
+        (S::Creating, "creating"),
+        (S::Active, "active"),
+        (S::Closing, "closing"),
+        (S::Closed, "closed"),
+        (S::Expired, "expired"),
+        (S::MigratingOut, "migrating_out"),
+        (S::Tombstoned, "tombstoned"),
+        (S::Poisoned, "poisoned"),
+    ];
+
+    const fn position(state: &S) -> usize {
+        match state {
+            S::Creating => 0,
+            S::Active => 1,
+            S::Closing => 2,
+            S::Closed => 3,
+            S::Expired => 4,
+            S::MigratingOut => 5,
+            S::Tombstoned => 6,
+            S::Poisoned => 7,
+        }
+    }
+
+    #[test]
+    fn context_state_str_pins_every_variant_name() {
+        for (index, (state, name)) in EXPECTED.iter().enumerate() {
+            assert_eq!(position(state), index, "table row {index} names {name}");
+            assert_eq!(context_state_str(state), *name);
+        }
+    }
+
+    #[test]
+    fn context_not_active_withheld_text_is_pinned() {
+        assert_eq!(CONTEXT_NOT_ACTIVE_WITHHELD, "context is not active");
+    }
+}

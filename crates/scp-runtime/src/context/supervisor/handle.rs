@@ -368,11 +368,18 @@ impl SupervisorHandle {
             .cloned()
     }
 
-    /// Read-only lifecycle-state probe for `context_id`. Returns `None`
-    /// if no per-context actor is registered (close / TTL does not
-    /// despawn the actor, so `Some(state)` reflects the live lifecycle
-    /// state — `Active` / `Creating` vs a terminal state — and `None`
-    /// means the actor genuinely does not exist).
+    /// Read-only lifecycle-state probe for `context_id`. Close / TTL does
+    /// not despawn the actor, so `Some(state)` reflects the live lifecycle
+    /// state — `Active` / `Creating` vs a terminal state — and a context the
+    /// crash watchdog poisoned reads `Some(Poisoned)` (ADR-049 §10).
+    ///
+    /// `None` does not mean the context is absent. It covers an id no actor
+    /// serves and also an actor this call could not reach: a busy or
+    /// timed-out actor, and a context mid-respawn or past a failed respawn.
+    /// Read `None` only as "no live `Active` context". A caller whose
+    /// decision turns on absence calls
+    /// [`Supervisor::read_context_state_checked`](crate::context::supervisor::supervisor::Supervisor::read_context_state_checked),
+    /// which reports the unreachable cases as `ActorBusy` and `ActorCrashed`.
     ///
     /// Capability-reduced surface over
     /// [`Supervisor::read_context_state`](crate::context::supervisor::supervisor::Supervisor::read_context_state):
