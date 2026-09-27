@@ -73,6 +73,32 @@ final class TypesTests: XCTestCase {
         }
     }
 
+    /// `SCP.governancePropose` checks a `SingleAdmin` proposal's auto-executed
+    /// outcome through `GovernanceActionResult.checkProposeResponse`. Making it
+    /// return `raw` without parsing `execution_result` fails the unknown-name
+    /// assertion.
+    func testCheckProposeResponseFailsClosedOnAnOutcomeItCannotName() throws {
+        for raw in [
+            #"{"proposal_id":"00","execution_result":"RoleChanged"}"#,
+            #"{"proposal_id":"00","execution_result":null}"#
+        ] {
+            XCTAssertEqual(try GovernanceActionResult.checkProposeResponse(raw), raw)
+        }
+        for raw in [
+            #"{"proposal_id":"00","execution_result":"SomethingThisSdkDoesNotKnow"}"#,
+            "not json",
+            "[]",
+            #"{"execution_result":7}"#
+        ] {
+            XCTAssertThrowsError(try GovernanceActionResult.checkProposeResponse(raw)) { error in
+                guard case let ScpError.Context(_, code) = error else {
+                    return XCTFail("expected ScpError.Context, got \(error)")
+                }
+                XCTAssertEqual(code, "SCP-GOV-11040", "for \(raw)")
+            }
+        }
+    }
+
     /// Each of the six names `RESERVED_ROLE_NAMES` reserves
     /// (`crates/scp-protocol/src/context/roles.rs`) parses to the case of that
     /// name. A bridge reports `RoleAssignment.role_name` in the lowercase form

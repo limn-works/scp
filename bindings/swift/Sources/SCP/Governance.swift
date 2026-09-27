@@ -59,6 +59,43 @@ public enum GovernanceActionResult: String, Sendable {
         }
         return result
     }
+
+    /// Checks the `execution_result` of a bridge's `governancePropose`
+    /// response and returns that response unchanged.
+    ///
+    /// A `SingleAdmin` proposal auto-executes, so its outcome arrives in this
+    /// response rather than through `governanceExecute`. A non-null
+    /// `execution_result` goes through ``fromBridge(_:)``, so an outcome this
+    /// SDK version cannot name throws on this path as it does on the execute
+    /// path.
+    ///
+    /// - Throws: ``ScpError/Context(msg:code:)`` with `SCP-GOV-11040` when
+    ///   `execution_result` names no case, or when `raw` is not a JSON object
+    ///   or its `execution_result` is neither a string nor `null`.
+    static func checkProposeResponse(_ raw: String) throws -> String {
+        guard let data = raw.data(using: .utf8),
+              let response = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else {
+            throw uncheckableProposeResponse("is not a JSON object")
+        }
+        guard let executionResult = response["execution_result"], !(executionResult is NSNull) else {
+            return raw
+        }
+        guard let name = executionResult as? String else {
+            throw uncheckableProposeResponse(
+                "carries an execution_result that is neither a string nor null"
+            )
+        }
+        _ = try fromBridge(name)
+        return raw
+    }
+
+    private static func uncheckableProposeResponse(_ what: String) -> ScpError {
+        ScpError.Context(
+            msg: "governance propose response \(what), so this SDK cannot name its outcome",
+            code: "SCP-GOV-11040"
+        )
+    }
 }
 
 // MARK: - MemberRole
@@ -371,7 +408,8 @@ public extension Context {
     ///   auto-executed, and is `null` while a multi-admin proposal awaits
     ///   votes.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
-    ///   active or the proposal fails.
+    ///   active or the proposal fails, and with `SCP-GOV-11040` when
+    ///   `execution_result` names an outcome this SDK version cannot name.
     func proposeGovernanceAction(
         actionJson: String,
         proposerDid: String
@@ -383,6 +421,8 @@ public extension Context {
             )
         }
 
+        // `SCP.governancePropose` checks `execution_result` and fails closed
+        // with `SCP-GOV-11040` on an outcome this SDK version cannot name.
         return try await scp.governancePropose(
             handle: handle, proposerDid: proposerDid, actionJson: actionJson
         )

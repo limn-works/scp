@@ -704,8 +704,14 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/governancePropose`` on ``inner``.
+    ///
+    /// - Throws: ``ScpError/Context(msg:code:)`` with `SCP-GOV-11040` when a
+    ///   `SingleAdmin` proposal auto-executed and its outcome has no name in
+    ///   this SDK version (``GovernanceActionResult/checkProposeResponse(_:)``),
+    ///   and whatever the bridge throws when the proposal fails.
     func governancePropose(handle: ContextHandle, proposerDid: String, actionJson: String) async throws -> String {
-        try await inner.governancePropose(handle: handle, proposerDid: proposerDid, actionJson: actionJson)
+        let raw = try await inner.governancePropose(handle: handle, proposerDid: proposerDid, actionJson: actionJson)
+        return try GovernanceActionResult.checkProposeResponse(raw)
     }
 
     /// Forwards to ``Scp/governanceReject`` on ``inner``.
