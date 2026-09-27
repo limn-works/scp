@@ -28,7 +28,8 @@
 # this file shadows the command, and an alias defined above the pinned text, with
 # `shopt -s expand_aliases`, rewrites a word in it. Bash can forbid neither.
 # Absence: `--target all` for every entry that gate's `--print-artifacts` writes
-# except the wheel's (`--print-wheel-entries`), and `--workspace` for every
+# except the wheel's (`--print-wheel-entries`), which that list must name exactly
+# once beside at least one other entry, and `--workspace` for every
 # Cargo.toml, tracked or untracked but not ignored by git, that cargo treats as a
 # workspace root: one that declares a `workspace` table
 # (the root workspace and each separately-workspaced template or scaffold,
@@ -125,7 +126,7 @@ report() {
 }
 
 run_gate() {
-  local failures=0 line wheel_file wheel_entry entry triple n
+  local failures=0 resolved=0 wheel_seen=0 line wheel_file wheel_entry entry triple n
   local -a args=()
   line="$(wheel_line)" || return 1
   wheel_file="${line%%$'\t'*}"; wheel_entry="${line#*$'\t'}"
@@ -139,14 +140,21 @@ run_gate() {
   echo "--> every other shipped configuration, over every triple"
   line="$(bash "$FEATURE_GRAPH_GATE" --print-artifacts)" || return 1
   while IFS= read -r entry; do
-    [[ -z "$entry" || "$entry" == "$wheel_entry" ]] && continue
-    n=""
+    [[ -z "$entry" ]] && continue
+    [[ "$entry" == "$wheel_entry" ]] && { wheel_seen=$((wheel_seen + 1)); continue; }
+    resolved=$((resolved + 1)); n=""
     if is_feature_selection "${entry#*|}"; then
       args=(); read -r -a args <<<"${entry#*|}"
       n="$(all_target_occurrences -p "${entry%%|*}" ${args[@]+"${args[@]}"})" || n=""
     fi
     report "$entry" "$n" none || failures=$((failures + 1))
   done <<<"$line"
+  # The skip above must match exactly one printed entry, and at least one other entry
+  # must be resolved, so an empty or wheel-less artifact list cannot pass.
+  [[ "$wheel_seen" -eq 1 ]] ||
+    { echo "    FAIL — --print-artifacts lists the wheel entry $wheel_seen time(s), and this gate wants it once"; failures=$((failures + 1)); }
+  [[ "$resolved" -gt 0 ]] ||
+    { echo "    FAIL — --print-artifacts lists no shipped configuration besides the wheel"; failures=$((failures + 1)); }
   line="$(manifest_paths | py -c "$WORKSPACE_ROOTS_PROGRAM")" || return 1
   [[ -n "$line" ]] || { echo "FAIL — no Cargo.toml declares a workspace"; return 1; }
   while IFS= read -r entry; do
@@ -203,7 +211,7 @@ run_fixtures() {
   wheel="$(printf 'bindings/python/pyproject.toml\tscp-ffi|--features extension-module,vendored-openssl')"
   printf '%s\n' '#!/usr/bin/env bash' 'case "$1" in' \
     "  --print-wheel-entries) printf '%s\n' $(printf '%q' "$wheel") ;;" \
-    "  --print-artifacts) printf '%s\n' 'scp-node|' 'scp-ffi|--no-default-features --features server' $(printf '%q' "${wheel#*$'\t'}") ;;" \
+    "  --print-artifacts) if [ -n \"\${FAKE_ARTIFACTS+x}\" ]; then printf '%s\n' \"\$FAKE_ARTIFACTS\"; else printf '%s\n' 'scp-node|' 'scp-ffi|--no-default-features --features server' $(printf '%q' "${wheel#*$'\t'}"); fi ;;" \
     'esac' > "$dir/gate.sh"
   : > "$ARGV_LOG"
   FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_triple_occurrences aarch64-apple-darwin >/dev/null
@@ -213,13 +221,22 @@ run_fixtures() {
   FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_triple_occurrences aarch64-apple-darwin scp-node --no-default-features >/dev/null
   same "$(cat "$ARGV_LOG")" "tree -p scp-ffi --features extension-module,vendored-openssl --target aarch64-apple-darwin -e no-dev --prefix none --format {p}"
   expect "a caller's package and feature arguments do not reach the one-triple resolution" PASS $?
-  # The readonly lines at the end of this file, applied here in a subshell: after
-  # them a call that sets FEATURE_GRAPH_GATE for itself, and a redefinition of
-  # wheel_line, fail instead of resolving another configuration.
-  ( readonly FEATURE_GRAPH_GATE; FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_triple_occurrences aarch64-apple-darwin ) >/dev/null 2>&1
-  expect "after readonly, a call that overrides FEATURE_GRAPH_GATE FAILS" FAIL $?
-  ( readonly -f wheel_line; eval 'wheel_line() { printf "x\tscp-node|\n"; }' ) >/dev/null 2>&1
-  expect "after readonly -f, a redefinition of wheel_line FAILS" FAIL $?
+  # The readonly lines at the end of this file, read from the file and run here in a
+  # subshell: after them each pinned variable refuses a call's temporary assignment
+  # and each pinned function refuses a redefinition. A readonly line deleted or
+  # narrowed lets that override through, and its fixture goes red. A subshell whose
+  # eval of those lines fails exits 0, so it cannot pass as a refused override.
+  local ro name
+  ro="$(grep -E '^readonly ' "${BASH_SOURCE[0]}")" || ro=""
+  ( eval "$ro" ) >/dev/null 2>&1; expect "this file's readonly lines run" PASS $?
+  ( eval "$ro" || exit 0; FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_triple_occurrences aarch64-apple-darwin ) >/dev/null 2>&1
+  expect "after this file's readonly lines, a call that overrides FEATURE_GRAPH_GATE FAILS" FAIL $?
+  ( eval "$ro" || exit 0; VENDOR_CRATE=pkg count_in "pkg v0.1.0" ) >/dev/null 2>&1
+  expect "after this file's readonly lines, a call that overrides VENDOR_CRATE FAILS" FAIL $?
+  for name in wheel_triple_occurrences wheel_line is_feature_selection count_in; do
+    ( eval "$ro" || exit 0; eval "$name() { :; }" ) >/dev/null 2>&1
+    expect "after this file's readonly lines, a redefinition of $name FAILS" FAIL $?
+  done
   scenario() { # <label> <want>
     out="$(FEATURE_GRAPH_GATE="$dir/gate.sh" WHEEL_MATRIX_FILE="$dir/m.yml" run_gate 2>&1)"; expect "$1" "$2" $?
   }
@@ -234,6 +251,12 @@ run_fixtures() {
   FAKE_VENDORS=server scenario "(absence) run_gate FAILS when a non-wheel scp-ffi entry reaches $VENDOR_CRATE" FAIL
   printf '%s\n' "$out" | grep -F "FAIL — scp-ffi|--no-default-features --features server reaches 1" >/dev/null; expect "(absence) it names that scp-ffi entry" PASS $?
   FAKE_VENDORS=extension-module,vendored-openssl scenario "(absence) run_gate skips only the wheel entry, which reaches $VENDOR_CRATE over every triple" PASS
+  FAKE_ARTIFACTS="" scenario "(absence) run_gate FAILS when --print-artifacts lists nothing" FAIL
+  printf '%s\n' "$out" | grep -F "lists the wheel entry 0 time(s)" >/dev/null; expect "(absence) it names the missing wheel entry" PASS $?
+  printf '%s\n' "$out" | grep -F "lists no shipped configuration besides the wheel" >/dev/null; expect "(absence) it names the empty list" PASS $?
+  FAKE_ARTIFACTS='scp-node|' scenario "(absence) run_gate FAILS when --print-artifacts omits the wheel entry" FAIL
+  FAKE_ARTIFACTS="$(printf '%s\n' "${wheel#*$'\t'}" 'scp-node|' "${wheel#*$'\t'}")" scenario "(absence) run_gate FAILS when --print-artifacts lists the wheel entry twice" FAIL
+  FAKE_ARTIFACTS="${wheel#*$'\t'}" scenario "(absence) run_gate FAILS when --print-artifacts lists only the wheel entry" FAIL
   FAKE_VENDORS=--workspace scenario "(absence) run_gate FAILS when a workspace resolution reaches $VENDOR_CRATE" FAIL
   FAKE_VENDORS=scaffolds/relay/Cargo.toml scenario "(absence) run_gate resolves a workspace root no list names" FAIL
   printf '%s\n' "$out" | grep -F "FAIL — the scaffolds/relay/Cargo.toml workspace reaches 1" >/dev/null; expect "(absence) it names that root" PASS $?
