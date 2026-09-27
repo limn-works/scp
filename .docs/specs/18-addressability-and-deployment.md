@@ -55,6 +55,7 @@ When a peer resolves an identity's service record, the `SCPRelay` entries tell i
 | `AttestationRevocations` | Where a verifier checks attestation revocation status | Attestation Verification | §7.4.4 |
 | `ScpIdentityLinkAttestation` | Identity-link attestation entries for platform verification | Attestation Verification | §3.5.3 |
 | `ScpDeviceAttestation` | One App Attest or Play Integrity token bound to the identifier and one context's challenge | Sybil-resistance evaluation | `09-security-model.md` §9.3.1 |
+| `PlayIntegrityVerifier` | A Play Integrity verifier's package name, Google Cloud project number, and HTTPS verdict URL, space-separated | Owner's SDK, before it requests a Play Integrity token | `09-security-model.md` §9.3.1 |
 
 **`PreRotationCommitment` is retired as an entry type.** The pre-rotation commitment is a field of the inception event and of every reveal-authorized event in the key-event log (`09-security-model.md` §9.7.4.2 definitions), so it is root-signed state and never service metadata.
 

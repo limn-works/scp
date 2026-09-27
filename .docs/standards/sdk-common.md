@@ -334,7 +334,6 @@ reusing `8001` would make one code string mean both "storage key not found" and
 | `SCP-ATTEST-9016` | Attestation list JSON bytes are not valid UTF-8 |
 | `SCP-ATTEST-9017` | Failed to re-serialize attestation to UTF-8 JSON |
 | `SCP-ATTEST-9018` | Cryptographic-class attestation not verifiable via browser fetch |
-| `SCP-ATTEST-9019` | Device attestation refused: the context's challenge equals another held context's challenge (`09-security-model.md` §9.3.1) |
 
 ### SCP-IDENT-1017 and its cross-bridge contract
 
