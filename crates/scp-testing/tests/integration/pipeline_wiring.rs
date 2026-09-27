@@ -2813,7 +2813,7 @@ fn context_event_channel_enabled_on_every_bridge() {
         include_str!("../../../../crates/scp-runtime/src/context/supervisor/supervisor.rs");
     assert!(
         supervisor_src.contains("fn subscribe_events"),
-        "Supervisor must expose subscribe_events (otherwise no consumer can subscribe)"
+        "Supervisor must expose subscribe_events (otherwise no Rust caller can subscribe)"
     );
 
     // PyO3 reference bridge.
@@ -2822,7 +2822,7 @@ fn context_event_channel_enabled_on_every_bridge() {
         ffi_runtime_src.contains("EVENT_CHANNEL_CAPACITY")
             && ffi_runtime_src.contains("Some(event_tx)"),
         "PyO3 production Supervisor construction must enable the event channel \
-         (otherwise subscribe_events yields None and no events are dispatched)"
+         (otherwise subscribe_events yields None)"
     );
 
     // NAPI bridge (Node.js/Bun).
@@ -2831,7 +2831,7 @@ fn context_event_channel_enabled_on_every_bridge() {
         napi_runtime_src.contains("EVENT_CHANNEL_CAPACITY")
             && napi_runtime_src.contains("Some(event_tx)"),
         "NAPI production Supervisor construction must enable the event channel \
-         (otherwise subscribe_events yields None and no events are dispatched)"
+         (otherwise subscribe_events yields None)"
     );
 
     // UniFFI bridge (Swift/Kotlin).
@@ -2840,7 +2840,7 @@ fn context_event_channel_enabled_on_every_bridge() {
         uniffi_runtime_src.contains("EVENT_CHANNEL_CAPACITY")
             && uniffi_runtime_src.contains("Some(event_tx)"),
         "UniFFI production Supervisor construction must enable the event channel \
-         (otherwise subscribe_events yields None and no events are dispatched)"
+         (otherwise subscribe_events yields None)"
     );
 }
 

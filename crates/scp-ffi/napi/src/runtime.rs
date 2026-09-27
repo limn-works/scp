@@ -1010,9 +1010,11 @@ where
 
 /// Bounded capacity of the supervisor's `ContextEvent` broadcast channel.
 ///
-/// Every production supervisor built here enables this channel so that an
-/// embedder can subscribe through `Supervisor::subscribe_events`. No production
-/// code in this repository subscribes to it. A receiver that falls more than
+/// Every production supervisor built here enables this channel, so
+/// `Supervisor::subscribe_events` returns a receiver. No export of this bridge
+/// and no SDK wrapper calls `subscribe_events`, and the bridge drops its own
+/// receiver at construction, so no production caller receives these events and
+/// the channel discards every event the actors emit. A receiver that falls more than
 /// this many events behind loses the oldest ones and gets
 /// `RecvError::Lagged` from its next `recv`; nothing else records the loss, so
 /// each subscriber must handle `Lagged` itself.
@@ -1034,11 +1036,12 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// same-backend invariant a type guarantee.
 ///
 /// The event broadcast channel is always enabled (capacity
-/// [`EVENT_CHANNEL_CAPACITY`]) so downstream consumers can subscribe via
-/// [`Supervisor::subscribe_events`](scp_core::context::supervisor::Supervisor::subscribe_events).
-/// When no consumer subscribes, emitting into the channel is a cheap no-op: the
-/// retained sender has no receivers, so `send` returns `Err` and the event is
-/// simply dropped without blocking context operations.
+/// [`EVENT_CHANNEL_CAPACITY`]), so
+/// [`Supervisor::subscribe_events`](scp_core::context::supervisor::Supervisor::subscribe_events)
+/// returns a receiver. Nothing on this bridge calls it (see
+/// [`EVENT_CHANNEL_CAPACITY`]). While the channel has no receiver, emitting into
+/// it costs little: `send` returns `Err` and the event is dropped without
+/// blocking context operations.
 fn build_supervisor_arc(
     crypto: Arc<scp_core::crypto::mls::provider::NodeMlsFactory>,
     transport: Box<dyn ContextTransportProvider>,
