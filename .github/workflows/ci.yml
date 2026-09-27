@@ -1596,7 +1596,7 @@ jobs:
       # first and overwrites nothing; each step's key names its own group, so neither
       # restore can match the other's entry. Neither entry holds the units that this
       # job's `scp-node/cloud-blobs` and `scp-relay/cloud-blobs` features change, so
-      # the job recompiles those units on every run. The paragraph after the THE GROUPS
+      # the job recompiles those units on every run. The paragraph after THE GROUPS
       # list at the top of this file says why no group holds them.
       - uses: Swatinem/rust-cache@v2
         with:
