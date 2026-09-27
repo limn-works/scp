@@ -202,8 +202,15 @@ impl StdioNotifier {
 /// pairing check to perform: the mismatch is unconstructable by type.
 ///
 /// The server is shared behind a mutex so the pump can consult the same
-/// subscription registry as the read loop; the lock is only ever held for the
-/// synchronous duration of a single call, never across an await.
+/// subscription registry as the read loop. The lock is an async mutex and is
+/// held across awaits on purpose: the read loop holds it across dispatch and the
+/// awaited response write, and the pump holds it across reading the registry and
+/// the awaited notification write. Releasing it before either write would let
+/// the read loop acknowledge `resources/unsubscribe` for a URI and then let the
+/// pump deliver a `notifications/resources/updated` for that URI which it
+/// computed from the registry as it stood before the unsubscribe. The test
+/// `unsubscribe_ack_never_precedes_a_notification_computed_before_it` fails if
+/// the pump drops the guard before its write.
 ///
 /// Per JSON-RPC 2.0, incoming *notifications* (messages without an `id`) never
 /// produce a response — this is why the transport parses into a request/
