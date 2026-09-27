@@ -243,6 +243,20 @@ fn rejection_message(error: &BackendSelectionError, binary_feature: &str) -> Str
 /// cargo feature that compiles the `postgres` and `s3` backends; when this
 /// build lacks either, the exit message tells the operator to rebuild with
 /// that feature.
+///
+/// # Storage backend selection
+///
+/// The `Default` column marks the backend this function chooses when
+/// `SCP_RELAY_STORAGE_BACKEND` is unset. [`storage_from_env`] reads the
+/// config variables of the backend this function chose.
+///
+/// | Value | Backend | Config env vars | Default |
+/// |---|---|---|---|
+/// | `sqlite` | `SQLite` | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.db`) | **yes** |
+/// | `redb` | redb | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.redb`) | |
+/// | `postgres` | `PostgreSQL` | `SCP_RELAY_DATABASE_URL` (required) | |
+/// | `s3` | S3-compat | `SCP_RELAY_S3_BUCKET` (required) + AWS env | |
+/// | `memory` | In-memory | — | |
 #[must_use]
 pub fn backend_choice_from_env(binary_feature: &str) -> BackendChoice {
     let value = env::var("SCP_RELAY_STORAGE_BACKEND").unwrap_or_else(|_| "sqlite".to_owned());
@@ -255,19 +269,11 @@ pub fn backend_choice_from_env(binary_feature: &str) -> BackendChoice {
 /// Constructs the blob storage backend `choice` names, reading that
 /// backend's configuration from the environment.
 ///
-/// `choice` comes from [`backend_choice_from_env`]. Calls
+/// `choice` comes from [`backend_choice_from_env`], which reads
+/// `SCP_RELAY_STORAGE_BACKEND` and applies the `sqlite` default; this function
+/// reads neither. Its doc comment lists each backend's config variables. Calls
 /// [`std::process::exit`] when the backend's configuration is missing or its
 /// store fails to open.
-///
-/// # Storage backend selection
-///
-/// | Value | Backend | Config env vars | Default |
-/// |---|---|---|---|
-/// | `sqlite` | `SQLite` | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.db`) | **yes** |
-/// | `redb` | redb | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.redb`) | |
-/// | `postgres` | `PostgreSQL` | `SCP_RELAY_DATABASE_URL` (required) | |
-/// | `s3` | S3-compat | `SCP_RELAY_S3_BUCKET` (required) + AWS env | |
-/// | `memory` | In-memory | — | |
 ///
 /// # Backend availability
 ///

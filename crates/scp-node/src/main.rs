@@ -955,8 +955,9 @@ async fn run_node_with<
     // (that would re-introduce the SCP-CAPSEL-8002 anti-pattern the story kills,
     // and would break ephemeral mode's all-in-memory contract). Ephemeral mode
     // passes `ephemeral_blob_backend()` (in-memory, no persistence, env-ignoring);
-    // persistent mode passes `startup::storage_from_env(backend)` (durable, default
-    // SQLite, honors env).
+    // persistent mode passes `startup::storage_from_env(backend)` (durable, honors
+    // env). `startup::backend_choice_from_env` chose `backend`, and it defaults to
+    // SQLite.
     blob_storage: BlobStorageBackend,
 ) {
     let use_self_signed = env_flag_is_truthy(env::var("SCP_NODE_TLS_SELF_SIGNED").ok().as_deref());
@@ -1201,8 +1202,9 @@ mod tests {
     /// Regression guard (SCP-CAPINJECT-010): ephemeral mode MUST select the
     /// in-memory blob backend — no persistence, env overrides ignored. This pins
     /// the ephemeral caller's boundary selection so it cannot silently regress to
-    /// a durable / env-driven backend (`startup::storage_from_env`, which defaults
-    /// to `Sqlite`), which would break the all-in-memory contract documented on
+    /// a durable / env-driven backend (`startup::storage_from_env` on the choice
+    /// `startup::backend_choice_from_env` makes, which defaults to `Sqlite`),
+    /// which would break the all-in-memory contract documented on
     /// `run_full_node_ephemeral` and re-persist blobs to disk. If someone swaps
     /// `ephemeral_blob_backend()` to any non-in-memory backend, this fails.
     #[test]
