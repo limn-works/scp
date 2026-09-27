@@ -11,9 +11,11 @@
 # for; and `openssl-src` appears in the dependency graph of no other configuration
 # this repository ships, and in the graph of no workspace member or
 # dev-dependency at its default features, resolved over every target triple.
+# The personal-relay package, which declares its own workspace, counts as a
+# configuration this repository ships.
 #
-# "No other configuration" is two resolutions, and each one covers what the other
-# cannot:
+# "No other configuration" is three resolutions, and each one covers what the
+# others cannot:
 #
 #   * every `ARTIFACTS` entry of `scripts/check-shipped-feature-graph.sh` except the
 #     wheel's own entry, each resolved alone. This covers a configuration that
@@ -21,6 +23,10 @@
 #     bridge cdylibs. The comparison against the wheel reads the whole
 #     `<package>|<feature arguments>` entry, because three entries build package
 #     `scp-ffi`;
+#   * the package `templates/personal-relay/README.md` builds into the
+#     personal-relay container, resolved from its own manifest. That manifest
+#     declares its own `[workspace]` table, so neither of the other two
+#     resolutions holds it;
 #   * the whole-workspace build with dev-dependencies: `cargo tree --workspace`,
 #     every member at its default features, dev units included. Cargo decides
 #     which packages that resolution holds, so every member — each `[[bin]]`, each
@@ -97,11 +103,12 @@
 # crate, but acting on that report means a lock bump and a new release; nobody can
 # patch the copy inside an installed artifact.
 #
-#   * `scp-node` and `scp-relay` ship in a container whose operator patches OpenSSL
-#     by upgrading `libssl3` in the runtime layer; `Dockerfile` and
-#     `templates/personal-relay/README.md` both name that dynamic link as the
-#     reason they install `libssl3`. Vendoring into these two breaks an operator
-#     procedure this repository documents.
+#   * `scp-node` and `scp-relay` ship in the `Dockerfile` container, and
+#     `scp-personal-relay` ships in the container `templates/personal-relay/README.md`
+#     builds. The operator of each patches OpenSSL by upgrading `libssl3` in the
+#     runtime layer, and both files name that dynamic link as the reason they
+#     install `libssl3`. Vendoring into these three breaks an operator procedure
+#     this repository documents.
 #   * `scp-core` and the six FFI-bridge configurations take their crypto from the
 #     build host, which is what they do on `main` today: for a Linux or Android
 #     target, a dynamic link to `crypto` that the linker resolves in the target's
@@ -140,6 +147,7 @@ VENDOR_CRATE="openssl-src"
 FEATURE_GRAPH_GATE="scripts/check-shipped-feature-graph.sh"
 WHEEL_MATRIX_FILE=".github/workflows/build-matrix.yml"
 WHEEL_JOB="python-wheels"
+PERSONAL_RELAY_MANIFEST="templates/personal-relay/Cargo.toml"
 
 # The program behind wheel_triples: it loads the workflow file on argv[1] with
 # PyYAML and prints the `target:` value of every item of the matrix `include:`
@@ -410,17 +418,23 @@ vendor_crate_occurrences() {
   tree_count "$tree"
 }
 
-# workspace_occurrences
+# workspace_occurrences [<manifest>]
 #   Emit the number of times the vendored crate appears in the dependency graph of
-#   every workspace member at its default features, dev-dependencies included,
-#   over every target triple. FAILS when cargo resolved no graph. Dev edges stay
-#   in because `cargo metadata`, which the presence half reads, unifies the
-#   features a dev-dependency selects; see the header.
+#   every member of a workspace at its default features, dev-dependencies
+#   included, over every target triple. With no argument the workspace is the
+#   repository root's; with a manifest path it is the workspace that manifest
+#   roots, such as $PERSONAL_RELAY_MANIFEST, which declares its own `[workspace]`
+#   table and so sits in no resolution of the root workspace. FAILS when cargo
+#   resolved no graph. Dev edges stay in because `cargo metadata`, which the
+#   presence half reads, unifies the features a dev-dependency selects; see the
+#   header.
 workspace_occurrences() {
   local tree cargo_rc=0
-  tree="$(cargo tree --workspace --target all --prefix none --format '{p}')" || cargo_rc=$?
+  local -a manifest=()
+  [[ -n "${1:-}" ]] && manifest=(--manifest-path "$1")
+  tree="$(cargo tree ${manifest[@]+"${manifest[@]}"} --workspace --target all --prefix none --format '{p}')" || cargo_rc=$?
   if [[ "$cargo_rc" -ne 0 ]]; then
-    echo "cargo tree exited $cargo_rc for the whole-workspace build" >&2
+    echo "cargo tree exited $cargo_rc for the whole-workspace build${1:+ of $1}" >&2
     return 1
   fi
   tree_count "$tree"
@@ -720,6 +734,9 @@ run_fixtures() {
   ARGV_DUMP="$dir/argv.txt" workspace_occurrences >/dev/null 2>&1
   same_string "$(cat "$dir/argv.txt")" "$(printf '%s\n' tree --workspace --target all --prefix none --format '{p}')"; rc=$?
   expect "(argv) the whole-workspace counter selects every member, keeps dev edges, and resolves every triple" "PASS" "$rc"
+  ARGV_DUMP="$dir/argv.txt" workspace_occurrences "$PERSONAL_RELAY_MANIFEST" >/dev/null 2>&1
+  same_string "$(cat "$dir/argv.txt")" "$(printf '%s\n' tree --manifest-path "$PERSONAL_RELAY_MANIFEST" --workspace --target all --prefix none --format '{p}')"; rc=$?
+  expect "(argv) given a manifest, the whole-workspace counter resolves the workspace that manifest roots" "PASS" "$rc"
   rm -f "$dir/argv.txt"
   ARGV_DUMP="$dir/argv.txt" wheel_reach_count "scp-ffi" "$(cargo_arguments_for '--all-features')" "aarch64-apple-darwin" >/dev/null 2>&1; rc=$?
   expect "(argv) the wheel counter FAILS on --all-features, which cargo metadata would apply to every member" "FAIL" "$rc"
@@ -782,6 +799,7 @@ run_fixtures() {
     'fi' \
     'echo "the-package v0.1.0"' \
     'case " $* " in' \
+    "  *\" --manifest-path \"*) [ -n \"\$FAKE_RELAY_VENDORS\" ] && echo \"${VENDOR_CRATE} v300.5.1+3.5.1\" ;;" \
     "  *vendored-openssl*) [ -n \"\$FAKE_WHEEL_TREE_EMPTY\" ] || echo \"${VENDOR_CRATE} v300.5.1+3.5.1\" ;;" \
     "  *\" -p \"*) for p in \$FAKE_VENDORS; do case \" \$* \" in *\" -p \$p \"*) echo \"${VENDOR_CRATE} v300.5.1+3.5.1\" ;; esac; done ;;" \
     "  *\" --workspace \"*) case \" \$* \" in *no-dev*) ;; *) [ -n \"\$FAKE_BARE_VENDORS\" ] && echo \"${VENDOR_CRATE} v300.5.1+3.5.1\" ;; esac ;;" \
@@ -827,6 +845,15 @@ run_fixtures() {
   FAKE_DROPPED_TRIPLE=none FAKE_VENDORS="" FAKE_BARE_VENDORS=1 scenario "(coverage) run_gate FAILS when a member no ARTIFACTS entry names reaches $VENDOR_CRATE" "FAIL"
   printf '%s\n' "$scenario_out" | grep -qF "FAIL — the whole-workspace build reaches $VENDOR_CRATE."; rc=$?
   expect "(coverage) it names the whole-workspace build" "PASS" "$rc"
+
+  # (personal-relay) the personal-relay template's own workspace vendors, which no
+  # ARTIFACTS entry and no resolution of the root workspace holds.
+  plant_gate "$gate_file" "$wheel_ok" "scp-node|" "scp-ffi|--features extension-module,vendored-openssl"
+  FAKE_RELAY_VENDORS=1 FAKE_DROPPED_TRIPLE=none FAKE_VENDORS="" FAKE_BARE_VENDORS="" scenario "(personal-relay) run_gate FAILS when the personal-relay package reaches $VENDOR_CRATE" "FAIL"
+  printf '%s\n' "$scenario_out" | grep -qF "FAIL — $PERSONAL_RELAY_MANIFEST reaches $VENDOR_CRATE"; rc=$?
+  expect "(personal-relay) it names the personal-relay manifest" "PASS" "$rc"
+  printf '%s\n' "$scenario_out" | grep -qF "ok   — the whole-workspace build"; rc=$?
+  expect "(personal-relay) and the root whole-workspace resolution passes it, so only this resolution catches it" "PASS" "$rc"
 
   # (unified) the wheel drops vendored-openssl while scp-testing, or a
   # dev-dependency, selects it: `cargo metadata` still shows the edge from
@@ -975,6 +1002,16 @@ run_gate() {
     echo "           own features."
     failures=$((failures + 1))
   fi
+  if ! count="$(workspace_occurrences "$PERSONAL_RELAY_MANIFEST")"; then
+    echo "    FAIL — cargo resolved no graph for $PERSONAL_RELAY_MANIFEST; the stderr above names why."
+    failures=$((failures + 1))
+  elif [[ "$count" -eq 0 ]]; then
+    echo "    ok   — the personal-relay container's package, $PERSONAL_RELAY_MANIFEST"
+  else
+    echo "    FAIL — $PERSONAL_RELAY_MANIFEST reaches $VENDOR_CRATE, so the personal-relay"
+    echo "           image carries an OpenSSL that upgrading libssl3 does not patch."
+    failures=$((failures + 1))
+  fi
   echo
 
   if [[ "$failures" -eq 0 ]]; then
@@ -982,8 +1019,8 @@ run_gate() {
     return 0
   fi
   echo "FAIL — $failures resolution(s) went the wrong way. An artifact other than the wheel"
-  echo "       that reaches $VENDOR_CRATE embeds a statically compiled OpenSSL: for scp-node"
-  echo "       and scp-relay that breaks the libssl3 upgrade Dockerfile and"
+  echo "       that reaches $VENDOR_CRATE embeds a statically compiled OpenSSL: for scp-node,"
+  echo "       scp-relay and scp-personal-relay that breaks the libssl3 upgrade Dockerfile and"
   echo "       templates/personal-relay/README.md document, and for a bridge it changes"
   echo "       what an npm package or an XCFramework carries. Ask for the vendored build"
   echo "       through scp-platform/vendored-openssl on the wheel alone, never through the"
