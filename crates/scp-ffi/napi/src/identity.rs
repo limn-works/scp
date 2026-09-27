@@ -119,6 +119,23 @@ pub(crate) fn no_pre_rotation_backend() -> ScpNapiError {
     }
 }
 
+/// Message for the `SCP-IDENT-1008` rejection of `"in_memory"` custody in a
+/// shipped (no-`testing`) build.
+///
+/// The message names no other custody as the remedy, because this build
+/// answers every identity creation with [`no_pre_rotation_backend`] whichever
+/// custody the caller names. It states that instead, so a caller who reads it
+/// does not retry with `"file"` and meet `SCP-IDENT-1059` second.
+#[cfg(not(feature = "testing"))]
+pub(crate) fn in_memory_unavailable_message() -> String {
+    format!(
+        "in_memory custody is not available in this build. This build also has no \
+         pre-rotation backend, so creating an identity fails closed with {} under \
+         every custody name (ADR-062 \u{a7}Decision 6)",
+        codes::IDENT_1059
+    )
+}
+
 /// Maps a shared [`FileCustodyError`] onto this bridge's error type.
 ///
 /// An unset environment variable is something the caller sets, so it surfaces

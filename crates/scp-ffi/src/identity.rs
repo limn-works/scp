@@ -793,9 +793,17 @@ fn parse_custody_inner(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), Sc
             Ok((kc, custody.to_owned()))
         }
         #[cfg(not(feature = "testing"))]
+        // Names no other custody as the remedy: this build answers every
+        // identity creation with `no_pre_rotation_backend` whichever custody
+        // the caller names, so recommending `"file"` would send the caller to
+        // `SCP-IDENT-1059` next.
         "in_memory" => Err(ScpPyError::identity_with_code(
-            "in_memory custody is not available in this build -- use \"file\" or \
-             \"platform\" custody for production key storage",
+            format!(
+                "in_memory custody is not available in this build. This build also has \
+                 no pre-rotation backend, so creating an identity fails closed with {} \
+                 under every custody name (ADR-062 \u{a7}Decision 6)",
+                scp_ffi_common::error_codes::IDENT_1059
+            ),
             scp_ffi_common::error_codes::IDENT_1008,
         )),
         // "file" is the canonical name; "platform" is a backward-compat alias
@@ -2868,6 +2876,36 @@ pub fn register_identity(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(identity_verify_device_attestation, m)?)?;
     m.add_function(wrap_pyfunction!(verify_identity_link_attestation, m)?)?;
     Ok(())
+}
+
+/// Shipped-build (no-`testing`) behaviour of `parse_custody_inner`.
+#[cfg(all(test, not(feature = "testing")))]
+#[allow(clippy::panic)]
+mod shipped_custody_tests {
+    use super::parse_custody_inner;
+    use scp_ffi_common::error_codes::{IDENT_1008, IDENT_1059};
+
+    /// The `"in_memory"` rejection names no other custody as the remedy,
+    /// because this build answers every identity creation with
+    /// `SCP-IDENT-1059`; it says that instead.
+    #[test]
+    fn in_memory_rejection_recommends_no_custody_this_build_cannot_serve() {
+        let Err(err) = parse_custody_inner("in_memory") else {
+            panic!("a shipped build must reject `\"in_memory\"` custody");
+        };
+        let crate::error::ScpPyError::IdentityError { message, code } = err else {
+            panic!("the `\"in_memory\"` rejection must be an identity error");
+        };
+        assert_eq!(code, IDENT_1008);
+        assert!(
+            !message.contains("\"file\"") && !message.contains("\"platform\""),
+            "the rejection recommends a custody this build cannot serve: {message}"
+        );
+        assert!(
+            message.contains(IDENT_1059),
+            "the rejection must state that every custody name meets {IDENT_1059}: {message}"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "testing"))]

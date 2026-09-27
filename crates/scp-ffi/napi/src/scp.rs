@@ -511,10 +511,7 @@ impl Scp {
                     }));
                 }
                 Err(ScpNapiError::Identity {
-                    message: "in_memory custody is not available in this build -- use \
-                              \"file\", \"software\" or \"platform\" custody for production \
-                              key storage"
-                        .to_owned(),
+                    message: crate::identity::in_memory_unavailable_message(),
                     code: codes::IDENT_1008.to_owned(),
                 }
                 .into())
@@ -624,8 +621,7 @@ impl Scp {
                         "custody type {custody:?} requires a wired platform \
                          KeyCustodyProvider — use the KeyCustodyProvider callback \
                          interface to inject Secure Enclave (iOS) or Android \
-                         Keystore (Android) backed custody, or name \"file\" custody \
-                         to hold keys in an encrypted file this process owns"
+                         Keystore (Android) backed custody"
                     ),
                     code: codes::IDENT_1003.to_owned(),
                 }
@@ -720,10 +716,7 @@ impl Scp {
             }
             #[cfg(not(feature = "testing"))]
             "in_memory" => Err(ScpNapiError::Identity {
-                message: "in_memory custody is not available in this build -- use \
-                          \"file\", \"software\" or \"platform\" custody for production \
-                          key storage"
-                    .to_owned(),
+                message: crate::identity::in_memory_unavailable_message(),
                 code: codes::IDENT_1008.to_owned(),
             }
             .into()),
@@ -813,8 +806,7 @@ impl Scp {
                     "custody type {custody:?} requires a wired platform \
                      KeyCustodyProvider — use the KeyCustodyProvider callback \
                      interface to inject Secure Enclave (iOS) or Android \
-                     Keystore (Android) backed custody, or name \"file\" custody \
-                     to hold keys in an encrypted file this process owns"
+                     Keystore (Android) backed custody"
                 ),
                 code: codes::IDENT_1003.to_owned(),
             }
@@ -5665,10 +5657,11 @@ mod identity_remove_validation_tests {
 // `validate_custody_type` admitted and no arm handles.
 //
 // Runs in the shipped (no-`testing`) lane, which CI drives with
-// `cargo test -p scp-ffi-napi --features server`. There the `"file"` arm opens
-// the encrypted key file and then returns the fail-closed pre-rotation error
-// `SCP-IDENT-1059` (ADR-062 §Decision 6), which is the answer `identity_create`
-// gives that lane.
+// `cargo test -p scp-ffi-napi --features server`. There the `"file"` arm
+// resolves `HOME` and `SCP_KEY_PASSPHRASE`, opens no file, and returns the
+// fail-closed pre-rotation error `SCP-IDENT-1059` (ADR-062 §Decision 6), which
+// is the answer `identity_create` gives that lane. A creation that fails closed
+// must leave no key file behind, and the inner test asserts that none exists.
 #[cfg(all(test, not(feature = "testing")))]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod file_custody_agent_key_tests {
@@ -5685,7 +5678,8 @@ mod file_custody_agent_key_tests {
     ///
     /// The `"file"` arm reads both variables through
     /// `scp_ffi_common::custody_file`, and `HOME` has to name a temporary
-    /// directory so that arm writes its key file there rather than into
+    /// directory so the inner test can assert that no key file appeared there
+    /// and so a regression that does write one writes it there rather than into
     /// whichever `$HOME/.scp` the machine running this test owns. Setting them
     /// with `std::env::set_var` is what this test must not do: CI drives this
     /// lane with `cargo test -p scp-ffi-napi --features server`, libtest runs a
@@ -5779,6 +5773,21 @@ mod file_custody_agent_key_tests {
                      `identity_create` reaches: {message}"
                 );
             }
+
+            // No rejection may send the caller to `"file"` custody, which
+            // this build answers with `SCP-IDENT-1059`.
+            assert!(
+                !message.contains("\"file\""),
+                "the rejection of {name:?} recommends `\"file\"` custody, which this build \
+                 cannot serve: {message}"
+            );
+            if name == "in_memory" {
+                assert!(
+                    message.contains(codes::IDENT_1008) && message.contains(codes::IDENT_1059),
+                    "the `\"in_memory\"` rejection must carry `SCP-IDENT-1008` and state \
+                     that every custody name meets `SCP-IDENT-1059` in this build: {message}"
+                );
+            }
         }
 
         // `identity_create` answers `"file"` with the same fail-closed error.
@@ -5790,6 +5799,27 @@ mod file_custody_agent_key_tests {
             message.contains(codes::IDENT_1059),
             "`identity_create(\"file\")` must fail closed with SCP-IDENT-1059: {message}"
         );
+
+        // `identity_create` rejects the other names without recommending
+        // `"file"`, which this build answers with `SCP-IDENT-1059`.
+        for name in ["in_memory", "platform", "software"] {
+            let message = match rt.block_on(scp.identity_create(name.to_owned(), None)) {
+                Ok(_) => panic!("a shipped build must fail closed on `identity_create({name:?})`"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                !message.contains("\"file\""),
+                "`identity_create({name:?})` recommends `\"file\"` custody, which this build \
+                 cannot serve: {message}"
+            );
+            if name == "in_memory" {
+                assert!(
+                    message.contains(codes::IDENT_1008) && message.contains(codes::IDENT_1059),
+                    "the `\"in_memory\"` rejection must carry `SCP-IDENT-1008` and state \
+                     that every custody name meets `SCP-IDENT-1059` in this build: {message}"
+                );
+            }
+        }
 
         // Both creators can only fail on a shipped build, so neither may leave
         // a key file sealed to whatever passphrase happened to be set.
