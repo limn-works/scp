@@ -907,7 +907,7 @@ Build order:
 The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with the Phase 1 and Phase 2 Rust stacks:
 
 ```
-1. Install the SDK: `pip install scp-python` in a clean Python venv on a platform a wheel covers. No Rust toolchain.
+1. Install the SDK: `pip install scp-python` in a clean Python venv on a platform and CPython minor a wheel covers. No Rust toolchain.
    Zero compilation. Binary wheel installs in seconds.
 
 2. Alice creates an identity in Python:

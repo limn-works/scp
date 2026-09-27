@@ -44,8 +44,8 @@ asyncio.run(main())
 
 ## Requirements
 
-- Python >= 3.10
-- Nothing else when a wheel exists for your platform: wheels are pre-built for CPython 3.10-3.13 on Linux (x86_64, aarch64), macOS, and Windows (x86_64)
+- CPython 3.10-3.13. CPython 3.14 and newer cannot install: the locked PyO3 0.24 builds for CPython 3.13 at most, so no wheel covers it and the source build fails
+- Nothing else when a wheel exists for your platform: wheels are pre-built for CPython 3.10-3.13 on Linux x86_64 and aarch64 with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64
 - A build from source compiles OpenSSL, both when pip falls back to the source distribution because no wheel matches and when you run `maturin develop` in `bindings/python`: it needs a Rust toolchain and a full perl, plus make on Linux and macOS. On Windows, NASM is optional: with it on PATH OpenSSL builds its assembly routines, and without it the build configures OpenSSL with `no-asm`
 
 ## API Reference

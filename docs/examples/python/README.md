@@ -12,7 +12,8 @@ context lifecycle, messaging, and tool invocation.
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    ```
 
-2. **Python 3.10+**; the repository's mise config installs 3.12:
+2. **CPython 3.10-3.13** (3.14 and newer cannot build: the locked PyO3 0.24
+   supports CPython 3.13 at most); the repository's mise config installs 3.12:
    ```bash
    mise install python@3.12
    ```
