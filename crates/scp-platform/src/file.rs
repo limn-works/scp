@@ -3079,6 +3079,58 @@ mod tests {
         }
     }
 
+    /// A writer who flips an Ed25519 entry's `key_type` byte to X25519 and
+    /// re-seals the file HMAC cannot use that seed as an X25519 secret through
+    /// a custody object that reopens the file.
+    ///
+    /// A reopened custody builds its handle map from the stored type byte, so
+    /// the handle's expected type and the stored type both read X25519 and the
+    /// comparison in `decrypt_entry` passes. The associated data `encrypt_key`
+    /// bound is the only check left: the entry was sealed under the Ed25519
+    /// type, so the AEAD rejects it. Passing a type-independent value to
+    /// `entry_aad` at both call sites makes `dh_agree` and `public_key` here
+    /// succeed with the Ed25519 seed used as an X25519 static secret.
+    #[tokio::test]
+    async fn a_flipped_key_type_byte_fails_the_aead_check_after_a_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let custody = FileKeyCustody::new(&path, "pw").unwrap();
+        custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        let mut data = custody.read_file().unwrap();
+        data[HEADER_SIZE] = KEY_TYPE_X25519;
+        seal_file_mac(&custody.mac_key, &mut data).unwrap();
+        atomic_write(&path, &data).unwrap();
+        drop(custody);
+
+        let reopened = FileKeyCustody::new(&path, "pw")
+            .expect("a re-sealed file passes its HMAC check, so the reopen succeeds");
+        let handle = KeyHandle::new(1);
+
+        // The X25519 base point, so an unmutated build could not fail on a
+        // low-order peer instead of on the AEAD.
+        let mut peer = [0u8; 32];
+        peer[0] = 9;
+        let dh_error = reopened
+            .dh_agree(&handle, &peer)
+            .await
+            .expect_err("an Ed25519 seed relabelled X25519 must not reach a DH agreement");
+        let public_key_error = reopened
+            .public_key(&handle)
+            .await
+            .expect_err("an Ed25519 seed relabelled X25519 must not yield an X25519 public key");
+        for error in [dh_error, public_key_error] {
+            match error {
+                PlatformError::CustodyError(msg) => assert!(
+                    msg.contains("decryption failed"),
+                    "the AEAD must reject the relabelled entry: {msg}"
+                ),
+                other => panic!("expected the AEAD's CustodyError, got {other:?}"),
+            }
+        }
+    }
+
     /// A writer who moves one entry's ciphertext behind another entry's
     /// identifier, and re-seals the file HMAC under the passphrase-derived MAC
     /// key, produces entries the AEAD rejects.
