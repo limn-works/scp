@@ -489,4 +489,10 @@ async def test_identity_create_rejects_an_absent_custody_selection(
     with pytest.raises(IdentityError) as excinfo:
         await getattr(wrapper, method_name)(custody)
     assert excinfo.value.code == "SCP-IDENT-1064"
+    # A shipped bridge answers every custody name with SCP-IDENT-1059, so the
+    # message recommends none and states that instead.
+    message = str(excinfo.value)
+    for name in ('"file"', '"platform"', '"software"', '"in_memory"'):
+        assert name not in message, f"message recommends {name}: {message}"
+    assert "SCP-IDENT-1059" in message
     getattr(native, method_name).assert_not_called()

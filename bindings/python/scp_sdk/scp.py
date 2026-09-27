@@ -450,17 +450,21 @@ def _require_custody_selection(custody: object) -> str:
     code the TypeScript SDK's ``requireCustodySelection`` reports. An
     unrecognized name still reaches the bridge, which answers
     ``SCP-VALID-7005``.
+
+    The message names no custody as the remedy: a shipped bridge answers every
+    identity creation with ``SCP-IDENT-1059``, so recommending one would send
+    the caller to that error next. It states that instead, as the PyO3 and napi
+    bridges' ``SCP-IDENT-1008`` rejection does.
     """
     from scp_sdk.errors import IdentityError
 
     name = custody.value if isinstance(custody, CustodyType) else custody
     if not isinstance(name, str) or name.strip() == "":
         raise IdentityError(
-            'custody selection is required: pass "file" to hold keys in an encrypted '
-            "file this process owns ($HOME/.scp/keys.bin under SCP_KEY_PASSPHRASE), "
-            "use SCP.identity_create_with_custody to wire a KeyCustodyProvider, or "
-            'pass "in_memory" on a build carrying the testing feature. There is no '
-            "default custody backend.",
+            "custody selection is required: name a custody backend, because there is "
+            "no default (SCP-CAPSEL-8000). A build without the testing feature has no "
+            "pre-rotation backend, so it answers every identity creation with "
+            "SCP-IDENT-1059 whichever custody the caller names (ADR-062 \u00a7Decision 6).",
             "SCP-IDENT-1064",
         )
     return name

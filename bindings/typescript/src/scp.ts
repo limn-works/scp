@@ -240,15 +240,19 @@ function checkGovernanceProposeResponse(raw: string): string {
  * recognizes, and `SCP-IDENT-1003` / `SCP-IDENT-1008` report a named backend a
  * build cannot serve. A storage-selection guard in this `SCP` constructor pairs
  * a required type with a runtime check that same way.
+ *
+ * The message names no custody as the remedy: a shipped addon answers every
+ * identity creation with `SCP-IDENT-1059`, so recommending one would send the
+ * caller to that error next. It states that instead, as the napi bridge's
+ * `SCP-IDENT-1008` rejection does.
  */
 function requireCustodySelection(custody: unknown): void {
   if (typeof custody !== "string" || custody.trim() === "") {
     throw new IdentityError(
-      'custody selection is required: pass "file" to hold keys in an encrypted ' +
-        "file this process owns ($HOME/.scp/keys.bin under SCP_KEY_PASSPHRASE), " +
-        'pass "platform" or "software" and wire a KeyCustodyProvider through ' +
-        'SCP.identityCreateWithCustody, or pass "in_memory" on a build carrying ' +
-        "a testing feature. There is no default custody backend.",
+      "custody selection is required: name a custody backend, because there is " +
+        "no default (SCP-CAPSEL-8000). A build without the testing feature has no " +
+        "pre-rotation backend, so it answers every identity creation with " +
+        "SCP-IDENT-1059 whichever custody the caller names (ADR-062 \u00a7Decision 6).",
       "SCP-IDENT-1064",
     );
   }

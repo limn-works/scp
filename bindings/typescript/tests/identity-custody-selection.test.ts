@@ -55,6 +55,12 @@ describe("custody selection is required", () => {
       expect(err).toBeInstanceOf(IdentityError);
       expect((err as IdentityError).code).toBe("SCP-IDENT-1064");
       expect((err as IdentityError).message).toContain("custody selection is required");
+      // A shipped addon answers every custody name with SCP-IDENT-1059, so the
+      // message recommends none and states that instead.
+      for (const name of ['"file"', '"platform"', '"software"', '"in_memory"']) {
+        expect((err as IdentityError).message).not.toContain(name);
+      }
+      expect((err as IdentityError).message).toContain("SCP-IDENT-1059");
     }
   });
 
