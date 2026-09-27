@@ -2879,17 +2879,23 @@ pub fn register_identity(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 /// Shipped-build (no-`testing`) behaviour of `parse_custody_inner`.
-#[cfg(all(test, not(feature = "testing")))]
+//
+// The shipped-only attribute sits on the test function rather than on this
+// module, because scripts/tests/ci-gate/ci_gate_selftest.py identifies a
+// shipped-build assertion by that attribute on the function and requires the
+// shipped pyo3 lane of .github/workflows/ci.yml to select it by name.
+#[cfg(test)]
 #[allow(clippy::panic)]
 mod shipped_custody_tests {
-    use super::parse_custody_inner;
-    use scp_ffi_common::error_codes::{IDENT_1008, IDENT_1059};
-
     /// The `"in_memory"` rejection names no other custody as the remedy,
     /// because this build answers every identity creation with
     /// `SCP-IDENT-1059`; it says that instead.
+    #[cfg(not(feature = "testing"))]
     #[test]
     fn in_memory_rejection_recommends_no_custody_this_build_cannot_serve() {
+        use super::parse_custody_inner;
+        use scp_ffi_common::error_codes::{IDENT_1008, IDENT_1059};
+
         let Err(err) = parse_custody_inner("in_memory") else {
             panic!("a shipped build must reject `\"in_memory\"` custody");
         };
