@@ -279,10 +279,6 @@ case "\$1" in
     check) exit $cargo_check_rc ;;
     fmt) exit $cargo_fmt_rc ;;
     metadata)
-        # A \`--filter-platform\` call is the per-triple resolution
-        # \`scripts/check-vendored-openssl-scope.sh\` reads for the wheel, and it is delegated
-        # for the reason \`cargo tree\` is: it resolves the graph and builds nothing.
-        case " \$* " in *" --filter-platform "*) ;; *)
         # The runner reads two things out of this answer: the target directory its summary
         # names, and the dependency declarations its compile step derives a feature set
         # from. A case that wants the second writes its own JSON to metadata.json beside
@@ -294,8 +290,6 @@ case "\$1" in
             printf '{"version":1,"target_directory":"$dir/stub-target-dir"}\n'
         fi
         exit 0
-        ;;
-        esac
         ;;
 esac
 # Delegating means removing this directory from PATH first. The cargo on PATH here is a

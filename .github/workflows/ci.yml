@@ -440,7 +440,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # `wheel_triples` reads the wheel job's matrix in build-matrix.yml with PyYAML,
+      # The gate reads the wheel job's matrix in build-matrix.yml with PyYAML,
       # which the interpreter setup-python installs does not carry, and the gate fails
       # when its interpreter cannot import it.
       - name: Install PyYAML

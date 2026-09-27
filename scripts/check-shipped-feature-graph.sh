@@ -98,7 +98,9 @@
 # tomorrow is covered without editing this gate. Measured on this tree, the union
 # and the host resolution agree row for row on every artifact, so `--target all`
 # costs no false rejection. `assert_every_cargo_tree_resolves_every_target`
-# asserts that flag across every shell script under scripts/.
+# asserts that flag across every shell script under scripts/, except in the one
+# function of `scripts/check-vendored-openssl-scope.sh` that it names, which
+# proves a crate PRESENT on each triple the PyPI wheel ships for.
 #
 # Usage:
 #   scripts/check-shipped-feature-graph.sh            # gate the real workspace
@@ -1092,15 +1094,53 @@ assert_every_pipeline_reader_consumes_its_input() {
 #   and crates/scp-protocol/Cargo.toml already carries a
 #   `[target.'cfg(target_arch = "wasm32")'.dependencies]` table, so the same
 #   host-triple blindness would hide a banned crate declared under a cfg.
+#
+#   ONE EXEMPT CALL SITE. Alec approved it on 2026-09-26 ("can we just make an
+#   exception to the rule??"). The site is the function TARGET_ALL_EXEMPT_FUNCTION
+#   in the file TARGET_ALL_EXEMPT_FILE: the PyPI wheel's presence proof, which has
+#   to resolve one triple at a time because the union over every triple admits an
+#   `openssl-src` edge that only a triple the wheel does not ship for compiles.
+#   The exemption covers a `cargo tree` line that names `--target` and sits between
+#   that function's `name() {` line and its closing `}` line, in the one file whose
+#   path equals TARGET_ALL_EXEMPT_FILE. A second definition of the function in that
+#   file cancels the exemption. Every other line, including a line elsewhere in that
+#   file and a same-named function in another file, still has to name `--target all`.
+TARGET_ALL_EXEMPT_FILE="scripts/check-vendored-openssl-scope.sh"
+TARGET_ALL_EXEMPT_FUNCTION="wheel_triple_occurrences"
+
+# target_all_exempt_range <file>
+#   Emit "<start> <end>", the line numbers of TARGET_ALL_EXEMPT_FUNCTION's
+#   `name() {` line and its first following `}` line, when the file defines that
+#   function exactly once; emit nothing otherwise.
+target_all_exempt_range() {
+  local line n=0 defs=0 start="" end=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    if [[ "$line" == "${TARGET_ALL_EXEMPT_FUNCTION}() {" ]]; then defs=$((defs + 1)); start=$n; end=""; fi
+    if [[ -n "$start" && -z "$end" && "$line" == "}" ]]; then end=$n; fi
+  done < "$1"
+  if [[ "$defs" -eq 1 && -n "$end" ]]; then echo "$start $end"; fi
+}
+
 assert_every_cargo_tree_resolves_every_target() {
   echo ">> fixture: every cargo tree invocation under scripts/ names --target all, so no cfg-gated dependency edge is invisible to an absence proof"
-  local script offenders all_offenders="" cmd_word
+  local script offenders all_offenders="" cmd_word range start end kept offender
   cmd_word='(^|[`;&|]|\$\()[[:space:]]*cargo[[:space:]]+tree[[:space:]]'
   while IFS= read -r script; do
     offenders="$(sed -E 's/\\`//g' "$script" \
       | grep -nE "$cmd_word" \
       | grep -vE '^[0-9]+:[[:space:]]*#' \
       | grep -vF -e '--target all' || true)"
+    range=""
+    if [[ "$script" == "$TARGET_ALL_EXEMPT_FILE" ]]; then range="$(target_all_exempt_range "$script")"; fi
+    if [[ -n "$range" && -n "$offenders" ]]; then
+      start="${range% *}"; end="${range#* }"; kept=""
+      while IFS= read -r offender; do
+        if (( ${offender%%:*} > start && ${offender%%:*} < end )) && [[ "$offender" == *"--target "* ]]; then continue; fi
+        kept="$kept$offender"$'\n'
+      done <<<"$offenders"
+      offenders="${kept%$'\n'}"
+    fi
     if [[ -n "$offenders" ]]; then
       all_offenders="$all_offenders$(printf '%s\n' "$offenders" | sed "s|^|${script}:|")
 "
@@ -1116,6 +1156,38 @@ assert_every_cargo_tree_resolves_every_target() {
     return
   fi
   echo "   ok   — every cargo tree invocation under scripts/ resolves every target triple"
+}
+
+# assert_target_all_exemption_names_one_site
+#   CRITERION: the `--target all` rule above passes a per-triple `cargo tree` inside
+#   TARGET_ALL_EXEMPT_FUNCTION of TARGET_ALL_EXEMPT_FILE, and fails the same call in
+#   any other file or anywhere else in that file. Each case plants a scripts/ tree
+#   and runs the rule from the directory holding it.
+assert_target_all_exemption_names_one_site() {
+  echo ">> fixture: the --target all rule exempts one named function in one named file and nothing else"
+  # The planted lines spell the command through $cargo, so this file's own text
+  # carries no per-triple invocation for the rule to read.
+  local plant rc per_triple no_target cargo=cargo
+  per_triple="  tree=\"\$($cargo tree -p x --target \"\$triple\" -e no-dev)\""
+  no_target="  tree=\"\$($cargo tree -p x -e no-dev)\""
+  plant="$(mktemp -d)"; mkdir -p "$plant/scripts"
+  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$per_triple" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
+  expect "(target-all exemption) the named function in the named file passes a per-triple cargo tree" "PASS" "$rc"
+  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$per_triple" '}' > "$plant/scripts/other-gate.sh"
+  ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
+  expect "(target-all exemption) the same function in another file under scripts/ FAILS" "FAIL" "$rc"
+  rm -f "$plant/scripts/other-gate.sh"
+  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$per_triple" '}' 'other() {' "$per_triple" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
+  expect "(target-all exemption) a per-triple cargo tree elsewhere in the named file FAILS" "FAIL" "$rc"
+  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$no_target" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
+  expect "(target-all exemption) a cargo tree naming no --target inside the named function FAILS" "FAIL" "$rc"
+  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$per_triple" '}' "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$per_triple" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
+  expect "(target-all exemption) a second definition of the named function cancels the exemption" "FAIL" "$rc"
+  rm -rf "$plant"
 }
 
 # assert_print_modes_emit_what_this_gate_holds
@@ -2181,6 +2253,8 @@ TREE
   assert_every_pipeline_reader_consumes_its_input
 
   assert_every_cargo_tree_resolves_every_target
+
+  assert_target_all_exemption_names_one_site
 
   assert_print_modes_emit_what_this_gate_holds
 
