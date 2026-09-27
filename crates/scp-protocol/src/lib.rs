@@ -55,7 +55,8 @@ pub use context::outlets::stream::{
 };
 pub use context::outlets::{
     OutletCancel, OutletError, OutletInvokedEvent, OutletKind, OutletRegisteredEvent,
-    OutletRequest, OutletStatus, OutletUpdatedEvent, OutletVerifiedEvent, OutletVerifiedReason,
+    OutletRemovedEvent, OutletRequest, OutletStatus, OutletUpdatedEvent, OutletVerifiedEvent,
+    OutletVerifiedReason,
 };
 
 // Typed §5.4.4 OutletError envelope and supporting types (SCP-OUT-024 / ADR-049

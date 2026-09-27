@@ -148,9 +148,27 @@
 #   Checks 2c and 2d read `ci.yml` alone, because the `rust` and `fuzz` filters they name
 #   live there and guard the jobs that compile from those files.
 #
+#   2e — THE WORKFLOW FILE, ROUTED TO EVERY LANE IT DEFINES. Every job a paths filter
+#   guards takes its command, its feature list, its matrix and its cache group from the
+#   workflow file that declares it, so that file decides every one of those jobs the way
+#   `.clippy.toml` decides `rust-clippy`. The file satisfies the 2c criterion: a pull
+#   request that rewrites one job's command and changes nothing else is rare, and before
+#   `ci.yml` listed itself such a pull request left every filter output false, skipped the
+#   job, and merged with the `ci` aggregator green over a command nothing had run. Listing
+#   the file in the `rust` filter alone then closed the hole for the Rust lane and left it
+#   open for `python-test`, `typescript-check`, `typescript-wasm-check`,
+#   `scaffold-typescript-web-check`, `kotlin-test`, `swift-build-test` and `fuzz-build`,
+#   each of which takes its command from the same file. The gate therefore reads every
+#   output of the `changes` job of every paths-filtered workflow, reads the filter names
+#   that output's expression refers to, and fails when none of those filters lists the
+#   workflow's own path. An output that ORs the `toolchain` filter in is routed by the one
+#   entry there; the `fuzz` output reads its own filter alone, so the `fuzz` filter holds
+#   the second copy.
+#
 # An `OK` from check 2 is not a claim that the filters are correct. It says the pin reaches
-# every lane of every paths-filtered workflow, and that every root-level file and every
-# cargo configuration file is classified. A `rust` filter stripped of `crates/**` still
+# every lane of every paths-filtered workflow, that every root-level file and every cargo
+# configuration file is classified, and that every lane of every paths-filtered workflow
+# runs when its own workflow file changes. A `rust` filter stripped of `crates/**` still
 # passes, and it does not need this gate: that omission reveals itself.
 #
 # ── CHECK 3: mise names no Rust version source ───────────────────────────────────────
@@ -523,7 +541,43 @@ check_pin_reaches_every_lane() {
     done <<< "$outputs"
 }
 
-# 2a/2b — over every workflow a paths filter guards, `ci.yml` among them.
+# 2e for one workflow: every output of its `changes` job reads at least one filter that
+# lists the workflow's own path.
+#
+# The expression of an output names the filters it reads as `steps.filter.outputs.<name>`,
+# and the gate resolves each name against the workflow's own filter block. An output that
+# reads a filter this file cannot find — a name with no block, or a block with no path
+# entries — reports the same way as one whose filters all miss the file: nothing routes
+# the workflow to that lane. `$wf` is the path the workflow listing printed, relative to
+# the repository root, which is the form a filter entry takes.
+check_workflow_routes_itself() {
+    local wf=$1 outputs line output_name output_expr filter_name entries routed
+
+    outputs=$(changes_job_outputs "$wf")
+    # Check 2b reports the absence of outputs; this check has nothing further to read.
+    [[ -n $outputs ]] || return 0
+
+    while IFS= read -r line; do
+        [[ -n $line ]] || continue
+        output_name=${line%%=*}
+        output_expr=${line#*=}
+        routed=0
+        while IFS= read -r filter_name; do
+            [[ -n $filter_name ]] || continue
+            entries=$(filter_entries "$wf" "$filter_name")
+            if routed_by "$wf" "$entries"; then
+                routed=1
+                break
+            fi
+        done < <(grep -oE 'steps\.filter\.outputs\.[A-Za-z0-9_.-]+' <<< "$output_expr" \
+            | sed -E 's/^steps\.filter\.outputs\.//' | sort -u)
+        if [[ $routed -eq 0 ]]; then
+            report "$wf: the 'changes' job's '$output_name' output reads no filter that lists $wf, so a pull request that rewrites a command in this workflow and changes nothing else skips every job that output guards, and each status check reports the skip as a pass. List $wf in the '$TOOLCHAIN_FILTER' filter when that output ORs it in, or in the output's own filter when it does not."
+        fi
+    done <<< "$outputs"
+}
+
+# 2a/2b/2e — over every workflow a paths filter guards, `ci.yml` among them.
 filtered_workflows=$(paths_filter_workflows)
 if [[ -z $filtered_workflows ]]; then
     report "no workflow under $WORKFLOW_DIR/ declares a dorny/paths-filter step, so the gate cannot check that a change to $PIN reaches the jobs that compile on it"
@@ -531,6 +585,7 @@ else
     while IFS= read -r workflow; do
         [[ -n $workflow ]] || continue
         check_pin_reaches_every_lane "$workflow"
+        check_workflow_routes_itself "$workflow"
     done <<< "$filtered_workflows"
 fi
 
@@ -669,7 +724,7 @@ fi
 
 if [[ $fail -eq 0 ]]; then
     printf 'OK: every container build asserts it resolved the compiler %s names\n' "$PIN"
-    printf 'OK: every lane of every paths-filtered workflow routes a %s change, and every root-level file and cargo configuration file is routed or declared unread\n' "$PIN"
+    printf 'OK: every lane of every paths-filtered workflow routes a %s change and a change to its own workflow file, and every root-level file and cargo configuration file is routed or declared unread\n' "$PIN"
     printf 'OK: %s names no Rust version source, so rustup resolves each directory from its own toolchain file\n' "$MISE_CONFIG"
     printf 'OK: %s\n' "$resolved_rustc_report"
     exit 0

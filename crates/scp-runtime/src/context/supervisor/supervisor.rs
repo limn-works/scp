@@ -4323,6 +4323,14 @@ impl Supervisor {
                     .lookup_miss_error(context_id, format!("context not registered: {context_id}"));
                 reply_with_error(cmd, err);
             }
+            // Test-only counter read: a counter for an unknown context has no
+            // honest default, so the reply is the hard error.
+            #[cfg(feature = "testing")]
+            QueriesCommand::CheckpointEventsSince { ref context_id, .. } => {
+                let err = self
+                    .lookup_miss_error(context_id, format!("context not registered: {context_id}"));
+                reply_with_error(cmd, err);
+            }
             // Soft-default variants — legacy methods return the
             // variant-specific default on unknown context.
             QueriesCommand::MemberCount { .. }
@@ -5792,6 +5800,16 @@ impl Supervisor {
             BroadcastCommand::ReleaseBroadcastReservation { reply, .. } => {
                 let _ = reply.send(Ok(()));
                 Outcome::ok(())
+            }
+            // Test-only seed seam — context must exist.
+            #[cfg(feature = "testing")]
+            BroadcastCommand::SeedBroadcastAuthor {
+                context_id, reply, ..
+            } => {
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
             }
         }
     }
@@ -13678,6 +13696,15 @@ impl Supervisor {
         scp_protocol::context::roles::CapabilityCeiling::new(params.ceiling.iter().cloned())
             .validate_entries()
             .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+        // Genesis outlet validation (§5.9, §5.4.2, §6.2). `builder::validate_params`
+        // runs this on the creator's own parameters, and `create_context` is its only
+        // caller, so a joiner — whose `params` arrive from a peer — would otherwise
+        // accept an outlet declaration of any length, carrying any schema and any
+        // operator DID, and retain it in `handle` and in the persisted
+        // `context_params`. Call the SAME validator here, on the same `params`, so
+        // the checks hold on both sides of the invitation (GitHub #2250).
+        crate::context::state::validate_genesis_outlets(&params.outlets)
+            .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
 
         // Build the joiner's actor deps (crypto, transport, event log, KP store,
         // mls_storage, persistence, capability token) for the owning identity.
@@ -14186,6 +14213,16 @@ impl Supervisor {
                 initial_members,
                 context_id,
                 Arc::clone(&deps.clock),
+                // A joiner arrives at an arbitrary later epoch, and `params` is the
+                // frozen genesis declaration, which records no outlet that
+                // governance removed after genesis. The joiner's registry
+                // therefore starts empty and STAYS empty: the creator's
+                // `OutletRegistered`/`OutletRemoved` leaves carry the
+                // registrations and the removals, but no runtime path replays
+                // another member's log into `registered_outlets`, so outlet
+                // invocation on this joiner fails closed. See
+                // `OutletRegistrySeed::AwaitingLeafReplication` (GitHub #2250).
+                crate::context::state::OutletRegistrySeed::AwaitingLeafReplication,
             ),
             role_state,
             receive_buffer: scp_protocol::context::membership::ReceiveBuffer::new(),
@@ -14477,6 +14514,78 @@ impl Supervisor {
         bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::seed_peer_pseudonym — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
+    /// Registers an additional DID as a broadcast author on an existing
+    /// broadcast context, bypassing the governance round-trip — test-only.
+    ///
+    /// Single-node integration tests that need a multi-author broadcast
+    /// context cannot drive genuine governance (the bridge key-resolver only
+    /// sees one actor's custody). This seam populates the author registry
+    /// mirroring the author-publish/add path, so multi-author KEA-leaf and
+    /// checkpoint-counter tests can exercise the real code path instead of
+    /// being limited to the creator-only case.
+    ///
+    /// Mirrors [`Self::seed_peer_pseudonym`] in purpose and gating. Gated
+    /// behind `testing` — never compiled into production builds, never
+    /// reachable from any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MembershipFailed`] if the context is not a
+    ///   broadcast context.
+    /// - [`ContextError::PermissionDenied`] if `author_did` is already
+    ///   registered.
+    /// - [`ContextError::ContextNotRegistered`] if the context has no actor.
+    /// - [`ContextError::TransportFailed`] if the actor reply channel closes.
+    #[cfg(feature = "testing")]
+    pub async fn seed_broadcast_author(
+        &self,
+        context_id: &str,
+        author_did: DID,
+    ) -> Result<(), ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = BroadcastCommand::SeedBroadcastAuthor {
+            context_id: context_id.to_owned(),
+            author_did,
+            reply: tx,
+        };
+        self.dispatch_broadcast_command(cmd).await?;
+        bounded_reply_await(rx).await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::seed_broadcast_author — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
+    /// Reads a context's `checkpoint_events_since` counter through the actor
+    /// mailbox — test-only.
+    ///
+    /// §9.9.3 of the security-model spec compares members' Merkle roots at an
+    /// equal event count, so every durable leaf a helper appends must credit
+    /// the counter exactly once. A test that counts leaves in the event log
+    /// cannot see a missed or doubled credit; a test that reads this counter
+    /// and compares its delta against the event-log delta can. Gated behind
+    /// `testing` — never compiled into production builds, never reachable from
+    /// any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] if the context has no actor.
+    /// - [`ContextError::TransportFailed`] if the actor reply channel closes.
+    #[cfg(feature = "testing")]
+    pub async fn checkpoint_events_since(&self, context_id: &str) -> Result<u64, ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::CheckpointEventsSince {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        self.dispatch_query(cmd).await?;
+        bounded_reply_await(rx).await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::checkpoint_events_since — actor reply channel closed".to_owned(),
             )
         })?
     }
@@ -15266,6 +15375,9 @@ impl Supervisor {
             BroadcastCommand::ReleaseBroadcastReservation { payload, .. } => {
                 Some(payload.context_id.as_str())
             }
+            // Test-only seed seam — routed to the per-context actor.
+            #[cfg(feature = "testing")]
+            BroadcastCommand::SeedBroadcastAuthor { context_id, .. } => Some(context_id.as_str()),
             // PublishBroadcast / PublishBroadcastContent need
             // KeyCustody on the shim, so they have no string target for
             // this custody-free router.
@@ -15423,7 +15535,8 @@ impl Supervisor {
             QueriesCommand::GetAccessKey { context_id, .. }
             | QueriesCommand::GetAllAccessKeys { context_id, .. }
             | QueriesCommand::RemainingBudgetForTest { context_id, .. }
-            | QueriesCommand::VelocityForTest { context_id, .. } => Some(context_id.as_str()),
+            | QueriesCommand::VelocityForTest { context_id, .. }
+            | QueriesCommand::CheckpointEventsSince { context_id, .. } => Some(context_id.as_str()),
         }
     }
 }
@@ -15827,6 +15940,11 @@ fn reply_with_soft_default(cmd: QueriesCommand) {
         QueriesCommand::VelocityForTest { reply, .. } => {
             let _ = reply.send(Ok(0));
         }
+        // Hard-error variant: routed through `reply_with_error`, never here.
+        #[cfg(feature = "testing")]
+        QueriesCommand::CheckpointEventsSince { .. } => {
+            debug_assert!(false, "hard-error variant routed through soft-default path");
+        }
     }
 }
 
@@ -15841,6 +15959,10 @@ fn reply_with_error(cmd: QueriesCommand, err: ContextError) {
             let _ = reply.send(Err(err));
         }
         QueriesCommand::GetBroadcastKeyForLocalAuthor { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        #[cfg(feature = "testing")]
+        QueriesCommand::CheckpointEventsSince { reply, .. } => {
             let _ = reply.send(Err(err));
         }
         // Every other variant is soft-fallback — they never route
@@ -19253,6 +19375,174 @@ mod tests {
             matches!(result, Err(ContextError::ImportRejected { .. })),
             "a broadcast-mode export must be rejected with ImportRejected; got {result:?}"
         );
+    }
+
+    /// Builds an `OutletRegistration` that
+    /// `OutletRegistration::validate_registrable` accepts: two properties on each
+    /// schema (the §6.2/§9.2.1 specificity floor is `MIN_SCHEMA_FIELDS == 2`), an
+    /// `Action` kind with no cost, and an operator DID that parses.
+    fn importable_outlet_fixture(
+        outlet_id: &str,
+    ) -> scp_protocol::context::outlets::OutletRegistration {
+        use scp_protocol::context::outlets::{OutletKind, OutletRegistration, OutletSchema};
+        OutletRegistration {
+            outlet_id: outlet_id.to_owned(),
+            kind: OutletKind::Action,
+            name: outlet_id.to_owned(),
+            description: "imported outlet fixture".to_owned(),
+            schema: OutletSchema {
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"lhs": {"type": "number"}, "rhs": {"type": "number"}}
+                }),
+                output_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"sum": {"type": "number"}, "carry": {"type": "boolean"}}
+                }),
+                aggregate_schema: None,
+            },
+            implementation_hash: [7u8; 32],
+            test_vectors: vec![],
+            message_catalog: Vec::new(),
+            operator_did: DID("did:dht:z6MkImportedOutletOperator".to_owned()),
+            cost: None,
+            registered_at: 0,
+            signature: Vec::new(),
+        }
+    }
+
+    /// Signs `snapshot` as `creator` and imports it, returning whatever
+    /// `Supervisor::import_context` returned. Every outlet-registry import test
+    /// below drives this one helper, so the only difference between them is the
+    /// `registered_outlets` vector the caller put on the snapshot.
+    async fn import_snapshot_signed_by_creator(
+        snapshot: crate::context::state::ContextSnapshot,
+        creator: &str,
+        ctx_id_bytes: &[u8; 32],
+    ) -> Result<crate::context::ContextHandle, ContextError> {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup = supervisor_with_clock_persistence_and_merkle_log(
+            clock_dyn,
+            Box::new(MapPersistence::default()),
+        );
+        let event_log_data =
+            create_event_log_data(ctx_id_bytes, &[scp_event_log::EventType::ContextCreated]).await;
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let export = crate::context::export_import::create_export(
+            snapshot,
+            event_log_data,
+            DID(creator.to_owned()),
+            crate::context::export_import::ExportScope::Full,
+            &scp_clock::SystemClock,
+            |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
+        )
+        .expect("build a valid signed full export");
+
+        sup.import_context(export, &verifying_key, None).await
+    }
+
+    /// The import path installs `export.snapshot.registered_outlets` into the
+    /// live `GovernanceState::registered_outlets`, which
+    /// `actor::handlers::saga::validate_input_specificity` reads as an
+    /// authorization grant. A creator-signed export carrying MORE than
+    /// `MAX_REGISTERED_OUTLETS` registrations must be refused, exactly as the
+    /// genesis path and `execute_register_outlet` refuse an over-cap set — the
+    /// snapshot signature authenticates the writer of those bytes and does not
+    /// establish that the registry is admissible (GitHub #2250).
+    #[tokio::test]
+    async fn import_rejects_an_over_cap_outlet_registry() {
+        let creator = "did:key:import-outlet-cap-creator";
+        let context_id = "import-outlet-cap-ctx";
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        snapshot.registered_outlets = (0..=crate::context::state::MAX_REGISTERED_OUTLETS)
+            .map(|i| importable_outlet_fixture(&format!("outlet-{i}")))
+            .collect();
+
+        let err = import_snapshot_signed_by_creator(snapshot, creator, &ctx_id_bytes)
+            .await
+            .expect_err("an over-cap imported outlet registry must be refused");
+        let ContextError::ImportRejected { reason } = &err else {
+            panic!("expected ImportRejected for an over-cap outlet registry, got {err:?}");
+        };
+        assert!(
+            reason.contains("imported outlet count"),
+            "the refusal names the imported outlet-count bound, got {reason}"
+        );
+    }
+
+    /// An imported registration that `register_outlet` would refuse — an
+    /// `operator_did` that is not a DID (§5.4.1) — must not reach the live
+    /// registry.
+    #[tokio::test]
+    async fn import_rejects_an_unregistrable_outlet() {
+        let creator = "did:key:import-outlet-operator-creator";
+        let context_id = "import-outlet-operator-ctx";
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        let mut hostile = importable_outlet_fixture("alpha");
+        hostile.operator_did = DID("not-a-did".to_owned());
+        snapshot.registered_outlets = vec![hostile];
+
+        let err = import_snapshot_signed_by_creator(snapshot, creator, &ctx_id_bytes)
+            .await
+            .expect_err("an unregistrable imported outlet must be refused");
+        let ContextError::ImportRejected { reason } = &err else {
+            panic!("expected ImportRejected for an unregistrable outlet, got {err:?}");
+        };
+        assert!(
+            reason.contains("is not a registrable OutletRegistration"),
+            "the refusal names the registration check, got {reason}"
+        );
+    }
+
+    /// Two imported registrations sharing one `outlet_id` must be refused:
+    /// `registered_outlets` is a `Vec`, so both would install, and a later
+    /// `execute_remove_outlet` would delete one and leave the other answering
+    /// invocations the context revoked.
+    #[tokio::test]
+    async fn import_rejects_duplicate_outlet_ids() {
+        let creator = "did:key:import-outlet-dup-creator";
+        let context_id = "import-outlet-dup-ctx";
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        snapshot.registered_outlets = vec![
+            importable_outlet_fixture("alpha"),
+            importable_outlet_fixture("alpha"),
+        ];
+
+        let err = import_snapshot_signed_by_creator(snapshot, creator, &ctx_id_bytes)
+            .await
+            .expect_err("a duplicate imported outlet id must be refused");
+        let ContextError::ImportRejected { reason } = &err else {
+            panic!("expected ImportRejected for a duplicate outlet id, got {err:?}");
+        };
+        assert!(
+            reason.contains("more than once"),
+            "the refusal names the duplication, got {reason}"
+        );
+    }
+
+    /// The control for the three rejections above: an imported registry of two
+    /// registrable outlets imports successfully, so the new check refuses
+    /// inadmissible registries rather than every registry.
+    #[tokio::test]
+    async fn import_accepts_a_registrable_outlet_registry() {
+        let creator = "did:key:import-outlet-ok-creator";
+        let context_id = "import-outlet-ok-ctx";
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        snapshot.registered_outlets = vec![
+            importable_outlet_fixture("alpha"),
+            importable_outlet_fixture("beta"),
+        ];
+
+        let _handle = import_snapshot_signed_by_creator(snapshot, creator, &ctx_id_bytes)
+            .await
+            .expect("an export carrying registrable outlets imports successfully");
     }
 
     /// A validly-signed export whose ceiling carries a MALFORMED entry (spec

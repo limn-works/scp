@@ -605,8 +605,15 @@ impl OutletError {
 /// Event payload for a `OutletRegistered` event in the context event log.
 ///
 /// Captures the full registration metadata for auditability. Serialized into
-/// the opaque `EventPayload::data` field.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// the opaque `EventPayload::data` field by
+/// `scp_event_log::payload::encode_payload`, which uses positional
+/// `MessagePack`: the field order below is the wire contract, and reordering a
+/// field changes every leaf hash that carries this payload. Never reorder.
+///
+/// A reader recovers which outlet a leaf registered from this payload — an
+/// `OutletRegistered` leaf carrying an empty payload names no outlet, so it
+/// cannot tell a replaying member what to install.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OutletRegisteredEvent {
     /// The registered outlet's ID.
     pub outlet_id: OutletId,
@@ -622,6 +629,26 @@ pub struct OutletRegisteredEvent {
     pub registrant_did: DID,
     /// Number of test vectors included.
     pub test_vector_count: usize,
+}
+
+/// Event payload for an `OutletRemoved` event in the context event log.
+///
+/// Names the outlet the removal revoked and the member who removed it.
+/// [`OutletRegisteredEvent`] and this type are the pair a replaying member reads
+/// to learn a context's outlet registry: registrations name what was granted,
+/// removals name what was withdrawn. A removal leaf carrying an empty payload
+/// names no outlet, so a reader that saw the registration cannot tell which
+/// grant the removal withdrew.
+///
+/// Serialized into the opaque `EventPayload::data` field by
+/// `scp_event_log::payload::encode_payload` under positional `MessagePack`, so
+/// the field order below is the wire contract. Never reorder.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OutletRemovedEvent {
+    /// The removed outlet's ID.
+    pub outlet_id: OutletId,
+    /// The DID of the member who removed the outlet.
+    pub remover_did: DID,
 }
 
 /// Event payload for a `OutletUpdated` event in the context event log.

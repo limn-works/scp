@@ -28,6 +28,14 @@
 #     compiles a crate of this workspace is guarded by such an output, and the `ci` job that
 #     aggregates every other job's result counts a skipped job as a pass, so an unrouted
 #     change merges unbuilt.
+#   * Check 2 fails when an output of the `changes` job reads no filter that lists the
+#     workflow's own path. Every job a filter guards takes its command from the workflow
+#     file that declares it, so a pull request that rewrites one job's command and changes
+#     nothing else skips that job unless the file routes itself to that lane. The cases
+#     drop the file from the `toolchain` filter, which every output but `fuzz` ORs in; drop
+#     it from the `fuzz` filter, which the `fuzz` output reads alone; put it back in the
+#     `rust` filter alone, which is the shape that closed the hole for one lane of eight;
+#     and drop it from the second workflow's `toolchain` filter.
 #   * Check 2 reads every workflow whose jobs a paths filter guards, not `ci.yml` alone.
 #     The cases write a second workflow that compiles on the pin and hold the gate to
 #     reporting the same two defects there; a workflow that declares no paths-filter step
@@ -104,6 +112,9 @@ failed=0
 #                     literally instead of OR-ing it in, or "" to leave every output whole.
 #   OMIT_FILTER     — "<filter> <entry>" drops one path entry from one filter, "<filter> *"
 #                     drops the filter and its header, "" drops nothing.
+#   EXTRA_FILTER_ENTRY — "<filter> <entry>" appends one path entry to one filter, "" appends
+#                     nothing. One case pairs it with OMIT_FILTER to move the workflow's
+#                     own path out of the `toolchain` filter and into the `rust` filter.
 #   MISE_SOURCE     — "none" writes a `.mise.toml` naming no Rust version source, "tools"
 #                     writes a `rust` key under `[tools]`, "idiomatic" writes the
 #                     `idiomatic_version_file_enable_tools` setting, "absent" writes no file.
@@ -142,6 +153,7 @@ failed=0
 #                     repository, which is the one defect no file's contents can express.
 OMIT_OUTPUT=""
 OMIT_FILTER=""
+EXTRA_FILTER_ENTRY=""
 MISE_SOURCE="none"
 EXTRA_ROOT_FILE=""
 EXTRA_FILES=()
@@ -259,6 +271,9 @@ emit_filter() {
         printf '              - %s%s%s\n' "$quote" "$entry" "$quote"
         index=$((index + 1))
     done
+    if [[ -n $EXTRA_FILTER_ENTRY && ${EXTRA_FILTER_ENTRY%% *} == "$name" ]]; then
+        printf "              - '%s'\n" "${EXTRA_FILTER_ENTRY#* }"
+    fi
 }
 
 emit_ci() {
@@ -271,7 +286,9 @@ emit_ci() {
         with:
           filters: |
 YAML
-    emit_filter toolchain 'rust-toolchain.toml' '.cargo/**'
+    # The workflow lists itself in the `toolchain` filter, which every output but `fuzz`
+    # ORs in, and again in the `fuzz` filter, which the `fuzz` output reads alone.
+    emit_filter toolchain 'rust-toolchain.toml' '.cargo/**' '.github/workflows/ci.yml'
     # `Dockerfile` and `.mise.toml` are the root-level files every canned repository holds,
     # so the `rust` filter routes the first and the gate's exemption list covers the second.
     emit_filter rust 'crates/**' 'Dockerfile' 'deny.toml'
@@ -281,7 +298,7 @@ YAML
     emit_filter scaffold-typescript-web 'scaffolds/typescript-web/**'
     emit_filter kotlin 'bindings/kotlin/**'
     emit_filter swift 'bindings/swift/**'
-    emit_filter fuzz 'crates/scp-protocol/**' 'fuzz/**'
+    emit_filter fuzz 'crates/scp-protocol/**' 'fuzz/**' '.github/workflows/ci.yml'
     # A second job, so the gate's output reader stops at the end of the `changes` job
     # rather than reading another job's outputs as this one's.
     cat <<'YAML'
@@ -364,6 +381,7 @@ routing_ok() {
     # which cases run against the complete filter set.
     OMIT_OUTPUT=""
     OMIT_FILTER=""
+    EXTRA_FILTER_ENTRY=""
     emit_ci
 }
 
@@ -534,6 +552,38 @@ EXTRA_ROOT_FILE="README.md"
 run_case "root-file-declared-unread" 0 "" emit_ci mise_ok
 EXTRA_ROOT_FILE=""
 
+# ── Check 2e: the workflow file routes itself to every lane it defines ───────────────
+#
+# Every job the canned `changes` outputs guard takes its command from `ci.yml`, so a pull
+# request that rewrites one job's command and changes nothing else has to run that job.
+# The passing case above lists the file in the `toolchain` filter, which every output but
+# `fuzz` ORs in, and in the `fuzz` filter, which the `fuzz` output reads alone.
+
+# The `toolchain` filter drops the file. Every output that ORs that filter in then reads
+# no filter listing it; the gate names each such output, and the case checks the first.
+OMIT_FILTER="toolchain .github/workflows/ci.yml"
+run_case "toolchain-filter-omits-the-workflow-file" 1 \
+    "the 'changes' job's 'rust' output reads no filter that lists .github/workflows/ci.yml" \
+    emit_ci mise_ok
+
+# The `fuzz` filter drops the file. The `fuzz` output reads that filter alone, so the
+# `toolchain` copy does not reach it.
+OMIT_FILTER="fuzz .github/workflows/ci.yml"
+run_case "fuzz-filter-omits-the-workflow-file" 1 \
+    "the 'changes' job's 'fuzz' output reads no filter that lists .github/workflows/ci.yml" \
+    emit_ci mise_ok
+
+# The file sits in the `rust` filter alone, which is how ci.yml first listed itself. The
+# Rust lane runs on a change to the file and every other lane skips, so the gate names
+# the first output that reads neither `rust` nor a filter listing the file.
+OMIT_FILTER="toolchain .github/workflows/ci.yml"
+EXTRA_FILTER_ENTRY="rust .github/workflows/ci.yml"
+run_case "workflow-file-routed-to-the-rust-lane-alone" 1 \
+    "the 'changes' job's 'python' output reads no filter that lists .github/workflows/ci.yml" \
+    emit_ci mise_ok
+OMIT_FILTER=""
+EXTRA_FILTER_ENTRY=""
+
 # ── Check 2a/2b: a second workflow whose jobs a paths filter guards ──────────────────
 #
 # The criterion binds every workflow that guards a job with a paths filter, and the gate
@@ -565,6 +615,7 @@ jobs:
             toolchain:
               - 'rust-toolchain.toml'
               - '.cargo/**'
+              - '.github/workflows/docs.yml'
             docs:
               - 'crates/scp-runtime/src/**'
   rust-docs:
@@ -596,6 +647,7 @@ jobs:
             toolchain:
               - 'rust-toolchain.toml'
               - '.cargo/**'
+              - '.github/workflows/docs.yml'
             docs:
               - 'crates/scp-runtime/src/**'
   rust-docs:
@@ -620,11 +672,22 @@ run_case "second-workflow-toolchain-filter-omits-the-pin" 1 \
     "docs.yml: the 'toolchain' paths filter does not list rust-toolchain.toml" \
     routing_ok mise_ok
 
+# The same workflow whose `toolchain` filter drops its own path. A pull request that
+# rewrites the `cargo doc` command in it then skips `rust-docs`, the one job that runs it.
+docs_workflow_omits_itself() {
+    docs_workflow_routes_the_pin | grep -v "^              - '.github/workflows/docs.yml'$"
+}
+EXTRA_FILES=(".github/workflows/docs.yml" docs_workflow_omits_itself)
+run_case "second-workflow-toolchain-filter-omits-the-workflow-file" 1 \
+    "docs.yml: the 'changes' job's 'docs' output reads no filter that lists .github/workflows/docs.yml" \
+    routing_ok mise_ok
+
 # The same workflow with no `toolchain` filter at all, which is how `docs.yml` stood
 # before this check read it.
 docs_workflow_declares_no_toolchain_filter() {
     docs_workflow_routes_the_pin | grep -v -e "^            toolchain:$" \
-        -e "^              - 'rust-toolchain.toml'$" -e "^              - '.cargo/\*\*'$"
+        -e "^              - 'rust-toolchain.toml'$" -e "^              - '.cargo/\*\*'$" \
+        -e "^              - '.github/workflows/docs.yml'$"
 }
 EXTRA_FILES=(".github/workflows/docs.yml" docs_workflow_declares_no_toolchain_filter)
 run_case "second-workflow-declares-no-toolchain-filter" 1 \

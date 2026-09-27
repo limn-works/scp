@@ -120,6 +120,13 @@ jobs:
             toolchain:
               - 'rust-toolchain.toml'
               - '.cargo/**'
+              # This file itself. `rust-docs` takes its `cargo doc` command and its
+              # feature list from this file, so a pull request that rewrites that
+              # command and changes nothing else would otherwise leave the `docs`
+              # output false and skip the one job that runs it.
+              # `scripts/check-toolchain-wiring.sh` check 2e fails when an output of
+              # this job reads no filter that lists this workflow's own path.
+              - '.github/workflows/docs.yml'
             docs:
               # `rust-docs` runs `cargo doc --workspace`, which compiles every one of the
               # 26 members the root Cargo.toml lists, so this filter names the whole
