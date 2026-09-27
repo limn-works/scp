@@ -3052,11 +3052,12 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
 
     // The bridge half of the resource gate: `validate_resource_access` must
     // read role state from the live source and pass THAT value to the shared
-    // predicate.
+    // predicate, and return the predicate's verdict.
     let bridge = "fn validate_resource_access(&self, context_id: &str, resource: ResourceKind) \
-                  -> Result<(), String> {\n    let bi = self.upgrade_bi()?;\n    \
+                  -> Result<(), AccessRefusal> {\n    let bi = self.upgrade_bi()?;\n    \
                   let role_state = Self::live_role_state(&bi, context_id)?;\n    \
-                  resource.check_access(&role_state, &self.agent_did, context_id)\n}\n\
+                  let access = resource.check_access(&role_state, &self.agent_did, context_id);\n    \
+                  access.map_err(AccessRefusal::Denied)\n}\n\
                   fn context_members(&self) {}\n";
     assert!(answers_resource_access_from_live_role_state(
         &production_code(bridge)
@@ -3076,6 +3077,23 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
     );
     assert!(!answers_resource_access_from_live_role_state(
         &production_code(&unchecked)
+    ));
+    // The predicate call survives, but the function discards its verdict and
+    // answers `Ok(())`.
+    let discarded = bridge
+        .replace("let access = resource", "let _access = resource")
+        .replace("access.map_err(AccessRefusal::Denied)", "Ok(())");
+    assert!(!answers_resource_access_from_live_role_state(
+        &production_code(&discarded)
+    ));
+    // The verdict is returned only from an inner block, and the function
+    // answers `Ok(())` after it.
+    let inner_block = bridge.replace(
+        "access.map_err(AccessRefusal::Denied)\n}",
+        "access.map_err(AccessRefusal::Denied)\n}\nOk(())\n}",
+    );
+    assert!(!answers_resource_access_from_live_role_state(
+        &production_code(&inner_block)
     ));
     // The live read and the predicate call survive only in ANOTHER function.
     let moved = "fn validate_resource_access(&self) -> Result<(), String> { Ok(()) }\n\
@@ -3109,14 +3127,17 @@ fn fn_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
 
 /// Whether the production `validate_resource_access` in `code` reads the
 /// context's role state from the live source (PyO3 and NAPI `live_role_state`,
-/// UniFFI `role_state_of`) and passes that value to
-/// `ResourceKind::check_access`.
+/// UniFFI `role_state_of`), passes that value to `ResourceKind::check_access`,
+/// and returns that call's verdict as the function's tail expression.
 fn answers_resource_access_from_live_role_state(code: &str) -> bool {
     fn_body(code, "validate_resource_access").is_some_and(|body| {
         (body.contains("let role_state = Self::live_role_state(&bi, context_id)")
             || body.contains("let role_state = live_role_state(&bi, context_id)")
             || body.contains("let role_state = Self::role_state_of(&bi, context_id)"))
-            && body.contains("resource.check_access(&role_state, &self.agent_did, context_id)")
+            && body.trim_end().ends_with(
+                "let access = resource.check_access(&role_state, &self.agent_did, context_id); \
+                 access.map_err(AccessRefusal::Denied) }",
+            )
     })
 }
 
