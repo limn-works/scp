@@ -438,7 +438,7 @@ Every push to a PR branch. Target: < 3 minutes.
 | fmt | ubuntu-latest | `cargo fmt --all -- --check` |
 | clippy | ubuntu-latest | `cargo clippy --workspace --all-targets -- -D warnings`, then the `cargo clippy -p scp-transport` command the CI Commands section above gives, which lints the two cloud blob backends `--workspace` leaves out |
 | test | ubuntu-latest, macos-latest | `cargo nextest run --workspace` |
-| optional features | ubuntu-latest | job `rust-test-optional-features` in `.github/workflows/ci.yml`. It runs the four commands the CI Commands section above gives beneath the `cargo test --workspace --doc` line, plus the optional network transports, because `--workspace` resolves none of those features |
+| optional features | ubuntu-latest, macos-latest (live PostgreSQL and S3 step: ubuntu-latest only) | job `rust-test-optional-features` in `.github/workflows/ci.yml`. It runs the four commands the CI Commands section above gives beneath the `cargo test --workspace --doc` line, plus the optional network transports, because `--workspace` resolves none of those features |
 | build-release | ubuntu-latest, macos-latest, windows-latest | `cargo build --workspace --release` |
 | doc | ubuntu-latest | `cargo test --workspace --doc`, then the `cargo doc` the CI Commands section above gives. A table cell holds no fenced block, and `scripts/tests/ci-gate/ci_gate_selftest.py` compares a documented `cargo doc` against job `rust-doc` in `.github/workflows/ci.yml` only where a shell block encloses it, so this row names that command rather than repeating its flags. |
 | deny | ubuntu-latest | `cargo deny check` |
