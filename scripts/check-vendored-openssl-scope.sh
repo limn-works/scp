@@ -3,7 +3,7 @@
 #
 # CRITERION: `openssl-src`, the crate whose build script compiles OpenSSL so that
 # `openssl-sys` links it statically, is in the dependency graph of the PyPI wheel's
-# configuration, with libsqlite3-sys depending on that `openssl-sys`, on every
+# configuration, with libsqlite3-sys's `bundled-sqlcipher-vendored-openssl` feature on, on every
 # target triple the `python-wheels` job of
 # `.github/workflows/build-matrix.yml` builds, and in the graph of no other
 # configuration this repository ships. `pip install` runs no linker, so the wheel
@@ -12,9 +12,9 @@
 #
 # Presence: `wheel_triple_occurrences` runs one `cargo tree --target <triple>` per
 # wheel triple, keeping build edges because `openssl-src` is a build-dependency of
-# `openssl-sys`, and a second one, `-i openssl-sys --depth 1`, that has to list
-# libsqlite3-sys among openssl-sys's direct dependents, because only that edge makes
-# SQLCipher compile against the vendored OpenSSL.
+# `openssl-sys`, and a second one, `-e no-dev,features -i libsqlite3-sys --depth 1`,
+# that has to list libsqlite3-sys's `bundled-sqlcipher-vendored-openssl` feature,
+# because only that feature makes SQLCipher compile against the vendored OpenSSL.
 # `scripts/check-shipped-feature-graph.sh` exempts that one function from its rule
 # that every `cargo tree` under scripts/ names `--target all` while
 # this whole file hashes to the value it pins, so an edit anywhere in this file
@@ -208,14 +208,16 @@ run_fixtures() {
 
   # A fake cargo that records its arguments and prints openssl-src for a graph naming
   # vendored-openssl on a triple other than $FAKE_DROPPED or naming a $FAKE_VENDORS word.
-  # It answers `-i openssl-sys` with libsqlite3-sys as a dependent unless $FAKE_NO_EDGE.
+  # It answers `-i libsqlite3-sys` with libsqlite3-sys's `openssl-sys` feature, and with
+  # its `bundled-sqlcipher-vendored-openssl` feature unless $FAKE_NO_FEATURE, so that
+  # fixture holds the libsqlite3-sys -> openssl-sys edge without the feature.
   printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$*" >> "$ARGV_LOG"' '[ -n "$FAKE_BROKEN" ] && exit 101' \
-    'case " $* " in *" -i openssl-sys "*) echo "openssl-sys v0.9.111"; [ -n "$FAKE_NO_EDGE" ] || echo "libsqlite3-sys v0.30.1"; exit 0;; esac' \
+    'case " $* " in *" -i libsqlite3-sys "*) echo "libsqlite3-sys v0.30.1"; echo "libsqlite3-sys feature \"openssl-sys\""; [ -n "$FAKE_NO_FEATURE" ] || echo "libsqlite3-sys feature \"bundled-sqlcipher-vendored-openssl\""; exit 0;; esac' \
     'echo "pkg v0.1.0"' \
     'for w in $FAKE_VENDORS; do case " $* " in *" $w "*) echo "openssl-src v300.5.1";; esac; done' \
     'case " $* " in *" --target all "*|*" --target $FAKE_DROPPED "*) ;; *vendored-openssl*) echo "openssl-src v300.5.1";; esac' > "$dir/bin/cargo"
   chmod +x "$dir/bin/cargo"
-  export ARGV_LOG="$dir/argv" FAKE_DROPPED=none FAKE_VENDORS="" FAKE_BROKEN="" FAKE_NO_EDGE=""
+  export ARGV_LOG="$dir/argv" FAKE_DROPPED=none FAKE_VENDORS="" FAKE_BROKEN="" FAKE_NO_FEATURE=""
   PATH="$dir/bin:$saved_path"
   FAKE_BROKEN=1 all_target_occurrences --workspace >/dev/null 2>&1; expect "a cargo that exits non-zero FAILS rather than counting zero" FAIL $?
 
@@ -227,11 +229,11 @@ run_fixtures() {
     'esac' > "$dir/gate.sh"
   local want_argv
   want_argv="$(printf '%s\n' "tree -p scp-ffi --features extension-module,vendored-openssl --target aarch64-apple-darwin -e no-dev --prefix none --format {p}" \
-    "tree -p scp-ffi --features extension-module,vendored-openssl --target aarch64-apple-darwin -e no-dev -i openssl-sys --depth 1 --prefix none --format {p}")"
+    "tree -p scp-ffi --features extension-module,vendored-openssl --target aarch64-apple-darwin -e no-dev,features -i libsqlite3-sys --depth 1 --prefix none --format {p}")"
   : > "$ARGV_LOG"
   FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_triple_occurrences aarch64-apple-darwin >/dev/null
   same "$(cat "$ARGV_LOG")" "$want_argv"
-  expect "the presence calls resolve the wheel entry on the one triple, with build edges and then openssl-sys's direct dependents" PASS $?
+  expect "the presence calls resolve the wheel entry on the one triple, with build edges and then libsqlite3-sys's enabled features" PASS $?
   : > "$ARGV_LOG"
   FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_triple_occurrences aarch64-apple-darwin scp-node --no-default-features >/dev/null
   same "$(cat "$ARGV_LOG")" "$want_argv"
@@ -242,8 +244,8 @@ run_fixtures() {
   scenario "run_gate PASSES when only the wheel vendors" PASS
   FAKE_DROPPED=x86_64-pc-windows-msvc scenario "(presence) run_gate FAILS when one wheel triple reaches no $VENDOR_CRATE" FAIL
   printf '%s\n' "$out" | grep -F "FAIL — x86_64-pc-windows-msvc reaches 0" >/dev/null; expect "(presence) it names that triple" PASS $?
-  FAKE_NO_EDGE=1 scenario "(presence) run_gate FAILS when $VENDOR_CRATE reaches the wheel but libsqlite3-sys does not depend on openssl-sys" FAIL
-  printf '%s\n' "$out" | grep -F "libsqlite3-sys does not depend on openssl-sys" >/dev/null; expect "(presence) it names the missing SQLCipher edge" PASS $?
+  FAKE_NO_FEATURE=1 scenario "(presence) run_gate FAILS when $VENDOR_CRATE reaches the wheel and libsqlite3-sys depends on openssl-sys without bundled-sqlcipher-vendored-openssl" FAIL
+  printf '%s\n' "$out" | grep -F "libsqlite3-sys's bundled-sqlcipher-vendored-openssl feature is off" >/dev/null; expect "(presence) it names the missing SQLCipher feature" PASS $?
   FAKE_VENDORS=scp-node scenario "(absence) run_gate FAILS when another shipped configuration reaches $VENDOR_CRATE" FAIL
   printf '%s\n' "$out" | grep -F "FAIL — scp-node| reaches 1" >/dev/null; expect "(absence) it names scp-node" PASS $?
   # The absence loop skips the wheel entry by exact match. Vendoring the scp-ffi
@@ -290,16 +292,16 @@ run_fixtures() {
 # two per-triple `cargo tree` calls its `--target all` rule exempts.
 #
 # wheel_triple_occurrences <triple>: how many `openssl-src` the wheel's graph on one
-# triple holds, or 0 when libsqlite3-sys does not depend on openssl-sys there. The
-# package and features come from wheel_line, never from the caller's arguments. A
-# cargo failure fails the count. libsqlite3-sys 0.30 declares openssl-sys as an
-# optional dependency that only its `bundled-sqlcipher-vendored-openssl` feature
-# enables, and only that feature makes its build script compile SQLCipher against
-# openssl-sys; under plain `bundled-sqlcipher` it links the build host's OpenSSL. So
-# an `openssl-src` that another crate pulls in, with no libsqlite3-sys -> openssl-sys
-# edge, counts 0, because it proves nothing about the crypto SQLCipher links.
+# triple holds, or 0 when libsqlite3-sys's `bundled-sqlcipher-vendored-openssl` feature
+# is off there. The package and features come from wheel_line, never from the caller's
+# arguments. A cargo failure fails the count. libsqlite3-sys 0.30's build script
+# compiles SQLCipher against openssl-sys's headers only under that feature; otherwise
+# it links the build host's OpenSSL. The libsqlite3-sys -> openssl-sys edge proves
+# nothing: libsqlite3-sys declares openssl-sys optional without `dep:`, so its implicit
+# `openssl-sys` feature makes the same edge. So an `openssl-src` in the graph counts 0
+# unless that feature is on.
 wheel_triple_occurrences() {
-  local triple="$1" entry tree dependents
+  local triple="$1" entry tree features
   local -a args=()
   entry="$(wheel_line)" || return 1
   entry="${entry#*$'\t'}"
@@ -307,10 +309,10 @@ wheel_triple_occurrences() {
   tree="$(cargo tree -p "${entry%%|*}" ${args[@]+"${args[@]}"} --target "$triple" -e no-dev --prefix none --format '{p}')" ||
     { echo "cargo tree failed for ${entry%%|*} on $triple" >&2; return 1; }
   if [[ "$(count_in "$tree")" -gt 0 ]]; then
-    dependents="$(cargo tree -p "${entry%%|*}" ${args[@]+"${args[@]}"} --target "$triple" -e no-dev -i openssl-sys --depth 1 --prefix none --format '{p}')" ||
-      { echo "cargo tree -i openssl-sys failed for ${entry%%|*} on $triple" >&2; return 1; }
-    if ! printf '%s\n' "$dependents" | grep -E '^libsqlite3-sys v' >/dev/null; then
-      echo "$triple: $VENDOR_CRATE is in the wheel's graph, but libsqlite3-sys does not depend on openssl-sys, so SQLCipher links the build host's OpenSSL" >&2
+    features="$(cargo tree -p "${entry%%|*}" ${args[@]+"${args[@]}"} --target "$triple" -e no-dev,features -i libsqlite3-sys --depth 1 --prefix none --format '{p}')" ||
+      { echo "cargo tree -i libsqlite3-sys failed for ${entry%%|*} on $triple" >&2; return 1; }
+    if ! printf '%s\n' "$features" | grep -xF 'libsqlite3-sys feature "bundled-sqlcipher-vendored-openssl"' >/dev/null; then
+      echo "$triple: $VENDOR_CRATE is in the wheel's graph, but libsqlite3-sys's bundled-sqlcipher-vendored-openssl feature is off, so SQLCipher links the build host's OpenSSL" >&2
       tree=""
     fi
   fi

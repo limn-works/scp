@@ -795,7 +795,7 @@ run_step format cargo fmt --all -- --check
 # graph.sh` runs three `cargo tree` resolutions per entry of its ARTIFACTS list plus its
 # default-members and fixture resolutions, `scripts/check-protocol-deps.sh` runs one, and
 # `scripts/check-vendored-openssl-scope.sh` runs two per wheel triple on a passing run
-# (the second, `-i openssl-sys`, whenever the first finds openssl-src), one per other
+# (the second, `-i libsqlite3-sys`, whenever the first finds openssl-src), one per other
 # shipped configuration and one per workspace root, and
 # `cargo tree` compiles nothing and takes no build lock: a 2026-09-13 run measured the
 # first two at 12.9 seconds and 391 ms while another worktree held that lock. A workspace
