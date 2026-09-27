@@ -636,6 +636,9 @@ EXTRA_FEATURE_CHECKS=(
     "scp-transport|quic,http3,udp,coap"
     "scp-transport|combined,local-cache"
     "scp-testing|sqlite"
+    "scp-transport|sqlite-blob,redb-blob,postgres-blob,s3-blob,startup"
+    "scp-node|cloud-blobs,testing"
+    "scp-relay|cloud-blobs"
 )
 
 # The packages the `wasm-protocol` job of `.github/workflows/ci.yml` compiles for

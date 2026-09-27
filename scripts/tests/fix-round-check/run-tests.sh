@@ -339,8 +339,8 @@ gate_paths() {
 # answer from `scp-ffi`. It also holds one file under no crate directory, which case 9
 # changes.
 #
-# It holds a fourth manifest, `crates/scp-transport`, because two of the three entries in
-# the runner's EXTRA_FEATURE_CHECKS array name that package, and case 13 reads both
+# It holds a fourth manifest, `crates/scp-transport`, because three of the six entries in
+# the runner's EXTRA_FEATURE_CHECKS array name that package, and case 13 reads the three
 # `cargo check` commands they produce. It holds `bindings/python/scp_sdk/context.py` for
 # case 12, `Cargo.toml` for case 11 and `.github/workflows/ci.yml` for case 17, and the
 # fixture's base commit holds all three, so each case decides for itself whether its own
@@ -773,6 +773,13 @@ if grep -qF 'check -p scp-transport --all-targets --features combined,local-cach
     report "case 13 compiles the blob-backend features the optional-feature test lane names" 0 ""
 else
     report "case 13 compiles the blob-backend features the optional-feature test lane names" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13.harness/cargo.log")"
+fi
+# The PostgreSQL and S3 backends compile only under features no workspace member's
+# dependency declaration requests, and the `rust-clippy` job names them in its own command.
+if grep -qF 'check -p scp-transport --all-targets --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup' "$FIXTURE13.harness/cargo.log"; then
+    report "case 13 compiles the cloud blob backends the rust-clippy job lints" 0 ""
+else
+    report "case 13 compiles the cloud blob backends the rust-clippy job lints" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13.harness/cargo.log")"
 fi
 
 # ── Case 14: the gate whose diff range holds no uncommitted edit ─────────────────────

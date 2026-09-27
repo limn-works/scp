@@ -1006,8 +1006,12 @@ jobs:
           cargo clippy -p scp-transport --features quic,http3,udp,coap --all-targets -- -D warnings
           # scp-node and scp-relay compile the PostgreSQL and S3 blob backends
           # only under their off-by-default `cloud-blobs` feature, which the
-          # --workspace sweep above leaves off. Job rust-test-optional-features runs
-          # the tests that select them.
+          # --workspace sweep above leaves off. The first command lints the
+          # backends' own modules and their `#[ignore]`d unit tests, which need a
+          # live PostgreSQL or S3 endpoint to run; the second lints the two
+          # binaries' cloud-blobs builds and their backend-selection tests, which
+          # job rust-test-optional-features runs.
+          cargo clippy -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings
           cargo clippy -p scp-node -p scp-relay --features scp-node/cloud-blobs,scp-node/testing,scp-relay/cloud-blobs --all-targets -- -D warnings
 
   # This job runs `cargo nextest run --workspace`, so a merge gate rests on it.
