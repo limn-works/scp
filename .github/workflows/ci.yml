@@ -1836,8 +1836,11 @@ jobs:
         run: python3.12 -m pip install 'maturin>=1.0,<2.0'
       # No --features and no --manifest-path: maturin reads both from the
       # `[tool.maturin]` table of bindings/python/pyproject.toml, which is where the
-      # release reads them, so this step compiles what the release compiles.
+      # release reads them. RUSTFLAGS repeats the workflow-level `-D warnings` of
+      # build-matrix.yml, so a warning that fails the release fails this step too.
       - name: Build the wheel from the project file the release builds from
+        env:
+          RUSTFLAGS: "-D warnings"
         run: |
           cd bindings/python
           maturin build --out dist -i python3.10 python3.12 --locked

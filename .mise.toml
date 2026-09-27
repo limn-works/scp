@@ -1,5 +1,8 @@
 # mise installs every tool this repository needs EXCEPT Rust, and it names no Rust
 # version. rustup installs Rust, and README.md lists rustup among the prerequisites.
+# Neither installs the full perl, plus make on Linux and macOS, that the Python
+# binding's `maturin develop` needs to compile OpenSSL; bindings/python/README.md
+# §Requirements names them.
 #
 # WHY. mise exports one `RUSTUP_TOOLCHAIN` for every command it runs, and it computes that
 # value once from the directory the shell sat in. `RUSTUP_TOOLCHAIN` overrides a
