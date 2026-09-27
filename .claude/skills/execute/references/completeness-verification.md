@@ -4,7 +4,7 @@ This reference defines how to verify that an implementation subagent actually co
 
 ## Verification Checklist
 
-Run every check in order. A story passes only if ALL checks pass.
+Run every check in order. A story passes only if every check passes.
 
 ### 1. Acceptance Criteria Audit
 
@@ -23,7 +23,7 @@ Record the result for each:
   [MISS] "Tokens include tenant ID" — no evidence of tenant_id in JWT claims
 ```
 
-If ANY criterion is FAIL or MISS, verification fails.
+If any criterion is FAIL or MISS, verification fails.
 
 ### 2. Stub and Placeholder Detection
 
@@ -91,7 +91,7 @@ Build failures or test failures are verification failures.
 
 ### Relaunch Decision
 
-If verification fails, do NOT launch a reviewer. Instead:
+If verification fails, do not launch a reviewer. Instead:
 
 1. Compile a specific list of what failed:
    - Which acceptance criteria are FAIL or MISS
@@ -103,7 +103,7 @@ If verification fails, do NOT launch a reviewer. Instead:
    - The original story object
    - The previous agent's branch as a starting point (so it doesn't redo completed work)
    - The explicit failure list with instructions to address each item
-   - A strengthened completeness warning
+   - The completeness standard from the original prompt (section 7, Completeness Standard, of `subagent-context.md`)
 
 3. Include in the relaunch prompt:
    ```

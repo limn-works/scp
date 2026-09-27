@@ -90,7 +90,7 @@ For each PRD file in `.docs/prds/`:
 2. For every story marked `done`:
    - Read every file listed in the story's `files` array
    - Check every acceptance criterion against actual code
-   - If ANY criterion is not met, that's a finding: "falsely marked done"
+   - If any criterion is not met, that's a finding: "falsely marked done"
 3. For every story marked `pending` or `in-progress`:
    - Check if implementation actually exists (partially implemented but not tracked)
 4. Run PRD validation: `python3.12 scripts/validate-prd.py`
@@ -209,7 +209,7 @@ Every issue must contain enough detail for autonomous implementation. Structure:
 
 ### 4.2 — Story-Structured Issues
 
-Do NOT create PRD stories. File GitHub issues instead — but enforce PRD story structure in the issue body so findings are directly actionable by agents. Every issue body must include these sections (mirroring `.docs/standards/prd.md` fields):
+Do not create PRD stories. File GitHub issues instead — but enforce PRD story structure in the issue body so findings are directly actionable by agents. Every issue body must include these sections (mirroring `.docs/standards/prd.md` fields):
 
 ```markdown
 ## Summary
@@ -286,7 +286,7 @@ After all stages complete, produce a summary:
 ## Subagent Dispatch Strategy
 
 - **Max 3 concurrent agents** to avoid rate limits
-- Each agent gets ONE focused task (one spec section, one crate, one bridge)
+- Each agent gets one focused task (one spec section, one crate, one bridge)
 - Agents that will modify files or run tests: use worktree isolation
 - Read-only audit agents: no isolation needed
 - Agent reports must include specific file paths and line numbers

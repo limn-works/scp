@@ -20,11 +20,10 @@ Diff:
 {GIT_DIFF_FOR_STORY_FILES}
 
 Instructions:
-1. Read CLAUDE.md at the project root
-2. Read every file listed in the story's sources array — in full, not just referenced sections. Adjacent sections often contain applicable constraints.
-3. Read .docs/ directories in the modified feature areas (ADRs, specs, conventions)
-4. Read every line of the diff — do not skip files or skim hunks
-5. For each modified file, read surrounding unchanged code to understand the full context
+1. Read every file listed in the story's sources array — in full, not just referenced sections. Adjacent sections often contain applicable constraints.
+2. Read .docs/ directories in the modified feature areas (ADRs, specs, conventions)
+3. Read every line of the diff — do not skip files or skim hunks
+4. For each modified file, read surrounding unchanged code to understand the full context
 
 Review checklist:
 - Does the diff satisfy EACH acceptance criterion? Report pass/fail per criterion with source citations.
@@ -98,7 +97,7 @@ Each agent receives:
 2. A summary of all stories executed (IDs, titles, domains)
 3. The PRD's description and gate structure
 4. Instructions to review through their specific lens (domain from the agents table)
-5. Instructions to read CLAUDE.md and relevant .docs/ before reviewing
+5. Instructions to read the relevant .docs/ before reviewing
 
 Launch all roster agents simultaneously. No worktree isolation — reviewers are read-only.
 
@@ -134,7 +133,7 @@ Before processing, scan all LEARNING items. Reclassify as ACTION if any describe
 5. Run the full test suite
 6. If tests pass, commit: `fix(<scope>): address review findings for <story-id>`
 7. If tests fail, revert the fix commits — the original code was green. Log the failure.
-8. **If fixes introduced new issues**, launch another review cycle on the fix diff. Repeat fix → review → fix up to **3 cycles** per story. After 3 cycles, escalate to the user — do not silently move on.
+8. **If fixes introduced new issues**, launch another review cycle on the fix diff. Repeat fix → review → fix until a review pass returns zero findings twice in a row (CLAUDE.md, Change protocol).
 
 The goal is a clean final state, not a single pass. Completeness means the code that ships has no known issues, not that one review was attempted.
 
@@ -166,15 +165,15 @@ Review findings — whether ACTION or LEARNING — **must never be dismissed.** 
 | "if we choose to" | The reviewer chose. By flagging it, they chose. |
 | "would be nice to have" | If it's worth flagging, it's worth fixing. |
 | "is a nit" | Nits get fixed. There is no severity classification — only ACTION and LEARNING. |
-| "not from our changes" / "pre-existing" | If the review surfaces a pre-existing issue that the current changes interact with, touch, or should have caught — fix it. Do not leave known bugs adjacent to new code. The only exception is something that requires a fresh design pass. |
-| "tracked separately" / "filed an issue" | Creating a tracking issue instead of doing the work is deferral with extra steps. Fix it now (unless it requires a design pass). |
+| "not from our changes" / "pre-existing" | If the review surfaces a pre-existing issue in code the change adds, alters, or needs — fix it. A defect in code the change neither touches nor needs goes into a GitHub issue that the PR description links. Either fix it or file it. |
+| "tracked separately" / "filed an issue" | For code the change adds, alters, or needs, creating a tracking issue instead of doing the work is deferral with extra steps. Fix it now (unless it requires a design pass). |
 | "known intentional gap" | There are no intentional gaps. If the gap is known, it should already be fixed. |
 | "planned deferral" | These two words never belong next to each other in this order. Planned deferrals are forbidden. See completeness rules. |
 | "updated the comment to note it" | Adding a comment about a problem is not fixing the problem. Fix the code, not the comment. |
 
 ### How to handle edge cases
 
-- **Genuinely unrelated pre-existing bug** in an untouched file: This is the only case where "pre-existing" is valid. If the reviewer flagged it in a file that was not modified as part of this PRD, acknowledge the finding, save it as a LEARNING to Vestige, and move on. But if ANY of the PRD's changes touch that file or interact with the buggy code path — fix it.
+- **Genuinely unrelated pre-existing bug** in an untouched file: This is the only case where "pre-existing" is valid. If the reviewer flagged it in code the PRD's changes neither touch nor need, file a GitHub issue for it, link the issue from the PR description, and save it as a LEARNING to Vestige. If any of the PRD's changes touch that code or need the buggy code path — fix it.
 - **Finding requires upstream spec change**: If a fix would contradict the spec, that means the spec needs updating first. Fix the spec, then fix the code. This is not deferral — it's the artifact flow (specs → code, never reverse).
 - **Finding requires true design consideration**: This is the only acceptable reason to not do work from a piece of feedback. In this case, make a github issue with as much detail and as many artifact, source, and commit references as possible, the context that the need was uncovered in (what change was being made that surfaced the comment), the scope of the design, options, and a suggestion.
 - **Finding is factually wrong**: If a reviewer's finding is based on a misunderstanding of the code or spec, dismiss it with a specific citation to the spec section or code that proves it wrong. "I disagree" is not a citation.

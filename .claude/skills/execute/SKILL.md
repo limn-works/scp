@@ -52,7 +52,6 @@ If specific story IDs were provided, filter to only those stories (and validate 
 
 Before dispatching agents, gather context they will need:
 
-- Read CLAUDE.md (project root and any relevant subdirectories)
 - Read `.docs/standards/` relevant to the PRD's domain
 - Search Vestige for patterns and decisions relevant to the stories' domains
 - Identify the project's test command and CI pipeline
@@ -66,9 +65,9 @@ Process one wave at a time. Within each wave, launch all stories in parallel.
 For each story in the current wave, launch one subagent with `isolation: "worktree"`. Read `references/subagent-context.md` for the full prompt template. Every subagent must receive:
 
 1. The **full story object** — read it from the PRD with `jq '.stories[] | select(.id == "STORY-ID")' <prd-path>`
-2. **Project context** — CLAUDE.md contents, relevant standards, Vestige patterns
+2. **Project context** — relevant standards and Vestige patterns. Leave CLAUDE.md out: a non-fork subagent loads every CLAUDE.md level itself
 3. **Source artifacts** — list every file in the story's `sources` array; instruct the agent to read each one in full before writing code
-4. **Explicit instructions** to: read CLAUDE.md, trace all artifact sources, use Vestige for lookup and memory, work only in the assigned worktree
+4. **Explicit instructions** to: trace all artifact sources, use Vestige for lookup and memory, work only in the assigned worktree
 
 Launch all subagents for the wave simultaneously. Do not poll or check on them — results arrive automatically.
 
@@ -116,15 +115,15 @@ Launch one review subagent per completed story. **No worktree isolation** — re
 
 Review findings are binary: **ACTION** (must fix) or **LEARNING** (worth remembering).
 
-**ACTION items**: Launch a fix subagent (with worktree isolation) to address them. After fixes, re-run tests. If tests fail, revert the fix commits. If fixes introduce new issues, review again and fix again — up to 3 review-fix cycles per story. After 3 cycles, escalate to the user.
+**ACTION items**: Launch a fix subagent (with worktree isolation) to address them. After fixes, re-run tests. If tests fail, revert the fix commits. If fixes introduce new issues, review again and fix again. Repeat until a review pass returns zero findings twice in a row.
 
 **LEARNING items**: Save to Vestige immediately using `smart_ingest` or `codebase(action: "remember_pattern")`. Update project artifacts (`.docs/`, CLAUDE.md) if the learning represents a convention or constraint.
 
-**Findings are not dismissible.** Read `references/review-protocol.md` §Forbidden Dismissals for the full list. No finding may be dismissed as "out of scope", "a nit", "pre-existing", "future enhancement", or any similar deflection. If a reviewer flags it, it gets fixed — period.
+**Findings are not dismissible.** Read `references/review-protocol.md` §Forbidden Dismissals for the full list. No finding may be dismissed as "out of scope", "a nit", "pre-existing", "future enhancement", or any similar deflection. Fix every finding about code the change adds, alters, or needs. A defect in code the change neither touches nor needs goes into a GitHub issue, and the PR description links it.
 
 ## Phase 4: Final Review
 
-After ALL stories across ALL waves are implemented, verified, reviewed, and merged:
+After all stories across all waves are implemented, verified, reviewed, and merged:
 
 ### 4.1 — Discover Review Agents
 
@@ -141,7 +140,7 @@ Launch **all selected review agents in parallel**, each reviewing the complete d
 
 ### 4.3 — Process Final Findings
 
-Same as Phase 3.2: fix ACTIONs, save LEARNINGs. Review-fix cycles continue until all findings are resolved (max 3 cycles). After all fixes, run the full test suite one final time.
+Same as Phase 3.2: fix ACTIONs, save LEARNINGs. Review-fix cycles continue until a review pass returns zero findings twice in a row. After all fixes, run the full test suite one final time.
 
 ## Phase 5: Push and PR
 
@@ -165,8 +164,8 @@ Push the branch and open a PR using `gh pr create`. The PR title should summariz
 6. **Sources are truth.** When a story's `sources` reference spec files or ADRs, those documents govern. If the story text conflicts with the source, follow the source.
 7. **Memory is continuous.** Instruct every subagent to read and write Vestige. Decisions, patterns, and gotchas discovered during execution must be persisted for future sessions.
 8. **Quick local check before push, full gate set in CI.** The quick check must pass before the push. A red CI run is never acceptable: fix the code the failing job rejected before the PR merges.
-9. **Every finding gets addressed.** Review feedback is never dismissed. No finding is "out of scope", "a nit", "pre-existing", or "for later." If a reviewer flags it, it gets fixed or the code gets changed. See `references/review-protocol.md` §Forbidden Dismissals.
-10. **Review-fix cycles continue until clean.** If a fix introduces a new issue, review again and fix again — up to 3 cycles. Completeness means the final code is clean, not that one pass was attempted.
+9. **Every finding gets addressed.** Review feedback is never dismissed. No finding is "out of scope", "a nit", "pre-existing", or "for later." Fix every finding about code the change adds, alters, or needs. A defect in code the change neither touches nor needs goes into a GitHub issue, and the PR description links it. See `references/review-protocol.md` §Forbidden Dismissals.
+10. **Review-fix cycles continue until clean.** If a fix introduces a new issue, review again and fix again, until a review pass returns zero findings twice in a row. Completeness means the final code is clean, not that one pass was attempted.
 
 ## Additional Resources
 

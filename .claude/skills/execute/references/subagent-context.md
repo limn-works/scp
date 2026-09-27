@@ -11,7 +11,7 @@ Build each subagent prompt from these sections, in order:
 ```
 Implement story {STORY_ID}: {STORY_TITLE}
 
-Work ONLY on this story. Do not fix adjacent code, add unrequested features, or refactor code that seems inconsistent with other specs. Scope is sacred.
+Work only on this story. Do not fix adjacent code, add unrequested features, or refactor code that seems inconsistent with other specs. Scope is sacred.
 ```
 
 ### 2. Story Object
@@ -26,12 +26,9 @@ Embed the entire object in the prompt. Do not summarize or omit fields.
 
 ### 3. Project Context
 
-Include CLAUDE.md contents (summarized if very long). Include relevant standards from `.docs/standards/`. Include any Vestige patterns or decisions found during Phase 1.3.
+Include relevant standards from `.docs/standards/` and any Vestige patterns or decisions found during Phase 1.3. Do not include CLAUDE.md: a non-fork subagent loads every CLAUDE.md level itself.
 
 ```
-Project instructions (CLAUDE.md):
-{CLAUDE_MD_CONTENTS}
-
 Relevant standards:
 {STANDARDS_CONTENTS}
 
@@ -54,21 +51,20 @@ These are the source of truth. If the story fields conflict with or omit details
 
 ```
 Before writing any code:
-1. Read CLAUDE.md at the project root
-2. Read every file listed in the story's sources array — in full, line by line
-3. Search the codebase for existing implementations before assuming something is missing
-4. Search Vestige for relevant patterns: search(query: "{project} {story-domain} patterns gotchas")
+1. Read every file listed in the story's sources array — in full, line by line
+2. Search the codebase for existing implementations before assuming something is missing
+3. Search Vestige for relevant patterns: search(query: "{project} {story-domain} patterns gotchas")
 
 While working:
-5. Trace provenance — every non-trivial implementation choice must reference the source document and section that drove it
-6. When making a judgment call (source is ambiguous or silent), document it explicitly in a comment and in your commit message
-7. Use Vestige to store decisions and patterns you discover: codebase(action: "remember_decision", ...) or codebase(action: "remember_pattern", ...)
+4. Trace provenance — every non-trivial implementation choice must reference the source document and section that drove it
+5. When making a judgment call (source is ambiguous or silent), document it explicitly in a comment and in your commit message
+6. Use Vestige to store decisions and patterns you discover: codebase(action: "remember_decision", ...) or codebase(action: "remember_pattern", ...)
 
 After implementation:
-8. Verify every acceptance criterion is addressed — check them one by one
-9. Run the project's test suite and fix any failures
-10. Ensure zero TODOs, FIXMEs, stubs, or placeholder values in your code
-11. If the story changes project-wide patterns or APIs, update relevant .docs/ files and CLAUDE.md
+7. Verify every acceptance criterion is addressed — check them one by one
+8. Run the project's test suite and fix any failures
+9. Ensure zero TODOs, FIXMEs, stubs, or placeholder values in your code
+10. If the story changes project-wide patterns or APIs, update relevant .docs/ files and CLAUDE.md
 ```
 
 ### 6. Worktree Awareness
@@ -80,11 +76,9 @@ You are working in an isolated git worktree. Your changes will be merged into th
 ### 7. Completeness Standard
 
 ```
-COMPLETENESS IS THE ONLY ACCEPTABLE OUTCOME.
+Report the story complete only when every acceptance criterion is fully satisfied, every field the spec defines has a real value (never None when the data exists elsewhere in the system), and every edge case the source mentions is handled. A story with any of these unmet is not complete.
 
-Two states exist: not started and finished. There is no partial. Every field the spec defines must have a real value — never None when data exists elsewhere in the system. Every acceptance criterion must be fully satisfied. Every edge case the source mentions must be handled.
-
-If you cannot complete the story fully, explain exactly what blocked you and what remains. Do not claim completion if any criterion is unmet.
+If you cannot complete the story fully, report what blocked you and what remains, and do not claim completion.
 ```
 
 ## Prompt Assembly
@@ -104,8 +98,7 @@ If the assembled prompt exceeds ~30k tokens (large stories with many sources), p
 
 1. Full story object (always include)
 2. Source artifacts (always include — instruct agent to read them, don't inline if too large)
-3. CLAUDE.md (always include, summarize if needed)
-4. Vestige context (include if relevant, skip if prompt is already large)
-5. Standards (instruct agent to read them rather than inlining)
+3. Vestige context (include if relevant, skip if prompt is already large)
+4. Standards (instruct agent to read them rather than inlining)
 
-The instruction to "read CLAUDE.md" and "read source files" is always more reliable than inlining truncated content.
+An instruction to read a source file is more reliable than inlining truncated content.
