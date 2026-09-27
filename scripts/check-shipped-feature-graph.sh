@@ -9,7 +9,16 @@
 # scp-relay binaries), the COMPLETE resolved feature set of the SCP
 # workspace crates is a SUBSET of a single explicit permitted-production allowlist
 # (one superset list covering all five artifacts) permitting durability-only +
-# real-backend features and ZERO nullifier features. Any resolved SCP-crate
+# real-backend features and ZERO nullifier features. Absence from this list means
+# one thing: no shipped build may resolve that feature. Absence does not say why
+# the list leaves a feature out. The features it leaves out include every
+# nullifier; the real-backend features `scp-transport/postgres-blob` and
+# `scp-transport/s3-blob`, which every shipped artifact is built without; the
+# `scp-node/cloud-blobs` and `scp-relay/cloud-blobs` features, the off-by-default
+# features that compile those two backends (ADR-062, capability injection,
+# §Enforcement G1); and optional transport features that no shipped build enables,
+# such as `scp-node/quic`, `scp-node/upnp`, `scp-transport/quic` and
+# `scp-transport/upnp`. Any resolved SCP-crate
 # feature that is NOT on this allowlist — named or novel, present or future —
 # FAILS this gate. This gate's soundness invariant — shipped-graph
 # feature-absence ≡ nullifier-type absence — holds for every `testing`-gated
@@ -235,9 +244,7 @@ scp-protocol/default
 scp-relay-client/default
 scp-runtime/default
 scp-transport/default
-scp-transport/postgres-blob
 scp-transport/redb-blob
-scp-transport/s3-blob
 scp-transport/sqlite-blob
 scp-transport/startup
 EOF
@@ -251,7 +258,7 @@ EOF
 #     feature-arg string is EMPTY. This matches the Dockerfile
 #     `cargo build --release -p scp-relay -p scp-node` and the `cargo publish`
 #     shipping config. NEITHER binary has a `server` feature (scp-node has no
-#     `default` block wiring one; scp-relay has no `[features]` table at all),
+#     `default` block wiring one; scp-relay's `[features]` table holds only the off-by-default `cloud-blobs`),
 #     so passing `--features server` here would ERROR — they are correctly gated
 #     with an empty feature-arg string, not with `--features server`.
 #
@@ -957,9 +964,13 @@ run_gate() {
     else
       echo "   FAIL — resolved features NOT on the permitted-production allowlist:"
       printf '%s\n' "$offenders" | sed 's/^/       ✗ /'
-      echo "   These are test-harness / nullifier features that must NOT reach a"
-      echo "   shipped artifact. A shipped build carries only durability-only +"
-      echo "   real-backend features (ADR-062 §Decision 6; ZERO-nullifier mandate,"
+      echo "   The allowlist leaves each of these out, so no shipped artifact may"
+      echo "   resolve it. The features the allowlist leaves out include every"
+      echo "   test-harness / nullifier feature; scp-transport/postgres-blob and"
+      echo "   scp-transport/s3-blob; scp-node/cloud-blobs and scp-relay/cloud-blobs,"
+      echo "   the off-by-default features that compile those two backends; and"
+      echo "   optional transport features such as scp-node/quic and scp-node/upnp"
+      echo "   (ADR-062 §Decision 6 and §Enforcement G1; ZERO-nullifier mandate,"
       echo "   zero nullifier exceptions)."
       failures=$((failures + 1))
     fi

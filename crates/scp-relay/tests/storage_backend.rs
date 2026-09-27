@@ -8,8 +8,84 @@
 //! - Invalid backend names produce a non-zero exit and descriptive error (AC 9)
 //! - `postgres` without `SCP_RELAY_DATABASE_URL` produces a non-zero exit (AC 10)
 //! - `s3` without `SCP_RELAY_S3_BUCKET` produces a non-zero exit (AC 6)
+//! - a build without `cloud-blobs` rejects `postgres` and `s3` instead, names
+//!   the feature, and opens no other store
 
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+/// Runs `command` and returns its output, killing the child and failing the
+/// test when it has not exited after 30 seconds.
+///
+/// The caller expects `scp-relay` to reject its configuration and exit. A
+/// regression that falls back to another store starts a relay that serves
+/// forever, and this deadline turns that hang into a failed assertion.
+fn output_within_deadline(command: &mut Command) -> Output {
+    let mut child = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn scp-relay");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().expect("try_wait").is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("scp-relay did not exit within 30 seconds, so it is serving a fallback store");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    child.wait_with_output().expect("collect scp-relay output")
+}
+
+/// Asserts that `scp-relay` exits non-zero on `SCP_RELAY_STORAGE_BACKEND=backend`,
+/// in lower and in upper case, with `required_var` unset, and opens no `SQLite`
+/// store in its place.
+///
+/// The expected error follows what the binary compiled, read from the
+/// `scp-transport` this test links, and not from this package's own
+/// `cloud-blobs` feature: cargo unifies `scp-transport`'s features across every
+/// package one invocation builds, so `scp-node`'s `cloud-blobs` alone compiles
+/// the arm into this binary too. A build with the arm names `required_var`; a
+/// build without it names the missing `cloud-blobs` feature. This package's
+/// own `cloud-blobs` feature decides one case: a build with it on must list
+/// the arm, so the test fails when that feature stops enabling
+/// `scp-transport/postgres-blob` or `scp-transport/s3-blob`.
+fn assert_cloud_backend_fails_closed(backend: &str, required_var: &str) {
+    let valid = scp_transport::startup::valid_backends();
+    let compiled = valid.split(", ").any(|name| name == backend);
+    assert!(
+        !cfg!(feature = "cloud-blobs") || compiled,
+        "scp-relay's cloud-blobs feature is on, but this build lists only {valid} and not '{backend}'"
+    );
+    for value in [backend.to_owned(), backend.to_uppercase()] {
+        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = tmp.path().join("must-not-exist.db");
+        let output = output_within_deadline(
+            Command::new(relay_bin())
+                .env("SCP_RELAY_STORAGE_BACKEND", &value)
+                .env("SCP_RELAY_STORAGE_PATH", &db_path)
+                .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+                .env_remove(required_var)
+                .env_remove("RUST_LOG"),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{value}: {stderr}");
+        if compiled {
+            assert!(stderr.contains(required_var), "{value}: {stderr}");
+        } else {
+            assert!(
+                stderr.contains(&format!("'{backend}' is not compiled into this binary")),
+                "{value}: {stderr}"
+            );
+            assert!(
+                stderr.contains("--features cloud-blobs"),
+                "{value}: {stderr}"
+            );
+        }
+        assert!(!db_path.exists(), "{value} opened {}", db_path.display());
+    }
+}
 
 /// Returns the path to the compiled `scp-relay` binary.
 ///
@@ -54,49 +130,19 @@ fn invalid_backend_exits_with_error() {
 }
 
 /// AC 10: Selecting `postgres` without `SCP_RELAY_DATABASE_URL` exits with
-/// a descriptive error.
+/// an error naming that variable, or, in a build without `cloud-blobs`, with
+/// an error naming the feature.
 #[test]
 fn postgres_without_url_exits_with_error() {
-    let output = Command::new(relay_bin())
-        .env("SCP_RELAY_STORAGE_BACKEND", "postgres")
-        .env_remove("SCP_RELAY_DATABASE_URL")
-        .env_remove("RUST_LOG")
-        .output()
-        .expect("failed to execute scp-relay");
-
-    assert!(
-        !output.status.success(),
-        "expected non-zero exit when postgres URL is missing"
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("SCP_RELAY_DATABASE_URL"),
-        "error should mention the required env var; got: {stderr}"
-    );
+    assert_cloud_backend_fails_closed("postgres", "SCP_RELAY_DATABASE_URL");
 }
 
-/// AC 6: Selecting `s3` without `SCP_RELAY_S3_BUCKET` exits with a
-/// descriptive error.
+/// AC 6: Selecting `s3` without `SCP_RELAY_S3_BUCKET` exits with an error
+/// naming that variable, or, in a build without `cloud-blobs`, with an error
+/// naming the feature.
 #[test]
 fn s3_without_bucket_exits_with_error() {
-    let output = Command::new(relay_bin())
-        .env("SCP_RELAY_STORAGE_BACKEND", "s3")
-        .env_remove("SCP_RELAY_S3_BUCKET")
-        .env_remove("RUST_LOG")
-        .output()
-        .expect("failed to execute scp-relay");
-
-    assert!(
-        !output.status.success(),
-        "expected non-zero exit when S3 bucket is missing"
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("SCP_RELAY_S3_BUCKET"),
-        "error should mention the required env var; got: {stderr}"
-    );
+    assert_cloud_backend_fails_closed("s3", "SCP_RELAY_S3_BUCKET");
 }
 
 /// AC 8: `SQLite` blob persistence across reopens.

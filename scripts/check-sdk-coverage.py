@@ -435,7 +435,7 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     # All four bindings expose an idiomatic wrapper over the typed
     # CapabilityValidationRecord and consume it inside their evaluate_trust /
     # evaluateTrust trust-signal wrapper (Python SCP.ucan_evaluate, TypeScript
-    # SCP.ucanEvaluate, Kotlin SCP.ucanEvaluate (Scp.kt), Swift SCP.ucanEvaluate
+    # SCP.ucanEvaluate, Kotlin SCP.ucanEvaluate (SCP.kt), Swift SCP.ucanEvaluate
     # (Trust.swift)).
     ("UCAN", "evaluate"): {
         "python": ["ucan_evaluate", "evaluate_trust"],

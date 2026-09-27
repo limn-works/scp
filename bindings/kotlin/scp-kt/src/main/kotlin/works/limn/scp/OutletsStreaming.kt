@@ -180,11 +180,12 @@ public data class OutletStreamChunk(
      * `terminal` flag is set).
      */
     public val isTerminal: Boolean
-        get() = when (kind) {
-            "end" -> true
-            "error" -> payload["terminal"]?.jsonPrimitive?.booleanOrNull == true
-            else -> false
-        }
+        get() =
+            when (kind) {
+                "end" -> true
+                "error" -> payload["terminal"]?.jsonPrimitive?.booleanOrNull == true
+                else -> false
+            }
 
     internal companion object {
         private val JSON = Json { ignoreUnknownKeys = true }
@@ -693,8 +694,9 @@ internal class ScpStreamingSagaNative(
             estimatedChunkCount = estimatedChunkCount,
         )
 
-    override suspend fun outletStreamingSagaPollNext(sagaId: String): ByteArray? =
-        inner.outletStreamingSagaPollNext(sagaId = sagaId)
+    override suspend fun outletStreamingSagaPollNext(sagaId: String): ByteArray? {
+        return inner.outletStreamingSagaPollNext(sagaId = sagaId)
+    }
 }
 
 /**

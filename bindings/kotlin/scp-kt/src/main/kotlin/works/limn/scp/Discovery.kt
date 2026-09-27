@@ -249,8 +249,9 @@ class DiscoveryBridge internal constructor(
      * @param address The address string to normalize.
      * @return Normalized address string.
      */
-    suspend fun normalizeAddress(address: String): String =
-        bridge.ffiCall { bindings.discoveryNormalizeAddress(address) }
+    suspend fun normalizeAddress(address: String): String {
+        return bridge.ffiCall { bindings.discoveryNormalizeAddress(address) }
+    }
 
     /**
      * Discovers contexts from a DID string or `scp://` URI.
@@ -395,8 +396,7 @@ class DiscoveryBridge internal constructor(
      * @param ownerDid DID of the identity that owns this petname map.
      * @return The count of DID petnames.
      */
-    suspend fun petnameDidCount(ownerDid: String): UInt =
-        bridge.ffiCall { bindings.petnameDidCount(ownerDid) }
+    suspend fun petnameDidCount(ownerDid: String): UInt = bridge.ffiCall { bindings.petnameDidCount(ownerDid) }
 
     /**
      * Returns the number of context petnames for an owner.
@@ -404,8 +404,7 @@ class DiscoveryBridge internal constructor(
      * @param ownerDid DID of the identity that owns this petname map.
      * @return The count of context petnames.
      */
-    suspend fun petnameContextCount(ownerDid: String): UInt =
-        bridge.ffiCall { bindings.petnameContextCount(ownerDid) }
+    suspend fun petnameContextCount(ownerDid: String): UInt = bridge.ffiCall { bindings.petnameContextCount(ownerDid) }
 
     // Handle registry operations (§22.3.1)
 
@@ -500,7 +499,13 @@ class DiscoveryBridge internal constructor(
     ): String =
         bridge.ffiCall {
             bindings.scopeRegister(
-                scopeContextId, name, targetContextId, relayUrls, registrantDid, description, tags,
+                scopeContextId,
+                name,
+                targetContextId,
+                relayUrls,
+                registrantDid,
+                description,
+                tags,
             )
         }
 
@@ -604,5 +609,6 @@ data class UnavailableResolutionLayer(
 )
 
 /** Parses a JSON string containing an array of strings into a `List<String>`. */
-private fun parseJsonStringArray(json: String): List<String> =
-    Json.parseToJsonElement(json).jsonArray.map { it.jsonPrimitive.content }
+private fun parseJsonStringArray(json: String): List<String> {
+    return Json.parseToJsonElement(json).jsonArray.map { it.jsonPrimitive.content }
+}

@@ -51,16 +51,17 @@ env:
 #
 #   workspace-debug   `target/debug` under build mode — rust-test (both matrix legs),
 #                     rust-test-napi-production, rust-build-pyo3-production,
-#                     rust-build-uniffi-production, rust-doc (its `cargo test --doc`),
-#                     kotlin-test, fail-closed-pre-rotation, shipped-feature-graph,
+#                     rust-build-uniffi-production, kotlin-test,
+#                     fail-closed-pre-rotation, shipped-feature-graph,
 #                     vendored-openssl-scope, fix-round-check-selftest, and
 #                     python-wheel-build, which compiles scp-ffi as a cdylib with
 #                     `extension-module,vendored-openssl`, a resolution no other
-#                     member produces.
-#   workspace-check   `target/debug` under check mode — rust-clippy, whose two
+#                     member produces; and rust-doc (its `cargo test --doc`) in part,
+#                     as the paragraph after this list says.
+#   workspace-check   `target/debug` under check mode — rust-clippy, whose five
 #                     `cargo clippy` commands compile every dependency to an `.rmeta`,
-#                     and rust-doc (its `cargo doc --no-deps`, whose dependency units
-#                     cargo compiles in check mode as well). rust-doc restores both
+#                     and rust-doc in part (its `cargo doc --no-deps`, whose dependency
+#                     units cargo compiles in check mode as well). rust-doc restores both
 #                     groups, one rust-cache step each, because its two commands read
 #                     two disjoint artifact sets out of the one directory.
 #   workspace-release `target/release` — python-test and bridge-parity (both run
@@ -71,11 +72,14 @@ env:
 #   transport-optional
 #                     `target/debug` again, but under a feature resolution no
 #                     other job produces — rust-test-optional-features. Its
-#                     `-p scp-transport` and `-p scp-testing` selections drop
-#                     `scp-runtime/testing` and unify third-party features over a
-#                     subgraph, which gives 337 packages a fingerprint the
-#                     `workspace-debug` entry does not hold. Sharing that entry
-#                     would restore artifacts none of its units match.
+#                     `-p scp-transport`, `-p scp-testing`, `-p scp-node` and
+#                     `-p scp-relay` selections resolve features over one
+#                     package's subgraph, not the workspace. The scp-transport
+#                     and scp-testing selections drop `scp-runtime/testing`,
+#                     which gave 337 packages a fingerprint the `workspace-debug`
+#                     entry does not hold, measured before the scp-node and
+#                     scp-relay selections existed. Sharing that entry would
+#                     restore artifacts none of its units match.
 #   wasm32            `target/wasm32-unknown-unknown/release` — typescript-wasm-check
 #                     and scaffold-typescript-web-check, which both run
 #                     `wasm-pack build`. Jobs wasm-protocol and wasm-test read this
@@ -87,6 +91,17 @@ env:
 #   fuzz              `fuzz/target/debug` — fuzz-build, whose `cargo check` compiles a
 #                     separate workspace on the nightly `fuzz/rust-toolchain.toml`
 #                     names, under the dev profile.
+#
+# rust-doc reads `workspace-debug` and `workspace-check` without matching either
+# entry in full. Its two commands add `scp-node/cloud-blobs` and
+# `scp-relay/cloud-blobs` to a `--workspace` command. Those features change the
+# resolved features of scp-transport and of every workspace package that depends
+# on it, and they add the `sqlx` and `aws-sdk-s3` dependency graphs. No job that
+# writes either group runs a `--workspace` command with those features, so
+# neither entry holds those units under rust-doc's feature resolution, and
+# rust-doc recompiles them on every run because it saves no entry. No group
+# holds rust-doc's resolution: the recompile costs one job's minutes, and a
+# ninth entry per generation would cost cache space that every run shares.
 #
 # The cap is per repository, so `.github/workflows/fuzz.yml` counts against the same
 # 10 GB: it writes two further groups, `fuzz-run` and `fuzz-run-opt`, both holding
@@ -1044,9 +1059,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # Writes the `workspace-check` group. Both `cargo clippy` commands below compile
-      # every dependency in check mode, to an `.rmeta` under a metadata hash that
-      # includes the mode, so the `workspace-debug` entry rust-test writes under build
+      # Writes the `workspace-check` group. The five `cargo clippy` commands below
+      # compile every dependency in check mode, to an `.rmeta` under a metadata hash
+      # that includes the mode, so the `workspace-debug` entry rust-test writes under build
       # mode holds nothing this job can restore: reading that entry gave this job the
       # registry and a `Checking` line for every one of the ~650 dependencies on every
       # run. This job is the one that compiles the most of `target/debug` in check
@@ -1072,6 +1087,20 @@ jobs:
           # udp/coap alongside ring-backed quic/http3), so a single combined
           # invocation covers all four.
           cargo clippy -p scp-transport --features quic,http3,udp,coap --all-targets -- -D warnings
+          # scp-node and scp-relay compile the PostgreSQL and S3 blob backends
+          # only under their off-by-default `cloud-blobs` feature, which the
+          # --workspace sweep above leaves off. The first command lints the
+          # backends' own modules and their `#[ignore]`d unit tests, which need a
+          # live PostgreSQL or S3 endpoint to run; the second and third lint each
+          # binary's cloud-blobs build and its backend-selection test, which job
+          # rust-test-optional-features runs. Each binary gets its own command
+          # because cargo unifies scp-transport's features across every package
+          # one invocation builds: in a joint command, scp-node's `cloud-blobs`
+          # would compile the backends for scp-relay even when scp-relay's own
+          # `cloud-blobs` no longer enables them.
+          cargo clippy -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings
+          cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings
+          cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings
 
   # This job runs `cargo nextest run --workspace`, so a merge gate rests on it.
   # It gates on `rust` at job level, never at step level. It carried seven
@@ -1176,11 +1205,13 @@ jobs:
 
   # ── Optional-feature test lanes ─────────────────────────────────────────────
   #
-  # Three invocations that job rust-test above used to carry. Each one activates
-  # a feature `--workspace` does not, so each one recompiles its package's graph
-  # under a feature set no other command in that job builds — 2 min 53 s of
-  # compilation and 43 s of execution on the warm run cited above. Sharding
-  # rust-test four ways would have repeated all of it four times per OS.
+  # Three invocations that job rust-test above used to carry, the three
+  # `cloud-blobs` backend-selection commands, and two `cargo check` commands on
+  # scp-testing. Each one activates or drops a feature `--workspace` does not, so
+  # each one recompiles its package's graph under a feature set no other command
+  # in rust-test builds. The first three cost 2 min 53 s of compilation and 43 s
+  # of execution on the warm run cited above. Sharding rust-test four ways would
+  # have repeated all of it four times per OS.
   #
   # Both operating systems, for the same reason rust-test runs on both: the
   # scp-testing lane below opens a real on-disk SQLite database across two
@@ -1201,7 +1232,7 @@ jobs:
   # resolution.
   #
   # That is the reason to give this job its own `shared-key`, and it is also the
-  # reason NOT to fold these three commands into `cargo nextest run --workspace
+  # reason NOT to fold these commands into `cargo nextest run --workspace
   # --features …,scp-transport/quic,…`. One invocation would compile each
   # package once, and it would compile scp-transport's graph with the workspace's
   # `testing` features ON and all six optional transport features on together.
@@ -1254,6 +1285,27 @@ jobs:
           # invocation exercises every transport's test suite and guards against
           # the silent rot that broke the quic feature for months.
           cargo nextest run -p scp-transport --features quic,http3,udp,coap
+          # scp-node and scp-relay compile the PostgreSQL and S3 arms of
+          # `storage_from_env` only under their off-by-default `cloud-blobs`
+          # feature, which --workspace leaves off. Run the two binaries' backend
+          # selection tests with it on. Each test fails when its own package's
+          # `cloud-blobs` feature is on and the build does not list both the
+          # `postgres` and `s3` backends, and when a build that lists a backend
+          # stops exiting on a missing SCP_RELAY_DATABASE_URL or
+          # SCP_RELAY_S3_BUCKET. Each binary
+          # runs in its own invocation because cargo unifies scp-transport's
+          # features across every package one invocation builds: a combined
+          # invocation compiles both arms into scp-relay through scp-node's
+          # feature alone, and passes when scp-relay's `cloud-blobs` enables
+          # nothing. The scp-transport command runs the `BackendChoice` unit
+          # tests with both arms compiled, the only build in which they assert
+          # that `postgres` and `s3` parse in either case and are cloud
+          # backends. The scp-node command also enables `testing`, the only
+          # build that compiles `--ephemeral`, so the test checks that
+          # `--ephemeral` exits on `postgres` and `s3`.
+          cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs,testing --test storage_backend_selection
+          cargo nextest run --no-tests=fail -p scp-relay --features cloud-blobs --test storage_backend
+          cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib startup::tests
           # The saga-journal durable crash-recovery round-trip is gated behind
           # scp-testing/sqlite (it opens a real on-disk SqliteStorage across two
           # processes). --workspace does NOT activate this optional feature, so
@@ -1586,7 +1638,10 @@ jobs:
       # writes to the `workspace-check` group. Cargo names the two sets under different
       # metadata hashes in the one `target/debug`, so the second restore adds to the
       # first and overwrites nothing; each step's key names its own group, so neither
-      # restore can match the other's entry.
+      # restore can match the other's entry. Neither entry holds the units that this
+      # job's `scp-node/cloud-blobs` and `scp-relay/cloud-blobs` features change, so
+      # the job recompiles those units on every run. The paragraph after THE GROUPS
+      # list at the top of this file says why no group holds them.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-debug
@@ -1620,10 +1675,15 @@ jobs:
         # workflow of this repository that omits the flag, and
         # `check_required_rustdoc_surface` fails when a `cargo doc` in any other
         # workflow passes a flag this command omits.
+        # `scp-node/cloud-blobs` and `scp-relay/cloud-blobs` compile
+        # `crates/scp-transport/src/native/postgres_blob.rs` and `s3_blob.rs`, which
+        # no other workspace member's dependency declaration enables. Without them
+        # both commands skip those two modules, so rustdoc resolves none of their
+        # intra-doc links and `cargo test --doc` compiles none of their doctests.
         run: |
           export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          cargo test --workspace --doc --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant
-          cargo doc --workspace --no-deps --document-private-items --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant
+          cargo test --workspace --doc --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant,scp-node/cloud-blobs,scp-relay/cloud-blobs
+          cargo doc --workspace --no-deps --document-private-items --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant,scp-node/cloud-blobs,scp-relay/cloud-blobs
 
   rust-deny:
     needs: changes
@@ -2133,7 +2193,12 @@ jobs:
           echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > $ANDROID_HOME/licenses/mips-android-sysimage-license
       - run: sdkmanager "platforms;android-35"
       - uses: gradle/actions/setup-gradle@v4
-      - run: ./gradlew :scp-kt:runKtlintCheckOverMainSourceSet
+      # `ktlintCheck`, not `runKtlintCheckOverMainSourceSet`: the `runKtlint*`
+      # tasks only write the report and exit 0 whatever it lists; the
+      # ktlint-gradle plugin fails the build in the `ktlint*SourceSetCheck`
+      # tasks, and `ktlintCheck` runs them for the main, test and Kotlin-script
+      # source sets (#2379). `:scp-kt` is the only module that applies ktlint.
+      - run: ./gradlew :scp-kt:ktlintCheck
       - run: ./gradlew :scp-kt:detekt
       # `generateUniffiBindings` writes into `src/main/kotlin`, so Gradle fails
       # any task that reads that root and carries no ordering edge to it. Gradle
