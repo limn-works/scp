@@ -65,7 +65,7 @@ cargo build --release -p scp-node --features http3
 Runs a bare `RelayServer`. No identity, no HTTP, no TLS. Suitable for infrastructure operators who want a minimal relay that accepts WebSocket connections.
 
 ```bash
-SCP_RELAY_STORAGE_BACKEND=sqlite scp-relay
+SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
 ```
 
 ### scp-node modes
@@ -80,10 +80,13 @@ SCP_RELAY_STORAGE_BACKEND=sqlite scp-relay
 
 ```bash
 # Full node (production)
-SCP_NODE_DOMAIN=relay.example.com scp-node
+SCP_NODE_DOMAIN=relay.example.com \
+SCP_RELAY_STORAGE_BACKEND=sqlite \
+SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db \
+scp-node
 
 # Relay-only mode
-scp-node --relay-only
+SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-node --relay-only
 
 # Ephemeral mode (everything in memory)
 SCP_NODE_DOMAIN=localhost scp-node --ephemeral
@@ -198,11 +201,13 @@ All backends implement the `BlobStorage` trait and pass the `blob_store_conforma
 ```bash
 # Minimal: SQLite storage, bind 0.0.0.0:9000. Every run names a backend —
 # `scp-relay` with `SCP_RELAY_STORAGE_BACKEND` unset prints an error and
-# exits 1.
-SCP_RELAY_STORAGE_BACKEND=sqlite scp-relay
+# exits 1, and so does the sqlite backend without an absolute
+# `SCP_RELAY_STORAGE_PATH`.
+SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
 
 # Custom bind address and limits
 SCP_RELAY_STORAGE_BACKEND=sqlite \
+SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db \
 SCP_RELAY_BIND_ADDR=127.0.0.1:8080 \
 SCP_RELAY_MAX_CONNECTIONS=5000 \
 SCP_RELAY_MAX_BLOB_SIZE=524288 \
@@ -214,10 +219,12 @@ The relay logs to stderr. Control verbosity with `SCP_RELAY_LOG_LEVEL` or `RUST_
 
 ```bash
 # Structured JSON logs for production
-SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_LOG_FORMAT=json SCP_RELAY_LOG_LEVEL=info scp-relay
+SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db \
+SCP_RELAY_LOG_FORMAT=json SCP_RELAY_LOG_LEVEL=info scp-relay
 
 # Debug-level with RUST_LOG (overrides SCP_RELAY_LOG_LEVEL)
-SCP_RELAY_STORAGE_BACKEND=sqlite RUST_LOG=scp_transport=debug scp-relay
+SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db \
+RUST_LOG=scp_transport=debug scp-relay
 ```
 
 ### Graceful shutdown
@@ -251,6 +258,7 @@ The full node (`scp-node` without `--relay-only`) starts an `ApplicationNode` (d
 SCP_NODE_DOMAIN=relay.example.com \
 SCP_STORAGE_PATH=/var/lib/scp/node \
 SCP_RELAY_STORAGE_BACKEND=sqlite \
+SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db \
 scp-node
 ```
 
@@ -353,6 +361,7 @@ For development, set `SCP_NODE_TLS_SELF_SIGNED=1`:
 SCP_NODE_DOMAIN=localhost \
 SCP_NODE_TLS_SELF_SIGNED=1 \
 SCP_RELAY_STORAGE_BACKEND=sqlite \
+SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db \
 scp-node
 ```
 
@@ -419,11 +428,13 @@ Log levels are controlled by `RUST_LOG` (takes precedence) or `SCP_RELAY_LOG_LEV
 ```bash
 # Module-level filtering
 SCP_RELAY_STORAGE_BACKEND=sqlite \
+SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db \
 RUST_LOG=scp_transport::native::server=debug,scp_node=info \
 scp-node
 
 # Simple level override
-SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_LOG_LEVEL=warn scp-relay
+SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db \
+SCP_RELAY_LOG_LEVEL=warn scp-relay
 ```
 
 ### Dev API (scp-node only)

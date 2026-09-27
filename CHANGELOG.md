@@ -109,8 +109,13 @@ every failure. It now returns `Result<BlobStorageBackend, StorageError>`, and
 `start_relay_from_env` returns `Result<_, StartupError>`; each binary turns
 those errors into exit code 1 at its own boundary. **An operator sets
 `SCP_RELAY_STORAGE_BACKEND` on every `scp-relay` run and on every persistent
-`scp-node` run** — `docker-compose.yml`, this repository's README, and
-`docs/guides/relay-operations.md` name `sqlite` in every example. `--ephemeral`
+`scp-node` run. The `sqlite` and `redb` backends also require
+`SCP_RELAY_STORAGE_PATH` to name an absolute path: they no longer fall back to
+a default path and they refuse a relative one, because a relative path opens a
+different file for every working directory the relay starts in.** —
+`docker-compose.yml`, this repository's README, and
+`docs/guides/relay-operations.md` name `sqlite` and an absolute
+`SCP_RELAY_STORAGE_PATH` in every example. `--ephemeral`
 still selects an in-memory blob backend and reads no env var. `health_check`
 returns a verdict instead of exiting, and `shutdown_signal` waits on ctrl_c
 alone when a kernel refuses a SIGTERM handler.

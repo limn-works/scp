@@ -144,16 +144,22 @@ SCP provides two binary entrypoints for local development and testing:
 
 ```sh
 # Bare relay — listens on 0.0.0.0:9000. Every run names a blob storage
-# backend; that variable has no default.
-SCP_RELAY_STORAGE_BACKEND=sqlite cargo run --release -p scp-relay
+# backend; that variable has no default. The sqlite backend also needs an
+# absolute SCP_RELAY_STORAGE_PATH and refuses a relative one.
+SCP_RELAY_STORAGE_BACKEND=sqlite \
+SCP_RELAY_STORAGE_PATH="$PWD/scp-relay.db" \
+cargo run --release -p scp-relay
 
 # Full application node — requires SCP_NODE_DOMAIN
 SCP_NODE_DOMAIN=localhost \
 SCP_RELAY_STORAGE_BACKEND=sqlite \
+SCP_RELAY_STORAGE_PATH="$PWD/scp-node-relay.db" \
 cargo run --release -p scp-node
 
 # Relay-only mode via scp-node
-SCP_RELAY_STORAGE_BACKEND=sqlite cargo run --release -p scp-node -- --relay-only
+SCP_RELAY_STORAGE_BACKEND=sqlite \
+SCP_RELAY_STORAGE_PATH="$PWD/scp-node-relay.db" \
+cargo run --release -p scp-node -- --relay-only
 ```
 
 #### With Docker
