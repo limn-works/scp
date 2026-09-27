@@ -6,7 +6,8 @@ This file says where each kind of fact is written, and when an agent reads each 
 
 | Fact | Store |
 |------|-------|
-| A design decision: protocol, architecture, or API, with its rationale and rejected alternatives | The repository: the spec, ADR, or standard that owns it, per the artifact flow in the root `AGENTS.md` |
+| A design decision (protocol, architecture, or API), and the reasoning about it that deserves to be checked in and shared: the concrete why this and not that | The repository: the spec, ADR, or standard that owns it, per the artifact flow in the root `AGENTS.md` |
+| Design rationale: the process by which a decision was reached, too informal to document and commit | Vestige, starting `RATIONALE (scp, <decision>, <date>)` |
 | A lesson that passes the lesson rule in the root `AGENTS.md` Workflow section, including a bug's root cause and fix | The repository: a nested `AGENTS.md`, a standard, or `.docs/lessons/` |
 | A workstream's tracks, work items, status, and the scope and sequencing Alec settles for it | The plan of record: the workstream's one plan file in `~/.claude/plans/` |
 | A standing rule Alec explicitly gives as one: a rule that holds for all future tasks and that no plan or repository artifact records yet | Vestige, starting `STANDING RULE (scp, ...)`, or `STANDING RULE (all projects, ...)` when it concerns Alec, the machine, or agents in general; in the agent's own words, dated |
