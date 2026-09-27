@@ -23,10 +23,9 @@
         ///
         /// A caller catches this case to learn that the device holds no
         /// hardware attestation signal. §9.3 of the security model spec,
-        /// "Sybil resistance and identity uniqueness", states that a missing
-        /// device attestation is an expected condition that costs the DID
-        /// nothing, so the caller presents no attestation rather than
-        /// presenting a weaker one.
+        /// "Sybil resistance and identity uniqueness", states that the absence
+        /// of a device attestation is expected and is not penalizing, so the
+        /// caller presents no attestation rather than presenting a weaker one.
         case unsupported(String)
         /// The stored App Attest key ID is missing; call `attest` first.
         case keyNotFound
@@ -102,7 +101,7 @@
     /// 1. `generateKey` — creates a Secure Enclave key via App Attest service.
     /// 2. `attestKey(_:clientDataHash:)` — requests Apple's attestation object
     ///    where `clientDataHash = SHA-256(clientDataJSON)`.
-    /// 3. `generateAssertion(_:clientData:)` — per-request proof of possession.
+    /// 3. `generateAssertion(_:clientDataHash:)` — per-request proof of possession.
     ///
     /// ## Unavailable service (simulator, or a device without App Attest)
     ///
@@ -110,9 +109,9 @@
     /// `assertRequest` throw `AttestationError.unsupported`. The adapter mints
     /// no substitute token, because a locally fabricated token would assert a
     /// hardware guarantee that no hardware produced. §9.3 of the security model
-    /// spec, "Sybil resistance and identity uniqueness", records that a DID
-    /// carrying no device attestation loses nothing for the absence, so the
-    /// honest result is the typed error rather than a token.
+    /// spec, "Sybil resistance and identity uniqueness", states that the
+    /// absence of a device attestation is expected and is not penalizing, so
+    /// the honest result is the typed error rather than a token.
     ///
     /// A caller that wants to branch before it calls reads `isHardwareBacked`.
     ///
@@ -138,7 +137,9 @@
         private var generationTask: Task<String, Error>?
 
         /// Runs one App Attest call at a time, so `classify(_:keyId:operation:)`
-        /// reads an attestation record no other call is concurrently writing.
+        /// reads an attestation record no other call is concurrently writing,
+        /// and each call reads the stored key ID after every preceding call
+        /// finished writing it.
         private let callSerializer: AppAttestCallSerializer
 
         /// Whether this instance is running in hardware-backed mode.
@@ -214,11 +215,23 @@
                 )
             }
 
-            let keyId = try await resolveKeyId()
             let clientDataHash = computeClientDataHash(challenge: challenge, deviceId: deviceId)
 
+            // The key ID is read inside the serialized body, because a call
+            // queued behind a predecessor that discarded or replaced the key
+            // would otherwise reach Apple with a key ID this adapter no longer
+            // stores, and `classify(_:keyId:operation:)` would then name a
+            // condition that does not hold.
             let outcome = await callSerializer.run { [weak self] () -> Result<Data, AttestationError> in
                 guard let self else { return .failure(.internalError("self was deallocated")) }
+                let keyId: String
+                do {
+                    keyId = try await self.resolveKeyId()
+                } catch let error as AttestationError {
+                    return .failure(error)
+                } catch {
+                    return .failure(.serviceError(error.localizedDescription))
+                }
                 return await self.requestAttestation(keyId: keyId, clientDataHash: clientDataHash)
             }
             return try outcome.get()
@@ -266,8 +279,9 @@
         /// Generate a per-request assertion for a previously attested key.
         ///
         /// On a real device with App Attest available, calls
-        /// `DCAppAttestService.generateAssertion(_:clientData:)`. The assertion
-        /// binds the request hash to the stored App Attest key.
+        /// `DCAppAttestService.generateAssertion(_:clientDataHash:)` and passes
+        /// `requestHash` as `clientDataHash` unchanged. The assertion binds the
+        /// request hash to the stored App Attest key.
         ///
         /// On simulator or on a device where App Attest is unavailable, this
         /// method throws `AttestationError.unsupported` and returns no bytes.
@@ -292,12 +306,11 @@
                 )
             }
 
-            guard let keyId = loadKeyId() else {
-                throw AttestationError.keyNotFound
-            }
-
+            // The key ID is read inside the serialized body for the reason
+            // `attest(challenge:deviceId:)` states.
             let outcome = await callSerializer.run { [weak self] () -> Result<Data, AttestationError> in
                 guard let self else { return .failure(.internalError("self was deallocated")) }
+                guard let keyId = self.loadKeyId() else { return .failure(.keyNotFound) }
                 return await self.requestAssertion(keyId: keyId, requestHash: requestHash)
             }
             return try outcome.get()
@@ -377,8 +390,10 @@
         /// succeeds and records an attestation, the other reads that record
         /// before the first wrote it, reads row `attestKey`/no, and discards a
         /// key Apple had just attested. `callSerializer` runs one App Attest
-        /// call at a time, so every read here follows every write a preceding
-        /// call made.
+        /// call at a time, and each call reads the stored key ID inside its
+        /// serialized body, so every read here, of the attestation record and
+        /// of the key ID the call names, follows every write a preceding call
+        /// made.
         ///
         /// **One ambiguity this table leaves standing.** A device restored from
         /// a backup can carry a recorded attestation for a key its Secure
@@ -441,7 +456,7 @@
         /// each observe absence and each generate a key.
         ///
         /// - Returns: An App Attest key ID string suitable for use in
-        ///   `attestKey(_:clientDataHash:)` and `generateAssertion(_:clientData:)`.
+        ///   `attestKey(_:clientDataHash:)` and `generateAssertion(_:clientDataHash:)`.
         /// - Throws: `AttestationError.serviceError` if `generateKey` fails.
         private func resolveKeyId() async throws -> String {
             enum Outcome {

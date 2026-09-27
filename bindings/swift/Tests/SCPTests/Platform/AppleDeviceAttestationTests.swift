@@ -1,13 +1,13 @@
 // Fail-closed, key-lifecycle, and call-ordering tests for adapter
 // `AppleDeviceAttestation`.
 //
-// These tests pin three properties of `AppleDeviceAttestation`:
+// These tests pin four properties of `AppleDeviceAttestation`:
 //
 // 1. When `DCAppAttestService.isSupported` is `false`, `attest` and
 //    `assertRequest` throw `AttestationError.unsupported` and return no bytes.
 //    §9.3 of SCP's security model spec, "Sybil resistance and identity
-//    uniqueness", states that a DID carrying no device attestation loses
-//    nothing for that absence, so a typed error is an honest result and a
+//    uniqueness", states that the absence of a device attestation is expected
+//    and is not penalizing, so a typed error is an honest result and a
 //    locally minted token would assert a hardware guarantee no hardware
 //    produced.
 // 2. Concurrent first calls to `attest` generate one App Attest key, because
@@ -16,12 +16,20 @@
 // 3. Concurrent calls reach Apple's App Attest service one at a time, and a
 //    second `attest` therefore keeps the key a first `attest` got attested
 //    rather than reading a stale attestation record and discarding that key.
+//    Each queued call also reads the stored key ID after its predecessors
+//    finished, so it never names a key ID a predecessor discarded.
+// 4. `attest` hands Apple `SHA-256` of the exact `clientDataJSON` bytes
+//    acceptance criterion 3 of ADR-025 fixes, and `assertRequest` hands Apple
+//    `requestHash` unchanged. Clause 6 of that criterion makes a reader rebuild
+//    those bytes, so a change to field order, encoding, or type string turns a
+//    case here red.
 //
 // See ADR-025 (Apple Platform Adapter) in `.docs/adrs/phase-5.md` and
 // `crates/scp-platform/src/traits.rs` `DeviceAttestation`.
 
 #if os(iOS) || os(macOS)
 
+    import CryptoKit
     import DeviceCheck
     import Foundation
     @testable import SCP
@@ -298,6 +306,114 @@
                 case let .failure(error):
                     completionHandler(nil, error)
                 }
+            }
+        }
+    }
+
+    /// A `DCAppAttestService` that records the key ID and the
+    /// `clientDataHash` of every call, and can hold its first assertion until
+    /// a case releases it.
+    ///
+    /// Every other double here ignores `clientDataHash`, so none of them
+    /// notices a change to the bytes `attest` and `assertRequest` hand Apple.
+    private final class RecordingAppAttestService: DCAppAttestService, @unchecked Sendable {
+        /// A key ID `generateKey` hands back.
+        static let generatedKeyId = "recording-key-id"
+
+        /// What Apple returns for each of three `DCError.invalidKey` conditions.
+        static let invalidKeyError = NSError(
+            domain: DCErrorDomain,
+            code: DCError.invalidKey.rawValue,
+            userInfo: nil
+        )
+
+        /// One App Attest call this double received.
+        struct Call: Equatable {
+            let keyId: String
+            let clientDataHash: Data
+        }
+
+        private let lock = NSLock()
+        private var attestCalls: [Call] = []
+        private var assertCalls: [Call] = []
+        private var heldAssertion: ((Data?, Error?) -> Void)?
+        private let holdsFirstAssertion: Bool
+        private let assertionResult: Result<Data, Error>
+
+        /// Every `attestKey` call, in arrival order.
+        var attestations: [Call] {
+            lock.withLock { attestCalls }
+        }
+
+        /// Every `generateAssertion` call, in arrival order.
+        var assertions: [Call] {
+            lock.withLock { assertCalls }
+        }
+
+        /// Whether the first assertion is waiting for `releaseHeldAssertion()`.
+        var isHoldingAssertion: Bool {
+            lock.withLock { heldAssertion != nil }
+        }
+
+        init(holdsFirstAssertion: Bool = false, assertionResult: Result<Data, Error> = .success(Data([0xB1]))) {
+            self.holdsFirstAssertion = holdsFirstAssertion
+            self.assertionResult = assertionResult
+            super.init()
+        }
+
+        override var isSupported: Bool {
+            true
+        }
+
+        override func generateKey(completionHandler: @escaping (String?, Error?) -> Void) {
+            completionHandler(Self.generatedKeyId, nil)
+        }
+
+        override func attestKey(
+            _ keyId: String,
+            clientDataHash: Data,
+            completionHandler: @escaping (Data?, Error?) -> Void
+        ) {
+            lock.withLock { attestCalls.append(Call(keyId: keyId, clientDataHash: clientDataHash)) }
+            completionHandler(Data([0xA1]), nil)
+        }
+
+        override func generateAssertion(
+            _ keyId: String,
+            clientDataHash: Data,
+            completionHandler: @escaping (Data?, Error?) -> Void
+        ) {
+            let hold: Bool = lock.withLock {
+                assertCalls.append(Call(keyId: keyId, clientDataHash: clientDataHash))
+                if holdsFirstAssertion, assertCalls.count == 1 {
+                    heldAssertion = completionHandler
+                    return true
+                }
+                return false
+            }
+            if hold {
+                return
+            }
+            deliver(assertionResult, to: completionHandler)
+        }
+
+        /// Answer the held first assertion with this double's assertion result.
+        func releaseHeldAssertion() {
+            let handler: ((Data?, Error?) -> Void)? = lock.withLock {
+                defer { heldAssertion = nil }
+                return heldAssertion
+            }
+            if let handler {
+                deliver(assertionResult, to: handler)
+            }
+        }
+
+        private func deliver(_ result: Result<Data, Error>, to completionHandler: (Data?, Error?) -> Void) {
+            switch result {
+            case let .success(data):
+                completionHandler(data, nil)
+            case let .failure(error):
+                completionHandler(nil, error)
             }
         }
     }
@@ -831,6 +947,92 @@
                 service.peakConcurrency == 1,
                 "App Attest saw \(service.peakConcurrency) outstanding calls at once"
             )
+        }
+    }
+
+    // MARK: - Client data tests
+
+    /// Cases that pin the bytes `AppleDeviceAttestation` hands Apple.
+    struct AppAttestClientDataTests {
+        @Test("attest hands Apple SHA-256 of the clientDataJSON ADR-025 fixes")
+        func attestHashesTheFixedClientDataJSON() async throws {
+            let service = RecordingAppAttestService()
+            let adapter = AppleDeviceAttestation(service: service, defaults: InMemoryUserDefaults())
+
+            _ = try await adapter.attest(challenge: Data([0x01, 0x02, 0x03]), deviceId: Data([0xFF, 0xEE]))
+
+            // RFC 4648 base64 of 0x010203 is `AQID`, and of 0xFFEE is `/+4=`.
+            // This literal restates acceptance criterion 3 of ADR-025 rather
+            // than calling the adapter's own formula, so a change to that
+            // formula turns this case red.
+            let expectedJSON = #"{"challenge":"AQID","deviceId":"/+4=","type":"scp-device-attestation-v1"}"#
+            let expectedHash = Data(SHA256.hash(data: Data(expectedJSON.utf8)))
+            #expect(
+                service.attestations == [
+                    .init(keyId: RecordingAppAttestService.generatedKeyId, clientDataHash: expectedHash)
+                ]
+            )
+        }
+
+        @Test("assertRequest hands Apple requestHash unchanged")
+        func assertRequestForwardsRequestHash() async throws {
+            let service = RecordingAppAttestService()
+            let adapter = AppleDeviceAttestation(service: service, defaults: InMemoryUserDefaults())
+            _ = try await adapter.attest(challenge: Data([0x01]), deviceId: Data([0x02]))
+
+            let requestHash = Data((0 ..< 32).map { UInt8($0) })
+            _ = try await adapter.assertRequest(requestHash: requestHash)
+
+            #expect(
+                service.assertions == [
+                    .init(keyId: RecordingAppAttestService.generatedKeyId, clientDataHash: requestHash)
+                ]
+            )
+        }
+
+        @Test("a queued assertion reads the key ID after its predecessor discarded it")
+        func queuedAssertionReadsKeyIdAfterPredecessor() async throws {
+            let service = RecordingAppAttestService(
+                holdsFirstAssertion: true,
+                assertionResult: .failure(RecordingAppAttestService.invalidKeyError)
+            )
+            let defaults = InMemoryUserDefaults()
+            let adapter = AppleDeviceAttestation(service: service, defaults: defaults)
+            _ = try await adapter.attest(challenge: Data([0x01]), deviceId: Data([0x02]))
+
+            // The first assertion reaches Apple and waits there. Apple then
+            // rejects that attested key, so the adapter discards its key ID.
+            let first = Task { try await adapter.assertRequest(requestHash: Data(repeating: 0x01, count: 32)) }
+            while !service.isHoldingAssertion {
+                try await Task.sleep(nanoseconds: 1_000_000)
+            }
+            // The second assertion arrives while the first is outstanding. An
+            // adapter that read the key ID before queueing would hand Apple the
+            // discarded key ID and report `keyNotAttested` for a key it no
+            // longer stores.
+            let second = Task { try await adapter.assertRequest(requestHash: Data(repeating: 0x02, count: 32)) }
+            try await Task.sleep(nanoseconds: 50_000_000)
+            service.releaseHeldAssertion()
+
+            do {
+                _ = try await first.value
+                Issue.record("the first assertion returned bytes for a rejected key")
+            } catch let error as AttestationError {
+                guard case .keyRejected = error else {
+                    Issue.record("the first assertion threw \(error) instead of keyRejected")
+                    return
+                }
+            }
+            do {
+                _ = try await second.value
+                Issue.record("the second assertion returned bytes with no stored key")
+            } catch let error as AttestationError {
+                guard case .keyNotFound = error else {
+                    Issue.record("the second assertion threw \(error) instead of keyNotFound")
+                    return
+                }
+            }
+            #expect(service.assertions.count == 1)
         }
     }
 
