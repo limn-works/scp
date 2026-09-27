@@ -636,12 +636,17 @@ PYEOF
 # `server` is absent from this list although three CI commands name it: `default =
 # ["server"]` in the manifest of each of scp-ffi, scp-ffi-napi and scp-ffi-uniffi, so the
 # `cargo check` above already compiles every module that feature gates.
+#
+# scp-node and scp-relay appear in two entries because two CI commands compile their
+# `cloud-blobs` features under different feature sets: the `rust-clippy` job adds
+# `scp-node/testing`, and the `rust-test-optional-features` job does not.
 EXTRA_FEATURE_CHECKS=(
     "scp-transport|quic,http3,udp,coap"
     "scp-transport|combined,local-cache"
     "scp-testing|sqlite"
     "scp-transport|sqlite-blob,redb-blob,postgres-blob,s3-blob,startup"
     "scp-node,scp-relay|scp-node/cloud-blobs,scp-node/testing,scp-relay/cloud-blobs"
+    "scp-node,scp-relay|scp-node/cloud-blobs,scp-relay/cloud-blobs"
 )
 
 # The packages the `wasm-protocol` job of `.github/workflows/ci.yml` compiles for
