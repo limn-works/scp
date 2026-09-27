@@ -55,7 +55,7 @@ env:
 #                     fail-closed-pre-rotation, shipped-feature-graph; and rust-doc
 #                     (its `cargo test --doc`) in part, as the paragraph after this
 #                     list says.
-#   workspace-check   `target/debug` under check mode — rust-clippy, whose two
+#   workspace-check   `target/debug` under check mode — rust-clippy, whose five
 #                     `cargo clippy` commands compile every dependency to an `.rmeta`,
 #                     and rust-doc in part (its `cargo doc --no-deps`, whose dependency
 #                     units cargo compiles in check mode as well). rust-doc restores both
@@ -69,11 +69,14 @@ env:
 #   transport-optional
 #                     `target/debug` again, but under a feature resolution no
 #                     other job produces — rust-test-optional-features. Its
-#                     `-p scp-transport` and `-p scp-testing` selections drop
-#                     `scp-runtime/testing` and unify third-party features over a
-#                     subgraph, which gives 337 packages a fingerprint the
-#                     `workspace-debug` entry does not hold. Sharing that entry
-#                     would restore artifacts none of its units match.
+#                     `-p scp-transport`, `-p scp-testing`, `-p scp-node` and
+#                     `-p scp-relay` selections resolve features over one
+#                     package's subgraph, not the workspace. The scp-transport
+#                     and scp-testing selections drop `scp-runtime/testing`,
+#                     which gave 337 packages a fingerprint the `workspace-debug`
+#                     entry does not hold, measured before the scp-node and
+#                     scp-relay selections existed. Sharing that entry would
+#                     restore artifacts none of its units match.
 #   wasm32            `target/wasm32-unknown-unknown/release` — typescript-wasm-check
 #                     and scaffold-typescript-web-check, which both run
 #                     `wasm-pack build`. Jobs wasm-protocol and wasm-test read this
@@ -1012,9 +1015,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # Writes the `workspace-check` group. Both `cargo clippy` commands below compile
-      # every dependency in check mode, to an `.rmeta` under a metadata hash that
-      # includes the mode, so the `workspace-debug` entry rust-test writes under build
+      # Writes the `workspace-check` group. The five `cargo clippy` commands below
+      # compile every dependency in check mode, to an `.rmeta` under a metadata hash
+      # that includes the mode, so the `workspace-debug` entry rust-test writes under build
       # mode holds nothing this job can restore: reading that entry gave this job the
       # registry and a `Checking` line for every one of the ~650 dependencies on every
       # run. This job is the one that compiles the most of `target/debug` in check
@@ -1158,11 +1161,13 @@ jobs:
 
   # ── Optional-feature test lanes ─────────────────────────────────────────────
   #
-  # Three invocations that job rust-test above used to carry. Each one activates
-  # a feature `--workspace` does not, so each one recompiles its package's graph
-  # under a feature set no other command in that job builds — 2 min 53 s of
-  # compilation and 43 s of execution on the warm run cited above. Sharding
-  # rust-test four ways would have repeated all of it four times per OS.
+  # Three invocations that job rust-test above used to carry, the three
+  # `cloud-blobs` backend-selection commands, and two `cargo check` commands on
+  # scp-testing. Each one activates or drops a feature `--workspace` does not, so
+  # each one recompiles its package's graph under a feature set no other command
+  # in rust-test builds. The first three cost 2 min 53 s of compilation and 43 s
+  # of execution on the warm run cited above. Sharding rust-test four ways would
+  # have repeated all of it four times per OS.
   #
   # Both operating systems, for the same reason rust-test runs on both: the
   # scp-testing lane below opens a real on-disk SQLite database across two
@@ -1183,7 +1188,7 @@ jobs:
   # resolution.
   #
   # That is the reason to give this job its own `shared-key`, and it is also the
-  # reason NOT to fold these three commands into `cargo nextest run --workspace
+  # reason NOT to fold these commands into `cargo nextest run --workspace
   # --features …,scp-transport/quic,…`. One invocation would compile each
   # package once, and it would compile scp-transport's graph with the workspace's
   # `testing` features ON and all six optional transport features on together.
