@@ -784,9 +784,9 @@ run_step format cargo fmt --all -- --check
 # cost is reading repository files and, for one gate, resolving a dependency graph. Every
 # gate that compiles or links belongs to CI, which runs it on the pushed head.
 #
-# WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 31 files named
-# `check-*`. This list names 30 of them, and GATES_NOT_RUN below names the other one with
-# the reason it is absent. Neither count is load-bearing: the loop below globs
+# WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 32 files named
+# `check-*`. This list names 30 of them, and GATES_NOT_RUN below names the other two with
+# the reason each is absent. Neither count is load-bearing: the loop below globs
 # `scripts/check-*` off the disk and fails the run on any file neither array names, so a
 # gate this repository gains and this list does not reports itself instead of going
 # unnoticed.
@@ -850,6 +850,11 @@ GATES=(
 GATES_NOT_RUN=(
     # The toolchain precondition this script runs before any cargo command, above.
     scripts/check-resolved-rustc.sh
+    # Runs `cargo clippy` over every example target in the workspace, one target at a
+    # time, so it compiles and takes the shared target directory's build lock, which the
+    # criterion above GATES excludes. The rust-clippy job of .github/workflows/ci.yml runs
+    # it on the pushed head.
+    scripts/check-examples-build-shipped.sh
 )
 
 # `scripts/check-workflow-compile-steps.py` imports PyYAML, which the standard library does
