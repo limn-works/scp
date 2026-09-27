@@ -3924,24 +3924,7 @@ impl crate::scp::PyScp {
             // Sync FFI handle state for migration transitions (§5.11A).
             // The core ContextManager has already transitioned; keep the
             // FFI-side string in lockstep.
-            match result_str {
-                "MigrationProposed" => {
-                    if let Ok(mut s) = handle_state.lock() {
-                        "migrating_out".clone_into(&mut s);
-                    }
-                }
-                "MigrationCancelled" => {
-                    if let Ok(mut s) = handle_state.lock() {
-                        "active".clone_into(&mut s);
-                    }
-                }
-                "ContextTombstoned" => {
-                    if let Ok(mut s) = handle_state.lock() {
-                        "tombstoned".clone_into(&mut s);
-                    }
-                }
-                _ => {}
-            }
+            sync_handle_state_after(&handle_state, &result);
 
             Ok(result_str.to_owned())
         })
@@ -4105,6 +4088,7 @@ impl crate::scp::PyScp {
         let action_json_owned = action_json.to_owned();
         let signing_key = resolve_signing_key(bi, identity_did)?;
         let proposer_did = scp_did::DID(identity_did.to_owned());
+        let handle_state = handle.state.clone();
 
         rt.block_on(async move {
             let action: scp_core::context::governance::GovernanceAction =
@@ -4140,6 +4124,13 @@ impl crate::scp::PyScp {
                     "failed to sync role state after governance proposal — \
                      local capability checks may be stale"
                 );
+            }
+
+            // A `single_admin` proposal auto-executes, so a migration or
+            // tombstone moves the handle here exactly as `governance_execute`
+            // moves it (§5.11A).
+            if let Some(result) = outcome.execution_result.as_ref() {
+                sync_handle_state_after(&handle_state, result);
             }
 
             // One shared builder names the outcome for all three bridges, so a
@@ -6210,6 +6201,32 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+/// Moves a handle's lifecycle string to the state a governance outcome leaves
+/// its context in, per the one mapping every bridge shares
+/// ([`scp_ffi_common::governance_result::handle_state_after`]).
+fn sync_handle_state_after(
+    handle_state: &Mutex<String>,
+    result: &scp_core::context::state::GovernanceActionResult,
+) {
+    use scp_core::context::ContextState;
+    let Some(next) = scp_ffi_common::governance_result::handle_state_after(result) else {
+        return;
+    };
+    let name = match next {
+        ContextState::Creating => "creating",
+        ContextState::Active => "active",
+        ContextState::Closing => "closing",
+        ContextState::Closed => "closed",
+        ContextState::Expired => "expired",
+        ContextState::MigratingOut => "migrating_out",
+        ContextState::Tombstoned => "tombstoned",
+        ContextState::Poisoned => "poisoned",
+    };
+    if let Ok(mut s) = handle_state.lock() {
+        name.clone_into(&mut s);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests (SCP-216)
 // ---------------------------------------------------------------------------
@@ -6220,6 +6237,32 @@ mod tests {
     use super::*;
     use crate::runtime::RECEIVE_BUFFER_CAPACITY;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Both `governance_execute` and an auto-executing `governance_propose`
+    /// call this, so a tombstone or migration outcome reaches the handle
+    /// string on either path, and any other outcome leaves it alone.
+    #[test]
+    fn sync_handle_state_after_moves_only_lifecycle_outcomes() {
+        use scp_core::context::state::GovernanceActionResult;
+        let state = Mutex::new("active".to_owned());
+        sync_handle_state_after(&state, &GovernanceActionResult::MemberRemoved);
+        assert_eq!(*state.lock().unwrap(), "active");
+        sync_handle_state_after(&state, &GovernanceActionResult::ContextTombstoned);
+        assert_eq!(*state.lock().unwrap(), "tombstoned");
+        let migrating = Mutex::new("active".to_owned());
+        sync_handle_state_after(
+            &migrating,
+            &GovernanceActionResult::MigrationProposed(
+                scp_core::context::state::MigrationProposedResult {
+                    destination_context_id: "dest".to_owned(),
+                    grace_period_end: 1,
+                },
+            ),
+        );
+        assert_eq!(*migrating.lock().unwrap(), "migrating_out");
+        sync_handle_state_after(&migrating, &GovernanceActionResult::MigrationCancelled);
+        assert_eq!(*migrating.lock().unwrap(), "active");
+    }
 
     fn __bi() -> std::sync::Arc<crate::runtime::PyBridgeInstance> {
         std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py())

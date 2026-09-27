@@ -19,6 +19,7 @@
 //! stopped doing so. [`governance_propose_response`] builds that whole JSON
 //! body, so both entry points hand a caller one name for one outcome.
 
+use scp_core::context::ContextState;
 use scp_core::context::governance::{ProposalId, ProposalStatus};
 use scp_core::context::state::GovernanceActionResult;
 
@@ -58,6 +59,53 @@ pub const fn governance_action_result_name(result: &GovernanceActionResult) -> &
         GovernanceActionResult::MigrationProposed(_) => "MigrationProposed",
         GovernanceActionResult::MigrationCancelled => "MigrationCancelled",
         GovernanceActionResult::ContextTombstoned => "ContextTombstoned",
+    }
+}
+
+/// Returns the lifecycle state a bridge's context handle moves to after a
+/// governance action produced `result`, or `None` when the action leaves that
+/// state alone (spec §5.11A).
+///
+/// `governance_execute` and an auto-executing `governance_propose` both run
+/// the action, so every bridge applies this answer on both paths. Each bridge
+/// used to write this match only in `governance_execute`, so a `single_admin`
+/// proposal that executed a migration reported `MigrationProposed` while the
+/// handle still read `Active`.
+///
+/// Every variant is named with no wildcard arm, so a new outcome stops this
+/// crate from compiling until someone decides whether it moves the handle.
+#[must_use]
+pub const fn handle_state_after(result: &GovernanceActionResult) -> Option<ContextState> {
+    match result {
+        GovernanceActionResult::MigrationProposed(_) => Some(ContextState::MigratingOut),
+        GovernanceActionResult::MigrationCancelled => Some(ContextState::Active),
+        GovernanceActionResult::ContextTombstoned => Some(ContextState::Tombstoned),
+        GovernanceActionResult::MemberAdded { .. }
+        | GovernanceActionResult::MemberRemoved
+        | GovernanceActionResult::RoleChanged
+        | GovernanceActionResult::OutletRegistered
+        | GovernanceActionResult::OutletRemoved
+        | GovernanceActionResult::CeilingModified
+        | GovernanceActionResult::ContextClosed
+        | GovernanceActionResult::TtlExtended
+        | GovernanceActionResult::PruningPolicyModified
+        | GovernanceActionResult::AdminTransferred
+        | GovernanceActionResult::SignerAdded
+        | GovernanceActionResult::SignerRemoved
+        | GovernanceActionResult::ThresholdModified
+        | GovernanceActionResult::ChildContextCreated
+        | GovernanceActionResult::OutletInterfaceEstablished
+        | GovernanceActionResult::MemberReset
+        | GovernanceActionResult::ConflictResolved
+        | GovernanceActionResult::ContextPromoted
+        | GovernanceActionResult::MemberSuspended(_)
+        | GovernanceActionResult::AccessRevoked(_)
+        | GovernanceActionResult::AccessRestored(_)
+        | GovernanceActionResult::ContentKeysRotated(_)
+        | GovernanceActionResult::GovernanceReconfigured(_)
+        | GovernanceActionResult::SubscriberBanned(_)
+        | GovernanceActionResult::SubscriberUnbanned { .. }
+        | GovernanceActionResult::Executed => None,
     }
 }
 
@@ -214,6 +262,37 @@ mod tests {
                 !name.contains('{') && !name.contains('(') && !name.contains(' '),
                 "governance outcome name must be a bare variant name, got {name}"
             );
+        }
+    }
+
+    /// A migration or tombstone moves the handle whichever entry point ran
+    /// the action; every other outcome leaves the handle alone.
+    #[test]
+    fn migration_and_tombstone_outcomes_move_the_handle_state() {
+        let proposed = GovernanceActionResult::MigrationProposed(
+            scp_core::context::state::MigrationProposedResult {
+                destination_context_id: "dest".to_owned(),
+                grace_period_end: 1,
+            },
+        );
+        assert_eq!(
+            handle_state_after(&proposed),
+            Some(ContextState::MigratingOut)
+        );
+        assert_eq!(
+            handle_state_after(&GovernanceActionResult::MigrationCancelled),
+            Some(ContextState::Active)
+        );
+        assert_eq!(
+            handle_state_after(&GovernanceActionResult::ContextTombstoned),
+            Some(ContextState::Tombstoned)
+        );
+        for result in [
+            GovernanceActionResult::MemberRemoved,
+            GovernanceActionResult::ContextClosed,
+            GovernanceActionResult::Executed,
+        ] {
+            assert_eq!(handle_state_after(&result), None, "{result:?}");
         }
     }
 }

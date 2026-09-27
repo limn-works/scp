@@ -3460,24 +3460,7 @@ pub(crate) async fn context_execute_governance_action_on(
     }
 
     // Sync FFI handle state for migration transitions (§5.11A).
-    match &result {
-        GovernanceActionResult::MigrationProposed(_) => {
-            if let Ok(mut s) = handle.state.lock() {
-                *s = ContextState::MigratingOut;
-            }
-        }
-        GovernanceActionResult::MigrationCancelled => {
-            if let Ok(mut s) = handle.state.lock() {
-                *s = ContextState::Active;
-            }
-        }
-        GovernanceActionResult::ContextTombstoned => {
-            if let Ok(mut s) = handle.state.lock() {
-                *s = ContextState::Tombstoned;
-            }
-        }
-        _ => {}
-    }
+    sync_handle_state_after(handle, &result);
 
     // One shared mapping names every outcome, so this bridge hands a caller a
     // string identical to what PyO3 and UniFFI hand theirs.
@@ -3893,6 +3876,17 @@ fn parse_napi_proposal_id(hex_str: &str) -> napi::Result<[u8; 32]> {
     Ok(arr)
 }
 
+/// Moves `handle` to the lifecycle state a governance outcome leaves its
+/// context in, per the one mapping every bridge shares
+/// ([`scp_ffi_common::governance_result::handle_state_after`]).
+fn sync_handle_state_after(handle: &NapiContextHandle, result: &GovernanceActionResult) {
+    if let Some(next) = scp_ffi_common::governance_result::handle_state_after(result)
+        && let Ok(mut state) = handle.state.lock()
+    {
+        *state = next;
+    }
+}
+
 /// Per-bridge-instance implementation of [`Scp::context_governance_propose`](crate::scp::Scp::context_governance_propose).
 pub(crate) async fn context_governance_propose_on(
     bi: &NapiBridgeInstance,
@@ -3974,6 +3968,13 @@ pub(crate) async fn context_governance_propose_on(
             error = %e,
             "failed to sync role state after governance proposal"
         );
+    }
+
+    // A `single_admin` proposal auto-executes, so a migration or tombstone
+    // moves the handle here exactly as `context_execute_governance_action`
+    // moves it (§5.11A).
+    if let Some(result) = outcome.execution_result.as_ref() {
+        sync_handle_state_after(handle, result);
     }
 
     // One shared builder names the outcome for all three bridges, so a
