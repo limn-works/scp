@@ -4924,17 +4924,25 @@ impl McpUniFfiBridgeProvider {
     ///
     /// # Errors
     ///
-    /// Returns `Ok(None)` when the actor holds no such context, and `Err` when
-    /// the read itself fails: the bridge is not ready or the query fails. A
-    /// caller must not treat the error as the context being absent.
+    /// Returns `Ok(None)` when no actor holds such a context, including when
+    /// no supervisor is attached, and `Err` when the read itself fails: the
+    /// bridge is suspended or shut down, or the query fails. A caller must not
+    /// treat the error as the context being absent.
     fn role_state_of(
         bi: &crate::runtime::UniffiBridgeInstance,
         context_id: &str,
     ) -> Result<Option<scp_core::context::roles::ContextRoleState>, String> {
-        let sup = bi
-            .context_manager_expect()
-            .map_err(|e| format!("role state of context '{context_id}' could not be read: {e}"))?
-            .clone();
+        let sup = match bi.context_manager_expect() {
+            Ok(sup) => Arc::clone(sup),
+            // No supervisor is attached, so no actor holds this context, and
+            // this provider reads role state only from the actor.
+            Err(_) if !bi.core.is_suspended() && !bi.core.is_shutdown() => return Ok(None),
+            Err(e) => {
+                return Err(format!(
+                    "role state of context '{context_id}' could not be read: {e}"
+                ));
+            }
+        };
         let id = context_id.to_owned();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
