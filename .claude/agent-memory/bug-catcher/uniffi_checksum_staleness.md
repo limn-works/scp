@@ -14,8 +14,12 @@ UniFFI method's signature changes, the committed
 `throws`) but leaves the checksum constants from an earlier generation. The generated
 initializer compares each checksum and `uniffiEnsureScpFfiUniffiInitialized()` calls
 `fatalError("UniFFI API checksum mismatch...")`, so the entire Swift SDK crashes at first
-object creation. Clippy, Rust tests, and other SDKs' checks never see it; it surfaces only
-when Swift links the real dylib. It happened once (`identity_remove`,
+object creation. Clippy, Rust tests, and other SDKs' checks never see it, and neither does
+CI: the Swift jobs run `bindings/swift/build-xcframework.sh --dev`, which regenerates
+`ScpBindings.swift` from the current Rust source before compiling, so CI's checksums always
+match its own dylib. Only a consumer that builds the dylib and uses the committed file hits
+the crash. The same regeneration means a local `swift build` (which uses the committed file)
+can pass while CI fails on a changed signature. It happened once (`identity_remove`,
 `identity_remove_if_present`) while about 125 other checksums matched.
 
 **Detection:** generate fresh bindings and diff the checksum lines.
