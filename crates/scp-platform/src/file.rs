@@ -857,11 +857,20 @@ impl FileKeyCustody {
     ///
     /// # Errors
     ///
-    /// Returns [`PlatformError::CustodyError`] when a caller's passphrase does
-    /// not match whichever passphrase created an existing file, when a file
+    /// Returns [`PlatformError::CustodyError`] when the passphrase is empty,
+    /// when a caller's passphrase does not match whichever passphrase created
+    /// an existing file, when a file
     /// exists but carries an invalid format or an unsupported version, or when
     /// an I/O operation fails.
     pub fn new(path: &Path, passphrase: &str) -> Result<Self, PlatformError> {
+        // Argon2id over an empty passphrase derives a key anyone who reads the
+        // file can re-derive from the salt in its header, so every opener is
+        // refused here before a file is reserved or read.
+        if passphrase.is_empty() {
+            return Err(PlatformError::CustodyError(
+                "key file passphrase must not be empty".to_owned(),
+            ));
+        }
         // `create_file_exclusive` creates a file with `O_EXCL` and reports
         // `false` when it loses that race, so two processes calling this
         // constructor at once never both create a file and never overwrite each
@@ -1901,6 +1910,26 @@ mod tests {
             sig2.as_bytes(),
             "deterministic signing must produce same signature"
         );
+    }
+
+    /// Construction refuses an empty passphrase before it reserves a file, so
+    /// no key file is ever sealed under a key anyone can derive. Deleting the
+    /// `is_empty` check in `FileKeyCustody::new` makes this return `Ok` and
+    /// leaves a file at `path`, so both assertions fail.
+    #[tokio::test]
+    async fn empty_passphrase_is_refused_and_writes_no_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        match FileKeyCustody::new(&path, "") {
+            Err(PlatformError::CustodyError(msg)) => assert!(
+                msg.contains("must not be empty"),
+                "error must name the empty passphrase: {msg}"
+            ),
+            Err(other) => panic!("expected CustodyError, got {other:?}"),
+            Ok(_) => panic!("construction must refuse an empty passphrase"),
+        }
+        assert!(!path.exists(), "no key file may be written under \"\"");
     }
 
     /// `SCP-CAPSEL-8001` (§17.17.1 of
