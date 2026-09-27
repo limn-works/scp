@@ -1934,7 +1934,8 @@ def emit_witness_and_relay_objects() -> None:
 
     def cosigned_head(
         label, sequence, event_digest, previous, observed_at, seed,
-        seed_event=designating_digest, key=REF_KEY_2,
+        seed_event=designating_digest, seed_observed_at=COSIGN_OBSERVED_AT,
+        key=REF_KEY_2,
     ):
         # §9.7.4.3: `seed` is 0x01 on the first head a witness cosigns for a
         # subject after a designation or a store loss, and 0x00 on every later
@@ -1950,10 +1951,11 @@ def emit_witness_and_relay_objects() -> None:
             + fixed_field(event_digest)
             + fixed_field(previous)
             + fixed_field(seed_event)
+            + u64(seed_observed_at)
             + bytes([seed])
             + u64(observed_at)
         )
-        assert len(fields) == 177, len(fields)
+        assert len(fields) == 185, len(fields)
         assert previous != bytes(32), "previous_cosigned_digest is never zero"
         emit_hex(f"{label}.witness", WITNESS_ID)
         emit_hex(f"{label}.subject", subject)
@@ -1961,6 +1963,7 @@ def emit_witness_and_relay_objects() -> None:
         emit_hex(f"{label}.event_digest", event_digest)
         emit_hex(f"{label}.previous_cosigned_digest", previous)
         emit_hex(f"{label}.seed_event", seed_event)
+        emit(f"{label}.seed_observed_at", seed_observed_at)
         emit(f"{label}.seed", seed)
         emit(f"{label}.observed_at", observed_at)
         emit(f"{label}.field_bytes", len(fields))
@@ -2035,7 +2038,7 @@ def emit_witness_and_relay_objects() -> None:
 
     # Vector 46: the two-heads fault proof — one witness, one subject, one
     # shared previous_cosigned_digest, two different event_digests, and `seed`
-    # clear on both heads, and one shared `seed_event`. Those are the six
+    # clear on both heads, and one shared seed (`seed_event`, `seed_observed_at`). Those are the six
     # conditions §9.7.4.3 states.
     baseline = sha256(b"scp-25-fault-proof-baseline-head")
     head_a = sha256(b"scp-25-fault-proof-successor-a")
