@@ -2996,7 +2996,8 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
             code.contains("let context_events = match")
                 && code.contains("Ok(supervisor) => supervisor.subscribe_events(),"),
             "{bridge} MCP serve must obtain the Supervisor ContextEvent receiver \
-             on its PRODUCTION path (a comment or test-module occurrence does not count)"
+             on its PRODUCTION path (an occurrence in the test module or on a \
+             comment-only line does not count)"
         );
         assert!(
             code.contains("McpServer::with_optional_event_source(provider, context_events)"),
@@ -3054,9 +3055,11 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
 /// line: everything before the trailing `#[cfg(test)] mod tests { ... }`, with
 /// every line that is only a comment (`//`, `///`, `//!`) removed.
 ///
-/// Source-text wiring gates must be satisfiable neither by a bridge's own unit
-/// tests nor by prose that names the symbol. Collapsing whitespace lets one
-/// pattern match a call rustfmt wraps across lines.
+/// A gate reading this cannot be satisfied by a bridge's own unit tests or by a
+/// comment-only line that names the symbol. Text on a code line still counts,
+/// including a trailing `//` comment, a `/* */` block and a string literal, so
+/// the gates that read it claim no more than that. Collapsing whitespace lets
+/// one pattern match a call rustfmt wraps across lines.
 fn production_code(src: &str) -> String {
     production_source(src)
         .lines()
@@ -3125,7 +3128,7 @@ fn mcp_resource_access_is_answered_from_real_role_state() {
             include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs"),
         ),
     ] {
-        // Search PRODUCTION code with comments removed, exactly as the
+        // Search PRODUCTION code with comment-only lines removed, as the
         // event-source gate above does: PyO3's and UniFFI's test modules and
         // NAPI's doc comments also name `Capability::MessagesRead`, so a
         // whole-file `contains` stayed green after the real check was deleted.
