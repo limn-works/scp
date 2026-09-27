@@ -51,12 +51,14 @@ env:
 #
 #   workspace-debug   `target/debug` under build mode — rust-test (both matrix legs),
 #                     rust-test-napi-production, rust-build-pyo3-production,
-#                     rust-build-uniffi-production, rust-doc (its `cargo test --doc`),
-#                     kotlin-test, fail-closed-pre-rotation, shipped-feature-graph.
+#                     rust-build-uniffi-production, kotlin-test,
+#                     fail-closed-pre-rotation, shipped-feature-graph; and rust-doc
+#                     (its `cargo test --doc`) in part, as the paragraph after this
+#                     list says.
 #   workspace-check   `target/debug` under check mode — rust-clippy, whose two
 #                     `cargo clippy` commands compile every dependency to an `.rmeta`,
-#                     and rust-doc (its `cargo doc --no-deps`, whose dependency units
-#                     cargo compiles in check mode as well). rust-doc restores both
+#                     and rust-doc in part (its `cargo doc --no-deps`, whose dependency
+#                     units cargo compiles in check mode as well). rust-doc restores both
 #                     groups, one rust-cache step each, because its two commands read
 #                     two disjoint artifact sets out of the one directory.
 #   workspace-release `target/release` — python-test and bridge-parity (both run
@@ -83,6 +85,17 @@ env:
 #   fuzz              `fuzz/target/debug` — fuzz-build, whose `cargo check` compiles a
 #                     separate workspace on the nightly `fuzz/rust-toolchain.toml`
 #                     names, under the dev profile.
+#
+# rust-doc reads `workspace-debug` and `workspace-check` without matching either
+# entry in full. Its two commands add `scp-node/cloud-blobs` and
+# `scp-relay/cloud-blobs` to a `--workspace` command. Those features change the
+# resolved features of scp-transport and of every workspace package that depends
+# on it, and they add the `sqlx` and `aws-sdk-s3` dependency graphs. No job that
+# writes either group runs a `--workspace` command with those features, so
+# neither entry holds those units under rust-doc's feature resolution, and
+# rust-doc recompiles them on every run because it saves no entry. No group
+# holds rust-doc's resolution: the recompile costs one job's minutes, and a
+# ninth entry per generation would cost cache space that every run shares.
 #
 # The cap is per repository, so `.github/workflows/fuzz.yml` counts against the same
 # 10 GB: it writes two further groups, `fuzz-run` and `fuzz-run-opt`, both holding
@@ -1238,8 +1251,10 @@ jobs:
           # nothing. The scp-transport command runs the `BackendChoice` unit
           # tests with both arms compiled, the only build in which they assert
           # that `postgres` and `s3` parse in either case and are cloud
-          # backends.
-          cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs --test storage_backend_selection
+          # backends. The scp-node command also enables `testing`, the only
+          # build that compiles `--ephemeral`, so the test checks that
+          # `--ephemeral` exits on `postgres` and `s3`.
+          cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs,testing --test storage_backend_selection
           cargo nextest run --no-tests=fail -p scp-relay --features cloud-blobs --test storage_backend
           cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib startup::tests
           # The saga-journal durable crash-recovery round-trip is gated behind
@@ -1574,7 +1589,10 @@ jobs:
       # writes to the `workspace-check` group. Cargo names the two sets under different
       # metadata hashes in the one `target/debug`, so the second restore adds to the
       # first and overwrites nothing; each step's key names its own group, so neither
-      # restore can match the other's entry.
+      # restore can match the other's entry. Neither entry holds the units that this
+      # job's `scp-node/cloud-blobs` and `scp-relay/cloud-blobs` features change, so
+      # the job recompiles those units on every run. The paragraph after the THE GROUPS
+      # list at the top of this file says why no group holds them.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-debug

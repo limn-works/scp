@@ -391,8 +391,9 @@ cargo nextest run --workspace
 
 # Test the backend selection of each binary's `cloud-blobs` build, and the
 # scp-transport startup tests with every blob backend compiled. The --workspace
-# command above compiles neither cloud backend.
-cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs --test storage_backend_selection
+# command above compiles neither cloud backend. scp-node's command adds
+# `testing`, the only build that compiles `--ephemeral`.
+cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs,testing --test storage_backend_selection
 cargo nextest run --no-tests=fail -p scp-relay --features cloud-blobs --test storage_backend
 cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib startup::tests
 

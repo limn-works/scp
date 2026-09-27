@@ -29,7 +29,9 @@ run_rust() (
   else
     cargo test --workspace
   fi
-  cargo test --workspace --doc
+  # The two cloud-blobs features compile the PostgreSQL and S3 blob backends,
+  # whose doctests no default feature compiles.
+  cargo test --workspace --doc --features scp-node/cloud-blobs,scp-relay/cloud-blobs
 )
 
 run_python() (

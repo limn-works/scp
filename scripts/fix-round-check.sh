@@ -639,10 +639,9 @@ PYEOF
 #
 # Four CI lint and test commands compile the `cloud-blobs` features of scp-node and
 # scp-relay, one package per command, and each has an entry here: the `rust-clippy` job
-# lints each package over every target, adding `testing` for scp-node, and the
-# `rust-test-optional-features` job leaves `testing` off and builds only each package's
-# backend-selection test target. Those four commands and this list keep the two packages
-# apart because cargo unifies scp-transport's features across every package one
+# lints each package over every target, and the `rust-test-optional-features` job builds
+# only each package's backend-selection test target. Both jobs add `testing` for
+# scp-node. Those four commands and this list keep the two packages apart because cargo unifies scp-transport's features across every package one
 # invocation builds: a joint command compiles the PostgreSQL and S3 backends into one
 # package through the other package's `cloud-blobs`, and so hides that package's own
 # mis-wired `cloud-blobs`. The `cargo test --doc` and `cargo doc` commands of the
@@ -657,7 +656,7 @@ EXTRA_FEATURE_CHECKS=(
     "scp-transport|sqlite-blob,redb-blob,postgres-blob,s3-blob,startup"
     "scp-node|cloud-blobs,testing"
     "scp-relay|cloud-blobs"
-    "scp-node|cloud-blobs|--test storage_backend_selection"
+    "scp-node|cloud-blobs,testing|--test storage_backend_selection"
     "scp-relay|cloud-blobs|--test storage_backend"
 )
 

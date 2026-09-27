@@ -1,7 +1,8 @@
 //! A `scp-node` rejects `SCP_RELAY_STORAGE_BACKEND` values `postgres` and `s3`
 //! that it cannot serve (a build without `cloud-blobs`, or a missing URL or
-//! bucket) instead of opening another blob store, and
-//! `--self-host`, which opens only `SQLite`, rejects both in every build.
+//! bucket) instead of opening another blob store. `--self-host`, which opens
+//! only `SQLite`, and `--ephemeral`, which keeps blobs in memory, reject both in
+//! every build that has the mode.
 
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -118,27 +119,38 @@ fn a_cloud_backend_fails_closed() {
 
 /// `--self-host` exits non-zero on `postgres` and `s3`, in either case, and
 /// names the value, instead of serving from a `SQLite` store the operator did
-/// not select.
+/// not select. A build with the `testing` feature also runs `--ephemeral`, which
+/// exits the same way instead of keeping blobs in memory.
 #[test]
-fn self_host_rejects_a_cloud_backend() {
-    for backend in ["postgres", "s3", "POSTGRES", "S3"] {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let output = output_within_deadline(
-            Command::new(node_bin())
-                .arg("--self-host")
-                .current_dir(tmp.path())
-                .env("SCP_STORAGE_PATH", tmp.path().join("node-storage"))
-                .env("SCP_RELAY_STORAGE_BACKEND", backend)
-                .env("SCP_NODE_DHT_MODE", "disabled")
-                .env("SCP_NODE_SELF_HOST_NO_NAT", "1")
-                .env("SCP_NODE_SELF_HOST_PORT", "0")
-                .env_remove("RUST_LOG"),
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(!output.status.success(), "{backend}: {stderr}");
-        assert!(
-            stderr.contains(&format!("SCP_RELAY_STORAGE_BACKEND='{backend}'")),
-            "{backend}: {stderr}"
-        );
+fn a_fixed_store_mode_rejects_a_cloud_backend() {
+    let mut modes = vec![("--self-host", "in SQLite under its storage directory")];
+    if cfg!(feature = "testing") {
+        modes.push(("--ephemeral", "in memory"));
+    }
+    for (flag, store) in modes {
+        for backend in ["postgres", "s3", "POSTGRES", "S3"] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let output = output_within_deadline(
+                Command::new(node_bin())
+                    .arg(flag)
+                    .current_dir(tmp.path())
+                    .env("SCP_NODE_DOMAIN", "example.com")
+                    .env("SCP_NODE_BIND_ADDR", "127.0.0.1:0")
+                    .env("SCP_STORAGE_PATH", tmp.path().join("node-storage"))
+                    .env("SCP_RELAY_STORAGE_BACKEND", backend)
+                    .env("SCP_NODE_DHT_MODE", "disabled")
+                    .env("SCP_NODE_SELF_HOST_NO_NAT", "1")
+                    .env("SCP_NODE_SELF_HOST_PORT", "0")
+                    .env_remove("RUST_LOG"),
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{flag} {backend}: {stderr}");
+            assert!(
+                stderr.contains(&format!(
+                    "{flag} stores blobs {store} and cannot use SCP_RELAY_STORAGE_BACKEND='{backend}'"
+                )),
+                "{flag} {backend}: {stderr}"
+            );
+        }
     }
 }

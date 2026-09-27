@@ -332,7 +332,10 @@ fn ephemeral_blob_backend() -> BlobStorageBackend {
 ///
 /// In ephemeral mode, ALL subsystems use in-memory implementations regardless
 /// of environment variable overrides. No mixed mode is permitted — if you want
-/// persistent storage or production DHT, omit the `--ephemeral` flag.
+/// persistent storage or production DHT, omit the `--ephemeral` flag. The mode
+/// exits when `SCP_RELAY_STORAGE_BACKEND` names `postgres` or `s3`, because it
+/// would otherwise keep blobs in memory in place of the store the operator
+/// selected.
 ///
 /// **Test-harness-only.** This path wires the `InMemoryDhtClient` (a §17.17.3
 /// resolve nullifier) and `InMemoryKeyCustody`, so it is compiled only under the
@@ -347,6 +350,7 @@ async fn run_full_node_ephemeral() {
     use scp_platform::in_memory::InMemoryStorage;
     use scp_platform::testing::InMemoryKeyCustody;
 
+    exit_on_ignored_cloud_backend("--ephemeral", EPHEMERAL_STORE);
     let domain = require_domain();
     let http_addr = node_http_addr();
 
@@ -719,18 +723,20 @@ fn env_flag_is_truthy(value: Option<&str>) -> bool {
     matches!(value, Some("1" | "true"))
 }
 
-/// Writes the error `--self-host` exits with when `SCP_RELAY_STORAGE_BACKEND`
-/// names `postgres` or `s3`, or returns `None` for every other value.
+/// Writes the error a mode that ignores `SCP_RELAY_STORAGE_BACKEND` exits with
+/// when the variable names `postgres` or `s3`, or returns `None` for every other
+/// value.
 ///
-/// `--self-host` opens only a `SQLite` blob store, in every build. Without this
-/// check, an operator who selected `postgres` or `s3` would get a `SQLite`
-/// store in its place. Every other value leaves `--self-host` on `SQLite`, as
-/// it ran before `cloud-blobs` existed.
+/// `--self-host` opens only a `SQLite` blob store and `--ephemeral` only an
+/// in-memory one, in every build. Without this check, an operator who selected
+/// `postgres` or `s3` would get the mode's own store in its place. Every other
+/// value leaves the mode on its own store, as it ran before `cloud-blobs`
+/// existed. `flag` names the mode and `store` says where it keeps blobs.
 ///
 /// The value is parsed by [`startup::BackendChoice::parse`], the parse
 /// `backend_choice_from_env` runs, so the two cannot disagree about which
 /// values name a cloud backend.
-fn self_host_backend_conflict(selected: Option<&str>) -> Option<String> {
+fn fixed_store_backend_conflict(flag: &str, store: &str, selected: Option<&str>) -> Option<String> {
     let value = selected?;
     let cloud = match startup::BackendChoice::parse(value) {
         Ok(choice) => choice.is_cloud(),
@@ -741,11 +747,28 @@ fn self_host_backend_conflict(selected: Option<&str>) -> Option<String> {
         return None;
     }
     Some(format!(
-        "error: --self-host stores blobs in SQLite under its storage directory and \
-         cannot use SCP_RELAY_STORAGE_BACKEND='{value}'. Unset the variable, or run \
-         the full node or --relay-only, which read it."
+        "error: {flag} stores blobs {store} and cannot use \
+         SCP_RELAY_STORAGE_BACKEND='{value}'. Unset the variable, or run the full \
+         node or --relay-only, which read it."
     ))
 }
+
+/// Exits the process with [`fixed_store_backend_conflict`]'s error when
+/// `SCP_RELAY_STORAGE_BACKEND` names `postgres` or `s3`.
+fn exit_on_ignored_cloud_backend(flag: &str, store: &str) {
+    let selected = std::env::var("SCP_RELAY_STORAGE_BACKEND").ok();
+    if let Some(message) = fixed_store_backend_conflict(flag, store, selected.as_deref()) {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
+}
+
+/// Where `--self-host` stores blobs, as its rejection message words it.
+const SELF_HOST_STORE: &str = "in SQLite under its storage directory";
+
+/// Where `--ephemeral` stores blobs, as its rejection message words it.
+#[cfg(any(test, feature = "testing"))]
+const EPHEMERAL_STORE: &str = "in memory";
 
 /// Runs the node in self-host mode, hosting a static site entirely on SCP.
 ///
@@ -764,11 +787,7 @@ fn self_host_backend_conflict(selected: Option<&str>) -> Option<String> {
 /// (share it out-of-band). `memory` is valid with NAT probing on or off. See the
 /// startup banner.
 async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf>) {
-    let selected = std::env::var("SCP_RELAY_STORAGE_BACKEND").ok();
-    if let Some(message) = self_host_backend_conflict(selected.as_deref()) {
-        eprintln!("{message}");
-        std::process::exit(1);
-    }
+    exit_on_ignored_cloud_backend("--self-host", SELF_HOST_STORE);
     let port: u16 = startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16);
     let plaintext = self_host_plaintext();
     let skip_nat = self_host_skip_nat();
@@ -1180,22 +1199,31 @@ async fn main() {
 mod tests {
     use super::*;
 
-    /// `--self-host` rejects `postgres` and `s3` in any case, and leaves every
-    /// other value to run on `SQLite` as before.
+    /// `--self-host` and `--ephemeral` each reject `postgres` and `s3` in any
+    /// case, and leave every other value to run on the mode's own store.
     #[test]
-    fn self_host_rejects_a_cloud_backend() {
-        for value in ["postgres", "s3", "POSTGRES", "S3"] {
-            let message = self_host_backend_conflict(Some(value));
-            assert!(
-                message
-                    .as_deref()
-                    .is_some_and(|m| m.contains(&format!("SCP_RELAY_STORAGE_BACKEND='{value}'"))),
-                "--self-host must reject '{value}'; got {message:?}"
-            );
-        }
-        assert_eq!(self_host_backend_conflict(None), None);
-        for value in ["sqlite", "redb", "memory", "banana"] {
-            assert_eq!(self_host_backend_conflict(Some(value)), None, "{value}");
+    fn a_fixed_store_mode_rejects_a_cloud_backend() {
+        for (flag, store) in [
+            ("--self-host", SELF_HOST_STORE),
+            ("--ephemeral", EPHEMERAL_STORE),
+        ] {
+            for value in ["postgres", "s3", "POSTGRES", "S3"] {
+                let message = fixed_store_backend_conflict(flag, store, Some(value));
+                assert!(
+                    message.as_deref().is_some_and(|m| m.contains(&format!(
+                        "{flag} stores blobs {store} and cannot use SCP_RELAY_STORAGE_BACKEND='{value}'"
+                    ))),
+                    "{flag} must reject '{value}'; got {message:?}"
+                );
+            }
+            assert_eq!(fixed_store_backend_conflict(flag, store, None), None);
+            for value in ["sqlite", "redb", "memory", "banana"] {
+                assert_eq!(
+                    fixed_store_backend_conflict(flag, store, Some(value)),
+                    None,
+                    "{flag} {value}"
+                );
+            }
         }
     }
 

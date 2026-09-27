@@ -798,15 +798,13 @@ fi
 # CI lints and tests the PostgreSQL and S3 blob backends of the two binaries in one
 # command per package. The `rust-clippy` job runs `cargo clippy -p scp-node --features cloud-blobs,testing
 # --all-targets` and `cargo clippy -p scp-relay --features cloud-blobs --all-targets`, and the
-# `rust-test-optional-features` job runs `cargo nextest run -p scp-node --features cloud-blobs
+# `rust-test-optional-features` job runs `cargo nextest run -p scp-node --features cloud-blobs,testing
 # --test storage_backend_selection` and `cargo nextest run -p scp-relay --features cloud-blobs
 # --test storage_backend`. A joint command would let cargo unify scp-transport's features
 # across both packages, so one package's `cloud-blobs` would compile the backends into the
 # other package and hide that package's own mis-wired `cloud-blobs`. The test-lane checks
-# name their test target rather than `--all-targets` because scp-node's `website` example
-# and `integration` test compile only under `testing`, so an `--all-targets` check without
-# it fails on targets that CI command never builds. The `rust-doc` job and
-# `.github/workflows/docs.yml` turn on both packages' `cloud-blobs` in one command, because
+# name their test target rather than `--all-targets` because the CI command they mirror
+# builds only that target. The `rust-doc` job and `.github/workflows/docs.yml` turn on both packages' `cloud-blobs` in one command, because
 # rustdoc needs only the backend modules compiled; this script mirrors no rustdoc command.
 #
 # The mutations it kills: deleting any of the four scp-node and scp-relay entries from
@@ -832,7 +830,7 @@ fi
 for expected in \
     'check -p scp-node --all-targets --features cloud-blobs,testing' \
     'check -p scp-relay --all-targets --features cloud-blobs' \
-    'check -p scp-node --test storage_backend_selection --features cloud-blobs' \
+    'check -p scp-node --test storage_backend_selection --features cloud-blobs,testing' \
     'check -p scp-relay --test storage_backend --features cloud-blobs'; do
     if grep -qF -- "$expected" "$FIXTURE13B.harness/cargo.log"; then
         report "case 13b runs \`$expected\`" 0 ""
