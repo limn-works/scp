@@ -64,14 +64,6 @@ needs the artifact that governs it.
 - Resolve architectural conflicts between agents
 - Document decisions and rationale
 
-## Interactions
-
-| With Agent | Architect's Role |
-|------------|------------------|
-| **Data** | Define repository protocols, model contracts, migration strategy |
-| **UI** | Define view protocols, navigation patterns, design system structure |
-| **Network** | Define API client protocols, error handling patterns, sync contracts |
-
 ## When to Invoke
 
 Spin up Architect when:
