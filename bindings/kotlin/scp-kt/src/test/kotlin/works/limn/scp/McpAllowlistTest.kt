@@ -12,11 +12,6 @@
 
 package works.limn.scp
 
-import uniffi.scp.StorageConfig
-import kotlin.test.assertEquals
-import kotlin.test.assertFalse
-import kotlin.test.assertTrue
-import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assumptions.assumeTrue
@@ -24,6 +19,11 @@ import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import uniffi.scp.StorageConfig
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.seconds
 
 class McpAllowlistTest {
     companion object {
@@ -63,10 +63,10 @@ class McpAllowlistTest {
         shutdownInstance(scp)
     }
 
-    /// Shuts down [instance] using a fresh [CoroutineBridge] over the
-    /// stub native bindings. Centralizes the cleanup pattern so changes
-    /// to dispatcher wiring or shutdown timeout land in one place. See
-    /// [ConformanceStubBindings] for the no-op shutdown surface.
+    // / Shuts down [instance] using a fresh [CoroutineBridge] over the
+    // / stub native bindings. Centralizes the cleanup pattern so changes
+    // / to dispatcher wiring or shutdown timeout land in one place. See
+    // / [ConformanceStubBindings] for the no-op shutdown surface.
     private fun shutdownInstance(instance: SCP) {
         runBlocking {
             val bridge =

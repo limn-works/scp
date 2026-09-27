@@ -294,8 +294,9 @@ private fun endAggregate(vector: JsonObject): JsonElement? =
         ?.jsonObject
         ?.get("aggregate")
 
-private fun expectedErrorCode(vector: JsonObject): String? =
-    (vector["expected_error_code"] as? JsonPrimitive)?.contentOrNull
+private fun expectedErrorCode(vector: JsonObject): String? {
+    return (vector["expected_error_code"] as? JsonPrimitive)?.contentOrNull
+}
 
 // ---------------------------------------------------------------------------
 // Credit value class.
@@ -749,8 +750,13 @@ class ConformanceVectorSmokeTest {
     fun `vectors cover exactly the seven names`() {
         assertEquals(
             setOf(
-                "non_streaming", "multi_chunk", "cancellation", "error_terminal",
-                "error_recoverable", "sequence_gap", "credit_stall",
+                "non_streaming",
+                "multi_chunk",
+                "cancellation",
+                "error_terminal",
+                "error_recoverable",
+                "sequence_gap",
+                "credit_stall",
             ),
             VECTORS.keys,
         )

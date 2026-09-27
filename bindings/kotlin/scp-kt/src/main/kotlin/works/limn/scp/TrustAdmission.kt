@@ -8,7 +8,7 @@
 // ParticipationProfile (§7.3.2.1, SCP-BA-004). The SDK exposes typed shapes
 // (no stringly-typed JSON) and serializes to the Rust serde wire format at the
 // bridge boundary — [SCP.verifyParticipationRequirements] and
-// [SCP.checkCapabilityRequirements] in Scp.kt call the encoders below before
+// [SCP.checkCapabilityRequirements] in SCP.kt call the encoders below before
 // crossing FFI. Mirrors the Swift SDK `Trust.swift` admission types and the
 // TypeScript SDK `types.ts` admission types field-for-field.
 //
