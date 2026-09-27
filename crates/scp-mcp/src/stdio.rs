@@ -254,7 +254,14 @@ where
     // `Some(pump)` exactly when the server is wired — the bundle guarantees it,
     // so no pairing check is needed here.
     let (server, pump) = bundle.into_parts();
-    let server = Arc::new(std::sync::Mutex::new(server));
+    // One async mutex orders the whole session: the read loop holds it across
+    // dispatch AND the response write, and the pump holds it across computing a
+    // notification AND writing it. A notification computed from the registry
+    // therefore reaches stdout before any later request's response, so the
+    // client never receives `resources/updated` for a URI after the
+    // `resources/unsubscribe` acknowledgement for it — the same ordering
+    // `sse::pump_events` gets by broadcasting under its server lock.
+    let server = Arc::new(tokio::sync::Mutex::new(server));
 
     let _pump_guard = pump.map(|pump| {
         AbortOnDrop(tokio::spawn(pump_events(
@@ -269,7 +276,7 @@ where
 
 /// Forwards runtime context events to the client as MCP notifications.
 async fn pump_events<P, C>(
-    server: Arc<std::sync::Mutex<McpServer<P>>>,
+    server: Arc<tokio::sync::Mutex<McpServer<P>>>,
     mut events: broadcast::Receiver<(String, ContextEvent)>,
     channel: C,
 ) where
@@ -288,38 +295,32 @@ async fn pump_events<P, C>(
                 // lagged client re-reads, exactly as the pump promises. Never
                 // fall silent.
                 tracing::warn!("MCP stdio event pump lagged, {skipped} events dropped");
-                let notifications = match server.lock() {
-                    Ok(srv) => srv.lagged_resync_notifications(),
-                    Err(e) => {
-                        tracing::error!("MCP server mutex poisoned in event pump: {e}");
-                        return;
-                    }
-                };
-                for notification in &notifications {
+                // Held across the writes: see `serve_stdio`.
+                let srv = server.lock().await;
+                for notification in &srv.lagged_resync_notifications() {
                     if !channel.notify(notification).await {
                         // stdout is gone; the session is over.
                         return;
                     }
                 }
+                // Released only after the writes land: see `serve_stdio`.
+                drop(srv);
                 continue;
             }
             Err(broadcast::error::RecvError::Closed) => return,
         };
 
-        let notifications = match server.lock() {
-            Ok(srv) => srv.notifications_for_event(&context_id, &event),
-            Err(e) => {
-                tracing::error!("MCP server mutex poisoned in event pump: {e}");
-                return;
-            }
-        };
-
-        for notification in &notifications {
+        // Held across the writes: see `serve_stdio`. Releasing it before the
+        // write would let the read loop acknowledge a `resources/unsubscribe`
+        // between this read of the registry and the delivery it authorized.
+        let srv = server.lock().await;
+        for notification in &srv.notifications_for_event(&context_id, &event) {
             if !channel.notify(notification).await {
                 // stdout is gone; the session is over.
                 return;
             }
         }
+        drop(srv);
     }
 }
 
@@ -367,7 +368,7 @@ impl ClientChannel for StdioNotifier {
 /// [`MAX_LINE_BYTES`] truncation guard and the dispatch path that ship are the
 /// ones under test — a test-local reimplementation would verify a copy.
 async fn read_loop_from<P, R, C>(
-    server: &Arc<std::sync::Mutex<McpServer<P>>>,
+    server: &Arc<tokio::sync::Mutex<McpServer<P>>>,
     mut reader: BufReader<R>,
     channel: &C,
 ) -> Result<(), StdioError>
@@ -400,8 +401,10 @@ where
             continue;
         }
 
+        // Held across dispatch and the response write: see `serve_stdio`.
+        let mut srv = server.lock().await;
         let response = match parse_incoming(trimmed) {
-            Ok(Incoming::Request(req)) => dispatch(server, &req),
+            Ok(Incoming::Request(req)) => srv.handle_request(&req),
             Ok(Incoming::Notification(notif)) => {
                 // Notifications are dispatched through the same entry point
                 // using a synthetic ID; `handle_request` returns `None` for
@@ -412,7 +415,7 @@ where
                     params: notif.params,
                     id: RequestId::Number(0),
                 };
-                dispatch(server, &synthetic);
+                srv.handle_request(&synthetic);
                 // Notifications never produce a response.
                 None
             }
@@ -420,36 +423,16 @@ where
         };
 
         if let Some(resp) = response {
-            let json = match serde_json::to_string(&resp) {
-                Ok(j) => j,
-                Err(e) => {
-                    tracing::error!("failed to serialize response: {e}");
-                    continue;
-                }
-            };
-            channel.write_line(&json).await?;
+            match serde_json::to_string(&resp) {
+                Ok(json) => channel.write_line(&json).await?,
+                Err(e) => tracing::error!("failed to serialize response: {e}"),
+            }
         }
+        // Released only after the response is on the wire: see `serve_stdio`.
+        drop(srv);
     }
 
     Ok(())
-}
-
-/// Dispatches a request against the shared server.
-///
-/// A poisoned mutex means another thread panicked mid-dispatch; there is no
-/// safe state to answer from, so the message is dropped with a logged error
-/// rather than propagating the panic into the transport loop.
-fn dispatch<P: ContextProvider>(
-    server: &std::sync::Arc<std::sync::Mutex<McpServer<P>>>,
-    request: &JsonRpcRequest,
-) -> Option<JsonRpcResponse> {
-    match server.lock() {
-        Ok(mut srv) => srv.handle_request(request),
-        Err(e) => {
-            tracing::error!("MCP server mutex poisoned: {e}");
-            None
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -771,7 +754,7 @@ mod tests {
         let resp: JsonRpcResponse = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(resp.id, RequestId::Number(1));
         assert!(resp.error.is_none());
-        assert!(server.lock().unwrap().is_initialized());
+        assert!(server.lock().await.is_initialized());
     }
 
     /// A line that hits `MAX_LINE_BYTES` with no terminator was truncated;
@@ -807,7 +790,7 @@ mod tests {
     /// notification handling this crate claims to have fixed was verified
     /// against a copy of itself rather than against shipped code.
     async fn process_lines<P: ContextProvider>(
-        server: &Arc<std::sync::Mutex<McpServer<P>>>,
+        server: &Arc<tokio::sync::Mutex<McpServer<P>>>,
         input: &[u8],
     ) -> Vec<u8> {
         let channel = VecSink::default();
@@ -853,8 +836,8 @@ mod tests {
     }
 
     /// Wraps a mock-backed server for the in-memory loop.
-    fn shared_server() -> Arc<std::sync::Mutex<McpServer<MockProvider>>> {
-        Arc::new(std::sync::Mutex::new(McpServer::new(
+    fn shared_server() -> Arc<tokio::sync::Mutex<McpServer<MockProvider>>> {
+        Arc::new(tokio::sync::Mutex::new(McpServer::new(
             MockProvider::default(),
         )))
     }
@@ -972,5 +955,128 @@ mod tests {
         );
 
         drop(keep_open);
+    }
+
+    /// A [`ClientChannel`] that records every write in one ordered log and
+    /// parks the first notification until the test releases it, so a test can
+    /// hold the pump mid-write while the read loop handles a request.
+    #[derive(Clone)]
+    struct GatedSink {
+        log: Arc<tokio::sync::Mutex<Vec<String>>>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl ClientChannel for GatedSink {
+        async fn write_line(&self, json: &str) -> std::io::Result<()> {
+            self.log.lock().await.push(json.to_owned());
+            Ok(())
+        }
+
+        async fn notify(&self, notification: &JsonRpcNotification) -> bool {
+            self.entered.notify_one();
+            let Ok(permit) = self.release.acquire().await else {
+                return false;
+            };
+            permit.forget();
+            let json = serde_json::to_string(notification).expect("serialize");
+            self.log.lock().await.push(json);
+            true
+        }
+    }
+
+    /// The pump computes a notification from the subscription registry and
+    /// writes it; a `resources/unsubscribe` the read loop handles in between
+    /// must not be acknowledged before that write lands. Otherwise the client
+    /// receives `resources/updated` for a URI it was just told is unsubscribed.
+    #[tokio::test]
+    async fn unsubscribe_ack_never_precedes_a_notification_computed_before_it() {
+        use scp_core::context::membership::ContextEvent;
+
+        let uri = "scp://ctx_a/events";
+        let (event_tx, server, pump) = wired_subscribed_server(uri);
+        let server = Arc::new(tokio::sync::Mutex::new(server));
+        let sink = GatedSink {
+            log: Arc::default(),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+
+        let pump_task = tokio::spawn(pump_events(
+            Arc::clone(&server),
+            pump.into_receiver(),
+            sink.clone(),
+        ));
+        event_tx
+            .send((
+                "ctx_a".to_owned(),
+                ContextEvent::ContentKeysRotated { reason: None },
+            ))
+            .expect("event send");
+        // The pump has read the registry and is parked inside its write.
+        tokio::time::timeout(Duration::from_secs(5), sink.entered.notified())
+            .await
+            .expect("the pump never started writing the notification");
+
+        let unsubscribe = serde_json::to_string(&JsonRpcRequest {
+            jsonrpc: crate::protocol::JSONRPC_VERSION.to_owned(),
+            method: crate::protocol::METHOD_RESOURCES_UNSUBSCRIBE.to_owned(),
+            params: Some(serde_json::json!({ "uri": uri })),
+            id: RequestId::Number(3),
+        })
+        .expect("serialize")
+            + "\n";
+        let read_loop = {
+            let server = Arc::clone(&server);
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                read_loop_from(
+                    &server,
+                    BufReader::new(std::io::Cursor::new(unsubscribe.into_bytes())),
+                    &sink,
+                )
+                .await
+            })
+        };
+        // Give the read loop time to acknowledge the unsubscribe if nothing
+        // orders it behind the pump's in-flight write.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        sink.release.add_permits(64);
+
+        tokio::time::timeout(Duration::from_secs(5), read_loop)
+            .await
+            .expect("read loop did not finish")
+            .expect("read loop task panicked")
+            .expect("read loop must not error on in-memory input");
+        // Let the released pump finish its write before reading the log.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !sink
+            .log
+            .lock()
+            .await
+            .iter()
+            .any(|l| l.contains(crate::protocol::METHOD_RESOURCES_UPDATED))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pump must deliver the notification it computed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        pump_task.abort();
+
+        let log = sink.log.lock().await.clone();
+        let updated = log
+            .iter()
+            .position(|l| l.contains(crate::protocol::METHOD_RESOURCES_UPDATED))
+            .expect("the pump must deliver the notification it computed");
+        let ack = log
+            .iter()
+            .position(|l| l.contains("\"id\":3"))
+            .expect("the unsubscribe must be acknowledged");
+        assert!(
+            updated < ack,
+            "resources/updated was written after the unsubscribe acknowledgement: {log:?}"
+        );
     }
 }
