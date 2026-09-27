@@ -2968,7 +2968,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-mcp/server.rs"
       ],
@@ -3016,7 +3016,8 @@
       "details": {
         "tool_call_example": "{\n    \"jsonrpc\": \"2.0\",\n    \"method\": \"tools/call\",\n    \"params\": {\n        \"name\": \"context_a/guide_assistant\",\n        \"arguments\": { \"query\": \"butter substitute\" }\n    },\n    \"id\": 1\n}"
       },
-      "result": "MCP server with ContextProvider trait, capability filtering, tool namespacing. 42 tests."
+      "result": "MCP server with ContextProvider trait, capability filtering, tool namespacing. 42 tests.",
+      "auditNote": "Downgraded from done (audit): the NAPI MCP provider in crates/scp-ffi/napi/src/mcp.rs does not implement ContextProvider::invoke_outlet, so its validate_capability refuses every tool, tools/list is empty and tools/call is refused. The tool-invocation criterion is unmet on NAPI. The PyO3 and UniFFI providers run outlets from tools/call."
     },
     {
       "id": "SCP-049",

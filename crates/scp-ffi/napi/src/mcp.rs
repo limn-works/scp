@@ -451,12 +451,13 @@ fn held_role_state(
     }
 }
 
-/// Why the NAPI MCP server lists no tools and refuses every `tools/call`: the
-/// bridge has no synchronous path from `ContextProvider::invoke_outlet` to an
-/// outlet handler, so it reports the capability as absent rather than
-/// advertising tools it cannot run.
-const OUTLET_INVOCATION_UNAVAILABLE: &str = "outlet invocation through the NAPI MCP server is unavailable: the bridge \
-     cannot execute an outlet from an MCP tools/call";
+/// Why the NAPI MCP server lists no tools and refuses every `tools/call`: this
+/// bridge's `ContextProvider::invoke_outlet` is not implemented, so it reports
+/// the capability as absent rather than advertising tools it cannot run. The
+/// `PyO3` and `UniFFI` providers do run outlets from `tools/call`.
+// Stub — see SCP-048
+const OUTLET_INVOCATION_UNAVAILABLE: &str = "outlet invocation through the NAPI MCP server is not implemented: no \
+     tools/call can run on this bridge, whatever grant the agent holds";
 
 impl ContextProvider for McpNapiBridgeProvider {
     fn active_context_ids(&self) -> Result<Vec<scp_mcp::namespace::ContextId>, String> {
@@ -522,9 +523,10 @@ impl ContextProvider for McpNapiBridgeProvider {
         _context_id: &str,
         _outlet_name: &str,
     ) -> Result<(), scp_mcp::server::AccessRefusal> {
+        // Stub — see SCP-048
         // `McpServer` lists a tool exactly when this method returns `Ok`, and
         // every `tools/call` ends in `invoke_outlet`. This bridge's
-        // `invoke_outlet` cannot execute an outlet, so granting here would
+        // `invoke_outlet` is not implemented, so granting here would
         // put tools in `tools/list` that every `tools/call` then fails. The
         // denial keeps `tools/list` empty and refuses `tools/call` before it
         // reaches `invoke_outlet`, so a client sees the capability as absent.
@@ -539,6 +541,7 @@ impl ContextProvider for McpNapiBridgeProvider {
         _outlet_name: &str,
         _arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
+        // Stub — see SCP-048
         Err(OUTLET_INVOCATION_UNAVAILABLE.to_owned())
     }
 
@@ -656,6 +659,42 @@ async fn run_mcp_stdio_server(
 // Bridge functions
 // ---------------------------------------------------------------------------
 
+/// Builds the one server `mcp_server_create_on` hands to its transport,
+/// paired with the supervisor's context event receiver when there is one.
+///
+/// `subscribe_events()` returns `None` only for a supervisor built without the
+/// channel; every NAPI supervisor path enables it (see
+/// `crate::runtime::build_supervisor_arc`). With no supervisor or no channel
+/// the bundle is unwired: the server advertises `resources.subscribe: false`
+/// and rejects `resources/subscribe`, so the capability is honestly absent
+/// rather than accepted-and-never-delivered. Serving is not failed: the server
+/// still serves `resources/list|read`, from the actor when a supervisor is
+/// attached and from the bridge state when none is. Failing outright would
+/// deny working functionality over an optional feature. This server lists no
+/// tools with or without a supervisor (`OUTLET_INVOCATION_UNAVAILABLE`).
+///
+/// One call decides both the advertisement and the delivery machinery, folded
+/// into one `McpServerForTransport` bundle.
+fn mcp_server_bundle(
+    bi: &NapiBridgeInstance,
+    provider: McpNapiBridgeProvider,
+) -> scp_mcp::server::McpServerForTransport<McpNapiBridgeProvider> {
+    let context_events = match crate::runtime::supervisor(bi) {
+        Ok(supervisor) => supervisor.subscribe_events(),
+        Err(e) => {
+            tracing::warn!("MCP server: no supervisor attached ({e})");
+            None
+        }
+    };
+    if context_events.is_none() {
+        tracing::warn!(
+            "MCP server: no context event source — resource subscriptions \
+             will be advertised as unsupported and rejected if requested"
+        );
+    }
+    scp_mcp::server::McpServer::with_optional_event_source(provider, context_events)
+}
+
 /// Per-bridge-instance implementation of [`Scp::mcp_server_create`](crate::scp::Scp::mcp_server_create).
 #[allow(clippy::unused_async)]
 pub(crate) async fn mcp_server_create_on(
@@ -684,36 +723,6 @@ pub(crate) async fn mcp_server_create_on(
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let transport_mode = config.transport.clone();
 
-    // Resource subscriptions are backed by the supervisor's context event
-    // broadcast channel. Subscribe *before* spawning so no event emitted
-    // between here and the transport loop starting is missed.
-    //
-    // `subscribe_events()` returns `None` only for a supervisor built without
-    // the channel; every NAPI supervisor path enables it (see
-    // `crate::runtime::build_supervisor_arc`). When it is `None` the transport
-    // advertises `resources.subscribe: false` and rejects
-    // `resources/subscribe` — the capability is honestly absent rather than
-    // accepted-and-never-delivered.
-    // A missing supervisor or channel does not fail serving: the server still
-    // serves `resources/list|read`, from the actor when a supervisor is
-    // attached and from the bridge state when none is, and advertises
-    // `resources.subscribe: false`. Failing outright would deny working
-    // functionality over an optional feature. This server lists no tools with
-    // or without a supervisor (`OUTLET_INVOCATION_UNAVAILABLE`).
-    let context_events = match crate::runtime::supervisor(bi) {
-        Ok(supervisor) => supervisor.subscribe_events(),
-        Err(e) => {
-            tracing::warn!("MCP server: no supervisor attached ({e})");
-            None
-        }
-    };
-    if context_events.is_none() {
-        tracing::warn!(
-            "MCP server: no context event source — resource subscriptions \
-             will be advertised as unsupported and rejected if requested"
-        );
-    }
-
     // The provider reads this instance's per-context registries through a
     // `Weak`, so the spawned server task cannot pin the instance alive.
     let provider = McpNapiBridgeProvider {
@@ -721,9 +730,9 @@ pub(crate) async fn mcp_server_create_on(
         agent_did: config.identity_did,
         context_ids: config.context_ids,
     };
-    // One call decides both the advertisement and the delivery machinery, folded
-    // into one `McpServerForTransport` bundle.
-    let server = scp_mcp::server::McpServer::with_optional_event_source(provider, context_events);
+    // Subscribe to the supervisor's events *before* spawning, so no event
+    // emitted between here and the transport loop starting is missed.
+    let server = mcp_server_bundle(bi, provider);
 
     // The bridge instance's cancel token fires on `emergency_cancel_tasks()`
     // from `Drop`, so an instance dropped without an explicit `mcp_server_stop`
@@ -1378,7 +1387,7 @@ mod tests {
     }
 
     /// `tools/list` must not name a tool that `tools/call` cannot run. The
-    /// NAPI `invoke_outlet` cannot execute an outlet, so the context creator,
+    /// NAPI `invoke_outlet` is not implemented, so the context creator,
     /// who holds the admin role, sees an empty tool list and a `tools/call`
     /// refused at the capability check.
     #[test]
@@ -1759,11 +1768,13 @@ mod tests {
     /// Wiring guard: `mcp_server_create_on` sources its receiver
     /// from `Supervisor::subscribe_events()`. Every NAPI supervisor path
     /// enables the broadcast channel (`build_supervisor_arc`), so that call
-    /// must yield `Some` — were it to regress to `None`, a fully-wired bridge
-    /// would silently downgrade to advertising `resources.subscribe: false`.
+    /// must yield `Some`, and `mcp_server_bundle`, the function
+    /// `mcp_server_create_on` builds its server with, must return the wired
+    /// bundle. Were either to regress, a fully-wired bridge would silently
+    /// downgrade to advertising `resources.subscribe: false`.
     #[test]
     fn supervisor_yields_context_event_receiver_for_mcp_napi() {
-        let bi = NapiBridgeInstance::new_napi();
+        let bi = Arc::new(NapiBridgeInstance::new_napi());
         crate::runtime::init_supervisor_for_test_on(&bi);
 
         let supervisor =
@@ -1773,6 +1784,15 @@ mod tests {
             "the NAPI supervisor must expose a context event receiver so MCP \
              resource subscriptions are wired rather than advertised-and-dropped"
         );
+        let bundle = mcp_server_bundle(
+            &bi,
+            McpNapiBridgeProvider {
+                bi: Arc::downgrade(&bi),
+                agent_did: AGENT_DID.to_owned(),
+                context_ids: vec![SUB_CTX.to_owned()],
+            },
+        );
+        assert_eq!(format!("{bundle:?}"), "McpServerForTransport::Wired");
     }
 
     /// A missing `Supervisor` degrades the subscription capability and must
@@ -1782,10 +1802,12 @@ mod tests {
     /// bridge state alone, so refusing to serve over an unavailable optional
     /// feature would be a regression. The NAPI server lists no tools with or
     /// without a supervisor (see `napi_mcp_lists_no_tool_it_cannot_invoke`).
-    /// The test drives the production entry point, then reads `resources/list`
-    /// through the provider type that entry point builds over the same
-    /// instance, so a provider that served nothing without a supervisor fails
-    /// here.
+    /// The test drives the production entry point, checks that
+    /// `mcp_server_bundle`, the function that entry point builds its server
+    /// with, returns the unwired bundle, whose server advertises
+    /// `resources.subscribe: false`, then reads `resources/list` through the
+    /// provider type that entry point builds over the same instance, so a
+    /// provider that served nothing without a supervisor fails here.
     #[test]
     fn missing_supervisor_degrades_subscriptions_not_the_whole_server_napi() {
         let (bi, mut server) = napi_mcp_fixture();
@@ -1811,7 +1833,23 @@ mod tests {
             .block_on(mcp_server_stop_on(&bi, &handle))
             .expect("the server created without a supervisor must stop cleanly");
 
-        assert!(!initialize_and_read_subscribe_flag(&mut server));
+        let bundle = mcp_server_bundle(
+            &bi,
+            McpNapiBridgeProvider {
+                bi: Arc::downgrade(&bi),
+                agent_did: AGENT_DID.to_owned(),
+                context_ids: vec![SUB_CTX.to_owned()],
+            },
+        );
+        assert_eq!(
+            format!("{bundle:?}"),
+            "McpServerForTransport::Unwired",
+            "without a supervisor the served server must not advertise resources.subscribe"
+        );
+        // Initialize the fixture server only so it answers `resources/list`.
+        // Its flag says nothing about the served server: the fixture builds
+        // with `McpServer::new`, which never advertises subscriptions.
+        let _ = initialize_and_read_subscribe_flag(&mut server);
         let listed = server
             .handle_request(&mcp_request("resources/list", serde_json::json!({})))
             .expect("resources/list must produce a response")

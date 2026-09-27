@@ -2982,10 +2982,10 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
     let pyo3_mcp_src = include_str!("../../../../crates/scp-ffi/src/mcp.rs");
     let napi_mcp_src = include_str!("../../../../crates/scp-ffi/napi/src/mcp.rs");
     let uniffi_mcp_src = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
-    for (bridge, src) in [
-        ("PyO3", pyo3_mcp_src),
-        ("NAPI", napi_mcp_src),
-        ("UniFFI", uniffi_mcp_src),
+    for (bridge, src, serve_fn) in [
+        ("PyO3", pyo3_mcp_src, "py_mcp_serve"),
+        ("NAPI", napi_mcp_src, "mcp_server_create_on"),
+        ("UniFFI", uniffi_mcp_src, "mcp_server_create"),
     ] {
         // Search the PRODUCTION code only: everything before the trailing
         // `#[cfg(test)]\nmod tests { ... }`, with comment lines removed. Each
@@ -2993,56 +2993,98 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
         // `contains` over the file stayed green after the real call was deleted.
         let code = production_code(src);
         assert!(
-            code.contains("let context_events = match")
-                && code.contains("Ok(supervisor) => supervisor.subscribe_events(),"),
-            "{bridge} MCP serve must obtain the Supervisor ContextEvent receiver \
-             on its PRODUCTION path (an occurrence in the test module or on a \
-             comment-only line does not count)"
-        );
-        assert!(
-            code.contains("McpServer::with_optional_event_source(provider, context_events)"),
-            "{bridge} MCP serve must hand the Supervisor receiver to the constructor \
-             that pairs the advertised capability with the pump that honours it — \
-             passing `None`, or building with McpServer::new, silently downgrades to \
-             resources.subscribe: false"
+            serves_the_supervisor_event_source(&code, serve_fn),
+            "{bridge} `{serve_fn}` must build its server with `mcp_server_bundle`, \
+             and `mcp_server_bundle` must obtain the Supervisor ContextEvent \
+             receiver and hand THAT receiver to \
+             `McpServer::with_optional_event_source`, the file's only call of \
+             that constructor. Passing `None`, or building the served server \
+             anywhere else, silently downgrades to resources.subscribe: false"
         );
     }
 }
 
-/// The gate above must go red when the wiring it pins is deleted and only a
-/// comment or a `None` receiver remains. Each case below is the regression the
+/// Whether `serve_fn` in `code` (from [`production_code`]) builds its server
+/// through `mcp_server_bundle`, and `mcp_server_bundle` both obtains the
+/// Supervisor's receiver and passes that receiver to
+/// `McpServer::with_optional_event_source`, which `code` calls nowhere else.
+fn serves_the_supervisor_event_source(code: &str, serve_fn: &str) -> bool {
+    let bundle_wired = fn_body(code, "mcp_server_bundle").is_some_and(|body| {
+        body.contains("let context_events = match")
+            && body.contains("Ok(supervisor) => supervisor.subscribe_events(),")
+            && body.contains("McpServer::with_optional_event_source(provider, context_events)")
+    });
+    let serve_uses_bundle =
+        fn_body(code, serve_fn).is_some_and(|body| body.contains("= mcp_server_bundle("));
+    bundle_wired && serve_uses_bundle && code.matches("with_optional_event_source(").count() == 1
+}
+
+/// The event-source gate above must go red when the wiring it pins is deleted
+/// and only a comment or a `None` receiver remains, or when its pieces survive
+/// in a function the serve path does not run. Each case below is the regression the
 /// gate exists to catch, written the way a real edit would leave the source.
 #[test]
 fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
-    let wired = "fn serve() {\n    // `subscribe_events()` returns `None` only for ...\n    \
+    let wired = "fn mcp_server_bundle(bi: &Bi, provider: P) -> McpServerForTransport<P> {\n    \
+                 // `subscribe_events()` returns `None` only for ...\n    \
                  let context_events = match rt.supervisor() {\n        \
                  Ok(supervisor) => supervisor.subscribe_events(),\n        Err(_) => None,\n    };\n    \
-                 let server =\n        McpServer::with_optional_event_source(provider, context_events);\n}\n\
+                 McpServer::with_optional_event_source(provider, context_events)\n}\n\
+                 fn serve() {\n    let server = mcp_server_bundle(bi, provider);\n}\n\
                  mod tests {\n    fn t() { let _ = supervisor.subscribe_events(); }\n}\n";
-    let code = production_code(wired);
-    assert!(code.contains("Ok(supervisor) => supervisor.subscribe_events(),"));
-    assert!(code.contains("McpServer::with_optional_event_source(provider, context_events)"));
+    assert!(serves_the_supervisor_event_source(
+        &production_code(wired),
+        "serve"
+    ));
 
+    // The receiver line survives only in the comment and the test module.
     let call_deleted = wired.replace(
         "Ok(supervisor) => supervisor.subscribe_events(),",
         "Ok(_) => None,",
     );
-    let code = production_code(&call_deleted);
-    assert!(
-        !code.contains("subscribe_events()"),
-        "neither the comment nor the test module may satisfy the receiver assertion: {code}"
-    );
-
+    assert!(!serves_the_supervisor_event_source(
+        &production_code(&call_deleted),
+        "serve"
+    ));
+    // The constructor gets `None` in place of the receiver.
     let none_passed = wired.replace(
         "with_optional_event_source(provider, context_events)",
         "with_optional_event_source(provider, None)",
     );
-    assert!(
-        !production_code(&none_passed)
-            .contains("McpServer::with_optional_event_source(provider, context_events)"),
-        "a `None` receiver must not satisfy the constructor assertion"
+    assert!(!serves_the_supervisor_event_source(
+        &production_code(&none_passed),
+        "serve"
+    ));
+    // The bundle function stays wired, but the serve path builds its own
+    // server over a `None` receiver instead of calling it.
+    let serve_builds_its_own = wired.replace(
+        "let server = mcp_server_bundle(bi, provider);",
+        "let context_events = None;\n    \
+         let server = McpServer::with_optional_event_source(provider, context_events);",
     );
+    assert!(!serves_the_supervisor_event_source(
+        &production_code(&serve_builds_its_own),
+        "serve"
+    ));
+    // The receiver is obtained in one function and the constructor is called
+    // over a `None` receiver in another.
+    let split = "fn events() {\n    let context_events = match rt.supervisor() {\n        \
+                 Ok(supervisor) => supervisor.subscribe_events(),\n        Err(_) => None,\n    };\n}\n\
+                 fn mcp_server_bundle(bi: &Bi, provider: P) -> McpServerForTransport<P> {\n    \
+                 let context_events = None;\n    \
+                 McpServer::with_optional_event_source(provider, context_events)\n}\n\
+                 fn serve() {\n    let server = mcp_server_bundle(bi, provider);\n}\n";
+    assert!(!serves_the_supervisor_event_source(
+        &production_code(split),
+        "serve"
+    ));
+}
 
+/// The resource-access gate must go red when a comment names the capability
+/// check, a stand-in role state reaches the predicate, the predicate's verdict
+/// is discarded, or the checked pieces survive only in another function.
+#[test]
+fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
     let doc_only = "/// `Events` require `Capability::MessagesRead` per spec.\n\
                     fn check() -> bool { rt.role_state.members.contains(agent) }\n";
     assert!(!checks_messages_read(&production_code(doc_only)));

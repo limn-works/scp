@@ -1384,6 +1384,45 @@ pub(crate) struct McpClientState {
 // Callers must use the per-instance `server_registry_of(bi)` /
 // `client_registry_of(bi)` accessors.
 
+/// Builds the one server `py_mcp_serve` hands to its transport, paired with
+/// the supervisor's context event receiver when there is one.
+///
+/// `subscribe_events()` returns `None` only for a supervisor built without the
+/// channel; production supervisors always enable it (see
+/// `crate::runtime::build_supervisor`). With no supervisor or no channel the
+/// bundle is unwired: the server advertises `resources.subscribe: false` and
+/// rejects `resources/subscribe`, so the capability is honestly absent rather
+/// than accepted-and-never-delivered. Absence degrades only this capability:
+/// the server still serves `tools/*` and `resources/list|read`. Serving is not
+/// failed outright, because that would deny working functionality over an
+/// optional feature.
+///
+/// One call decides both halves: the server that advertises
+/// `resources.subscribe` and the pump that honours it, folded into one
+/// `McpServerForTransport` value. There is no setter that could desynchronize
+/// them, and only one server is built per serve call: two servers over one
+/// event source would each advertise subscriptions while only one had the
+/// pump.
+fn mcp_server_bundle(
+    bi: &crate::runtime::PyBridgeInstance,
+    provider: FfiBridgeProvider,
+) -> scp_mcp::server::McpServerForTransport<FfiBridgeProvider> {
+    let context_events = match crate::runtime::supervisor(bi) {
+        Ok(supervisor) => supervisor.subscribe_events(),
+        Err(e) => {
+            tracing::warn!("MCP server: no supervisor attached ({e})");
+            None
+        }
+    };
+    if context_events.is_none() {
+        tracing::warn!(
+            "MCP server: no context event source — resource subscriptions \
+             will be advertised as unsupported and rejected if requested"
+        );
+    }
+    McpServer::with_optional_event_source(provider, context_events)
+}
+
 /// Returns a reference to the given bridge instance's MCP server registry.
 fn server_registry_of(bi: &crate::runtime::PyBridgeInstance) -> &DashMap<String, McpServerState> {
     bi.mcp_server_registry().as_ref()
@@ -1493,41 +1532,9 @@ impl crate::scp::PyScp {
         // extend the instance's lifetime.
         let cancel_token = bi_arc.core.cancel_token();
 
-        // Resource subscriptions are backed by the supervisor's context event
-        // broadcast channel. Subscribe *before* spawning so no event emitted
-        // between here and the transport loop starting is missed.
-        //
-        // `subscribe_events()` returns `None` only for a supervisor built
-        // without the channel; production supervisors always enable it (see
-        // `crate::runtime::build_supervisor`). When it is `None` the transport
-        // advertises `resources.subscribe: false` and rejects
-        // `resources/subscribe` — the capability is honestly absent rather
-        // than accepted-and-never-delivered.
-        // Absence degrades only this capability: the server still serves
-        // `tools/*` and `resources/list|read`, and honestly advertises
-        // `resources.subscribe: false`. Serving is NOT failed outright — that
-        // would deny working functionality over an optional feature.
-        let context_events = match crate::runtime::supervisor(bi) {
-            Ok(supervisor) => supervisor.subscribe_events(),
-            Err(e) => {
-                tracing::warn!("MCP server: no supervisor attached ({e})");
-                None
-            }
-        };
-        if context_events.is_none() {
-            tracing::warn!(
-                "MCP server: no context event source — resource subscriptions \
-                 will be advertised as unsupported and rejected if requested"
-            );
-        }
-
-        // One call decides both halves: the server that advertises
-        // `resources.subscribe` and the pump that honours it, folded into one
-        // `McpServerForTransport` value. There is no setter that could
-        // desynchronize them, and only one server is built per serve call — two
-        // servers over one event source would each advertise subscriptions while
-        // only one had the pump.
-        let server = McpServer::with_optional_event_source(provider, context_events);
+        // Subscribe to the supervisor's events *before* spawning, so no event
+        // emitted between here and the transport loop starting is missed.
+        let server = mcp_server_bundle(bi, provider);
 
         let task_handle = rt.spawn(async move {
             match transport_mode.as_str() {
@@ -4530,8 +4537,10 @@ mod tests {
     /// Wiring guard, mirroring the NAPI and `UniFFI` tests:
     /// `py_mcp_serve` sources its receiver from `Supervisor::subscribe_events()`,
     /// and `crate::runtime::build_supervisor` enables the broadcast channel, so
-    /// that call must yield `Some`. Were it to regress to `None`, every `PyO3`
-    /// MCP server would silently advertise `resources.subscribe: false`.
+    /// that call must yield `Some`, and `mcp_server_bundle`, the function
+    /// `py_mcp_serve` builds its server with, must return the wired bundle.
+    /// Were either to regress, every `PyO3` MCP server would silently advertise
+    /// `resources.subscribe: false`.
     #[test]
     fn supervisor_yields_context_event_receiver_for_mcp_pyo3() {
         crate::init_runtime().ok();
@@ -4545,15 +4554,22 @@ mod tests {
             "the PyO3 supervisor must expose a context event receiver so MCP \
              resource subscriptions are wired rather than advertised-and-dropped"
         );
+        let bundle = mcp_server_bundle(
+            &bi,
+            pyo3_mcp_provider(&bi, "ctx-wired", "did:dht:z6MkWiredBundle"),
+        );
+        assert_eq!(format!("{bundle:?}"), "McpServerForTransport::Wired");
     }
 
     /// A missing `Supervisor` degrades ONLY the subscription capability — it
     /// must not fail MCP serving outright. Drives the production entry point:
     /// were `py_mcp_serve` to propagate the missing-supervisor error
-    /// (`supervisor(bi)?`), the serve call would return `Err`. Then reads
-    /// `resources/list` through the provider type that entry point builds over
-    /// the same instance, so a provider that served nothing without a
-    /// supervisor fails here.
+    /// (`supervisor(bi)?`), the serve call would return `Err`. Then checks that
+    /// `mcp_server_bundle`, the function `py_mcp_serve` builds its server with,
+    /// returns the unwired bundle, whose server advertises
+    /// `resources.subscribe: false`, and reads `resources/list` through the
+    /// provider type that entry point builds over the same instance, so a
+    /// provider that served nothing without a supervisor fails here.
     #[test]
     fn missing_supervisor_degrades_subscriptions_not_the_whole_server_pyo3() {
         crate::init_runtime().ok();
@@ -4574,8 +4590,17 @@ mod tests {
         scp.py_mcp_server_stop(&handle)
             .expect("the server created without a supervisor must stop cleanly");
 
+        let bundle = mcp_server_bundle(&bi, pyo3_mcp_provider(&bi, &ctx_id, agent));
+        assert_eq!(
+            format!("{bundle:?}"),
+            "McpServerForTransport::Unwired",
+            "without a supervisor the served server must not advertise resources.subscribe"
+        );
+        // Initialize this server only so it answers `resources/list`. Its flag
+        // says nothing about the served server: `McpServer::new` never
+        // advertises subscriptions.
         let mut server = McpServer::new(pyo3_mcp_provider(&bi, &ctx_id, agent));
-        assert!(!initialize_and_read_subscribe_flag(&mut server));
+        let _ = initialize_and_read_subscribe_flag(&mut server);
         let listed = server
             .handle_request(&mcp_request("resources/list", serde_json::json!({})))
             .expect("resources/list must produce a response")

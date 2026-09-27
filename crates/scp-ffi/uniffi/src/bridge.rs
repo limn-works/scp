@@ -5475,6 +5475,48 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 // MCP stdio server loop
 // ---------------------------------------------------------------------------
 
+/// Builds the one server `mcp_server_create` hands to its transport, paired
+/// with the supervisor's context event receiver when there is one.
+///
+/// `subscribe_events()` returns `None` only for a supervisor built without the
+/// channel; production supervisors always enable it (see
+/// `crate::runtime::build_supervisor`). With no supervisor or no channel the
+/// bundle is unwired: the server advertises `resources.subscribe: false` and
+/// rejects `resources/subscribe`, so the capability is honestly absent rather
+/// than accepted-and-never-delivered. A supervisor built without the channel
+/// degrades only this capability: the server still serves `tools/*` and
+/// `resources/list|read`. With no supervisor attached at all, the provider has
+/// no role state to read, because it asks the actor on every read, so the
+/// server serves no context: `tools/list` and `resources/list` return empty
+/// lists and `resources/read` answers "not a participant". Serving still
+/// starts, so a supervisor attached later is read on the next request.
+///
+/// One call decides both halves: the server that advertises
+/// `resources.subscribe` and the pump that honours it, folded into one
+/// `McpServerForTransport` bundle. There is no setter that could desynchronize
+/// them, and only one server is built per serve call: two servers over one
+/// event source would each advertise subscriptions while only one had the
+/// pump.
+fn mcp_server_bundle(
+    bi: &crate::runtime::UniffiBridgeInstance,
+    provider: McpUniFfiBridgeProvider,
+) -> scp_mcp::server::McpServerForTransport<McpUniFfiBridgeProvider> {
+    let context_events = match bi.context_manager_or_error() {
+        Ok(supervisor) => supervisor.subscribe_events(),
+        Err(e) => {
+            tracing::warn!("MCP server: no supervisor attached ({e})");
+            None
+        }
+    };
+    if context_events.is_none() {
+        tracing::warn!(
+            "MCP server: no context event source — resource subscriptions \
+             will be advertised as unsupported and rejected if requested"
+        );
+    }
+    scp_mcp::server::McpServer::with_optional_event_source(provider, context_events)
+}
+
 /// Runs the MCP stdio transport for this bridge instance until shutdown.
 ///
 /// `server` is the [`scp_mcp::server::McpServerForTransport`] bundle: when it is
@@ -16365,46 +16407,9 @@ impl Scp {
         // extend the instance's lifetime.
         let cancel_token = self.inner.core.cancel_token();
 
-        // Resource subscriptions are backed by the supervisor's context event
-        // broadcast channel. Subscribe *before* spawning so no event emitted
-        // between here and the transport loop starting is missed.
-        //
-        // `subscribe_events()` returns `None` only for a supervisor built
-        // without the channel; production supervisors always enable it (see
-        // `crate::runtime::build_supervisor`). When it is `None` the transport
-        // advertises `resources.subscribe: false` and rejects
-        // `resources/subscribe` — the capability is honestly absent rather
-        // than accepted-and-never-delivered.
-        // A supervisor built without the channel degrades only this
-        // capability: the server still serves `tools/*` and
-        // `resources/list|read`, and advertises `resources.subscribe: false`.
-        // With no supervisor attached at all, the provider has no role state to
-        // read, because it asks the actor on every read, so the server serves
-        // no context: `tools/list` and `resources/list` return empty lists and
-        // `resources/read` answers "not a participant". Serving still starts,
-        // so a supervisor attached later is read on the next request.
-        let context_events = match self.inner.context_manager_or_error() {
-            Ok(supervisor) => supervisor.subscribe_events(),
-            Err(e) => {
-                tracing::warn!("MCP server: no supervisor attached ({e})");
-                None
-            }
-        };
-        if context_events.is_none() {
-            tracing::warn!(
-                "MCP server: no context event source — resource subscriptions \
-                 will be advertised as unsupported and rejected if requested"
-            );
-        }
-
-        // One call decides both halves: the server that advertises
-        // `resources.subscribe` and the pump that honours it, folded into one
-        // `McpServerForTransport` bundle. There is no setter that could
-        // desynchronize them, and only one server is built per serve call — two
-        // servers over one event source would each advertise subscriptions while
-        // only one had the pump.
-        let server =
-            scp_mcp::server::McpServer::with_optional_event_source(provider, context_events);
+        // Subscribe to the supervisor's events *before* spawning, so no event
+        // emitted between here and the transport loop starting is missed.
+        let server = mcp_server_bundle(&self.inner, provider);
 
         let task_handle = runtime().spawn(async move {
             match transport_mode.as_str() {
@@ -22761,7 +22766,10 @@ mod tests {
     /// With no `Supervisor` attached, the production `mcp_server_create` still
     /// returns a server handle, and that server serves no context: the
     /// provider it builds reads role state from the actor, so `resources/list`
-    /// comes back empty and `resources/read` answers "not a participant". Were
+    /// comes back empty and `resources/read` answers "not a participant".
+    /// `mcp_server_bundle`, the function `mcp_server_create` builds its server
+    /// with, returns the unwired bundle, whose server advertises
+    /// `resources.subscribe: false`. Were
     /// `mcp_server_create` to propagate the missing-supervisor error
     /// (`context_manager_or_error()?`), or the provider to read a bridge copy,
     /// this test would fail.
@@ -22788,14 +22796,21 @@ mod tests {
             .await
             .expect("the server created without a supervisor must stop cleanly");
 
-        let mut server = scp_mcp::server::McpServer::new(McpUniFfiBridgeProvider {
+        let provider = || McpUniFfiBridgeProvider {
             bi: Arc::downgrade(&scp.inner),
             agent_did: "did:dht:z6MkTestUser".to_owned(),
             context_ids: vec!["ctx-1".to_owned()],
             outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
             agent_ucan_token: None,
             agent_proof_tokens: None,
-        });
+        };
+        let bundle = mcp_server_bundle(&scp.inner, provider());
+        assert_eq!(
+            format!("{bundle:?}"),
+            "McpServerForTransport::Unwired",
+            "without a supervisor the served server must not advertise resources.subscribe"
+        );
+        let mut server = scp_mcp::server::McpServer::new(provider());
         let request = |method: &str, params: serde_json::Value| scp_mcp::protocol::JsonRpcRequest {
             jsonrpc: scp_mcp::protocol::JSONRPC_VERSION.to_owned(),
             method: method.to_owned(),
@@ -23673,8 +23688,9 @@ mod tests {
     }
 
     /// `mcp_server_create` sources subscription events from
-    /// `supervisor.subscribe_events()`. If that degrades to `None`, every
-    /// `UniFFI` MCP server silently advertises `resources.subscribe: false`.
+    /// `supervisor.subscribe_events()` through `mcp_server_bundle`. If that
+    /// degrades to `None`, or the bundle comes back unwired, every `UniFFI` MCP
+    /// server silently advertises `resources.subscribe: false`.
     #[test]
     fn uniffi_supervisor_yields_a_context_event_receiver_for_mcp() {
         let bi = Arc::new(crate::runtime::UniffiBridgeInstance::new_uniffi());
@@ -23689,6 +23705,18 @@ mod tests {
             "the UniFFI supervisor must expose a context event channel — without \
              it the MCP transport can only advertise resources.subscribe=false"
         );
+        let bundle = mcp_server_bundle(
+            &bi,
+            McpUniFfiBridgeProvider {
+                bi: Arc::downgrade(&bi),
+                agent_did: "did:dht:z6MkSubscriber".to_owned(),
+                context_ids: vec!["ctx-1".to_owned()],
+                outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
+                agent_ucan_token: None,
+                agent_proof_tokens: None,
+            },
+        );
+        assert_eq!(format!("{bundle:?}"), "McpServerForTransport::Wired");
     }
 
     /// Creates a live, supervisor-backed context whose creator is
