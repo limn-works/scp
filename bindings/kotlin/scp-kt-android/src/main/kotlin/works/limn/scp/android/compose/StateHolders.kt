@@ -5,27 +5,29 @@ package works.limn.scp.android.compose
 
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.State
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharedFlow
-import kotlinx.coroutines.flow.SharingStarted
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 
 /**
  * Holder for an SCP context's observable state within a Composable.
  *
- * Wraps the raw context handle, identity handle, and coroutine scope needed
- * to collect SCP streams as Compose [State]. Created by [rememberScpContext]
+ * Wraps the raw context handle, identity handle, and a coroutine scope whose
+ * cancellation marks the holder's end of life; [rememberScpStateIn] stops
+ * collecting when that scope is cancelled. Created by [rememberScpContext]
  * and cleaned up via [DisposableEffect] when the Composable leaves composition.
  *
  * Mirrors the [works.limn.scp.android.TrackedContext] pattern from
@@ -34,8 +36,9 @@ import kotlinx.coroutines.launch
  *
  * @property contextHandle Opaque context handle from create/join.
  * @property identityHandle Opaque identity handle for the member in this context.
- * @property scope Coroutine scope for converting Flows to StateFlows.
- *   Cancelled on disposal.
+ * @property scope Coroutine scope that lives as long as the holder.
+ *   Cancelled on disposal, which ends every [rememberScpStateIn]
+ *   collection bound to this holder.
  * @property onDispose Cleanup callback invoked when the Composable
  *   leaves composition. Receives both the context handle and identity handle.
  *   Typically calls leave/close on the context.
@@ -106,9 +109,11 @@ fun rememberScpContext(
  * Collect a [Flow] as Compose [State] with an initial value, scoped to
  * the Composable's lifetime.
  *
- * Wraps `Flow.collectAsState()` with a [remember]-based scope and
- * [DisposableEffect] cleanup. The flow collection starts when the
- * Composable enters composition and stops when it leaves.
+ * The collector subscribes to [flow] when the composition applies, before
+ * any later work on the composition thread runs, so a hot flow cannot drop
+ * an event emitted after the Composable appears. Collection runs in the
+ * composition's coroutine context and stops when the Composable leaves
+ * composition or [flow] changes.
  *
  * This is the primary integration point for SCP streams in Compose:
  * `val messages by rememberScpFlow(messageFlow, emptyList())`
@@ -121,7 +126,9 @@ fun rememberScpContext(
 fun <T> rememberScpFlow(
     flow: Flow<T>,
     initial: T,
-): State<T> = flow.collectAsState(initial = initial)
+): State<T> = rememberCollectedState(initial, flow) { state ->
+    flow.collect { state.value = it }
+}
 
 /**
  * Collect a [SharedFlow] of SCP events as a Compose [State] list.
@@ -131,53 +138,49 @@ fun <T> rememberScpFlow(
  * that grows as new events arrive. The list is capped at [maxItems]
  * to prevent unbounded memory growth in long-lived Composables.
  *
- * Recomposition occurs on every new event. The accumulated list is
- * cleared when the Composable leaves composition.
+ * The collector subscribes to [eventFlow] when the composition applies,
+ * before any later work on the composition thread runs. A hot flow that
+ * replays nothing drops every event no subscriber holds, so a subscription
+ * that started later, on another thread, would lose the events emitted
+ * right after the Composable appears.
+ *
+ * Recomposition occurs on every new event. Collection stops and the
+ * accumulated list is discarded when the Composable leaves composition
+ * or [eventFlow] changes.
  *
  * @param eventFlow Hot SharedFlow of JSON-encoded events.
  * @param maxItems Maximum number of events to retain. Oldest events
- *   are dropped when the limit is exceeded. Defaults to 100.
+ *   are dropped when the limit is exceeded. Defaults to 100. Read once,
+ *   when collection of [eventFlow] starts.
  * @return Compose [State] containing the accumulated event list.
  */
 @Composable
 fun rememberScpEventList(
     eventFlow: SharedFlow<String>,
     maxItems: Int = MAX_EVENT_LIST_SIZE,
-): State<List<String>> {
-    val scope = remember { CoroutineScope(SupervisorJob() + Dispatchers.Default) }
-    DisposableEffect(Unit) {
-        onDispose { scope.cancel() }
+): State<List<String>> = rememberCollectedState(emptyList(), eventFlow) { state ->
+    val accumulator = ArrayDeque<String>()
+    eventFlow.collect { event ->
+        accumulator.addLast(event)
+        if (accumulator.size > maxItems) {
+            accumulator.removeFirst()
+        }
+        state.value = accumulator.toList()
     }
-    val stateFlow: StateFlow<List<String>> = remember(eventFlow) {
-        val accumulator = mutableListOf<String>()
-        eventFlow
-            .map { event ->
-                synchronized(accumulator) {
-                    accumulator.add(event)
-                    if (accumulator.size > maxItems) {
-                        accumulator.removeAt(0)
-                    }
-                    accumulator.toList()
-                }
-            }
-            .stateIn(
-                scope = scope,
-                started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS),
-                initialValue = emptyList(),
-            )
-    }
-    return stateFlow.collectAsState()
 }
 
 /**
  * Collect a [Flow] as Compose [State], scoped to an [ScpContextHolder].
  *
- * Converts the flow to a [StateFlow] using the holder's coroutine scope,
- * so collection stops automatically when the holder is disposed. Uses
- * [SharingStarted.WhileSubscribed] with a 5-second stop timeout to
- * survive brief recompositions without restarting the upstream flow.
+ * The collector subscribes to [flow] when the composition applies, before
+ * any later work on the composition thread runs, so a hot flow cannot drop
+ * an event emitted after the Composable appears. Collection runs in the
+ * composition's coroutine context and stops at the first of: the
+ * Composable leaving composition, [holder] or [flow] changing, or the
+ * holder being disposed. A recomposition with the same [holder] and [flow]
+ * keeps the running collection.
  *
- * @param holder The [ScpContextHolder] whose scope drives collection.
+ * @param holder The [ScpContextHolder] whose disposal ends collection.
  * @param flow The SCP stream to collect.
  * @param initial The initial value before the first emission.
  * @return Compose [State] that triggers recomposition on each emission.
@@ -187,15 +190,41 @@ fun <T> rememberScpStateIn(
     holder: ScpContextHolder,
     flow: Flow<T>,
     initial: T,
-): State<T> {
-    val stateFlow: StateFlow<T> = remember(holder, flow) {
-        flow.stateIn(
-            scope = holder.scope,
-            started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS),
-            initialValue = initial,
-        )
+): State<T> = rememberCollectedState(initial, holder, flow) { state ->
+    val collector = currentCoroutineContext().job
+    val holderDisposal = holder.scope.coroutineContext[Job]?.invokeOnCompletion {
+        collector.cancel()
     }
-    return stateFlow.collectAsState()
+    try {
+        flow.collect { state.value = it }
+    } finally {
+        holderDisposal?.dispose()
+    }
+}
+
+/**
+ * Run [collect] against a remembered [MutableState] for as long as the
+ * Composable stays in composition with the same [keys].
+ *
+ * The collecting coroutine starts undispatched in the composition's
+ * coroutine context when the composition applies, so it runs up to its
+ * first suspension, which for a flow collector is the subscription, before
+ * the composition thread does anything else. Leaving composition or a
+ * change of [keys] cancels it and discards the state.
+ */
+@Composable
+private fun <R> rememberCollectedState(
+    initial: R,
+    vararg keys: Any?,
+    collect: suspend (MutableState<R>) -> Unit,
+): State<R> {
+    val state = remember(*keys) { mutableStateOf(initial) }
+    val scope = rememberCoroutineScope()
+    DisposableEffect(*keys) {
+        val job = scope.launch(start = CoroutineStart.UNDISPATCHED) { collect(state) }
+        onDispose { job.cancel() }
+    }
+    return state
 }
 
 /**
@@ -312,5 +341,3 @@ class ScpContextState(
 }
 
 private const val MAX_EVENT_LIST_SIZE = 100
-
-private const val STOP_TIMEOUT_MS = 5_000L

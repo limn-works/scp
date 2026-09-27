@@ -6,13 +6,38 @@ set -euo pipefail
 STAGED=$(git diff --cached --name-only --diff-filter=ACM)
 [ -z "$STAGED" ] && exit 0
 
+# ── Which files this commit changes, for the language steps ──
+#
+# On a merge commit, `STAGED` lists every file the merged-in branch changed, and the CI of
+# that branch already formatted and linted each of them. A language step runs here only for
+# a file whose staged content differs from what a merged-in head carries: a file this
+# branch changed, or a file the conflict resolution changed. So when `MERGE_HEAD` exists,
+# the language flags below read the files where the staged tree differs from each merged-in
+# head, and a file identical to a merged-in head's copy sets no flag. An octopus merge
+# names several heads in `MERGE_HEAD`; the list is the union over all of them, so a file
+# differing from any one merged-in head still sets its flag.
+#
+# `STAGED` still decides the early exit above, so the toolchain check below runs on every
+# commit that stages a file, merge or not.
+MERGE_HEAD_FILE=$(git rev-parse --git-path MERGE_HEAD)
+if [ -f "$MERGE_HEAD_FILE" ]; then
+  CHANGED=""
+  while IFS= read -r merged_head; do
+    [ -z "$merged_head" ] && continue
+    CHANGED="$CHANGED
+$(git diff --cached --name-only --diff-filter=ACM "$merged_head")"
+  done < "$MERGE_HEAD_FILE"
+else
+  CHANGED=$STAGED
+fi
+
 HAS_RUST=false
 HAS_PYTHON=false
 HAS_TS=false
 HAS_KOTLIN=false
 HAS_SWIFT=false
 
-for f in $STAGED; do
+for f in $CHANGED; do
   case "$f" in
     *.rs) HAS_RUST=true ;;
     bindings/python/*) HAS_PYTHON=true ;;
