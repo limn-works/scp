@@ -10926,15 +10926,29 @@ impl Supervisor {
             // no caller mistakes a crashed context for one the supervisor
             // stopped serving. Only an id with no actor and no crash-window
             // signal reads as `None`.
-            if self.is_context_poisoned(context_id) {
-                return Ok(Some(scp_protocol::context::ContextState::Poisoned));
+            //
+            // The poison flag and the respawn markers are read from ONE
+            // `crash_windows` guard. A failed bootstrap's
+            // `BootstrapCrashWindow::drop` swaps a marker-only window for the
+            // prior poisoned one in a single insert; two separate reads could
+            // see the fresh window's clear poison flag and then the restored
+            // window's clear markers, and report a poisoned context as absent.
+            let crash_signal = self.crash_windows.get(context_id).map(|window| {
+                (
+                    window.is_poisoned(),
+                    window.is_respawning() || window.last_respawn_failed(),
+                )
+            });
+            match crash_signal {
+                Some((true, _)) => {
+                    return Ok(Some(scp_protocol::context::ContextState::Poisoned));
+                }
+                Some((false, true)) => {
+                    return Err(ContextError::ActorCrashed(context_id.to_owned()));
+                }
+                Some((false, false)) | None => {}
             }
-            if let Some(window) = self.crash_windows.get(context_id)
-                && (window.is_respawning() || window.last_respawn_failed())
-            {
-                return Err(ContextError::ActorCrashed(context_id.to_owned()));
-            }
-            // The two reads above hold no lock across them, so the miss can be
+            // The reads above hold no lock across them, so the miss can be
             // stale: a respawn (`respawn_rebuild_and_restore`) or an
             // import-replace (`import_context`) that was in its gap when
             // `lookup` ran may have registered the replacement actor and then
@@ -21681,6 +21695,46 @@ mod tests {
         );
     }
 
+    /// A checked read racing bootstraps that fail over a poisoned id never
+    /// reads as `Ok(None)`. Each failed bootstrap swaps a marker-only window
+    /// in and then restores the poisoned one. A read that took the poison
+    /// flag and the respawn markers from two separate `crash_windows` reads
+    /// could see the fresh window's clear poison flag and then the restored
+    /// window's clear markers, and report the poisoned context as absent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_checked_read_racing_failed_bootstraps_never_reads_a_poisoned_id_as_absent() {
+        let clock = Arc::new(TestClock::new(1_700_000_000));
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let poisoned = hex::encode([0xD1u8; 32]);
+        sup.crash_windows
+            .entry(poisoned.clone())
+            .or_default()
+            .poisoned = true;
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flipper = {
+            let sup = Arc::clone(&sup);
+            let id = poisoned.clone();
+            let stop = Arc::clone(&stop);
+            tokio::task::spawn_blocking(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    drop(sup.begin_bootstrap_window(&id));
+                }
+            })
+        };
+        for _ in 0..20_000 {
+            let read = sup.read_context_state_checked(&poisoned).await;
+            assert!(
+                !matches!(read, Ok(None)),
+                "a poisoned id must never read as absent mid-bootstrap"
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        flipper.await.expect("the bootstrap loop must not panic");
+    }
+
     /// `clear_poison` on a context with NO persisted snapshot records a FRESH
     /// respawn failure (the single retry fails) and returns an error WITHOUT
     /// looping: the budget is reset to one fresh failure, not re-poisoned in a
@@ -23334,6 +23388,7 @@ mod tests {
     /// `None` here would let a caller holding no `context:close` capability
     /// release a context the supervisor can serve as `Active` again. The
     /// bridges refuse a `Poisoned` close for the same reason.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_crashed_context_with_no_actor_reads_as_actor_crashed_not_as_absent() {
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
