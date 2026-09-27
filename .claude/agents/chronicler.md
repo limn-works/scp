@@ -61,7 +61,7 @@ When invoked, you will:
 
 ### 3. Long-Term Memory (Vestige)
 
-`~/.claude/CLAUDE.md` describes how to use Vestige. Tag each memory you save with one connotation so a later session knows how to act:
+`.claude/MEMORY_STORES.md` says which memory store takes each kind of fact, and `~/.claude/CLAUDE.md` describes how to use Vestige. Tag each memory you save with one connotation so a later session knows how to act:
 
 - `"always"` — do this every time, no exceptions.
 - `"prefer"` — good default, may have exceptions. Use unless context says otherwise.
