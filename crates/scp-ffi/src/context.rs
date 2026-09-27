@@ -6269,6 +6269,105 @@ mod tests {
         );
     }
 
+    /// Registers `did` with callback custody over the fake Python provider,
+    /// its identity key freshly generated there. Returns the identity key id.
+    #[cfg(feature = "testing")]
+    fn register_fake_callback_identity(
+        bi: &crate::runtime::PyBridgeInstance,
+        did: &str,
+        fault: Option<&str>,
+    ) -> u64 {
+        use scp_platform::KeyCustody as _;
+        crate::init_runtime().expect("init the SCP tokio runtime");
+        let custody = std::sync::Arc::new(crate::custody::FfiKeyCustody::Callback(
+            crate::custody::test_fakes::fake_py_custody(fault),
+        ));
+        let identity_key = crate::runtime()
+            .unwrap()
+            .block_on(custody.generate_keypair(scp_platform::KeyType::Ed25519))
+            .unwrap();
+        crate::runtime::register_identity(
+            bi,
+            did,
+            crate::runtime::IdentityEntry {
+                identity: scp_identity::ScpIdentity {
+                    did: did.to_owned(),
+                    identity_key,
+                    active_signing_key: identity_key,
+                    agent_signing_key: None,
+                    pre_rotation_commitment: [0u8; 32],
+                },
+                custody,
+                document: scp_did::DidDocument {
+                    context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+                    id: did.to_owned(),
+                    verification_method: vec![],
+                    authentication: vec![],
+                    assertion_method: vec![],
+                    also_known_as: vec![],
+                    service: vec![],
+                },
+                identity_link_attestations: Vec::new(),
+                pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+                pre_rotation_custody: std::sync::Arc::new(
+                    scp_platform::testing::InMemoryPreRotationCustody::new(),
+                ),
+            },
+        );
+        identity_key.id()
+    }
+
+    /// The bridge helper returns the §9.10.4 routing id of the host's P-256
+    /// point, `SHA-256("scp-pseudonym-routing-v1:" || point)`, not the point.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn member_pseudonym_is_the_routing_id_of_the_host_point() {
+        let bi = __bi();
+        let did = "did:dht:z6MkPseudonymRoutingValue";
+        let key_id = register_fake_callback_identity(&bi, did, None);
+        let routing_id = derive_member_pseudonym(&bi, did, "ctx-routing").expect("derives");
+        let point = crate::custody::test_fakes::fake_pseudonym_point(
+            &crate::custody::test_fakes::fake_context_seed(key_id, b"ctx-routing", None),
+        );
+        assert_eq!(
+            routing_id,
+            scp_crypto::pseudonym::pseudonym_routing_id(&point)
+        );
+    }
+
+    /// A host still returning a 32-byte (Ed25519-era) pseudonym key fails with
+    /// SCP-IDENT-1055, and for that reason: the point length.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn legacy_host_pseudonym_is_ident_1055_on_point_length() {
+        let bi = __bi();
+        let did = "did:dht:z6MkPseudonymLegacyHost";
+        register_fake_callback_identity(&bi, did, Some("legacy32"));
+        let msg = derive_member_pseudonym(&bi, did, "ctx")
+            .expect_err("legacy host key rejected")
+            .to_string();
+        assert!(msg.contains("SCP-IDENT-1055"), "{msg}");
+        assert!(msg.contains("got 32 bytes"), "{msg}");
+    }
+
+    /// A host whose `get_public_key(key_id)` disagrees with the point it
+    /// returned fails with SCP-IDENT-1055.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn host_public_key_mismatch_is_ident_1055() {
+        let bi = __bi();
+        let did = "did:dht:z6MkPseudonymWrongPublicKey";
+        register_fake_callback_identity(&bi, did, Some("wrong_public_key"));
+        let msg = derive_member_pseudonym(&bi, did, "ctx")
+            .expect_err("mismatched host key rejected")
+            .to_string();
+        assert!(msg.contains("SCP-IDENT-1055"), "{msg}");
+        assert!(
+            msg.contains("does not match the derived pseudonym point"),
+            "{msg}"
+        );
+    }
+
     /// Builds an active `PyContextHandle` for the given mode, driving the real
     /// `PyContextParams` parse so the handle carries an authoritative
     /// `ContextMode` (the same axis `context_join` branches on at the mode

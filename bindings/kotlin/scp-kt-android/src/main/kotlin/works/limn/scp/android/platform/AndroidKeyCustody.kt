@@ -148,6 +148,14 @@ class AndroidKeyCustody internal constructor(
     internal val softwareKeyTypes = ConcurrentHashMap<String, KeyType>()
 
     /**
+     * P-256 pseudonym private scalars (§9.10.4.A), keyed by pseudonym handle id.
+     *
+     * Pseudonym keys are software-only and in-memory: they are re-derived on demand
+     * from the identity key, so they are never persisted.
+     */
+    internal val pseudonymKeys = ConcurrentHashMap<String, java.math.BigInteger>()
+
+    /**
      * Delegate for Bouncy Castle software key operations.
      *
      * Shares the same [softwareKeys] and [softwareKeyTypes] maps so that keys
@@ -204,12 +212,14 @@ class AndroidKeyCustody internal constructor(
      * performs the signing with key material from [softwareKeys].
      *
      * @param keyHandle Handle returned by [generateKeypair] for an Ed25519 key.
-     * @param data The bytes to sign.
-     * @return 64-byte Ed25519 signature.
+     * @param data The bytes to sign. For a pseudonym handle from [derivePseudonym], a
+     *   32-byte digest, signed without a second hash as P-256 ECDSA with low s (§9.5.1).
+     * @return 64-byte signature.
      * @throws ScpException with code `SCP-CRYPTO-4001` if the key is not found.
      * @throws ScpException with code `SCP-CRYPTO-4003` if the key is not Ed25519.
      */
     override fun sign(keyHandle: KeyHandle, data: ByteArray): ByteArray {
+        pseudonymKeys[keyHandle.id]?.let { return P256Pseudonym.signPrehash(it, data) }
         return if (keyHandle.custodyType == CustodyType.HARDWARE) {
             signWithKeystore(keyHandle, data)
         } else {
@@ -227,10 +237,12 @@ class AndroidKeyCustody internal constructor(
      * For software-backed keys: returns the Bouncy Castle public key parameters directly.
      *
      * @param keyHandle Handle returned by [generateKeypair] or [derivePseudonym].
-     * @return Raw 32-byte public key bytes.
+     * @return Raw 32-byte public key bytes, or the 33-byte compressed P-256 point for a
+     *   pseudonym handle.
      * @throws ScpException with code `SCP-CRYPTO-4001` if the key is not found.
      */
     override fun publicKey(keyHandle: KeyHandle): ByteArray {
+        pseudonymKeys[keyHandle.id]?.let { return P256Pseudonym.compressedPublicKey(it) }
         return if (keyHandle.custodyType == CustodyType.HARDWARE) {
             publicKeyFromKeystore(keyHandle)
         } else {
@@ -255,6 +267,9 @@ class AndroidKeyCustody internal constructor(
      * @throws ScpException with code `SCP-CRYPTO-4004` if destruction cannot be confirmed.
      */
     override fun destroyKey(keyHandle: KeyHandle): DestructionAttestation {
+        if (pseudonymKeys.remove(keyHandle.id) != null) {
+            return DestructionAttestation(method = DestructionMethod.SOFTWARE_ONLY, confirmed = true)
+        }
         return if (keyHandle.custodyType == CustodyType.HARDWARE) {
             destroyKeystoreKey(keyHandle)
         } else {
@@ -310,7 +325,7 @@ class AndroidKeyCustody internal constructor(
     }
 
     /**
-     * Derives a deterministic, context-scoped Ed25519 pseudonym keypair.
+     * Derives a deterministic, context-scoped P-256 pseudonym keypair (§9.10.4.A).
      *
      * ## Algorithm (spec section 9.10.4.A):
      *
@@ -369,25 +384,11 @@ class AndroidKeyCustody internal constructor(
         mac.update(contextId)
         mac.update("scp-pseudonym".toByteArray(Charsets.UTF_8))
         val seed = mac.doFinal()
-
-        // Derive Ed25519 keypair from seed using FixedSecureRandom for determinism.
-        val pseudonymKeypair = Ed25519KeyPairGenerator().apply {
-            init(Ed25519KeyGenerationParameters(FixedSecureRandom(seed)))
-        }.generateKeyPair()
-        seed.fill(0) // zeroize after use
-
-        val pseudonymId = UUID.randomUUID().toString()
-        softwareKeys[pseudonymId] = pseudonymKeypair
-        softwareKeyTypes[pseudonymId] = KeyType.ED25519
-
-        return PseudonymKeyHandle(
-            id = pseudonymId,
-            custodyType = CustodyType.SOFTWARE,
-        )
+        return P256Pseudonym.register(pseudonymKeys, seed)
     }
 
     /**
-     * Derives a deterministic, context-scoped, epoch-rotatable Ed25519 pseudonym keypair.
+     * Derives a deterministic, context-scoped, epoch-rotatable P-256 pseudonym keypair.
      *
      * Identical to [derivePseudonym] except the big-endian u64 epoch and the v2 domain
      * separator are folded into the HMAC body, yielding an independent, unlinkable
@@ -400,7 +401,8 @@ class AndroidKeyCustody internal constructor(
      *   2. Compute `seed = HMAC-SHA256(pseudonymSecret, contextId || BE64(epoch) ||
      *      "scp-pseudonym-v2")`. The `BE64(epoch)` term is the 8-byte big-endian encoding
      *      of [pseudonymEpoch].
-     *   3. Derive an Ed25519 keypair from the first 32 bytes of `seed`.
+     *   3. `d = HKDF-Expand-SHA256(prk = seed, info = "SCP-PSEUDONYM-P256-V1", 48)
+     *      mod (n - 1) + 1`; the public key is the 33-byte compressed point `d * G`.
      *
      * The `"scp-pseudonym-v2"` separator differs from v1's `"scp-pseudonym"`, so a v2
      * pseudonym at any epoch never collides with the v1 [derivePseudonym] output.
@@ -451,21 +453,7 @@ class AndroidKeyCustody internal constructor(
         mac.update(epochBe)
         mac.update("scp-pseudonym-v2".toByteArray(Charsets.UTF_8))
         val seed = mac.doFinal()
-
-        // Derive Ed25519 keypair from seed using FixedSecureRandom for determinism.
-        val pseudonymKeypair = Ed25519KeyPairGenerator().apply {
-            init(Ed25519KeyGenerationParameters(FixedSecureRandom(seed)))
-        }.generateKeyPair()
-        seed.fill(0) // zeroize after use
-
-        val pseudonymId = UUID.randomUUID().toString()
-        softwareKeys[pseudonymId] = pseudonymKeypair
-        softwareKeyTypes[pseudonymId] = KeyType.ED25519
-
-        return PseudonymKeyHandle(
-            id = pseudonymId,
-            custodyType = CustodyType.SOFTWARE,
-        )
+        return P256Pseudonym.register(pseudonymKeys, seed)
     }
 
     /**
@@ -801,7 +789,7 @@ internal class SoftwareKeyOps(
                 pubKey.encoded
             }
             else -> {
-                // Ed25519 (default for pseudonym keys where type may not be tracked)
+                // Ed25519
                 val pubKey = keyPair.public as Ed25519PublicKeyParameters
                 pubKey.encoded
             }

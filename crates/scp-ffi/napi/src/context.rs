@@ -7522,6 +7522,73 @@ mod tests {
         );
     }
 
+    /// §9.10.4: `derive_pseudonym_bytes` returns the routing id of the
+    /// custody's P-256 pseudonym, recomputed here from the identity seed with
+    /// the scp-crypto recipe and a direct SHA-256 over the routing prefix.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn derive_pseudonym_bytes_is_the_recipe_routing_id() {
+        use crate::identity::OpaqueInMemoryKeyCustody;
+        use scp_platform::KeyCustody as _;
+        use scp_platform::testing::InMemoryKeyCustody;
+        use sha2::{Digest, Sha256};
+
+        let custody = crate::custody::NapiKeyCustody::InMemory(OpaqueInMemoryKeyCustody(
+            InMemoryKeyCustody::new(),
+        ));
+        let handle = custody
+            .generate_keypair(scp_platform::KeyType::Ed25519)
+            .await
+            .expect("generate identity key");
+        let seed = zeroize::Zeroizing::new(
+            custody
+                .export_ed25519_signing_key(&handle)
+                .await
+                .expect("export identity seed")
+                .to_bytes(),
+        );
+        let routing_id = super::derive_pseudonym_bytes(&custody, &handle, "ctx-napi-kat")
+            .await
+            .expect("derivation succeeds");
+
+        let point = scp_crypto::pseudonym::derive_pseudonym_keypair(&seed, b"ctx-napi-kat", None)
+            .expect("recipe")
+            .public_key()
+            .to_compressed();
+        let mut hasher = Sha256::new();
+        hasher.update(b"scp-pseudonym-routing-v1:");
+        hasher.update(point);
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(routing_id, expected);
+    }
+
+    /// §9.10.4: a custody derivation failure surfaces as `SCP-IDENT-1055`
+    /// carrying the custody cause, never as a zero routing id.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn derive_pseudonym_bytes_failure_is_ident_1055() {
+        use crate::identity::OpaqueInMemoryKeyCustody;
+        use scp_platform::testing::InMemoryKeyCustody;
+
+        let custody = crate::custody::NapiKeyCustody::InMemory(OpaqueInMemoryKeyCustody(
+            InMemoryKeyCustody::new(),
+        ));
+        let missing = scp_platform::KeyHandle::new(4242);
+        let err = super::derive_pseudonym_bytes(&custody, &missing, "ctx-napi-kat")
+            .await
+            .expect_err("an unknown identity key must fail derivation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(codes::IDENT_1055),
+            "expected {}, got: {msg}",
+            codes::IDENT_1055
+        );
+        assert!(
+            msg.contains("pseudonym derivation failed:"),
+            "cause missing: {msg}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn broadcast_publish_without_retained_custody_returns_ident_1017() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());

@@ -99,6 +99,8 @@ scp-ffi-common = { path = "../common", features = ["testing", "custody"] }
 # non-testing feature list.
 scp-dht = { path = "../../scp-dht", features = ["testing"] }
 tempfile = "3"
+# Independent recompute of the §9.10.4 pseudonym in the routing-id tests.
+scp-crypto = { path = "../../scp-crypto" }
 # Provides weak C stubs for napi runtime symbols so the test binary
 # can link without a Node.js runtime. Kept as a dev-dependency so
 # the cdylib build NEVER sees these stubs (if they leaked into the

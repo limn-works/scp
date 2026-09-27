@@ -456,6 +456,24 @@ export interface KeyPackageReservation {
   readonly keyPackagePublic: Uint8Array;
 }
 
+/** A pseudonym a {@link KeyCustodyProvider} derived (spec §9.10.4). */
+export interface PseudonymResult {
+  /** The 33-byte SEC1 compressed P-256 public key. */
+  publicKey: Uint8Array;
+  /** The numeric id of the pseudonym key, usable with `sign` and `getPublicKey`. */
+  keyId: string;
+}
+
+/** The shape napi-rs marshals for a {@link PseudonymResult}: bytes as a number array. */
+interface NativePseudonymResult {
+  publicKey: number[];
+  keyId: string;
+}
+
+function toNativePseudonym(result: PseudonymResult): NativePseudonymResult {
+  return { publicKey: Array.from(result.publicKey), keyId: result.keyId };
+}
+
 /**
  * Caller-supplied custody backend for {@link SCP.identityCreateWithCustody}.
  *
@@ -478,32 +496,42 @@ export interface KeyPackageReservation {
 export interface KeyCustodyProvider {
   /** Generate a keypair (`"ed25519"` or `"x25519"`); return its opaque id. */
   generateKeypair(keyType: string): string;
-  /** Return the 64-byte Ed25519 signature of `message` under `keyId`. */
+  /**
+   * Return the 64-byte signature of `message` under `keyId`. For an identity
+   * key this is Ed25519. For a pseudonym key returned by
+   * {@link derivePseudonym} `message` is a 32-byte digest and the result is
+   * the P-256 prehash ECDSA `r || s` with low s (§9.5.1); the bridge rejects
+   * any other length and any signature that fails strict verification.
+   */
   sign(keyId: string, message: Uint8Array): Uint8Array;
-  /** Return the 32 public-key bytes for `keyId`. */
+  /**
+   * Return the public key for `keyId`: 32 Ed25519 bytes for an identity key,
+   * the 33-byte compressed P-256 point for a pseudonym key.
+   */
   getPublicKey(keyId: string): Uint8Array;
   /** Destroy key material for `keyId`; subsequent operations must fail. */
   destroyKey(keyId: string): void;
   /** Return the 32-byte X25519 shared secret with `peerPublic`. */
   dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array;
   /**
-   * Derive a context-scoped pseudonym keypair. Returns
-   * `publicKey(32) || keyIdUtf8` — the 32-byte pseudonym public key
-   * concatenated with the UTF-8 numeric id of the derived signing key.
+   * Derive the context-scoped P-256 pseudonym of identity key `keyId`
+   * (spec §9.10.4.A). `publicKey` is the 33-byte compressed point and `keyId`
+   * the numeric id of the new pseudonym key. The bridge requires
+   * `getPublicKey(keyId)` to return the same 33 bytes, and fails the
+   * operation with `SCP-IDENT-1055` otherwise.
    */
-  derivePseudonym(keyId: string, contextId: Uint8Array): Uint8Array;
+  derivePseudonym(keyId: string, contextId: Uint8Array): PseudonymResult;
   /**
-   * Derive a rotatable (epoch-versioned) context-scoped pseudonym keypair.
-   * Identical layout to {@link derivePseudonym} — returns
-   * `publicKey(32) || keyIdUtf8` — but the derivation mixes the big-endian
-   * 64-bit `pseudonymEpoch` and a distinct domain separator so rotating the
-   * epoch yields an unlinkable new keypair (spec §9.10.4.A).
+   * Derive a rotatable (epoch-versioned) context-scoped pseudonym. Same
+   * contract as {@link derivePseudonym}, but the derivation mixes the
+   * big-endian 64-bit `pseudonymEpoch` and a distinct domain separator so
+   * rotating the epoch yields an unlinkable new keypair (spec §9.10.4.A).
    */
   deriveRotatablePseudonym(
     keyId: string,
     contextId: Uint8Array,
     pseudonymEpoch: bigint,
-  ): Uint8Array;
+  ): PseudonymResult;
   /**
    * Return the 32 raw Ed25519 private-seed bytes for `keyId`.
    *
@@ -782,13 +810,19 @@ export class SCP {
       destroyKey: (keyId: string): void => provider.destroyKey(keyId),
       dhAgree: ([keyId, peerPublic]: [string, number[]]): number[] =>
         Array.from(provider.dhAgree(keyId, Uint8Array.from(peerPublic))),
-      derivePseudonym: ([keyId, contextId]: [string, number[]]): number[] =>
-        Array.from(provider.derivePseudonym(keyId, Uint8Array.from(contextId))),
+      derivePseudonym: ([keyId, contextId]: [string, number[]]): NativePseudonymResult =>
+        toNativePseudonym(provider.derivePseudonym(keyId, Uint8Array.from(contextId))),
       // The Rust `(String, Vec<u8>, u64)` tuple likewise arrives as a single
       // `[keyId, contextId, epoch]` array; the `u64` epoch crosses as a JS
       // `bigint` (the field's declared `ts_type`).
-      deriveRotatablePseudonym: ([keyId, contextId, epoch]: [string, number[], bigint]): number[] =>
-        Array.from(provider.deriveRotatablePseudonym(keyId, Uint8Array.from(contextId), epoch)),
+      deriveRotatablePseudonym: ([keyId, contextId, epoch]: [
+        string,
+        number[],
+        bigint,
+      ]): NativePseudonymResult =>
+        toNativePseudonym(
+          provider.deriveRotatablePseudonym(keyId, Uint8Array.from(contextId), epoch),
+        ),
       // A sign-only / hardware / secure-enclave custody throws here to signal it
       // cannot export raw private-key bytes (ADR-006). Translate that into the
       // native error channel by returning an empty array (the Rust bridge's

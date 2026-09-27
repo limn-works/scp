@@ -21,6 +21,7 @@
 //!
 //! See ADR-006 and the per-bridge `CallbackKeyCustody` adapters.
 
+use scp_crypto::p256::P256PublicKey;
 use scp_platform::error::PlatformError;
 use scp_platform::traits::{KeyHandle, PseudonymKeypair};
 
@@ -55,35 +56,131 @@ pub fn expect_32(method: &str, bytes: &[u8]) -> Result<[u8; 32], PlatformError> 
 
 /// Length of the pseudonym public key a provider returns: a SEC1 compressed
 /// P-256 point (§9.10.4).
-pub const PSEUDONYM_PUBLIC_KEY_LEN: usize = 33;
+pub const PSEUDONYM_PUBLIC_KEY_LEN: usize = scp_crypto::p256::COMPRESSED_POINT_LEN;
 
-/// Unpacks a `derive_pseudonym`-style return (`[pubkey(33) || key_id_utf8]`,
-/// where `pubkey` is the SEC1 compressed P-256 pseudonym point) into a
-/// validated [`PseudonymKeypair`].
+/// Validates a structured `derive_pseudonym`-style return (`public_key`,
+/// `key_id`) into a [`PseudonymKeypair`].
+///
+/// The host returns the two fields separately; no byte-splitting happens here,
+/// so a key id can never be read as part of the point or the reverse.
 ///
 /// # Errors
 ///
-/// Returns [`PlatformError::CustodyError`] if `bytes` is shorter than 34 bytes,
-/// the key-id portion is not valid UTF-8, the key-id is not numeric, or the
-/// public key is not a valid compressed P-256 point (a provider still
-/// returning a 32-byte Ed25519 pseudonym fails here).
-pub fn unpack_pseudonym(method: &str, bytes: &[u8]) -> Result<PseudonymKeypair, PlatformError> {
-    if bytes.len() <= PSEUDONYM_PUBLIC_KEY_LEN {
-        return Err(PlatformError::CustodyError(format!(
-            "KeyCustodyProvider.{method} returned {} bytes, expected at least 34 \
-             (33-byte compressed P-256 public key + key_id)",
-            bytes.len()
-        )));
-    }
-    let (public_key_bytes, key_id_bytes) = bytes.split_at(PSEUDONYM_PUBLIC_KEY_LEN);
-    let key_id_str = std::str::from_utf8(key_id_bytes).map_err(|_| {
-        PlatformError::CustodyError(format!(
-            "KeyCustodyProvider.{method} key_id portion is not valid UTF-8"
-        ))
-    })?;
-    let key_id = parse_handle(method, key_id_str)?;
-    PseudonymKeypair::new(public_key_bytes, key_id)
+/// Returns [`PlatformError::CustodyError`] if `key_id` is not numeric or
+/// `public_key` is not a 33-byte SEC1 compressed point on P-256 (a provider
+/// still returning a 32-byte Ed25519 pseudonym fails here).
+pub fn parse_pseudonym(
+    method: &str,
+    public_key: &[u8],
+    key_id: &str,
+) -> Result<PseudonymKeypair, PlatformError> {
+    let handle = parse_handle(method, key_id)?;
+    PseudonymKeypair::new(public_key, handle)
         .map_err(|e| PlatformError::CustodyError(format!("KeyCustodyProvider.{method}: {e}")))
+}
+
+/// The pseudonym handles a callback custody adapter has derived, each bound to
+/// the P-256 point the host returned for it.
+///
+/// A bridge [`bind`](Self::bind)s a handle after checking that the host's own
+/// `public_key(key_id)` reports the same point, and routes every `sign` through
+/// [`check_sign_input`](Self::check_sign_input) and
+/// [`check_signature`](Self::check_signature) so a pseudonym signature is a
+/// strict §9.5.1 signature under the bound point. A host that returns a high-`s`
+/// or otherwise invalid signature fails closed; the bridge never normalizes it.
+#[derive(Debug, Default)]
+pub struct PseudonymBindings {
+    points: dashmap::DashMap<u64, P256PublicKey>,
+}
+
+impl PseudonymBindings {
+    /// Binds `pseudonym`'s handle to its point once the host's
+    /// `public_key(key_id)` return (`host_public_key`) matches it byte for byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::CustodyError`] if `host_public_key` differs from
+    /// the derived point, or if the handle is already bound to a different
+    /// point (a host that reuses one key id for two pseudonyms).
+    pub fn bind(
+        &self,
+        method: &str,
+        pseudonym: &PseudonymKeypair,
+        host_public_key: &[u8],
+    ) -> Result<(), PlatformError> {
+        let derived = pseudonym.public_key().as_bytes();
+        if host_public_key != derived {
+            return Err(PlatformError::CustodyError(format!(
+                "KeyCustodyProvider.{method}: public_key(key_id) does not match the derived \
+                 pseudonym point"
+            )));
+        }
+        let point = P256PublicKey::from_sec1(derived).map_err(|e| {
+            PlatformError::CustodyError(format!("KeyCustodyProvider.{method}: {e}"))
+        })?;
+        match self.points.entry(pseudonym.key_handle().id()) {
+            dashmap::Entry::Occupied(existing) if *existing.get() != point => {
+                Err(PlatformError::CustodyError(format!(
+                    "KeyCustodyProvider.{method}: key_id {} is already bound to a different \
+                     pseudonym point",
+                    pseudonym.key_handle().id()
+                )))
+            }
+            dashmap::Entry::Occupied(_) => Ok(()),
+            dashmap::Entry::Vacant(slot) => {
+                slot.insert(point);
+                Ok(())
+            }
+        }
+    }
+
+    /// Removes the binding for a destroyed handle.
+    pub fn unbind(&self, key: &KeyHandle) {
+        self.points.remove(&key.id());
+    }
+
+    /// Checks the input to a `sign` call. Returns the bound point and the
+    /// digest when `key` is a pseudonym handle, and `None` for any other handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::CustodyError`] if `key` is a pseudonym handle
+    /// and `data` is not a 32-byte digest (§9.5.1 prehash).
+    pub fn check_sign_input(
+        &self,
+        key: &KeyHandle,
+        data: &[u8],
+    ) -> Result<Option<(P256PublicKey, [u8; 32])>, PlatformError> {
+        let Some(point) = self.points.get(&key.id()).map(|p| *p) else {
+            return Ok(None);
+        };
+        let digest: [u8; 32] = data.try_into().map_err(|_| {
+            PlatformError::CustodyError(format!(
+                "pseudonym key {} signs only a 32-byte digest, got {} bytes",
+                key.id(),
+                data.len()
+            ))
+        })?;
+        Ok(Some((point, digest)))
+    }
+
+    /// Verifies a host signature from a pseudonym handle under its bound point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::CustodyError`] unless `signature` is a 64-byte
+    /// low-`s` `r ‖ s` that verifies strictly over `digest`.
+    pub fn check_signature(
+        point: &P256PublicKey,
+        digest: &[u8; 32],
+        signature: &[u8],
+    ) -> Result<(), PlatformError> {
+        scp_crypto::p256::verify_prehash_strict(point, digest, signature).map_err(|e| {
+            PlatformError::CustodyError(format!(
+                "KeyCustodyProvider.sign returned an invalid pseudonym signature: {e}"
+            ))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -142,84 +239,226 @@ mod tests {
         }
     }
 
+    fn custody_msg(err: PlatformError) -> String {
+        match err {
+            PlatformError::CustodyError(msg) => msg,
+            other => panic!("expected CustodyError, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn unpack_pseudonym_accepts_pubkey_plus_key_id() {
-        let mut bytes = REFERENCE_POINT.to_vec();
-        bytes.extend_from_slice(b"123");
-        let pseudo = unpack_pseudonym("derive_pseudonym", &bytes).expect("valid pseudonym unpacks");
+    fn parse_pseudonym_accepts_point_and_key_id() {
+        let pseudo = parse_pseudonym("derive_pseudonym", &REFERENCE_POINT, "123")
+            .expect("valid pseudonym parses");
         assert_eq!(pseudo.public_key().as_bytes(), &REFERENCE_POINT);
         assert_eq!(pseudo.key_handle().id(), 123);
     }
 
+    /// Every malformed point reaches a distinct rejection path in
+    /// `P256PublicKey::from_sec1` (length, prefix, curve equation).
     #[test]
-    fn unpack_pseudonym_rejects_invalid_point() {
-        // A legacy 32-byte Ed25519 pseudonym + key id: the first 33 bytes are
-        // not a compressed P-256 point (prefix 0xAB), so it fails closed.
-        let mut legacy = vec![0xABu8; 32];
-        legacy.extend_from_slice(b"12");
-        assert!(matches!(
-            unpack_pseudonym("derive_pseudonym", &legacy),
-            Err(PlatformError::CustodyError(_))
-        ));
-        // A valid prefix with x = 2^256 - 1, which is not a field element.
-        let mut not_field = vec![0x02u8];
-        not_field.extend_from_slice(&[0xFFu8; 32]);
-        not_field.extend_from_slice(b"7");
-        assert!(matches!(
-            unpack_pseudonym("derive_pseudonym", &not_field),
-            Err(PlatformError::CustodyError(_))
-        ));
+    fn parse_pseudonym_rejects_invalid_points() {
+        let reject = |bytes: &[u8]| {
+            custody_msg(
+                parse_pseudonym("derive_pseudonym", bytes, "7")
+                    .expect_err("invalid point rejected"),
+            )
+        };
+        // Wrong lengths: 32 (a legacy Ed25519 key) and 34.
+        assert_eq!(
+            reject(&REFERENCE_POINT[1..]),
+            "KeyCustodyProvider.derive_pseudonym: custody error: pseudonym public key must be a \
+             33-byte compressed P-256 point, got 32 bytes"
+        );
+        let mut long = REFERENCE_POINT.to_vec();
+        long.push(0x00);
+        assert!(reject(&long).contains("got 34 bytes"));
+        // Bad prefix: 33 bytes led by 0x04 (the uncompressed tag).
+        let mut bad_prefix = REFERENCE_POINT;
+        bad_prefix[0] = 0x04;
+        assert!(reject(&bad_prefix).contains("invalid leading byte 0x04"));
+        // Off-curve x: x = 1 is a field element, but 1 - 3 + b is a quadratic
+        // non-residue mod p, so no y exists.
+        let mut off_curve = [0u8; 33];
+        off_curve[0] = 0x02;
+        off_curve[32] = 0x01;
+        assert!(reject(&off_curve).contains("not on the curve"));
+        // x = 2^256 - 1 is not a field element at all.
+        let mut not_field = [0xFFu8; 33];
+        not_field[0] = 0x02;
+        assert!(reject(&not_field).contains("not on the curve"));
+    }
+
+    /// The fail-open counterexample against the old concatenated return: a
+    /// 32-byte Ed25519 key `K` with key id `"22"` concatenated to `K || "22"`,
+    /// whose first 33 bytes `K || 0x32` happen to be a valid P-256 point, so the
+    /// split parse accepted it as a pseudonym with handle 2. With separate fields
+    /// the 32-byte key is rejected on length, and a host that forwards the
+    /// concatenated point anyway fails the `public_key(key_id)` binding.
+    #[test]
+    fn legacy_concatenation_counterexample_is_rejected() {
+        let legacy_key: [u8; 32] = [
+            0x02, 0x6e, 0x34, 0x0b, 0x9c, 0xff, 0xb3, 0x7a, 0x98, 0x9c, 0xa5, 0x44, 0xe6, 0xbb,
+            0x78, 0x0a, 0x2c, 0x78, 0x90, 0x1d, 0x3f, 0xb3, 0x37, 0x38, 0x76, 0x85, 0x11, 0xa3,
+            0x06, 0x17, 0xaf, 0xa0,
+        ];
+        let msg = custody_msg(
+            parse_pseudonym("derive_pseudonym", &legacy_key, "22").expect_err("32 bytes rejected"),
+        );
+        assert!(msg.contains("got 32 bytes"), "{msg}");
+
+        let mut old_split_point = legacy_key.to_vec();
+        old_split_point.push(b'2');
+        let pseudo = parse_pseudonym("derive_pseudonym", &old_split_point, "2")
+            .expect("the old split's first 33 bytes are a valid point");
+        let bindings = PseudonymBindings::default();
+        let msg = custody_msg(
+            bindings
+                .bind("derive_pseudonym", &pseudo, &legacy_key)
+                .expect_err("host key 2 is not that point"),
+        );
+        assert!(
+            msg.contains("does not match the derived pseudonym point"),
+            "{msg}"
+        );
+        assert!(
+            bindings
+                .check_sign_input(pseudo.key_handle(), &[0u8; 32])
+                .expect("unbound handle")
+                .is_none(),
+            "a failed bind leaves the handle unbound"
+        );
     }
 
     #[test]
-    fn unpack_pseudonym_rejects_short_input() {
-        let bytes = REFERENCE_POINT; // exactly 33 — no key_id, below the 34 minimum.
-        let err =
-            unpack_pseudonym("derive_pseudonym", &bytes).expect_err("33-byte input has no key_id");
-        match err {
-            PlatformError::CustodyError(msg) => {
-                assert_eq!(
-                    msg,
-                    "KeyCustodyProvider.derive_pseudonym returned 33 bytes, expected at least 34 \
-                     (33-byte compressed P-256 public key + key_id)"
-                );
-            }
-            other => panic!("expected CustodyError, got {other:?}"),
-        }
+    fn parse_pseudonym_rejects_non_numeric_key_id() {
+        let msg = custody_msg(
+            parse_pseudonym("derive_rotatable_pseudonym", &REFERENCE_POINT, "xyz")
+                .expect_err("non-numeric key_id is rejected"),
+        );
+        assert_eq!(
+            msg,
+            "KeyCustodyProvider.derive_rotatable_pseudonym returned a non-numeric key_id: xyz"
+        );
     }
 
     #[test]
-    fn unpack_pseudonym_rejects_non_utf8_key_id() {
-        let mut bytes = REFERENCE_POINT.to_vec();
-        // 0xFF is an invalid UTF-8 lead byte.
-        bytes.push(0xFF);
-        let err =
-            unpack_pseudonym("derive_pseudonym", &bytes).expect_err("non-utf8 key_id is rejected");
-        match err {
-            PlatformError::CustodyError(msg) => {
-                assert_eq!(
-                    msg,
-                    "KeyCustodyProvider.derive_pseudonym key_id portion is not valid UTF-8"
-                );
+    fn bind_rejects_rebinding_a_key_id_to_another_point() {
+        let bindings = PseudonymBindings::default();
+        let first = parse_pseudonym("derive_pseudonym", &REFERENCE_POINT, "5").expect("valid");
+        bindings
+            .bind("derive_pseudonym", &first, &REFERENCE_POINT)
+            .expect("bind");
+        let other = signing_key().public_key().to_compressed();
+        let second = parse_pseudonym("derive_pseudonym", &other, "5").expect("valid");
+        let msg = custody_msg(
+            bindings
+                .bind("derive_pseudonym", &second, &other)
+                .expect_err("rebinding is rejected"),
+        );
+        assert!(
+            msg.contains("already bound to a different pseudonym point"),
+            "{msg}"
+        );
+        bindings.unbind(first.key_handle());
+        bindings
+            .bind("derive_pseudonym", &second, &other)
+            .expect("bind after unbind");
+    }
+
+    const N: [u8; 32] = [
+        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63,
+        0x25, 0x51,
+    ];
+
+    fn signing_key() -> scp_crypto::p256::P256SigningKey {
+        scp_crypto::p256::P256SigningKey::from_seed(b"SCP-FFI-COMMON-TEST", &[9u8; 32])
+            .expect("seed maps to a scalar")
+    }
+
+    /// `n - s` for a big-endian 32-byte `s < n`.
+    fn negate_s(s: &[u8]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let mut d = i16::from(N[i]) - i16::from(s[i]) - borrow;
+            borrow = i16::from(d < 0);
+            if d < 0 {
+                d += 256;
             }
-            other => panic!("expected CustodyError, got {other:?}"),
+            out[i] = u8::try_from(d).expect("byte");
         }
+        out
     }
 
     #[test]
-    fn unpack_pseudonym_rejects_non_numeric_key_id() {
-        let mut bytes = REFERENCE_POINT.to_vec();
-        bytes.extend_from_slice(b"xyz");
-        let err = unpack_pseudonym("derive_rotatable_pseudonym", &bytes)
-            .expect_err("non-numeric key_id is rejected");
-        match err {
-            PlatformError::CustodyError(msg) => {
-                assert_eq!(
-                    msg,
-                    "KeyCustodyProvider.derive_rotatable_pseudonym returned a non-numeric key_id: xyz"
-                );
-            }
-            other => panic!("expected CustodyError, got {other:?}"),
-        }
+    fn pseudonym_sign_is_checked_strictly_against_the_bound_point() {
+        let key = signing_key();
+        let point = key.public_key().to_compressed();
+        let pseudo = parse_pseudonym("derive_pseudonym", &point, "9").expect("valid");
+        let bindings = PseudonymBindings::default();
+        bindings
+            .bind("derive_pseudonym", &pseudo, &point)
+            .expect("bind");
+        let handle = pseudo.key_handle();
+
+        // Non-pseudonym handles pass through unchecked.
+        assert!(
+            bindings
+                .check_sign_input(&KeyHandle::new(10), b"any length")
+                .expect("identity handle")
+                .is_none()
+        );
+        // A pseudonym handle signs only a 32-byte digest.
+        let msg = custody_msg(
+            bindings
+                .check_sign_input(handle, &[0u8; 12])
+                .expect_err("12-byte input rejected"),
+        );
+        assert_eq!(
+            msg,
+            "pseudonym key 9 signs only a 32-byte digest, got 12 bytes"
+        );
+
+        let digest = [0x5au8; 32];
+        let (bound, checked) = bindings
+            .check_sign_input(handle, &digest)
+            .expect("32-byte digest")
+            .expect("pseudonym handle is bound");
+        assert_eq!(checked, digest);
+        let good = scp_crypto::p256::sign_prehash_rfc6979(&key, &digest).expect("sign");
+        PseudonymBindings::check_signature(&bound, &digest, &good).expect("low-s verifies");
+
+        // High-s form of the same signature: valid ECDSA, rejected, not normalized.
+        let mut high = good;
+        high[32..].copy_from_slice(&negate_s(&good[32..]));
+        let msg = custody_msg(
+            PseudonymBindings::check_signature(&bound, &digest, &high).expect_err("high-s"),
+        );
+        assert!(msg.contains("high-s"), "{msg}");
+        assert!(
+            scp_crypto::p256::verify_prehash_lenient(&bound, &digest, &high).is_ok(),
+            "the high-s mutant is otherwise a valid signature"
+        );
+
+        // Wrong length and wrong key.
+        let msg = custody_msg(
+            PseudonymBindings::check_signature(&bound, &digest, &good[..63]).expect_err("63"),
+        );
+        assert!(msg.contains("must be 64 bytes, got 63"), "{msg}");
+        let other = scp_crypto::p256::P256PublicKey::from_sec1(&REFERENCE_POINT).expect("point");
+        let msg = custody_msg(
+            PseudonymBindings::check_signature(&other, &digest, &good).expect_err("wrong key"),
+        );
+        assert!(msg.contains("does not verify"), "{msg}");
+
+        bindings.unbind(handle);
+        assert!(
+            bindings
+                .check_sign_input(handle, &[0u8; 12])
+                .expect("unbound")
+                .is_none()
+        );
     }
 }

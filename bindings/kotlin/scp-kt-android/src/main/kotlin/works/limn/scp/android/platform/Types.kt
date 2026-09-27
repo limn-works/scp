@@ -17,7 +17,7 @@ package works.limn.scp.android.platform
  * X25519 keys are used for key agreement (HPKE wrapping keys).
  */
 enum class KeyType {
-    /** Ed25519 signing key (identity keys, active signing keys, pseudonym keys). */
+    /** Ed25519 signing key (identity keys, active signing keys). */
     ED25519,
 
     /** X25519 key agreement key (HPKE wrapping keys). */
@@ -272,7 +272,10 @@ interface KeyCustodyProvider {
      * `pseudonym_secret`, NEVER the public key (public-key keying would be a
      * membership-enumeration oracle):
      *   1. `seed = HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")`
-     *   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`  // RFC-8032 seed
+     *   2. `d = HKDF-Expand-SHA256(seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n - 1) + 1`;
+     *      the pseudonym key is P-256 `d`, public key the 33-byte compressed `d * G`.
+     *      [sign] on its handle takes a 32-byte digest and returns 64-byte low-s
+     *      `r || s` (§9.5.1).
      *
      * Software custody: `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
      * salt="scp-pseudonym-secret-v1")` — cross-platform deterministic. Hardware
@@ -296,7 +299,10 @@ interface KeyCustodyProvider {
      * §9.10.4.A). The HMAC key is the private-derived `pseudonym_secret`, NEVER the
      * public key (public-key keying would be a membership-enumeration oracle):
      *   1. `seed = HMAC-SHA256(pseudonym_secret, contextId || BE64(epoch) || "scp-pseudonym-v2")`
-     *   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`  // RFC-8032 seed
+     *   2. `d = HKDF-Expand-SHA256(seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n - 1) + 1`;
+     *      the pseudonym key is P-256 `d`, public key the 33-byte compressed `d * G`.
+     *      [sign] on its handle takes a 32-byte digest and returns 64-byte low-s
+     *      `r || s` (§9.5.1).
      *
      * The `"scp-pseudonym-v2"` domain separator differs from v1's `"scp-pseudonym"`,
      * so v2 at any epoch never collides with the v1 [derivePseudonym] output.

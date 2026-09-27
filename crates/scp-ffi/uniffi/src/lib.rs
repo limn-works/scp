@@ -314,6 +314,17 @@ pub trait MessageListener: Send + Sync {
     fn on_complete(&self);
 }
 
+/// A host-derived §9.10.4 pseudonym, returned by
+/// [`KeyCustodyProvider::derive_pseudonym`] and
+/// [`KeyCustodyProvider::derive_rotatable_pseudonym`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PseudonymResult {
+    /// The 33-byte SEC1 compressed P-256 pseudonym public key.
+    pub public_key: Vec<u8>,
+    /// The key id of the pseudonym's signing key in the host's custody.
+    pub key_id: String,
+}
+
 /// Callback for platform cryptographic key management.
 ///
 /// Swift SDK: Secure Enclave / Keychain.
@@ -335,12 +346,16 @@ pub trait MessageListener: Send + Sync {
 #[uniffi::export(callback_interface)]
 #[async_trait::async_trait]
 pub trait KeyCustodyProvider: Send + Sync {
-    /// Sign `message` bytes with the Ed25519 key identified by `key_id`.
+    /// Sign `message` bytes with the key identified by `key_id`.
     ///
-    /// Returns the raw 64-byte Ed25519 signature.
+    /// For an Ed25519 key, returns the raw 64-byte Ed25519 signature. For a
+    /// pseudonym key id from `derive_pseudonym`, `message` is a 32-byte digest
+    /// and the return is the 64-byte low-`s` P-256 `r || s` (§9.5.1); the
+    /// bridge verifies it strictly and rejects anything else.
     async fn sign(&self, key_id: String, message: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 
-    /// Return the Ed25519 public key bytes (32 bytes) for `key_id`.
+    /// Return the public key bytes for `key_id`: 32 bytes for an Ed25519 or
+    /// X25519 key, the 33-byte compressed point for a pseudonym key.
     async fn get_public_key(&self, key_id: String) -> Result<Vec<u8>, ScpError>;
 
     /// Destroy key material for `key_id`. Subsequent operations must fail.
@@ -374,16 +389,17 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// Routing fields carry `SHA-256("scp-pseudonym-routing-v1:" || point)`,
     /// which the Rust side computes from the returned point.
     ///
-    /// Returns `[pseudonym_public_key_bytes (33) || key_id_utf8]`. A point that
-    /// is not a valid compressed P-256 point is rejected (fail closed). Host
-    /// adapters that still return 32-byte Ed25519 keys fail until they move
-    /// to P-256.
-    /// The bridge unpacks this into a `PseudonymKeypair`.
+    /// Returns the pseudonym's 33-byte compressed point and the key id of its
+    /// signing key as a [`PseudonymResult`]. The bridge rejects (fail closed,
+    /// `SCP-IDENT-1055`) a point that is not a valid compressed P-256 point, a
+    /// non-numeric key id, and a key id whose `get_public_key` does not return
+    /// the same 33 bytes. `sign` on that key id receives a 32-byte digest and
+    /// must return a 64-byte low-`s` `r || s` that verifies under the point.
     async fn derive_pseudonym(
         &self,
         key_id: String,
         context_id: Vec<u8>,
-    ) -> Result<Vec<u8>, ScpError>;
+    ) -> Result<PseudonymResult, ScpError>;
 
     /// Derive a rotatable (epoch-versioned) per-context pseudonym keypair.
     ///
@@ -391,8 +407,8 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// private-derived `pseudonym_secret` (HKDF over the identity private seed),
     /// NEVER the public key.
     /// `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2")`;
-    /// `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`. Returns
-    /// `[pseudonym_public_key_bytes (33, compressed P-256) || key_id_utf8]`.
+    /// `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`. Returns a
+    /// [`PseudonymResult`], checked exactly as for `derive_pseudonym`.
     ///
     /// The `pseudonym_epoch` is passed through to the provider so it performs
     /// the canonical v2 derivation itself. Bridges MUST NOT synthesize a
@@ -420,7 +436,7 @@ pub trait KeyCustodyProvider: Send + Sync {
         key_id: String,
         context_id: Vec<u8>,
         pseudonym_epoch: u64,
-    ) -> Result<Vec<u8>, ScpError> {
+    ) -> Result<PseudonymResult, ScpError> {
         let _ = (key_id, context_id, pseudonym_epoch);
         Err(ScpError::Context {
             msg: "derive_rotatable_pseudonym not implemented by this KeyCustodyProvider".to_owned(),

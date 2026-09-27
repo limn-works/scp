@@ -14,6 +14,10 @@ package works.limn.scp.android.platform
 
 import android.content.SharedPreferences
 import org.bouncycastle.crypto.AsymmetricCipherKeyPair
+import org.bouncycastle.crypto.ec.CustomNamedCurves
+import org.bouncycastle.crypto.params.ECDomainParameters
+import org.bouncycastle.crypto.params.ECPublicKeyParameters
+import org.bouncycastle.crypto.signers.ECDSASigner
 import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
 import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
 import org.bouncycastle.crypto.signers.Ed25519Signer
@@ -26,6 +30,8 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import java.math.BigInteger
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -479,17 +485,42 @@ class AndroidKeyCustodyTest {
                 id = pseudonym.id,
                 custodyType = pseudonym.custodyType,
             )
-            val data = "pseudonym signed message".toByteArray(Charsets.UTF_8)
-            val signature = custody.sign(pseudonymKeyHandle, data)
-            assertEquals(64, signature.size)
-
-            // Verify signature
+            // §9.5.1: the host signs a 32-byte digest as P-256 ECDSA, 64-byte r || s, low s.
+            val curve = CustomNamedCurves.getByName("secp256r1")
+            val domain = ECDomainParameters(curve.curve, curve.g, curve.n, curve.h)
             val pubKeyBytes = custody.publicKey(pseudonymKeyHandle)
-            val pubKeyParams = Ed25519PublicKeyParameters(pubKeyBytes, 0)
-            val verifier = Ed25519Signer()
-            verifier.init(false, pubKeyParams)
-            verifier.update(data, 0, data.size)
-            assertTrue(verifier.verifySignature(signature))
+            assertEquals(33, pubKeyBytes.size)
+            val verifier = ECDSASigner()
+            verifier.init(false, ECPublicKeyParameters(curve.curve.decodePoint(pubKeyBytes), domain))
+            for (i in 0 until 16) {
+                val digest = MessageDigest.getInstance("SHA-256").digest(byteArrayOf(i.toByte()))
+                val signature = custody.sign(pseudonymKeyHandle, digest)
+                assertEquals(64, signature.size)
+                val r = BigInteger(1, signature.copyOfRange(0, 32))
+                val sVal = BigInteger(1, signature.copyOfRange(32, 64))
+                assertTrue(sVal <= curve.n.shiftRight(1), "s must be low (§9.5.1)")
+                assertTrue(verifier.verifySignature(digest, r, sVal))
+            }
+        }
+
+        @Test
+        fun `pseudonym sign rejects a non-32-byte input`() {
+            val identityHandle = custody.generateKeypair(KeyType.ED25519)
+            val pseudonym = custody.derivePseudonym(identityHandle, "ctx".toByteArray())
+            val handle = KeyHandle(id = pseudonym.id, custodyType = pseudonym.custodyType)
+            val exception = assertThrows<ScpException> {
+                custody.sign(handle, ByteArray(12))
+            }
+            assertEquals("SCP-CRYPTO-4003", exception.code)
+        }
+
+        @Test
+        fun `destroyKey removes a pseudonym key`() {
+            val identityHandle = custody.generateKeypair(KeyType.ED25519)
+            val pseudonym = custody.derivePseudonym(identityHandle, "ctx".toByteArray())
+            val handle = KeyHandle(id = pseudonym.id, custodyType = pseudonym.custodyType)
+            assertTrue(custody.destroyKey(handle).confirmed)
+            assertThrows<ScpException> { custody.publicKey(handle) }
         }
 
         @Test
@@ -563,7 +594,7 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `derivePseudonym public key is 32 bytes`() {
+        fun `derivePseudonym public key is a 33-byte compressed P-256 point`() {
             val identityHandle = custody.generateKeypair(KeyType.ED25519)
             val pseudonym = custody.derivePseudonym(
                 identityHandle,
@@ -572,7 +603,8 @@ class AndroidKeyCustodyTest {
             val pubKey = custody.publicKey(
                 KeyHandle(id = pseudonym.id, custodyType = pseudonym.custodyType),
             )
-            assertEquals(32, pubKey.size)
+            assertEquals(33, pubKey.size)
+            assertTrue(pubKey[0] == 0x02.toByte() || pubKey[0] == 0x03.toByte())
         }
     }
 
@@ -778,14 +810,16 @@ class AndroidKeyCustodyTest {
     // -------------------------------------------------------------------
     // Known-answer tests for pseudonym derivation (spec §25.19)
     //
-    // Pins the software-custody Ed25519 pseudonym public key bytes for fixed
-    // identity seeds and context "context-alpha", proving the Kotlin adapter
-    // matches the cross-platform recipe shared with the Rust core and the other
-    // SDK bindings:
-    //   pseudonym_secret = HKDF-SHA256(seed, salt="scp-pseudonym-secret-v1")
+    // Pins the software-custody P-256 pseudonym points for the §25.19 vectors 30
+    // and 31 over context "context-alpha", proving the Kotlin adapter matches the
+    // cross-platform recipe (§9.10.4.A). The vectors map the identity seed to the
+    // ikm with seedToScalar("SCP-TEST-VECTOR-KEY-V1", seed); the adapter's ikm is
+    // its Ed25519 seed, so the test installs the spec scalar as that seed.
+    //   pseudonym_secret = HKDF-SHA256(ikm, salt="scp-pseudonym-secret-v1")
     //   v1 seed          = HMAC-SHA256(secret, ctx || "scp-pseudonym")
     //   v2 seed          = HMAC-SHA256(secret, ctx || BE64(epoch) || "scp-pseudonym-v2")
-    //   pseudonym_pubkey = Ed25519_keygen(seed[0..32]).public_key
+    //   d                = HKDF-Expand(seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n-1) + 1
+    //   pseudonym_pubkey = SEC1-compressed(d * G)
     // -------------------------------------------------------------------
 
     @Nested
@@ -795,8 +829,9 @@ class AndroidKeyCustodyTest {
         fun `vector 30 static and rotatable pseudonyms match spec bytes`() {
             assertVectorMatches(
                 seed = ByteArray(32) { 0x01 },
-                expectedV1 = "fddc04882a48aa39888f6dbec622f9c5aa6f06b2e40820a69a2e0e89b5f09ac2",
-                expectedV2Epoch1 = "43e50a947c4b2be44f871e309c7edc64afaf4207b9a589c9b01f61c01158090f",
+                expectedScalar = "32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64",
+                expectedV1 = "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72",
+                expectedV2Epoch1 = "0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479",
             )
         }
 
@@ -806,8 +841,9 @@ class AndroidKeyCustodyTest {
             val seed = ByteArray(32) { i -> if (i == 0) 0x9d.toByte() else i.toByte() }
             assertVectorMatches(
                 seed = seed,
-                expectedV1 = "ff6e2e909a008318f97bb2c26c1d787ceb9aa2996f746766335e10ba7e2213cc",
-                expectedV2Epoch1 = "edd47319719e2350d1db9488e0189f2405267d7dc243489cfd9aa6f3ac3fc639",
+                expectedScalar = "65d56a863d03d31ea15ade82f677058d5bbe53afedc6ff7d2b8846aa25a1bc2b",
+                expectedV1 = "0239f7c3213f3567183fd2fcf7aec6c884bc70e0e694c42053284a4b5ebef4fe2d",
+                expectedV2Epoch1 = "037967cfe8d3111cdd72288ea3f444c15b710300323162fec63ca9036af73754e3",
             )
         }
 
@@ -818,10 +854,16 @@ class AndroidKeyCustodyTest {
          */
         private fun assertVectorMatches(
             seed: ByteArray,
+            expectedScalar: String,
             expectedV1: String,
             expectedV2Epoch1: String,
         ) {
-            val identityHandle = injectSoftwareEd25519(seed)
+            val scalar = P256Pseudonym.seedToScalar("SCP-TEST-VECTOR-KEY-V1", seed)
+            val ikm = scalar.toByteArray().let {
+                if (it.size > 32) it.copyOfRange(it.size - 32, it.size) else ByteArray(32 - it.size) + it
+            }
+            assertEquals(expectedScalar, ikm.toHexString())
+            val identityHandle = injectSoftwareEd25519(ikm)
             val contextAlpha = "context-alpha".toByteArray(Charsets.UTF_8)
 
             val v1Pseudonym = custody.derivePseudonym(identityHandle, contextAlpha)
