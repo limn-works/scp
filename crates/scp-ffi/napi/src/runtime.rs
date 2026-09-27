@@ -1912,9 +1912,10 @@ pub fn remove_context(bi: &NapiBridgeInstance, context_id: &str) {
 /// Reads a context's role state from that context's supervisor actor.
 ///
 /// Every NAPI entry point that decides authorization, membership, a role, a
-/// capability, or a capability ceiling reads through this function, except the
-/// media helpers `media_check_capability` and `media_initiate_session`, which
-/// check a request against a ceiling list the caller passes.
+/// capability, or a capability ceiling reads through this function, except
+/// `media_initiate_session`, which breaks the rule: it checks media
+/// capabilities against a ceiling list the caller passes, not against the
+/// context's live ceiling that ADR-024 requires.
 /// [`UcanContextState`] deliberately holds no role-state copy: a bridge-local
 /// copy only refreshes when THIS bridge performs the mutation, so a membership
 /// change another participant authored — a governance execution, a

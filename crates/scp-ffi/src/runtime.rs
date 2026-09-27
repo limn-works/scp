@@ -1466,9 +1466,9 @@ pub(crate) fn ffi_state_registry(bi: &PyBridgeInstance) -> &DashMap<String, FfiB
 /// This struct holds NO role state, NO membership set, NO capability ceiling,
 /// and NO creator DID. Every authorization, membership, role, and ceiling
 /// decision reads [`live_role_state`], which queries the context's supervisor
-/// actor, except the media helpers `media_check_capability` and
-/// `media_initiate_session`: they check a request against a ceiling list the
-/// caller passes and read no supervisor state. A bridge-local copy of any of those refreshes only when THIS bridge
+/// actor. `media_initiate_session` breaks this rule: it checks the requested
+/// media capabilities against a ceiling list the caller passes, not against
+/// the context's live ceiling that ADR-024 requires. A bridge-local copy of any of those refreshes only when THIS bridge
 /// performs the mutation, so a change the supervisor applied by another route —
 /// a governance execution, a broadcast-subscriber removal, a TTL expiry, a
 /// trust-recovery transition — left the copy granting authority the supervisor
@@ -1711,9 +1711,10 @@ where
 /// Reads a context's role state from that context's supervisor actor.
 ///
 /// Every `PyO3` entry point that decides authorization, membership, a role, a
-/// capability, or a capability ceiling reads through this function, except the
-/// media helpers `media_check_capability` and `media_initiate_session`, which
-/// check a request against a ceiling list the caller passes.
+/// capability, or a capability ceiling reads through this function, except
+/// `media_initiate_session`, which breaks the rule: it checks media
+/// capabilities against a ceiling list the caller passes, not against the
+/// context's live ceiling that ADR-024 requires.
 /// [`FfiBridgeState`] deliberately holds no role-state copy: a bridge-local
 /// copy only refreshes when THIS bridge performs the mutation, so a membership
 /// change another participant authored — an MLS commit that the per-context
@@ -2607,6 +2608,18 @@ pub fn remove_context(bi: &PyBridgeInstance, context_id: &str) {
 /// context keeps its revocation list, nonce tracker, outlets, and sessions.
 /// Any other answer, a failed read included, removes the state and returns
 /// `true`.
+///
+/// The re-read and the removal are two steps, and nothing stops a readmit
+/// from landing between them. That window fails closed on this bridge, so it
+/// carries no release mark of the kind the NAPI and `UniFFI` bridges use:
+/// - `context_import` and `restore_context` register no `FfiBridgeState`, so
+///   an id they return to `Active` after the re-read is left with none, the
+///   same state either call leaves on any id. Outlet dispatch and UCAN
+///   issue, revoke, and validate refuse it.
+/// - A Welcome join registers its state before it commits and checks the
+///   state is still present after it commits. A removal in between makes the
+///   join tear down its actor and return `SCP-CTX-2040`, so no context stays
+///   live without state.
 pub fn release_context_unless_readmitted(bi: &PyBridgeInstance, context_id: &str) -> bool {
     if matches!(
         read_live_context_state(bi, context_id),

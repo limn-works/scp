@@ -989,8 +989,9 @@ impl UniffiBridgeInstance {
     ///
     /// Every `UniFFI` entry point that decides authorization, membership, a role,
     /// a capability, or a capability ceiling reads through this function, except
-    /// the media helpers `media_check_capability` and `media_initiate_session`,
-    /// which check a request against a ceiling list the caller passes. The
+    /// `media_initiate_session`, which breaks the rule: it checks media
+    /// capabilities against a ceiling list the caller passes, not against the
+    /// context's live ceiling that ADR-024 requires. The
     /// per-context UCAN state carried a `creator_did` and a `ceiling_strings`
     /// set recorded when THIS bridge registered the context, and a
     /// `ModifyCeiling` governance action left the ceiling granting what the
