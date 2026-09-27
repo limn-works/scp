@@ -766,23 +766,16 @@ run_step format cargo fmt --all -- --check
 # cost is reading repository files and, for one gate, resolving a dependency graph. Every
 # gate that compiles or links belongs to CI, which runs it on the pushed head.
 #
-# WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 31 files named
-# `check-*`. This list names 29 of them, and GATES_NOT_RUN below names the other two with
-# the reason each is absent. Neither count is load-bearing: the loop below globs
+# WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 30 files named
+# `check-*`. This list names 29 of them, and GATES_NOT_RUN below names the other one with
+# the reason it is absent. Neither count is load-bearing: the loop below globs
 # `scripts/check-*` off the disk and fails the run on any file neither array names, so a
 # gate this repository gains and this list does not reports itself instead of going
 # unnoticed.
 #
-# THE ONE GATE THIS LIST LEAVES OUT, and the measurement that decided it.
-# `scripts/check-pure-helpers.sh` runs `cargo test -p scp-testing --test ffi_conformance`,
-# which links a test binary and takes the build lock. Run on 2026-09-13 while another
-# worktree's cargo held that lock, it printed "Blocking waiting for file lock on build
-# directory" and compiled nothing for the 300 seconds before a timeout killed it. Its own
-# job in `.github/workflows/ci.yml` runs the underlying Rust test on the pushed head.
-#
 # TWO GATES STAY IN THE LIST ALTHOUGH THEY START CARGO. `scripts/check-shipped-feature-
 # graph.sh` runs eleven `cargo tree` resolutions and `scripts/check-protocol-deps.sh` runs
-# one, and `cargo tree` compiles nothing and takes no build lock: the same 2026-09-13 run
+# one, and `cargo tree` compiles nothing and takes no build lock: a 2026-09-13 run
 # measured them at 12.9 seconds and 391 ms while another worktree held that lock.
 #
 # Measured on 2026-09-13, one run each, in the order below: 47 seconds for the 28 this
@@ -824,7 +817,7 @@ GATES=(
 )
 
 # The `scripts/check-*` files this run deliberately does not execute, each with the reason
-# the paragraphs above give in full.
+# it is absent.
 #
 # WHY THIS ARRAY EXISTS RATHER THAN THE PROSE ALONE. GATES above is written by hand, and a
 # hand-written list of a directory's contents goes stale the first time someone adds a file
@@ -836,10 +829,6 @@ GATES=(
 GATES_NOT_RUN=(
     # The toolchain precondition this script runs before any cargo command, above.
     scripts/check-resolved-rustc.sh
-    # Runs `cargo test -p scp-testing --test ffi_conformance`, which links a test binary
-    # and takes the shared target directory's build lock, for the reason and the
-    # measurement the paragraph above gives. Its own CI job runs the underlying test.
-    scripts/check-pure-helpers.sh
 )
 
 # `scripts/check-workflow-compile-steps.py` imports PyYAML, which the standard library does
