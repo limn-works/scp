@@ -80,13 +80,15 @@ pub const fn handle_state_after(result: &GovernanceActionResult) -> Option<Conte
         GovernanceActionResult::MigrationProposed(_) => Some(ContextState::MigratingOut),
         GovernanceActionResult::MigrationCancelled => Some(ContextState::Active),
         GovernanceActionResult::ContextTombstoned => Some(ContextState::Tombstoned),
+        // The runtime's `execute_close_context` moves the context to
+        // `Closing` before it returns `ContextClosed`.
+        GovernanceActionResult::ContextClosed => Some(ContextState::Closing),
         GovernanceActionResult::MemberAdded { .. }
         | GovernanceActionResult::MemberRemoved
         | GovernanceActionResult::RoleChanged
         | GovernanceActionResult::OutletRegistered
         | GovernanceActionResult::OutletRemoved
         | GovernanceActionResult::CeilingModified
-        | GovernanceActionResult::ContextClosed
         | GovernanceActionResult::TtlExtended
         | GovernanceActionResult::PruningPolicyModified
         | GovernanceActionResult::AdminTransferred
@@ -265,10 +267,15 @@ mod tests {
         }
     }
 
-    /// A migration or tombstone moves the handle whichever entry point ran
-    /// the action; every other outcome leaves the handle alone.
+    /// A migration, a tombstone, or a close moves the handle whichever entry
+    /// point ran the action; every other outcome leaves the handle alone.
+    ///
+    /// A close moves the handle to `Closing` because the runtime's
+    /// `execute_close_context` transitions the context to `Closing` before it
+    /// returns `ContextClosed`; mapping `ContextClosed` to `None` would leave
+    /// a closing context's handle reading `active`.
     #[test]
-    fn migration_and_tombstone_outcomes_move_the_handle_state() {
+    fn migration_tombstone_and_close_outcomes_move_the_handle_state() {
         let proposed = GovernanceActionResult::MigrationProposed(
             scp_core::context::state::MigrationProposedResult {
                 destination_context_id: "dest".to_owned(),
@@ -287,9 +294,12 @@ mod tests {
             handle_state_after(&GovernanceActionResult::ContextTombstoned),
             Some(ContextState::Tombstoned)
         );
+        assert_eq!(
+            handle_state_after(&GovernanceActionResult::ContextClosed),
+            Some(ContextState::Closing)
+        );
         for result in [
             GovernanceActionResult::MemberRemoved,
-            GovernanceActionResult::ContextClosed,
             GovernanceActionResult::Executed,
         ] {
             assert_eq!(handle_state_after(&result), None, "{result:?}");
