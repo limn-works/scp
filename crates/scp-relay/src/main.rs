@@ -21,6 +21,10 @@
 //! | `s3`       | S3-compat  | `SCP_RELAY_S3_BUCKET` (required) + AWS env    | |
 //! | `memory`   | In-memory  | —                                             | |
 //!
+//! The `postgres` and `s3` rows exist only in a binary built with
+//! `--features cloud-blobs`. A default build exits on either value with an
+//! error naming that feature.
+//!
 //! See §10.5 of the SCP infrastructure spec.
 
 use std::net::SocketAddr;

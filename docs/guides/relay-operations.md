@@ -152,14 +152,14 @@ OPTIONS:
 
 ## 4. Blob Storage Backend Selection
 
-Both `scp-relay` and `scp-node` (in relay-only mode) select a blob storage backend via `SCP_RELAY_STORAGE_BACKEND`. The value maps to a `BlobStorageBackend` enum variant:
+Both `scp-relay` and `scp-node` (in relay-only mode) select a blob storage backend via `SCP_RELAY_STORAGE_BACKEND`. The value maps to a `BlobStorageBackend` enum variant. A default build, including the container image the repository's `Dockerfile` builds, compiles neither `postgres` nor `s3`: build the binary with `--features cloud-blobs` to use them. A binary built without that feature exits on either value with `storage backend '<value>' is not compiled into this binary`.
 
 | Value | Backend | Required env vars | Default path |
 |-------|---------|-------------------|-------------|
 | `sqlite` (default) | SQLite | `SCP_RELAY_STORAGE_PATH` | `./scp-relay.db` |
 | `redb` | redb (embedded) | `SCP_RELAY_STORAGE_PATH` | `./scp-relay.redb` |
-| `postgres` | PostgreSQL | `SCP_RELAY_DATABASE_URL` (required) | N/A |
-| `s3` | S3-compatible | `SCP_RELAY_S3_BUCKET` (required), `SCP_RELAY_S3_PREFIX` | prefix: `blobs/` |
+| `postgres` (needs `cloud-blobs`) | PostgreSQL | `SCP_RELAY_DATABASE_URL` (required) | N/A |
+| `s3` (needs `cloud-blobs`) | S3-compatible | `SCP_RELAY_S3_BUCKET` (required), `SCP_RELAY_S3_PREFIX` | prefix: `blobs/` |
 | `memory` | In-memory | none | N/A (data lost on restart) |
 
 ### Examples
@@ -168,12 +168,12 @@ Both `scp-relay` and `scp-node` (in relay-only mode) select a blob storage backe
 # SQLite (default)
 SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
 
-# PostgreSQL
+# PostgreSQL (binary built with: cargo build --release -p scp-relay --features cloud-blobs)
 SCP_RELAY_STORAGE_BACKEND=postgres \
 SCP_RELAY_DATABASE_URL="postgres://user:pass@localhost/scp_relay" \
 scp-relay
 
-# S3-compatible (e.g., MinIO)
+# S3-compatible, e.g. MinIO (binary built with --features cloud-blobs)
 SCP_RELAY_STORAGE_BACKEND=s3 \
 SCP_RELAY_S3_BUCKET=scp-blobs \
 SCP_RELAY_S3_PREFIX=production/ \
