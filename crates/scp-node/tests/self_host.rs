@@ -421,7 +421,7 @@ async fn projection_status(node: &scp_node::ApplicationNode<SqliteStorage>, path
 /// route serves while `/scp/v1` is NOT routed (it falls through to the
 /// virtual-host fallback -> 404).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn self_host_public_surface_excludes_relay_and_bridge() {
+async fn self_host_public_surface_excludes_relay() {
     let built = build_self_host_node().await;
     let node_did = built.node.identity().did().to_owned();
     let context_id = self_host_context_id(&node_did);
@@ -1271,7 +1271,7 @@ async fn skip_nat_probe_uses_loopback_relay_url_without_probing() {
 /// absent) while the site projection serves — and the SAME GET on the `Full`
 /// surface IS routed (non-404, the WebSocket extractor rejecting a plain GET),
 /// proving the self-host 404 is genuine route absence, not a generic rejection.
-/// (The companion `self_host_public_surface_excludes_relay_and_bridge` covers
+/// (The companion `self_host_public_surface_excludes_relay` covers
 /// the full surface/site detail; this test deliberately
 /// keeps the surface half tight and adds the relay-loopback binding the other
 /// test lacks.)

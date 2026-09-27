@@ -82,8 +82,9 @@ use crate::context::governance_helpers;
 use crate::context::state::{self, CHECKPOINT_PAYLOAD_TAG, CheckpointMessage, emit_event_into};
 use crate::context::supervisor::MessageSigner;
 
-/// Alias for the broadcast channel used to fan out [`ContextEvent`]s to
-/// external subscribers (SDK event streams).
+/// Alias for the broadcast channel that fans out [`ContextEvent`]s to every
+/// receiver taken from `Supervisor::subscribe_events`. No production code in
+/// this repository subscribes to it.
 pub type ContextEventSender = tokio::sync::broadcast::Sender<(String, ContextEvent)>;
 
 /// Default TTL (in seconds) for sealed message blobs sent through the

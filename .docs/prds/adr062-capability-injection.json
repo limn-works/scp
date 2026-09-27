@@ -346,7 +346,7 @@
       "sources": [
         {
           "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
-          "section": "### 5. Credentials (E2), blob (E3), relay-publisher default (E4) — classified + storied now (live SCP-CAPSEL fixes)"
+          "section": "### 5. Blob (E3), relay-publisher default (E4) — classified + storied now (live SCP-CAPSEL fixes)"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
@@ -397,7 +397,7 @@
       "sources": [
         {
           "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
-          "section": "### 5. Credentials (E2), blob (E3), relay-publisher default (E4) — classified + storied now (live SCP-CAPSEL fixes)"
+          "section": "### 5. Blob (E3), relay-publisher default (E4) — classified + storied now (live SCP-CAPSEL fixes)"
         },
         {
           "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",

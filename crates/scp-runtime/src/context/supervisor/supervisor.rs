@@ -2374,6 +2374,11 @@ impl Supervisor {
     /// the `event_tx` argument — e.g. via `Self::for_query_shim` — yields
     /// `None`).
     ///
+    /// No production code in this repository calls this method, so every event
+    /// the actors emit is dropped unless an embedder subscribes. A receiver
+    /// that falls behind the channel capacity gets `RecvError::Lagged` and must
+    /// handle it itself; nothing else records the lost events.
+    ///
     /// Message payloads on the channel are stripped of plaintext before sending
     /// (see [`crate::context::state::strip_event_payload`]) — subscribers
     /// observe metadata only, never decrypted content.

@@ -1170,9 +1170,12 @@ pub(crate) fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn Context
 /// ADR-049 — the FFI bridge no longer touches `ContextManager` at all.
 /// Bounded capacity of the supervisor's `ContextEvent` broadcast channel.
 ///
-/// Every production supervisor built here enables this channel so that local
-/// context events can be consumed by external sinks. Lagging consumers
-/// drop the oldest events (logged, never panics); `1024` is the documented
+/// Every production supervisor built here enables this channel so that an
+/// embedder can subscribe through `Supervisor::subscribe_events`. No production
+/// code in this repository subscribes to it. A receiver that falls more than
+/// this many events behind loses the oldest ones and gets
+/// `RecvError::Lagged` from its next `recv`; nothing else records the loss, so
+/// each subscriber must handle `Lagged` itself. `1024` is the documented
 /// default shared across all three FFI bridges.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 

@@ -278,8 +278,7 @@ async fn supervisor_send_emits_stripped_message_sent_to_subscriber() {
     observed.expect("a MessageSent event must reach the subscriber before timeout");
 }
 
-/// A live `Supervisor` emitting a SECURITY/AUDIT event — `MemberLeft`, one of
-/// the variants the lag-warning flags as critical — reaches a
+/// A live `Supervisor` emitting a SECURITY/AUDIT event — `MemberLeft` — reaches a
 /// `subscribe_events()` subscriber with the correct shape. The `MessageSent`
 /// test above proves the channel carries application traffic; this proves an
 /// actual audit event reaches the channel, which is the security-relevant
@@ -345,7 +344,7 @@ async fn supervisor_leave_emits_member_left_audit_event_to_subscriber() {
 
 /// A `Supervisor` built without the event channel (the `test_supervisor` /
 /// `for_query_shim` shape) returns `None` from `subscribe_events()` rather than
-/// panicking — the defensive branch the FFI wiring relies on (ADR-049 §12a).
+/// panicking — the branch every subscriber must handle (ADR-049 §12a).
 #[tokio::test]
 async fn supervisor_without_channel_yields_no_subscriber() {
     let supervisor = scp_runtime::context::test_supervisor(

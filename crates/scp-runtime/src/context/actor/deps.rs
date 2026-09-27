@@ -174,7 +174,8 @@ pub struct ActorDeps {
     /// callsite re-derived it from the supervisor.
     pub clock: Arc<dyn Clock>,
     /// Optional fan-out channel for `(context_id, ContextEvent)` pairs
-    /// sent to external subscribers (SDK event streams). Formerly
+    /// sent to every receiver taken from `Supervisor::subscribe_events`; no
+    /// production code in this repository subscribes to it. Formerly
     /// `ContextManager::event_tx`. `None` in embedders that do not
     /// subscribe to context events — handlers check `Option::is_some`
     /// before sending and drop silently otherwise, matching the legacy behavior.

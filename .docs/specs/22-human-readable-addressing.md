@@ -163,7 +163,7 @@ The `did` parameter in `handle_deregister` is explicit rather than inferred from
      "signing_key_id": "#active"          // which verification method signed
    }
    ```
-5. **Writer verification.** The writer resolves the `requester_did` via DID document, extracts the public key for `signing_key_id`, and verifies the Ed25519 signature over the reconstructed `signed_content`. If verification fails, the request is rejected with a `BRIDGE_NOT_AUTHORIZED` error. The writer MUST verify that the DID document is fresh (fetched within the last 300 seconds or cached with valid TTL).
+5. **Writer verification.** The writer resolves the `requester_did` via DID document, extracts the public key for `signing_key_id`, and verifies the Ed25519 signature over the reconstructed `signed_content`. If verification fails, the request is rejected with code `SCP-OUTLET-6110`, slug `authorization.denied` (§5.4.4). The writer MUST verify that the DID document is fresh (fetched within the last 300 seconds or cached with valid TTL).
 
 **Two-tier model.** Handle outlets follow the same two-tier architecture as existing discovery outlets (§6.2.2B). Writers (MLS members) process handle registrations. Readers (DID-authenticated, unbounded) perform handle lookups. Registration is a write operation processed by writers; lookup is a read operation available to all.
 

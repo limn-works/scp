@@ -488,7 +488,7 @@ An implementation that passes all Core tests can:
 
 ### SCP Full Conformance
 
-Tests: All CONF-001 through CONF-042.
+Tests: CONF-001 through CONF-035 and CONF-039 through CONF-042. CONF-036, CONF-037, and CONF-038 are retired: they tested the platform bridge protocol, which SCP no longer defines, and no conformance tier includes them.
 
 An implementation that passes all Full tests additionally supports:
 - UCAN delegation chains and revocation
