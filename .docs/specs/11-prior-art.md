@@ -355,7 +355,7 @@ GNUnet's communicator model offers one lesson SCP has already partially adopted:
 - **Infrastructure distrust.** Both protocols treat all infrastructure as potentially adversarial. GNUnet encrypts at every layer because any hop might be compromised. SCP encrypts at the message layer (MLS) and treats relays as untrusted dumb pipes. Different mechanisms, same principle.
 - **Relay as native transport.** GNUnet's DV routing makes relaying an inherent transport property. SCP's Tier 3 bridge relay serves the same function — when direct connection fails, relay forwarding is a seamless fallback, not an external service.
 - **NAT as first-class problem.** Both protocols treat NAT traversal as a core protocol concern, not an application-layer afterthought. GNUnet's multiple traversal mechanisms and SCP's 4-tier reachability strategy both reflect this.
-- **Decentralized discovery.** GNUnet discovers peers through the R5N distributed hash table; SCP discovers them through its own relay network and the shipped community relay list (§18.5.1). Both refuse a centralized registry.
+- **Decentralized discovery.** GNUnet discovers peers through the R5N distributed hash table; SCP discovers them through its own relay network and the community relay list, which a relay-list context serves (§18.5.1). Both refuse a centralized registry.
 
 ### 11.3.9 Why SCP Does Not Adopt GNUnet's Approach
 
@@ -718,7 +718,7 @@ Server selection uses consistent permutation: `HASH(storage_index + nodeid)` sor
 
 | Dimension | Tahoe-LAFS Grid | SCP Relay + Node Architecture |
 |-----------|----------------|------------------------------|
-| **Discovery** | Introducer (centralized roster) | The SCP relay network, the shipped community relay list, and the identity's own service record (§3.10, §18) |
+| **Discovery** | Introducer (centralized roster) | The SCP relay network, the community relay list a relay-list context serves, and the identity's own service record (§3.10, §18) |
 | **Infrastructure role** | Storage servers — store shares, serve shares, nothing else | Relays — receive blobs, deliver blobs, nothing else |
 | **Client role** | All crypto + erasure coding + share management | All crypto + MLS + governance + capability validation |
 | **Topology** | Bi-clique (every client → every server) | Subscription-based (participants subscribe to routing IDs on relays) |

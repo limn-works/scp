@@ -615,7 +615,7 @@ HOLE_PUNCH_RESPONSE (self-hosted relay → intermediary relay → peer) {
 
 **STUN service on SCP relays:** Any SCP relay MAY serve as a STUN endpoint. STUN is lightweight (stateless, single UDP socket, minimal CPU) and can coexist with the relay's WebSocket endpoint. The relay advertises STUN support in its `.well-known/scp` `relay_config` or relay metadata.
 
-- Bootstrap relays (§18.5.1, fallback relay list) MUST include at least one STUN-capable relay. This ensures that new identities can probe their NAT type without prior infrastructure.
+- The community relay list (§18.5.1) MUST include at least one STUN-capable relay. This ensures that new identities can probe their NAT type without prior infrastructure.
 - Self-hosted relays that have achieved public reachability (Tiers 1, 2, or 4) MAY also offer STUN service — a self-reinforcing network where every new reachable relay makes the next NAT traversal easier.
 
 **Symmetric NAT:** If the STUN probe determines the NAT is symmetric (~15% of deployments), hole punching is not viable — the NAT assigns a different external mapping per destination, making the external address unpredictable. The SDK falls through to Tier 3.
@@ -785,7 +785,7 @@ impl ApplicationNodeBuilder {
     pub fn stun_server(mut self, url: &str) -> Self;
 
     /// Override the bridge relay used for Tier 3 fallback.
-    /// Default: first bridge-capable relay in the fallback relay list.
+    /// Default: first bridge-capable relay in the community relay list (§18.5.1).
     pub fn bridge_relay(mut self, url: &str) -> Self;
 }
 ```

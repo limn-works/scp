@@ -22,7 +22,7 @@ Three P-256 keypairs carry every signature in this section. Each derives from a 
 
 **Seed-to-scalar rule.** A seed becomes a private scalar by the extra-random-bits method of FIPS 186-5 Appendix A.2.1, which §9.10.4 states in full: expand the seed to 48 bytes with HKDF-Expand-SHA256 under a label, read those bytes as a big-endian integer, reduce modulo `n − 1`, and add one. P-256 carries no RFC 8032 seed expansion, so the curve ruling of 2026-09-10 required a defined step here. The label for these three fixtures is the ASCII string `"SCP-TEST-VECTOR-KEY-V1"`, which labels a test fixture and names no protocol object, so §9.18.2 registers no separator for it.
 
-Each key prints its seed, its private scalar, the 33-byte SEC1 compressed point §9.5 fixes for signature verification, and the 65-byte uncompressed point RFC 9420 §5.1.2 and RFC 9180 §7.1 fix. **These three are fixtures and their private scalars are published here**, so no key below is ever a shipped key: Vector 49's two community-relay-list entries carry the reference and secondary keys, which is what makes that vector a fixture rather than the artifact a binding ships (`18-addressability-and-deployment.md` §18.5.1).
+Each key prints its seed, its private scalar, the 33-byte SEC1 compressed point §9.5 fixes for signature verification, and the 65-byte uncompressed point RFC 9420 §5.1.2 and RFC 9180 §7.1 fix. **These three are fixtures and their private scalars are published here**, so no key below ever signs for a real party: Vector 49's two relay-list entries carry the reference and secondary keys, which is what makes that vector a fixture rather than a record the relay-list context serves (`18-addressability-and-deployment.md` §18.5.1).
 
 ```
 Reference seed:
@@ -1711,12 +1711,11 @@ Shared seed: seed_event, seed_observed_at 1700000000
   731ec51ab8c0dd7985b579d4cc8ec55cf5bb142fcabc78da89ccb2c4ff768454
 ```
 
-### Vector 49: the community relay list's encoding
+### Vector 49: the relay-list record
 
-`18-addressability-and-deployment.md` §18.5.1 fixes the artifact: one JSON document named `community-relays.json`, holding a JSON array of entries, each an object carrying `operator`, `key`, `url` and `free` in that order. **The two entries below are a fixture and are never the shipped list.** Each operator identifier is `SHA-256` over a stated ASCII label, and the two keys are §25.2's reference and secondary keys, whose private scalars §25.2 prints. This vector pins the document's encoding — member order, lowercase hexadecimal, no insignificant whitespace, and the digest construction — and pins no byte a binding ships. The shipped `community-relays.json` is a release artifact the curator publishes; a release process computes this digest over the four bindings' copies and compares them to each other, never to the digest below, and an entry whose `key` appears anywhere in this corpus MUST NOT ship.
+`18-addressability-and-deployment.md` §18.5.1 fixes the record the relay-list context's `relay_list` outlet returns: an `entries` document holding one JSON array of entries, each an object carrying `operator`, `key`, `url` and `free` in that order, and the governor's signature over `SHA-256("SCP-RELAY-LIST-V1:" || context_id || sequence || governor || SHA-256(entries))`. **The two entries below are a fixture and are never the community relay list.** Each operator identifier is `SHA-256` over a stated ASCII label, and the two keys are §25.2's reference and secondary keys, whose private scalars §25.2 prints. The context id is `SHA-256` over a stated ASCII label, and the governor is Vector 41's identity, whose `#active` key is §25.2's secondary key. This vector pins the document's encoding — member order, lowercase hexadecimal, no insignificant whitespace — and the record's preimage and signature. An entry whose `key` appears anywhere in this corpus MUST NOT appear in the community relay list.
 
 ```
-File name:  community-relays.json
 entry 0:  operator = SHA-256("scp-25-relay-operator")
           c45b32c65d25b3d070929aa68fa4532f69fd5ab56fa15173be77d6c5c6d03c18
           key      = §25.2's reference key, 33-byte SEC1 compressed
@@ -1747,8 +1746,25 @@ Document bytes:
   3937353363326662643463346566613765316533333930356533373233613431
   32623230616561222c2275726c223a227773733a2f2f72656c6179322e657861
   6d706c652e636f6d2f7363702f7631222c2266726565223a66616c73657d5d
-SHA-256 over those bytes:
+SHA-256 over those bytes, the record's entries digest:
   526839862b1ba39c6a9e163f8a56ef34162078ddffc8d0745dbf3b1a6de9c0b4
+
+context_id = SHA-256("scp-25-relay-list-context"):
+  69fb718bd4cac0da5577db43fbabf3b13d21163ec05d2cbfd3da82e8e07f829b
+sequence:   1
+governor = Vector 41's identifier:
+  2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32
+
+Preimage (122 bytes = 18-byte separator + 104 field bytes):
+  5343502d52454c41592d4c4953542d56313a69fb718bd4cac0da5577db43fbab
+  f3b13d21163ec05d2cbfd3da82e8e07f829b00000000000000012c0f7f4478be
+  94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32526839862b1b
+  a39c6a9e163f8a56ef34162078ddffc8d0745dbf3b1a6de9c0b4
+Canonical hash:
+  802a7f4570a96bdd6134b5daf24f3dcb5b52b4e1c1e888a18029e0d7732640a8
+Signature, secondary key (the governor's #active):
+  e5a28b5e36e1fec5b0c536e9a2b60d204c389f6f318a1996ea823ba8b6222a9f
+  0993f9168ef862e7589319bc3cb741c13eac08edf90cec70057cd5e12009bf9a
 ```
 
 ## 25.28 Pre-Rotation Commitment and Service Record Vectors (§9.7.4.2 definitions, `03-identity.md` §3.10.13)

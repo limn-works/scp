@@ -57,7 +57,7 @@ SCP is governed by nine design principles. Each has a load-bearing consequence f
 
 5. **Legibility before opt-in.** Every context's parameters are visible before joining. *Consequence:* informed consent is mechanical, not social.
 
-6. **No operator dependency.** The protocol must function if its creators disappear. *Consequence:* identity is self-sovereign, every cryptographic operation is local, and relays are substitutable for every act except a first contact, which reads two entries of the shipped community relay list under distinct operator keys.
+6. **No operator dependency.** The protocol must function if its creators disappear. *Consequence:* identity is self-sovereign, every cryptographic operation is local, and relays are substitutable for every act except a first contact, which reads two entries of the community relay list under distinct operator keys; the SDK fetches that list from a relay-list context Limn governs.
 
 7. **Transport independence.** No structural coupling to any single transport. *Consequence:* the protocol defines a transport adapter trait with 17 adapter specifications (Section 9).
 
@@ -293,7 +293,7 @@ flowchart LR
 
 ### 4.3 Resolution
 
-A resolver queries two disjoint relay sets in parallel: the relays the identity's service record names, and a fallback set from the community relay list the SDK ships. Each response carries a key-event frame, which the resolver decodes, recomputing the identifier, verifying every event, and settling the surviving chains by shared prefix and then by fork precedence (`03-identity.md` §3.10.4).
+A resolver queries two disjoint relay sets in parallel: the relays the identity's service record names, and a fallback set from the community relay list, which the SDK fetches from a relay-list context its shipped pointer names. Each response carries a key-event frame, which the resolver decodes, recomputing the identifier, verifying every event, and settling the surviving chains by shared prefix and then by fork precedence (`03-identity.md` §3.10.4).
 
 On a first contact, where the resolver holds no earlier chain for the identifier, each relay must also return a proof of control: a signature over the resolver's nonce, the routing id queried, and a digest of the bytes served, verifiable against the P-256 key that operator's community-relay-list entry declares. A relay serving no proof counts as one unattributed source and can never be the second of two, so a first contact that cannot reach two proven operators returns an inconclusive verdict rather than a key state (`03-identity.md` §3.10.1 and §3.10.8).
 
