@@ -243,16 +243,17 @@ pub struct MemberInfo {
 ///
 /// A UCAN check records the token's nonce (ADR-016 Step 9), and a recorded
 /// nonce fails every later check of the same token as a replay. The server
-/// holds one agent token for its lifetime, so only the check that authorizes a
-/// `tools/call` may record it.
+/// holds one agent token for its lifetime, so that token authorizes one
+/// outlet run: only the check made just before `invoke_outlet` may record it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityCheck {
-    /// Decides what the agent sees: `tools/list`, `scp://{ctx}/tools` and the
-    /// notification pump's view. The provider checks the nonce and records
-    /// nothing.
+    /// Decides what the agent sees (`tools/list`, `scp://{ctx}/tools` and the
+    /// notification pump's view) and refuses a `tools/call` before its input
+    /// is validated. The provider checks the nonce and records nothing.
     Probe,
-    /// Authorizes a `tools/call` that runs next. The provider records the
-    /// nonce when the check passes.
+    /// Authorizes the outlet run a `tools/call` makes next, after its input
+    /// passed validation. The provider records the nonce when the check
+    /// passes.
     Invoke,
 }
 
@@ -1010,25 +1011,13 @@ impl<P: ContextProvider> McpServer<P> {
             );
         }
 
-        // Validate UCAN capability.
-        if let Err(refusal) =
-            self.provider
-                .validate_capability(&context_id, tool_name, CapabilityCheck::Invoke)
+        // Validate UCAN capability. A probe refuses an agent that may not call
+        // the tool before its input is examined; it records no nonce, so a
+        // call refused below leaves the agent token unspent.
+        if let Some(refused) =
+            self.capability_refusal(request, &context_id, tool_name, CapabilityCheck::Probe)
         {
-            let msg = match refusal {
-                AccessRefusal::Denied(msg) => msg,
-                AccessRefusal::Unreadable(msg) => {
-                    return internal_error(request.id.clone(), &msg);
-                }
-            };
-            return JsonRpcResponse::error(
-                request.id.clone(),
-                JsonRpcError {
-                    code: protocol::CAPABILITY_DENIED,
-                    message: msg,
-                    data: None,
-                },
-            );
+            return refused;
         }
 
         // Validate input against schema. A registry the provider cannot read
@@ -1049,6 +1038,13 @@ impl<P: ContextProvider> McpServer<P> {
                     data: None,
                 },
             );
+        }
+
+        // The recording check runs last, just before the outlet it authorizes.
+        if let Some(refused) =
+            self.capability_refusal(request, &context_id, tool_name, CapabilityCheck::Invoke)
+        {
+            return refused;
         }
 
         // Invoke the tool.
@@ -1785,6 +1781,33 @@ impl<P: ContextProvider> McpServer<P> {
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    /// The `tools/call` error response for a `check` the provider refuses:
+    /// `CAPABILITY_DENIED` for a denial, an internal error for a failed read,
+    /// and `None` when the check passes.
+    fn capability_refusal(
+        &self,
+        request: &JsonRpcRequest,
+        context_id: &str,
+        tool_name: &str,
+        check: CapabilityCheck,
+    ) -> Option<JsonRpcResponse> {
+        match self
+            .provider
+            .validate_capability(context_id, tool_name, check)
+        {
+            Ok(()) => None,
+            Err(AccessRefusal::Unreadable(msg)) => Some(internal_error(request.id.clone(), &msg)),
+            Err(AccessRefusal::Denied(msg)) => Some(JsonRpcResponse::error(
+                request.id.clone(),
+                JsonRpcError {
+                    code: protocol::CAPABILITY_DENIED,
+                    message: msg,
+                    data: None,
+                },
+            )),
+        }
+    }
 
     /// Finds the input schema for a tool (built-in or context-registered).
     ///
@@ -2568,9 +2591,10 @@ mod tests {
     }
 
     /// Listing asks the provider only for probes, which record no UCAN nonce;
-    /// the one check that authorizes a `tools/call` is the only `Invoke`. A
-    /// listing that recorded the agent token's nonce would fail every later
-    /// check of that token as a replay.
+    /// the one check made just before a `tools/call` runs its outlet is the
+    /// only `Invoke`. A listing, or a call refused for its input, that
+    /// recorded the agent token's nonce would fail every later check of that
+    /// token as a replay.
     #[test]
     fn only_tools_call_asks_for_an_invoke_check() {
         let mut server = initialized_server(MockProvider::default());
@@ -2594,8 +2618,23 @@ mod tests {
         );
         assert!(server.handle_request(&call).unwrap().error.is_none());
         assert_eq!(
+            std::mem::take(&mut *server.provider.checks.lock().unwrap()),
+            vec![CapabilityCheck::Probe, CapabilityCheck::Invoke]
+        );
+
+        let bad_input = make_request(
+            protocol::METHOD_TOOLS_CALL,
+            Some(serde_json::json!({
+                "name": "ctx_a/send_message",
+                "arguments": "not an object"
+            })),
+        );
+        let err = server.handle_request(&bad_input).unwrap().error.unwrap();
+        assert_eq!(err.code, protocol::INVALID_PARAMS);
+        assert_eq!(
             *server.provider.checks.lock().unwrap(),
-            vec![CapabilityCheck::Invoke]
+            vec![CapabilityCheck::Probe],
+            "a call refused for its input must not reach the recording check"
         );
     }
 

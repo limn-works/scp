@@ -801,12 +801,12 @@ impl FfiBridgeProvider {
                 let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
                     revocation_list: &rt.revocation_list,
                 };
-                // Only a `tools/call` records the token's nonce; a probe
-                // records nothing, so listing cannot burn the token.
-                let mut nonce_adapter = crate::bridge_adapters::OutletGrantNonceTracker {
-                    inner: &mut rt.nonce_tracker,
-                    record: check == scp_mcp::server::CapabilityCheck::Invoke,
-                };
+                // Only the Invoke check made just before a `tools/call` runs
+                // its outlet records the nonce; a probe records nothing.
+                let mut nonce_adapter = crate::bridge_adapters::OutletGrantNonceTracker::new(
+                    &mut rt.nonce_tracker,
+                    check,
+                );
 
                 let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
                     did_resolver: &did_resolver,
@@ -1574,8 +1574,10 @@ impl crate::scp::PyScp {
                     }
                 }
                 "sse" => {
-                    // `run_sse` takes ownership of the `McpServer` directly —
-                    // no mutex wrapper, since the SSE transport owns it.
+                    // `run_sse` takes ownership of the `McpServerForTransport`
+                    // bundle: the server and, when it advertises
+                    // subscriptions, the event pump that delivers them. No
+                    // mutex wrapper, since the SSE transport owns the bundle.
                     // `SseConfig::new` draws a fresh bearer token, and the transport rejects
                     // every request that does not present it. This bridge returns neither that
                     // token nor the bound port to its caller, so no client can reach this

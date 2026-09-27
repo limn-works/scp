@@ -4918,9 +4918,9 @@ impl McpUniFfiBridgeProvider {
 
     /// Reads a context's role state through the ADR-049 query shim.
     ///
-    /// Shared by `active_context_ids`, `agent_role`, `context_members` and
-    /// `validate_resource_access` so all four answer from one source rather
-    /// than near-identical `block_in_place` blocks.
+    /// Shared by `active_context_ids`, `agent_role`, `context_members`,
+    /// `validate_capability` and `validate_resource_access` so all five answer
+    /// from one source rather than near-identical `block_in_place` blocks.
     ///
     /// # Errors
     ///
@@ -5029,12 +5029,12 @@ impl McpUniFfiBridgeProvider {
                 let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                     revocation_list: &ucan_state.revocation_list,
                 };
-                // Only a `tools/call` records the token's nonce; a probe
-                // records nothing, so listing cannot burn the token.
-                let mut nonce_adapter = scp_ffi_common::OutletGrantNonceTracker {
-                    inner: &mut ucan_state.nonce_tracker,
-                    record: check == scp_mcp::server::CapabilityCheck::Invoke,
-                };
+                // Only the Invoke check made just before a `tools/call` runs
+                // its outlet records the nonce; a probe records nothing.
+                let mut nonce_adapter = scp_ffi_common::OutletGrantNonceTracker::new(
+                    &mut ucan_state.nonce_tracker,
+                    check,
+                );
 
                 let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
                     did_resolver: &did_resolver,
@@ -16422,7 +16422,9 @@ impl Scp {
                     run_mcp_stdio_server_uniffi(server, shutdown_rx, cancel_token).await;
                 }
                 "sse" => {
-                    // `run_sse` takes ownership of the `McpServer` directly.
+                    // `run_sse` takes ownership of the `McpServerForTransport`
+                    // bundle: the server and, when it advertises
+                    // subscriptions, the event pump that delivers them.
                     // `SseConfig::new` draws a fresh bearer token, and the transport rejects
                     // every request that does not present it. This bridge returns neither that
                     // token nor the bound port to its caller, so no client can reach this
