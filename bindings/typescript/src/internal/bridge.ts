@@ -903,9 +903,9 @@ export async function getBridge(scp: SCP): Promise<Bridge> {
  * for non-bundled / dev-server usage.
  *
  * Intended use: construct a mock `Bridge` with spy stubs for specific
- * operations (e.g. `evaluateTrust`), then call
- * `__setBridgeForTests(scp, mockBridge)` before invoking module-level helpers
- * (`evaluateTrust`, …) under test.
+ * operations (e.g. `identityMigrate`), then call
+ * `__setBridgeForTests(scp, mockBridge)` before invoking the `SCP` methods
+ * that route to them (`scp.identityMigrate`, …) under test.
  *
  * @internal Phase 4 PR 4 — used by `identity-lifecycle.test.ts` routing tests.
  */

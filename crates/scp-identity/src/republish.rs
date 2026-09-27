@@ -262,7 +262,7 @@ pub struct RecordedRelayPublish {
 /// Test-harness-only: gated behind `#[cfg(any(test, feature = "testing"))]` so
 /// it is ABSENT from every shipped (non-testing) build — it can never be bound
 /// on a production `RepublishManager` path (ADR-062 §Decision 5, E4; mirrors
-/// E1's `InMemoryDhtClient` and E2's `InMemoryCredentialStore` demotions).
+/// E1's `InMemoryDhtClient` demotion).
 #[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]
 pub struct InMemoryRelayPublisher {
