@@ -114,6 +114,10 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# This file's absolute path, fixed before the cd below: a relative
+# BASH_SOURCE stops resolving once the working directory moves to the root,
+# and the fixtures that read or re-run this file would then read nothing.
+GATE_SELF="$REPO_ROOT/scripts/$(basename "${BASH_SOURCE[0]}")"
 cd "$REPO_ROOT"
 
 # ---------------------------------------------------------------------------
@@ -1056,7 +1060,9 @@ expect() { # <label> <expected: PASS|FAIL> <actual-rc>
 assert_every_pipeline_reader_consumes_its_input() {
   echo ">> fixture: every stage this gate pipes into reads its whole input, so no probe can report SIGPIPE (141) as a verdict"
   local self offenders
-  self="${BASH_SOURCE[0]}"
+  self="$GATE_SELF"
+  expect "(sigpipe) the file this fixture scans is this gate, by an absolute path" "PASS" \
+    "$([[ "$self" == /* && -r "$self" && "${self##*/}" == "${BASH_SOURCE[0]##*/}" ]] && echo 0 || echo 1)"
   offenders="$(grep -nE '\|[[:space:]]*(head[[:space:]]|awk[[:space:]]|grep[[:space:]]+(-[a-zA-Z]*q|--quiet|--silent|-m[[:space:]]|--max-count))' "$self" \
     | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
   if [[ -n "$offenders" ]]; then
@@ -1252,7 +1258,9 @@ assert_print_modes_emit_what_this_gate_holds() {
   echo ">> fixture: --print-artifacts writes the array bash holds and --print-wheel-entries writes one entry per maturin project file (the interface check-vendored-openssl-scope.sh reads)"
   local self expected printed rc plant_dir copy last_line project_file
 
-  self="${BASH_SOURCE[0]}"
+  self="$GATE_SELF"
+  expect "(print-modes) the file this fixture re-runs is this gate, by an absolute path" "PASS" \
+    "$([[ "$self" == /* && -r "$self" && "${self##*/}" == "${BASH_SOURCE[0]##*/}" ]] && echo 0 || echo 1)"
   expected="$(printf '%s\n' "${ARTIFACTS[@]}")"
   printed="$(bash "$self" --print-artifacts)"; rc=$?
   expect "(print-modes) --print-artifacts exits 0" "PASS" "$rc"
