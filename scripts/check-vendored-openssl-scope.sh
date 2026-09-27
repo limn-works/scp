@@ -13,6 +13,9 @@
 # wheel triple, keeping build edges because `openssl-src` is a build-dependency of
 # `openssl-sys`. `scripts/check-shipped-feature-graph.sh` exempts that one function
 # by name from its rule that every `cargo tree` under scripts/ names `--target all`.
+# The function reads the package and features from `--print-wheel-entries` itself
+# and takes only the triple from its caller, so no call of it can resolve another
+# configuration on one triple.
 # Absence: `--target all` for every entry that gate's `--print-artifacts` writes
 # except the wheel's (`--print-wheel-entries`), and `--workspace` for every tracked
 # Cargo.toml that declares a `workspace` table, which is the root workspace and each
@@ -90,13 +93,30 @@ is_feature_selection() {
 # count_in <tree>: how many `openssl-src` lines a `cargo tree --prefix none` graph holds.
 count_in() { printf '%s\n' "$1" | grep -cE "^${VENDOR_CRATE} v" || true; }
 
-# wheel_triple_occurrences <triple> <package> [<feature argument>...]: the wheel's
-# graph on one triple. The owner gate exempts this function, and no other call
-# site, from its `--target all` rule. A cargo failure fails the count.
+# wheel_line: the one `<pyproject path>\t<package>|<feature arguments>` line the
+# owner gate's `--print-wheel-entries` writes, after checking that it is one line
+# whose arguments are a feature selection. A print mode that exits non-zero fails,
+# so a partial list is never read.
+wheel_line() {
+  local line
+  line="$(bash "$FEATURE_GRAPH_GATE" --print-wheel-entries)" || return 1
+  [[ "$(printf '%s\n' "$line" | grep -c .)" -eq 1 ]] || { echo "FAIL — expected one wheel entry, got: $line" >&2; return 1; }
+  is_feature_selection "${line#*|}" || return 1
+  printf '%s\n' "$line"
+}
+
+# wheel_triple_occurrences <triple>: the wheel's graph on one triple. The package
+# and features come from wheel_line, never from the caller, so every call is the
+# wheel's presence proof; the owner gate exempts this function from its
+# `--target all` rule on that ground. A cargo failure fails the count.
 wheel_triple_occurrences() {
-  local triple="$1" tree; shift
-  tree="$(cargo tree -p "$@" --target "$triple" -e no-dev --prefix none --format '{p}')" ||
-    { echo "cargo tree failed for $1 on $triple" >&2; return 1; }
+  local triple="$1" entry tree
+  local -a args=()
+  entry="$(wheel_line)" || return 1
+  entry="${entry#*$'\t'}"
+  read -r -a args <<<"${entry#*|}"
+  tree="$(cargo tree -p "${entry%%|*}" ${args[@]+"${args[@]}"} --target "$triple" -e no-dev --prefix none --format '{p}')" ||
+    { echo "cargo tree failed for ${entry%%|*} on $triple" >&2; return 1; }
   count_in "$tree"
 }
 
@@ -119,16 +139,12 @@ report() {
 run_gate() {
   local failures=0 line wheel_file wheel_entry entry triple n
   local -a args=()
-  # A print mode that exits non-zero fails the gate, so a partial list is never read.
-  line="$(bash "$FEATURE_GRAPH_GATE" --print-wheel-entries)" || return 1
-  [[ "$(printf '%s\n' "$line" | grep -c .)" -eq 1 ]] || { echo "FAIL — expected one wheel entry, got: $line"; return 1; }
+  line="$(wheel_line)" || return 1
   wheel_file="${line%%$'\t'*}"; wheel_entry="${line#*$'\t'}"
-  is_feature_selection "${wheel_entry#*|}" || return 1
-  read -r -a args <<<"${wheel_entry#*|}"
   line="$(python3.12 -c "$WHEEL_TRIPLES_PROGRAM" "$WHEEL_MATRIX_FILE" python-wheels)" || return 1
   echo "--> the wheel, $wheel_entry from $wheel_file, on each triple it ships for"
   while IFS= read -r triple; do
-    n="$(wheel_triple_occurrences "$triple" "${wheel_entry%%|*}" ${args[@]+"${args[@]}"})" || n=""
+    n="$(wheel_triple_occurrences "$triple")" || n=""
     report "$triple" "$n" some || failures=$((failures + 1))
   done <<<"$line"
 
@@ -183,9 +199,6 @@ run_fixtures() {
   chmod +x "$dir/bin/cargo"
   export ARGV_LOG="$dir/argv" FAKE_DROPPED=none FAKE_VENDORS="" FAKE_BROKEN=""
   PATH="$dir/bin:$saved_path"
-  wheel_triple_occurrences aarch64-apple-darwin scp-ffi --features a,b >/dev/null
-  same "$(cat "$ARGV_LOG")" "tree -p scp-ffi --features a,b --target aarch64-apple-darwin -e no-dev --prefix none --format {p}"
-  expect "the presence call resolves the one triple with build edges" PASS $?
   FAKE_BROKEN=1 all_target_occurrences --workspace >/dev/null 2>&1; expect "a cargo that exits non-zero FAILS rather than counting zero" FAIL $?
 
   # run_gate against a planted owner gate and matrix.
@@ -194,6 +207,14 @@ run_fixtures() {
     "  --print-wheel-entries) printf '%s\n' $(printf '%q' "$wheel") ;;" \
     "  --print-artifacts) printf '%s\n' 'scp-node|' 'scp-ffi|--no-default-features --features server' $(printf '%q' "${wheel#*$'\t'}") ;;" \
     'esac' > "$dir/gate.sh"
+  : > "$ARGV_LOG"
+  FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_triple_occurrences aarch64-apple-darwin >/dev/null
+  same "$(cat "$ARGV_LOG")" "tree -p scp-ffi --features extension-module,vendored-openssl --target aarch64-apple-darwin -e no-dev --prefix none --format {p}"
+  expect "the presence call resolves the wheel entry on the one triple with build edges" PASS $?
+  : > "$ARGV_LOG"
+  FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_triple_occurrences aarch64-apple-darwin scp-node --no-default-features >/dev/null
+  same "$(cat "$ARGV_LOG")" "tree -p scp-ffi --features extension-module,vendored-openssl --target aarch64-apple-darwin -e no-dev --prefix none --format {p}"
+  expect "a caller's package and feature arguments do not reach the one-triple resolution" PASS $?
   scenario() { # <label> <want>
     out="$(FEATURE_GRAPH_GATE="$dir/gate.sh" WHEEL_MATRIX_FILE="$dir/m.yml" run_gate 2>&1)"; expect "$1" "$2" $?
   }
