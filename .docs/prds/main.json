@@ -727,6 +727,7 @@
         "Unit tests for publish and resolve against an in-memory relay mock",
         "Unit tests for cache TTL behavior (24h active, 7d inactive)",
         "Unit tests for staleness detection",
+        "`publish` sends each entry only the events that entry does not hold, starting at the first event it lacks: a test publishes a two-event extension to an entry holding the rest of the chain and asserts that the frame opens at the first new event (`03-identity.md` §3.10.5)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
@@ -800,6 +801,8 @@
         "A member that answers bytes the SDK cannot decode as a `RecoveryHandle` counts as unreached: a test serves such bytes from one member and asserts `IdentityError::StorePartiallyUnreadable` (`09-security-model.md` §9.7.4.2 R10).",
         "A `Browser` SDK under a platform account that syncs the credential composes no reveal: a test runs the `Browser` profile with a syncing platform account and asserts `IdentityError::StorePartiallyUnreadable` and no signature (`09-security-model.md` §9.7.4.2 R10).",
         "A `largeBlob` store joins the store set only after a write lands at the credential's designation, and a write that does not land removes that member alone: a test fails the write and asserts that the next compose reads the platform-account member and not the `largeBlob` member (`09-security-model.md` §9.7.4.2 R10).",
+        "The ceremony's first step runs a self-observation pass and adopts what the extending arm adopts: a test completes a `CommitmentRollover` on one device, then calls `begin` on a second device whose retained log lacks it, and asserts that the second device adopts the rollover and reveals the next commitment rather than the one the rollover consumed (`09-security-model.md` §9.7.4.2 R10)",
+        "An SDK refuses with `IdentityError::RevealAlreadyPending` to compose a reveal of a commitment an event of its adopted log already reveals: a test asserts the refusal and that nothing is signed (`09-security-model.md` §9.7.4.2 R10)",
         "No unwrap() or expect() in library code."
       ],
       "actionItems": [
@@ -10651,7 +10654,7 @@
     },
     {
       "id": "SCP-305",
-      "title": "Implement the recovery entry points: identity.recovery(), begin, load_pending_recovery, resume_recovery and abort_recovery",
+      "title": "Implement the recovery entry points: identity.recovery(), begin, cosign, attach, load_pending_recovery, resume_recovery and abort_recovery",
       "gate": "gate-kel",
       "priority": "P0",
       "severity": "critical",
@@ -10660,22 +10663,25 @@
         "crates/scp-identity/src/recovery.rs",
         "crates/scp-identity/src/lib.rs"
       ],
-      "description": "Implement the ceremony's four entry points on the `Recovery` type that `09-security-model.md` §9.7.4.2 R10 declares, obtained through `identity.recovery()` over the identity's own persistence, custody and backend slots. `RecoveryPhase` has four values, `Composed`, `Signed`, `PublishSent` and `Confirmed`, and the ceremony removes the handle from every member of the store set once, after the spent keys are destroyed at `Confirmed`. `abort_recovery` refuses with `IdentityError::SignedRevealUnpublished` (SCP-IDENT-1107, `03-identity.md` §3.10.10) where the device's own store holds the signed event, and clears the handle otherwise. The ceremony's event composition is SCP-008; the bridge exports are SCP-314.",
+      "description": "Implement the ceremony's six entry points on the `Recovery` type that `09-security-model.md` §9.7.4.2 R10 declares, obtained through `identity.recovery()` over the identity's own persistence, custody and backend slots. `RecoveryPhase` has four values, `Composed`, `Signed`, `PublishSent` and `Confirmed`, and the ceremony removes the handle from every member of the store set once, after the spent keys are destroyed at `Confirmed`. `abort_recovery` refuses with `IdentityError::SignedRevealUnpublished` (SCP-IDENT-1107, `03-identity.md` §3.10.10) where the device's own store holds the signed event, and clears the handle otherwise. The ceremony's event composition is SCP-008; the bridge exports are SCP-314. `begin` composes a `PendingEvent` under a caller-supplied `SignerPlan`, each holder of a named member returns its `IndexedSignature` through `cosign`, and `attach` checks the set and completes the ceremony; the application carries `PendingEvent` and the signatures between holders.",
       "acceptanceCriteria": [
-        "`Recovery::begin(kind)` runs the ceremony order from its first step through the removal and returns the cycle's `PublishOutcome`: `RecoveryKind::CommitmentRollover` signs a `CommitmentRollover` fixing a next commitment, `RecoveryKind::Abandon` signs one declaring abandonment, and `RecoveryKind::RootRecovery` signs a `RootRecovery` whose `standing_root` is `CoSigns` where the SDK reaches a threshold of the standing root and `Lost` where it does not; one test per kind (`09-security-model.md` §9.7.4.2 R10)",
-        "`RecoveryKind` declares exactly the variants `CommitmentRollover`, `RootRecovery` and `Abandon` (`09-security-model.md` §9.7.4.2 R10)",
+        "`Recovery::begin(kind, signers)` runs the ceremony order from its first step through the `Composed` handle write and returns a `PendingEvent` whose preimage binds each group's signer index list and form list from `signers`; `RecoveryKind::RootRecovery(declaration)` sets `standing_root` to the declaration and `begin` refuses `Lost` with `RootThresholdHeld` where the SDK holds a threshold of the standing root: one test per kind (`09-security-model.md` §9.7.4.2 R10)",
+        "`RecoveryKind` declares exactly the variants `CommitmentRollover`, `RootRecovery(StandingRootDeclaration)` and `Abandon` (`09-security-model.md` §9.7.4.2 R10)",
         "`RecoveryPhase` declares exactly four variants, `Composed`, `Signed`, `PublishSent` and `Confirmed`, and `grep -rn 'Submitted' crates/scp-identity/src` prints nothing (`09-security-model.md` §9.7.4.2 R10)",
         "`Identity::recovery(&self) -> Recovery<S>` builds the `Recovery` over the identity's own persistence, custody and backend slots, and `Recovery` has no public constructor and no public field: a trybuild compile-fail test asserts that a struct literal of `Recovery` outside the crate does not compile (`09-security-model.md` §9.7.4.2 R10)",
         "The ceremony writes the handle at each of the four phases into every member of the store set: a test injects a crash after each phase's write and asserts that `load_pending_recovery` returns the handle at that phase (`09-security-model.md` §9.7.4.2 R10)",
-        "`resume_recovery` re-enters the ceremony order at the phase the handle names and performs no step the order has passed: a test crashes after the `Signed` write and asserts the resumed ceremony signs no new event and publishes the signed event from the SDK's own store (`09-security-model.md` §9.7.4.2 R10)",
+        "`resume_recovery` re-enters the ceremony order at the phase the handle names, from `Signed` on, and performs no step the order has passed: a test crashes after the `Signed` write and asserts the resumed ceremony signs no new event and publishes the signed event from the SDK's own store (`09-security-model.md` §9.7.4.2 R10)",
         "The ceremony removes the handle once, after the spent keys are destroyed at `Confirmed`: a test asserts the handle is present in every member until destruction and absent from every member after it (`09-security-model.md` §9.7.4.2 R10)",
-        "`abort_recovery` returns `IdentityError::SignedRevealUnpublished` where the device's own store holds the signed event under the handle's digest, and leaves the handle in every member: a test asserts both (`09-security-model.md` §9.7.4.2 R10, `03-identity.md` §3.10.10)",
-        "`abort_recovery` removes the handle from every member where the device's own store holds no signed event, after which `load_pending_recovery` returns `None`: one test aborts at `Composed` and a second aborts on a second device that holds no signed event (`09-security-model.md` §9.7.4.2 R10)",
+        "At `Signed` or a later phase `abort_recovery` returns `IdentityError::SignedRevealUnpublished` and leaves the handle in every member, whether or not this device's own store holds the signed event, except that a device whose adopted log carries the event the handle names removes the handle: a test per case, the first run on a second device that holds no signed event (`09-security-model.md` §9.7.4.2 R10)",
+        "At `Composed`, `abort_recovery` removes the handle from every member on any device, after which `load_pending_recovery` returns `None`: a test aborts from a second device (`09-security-model.md` §9.7.4.2 R10)",
         "`abort_recovery` returns a `RemovalOutcome` carrying one `StoreRemoval` per member reached, and a removal that does not land yields `removed: false` and a surfaced condition: a test fails one member's removal and asserts both (`09-security-model.md` §9.7.4.2 R10)",
+        "Two holders of a 2-of-3 standing root complete a `RootRecovery{CoSigns}`: the composer calls `begin`, each holder calls `cosign` on its own device, and `attach` publishes an event whose standing-root group carries both signatures; a second test passes one signature and asserts `IdentityError::SignatureSetIncomplete` (SCP-IDENT-1112) and no `Signed` write (`09-security-model.md` §9.7.4.2 R10)",
+        "An SDK re-reads the handle immediately before it signs and immediately before it publishes: a test removes the handle from another device between `begin` and `attach`, and a second test replaces it with another digest before the publish; each asserts `IdentityError::RevealAlreadyPending` and no signature or publish (`09-security-model.md` §9.7.4.2 R10)",
         "`resume_recovery` on an SDK whose own store holds no preimage under the handle's digest returns `IdentityError::RecoveryPreimageMissing` (SCP-IDENT-1110), and signs and publishes nothing: a test asserts all three (`09-security-model.md` §9.7.4.2 R10)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
+        "Implement `begin`, `cosign` and `attach` over a `SignerPlan`, and the handle re-read before signing and publishing.",
         "Implement `Recovery::begin` over SCP-008's composition, selecting the event kind from `RecoveryKind`.",
         "Declare `RecoveryPhase`, `RecoveryHandle`, `CredentialStore`, `StoreRemoval`, `RemovalOutcome`, `RecoveryCompletion` and `Recovery` as §9.7.4.2 R10 declares them.",
         "Add `Identity::recovery` and build `Recovery` from the identity's own slots.",
@@ -11080,9 +11086,9 @@
       ],
       "description": "Architecture slice S11. PyO3, UniFFI and napi export identical identity and recovery functions, and each SDK wraps them under the names the shared scaffold's naming table gives, including `identity.recovery()` and `observe_self`. Every name-bound enumeration keeps the spec's PascalCase in every language. This satisfies the integration checklist's second, third and fifth checks.",
       "acceptanceCriteria": [
-        "PyO3, UniFFI and napi each export `identity_create`, `identity_resolve`, `identity_publish`, `identity_read_service_record`, `identity_publish_service_record`, `identity_read_policy`, `identity_fallback_set`, `identity_observe_self`, `identity_rotate_active`, `identity_set_witnesses` and the `recovery_*` functions, `recovery_begin` included: `ffi_conformance.rs` asserts each export on each bridge",
+        "PyO3, UniFFI and napi each export `identity_create`, `identity_resolve`, `identity_publish`, `identity_read_service_record`, `identity_publish_service_record`, `identity_read_policy`, `identity_fallback_set`, `identity_observe_self`, `identity_rotate_active`, `identity_set_witnesses` and the `recovery_*` functions, `recovery_begin`, `recovery_cosign` and `recovery_attach` included: `ffi_conformance.rs` asserts each export on each bridge",
         "Each SDK wraps each export under the name the shared scaffold's naming table gives: a test per SDK calls each wrapper",
-        "`EntryReach`, `ChainRelation`, `ExtendingAct`, `EntryResult`, `NotSentReason`, `RecoveryPhase`, `RecoveryKind`, `RotationReason` and `ResolutionVerdict` carry their spec variant names verbatim in every SDK: a conformance test compares the variant names across the five languages (`03-identity.md` §3.10.10)",
+        "`EntryReach`, `ChainRelation`, `ExtendingAct`, `EntryResult`, `NotSentReason`, `RecoveryPhase`, `RecoveryKind`, `SignatureGroup`, `RotationReason` and `ResolutionVerdict` carry their spec variant names verbatim in every SDK: a conformance test compares the variant names across the five languages (`03-identity.md` §3.10.10)",
         "One conformance fixture of identity operations replays in Rust, Python, TypeScript, Swift and Kotlin with identical results",
         "The SDK capability matrix lists every operation above for every SDK",
         "The agent-key exports, `identity_migrate`, the DID-document classes and the FFI DHT client are absent from all three bridges: a grep per name prints nothing"
