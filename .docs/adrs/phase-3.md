@@ -989,7 +989,7 @@ The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with
     full PEP 484 hints. IDE autocompletion works.
 ```
 
-This test proves: pip install works without Rust, the 20-line agent works, async Python wraps Rust correctly, UCAN enforces on every action, MCP exposes SCP outlets to any model, the event log is queryable from Python, and the full Phase 1 + Phase 2 Rust stack is accessible through a Pythonic API.
+This test proves: pip install works without Rust on a platform and CPython minor a wheel covers, the 20-line agent works, async Python wraps Rust correctly, UCAN enforces on every action, MCP exposes SCP outlets to any model, the event log is queryable from Python, and the full Phase 1 + Phase 2 Rust stack is accessible through a Pythonic API.
 
 ---
 

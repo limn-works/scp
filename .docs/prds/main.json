@@ -3436,9 +3436,9 @@
       "files": [
         "tests/integration/phase3_integration_test.py"
       ],
-      "description": "The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with the Phase 1 and Phase 2 Rust stacks. Two Python agents on different machines exchange encrypted messages, invoke outlets, and expose SCP contexts as MCP tools. This test proves: pip install works without Rust, the 20-line agent works, async Python wraps Rust correctly, UCAN enforces on every action, MCP exposes SCP outlets to any model, the event log is queryable from Python, and the full Phase 1 + Phase 2 Rust stack is accessible through a Pythonic API.",
+      "description": "The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with the Phase 1 and Phase 2 Rust stacks. Two Python agents on different machines exchange encrypted messages, invoke outlets, and expose SCP contexts as MCP tools. This test proves: pip install works without Rust on a platform and CPython minor a wheel covers, the 20-line agent works, async Python wraps Rust correctly, UCAN enforces on every action, MCP exposes SCP outlets to any model, the event log is queryable from Python, and the full Phase 1 + Phase 2 Rust stack is accessible through a Pythonic API.",
       "acceptanceCriteria": [
-        "Install the SDK: `pip install scp-python` in a clean Python venv on a platform a wheel covers. No Rust toolchain. Zero compilation. Binary wheel installs in seconds.",
+        "Install the SDK: `pip install scp-python` in a clean Python venv on a platform and CPython minor a wheel covers. No Rust toolchain. Zero compilation. Binary wheel installs in seconds.",
         "Alice creates an identity in Python: `alice = await scp.Identity.create(custody=\"in_memory\")`. Calls through: Python wrapper (ADR-014) -> PyO3 bridge (ADR-013) -> scp-core Identity::create.",
         "Alice creates a context with outlets: `ctx = await scp.Context.create(creator=alice, ceiling=[\"messaging\", \"outlet_call\"], outlets=[scp.OutletDefinition(name=\"calculator\", ...)])`. Context creation mints admin UCAN tokens for Alice (ADR-016). UCAN nonce is generated and tracked. Capability ceiling is set and immutable.",
         "Bob creates an identity and joins the context: `bob = await scp.Identity.create(custody=\"in_memory\")`, `membership = await ctx.join(bob)`. Bob receives member-role UCAN tokens (ADR-016). Tokens are scoped to messages:read, messages:write, outlet_query_all, outlet_call_all. UCAN signature chain traces to Alice (context creator) as root authority.",
@@ -3454,7 +3454,7 @@
       ],
       "actionItems": [
         "Create `tests/integration/phase3_integration_test.py` with the 13-step end-to-end test.",
-        "Set up clean Python venv and verify `pip install scp-python` works without Rust toolchain on a platform a wheel covers.",
+        "Set up clean Python venv and verify `pip install scp-python` works without Rust toolchain on a platform and CPython minor a wheel covers.",
         "Test identity creation via Python SDK -> PyO3 bridge -> scp-core.",
         "Test context creation with outlets, UCAN minting, and ceiling enforcement.",
         "Test member join with role-scoped UCAN token delegation.",
