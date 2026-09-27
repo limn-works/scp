@@ -42,6 +42,13 @@ android {
         unitTests {
             isReturnDefaultValues = true
             isIncludeAndroidResources = true
+            // The Android Gradle plugin runs unit tests on the JUnit 4 runner
+            // unless a test task opts into the JUnit Platform, and the JUnit 4
+            // runner never discovers a class annotated with Jupiter's `@Test`.
+            // The Platform runs the Jupiter tests through `junit-jupiter-engine`
+            // and the JUnit 4 tests (Robolectric, the Compose rule) through
+            // `junit-vintage-engine`, both declared below.
+            all { it.useJUnitPlatform() }
         }
     }
 

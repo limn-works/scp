@@ -13,7 +13,7 @@ import works.limn.scp.bridge.CoroutineBridge
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -72,7 +72,12 @@ abstract class ScpViewModel : ViewModel() {
 
     private val mutex = Mutex()
     private val activeContexts = mutableListOf<TrackedContext>()
-    private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val cleanupJob = SupervisorJob()
+
+    // `Dispatchers.Unconfined` starts the cleanup coroutine on the thread that calls
+    // [onCleared] and keeps it there only until the first `leave` suspends into the
+    // bridge's I/O dispatcher, so [onCleared] returns without waiting on an FFI call.
+    private val cleanupScope = CoroutineScope(cleanupJob + Dispatchers.Unconfined)
 
     /**
      * Register a context for automatic cleanup on ViewModel clear.
@@ -104,14 +109,20 @@ abstract class ScpViewModel : ViewModel() {
     /**
      * Called when the ViewModel is cleared (Activity/Fragment destroyed permanently).
      *
-     * Uses a dedicated [cleanupScope] because [viewModelScope] is already cancelled
-     * before [onCleared] is called. Leaves all tracked contexts gracefully via
-     * [runBlocking] to ensure cleanup completes before the method returns. Errors
-     * during individual leave operations are caught to ensure all contexts are attempted.
+     * Android calls this method on the main thread after it has cancelled [viewModelScope],
+     * so a coroutine launched into [viewModelScope] here would never run. The method
+     * launches the cleanup into a dedicated [cleanupScope] instead and returns without
+     * waiting for it: each `leave` is a blocking FFI call that the bridge runs on its I/O
+     * dispatcher, and `.docs/standards/kotlin.md` keeps callers off the main thread.
+     * The cleanup coroutine leaves every tracked context, catching each error so that one
+     * failed `leave` does not stop the others.
+     *
+     * The method completes [cleanupJob] after launching, so the scope finishes once the
+     * cleanup coroutine returns and a second call starts no second cleanup.
      */
     override fun onCleared() {
         super.onCleared()
-        runBlocking(cleanupScope.coroutineContext) {
+        cleanupScope.launch {
             val contexts = mutex.withLock {
                 val snapshot = activeContexts.toList()
                 activeContexts.clear()
@@ -121,6 +132,6 @@ abstract class ScpViewModel : ViewModel() {
                 runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }
             }
         }
-        cleanupScope.cancel()
+        cleanupJob.complete()
     }
 }

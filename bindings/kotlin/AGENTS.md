@@ -15,13 +15,16 @@
 - `StandardTestDispatcher()` is a function returning `TestDispatcher`; declare fields as `TestDispatcher`.
 - Raising a deprecation from `WARNING` to `ERROR` requires changing the tests' `@Suppress("DEPRECATION")` to `@Suppress("DEPRECATION_ERROR")`, or the tests stop compiling.
 - A test that needs `android.util.Base64`, an application `Context`, or a Compose rule runs under Robolectric with JUnit 4 (`@RunWith(RobolectricTestRunner::class)`, `@Config(manifest = Config.NONE, sdk = [33])`); every other test uses JUnit 5.
+- Both modules run their unit tests on the JUnit Platform: `scp-kt` through `useJUnitPlatform()` on `tasks.test`, and `scp-kt-android` through `unitTests.all { it.useJUnitPlatform() }`, which runs the JUnit 4 classes through `junit-vintage-engine`. Without it the Android Gradle plugin uses the JUnit 4 runner, which never discovers a Jupiter `@Test`.
+- `flowWithLifecycle` and `repeatOnLifecycle` switch to `Dispatchers.Main.immediate`, which a local JVM test lacks; call `Dispatchers.setMain` in `@BeforeEach`.
+- Kotlin mangles the JVM name of an `internal` member with the module name, so `getDeclaredMethod("name")` finds nothing; reference the member directly (`Type::member`).
 - Pass `UnconfinedTestDispatcher(testScheduler)` to `TestLifecycleOwner` so lifecycle transitions apply immediately.
 
 ## Coroutines and streams
 
 - A Rust callback (`onMessage`, `onEvent`) runs on a thread with no coroutine, so it cannot suspend: use `trySend` or `tryEmit`, and handle the `trySend` result.
 - Every `callbackFlow` releases its Rust subscription inside `awaitClose`. `HotStreamFactory` subscriptions outlive scope cancellation; stop them explicitly (`stopAll()` in teardown).
-- `ViewModel.clear()` cancels `viewModelScope` before it calls `onCleared()`, so a launch into `viewModelScope` from `onCleared()` never runs; `ScpViewModel` uses its own cleanup scope.
+- `ViewModel.clear()` cancels `viewModelScope` before it calls `onCleared()`, so a launch into `viewModelScope` from `onCleared()` never runs; `ScpViewModel` launches its cleanup into its own scope and returns without blocking, because Android calls `onCleared()` on the main thread. A test that clears a view model goes through `ViewModelStore.clear()`, which runs that same cancel-then-`onCleared()` sequence.
 - Compose does not cancel a `CoroutineScope` created inside `remember { }`. Pair it with `DisposableEffect { onDispose { scope.cancel() } }`, or reuse a managed scope.
 
 ## Android platform adapters
