@@ -1667,7 +1667,7 @@ Signature, secondary key (216 bytes on the wire):
 
 ### Vector 46: the two-heads fault proof
 
-Two cosigned heads of one witness, over one subject, carrying one shared `previous_cosigned_digest`, two different `event_digest` values, and `seed` clear on both. **Those five conditions are the fault proof §9.7.4.3 defines**, and a relay keys its cosigned-head store on (subject, witness, `event_digest`) so that both survive at one address (`03-identity.md` §3.10.2). A conforming implementation assembles the pair, verifies both signatures against the P-256 key the witness operator's community-relay-list entry declares, and reports a valid fault proof. **Substituting Vector 43, whose `seed` carries `0x01`, for either head yields no proof**, which is how a declared re-seed stays outside the predicate.
+Two cosigned heads of one witness, over one subject, carrying one shared `previous_cosigned_digest`, two different `event_digest` values, and `seed` clear on both. The shared digest is where the two heads' chains meet, before any head that sets `seed`, so the sixth condition holds too. **Those six conditions are the fault proof §9.7.4.3 defines**, and a relay keys its cosigned-head store on (subject, witness, `event_digest`) so that both survive at one address (`03-identity.md` §3.10.2). A conforming implementation assembles the pair, verifies both signatures against the P-256 key the witness operator's community-relay-list entry declares, and reports a valid fault proof. **Substituting Vector 43, whose `seed` carries `0x01`, for either head yields no proof**, which is how a declared re-seed stays outside the predicate.
 
 ```
 Shared previous_cosigned_digest:
