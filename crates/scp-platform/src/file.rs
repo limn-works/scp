@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! ┌────────────────────────────────────────────────┐
-//! │ version: u8          (1 byte, currently 0x02)  │
+//! │ version: u8          (1 byte, currently 0x03)  │
 //! │ argon2id_salt: [u8]  (16 bytes)                │
 //! ├────────────────────────────────────────────────┤
 //! │ entry_count: u32 LE  (4 bytes)                 │
@@ -27,8 +27,20 @@
 //! │   ciphertext+tag: [u8] (48 bytes = 32 + 16)    │
 //! ├────────────────────────────────────────────────┤
 //! │ Entry 1: ...                                   │
+//! ├────────────────────────────────────────────────┤
+//! │ file_tag: [u8]       (32 bytes, HMAC-SHA256)   │
 //! └────────────────────────────────────────────────┘
 //! ```
+//!
+//! The file is exactly `HEADER_SIZE + entry_count * ENTRY_SIZE + 32` bytes;
+//! any other length is refused. `file_tag` is HMAC-SHA256 over every byte
+//! before it, so a lowered `entry_count`, a dropped, appended or replayed
+//! entry, and trailing bytes all fail on open and on every later read.
+//!
+//! The Argon2id output is never used as a key directly. HKDF-SHA256 over it
+//! derives two independent subkeys under distinct info labels: the
+//! AES-256-GCM entry key ([`ENTRY_KEY_INFO`]) and the file-tag HMAC key
+//! ([`FILE_MAC_INFO`]).
 //!
 //! The Argon2id salt is generated once when the file is created and reused
 //! for all entries. Each entry has a unique AES-256-GCM nonce. The
@@ -79,10 +91,20 @@ use crate::traits::{
 
 /// Current file format version.
 ///
-/// Version 0x02 binds each entry's type byte and index into the AES-256-GCM
-/// associated data; version 0x01 files are refused (SCP has no deployed
-/// key files to migrate).
-const FORMAT_VERSION: u8 = 0x02;
+/// Version 0x03 authenticates the whole file with a trailing HMAC-SHA256
+/// tag, and version 0x02 introduced the per-entry associated data (type
+/// byte and index). Older versions are refused (SCP has no deployed key
+/// files to migrate).
+const FORMAT_VERSION: u8 = 0x03;
+
+/// Length of the trailing whole-file HMAC-SHA256 tag.
+const FILE_TAG_LEN: usize = 32;
+
+/// HKDF-SHA256 info label for the AES-256-GCM entry-encryption subkey.
+const ENTRY_KEY_INFO: &[u8] = b"scp/file-key-custody/v3/entry-aead";
+
+/// HKDF-SHA256 info label for the whole-file HMAC-SHA256 subkey.
+const FILE_MAC_INFO: &[u8] = b"scp/file-key-custody/v3/file-mac";
 
 /// Argon2id salt length in bytes.
 const SALT_LEN: usize = 16;
@@ -292,6 +314,78 @@ fn sync_parent_dir(dir: &Path) {
 }
 
 // ---------------------------------------------------------------------------
+// Whole-file tag
+// ---------------------------------------------------------------------------
+
+/// Checks the version byte and that `data` is exactly
+/// `HEADER_SIZE + entry_count * ENTRY_SIZE + FILE_TAG_LEN` bytes, and
+/// returns `entry_count`. The tag itself is checked by [`open_file`].
+fn check_file_shape(data: &[u8]) -> Result<usize, PlatformError> {
+    if data.len() < HEADER_SIZE + FILE_TAG_LEN {
+        return Err(PlatformError::CustodyError(format!(
+            "key file too short: {} bytes",
+            data.len()
+        )));
+    }
+    if data[0] != FORMAT_VERSION {
+        return Err(PlatformError::CustodyError(format!(
+            "unsupported key file version: {:#04x}",
+            data[0]
+        )));
+    }
+    let mut count = [0u8; 4];
+    count.copy_from_slice(&data[1 + SALT_LEN..HEADER_SIZE]);
+    let entry_count = u32::from_le_bytes(count) as usize;
+    let expected_len = entry_count
+        .checked_mul(ENTRY_SIZE)
+        .and_then(|n| n.checked_add(HEADER_SIZE + FILE_TAG_LEN))
+        .ok_or_else(|| {
+            PlatformError::CustodyError(format!("key file entry count {entry_count} overflows"))
+        })?;
+    if data.len() != expected_len {
+        return Err(PlatformError::CustodyError(format!(
+            "key file length mismatch: {entry_count} entries need {expected_len} bytes, got {}",
+            data.len()
+        )));
+    }
+    Ok(entry_count)
+}
+
+/// A fresh HMAC-SHA256 instance keyed by `mac_key`.
+fn file_mac(mac_key: &[u8; 32]) -> Result<hmac::Hmac<sha2::Sha256>, PlatformError> {
+    <hmac::Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(mac_key)
+        .map_err(|e| PlatformError::CustodyError(format!("file MAC init failed: {e}")))
+}
+
+/// Appends the whole-file tag over `body`.
+fn seal_file(mac_key: &[u8; 32], mut body: Vec<u8>) -> Result<Vec<u8>, PlatformError> {
+    use hmac::Mac;
+    let mut mac = file_mac(mac_key)?;
+    mac.update(&body);
+    body.extend_from_slice(&mac.finalize().into_bytes());
+    Ok(body)
+}
+
+/// Verifies the trailing tag over every byte before it (constant time) and
+/// returns the bytes without the tag.
+fn open_file(mac_key: &[u8; 32], mut data: Vec<u8>) -> Result<Vec<u8>, PlatformError> {
+    use hmac::Mac;
+    let body_len = data
+        .len()
+        .checked_sub(FILE_TAG_LEN)
+        .ok_or_else(|| PlatformError::CustodyError("key file too short for its tag".into()))?;
+    let mut mac = file_mac(mac_key)?;
+    mac.update(&data[..body_len]);
+    mac.verify_slice(&data[body_len..]).map_err(|_| {
+        PlatformError::CustodyError(
+            "key file authentication failed (wrong passphrase, or a tampered file)".into(),
+        )
+    })?;
+    data.truncate(body_len);
+    Ok(data)
+}
+
+// ---------------------------------------------------------------------------
 // FileKeyCustody
 // ---------------------------------------------------------------------------
 
@@ -309,8 +403,10 @@ fn sync_parent_dir(dir: &Path) {
 pub struct FileKeyCustody {
     /// Path to the key file on disk.
     path: PathBuf,
-    /// AES-256-GCM encryption key derived from the passphrase.
-    derived_key: Zeroizing<[u8; 32]>,
+    /// AES-256-GCM entry-encryption subkey ([`ENTRY_KEY_INFO`]).
+    entry_key: Zeroizing<[u8; 32]>,
+    /// Whole-file HMAC-SHA256 subkey ([`FILE_MAC_INFO`]).
+    mac_key: Zeroizing<[u8; 32]>,
     /// Maps handle IDs to key type and entry index.
     handle_map: Mutex<HandleMap>,
     /// Counter for allocating new handle IDs.
@@ -349,20 +445,22 @@ impl FileKeyCustody {
         let mut salt = [0u8; SALT_LEN];
         rand::rngs::OsRng.fill_bytes(&mut salt);
 
-        let derived_key = Self::derive_key(passphrase, &salt)?;
+        let (entry_key, mac_key) = Self::derive_keys(passphrase, &salt)?;
 
-        // Write the initial file: version + salt + entry_count(0).
-        let mut data = Vec::with_capacity(HEADER_SIZE);
+        // Write the initial file: version + salt + entry_count(0) + tag.
+        let mut data = Vec::with_capacity(HEADER_SIZE + FILE_TAG_LEN);
         data.push(FORMAT_VERSION);
         data.extend_from_slice(&salt);
         data.extend_from_slice(&0u32.to_le_bytes());
+        let data = seal_file(&mac_key, data)?;
 
         // Write to temp file, sync, then atomic rename (#1470).
         atomic_write(path, &data)?;
 
         Ok(Self {
             path: path.to_path_buf(),
-            derived_key,
+            entry_key,
+            mac_key,
             handle_map: Mutex::new(HandleMap::new()),
             next_id: AtomicU64::new(1),
             pseudonym_keys: Mutex::new(HashMap::new()),
@@ -375,37 +473,12 @@ impl FileKeyCustody {
         let data = std::fs::read(path)
             .map_err(|e| PlatformError::CustodyError(format!("failed to read key file: {e}")))?;
 
-        if data.len() < HEADER_SIZE {
-            return Err(PlatformError::CustodyError(
-                "key file too short for header".into(),
-            ));
-        }
-
-        if data[0] != FORMAT_VERSION {
-            return Err(PlatformError::CustodyError(format!(
-                "unsupported key file version: {:#04x}",
-                data[0]
-            )));
-        }
-
+        let entry_count = check_file_shape(&data)?;
         let mut salt = [0u8; SALT_LEN];
         salt.copy_from_slice(&data[1..=SALT_LEN]);
-
-        let entry_count = u32::from_le_bytes(
-            data[1 + SALT_LEN..HEADER_SIZE]
-                .try_into()
-                .map_err(|_| PlatformError::CustodyError("invalid entry count bytes".into()))?,
-        ) as usize;
-
-        let expected_len = HEADER_SIZE + entry_count * ENTRY_SIZE;
-        if data.len() < expected_len {
-            return Err(PlatformError::CustodyError(format!(
-                "key file truncated: expected {expected_len} bytes, got {}",
-                data.len()
-            )));
-        }
-
-        let derived_key = Self::derive_key(passphrase, &salt)?;
+        let (entry_key, mac_key) = Self::derive_keys(passphrase, &salt)?;
+        // A wrong passphrase derives a different MAC key, so it fails here.
+        let data = open_file(&mac_key, data)?;
 
         // Build the handle map from stored entries.
         let mut handle_map = HandleMap::new();
@@ -423,7 +496,8 @@ impl FileKeyCustody {
 
         Ok(Self {
             path: path.to_path_buf(),
-            derived_key,
+            entry_key,
+            mac_key,
             handle_map: Mutex::new(handle_map),
             next_id: AtomicU64::new(next_id),
             pseudonym_keys: Mutex::new(HashMap::new()),
@@ -431,16 +505,23 @@ impl FileKeyCustody {
         })
     }
 
-    /// Derives an AES-256 key from a passphrase and salt using Argon2id.
-    ///
-    /// Delegates to [`crate::kdf::derive_argon2id_key`] — the single source of
-    /// the Argon2id parameterization (spec §17.6 / §17.8). Behavior is
-    /// byte-identical to the historical inline derivation.
-    fn derive_key(
+    /// Derives the entry-encryption and file-MAC subkeys from a passphrase
+    /// and salt: Argon2id through [`crate::kdf::derive_argon2id_key`] (the
+    /// single source of the Argon2id parameterization, spec §17.6 / §17.8),
+    /// then HKDF-SHA256 under [`ENTRY_KEY_INFO`] and [`FILE_MAC_INFO`].
+    #[allow(clippy::type_complexity)]
+    fn derive_keys(
         passphrase: &str,
         salt: &[u8; SALT_LEN],
-    ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
-        crate::kdf::derive_argon2id_key(passphrase.as_bytes(), salt)
+    ) -> Result<(Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>), PlatformError> {
+        let master = crate::kdf::derive_argon2id_key(passphrase.as_bytes(), salt)?;
+        let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, master.as_ref());
+        let mut entry_key = Zeroizing::new([0u8; 32]);
+        let mut mac_key = Zeroizing::new([0u8; 32]);
+        hk.expand(ENTRY_KEY_INFO, entry_key.as_mut())
+            .and_then(|()| hk.expand(FILE_MAC_INFO, mac_key.as_mut()))
+            .map_err(|e| PlatformError::CustodyError(format!("key file HKDF failed: {e}")))?;
+        Ok((entry_key, mac_key))
     }
 
     /// The AES-256-GCM associated data for an entry:
@@ -482,7 +563,7 @@ impl FileKeyCustody {
         plaintext: &[u8; KEY_LEN],
     ) -> Result<([u8; NONCE_LEN], Vec<u8>), PlatformError> {
         let aad = Self::entry_aad(key_type, entry_index)?;
-        let cipher = Aes256Gcm::new_from_slice(self.derived_key.as_ref())
+        let cipher = Aes256Gcm::new_from_slice(self.entry_key.as_ref())
             .map_err(|e| PlatformError::CustodyError(format!("cipher init failed: {e}")))?;
 
         let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -536,7 +617,7 @@ impl FileKeyCustody {
         let nonce = Nonce::from_slice(&data[nonce_start..ct_start]);
         let ciphertext_and_tag = &data[ct_start..ct_end];
 
-        let cipher = Aes256Gcm::new_from_slice(self.derived_key.as_ref())
+        let cipher = Aes256Gcm::new_from_slice(self.entry_key.as_ref())
             .map_err(|e| PlatformError::CustodyError(format!("cipher init failed: {e}")))?;
 
         let plaintext = Zeroizing::new(
@@ -566,10 +647,18 @@ impl FileKeyCustody {
         Ok(key_bytes)
     }
 
-    /// Reads the key file from disk.
+    /// Reads the key file from disk, checks its exact length and its
+    /// whole-file tag, and returns the authenticated bytes without the tag.
     fn read_file(&self) -> Result<Vec<u8>, PlatformError> {
-        std::fs::read(&self.path)
-            .map_err(|e| PlatformError::CustodyError(format!("failed to read key file: {e}")))
+        let data = std::fs::read(&self.path)
+            .map_err(|e| PlatformError::CustodyError(format!("failed to read key file: {e}")))?;
+        check_file_shape(&data)?;
+        open_file(&self.mac_key, data)
+    }
+
+    /// Appends the whole-file tag to `body` and writes it atomically.
+    fn write_file(&self, body: Vec<u8>) -> Result<(), PlatformError> {
+        atomic_write(&self.path, &seal_file(&self.mac_key, body)?)
     }
 
     /// Appends an encrypted key entry to the file and updates the entry count.
@@ -605,7 +694,7 @@ impl FileKeyCustody {
         data[count_offset..count_offset + 4].copy_from_slice(&new_count.to_le_bytes());
 
         // Write to temp file with sync_all, then atomic rename (#1470).
-        atomic_write(&self.path, &data)?;
+        self.write_file(data)?;
 
         Ok(new_index)
     }
@@ -899,7 +988,7 @@ impl KeyCustody for FileKeyCustody {
             // Commit to disk BEFORE mutating the in-memory map. If
             // `atomic_write` fails, the map still references the
             // (unmodified) on-disk entry — no orphaned ciphertext.
-            atomic_write(&self.path, &new_data)?;
+            self.write_file(new_data)?;
 
             // Now that disk state is updated, mutate the in-memory
             // map: drop the destroyed entry and shift indices for
@@ -1205,22 +1294,16 @@ mod tests {
         custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         drop(custody);
 
-        // Reopen with the wrong passphrase — file opens but operations fail.
-        let custody2 = FileKeyCustody::new(&path, "wrong").unwrap();
-        let handle = KeyHandle::new(1);
-        let result = custody2.sign(&handle, b"data").await;
-        assert!(
-            result.is_err(),
-            "wrong passphrase must cause decryption failure"
-        );
-        match result.unwrap_err() {
-            PlatformError::CustodyError(msg) => {
+        // Reopen with the wrong passphrase: the file tag fails on open.
+        match FileKeyCustody::new(&path, "wrong") {
+            Err(PlatformError::CustodyError(msg)) => {
                 assert!(
-                    msg.contains("decryption failed"),
-                    "error must mention decryption: {msg}"
+                    msg.contains("authentication failed"),
+                    "error must name the failed file tag: {msg}"
                 );
             }
-            other => panic!("expected CustodyError, got {other:?}"),
+            Err(other) => panic!("expected CustodyError, got {other:?}"),
+            Ok(_) => panic!("a wrong passphrase must not open the key file"),
         }
     }
 
@@ -1828,10 +1911,11 @@ mod tests {
         custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         drop(custody);
 
-        let mut data = std::fs::read(&path).unwrap();
-        assert_eq!(data[HEADER_SIZE], KEY_TYPE_ED25519);
-        data[HEADER_SIZE] = KEY_TYPE_X25519;
-        std::fs::write(&path, &data).unwrap();
+        // Re-tag the file so the entry AEAD, not the file tag, is under test.
+        tamper_and_retag(&path, "pass", |data| {
+            assert_eq!(data[HEADER_SIZE], KEY_TYPE_ED25519);
+            data[HEADER_SIZE] = KEY_TYPE_X25519;
+        });
 
         let custody = FileKeyCustody::new(&path, "pass").unwrap();
         let handle = KeyHandle::new(1);
@@ -1873,12 +1957,13 @@ mod tests {
         assert_eq!(custody.public_key(&KeyHandle::new(2)).await.unwrap(), c_pub);
         drop(custody);
 
-        // Swap the two remaining entries (the type bytes move with them).
-        let mut data = std::fs::read(&path).unwrap();
-        let (first, second) =
-            data[HEADER_SIZE..HEADER_SIZE + 2 * ENTRY_SIZE].split_at_mut(ENTRY_SIZE);
-        first.swap_with_slice(second);
-        std::fs::write(&path, &data).unwrap();
+        // Swap the two remaining entries (the type bytes move with them),
+        // re-tagging so the entry AEAD, not the file tag, is under test.
+        tamper_and_retag(&path, "pass", |data| {
+            let (first, second) =
+                data[HEADER_SIZE..HEADER_SIZE + 2 * ENTRY_SIZE].split_at_mut(ENTRY_SIZE);
+            first.swap_with_slice(second);
+        });
 
         let custody = FileKeyCustody::new(&path, "pass").unwrap();
         for id in [1, 2] {
@@ -1889,19 +1974,128 @@ mod tests {
         }
     }
 
-    /// A1: a version 0x01 file (no associated data) is refused.
+    /// Older versions (0x01 without associated data, 0x02 without the file
+    /// tag) are refused.
     #[tokio::test]
-    async fn version_one_key_file_is_refused() {
+    async fn older_key_file_versions_are_refused() {
+        for version in [0x01u8, 0x02] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("keys.scp");
+            let mut data = vec![version];
+            data.extend_from_slice(&[0u8; SALT_LEN]);
+            data.extend_from_slice(&0u32.to_le_bytes());
+            data.extend_from_slice(&[0u8; FILE_TAG_LEN]);
+            std::fs::write(&path, &data).unwrap();
+            match FileKeyCustody::new(&path, "pass") {
+                Err(PlatformError::CustodyError(msg)) => {
+                    assert!(msg.contains("unsupported key file version"), "{msg}");
+                }
+                other => panic!(
+                    "version {version:#04x} must be refused, got {:?}",
+                    other.err()
+                ),
+            }
+        }
+    }
+
+    /// Rewrites the key file at `path` through `f`, which sees the bytes
+    /// before the tag, and re-tags it under `passphrase`: a stand-in for an
+    /// attacker who holds the passphrase, so a test can reach the per-entry
+    /// AEAD checks behind the file tag.
+    fn tamper_and_retag(path: &Path, passphrase: &str, f: impl FnOnce(&mut Vec<u8>)) {
+        let data = std::fs::read(path).unwrap();
+        let mut salt = [0u8; SALT_LEN];
+        salt.copy_from_slice(&data[1..=SALT_LEN]);
+        let (_, mac_key) = FileKeyCustody::derive_keys(passphrase, &salt).unwrap();
+        let mut body = open_file(&mac_key, data).unwrap();
+        f(&mut body);
+        std::fs::write(path, seal_file(&mac_key, body).unwrap()).unwrap();
+    }
+
+    /// Asserts that opening the key file at `path` fails with `needle`.
+    fn assert_open_fails(path: &Path, needle: &str) {
+        match FileKeyCustody::new(path, "pass") {
+            Err(PlatformError::CustodyError(msg)) => {
+                assert!(msg.contains(needle), "expected {needle:?}, got: {msg}");
+            }
+            Err(other) => panic!("expected CustodyError, got {other:?}"),
+            Ok(_) => panic!("a tampered key file must not open"),
+        }
+    }
+
+    /// E1: lowering `entry_count` hides the last entry from the handle map;
+    /// the file tag refuses it. Also covers an in-session read: the tag is
+    /// checked on every read, not only on open.
+    #[tokio::test]
+    async fn lowered_entry_count_fails_the_file_tag() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
-        let mut data = vec![0x01u8];
-        data.extend_from_slice(&[0u8; SALT_LEN]);
-        data.extend_from_slice(&0u32.to_le_bytes());
+        let custody = FileKeyCustody::new(&path, "pass").unwrap();
+        let a = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        let mut data = std::fs::read(&path).unwrap();
+        let total = data.len();
+        let count_offset = 1 + SALT_LEN;
+        data[count_offset..HEADER_SIZE].copy_from_slice(&1u32.to_le_bytes());
+        // Drop the second entry so the length matches the lowered count.
+        data.drain(HEADER_SIZE + ENTRY_SIZE..HEADER_SIZE + 2 * ENTRY_SIZE);
+        assert_eq!(data.len(), total - ENTRY_SIZE);
         std::fs::write(&path, &data).unwrap();
+
         assert!(matches!(
-            FileKeyCustody::new(&path, "pass"),
-            Err(PlatformError::CustodyError(_))
+            custody.public_key(&a).await,
+            Err(PlatformError::CustodyError(msg)) if msg.contains("authentication failed")
         ));
+        drop(custody);
+        assert_open_fails(&path, "authentication failed");
+    }
+
+    /// E1: a copy of a destroyed last entry appended back (with the count
+    /// raised to match) fails the file tag instead of resurrecting the key.
+    #[tokio::test]
+    async fn replayed_destroyed_last_entry_fails_the_file_tag() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let custody = FileKeyCustody::new(&path, "pass").unwrap();
+        custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let last = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let destroyed_entry =
+            before[HEADER_SIZE + ENTRY_SIZE..HEADER_SIZE + 2 * ENTRY_SIZE].to_vec();
+        custody.destroy_key(&last).await.unwrap();
+        drop(custody);
+
+        let mut data = std::fs::read(&path).unwrap();
+        let tag_at = data.len() - FILE_TAG_LEN;
+        let tag = data.split_off(tag_at);
+        data[1 + SALT_LEN..HEADER_SIZE].copy_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&destroyed_entry);
+        data.extend_from_slice(&tag);
+        std::fs::write(&path, &data).unwrap();
+        assert_open_fails(&path, "authentication failed");
+        // Out of scope: restoring the whole pre-destroy file (its own tag
+        // included) is a rollback, which no MAC under a fixed key detects.
+    }
+
+    /// E1: the file must be exactly the expected length; trailing bytes
+    /// after the tag are refused on open and on an in-session read.
+    #[tokio::test]
+    async fn trailing_bytes_fail_the_exact_length_check() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let custody = FileKeyCustody::new(&path, "pass").unwrap();
+        let a = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let mut data = std::fs::read(&path).unwrap();
+        data.push(0);
+        std::fs::write(&path, &data).unwrap();
+
+        assert!(matches!(
+            custody.public_key(&a).await,
+            Err(PlatformError::CustodyError(msg)) if msg.contains("length mismatch")
+        ));
+        drop(custody);
+        assert_open_fails(&path, "length mismatch");
     }
 
     #[tokio::test]

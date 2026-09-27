@@ -51,7 +51,7 @@ apple = ["dep:rusqlite", "dep:hex", "dep:fs2"]
 sqlite = ["dep:rusqlite", "dep:hex", "dep:argon2", "dep:rand", "dep:fs2"]
 # Encrypted file-backed key custody (Argon2id + AES-256-GCM).
 # Universal fallback for non-HSM platforms. See GitHub issue #391.
-file = ["software_platform", "dep:aes-gcm", "dep:argon2"]
+file = ["software_platform", "dep:aes-gcm", "dep:argon2", "dep:hkdf"]
 # Filesystem storage adapter (spec section 17.6).
 filesystem = []
 # EncryptingAdapter — wraps any Storage backend with AES-256-GCM per-value
@@ -82,6 +82,7 @@ rmp-serde = { workspace = true }
 # file dependencies, gated behind the `file` feature flag.
 aes-gcm = { workspace = true, optional = true }
 argon2 = { workspace = true, optional = true }
+hkdf = { workspace = true, optional = true }
 
 # software_platform dependencies, gated behind the `software_platform` feature flag.
 ed25519-dalek = { workspace = true, optional = true }

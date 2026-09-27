@@ -689,6 +689,8 @@ output_len = 32                      // 32-byte derived key
 salt       = per-file 16-byte salt   // generated once, persisted with the custody file
 ```
 
+The Argon2id output is not used as a key itself. HKDF-SHA256 over it, with no salt, derives two subkeys under distinct info labels: `scp/file-key-custody/v3/entry-aead` is the AES-256-GCM key for each entry, and `scp/file-key-custody/v3/file-mac` is an HMAC-SHA256 key. The file ends with an HMAC-SHA256 tag over every byte before it. An implementation MUST refuse a file whose length is not exactly the header, plus `entry_count` entries, plus the 32-byte tag, and MUST refuse a file whose tag does not verify, on open and on every later read. The tag stops an entry from being removed, appended or replayed, and stops the entry count from being changed. It does not stop the whole file being rolled back to an earlier version.
+
 ## 17.9 OpenMLS StorageProvider Bridge
 
 OpenMLS requires a `StorageProvider` trait implementation for persisting MLS group state (tree nodes, key schedules, proposals, etc.). `MlsStorageBridge` wraps `ProtocolRepository` and delegates to the `mls/{context_id}/...` key prefix.
