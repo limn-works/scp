@@ -4,27 +4,6 @@
 
 Pure Kotlin ergonomics layer over UniFFI-generated Rust bindings. Provides idiomatic Kotlin API: `suspend` functions, `Flow<T>` streaming, `AutoCloseable` lifecycle. Zero protocol logic — every SDK method delegates through the coroutine bridge to exactly one UniFFI function (ADR-028 flat delegation pattern).
 
-## Breaking Changes
-
-### `HotStreamFactory` methods changed from synchronous to `suspend`
-
-`HotStreamFactory.contextEvents()`, `incomingMessages()`, `stopContextEvents()`, `stopMessageStream()`, and `stopAll()` are now `suspend` functions. Previously they were synchronous and used `runBlocking(Dispatchers.IO)` internally to call FFI.
-
-**Rationale:** Coroutine safety and proper structured concurrency. `runBlocking` inside a synchronous function blocks the calling thread and risks deadlock when called from a single-threaded dispatcher (e.g., `Dispatchers.Main`). Making them `suspend` lets the caller control the dispatcher and avoids thread starvation.
-
-**Migration:** Callers must now invoke these methods from a coroutine scope:
-```kotlin
-// Before (synchronous):
-val events = factory.contextEvents(handle)
-
-// After (suspend):
-lifecycleScope.launch {
-    val events = factory.contextEvents(handle)
-}
-```
-
-Additionally, `contextEvents()` and `incomingMessages()` now use a `Mutex` internally to prevent duplicate subscriptions from concurrent calls (TOCTOU fix). This is transparent to callers.
-
 ## Architecture
 
 ### Coroutine Bridge (`bridge/CoroutineBridge.kt`)
@@ -101,7 +80,7 @@ Rust callbacks (`onMessage`, `onEvent`) run on non-coroutine threads. You cannot
 
 ### Streaming: HotStreamFactory methods are suspend — call from a coroutine scope
 
-`HotStreamFactory.contextEvents()` and `incomingMessages()` are `suspend` functions that use `withContext(ioDispatcher)` for FFI calls and a `Mutex` to prevent duplicate subscriptions. They must be called from a coroutine scope (e.g., `lifecycleScope.launch { }`, `viewModelScope.launch { }`). See the Breaking Changes section above for migration details.
+`HotStreamFactory.contextEvents()`, `incomingMessages()`, `stopContextEvents()`, `stopMessageStream()`, and `stopAll()` are `suspend` functions. `contextEvents()` and `incomingMessages()` use `withContext(ioDispatcher)` for FFI calls and a `Mutex` to prevent duplicate subscriptions from concurrent calls. They must be called from a coroutine scope (e.g., `lifecycleScope.launch { }`, `viewModelScope.launch { }`). Do not make them synchronous with `runBlocking` inside: that blocks the calling thread and deadlocks when the caller runs on a single-threaded dispatcher such as `Dispatchers.Main`.
 
 ### UniFFI NativeLib.kt generation configured but requires compiled Rust binary
 

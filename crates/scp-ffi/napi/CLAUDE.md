@@ -99,7 +99,7 @@ The NAPI bridge uses `rand::rngs::OsRng.fill_bytes` directly. Format:
      worker on the wait, so the bridge prefers immediate-busy over queued.
   These methods are **sync** napi entry points — the async orchestrator is driven by
   `crate::runtime().block_on(...)`. Do not change them back to `async fn`; the
-  napi-rs worker thread has no tokio context (see `3de6cbe30` / `78102c871` history).
+  napi-rs worker thread has no tokio context.
 - UCAN validation state (revocation lists, nonce trackers) lives in a separate `DashMap` registry,
   NOT in the `Supervisor`. The `ensure_registered` / `with_context` pattern accesses this state.
 - `context_close` does NOT perform bridge-layer authorization — it delegates to `Supervisor::close_context` (the hoisted `lifecycle_helpers::close_context` body) which checks the `ContextClose` capability. Removes UCAN state via `remove_context` after closing.
@@ -107,9 +107,10 @@ The NAPI bridge uses `rand::rngs::OsRng.fill_bytes` directly. Format:
 - The bridge event log provider uses `MerkleEventLogProvider::with_persistence` backed by
   `ProtocolRepositoryEventLogBridge` over encrypted in-memory storage (#484). The UCAN
   registry's `EventLog` is used separately for per-context Merkle proofs.
-- `NapiUcanToken.encoded` is `#[allow(dead_code)]` because `ucan_revoke` currently returns a stub
-  error. When revocation is wired to the runtime, the bridge will parse the full JWT `token`
-  parameter to compute the revocation CID.
+- `ucan_revoke` (`ucan_revoke_on` in `ucan.rs`) validates the token and the revoker DID, parses the
+  token for its issuer, and calls `scp_core::crypto::ucan::revoke::revoke_ucan` against the
+  context's revocation list and event log. `NapiUcanToken.encoded` holds the raw JWT that delegation
+  and the outlet revocation-CID computation read.
 - **Storage provider (spec §17.6)**: storage selection is per-instance via the `SCP.withStorage(configJson)` factory (`scp.rs`) → `NapiBridgeInstance::with_storage_napi(StorageConfig)`. `{"type":"in_memory"}` → encrypted in-memory; `{"type":"sqlite","path":...,"key":"<hex>"|[..]}` → raw-key `SqliteKeyMaterial::Raw`; `{"type":"sqlite","path":...,"passphrase":"..."}` → Argon2id `SqliteKeyMaterial::Passphrase`. For `sqlite`, **exactly one** of `key`/`passphrase` is required — both/neither is `SCP-VALID-7005`.
   - **FAIL CLOSED (spec §17.6).** `with_storage_napi` returns `Result<Self, StorageInitError>`. A failed SQLCipher open (bad key/passphrase, permission denied, corrupt file, salt-sidecar fail-closed) returns `StorageInitError::SqliteOpen`; the factory surfaces it as a JS-thrown `ValidationError`. There is **no** silent degrade to in-memory; in-memory is reachable only via the explicit `{"type":"in_memory"}` selection.
   - **`mls_storage` consumer (supervisor).** `build_supervisor_arc` takes a required `durable: DurableProviders` arg, sourced from `bi.durable_providers_ref()`. `durable_providers_from_handle` calls `DurableProviders::from_handle(handle)`, deriving BOTH the durable `ProtocolRepositorySagaJournal` and the `mls_storage` view from one `Arc<S>` — so they share one backend by construction (type-enforced, not by convention). That single chosen `Storage`: the Sqlite path retains the same `Arc<SqliteStorage>` that backs persistence + event log; the in-memory path uses the un-swallowed `EventLogInMemoryStorageHandle` (3rd element of `build_event_log_provider`, an `Arc<EncryptingAdapter<scp_platform::in_memory::InMemoryStorage>>`) — NOT `NapiBridgePersistence` (a `DashMap`, not a `Storage`). All `init_supervisor*` paths read `durable_providers_ref()` and fail closed (no supervisor attached) if unset.

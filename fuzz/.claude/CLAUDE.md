@@ -6,7 +6,7 @@ The `fuzz/` directory is a **standalone cargo-fuzz crate, NOT a workspace member
 
 ## Nightly Rust Required
 
-All `cargo fuzz` commands require the nightly compiler, and one specific nightly: nightlies after 2026-05-03 reject openmls 0.8.1's prelude re-export (E0365). `fuzz/rust-toolchain.toml` pins that date, and the repository root pins stable, so a command you run from the root names the nightly itself:
+All `cargo fuzz` commands require the nightly compiler, and one specific nightly: nightlies after 2026-05-03 reject openmls 0.8.1's prelude re-export (E0365). `fuzz/rust-toolchain.toml` pins that date and the repository root pins stable. rustup applies the toolchain file of the directory a command runs in, so run every command from inside `fuzz/`; no command names the nightly:
 
 ```sh
 cd fuzz && cargo fuzz run <target> -- -dict=dicts/<dict> -max_total_time=60

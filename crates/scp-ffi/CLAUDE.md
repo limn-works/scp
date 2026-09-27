@@ -8,7 +8,7 @@ This crate is the `_scp_core` Python extension module. It exposes scp-core/scp-m
 
 ### Runtime Registry (`runtime.rs`)
 
-**Architecture (post-ADR-049 / commit 12):** Context lifecycle is delegated to a shared `Arc<Supervisor>` held in the per-bridge `BridgeInstanceCore.supervisor` slot. Per-context FFI-specific state lives in `FfiBridgeState` in a `OnceLock<DashMap<String, FfiBridgeState>>`. The previously-shared `Arc<ContextManager>` is gone (see `.docs/adrs/ADR-049-actor-per-context.md` for the rationale and migration path).
+**Architecture (post-ADR-049 / commit 12):** Context lifecycle is delegated to a shared `Arc<Supervisor>` held in the per-bridge `BridgeInstanceCore.supervisor` slot. Per-context FFI-specific state lives in `FfiBridgeState`, held per bridge instance in the `PyBridgeInstance.ffi_bridge_state` field (`Arc<DashMap<String, FfiBridgeState>>`); no process-global registry holds it. The previously-shared `Arc<ContextManager>` is gone (see `.docs/adrs/ADR-049-actor-per-context.md` for the rationale and migration path).
 
 **Supervisor (shared):** Owns context lifecycle state — membership, roles, governance, broadcast, TTL. All `py_context_*` functions delegate to `Supervisor::create_context`, `join_context`, `leave_context`, `close_context`, `send_message`. Built via `Supervisor::with_providers_and_journal(...)` (durable saga journal) with production providers: `NodeMlsFactory` (real OpenMLS-backed encryption, sender keys, and group management — #1324, matching NAPI bridge #1305), `NotConfiguredTransportProvider` (returns descriptive errors until relay is configured via `transport_connect`), the persistent `MerkleEventLogProvider` from `build_event_log_provider` (sharing the bridge instance's single storage backend, so the supervisor's own convergent event log is readable by `Supervisor::participation_record` (§7.3.2) and other supervisor log queries — every `init_context_manager*` path, including the relay/local-transport paths, wires this; the former `NoOpEventLogProvider` was removed because a no-op silently dropped governance/role/membership leaves the supervisor must read), and a `not_configured_key_resolver` that logs errors on every lookup rather than silently skipping verification (#501). The `local_did` is passed to `NodeMlsFactory::new` as the MLS credential identity.
 
@@ -26,9 +26,9 @@ This crate is the `_scp_core` Python extension module. It exposes scp-core/scp-m
 
 **Backward-compatibility aliases:** `with_context` → `with_ffi_state`, `register_context` → `register_ffi_state` + Supervisor wiring (formerly `init_context_manager`), `remove_context` → `remove_ffi_state`. Existing modules (`outlets.rs`, `ucan.rs`, `event_log.rs`, `mcp.rs`) use these aliases without modification.
 
-**Identity registry (SCP-214):** A global `OnceLock<DashMap<String, IdentityEntry>>` maps DID strings to retained identity state:
+**Identity registry (SCP-214):** The `PyBridgeInstance.identity_registry` field (`Arc<DashMap<String, IdentityEntry>>`) maps DID strings to retained identity state for that bridge instance:
 - `ScpIdentity` — opaque key handles (`identity_key`, `active_signing_key`), pre-rotation commitment, DID string
-- `Arc<InMemoryKeyCustody>` — the custody provider holding actual key material. Private keys never cross FFI (ADR-006).
+- `Arc<FfiKeyCustody>` — the custody provider holding actual key material: file-backed custody, a caller-provided Python custody callback, or, under the `testing` feature only, in-memory custody. Private keys never cross FFI (ADR-006).
 - `DidDocument` — the identity's DID document
 
 `py_identity_create` registers identity state. Bridge functions (`context.rs`, `ucan.rs`, `identity.rs`) look up state by DID via `with_identity` / `with_identity_mut`. `remove_identity` is called during DID migration.
@@ -37,11 +37,13 @@ DashMap provides lock-free concurrent access with internal sharding — no globa
 
 `py_context_create` in `context.rs` registers FFI bridge state and delegates lifecycle to `Supervisor`. Other modules (`outlets.rs`, `ucan.rs`, `event_log.rs`) look up FFI state by context ID via `with_context` (alias for `with_ffi_state`).
 
-Known contexts (SCP-213), transport, storage provider, identity registry, UCAN registry,
-economy trackers, and bridge connector state are now owned by `BridgeInstance` and
-accessed via `crate::runtime::bridge_instance()`. The old per-bridge `OnceLock` globals
-(`KNOWN_CONTEXTS`, `RELAY_CONNECTION`, `STORAGE_PROVIDER`, `IDENTITY_REGISTRY`, etc.)
-have been consolidated into `BridgeInstance` (see `scp-ffi-common/src/bridge_instance.rs`).
+Every registry is per bridge instance. `PyBridgeInstance` (`runtime.rs`) owns the
+identity registry, the storage provider, the FFI bridge state, the MCP registries, and
+the outlet stream registries; its `core: CoreFields` field (from
+`crates/scp-ffi/common/src/bridge_instance.rs`) owns transport, known contexts (SCP-213),
+and the other bridge-agnostic state. Python code reaches an instance through
+`PyScp::bridge_instance()` (`scp.rs`), and every runtime helper (`with_ffi_state`,
+`with_identity`, `register_context`, …) takes `bi: &PyBridgeInstance` as its first argument.
 
 ### Module Structure
 
@@ -122,7 +124,7 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
 - **Identity registry (SCP-214)**: `py_identity_create` registers identity state in the `BridgeInstance` identity registry (type-erased, set via `set_identity_registry`). All crypto bridge functions (`py_ucan_mint`, `py_ucan_delegate`, `py_context_send`, `py_identity_rotate_key`, `py_identity_migrate`) look up the retained `InMemoryKeyCustody` and `KeyHandle`s via `with_identity()`. The `KeyCustody` trait uses RPITIT (return-position impl Trait in trait), making it NOT object-safe — must use concrete `InMemoryKeyCustody` type directly. `parse_custody("platform")` returns an error (criterion 11) to prevent silent fallback.
 - **Nested block_on prevention**: `with_identity` / `with_identity_mut` are sync closures wrapping DashMap access. If a crypto operation inside the closure is async (e.g., `derive_pseudonym`, `create_inner_envelope`), call `rt.block_on()` inside the closure — never nest `block_on` calls or tokio will deadlock. Pattern: `with_identity(did, |entry| { rt.block_on(async { ... }) })`.
 - UCAN validation (SCP-164) now delegates to scp-core's full 11-step ADR-016 pipeline including Ed25519 signature verification. Bridge trait implementations (`DispatchDidResolver`, `BridgeRevocationChecker`, `BridgeProofResolver`, `BridgeNonceTracker`) in `ucan.rs` adapt runtime state to scp-core's validation traits. The `py_ucan_validate` function accepts optional `presenting_agent_did` and `proof_tokens` parameters for delegation chain verification.
-- **Unified DID resolver (#311)**: `DispatchDidResolver` replaces `BridgeDidResolver` in production code paths. When the global `DID_RESOLVER` is initialized (via `runtime::init_did_resolver`, called from `py_identity_create`), it delegates to `IdentityBackedDidResolver` which performs full DID document validation (BEP44 sig, self-certification, sequence tracking). Falls back to `BridgeDidResolver` (string-only) when uninitialized. The resolver is in `scp-ffi-common` — shared across all FFI bridges.
+- **Unified DID resolver (#311)**: `DispatchDidResolver` replaces `BridgeDidResolver` in production code paths. When the bridge instance's DID resolver, stored in its `CoreFields`, is initialized (via `runtime::init_did_resolver`, called from `py_identity_create`), it delegates to `IdentityBackedDidResolver` which performs full DID document validation (BEP44 sig, self-certification, sequence tracking). Falls back to `BridgeDidResolver` (string-only) when uninitialized. The resolver is in `scp-ffi-common` — shared across all FFI bridges.
 - MCP server async tasks hold `Arc<Mutex<McpServer>>` — when extracting data from the mutex guard for use in async code (e.g. SSE transport), scope the lock to avoid holding `MutexGuard` across `.await` points (the guard is not `Send`).
 - `EventLog` is a Merkle tree storing only leaf hashes, not event payloads. The `context_events` provider method returns event count and Merkle root, not raw events.
 - `OutletRegistry::registrations()` returns an iterator, not a Vec. There is no `invoke()` method — outlet invocation checks outlet existence and returns a JSON status response.
