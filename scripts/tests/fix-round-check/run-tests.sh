@@ -80,9 +80,15 @@
 #     line would take the Python half of a round to have been checked.
 #
 #     Case 13 changes a file under `crates/scp-transport/` and asserts that the run issues
-#     the second `cargo check` the `rust-clippy` job's second command mirrors. Without it,
-#     an edit inside a `#[cfg(feature = "quic")]` module compiles nothing and reports
-#     `compile ok`.
+#     one `cargo check` for each feature set of that package the `rust-clippy` job lints
+#     and the workspace command never activates: the optional transports, the blob-backend
+#     features, and the PostgreSQL and S3 blob backends. Without them, an edit inside a
+#     `#[cfg(feature = "quic")]` module compiles nothing and reports `compile ok`.
+#
+#     Case 13b changes a file under `crates/scp-relay/` and asserts that the run compiles
+#     scp-relay's `cloud-blobs` feature together with scp-node's `cloud-blobs` and
+#     `testing` in one command, the unification the `rust-clippy` job lints, and starts
+#     no scp-relay-only `cloud-blobs` compile.
 #
 #     Case 14 leaves one edit uncommitted and asserts that the summary names
 #     `scripts/check-cross-layer.sh` as the gate whose diff range holds no uncommitted edit.
@@ -760,9 +766,9 @@ fixture_commit "$FIXTURE13" crates/scp-transport/src/lib.rs
 run_fixture "$FIXTURE13"
 rc=$(cat "$FIXTURE13.harness/rc.txt")
 if [[ $rc -eq 0 ]]; then
-    report "case 13 exits 0 when both transport compiles pass" 0 ""
+    report "case 13 exits 0 when every scp-transport compile passes" 0 ""
 else
-    report "case 13 exits 0 when both transport compiles pass" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE13.harness/out.txt")"
+    report "case 13 exits 0 when every scp-transport compile passes" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE13.harness/out.txt")"
 fi
 if grep -qF 'check -p scp-transport --all-targets --features quic,http3,udp,coap' "$FIXTURE13.harness/cargo.log"; then
     report "case 13 compiles the optional transports the workspace command never activates" 0 ""
