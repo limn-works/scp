@@ -1,26 +1,5 @@
 {
   "hooks": {
-    "PreCompact": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "echo '{\"systemMessage\": \"Context compaction imminent. Important conversation context should be checkpointed to vestige memory.\"}'"
-          }
-        ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "matcher": "compact",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "echo 'IMPORTANT: Context was just compacted. Proactively save important conversation context to the vestige memory MCP — architectural decisions, design discussions, key insights, implementation details, and task progress — using session_checkpoint or smart_ingest. Be liberal; losing important context is worse than saving too much.'"
-          }
-        ]
-      }
-    ],
     "PreToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit",
