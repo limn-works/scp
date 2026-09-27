@@ -1322,13 +1322,16 @@ jobs:
           # `scp-ffi/testing`. This step is a lane that doc block names, so
           # AC5 (identity_create → SCP-IDENT-1059) and AC3 (device-attestation
           # verify → SCP-IDENT-1016) per-bridge proofs now execute.
+          # The third test pins the shipped `"in_memory"` custody rejection to
+          # SCP-IDENT-1008 and forbids it from recommending `"file"` custody,
+          # which a shipped build refuses with SCP-IDENT-1059.
           #
           # nextest supplies process-per-test isolation, which a SAFETY
           # comment at crates/scp-ffi/src/scp.rs:560-565 rests two
           # `std::env::set_var` calls on, and `--no-tests=fail` exits 4 rather
           # than 0 if a feature flip selects zero tests.
           cargo nextest run --no-tests=fail -p scp-ffi --features server --lib \
-            -E 'test(identity_create_fails_closed_without_pre_rotation_backend) + test(verify_device_attestation_fails_closed)'
+            -E 'test(identity_create_fails_closed_without_pre_rotation_backend) + test(verify_device_attestation_fails_closed) + test(in_memory_rejection_recommends_no_custody_this_build_cannot_serve)'
 
   # Builds the uniffi bridge (`scp-ffi-uniffi`) in its PRODUCTION configuration:
   # default features (`server` on) but WITHOUT `testing`. Same
