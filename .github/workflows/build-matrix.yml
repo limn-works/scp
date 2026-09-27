@@ -139,7 +139,10 @@ jobs:
   #     interpreters (`-i`). Without abi3 a wheel serves one CPython minor, so
   #     each leg builds one wheel per minor that bindings/python/pyproject.toml
   #     declares (requires-python >= 3.10, classifiers 3.10-3.13); a minor with
-  #     no wheel falls back to the sdist, which needs a Rust toolchain.
+  #     no wheel falls back to the sdist. The sdist builds with the same
+  #     `vendored-openssl` feature, so installing it compiles OpenSSL through
+  #     openssl-src: it needs a Rust toolchain and a full perl on the
+  #     installing machine, plus make on Linux and macOS and NASM on Windows.
   #   - manylinux 2_28, not 2014: CentOS 7 (EOL) can build neither
   #     ring/aws-lc-sys (glibc >= 2.18, newer gcc) nor vendored OpenSSL.
   #   - x86_64 2_28 container ships a minimal perl that openssl-src's

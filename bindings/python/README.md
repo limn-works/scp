@@ -44,8 +44,9 @@ asyncio.run(main())
 
 ## Requirements
 
-- Python >= 3.12
-- Rust toolchain (build only -- wheels are pre-built for Linux, macOS, Windows)
+- Python >= 3.10
+- Nothing else when a wheel exists for your platform: wheels are pre-built for CPython 3.10-3.13 on Linux (x86_64, aarch64), macOS, and Windows (x86_64)
+- A build from the source distribution, which pip falls back to when no wheel matches, compiles OpenSSL: it needs a Rust toolchain and a full perl, plus make on Linux and macOS and NASM on Windows
 
 ## API Reference
 
