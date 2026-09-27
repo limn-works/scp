@@ -219,7 +219,7 @@ ENVIRONMENT VARIABLES:
                                 (default: sqlite). On any other value the relay prints
                                 the cargo feature that compiles that backend, or reports
                                 the value as unknown, then exits 1. --self-host exits 1
-                                on any value but sqlite; --ephemeral ignores the
+                                on postgres or s3; --ephemeral ignores the
                                 variable and keeps blobs in memory. See
                                 docs/guides/relay-operations.md for the cloud backends.
     SCP_RELAY_STORAGE_PATH      Path for sqlite/redb blob storage (default: ./scp-relay.db){postgres_vars}{s3_vars}
@@ -767,18 +767,21 @@ fn env_flag_is_truthy(value: Option<&str>) -> bool {
 }
 
 /// Writes the error `--self-host` exits with when `SCP_RELAY_STORAGE_BACKEND`
-/// names a backend other than `sqlite`, or returns `None`.
+/// names `postgres` or `s3`, or returns `None`.
 ///
 /// `--self-host` opens its blob store with `SQLite` under its storage directory
-/// and constructs no other backend, so a value naming another backend would
-/// otherwise be dropped and the operator would get a different store from the
-/// one selected, which §17.7 of the persistence spec forbids for `postgres` and
-/// `s3`.
+/// and constructs no other backend, so a `postgres` or `s3` selection would
+/// otherwise be dropped and the operator would get a `SQLite` store in place of
+/// the cloud store selected, which §17.7 of the persistence spec forbids. The
+/// rejected set is every backend a binary cargo feature gates
+/// ([`startup::backend_binary_feature`]), matched case-insensitively as the
+/// full node matches it, and it is the same in every build, because
+/// `--self-host` opens neither cloud store even when `cloud-blobs` compiles it.
+/// Every other value, `redb` and `memory` included, leaves `--self-host`
+/// running on `SQLite` as it ran before `cloud-blobs` existed.
 fn self_host_backend_conflict(selected: Option<&str>) -> Option<String> {
     let value = selected?;
-    if value.eq_ignore_ascii_case("sqlite") {
-        return None;
-    }
+    startup::backend_binary_feature(&value.to_lowercase())?;
     Some(format!(
         "error: --self-host stores blobs in SQLite under its storage directory and \
          cannot use SCP_RELAY_STORAGE_BACKEND='{value}'. Unset the variable, or run \
@@ -1316,21 +1319,34 @@ mod tests {
         );
     }
 
-    /// `--self-host` opens only `SQLite`, so it accepts an unset variable and
-    /// `sqlite` in any case, and rejects every other value, `postgres` and `s3`
-    /// included, with a message naming the value.
+    /// `--self-host` opens only `SQLite`, so it rejects `postgres` and `s3` in
+    /// any case with a message naming the value, and leaves every other value,
+    /// which it ignored before `cloud-blobs` existed, to run on `SQLite`.
     #[test]
     fn self_host_rejects_a_backend_it_does_not_open() {
-        assert_eq!(self_host_backend_conflict(None), None);
-        assert_eq!(self_host_backend_conflict(Some("sqlite")), None);
-        assert_eq!(self_host_backend_conflict(Some("SQLite")), None);
-        for value in ["postgres", "s3", "redb", "memory", "banana", ""] {
+        for value in ["postgres", "s3", "POSTGRES", "S3"] {
             let message = self_host_backend_conflict(Some(value));
             assert!(
                 message
                     .as_deref()
                     .is_some_and(|m| m.contains(&format!("SCP_RELAY_STORAGE_BACKEND='{value}'"))),
                 "--self-host must reject '{value}'; got {message:?}"
+            );
+        }
+        assert_eq!(self_host_backend_conflict(None), None);
+        for value in [
+            "sqlite",
+            "SQLite",
+            "redb",
+            "memory",
+            "banana",
+            "",
+            "sq\u{fffd}lite",
+        ] {
+            assert_eq!(
+                self_host_backend_conflict(Some(value)),
+                None,
+                "--self-host must keep running on SQLite for '{value}', as it did on main"
             );
         }
     }

@@ -171,16 +171,15 @@ fn an_unusable_storage_path_opens_no_blob_database() {
     );
 }
 
-/// `--self-host` opens only `SQLite`, so `SCP_RELAY_STORAGE_BACKEND=postgres`,
-/// `=s3`, or a value that is not valid UTF-8 exits non-zero, names the value,
-/// and leaves no storage directory, instead of serving from a `SQLite` store
-/// the operator did not select.
+/// `--self-host` opens only `SQLite`, so `SCP_RELAY_STORAGE_BACKEND=postgres`
+/// or `=s3` exits non-zero, names the value, and leaves no storage directory,
+/// instead of serving from a `SQLite` store the operator did not select.
 ///
 /// A regression would start a server that never exits, so the child is killed
 /// after 30 seconds and the test fails on the missing exit.
 #[test]
 fn self_host_rejects_a_cloud_backend_before_writing_storage() {
-    for value in rejected_backend_values() {
+    for value in [OsString::from("postgres"), OsString::from("s3")] {
         let backend = value.to_string_lossy();
         let tmp = tempfile::tempdir().expect("tempdir");
         let storage_dir = tmp.path().join("node-storage");

@@ -181,7 +181,7 @@ A binary built without `cloud-blobs` rejects `SCP_RELAY_STORAGE_BACKEND=postgres
 and `=s3` at startup, exits with code 1, and prints the feature to rebuild with.
 It never falls back to another backend. `scp-node --self-host` stores blobs in
 SQLite under its storage directory in every build, and exits with code 1 when
-`SCP_RELAY_STORAGE_BACKEND` names any other value. `scp-node --ephemeral` keeps
+`SCP_RELAY_STORAGE_BACKEND` names `postgres` or `s3`. `scp-node --ephemeral` keeps
 blobs in memory and does not read the variable.
 
 ### Examples
