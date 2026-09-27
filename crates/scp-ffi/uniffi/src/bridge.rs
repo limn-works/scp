@@ -5242,13 +5242,93 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         self.outlet_grant(&bi, &role_state, context_id, outlet_name, check)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn invoke_outlet(
         &self,
         context_id: &str,
         outlet_name: &str,
         arguments: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, scp_mcp::server::OutletInvokeError> {
+        self.run_outlet(context_id, outlet_name, arguments, || {
+            self.validate_capability(
+                context_id,
+                outlet_name,
+                scp_mcp::server::CapabilityCheck::Invoke,
+            )
+        })
+    }
+
+    fn context_members(
+        &self,
+        context_id: &str,
+    ) -> Result<Vec<scp_mcp::server::MemberInfo>, String> {
+        // Read the roster and role assignments from the context's role state
+        // through the ADR-049 query shim, as the PyO3 and NAPI bridges read
+        // `role_state.members`. A dropped bridge, an unreachable actor or an
+        // unknown context is an error, never an empty roster.
+        let bi = self.upgrade_bi()?;
+        let role_state = Self::role_state_of(&bi, context_id)?
+            .ok_or_else(|| format!("context '{context_id}' could not be read — no role state"))?;
+        Ok(role_state
+            .members
+            .iter()
+            .map(|did| scp_mcp::server::MemberInfo {
+                did: did.clone(),
+                role: role_state
+                    .assignments
+                    .get(did)
+                    .map_or_else(|| "member".to_owned(), |a| a.role_name.clone()),
+            })
+            .collect())
+    }
+
+    fn context_events(&self, context_id: &str) -> Result<serde_json::Value, String> {
+        // The event log stores Merkle tree hashes, not event payloads, so the
+        // resource reports entry counts and Merkle roots, matching PyO3.
+        // `event_count` and `merkle_root` summarize the actor's log, whose
+        // events drive the pump's `resources/updated` notices.
+        // `bridge_event_log` summarizes the bridge's UCAN-state tree, to which
+        // `invoke_outlet` appends the OutletInvokedEvent of every MCP
+        // `tools/call`. The actor's log never receives that record, so without
+        // `bridge_event_log` a `tools/call` would leave this resource
+        // unchanged. `bridge_event_log` is `null` when the bridge holds no
+        // UCAN state for the context. A dropped bridge, a missing supervisor or
+        // an unreadable actor log is an error, never an empty log.
+        let bi = self.upgrade_bi()?;
+        let supervisor = bi
+            .context_manager_expect()
+            .map_err(|e| format!("cannot read the event log of context '{context_id}': {e}"))?;
+        let (event_count, root) = supervisor
+            .event_log_summary(&scp_core::context::state::context_id_to_bytes(context_id))
+            .map_err(|e| format!("cannot read the event log of context '{context_id}': {e}"))?;
+        let bridge_event_log = bi.with_ucan_state(context_id, |ucan_state| {
+            serde_json::json!({
+                "event_count": ucan_state.event_log.leaves().len(),
+                "merkle_root": hex::encode(scp_event_log::tree::root(&ucan_state.event_log)),
+            })
+        });
+        Ok(serde_json::json!({
+            "event_count": event_count,
+            "merkle_root": hex::encode(root),
+            "bridge_event_log": bridge_event_log,
+        }))
+    }
+}
+
+impl McpUniFfiBridgeProvider {
+    /// Runs `outlet_name` for
+    /// [`scp_mcp::server::ContextProvider::invoke_outlet`], which passes the
+    /// Invoke check as `authorize`. `authorize` runs after every refusal that
+    /// runs no outlet (the handle lookup, the registry lookup and the input
+    /// schema) and just before the handler dispatch, because a passing
+    /// Invoke check spends the agent token.
+    #[allow(clippy::too_many_lines)]
+    fn run_outlet(
+        &self,
+        context_id: &str,
+        outlet_name: &str,
+        arguments: serde_json::Value,
+        authorize: impl FnOnce() -> Result<(), scp_mcp::server::AccessRefusal>,
+    ) -> Result<serde_json::Value, scp_mcp::server::OutletInvokeError> {
         let start = std::time::Instant::now();
         let agent_did = self.agent_did.clone();
         let timeout = std::time::Duration::from_millis(self.outlet_timeout_ms);
@@ -5296,6 +5376,10 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 
             (handler_dispatch, input_hash)
         };
+
+        // The Invoke check records the agent token's nonce, so it runs after
+        // every refusal above and just before the dispatch below.
+        authorize().map_err(scp_mcp::server::OutletInvokeError::Refused)?;
 
         // Phase 2: Execute handler OUTSIDE the locks so that concurrent
         // same-context operations are not blocked. Handler execution is
@@ -5425,62 +5509,6 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         }
 
         Ok(output)
-    }
-
-    fn context_members(
-        &self,
-        context_id: &str,
-    ) -> Result<Vec<scp_mcp::server::MemberInfo>, String> {
-        // Read the roster and role assignments from the context's role state
-        // through the ADR-049 query shim, as the PyO3 and NAPI bridges read
-        // `role_state.members`. A dropped bridge, an unreachable actor or an
-        // unknown context is an error, never an empty roster.
-        let bi = self.upgrade_bi()?;
-        let role_state = Self::role_state_of(&bi, context_id)?
-            .ok_or_else(|| format!("context '{context_id}' could not be read — no role state"))?;
-        Ok(role_state
-            .members
-            .iter()
-            .map(|did| scp_mcp::server::MemberInfo {
-                did: did.clone(),
-                role: role_state
-                    .assignments
-                    .get(did)
-                    .map_or_else(|| "member".to_owned(), |a| a.role_name.clone()),
-            })
-            .collect())
-    }
-
-    fn context_events(&self, context_id: &str) -> Result<serde_json::Value, String> {
-        // The event log stores Merkle tree hashes, not event payloads, so the
-        // resource reports entry counts and Merkle roots, matching PyO3.
-        // `event_count` and `merkle_root` summarize the actor's log, whose
-        // events drive the pump's `resources/updated` notices.
-        // `bridge_event_log` summarizes the bridge's UCAN-state tree, to which
-        // `invoke_outlet` appends the OutletInvokedEvent of every MCP
-        // `tools/call`. The actor's log never receives that record, so without
-        // `bridge_event_log` a `tools/call` would leave this resource
-        // unchanged. `bridge_event_log` is `null` when the bridge holds no
-        // UCAN state for the context. A dropped bridge, a missing supervisor or
-        // an unreadable actor log is an error, never an empty log.
-        let bi = self.upgrade_bi()?;
-        let supervisor = bi
-            .context_manager_expect()
-            .map_err(|e| format!("cannot read the event log of context '{context_id}': {e}"))?;
-        let (event_count, root) = supervisor
-            .event_log_summary(&scp_core::context::state::context_id_to_bytes(context_id))
-            .map_err(|e| format!("cannot read the event log of context '{context_id}': {e}"))?;
-        let bridge_event_log = bi.with_ucan_state(context_id, |ucan_state| {
-            serde_json::json!({
-                "event_count": ucan_state.event_log.leaves().len(),
-                "merkle_root": hex::encode(scp_event_log::tree::root(&ucan_state.event_log)),
-            })
-        });
-        Ok(serde_json::json!({
-            "event_count": event_count,
-            "merkle_root": hex::encode(root),
-            "bridge_event_log": bridge_event_log,
-        }))
     }
 }
 
@@ -23568,6 +23596,85 @@ mod tests {
                 "the {kind:?} denial must name messages:read, got: {denial}"
             );
         }
+    }
+
+    /// `run_outlet` asks for the Invoke check, which spends the agent token,
+    /// only after every refusal that runs no outlet: an unknown context, an
+    /// unknown outlet, and an input the schema rejects each refuse the call
+    /// without asking. A refused check runs no outlet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uniffi_run_outlet_authorizes_after_every_refusal_that_runs_no_outlet() {
+        let scp = scp_test();
+        let bi = Arc::clone(&scp.inner);
+        let handle = test_handle_for(&scp);
+        register_context_handle(&bi, &handle);
+        handle
+            .outlet_registry
+            .lock()
+            .expect("registry lock")
+            .insert(scp_core::context::outlets::OutletRegistration {
+                outlet_id: "calculator".to_owned(),
+                kind: scp_core::context::outlets::OutletKind::default(),
+                name: "Calculator".to_owned(),
+                description: "A simple calculator".to_owned(),
+                schema: scp_core::context::outlets::OutletSchema {
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "required": ["a"]
+                    }),
+                    output_schema: serde_json::json!({"type": "object"}),
+                    aggregate_schema: None,
+                },
+                implementation_hash: [0xAA; 32],
+                test_vectors: vec![],
+                operator_did: "did:dht:z6MkOperator".into(),
+                cost: None,
+                message_catalog: Vec::new(),
+                registered_at: 0,
+                signature: Vec::new(),
+            });
+        let provider = McpUniFfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: "did:dht:z6MkTestUser".to_owned(),
+            context_ids: vec!["ctx-test".to_owned()],
+            outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: None,
+            agent_proof_tokens: None,
+        };
+        let asked = std::cell::Cell::new(0_u32);
+        let authorize = || {
+            asked.set(asked.get() + 1);
+            Ok(())
+        };
+        let args = serde_json::json!({"a": 1});
+
+        for (context_id, outlet, arguments) in [
+            ("ctx-unknown", "calculator", args.clone()),
+            ("ctx-test", "nonexistent", args.clone()),
+            ("ctx-test", "calculator", serde_json::json!("bad")),
+        ] {
+            assert!(
+                provider
+                    .run_outlet(context_id, outlet, arguments, authorize)
+                    .is_err()
+            );
+        }
+        assert_eq!(asked.get(), 0, "a refused call must not spend the token");
+
+        let refused = provider.run_outlet("ctx-test", "calculator", args.clone(), || {
+            Err(scp_mcp::server::AccessRefusal::Denied("replay".to_owned()))
+        });
+        assert!(matches!(
+            refused,
+            Err(scp_mcp::server::OutletInvokeError::Refused(_))
+        ));
+
+        assert!(
+            provider
+                .run_outlet("ctx-test", "calculator", args, authorize)
+                .is_ok()
+        );
+        assert_eq!(asked.get(), 1, "the dispatched call asks once");
     }
 
     /// Struct-level proof: `McpUniFfiBridgeProvider.bi` is `Weak`.

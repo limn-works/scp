@@ -759,8 +759,9 @@ impl<C: Clock> NonceTrackerTrait for BridgeNonceTracker<'_, C> {
 /// tracker unchanged.
 ///
 /// An MCP server holds one agent token for its lifetime, and ADR-016 Step 9
-/// makes that token single-use: the first `tools/call` whose outlet runs
-/// records its nonce, and every check after that fails it as a replay. A
+/// makes that token single-use: the Invoke check a bridge's `invoke_outlet`
+/// makes just before it dispatches the first outlet records the nonce, and
+/// every check after that fails it as a replay. A
 /// `tools/list` or a view refresh that recorded the nonce would spend the
 /// token before any `tools/call`, so a probe never records it. Both bridges
 /// build this adapter through [`Self::new`], so the mapping from check to

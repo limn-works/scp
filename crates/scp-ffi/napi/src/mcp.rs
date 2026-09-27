@@ -555,9 +555,9 @@ impl ContextProvider for McpNapiBridgeProvider {
         _context_id: &str,
         _outlet_name: &str,
         _arguments: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, scp_mcp::server::OutletInvokeError> {
         // Stub — see SCP-048
-        Err(OUTLET_INVOCATION_UNAVAILABLE.to_owned())
+        Err(OUTLET_INVOCATION_UNAVAILABLE.to_owned().into())
     }
 
     fn validate_resource_access(

@@ -249,7 +249,9 @@ pub(crate) struct McpNotifier {
     /// atomic w.r.t. the server lock *and* emission never moves outside it. If
     /// either changes, the shared channel becomes a cross-principal exposure
     /// vector, and the fix at that point is per-session channel identity — mint
-    /// the channel at admission, drop it at reset.
+    /// the channel at admission, drop it at reset. [`Self::broadcast`] and
+    /// [`Self::notify`] take the lock's guard, so an emission outside the
+    /// lock does not compile.
     tx: broadcast::Sender<(u64, String)>,
     /// Monotonically increasing event ID counter.
     ///
@@ -273,7 +275,16 @@ impl McpNotifier {
 
     /// Broadcasts a JSON payload to all connected SSE clients. Returns the
     /// assigned event ID.
-    fn broadcast(&self, data: String) -> u64 {
+    ///
+    /// `_held` is the guard of the `state.server` lock. Requiring it makes a
+    /// broadcast after the caller released that lock fail to compile, which
+    /// keeps every emission inside the critical section described on
+    /// [`Self::tx`].
+    fn broadcast<P: ContextProvider>(
+        &self,
+        _held: &tokio::sync::MutexGuard<'_, McpServer<P>>,
+        data: String,
+    ) -> u64 {
         let id = self.next_event_id.fetch_add(1, Ordering::SeqCst);
         let _ = self.tx.send((id, data));
         id
@@ -287,10 +298,17 @@ impl McpNotifier {
     /// single-session and every admission resets the session, so a later
     /// client starts from a fresh handshake and re-reads current state
     /// rather than depending on notifications sent before it attached.
-    fn notify(&self, notification: &JsonRpcNotification) -> usize {
+    ///
+    /// `held` is the guard of the `state.server` lock, as for
+    /// [`Self::broadcast`].
+    fn notify<P: ContextProvider>(
+        &self,
+        held: &tokio::sync::MutexGuard<'_, McpServer<P>>,
+        notification: &JsonRpcNotification,
+    ) -> usize {
         match serde_json::to_string(notification) {
             Ok(json) => {
-                self.broadcast(json);
+                self.broadcast(held, json);
                 self.tx.receiver_count()
             }
             Err(e) => {
@@ -764,7 +782,7 @@ async fn message_handler<P: ContextProvider + 'static>(
             if let Some(resp) = server.handle_request(&req)
                 && let Ok(json) = serde_json::to_string(&resp)
             {
-                state.notifier.broadcast(json);
+                state.notifier.broadcast(&server, json);
             }
         }
         Ok(SseIncoming::Notification(notif)) => {
@@ -783,9 +801,14 @@ async fn message_handler<P: ContextProvider + 'static>(
             // it is still a server->client message on the shared broadcast, so
             // it goes out under the server lock like every other response.
             if let Ok(json) = serde_json::to_string(&err_response) {
-                state.notifier.broadcast(json);
+                state.notifier.broadcast(&server, json);
             }
         }
+    }
+    // A `tools/call` queues the notifications its outlet run causes. They go
+    // out after its response, under the same lock.
+    for notification in &server.take_pending_notifications() {
+        state.notifier.notify(&server, notification);
     }
     // Released only after the broadcast, for the ordering described above.
     drop(server);
@@ -831,7 +854,7 @@ async fn pump_events<P: ContextProvider + 'static>(
                 // `.await`.
                 let server = state.server.lock().await;
                 for notification in &server.lagged_resync_notifications() {
-                    state.notifier.notify(notification);
+                    state.notifier.notify(&server, notification);
                 }
                 // Release only after every resync notification is broadcast —
                 // the whole loop above runs under the lock, on purpose.
@@ -858,7 +881,7 @@ async fn pump_events<P: ContextProvider + 'static>(
         // crossed while the lock is held.
         let server = state.server.lock().await;
         for notification in &server.notifications_for_event(&context_id, &event) {
-            state.notifier.notify(notification);
+            state.notifier.notify(&server, notification);
         }
     }
 }
@@ -1036,7 +1059,7 @@ mod tests {
             _context_id: &str,
             _outlet_id: &str,
             _arguments: serde_json::Value,
-        ) -> Result<serde_json::Value, String> {
+        ) -> Result<serde_json::Value, crate::server::OutletInvokeError> {
             Ok(serde_json::json!({"status": "ok"}))
         }
         fn validate_resource_access(
@@ -1302,7 +1325,7 @@ mod tests {
         let mut rx = state.notifier.tx.subscribe();
 
         let notif = McpServer::<MockProvider>::tools_list_changed_notification();
-        let count = state.notifier.notify(&notif);
+        let count = state.notifier.notify(&state.server.lock().await, &notif);
         assert_eq!(count, 1);
 
         let (_id, received) = rx.recv().await.unwrap();
@@ -1316,7 +1339,7 @@ mod tests {
         let state = test_state();
 
         let notif = McpServer::<MockProvider>::tools_list_changed_notification();
-        let count = state.notifier.notify(&notif);
+        let count = state.notifier.notify(&state.server.lock().await, &notif);
         assert_eq!(count, 0);
     }
 
@@ -1442,8 +1465,10 @@ mod tests {
         let state = test_state();
         let mut rx = state.notifier.tx.subscribe();
 
-        let id1 = state.notifier.broadcast("msg-1".to_owned());
-        let id2 = state.notifier.broadcast("msg-2".to_owned());
+        let held = state.server.lock().await;
+        let id1 = state.notifier.broadcast(&held, "msg-1".to_owned());
+        let id2 = state.notifier.broadcast(&held, "msg-2".to_owned());
+        drop(held);
 
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
@@ -2237,6 +2262,45 @@ mod tests {
         );
     }
 
+    /// `message_handler` broadcasts the notifications a `tools/call` queued,
+    /// after the call's response. Without the drain, a subscriber to
+    /// `scp://{ctx}/events` would not learn that the call appended to the log.
+    #[tokio::test]
+    async fn post_handler_sends_the_notifications_a_tools_call_queued() {
+        let (_event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
+        let (server, _pump) = subscribed_server("scp://ctx_a/events", event_rx);
+        let state = test_state();
+        *state.server.lock().await = server;
+        let mut rx = state.notifier.tx.subscribe();
+
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "ctx_a/send_message", "arguments": {"content": "hi"}},
+            "id": 3
+        });
+        let status = message_handler(
+            State(Arc::clone(&state)),
+            session(TEST_SESSION),
+            call.to_string(),
+        )
+        .await
+        .into_response()
+        .status();
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let (_id, response) = rx.try_recv().expect("the call's response goes out first");
+        assert!(response.contains("\"id\":3"), "{response}");
+        let (_id, notification) = rx
+            .try_recv()
+            .expect("the queued notification follows the response");
+        assert!(
+            notification.contains("notifications/resources/updated")
+                && notification.contains("scp://ctx_a/events"),
+            "{notification}"
+        );
+    }
+
     // -- Response broadcast is ordered under the server lock ------------------
 
     /// `message_handler` must broadcast its response *while holding the
@@ -2254,11 +2318,12 @@ mod tests {
     /// lock is held, a correct handler cannot broadcast; a handler that
     /// broadcasts lock-free (the bug) delivers immediately and this test fails.
     ///
-    /// What it proves: no `message_handler` broadcast escapes the server-lock
-    /// critical section. What it does not attempt: a fully deterministic 3-way
-    /// reset race — the request-response arm shares the *same* single critical
-    /// section as this arm by construction (see `message_handler`), so the
-    /// ordering this locks down covers it too.
+    /// What it proves: a `message_handler` that broadcasts before it takes the
+    /// server lock turns this test red. It cannot catch a handler that takes
+    /// the lock, releases it, and then broadcasts, because that handler also
+    /// parks on the lock this test holds. That second ordering fails to
+    /// compile instead: [`McpNotifier::broadcast`] and [`McpNotifier::notify`]
+    /// take the lock's guard, so neither can run after the guard is dropped.
     #[tokio::test]
     async fn response_broadcast_is_serialized_under_the_server_lock() {
         let state = test_state();
@@ -2330,9 +2395,11 @@ mod tests {
 
         // With the stream unpolled, drive the channel far past its capacity
         // (`test_config` uses 16) so the receiver is deterministically lagged.
+        let held = state.server.lock().await;
         for i in 0..64 {
-            state.notifier.broadcast(format!("event-{i}"));
+            state.notifier.broadcast(&held, format!("event-{i}"));
         }
+        drop(held);
 
         // Poll the body: after the endpoint event, the first broadcast poll
         // observes the lag and must END the stream rather than resume past it.

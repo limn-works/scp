@@ -975,13 +975,116 @@ impl ContextProvider for FfiBridgeProvider {
         self.outlet_grant(&bi, &role_state, context_id, outlet_name, check)
     }
 
-    #[allow(clippy::too_many_lines)] // Three-phase dispatch: validate + execute + emit event.
     fn invoke_outlet(
         &self,
         context_id: &str,
         outlet_name: &str,
         arguments: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, scp_mcp::server::OutletInvokeError> {
+        self.run_outlet(context_id, outlet_name, arguments, || {
+            self.validate_capability(
+                context_id,
+                outlet_name,
+                scp_mcp::server::CapabilityCheck::Invoke,
+            )
+        })
+    }
+
+    fn validate_resource_access(
+        &self,
+        context_id: &str,
+        resource: scp_mcp::server::ResourceKind,
+    ) -> Result<(), scp_mcp::server::AccessRefusal> {
+        use scp_mcp::server::AccessRefusal;
+        // A dropped bridge instance or an unreadable role state is a failed
+        // read, which `resources/list` reports as an error instead of
+        // omitting the context's resources.
+        let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
+        let role_state =
+            Self::live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;
+        let access = resource.check_access(&role_state, &self.agent_did, context_id);
+        access.map_err(AccessRefusal::Denied)
+    }
+
+    fn context_members(&self, context_id: &str) -> Result<Vec<MemberInfo>, String> {
+        // A dropped bridge or an unreadable context is an error, never an
+        // empty roster.
+        let bi = self.upgrade_bi()?;
+        let role_state = Self::live_role_state(&bi, context_id)?;
+        Ok(role_state
+            .members
+            .iter()
+            .map(|did| MemberInfo {
+                did: did.clone(),
+                role: role_state
+                    .assignments
+                    .get(did)
+                    .map_or_else(|| "member".to_owned(), |a| a.role_name.clone()),
+            })
+            .collect())
+    }
+
+    fn context_events(&self, context_id: &str) -> Result<serde_json::Value, String> {
+        // The event log stores Merkle tree hashes, not event payloads, so the
+        // resource reports entry counts and Merkle roots. A dropped bridge or
+        // an unreadable log is an error, never an empty log.
+        let bi = self.upgrade_bi()?;
+        // `bridge_event_log` summarizes the bridge's local tree, to which
+        // `invoke_outlet` appends the OutletInvokedEvent of every MCP
+        // `tools/call`. The actor's log never receives that record, so without
+        // `bridge_event_log` a `tools/call` would leave this resource
+        // unchanged.
+        let bridge_log = crate::runtime::with_context(&bi, context_id, |rt| {
+            Ok((
+                rt.event_log.leaves().len(),
+                scp_event_log::tree::root(&rt.event_log),
+            ))
+        })
+        .map_err(|e| format!("{e}"));
+        // With a supervisor attached, the top level reports the actor's log,
+        // whose events drive the pump's `resources/updated` notices, and
+        // `bridge_event_log` is `null` when the bridge holds no local tree for
+        // the context. Without a supervisor the bridge's tree is the context's
+        // only log, so an unreadable tree is an error.
+        let ((event_count, root), bridge_log) = if let Some(supervisor) = bi.core.try_supervisor() {
+            let actor_log = supervisor
+                .event_log_summary(&scp_core::context::state::context_id_to_bytes(context_id))
+                .map_err(|e| format!("cannot read the event log of context '{context_id}': {e}"))?;
+            (actor_log, bridge_log.ok())
+        } else {
+            let bridge_log = bridge_log?;
+            (bridge_log, Some(bridge_log))
+        };
+        let bridge_event_log = bridge_log.map(|(count, root)| {
+            serde_json::json!({
+                "event_count": count,
+                "merkle_root": crate::types::encode_hex(&root),
+            })
+        });
+        Ok(serde_json::json!({
+            "event_count": event_count,
+            "merkle_root": crate::types::encode_hex(&root),
+            "bridge_event_log": bridge_event_log,
+        }))
+    }
+}
+
+impl FfiBridgeProvider {
+    /// Runs `outlet_name` for [`ContextProvider::invoke_outlet`], which
+    /// passes the Invoke check as `authorize`. `authorize` runs after every
+    /// refusal that runs no outlet (the supervisor lookup, the hard rate
+    /// limit, the registry lookup and the input schema) and just before the
+    /// handler dispatch, because a passing Invoke check spends the agent
+    /// token. A refused `authorize` refunds the rate-limit token and runs no
+    /// outlet.
+    #[allow(clippy::too_many_lines)] // Three-phase dispatch: validate + execute + emit event.
+    fn run_outlet(
+        &self,
+        context_id: &str,
+        outlet_name: &str,
+        arguments: serde_json::Value,
+        authorize: impl FnOnce() -> Result<(), scp_mcp::server::AccessRefusal>,
+    ) -> Result<serde_json::Value, scp_mcp::server::OutletInvokeError> {
         // Validates outlet existence and input schema, then dispatches to a
         // registered handler if one exists. If no handler is registered, falls
         // back to echoing the validated input with metadata (schema-only mode).
@@ -1067,7 +1170,8 @@ impl ContextProvider for FfiBridgeProvider {
         ) {
             return Err("SCP-ECON-12090: rate limit exceeded on outlet_invoke: \
                         hard rate limit exceeded for invoker"
-                .to_owned());
+                .to_owned()
+                .into());
         }
         // Helper that refunds the token on any failure path. Used by
         // every `return Err` below. Same runtime-agnostic dispatch
@@ -1113,6 +1217,13 @@ impl ContextProvider for FfiBridgeProvider {
             ))
         })
         .map_err(|e| refund(format!("{e}")))?;
+
+        // The Invoke check records the agent token's nonce, so it runs after
+        // every refusal above and just before the dispatch below.
+        if let Err(refusal) = authorize() {
+            supervisor.refund_hard_rate_limit_from_any_context(context_id, &invoker_did_typed);
+            return Err(scp_mcp::server::OutletInvokeError::Refused(refusal));
+        }
 
         // Phase 2: Execute handler OUTSIDE the DashMap shard lock so that
         // concurrent same-context operations are not blocked during Python
@@ -1284,84 +1395,6 @@ impl ContextProvider for FfiBridgeProvider {
         }
 
         Ok(output)
-    }
-
-    fn validate_resource_access(
-        &self,
-        context_id: &str,
-        resource: scp_mcp::server::ResourceKind,
-    ) -> Result<(), scp_mcp::server::AccessRefusal> {
-        use scp_mcp::server::AccessRefusal;
-        // A dropped bridge instance or an unreadable role state is a failed
-        // read, which `resources/list` reports as an error instead of
-        // omitting the context's resources.
-        let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
-        let role_state =
-            Self::live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;
-        let access = resource.check_access(&role_state, &self.agent_did, context_id);
-        access.map_err(AccessRefusal::Denied)
-    }
-
-    fn context_members(&self, context_id: &str) -> Result<Vec<MemberInfo>, String> {
-        // A dropped bridge or an unreadable context is an error, never an
-        // empty roster.
-        let bi = self.upgrade_bi()?;
-        let role_state = Self::live_role_state(&bi, context_id)?;
-        Ok(role_state
-            .members
-            .iter()
-            .map(|did| MemberInfo {
-                did: did.clone(),
-                role: role_state
-                    .assignments
-                    .get(did)
-                    .map_or_else(|| "member".to_owned(), |a| a.role_name.clone()),
-            })
-            .collect())
-    }
-
-    fn context_events(&self, context_id: &str) -> Result<serde_json::Value, String> {
-        // The event log stores Merkle tree hashes, not event payloads, so the
-        // resource reports entry counts and Merkle roots. A dropped bridge or
-        // an unreadable log is an error, never an empty log.
-        let bi = self.upgrade_bi()?;
-        // `bridge_event_log` summarizes the bridge's local tree, to which
-        // `invoke_outlet` appends the OutletInvokedEvent of every MCP
-        // `tools/call`. The actor's log never receives that record, so without
-        // `bridge_event_log` a `tools/call` would leave this resource
-        // unchanged.
-        let bridge_log = crate::runtime::with_context(&bi, context_id, |rt| {
-            Ok((
-                rt.event_log.leaves().len(),
-                scp_event_log::tree::root(&rt.event_log),
-            ))
-        })
-        .map_err(|e| format!("{e}"));
-        // With a supervisor attached, the top level reports the actor's log,
-        // whose events drive the pump's `resources/updated` notices, and
-        // `bridge_event_log` is `null` when the bridge holds no local tree for
-        // the context. Without a supervisor the bridge's tree is the context's
-        // only log, so an unreadable tree is an error.
-        let ((event_count, root), bridge_log) = if let Some(supervisor) = bi.core.try_supervisor() {
-            let actor_log = supervisor
-                .event_log_summary(&scp_core::context::state::context_id_to_bytes(context_id))
-                .map_err(|e| format!("cannot read the event log of context '{context_id}': {e}"))?;
-            (actor_log, bridge_log.ok())
-        } else {
-            let bridge_log = bridge_log?;
-            (bridge_log, Some(bridge_log))
-        };
-        let bridge_event_log = bridge_log.map(|(count, root)| {
-            serde_json::json!({
-                "event_count": count,
-                "merkle_root": crate::types::encode_hex(&root),
-            })
-        });
-        Ok(serde_json::json!({
-            "event_count": event_count,
-            "merkle_root": crate::types::encode_hex(&root),
-            "bridge_event_log": bridge_event_log,
-        }))
     }
 }
 
@@ -3186,7 +3219,7 @@ mod tests {
         };
 
         let input = serde_json::json!({"a": 3, "b": 4});
-        let result = provider.invoke_outlet(&ctx_id, "calculator", input.clone());
+        let result = invoke_granted(&provider, &ctx_id, "calculator", input.clone());
         assert!(result.is_ok(), "invoke_outlet should succeed: {result:?}");
 
         let output = result.unwrap();
@@ -3231,8 +3264,12 @@ mod tests {
         };
 
         // Invoke in echo mode (no handler registered).
-        let result =
-            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+        let result = invoke_granted(
+            &provider,
+            &ctx_id,
+            "calculator",
+            serde_json::json!({"a": 1, "b": 2}),
+        );
         assert!(result.is_ok(), "invoke_outlet should succeed: {result:?}");
 
         // Verify the event log now has one event.
@@ -3245,8 +3282,12 @@ mod tests {
             "event log should have 1 event after invocation"
         );
         // Invoke again to verify sequential appending.
-        let result2 =
-            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 5, "b": 6}));
+        let result2 = invoke_granted(
+            &provider,
+            &ctx_id,
+            "calculator",
+            serde_json::json!({"a": 5, "b": 6}),
+        );
         assert!(result2.is_ok());
 
         let final_count = crate::runtime::with_context(&bi, &ctx_id, |rt| {
@@ -3286,8 +3327,12 @@ mod tests {
             agent_proof_tokens: None,
         };
 
-        let result =
-            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 10, "b": 20}));
+        let result = invoke_granted(
+            &provider,
+            &ctx_id,
+            "calculator",
+            serde_json::json!({"a": 10, "b": 20}),
+        );
         assert!(result.is_ok(), "invoke_outlet should succeed: {result:?}");
         assert_eq!(result.unwrap(), serde_json::json!({"result": 30.0}));
 
@@ -3311,6 +3356,114 @@ mod tests {
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
+    /// Runs an outlet through `run_outlet` with an Invoke check that passes,
+    /// so a test of the dispatch needs no UCAN token.
+    fn invoke_granted(
+        provider: &FfiBridgeProvider,
+        context_id: &str,
+        outlet_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        provider
+            .run_outlet(context_id, outlet_name, arguments, || Ok(()))
+            .map_err(|e| e.to_string())
+    }
+
+    fn event_count(bi: &crate::runtime::PyBridgeInstance, ctx_id: &str) -> u64 {
+        crate::runtime::with_context(bi, ctx_id, |rt| {
+            Ok(scp_event_log::tree::event_count(&rt.event_log))
+        })
+        .unwrap()
+    }
+
+    /// `run_outlet` asks for the Invoke check, which spends the agent token,
+    /// only after every refusal that runs no outlet: a missing supervisor, an
+    /// unknown outlet, and an input the schema rejects each refuse the call
+    /// without asking.
+    #[test]
+    fn run_outlet_authorizes_after_every_refusal_that_runs_no_outlet() {
+        let creator = "did:dht:z6MkCreatorAuthorizeLast";
+        let bi = __bi();
+        let provider_for = |ctx_id: &str| FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.to_owned()],
+            outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: None,
+            agent_proof_tokens: None,
+        };
+        let asked = std::cell::Cell::new(0_u32);
+        let authorize = || {
+            asked.set(asked.get() + 1);
+            Ok(())
+        };
+
+        let unsupervised = setup_unsupervised_context(&bi, creator, true);
+        let provider = provider_for(&unsupervised);
+        let args = serde_json::json!({"a": 1, "b": 2});
+        assert!(
+            provider
+                .run_outlet(&unsupervised, "calculator", args.clone(), authorize)
+                .is_err()
+        );
+        assert_eq!(asked.get(), 0, "no supervisor: the token must stay unspent");
+        crate::runtime::remove_context(&bi, &unsupervised);
+
+        let ctx_id = setup_test_context(&bi, creator, true);
+        let provider = provider_for(&ctx_id);
+        assert!(
+            provider
+                .run_outlet(&ctx_id, "nonexistent", args.clone(), authorize)
+                .is_err()
+        );
+        assert!(
+            provider
+                .run_outlet(&ctx_id, "calculator", serde_json::json!("bad"), authorize)
+                .is_err()
+        );
+        assert_eq!(asked.get(), 0, "a refused call must not spend the token");
+
+        assert!(
+            provider
+                .run_outlet(&ctx_id, "calculator", args, authorize)
+                .is_ok()
+        );
+        assert_eq!(asked.get(), 1, "the dispatched call asks once");
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// A refused Invoke check runs no outlet and appends no event, and the
+    /// trait's `invoke_outlet` passes its Invoke check as `authorize`: with no
+    /// UCAN token, that check refuses.
+    #[test]
+    fn refused_invoke_check_runs_no_outlet() {
+        let creator = "did:dht:z6MkCreatorRefusedInvoke";
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
+        let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+            outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: None,
+            agent_proof_tokens: None,
+        };
+        let args = serde_json::json!({"a": 1, "b": 2});
+        let refused = provider.run_outlet(&ctx_id, "calculator", args.clone(), || {
+            Err(scp_mcp::server::AccessRefusal::Denied("replay".to_owned()))
+        });
+        assert!(matches!(
+            refused,
+            Err(scp_mcp::server::OutletInvokeError::Refused(_))
+        ));
+        assert!(matches!(
+            provider.invoke_outlet(&ctx_id, "calculator", args),
+            Err(scp_mcp::server::OutletInvokeError::Refused(_))
+        ));
+        assert_eq!(event_count(&bi, &ctx_id), 0, "no outlet may have run");
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
     #[test]
     fn invoke_outlet_error_does_not_append_event() {
         let creator = "did:dht:z6MkCreatorNoEventOnErr";
@@ -3328,8 +3481,12 @@ mod tests {
         };
 
         // Invoke with invalid input (schema validation fails).
-        let result =
-            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!("not an object"));
+        let result = invoke_granted(
+            &provider,
+            &ctx_id,
+            "calculator",
+            serde_json::json!("not an object"),
+        );
         assert!(result.is_err(), "invalid input should be rejected");
 
         // Event log should still be empty (no event appended on error).
@@ -3367,8 +3524,12 @@ mod tests {
 
         // Input schema requires an object with "a" and "b" as required fields.
         // Pass a string instead.
-        let result =
-            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!("not an object"));
+        let result = invoke_granted(
+            &provider,
+            &ctx_id,
+            "calculator",
+            serde_json::json!("not an object"),
+        );
         assert!(result.is_err(), "invalid input should be rejected");
         let err = result.unwrap_err();
         assert!(
@@ -3377,15 +3538,24 @@ mod tests {
         );
 
         // Pass an object missing required fields.
-        let result = provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 1}));
+        let result = invoke_granted(
+            &provider,
+            &ctx_id,
+            "calculator",
+            serde_json::json!({"a": 1}),
+        );
         assert!(
             result.is_err(),
             "input missing required field 'b' should be rejected"
         );
 
         // Pass valid input — should succeed.
-        let result =
-            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+        let result = invoke_granted(
+            &provider,
+            &ctx_id,
+            "calculator",
+            serde_json::json!({"a": 1, "b": 2}),
+        );
         assert!(result.is_ok(), "valid input should succeed: {result:?}");
 
         crate::runtime::remove_context(&bi, &ctx_id);
@@ -3411,7 +3581,7 @@ mod tests {
             agent_proof_tokens: None,
         };
 
-        let result = provider.invoke_outlet(&ctx_id, "nonexistent", serde_json::json!({}));
+        let result = invoke_granted(&provider, &ctx_id, "nonexistent", serde_json::json!({}));
         assert!(result.is_err(), "unknown outlet should be rejected");
         let err = result.unwrap_err();
         assert!(
@@ -3561,7 +3731,7 @@ mod tests {
         };
 
         let input = serde_json::json!({"a": 3, "b": 4});
-        let result = provider.invoke_outlet(&ctx_id, "calculator", input);
+        let result = invoke_granted(&provider, &ctx_id, "calculator", input);
         assert!(result.is_ok(), "invoke_outlet should succeed: {result:?}");
 
         let output = result.unwrap();
@@ -3626,8 +3796,12 @@ mod tests {
             agent_proof_tokens: None,
         };
 
-        let result =
-            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+        let result = invoke_granted(
+            &provider,
+            &ctx_id,
+            "calculator",
+            serde_json::json!({"a": 1, "b": 2}),
+        );
         assert!(
             result.is_err(),
             "handler returning invalid output should be rejected"
@@ -3664,8 +3838,12 @@ mod tests {
             agent_proof_tokens: None,
         };
 
-        let result =
-            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+        let result = invoke_granted(
+            &provider,
+            &ctx_id,
+            "calculator",
+            serde_json::json!({"a": 1, "b": 2}),
+        );
         assert!(result.is_err(), "failing handler should propagate error");
         let err = result.unwrap_err();
         assert!(
@@ -3705,8 +3883,12 @@ mod tests {
             agent_proof_tokens: None,
         };
 
-        let result =
-            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+        let result = invoke_granted(
+            &provider,
+            &ctx_id,
+            "calculator",
+            serde_json::json!({"a": 1, "b": 2}),
+        );
         assert!(result.is_err(), "blocking handler should be timed out");
         let err = result.unwrap_err();
         assert!(
@@ -3753,8 +3935,12 @@ mod tests {
             agent_proof_tokens: None,
         };
 
-        let result =
-            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 3, "b": 4}));
+        let result = invoke_granted(
+            &provider,
+            &ctx_id,
+            "calculator",
+            serde_json::json!({"a": 3, "b": 4}),
+        );
         assert!(
             result.is_ok(),
             "fast handler should complete within timeout: {result:?}"

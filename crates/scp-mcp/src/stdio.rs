@@ -456,6 +456,14 @@ where
                 Err(e) => tracing::error!("failed to serialize response: {e}"),
             }
         }
+        // A `tools/call` queues the notifications its outlet run causes. They
+        // go out after its response, under the same lock.
+        for notification in &srv.take_pending_notifications() {
+            if !channel.notify(notification).await {
+                // stdout is gone; the session is over.
+                return Ok(());
+            }
+        }
         // Released only after the response is on the wire: see `serve_stdio`.
         drop(srv);
     }
@@ -584,7 +592,7 @@ mod tests {
             _context_id: &str,
             _outlet_id: &str,
             _arguments: serde_json::Value,
-        ) -> Result<serde_json::Value, String> {
+        ) -> Result<serde_json::Value, crate::server::OutletInvokeError> {
             Ok(serde_json::json!({"status": "ok"}))
         }
         fn validate_resource_access(
@@ -954,6 +962,42 @@ mod tests {
         assert!(server.handle_request(&sub).unwrap().error.is_none());
 
         (tx, server, pump)
+    }
+
+    /// The read loop sends the notifications a `tools/call` queued, after the
+    /// call's response. Without the drain, a subscriber to
+    /// `scp://{ctx}/events` would not learn that the call appended to the log.
+    #[tokio::test]
+    async fn read_loop_sends_the_notifications_a_tools_call_queued() {
+        let (_event_tx, server, _pump) = wired_subscribed_server("scp://ctx_a/events");
+        let server = Arc::new(tokio::sync::Mutex::new(server));
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "ctx_a/send_message", "arguments": {"content": "hi"}},
+            "id": 3
+        });
+        let channel = VecSink::default();
+        read_loop_from(
+            &server,
+            BufReader::new(format!("{call}\n").as_bytes()),
+            &channel,
+        )
+        .await
+        .unwrap();
+
+        let lines = channel.lines.lock().await.clone();
+        let response: serde_json::Value = serde_json::from_slice(&lines).unwrap();
+        assert!(response.get("error").is_none(), "{response}");
+        let notifications = channel.notifications().await;
+        assert!(
+            notifications
+                .iter()
+                .any(|n| n.contains("notifications/resources/updated")
+                    && n.contains("scp://ctx_a/events")),
+            "{notifications:?}"
+        );
+        assert!(server.lock().await.take_pending_notifications().is_empty());
     }
 
     /// The HIGH-severity fix: stopping the server while stdin is still open must

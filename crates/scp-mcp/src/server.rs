@@ -21,7 +21,9 @@
 //!   event invalidates.
 //! - **MCP lifecycle** (`initialize`, `notifications/initialized`, `ping`).
 //! - **Dynamic updates** -- emits `notifications/tools/list_changed` when an
-//!   event changes the capability-filtered tool set.
+//!   event or a `tools/call` changes the capability-filtered tool set. A
+//!   `tools/call` queues its notifications, and the transport drains them
+//!   with [`McpServer::take_pending_notifications`].
 //!
 //! The server uses trait-based abstractions ([`ContextProvider`]) so it can
 //! be tested independently of the full SCP stack.
@@ -244,16 +246,18 @@ pub struct MemberInfo {
 /// A UCAN check records the token's nonce (ADR-016 Step 9), and a recorded
 /// nonce fails every later check of the same token as a replay. The server
 /// holds one agent token for its lifetime, so that token authorizes one
-/// outlet run: only the check made just before `invoke_outlet` may record it.
+/// outlet run: only the check a provider's
+/// [`ContextProvider::invoke_outlet`] makes just before it dispatches the
+/// outlet may record it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityCheck {
     /// Decides what the agent sees (`tools/list`, `scp://{ctx}/tools` and the
     /// notification pump's view) and refuses a `tools/call` before its input
     /// is validated. The provider checks the nonce and records nothing.
     Probe,
-    /// Authorizes the outlet run a `tools/call` makes next, after its input
-    /// passed validation. The provider records the nonce when the check
-    /// passes.
+    /// Authorizes the outlet run that [`ContextProvider::invoke_outlet`]
+    /// dispatches next, after every refusal that runs no outlet. The provider
+    /// records the nonce when the check passes.
     Invoke,
 }
 
@@ -275,6 +279,32 @@ impl std::fmt::Display for AccessRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Denied(msg) | Self::Unreadable(msg) => f.write_str(msg),
+        }
+    }
+}
+
+/// Why [`ContextProvider::invoke_outlet`] returned no output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutletInvokeError {
+    /// The [`CapabilityCheck::Invoke`] check refused the run. No outlet ran,
+    /// and the provider recorded no nonce.
+    Refused(AccessRefusal),
+    /// The provider refused the call before that check, or the outlet failed
+    /// after it. The message says which.
+    Failed(String),
+}
+
+impl From<String> for OutletInvokeError {
+    fn from(msg: String) -> Self {
+        Self::Failed(msg)
+    }
+}
+
+impl std::fmt::Display for OutletInvokeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(refusal) => refusal.fmt(f),
+            Self::Failed(msg) => f.write_str(msg),
         }
     }
 }
@@ -384,16 +414,24 @@ pub trait ContextProvider: Send + Sync {
     /// Invokes a tool and returns its output as a JSON value.
     ///
     /// The implementation is responsible for schema validation and execution.
+    /// It makes every refusal that runs no outlet (an input the schema
+    /// rejects, an unknown outlet, an exhausted rate limit) first, then calls
+    /// [`Self::validate_capability`] with [`CapabilityCheck::Invoke`], and
+    /// dispatches the outlet only when that check passes. The Invoke check
+    /// records the agent token's nonce, so a refusal made after it would
+    /// spend the token without running an outlet.
     ///
     /// # Errors
     ///
-    /// Returns an error message if tool execution fails.
+    /// Returns [`OutletInvokeError::Refused`] when the Invoke check refuses
+    /// the run, and [`OutletInvokeError::Failed`] when the provider refuses
+    /// the call before that check or the outlet fails.
     fn invoke_outlet(
         &self,
         context_id: &str,
         tool_name: &str,
         arguments: Value,
-    ) -> Result<Value, String>;
+    ) -> Result<Value, OutletInvokeError>;
 
     /// Returns the current members of a context.
     ///
@@ -464,6 +502,10 @@ pub struct McpServer<P: ContextProvider> {
     /// `resources.listChanged` and `tools.listChanged` at `initialize`, and
     /// whether `resources/subscribe` is accepted.
     event_source_wired: bool,
+    /// Notifications a `tools/call` produced that the transport has not yet
+    /// sent. A transport drains them with [`Self::take_pending_notifications`]
+    /// after each [`Self::handle_request`], under the same lock.
+    pending_notifications: Vec<JsonRpcNotification>,
 }
 
 /// The receiving half of a wired [`ContextEvent`] source, produced together
@@ -623,6 +665,7 @@ impl<P: ContextProvider> McpServer<P> {
             client_views: std::sync::Mutex::new(HashMap::new()),
             // Fail closed: no event source, no promises that need one.
             event_source_wired: false,
+            pending_notifications: Vec::new(),
         }
     }
 
@@ -666,6 +709,7 @@ impl<P: ContextProvider> McpServer<P> {
             served_contexts: std::sync::Mutex::new(HashSet::new()),
             client_views: std::sync::Mutex::new(HashMap::new()),
             event_source_wired: true,
+            pending_notifications: Vec::new(),
         };
         (server, ContextEventPump { rx })
     }
@@ -782,10 +826,11 @@ impl<P: ContextProvider> McpServer<P> {
 
         // Every advertised capability below is *derived* from
         // `event_source_wired`, never asserted. `notifications/tools/list_changed`
-        // and `notifications/resources/list_changed` are advertised iff wired; the
-        // pump — through `notifications_for_event` on a live event and through
-        // `lagged_resync_notifications` after a broadcast lag — is their only
-        // producer, so without an event source they can never be sent, and
+        // and `notifications/resources/list_changed` are advertised iff wired. The
+        // pump (through `notifications_for_event` on a live event and through
+        // `lagged_resync_notifications` after a broadcast lag) and the queue a
+        // `tools/call` fills produce them, and both return nothing on an unwired
+        // server, so without an event source they can never be sent, and
         // claiming otherwise is the same false guarantee `resources.subscribe:
         // true` used to make.
         let wired = self.event_source_wired;
@@ -956,7 +1001,7 @@ impl<P: ContextProvider> McpServer<P> {
     // input schema, output schema) plus invocation and provenance attachment
     // form a linear pipeline that reads worse when split across functions.
     #[allow(clippy::too_many_lines)]
-    fn handle_tools_call(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
+    fn handle_tools_call(&mut self, request: &JsonRpcRequest) -> JsonRpcResponse {
         let params: ToolsCallParams = match parse_params(request.params.as_ref()) {
             Ok(p) => p,
             Err(resp) => return with_id(resp, request.id.clone()),
@@ -1013,7 +1058,9 @@ impl<P: ContextProvider> McpServer<P> {
 
         // Validate UCAN capability. A probe refuses an agent that may not call
         // the tool before its input is examined; it records no nonce, so a
-        // call refused below leaves the agent token unspent.
+        // call refused below leaves the agent token unspent. The recording
+        // Invoke check runs inside `invoke_outlet`, after the provider's own
+        // refusals and just before the outlet it authorizes.
         if let Some(refused) =
             self.capability_refusal(request, &context_id, tool_name, CapabilityCheck::Probe)
         {
@@ -1040,18 +1087,21 @@ impl<P: ContextProvider> McpServer<P> {
             );
         }
 
-        // The recording check runs last, just before the outlet it authorizes.
-        if let Some(refused) =
-            self.capability_refusal(request, &context_id, tool_name, CapabilityCheck::Invoke)
-        {
-            return refused;
-        }
-
         // Invoke the tool.
-        match self
+        let invoked = self
             .provider
-            .invoke_outlet(&context_id, tool_name, params.arguments)
-        {
+            .invoke_outlet(&context_id, tool_name, params.arguments);
+        if !matches!(invoked, Err(OutletInvokeError::Refused(_))) {
+            // An outlet run appends to the log behind `scp://{ctx}/events`,
+            // and the Invoke check that authorized it spent the agent token,
+            // which empties the tool view. No `ContextEvent` reports either
+            // change, so this queues what the pump would send for one. A
+            // failed call may have run no outlet; it costs the client one
+            // spurious read.
+            let notifications = self.notifications_for(&context_id, OUTLET_RUN_AFFECTS);
+            self.pending_notifications.extend(notifications);
+        }
+        match invoked {
             Ok(output) => {
                 // Validate output against schema if available. A registry the
                 // provider cannot read withholds the output: returning it
@@ -1076,7 +1126,7 @@ impl<P: ContextProvider> McpServer<P> {
                 // Attach provenance.
                 let provenance = ToolProvenance {
                     invoked_by: self.provider.agent_did().to_owned(),
-                    context_id: context_id.clone(),
+                    context_id,
                     tool_name: tool_name.to_owned(),
                 };
 
@@ -1106,7 +1156,8 @@ impl<P: ContextProvider> McpServer<P> {
                     Err(e) => internal_error(request.id.clone(), &e.to_string()),
                 }
             }
-            Err(msg) => JsonRpcResponse::error(
+            Err(OutletInvokeError::Refused(refusal)) => refusal_response(request, refusal),
+            Err(OutletInvokeError::Failed(msg)) => JsonRpcResponse::error(
                 request.id.clone(),
                 JsonRpcError {
                     code: protocol::TOOL_EXECUTION_ERROR,
@@ -1428,6 +1479,7 @@ impl<P: ContextProvider> McpServer<P> {
     /// server's wiring, not the session.
     pub fn reset_session(&mut self) {
         self.subscriptions.clear();
+        self.pending_notifications.clear();
         self.initialized = false;
         self.client_capabilities = None;
         self.served_contexts
@@ -1438,6 +1490,13 @@ impl<P: ContextProvider> McpServer<P> {
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+    }
+
+    /// Removes and returns the notifications that `tools/call` requests
+    /// queued. A transport sends them after the response of the request that
+    /// queued them, under the lock it holds for [`Self::handle_request`].
+    pub fn take_pending_notifications(&mut self) -> Vec<JsonRpcNotification> {
+        std::mem::take(&mut self.pending_notifications)
     }
 
     /// Creates a `notifications/tools/list_changed` notification.
@@ -1514,6 +1573,17 @@ impl<P: ContextProvider> McpServer<P> {
         context_id: &str,
         event: &ContextEvent,
     ) -> Vec<JsonRpcNotification> {
+        self.notifications_for(context_id, affected_resources(event))
+    }
+
+    /// The notifications for a change to `context_id` that invalidates the
+    /// `affected` resources. [`Self::notifications_for_event`] describes the
+    /// rules.
+    fn notifications_for(
+        &self,
+        context_id: &str,
+        affected: AffectedResources,
+    ) -> Vec<JsonRpcNotification> {
         // A server that advertised none of the pump-backed capabilities must
         // produce none of their notifications, even if some caller hands it an
         // event anyway. This makes "advertised ⟺ emittable" total rather than
@@ -1522,7 +1592,6 @@ impl<P: ContextProvider> McpServer<P> {
             return Vec::new();
         }
 
-        let affected = affected_resources(event);
         // When the provider cannot read whether the agent still takes part,
         // the event is neither a change to a served context nor the one that
         // removed it. `served_contexts` stays as it is. A client that was told
@@ -1792,21 +1861,10 @@ impl<P: ContextProvider> McpServer<P> {
         tool_name: &str,
         check: CapabilityCheck,
     ) -> Option<JsonRpcResponse> {
-        match self
-            .provider
+        self.provider
             .validate_capability(context_id, tool_name, check)
-        {
-            Ok(()) => None,
-            Err(AccessRefusal::Unreadable(msg)) => Some(internal_error(request.id.clone(), &msg)),
-            Err(AccessRefusal::Denied(msg)) => Some(JsonRpcResponse::error(
-                request.id.clone(),
-                JsonRpcError {
-                    code: protocol::CAPABILITY_DENIED,
-                    message: msg,
-                    data: None,
-                },
-            )),
-        }
+            .err()
+            .map(|refusal| refusal_response(request, refusal))
     }
 
     /// Finds the input schema for a tool (built-in or context-registered).
@@ -1946,6 +2004,22 @@ fn internal_error(id: RequestId, message: &str) -> JsonRpcResponse {
     )
 }
 
+/// The `tools/call` error response for a capability `refusal`:
+/// `CAPABILITY_DENIED` for a denial, and an internal error for a failed read.
+fn refusal_response(request: &JsonRpcRequest, refusal: AccessRefusal) -> JsonRpcResponse {
+    match refusal {
+        AccessRefusal::Unreadable(msg) => internal_error(request.id.clone(), &msg),
+        AccessRefusal::Denied(msg) => JsonRpcResponse::error(
+            request.id.clone(),
+            JsonRpcError {
+                code: protocol::CAPABILITY_DENIED,
+                message: msg,
+                data: None,
+            },
+        ),
+    }
+}
+
 /// Which of a context's MCP resources a [`ContextEvent`] invalidates.
 ///
 /// Crate-internal: the fields name resource URIs that only [`ResourceKind`]
@@ -1961,6 +2035,15 @@ pub(crate) struct AffectedResources {
     /// `scp://{ctx}/tools` -- the capability-filtered tool list.
     pub(crate) tools: bool,
 }
+
+/// The resources a `tools/call` invalidates: its outlet run appends to the
+/// event log, and the Invoke check that authorized the run spent the agent
+/// token, which removes every outlet from the tool view.
+const OUTLET_RUN_AFFECTS: AffectedResources = AffectedResources {
+    events: true,
+    members: false,
+    tools: true,
+};
 
 /// Classifies a [`ContextEvent`] by which MCP resources it invalidates.
 ///
@@ -2121,6 +2204,16 @@ mod tests {
         participation_unreadable: bool,
         /// Every `validate_capability` call's purpose, in call order.
         checks: std::sync::Mutex<Vec<CapabilityCheck>>,
+        /// Whether an Invoke check refuses the run, as a concurrent call that
+        /// spent the token first makes it do.
+        refuse_invoke: bool,
+        /// Whether a passing Invoke check records the agent token's nonce, as
+        /// the bridges' `OutletGrantNonceTracker` does. Off by default, so a
+        /// test can make several calls.
+        single_use_token: bool,
+        /// Whether a passing Invoke check recorded the nonce. Every later
+        /// check then fails the token as a replay.
+        token_spent: std::sync::atomic::AtomicBool,
     }
 
     impl MockProvider {
@@ -2165,6 +2258,9 @@ mod tests {
                 unreadable: Vec::new(),
                 participation_unreadable: false,
                 checks: std::sync::Mutex::new(Vec::new()),
+                refuse_invoke: false,
+                single_use_token: false,
+                token_spent: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -2214,21 +2310,31 @@ mod tests {
                 .iter()
                 .any(|(cid, tn)| cid == context_id && tn == tool_name)
             {
-                Err(AccessRefusal::Denied(format!(
+                return Err(AccessRefusal::Denied(format!(
                     "capability denied: {tool_name} in {context_id}"
-                )))
-            } else {
-                Ok(())
+                )));
             }
+            if self.token_spent.load(std::sync::atomic::Ordering::SeqCst)
+                || (check == CapabilityCheck::Invoke && self.refuse_invoke)
+            {
+                return Err(AccessRefusal::Denied("token replay".to_owned()));
+            }
+            if check == CapabilityCheck::Invoke && self.single_use_token {
+                self.token_spent
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
         }
 
         fn invoke_outlet(
             &self,
-            _context_id: &str,
-            _tool_name: &str,
+            context_id: &str,
+            tool_name: &str,
             _arguments: Value,
-        ) -> Result<Value, String> {
-            self.invoke_result.clone()
+        ) -> Result<Value, OutletInvokeError> {
+            self.validate_capability(context_id, tool_name, CapabilityCheck::Invoke)
+                .map_err(OutletInvokeError::Refused)?;
+            Ok(self.invoke_result.clone()?)
         }
 
         fn validate_resource_access(
@@ -2590,11 +2696,11 @@ mod tests {
         assert!(names.contains(&"ctx_b/send_message"));
     }
 
-    /// Listing asks the provider only for probes, which record no UCAN nonce;
-    /// the one check made just before a `tools/call` runs its outlet is the
-    /// only `Invoke`. A listing, or a call refused for its input, that
-    /// recorded the agent token's nonce would fail every later check of that
-    /// token as a replay.
+    /// Listing asks the provider only for probes, which record no UCAN nonce.
+    /// A `tools/call` makes one probe and leaves the recording Invoke check to
+    /// `invoke_outlet`, which this mock makes as the trait contract requires.
+    /// A listing, or a call refused for its input, that recorded the agent
+    /// token's nonce would fail every later check of that token as a replay.
     #[test]
     fn only_tools_call_asks_for_an_invoke_check() {
         let mut server = initialized_server(MockProvider::default());
@@ -2636,6 +2742,89 @@ mod tests {
             vec![CapabilityCheck::Probe],
             "a call refused for its input must not reach the recording check"
         );
+    }
+
+    fn send_message_call() -> JsonRpcRequest {
+        make_request(
+            protocol::METHOD_TOOLS_CALL,
+            Some(serde_json::json!({
+                "name": "ctx_a/send_message",
+                "arguments": {"content": "hello"}
+            })),
+        )
+    }
+
+    /// An Invoke check that refuses inside `invoke_outlet` answers
+    /// `CAPABILITY_DENIED`, as a refused probe does, and queues no
+    /// notification, because no outlet ran.
+    #[test]
+    fn refused_invoke_check_answers_capability_denied_and_queues_nothing() {
+        let mut server = subscribing_server(MockProvider {
+            refuse_invoke: true,
+            ..MockProvider::default()
+        });
+        subscribe(&mut server, "scp://ctx_a/events");
+        let err = server
+            .handle_request(&send_message_call())
+            .unwrap()
+            .error
+            .expect("a refused Invoke check must refuse the call");
+        assert_eq!(err.code, protocol::CAPABILITY_DENIED);
+        assert!(server.take_pending_notifications().is_empty());
+    }
+
+    /// A `tools/call` changes `scp://{ctx}/events` and, by spending the agent
+    /// token, the tool view. No `ContextEvent` reports either change, so the
+    /// call queues the notifications a subscriber and a lister need.
+    #[test]
+    fn tools_call_queues_events_update_and_tool_view_change() {
+        let mut server = subscribing_server(MockProvider {
+            single_use_token: true,
+            ..MockProvider::default()
+        });
+        let list = make_request(protocol::METHOD_TOOLS_LIST, None);
+        assert!(server.handle_request(&list).unwrap().error.is_none());
+        subscribe(&mut server, "scp://ctx_a/events");
+        subscribe(&mut server, "scp://ctx_a/tools");
+
+        assert!(
+            server
+                .handle_request(&send_message_call())
+                .unwrap()
+                .error
+                .is_none()
+        );
+        let queued = server.take_pending_notifications();
+        let updated: Vec<&str> = queued
+            .iter()
+            .filter(|n| n.method == protocol::METHOD_RESOURCES_UPDATED)
+            .map(|n| n.params.as_ref().unwrap()["uri"].as_str().unwrap())
+            .collect();
+        assert_eq!(updated, vec!["scp://ctx_a/events", "scp://ctx_a/tools"]);
+        assert!(
+            queued
+                .iter()
+                .any(|n| n.method == protocol::METHOD_TOOLS_LIST_CHANGED)
+        );
+        assert!(
+            server.take_pending_notifications().is_empty(),
+            "taking the queue empties it"
+        );
+    }
+
+    /// An unwired server advertised no notifications, so a `tools/call`
+    /// queues none.
+    #[test]
+    fn unwired_tools_call_queues_nothing() {
+        let mut server = initialized_server(MockProvider::default());
+        assert!(
+            server
+                .handle_request(&send_message_call())
+                .unwrap()
+                .error
+                .is_none()
+        );
+        assert!(server.take_pending_notifications().is_empty());
     }
 
     // -----------------------------------------------------------------------
