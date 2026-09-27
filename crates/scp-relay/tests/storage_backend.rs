@@ -22,7 +22,64 @@
 //! gating the whole test out keeps every test running in every configuration
 //! CI builds.
 
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+/// Runs `command` and returns its output, killing the child and failing the
+/// test if it has not exited after 30 seconds.
+///
+/// Every test that calls this expects `scp-relay` to reject its configuration
+/// and exit. A regression that lets a rejected backend fall back to another
+/// store starts a relay that serves forever, and `Command::output` would then
+/// block until the CI job's own timeout instead of failing an assertion that
+/// names the fallback. Both pipes are drained on their own threads so a child
+/// that writes more than a pipe buffer before it exits cannot stall on a full
+/// pipe and trip the deadline. `crates/scp-node/tests/storage_backend_selection.rs`
+/// carries the node binary's copy.
+fn output_within_deadline(command: &mut Command) -> Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn scp-relay");
+    let drain = |mut pipe: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).expect("read child pipe");
+            bytes
+        })
+    };
+    let stdout = drain(Box::new(child.stdout.take().expect("stdout is piped")));
+    let stderr = drain(Box::new(child.stderr.take().expect("stderr is piped")));
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = stdout.join().expect("stdout reader thread");
+    let stderr = stderr.join().expect("stderr reader thread");
+    let Some(status) = status else {
+        panic!(
+            "scp-relay did not exit within 30 seconds, so it is serving instead \
+             of rejecting its configuration; stderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+    };
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
 
 /// Reports whether this build compiled the `storage_from_env` arm that
 /// constructs `name`.
@@ -69,11 +126,11 @@ fn relay_bin() -> std::path::PathBuf {
 /// and then listed `postgres` among the valid options.
 #[test]
 fn invalid_backend_exits_with_error() {
-    let output = Command::new(relay_bin())
-        .env("SCP_RELAY_STORAGE_BACKEND", "banana")
-        .env_remove("RUST_LOG")
-        .output()
-        .expect("failed to execute scp-relay");
+    let output = output_within_deadline(
+        Command::new(relay_bin())
+            .env("SCP_RELAY_STORAGE_BACKEND", "banana")
+            .env_remove("RUST_LOG"),
+    );
 
     assert!(
         !output.status.success(),
@@ -109,12 +166,12 @@ fn invalid_backend_exits_with_error() {
 /// build compiled no postgres arm, and exits naming the feature that would.
 #[test]
 fn postgres_without_url_exits_with_error() {
-    let output = Command::new(relay_bin())
-        .env("SCP_RELAY_STORAGE_BACKEND", "postgres")
-        .env_remove("SCP_RELAY_DATABASE_URL")
-        .env_remove("RUST_LOG")
-        .output()
-        .expect("failed to execute scp-relay");
+    let output = output_within_deadline(
+        Command::new(relay_bin())
+            .env("SCP_RELAY_STORAGE_BACKEND", "postgres")
+            .env_remove("SCP_RELAY_DATABASE_URL")
+            .env_remove("RUST_LOG"),
+    );
 
     assert!(
         !output.status.success(),
@@ -144,12 +201,12 @@ fn postgres_without_url_exits_with_error() {
 /// compiled no s3 arm, and exits naming the feature that would.
 #[test]
 fn s3_without_bucket_exits_with_error() {
-    let output = Command::new(relay_bin())
-        .env("SCP_RELAY_STORAGE_BACKEND", "s3")
-        .env_remove("SCP_RELAY_S3_BUCKET")
-        .env_remove("RUST_LOG")
-        .output()
-        .expect("failed to execute scp-relay");
+    let output = output_within_deadline(
+        Command::new(relay_bin())
+            .env("SCP_RELAY_STORAGE_BACKEND", "s3")
+            .env_remove("SCP_RELAY_S3_BUCKET")
+            .env_remove("RUST_LOG"),
+    );
 
     assert!(
         !output.status.success(),
@@ -418,12 +475,12 @@ fn the_cloud_blobs_feature_compiles_both_cloud_backends() {
         ("postgres", "SCP_RELAY_DATABASE_URL"),
         ("s3", "SCP_RELAY_S3_BUCKET"),
     ] {
-        let output = Command::new(relay_bin())
-            .env("SCP_RELAY_STORAGE_BACKEND", backend)
-            .env_remove(required)
-            .env_remove("RUST_LOG")
-            .output()
-            .expect("failed to execute scp-relay");
+        let output = output_within_deadline(
+            Command::new(relay_bin())
+                .env("SCP_RELAY_STORAGE_BACKEND", backend)
+                .env_remove(required)
+                .env_remove("RUST_LOG"),
+        );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             !stderr.contains("not compiled"),
@@ -447,15 +504,15 @@ fn a_non_utf8_backend_value_is_rejected_not_defaulted() {
 
     let tmp = tempfile::tempdir().expect("failed to create tempdir");
     let db_path = tmp.path().join("must-not-exist.db");
-    let output = Command::new(relay_bin())
-        .env(
-            "SCP_RELAY_STORAGE_BACKEND",
-            std::ffi::OsStr::from_bytes(b"sq\xfflite"),
-        )
-        .env("SCP_RELAY_STORAGE_PATH", &db_path)
-        .env_remove("RUST_LOG")
-        .output()
-        .expect("failed to execute scp-relay");
+    let output = output_within_deadline(
+        Command::new(relay_bin())
+            .env(
+                "SCP_RELAY_STORAGE_BACKEND",
+                std::ffi::OsStr::from_bytes(b"sq\xfflite"),
+            )
+            .env("SCP_RELAY_STORAGE_PATH", &db_path)
+            .env_remove("RUST_LOG"),
+    );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

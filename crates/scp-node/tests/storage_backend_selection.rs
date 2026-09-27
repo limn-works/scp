@@ -18,8 +18,10 @@
 #![allow(clippy::expect_used)]
 
 use std::ffi::{OsStr, OsString};
+use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 /// The `SCP_RELAY_STORAGE_BACKEND` values the persistent full node must
 /// reject: the two cloud backends, and on Unix a value that is not valid UTF-8.
@@ -65,7 +67,59 @@ fn run_node(cwd: &Path, storage_dir: &Path, blob_db: &Path, extra: &[(&str, &OsS
     for (key, value) in extra {
         command.env(key, value);
     }
-    command.output().expect("failed to execute scp-node")
+    output_within_deadline(&mut command)
+}
+
+/// Runs `command` and returns its output, killing the child and failing the
+/// test if it has not exited after 30 seconds.
+///
+/// Every test in this file expects `scp-node` to exit. A regression that lets a
+/// rejected configuration fall back to another store starts a server that never
+/// exits, and `Command::output` would then block until the CI job's own timeout
+/// instead of failing an assertion that names the fallback. Both pipes are
+/// drained on their own threads so a child that writes more than a pipe buffer
+/// before it exits cannot stall on a full pipe and trip the deadline.
+fn output_within_deadline(command: &mut Command) -> Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn scp-node");
+    let drain = |mut pipe: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).expect("read child pipe");
+            bytes
+        })
+    };
+    let stdout = drain(Box::new(child.stdout.take().expect("stdout is piped")));
+    let stderr = drain(Box::new(child.stderr.take().expect("stderr is piped")));
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = stdout.join().expect("stdout reader thread");
+    let stderr = stderr.join().expect("stderr reader thread");
+    assert!(
+        status.is_some(),
+        "scp-node did not exit within 30 seconds, so it is serving instead of \
+         rejecting its configuration; stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    Output {
+        status: status.expect("checked above"),
+        stdout,
+        stderr,
+    }
 }
 
 /// `postgres` and `s3` fail on every build: a default build compiled neither
@@ -98,6 +152,16 @@ fn a_rejected_blob_backend_writes_no_storage_before_exiting() {
             stderr.contains(&*backend),
             "the rejection names the requested backend; stderr: {stderr}"
         );
+        if let Some(feature) = scp_transport::startup::backend_binary_feature(&backend)
+            && !scp_transport::startup::backend_is_compiled(&backend)
+        {
+            assert!(
+                stderr.contains("is not compiled into this binary")
+                    && stderr.contains(&format!("--features {feature}")),
+                "a build without the {backend} arm must say so and name \
+                 `--features {feature}`; stderr: {stderr}"
+            );
+        }
         assert!(
             !storage_dir.exists(),
             "a rejected {backend} backend must create no storage directory, key \
@@ -177,46 +241,31 @@ fn an_unusable_storage_path_opens_no_blob_database() {
 /// or `=s3` exits non-zero, names the value, and leaves no storage directory,
 /// instead of serving from a `SQLite` store the operator did not select.
 ///
-/// A regression would start a server that never exits, so the child is killed
-/// after 30 seconds and the test fails on the missing exit.
+/// A regression would start a server that never exits, so
+/// [`output_within_deadline`] kills the child after 30 seconds and fails.
 #[test]
 fn self_host_rejects_a_cloud_backend_before_writing_storage() {
     for value in [OsString::from("postgres"), OsString::from("s3")] {
         let backend = value.to_string_lossy();
         let tmp = tempfile::tempdir().expect("tempdir");
         let storage_dir = tmp.path().join("node-storage");
-        let mut child = Command::new(node_bin())
-            .arg("--self-host")
-            .current_dir(tmp.path())
-            .env("SCP_STORAGE_PATH", &storage_dir)
-            .env("SCP_RELAY_STORAGE_BACKEND", &value)
-            .env("SCP_NODE_DHT_MODE", "disabled")
-            .env("SCP_NODE_SELF_HOST_NO_NAT", "1")
-            .env("SCP_NODE_SELF_HOST_PORT", "0")
-            .env_remove("RUST_LOG")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("failed to spawn scp-node --self-host");
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let status = loop {
-            if let Some(status) = child.try_wait().expect("try_wait") {
-                break Some(status);
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                break None;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        };
-        let output = child.wait_with_output().expect("collect stderr");
+        let output = output_within_deadline(
+            Command::new(node_bin())
+                .arg("--self-host")
+                .current_dir(tmp.path())
+                .env("SCP_STORAGE_PATH", &storage_dir)
+                .env("SCP_RELAY_STORAGE_BACKEND", &value)
+                .env("SCP_NODE_DHT_MODE", "disabled")
+                .env("SCP_NODE_SELF_HOST_NO_NAT", "1")
+                .env("SCP_NODE_SELF_HOST_PORT", "0")
+                .env_remove("RUST_LOG"),
+        );
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         assert!(
-            status.is_some_and(|s| !s.success()),
+            !output.status.success(),
             "--self-host with SCP_RELAY_STORAGE_BACKEND={backend} must exit \
-             non-zero; status {status:?}, stderr: {stderr}"
+             non-zero; stderr: {stderr}"
         );
         assert!(
             stderr.contains(&format!("SCP_RELAY_STORAGE_BACKEND='{backend}'")),
