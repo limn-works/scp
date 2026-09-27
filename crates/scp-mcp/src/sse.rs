@@ -1524,11 +1524,17 @@ mod tests {
             .await
             .expect("run_sse must return while a session is attached");
         assert!(result.unwrap().is_ok());
-        assert_eq!(
-            event_tx.receiver_count(),
-            0,
-            "the pump must stop when run_sse returns"
-        );
+        // `run_sse` returning drops its `AbortOnDrop` pump guard, and task
+        // abortion completes asynchronously; poll until the pump's receiver
+        // is gone.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while event_tx.receiver_count() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pump must stop when run_sse returns"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         drop(conn);
     }
 

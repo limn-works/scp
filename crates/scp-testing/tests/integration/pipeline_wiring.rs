@@ -3008,9 +3008,37 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
 /// through `mcp_server_bundle`, and `mcp_server_bundle` both obtains the
 /// Supervisor's receiver and passes that receiver to
 /// `McpServer::with_optional_event_source`, which `code` calls nowhere else.
+///
+/// "That receiver" is pinned two ways: the `match` is the whole initializer of
+/// `context_events` (its closing `}` is followed by `;`, so no chained call
+/// replaces its value), and every other mention of `context_events` in the
+/// body is a read through `.is_none()` or the constructor argument, so no
+/// statement rebinds or shadows it between the `match` and the constructor.
 fn serves_the_supervisor_event_source(code: &str, serve_fn: &str) -> bool {
+    const BIND: &str = "let context_events = match";
     let bundle_wired = fn_body(code, "mcp_server_bundle").is_some_and(|body| {
-        body.contains("let context_events = match")
+        let match_is_whole_initializer = body.find(BIND).is_some_and(|at| {
+            let rest = &body[at + BIND.len()..];
+            let Some(open) = rest.find('{') else {
+                return false;
+            };
+            let mut depth = 0usize;
+            rest[open..]
+                .char_indices()
+                .find_map(|(i, c)| {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        _ => return None,
+                    }
+                    (depth == 0).then_some(open + i + 1)
+                })
+                .is_some_and(|end| rest[end..].trim_start().starts_with(';'))
+        });
+        let mentions = body.matches("context_events").count();
+        let reads = body.matches("context_events.is_none()").count();
+        match_is_whole_initializer
+            && mentions == reads + 2
             && body.contains("Ok(supervisor) => supervisor.subscribe_events(),")
             && body.contains("McpServer::with_optional_event_source(provider, context_events)")
     });
@@ -3020,9 +3048,11 @@ fn serves_the_supervisor_event_source(code: &str, serve_fn: &str) -> bool {
 }
 
 /// The event-source gate above must go red when the wiring it pins is deleted
-/// and only a comment or a `None` receiver remains, or when its pieces survive
-/// in a function the serve path does not run. Each case below is the regression the
-/// gate exists to catch, written the way a real edit would leave the source.
+/// and only a comment or a `None` receiver remains, when a rebinding or a
+/// chained call replaces the receiver before the constructor, or when its
+/// pieces survive in a function the serve path does not run. Each case below
+/// is the regression the gate exists to catch, written the way a real edit
+/// would leave the source.
 #[test]
 fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
     let wired = "fn mcp_server_bundle(bi: &Bi, provider: P) -> McpServerForTransport<P> {\n    \
@@ -3053,6 +3083,26 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
     );
     assert!(!serves_the_supervisor_event_source(
         &production_code(&none_passed),
+        "serve"
+    ));
+    // The receiver is obtained, then a `None` rebinding shadows it before the
+    // constructor, in the same function.
+    let shadowed = wired.replace(
+        "McpServer::with_optional_event_source(provider, context_events)",
+        "let context_events = None;\n    \
+         McpServer::with_optional_event_source(provider, context_events)",
+    );
+    assert!(!serves_the_supervisor_event_source(
+        &production_code(&shadowed),
+        "serve"
+    ));
+    // A call chained onto the `match` replaces the receiver it produced.
+    let chained = wired.replace(
+        "Err(_) => None,\n    };",
+        "Err(_) => None,\n    }.and(None);",
+    );
+    assert!(!serves_the_supervisor_event_source(
+        &production_code(&chained),
         "serve"
     ));
     // The bundle function stays wired, but the serve path builds its own
