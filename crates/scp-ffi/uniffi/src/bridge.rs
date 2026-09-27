@@ -25607,6 +25607,52 @@ mod tests {
         .expect("a mint inside the supervisor's ceiling must succeed");
     }
 
+    /// `outlet_register` refuses the creator when the supervisor ceiling omits
+    /// `outlet:register`, and admits the creator once the supervisor ceiling
+    /// carries it.
+    ///
+    /// Before the live read existed, `outlet_register` graded the registrant
+    /// against a `ContextRoleState` it built on the spot from the handle's
+    /// creator DID and `default_ceiling()`, which carries `outlet:register`, so
+    /// the narrow supervisor ceiling below changed nothing about what it
+    /// admitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outlet_register_follows_the_supervisor_ceiling_not_the_handle_ceiling() {
+        let definition = |name: &str, operator: &str| OutletDefinition {
+            name: name.to_owned(),
+            description: "a live-ceiling fixture outlet".to_owned(),
+            kind: OutletKind::Action,
+            input_schema_json:
+                r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
+                    .to_owned(),
+            output_schema_json: r#"{"type":"object"}"#.to_owned(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: operator.to_owned(),
+            cost: None,
+        };
+
+        let narrow_scp = scp_test();
+        let (narrow, _key) = callback_context_handle(&narrow_scp, &["messages:write"]).await;
+        let operator = narrow.creator_did.clone();
+        let err = narrow_scp
+            .outlet_register(narrow, definition("uniffi-narrow-ceiling-probe", &operator))
+            .await
+            .expect_err("a supervisor ceiling without outlet:register must refuse registration");
+        assert!(
+            err.to_string().contains("OutletRegister"),
+            "the refusal must name the missing capability: {err}"
+        );
+
+        let wide_scp = scp_test();
+        let (wide, _key) =
+            callback_context_handle(&wide_scp, &["messages:write", "outlet:register"]).await;
+        wide_scp
+            .outlet_register(wide, definition("uniffi-wide-ceiling-probe", &operator))
+            .await
+            .expect("a supervisor ceiling carrying outlet:register must admit registration");
+    }
+
     /// `ucan_validate`, `ucan_evaluate`, and `ucan_delegate` read the ceiling
     /// and the context creator off the supervisor actor, so each one fails
     /// closed once no actor serves the context.

@@ -6819,6 +6819,143 @@ mod tests {
         );
     }
 
+    /// Builds a handle for `context_id` whose `ceiling` is the wide default,
+    /// while the supervisor actor for that context holds a narrower ceiling.
+    ///
+    /// Before the live read existed, NAPI's UCAN mint and delegate sites read
+    /// `NapiContextHandle::ceiling`, and outlet registration read a role-state
+    /// copy seeded from it. Every capability `default_ceiling()` carries is in
+    /// this handle, so a site that reads the handle admits what the actor
+    /// withholds.
+    fn wide_ceiling_handle_for(
+        bi: &Arc<crate::runtime::NapiBridgeInstance>,
+        context_id: &str,
+        creator_did: &str,
+    ) -> super::NapiContextHandle {
+        let mut handle = active_handle_for(bi, context_id, creator_did);
+        handle.ceiling = scp_core::context::roles::default_ceiling()
+            .to_ucan_string_set()
+            .into_iter()
+            .collect();
+        handle
+    }
+
+    /// `ucan_mint_on` grants no more than the ceiling the supervisor actor
+    /// holds, even when the handle's registration-time ceiling is wider.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_mint_enforces_the_supervisor_ceiling_not_the_handle_ceiling() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let owner = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let owner_did = owner.inner.did.clone();
+        let ctx_id = format!("napi-mint-live-ceiling-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_for_test(
+            &bi,
+            &ctx_id,
+            &owner_did,
+            &["messages:read"],
+        )
+        .await;
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        let handle = wide_ceiling_handle_for(&bi, &ctx_id, &owner_did);
+        assert!(
+            handle.ceiling.iter().any(|c| c == "messages:write"),
+            "the fixture's handle must carry the capability the actor withholds"
+        );
+
+        let Err(err) = crate::ucan::ucan_mint_on(
+            &bi,
+            &handle,
+            "did:dht:z6MkNapiLiveCeilingMember".to_owned(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        else {
+            panic!("a mint outside the supervisor's ceiling must fail");
+        };
+        assert!(
+            err.to_string().contains("ceiling"),
+            "expected a ceiling refusal, got: {err}"
+        );
+
+        // The capability the actor holds still mints, so the refusal above is
+        // the ceiling check and not a broken fixture.
+        crate::ucan::ucan_mint_on(
+            &bi,
+            &handle,
+            "did:dht:z6MkNapiLiveCeilingMember".to_owned(),
+            vec!["messages:read".to_owned()],
+            None,
+        )
+        .await
+        .expect("a mint inside the supervisor's ceiling must succeed");
+    }
+
+    /// `outlet_register_on` refuses the creator when the supervisor ceiling
+    /// omits `outlet:register`, although the handle's ceiling carries it, and
+    /// admits the creator once the supervisor ceiling carries it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outlet_register_follows_the_supervisor_ceiling_not_the_handle_ceiling() {
+        let creator = "did:dht:z6MkNapiRegisterLiveCeiling";
+        let definition = |name: &str| crate::outlets::NapiOutletDefinition {
+            name: name.to_owned(),
+            description: "a live-ceiling fixture outlet".to_owned(),
+            kind: crate::outlets::NapiOutletKind::Action,
+            input_schema_json:
+                r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
+                    .to_owned(),
+            output_schema_json: r#"{"type":"object"}"#.to_owned(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: creator.to_owned(),
+            cost: None,
+        };
+
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let narrow = format!("napi-register-narrow-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_for_test(
+            &bi,
+            &narrow,
+            creator,
+            &["messages:write"],
+        )
+        .await;
+        crate::runtime::register_test_context(&bi, &narrow);
+        let err = crate::outlets::outlet_register_on(
+            &bi,
+            &wide_ceiling_handle_for(&bi, &narrow, creator),
+            definition("napi-narrow-ceiling-probe"),
+        )
+        .await
+        .expect_err("a supervisor ceiling without outlet:register must refuse registration");
+        assert!(
+            err.to_string().contains("OutletRegister"),
+            "the refusal must name the missing capability: {err}"
+        );
+
+        let wide = format!("napi-register-wide-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_for_test(
+            &bi,
+            &wide,
+            creator,
+            &["messages:write", "outlet:register"],
+        )
+        .await;
+        crate::runtime::register_test_context(&bi, &wide);
+        crate::outlets::outlet_register_on(
+            &bi,
+            &wide_ceiling_handle_for(&bi, &wide, creator),
+            definition("napi-wide-ceiling-probe"),
+        )
+        .await
+        .expect("a supervisor ceiling carrying outlet:register must admit registration");
+    }
+
     /// A close of a poisoned context succeeds idempotently and releases the
     /// bridge state for that id.
     ///
