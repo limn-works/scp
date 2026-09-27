@@ -631,7 +631,11 @@ PYEOF
 # For the same reason an entry names every package its CI command names: the part before
 # `|` is a comma-separated package list, each becomes one `-p`, and the entry runs when
 # this run selected any one of them. An entry naming more than one package spells each
-# feature as `package/feature`, as its CI command does.
+# feature as `package/feature`, as its CI command does. An entry whose CI command names
+# its targets carries a third `|` field holding those target flags, and the check passes
+# them in place of `--all-targets`: a target that CI command never builds, such as an
+# example that compiles only under a feature the command leaves off, fails a check here
+# that the merge gate never runs.
 #
 # `server` is absent from this list although three CI commands name it: `default =
 # ["server"]` in the manifest of each of scp-ffi, scp-ffi-napi and scp-ffi-uniffi, so the
@@ -639,14 +643,15 @@ PYEOF
 #
 # scp-node and scp-relay appear in two entries because two CI commands compile their
 # `cloud-blobs` features under different feature sets: the `rust-clippy` job adds
-# `scp-node/testing`, and the `rust-test-optional-features` job does not.
+# `scp-node/testing` and lints every target, and the `rust-test-optional-features` job
+# leaves `testing` off and builds only the two test targets it names.
 EXTRA_FEATURE_CHECKS=(
     "scp-transport|quic,http3,udp,coap"
     "scp-transport|combined,local-cache"
     "scp-testing|sqlite"
     "scp-transport|sqlite-blob,redb-blob,postgres-blob,s3-blob,startup"
     "scp-node,scp-relay|scp-node/cloud-blobs,scp-node/testing,scp-relay/cloud-blobs"
-    "scp-node,scp-relay|scp-node/cloud-blobs,scp-relay/cloud-blobs"
+    "scp-node,scp-relay|scp-node/cloud-blobs,scp-relay/cloud-blobs|--test storage_backend_selection --test storage_backend"
 )
 
 # The packages the `wasm-protocol` job of `.github/workflows/ci.yml` compiles for
@@ -732,8 +737,8 @@ else
     fi
 
     for entry in "${EXTRA_FEATURE_CHECKS[@]}"; do
-        extra_pkgs=${entry%%|*}
-        extra_features=${entry#*|}
+        IFS='|' read -r extra_pkgs extra_features extra_targets <<< "$entry"
+        read -r -a extra_target_args <<< "${extra_targets:---all-targets}"
         IFS=, read -r -a extra_pkg_list <<< "$extra_pkgs"
         extra_selected=false
         declare -a extra_pkg_args=()
@@ -745,7 +750,7 @@ else
         done
         if $extra_selected; then
             run_step "compile($extra_pkgs:$extra_features)" \
-                cargo check "${extra_pkg_args[@]}" --all-targets --features "$extra_features"
+                cargo check "${extra_pkg_args[@]}" "${extra_target_args[@]}" --features "$extra_features"
         fi
         unset extra_pkg_args
     done
