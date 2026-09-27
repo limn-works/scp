@@ -332,25 +332,14 @@
             guard let statement else {
                 throw StorageError.databaseError("bindText received no prepared statement")
             }
-            let utf8 = Array(value.utf8)
-            let byteCount = try sqliteByteCount(utf8.count, binder: "bindText")
-            let status = utf8.withUnsafeBufferPointer { buffer -> Int32 in
-                guard let base = buffer.baseAddress else {
-                    // `UnsafeBufferPointer.baseAddress` documents `nil` for an
-                    // empty buffer, and SQLite reads a null pointer as a request
-                    // to bind `NULL` while still answering `SQLITE_OK`, so this
-                    // arm binds zero bytes of a literal instead. The Swift 6.2
-                    // toolchain answers a non-null address for an empty
-                    // `Array<UInt8>`, so no `swift test` case reaches this arm
-                    // and none of them pins it.
-                    return sqlite3_bind_text(statement, index, "", 0, transientDestructor)
-                }
-                return UnsafeRawPointer(base).withMemoryRebound(
-                    to: CChar.self,
-                    capacity: buffer.count
-                ) { characters in
-                    sqlite3_bind_text(statement, index, characters, byteCount, transientDestructor)
-                }
+            // `utf8CString` holds every UTF-8 byte of `value`, zero bytes
+            // included, followed by one terminating zero, so its buffer is never
+            // empty and its base address is never `nil`; the byte count leaves
+            // that terminator out.
+            let characters = value.utf8CString
+            let byteCount = try sqliteByteCount(characters.count - 1, binder: "bindText")
+            let status = characters.withUnsafeBufferPointer { buffer in
+                sqlite3_bind_text(statement, index, buffer.baseAddress, byteCount, transientDestructor)
             }
             guard status == SQLITE_OK else {
                 throw StorageError.databaseError(errorMessage(for: statement))

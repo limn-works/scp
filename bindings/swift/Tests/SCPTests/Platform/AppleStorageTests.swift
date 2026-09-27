@@ -9,10 +9,13 @@
 //
 // Four properties these cases pin:
 //
-// 1. Every `AppleStorage` method throws when SQLite rejects a parameter bind,
-//    and none of them reports a result computed from an unbound parameter.
-//    SQLite reports a rejected bind through a return code and leaves that
-//    parameter reading `NULL`, and a statement carrying `NULL` where a key
+// 1. The binding helpers `AppleStorage.bindText(_:to:at:)` and
+//    `AppleStorage.bindBlob(_:to:at:)`, through which every `AppleStorage`
+//    method binds its parameters, throw when SQLite rejects a bind, and bind
+//    an empty value as zero bytes rather than as `NULL`. No case here makes
+//    SQLite reject a bind inside one of the six methods. SQLite reports a
+//    rejected bind through a return code and leaves that parameter reading
+//    `NULL`, and a statement carrying `NULL` where a key
 //    belongs still steps to `SQLITE_DONE`: `delete` would remove no row and
 //    return, `exists` would answer `false` for a key the database holds, and
 //    `get` would answer `nil` for it. Acceptance criterion 5 of ADR-025, the
@@ -211,6 +214,25 @@
             try AppleStorage.bindText("alpha\u{0}one", to: stmt, at: 1)
             #expect(sqlite3_step(stmt) == SQLITE_ROW)
             #expect(sqlite3_column_int(stmt, 0) == 9)
+        }
+
+        @Test("bindText binds an empty string as zero bytes of text rather than as NULL")
+        func bindTextBindsEmptyStringAsText() throws {
+            // SQLite reads a null pointer as a request to bind `NULL` and still
+            // answers `SQLITE_OK`, so this case fails for an implementation that
+            // hands `sqlite3_bind_text` a null pointer for an empty string.
+            let connection = try makeBareConnection()
+            defer { sqlite3_close_v2(connection) }
+
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let sql = "SELECT typeof(?1), length(?1)"
+            #expect(sqlite3_prepare_v2(connection, sql, -1, &stmt, nil) == SQLITE_OK)
+
+            try AppleStorage.bindText("", to: stmt, at: 1)
+            #expect(sqlite3_step(stmt) == SQLITE_ROW)
+            #expect(String(cString: sqlite3_column_text(stmt, 0)) == "text")
+            #expect(sqlite3_column_int(stmt, 1) == 0)
         }
 
         /// `bindText` and `bindBlob` both reach this conversion, so a count

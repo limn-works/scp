@@ -11,10 +11,11 @@
 // ``AppleStorage/bindText(_:to:at:)`` and
 // ``AppleStorage/bindBlob(_:to:at:)`` rather than through a second copy
 // of that binding code. A copy would let one of the two spellings carry
-// a binding defect the other had fixed, which is how `-1` reached
-// `sqlite3_bind_text` here after ``AppleStorage`` stopped passing it.
-// Two differences remain: this backend applies no SQLCipher encryption
-// pragma and opens `:memory:` instead of a file path. This validates the
+// a binding defect the other had fixed.
+// Three differences remain: this backend applies no SQLCipher encryption
+// pragma, opens `:memory:` instead of a file path, and serializes access
+// through a serial `DispatchQueue` where ``AppleStorage`` is an actor, so
+// its method bodies are not ``AppleStorage``'s. This validates the
 // storage contract (sorted key enumeration, prefix scans, delete
 // semantics, concurrent safety) without coupling to platform-specific
 // Keychain infrastructure.

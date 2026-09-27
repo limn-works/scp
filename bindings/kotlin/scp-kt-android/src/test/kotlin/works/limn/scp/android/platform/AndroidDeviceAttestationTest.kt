@@ -236,15 +236,12 @@ class AndroidDeviceAttestationTest {
     // -----------------------------------------------------------------------
 
     @Test
-    fun `clientDataJSON field order matches Apple adapter formula`() {
-        // The relay reconstructs clientDataJSON with the same fixed-field-order
-        // formula. This test ensures the Android adapter produces the same
-        // structure as the Apple adapter (AppleDeviceAttestation.swift).
-        //
-        // Apple formula: {"challenge":"<b64>","deviceId":"<b64>","type":"scp-device-attestation-v1"}
+    fun `clientDataJSON fields appear in the fixed order challenge then deviceId then type`() {
         // Android formula: {"challenge":"<b64>","deviceId":"<b64>","type":"scp-device-attestation-v1"}
         //
-        // Both use the same fixed order: challenge, deviceId, type.
+        // The Apple adapter no longer builds this JSON: it hands App Attest the
+        // 32-byte binding digest of 09-security-model.md section 9.3.1
+        // unchanged. OQ-33 of spec 27 keeps the Android binding open.
         val attestation = createAttestationWithMockContext()
         val json = attestation.buildClientDataJSON(
             byteArrayOf(1, 2, 3),
