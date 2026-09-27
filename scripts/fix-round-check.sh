@@ -798,8 +798,10 @@ run_step format cargo fmt --all -- --check
 # (the second, `-i libsqlite3-sys`, whenever the first finds openssl-src), one per other
 # shipped configuration and one per workspace root, and
 # `cargo tree` compiles nothing and takes no build lock: a 2026-09-13 run measured the
-# first two at 12.9 seconds and 391 ms while another worktree held that lock. A workspace
-# root with no Cargo.lock sends the vendored-OpenSSL gate to the crates.io index.
+# first two at 12.9 seconds and 391 ms while another worktree held that lock. The
+# vendored-OpenSSL gate resolves a workspace root with no Cargo.lock from a copy of the
+# root one and fails when it pins a version the root one does not, so the network can
+# slow or fail that gate but cannot change its verdict.
 #
 # Measured on 2026-09-13, one run each, in the order below: 47 seconds for the 28 this
 # list held that day. `scripts/check-workflow-compile-steps.py` joined it afterwards: the

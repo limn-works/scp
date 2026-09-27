@@ -40,7 +40,10 @@
 # `templates/personal-relay` among them), and a package that no enclosing workspace
 # claims, because none sits above it or each one above lists it under `exclude`. A
 # new workspace root is so resolved without anyone listing it. The one exclusion is
-# NOT_SHIPPED_ROOTS below.
+# NOT_SHIPPED_ROOTS below. Every resolution reads the versions the root Cargo.lock
+# pins: the root workspace's under --locked, and a root without a Cargo.lock of its own
+# through workspace_occurrences, which fails when that root needs a version the root
+# Cargo.lock does not pin.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -118,6 +121,31 @@ all_target_occurrences() {
   count_in "$tree"
 }
 
+# Exits non-zero when the Cargo.lock argv[1] names pins a registry package, by name,
+# version and source, that the Cargo.lock argv[2] names does not pin.
+read -r -d '' LOCK_SUBSET_PROGRAM <<'PYTHON' || true
+import sys, tomllib
+pins = lambda path: {(p["name"], p["version"], p["source"]) for p in tomllib.load(open(path, "rb")).get("package", []) if "source" in p}
+extra = sorted(pins(sys.argv[1]) - pins(sys.argv[2]))
+if extra:
+    sys.exit(f"{sys.argv[1]} pins {len(extra)} registry package(s) {sys.argv[2]} does not, {extra[0][0]} {extra[0][1]} first")
+PYTHON
+
+# workspace_occurrences <root manifest>: the every-triple count for the workspace that
+# manifest heads, resolved from versions the root Cargo.lock pins. A root holding its
+# own Cargo.lock resolves under --locked. A root without one (each scaffold and template
+# ignores its own) resolves from a copy of the root Cargo.lock, which the subshell body
+# removes on exit, so cargo keeps each version that copy pins. The lock the resolution
+# leaves must then pin no registry package the root Cargo.lock does not, so a version
+# the crates.io index chose on the day of the run fails the count instead of deciding it.
+workspace_occurrences() (
+  lock="${1%Cargo.toml}Cargo.lock"; locked=--locked
+  if [[ ! -e "$lock" ]]; then locked=""; trap 'rm -f "$lock"' EXIT; cp Cargo.lock "$lock"; fi
+  n="$(all_target_occurrences ${locked:+"$locked"} --manifest-path "$1" --workspace)" || exit 1
+  py -c "$LOCK_SUBSET_PROGRAM" "$lock" Cargo.lock || exit 1
+  echo "$n"
+)
+
 # manifest_paths: every Cargo.toml git tracks that the working tree still holds, plus
 # every one in the working tree that git does not ignore, so an uncommitted new
 # workspace root is resolved too and an uncommitted deletion leaves no path that
@@ -156,7 +184,7 @@ run_gate() {
     resolved=$((resolved + 1)); n=""
     if is_feature_selection "${entry#*|}"; then
       args=(); read -r -a args <<<"${entry#*|}"
-      n="$(all_target_occurrences -p "${entry%%|*}" ${args[@]+"${args[@]}"})" || n=""
+      n="$(all_target_occurrences --locked -p "${entry%%|*}" ${args[@]+"${args[@]}"})" || n=""
     fi
     report "$entry" "$n" none || failures=$((failures + 1))
   done <<<"$line"
@@ -170,7 +198,7 @@ run_gate() {
   [[ -n "$line" ]] || { echo "FAIL — no Cargo.toml declares a workspace"; return 1; }
   while IFS= read -r entry; do
     [[ " $NOT_SHIPPED_ROOTS " == *" $entry "* ]] && continue
-    n="$(all_target_occurrences --manifest-path "$entry" --workspace)" || n=""
+    n="$(workspace_occurrences "$entry")" || n=""
     report "the $entry workspace" "$n" none || failures=$((failures + 1))
   done <<<"$line"
   [[ "$failures" -eq 0 ]] && echo "PASS — $VENDOR_CRATE reaches the wheel on every triple and nothing else shipped." && return 0
@@ -214,6 +242,7 @@ run_fixtures() {
   # its `bundled-sqlcipher-vendored-openssl` feature unless $FAKE_NO_FEATURE, so that
   # fixture holds the libsqlite3-sys -> openssl-sys edge without the feature.
   printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$*" >> "$ARGV_LOG"' '[ -n "$FAKE_BROKEN" ] && exit 101' \
+    '[ -z "$FAKE_DRIFT" ] || printf "[[package]]\nname = \"drift\"\nversion = \"9.9.9\"\nsource = \"registry+x\"\n" >> "$FAKE_DRIFT"' \
     'case " $* " in *" -i libsqlite3-sys "*) echo "libsqlite3-sys v0.30.1"; echo "libsqlite3-sys feature \"openssl-sys\""; [ -n "$FAKE_NO_FEATURE" ] || echo "libsqlite3-sys feature \"bundled-sqlcipher-vendored-openssl\""; exit 0;; esac' \
     'echo "pkg v0.1.0"' \
     'for w in $FAKE_VENDORS; do case " $* " in *" $w "*) echo "openssl-src v300.5.1";; esac; done' \
@@ -222,6 +251,14 @@ run_fixtures() {
   export ARGV_LOG="$dir/argv" FAKE_DROPPED=none FAKE_VENDORS="" FAKE_BROKEN="" FAKE_NO_FEATURE=""
   PATH="$dir/bin:$saved_path"
   FAKE_BROKEN=1 all_target_occurrences --workspace >/dev/null 2>&1; expect "a cargo that exits non-zero FAILS rather than counting zero" FAIL $?
+  mkdir -p "$dir/ws/own" "$dir/ws/bare"; printf '%s\n' '[[package]]' 'name = "a"' 'version = "1.0.0"' 'source = "registry+x"' > "$dir/ws/Cargo.lock"
+  cp "$dir/ws/Cargo.lock" "$dir/ws/own/Cargo.lock"; : > "$ARGV_LOG"
+  (cd "$dir/ws" && workspace_occurrences bare/Cargo.toml && workspace_occurrences own/Cargo.toml) >/dev/null
+  same "$(cut -d' ' -f1-3 "$ARGV_LOG" | paste -sd'|' -)" "tree --manifest-path bare/Cargo.toml|tree --locked --manifest-path"
+  expect "a root without a Cargo.lock resolves from a copy of the root one, and a root holding one resolves under --locked" PASS $?
+  [[ ! -e "$dir/ws/bare/Cargo.lock" && -e "$dir/ws/own/Cargo.lock" ]]; expect "the copied Cargo.lock is removed and a root's own is kept" PASS $?
+  (cd "$dir/ws" && FAKE_DRIFT=bare/Cargo.lock workspace_occurrences bare/Cargo.toml) >/dev/null 2>&1
+  expect "a resolution that pins a registry package the root Cargo.lock does not FAILS" FAIL $?
 
   # run_gate against a planted owner gate and matrix.
   wheel="$(printf 'bindings/python/pyproject.toml\tscp-ffi|--features extension-module,vendored-openssl')"
@@ -230,8 +267,8 @@ run_fixtures() {
     "  --print-artifacts) if [ -n \"\${FAKE_ARTIFACTS+x}\" ]; then printf '%s\n' \"\$FAKE_ARTIFACTS\"; else printf '%s\n' 'scp-node|' 'scp-ffi|--no-default-features --features server' $(printf '%q' "${wheel#*$'\t'}"); fi ;;" \
     'esac' > "$dir/gate.sh"
   local want_argv
-  want_argv="$(printf '%s\n' "tree -p scp-ffi --features extension-module,vendored-openssl --target aarch64-apple-darwin -e no-dev --prefix none --format {p}" \
-    "tree -p scp-ffi --features extension-module,vendored-openssl --target aarch64-apple-darwin -e no-dev,features -i libsqlite3-sys --depth 1 --prefix none --format {p}")"
+  want_argv="$(printf '%s\n' "tree --locked -p scp-ffi --features extension-module,vendored-openssl --target aarch64-apple-darwin -e no-dev --prefix none --format {p}" \
+    "tree --locked -p scp-ffi --features extension-module,vendored-openssl --target aarch64-apple-darwin -e no-dev,features -i libsqlite3-sys --depth 1 --prefix none --format {p}")"
   : > "$ARGV_LOG"
   FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_triple_occurrences aarch64-apple-darwin >/dev/null
   same "$(cat "$ARGV_LOG")" "$want_argv"
@@ -308,10 +345,10 @@ wheel_triple_occurrences() {
   entry="$(wheel_line)" || return 1
   entry="${entry#*$'\t'}"
   read -r -a args <<<"${entry#*|}"
-  tree="$(cargo tree -p "${entry%%|*}" ${args[@]+"${args[@]}"} --target "$triple" -e no-dev --prefix none --format '{p}')" ||
+  tree="$(cargo tree --locked -p "${entry%%|*}" ${args[@]+"${args[@]}"} --target "$triple" -e no-dev --prefix none --format '{p}')" ||
     { echo "cargo tree failed for ${entry%%|*} on $triple" >&2; return 1; }
   if [[ "$(count_in "$tree")" -gt 0 ]]; then
-    features="$(cargo tree -p "${entry%%|*}" ${args[@]+"${args[@]}"} --target "$triple" -e no-dev,features -i libsqlite3-sys --depth 1 --prefix none --format '{p}')" ||
+    features="$(cargo tree --locked -p "${entry%%|*}" ${args[@]+"${args[@]}"} --target "$triple" -e no-dev,features -i libsqlite3-sys --depth 1 --prefix none --format '{p}')" ||
       { echo "cargo tree -i libsqlite3-sys failed for ${entry%%|*} on $triple" >&2; return 1; }
     if ! printf '%s\n' "$features" | grep -xF 'libsqlite3-sys feature "bundled-sqlcipher-vendored-openssl"' >/dev/null; then
       echo "$triple: $VENDOR_CRATE is in the wheel's graph, but libsqlite3-sys's bundled-sqlcipher-vendored-openssl feature is off, so SQLCipher links the build host's OpenSSL" >&2
