@@ -431,3 +431,69 @@ def test_the_detector_counts_no_statement_that_imports_something_else(source: st
     """A name that starts with the extension's name is a different module, and
     prose that quotes the statement imports nothing."""
     assert _count_extension_imports(source) == 0
+
+
+# ---------------------------------------------------------------------------
+# A loaded extension that lacks an export
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def stale_extension(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Install a loaded ``scp_sdk._scp_core`` that exports one name, ``present``.
+
+    It stands in for a stale or partial build: the module imports, and every
+    export an SDK wrapper calls beyond ``present`` is missing from it.
+    """
+    import types
+
+    import scp_sdk
+
+    module = types.ModuleType(_extension.EXTENSION_MODULE)
+    module.present = lambda: "called"  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, _extension.EXTENSION_MODULE, module)
+    monkeypatch.setattr(scp_sdk, "_scp_core", module, raising=False)
+    return module
+
+
+def test_a_missing_export_raises_the_load_failure_code(stale_extension: Any) -> None:
+    native = _extension.native_module()
+    assert native.present() == "called"
+    with pytest.raises(ScpError) as caught:
+        native.scpid_challenge
+    assert caught.value.code == _extension.EXTENSION_LOAD_FAILED_CODE
+    assert "scpid_challenge" in caught.value.message
+
+
+def test_a_probe_for_an_optional_export_still_reads_absence(stale_extension: Any) -> None:
+    """``hasattr`` and ``getattr(..., default)`` keep working on the returned object.
+
+    ``scp_sdk/event_log.py`` probes ``init_pyo3_log`` and ``scp_sdk/scp.py`` probes
+    ``identity_verify_device_attestation`` with ``hasattr``; each needs ``False``
+    for a name the build lacks, not an exception.
+    """
+    native = _extension.native_module()
+    assert not hasattr(native, "init_pyo3_log")
+    assert getattr(native, "SCP", None) is None
+
+
+@pytest.mark.parametrize(("module_name", "accessor"), BRIDGE_ACCESSORS)
+def test_every_bridge_accessor_reports_a_missing_export_with_the_load_failure_code(
+    stale_extension: Any, module_name: str, accessor: str
+) -> None:
+    """Each SDK accessor hands its wrappers an object that raises the registered code."""
+    bridge = getattr(importlib.import_module(module_name), accessor)()
+    with pytest.raises(ScpError) as caught:
+        bridge.evaluate_provenance_quality
+    assert caught.value.code == _extension.EXTENSION_LOAD_FAILED_CODE
+
+
+async def test_a_wrapper_call_on_a_stale_build_raises_the_load_failure_code(
+    stale_extension: Any,
+) -> None:
+    """End to end through one SDK wrapper: ``SCP.scpid_challenge`` on a stale build."""
+    from scp_sdk.scp import SCP
+
+    with pytest.raises(ScpError) as caught:
+        await SCP.scpid_challenge(object.__new__(SCP), "https://example.test")
+    assert caught.value.code == _extension.EXTENSION_LOAD_FAILED_CODE

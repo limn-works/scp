@@ -124,8 +124,44 @@ def reject_load_failure(exc: ImportError) -> None:
     ) from exc
 
 
+class MissingExportError(ScpError, AttributeError):
+    """A loaded extension lacks an export the SDK asked for.
+
+    Carries :data:`EXTENSION_LOAD_FAILED_CODE`, because a module that loaded
+    without a name the SDK calls is a stale or partial build, the same
+    condition the ts-native SDK reports with that code. It is also an
+    ``AttributeError``, so ``hasattr`` and ``getattr(..., default)`` probes for
+    an optional export keep returning ``False`` and the default.
+    """
+
+
+class _NativeExports:
+    """Read attributes off the extension, raising :class:`MissingExportError` for an absent one."""
+
+    __slots__ = ("_module",)
+
+    def __init__(self, module: Any) -> None:
+        self._module = module
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return getattr(self._module, name)
+        except AttributeError as exc:
+            raise MissingExportError(
+                f"{EXTENSION_MODULE} loaded but does not export {name!r}. Rebuild "
+                "it with `maturin develop --release` from bindings/python.",
+                code=EXTENSION_LOAD_FAILED_CODE,
+            ) from exc
+
+
 def native_module() -> Any:
-    """Return the ``_scp_core`` extension module, imported lazily.
+    """Return the ``_scp_core`` extension's exports, imported lazily.
+
+    The returned object reads every attribute off the extension module, and
+    reading a name the module does not export raises
+    :class:`MissingExportError` with :data:`EXTENSION_LOAD_FAILED_CODE`, so
+    every module-level call an SDK wrapper makes through it reports a stale
+    build with the registered code instead of a bare ``AttributeError``.
 
     Raised at call time, not at import time, so a pure-Python environment can
     import :mod:`scp_sdk` and reach a meaningful error the first time it uses
@@ -146,6 +182,9 @@ def native_module() -> Any:
             installed and failed to load. The two codes differ because the ``scp`` fixture in
             ``bindings/python/tests/conftest.py`` skips on the first and fails
             on the second.
+        MissingExportError: :data:`EXTENSION_LOAD_FAILED_CODE`, on attribute
+            access to the returned object, for a name the extension does not
+            export.
     """
     try:
         import scp_sdk._scp_core as native  # type: ignore[import-not-found]
@@ -156,4 +195,4 @@ def native_module() -> Any:
             "Install scp-python with: pip install scp-python",
             code=EXTENSION_ABSENT_CODE,
         ) from exc
-    return native
+    return _NativeExports(native)
