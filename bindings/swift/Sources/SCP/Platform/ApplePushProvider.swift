@@ -88,8 +88,15 @@
 
     /// Actor-isolated APNs push notification provider for the SCP Rust engine.
     ///
-    /// Conforms to the UniFFI-generated `PushProvider` protocol so that it can be
-    /// injected into the engine via the callback interface bridge (ADR-021).
+    /// This actor does not conform to the UniFFI-generated `PushProvider`
+    /// protocol (ADR-021): that protocol names its registration method
+    /// `registerPush()` and declares `ScpError` as its error type, while this
+    /// actor names it `register()` and throws `PushError`. UniFFI panics on the
+    /// Rust side when a callback throws a type the callback does not declare,
+    /// so a conformance that let a `PushError` cross the callback would turn
+    /// each rejected payload into a panic.
+    /// Acceptance criterion 4 of ADR-025 in `.docs/adrs/phase-5.md` records
+    /// this.
     ///
     /// ## AppDelegate Integration
     ///
