@@ -105,7 +105,10 @@ pub enum BackendSelectionError {
     NotCompiled {
         /// The backend the operator selected.
         backend: &'static str,
-        /// The `scp-node` / `scp-relay` cargo feature that compiles `backend`.
+        /// The `scp-transport` cargo feature that compiles `backend`:
+        /// `postgres-blob` or `s3-blob`. The binary's own feature that
+        /// enables it is the `binary_feature` its caller passes to
+        /// [`backend_choice_from_env`].
         feature: &'static str,
     },
     /// The value names no backend this build compiled, and is neither
@@ -121,8 +124,8 @@ impl std::fmt::Display for BackendSelectionError {
         match self {
             Self::NotCompiled { backend, feature } => write!(
                 f,
-                "storage backend '{backend}' is not compiled into this binary; rebuild it \
-                 with `--features {feature}`. Compiled-in options: {}",
+                "storage backend '{backend}' is not compiled into this binary, which was \
+                 built without scp-transport's `{feature}` feature. Compiled-in options: {}",
                 valid_backends()
             ),
             Self::Unknown { value } => write!(
@@ -181,14 +184,14 @@ impl BackendChoice {
             #[cfg(not(feature = "postgres-blob"))]
             "postgres" => Err(BackendSelectionError::NotCompiled {
                 backend: "postgres",
-                feature: "cloud-blobs",
+                feature: "postgres-blob",
             }),
             #[cfg(feature = "s3-blob")]
             "s3" => Ok(Self::S3),
             #[cfg(not(feature = "s3-blob"))]
             "s3" => Err(BackendSelectionError::NotCompiled {
                 backend: "s3",
-                feature: "cloud-blobs",
+                feature: "s3-blob",
             }),
             "memory" => Ok(Self::Memory),
             other => Err(BackendSelectionError::Unknown {
@@ -215,17 +218,45 @@ impl BackendChoice {
     }
 }
 
-/// Prints `error` and exits the process with code 1.
-fn exit_rejecting(error: &BackendSelectionError) -> ! {
-    eprintln!("error: {error}");
-    std::process::exit(1);
+/// The message a binary exits with when [`BackendChoice::parse`] rejects
+/// `SCP_RELAY_STORAGE_BACKEND`.
+///
+/// For [`BackendSelectionError::NotCompiled`] the message also tells the
+/// operator to rebuild with `binary_feature`, the binary's own cargo feature
+/// that enables the missing `scp-transport` feature.
+fn rejection_message(error: &BackendSelectionError, binary_feature: &str) -> String {
+    match error {
+        BackendSelectionError::NotCompiled { .. } => {
+            format!("error: {error}\nrebuild this binary with `--features {binary_feature}`")
+        }
+        BackendSelectionError::Unknown { .. } => format!("error: {error}"),
+    }
 }
 
-/// Constructs the blob storage backend from environment configuration.
+/// Parses `SCP_RELAY_STORAGE_BACKEND` (default: `sqlite`) and exits the
+/// process with code 1 on a value this build cannot serve.
 ///
-/// Reads `SCP_RELAY_STORAGE_BACKEND` (default: `sqlite`) and delegates to the
-/// appropriate backend constructor. Calls [`std::process::exit`] on
-/// misconfiguration with a descriptive error naming the valid options.
+/// A binary calls this before it creates a directory, a key, or a store, so a
+/// rejected value leaves nothing behind, and passes the result to
+/// [`storage_from_env`]. `binary_feature` names the calling binary's own
+/// cargo feature that compiles the `postgres` and `s3` backends; when this
+/// build lacks either, the exit message tells the operator to rebuild with
+/// that feature.
+#[must_use]
+pub fn backend_choice_from_env(binary_feature: &str) -> BackendChoice {
+    let value = env::var("SCP_RELAY_STORAGE_BACKEND").unwrap_or_else(|_| "sqlite".to_owned());
+    BackendChoice::parse(&value).unwrap_or_else(|error| {
+        eprintln!("{}", rejection_message(&error, binary_feature));
+        std::process::exit(1);
+    })
+}
+
+/// Constructs the blob storage backend `choice` names, reading that
+/// backend's configuration from the environment.
+///
+/// `choice` comes from [`backend_choice_from_env`]. Calls
+/// [`std::process::exit`] when the backend's configuration is missing or its
+/// store fails to open.
 ///
 /// # Storage backend selection
 ///
@@ -240,12 +271,12 @@ fn exit_rejecting(error: &BackendSelectionError) -> ! {
 /// # Panics
 ///
 /// Backend arms are compiled only when the corresponding feature is enabled
-/// (`sqlite-blob`, `redb-blob`, `postgres-blob`, `s3-blob`). `scp-node` and
+/// (`sqlite-blob`, `redb-blob`, `postgres-blob`, `s3-blob`), and a
+/// [`BackendChoice`] variant exists only for a compiled arm. `scp-node` and
 /// `scp-relay` enable `postgres-blob` and `s3-blob` only under their
-/// off-by-default `cloud-blobs` feature. A request for `postgres` or `s3` in a
-/// build without that arm prints the [`BackendSelectionError::NotCompiled`]
-/// that [`BackendChoice::parse`] returns, and exits; it never falls back to
-/// another backend.
+/// off-by-default `cloud-blobs` feature. A request for `postgres` or `s3` in
+/// a build without it exits in [`backend_choice_from_env`] and never reaches
+/// this function, so it never falls back to another backend.
 #[cfg_attr(
     not(any(feature = "postgres-blob", feature = "s3-blob")),
     expect(
@@ -253,10 +284,7 @@ fn exit_rejecting(error: &BackendSelectionError) -> ! {
         reason = "only the postgres and s3 arms await, and this build compiled neither"
     )
 )]
-pub async fn storage_from_env() -> BlobStorageBackend {
-    let value = env::var("SCP_RELAY_STORAGE_BACKEND").unwrap_or_else(|_| "sqlite".to_owned());
-    let choice = BackendChoice::parse(&value).unwrap_or_else(|error| exit_rejecting(&error));
-
+pub async fn storage_from_env(choice: BackendChoice) -> BlobStorageBackend {
     match choice {
         #[cfg(feature = "sqlite-blob")]
         BackendChoice::Sqlite => {
@@ -409,8 +437,11 @@ pub async fn shutdown_signal() {
 /// server handle, bound address, and storage reference.
 ///
 /// This encapsulates the common pattern of reading config + storage from env,
-/// building the relay, starting it, and logging the result.
-pub async fn start_relay_from_env() -> (
+/// building the relay, starting it, and logging the result. `backend` comes
+/// from [`backend_choice_from_env`].
+pub async fn start_relay_from_env(
+    backend: BackendChoice,
+) -> (
     crate::native::server::ShutdownHandle,
     SocketAddr,
     Arc<BlobStorageBackend>,
@@ -423,7 +454,7 @@ pub async fn start_relay_from_env() -> (
         "starting relay"
     );
 
-    let storage = Arc::new(storage_from_env().await);
+    let storage = Arc::new(storage_from_env(backend).await);
     let server = crate::native::server::RelayServer::new(config, Arc::clone(&storage));
 
     let (handle, local_addr) = match server.start().await {
@@ -441,19 +472,30 @@ pub async fn start_relay_from_env() -> (
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendChoice, BackendSelectionError, valid_backends};
+    use super::{BackendChoice, BackendSelectionError, rejection_message, valid_backends};
 
     /// `parse` accepts a name in either case exactly when this build compiled
-    /// its backend, returns `NotCompiled` naming `cloud-blobs` for a cloud
-    /// backend this build left out, and calls every other value unknown.
+    /// its backend, returns `NotCompiled` naming the backend's own
+    /// `scp-transport` feature for a cloud backend this build left out, and
+    /// calls every other value unknown.
     #[test]
     fn parse_accepts_exactly_the_compiled_backends() {
-        for (name, compiled, cloud) in [
-            ("sqlite", cfg!(feature = "sqlite-blob"), false),
-            ("redb", cfg!(feature = "redb-blob"), false),
-            ("postgres", cfg!(feature = "postgres-blob"), true),
-            ("s3", cfg!(feature = "s3-blob"), true),
-            ("memory", true, false),
+        for (name, feature, compiled, cloud) in [
+            (
+                "sqlite",
+                "sqlite-blob",
+                cfg!(feature = "sqlite-blob"),
+                false,
+            ),
+            ("redb", "redb-blob", cfg!(feature = "redb-blob"), false),
+            (
+                "postgres",
+                "postgres-blob",
+                cfg!(feature = "postgres-blob"),
+                true,
+            ),
+            ("s3", "s3-blob", cfg!(feature = "s3-blob"), true),
+            ("memory", "", true, false),
         ] {
             for value in [name.to_owned(), name.to_uppercase()] {
                 let parsed = BackendChoice::parse(&value);
@@ -464,7 +506,7 @@ mod tests {
                         parsed,
                         Err(BackendSelectionError::NotCompiled {
                             backend: name,
-                            feature: "cloud-blobs",
+                            feature,
                         }),
                         "{value}"
                     );
@@ -500,17 +542,30 @@ mod tests {
         }
     }
 
-    /// The not-compiled error names the backend and the feature to rebuild
-    /// with, and does not call the value unknown.
+    /// The not-compiled error names the backend and scp-transport's own
+    /// feature for it, and names no binary's feature; the exit message adds
+    /// the feature the calling binary passed, and only for a not-compiled
+    /// backend.
     #[test]
     fn a_not_compiled_backend_names_the_feature() {
-        let message = BackendSelectionError::NotCompiled {
+        let error = BackendSelectionError::NotCompiled {
             backend: "postgres",
-            feature: "cloud-blobs",
-        }
-        .to_string();
-        assert!(message.contains("'postgres' is not compiled"), "{message}");
-        assert!(message.contains("--features cloud-blobs"), "{message}");
-        assert!(!message.contains("unknown"), "{message}");
+            feature: "postgres-blob",
+        };
+        let display = error.to_string();
+        assert!(display.contains("'postgres' is not compiled"), "{display}");
+        assert!(display.contains("`postgres-blob`"), "{display}");
+        assert!(!display.contains("cloud-blobs"), "{display}");
+        assert!(!display.contains("unknown"), "{display}");
+
+        let exit = rejection_message(&error, "some-binary-feature");
+        assert!(exit.starts_with(&format!("error: {display}")), "{exit}");
+        assert!(exit.contains("--features some-binary-feature"), "{exit}");
+
+        let unknown = BackendSelectionError::Unknown {
+            value: "banana".to_owned(),
+        };
+        let exit = rejection_message(&unknown, "some-binary-feature");
+        assert_eq!(exit, format!("error: {unknown}"));
     }
 }

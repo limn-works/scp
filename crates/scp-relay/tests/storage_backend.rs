@@ -38,8 +38,9 @@ fn output_within_deadline(command: &mut Command) -> Output {
     child.wait_with_output().expect("collect scp-relay output")
 }
 
-/// Asserts that `scp-relay` exits non-zero on `SCP_RELAY_STORAGE_BACKEND=backend`
-/// with `required_var` unset, and opens no `SQLite` store in its place.
+/// Asserts that `scp-relay` exits non-zero on `SCP_RELAY_STORAGE_BACKEND=backend`,
+/// in lower and in upper case, with `required_var` unset, and opens no `SQLite`
+/// store in its place.
 ///
 /// The expected error follows what the binary compiled, read from the
 /// `scp-transport` this test links, and not from this package's own
@@ -51,31 +52,33 @@ fn assert_cloud_backend_fails_closed(backend: &str, required_var: &str) {
     let compiled = scp_transport::startup::valid_backends()
         .split(", ")
         .any(|name| name == backend);
-    let tmp = tempfile::tempdir().expect("failed to create tempdir");
-    let db_path = tmp.path().join("must-not-exist.db");
-    let output = output_within_deadline(
-        Command::new(relay_bin())
-            .env("SCP_RELAY_STORAGE_BACKEND", backend)
-            .env("SCP_RELAY_STORAGE_PATH", &db_path)
-            .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
-            .env_remove(required_var)
-            .env_remove("RUST_LOG"),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "{backend}: {stderr}");
-    if compiled {
-        assert!(stderr.contains(required_var), "{backend}: {stderr}");
-    } else {
-        assert!(
-            stderr.contains(&format!("'{backend}' is not compiled into this binary")),
-            "{backend}: {stderr}"
+    for value in [backend.to_owned(), backend.to_uppercase()] {
+        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = tmp.path().join("must-not-exist.db");
+        let output = output_within_deadline(
+            Command::new(relay_bin())
+                .env("SCP_RELAY_STORAGE_BACKEND", &value)
+                .env("SCP_RELAY_STORAGE_PATH", &db_path)
+                .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+                .env_remove(required_var)
+                .env_remove("RUST_LOG"),
         );
-        assert!(
-            stderr.contains("--features cloud-blobs"),
-            "{backend}: {stderr}"
-        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{value}: {stderr}");
+        if compiled {
+            assert!(stderr.contains(required_var), "{value}: {stderr}");
+        } else {
+            assert!(
+                stderr.contains(&format!("'{backend}' is not compiled into this binary")),
+                "{value}: {stderr}"
+            );
+            assert!(
+                stderr.contains("--features cloud-blobs"),
+                "{value}: {stderr}"
+            );
+        }
+        assert!(!db_path.exists(), "{value} opened {}", db_path.display());
     }
-    assert!(!db_path.exists(), "{backend} opened {}", db_path.display());
 }
 
 /// Returns the path to the compiled `scp-relay` binary.

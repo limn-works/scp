@@ -261,7 +261,12 @@ fn resolve_storage_key_or_exit(storage_dir: &std::path::Path) -> Zeroizing<[u8; 
 // Relay blob storage from env
 // ---------------------------------------------------------------------------
 
-// `storage_from_env` is provided by `scp_transport::startup::storage_from_env`.
+// `backend_choice_from_env` and `storage_from_env` are provided by
+// `scp_transport::startup`.
+
+/// This binary's cargo feature that compiles the `postgres` and `s3` blob
+/// backends; a build without it names this feature when it rejects either.
+const CLOUD_BLOBS_FEATURE: &str = "cloud-blobs";
 
 // ---------------------------------------------------------------------------
 // Relay-only mode
@@ -269,6 +274,7 @@ fn resolve_storage_key_or_exit(storage_dir: &std::path::Path) -> Zeroizing<[u8; 
 
 /// Runs a bare relay server (same as `scp-relay` binary).
 async fn run_relay_only() {
+    let backend = startup::backend_choice_from_env(CLOUD_BLOBS_FEATURE);
     let config = startup::relay_config_from_env();
     tracing::info!(
         bind_addr = %config.bind_addr,
@@ -277,7 +283,7 @@ async fn run_relay_only() {
         "starting scp-node in relay-only mode"
     );
 
-    let storage = Arc::new(startup::storage_from_env().await);
+    let storage = Arc::new(startup::storage_from_env(backend).await);
     let server = RelayServer::new(config, storage);
 
     let (handle, local_addr) = match server.start().await {
@@ -466,6 +472,10 @@ fn validate_storage_path_or_exit(dir: &std::path::Path) {
 
 /// Runs the full node with persistent `SQLite` storage (production default).
 async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
+    // Parse the blob backend before anything below creates the storage
+    // directory, the storage key, or a store, so a backend this build cannot
+    // serve exits with nothing left on disk.
+    let backend = startup::backend_choice_from_env(CLOUD_BLOBS_FEATURE);
     let domain = require_domain();
     let http_addr = node_http_addr();
 
@@ -532,7 +542,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
                 // `SCP_RELAY_STORAGE_PATH` — the same explicit selection
                 // relay-only mode makes (SCP-CAPINJECT-010).
-                startup::storage_from_env().await,
+                startup::storage_from_env(backend).await,
             )
             .await;
         }
@@ -563,7 +573,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 // Persistent mode: operator-configured durable blob backend
                 // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
                 // `SCP_RELAY_STORAGE_PATH` (SCP-CAPINJECT-010).
-                startup::storage_from_env().await,
+                startup::storage_from_env(backend).await,
             )
             .await;
         }
@@ -718,8 +728,8 @@ fn env_flag_is_truthy(value: Option<&str>) -> bool {
 /// it ran before `cloud-blobs` existed.
 ///
 /// The value is parsed by [`startup::BackendChoice::parse`], the parse
-/// `storage_from_env` runs, so the two cannot disagree about which values name
-/// a cloud backend.
+/// `backend_choice_from_env` runs, so the two cannot disagree about which
+/// values name a cloud backend.
 fn self_host_backend_conflict(selected: Option<&str>) -> Option<String> {
     let value = selected?;
     let cloud = match startup::BackendChoice::parse(value) {
@@ -945,7 +955,7 @@ async fn run_node_with<
     // (that would re-introduce the SCP-CAPSEL-8002 anti-pattern the story kills,
     // and would break ephemeral mode's all-in-memory contract). Ephemeral mode
     // passes `ephemeral_blob_backend()` (in-memory, no persistence, env-ignoring);
-    // persistent mode passes `startup::storage_from_env()` (durable, default
+    // persistent mode passes `startup::storage_from_env(backend)` (durable, default
     // SQLite, honors env).
     blob_storage: BlobStorageBackend,
 ) {

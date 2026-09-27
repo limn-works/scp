@@ -47,7 +47,8 @@ async fn main() {
 
     startup::init_tracing();
 
-    let (handle, _local_addr, _storage) = startup::start_relay_from_env().await;
+    let backend = startup::backend_choice_from_env("cloud-blobs");
+    let (handle, _local_addr, _storage) = startup::start_relay_from_env(backend).await;
 
     // Start Prometheus metrics HTTP server on a separate port (#1467).
     let metrics_port = startup::env_or("SCP_RELAY_METRICS_PORT", 9001u16);

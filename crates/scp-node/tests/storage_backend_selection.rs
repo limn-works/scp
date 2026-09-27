@@ -38,9 +38,11 @@ fn output_within_deadline(command: &mut Command) -> Output {
 }
 
 /// A persistent full node exits non-zero on `postgres` without
-/// `SCP_RELAY_DATABASE_URL` and on `s3` without `SCP_RELAY_S3_BUCKET`, and
-/// opens no `SQLite` blob store in their place. A build that compiled the arm
-/// names the missing variable; a build without `cloud-blobs` names the feature.
+/// `SCP_RELAY_DATABASE_URL` and on `s3` without `SCP_RELAY_S3_BUCKET`, in
+/// either case, and opens no `SQLite` blob store in their place. A build that
+/// compiled the arm names the missing variable; a build without `cloud-blobs`
+/// names the feature, and exits before it creates the node's storage
+/// directory, its storage key, or its root and custody stores.
 ///
 /// Which of the two errors to expect is read from the `scp-transport` this test
 /// links, and not from this package's own `cloud-blobs` feature: cargo unifies
@@ -49,48 +51,57 @@ fn output_within_deadline(command: &mut Command) -> Output {
 #[test]
 fn a_cloud_backend_fails_closed() {
     let compiled = scp_transport::startup::valid_backends();
-    for (backend, required_var) in [
-        ("postgres", "SCP_RELAY_DATABASE_URL"),
-        ("s3", "SCP_RELAY_S3_BUCKET"),
+    for (backend, value, required_var) in [
+        ("postgres", "postgres", "SCP_RELAY_DATABASE_URL"),
+        ("postgres", "POSTGRES", "SCP_RELAY_DATABASE_URL"),
+        ("s3", "s3", "SCP_RELAY_S3_BUCKET"),
+        ("s3", "S3", "SCP_RELAY_S3_BUCKET"),
     ] {
         let tmp = tempfile::tempdir().expect("tempdir");
         let blob_db = tmp.path().join("blobs.db");
+        let node_storage = tmp.path().join("node-storage");
         let output = output_within_deadline(
             Command::new(node_bin())
                 .current_dir(tmp.path())
                 .env("SCP_NODE_DOMAIN", "example.com")
                 .env("SCP_NODE_BIND_ADDR", "127.0.0.1:0")
-                .env("SCP_STORAGE_PATH", tmp.path().join("node-storage"))
+                .env("SCP_STORAGE_PATH", &node_storage)
                 .env("SCP_RELAY_STORAGE_PATH", &blob_db)
-                .env("SCP_RELAY_STORAGE_BACKEND", backend)
+                .env("SCP_RELAY_STORAGE_BACKEND", value)
                 .env_remove(required_var)
                 .env_remove("SCP_NODE_DHT_MODE")
                 .env_remove("SCP_STORAGE_KEY")
                 .env_remove("RUST_LOG"),
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(!output.status.success(), "{backend}: {stderr}");
+        assert!(!output.status.success(), "{value}: {stderr}");
         if compiled.split(", ").any(|name| name == backend) {
-            assert!(stderr.contains(required_var), "{backend}: {stderr}");
+            assert!(stderr.contains(required_var), "{value}: {stderr}");
         } else {
             assert!(
                 stderr.contains(&format!("'{backend}' is not compiled into this binary")),
-                "{backend}: {stderr}"
+                "{value}: {stderr}"
             );
             assert!(
                 stderr.contains("--features cloud-blobs"),
-                "{backend}: {stderr}"
+                "{value}: {stderr}"
+            );
+            assert!(
+                !node_storage.exists(),
+                "{value} created {} before rejecting the backend",
+                node_storage.display()
             );
         }
-        assert!(!blob_db.exists(), "{backend} opened {}", blob_db.display());
+        assert!(!blob_db.exists(), "{value} opened {}", blob_db.display());
     }
 }
 
-/// `--self-host` exits non-zero on `postgres` and `s3` and names the value,
-/// instead of serving from a `SQLite` store the operator did not select.
+/// `--self-host` exits non-zero on `postgres` and `s3`, in either case, and
+/// names the value, instead of serving from a `SQLite` store the operator did
+/// not select.
 #[test]
 fn self_host_rejects_a_cloud_backend() {
-    for backend in ["postgres", "s3"] {
+    for backend in ["postgres", "s3", "POSTGRES", "S3"] {
         let tmp = tempfile::tempdir().expect("tempdir");
         let output = output_within_deadline(
             Command::new(node_bin())
