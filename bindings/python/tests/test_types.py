@@ -1080,3 +1080,63 @@ class TestMemberRoleFromBridge:
         from scp_sdk.types import MemberRole
 
         assert MemberRole.from_bridge('  "subscriber"  ') is MemberRole.SUBSCRIBER
+
+
+class TestGovernanceProposeOutcome:
+    """``SCP.governance_propose`` fails closed on an auto-executed outcome.
+
+    A ``single_admin`` proposal auto-executes, so its outcome arrives in the
+    propose response's ``execution_result``. Deleting the check from
+    ``governance_propose`` makes ``test_unknown_outcome_raises`` fail.
+    """
+
+    @staticmethod
+    def _scp_returning(raw: object) -> object:
+        from unittest.mock import MagicMock
+
+        scp = MagicMock()
+        scp._native.governance_propose = MagicMock(return_value=raw)
+        return scp
+
+    async def test_unknown_outcome_raises(self) -> None:
+        import json
+
+        import pytest
+
+        from scp_sdk.errors import UnknownGovernanceOutcomeError
+        from scp_sdk.scp import SCP
+
+        raw = json.dumps(
+            {
+                "proposal_id": "ab" * 16,
+                "status": "Executed",
+                "execution_result": "SomethingThisSdkDoesNotKnow",
+            }
+        )
+        with pytest.raises(UnknownGovernanceOutcomeError) as excinfo:
+            await SCP.governance_propose(self._scp_returning(raw), "ctx", "did:dht:zA", "{}")
+        assert excinfo.value.code == "SCP-GOV-11040"
+        assert excinfo.value.raw_outcome == "SomethingThisSdkDoesNotKnow"
+
+    async def test_named_or_pending_outcome_returns_the_response(self) -> None:
+        import json
+
+        from scp_sdk.scp import SCP
+
+        for execution_result in ("RoleChanged", None):
+            raw = json.dumps({"proposal_id": "ab" * 16, "execution_result": execution_result})
+            got = await SCP.governance_propose(self._scp_returning(raw), "ctx", "did:dht:zA", "{}")
+            assert got == raw
+
+    async def test_uncheckable_response_raises(self) -> None:
+        import json
+
+        import pytest
+
+        from scp_sdk.errors import GovernanceError
+        from scp_sdk.scp import SCP
+
+        for raw in ("not json", "[]", json.dumps({"execution_result": 7})):
+            with pytest.raises(GovernanceError) as excinfo:
+                await SCP.governance_propose(self._scp_returning(raw), "ctx", "did:dht:zA", "{}")
+            assert excinfo.value.code == "SCP-GOV-11040"

@@ -93,6 +93,49 @@ __all__ = [
 ]
 
 
+def _check_governance_propose_response(raw: Any) -> Any:
+    """Check a governance-propose response's ``execution_result`` and return it.
+
+    A ``single_admin`` proposal auto-executes, so its outcome arrives in this
+    response rather than through ``governance_execute``. A non-null
+    ``execution_result`` goes through
+    :meth:`~scp_sdk.governance.GovernanceActionResult.from_bridge`, so an
+    outcome this SDK version cannot name raises
+    :class:`~scp_sdk.errors.UnknownGovernanceOutcomeError` on this path too.
+
+    Raises:
+        UnknownGovernanceOutcomeError: ``execution_result`` names no member.
+        GovernanceError: ``raw`` is not a JSON object, or its
+            ``execution_result`` is neither a string nor ``null``
+            (``SCP-GOV-11040``).
+    """
+    import json
+
+    from scp_sdk.errors import GovernanceError
+
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        parsed = None
+    if not isinstance(parsed, dict):
+        raise GovernanceError(
+            "governance propose response is not a JSON object, so this SDK cannot "
+            "check its execution_result",
+            "SCP-GOV-11040",
+        )
+    execution_result = parsed.get("execution_result")
+    if execution_result is None:
+        return raw
+    if not isinstance(execution_result, str):
+        raise GovernanceError(
+            "governance propose response carries an execution_result that is neither "
+            "a string nor null, so this SDK cannot name its outcome",
+            "SCP-GOV-11040",
+        )
+    GovernanceActionResult.from_bridge(execution_result)
+    return raw
+
+
 @runtime_checkable
 class KeyCustodyProvider(Protocol):
     """Caller-supplied custody backend for :meth:`SCP.identity_create_with_custody`.
@@ -1861,14 +1904,25 @@ class SCP:
         :class:`~scp_sdk.governance.GovernanceActionResult` member when a
         ``single_admin`` proposal auto-approved and auto-executed, and is
         ``null`` while a multi-admin proposal awaits votes.
+
+        Raises:
+            UnknownGovernanceOutcomeError: ``execution_result`` names an
+                outcome this SDK version cannot name, as
+                :meth:`governance_execute` raises for the same outcome.
+            GovernanceError: The response is not a JSON object, or its
+                ``execution_result`` is neither a string nor ``null``, so this
+                SDK cannot check it (``SCP-GOV-11040``).
         """
 
         try:
-            return await asyncio.to_thread(
+            raw = await asyncio.to_thread(
                 self._native.governance_propose, handle, identity_did, action_json
             )
         except Exception as exc:
             raise _coded_bridge_error(exc) from exc
+        # Checked outside that try block, so a rejected outcome name never reads
+        # as a bridge error.
+        return _check_governance_propose_response(raw)
 
     async def governance_reject(self, handle: Any, identity_did: str, proposal_id_hex: str) -> Any:
         """Delegate to ``_scp_core.SCP.governance_reject``."""
