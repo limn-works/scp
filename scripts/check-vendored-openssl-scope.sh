@@ -28,8 +28,9 @@
 # this file shadows the command, and an alias defined above the pinned text, with
 # `shopt -s expand_aliases`, rewrites a word in it. Bash can forbid neither.
 # Absence: `--target all` for every entry that gate's `--print-artifacts` writes
-# except the wheel's (`--print-wheel-entries`), and `--workspace` for every tracked
-# Cargo.toml cargo treats as a workspace root: one that declares a `workspace` table
+# except the wheel's (`--print-wheel-entries`), and `--workspace` for every
+# Cargo.toml, tracked or untracked but not ignored by git, that cargo treats as a
+# workspace root: one that declares a `workspace` table
 # (the root workspace and each separately-workspaced template or scaffold,
 # `templates/personal-relay` among them), and a package that no enclosing workspace
 # claims, because none sits above it or each one above lists it under `exclude`. A
@@ -112,6 +113,10 @@ all_target_occurrences() {
   count_in "$tree"
 }
 
+# manifest_paths: every Cargo.toml git tracks, plus every one in the working tree
+# that git does not ignore, so an uncommitted new workspace root is resolved too.
+manifest_paths() { git ls-files --cached --others --exclude-standard -- 'Cargo.toml' '*/Cargo.toml'; }
+
 # report <label> <count or empty on failure> <want: some|none>: one verdict line.
 report() {
   if [[ -z "$2" ]]; then echo "    FAIL — $1 resolved no graph"; return 1; fi
@@ -142,8 +147,8 @@ run_gate() {
     fi
     report "$entry" "$n" none || failures=$((failures + 1))
   done <<<"$line"
-  line="$(git ls-files -- 'Cargo.toml' '*/Cargo.toml' | py -c "$WORKSPACE_ROOTS_PROGRAM")" || return 1
-  [[ -n "$line" ]] || { echo "FAIL — no tracked Cargo.toml declares a workspace"; return 1; }
+  line="$(manifest_paths | py -c "$WORKSPACE_ROOTS_PROGRAM")" || return 1
+  [[ -n "$line" ]] || { echo "FAIL — no Cargo.toml declares a workspace"; return 1; }
   while IFS= read -r entry; do
     [[ " $NOT_SHIPPED_ROOTS " == *" $entry "* ]] && continue
     n="$(all_target_occurrences --manifest-path "$entry" --workspace)" || n=""
@@ -243,6 +248,10 @@ run_fixtures() {
     py -c "$WORKSPACE_ROOTS_PROGRAM" | paste -sd' ' -)"
   same "$out" "$dir/w/Cargo.toml $dir/w/out/Cargo.toml $dir/solo/Cargo.toml"
   expect "a quoted [ \"workspace\" ] header, an excluded package, and an unenclosed package count as roots; a member, a package.workspace pointer, and a package below that pointer do not" PASS $?
+  mkdir -p "$dir/g/new" "$dir/g/skip"; printf '%s\n' skip/ > "$dir/g/.gitignore"
+  cp "$dir/w/member/Cargo.toml" "$dir/g/new/Cargo.toml"; cp "$dir/w/member/Cargo.toml" "$dir/g/skip/Cargo.toml"
+  out="$(cd "$dir/g" && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE && git init -q && manifest_paths | paste -sd' ' -)"
+  same "$out" "new/Cargo.toml"; expect "an untracked manifest is listed and an ignored one is not" PASS $?
   printf '%s\n' '[workspace' > "$dir/c.toml"
   echo "$dir/c.toml" | py -c "$WORKSPACE_ROOTS_PROGRAM" >/dev/null 2>&1; expect "an unparseable manifest FAILS" FAIL $?
   PATH="$saved_path"; rm -rf "$dir"
