@@ -1105,23 +1105,11 @@ def emit_fingerprint() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §25.10 claim hash, §25.11 proposal ID, §25.12 HPKE info strings
+# §25.11 proposal ID, §25.12 HPKE info strings
 # ---------------------------------------------------------------------------
 
 
-def emit_claim_and_proposal() -> None:
-    section("§25.10 Shadow claim hash")
-    claim_preimage = canonical_preimage(
-        "SCP-CLAIM-V1:",
-        var_field("shadow-alice-x-12345"),
-        var_field("did:dht:z6MkClaim"),
-        var_field("bridge-test-context"),
-        u64(1_700_000_000),
-    )
-    emit("vector_22.preimage_len", len(claim_preimage))
-    emit_hex("vector_22.preimage", claim_preimage)
-    emit_hex("vector_22.claim_hash", sha256(claim_preimage))
-
+def emit_proposal() -> None:
     section("§25.11 Governance proposal ID")
     action_bytes = json.dumps(
         {"AddMember": {"did": "did:dht:z6MkNewMember", "role": "member"}},
@@ -2476,7 +2464,7 @@ def main() -> int:
     emit_typed_leaves()
     emit_provenance_hash()
     emit_fingerprint()
-    emit_claim_and_proposal()
+    emit_proposal()
     emit_hpke_info()
     emit_identity_link_attestation()
     emit_hash_only_vectors()
