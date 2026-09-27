@@ -1221,13 +1221,21 @@ jobs:
           # scp-node and scp-relay compile the PostgreSQL and S3 arms of
           # `storage_from_env` only under their off-by-default `cloud-blobs`
           # feature, which --workspace leaves off. Run the two binaries' backend
-          # selection tests with it on, so a cloud-blobs build that stops
-          # exiting on a missing SCP_RELAY_DATABASE_URL or SCP_RELAY_S3_BUCKET
-          # fails here. The scp-transport command runs the `BackendChoice`
-          # unit tests with both arms compiled, the only build in which they
-          # assert that `postgres` and `s3` parse in either case and are cloud
+          # selection tests with it on. Each test fails when its own package's
+          # `cloud-blobs` feature is on and the build does not list both the
+          # `postgres` and `s3` backends, and when a build that lists a backend
+          # stops exiting on a missing SCP_RELAY_DATABASE_URL or
+          # SCP_RELAY_S3_BUCKET. Each binary
+          # runs in its own invocation because cargo unifies scp-transport's
+          # features across every package one invocation builds: a combined
+          # invocation compiles both arms into scp-relay through scp-node's
+          # feature alone, and passes when scp-relay's `cloud-blobs` enables
+          # nothing. The scp-transport command runs the `BackendChoice` unit
+          # tests with both arms compiled, the only build in which they assert
+          # that `postgres` and `s3` parse in either case and are cloud
           # backends.
-          cargo nextest run --no-tests=fail -p scp-node -p scp-relay --features scp-node/cloud-blobs,scp-relay/cloud-blobs --test storage_backend_selection --test storage_backend
+          cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs --test storage_backend_selection
+          cargo nextest run --no-tests=fail -p scp-relay --features cloud-blobs --test storage_backend
           cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib startup::tests
           # The saga-journal durable crash-recovery round-trip is gated behind
           # scp-testing/sqlite (it opens a real on-disk SqliteStorage across two

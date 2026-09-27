@@ -51,9 +51,20 @@ The resulting binaries are at:
 | Feature | What it enables |
 |---------|----------------|
 | `http3` | HTTP/3 and QUIC-based HTTP endpoint (spec SS10.15.1) |
+| `cloud-blobs` | The PostgreSQL and S3 blob storage backends (`SCP_RELAY_STORAGE_BACKEND=postgres` or `=s3`, section 4) |
+
+`scp-relay` supports one optional feature:
+
+| Feature | What it enables |
+|---------|----------------|
+| `cloud-blobs` | The PostgreSQL and S3 blob storage backends (`SCP_RELAY_STORAGE_BACKEND=postgres` or `=s3`, section 4) |
+
+A default build of either binary leaves `cloud-blobs` off, and exits when `SCP_RELAY_STORAGE_BACKEND` names `postgres` or `s3`.
 
 ```bash
 cargo build --release -p scp-node --features http3
+cargo build --release -p scp-relay --features cloud-blobs
+cargo build --release -p scp-node --features cloud-blobs
 ```
 
 ---

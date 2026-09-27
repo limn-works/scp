@@ -47,11 +47,17 @@ fn output_within_deadline(command: &mut Command) -> Output {
 /// `cloud-blobs` feature: cargo unifies `scp-transport`'s features across every
 /// package one invocation builds, so `scp-node`'s `cloud-blobs` alone compiles
 /// the arm into this binary too. A build with the arm names `required_var`; a
-/// build without it names the missing `cloud-blobs` feature.
+/// build without it names the missing `cloud-blobs` feature. This package's
+/// own `cloud-blobs` feature decides one case: a build with it on must list
+/// the arm, so the test fails when that feature stops enabling
+/// `scp-transport/postgres-blob` or `scp-transport/s3-blob`.
 fn assert_cloud_backend_fails_closed(backend: &str, required_var: &str) {
-    let compiled = scp_transport::startup::valid_backends()
-        .split(", ")
-        .any(|name| name == backend);
+    let valid = scp_transport::startup::valid_backends();
+    let compiled = valid.split(", ").any(|name| name == backend);
+    assert!(
+        !cfg!(feature = "cloud-blobs") || compiled,
+        "scp-relay's cloud-blobs feature is on, but this build lists only {valid} and not '{backend}'"
+    );
     for value in [backend.to_owned(), backend.to_uppercase()] {
         let tmp = tempfile::tempdir().expect("failed to create tempdir");
         let db_path = tmp.path().join("must-not-exist.db");

@@ -641,17 +641,19 @@ PYEOF
 # ["server"]` in the manifest of each of scp-ffi, scp-ffi-napi and scp-ffi-uniffi, so the
 # `cargo check` above already compiles every module that feature gates.
 #
-# scp-node and scp-relay appear in two entries because two CI commands compile their
-# `cloud-blobs` features under different feature sets: the `rust-clippy` job adds
-# `scp-node/testing` and lints every target, and the `rust-test-optional-features` job
-# leaves `testing` off and builds only the two test targets it names.
+# Three CI commands compile the `cloud-blobs` features of scp-node and scp-relay under
+# different feature sets, and each has an entry here: the `rust-clippy` job lints both
+# packages in one command that adds `scp-node/testing` and builds every target, and the
+# `rust-test-optional-features` job leaves `testing` off and runs one command per package,
+# each building only that package's backend-selection test target.
 EXTRA_FEATURE_CHECKS=(
     "scp-transport|quic,http3,udp,coap"
     "scp-transport|combined,local-cache"
     "scp-testing|sqlite"
     "scp-transport|sqlite-blob,redb-blob,postgres-blob,s3-blob,startup"
     "scp-node,scp-relay|scp-node/cloud-blobs,scp-node/testing,scp-relay/cloud-blobs"
-    "scp-node,scp-relay|scp-node/cloud-blobs,scp-relay/cloud-blobs|--test storage_backend_selection --test storage_backend"
+    "scp-node|cloud-blobs|--test storage_backend_selection"
+    "scp-relay|cloud-blobs|--test storage_backend"
 )
 
 # The packages the `wasm-protocol` job of `.github/workflows/ci.yml` compiles for

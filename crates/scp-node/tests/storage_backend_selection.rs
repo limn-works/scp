@@ -53,9 +53,18 @@ fn output_within_deadline(command: &mut Command) -> Output {
 /// links, and not from this package's own `cloud-blobs` feature: cargo unifies
 /// `scp-transport`'s features across every package one invocation builds, so
 /// `scp-relay`'s `cloud-blobs` alone compiles the arms into this binary too.
+/// This package's own `cloud-blobs` feature decides one case: a build with it
+/// on must list both arms, so the test fails when that feature stops enabling
+/// `scp-transport/postgres-blob` or `scp-transport/s3-blob`.
 #[test]
 fn a_cloud_backend_fails_closed() {
     let compiled = scp_transport::startup::valid_backends();
+    for backend in ["postgres", "s3"] {
+        assert!(
+            !cfg!(feature = "cloud-blobs") || compiled.split(", ").any(|name| name == backend),
+            "scp-node's cloud-blobs feature is on, but this build lists only {compiled} and not '{backend}'"
+        );
+    }
     let cases = [
         ("postgres", "postgres", "SCP_RELAY_DATABASE_URL"),
         ("postgres", "POSTGRES", "SCP_RELAY_DATABASE_URL"),
