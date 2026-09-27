@@ -18,10 +18,12 @@
 # configuration on one triple.
 # Absence: `--target all` for every entry that gate's `--print-artifacts` writes
 # except the wheel's (`--print-wheel-entries`), and `--workspace` for every tracked
-# Cargo.toml that declares a `workspace` table, which is the root workspace and each
-# separately-workspaced template or scaffold (`templates/personal-relay` among
-# them), so a new workspace root is resolved without anyone listing it. The one
-# exclusion is NOT_SHIPPED_ROOTS below.
+# Cargo.toml cargo treats as a workspace root: one that declares a `workspace` table
+# (the root workspace and each separately-workspaced template or scaffold,
+# `templates/personal-relay` among them), and a package that no enclosing workspace
+# claims, because none sits above it or each one above lists it under `exclude`. A
+# new workspace root is so resolved without anyone listing it. The one exclusion is
+# NOT_SHIPPED_ROOTS below.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -32,17 +34,34 @@ WHEEL_MATRIX_FILE=".github/workflows/build-matrix.yml"
 # and it resolves only under the nightly `fuzz/rust-toolchain.toml` pins.
 NOT_SHIPPED_ROOTS="fuzz/Cargo.toml"
 
-# Prints each manifest path, one per stdin line, whose TOML document holds a `workspace`
-# table. tomllib decides, so `[workspace]`, `[ "workspace" ]` and
-# `workspace = {}` all count, and an unparseable manifest fails the run.
+# Prints each manifest path, one per stdin line, that cargo treats as a workspace root:
+# its TOML document holds a `workspace` table, or it holds a `package` table without
+# `package.workspace` and no manifest above it in the input holds a `workspace` table
+# whose `exclude` list leaves it out, which is cargo's ancestor search. tomllib decides,
+# so `[workspace]`, `[ "workspace" ]` and `workspace = {}` all count, and an
+# unparseable manifest fails the run.
 read -r -d '' WORKSPACE_ROOTS_PROGRAM <<'PYTHON' || true
-import sys, tomllib
+import os, sys, tomllib
+docs = {}
 for path in sys.stdin.read().splitlines():
     try:
-        doc = tomllib.load(open(path, "rb"))
+        docs[path] = tomllib.load(open(path, "rb"))
     except (OSError, tomllib.TOMLDecodeError) as error:
         sys.exit(f"{path}: {error}")
-    if "workspace" in doc:
+def claimed(path):
+    here = d = os.path.dirname(path)
+    while d != os.path.dirname(d) or d == "":
+        d = os.path.dirname(d)
+        ws = docs.get(os.path.join(d, "Cargo.toml"), {}).get("workspace")
+        if isinstance(ws, dict):
+            rel = os.path.relpath(here, d or ".").split(os.sep)
+            if not any(rel[:len(e)] == e for e in (os.path.normpath(x).split(os.sep) for x in ws.get("exclude", []))):
+                return True
+        if d == "":
+            return False
+    return False
+for path, doc in docs.items():
+    if "workspace" in doc or ("package" in doc and "workspace" not in doc["package"] and not claimed(path)):
         print(path)
 PYTHON
 
@@ -227,9 +246,16 @@ run_fixtures() {
   FAKE_VENDORS=scaffolds/relay/Cargo.toml scenario "(absence) run_gate resolves a workspace root no list names" FAIL
   printf '%s\n' "$out" | grep -F "FAIL — the scaffolds/relay/Cargo.toml workspace reaches 1" >/dev/null; expect "(absence) it names that root" PASS $?
   grep -F -- "--manifest-path fuzz/Cargo.toml" "$ARGV_LOG" >/dev/null; expect "(absence) the not-shipped fuzz root is not resolved" FAIL $?
-  printf '%s\n' '[ "workspace" ]' > "$dir/a.toml"; printf '%s\n' '[package]' 'name = "x"' > "$dir/b.toml"
-  out="$(printf '%s\n' "$dir/a.toml" "$dir/b.toml" | python3.12 -c "$WORKSPACE_ROOTS_PROGRAM")"
-  same "$out" "$dir/a.toml"; expect "a quoted [ \"workspace\" ] header counts as a root and a package alone does not" PASS $?
+  mkdir -p "$dir/w/member" "$dir/w/out" "$dir/w/sub/in" "$dir/solo"
+  printf '%s\n' '[ "workspace" ]' 'members = ["member"]' 'exclude = ["out", "sub"]' > "$dir/w/Cargo.toml"
+  printf '%s\n' '[package]' 'name = "x"' > "$dir/w/member/Cargo.toml"
+  cp "$dir/w/member/Cargo.toml" "$dir/w/out/Cargo.toml"; cp "$dir/w/member/Cargo.toml" "$dir/w/sub/in/Cargo.toml"
+  cp "$dir/w/member/Cargo.toml" "$dir/solo/Cargo.toml"
+  printf '%s\n' '[package]' 'name = "y"' 'workspace = ".."' > "$dir/w/sub/Cargo.toml"
+  out="$(printf '%s\n' "$dir/w/Cargo.toml" "$dir/w/member/Cargo.toml" "$dir/w/out/Cargo.toml" "$dir/w/sub/in/Cargo.toml" "$dir/w/sub/Cargo.toml" "$dir/solo/Cargo.toml" |
+    python3.12 -c "$WORKSPACE_ROOTS_PROGRAM" | paste -sd' ' -)"
+  same "$out" "$dir/w/Cargo.toml $dir/w/out/Cargo.toml $dir/w/sub/in/Cargo.toml $dir/solo/Cargo.toml"
+  expect "a quoted [ \"workspace\" ] header, an excluded package, and an unenclosed package count as roots; a member and a package.workspace pointer do not" PASS $?
   printf '%s\n' '[workspace' > "$dir/c.toml"
   echo "$dir/c.toml" | python3.12 -c "$WORKSPACE_ROOTS_PROGRAM" >/dev/null 2>&1; expect "an unparseable manifest FAILS" FAIL $?
   PATH="$saved_path"; rm -rf "$dir"
