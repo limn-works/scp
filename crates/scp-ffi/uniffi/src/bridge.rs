@@ -302,6 +302,30 @@ fn no_pre_rotation_backend() -> ScpError {
 /// Selects the DHT client that key-rotation / agent-key / migration operations
 /// should publish their UPDATED DID document into, **failing closed**.
 ///
+/// Tears down a committed Welcome join whose UCAN state a concurrent close or
+/// leave removed, and returns the join's `CTX_2040` error.
+///
+/// The close that removed the state marked the id, and the join's readmit may
+/// have cleared that mark. No actor serves the id after the teardown, so this
+/// re-marks it: an ungated call such as `event_log_query` must not rebuild
+/// UCAN state for it.
+async fn tear_down_vanished_join(
+    bi: &crate::runtime::UniffiBridgeInstance,
+    sup: &scp_core::context::supervisor::Supervisor,
+    context_id: &str,
+) -> ScpError {
+    sup.discard_joined_context(context_id).await;
+    bi.release_ucan_state(context_id);
+    ScpError::Context {
+        msg: format!(
+            "UCAN state for context '{context_id}' vanished between the reversible occupy and \
+             the committed join; the just-committed actor was torn down to avoid a stranded \
+             context"
+        ),
+        code: codes::CTX_2040.to_owned(),
+    }
+}
+
 /// Rotation, agent-key, and migration operations re-publish a NEW DID document
 /// (a higher BEP44 sequence) that MUST land in the per-instance resolver DHT
 /// client — the one [`IdentityBackedDidResolver`](scp_ffi_common::IdentityBackedDidResolver)
@@ -10740,7 +10764,8 @@ impl Scp {
                 };
                 // The supervisor serves the id again, so a release mark a
                 // prior close left no longer applies. A close landing after
-                // this line re-marks the id, and the probe below catches it.
+                // this line re-marks the id, and the probe below catches it;
+                // the probe's teardown re-marks the id in either order.
                 bi.readmit_context(&context_id);
 
                 // FLAG-1: this block once re-synced the AUTHENTICATED ceiling
@@ -10764,19 +10789,10 @@ impl Scp {
                 // the durable Class-S snapshot the join persisted — a bare
                 // `despawn_actor` would leave the crypto group and snapshot
                 // behind, resurrecting the context on restart and blocking a
-                // fresh re-join. Then purge residual UCAN state and surface the
+                // fresh re-join. Then re-mark the id released and surface the
                 // error.
                 if bi.with_ucan_state(&context_id, |_| ()).is_none() {
-                    sup.discard_joined_context(&context_id).await;
-                    bi.remove_ucan_state(&context_id);
-                    return Err(ScpError::Context {
-                        msg: format!(
-                            "UCAN state for context '{context_id}' vanished between the \
-                             reversible occupy and the committed join; the just-committed actor \
-                             was torn down to avoid a stranded context"
-                        ),
-                        code: codes::CTX_2040.to_owned(),
-                    });
+                    return Err(tear_down_vanished_join(&bi, sup, &context_id).await);
                 }
 
                 // Runtime join committed. Build and register the FFI context handle
@@ -20242,6 +20258,44 @@ mod tests {
         assert!(
             scp.inner.released_contexts.contains_key(&absent),
             "a release on an id no actor serves must keep the mark"
+        );
+    }
+
+    /// A committed Welcome join whose UCAN state a racing close removed tears
+    /// the join down and re-marks the id, even though the join's readmit had
+    /// cleared the close's mark: an ungated call must not rebuild UCAN state
+    /// for an id no actor serves.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn a_vanished_join_teardown_re_marks_the_id_its_readmit_cleared() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        rt.block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create initializes the supervisor");
+        let ctx_id = scp_ffi_common::generate_context_id();
+        scp.inner.release_ucan_state(&ctx_id);
+        scp.inner.readmit_context(&ctx_id);
+
+        let sup = scp
+            .inner
+            .context_manager_or_error()
+            .expect("the supervisor is initialized");
+        let err = rt.block_on(super::tear_down_vanished_join(&scp.inner, sup, &ctx_id));
+        assert!(
+            matches!(err, ScpError::Context { ref code, .. } if code == codes::CTX_2040),
+            "the teardown must surface CTX_2040, got {err:?}"
+        );
+        assert!(
+            scp.inner.released_contexts.contains_key(&ctx_id),
+            "the teardown must re-mark the id the join's readmit cleared"
+        );
+        scp.inner.ensure_ucan_registered(&ctx_id);
+        assert!(
+            scp.inner.with_ucan_state(&ctx_id, |_| ()).is_none(),
+            "no UCAN state may be rebuilt for a torn-down join"
         );
     }
 

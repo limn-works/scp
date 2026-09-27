@@ -1306,6 +1306,30 @@ pub(crate) async fn reserve_key_package_on(
     })
 }
 
+/// Tears down a committed Welcome join whose bridge state a concurrent close
+/// or leave removed, and returns the join's `CTX_2040` error.
+///
+/// The close that removed the state marked the id, and the join's readmit may
+/// have cleared that mark. No actor serves the id after the teardown, so this
+/// re-marks it: an ungated call such as `event_log_query_on` must not rebuild
+/// UCAN state for it.
+async fn tear_down_vanished_join(
+    bi: &crate::runtime::NapiBridgeInstance,
+    sup: &scp_core::context::supervisor::Supervisor,
+    context_id: &str,
+) -> ScpNapiError {
+    sup.discard_joined_context(context_id).await;
+    crate::runtime::release_context(bi, context_id);
+    ScpNapiError::Context {
+        message: format!(
+            "bridge state for context '{context_id}' vanished between the reversible \
+             registration and the committed join; the just-committed actor was torn down so \
+             no context stays live without bridge state"
+        ),
+        code: codes::CTX_2040.to_owned(),
+    }
+}
+
 /// Per-bridge-instance implementation of `context_join_from_welcome`.
 ///
 /// Completes the reserve → Welcome → join handshake begun by
@@ -1449,7 +1473,8 @@ pub(crate) async fn context_join_from_welcome_on(
     };
     // The supervisor serves the id again, so a release mark a prior close left
     // no longer applies. A close landing after this line re-marks the id, and
-    // the presence probe below catches it.
+    // the presence probe below catches it; the probe's teardown re-marks the
+    // id in either order.
     crate::runtime::readmit_context(bi, &sealed.context_id);
 
     // FLAG-1: no ceiling copy is written here. `spawn_actor_from_welcome`
@@ -1471,17 +1496,9 @@ pub(crate) async fn context_join_from_welcome_on(
     // behind, so a restart would restore the context and a fresh re-join would
     // collide with it.
     if !crate::runtime::ucan_registry(bi).contains_key(&sealed.context_id) {
-        sup.discard_joined_context(&sealed.context_id).await;
-        crate::runtime::remove_context(bi, &sealed.context_id);
-        return Err(NapiError::from(ScpNapiError::Context {
-            message: format!(
-                "bridge state for context '{}' vanished between the reversible registration \
-                 and the committed join; the just-committed actor was torn down so no \
-                 context stays live without bridge state",
-                sealed.context_id
-            ),
-            code: codes::CTX_2040.to_owned(),
-        }));
+        return Err(NapiError::from(
+            tear_down_vanished_join(bi, &sup, &sealed.context_id).await,
+        ));
     }
     //
     // Runtime join committed. Register the context in the known-contexts
@@ -1785,12 +1802,6 @@ pub(crate) async fn context_close_on(
             }
         };
 
-    // Cancel the subscription task before closing so the background relay
-    // listener stops promptly.
-    if let Ok(token) = handle.subscription_cancel.lock() {
-        token.cancel();
-    }
-
     // Route through the ADR-049 lifecycle dispatch surface
     // ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command))
     // rather than calling a `ContextManager` method directly. The actor
@@ -1829,17 +1840,25 @@ pub(crate) async fn context_close_on(
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     }
 
-    handle.set_closed().map_err(NapiError::from)?;
-
     // Release UCAN state for this context, and mark the id so no later call
     // rebuilds it empty, unless an import or restore returned the id to
-    // `Active` after the lifecycle read above.
+    // `Active` after the lifecycle read above. That check runs before the
+    // handle is written `Closed` and before its subscription is cancelled, so
+    // a close that reports the context stays open leaves the handle reading
+    // "active" with its subscription running, as on the PyO3 and UniFFI
+    // bridges.
     if !crate::runtime::release_context_unless_readmitted(bi, &handle.context_id).await {
         return Err(NapiError::from(ScpNapiError::Context {
             message: "the context returned to Active through an import or restore while this close ran; the imported context stays open and keeps its state on this bridge".to_owned(),
             code: codes::CTX_2017.to_owned(),
         }));
     }
+
+    // Stop the background relay listener for this handle.
+    if let Ok(token) = handle.subscription_cancel.lock() {
+        token.cancel();
+    }
+    handle.set_closed().map_err(NapiError::from)?;
 
     // Clean up per-context bridge connector state and economy state via the
     // same NapiBridgeInstance's core (not the process-global bridge).
@@ -2060,14 +2079,14 @@ impl ActiveFlagGuard {
     }
 }
 
-/// Per-bridge-instance implementation of [`Scp::context_subscribe`](crate::scp::Scp::context_subscribe).
-pub(crate) async fn context_subscribe_on(
+/// Admits one subscription on `handle`: refuses a second concurrent
+/// subscription (`CTX_2022`) and a context the supervisor does not report
+/// `Active` (`CTX_2021`), and returns the guard that resets the handle's
+/// subscription flag when it drops.
+async fn subscribe_admission(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
-    identity_did: String,
-    on_message: napi::threadsafe_function::ThreadsafeFunction<Option<NapiMessage>>,
-) -> napi::Result<()> {
-    crate::napi_check_handle!(&bi.core, handle);
+) -> napi::Result<ActiveFlagGuard> {
     // Guard: prevent duplicate subscriptions. The AtomicBool is swapped to
     // true on the first call; subsequent calls see `true` and bail.
     // The flag is reset to `false` by the spawned task when it exits (via
@@ -2102,6 +2121,18 @@ pub(crate) async fn context_subscribe_on(
     })
     .await
     .map_err(NapiError::from)?;
+    Ok(outer_guard)
+}
+
+/// Per-bridge-instance implementation of [`Scp::context_subscribe`](crate::scp::Scp::context_subscribe).
+pub(crate) async fn context_subscribe_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    identity_did: String,
+    on_message: napi::threadsafe_function::ThreadsafeFunction<Option<NapiMessage>>,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
+    let outer_guard = subscribe_admission(bi, handle).await?;
 
     // `identity_did` is validated at the API boundary and reused below as the
     // heartbeat author DID for the periodic suppression-detection scheduler
@@ -6211,6 +6242,35 @@ mod tests {
         );
     }
 
+    /// A committed Welcome join whose bridge state a racing close removed
+    /// tears the join down and re-marks the id, even though the join's readmit
+    /// had cleared the close's mark: an ungated call must not rebuild UCAN
+    /// state for an id no actor serves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vanished_join_teardown_re_marks_the_id_its_readmit_cleared() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-vanished-join-{}", uuid::Uuid::new_v4());
+        crate::runtime::release_context(&bi, &ctx_id);
+        crate::runtime::readmit_context(&bi, &ctx_id);
+
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("the supervisor is initialized"));
+        let err = super::tear_down_vanished_join(&bi, &sup, &ctx_id).await;
+        assert!(
+            matches!(err, crate::error::ScpNapiError::Context { ref code, .. } if code == codes::CTX_2040),
+            "the teardown must surface CTX_2040, got {err:?}"
+        );
+        assert!(
+            bi.released_contexts.contains_key(&ctx_id),
+            "the teardown must re-mark the id the join's readmit cleared"
+        );
+        let handle = active_handle_for(&bi, &ctx_id, "did:key:z6MkNapiVanishedJoinCreator");
+        assert!(
+            crate::runtime::ensure_registered(&bi, &handle).is_err(),
+            "no UCAN state may be rebuilt for a torn-down join"
+        );
+    }
+
     /// A readmit that clears the release mark before the close's removal takes
     /// the registry shard lock leaves the readmitted context's state in place;
     /// while the mark stands, the removal takes the state.
@@ -6730,8 +6790,8 @@ mod tests {
     /// `register_test_context` registers the bridge's per-context UCAN state
     /// without spawning an actor, which is the state a completed TTL expiry
     /// leaves behind. The handle's cached string still reads `"active"`, so a
-    /// gate reading that string would admit join, leave, and send into a
-    /// context the supervisor stopped serving.
+    /// gate reading that string would admit join, leave, send, and subscribe
+    /// into a context the supervisor stopped serving.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lifecycle_gates_fail_closed_without_a_supervisor_actor() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -6764,6 +6824,90 @@ mod tests {
         assert!(
             send.to_string().contains("no live supervisor state"),
             "send reported: {send}"
+        );
+
+        let Err(subscribe) = super::subscribe_admission(&bi, &handle).await else {
+            panic!("subscribe must refuse a context no actor serves");
+        };
+        assert!(
+            subscribe.to_string().contains("no live supervisor state"),
+            "subscribe reported: {subscribe}"
+        );
+        assert!(
+            !handle
+                .subscription_active
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a refused subscribe must reset the subscription flag"
+        );
+    }
+
+    /// Join, leave, send, and subscribe refuse a context whose actor is
+    /// resident but reports `Closing`, the state a close another member
+    /// started leaves while this handle's cached string still reads "active".
+    /// A gate weakened to an existence check admits all four here, because the
+    /// actor answers the lifecycle read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lifecycle_gates_refuse_a_resident_actor_in_closing() {
+        use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-closing-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiClosingCreator";
+        test_dispatch_create_context(
+            &bi,
+            &ctx_id,
+            ContextParams::default(),
+            DID(creator.to_owned()),
+        )
+        .await;
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+
+        let admitted = super::subscribe_admission(&bi, &handle)
+            .await
+            .expect("an Active context admits a subscription");
+        drop(admitted);
+
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sup.dispatch_lifecycle_command(LifecycleCommand::CloseContext {
+            payload: Box::new(CloseContextPayload {
+                context_id: ctx_id.clone(),
+                params: ContextParams::default(),
+                initiator_did: DID(creator.to_owned()),
+            }),
+            reply: tx,
+        })
+        .await
+        .expect("close dispatch");
+        rx.await.expect("close reply").expect("close must succeed");
+        assert_eq!(
+            crate::runtime::read_live_context_state(&bi, &ctx_id)
+                .await
+                .expect("the resident actor answers"),
+            Some(scp_core::context::ContextState::Closing),
+        );
+        assert_eq!(handle.state().expect("state"), "active");
+
+        let closing = "'closing' state";
+        let join = super::context_join_on(&bi, &handle, creator.to_owned(), None)
+            .await
+            .expect_err("join must refuse a closing context");
+        assert!(join.to_string().contains(closing), "join reported: {join}");
+        let leave = super::context_leave_on(&bi, &handle, creator.to_owned())
+            .await
+            .expect_err("leave must refuse a closing context");
+        assert!(leave.to_string().contains(closing), "leave reported: {leave}");
+        let send = super::context_send_on(&bi, &handle, creator.to_owned(), b"hi".to_vec(), None)
+            .await
+            .expect_err("send must refuse a closing context");
+        assert!(send.to_string().contains(closing), "send reported: {send}");
+        let Err(subscribe) = super::subscribe_admission(&bi, &handle).await else {
+            panic!("subscribe must refuse a closing context");
+        };
+        assert!(
+            subscribe.to_string().contains(closing),
+            "subscribe reported: {subscribe}"
         );
     }
 
