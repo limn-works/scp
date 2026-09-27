@@ -1,48 +1,47 @@
-# Hash-Then-Reveal Commitments Require Preimage Retention From t=commit Through t=reveal
+# A Hash-Then-Reveal Commitment Needs Its Preimage From Commit Time Through Reveal Time
 
 > **Dating note (2026-09-02):** this lesson describes `migrate_identity` and the pre-rotation model as Pre-Rotation Key Custody, §9.7.4.1 of `09-security-model.md`, read before the key-event-log recovery amendment. Root-Authority Recovery and Fork Precedence, §9.7.4.2 of that spec, states the amended model. The lesson's principle stands; its spec citations are historical.
 
-**Source:** the pre-rotation key, destroyed at create time and then required at migrate time. `.docs/lessons/pre-rotation-key-must-be-stored-at-creation.md`, from the SCP-214 review, predicted this failure before it occurred.
-
 ## Rule
 
-Any hash-then-reveal commitment scheme — the commitment (hash) is published at time T, the preimage is required at time T+N — must persist a reference to the preimage from T through T+N on every reachable code path. The persistence boundary is set by the longest possible delay between commit and reveal, not the typical case.
+When a scheme publishes a commitment (a hash) at time T and requires the preimage at time
+T+N, every reachable code path keeps a reference to the preimage from T through T+N, and the
+longest possible delay sets the bound. A path that destroys or never stores the preimage
+before the reveal site breaks the scheme: verifiers reject the proof and reveal becomes
+impossible.
 
-If the commitment-publishing code path destroys or fails to retain the preimage before any reveal-time call site, the invariant is broken cryptographically. Verifiers will reject the proof; reveal becomes impossible.
+| Commitment | Preimage | Spec | Lifetime |
+|---|---|---|---|
+| `pre_rotation_commitment` | pre-rotation public key | §9.7.4.1, §9.7.4.2 R1 | inception → the next reveal-authorized event (possibly years) |
+| KeyPackage | KeyPackage init key | RFC 9420 | publish → consumption |
+| sender key commitment | sender key | §9.16.2 | distribution → destruction |
 
-## SCP examples of hash-then-reveal commitments
+## Detection
 
-| Commitment | Preimage | Spec location | Lifetime |
-|------------|----------|---------------|----------|
-| `pre_rotation_commitment` (32-byte SHA-256) | Pre-rotation key public bytes | §9.7.4.1, §9.7.4.2 R1 | Inception → the next reveal-authorized event (potentially years) |
-| KeyPackage commitment | KeyPackage init key | RFC 9420 / §9.7.3 | KeyPackage publish → KeyPackage consumption (single-use) |
-| Sender key commitment | Sender key | §9.16.2 | Key distribution → key destruction |
-| MLS leaf commitment | Leaf encryption key | RFC 9420 §7 | Epoch advance → next epoch advance |
+Find each hash over key material (`Sha256::digest`, `*_commitment`), trace where its
+preimage is generated, stored, and needed again, and look for a destroy, drop, or scope end
+before any reveal site. Then test the whole commit-to-reveal cycle on emitted bytes, as
+`.docs/lessons/behavioral-invariant-must-be-asserted-on-every-bridge.md` describes.
 
-For each, the preimage must remain in *some* custody until the reveal-time code path is reachable. The custody discipline (HSM, cold storage, in-memory, encrypted backup) varies by threat model, but the basic invariant is the same: don't destroy the preimage before the reveal site.
+## The pre-rotation case
 
-## Detection pattern
+`create` published `SHA-256(pre_rotation_public)` and then destroyed the pre-rotation key
+under a literal reading of §9.7.4.1 item 5f; the key handle never reached `ScpIdentity`, and
+migration generated a fresh key whose hash could not match. Three fixes were weighed:
 
-Static review:
-1. Grep for hashing primitives over keys: `Sha256::digest`, `compute_commitment`, `*_commitment`, `key_commitment`, `commitment_bytes`.
-2. For each match, identify the preimage variable. Where is it generated? Where is it stored (or not)? Where is it required again?
-3. If any `destroy_key`, drop, scope-end, or end-of-function precedes any reveal-time site on a reachable code path, the invariant is broken.
-4. Test: write an integration test that runs the full commit-to-reveal cycle and asserts the spec invariant on the emitted artifact bytes (see `behavioral-invariant-must-be-asserted-on-every-bridge.md`).
+1. **Exempt in-memory custody in the spec.** Rejected: it gives up compromise recovery in
+   that profile.
+2. **Keep the key in operational custody** (`pre_rotation_key: KeyHandle` on `ScpIdentity`).
+   Rejected: an attacker who compromises operational custody also gets the recovery
+   backstop, which §9.7.4.1 item 3 storage isolation forbids.
+3. **A separate `PreRotationCustody` trait with its own `PreRotationKeyHandle`.** Landed.
+   `ScpIdentity` carries only `pre_rotation_commitment`; `create` returns
+   `(ScpIdentity, KeyEvent, PreRotationKeyHandle)`; `migrate_identity` takes the handle
+   and a `&impl PreRotationCustody`. The only implementation, `InMemoryPreRotationCustody`,
+   compiles under the `testing` feature alone, so a shipped build has no backend and
+   `create_inner` in `crates/scp-identity/src/config.rs` fails closed with
+   `IdentityError::NoPreRotationBackend` (`SCP-IDENT-1059`), per ADR-062 §Decision 6.
 
-## SCP-1717 specifics
-
-`create_new_identity_keys` published `SHA-256(pre_rotation_public)` as the commitment, then called `key_custody.destroy_key(&pre_rotation_key)` per literal spec §9.7.4.1 #5f ("destroy from memory after backup is confirmed"). For `InMemoryKeyCustody`, no backup callback existed — the destroy was unconditional. At migrate time, native bridges generated a fresh keypair, breaking `SHA-256(revealed_key) == commitment` from spec §9.7.4.1.
-
-Three resolutions were considered:
-
-1. **Spec amendment**: §9.7.4.1 #3 and #5f gain an exemption for in-memory custody profiles, on the basis that there is no operational/cold separation in test/in-memory mode. §9.12 line 1067 ("from cold storage") is amended to acknowledge in-memory mode has no cold storage and therefore no compromise recovery in that profile.
-2. **Custody handoff with type-level isolation**: introduce a separate `PreRotationCustody` trait with a distinct `PreRotationKeyHandle` type. The pre-rotation private key is generated by the platform CSPRNG, immediately handed to a `PreRotationCustody` instance (whose backend may be in-memory, FIDO2, paper, callback, etc.), and never enters operational `KeyCustody`. `ScpIdentity` carries only the public commitment; the handle is returned alongside so callers can persist it. The type system *structurally encourages* §9.7.4.1 §3 storage isolation — `KeyHandle` and `PreRotationKeyHandle` have no `From`/`Into` either direction — but cannot verify that two distinct foreign callback objects are not backed by the same Keychain access group or biometric prompt; hardware/OS-level substrate and auth-flow isolation remains a foreign-implementation obligation (see `.docs/lessons/custody-substrate-isolation-holds-at-rest-not-in-transit.md`).
-3. **Retain in operational custody**: `pre_rotation_key: KeyHandle` on `ScpIdentity`. Simplest, but regresses the §9.7.4.1 #3 (storage isolation) threat model — an attacker who compromises operational custody now also gets the recovery backstop.
-
-**Resolution (2) is what landed.** `scp-platform` exposes `PreRotationCustody` as a sibling trait of `KeyCustody`. `InMemoryPreRotationCustody` is the only implementation of that trait in the tree, and `crates/scp-platform/src/lib.rs` compiles the module holding it only under the `testing` feature, so a shipped build carries no `PreRotationCustody` backend at all. `ScpIdentity` carries `pre_rotation_commitment: [u8; 32]` (public hash) and the three operational handles (`identity_key`, `active_signing_key`, `agent_signing_key`); the pre-rotation private bytes are never on `ScpIdentity` directly. `create` now returns `(ScpIdentity, DidDocument, PreRotationKeyHandle)` and `migrate_identity` takes the handle plus a `&impl PreRotationCustody` parameter and consumes the OLD entry to mint the new `#0`.
-
-The in-memory backend satisfies type-level isolation and fails §9.7.4.1 §3's "separate storage substrate" threat model, so it serves the test harness and nothing else. A shipped build does not substitute a weaker backend for the missing one: `create_inner` in `crates/scp-identity/src/config.rs` returns `IdentityError::NoPreRotationBackend` on the arm that a build without the `testing` feature selects, and each of the three FFI bridges surfaces that error as the code `SCP-IDENT-1059`. ADR-062, capability injection and prove-absent dev backends, §Decision 6 decided that severance, because a build that substituted the nullifier would report a recovery backstop it does not hold. A hardware-backed backend (FIDO2, Secure Enclave companion) and a callback-based one (cross-app cold storage) are forward work under issue #1729, production `PreRotationCustody` backends, and RFC #2130, pre-rotation recovery custody; each lands as an additional `PreRotationCustody` impl and re-shapes no protocol type.
-
-## Companion lesson
-
-`.docs/lessons/pre-rotation-key-must-be-stored-at-creation.md` — narrower, predicts the SCP-1717 fix from SCP-214 review. This lesson is the generalization: every commit-then-reveal scheme has the same structure.
+A distinct trait stops one object from serving both roles and cannot prove two foreign
+callbacks use different hardware; see
+`.docs/lessons/custody-substrate-isolation-holds-at-rest-not-in-transit.md`.

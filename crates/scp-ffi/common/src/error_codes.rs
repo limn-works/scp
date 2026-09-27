@@ -283,7 +283,7 @@ pub const IDENT_1058: &str = "SCP-IDENT-1058";
 /// only implementation that exists today is the in-memory test nullifier
 /// (`InMemoryPreRotationCustody`), now gated to the test harness only (ADR-062
 /// §Decision 6). Rather than silently mint the nullifier (which would ship a
-/// false durability guarantee — CLAUDE.md builder tenet "No dev/test-only
+/// false durability guarantee — AGENTS.md builder tenet "No dev/test-only
 /// stand-ins in production"), creation fails closed with this typed code. Maps
 /// from [`scp_identity::IdentityError::NoPreRotationBackend`]. A real, persistent
 /// pre-rotation backend is tracked by #1729 / RFC #2130; non-committing creation

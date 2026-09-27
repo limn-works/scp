@@ -26,7 +26,7 @@ CRITERION
 
 WHAT THE CHECK READS
     The files that tell an agent how to write and how to work: `.docs/standards/`,
-    `.docs/lessons/`, `.claude/agents/`, `CLAUDE.md`, and the two build blueprints an
+    `.docs/lessons/`, `.claude/agents/`, `AGENTS.md`, and the two build blueprints an
     agent reads before it writes a crate — `.docs/scaffold/` and `.docs/architecture.md`.
     It also reads the product specs in `.docs/specs/` and the decision records in
     `.docs/adrs/`, which is the widening the section below reserved.
@@ -102,7 +102,7 @@ SCOPE_DIRS = (
     ".docs/specs",
     ".docs/adrs",
 )
-SCOPE_FILES = ("CLAUDE.md", ".docs/architecture.md")
+SCOPE_FILES = ("AGENTS.md", ".docs/architecture.md")
 
 
 def spec_files(root: Path) -> dict[str, Path]:

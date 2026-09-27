@@ -551,7 +551,7 @@ impl<'a> SharedClassS<'a> {
 /// sees. The load-bearing guarantee is that structural shape (private field, no
 /// `&mut`/`DerefMut`), witnessed at compile time by
 /// `assert_not_impl_any!(SharedClassS<'static>: DerefMut)` in this module's test
-/// submodule. (Per `.docs/lessons/rust/compile-time-boundary-over-source-text-denylist.md`,
+/// submodule. (Per `.docs/lessons/ast-gate-checks-definition-not-name-resolution.md`,
 /// the structural wrapper + assert is the guarantee; an illustrative doctest is a
 /// demoted, accurate signpost — NOT a decoupled mirror that can drift from a real
 /// field flip, which is the BLACK-CS-01 defect this replaces.)
@@ -908,7 +908,7 @@ pub(crate) struct EconomyPreCheckBorrows<'a> {
 /// survives — is caught by the SAFETY-INVARIANT contract on [`Self::new`]'s
 /// destructure (the `..` rest) plus the type having no `class_s` field; it does
 /// NOT rely on an example. (Per
-/// `.docs/lessons/rust/compile-time-boundary-over-source-text-denylist.md`, prefer
+/// `.docs/lessons/ast-gate-checks-definition-not-name-resolution.md`, prefer
 /// the structural shape over a source-text/doctest signpost.)
 pub(crate) struct GovernanceClassCMut<'a> {
     /// `&mut` to the per-sender velocity tracker (§19.7).
@@ -1334,7 +1334,7 @@ impl<'a> GovernanceClassCMut<'a> {
 /// over method resolution — the two such witnesses that used to live here were
 /// shape-fragile (they missed the realistic `&mut self` inherent GROW) and were
 /// deleted; see the honest §9 structural account in the test submodule. Per
-/// `.docs/lessons/rust/compile-time-boundary-over-source-text-denylist.md`.
+/// `.docs/lessons/ast-gate-checks-definition-not-name-resolution.md`.
 ///
 /// SCOPE: this is NOT a claim that a GROW lives nowhere else. The consequence-only
 /// [`ConsequenceRoleStateMut`] exposes the GROW (reachable from a best-effort
@@ -3954,7 +3954,7 @@ mod tests {
     // an injected `fn suspend_all(&mut self, did)` on `RoleStateClassCMut` compiled
     // with all witnesses passing.) A coupled witness over method RESOLUTION is
     // fragile to receiver mutability, arity, generics, and macros; per
-    // `.docs/lessons/rust/compile-time-boundary-over-source-text-denylist.md` and
+    // `.docs/lessons/ast-gate-checks-definition-not-name-resolution.md` and
     // the project's "a gate adds ~zero marginal security vs an insider who can edit
     // it — prefer real type-system enforcement" philosophy, false confidence is
     // worse than none.

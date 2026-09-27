@@ -14,7 +14,7 @@
 #
 # DYLD_LIBRARY_PATH is set to libpython for the linker if missing — every
 # scp-testing integration test that touches scp-ffi via cargo workspace
-# linkage needs this (see project CLAUDE.md "Language-specific gotchas").
+# linkage needs this (see project AGENTS.md "Toolchain" gotchas).
 
 set -euo pipefail
 

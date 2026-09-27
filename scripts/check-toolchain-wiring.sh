@@ -389,8 +389,8 @@ fi
 # claim at face value — it is the one judgement this check cannot make.
 NO_RUST_JOB_READS=(
     # Documentation and licensing. No job compiles from them.
+    "AGENTS.md"
     "CHANGELOG.md"
-    "CLAUDE.md"
     "CONTRIBUTING.md"
     "GETTING-STARTED.md"
     "LICENSE"

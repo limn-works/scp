@@ -1,33 +1,37 @@
-# An "Awaiting Upstream" Advisory Ignore Is a Claim About a Date
+# An Advisory Ignore Is a Claim to Re-Check, and a Local `cargo deny` Sees Less Than CI
 
-**Problem**: `deny.toml` suppressed RUSTSEC-2026-0098, RUSTSEC-2026-0099, and
-RUSTSEC-2026-0104 — three rustls-webpki advisories — with the justification "Awaiting
-upstream rustls-webpki patch". rustls-webpki had published the patch for all three four
-months before anyone read the file again, and every requirement on that crate in this
-workspace was semver-compatible with the fixed release, so
-`cargo update -p rustls-webpki --precise 0.103.13` moved one lockfile entry and nothing
-else.
-Until then the relay kept linking a version that accepts a URI name constraint it should
-reject, accepts a wildcard-asserting certificate under a permitted DNS-name constraint, and
-panics on a syntactically valid empty `BIT STRING` in a certificate revocation list's
-`onlySomeReasons` extension before that list's signature is verified.
+## An "awaiting upstream" ignore goes stale silently
 
-**Root cause**: the justification states a fact about the world on the day somebody wrote
-it, and the file does not age with the world. An operator reading `deny.toml` to learn which
-advisories this repository still carries reads "no fix exists" and leaves every entry
-suppressed.
+`deny.toml` suppressed three rustls-webpki advisories with the justification "Awaiting
+upstream rustls-webpki patch". The patch had shipped four months earlier and a lock-only
+`cargo update -p rustls-webpki --precise 0.103.13` fixed all three, while the relay kept
+linking a version that panicked on a crafted certificate revocation list before verifying its
+signature.
 
-## Rules
+- **An ignore whose justification is the absence of a fix is a claim to re-check against the
+  advisory's `patched` range whenever you touch `deny.toml`.** Delete the entries upstream has
+  since fixed.
+- **Write the justification so a reader can check it:** name the release that would clear the
+  entry, or the reason no release can.
+- **Never write "do not delete this entry."** The reader who obeys it never runs the
+  `cargo update --dry-run` that shows the mask is unnecessary.
 
-- **An ignore entry whose justification is the absence of a fix is a claim to re-check
-  against the advisory database's `patched` range, not a decision to record once.** Re-check
-  every such entry whenever you touch the file, and delete the ones the upstream has since
-  fixed.
-- **Write the justification so a reader can check it.** Name the upstream release that would
-  clear the entry, or the reason no release can. "Awaiting upstream" names neither, so
-  nothing in the entry tells a later reader how to decide whether it still holds.
-- **Deleting the entry is the fix, and the audit is the enforcement.** The `rust-deny` job
-  in `.github/workflows/ci.yml` runs `EmbarkStudios/cargo-deny-action`, whose default check
-  set includes advisories, and the paths filter guarding that job lists `deny.toml` and
-  `Cargo.lock`. The audit fails if the lock ever resolves a vulnerable version again, so the
-  entry does not need to stay behind as a reminder.
+## A local run is a lower bound on what CI reports
+
+A local `cargo deny check advisories` (cargo-deny 0.19.0, advisory database fetched that day)
+reported RUSTSEC-2026-0097 as `advisory-not-detected` while `Cargo.lock` resolved an affected
+rand release; the `Rust / deny` job, which runs `EmbarkStudios/cargo-deny-action`, reported
+the same advisory as `error[unsound]` against the same lockfile. The cause of the difference
+is unknown. So before deleting an ignore entry, open its record under
+`~/.cargo/advisory-db/`, read the `patched` range, and delete only when one of these holds:
+
+1. `cargo update --dry-run -p <crate>@<locked version>` moves the crate into the patched
+   range. Run the update and delete the entry. An ignore is keyed by advisory ID, so it masks
+   every affected major line in the lock at once; update each one.
+2. `cargo tree -i <crate>` prints nothing, so nothing reaches the advisory.
+
+Otherwise the entry stays, and its comment names the release that clears it.
+
+`fuzz/Cargo.lock` is a second lockfile that resolves the workspace crates through path
+dependencies, and no CI job runs `cargo deny` against it. Repeat every lock-only fix inside
+`fuzz/`.
