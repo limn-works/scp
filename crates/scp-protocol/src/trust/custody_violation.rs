@@ -1356,8 +1356,10 @@ pub trait ViolationStore {
 /// shipped build should offer, not its availability.
 ///
 /// This tree ships no `ViolationStore` implementation at all: no type outside
-/// this gate implements that trait today. A caller that needs one writes a
-/// durable implementation over `Storage` rather than reaching for this double.
+/// this gate implements that trait today. Which durable store holds these
+/// records is open question OQ-26 of `.docs/specs/27-attestations.md`, and
+/// done story SCP-AB-019 names `ProtocolRepository`; until a human settles
+/// OQ-26, a shipped build has no violation store rather than this double.
 /// This gate itself copies its shape from
 /// `scp_runtime::bridge::credentials::InMemoryCredentialStore`, which ADR-062
 /// (capability injection, §Decision 5) gated for its own capability; ADR-062

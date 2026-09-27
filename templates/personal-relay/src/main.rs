@@ -347,12 +347,18 @@ async fn main() {
     // Handle --health before initializing tracing (keep probe quiet).
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--health") {
-        let config = Config::from_env();
+        let config = Config::from_env().unwrap_or_else(|e| {
+            eprintln!("invalid configuration: {e}");
+            std::process::exit(1);
+        });
         health_probe(config.bind_addr).await;
         return;
     }
 
-    let config = Config::from_env();
+    let config = Config::from_env().unwrap_or_else(|e| {
+        eprintln!("invalid configuration: {e}");
+        std::process::exit(1);
+    });
     init_tracing(&config);
 
     // Validate storage path.
