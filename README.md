@@ -143,14 +143,17 @@ SCP provides two binary entrypoints for local development and testing:
 #### From source
 
 ```sh
-# Bare relay — listens on 0.0.0.0:9000
-cargo run --release -p scp-relay
+# Bare relay — listens on 0.0.0.0:9000. Every run names a blob storage
+# backend; that variable has no default.
+SCP_RELAY_STORAGE_BACKEND=sqlite cargo run --release -p scp-relay
 
 # Full application node — requires SCP_NODE_DOMAIN
-SCP_NODE_DOMAIN=localhost cargo run --release -p scp-node
+SCP_NODE_DOMAIN=localhost \
+SCP_RELAY_STORAGE_BACKEND=sqlite \
+cargo run --release -p scp-node
 
 # Relay-only mode via scp-node
-cargo run --release -p scp-node -- --relay-only
+SCP_RELAY_STORAGE_BACKEND=sqlite cargo run --release -p scp-node -- --relay-only
 ```
 
 #### With Docker
@@ -187,6 +190,7 @@ scp-node --health
 
 | Variable | Default | Description |
 |---|---|---|
+| `SCP_RELAY_STORAGE_BACKEND` | none — required | Blob storage backend: `sqlite`, `redb`, `postgres`, `s3`, or `memory`. A relay that reads it unset exits 1 (persistence spec §17.17.1, `SCP-CAPSEL-8000`) |
 | `SCP_RELAY_BIND_ADDR` | `0.0.0.0:9000` | Listen address |
 | `SCP_RELAY_MAX_BLOB_SIZE` | `262144` | Max blob size (bytes) |
 | `SCP_RELAY_MAX_BLOB_TTL` | `604800` | Max blob TTL (seconds) |

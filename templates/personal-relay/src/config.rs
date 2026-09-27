@@ -4,7 +4,7 @@
 //! See the [`Config`] struct for the full list.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Personal relay configuration, loaded from environment variables.
 pub struct Config {
@@ -46,6 +46,9 @@ pub struct Config {
 
     /// Directory for SQLite databases (node storage + key custody).
     /// Default: `$XDG_DATA_HOME/scp/personal-relay` or `$HOME/.local/share/scp/personal-relay`.
+    /// An empty value counts as unset. With neither an absolute
+    /// `XDG_DATA_HOME` nor an absolute `HOME`, [`Config::from_env`] returns an
+    /// error instead of choosing a directory.
     ///
     /// Env: `SCP_RELAY_STORAGE_PATH`
     pub storage_path: PathBuf,
@@ -80,7 +83,13 @@ impl Config {
     /// Loads configuration from environment variables.
     ///
     /// Missing variables use the defaults documented on each field.
-    pub fn from_env() -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when `SCP_RELAY_STORAGE_PATH` is unset or empty, no
+    /// absolute `XDG_DATA_HOME` is set, and `HOME` is unset, empty, or
+    /// relative.
+    pub fn from_env() -> Result<Self, String> {
         let domain = non_empty_env("SCP_RELAY_DOMAIN");
 
         let default_addr = if domain.is_some() {
@@ -98,9 +107,13 @@ impl Config {
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false);
 
-        let storage_path = std::env::var("SCP_RELAY_STORAGE_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| default_storage_path());
+        let storage_path = match non_empty_env("SCP_RELAY_STORAGE_PATH") {
+            Some(path) => PathBuf::from(path),
+            None => default_storage_path(
+                std::env::var_os("XDG_DATA_HOME").as_deref(),
+                std::env::var_os("HOME").as_deref(),
+            )?,
+        };
 
         let dht_gateways = std::env::var("SCP_RELAY_DHT_GATEWAYS")
             .ok()
@@ -113,7 +126,7 @@ impl Config {
             })
             .unwrap_or_default();
 
-        Self {
+        Ok(Self {
             domain,
             acme_email: non_empty_env("SCP_RELAY_ACME_EMAIL"),
             bind_addr,
@@ -125,7 +138,7 @@ impl Config {
             dht_gateways,
             log_level: std::env::var("SCP_RELAY_LOG_LEVEL").unwrap_or_else(|_| "info".into()),
             log_format: std::env::var("SCP_RELAY_LOG_FORMAT").unwrap_or_else(|_| "pretty".into()),
-        }
+        })
     }
 }
 
@@ -134,14 +147,73 @@ fn non_empty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
-/// Default storage path following XDG Base Directory Specification.
-fn default_storage_path() -> PathBuf {
-    let data_home = std::env::var("XDG_DATA_HOME").map_or_else(
-        |_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
-            PathBuf::from(home).join(".local").join("share")
-        },
-        PathBuf::from,
-    );
-    data_home.join("scp").join("personal-relay")
+/// Default storage path following the XDG Base Directory Specification, over
+/// explicit `XDG_DATA_HOME` and `HOME` values.
+///
+/// An empty or relative `XDG_DATA_HOME` is ignored, as that specification
+/// directs. An empty or relative `HOME` is rejected, and so is an unset one:
+/// a relative base resolves against the working directory, so a relay started
+/// from two working directories would open two databases under two storage
+/// keys, and a fixed fallback such as `/tmp` is a directory another local
+/// user can create first.
+fn default_storage_path(
+    xdg_data_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, String> {
+    if let Some(xdg) = xdg_data_home.map(Path::new).filter(|xdg| xdg.is_absolute()) {
+        return Ok(xdg.join("scp").join("personal-relay"));
+    }
+    let home = home
+        .map(Path::new)
+        .filter(|home| home.is_absolute())
+        .ok_or_else(|| {
+            "HOME is unset, empty, or relative, and neither SCP_RELAY_STORAGE_PATH nor an \
+             absolute XDG_DATA_HOME is set; set one of them to an absolute directory"
+                .to_owned()
+        })?;
+    Ok(home
+        .join(".local")
+        .join("share")
+        .join("scp")
+        .join("personal-relay"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    /// An unset, empty, or relative `HOME` is rejected rather than replaced by
+    /// `/tmp` or resolved against the working directory; an empty or relative
+    /// `XDG_DATA_HOME` is ignored.
+    ///
+    /// Restoring the `/tmp` fallback makes the unset-`HOME` case return `Ok`,
+    /// and passing `XDG_DATA_HOME` through unfiltered makes the relative
+    /// `share` case return `Ok`, so either regression fails this test.
+    #[test]
+    fn default_storage_path_rejects_a_working_directory_relative_or_fixed_base() {
+        for home in [None, Some(""), Some("data")] {
+            let home = home.map(OsStr::new);
+            for xdg in [None, Some(OsStr::new("")), Some(OsStr::new("share"))] {
+                assert!(
+                    default_storage_path(xdg, home).is_err(),
+                    "HOME={home:?} XDG_DATA_HOME={xdg:?} must be rejected"
+                );
+            }
+        }
+
+        let home = Some(OsStr::new("/home/op"));
+        assert_eq!(
+            default_storage_path(Some(OsStr::new("")), home),
+            Ok(PathBuf::from("/home/op/.local/share/scp/personal-relay"))
+        );
+        assert_eq!(
+            default_storage_path(Some(OsStr::new("share")), home),
+            Ok(PathBuf::from("/home/op/.local/share/scp/personal-relay"))
+        );
+        assert_eq!(
+            default_storage_path(Some(OsStr::new("/data")), home),
+            Ok(PathBuf::from("/data/scp/personal-relay"))
+        );
+    }
 }

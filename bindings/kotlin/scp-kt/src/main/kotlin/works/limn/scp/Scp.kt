@@ -1121,14 +1121,21 @@ class SCP internal constructor(
      * quorum-validated governance engine; the caller supplies no proposal,
      * action, status, or identity. The executor and consequence subject are
      * resolved from the tracked proposal's proposer.
+     *
+     * @return The [GovernanceActionResult] naming which action ran.
+     * @throws uniffi.scp.ScpException.Context with `SCP-GOV-11040` when the
+     *   bridge reports an outcome this SDK version cannot name, and whatever
+     *   the bridge throws when execution fails.
      */
     suspend fun governanceExecute(
         handle: ContextHandle,
         proposalIdHex: String,
-    ): String =
-        inner.governanceExecute(
-            handle = handle,
-            proposalIdHex = proposalIdHex,
+    ): GovernanceActionResult =
+        GovernanceActionResult.fromBridge(
+            inner.governanceExecute(
+                handle = handle,
+                proposalIdHex = proposalIdHex,
+            ),
         )
 
     /** Forwards to [NativeScp.governanceGetProposal] on [inner]. */
@@ -1144,16 +1151,26 @@ class SCP internal constructor(
     /** Forwards to [NativeScp.governanceListProposals] on [inner]. */
     suspend fun governanceListProposals(handle: ContextHandle): String = inner.governanceListProposals(handle = handle)
 
-    /** Forwards to [NativeScp.governancePropose] on [inner]. */
+    /**
+     * Forwards to [NativeScp.governancePropose] on [inner].
+     *
+     * @return JSON with `proposal_id`, `status`, and `execution_result`,
+     *   checked by [GovernanceActionResult.checkProposeResponse].
+     * @throws uniffi.scp.ScpException.Context with `SCP-GOV-11040` when a
+     *   `SingleAdmin` proposal auto-executed and its outcome has no name in
+     *   this SDK version, as [governanceExecute] throws for that outcome.
+     */
     suspend fun governancePropose(
         handle: ContextHandle,
         proposerDid: String,
         actionJson: String,
     ): String =
-        inner.governancePropose(
-            handle = handle,
-            proposerDid = proposerDid,
-            actionJson = actionJson,
+        GovernanceActionResult.checkProposeResponse(
+            inner.governancePropose(
+                handle = handle,
+                proposerDid = proposerDid,
+                actionJson = actionJson,
+            ),
         )
 
     /** Forwards to [NativeScp.governanceReject] on [inner]. */

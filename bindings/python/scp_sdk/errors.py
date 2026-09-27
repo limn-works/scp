@@ -198,6 +198,29 @@ class GovernanceError(ScpError):
     _default_code: str = "SCP-GOV-11000"
 
 
+class UnknownGovernanceOutcomeError(GovernanceError):
+    """A governance action executed, and its outcome has no name in this SDK.
+
+    An engine runs a governance action and reports which action it ran. This
+    SDK enumerates those outcomes, so an SDK older than its bridge reads a
+    string no member matches. That is two facts a caller acts on: an action DID
+    execute, and this SDK cannot say which one. :attr:`raw_outcome` carries what
+    a bridge reported, so a caller logs it, matches it, or upgrades this SDK.
+
+    Attributes:
+        raw_outcome: Outcome string a bridge reported, stripped of surrounding
+            whitespace.
+    """
+
+    #: Distinct from ``SCP-GOV-11000``: an action that never ran versus an
+    #: action that ran under a name this SDK does not carry.
+    _default_code: str = "SCP-GOV-11040"
+
+    def __init__(self, message: str, raw_outcome: str, code: str | None = None) -> None:
+        super().__init__(message, code)
+        self.raw_outcome = raw_outcome
+
+
 class EconomyError(ScpError):
     """Payment, budget, or economic-policy failure (SCP-ECON range, 12000-12999)."""
 

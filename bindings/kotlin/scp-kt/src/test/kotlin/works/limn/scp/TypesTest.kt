@@ -8,6 +8,7 @@
 package works.limn.scp
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.Test
 
 class TypesTest {
@@ -51,5 +52,53 @@ class TypesTest {
         )
         assertEquals(true, handle.hasCapability("outlet:query:calculator"))
         assertEquals(false, handle.hasCapability("outlet:call:calculator"))
+    }
+
+    /**
+     * `Scp.governanceExecute` parses through [GovernanceActionResult.fromBridge],
+     * which returns the entry for a name one carries and throws
+     * `SCP-GOV-11040` for a name none carries. Making it return
+     * [GovernanceActionResult.EXECUTED] for an unknown name fails this test.
+     */
+    @Test
+    fun `governance outcome parse fails closed on an unknown name`() {
+        assertEquals(29, GovernanceActionResult.entries.size)
+        assertEquals(
+            GovernanceActionResult.MEMBER_ADDED,
+            GovernanceActionResult.fromBridge("MemberAdded"),
+        )
+        val error =
+            assertThrows<uniffi.scp.ScpException.Context> {
+                GovernanceActionResult.fromBridge("SomethingThisSdkDoesNotKnow")
+            }
+        assertEquals("SCP-GOV-11040", error.code)
+    }
+
+    /**
+     * `Scp.governancePropose` and `GovernanceBridgeOps.propose` check the
+     * auto-executed outcome through
+     * [GovernanceActionResult.checkProposeResponse]. Making it return [raw]
+     * without parsing `execution_result` fails the unknown-name assertion.
+     */
+    @Test
+    fun `governance propose response check fails closed on an outcome it cannot name`() {
+        for (raw in listOf(
+            """{"proposal_id":"00","execution_result":"RoleChanged"}""",
+            """{"proposal_id":"00","execution_result":null}""",
+        )) {
+            assertEquals(raw, GovernanceActionResult.checkProposeResponse(raw))
+        }
+        for (raw in listOf(
+            """{"proposal_id":"00","execution_result":"SomethingThisSdkDoesNotKnow"}""",
+            "not json",
+            "[]",
+            """{"execution_result":7}""",
+        )) {
+            val error =
+                assertThrows<uniffi.scp.ScpException.Context> {
+                    GovernanceActionResult.checkProposeResponse(raw)
+                }
+            assertEquals("SCP-GOV-11040", error.code)
+        }
     }
 }

@@ -777,7 +777,7 @@ class CoroutineBridgeTest {
                     assertFailsWith<BridgeException> {
                         bridge.broadcast.publishAsset(1L, asset = asset)
                     }
-                assertEquals("SCP-IDENT-1060", exception.code)
+                assertEquals("SCP-IDENT-1063", exception.code)
             }
     }
 
@@ -1082,7 +1082,7 @@ class StubNativeBindings : NativeBindings {
     override fun governanceExecute(
         contextHandle: Long,
         proposalIdHex: String,
-    ): String = """{"status":"executed"}"""
+    ): String = "MemberAdded"
 
     override fun governancePropose(
         contextHandle: Long,

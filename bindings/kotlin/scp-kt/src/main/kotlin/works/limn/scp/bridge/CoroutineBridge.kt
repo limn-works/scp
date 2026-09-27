@@ -410,7 +410,10 @@ interface GovernanceBindings {
      * @param proposerDid DID of the member submitting the proposal.
      * @param actionJson JSON-serialized governance action to propose.
      * @return JSON string with `proposal_id`, `status`, and
-     *   `execution_result` (if auto-approved).
+     *   `execution_result`. `execution_result` carries the same action-result
+     *   name [governanceExecute] returns (e.g., `"MemberAdded"`,
+     *   `"RoleChanged"`) when a `SingleAdmin` proposal auto-executed, and is
+     *   `null` while a multi-admin proposal awaits votes.
      * @throws BridgeException if the proposer lacks permission or
      *   the action JSON is malformed.
      */
@@ -2169,12 +2172,19 @@ class GovernanceBridgeOps internal constructor(
      *
      * @param contextHandle Handle from context create.
      * @param proposalIdHex Hex-encoded id of the approved, tracked proposal.
-     * @return A string describing the governance action result.
+     * @return The outcome name a bridge reported, checked by
+     *   [works.limn.scp.GovernanceActionResult.fromBridge].
+     * @throws uniffi.scp.ScpException.Context with `SCP-GOV-11040` when that
+     *   outcome has no name in this SDK version.
      */
     suspend fun execute(
         contextHandle: Long,
         proposalIdHex: String,
-    ): String = bridge.ffiCall { bindings.governanceExecute(contextHandle, proposalIdHex) }
+    ): String {
+        val raw = bridge.ffiCall { bindings.governanceExecute(contextHandle, proposalIdHex) }
+        works.limn.scp.GovernanceActionResult.fromBridge(raw)
+        return raw
+    }
 
     /**
      * Propose a governance action for voting (#621).
@@ -2185,16 +2195,25 @@ class GovernanceBridgeOps internal constructor(
      * @param contextHandle Handle from context create.
      * @param proposerDid DID of the proposer.
      * @param actionJson JSON-serialized governance action.
-     * @return JSON string with `proposal_id`, `status`, and `execution_result`.
+     * @return JSON string with `proposal_id`, `status`, and
+     *   `execution_result`. `execution_result` carries the same action-result
+     *   name [execute] returns (e.g., `"MemberAdded"`, `"RoleChanged"`) when a
+     *   `SingleAdmin` proposal auto-executed, and is `null` while a
+     *   multi-admin proposal awaits votes.
+     * @throws uniffi.scp.ScpException.Context with `SCP-GOV-11040` when
+     *   `execution_result` names an outcome this SDK version cannot name
+     *   ([works.limn.scp.GovernanceActionResult.checkProposeResponse]).
      */
     suspend fun propose(
         contextHandle: Long,
         proposerDid: String,
         actionJson: String,
     ): String =
-        bridge.ffiCall {
-            bindings.governancePropose(contextHandle, proposerDid, actionJson)
-        }
+        works.limn.scp.GovernanceActionResult.checkProposeResponse(
+            bridge.ffiCall {
+                bindings.governancePropose(contextHandle, proposerDid, actionJson)
+            },
+        )
 
     /**
      * Cast an approval vote on a pending governance proposal (#621).
@@ -2601,7 +2620,7 @@ class BroadcastBridgeOps internal constructor(
         explicit ?: defaultIdentityHandle ?: throw BridgeException(
             "identityHandle is required: pass it explicitly or set " +
                 "BroadcastBridgeOps.defaultIdentityHandle",
-            "SCP-IDENT-1060",
+            "SCP-IDENT-1063",
         )
 }
 

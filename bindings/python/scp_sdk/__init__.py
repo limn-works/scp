@@ -102,6 +102,7 @@ from scp_sdk.errors import (
     StreamGap,
     TransportError,
     UcanPermissionError,
+    UnknownGovernanceOutcomeError,
     ValidationError,
 )
 from scp_sdk.event_log import Checkpoint, Event, Proof, SignedCheckpoint
@@ -332,6 +333,7 @@ __all__ = [
     "TrustEvaluation",
     "UcanPermissionError",
     "UcanToken",
+    "UnknownGovernanceOutcomeError",
     "ValidationError",
     "VerificationLevel",
     "__version__",

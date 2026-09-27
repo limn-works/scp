@@ -3256,3 +3256,85 @@ fn outlet_stream_pure_wrappers_roundtrip() {
         );
     });
 }
+
+/// A `single_admin` proposal auto-approves and auto-executes, so a caller
+/// never reaches `governance_execute` and reads which action ran out of the
+/// `execution_result` field `governance_propose` returns. Every SDK enum
+/// stores Rust variant names, so that field must carry one.
+///
+/// `SuspendCapability` resolves to `GovernanceActionResult::MemberSuspended`,
+/// which wraps a `SuspendMemberResult` payload. All three bridges rendered
+/// that field with `format!("{r:?}")` until
+/// `scp_ffi_common::governance_result::governance_propose_response` existed,
+/// which handed a caller
+/// `MemberSuspended(SuspendMemberResult { did: DID("did:dht:…"),
+/// capabilities: [MessagesWrite] })` — a string Python's
+/// `GovernanceActionResult`, Swift's enum, and TypeScript's
+/// `GOVERNANCE_ACTION_RESULTS` all reject.
+#[test]
+fn governance_propose_names_a_payload_carrying_execution_result() {
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let bi = scp.bridge_instance();
+
+        // `identity_create` publishes the owner's DID document into this
+        // instance's resolver, which single-admin vote verification reads to
+        // resolve the proposer's public key. It MUST precede
+        // `init_context_manager_for_test`, because the supervisor snapshots
+        // the resolver when it is built.
+        let owner_identity = scp
+            .identity_create(py, "in_memory", None)
+            .unwrap()
+            .into_pyobject(py)
+            .unwrap();
+        let owner = owner_identity
+            .getattr("did")
+            .unwrap()
+            .extract::<String>()
+            .unwrap();
+        runtime::init_context_manager_for_test(bi);
+
+        // `governance:propose` lets the creator-admin propose;
+        // `execute_suspend_member` requires `member:ban` in the ceiling.
+        let params = PyDict::new(py);
+        let ceiling = PyList::new(
+            py,
+            [
+                "governance:propose",
+                "member:ban",
+                "messages:read",
+                "messages:write",
+            ],
+        )
+        .unwrap();
+        params.set_item("ceiling", ceiling).unwrap();
+        let handle = scp.context_create(&owner, &params.as_borrowed()).unwrap();
+
+        // The creator is a member, which `execute_suspend_member` requires of
+        // its target.
+        let action_json = serde_json::json!({
+            "SuspendCapability": {
+                "did": owner,
+                "capabilities": ["MessagesWrite"],
+            }
+        })
+        .to_string();
+        let response = scp
+            .governance_propose(&handle, &owner, &action_json)
+            .expect("SuspendCapability must auto-execute under single_admin");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&response).expect("governance_propose must return JSON");
+        assert_eq!(
+            parsed["status"].as_str(),
+            Some("Approved"),
+            "a single-admin proposal auto-approves; got {response}"
+        );
+        assert_eq!(
+            parsed["execution_result"].as_str(),
+            Some("MemberSuspended"),
+            "a propose response must name its outcome, not dump its payload; got {response}"
+        );
+    });
+}

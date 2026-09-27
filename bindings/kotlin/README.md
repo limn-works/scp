@@ -16,34 +16,104 @@ dependencies {
 ## Quick Start
 
 ```kotlin
-import works.limn.scp.Identity
-import works.limn.scp.Context
-import kotlinx.coroutines.flow.first
+import uniffi.scp.CeilingPolicy
+import uniffi.scp.ContextMode
+import uniffi.scp.ContextParams
+import uniffi.scp.GovernanceModel
+import uniffi.scp.MemoryScope
+import uniffi.scp.StorageConfig
+import works.limn.scp.SCP
 
 suspend fun main() {
-    // Create a cryptographic identity (DID)
-    val identity = Identity.create(custody = "platform")
-    println("DID: ${identity.did}")
+    // Every call routes through an SCP instance (ADR-048). Name a storage
+    // backend: this factory has no default.
+    val scp = SCP(StorageConfig.InMemory)
 
-    // Create an encrypted context
-    val ctx = Context.create(
+    // Create a cryptographic identity (DID). Name a custody backend too —
+    // `identityCreate` has no default either (spec §17.17.1,
+    // SCP-CAPSEL-8000). `"in_memory"` keeps key material in this process's
+    // heap and loses it at exit, and a build without the `testing` feature
+    // rejects it with SCP-IDENT-1008 — it is what this quick start uses and
+    // what a shipped app must not. A shipped Android or iOS app names
+    // `"platform"` and wires a KeyCustodyProvider through
+    // `identityCreateWithCustody`, so the Android Keystore or the Secure
+    // Enclave holds the key material and it never enters this process.
+    val identity = scp.identityCreate(custody = "in_memory")
+    println("DID: ${identity.did()}")
+
+    // Create an encrypted context. `ContextParams` names every parameter a
+    // prospective member reads before joining, so it carries no defaults. The
+    // ceiling bounds every capability any member can ever hold, so it must
+    // carry `context:close` for the `contextClose` call below to pass its
+    // capability check.
+    val ctx = scp.contextCreate(
         identity = identity,
-        params = mapOf(
-            "ceiling" to listOf("msg:send", "msg:receive"),
-            "ttl" to 3600,
+        params = ContextParams(
+            mode = ContextMode.ENCRYPTED,
+            ceiling = listOf("messages:read", "messages:write", "context:close"),
+            ceilingPolicy = CeilingPolicy.IMMUTABLE,
+            governance = GovernanceModel.SINGLE_ADMIN,
+            memoryScope = MemoryScope.EPHEMERAL,
+            ttlSeconds = 3600uL,
+            promotable = false,
+            minProtocolVersion = 0.toUShort(),
+            maxChainDepth = null,
+            maxNestingDepth = null,
+            sessionCap = null,
+            economicPolicy = null,
+            consequenceRulesJson = null,
+            consequenceConfigJson = null,
         ),
     )
 
-    // Send a message (MLS-encrypted, signed, provenance-tagged)
-    ctx.send("Hello from SCP".toByteArray())
+    // Send a message (MLS-encrypted, signed, provenance-tagged).
+    scp.contextSend(
+        handle = ctx,
+        identity = identity,
+        payload = "Hello from SCP".toByteArray(),
+        spendingUcanJwt = null,
+    )
 
-    // Receive messages
-    val msg = ctx.receiveFlow().first()
-    println("${msg.senderDid}: ${String(msg.content)}")
-
-    ctx.close()
+    scp.contextClose(handle = ctx, identity = identity)
 }
 ```
+
+### What this quick start needs, and why a published artifact refuses it
+
+Two things above run only on a build that carries the `testing` cargo feature,
+and both refusals are the protocol failing closed rather than minting a
+test-only stand-in (`.docs/adrs/ADR-062-capability-injection.md` §Decision 6):
+
+1. `identityCreate` commits a pre-rotation commitment at creation, which spec
+   §9.7.4.1 §3 makes mandatory. No production `PreRotationCustody` backend
+   exists yet, so a published artifact answers every `identityCreate` call —
+   whichever custody you name — with `[SCP-IDENT-1059] no production
+   pre-rotation custody backend available`. Issue #1729 and RFC #2130 track
+   the real backend.
+2. `"in_memory"` custody is a development affordance whose key material lives
+   in this process's heap and dies with it. A build without `testing` answers
+   `[SCP-IDENT-1008] in_memory custody is not available in this build`. A
+   shipped app names `"platform"` and wires a `KeyCustodyProvider` through
+   `identityCreateWithCustody`, so the Android Keystore holds the keys.
+
+Build the native library with `testing` to run the quick start today:
+
+```sh
+cargo build -p scp-ffi-uniffi --features testing
+./scripts/generate-uniffi-kotlin.sh --skip-build --features=testing
+```
+
+`ReadmeQuickStartTest` in `scp-kt`'s test source set runs the block above
+verbatim against a `testing` build and loads every class the block imports,
+so this README stops drifting from what that build runs; no test runs it
+against a published artifact.
+
+A `testing` build compiles in every in-memory stand-in a shipped build
+refuses, among them `InMemoryPreRotationCustody`, the in-memory DHT client,
+and `InMemoryKeyCustody`. An identity it creates keeps its pre-rotation
+commitment in process memory, so that commitment is gone when the process
+exits. Use a `testing` build to try the quick start, and never ship an app
+built with it.
 
 ## Requirements
 

@@ -7,12 +7,14 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { memberRoleFromBridge } from "../src/internal/native";
 import type {
   AddressResolution,
   Checkpoint,
   ContextParams,
   DIDDocument,
   Event,
+  MemberRole,
   Message,
   OutletDefinition,
   ParticipationFact,
@@ -648,5 +650,42 @@ describe("validateBroadcastKeyHex", () => {
     expect(() => validateBroadcastKeyHex("")).toThrow(
       "broadcastKeyHex must be exactly 64 hex characters",
     );
+  });
+});
+
+describe("memberRoleFromBridge", () => {
+  it("names each of the six built-in roles rather than reporting it as Custom", () => {
+    // `RESERVED_ROLE_NAMES` in `crates/scp-protocol/src/context/roles.rs`
+    // forbids a custom role from taking any of these six names, so each one
+    // that reaches this parser names the protocol-defined role of that name.
+    // `author` carries `messages:write` and the outlet capabilities;
+    // `subscriber` is what `broadcast_helpers.rs` assigns on subscribe. Reading
+    // either as `"Custom"` hides that difference from a caller.
+    expect(memberRoleFromBridge("admin")).toBe("Admin");
+    expect(memberRoleFromBridge("moderator")).toBe("Moderator");
+    expect(memberRoleFromBridge("member")).toBe("Member");
+    expect(memberRoleFromBridge("observer")).toBe("Observer");
+    expect(memberRoleFromBridge("author")).toBe("Author");
+    expect(memberRoleFromBridge("subscriber")).toBe("Subscriber");
+  });
+
+  it("reports a governance-defined role as Custom, not as a value outside the union", () => {
+    const roles: MemberRole[] = [
+      "Admin",
+      "Moderator",
+      "Member",
+      "Observer",
+      "Author",
+      "Subscriber",
+      "Custom",
+    ];
+    const parsed = memberRoleFromBridge("night-shift-reviewer");
+    expect(parsed).toBe("Custom");
+    expect(roles).toContain(parsed);
+  });
+
+  it("matches a role name without regard to case or surrounding whitespace", () => {
+    expect(memberRoleFromBridge("  Subscriber \n")).toBe("Subscriber");
+    expect(memberRoleFromBridge("ADMIN")).toBe("Admin");
   });
 });

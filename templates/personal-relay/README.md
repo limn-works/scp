@@ -121,7 +121,7 @@ The `/.well-known/scp` endpoint also serves relay metadata as JSON.
 | `SCP_RELAY_TLS_SELF_SIGNED` | `false` | Set `1` for self-signed cert (dev only). |
 | `SCP_RELAY_TLS_CERT` | *(none)* | Path to PEM certificate chain (manual TLS). |
 | `SCP_RELAY_TLS_KEY` | *(none)* | Path to PEM private key (manual TLS). |
-| `SCP_RELAY_STORAGE_PATH` | `$XDG_DATA_HOME/scp/personal-relay` | SQLite database directory. |
+| `SCP_RELAY_STORAGE_PATH` | `$XDG_DATA_HOME/scp/personal-relay`, else `$HOME/.local/share/scp/personal-relay` | SQLite database directory. The relay refuses to start when this is unset and neither `XDG_DATA_HOME` nor `HOME` is an absolute path. |
 | `SCP_RELAY_STORAGE_KEY` | *(auto-generated)* | Hex-encoded 32-byte SQLCipher key. |
 | `SCP_RELAY_DHT_GATEWAYS` | *(built-in)* | Comma-separated DHT HTTP gateway URLs. |
 | `SCP_RELAY_LOG_LEVEL` | `info` | Log level (overridden by `RUST_LOG`). |

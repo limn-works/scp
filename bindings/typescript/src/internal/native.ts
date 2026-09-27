@@ -153,6 +153,46 @@ export function loadNativeAddon(): NativeAddon {
 }
 
 // ---------------------------------------------------------------------------
+// Role names
+// ---------------------------------------------------------------------------
+
+/**
+ * Parses a bridge-layer role name into a {@link MemberRole}.
+ *
+ * Every bridge reports an assigned role's name (`RoleAssignment.role_name`) in
+ * the lowercase form `scp_core::context::roles` stores, and {@link MemberRole}
+ * carries a PascalCase member for each of the six names `RESERVED_ROLE_NAMES`
+ * reserves. A name none of those six carries is therefore a role a context's
+ * governance defined, which `"Custom"` is exactly what this protocol calls.
+ *
+ * Capitalizing a first letter and asserting the result instead put values
+ * outside the union into a `MemberRole`: a governance-defined `my-role` became
+ * `"My-role"`, so a `switch` over `MemberRole` matched no case and fell
+ * through. Swift's `MemberRole.fromBridge` and Python's `MemberRole.from_bridge`
+ * answer the same way this does.
+ *
+ * @internal
+ */
+export function memberRoleFromBridge(raw: string): MemberRole {
+  switch (raw.trim().toLowerCase()) {
+    case "admin":
+      return "Admin";
+    case "moderator":
+      return "Moderator";
+    case "member":
+      return "Member";
+    case "observer":
+      return "Observer";
+    case "author":
+      return "Author";
+    case "subscriber":
+      return "Subscriber";
+    default:
+      return "Custom";
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Bridge factory
 // ---------------------------------------------------------------------------
 
@@ -362,10 +402,7 @@ export function createNativeBridge(scp: SCP): Bridge {
         native.contextMemberRole as (h: BridgeContextHandle, d: string) => Promise<string | null>
       )(handle, did);
       if (raw === null) return null;
-      // The NAPI bridge returns lowercase ("admin", "member") but the Bridge
-      // interface expects PascalCase ("Admin", "Member"). Normalize here.
-      // Closes #1236.
-      return (raw.charAt(0).toUpperCase() + raw.slice(1)) as MemberRole;
+      return memberRoleFromBridge(raw);
     },
 
     // Broadcast operations

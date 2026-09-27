@@ -1715,29 +1715,48 @@ where
 /// Priority: `cli_path` > `$XDG_DATA_HOME/scp/node` > `$HOME/.local/share/scp/node`.
 /// (The `SCP_STORAGE_PATH` env var is resolved by the binary into `cli_path`.)
 ///
+/// An empty or relative `XDG_DATA_HOME` is ignored, as the XDG Base Directory
+/// Specification directs. An empty or relative `HOME` is rejected: either one
+/// resolves against the working directory, so a node started from two working
+/// directories would open two storage directories.
+///
 /// # Errors
 ///
-/// Returns [`HostSiteError::StoragePath`] when no explicit path is given and
-/// neither `XDG_DATA_HOME` nor `HOME` is set.
+/// Returns [`HostSiteError::StoragePath`] when no explicit path is given, no
+/// absolute `XDG_DATA_HOME` is set, and `HOME` is unset, empty, or relative.
 pub fn resolve_storage_path(cli_path: Option<&PathBuf>) -> Result<PathBuf, HostSiteError> {
     if let Some(path) = cli_path {
         return Ok(path.clone());
     }
+    default_storage_path(
+        std::env::var_os("XDG_DATA_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// [`resolve_storage_path`] without an explicit path, over explicit
+/// `XDG_DATA_HOME` and `HOME` values, so a test exercises every case without
+/// mutating the process environment.
+fn default_storage_path(
+    xdg_data_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, HostSiteError> {
     // XDG Base Directory Specification: $XDG_DATA_HOME or $HOME/.local/share.
-    let data_home = if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        PathBuf::from(xdg)
-    } else {
-        let home = std::env::var("HOME").map_err(|_| {
+    if let Some(xdg) = xdg_data_home.map(Path::new).filter(|xdg| xdg.is_absolute()) {
+        return Ok(xdg.join("scp").join("node"));
+    }
+    let home = home
+        .map(Path::new)
+        .filter(|home| home.is_absolute())
+        .ok_or_else(|| {
             HostSiteError::StoragePath(
-                "HOME environment variable is not set and no storage path or \
-                 XDG_DATA_HOME was provided; set HOME, XDG_DATA_HOME, or pass an \
-                 explicit storage path"
+                "HOME is unset, empty, or relative, and no storage path or absolute \
+             XDG_DATA_HOME was provided; set HOME or XDG_DATA_HOME to an absolute \
+             directory, or pass an explicit storage path"
                     .to_owned(),
             )
         })?;
-        PathBuf::from(home).join(".local").join("share")
-    };
-    Ok(data_home.join("scp").join("node"))
+    Ok(home.join(".local").join("share").join("scp").join("node"))
 }
 
 /// Validates that the storage directory can be created and is writable.
@@ -2500,6 +2519,41 @@ pub fn external_ip_from_relay_url(relay_url: &str) -> Option<std::net::IpAddr> {
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// An empty or relative `HOME` resolves against the working directory, so
+    /// it is rejected; an empty or relative `XDG_DATA_HOME` is ignored, as the
+    /// XDG Base Directory Specification directs.
+    #[test]
+    fn default_storage_path_rejects_a_working_directory_relative_base() {
+        use std::ffi::OsStr;
+
+        for home in [None, Some(""), Some("data")] {
+            let home = home.map(OsStr::new);
+            for xdg in [None, Some(OsStr::new("")), Some(OsStr::new("share"))] {
+                assert!(
+                    matches!(
+                        default_storage_path(xdg, home),
+                        Err(HostSiteError::StoragePath(_))
+                    ),
+                    "HOME={home:?} XDG_DATA_HOME={xdg:?} must be rejected"
+                );
+            }
+        }
+
+        let home = Some(OsStr::new("/home/op"));
+        assert_eq!(
+            default_storage_path(Some(OsStr::new("")), home).expect("absolute HOME"),
+            PathBuf::from("/home/op/.local/share/scp/node")
+        );
+        assert_eq!(
+            default_storage_path(Some(OsStr::new("share")), home).expect("absolute HOME"),
+            PathBuf::from("/home/op/.local/share/scp/node")
+        );
+        assert_eq!(
+            default_storage_path(Some(OsStr::new("/data")), home).expect("absolute XDG"),
+            PathBuf::from("/data/scp/node")
+        );
+    }
 
     // -----------------------------------------------------------------------
     // HostSiteConfig shape + reach/tls lowering (`lower_host_site_reach_tls`)

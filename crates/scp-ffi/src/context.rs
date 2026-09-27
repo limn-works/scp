@@ -3915,60 +3915,16 @@ impl crate::scp::PyScp {
                 }
             }
 
-            use scp_core::context::state::GovernanceActionResult;
-            let result_str = match result {
-                GovernanceActionResult::MemberAdded { .. } => "MemberAdded",
-                GovernanceActionResult::MemberRemoved => "MemberRemoved",
-                GovernanceActionResult::RoleChanged => "RoleChanged",
-                GovernanceActionResult::OutletRegistered => "OutletRegistered",
-                GovernanceActionResult::OutletRemoved => "OutletRemoved",
-                GovernanceActionResult::CeilingModified => "CeilingModified",
-                GovernanceActionResult::ContextClosed => "ContextClosed",
-                GovernanceActionResult::TtlExtended => "TtlExtended",
-                GovernanceActionResult::PruningPolicyModified => "PruningPolicyModified",
-                GovernanceActionResult::AdminTransferred => "AdminTransferred",
-                GovernanceActionResult::SignerAdded => "SignerAdded",
-                GovernanceActionResult::SignerRemoved => "SignerRemoved",
-                GovernanceActionResult::ThresholdModified => "ThresholdModified",
-                GovernanceActionResult::ChildContextCreated => "ChildContextCreated",
-                GovernanceActionResult::OutletInterfaceEstablished => "OutletInterfaceEstablished",
-                GovernanceActionResult::MemberReset => "MemberReset",
-                GovernanceActionResult::ConflictResolved => "ConflictResolved",
-                GovernanceActionResult::ContextPromoted => "ContextPromoted",
-                GovernanceActionResult::MemberSuspended(_) => "MemberSuspended",
-                GovernanceActionResult::AccessRevoked(_) => "AccessRevoked",
-                GovernanceActionResult::AccessRestored(_) => "AccessRestored",
-                GovernanceActionResult::ContentKeysRotated(_) => "ContentKeysRotated",
-                GovernanceActionResult::GovernanceReconfigured(_) => "GovernanceReconfigured",
-                GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
-                GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
-                GovernanceActionResult::Executed => "Executed",
-                GovernanceActionResult::MigrationProposed(_) => "MigrationProposed",
-                GovernanceActionResult::MigrationCancelled => "MigrationCancelled",
-                GovernanceActionResult::ContextTombstoned => "ContextTombstoned",
-            };
+            // One shared mapping names every outcome, so PyO3, napi-rs, and
+            // UniFFI hand a caller identical strings
+            // (`scp_ffi_common::governance_result`).
+            let result_str =
+                scp_ffi_common::governance_result::governance_action_result_name(&result);
 
             // Sync FFI handle state for migration transitions (§5.11A).
             // The core ContextManager has already transitioned; keep the
             // FFI-side string in lockstep.
-            match result_str {
-                "MigrationProposed" => {
-                    if let Ok(mut s) = handle_state.lock() {
-                        "migrating_out".clone_into(&mut s);
-                    }
-                }
-                "MigrationCancelled" => {
-                    if let Ok(mut s) = handle_state.lock() {
-                        "active".clone_into(&mut s);
-                    }
-                }
-                "ContextTombstoned" => {
-                    if let Ok(mut s) = handle_state.lock() {
-                        "tombstoned".clone_into(&mut s);
-                    }
-                }
-                _ => {}
-            }
+            sync_handle_state_after(&handle_state, &result);
 
             Ok(result_str.to_owned())
         })
@@ -4103,7 +4059,13 @@ impl crate::scp::PyScp {
     /// # Returns
     ///
     /// JSON string with `{ "proposal_id": hex, "status": string,
-    /// "execution_result": string | null }`.
+    /// "execution_result": string | null }`. `execution_result` names one
+    /// variant of `GovernanceActionResult` — the same name
+    /// [`governance_execute`](crate::scp::PyScp::governance_execute) returns
+    /// for that action — and is `null` while a multi-admin proposal awaits
+    /// votes. `status` renders
+    /// `ProposalStatus`, whose `Rejected` and `Invalidated` forms carry the
+    /// reason a proposal did not pass.
     ///
     /// # Errors
     ///
@@ -4126,6 +4088,7 @@ impl crate::scp::PyScp {
         let action_json_owned = action_json.to_owned();
         let signing_key = resolve_signing_key(bi, identity_did)?;
         let proposer_did = scp_did::DID(identity_did.to_owned());
+        let handle_state = handle.state.clone();
 
         rt.block_on(async move {
             let action: scp_core::context::governance::GovernanceAction =
@@ -4163,14 +4126,23 @@ impl crate::scp::PyScp {
                 );
             }
 
-            let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
+            // A `single_admin` proposal auto-executes, so a migration or
+            // tombstone moves the handle here exactly as `governance_execute`
+            // moves it (§5.11A).
+            if let Some(result) = outcome.execution_result.as_ref() {
+                sync_handle_state_after(&handle_state, result);
+            }
 
-            let response = serde_json::json!({
-                "proposal_id": hex::encode(outcome.proposal.proposal_id),
-                "status": format!("{:?}", outcome.status),
-                "execution_result": result_str,
-            });
-            Ok(response.to_string())
+            // One shared builder names the outcome for all three bridges, so a
+            // `single_admin` auto-execution reports the same string
+            // `governance_execute` reports (`scp_ffi_common::governance_result`).
+            Ok(
+                scp_ffi_common::governance_result::governance_propose_response(
+                    &outcome.proposal.proposal_id,
+                    &outcome.status,
+                    outcome.execution_result.as_ref(),
+                ),
+            )
         })
     }
 
@@ -5730,9 +5702,17 @@ impl crate::scp::PyScp {
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let context_id = handle.context_id.clone();
+        // Report a role by name, which is what napi-rs already reports.
+        // `format!("{r:?}")` stood here and rendered a whole `RoleAssignment`
+        // struct, so `MemberRole.from_bridge` in Python and `fromBridge` in
+        // Swift matched no member and read every role — administrator included
+        // — as a custom role. Both parse a name without regard to case, and
+        // TypeScript capitalizes a first letter in its bridge wrapper
+        // (`bindings/typescript/src/internal/native.ts`), so a lowercase
+        // `role_name` reaches each one correctly.
         Ok(rt
             .block_on(sup.member_role(&context_id, did))
-            .map(|r| format!("{r:?}")))
+            .map(|r| r.role_name))
     }
 
     /// Drains all pending events from the context's receive buffer.
@@ -6221,6 +6201,32 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+/// Moves a handle's lifecycle string to the state a governance outcome leaves
+/// its context in, per the one mapping every bridge shares
+/// ([`scp_ffi_common::governance_result::handle_state_after`]).
+fn sync_handle_state_after(
+    handle_state: &Mutex<String>,
+    result: &scp_core::context::state::GovernanceActionResult,
+) {
+    use scp_core::context::ContextState;
+    let Some(next) = scp_ffi_common::governance_result::handle_state_after(result) else {
+        return;
+    };
+    let name = match next {
+        ContextState::Creating => "creating",
+        ContextState::Active => "active",
+        ContextState::Closing => "closing",
+        ContextState::Closed => "closed",
+        ContextState::Expired => "expired",
+        ContextState::MigratingOut => "migrating_out",
+        ContextState::Tombstoned => "tombstoned",
+        ContextState::Poisoned => "poisoned",
+    };
+    if let Ok(mut s) = handle_state.lock() {
+        name.clone_into(&mut s);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests (SCP-216)
 // ---------------------------------------------------------------------------
@@ -6231,6 +6237,32 @@ mod tests {
     use super::*;
     use crate::runtime::RECEIVE_BUFFER_CAPACITY;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Both `governance_execute` and an auto-executing `governance_propose`
+    /// call this, so a tombstone or migration outcome reaches the handle
+    /// string on either path, and any other outcome leaves it alone.
+    #[test]
+    fn sync_handle_state_after_moves_only_lifecycle_outcomes() {
+        use scp_core::context::state::GovernanceActionResult;
+        let state = Mutex::new("active".to_owned());
+        sync_handle_state_after(&state, &GovernanceActionResult::MemberRemoved);
+        assert_eq!(*state.lock().unwrap(), "active");
+        sync_handle_state_after(&state, &GovernanceActionResult::ContextTombstoned);
+        assert_eq!(*state.lock().unwrap(), "tombstoned");
+        let migrating = Mutex::new("active".to_owned());
+        sync_handle_state_after(
+            &migrating,
+            &GovernanceActionResult::MigrationProposed(
+                scp_core::context::state::MigrationProposedResult {
+                    destination_context_id: "dest".to_owned(),
+                    grace_period_end: 1,
+                },
+            ),
+        );
+        assert_eq!(*migrating.lock().unwrap(), "migrating_out");
+        sync_handle_state_after(&migrating, &GovernanceActionResult::MigrationCancelled);
+        assert_eq!(*migrating.lock().unwrap(), "active");
+    }
 
     fn __bi() -> std::sync::Arc<crate::runtime::PyBridgeInstance> {
         std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py())

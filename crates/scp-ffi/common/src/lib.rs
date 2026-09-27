@@ -82,6 +82,13 @@ pub fn html_escape_event_string(s: &str) -> String {
 #[cfg(feature = "custody")]
 pub mod custody_parse;
 
+// Opens the encrypted key file that backs `"file"` custody. Every bridge
+// resolves the same `$HOME/.scp/keys.bin` path and the same
+// `SCP_KEY_PASSPHRASE` variable through this module, so one machine holds one
+// key file whichever SDK a caller reaches for. See ADR-006 and spec §17.8.
+#[cfg(feature = "custody")]
+pub mod custody_file;
+
 // Shared attestation construction pipeline for all FFI bridges.
 // Requires scp-core + scp-identity (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]
@@ -144,6 +151,12 @@ pub mod event_log;
 // Requires scp-core (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]
 pub mod trust_store;
+
+// One name per governance outcome, shared by PyO3, napi-rs, and UniFFI so a
+// caller reads an identical string whichever bridge it called. Requires
+// scp-core (behind `resolvers` feature).
+#[cfg(feature = "resolvers")]
+pub mod governance_result;
 
 // Canonical §6.2.4 SagaError decomposition shared across PyO3, napi-rs, and
 // UniFFI. Pins the `RateLimited → Option<u64>` read, the `None`-never-`0` rule,

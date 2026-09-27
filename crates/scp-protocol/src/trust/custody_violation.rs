@@ -29,7 +29,8 @@
 //! - [`CategoryARejection`] — What a verification point returns when it rejects
 //!   a Category A action, carrying the record ADR-039 layer 3 requires it to log.
 //! - [`ViolationStore`] — Trait for custody violation storage (append-only).
-//! - [`InMemoryViolationStore`] — In-memory implementation for testing.
+//! - `InMemoryViolationStore` — in-memory implementation, compiled only under
+//!   `#[cfg(any(test, feature = "testing"))]` so no shipped artifact carries it.
 //!
 //! # Signature verification
 //!
@@ -74,6 +75,9 @@
 //! `.docs/adrs/phase-1.md`, and spec section §9.5.2 of
 //! `.docs/specs/09-security-model.md` for both signing-preimage field tables.
 
+// Only a test-harness `InMemoryViolationStore` below holds maps, so this
+// import carries that store's gate.
+#[cfg(any(test, feature = "testing"))]
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -1343,9 +1347,26 @@ pub trait ViolationStore {
 
 /// In-memory implementation of [`ViolationStore`].
 ///
-/// Suitable for testing and short-lived processes. Production deployments
-/// should use a persistent store via the `Storage` trait.
-#[derive(Debug, Default)]
+/// Test-harness-only: `#[cfg(any(test, feature = "testing"))]` keeps this type
+/// out of every shipped artifact. Two facts decide that gate. Nothing outside
+/// a test constructs it, so gating removes public API no shipped caller uses.
+/// And a store that forgets every custody violation on restart would, if a
+/// shipped caller reached for it, drop a durable behavioral record this
+/// protocol's human-accountability tenet requires — so its absence is what a
+/// shipped build should offer, not its availability.
+///
+/// This tree ships no `ViolationStore` implementation at all: no type outside
+/// this gate implements that trait today. Which durable store holds these
+/// records is open question OQ-26 of `.docs/specs/27-attestations.md`, and
+/// done story SCP-AB-019 names `ProtocolRepository`; until a human settles
+/// OQ-26, a shipped build has no violation store rather than this double.
+/// This gate itself copies its shape from
+/// `scp_runtime::bridge::credentials::InMemoryCredentialStore`, which ADR-062
+/// (capability injection, §Decision 5) gated for its own capability; ADR-062
+/// enumerates seven provider capabilities and violation storage is not among
+/// them, so that ADR is precedent here rather than authority.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Debug)]
 pub struct InMemoryViolationStore {
     /// Violations keyed by subject DID.
     violations: HashMap<DID, Vec<VerifiedCustodyViolation>>,
@@ -1354,14 +1375,24 @@ pub struct InMemoryViolationStore {
     counter_attestations: HashMap<DID, Vec<VerifiedCounterAttestation>>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl InMemoryViolationStore {
     /// Create a new empty in-memory violation store.
+    // No `Default` impl and no `#[derive(Default)]`: a `Default` reads as a
+    // default selection of an in-memory arm, which `SCP-CAPSEL-8000` (§17.17.1
+    // of `.docs/specs/17-persistence-and-storage.md`) forbids. A caller names
+    // this store explicitly.
+    #[allow(clippy::new_without_default)]
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            violations: HashMap::new(),
+            counter_attestations: HashMap::new(),
+        }
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl ViolationStore for InMemoryViolationStore {
     fn log_violation(
         &mut self,

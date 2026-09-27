@@ -4,8 +4,8 @@ import Foundation
 
 /// Result of executing a governance action (ADR-031).
 ///
-/// Each case corresponds to one of the 28 governance action outcomes from
-/// `scp_core::context::manager::GovernanceActionResult`.
+/// Each case corresponds to one of 29 governance action outcomes from
+/// `scp_core::context::state::GovernanceActionResult`.
 ///
 /// See `.docs/specs/05-contexts.md` section 5.9 and ADR-031.
 public enum GovernanceActionResult: String, Sendable {
@@ -35,13 +35,77 @@ public enum GovernanceActionResult: String, Sendable {
     case subscriberBanned = "SubscriberBanned"
     case subscriberUnbanned = "SubscriberUnbanned"
     case executed = "Executed"
+    case migrationProposed = "MigrationProposed"
+    case migrationCancelled = "MigrationCancelled"
+    case contextTombstoned = "ContextTombstoned"
+
+    /// Parses the outcome name a bridge's `governanceExecute` returns.
+    ///
+    /// Fails closed on a name this SDK version cannot name. Returning the bare
+    /// string, or resolving it to ``executed``, would let a caller read an
+    /// outcome this SDK cannot name as a success, and governance decides
+    /// authorization. The message states both facts a caller acts on: an
+    /// action DID execute, and this SDK is older than its bridge.
+    ///
+    /// - Throws: ``ScpError/Context(msg:code:)`` with `SCP-GOV-11040`.
+    static func fromBridge(_ raw: String) throws -> GovernanceActionResult {
+        guard let result = GovernanceActionResult(rawValue: raw) else {
+            throw ScpError.Context(
+                msg: "governance action executed, and its outcome '\(raw)' has no name in "
+                    + "this SDK version. Upgrade an SCP Swift package to match whichever "
+                    + "bridge it calls.",
+                code: "SCP-GOV-11040"
+            )
+        }
+        return result
+    }
+
+    /// Checks the `execution_result` of a bridge's `governancePropose`
+    /// response and returns that response unchanged.
+    ///
+    /// A `SingleAdmin` proposal auto-executes, so its outcome arrives in this
+    /// response rather than through `governanceExecute`. A non-null
+    /// `execution_result` goes through ``fromBridge(_:)``, so an outcome this
+    /// SDK version cannot name throws on this path as it does on the execute
+    /// path.
+    ///
+    /// - Throws: ``ScpError/Context(msg:code:)`` with `SCP-GOV-11040` when
+    ///   `execution_result` names no case, or when `raw` is not a JSON object
+    ///   or its `execution_result` is neither a string nor `null`.
+    static func checkProposeResponse(_ raw: String) throws -> String {
+        guard let data = raw.data(using: .utf8),
+              let response = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else {
+            throw uncheckableProposeResponse("is not a JSON object")
+        }
+        guard let executionResult = response["execution_result"], !(executionResult is NSNull) else {
+            return raw
+        }
+        guard let name = executionResult as? String else {
+            throw uncheckableProposeResponse(
+                "carries an execution_result that is neither a string nor null"
+            )
+        }
+        _ = try fromBridge(name)
+        return raw
+    }
+
+    private static func uncheckableProposeResponse(_ what: String) -> ScpError {
+        ScpError.Context(
+            msg: "governance propose response \(what), so this SDK cannot name its outcome",
+            code: "SCP-GOV-11040"
+        )
+    }
 }
 
 // MARK: - MemberRole
 
 /// Role assigned to a member within a context (spec section 5.5).
 ///
-/// Mirrors `scp_core::context::roles::Role`.
+/// The six cases before ``custom`` carry the six built-in role names
+/// `scp_core::context::roles` reserves: `RESERVED_ROLE_NAMES` forbids a custom
+/// role from taking any of them, so a member holding one of those names holds
+/// the protocol-defined role of that name.
 public enum MemberRole: String, Sendable {
     /// Context administrator with full governance capabilities.
     case admin = "Admin"
@@ -51,12 +115,21 @@ public enum MemberRole: String, Sendable {
     case member = "Member"
     /// Read-only observer with no write capabilities.
     case observer = "Observer"
+    /// Broadcast-context writer: message writes plus outlet query and call.
+    case author = "Author"
+    /// Broadcast-context reader, which a subscribe assigns.
+    case subscriber = "Subscriber"
     /// Custom role defined by context governance.
     case custom = "Custom"
 
-    /// Parse a bridge-layer role string into a ``MemberRole``.
+    /// Parse a bridge-layer role name into a ``MemberRole``.
     ///
-    /// Falls back to ``custom`` for unrecognised strings.
+    /// Every bridge reports an assigned role's name
+    /// (`RoleAssignment.role_name`), and every built-in name has a case above.
+    /// A name no case carries is therefore a role a context's governance
+    /// defined, which ``custom`` is exactly what this protocol calls — so that
+    /// answer states what a governance engine reported rather than
+    /// substituting a protocol-defined role for it.
     public static func fromBridge(_ raw: String) -> MemberRole {
         let normalised = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
@@ -292,9 +365,11 @@ public extension Context {
     ///
     /// - Parameters:
     ///   - proposalIdHex: Hex-encoded id of the approved, tracked proposal.
-    /// - Returns: A ``GovernanceActionResult`` describing the outcome.
-    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
-    ///   active or governance execution fails.
+    /// - Returns: A ``GovernanceActionResult`` naming which action ran.
+    /// - Throws: ``ScpError/Context(msg:code:)`` when this context is not
+    ///   active (`SCP-CTX-2001`), when governance execution fails, or when a
+    ///   bridge reports an outcome this SDK version cannot name
+    ///   (`SCP-GOV-11040`).
     func executeGovernanceAction(
         proposalIdHex: String
     ) async throws -> GovernanceActionResult {
@@ -305,11 +380,12 @@ public extension Context {
             )
         }
 
-        let raw = try await scp.governanceExecute(
+        // `SCP.governanceExecute` parses the outcome and fails closed with
+        // `SCP-GOV-11040` on one this SDK version cannot name.
+        return try await scp.governanceExecute(
             handle: handle,
             proposalIdHex: proposalIdHex
         )
-        return GovernanceActionResult(rawValue: raw) ?? .executed
     }
 }
 
@@ -326,9 +402,14 @@ public extension Context {
     ///   - actionJson: JSON-serialized ``GovernanceAction``.
     ///   - proposerDid: DID of the proposer.
     ///   - proposeFn: Bridge function override for testing.
-    /// - Returns: JSON string with `proposal_id`, `status`, and `execution_result`.
+    /// - Returns: JSON string with `proposal_id`, `status`, and
+    ///   `execution_result`. `execution_result` carries the raw value of one
+    ///   ``GovernanceActionResult`` case when a `SingleAdmin` proposal
+    ///   auto-executed, and is `null` while a multi-admin proposal awaits
+    ///   votes.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
-    ///   active or the proposal fails.
+    ///   active or the proposal fails, and with `SCP-GOV-11040` when
+    ///   `execution_result` names an outcome this SDK version cannot name.
     func proposeGovernanceAction(
         actionJson: String,
         proposerDid: String
@@ -340,6 +421,8 @@ public extension Context {
             )
         }
 
+        // `SCP.governancePropose` checks `execution_result` and fails closed
+        // with `SCP-GOV-11040` on an outcome this SDK version cannot name.
         return try await scp.governancePropose(
             handle: handle, proposerDid: proposerDid, actionJson: actionJson
         )

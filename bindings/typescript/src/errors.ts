@@ -233,6 +233,29 @@ export class GovernanceError extends ScpError {
   }
 }
 
+/**
+ * A governance action executed, and its outcome has no name in this SDK
+ * version.
+ *
+ * An engine runs a governance action and reports which action it ran. This SDK
+ * enumerates those outcomes in {@link GOVERNANCE_ACTION_RESULTS}, so an SDK
+ * older than its bridge reads a name no entry matches. That is two facts a
+ * caller acts on: an action DID execute, and this SDK cannot say which one.
+ * {@link rawOutcome} carries what a bridge reported, so a caller logs it,
+ * matches on it, or upgrades this package. Python's
+ * `UnknownGovernanceOutcomeError` carries that same field.
+ */
+export class UnknownGovernanceOutcomeError extends GovernanceError {
+  /** Outcome name a bridge reported, trimmed of surrounding whitespace. */
+  readonly rawOutcome: string;
+
+  constructor(message: string, rawOutcome: string, code = "SCP-GOV-11040") {
+    super(message, code);
+    this.name = "UnknownGovernanceOutcomeError";
+    this.rawOutcome = rawOutcome;
+  }
+}
+
 /** Economy / payment / spending UCAN / budget failures (SCP-ECON-* range). */
 export class EconomyError extends ScpError {
   constructor(message: string, code: string) {

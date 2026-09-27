@@ -96,7 +96,8 @@ pub enum ServerError {
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
 
-    /// No passphrase was provided when one is required for persistent node identity.
+    /// No passphrase, or an empty one, was provided when one is required for
+    /// persistent node identity.
     #[error("passphrase required for persistent node identity")]
     MissingPassphrase,
 
@@ -574,7 +575,8 @@ const fn warn_on_permissive_data_dir(_data_dir: &Path) {}
 /// - A data directory cannot be created ([`ServerError::Io`])
 /// - A redb blob database cannot be opened ([`ServerError::Storage`])
 /// - A key custody file cannot be opened ([`ServerError::Platform`])
-/// - No passphrase arrived when `identity` is `None` ([`ServerError::MissingPassphrase`])
+/// - No passphrase, or an empty one, arrived when `identity` is `None`
+///   ([`ServerError::MissingPassphrase`])
 /// - Relay binding, identity generation, or TLS fails ([`ServerError::Node`])
 pub async fn start_node_local<S>(
     data_dir: &Path,
@@ -643,12 +645,23 @@ where
         .await?
     } else {
         // Persistent key custody — keys survive process restarts.
-        let passphrase = passphrase.ok_or(ServerError::MissingPassphrase)?;
+        // An empty passphrase counts as absent: Argon2id over "" seals the key
+        // file under a key anyone who reads the file can derive.
+        let passphrase = passphrase
+            .filter(|passphrase| !passphrase.is_empty())
+            .ok_or(ServerError::MissingPassphrase)?;
         let key_path = data_dir.join("identity.key");
-        let key_custody = Arc::new(scp_platform::file::FileKeyCustody::new(
-            &key_path,
-            &passphrase,
-        )?);
+        // `FileKeyCustody::new` runs an Argon2id derivation and can wait up to
+        // 1.5 s for another process to finish writing a file it reserved, so
+        // it runs on the blocking pool rather than on this future's worker
+        // thread.
+        let key_custody = Arc::new(
+            tokio::task::spawn_blocking(move || {
+                scp_platform::file::FileKeyCustody::new(&key_path, &passphrase)
+            })
+            .await
+            .map_err(std::io::Error::from)??,
+        );
 
         // Build the node's DHT client for its DID method. A shipped build uses
         // the real Mainline Pkarr client, fail-closed (never an in-memory
@@ -1946,6 +1959,33 @@ mod tests {
         );
 
         // Cleanup (data_dir may not have been fully created).
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Verifies that `start_node_local` refuses an empty passphrase with
+    /// `MissingPassphrase` and writes no `identity.key`, because a key file
+    /// sealed under "" is readable by anyone who can read the file.
+    #[tokio::test]
+    async fn node_local_rejects_empty_passphrase() {
+        let tmp = temp_dir_for("node-empty-pass");
+        let result = start_node_local(
+            &tmp,
+            instance_in_memory_storage(),
+            None,
+            Some(zeroize::Zeroizing::new(String::new())),
+        )
+        .await;
+
+        let err = result.err().expect("an empty passphrase must be refused");
+        assert!(
+            matches!(err, ServerError::MissingPassphrase),
+            "expected ServerError::MissingPassphrase, got: {err:?}"
+        );
+        assert!(
+            !tmp.join("identity.key").exists(),
+            "no identity.key may be written under an empty passphrase"
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

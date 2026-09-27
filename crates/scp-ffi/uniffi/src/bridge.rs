@@ -1811,6 +1811,35 @@ pub enum ContextState {
     Poisoned,
 }
 
+impl From<scp_core::context::ContextState> for ContextState {
+    fn from(state: scp_core::context::ContextState) -> Self {
+        use scp_core::context::ContextState as Core;
+        match state {
+            Core::Creating => Self::Creating,
+            Core::Active => Self::Active,
+            Core::Closing => Self::Closing,
+            Core::Closed => Self::Closed,
+            Core::Expired => Self::Expired,
+            Core::MigratingOut => Self::MigratingOut,
+            Core::Tombstoned => Self::Tombstoned,
+            Core::Poisoned => Self::Poisoned,
+        }
+    }
+}
+
+/// Moves `handle` to `next`, the lifecycle state a governance outcome leaves
+/// its context in, per the one mapping every bridge shares
+/// ([`scp_ffi_common::governance_result::handle_state_after`]). `None` leaves
+/// the handle alone.
+async fn sync_handle_state_after(
+    handle: &ContextHandle,
+    next: Option<scp_core::context::ContextState>,
+) {
+    if let Some(next) = next {
+        *handle.state.lock().await = ContextState::from(next);
+    }
+}
+
 /// Memory scope for a context — governs key destruction and data retention on close.
 ///
 /// See ADR-018 (Context TTL and Memory Scope) and spec §5.11.
@@ -11498,7 +11527,7 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         let context_id = handle.context_id.clone();
 
-        let result = runtime()
+        let (result, next_state) = runtime()
             .spawn(async move {
                 // Route through the ADR-049 governance dispatch surface. The
                 // runtime resolves the authoritative proposal from its own
@@ -11528,42 +11557,13 @@ impl Scp {
                         })?
                         .map_err(ScpError::from)?
                 };
-                // Serialize the result variant name for the caller.
-                use scp_core::context::state::GovernanceActionResult;
-                let result_str = match result {
-                    GovernanceActionResult::MemberAdded { .. } => "MemberAdded",
-                    GovernanceActionResult::MemberRemoved => "MemberRemoved",
-                    GovernanceActionResult::RoleChanged => "RoleChanged",
-                    GovernanceActionResult::OutletRegistered => "OutletRegistered",
-                    GovernanceActionResult::OutletRemoved => "OutletRemoved",
-                    GovernanceActionResult::CeilingModified => "CeilingModified",
-                    GovernanceActionResult::ContextClosed => "ContextClosed",
-                    GovernanceActionResult::TtlExtended => "TtlExtended",
-                    GovernanceActionResult::PruningPolicyModified => "PruningPolicyModified",
-                    GovernanceActionResult::AdminTransferred => "AdminTransferred",
-                    GovernanceActionResult::SignerAdded => "SignerAdded",
-                    GovernanceActionResult::SignerRemoved => "SignerRemoved",
-                    GovernanceActionResult::ThresholdModified => "ThresholdModified",
-                    GovernanceActionResult::ChildContextCreated => "ChildContextCreated",
-                    GovernanceActionResult::OutletInterfaceEstablished => {
-                        "OutletInterfaceEstablished"
-                    }
-                    GovernanceActionResult::MemberReset => "MemberReset",
-                    GovernanceActionResult::ConflictResolved => "ConflictResolved",
-                    GovernanceActionResult::ContextPromoted => "ContextPromoted",
-                    GovernanceActionResult::MemberSuspended(_) => "MemberSuspended",
-                    GovernanceActionResult::AccessRevoked(_) => "AccessRevoked",
-                    GovernanceActionResult::AccessRestored(_) => "AccessRestored",
-                    GovernanceActionResult::ContentKeysRotated(_) => "ContentKeysRotated",
-                    GovernanceActionResult::GovernanceReconfigured(_) => "GovernanceReconfigured",
-                    GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
-                    GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
-                    GovernanceActionResult::Executed => "Executed",
-                    GovernanceActionResult::MigrationProposed(_) => "MigrationProposed",
-                    GovernanceActionResult::MigrationCancelled => "MigrationCancelled",
-                    GovernanceActionResult::ContextTombstoned => "ContextTombstoned",
-                };
-                Ok::<_, ScpError>(result_str.to_owned())
+                // Serialize a result variant name for a caller through one
+                // shared mapping, so PyO3, napi-rs, and UniFFI hand a caller
+                // identical strings (`scp_ffi_common::governance_result`).
+                let result_str =
+                    scp_ffi_common::governance_result::governance_action_result_name(&result);
+                let next_state = scp_ffi_common::governance_result::handle_state_after(&result);
+                Ok::<_, ScpError>((result_str.to_owned(), next_state))
             })
             .await
             .map_err(|e| ScpError::Context {
@@ -11588,18 +11588,7 @@ impl Scp {
         }
 
         // Sync FFI handle state for migration transitions (§5.11A).
-        match result.as_str() {
-            "MigrationProposed" => {
-                *handle.state.lock().await = ContextState::MigratingOut;
-            }
-            "MigrationCancelled" => {
-                *handle.state.lock().await = ContextState::Active;
-            }
-            "ContextTombstoned" => {
-                *handle.state.lock().await = ContextState::Tombstoned;
-            }
-            _ => {}
-        }
+        sync_handle_state_after(&handle, next_state).await;
 
         Ok(result)
     }
@@ -11622,7 +11611,7 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         let context_id = handle.context_id.clone();
 
-        let (result, action_name) = runtime()
+        let (result, action_name, next_state) = runtime()
             .spawn(async move {
                 let action: scp_core::context::governance::GovernanceAction =
                     serde_json::from_str(&action_json)?;
@@ -11642,14 +11631,23 @@ impl Scp {
                     .await
                     .map_err(ScpError::from)?;
 
-                let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
-
-                let response = serde_json::json!({
-                    "proposal_id": hex::encode(outcome.proposal.proposal_id),
-                    "status": format!("{:?}", outcome.status),
-                    "execution_result": result_str,
-                });
-                Ok::<_, ScpError>((response.to_string(), action_name))
+                // One shared builder names the outcome for all three bridges, so a
+                // `single_admin` auto-execution reports the same string
+                // `governance_execute` reports
+                // (`scp_ffi_common::governance_result`).
+                let response = scp_ffi_common::governance_result::governance_propose_response(
+                    &outcome.proposal.proposal_id,
+                    &outcome.status,
+                    outcome.execution_result.as_ref(),
+                );
+                // A `single_admin` proposal auto-executes, so a migration or
+                // tombstone moves the handle here exactly as
+                // `governance_execute` moves it (§5.11A).
+                let next_state = outcome
+                    .execution_result
+                    .as_ref()
+                    .and_then(scp_ffi_common::governance_result::handle_state_after);
+                Ok::<_, ScpError>((response, action_name, next_state))
             })
             .await
             .map_err(|e| ScpError::Context {
@@ -11669,6 +11667,8 @@ impl Scp {
                 "failed to sync role state after governance proposal"
             );
         }
+
+        sync_handle_state_after(&handle, next_state).await;
 
         Ok(result)
     }
@@ -13397,10 +13397,16 @@ impl Scp {
         let Ok(manager) = self.inner.context_manager_expect() else {
             return None;
         };
+        // Report a role by name, which is what napi-rs already reports.
+        // `format!("{r:?}")` stood here and rendered a whole `RoleAssignment`
+        // struct, so `MemberRole.fromBridge` matched no case and read every
+        // role — administrator included — as a custom role. Swift parses a
+        // name without regard to case, capitalizing a lowercase `role_name`
+        // before matching.
         manager
             .member_role(&handle.context_id, &did)
             .await
-            .map(|r| format!("{r:?}"))
+            .map(|r| r.role_name)
     }
 
     /// Per-instance equivalent of the free-function `context_drain_events`.

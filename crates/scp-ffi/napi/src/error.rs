@@ -660,7 +660,7 @@ impl From<scp_ffi_common::bridge_instance::HandleAffinityError> for ScpNapiError
 /// Returns the canonical custody type string or `Err(ScpNapiError::Validation)`.
 pub(crate) fn validate_custody_type(custody: &str) -> Result<&str, ScpNapiError> {
     match custody {
-        "in_memory" | "platform" | "software" => Ok(custody),
+        "in_memory" | "file" | "platform" | "software" => Ok(custody),
         // VALID_7005 ("invalid field value") matches the semantic: an
         // unrecognized enum string is a wrong-value error, not the
         // malformed/wrong-shape byte input that VALID_7007 is reserved for
@@ -669,7 +669,7 @@ pub(crate) fn validate_custody_type(custody: &str) -> Result<&str, ScpNapiError>
         // both distinct from the narrower 7007.
         other => Err(ScpNapiError::Validation {
             message: format!(
-                "unknown custody type: {other:?} — expected \"in_memory\", \"platform\", or \"software\""
+                "unknown custody type: {other:?} — expected \"in_memory\", \"file\", \"platform\", or \"software\""
             ),
             code: codes::VALID_7005.to_owned(),
         }),

@@ -443,3 +443,56 @@ def test_wrapper_with_storage_sqlite_passes_config_through() -> None:
         wrapper = WrapperSCP(storage=sqlite_cfg)
     mock_cls.with_storage.assert_called_once_with(sqlite_cfg)
     assert wrapper.instance_id == 42
+
+
+def test_identity_create_requires_a_custody_selection() -> None:
+    """`identity_create` names no default custody backend.
+
+    Persistence spec §17.17.1 (``SCP-CAPSEL-8000``) forbids a form that selects
+    a backend for a caller, whichever backend that form would pick.
+    Restoring ``custody: CustodyType | str = CustodyType.FILE`` makes this call
+    succeed, so this assertion fails.
+    """
+    import inspect
+
+    from scp_sdk.scp import SCP as WrapperScp
+
+    for method_name in ("identity_create", "identity_create_with_agent_key"):
+        signature = inspect.signature(getattr(WrapperScp, method_name))
+        custody = signature.parameters["custody"]
+        assert custody.default is inspect.Parameter.empty, (
+            f"{method_name} must require a custody selection; found default {custody.default!r}"
+        )
+
+
+@pytest.mark.parametrize("custody", [None, "", "   "])
+@pytest.mark.parametrize("method_name", ["identity_create", "identity_create_with_agent_key"])
+async def test_identity_create_rejects_an_absent_custody_selection(
+    method_name: str, custody: Any
+) -> None:
+    """An absent custody selection raises ``SCP-IDENT-1064`` before the bridge runs.
+
+    The type hint cannot stop ``None`` or an empty string. The TypeScript SDK
+    answers both with ``SCP-IDENT-1064``, so this SDK does too, and the native
+    bridge is never called. Deleting ``_require_custody_selection`` sends the
+    value to the mocked bridge, which then returns instead of raising, so this
+    test fails.
+    """
+    from unittest.mock import patch
+
+    from scp_sdk.errors import IdentityError
+
+    mock_cls = MagicMock()
+    with patch("scp_sdk.scp._native_cls", return_value=mock_cls):
+        wrapper = WrapperSCP(storage={"type": "in_memory"})
+    native = mock_cls.with_storage.return_value
+    with pytest.raises(IdentityError) as excinfo:
+        await getattr(wrapper, method_name)(custody)
+    assert excinfo.value.code == "SCP-IDENT-1064"
+    # A shipped bridge answers every custody name with SCP-IDENT-1059, so the
+    # message recommends none and states that instead.
+    message = str(excinfo.value)
+    for name in ('"file"', '"platform"', '"software"', '"in_memory"'):
+        assert name not in message, f"message recommends {name}: {message}"
+    assert "SCP-IDENT-1059" in message
+    getattr(native, method_name).assert_not_called()

@@ -10,6 +10,9 @@ package works.limn.scp
 
 import java.text.Normalizer
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
@@ -786,4 +789,104 @@ private fun deployIdError(deployId: String): String? = when {
  */
 fun validateDeployId(deployId: String) {
     deployIdError(deployId)?.let { throw BridgeException(it, "SCP-VALID-7012") }
+}
+
+
+/**
+ * Outcome of executing a governance proposal (ADR-031).
+ *
+ * Each entry carries, as [rawValue], the name one shared bridge mapping
+ * (`scp_ffi_common::governance_result`) reports for a variant of
+ * `scp_core::context::state::GovernanceActionResult`. See
+ * `.docs/specs/05-contexts.md` section 5.9.
+ *
+ * @property rawValue Name the bridge reports for this outcome.
+ */
+enum class GovernanceActionResult(val rawValue: String) {
+    MEMBER_ADDED("MemberAdded"),
+    MEMBER_REMOVED("MemberRemoved"),
+    ROLE_CHANGED("RoleChanged"),
+    OUTLET_REGISTERED("OutletRegistered"),
+    OUTLET_REMOVED("OutletRemoved"),
+    CEILING_MODIFIED("CeilingModified"),
+    CONTEXT_CLOSED("ContextClosed"),
+    TTL_EXTENDED("TtlExtended"),
+    PRUNING_POLICY_MODIFIED("PruningPolicyModified"),
+    ADMIN_TRANSFERRED("AdminTransferred"),
+    SIGNER_ADDED("SignerAdded"),
+    SIGNER_REMOVED("SignerRemoved"),
+    THRESHOLD_MODIFIED("ThresholdModified"),
+    CHILD_CONTEXT_CREATED("ChildContextCreated"),
+    OUTLET_INTERFACE_ESTABLISHED("OutletInterfaceEstablished"),
+    MEMBER_RESET("MemberReset"),
+    CONFLICT_RESOLVED("ConflictResolved"),
+    CONTEXT_PROMOTED("ContextPromoted"),
+    MEMBER_SUSPENDED("MemberSuspended"),
+    ACCESS_REVOKED("AccessRevoked"),
+    ACCESS_RESTORED("AccessRestored"),
+    CONTENT_KEYS_ROTATED("ContentKeysRotated"),
+    GOVERNANCE_RECONFIGURED("GovernanceReconfigured"),
+    SUBSCRIBER_BANNED("SubscriberBanned"),
+    SUBSCRIBER_UNBANNED("SubscriberUnbanned"),
+    EXECUTED("Executed"),
+    MIGRATION_PROPOSED("MigrationProposed"),
+    MIGRATION_CANCELLED("MigrationCancelled"),
+    CONTEXT_TOMBSTONED("ContextTombstoned"),
+    ;
+
+    companion object {
+        /**
+         * Parses the outcome name a bridge's `governanceExecute` returns.
+         *
+         * Fails closed on a name this SDK version cannot name. Returning the
+         * bare string, or resolving it to [EXECUTED], would let a caller read
+         * an outcome this SDK cannot name as a success, and governance decides
+         * authorization. The message states both facts a caller acts on: an
+         * action DID execute, and this SDK is older than its bridge.
+         *
+         * @throws uniffi.scp.ScpException.Context with `SCP-GOV-11040`.
+         */
+        fun fromBridge(raw: String): GovernanceActionResult =
+            entries.find { it.rawValue == raw }
+                ?: throw uniffi.scp.ScpException.Context(
+                    msg =
+                        "governance action executed, and its outcome '$raw' has no name in " +
+                            "this SDK version. Upgrade the SCP Kotlin SDK to match whichever " +
+                            "bridge it calls.",
+                    code = "SCP-GOV-11040",
+                )
+
+        /**
+         * Checks the `execution_result` of a bridge's `governancePropose`
+         * response and returns that response unchanged.
+         *
+         * A `SingleAdmin` proposal auto-executes, so its outcome arrives in
+         * this response rather than through `governanceExecute`. A non-null
+         * `execution_result` goes through [fromBridge], so an outcome this SDK
+         * version cannot name throws on this path as it does on the execute
+         * path.
+         *
+         * @throws uniffi.scp.ScpException.Context with `SCP-GOV-11040` when
+         *   `execution_result` names no entry, or when [raw] is not a JSON
+         *   object or its `execution_result` is neither a string nor `null`.
+         */
+        fun checkProposeResponse(raw: String): String {
+            val response =
+                runCatching { Json.parseToJsonElement(raw) }.getOrNull() as? JsonObject
+                    ?: throw uncheckableProposeResponse("is not a JSON object")
+            val executionResult = response["execution_result"]
+            if (executionResult == null || executionResult is JsonNull) return raw
+            if (executionResult !is JsonPrimitive || !executionResult.isString) {
+                throw uncheckableProposeResponse("carries an execution_result that is neither a string nor null")
+            }
+            fromBridge(executionResult.content)
+            return raw
+        }
+
+        private fun uncheckableProposeResponse(what: String): uniffi.scp.ScpException.Context =
+            uniffi.scp.ScpException.Context(
+                msg = "governance propose response $what, so this SDK cannot name its outcome",
+                code = "SCP-GOV-11040",
+            )
+    }
 }

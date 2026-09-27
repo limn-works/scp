@@ -549,12 +549,12 @@ blob_store_conformance!({
 | Implementation | Location | Use case | Env var value |
 |----------------|----------|----------|---------------|
 | `InMemoryBlobStorage` | `crates/scp-transport/src/native/storage.rs` | Testing and development | `memory` |
-| `SqliteBlobStore` | `crates/scp-transport/src/native/sqlite_blob.rs` | Default production backend | `sqlite` |
+| `SqliteBlobStore` | `crates/scp-transport/src/native/sqlite_blob.rs` | Single-host production backend | `sqlite` |
 | `RedbBlobStore` | `crates/scp-transport/src/native/redb_blob.rs` | Embedded alternative | `redb` |
 | `PostgresBlobStore` | `crates/scp-transport/src/native/postgres_blob.rs` | Scalable production backend | `postgres` |
 | `S3BlobStore` | `crates/scp-transport/src/native/s3_blob.rs` | Object storage | `s3` |
 
-The `BlobStorageBackend` enum wraps all five implementations. The relay binary selects the backend via the `SCP_RELAY_STORAGE_BACKEND` environment variable (default: `sqlite`). See [Relay Operations](relay-operations.md) for configuration details.
+A `BlobStorageBackend` enum wraps all five implementations. Each relay binary reads a `SCP_RELAY_STORAGE_BACKEND` environment variable to learn which one an operator chose; that variable has no default, and a relay that reads it unset exits with code 1 (persistence spec §17.17.1, `SCP-CAPSEL-8000`). See [Relay Operations](relay-operations.md) for configuration details.
 
 ---
 
