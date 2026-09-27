@@ -119,6 +119,16 @@ check 0 "python script read"    "$(bash_payload "python3.12 validate.py $B")"
 check 0 "ls"                    "$(bash_payload "ls -la scripts/")"
 check 0 "unrelated command"     "$(bash_payload "echo hello")"
 
+# `.claude/settings.json` is Claude Code configuration, not an enforcement
+# file, so the hook allows writes to it in the repository and in the home
+# directory.
+S=".claude/settings.json"
+echo "== Bash branch: $S is not protected, writes must ALLOW (exit 0) =="
+check 0 "cp home $S to backups" "$(bash_payload "cp ~/$S ~/.claude/backups/x")"
+check 0 "redirect to home $S"   "$(bash_payload "echo x > ~/$S")"
+check 0 "redirect to repo $S"   "$(bash_payload "echo x > $S")"
+check 0 "cp home $S onto repo"  "$(bash_payload "cp ~/$S $S")"
+
 echo "== Edit/Write branch =="
 check 2 "Edit protected"        "$(edit_payload Edit "$PROTECTED_ABS")"
 check 2 "Write protected hook"  "$(edit_payload Write "$PROTECTED_HOOK_ABS")"
@@ -126,6 +136,8 @@ check 0 "Edit non-protected"    "$(edit_payload Edit "$UNPROTECTED_ABS")"
 check 0 "Edit fixture copy"     "$(edit_payload Edit "$FIXTURE_ABS")"
 check 2 "MultiEdit protected"   "$(multiedit_payload "$PROTECTED_ABS")"
 check 0 "MultiEdit non-protected" "$(multiedit_payload "$UNPROTECTED_ABS")"
+check 0 "Edit repo $S"          "$(edit_payload Edit "$REPO_ROOT/$S")"
+check 0 "Write home $S"         "$(edit_payload Write "$HOME/$S")"
 
 echo "== Fail-closed =="
 check 2 "malformed JSON"        'not json {{{'

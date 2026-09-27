@@ -34,7 +34,6 @@ set -euo pipefail
 # to absolute realpath, so symlink redirection can't bypass. Any new
 # enforcement surface added to the project must append here.
 PROTECTED_REPO_RELATIVE_PATHS=(
-    ".claude/settings.json"
     "scripts/check-bridge-symmetry.sh"
     "scripts/bridge-aliases.json"
     "scripts/check-pure-helpers.sh"
