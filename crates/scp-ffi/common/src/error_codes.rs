@@ -384,10 +384,6 @@ pub const CTX_2006: &str = "SCP-CTX-2006";
 pub const CTX_2007: &str = "SCP-CTX-2007";
 /// Context receive failed.
 pub const CTX_2008: &str = "SCP-CTX-2008";
-/// Context close failed.
-pub const CTX_2009: &str = "SCP-CTX-2009";
-/// Context export/import failed.
-pub const CTX_2010: &str = "SCP-CTX-2010";
 /// Context mode error.
 pub const CTX_2011: &str = "SCP-CTX-2011";
 /// Context manager error.
