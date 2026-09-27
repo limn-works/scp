@@ -87,12 +87,12 @@
 #     blob-backend features `combined,local-cache`. Without them, an edit inside a
 #     `#[cfg(feature = "quic")]` module compiles nothing and reports `compile ok`.
 #
-#     Case 13b changes a file under `crates/scp-relay/` and asserts that the run compiles
-#     scp-relay's `cloud-blobs` feature in two commands: one together with scp-node's
-#     `cloud-blobs` and `testing` over every target, as the `rust-clippy` job does, and
-#     one for scp-relay alone over its `storage_backend` test target, as the
-#     `rust-test-optional-features` job does. It also asserts that the run starts no
-#     scp-relay-only `cloud-blobs` compile over every target, which no CI command runs.
+#     Case 13b changes a file under `crates/scp-node/` and one under `crates/scp-relay/`,
+#     and asserts that the run compiles each package's `cloud-blobs` feature in checks of
+#     its own, one per CI command: each package over every target, scp-node's with
+#     `testing`, as the `rust-clippy` job does, and each package over its backend-selection
+#     test target, as the `rust-test-optional-features` job does. It also asserts that no
+#     check names both packages with `cloud-blobs` on.
 #
 #     Case 14 leaves one edit uncommitted and asserts that the summary names
 #     `scripts/check-cross-layer.sh` as the gate whose diff range holds no uncommitted edit.
@@ -793,58 +793,53 @@ else
     report "case 13 compiles the cloud blob backends the rust-clippy job lints" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13.harness/cargo.log")"
 fi
 
-# ── Case 13b: an extra-feature check that names two packages ─────────────────────────
+# ── Case 13b: each binary's cloud-blobs feature in checks of its own ─────────────────
 #
-# Three CI commands compile the PostgreSQL and S3 blob backends of the two binaries. The
-# `rust-clippy` job runs one command naming both packages, `cargo clippy -p scp-node -p
-# scp-relay --features scp-node/cloud-blobs,scp-node/testing,scp-relay/cloud-blobs
-# --all-targets`. The `rust-test-optional-features` job runs one command per package,
-# `cargo nextest run -p scp-node --features cloud-blobs --test storage_backend_selection`
-# and `cargo nextest run -p scp-relay --features cloud-blobs --test storage_backend`, which
-# leave scp-node's `testing` off and build only the named test target. That job runs them
-# apart because cargo unifies scp-transport's features across every package one invocation
-# builds, so a combined invocation compiles the backends into scp-relay through scp-node's
-# feature alone. A change can compile under one of those feature sets and fail under
-# another, so a branch that changed scp-relay alone must compile the two-package clippy
-# set over every target and the scp-relay test set over its one test target. The test-set
-# check names the test target rather than `--all-targets` because no CI command compiles
-# scp-relay's other targets under `cloud-blobs` alone.
+# CI compiles the PostgreSQL and S3 blob backends of the two binaries in one command per
+# package. The `rust-clippy` job runs `cargo clippy -p scp-node --features cloud-blobs,testing
+# --all-targets` and `cargo clippy -p scp-relay --features cloud-blobs --all-targets`, and the
+# `rust-test-optional-features` job runs `cargo nextest run -p scp-node --features cloud-blobs
+# --test storage_backend_selection` and `cargo nextest run -p scp-relay --features cloud-blobs
+# --test storage_backend`. A joint command would let cargo unify scp-transport's features
+# across both packages, so one package's `cloud-blobs` would compile the backends into the
+# other package and hide that package's own mis-wired `cloud-blobs`. The test-lane checks
+# name their test target rather than `--all-targets` because scp-node's `website` example
+# and `integration` test compile only under `testing`, so an `--all-targets` check without
+# it fails on targets that CI command never builds.
 #
-# The mutations it kills: deleting the two-package entry or the scp-relay test entry from
-# EXTRA_FEATURE_CHECKS, splitting the two-package entry into one `cargo check` per
-# package, or merging the two test entries back into one two-package check.
-FIXTURE13B="$WORK/two-package-extra-features"
+# The mutations it kills: deleting any of the four scp-node and scp-relay entries from
+# EXTRA_FEATURE_CHECKS, or merging two of them back into one two-package check.
+FIXTURE13B="$WORK/binary-cloud-blobs"
 build_fixture "$FIXTURE13B"
-mkdir -p "$FIXTURE13B/crates/scp-relay/src"
-printf '[package]\nname = "scp-relay"\nversion = "0.0.0"\n' > "$FIXTURE13B/crates/scp-relay/Cargo.toml"
-printf '// fixture source\n' > "$FIXTURE13B/crates/scp-relay/src/lib.rs"
+for crate in scp-node scp-relay; do
+    mkdir -p "$FIXTURE13B/crates/$crate/src"
+    printf '[package]\nname = "%s"\nversion = "0.0.0"\n' "$crate" > "$FIXTURE13B/crates/$crate/Cargo.toml"
+    printf '// fixture source\n' > "$FIXTURE13B/crates/$crate/src/lib.rs"
+done
+fixture_commit "$FIXTURE13B" crates/scp-node/src/lib.rs
 fixture_commit "$FIXTURE13B" crates/scp-relay/src/lib.rs
 run_fixture "$FIXTURE13B"
 rc=$(cat "$FIXTURE13B.harness/rc.txt")
 if [[ $rc -eq 0 ]]; then
-    report "case 13b exits 0 when the cloud-blobs compile passes" 0 ""
+    report "case 13b exits 0 when the cloud-blobs compiles pass" 0 ""
 else
-    report "case 13b exits 0 when the cloud-blobs compile passes" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE13B.harness/out.txt")"
+    report "case 13b exits 0 when the cloud-blobs compiles pass" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE13B.harness/out.txt")"
 fi
-if grep -qF 'check -p scp-node -p scp-relay --all-targets --features scp-node/cloud-blobs,scp-node/testing,scp-relay/cloud-blobs' "$FIXTURE13B.harness/cargo.log"; then
-    report "case 13b compiles both binaries' cloud-blobs features in the one command the rust-clippy job runs" 0 ""
+for expected in \
+    'check -p scp-node --all-targets --features cloud-blobs,testing' \
+    'check -p scp-relay --all-targets --features cloud-blobs' \
+    'check -p scp-node --test storage_backend_selection --features cloud-blobs' \
+    'check -p scp-relay --test storage_backend --features cloud-blobs'; do
+    if grep -qF -- "$expected" "$FIXTURE13B.harness/cargo.log"; then
+        report "case 13b runs \`$expected\`" 0 ""
+    else
+        report "case 13b runs \`$expected\`" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13B.harness/cargo.log")"
+    fi
+done
+if grep -qE -- '-p scp-node -p scp-relay [^|]*cloud-blobs' "$FIXTURE13B.harness/cargo.log"; then
+    report "case 13b starts no check that turns on cloud-blobs for both binaries at once" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13B.harness/cargo.log")"
 else
-    report "case 13b compiles both binaries' cloud-blobs features in the one command the rust-clippy job runs" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13B.harness/cargo.log")"
-fi
-if grep -qF 'check -p scp-relay --test storage_backend --features cloud-blobs' "$FIXTURE13B.harness/cargo.log"; then
-    report "case 13b compiles scp-relay's cloud-blobs feature alone over its storage_backend test, as the rust-test-optional-features job runs it" 0 ""
-else
-    report "case 13b compiles scp-relay's cloud-blobs feature alone over its storage_backend test, as the rust-test-optional-features job runs it" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13B.harness/cargo.log")"
-fi
-if grep -qF 'check -p scp-node -p scp-relay --test ' "$FIXTURE13B.harness/cargo.log"; then
-    report "case 13b starts no two-package test-target compile, which no CI command runs" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13B.harness/cargo.log")"
-else
-    report "case 13b starts no two-package test-target compile, which no CI command runs" 0 ""
-fi
-if grep -qE 'check -p scp-relay --all-targets --features [^|]*cloud-blobs' "$FIXTURE13B.harness/cargo.log"; then
-    report "case 13b starts no scp-relay-only cloud-blobs compile over every target, which no CI command runs" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13B.harness/cargo.log")"
-else
-    report "case 13b starts no scp-relay-only cloud-blobs compile over every target, which no CI command runs" 0 ""
+    report "case 13b starts no check that turns on cloud-blobs for both binaries at once" 0 ""
 fi
 
 # ── Case 14: the gate whose diff range holds no uncommitted edit ─────────────────────

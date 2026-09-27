@@ -1031,11 +1031,16 @@ jobs:
           # only under their off-by-default `cloud-blobs` feature, which the
           # --workspace sweep above leaves off. The first command lints the
           # backends' own modules and their `#[ignore]`d unit tests, which need a
-          # live PostgreSQL or S3 endpoint to run; the second lints the two
-          # binaries' cloud-blobs builds and their backend-selection tests, which
-          # job rust-test-optional-features runs.
+          # live PostgreSQL or S3 endpoint to run; the second and third lint each
+          # binary's cloud-blobs build and its backend-selection test, which job
+          # rust-test-optional-features runs. Each binary gets its own command
+          # because cargo unifies scp-transport's features across every package
+          # one invocation builds: in a joint command, scp-node's `cloud-blobs`
+          # would compile the backends for scp-relay even when scp-relay's own
+          # `cloud-blobs` no longer enables them.
           cargo clippy -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings
-          cargo clippy -p scp-node -p scp-relay --features scp-node/cloud-blobs,scp-node/testing,scp-relay/cloud-blobs --all-targets -- -D warnings
+          cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings
+          cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings
 
   # This job runs `cargo nextest run --workspace`, so a merge gate rests on it.
   # It gates on `rust` at job level, never at step level. It carried seven

@@ -628,30 +628,30 @@ PYEOF
 # Each entry runs as its own `cargo check`, the way CI runs each as its own command. One
 # invocation carrying every feature would resolve a feature unification no CI command
 # resolves, so a failure it reported would answer a question the merge gate never asks.
-# For the same reason an entry names every package its CI command names: the part before
-# `|` is a comma-separated package list, each becomes one `-p`, and the entry runs when
-# this run selected any one of them. An entry naming more than one package spells each
-# feature as `package/feature`, as its CI command does. An entry whose CI command names
-# its targets carries a third `|` field holding those target flags, and the check passes
-# them in place of `--all-targets`: a target that CI command never builds, such as an
-# example that compiles only under a feature the command leaves off, fails a check here
-# that the merge gate never runs.
+# An entry whose CI command names its targets carries a third `|` field holding those
+# target flags, and the check passes them in place of `--all-targets`: a target that CI
+# command never builds, such as an example that compiles only under a feature the command
+# leaves off, fails a check here that the merge gate never runs.
 #
 # `server` is absent from this list although three CI commands name it: `default =
 # ["server"]` in the manifest of each of scp-ffi, scp-ffi-napi and scp-ffi-uniffi, so the
 # `cargo check` above already compiles every module that feature gates.
 #
-# Three CI commands compile the `cloud-blobs` features of scp-node and scp-relay under
-# different feature sets, and each has an entry here: the `rust-clippy` job lints both
-# packages in one command that adds `scp-node/testing` and builds every target, and the
-# `rust-test-optional-features` job leaves `testing` off and runs one command per package,
-# each building only that package's backend-selection test target.
+# Four CI commands compile the `cloud-blobs` features of scp-node and scp-relay, one
+# package per command, and each has an entry here: the `rust-clippy` job lints each
+# package over every target, adding `testing` for scp-node, and the
+# `rust-test-optional-features` job leaves `testing` off and builds only each package's
+# backend-selection test target. CI and this list keep the two packages apart because
+# cargo unifies scp-transport's features across every package one invocation builds: a
+# joint command compiles the PostgreSQL and S3 backends into one package through the
+# other package's `cloud-blobs`.
 EXTRA_FEATURE_CHECKS=(
     "scp-transport|quic,http3,udp,coap"
     "scp-transport|combined,local-cache"
     "scp-testing|sqlite"
     "scp-transport|sqlite-blob,redb-blob,postgres-blob,s3-blob,startup"
-    "scp-node,scp-relay|scp-node/cloud-blobs,scp-node/testing,scp-relay/cloud-blobs"
+    "scp-node|cloud-blobs,testing"
+    "scp-relay|cloud-blobs"
     "scp-node|cloud-blobs|--test storage_backend_selection"
     "scp-relay|cloud-blobs|--test storage_backend"
 )
@@ -739,22 +739,14 @@ else
     fi
 
     for entry in "${EXTRA_FEATURE_CHECKS[@]}"; do
-        IFS='|' read -r extra_pkgs extra_features extra_targets <<< "$entry"
+        IFS='|' read -r extra_pkg extra_features extra_targets <<< "$entry"
         read -r -a extra_target_args <<< "${extra_targets:---all-targets}"
-        IFS=, read -r -a extra_pkg_list <<< "$extra_pkgs"
-        extra_selected=false
-        declare -a extra_pkg_args=()
-        for p in "${extra_pkg_list[@]}"; do
-            extra_pkg_args+=(-p "$p")
-            for c in "${CRATES[@]}"; do
-                [[ $c == "$p" ]] && extra_selected=true
-            done
+        for c in "${CRATES[@]}"; do
+            [[ $c == "$extra_pkg" ]] || continue
+            run_step "compile($extra_pkg:$extra_features)" \
+                cargo check -p "$extra_pkg" "${extra_target_args[@]}" --features "$extra_features"
+            break
         done
-        if $extra_selected; then
-            run_step "compile($extra_pkgs:$extra_features)" \
-                cargo check "${extra_pkg_args[@]}" "${extra_target_args[@]}" --features "$extra_features"
-        fi
-        unset extra_pkg_args
     done
 
     NOTES+=("the reverse dependencies of $crate_list: cargo check -p compiles the packages it names and none of their dependents, so a changed public signature compiles here and fails to compile its dependents in the rust-clippy job of .github/workflows/ci.yml")
