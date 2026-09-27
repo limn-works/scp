@@ -10,8 +10,10 @@
 //! See §10.5 of the SCP infrastructure spec.
 
 use std::env;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use tracing_subscriber::EnvFilter;
@@ -75,84 +77,166 @@ pub fn relay_config_from_env() -> RelayConfig {
 // Blob storage backend from environment
 // ---------------------------------------------------------------------------
 
+/// The constructor a [`BACKENDS`] row carries: opens the backend from its
+/// environment variables, or exits 1 when it cannot.
+type OpenFn = fn() -> Pin<Box<dyn Future<Output = BlobStorageBackend> + Send>>;
+
 /// One row of [`BACKENDS`]: a value an operator can write into
-/// `SCP_RELAY_STORAGE_BACKEND`, and what it takes to compile the arm of
-/// [`storage_from_env`] that constructs it.
+/// `SCP_RELAY_STORAGE_BACKEND`, and the constructor for it when this build
+/// compiled one.
 struct Backend {
     /// The value an operator writes into `SCP_RELAY_STORAGE_BACKEND`.
     name: &'static str,
-    /// The `scp-transport` feature that compiles this backend's arm, or `None`
-    /// for an arm no feature gates.
+    /// The `scp-transport` feature that compiles this backend's constructor,
+    /// or `None` for a constructor no feature gates.
     transport_feature: Option<&'static str>,
-    /// Whether this build enabled that feature.
-    compiled: bool,
     /// The `scp-node` / `scp-relay` feature an operator enables to get
     /// `transport_feature`, or `None` when no binary feature gates it. This
     /// module compiles only under `startup`, which `scp-node` and `scp-relay`
     /// are the only two crates to enable, so naming their feature here tells a
     /// reader of the diagnostic what to pass to `cargo build`.
     binary_feature: Option<&'static str>,
+    /// The environment variable the constructor cannot open the backend
+    /// without, if any.
+    required_var: Option<&'static str>,
+    /// The constructor, or `None` when this build did not enable
+    /// `transport_feature`.
+    open: Option<OpenFn>,
 }
 
-/// Every value [`storage_from_env`] recognizes, paired with whether this build
-/// compiled the arm that constructs it.
+/// Declares one [`BACKENDS`] row and writes each fact about the backend once.
 ///
-/// A backend's gating feature is written in two places, and this table is one
-/// of them:
+/// The `feature` literal becomes both the row's `transport_feature` and the
+/// `cfg` that compiles `open`, so the feature a diagnostic names and the
+/// feature that decides whether the constructor exists are one token. The
+/// `requires` literal becomes both the row's `required_var`, which
+/// [`check_storage_selection_from_env`] reads, and the variable the
+/// constructor reads into the binding the row names.
+macro_rules! backend {
+    (name: $name:literal, open: $open:block) => {
+        Backend {
+            name: $name,
+            transport_feature: None,
+            binary_feature: None,
+            required_var: None,
+            open: Some::<OpenFn>(|| Box::pin(async move $open)),
+        }
+    };
+    (
+        name: $name:literal,
+        feature: $feature:literal,
+        binary_feature: $binary:expr,
+        $(requires: $var:literal as $value:ident,)?
+        open: $open:block
+    ) => {
+        Backend {
+            name: $name,
+            transport_feature: Some($feature),
+            binary_feature: $binary,
+            required_var: backend!(@var $($var)?),
+            open: {
+                #[cfg(feature = $feature)]
+                let open = Some::<OpenFn>(|| {
+                    Box::pin(async move {
+                        $(let $value = required_var_or_exit($name, $var);)?
+                        $open
+                    })
+                });
+                #[cfg(not(feature = $feature))]
+                let open = None;
+                open
+            },
+        }
+    };
+    (@var) => { None };
+    (@var $var:literal) => { Some($var) };
+}
+
+/// Every value [`storage_from_env`] recognizes, with the constructor for it
+/// when this build compiled one.
 ///
-/// 1. The `#[cfg]` attribute on the arm of [`storage_from_env`] that constructs
-///    the backend, which decides whether the binary can open it at all.
-/// 2. This table, twice per row: `transport_feature`, which
-///    `reject_backend_message` prints in its rebuild instruction, and
-///    `compiled`, which decides whether that message prints at all or the value
-///    reads as a typo instead. [`valid_backends`] reads the `compiled` column
-///    to build the options list both messages interpolate, so that list holds
-///    no copy of the feature names.
-///
-/// Nothing in the type system holds the arm and its row in agreement, so a
-/// fifth backend needs an edit at both and two tests fail on a missing one.
-/// `every_site_names_the_same_feature_for_a_backend` reads the feature name out
-/// of each site's source text and fails when any two disagree, whatever
-/// features this build enabled. `every_constructor_arm_has_a_table_row` fails
-/// on an arm no row names.
+/// Each row is one `backend!` invocation, which names the gating feature once,
+/// so no second site can disagree with it. [`valid_backends`],
+/// [`backend_is_compiled`], the private `reject_backend_message`, the private
+/// `required_var` and [`storage_from_env`] all read this table.
 const BACKENDS: &[Backend] = &[
-    Backend {
+    backend! {
         name: "sqlite",
-        transport_feature: Some("sqlite-blob"),
-        compiled: cfg!(feature = "sqlite-blob"),
+        feature: "sqlite-blob",
         binary_feature: None,
+        open: {
+            let path =
+                env::var("SCP_RELAY_STORAGE_PATH").unwrap_or_else(|_| "./scp-relay.db".to_owned());
+            let path = PathBuf::from(path);
+            tracing::info!(path = %path.display(), "using sqlite blob storage");
+            BlobStorageBackend::sqlite(&path).unwrap_or_else(|e| {
+                tracing::error!(error = %e, path = %path.display(), "failed to open sqlite storage");
+                std::process::exit(1);
+            })
+        }
     },
-    Backend {
+    backend! {
         name: "redb",
-        transport_feature: Some("redb-blob"),
-        compiled: cfg!(feature = "redb-blob"),
+        feature: "redb-blob",
         binary_feature: None,
+        open: {
+            let path = env::var("SCP_RELAY_STORAGE_PATH")
+                .unwrap_or_else(|_| "./scp-relay.redb".to_owned());
+            let path = PathBuf::from(path);
+            tracing::info!(path = %path.display(), "using redb blob storage");
+            BlobStorageBackend::redb(&path).unwrap_or_else(|e| {
+                tracing::error!(error = %e, path = %path.display(), "failed to open redb storage");
+                std::process::exit(1);
+            })
+        }
     },
-    Backend {
+    backend! {
         name: "postgres",
-        transport_feature: Some("postgres-blob"),
-        compiled: cfg!(feature = "postgres-blob"),
+        feature: "postgres-blob",
         binary_feature: Some("cloud-blobs"),
+        requires: "SCP_RELAY_DATABASE_URL" as url,
+        open: {
+            tracing::info!("using postgres blob storage");
+            let store = crate::native::postgres_blob::PostgresBlobStore::open(&url)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!(error = %e, "failed to connect to postgres");
+                    std::process::exit(1);
+                });
+            BlobStorageBackend::Postgres(store)
+        }
     },
-    Backend {
+    backend! {
         name: "s3",
-        transport_feature: Some("s3-blob"),
-        compiled: cfg!(feature = "s3-blob"),
+        feature: "s3-blob",
         binary_feature: Some("cloud-blobs"),
+        requires: "SCP_RELAY_S3_BUCKET" as bucket,
+        open: {
+            let prefix = env::var("SCP_RELAY_S3_PREFIX").unwrap_or_else(|_| "blobs/".to_owned());
+            tracing::info!(bucket = %bucket, prefix = %prefix, "using s3 blob storage");
+            let store = crate::native::s3_blob::S3BlobStore::open(&bucket, &prefix)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!(error = %e, "failed to initialize s3 storage");
+                    std::process::exit(1);
+                });
+            BlobStorageBackend::S3(store)
+        }
     },
-    Backend {
+    backend! {
         name: "memory",
-        transport_feature: None,
-        compiled: true,
-        binary_feature: None,
+        open: {
+            tracing::warn!("using in-memory blob storage — all data will be lost on restart");
+            BlobStorageBackend::in_memory()
+        }
     },
 ];
 
 /// The `SCP_RELAY_STORAGE_BACKEND` values this build can construct, comma
 /// separated, for diagnostics and help text.
 ///
-/// This lists the rows of the private `BACKENDS` table whose `compiled`
-/// column is true, in table order, so it never offers a backend the binary
+/// This lists the rows of the private `BACKENDS` table that carry a
+/// constructor, in table order, so it never offers a backend the binary
 /// cannot open. A build with neither cloud feature returns
 /// `"sqlite, redb, memory"`; one with both returns
 /// `"sqlite, redb, postgres, s3, memory"`.
@@ -165,18 +249,18 @@ const BACKENDS: &[Backend] = &[
 pub fn valid_backends() -> String {
     BACKENDS
         .iter()
-        .filter(|b| b.compiled)
+        .filter(|b| b.open.is_some())
         .map(|b| b.name)
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-/// Reports whether this build compiled the arm of [`storage_from_env`] that
-/// constructs `name`, for a caller that has to predict which of two outcomes a
+/// Reports whether this build compiled the constructor [`storage_from_env`]
+/// calls for `name`, for a caller that has to predict which of two outcomes a
 /// binary linking this crate will produce.
 ///
-/// This reads the `compiled` column of the private `BACKENDS` table, which is a
-/// [`cfg!`] read of the same feature that gates the arm. It deliberately does
+/// This reads whether the row of the private `BACKENDS` table carries a
+/// constructor, which the row's own `cfg` decides. It deliberately does
 /// not parse [`valid_backends`]: a test that compared a binary's diagnostic
 /// against a prediction parsed out of the very list that diagnostic is built
 /// from would assert a tautology, and would stay green through a revert of
@@ -184,13 +268,14 @@ pub fn valid_backends() -> String {
 /// cannot construct.
 #[must_use]
 pub fn backend_is_compiled(name: &str) -> bool {
-    BACKENDS.iter().any(|b| b.name == name && b.compiled)
+    BACKENDS.iter().any(|b| b.name == name && b.open.is_some())
 }
 
-/// Names the `scp-node` / `scp-relay` cargo feature that compiles `name`'s arm.
+/// Names the `scp-node` / `scp-relay` cargo feature that compiles the
+/// constructor for `name`.
 ///
-/// Returns `None` when no binary feature gates the arm of [`storage_from_env`]
-/// that constructs `name`, and when `name` names no backend at all.
+/// Returns `None` when no binary feature gates the constructor for `name`, and
+/// when `name` names no backend at all.
 ///
 /// `reject_backend_message` prints this name in the rebuild instruction it
 /// writes for an uncompiled backend, and the binary reading that instruction
@@ -220,7 +305,9 @@ pub fn backend_binary_feature(name: &str) -> Option<&'static str> {
 /// - `requested` names a backend this build did not compile, so the operator
 ///   wrote a real value and needs the cargo feature that compiles it.
 fn reject_backend_message(requested: &str) -> String {
-    let uncompiled = BACKENDS.iter().find(|b| b.name == requested && !b.compiled);
+    let uncompiled = BACKENDS
+        .iter()
+        .find(|b| b.name == requested && b.open.is_none());
 
     let Some(backend) = uncompiled else {
         return format!(
@@ -271,87 +358,22 @@ fn reject_backend_message(requested: &str) -> String {
 /// backend this build did not compile, when a required env var is absent, and
 /// when the backend constructor fails.
 ///
-/// Each arm compiles only under its `scp-transport` feature (`sqlite-blob`,
-/// `redb-blob`, `postgres-blob`, `s3-blob`), and `scp-node` and `scp-relay`
-/// leave `postgres-blob` and `s3-blob` off unless a build passes
-/// `--features cloud-blobs`. A request for an uncompiled backend prints the
-/// feature to rebuild with; it never falls back to another backend.
-///
-/// The `postgres` and `s3` arms are the only ones that await, so a build that
-/// compiles neither leaves this function with nothing to await and
-/// `clippy::unused_async` fires. The attribute below silences the lint in
-/// exactly that configuration and nowhere else, which keeps the workspace's
-/// rule — an async function with no await justifies itself at every
-/// free-function site — answered here rather than waived. The signature keeps
-/// `async`: a `cloud-blobs` build does await inside it, and
-/// [`start_relay_from_env`] awaits the call either way.
-#[cfg_attr(
-    not(any(feature = "postgres-blob", feature = "s3-blob")),
-    expect(
-        clippy::unused_async,
-        reason = "the only two arms that await are compiled out of this build"
-    )
-)]
+/// Each constructor compiles only under its `scp-transport` feature
+/// (`sqlite-blob`, `redb-blob`, `postgres-blob`, `s3-blob`), and `scp-node`
+/// and `scp-relay` leave `postgres-blob` and `s3-blob` off unless a build
+/// passes `--features cloud-blobs`. A request for an uncompiled backend prints
+/// the feature to rebuild with; it never falls back to another backend.
 pub async fn storage_from_env() -> BlobStorageBackend {
     let backend = selected_backend();
-
-    match backend.as_str() {
-        #[cfg(feature = "sqlite-blob")]
-        "sqlite" => {
-            let path =
-                env::var("SCP_RELAY_STORAGE_PATH").unwrap_or_else(|_| "./scp-relay.db".to_owned());
-            let path = PathBuf::from(path);
-            tracing::info!(path = %path.display(), "using sqlite blob storage");
-            BlobStorageBackend::sqlite(&path).unwrap_or_else(|e| {
-                tracing::error!(error = %e, path = %path.display(), "failed to open sqlite storage");
-                std::process::exit(1);
-            })
-        }
-        #[cfg(feature = "redb-blob")]
-        "redb" => {
-            let path = env::var("SCP_RELAY_STORAGE_PATH")
-                .unwrap_or_else(|_| "./scp-relay.redb".to_owned());
-            let path = PathBuf::from(path);
-            tracing::info!(path = %path.display(), "using redb blob storage");
-            BlobStorageBackend::redb(&path).unwrap_or_else(|e| {
-                tracing::error!(error = %e, path = %path.display(), "failed to open redb storage");
-                std::process::exit(1);
-            })
-        }
-        #[cfg(feature = "postgres-blob")]
-        "postgres" => {
-            let url = required_var_or_exit("postgres", "SCP_RELAY_DATABASE_URL");
-            tracing::info!("using postgres blob storage");
-            let store = crate::native::postgres_blob::PostgresBlobStore::open(&url)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::error!(error = %e, "failed to connect to postgres");
-                    std::process::exit(1);
-                });
-            BlobStorageBackend::Postgres(store)
-        }
-        #[cfg(feature = "s3-blob")]
-        "s3" => {
-            let bucket = required_var_or_exit("s3", "SCP_RELAY_S3_BUCKET");
-            let prefix = env::var("SCP_RELAY_S3_PREFIX").unwrap_or_else(|_| "blobs/".to_owned());
-            tracing::info!(bucket = %bucket, prefix = %prefix, "using s3 blob storage");
-            let store = crate::native::s3_blob::S3BlobStore::open(&bucket, &prefix)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::error!(error = %e, "failed to initialize s3 storage");
-                    std::process::exit(1);
-                });
-            BlobStorageBackend::S3(store)
-        }
-        "memory" => {
-            tracing::warn!("using in-memory blob storage — all data will be lost on restart");
-            BlobStorageBackend::in_memory()
-        }
-        other => {
-            eprintln!("{}", reject_backend_message(other));
-            std::process::exit(1);
-        }
-    }
+    let Some(open) = BACKENDS
+        .iter()
+        .find(|b| b.name == backend)
+        .and_then(|b| b.open)
+    else {
+        eprintln!("{}", reject_backend_message(&backend));
+        std::process::exit(1);
+    };
+    open().await
 }
 
 /// Exits 1 on every `SCP_RELAY_STORAGE_BACKEND` configuration error that
@@ -384,14 +406,13 @@ fn selected_backend() -> String {
         .to_lowercase()
 }
 
-/// The environment variable that [`storage_from_env`]'s arm for `backend`
-/// cannot construct the backend without, if any.
+/// The environment variable the constructor for `backend` cannot open the
+/// backend without, if any, read from its `BACKENDS` row.
 fn required_var(backend: &str) -> Option<&'static str> {
-    match backend {
-        "postgres" => Some("SCP_RELAY_DATABASE_URL"),
-        "s3" => Some("SCP_RELAY_S3_BUCKET"),
-        _ => None,
-    }
+    BACKENDS
+        .iter()
+        .find(|b| b.name == backend)
+        .and_then(|b| b.required_var)
 }
 
 /// Reads `var`, and exits 1 with a message naming `backend` and `var` when it
@@ -540,12 +561,12 @@ mod tests {
     }
 
     /// [`valid_backends`] names a backend exactly when this build compiled
-    /// that backend's arm. The list was a hardcoded constant until
+    /// that backend's constructor. The list was a hardcoded constant until
     /// `postgres-blob` and `s3-blob` stopped being unconditional, and this test
     /// fails on that hardcoded value for any build leaving a backend feature
     /// off. It reads the features with its own `cfg!` calls rather than the
-    /// table's `compiled` column, so it fails on a row whose column reads the
-    /// wrong feature in any build that separates the two.
+    /// table, so it fails on a row declared with the wrong feature in any build
+    /// that separates the two.
     #[test]
     fn the_options_list_names_every_compiled_backend_and_no_other() {
         let listed = valid_backends();
@@ -567,69 +588,12 @@ mod tests {
         }
     }
 
-    /// The text of `storage_from_env`'s dispatch, from the `match` line to the
-    /// catch-all arm, read out of this file rather than out of the compiled
-    /// match.
-    ///
-    /// A `cfg` attribute removes an arm from the match this build compiles and
-    /// never from the source, so a scan of this text sees all five arms and
-    /// their gates whatever features are enabled.
-    fn dispatch_body() -> &'static str {
-        let source = include_str!("startup.rs");
-        let dispatch = source
-            .split_once("    match backend.as_str() {")
-            .map(|(_, rest)| rest);
-        assert!(
-            dispatch.is_some(),
-            "storage_from_env no longer dispatches on `match backend.as_str()`, \
-             so this scan reads nothing"
-        );
-        let body = dispatch
-            .unwrap_or_default()
-            .split_once("\n        other =>")
-            .map(|(head, _)| head);
-        assert!(
-            body.is_some(),
-            "the dispatch no longer ends in a catch-all `other` arm, so this \
-             scan has no end marker"
-        );
-        body.unwrap_or_default()
-    }
-
-    /// The text between two markers, or a failure naming the marker that is
-    /// gone.
-    fn source_region(open: &str, close: &str) -> &'static str {
-        let source = include_str!("startup.rs");
-        let after = source.split_once(open).map(|(_, rest)| rest);
-        assert!(after.is_some(), "this file no longer contains `{open}`");
-        let region = after
-            .unwrap_or_default()
-            .split_once(close)
-            .map(|(head, _)| head);
-        assert!(
-            region.is_some(),
-            "this file no longer contains `{close}` after `{open}`"
-        );
-        region.unwrap_or_default()
-    }
-
-    /// The feature name in a line that reads `#[cfg(feature = "…")]`, and
-    /// `None` for any other line — `#[cfg(not(feature = "…"))]` included, since
-    /// that prefix does not match.
-    fn positive_cfg_feature(line: &str) -> Option<&str> {
-        line.trim_start()
-            .strip_prefix("#[cfg(feature = \"")
-            .and_then(|rest| rest.split_once("\")]"))
-            .map(|(feature, _)| feature)
-    }
-
     /// No two rows of the table claim the same name, and the set of rows is the
     /// one this module was written against.
     ///
     /// This compares the table against a literal, so it fails when a row is
-    /// added or dropped and says nothing about the arms of
-    /// [`storage_from_env`]. `every_constructor_arm_has_a_table_row` below is
-    /// what ties the two together.
+    /// added or dropped. [`storage_from_env`] dispatches through the table
+    /// itself, so no value can reach a constructor without a row.
     #[test]
     fn every_table_row_names_a_distinct_backend() {
         let mut names: Vec<&str> = BACKENDS.iter().map(|b| b.name).collect();
@@ -640,196 +604,62 @@ mod tests {
         assert_eq!(
             names,
             ["memory", "postgres", "redb", "s3", "sqlite"],
-            "BACKENDS must name every value storage_from_env matches on"
+            "BACKENDS must name every value storage_from_env recognizes"
         );
     }
 
-    /// The arms of [`storage_from_env`] and the rows of [`BACKENDS`] name the
-    /// same set of values.
+    /// Each row names, as its `transport_feature`, the feature this test
+    /// expects to gate it.
     ///
-    /// The test above compares the table against a literal, so it catches a row
-    /// added without an arm and cannot catch an arm added without a row. That
-    /// second direction reproduces the defect this module exists to remove: a
-    /// `match` arm no row names is a backend [`reject_backend_message`] reports
-    /// as unknown rather than as uncompiled, so an operator who asked for a real
-    /// backend is told the value names nothing and is handed no feature to
-    /// rebuild with.
-    ///
-    /// The scan reads this file's own text, so it sees every arm whatever
-    /// features this build enabled: a `cfg` attribute removes an arm from the
-    /// compiled match, never from the source.
+    /// `backend!` writes the row's `transport_feature` and the `cfg` on its
+    /// constructor from one literal, so this literal comparison is what catches
+    /// a row declared with the wrong feature, such as `postgres` gated on
+    /// `s3-blob`. `the_compiled_predicate_answers_from_the_features` catches
+    /// the same edit through `cfg!` in any build that enables one of the two
+    /// features and not the other.
     #[test]
-    fn every_constructor_arm_has_a_table_row() {
-        let body = dispatch_body();
-
-        let mut arms: Vec<&str> = body
-            .lines()
-            .filter_map(|line| line.trim_start().strip_prefix('"'))
-            .filter_map(|rest| rest.split_once("\" =>"))
-            .map(|(name, _)| name)
-            .collect();
-        assert!(
-            !arms.is_empty(),
-            "the scan matched no arm, so it would pass over any drift"
-        );
-
-        let mut rows: Vec<&str> = BACKENDS.iter().map(|b| b.name).collect();
-        arms.sort_unstable();
-        rows.sort_unstable();
-        assert_eq!(
-            arms, rows,
-            "every arm of storage_from_env needs a BACKENDS row and every row \
-             needs an arm; an arm with no row reports as an unknown backend"
-        );
-    }
-
-    /// Every site that names a backend's gating feature names the same one.
-    ///
-    /// A backend's name and its `scp-transport` feature are written out three
-    /// times in this file, and no two of the three are tied together by the type
-    /// system:
-    ///
-    /// 1. `#[cfg(feature = "…")]` on the arm of [`storage_from_env`] that
-    ///    constructs the backend — the gate that decides whether the binary can
-    ///    open it.
-    /// 2. `transport_feature` in the backend's [`BACKENDS`] row — the feature
-    ///    name `reject_backend_message` prints in its rebuild instruction.
-    /// 3. `compiled: cfg!(feature = "…")` in that same row — what decides
-    ///    whether the operator is told the value is unknown or is told to
-    ///    rebuild, and whether [`valid_backends`] offers the name.
-    ///
-    /// Every other test in this module compares values a `cfg` already
-    /// resolved, so each can see a mismatch only in a build whose feature state
-    /// distinguishes the two sides it reads. The two states CI compiles — all
-    /// four blob features off, and all four on — distinguish none of these: a
-    /// row or an arm gated on a sibling backend's feature reads
-    /// identically to a correct one when every sibling is off and when every
-    /// sibling is on. So a copy-pasted row that kept `postgres-blob` in its
-    /// `compiled` column while its arm reads `gcs-blob` passes both lanes, and
-    /// ships a relay that either rejects a backend it can open or offers one it
-    /// cannot — the regression `crates/scp-relay/tests/storage_backend.rs`
-    /// exists to keep out.
-    ///
-    /// This scan reads the three literals out of the file's own text, which is
-    /// the same text under every feature state, so it fails on the first
-    /// compile whatever CI enabled.
-    #[test]
-    fn every_site_names_the_same_feature_for_a_backend() {
-        // The table, as the compiler sees it: `(name, transport_feature)`.
-        let mut table: Vec<(&str, Option<&str>)> = BACKENDS
+    fn every_row_names_the_feature_that_gates_its_constructor() {
+        let rows: Vec<(&str, Option<&str>, Option<&str>)> = BACKENDS
             .iter()
-            .map(|b| (b.name, b.transport_feature))
+            .map(|b| (b.name, b.transport_feature, b.binary_feature))
             .collect();
-
-        // Site 1: the `#[cfg]` above each dispatch arm. A `#[cfg]` line sets
-        // the pending feature and the arm line immediately below consumes it,
-        // so an arm no `#[cfg]` precedes reads `None` — which is what `memory`
-        // must read.
-        let mut arm_sites: Vec<(&str, Option<&str>)> = Vec::new();
-        let mut pending: Option<&str> = None;
-        for line in dispatch_body().lines() {
-            if let Some(feature) = positive_cfg_feature(line) {
-                pending = Some(feature);
-                continue;
-            }
-            if let Some((name, _)) = line
-                .trim_start()
-                .strip_prefix('"')
-                .and_then(|rest| rest.split_once("\" =>"))
-            {
-                arm_sites.push((name, pending.take()));
-            }
-        }
-        assert!(
-            !arm_sites.is_empty(),
-            "the dispatch scan matched no arm, so it would pass over any drift"
-        );
-
-        // Sites 2 and 3: each row's `name` paired with the feature its
-        // `compiled` column reads, taken from the table's source text rather
-        // than from the resolved `bool`.
-        let mut compiled_sites: Vec<(&str, Option<&str>)> = Vec::new();
-        for row in source_region("const BACKENDS: &[Backend] = &[", "\n];")
-            .split("Backend {")
-            .skip(1)
-        {
-            let name = row
-                .split_once("name: \"")
-                .and_then(|(_, rest)| rest.split_once('"'))
-                .map(|(name, _)| name);
-            assert!(name.is_some(), "a BACKENDS row carries no `name: \"…\"`");
-            let feature = row
-                .split_once("compiled: cfg!(feature = \"")
-                .and_then(|(_, rest)| rest.split_once('"'))
-                .map(|(feature, _)| feature);
-            assert!(
-                feature.is_some() || row.contains("compiled: true,"),
-                "a BACKENDS row's `compiled` column is neither \
-                 `cfg!(feature = \"…\")` nor the literal `true`, so this scan \
-                 cannot read the feature it gates on"
-            );
-            compiled_sites.push((name.unwrap_or_default(), feature));
-        }
-
-        table.sort_unstable();
-        arm_sites.sort_unstable();
-        compiled_sites.sort_unstable();
-
         assert_eq!(
-            arm_sites, table,
-            "each arm of storage_from_env must be gated on the feature its \
-             BACKENDS row names in `transport_feature`, which is the feature \
-             reject_backend_message tells the operator to rebuild with"
-        );
-        assert_eq!(
-            compiled_sites, table,
-            "each row's `compiled` column must read the same feature the row \
-             names in `transport_feature`; a row reading a sibling's feature \
-             reports a compiled backend as absent"
+            rows,
+            [
+                ("sqlite", Some("sqlite-blob"), None),
+                ("redb", Some("redb-blob"), None),
+                ("postgres", Some("postgres-blob"), Some("cloud-blobs")),
+                ("s3", Some("s3-blob"), Some("cloud-blobs")),
+                ("memory", None, None),
+            ]
         );
     }
 
     /// [`check_storage_selection_from_env`] rejects a missing variable for
-    /// exactly the backends, and exactly the variables, that the arms of
-    /// [`storage_from_env`] read.
+    /// exactly `postgres` and `s3`.
     ///
     /// `scp-node` calls the check before it writes its storage key and opens
-    /// the blob store after, so an arm that required a variable
-    /// [`required_var`] did not name would exit only after the key file
-    /// exists. The scan reads the arms out of this file's text, so it sees the
-    /// `postgres` and `s3` arms in a build that compiled neither.
+    /// the blob store after. `backend!` binds the constructor's variable from
+    /// the same `requires` literal that fills the row's `required_var`, which
+    /// the check reads, so the check cannot miss a variable a constructor
+    /// needs.
     #[test]
-    fn the_selection_check_requires_what_each_arm_reads() {
-        let mut arm_vars: Vec<(&str, &str)> = dispatch_body()
-            .lines()
-            .filter_map(|line| {
-                line.split_once("required_var_or_exit(\"")
-                    .map(|(_, rest)| rest)
-            })
-            .filter_map(|rest| rest.split_once("\", \""))
-            .filter_map(|(backend, rest)| rest.split_once('"').map(|(var, _)| (backend, var)))
-            .collect();
-        arm_vars.sort_unstable();
-        assert_eq!(
-            arm_vars,
-            [
-                ("postgres", "SCP_RELAY_DATABASE_URL"),
-                ("s3", "SCP_RELAY_S3_BUCKET")
-            ],
-            "the arms of storage_from_env changed which variables they require"
-        );
-        let mut checked: Vec<(&str, &str)> = BACKENDS
+    fn the_selection_check_requires_the_cloud_backends_variables() {
+        let checked: Vec<(&str, &str)> = BACKENDS
             .iter()
             .filter_map(|b| required_var(b.name).map(|var| (b.name, var)))
             .collect();
-        checked.sort_unstable();
         assert_eq!(
-            checked, arm_vars,
-            "required_var must name every variable an arm of storage_from_env requires"
+            checked,
+            [
+                ("postgres", "SCP_RELAY_DATABASE_URL"),
+                ("s3", "SCP_RELAY_S3_BUCKET")
+            ]
         );
+        assert_eq!(required_var("banana"), None);
     }
 
-    /// [`backend_is_compiled`] answers from the `cfg!` reads in [`BACKENDS`],
+    /// [`backend_is_compiled`] answers from the constructors in [`BACKENDS`],
     /// not from [`valid_backends`].
     ///
     /// That is what makes `scp-relay`'s `invalid_backend_exits_with_error` a
@@ -859,7 +689,7 @@ mod tests {
     }
 
     /// `postgres` is a real backend, so a build without `postgres-blob` must
-    /// say the arm is absent and name the feature that compiles it, rather than
+    /// say the constructor is absent and name the feature that compiles it, rather than
     /// calling the value unknown.
     #[cfg(not(feature = "postgres-blob"))]
     #[test]
@@ -874,7 +704,7 @@ mod tests {
         assert!(!message.contains("unknown storage backend"), "{message}");
         assert!(
             !message.contains("Valid options"),
-            "an absent arm is not a typo; {message}"
+            "an absent constructor is not a typo; {message}"
         );
     }
 
@@ -892,34 +722,20 @@ mod tests {
         assert!(!message.contains("unknown storage backend"), "{message}");
     }
 
-    /// [`reject_backend_message`] names a rebuild only for a backend whose
-    /// `compiled` column reads false.
+    /// [`reject_backend_message`] names a rebuild only for a backend whose row
+    /// carries no constructor.
     ///
-    /// The edit this test catches is the `&& !b.compiled` filter dropping out
-    /// of that function's `find`. Without the filter the function matches the
-    /// row of a backend this build did compile, and hands an operator who typed
-    /// a working value the rebuild instruction written for an absent arm, which
-    /// reports a capability as gone from a binary that holds it. No other test
-    /// in this module reads that filter:
+    /// The edit this test catches is the `&& b.open.is_none()` filter dropping
+    /// out of that function's `find`. Without the filter the function matches
+    /// the row of a backend this build did compile, and hands an operator who
+    /// typed a working value the rebuild instruction written for an absent
+    /// constructor. No other test in this module reads that filter:
     /// `an_unrecognized_value_is_reported_as_unknown` passes a name no row
-    /// carries, and the two `an_uncompiled_*` tests pass names whose rows
-    /// already read false, so removing the filter changes none of those three
-    /// results.
-    ///
-    /// This loop reads the `compiled` column rather than checking it, so it
-    /// says nothing about a row whose column reads a sibling backend's feature:
-    /// such a row agrees with itself on both sides of the comparison and stays
-    /// green here. `the_compiled_predicate_answers_from_the_features` and
-    /// `every_site_names_the_same_feature_for_a_backend` fail on that row.
-    /// Which values [`storage_from_env`] routes to this function is held
-    /// elsewhere too: `every_constructor_arm_has_a_table_row` pairs each arm
-    /// with a row, and `every_site_names_the_same_feature_for_a_backend` pins
-    /// each arm's `#[cfg]` to the feature its row names, so a value whose arm
-    /// this build compiled reaches a constructor and never reaches either
-    /// diagnostic.
+    /// carries, and the two `an_uncompiled_*` tests pass names whose rows carry
+    /// no constructor in the builds that run them.
     #[test]
     fn a_compiled_backend_never_reads_as_absent() {
-        for backend in BACKENDS.iter().filter(|b| b.compiled) {
+        for backend in BACKENDS.iter().filter(|b| b.open.is_some()) {
             let message = reject_backend_message(backend.name);
             assert!(
                 !message.contains("not compiled into this binary"),

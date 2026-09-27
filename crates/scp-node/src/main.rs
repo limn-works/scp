@@ -1195,9 +1195,9 @@ mod tests {
     /// the help text interpolates the same `startup::valid_backends()` that
     /// `startup::storage_from_env` interpolates when it rejects a value.
     ///
-    /// `startup.rs` pins the sites that name a backend's gating feature, and
-    /// every one of its scanning tests reads `include_str!("startup.rs")`, so
-    /// none of them reaches this binary's help text. That help text held its own
+    /// `startup.rs` declares each backend's gating feature once, in its
+    /// `BACKENDS` table, and its tests read that table, so none of them reaches
+    /// this binary's help text. That help text held its own
     /// hardcoded list of backend names until this assertion existed, which is
     /// the drift that made a default build print `postgres` among the accepted
     /// values while `storage_from_env` refused to construct it.

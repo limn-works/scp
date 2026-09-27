@@ -180,10 +180,9 @@ fn s3_without_bucket_exits_with_error() {
 /// `BACKENDS` in `crates/scp-transport/src/startup.rs` carries that name in its
 /// `binary_feature` column, `crates/scp-relay/Cargo.toml` and
 /// `crates/scp-node/Cargo.toml` each declare it in their `[features]` table,
-/// and until this test existed no check compared the three. The four scanning
-/// tests beside that table all read `include_str!("startup.rs")`, so each one
-/// pins the `scp-transport` feature a backend needs and none of them opens
-/// either manifest. A rename carried through one manifest and not the column,
+/// and until this test existed no check compared the three. The tests beside
+/// that table read the table itself, so they pin the `scp-transport` feature a
+/// backend needs and none of them opens either manifest. A rename carried through one manifest and not the column,
 /// or through the column and neither manifest, left every one of them green
 /// while a default-build relay sent an operator to a `--features` value cargo
 /// rejects with "none of the selected packages contains this feature".
