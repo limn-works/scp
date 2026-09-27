@@ -1707,9 +1707,15 @@ fn build_ucan_context_state(
 /// consumed — and leaves the pre-existing entry untouched (the bridge must
 /// never roll back state it did not create).
 ///
-/// `creator_did` becomes the role-state admin; the joiner is inserted as a
-/// member by the caller via [`with_context`] immediately after, so a
-/// member-insert failure can roll this back.
+/// The registered state holds no role state, membership, capability ceiling,
+/// or creator DID: the supervisor actor owns them and every authorization site
+/// reads them through [`live_role_state`]. The caller writes no bridge-side
+/// membership after this call.
+///
+/// `user_ceiling` is VALIDATED against the ceiling-entry grammar (spec
+/// §5.3.1.1) by [`build_ucan_context_state`] and then discarded; no ceiling is
+/// stored. The Welcome-join path passes an empty slice, because the ceiling
+/// the creator signed reaches the actor through `spawn_actor_from_welcome`.
 ///
 /// # Errors
 ///

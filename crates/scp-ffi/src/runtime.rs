@@ -2923,12 +2923,12 @@ mod tests {
     }
 
     /// User-provided ceiling strings in colon format (e.g. `"outlet:call:*"`)
-    /// must be converted to UCAN underscore format (e.g. `"outlet_call:*"`)
-    /// when stored in `FfiBridgeState.ceiling_strings`. Without this
-    /// conversion, `mint_ucan` ceiling checks fail because the minted
-    /// capability name (underscore format) doesn't match the stored
-    /// raw string. The set now comes from the supervisor actor, so this also
-    /// proves the normalization survives the round trip through the supervisor.
+    /// must reach UCAN checks in underscore format (e.g. `"outlet_call:*"`).
+    /// Without this conversion, `mint_ucan` ceiling checks fail because the
+    /// minted capability name (underscore format) doesn't match the raw
+    /// string. `live_ceiling_strings` reads the set from the supervisor actor,
+    /// so this proves the normalization survives the round trip through the
+    /// supervisor.
     #[test]
     fn user_ceiling_strings_converted_to_ucan_format() {
         crate::init_runtime().ok();

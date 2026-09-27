@@ -10633,7 +10633,7 @@ impl Scp {
                     })?;
 
                 // Atomic occupy — register the bridge-side UCAN validation state
-                // (revocation list, nonce tracker, event log, ceiling) and gate on
+                // (revocation list, nonce tracker, event log) and gate on
                 // collision in ONE indivisible step, fail-closed BEFORE
                 // `spawn_actor_from_welcome` consumes the single-use KeyPackage.
                 // Mirrors the PyO3/napi reference bridges' `register_ffi_state`

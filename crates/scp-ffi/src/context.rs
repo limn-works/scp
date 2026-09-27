@@ -2933,12 +2933,12 @@ impl crate::scp::PyScp {
         })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        // Register the bridge-side FFI state (OutletRegistry / EventLog / RoleState)
-        // as a REVERSIBLE precheck BEFORE the irreversible runtime join. Mirrors
-        // `context_create`, which registers FFI state first and rolls it back via
-        // `remove_context` if the runtime step fails. The creator is the
-        // role-state admin (bundle-derived); the joiner is added as a member
-        // below.
+        // Register the bridge-side FFI state (OutletRegistry / EventLog /
+        // RevocationList / NonceTracker / SessionStore) as a REVERSIBLE precheck
+        // BEFORE the irreversible runtime join. Mirrors `context_create`, which
+        // registers FFI state first and rolls it back via `remove_context` if the
+        // runtime step fails. The FFI state holds no role state and no
+        // membership; `spawn_actor_from_welcome` records both in the supervisor.
         //
         // FLAG-1: the caller supplies no ceiling, and none is stored here. FFI
         // state holds no ceiling at all; UCAN validation reads the ceiling that
@@ -3009,8 +3009,9 @@ impl crate::scp::PyScp {
         // and needs no rollback. spawn-from-Welcome always stands up an ENCRYPTED
         // context, so the routing id is the joiner's derived §9.10.4 pseudonym
         // (`local_pseudonym` is `Copy`, still valid after the request move). The
-        // member is the JOINER (`owning_did`), matching the role-state member
-        // inserted above so `context_ids_for_member` / discovery agree.
+        // member is the JOINER (`owning_did`), the member `spawn_actor_from_welcome`
+        // recorded in the supervisor's role state, so `context_ids_for_member` /
+        // discovery agree.
         {
             let relay_url = match self.transport_status() {
                 Ok(status) => status.relay_url,

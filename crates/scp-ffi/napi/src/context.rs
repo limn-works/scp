@@ -1394,11 +1394,11 @@ pub(crate) async fn context_join_from_welcome_on(
     // `spawn_actor_from_welcome` consumes the single-use KeyPackage, and leaves
     // any pre-existing entry untouched (never roll back state we did not create).
     //
-    // FLAG-1: the caller no longer supplies a ceiling, so register with the
-    // DEFAULT ceiling (`&[]`). The Occupied dedup is keyed on `context_id`, so
-    // the "detect a duplicate BEFORE consuming the single-use KeyPackage"
-    // crash-safety is preserved regardless of the ceiling. The bridge state
-    // carries no role state and no ceiling that authorization reads: the
+    // FLAG-1: the caller supplies no ceiling, and `register_ffi_state` stores
+    // none; the empty slice gives its grammar check nothing to validate. The
+    // Occupied dedup is keyed on `context_id`, so the "detect a duplicate
+    // BEFORE consuming the single-use KeyPackage" crash-safety holds. The
+    // bridge state carries no role state, no membership, and no ceiling: the
     // spawned actor holds the AUTHENTICATED membership and ceiling, and every
     // authorization site reads that record through
     // `crate::runtime::live_role_state`.
@@ -1432,32 +1432,20 @@ pub(crate) async fn context_join_from_welcome_on(
         }
     };
 
-    // FLAG-1: re-sync the AUTHENTICATED ceiling from the joined handle's signed
-    // params, overwriting the default ceiling used for the reversible precheck.
-    // The authoritative ceiling lives in the bundle the creator signed — never in
-    // caller input. This runs AFTER the irreversible commit; the FFI state was
-    // just registered (and not removed on this success path), so the sync targets
-    // a live entry.
+    // FLAG-1: no ceiling copy is written here. `spawn_actor_from_welcome`
+    // stored the ceiling the creator signed into the supervisor's role state,
+    // and every authorization site reads it through `live_role_state`, so no
+    // bridge-side copy exists for a later governance `ModifyCeiling` to leave
+    // stale. No post-commit sync runs, so no sync failure needs a teardown.
     //
-    // BLACK-2JF-01 — post-irreversible-commit compensation: the sync fails ONLY
-    // if a concurrent close/leave removed the just-registered FFI state in the
-    // window since the spawn returned. A close/leave does NOT despawn the runtime
-    // actor, so returning `Err` here without tearing the actor down would strand a
-    // live, orphaned actor for a join that never fully materialized at the bridge.
-    // Compensate with the COMPLETE teardown (`discard_joined_context`): it removes
-    // the actor handle AND destroys the resident MLS group AND deletes the durable
-    // Class-S snapshot the join persisted — a bare `despawn_actor` would leave the
-    // crypto group and snapshot behind, resurrecting the context on restart and
-    // blocking a fresh re-join. Then purge residual bridge state and surface the
-    // error.
     // Runtime join committed. Register the context in the known-contexts
     // discovery registry so a Welcome-joined context is surfaced by discovery,
     // exactly as `context_create` peers do post-create. Infallible and
     // idempotent (overwrites), so it is safe after the irreversible commit and
     // needs no rollback. The routing id is the joiner's derived §9.10.4
     // pseudonym (`local_pseudonym` is `Copy`, still valid after the request
-    // move); the member is the JOINER, matching the role-state member inserted
-    // above.
+    // move); the member is the JOINER, the member `spawn_actor_from_welcome`
+    // recorded in the supervisor's role state.
     //
     // The relay URL comes from the handleless transport probe. On the NAPI
     // bridge the relay URL lives on a `NapiTransportManager` handle, not on the
