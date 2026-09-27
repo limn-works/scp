@@ -9,7 +9,12 @@
 # scp-relay binaries), the COMPLETE resolved feature set of the SCP
 # workspace crates is a SUBSET of a single explicit permitted-production allowlist
 # (one superset list covering all five artifacts) permitting durability-only +
-# real-backend features and ZERO nullifier features. Any resolved SCP-crate
+# real-backend features and ZERO nullifier features. Two real-backend features are
+# also left off it, `scp-transport/postgres-blob` and `scp-transport/s3-blob`: every
+# shipped artifact is built without them, and only the off-by-default `cloud-blobs`
+# feature of scp-node and scp-relay compiles them (ADR-062 §Enforcement G1). Absence
+# from this list therefore means "nullifier, or one of those two backends", and a
+# resolved set that names either backend means a shipped build pulled it in. Any resolved SCP-crate
 # feature that is NOT on this allowlist — named or novel, present or future —
 # FAILS this gate. This gate's soundness invariant — shipped-graph
 # feature-absence ≡ nullifier-type absence — holds for every `testing`-gated
@@ -904,10 +909,12 @@ run_gate() {
     else
       echo "   FAIL — resolved features NOT on the permitted-production allowlist:"
       printf '%s\n' "$offenders" | sed 's/^/       ✗ /'
-      echo "   These are test-harness / nullifier features that must NOT reach a"
-      echo "   shipped artifact. A shipped build carries only durability-only +"
-      echo "   real-backend features (ADR-062 §Decision 6; ZERO-nullifier mandate,"
-      echo "   zero nullifier exceptions)."
+      echo "   Each is either a test-harness / nullifier feature, or one of the two"
+      echo "   real backends every shipped build leaves out: scp-transport/postgres-blob"
+      echo "   and scp-transport/s3-blob, which only the off-by-default cloud-blobs"
+      echo "   feature of scp-node and scp-relay compiles. Neither class may reach a"
+      echo "   shipped artifact (ADR-062 §Decision 6 and §Enforcement G1;"
+      echo "   ZERO-nullifier mandate, zero nullifier exceptions)."
       failures=$((failures + 1))
     fi
   done
