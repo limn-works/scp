@@ -14,7 +14,7 @@ bindings/java/
     build.gradle.kts
     src/
       main/java/works/limn/scp/
-        Identity.java            # Identity class, DIDDocument
+        Identity.java            # Identity class
         Context.java             # Context class, Membership, AutoCloseable
         Tools.java               # ToolDefinition, TestVector records
         Trust.java               # evaluateTrust(), TrustEvaluation
@@ -67,9 +67,9 @@ import com.sun.jna.ptr.PointerByReference;
 public interface NativeLib extends Library {
     NativeLib INSTANCE = Native.load("scp_ffi", NativeLib.class);
 
-    int scp_identity_create(String custody, PointerByReference outHandle, PointerByReference outError);
+    int scp_identity_create(IdentityConfig config, PointerByReference outHandle, PointerByReference outError);
     void scp_identity_free(Pointer handle);
-    int scp_identity_did(Pointer handle, PointerByReference outDid);
+    int scp_identity_identifier(Pointer handle, byte[] outIdentifier);
     void scp_string_free(Pointer s);
 
     int scp_context_create(Pointer identity, String paramsJson, PointerByReference outHandle, PointerByReference outError);
@@ -170,7 +170,7 @@ publishing {
 
 ```java
 public record Message(
-    String senderDid,
+    byte[] senderIdentifier,
     byte[] content,
     long timestamp,
     long sequence,
@@ -183,7 +183,7 @@ public record ToolDefinition(
     String description,
     Map<String, Object> inputSchema,
     Map<String, Object> outputSchema,
-    String operator,
+    byte[] operator,
     List<TestVector> testVectors,      // nullable
     byte[] implementationHash          // nullable
 ) {}
@@ -230,26 +230,26 @@ public final class ValidationException extends ScpException { ... }
 public final class Identity implements AutoCloseable {
     private Pointer handle;
 
-    public String did() {
-        return NativeLib.getDid(handle);
+    public byte[] identifier() {
+        return NativeLib.getIdentifier(handle);
     }
 
-    public String custodyType() {
+    public CustodyType custodyType() {
         return NativeLib.getCustodyType(handle);
     }
 
-    public static CompletableFuture<Identity> create(String custody) {
+    // IdentityConfig is the three-slot config object
+    // `.docs/standards/construction.md` states. Its custody slot carries the
+    // bridge's KeyCustodyConfig and carries no default, because that slot
+    // decides where an identity's private key lives.
+    public static CompletableFuture<Identity> create(IdentityConfig config) {
         return CompletableFuture.supplyAsync(() -> {
             var ref = new PointerByReference();
             var err = new PointerByReference();
-            int rc = NativeLib.INSTANCE.scp_identity_create(custody, ref, err);
+            int rc = NativeLib.INSTANCE.scp_identity_create(config, ref, err);
             if (rc != 0) throw extractException(err);
             return new Identity(ref.getValue());
         });
-    }
-
-    public static CompletableFuture<Identity> create() {
-        return create("platform");
     }
 
     @Override

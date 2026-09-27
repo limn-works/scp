@@ -22,7 +22,7 @@ SCP sits at a convergence point of real systems, theoretical work, and speculati
 
 **MLS (Messaging Layer Security, IETF RFC 9420).** Evolved from Signal's Double Ratchet. SCP uses MLS for group encryption, but repurposes it as an access control mechanism — group membership is the cryptographic truth about who's "in" a context.
 
-**DIDs and self-sovereign identity.** The W3C DID standard draws on PGP's web of trust (1991), Christopher Allen's 10 principles of self-sovereign identity (2016), and the rejection of centralized identity providers. SCP's choice of `did:dht` uses the BitTorrent DHT as a decentralized registry, avoiding both centralized registries and blockchain.
+**DIDs and self-sovereign identity.** The W3C DID standard draws on PGP's web of trust (1991), Christopher Allen's 10 principles of self-sovereign identity (2016), and the rejection of centralized identity providers. SCP derives an identifier from its own inception event, following KERI, so no registry names an identity.
 
 **Zero-trust architecture.** Google's BeyondCorp (2014) formalized the idea that no network location should be inherently trusted. SCP goes further: no infrastructure component is trusted — not the relay, not the transport, not the discovery mechanism.
 

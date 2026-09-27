@@ -2,90 +2,53 @@
 
 ## 3.1 Root of Identity
 
-Every identity is rooted in a cryptographic keypair. This is the canonical identifier at the protocol level — not a username, not an email, not an account on someone's server.
+An identity's identifier is the digest of its inception event's signed preimage, and it encodes no key (`09-security-model.md` §9.7.4.2 R13). It is not a username, not an email, and not an account on someone's server.
 
-Build on **DID (Decentralized Identifiers, W3C standard)**. DIDs provide the right abstraction: a cryptographic root that's method-agnostic, meaning the underlying key custody can vary without changing the identity itself.
+**The identifier's text form is `scp:` followed by the RFC 4648 base32 encoding of its 32 bytes, in lowercase and without padding**, which is 52 base32 characters and 56 characters in all. **That form is the one canonical form, and a parser MUST reject every other string with `IdentityError::NonCanonicalIdentifier`**, uppercase or padded base32 and a DID string included (§3.10.10). Every field that carries an identifier as a string carries this form: every signed structure `09-security-model.md` §9.5.2 enumerates, a UCAN's `iss` and `aud`, a context's membership records, and the runtime's keys. Vector 57 of `25-test-vectors.md` §25.29 pins the encoding.
+
+The identifier never changes. A root change installs a fresh root set under the same identifier, so a relying party re-verifies key continuity against that set rather than reading a rename (`09-security-model.md` §9.11).
+
+The identity publishes no W3C Decentralized Identifiers document. Key material and each key's condition live in the key-event log, and transport and service metadata live in the service record (`18-addressability-and-deployment.md` §18.2.2A, §3.10.13).
 
 ## 3.2 Key Custody
 
-Users never see or manage keys directly. Custody is delegated to whatever the user already trusts:
+A key's custody type names the substrate that holds its private half, and `09-security-model.md` §9.7.4.1 item 4 states which custody types the SDK may offer for a pre-rotation key on each custody profile. `SecureEnclave` and `AndroidKeystore` conform on no profile, because the operational key sits in that same keystore under that same application principal. `EncryptedOfflineBackup`, `ShamirShares` and `PaperBackup` conform on the `Headless` profile alone, because each yields key bytes a holder can copy. A passkey is the default pre-rotation substrate on every other profile.
 
-- Device secure enclave (iOS Secure Enclave, Android Keystore)
-- Platform accounts (Apple, Google) via passkey infrastructure
-- Hardware security keys
-- Self-managed keys (power users who want direct control)
-
-The identity layer abstracts custody. The user authenticates however they choose; under the hood it resolves to a protocol-level DID. Migration between custody methods is possible without changing identity, using the key custody migration protocol (§3.2.1).
+The identifier does not depend on custody, because it is the inception event's digest and encodes no key (`09-security-model.md` §9.7.4.2 R13). A controller therefore moves its operational signing capability from one substrate to another under the key custody migration protocol (§3.2.1), and every relying party keeps resolving the same identifier.
 
 ### 3.2.1 Key Custody Migration Protocol
 
-Custody migration moves the operational signing capability from one custody provider to another (e.g., Secure Enclave to hardware security key, or passkey to self-managed key) without changing the identity (DID string). The Identity Key (`#0`) remains the root of trust throughout.
+Custody migration moves the operational signing capability from one custody provider to another — a passkey to a FIDO2 token, a secure element to a self-managed key — and the identifier does not change, because the identifier is the inception event's digest and encodes no key (`09-security-model.md` §9.7.4.2 R13). An operational-key custody migration leaves the root set unchanged; case 2 below is the one case in which the root itself changes.
 
-**Two cases:**
+**Case 1, Active Signing Key migration.** The controller generates a new key in the target custody provider, and the standing root signs a `KeyState` whose key list carries the new key `Current` in the `#active` role and carries the replaced key's drop entry naming its new condition — `Superseded` where the new key takes the role, `Retired` where none does (`09-security-model.md` §9.7.4.2 R3 for the kind and its signatures, R8 for what a key list names). **For a compromised `#active` the controller composes one `KeyState`** that drops the stolen key from the key list and carries that key's `Compromised{from: N}` entry, N being that `KeyState`'s own sequence, **and composes no `RootRecovery`**, because an operational-key compromise changes no root (`09-security-model.md` §9.12 step 1). That entry is what arms the first-seen test of the log-anchored evidence class (`09-security-model.md` §9.7.1), which is how a stolen `#active` stops anchoring a forged durable artifact behind the compromise. A peer that observes a migration `KeyState` sets no standing against the identifier, because `09-security-model.md` §9.11 reserves `PendingReverify` for an observed `RootRecovery` and for a `Contested` verdict. A routine operational rotation is therefore transparent to peers.
 
-1. **Active Signing Key migration (common).** The Active Signing Key (`#active`) is rotatable by design (ADR-003 §4a). Migration generates a new `#active` key in the target custody provider and publishes an updated DID document signed by `#0`. The old `#active` key is revoked. The DID string does not change because it is derived from `#0`, not `#active`. This is the standard `rotate_active_key` operation applied to a custody change rather than a compromise.
+**Case 2, root key change.** The root changes by a `RootRecovery`: a threshold-satisficing subset of the next set authorizes the event, a fresh root set generated under that recovery's device boundary is installed (`09-security-model.md` §9.7.4.2 R3 and R10), and the identifier does not change. Relying parties re-verify key continuity against the fresh root set (`09-security-model.md` §9.11). A planned root move that follows no compromise — a custody substrate decommissioned while its key stays unexportable — is the same event: a `RootRecovery{CoSigns}` whose key-state snapshot marks nothing compromised. Alec ruled on 2026-09-06 that the planned move is the same event as a recovery, and he gave the reason: an attacker would use a separate benign kind too, so peers could not trust the distinction.
 
-2. **Identity Key migration (rare).** If `#0` itself must move (e.g., the Secure Enclave device is being decommissioned and the key cannot be exported), the pre-rotation key mechanism (ADR-003 §4b, §9.12) is used. This creates a new DID — identity continuity is maintained through the `alsoKnownAs` forwarding record and the `DidRotationEvent` sent to all active contexts. The pre-rotation proof cryptographically binds the old identity to the new one.
+**The migration protocol runs five ordered steps.**
 
-**Migration protocol (case 1 — Active Signing Key):**
+1. **Initiate on the target device.** Generate the new keypair in the target custody provider and record the key's algorithm and its custody type, both of which `09-security-model.md` §9.7.4.2's definitions fix. The custody type is a declaration the requesting device wrote, and every consumer reads it as `Software` until a platform proof verifies (`27-attestations.md` §27.4.4), so no step below reads it as a hardware rating.
+2. **Authorize on a device holding a threshold of the standing root.** Compose the `KeyState` carrying the complete key state and sign it with a root signature by the standing root set (`09-security-model.md` §9.7.4.2 R3 and R8).
+3. **Publish, re-sign, and reissue.** Publish the extended key-event log to the identity's own relays and to the fallback set (§3.10.5). Re-sign the service record under the new key and republish it (§3.10.13): the rotation resets every reader's high-water mark for that record, and every copy the replaced key signed stops verifying the moment a reader adopts the `KeyState` of step 2. Issue MLS Update proposals in every active context (§9.7.3). Revoke every UCAN the replaced key signed and reissue under the new one.
+4. **Re-sign the attestation chain.** Every identity attestation the replaced key signed is re-signed under the new key and republished (§3.5), which the SDK does as one transaction with the steps above.
+5. **Destroy the replaced key material** after confirmed publication, which `09-security-model.md` §9.7.4.2 R10 defines as durable self-retention together with acceptance by at least one relay in the fallback set. A controller that destroyed on a local signature alone would leave every party that never received the event resolving the replaced key as `Current`, and the identity could then sign nothing that party accepts.
 
-```
-1. INITIATE on target device:
-   a. Generate new Ed25519 keypair in target custody provider.
-   b. Create CustodyMigrationRequest:
-      - new_active_pubkey: [u8; 32]
-      - target_custody_type: enum { SecureEnclave, AndroidKeystore, HardwareKey, Passkey, Software }
-      - requested_at: u64 (Unix timestamp)
+**A context that watched no retirement holds no boundary.** A context whose log records no retirement Commit for the replaced `#active` holds no boundary for that key, and a member verifying content signed by that key in that context returns `ContentVerdict::Invalid{NoBoundary}`, the type `09-security-model.md` §9.7.1 defines together with the content rule. Step 3's Updates are what create the boundary, and `09-security-model.md` §9.7.4.2 R4 admits a context the controller cannot reach.
 
-2. AUTHORIZE on device holding #0:
-   a. Verify the migration request was initiated by the identity owner
-      (device-local authentication — biometric, PIN, or platform credential).
-   b. Construct updated DID document:
-      - Replace #active verification method with new_active_pubkey.
-      - Retain #0 and #agent (if present) unchanged.
-      - Increment BEP44 sequence number.
-   c. Sign DID document with #0 (Identity Key).
-
-3. PUBLISH:
-   a. Publish updated DID document to both resolution layers (§3.10.5).
-   b. Issue MLS Update proposals in all active contexts with credentials
-      referencing the new #active key (§9.7.3).
-   c. Revoke all UCAN tokens signed by the old #active key.
-      Reissue under the new #active key.
-
-4. TRANSFER attestation chain:
-   a. Identity attestations (§3.5) that were signed by the old #active key
-      MUST be re-signed by the new #active key and republished.
-   b. The SDK enumerates all published attestations and re-signs them
-      as part of the migration transaction.
-
-5. DESTROY old key material:
-   a. After confirmation that the new DID document has propagated
-      (verified by resolving from at least one relay and DHT),
-      the old #active private key is destroyed in the source custody provider.
-   b. Destruction is best-effort for HSM-backed keys (the HSM may not support
-      explicit deletion, but the key becomes inaccessible once the device
-      is decommissioned).
-```
-
-**Failure semantics:**
-
-- **Step 2 fails (authorization denied):** No state change. The old custody provider remains active. The new keypair generated in step 1 is discarded.
-- **Step 3a fails (publication fails on some relays/DHT):** The SDK retries publication. The RepublishManager (§3.10.5) will propagate on its next cycle. Partial publication is safe — peers that resolve the old document continue to work; peers that resolve the new document use the new key. Both are valid until the old key is destroyed.
-- **Step 3b/3c fails (MLS Update or UCAN reissuance fails in some contexts):** The SDK queues failed operations for retry. Contexts that have not received the Update continue to verify messages against the old `#active` key (still in the previously-resolved DID document). The migration converges as retries succeed.
-- **Step 5 fails (old key destruction fails):** The migration is still complete — the DID document references the new key. The old key is orphaned but harmless: UCAN tokens signed by it are revoked, and peers verify against the new DID document.
-
-**Multi-device coordination:** If the identity owner has multiple devices (e.g., phone + laptop + tablet), each device holds its own key material for signing. Custody migration affects only the `#active` key published in the DID document — the single authoritative signing key. Other devices learn of the migration by resolving the updated DID document (§3.10.4). After migration, only the device with the new custody provider can sign as `#active`. Other devices that need signing capability must independently generate keys and request delegation via scoped UCANs from the new `#active` key holder.
-
-**Invariant:** At no point during migration are there zero valid signing keys for the identity. The old key remains valid until the new DID document propagates. The new key becomes valid upon publication. The overlap window ensures continuity.
+**Invariant.** At no point during migration are there zero valid signing keys for the identity, and at no point is the service record left signed by a key no reader will accept, because step 3 republishes it under the new key before step 5 destroys the replaced one. A peer that adopted the `KeyState` before step 3's Update reaches one of its contexts waits out `LEAF_REPLACEMENT_GRACE` before it proposes Remove for the not-yet-replaced leaf (`09-security-model.md` §9.12 step 1a, §9.18.17); without that wait the overlap would evict the migrating member from its own context.
 
 ## 3.3 Recovery
 
-No seed phrases. Recovery uses social and device mechanisms:
+**Where the root cannot be recovered by key material at all, the person establishes a new identity**, and `09-security-model.md` §9.7.4.1's failure-mode table states that outcome, so a reader of this section does not look here for a mechanism that re-establishes custody of the same identity.
 
-- **Trusted device recovery:** Another device you control vouches for a new one. The trusted device enrolls the new device into the identity's device registry and distributes the Private State Key (PSK) via HPKE (§3.7.2). Recovery IS device enrollment — the same cryptographic protocol applies.
-- **Social recovery:** Trusted contacts confirm your identity. After social recovery re-establishes key custody, the recovering device is enrolled as a new device (§3.7.2) and receives the PSK from any existing enrolled device. If no enrolled devices remain (all devices lost), PSK recovery requires re-keying: a new PSK is generated, existing private state history encrypted under the old PSK is permanently inaccessible (same forward-only property as §9.17.5), and the identity starts a fresh private state log.
-- **Platform-backed recovery:** If custody is delegated to Apple/Google, their recovery mechanisms apply. The PSK is stored in the platform's secure key store (Keychain, Keystore — §17.8) and may be recoverable through platform backup/restore mechanisms (e.g., iCloud Keychain sync, Google Cloud Key Vault). This provides a recovery path for the PSK that does not depend on another SCP device being available.
+**A root changes only through a `RootRecovery`**, which carries an indexed signature group from a threshold-satisficing subset of the standing next set (`09-security-model.md` §9.7.4.2 R3 for the kind and its signature groups, R10 for the procedure the controller follows).
+
+**The three mechanisms below help a controller reach its own credentials, and none of them authorizes a root change**, because no trusted contact and no platform account holds a member of the next set.
+
+- **Trusted device recovery:** another device the person controls vouches for a new one. The trusted device enrolls the new device into the identity's device registry and distributes the Private State Key (PSK) via HPKE (§3.7.2), so recovery is device enrollment and runs the same cryptographic protocol.
+- **Social recovery:** trusted contacts confirm the person's identity, the recovering device is enrolled as a new device (§3.7.2), and it receives the PSK from an existing enrolled device. Where no enrolled device remains, PSK recovery requires re-keying: a new PSK is generated, the private state history encrypted under the old PSK is permanently inaccessible under the forward-only property of §9.17.5, and the identity starts a fresh private state log.
+- **Platform-backed recovery:** where custody sits in an Apple or Google account, that platform's recovery mechanisms apply. The PSK is stored in the platform's secure key store (Keychain, Keystore — §17.8) and may be recoverable through platform backup and restore, such as iCloud Keychain sync and Google Cloud Key Vault. That path does not depend on another SCP device being available.
+
+**Every recovery path above ends at confirmed publication.** A recovery that re-establishes custody appends a key event, and that event takes effect at each relying party the moment that party resolves the extended chain (`09-security-model.md` §9.7.4.3). The recovering device still submits the event to the identity's witness set, for a separate reason: a cosigned head is portable evidence, where a peer's own relay read is not, and the SDK records which of the two it used in the `HeadProvenance` record §9.7.4.2's definitions state. No rule reads that record, so an identity whose witnesses are silent keeps its standing and every grant at every peer. A controller that wants the portable half of that evidence back replaces a silent set with a `KeyState` naming a fresh one (`09-security-model.md` §9.7.4.2 R10), which spends no pre-rotation commitment. Every relying party sets `PendingReverify` on an observed `RootRecovery`, and the exit is the out-of-band fingerprint comparison of `09-security-model.md` §9.11.
 
 For new users with a single device and no SCP contacts, platform-backed recovery is the practical safety net. Social and device recovery grow in value over time as users add devices and build connections. Apps should prompt for trusted recovery contacts during onboarding — the same pattern Google and Apple use today.
 
@@ -96,17 +59,17 @@ Existing platform identities (Google, Apple, social accounts) can be linked to a
 
 ## 3.5 Identity Attestations
 
-A user can publish cryptographic attestations binding their external platform identities to their DID. These attestations are the mechanism that makes social graph import possible.
+A user can publish cryptographic attestations binding their external platform identities to their identifier. These attestations are the mechanism that makes social graph import possible.
 
-An attestation says: "The human behind DID `did:key:abc...` is the same human behind `@alice` on X." The attestation is verifiable — the user proves ownership of the external identity (e.g., by signing a challenge, posting a proof, or using OAuth) and the result is a signed statement linking the two.
+An attestation says: "The human behind the identity `<scp-identifier:alice>` is the same human behind `@alice` on X." The attestation is verifiable — the user proves ownership of the external identity (e.g., by signing a challenge, posting a proof, or using OAuth) and the result is a signed statement linking the two.
 
 Properties of identity attestations:
 
-- **Non-fungible.** The attestation binds a specific external identity to a specific DID. It cannot be transferred, forked, or shared. This is the foundation for cross-platform identity attribution.
+- **Non-fungible.** The attestation binds one external identity to one identifier. It cannot be transferred, forked, or shared. This is the foundation for cross-platform identity attribution.
 - **User-initiated.** Only the human creates attestations for their own identities. No third party can assert a link on someone's behalf.
 - **Independently verifiable.** Any participant can verify the attestation without relying on a central authority. Verification methods vary by platform (OAuth proof, signed message, DNS record, etc.).
 - **Revocable.** Users can revoke attestations at any time, severing the link.
-- **Discoverable.** Other SCP participants can look up whether a given external identity maps to a known DID. Attestations are discoverable through contexts with discovery outlets (§6.2.2B) and DID document service entries (§3.5.3). Reverse-lookup (external handle → DID) is provided by the `attestation_lookup` outlet in contexts with discovery outlets (§22.5).
+- **Discoverable.** Other SCP participants can look up whether a given external identity maps to a known identifier. Attestations are discoverable through contexts with discovery outlets (§6.2.2B [no such section]) and service-record entries (§3.5.3). Reverse-lookup, from an external handle to an identifier, is provided by the `attestation_lookup` outlet in contexts with discovery outlets (§22.5).
 
 Identity attestations enable two critical flows:
 
@@ -120,19 +83,19 @@ Identity link attestations are sub-classified into two classes based on when and
 **Class 1: Cryptographic.** The provider's confirmation of identity ownership was cryptographically verified at attestation creation time. Verification methods: `Oauth`, `ChallengeResponse`.
 
 - The SDK performs the verification flow (OAuth code exchange, challenge-response round trip) locally at creation time.
-- On success, the SDK extracts the minimal identifying claim (`provider`, `subject_id`, `verified_at`) and signs it with the DID's signing key. This SDK-signed proof replaces the raw provider token — no JWT, no OIDC ID token, no PII is stored.
-- The attestation proof is: `{ "provider": "<platform>", "subject_id": "<platform_user_id>", "verified_at": <unix_s> }` signed by the issuer's `#active` or `#agent` key. The signature is the one on the `IdentityLinkAttestation` envelope itself — the proof field carries the claim content, the envelope signature covers it.
-- Self-attestation model: issuer == subject. The DID owner asserts "I verified this at creation time." Consumers trust the assertion because: (a) the DID key signed it, (b) the claim is minimal (no forgery incentive beyond the link itself), and (c) falsifying the link provides no benefit — social graph import (§3.6) only works if the external account is genuinely controlled.
+- On success, the SDK extracts the minimal identifying claim (`provider`, `subject_id`, `verified_at`) and signs it with the identity's `#active` key. This SDK-signed proof replaces the raw provider token — no JWT, no OIDC ID token, no PII is stored.
+- The attestation proof is: `{ "provider": "<platform>", "subject_id": "<platform_user_id>", "verified_at": <unix_s> }` signed by the issuer's `#active` key. The signature is the one on the `IdentityLinkAttestation` envelope itself — the proof field carries the claim content, the envelope signature covers it.
+- Self-attestation model: issuer == subject. The identity's controller asserts "I verified this at creation time." Consumers trust the assertion because: (a) the `#active` key signed it, (b) the claim is minimal (no forgery incentive beyond the link itself), and (c) falsifying the link provides no benefit — social graph import (§3.6) only works if the external account is genuinely controlled.
 - **No raw token storage.** The SDK MUST discard the OAuth access token, refresh token, and ID token after extracting the `subject_id`. Only the minimal signed claim persists. This eliminates PII leakage — Google OIDC tokens always include `email`, Apple tokens include `email` when requested. None of that data enters the attestation.
 
 **Class 2: Reference.** The proof is a live external resource that consumers must verify themselves. Verification methods: `SignedPost`, `DnsRecord`.
 
-- The user places their DID string in an externally-visible location (profile bio, DNS TXT record, public post).
-- The attestation's `proof` field points to the resource URL or record location. No cryptographic proof of ownership exists at creation time — the proof is the continued presence of the DID in the external resource.
-- **Zero trust until verified.** A Reference attestation carries no trust weight on its own. Consumers MUST fetch the proof URL or query the DNS record and confirm the DID is present before granting any trust weight. An unverified Reference attestation is equivalent to no attestation.
+- The user places their identifier, in the text form §3.1 fixes, in an externally-visible location: a profile bio, a DNS TXT record, or a public post.
+- The attestation's `proof` field points to the resource URL or record location. No cryptographic proof of ownership exists at creation time, so the proof is the continued presence of that identifier in the external resource.
+- **Zero trust until verified.** A Reference attestation carries no trust weight on its own. Consumers MUST fetch the proof URL or query the DNS record and confirm the identifier is present before granting any trust weight. An unverified Reference attestation is equivalent to no attestation.
 - Verification is consumer-side, cached with a 1-hour TTL (§3.5.4). Consumers that cannot verify (offline, rate-limited, proof URL inaccessible) MUST treat the attestation as unverified.
 
-The class distinction is critical for trust evaluation (§7.5). Class 1 attestations provide immediate trust signal upon DID signature verification. Class 2 attestations provide no trust signal until the consumer independently verifies the proof — they are pointers, not proofs.
+The class distinction is critical for trust evaluation (§7.5). Class 1 attestations provide immediate trust signal once the `#active` signature verifies. Class 2 attestations provide no trust signal until the consumer independently verifies the proof — they are pointers, not proofs.
 
 ### 3.5.1 Provider Registry
 
@@ -140,22 +103,22 @@ The following 16 platforms are supported for identity link attestations. New pro
 
 | Platform | `platform` value | Class | Verification method | Proof location | Renewal interval |
 |----------|-----------------|-------|--------------------|----|-----------------|
-| GitHub | `github.com` | 2 (Reference) | `SignedPost` | Profile bio containing DID | 90 days |
-| X / Twitter | `x.com` | 2 (Reference) | `SignedPost` | Profile description containing DID | 90 days |
+| GitHub | `github.com` | 2 (Reference) | `SignedPost` | Profile bio carrying the identifier | 90 days |
+| X / Twitter | `x.com` | 2 (Reference) | `SignedPost` | Profile description carrying the identifier | 90 days |
 | Google | `google.com` | 1 (Cryptographic) | `Oauth` | SDK-signed OIDC claim | 30 days |
 | Apple | `apple.com` | 1 (Cryptographic) | `Oauth` | SDK-signed OIDC claim | 30 days |
 | Microsoft | `microsoft.com` | 1 (Cryptographic) | `Oauth` | SDK-signed OIDC claim | 30 days |
 | LinkedIn | `linkedin.com` | 1 (Cryptographic) | `Oauth` | SDK-signed OIDC claim | 30 days |
 | Discord | `discord.com` | 1 (Cryptographic) | `Oauth` | SDK-signed OIDC claim | 30 days |
-| Reddit | `reddit.com` | 2 (Reference) | `SignedPost` | Profile bio containing DID | 90 days |
-| Bluesky | `bluesky.com` | 2 (Reference) | `SignedPost` | Profile description containing DID | 90 days |
-| Mastodon | `mastodon:<instance>` | 2 (Reference) | `SignedPost` | Profile bio containing DID | 90 days |
+| Reddit | `reddit.com` | 2 (Reference) | `SignedPost` | Profile bio carrying the identifier | 90 days |
+| Bluesky | `bluesky.com` | 2 (Reference) | `SignedPost` | Profile description carrying the identifier | 90 days |
+| Mastodon | `mastodon:<instance>` | 2 (Reference) | `SignedPost` | Profile bio carrying the identifier | 90 days |
 | Telegram | `telegram.com` | 1 (Cryptographic) | `ChallengeResponse` | Bot-verified round trip | 60 days |
-| npm | `npm` | 2 (Reference) | `SignedPost` | Profile page containing DID | 90 days |
-| PyPI | `pypi` | 2 (Reference) | `SignedPost` | Profile page containing DID | 90 days |
+| npm | `npm` | 2 (Reference) | `SignedPost` | Profile page carrying the identifier | 90 days |
+| PyPI | `pypi` | 2 (Reference) | `SignedPost` | Profile page carrying the identifier | 90 days |
 | Steam | `steam` | 1 (Cryptographic) | `ChallengeResponse` | Bot-verified round trip | 60 days |
-| .well-known | `well-known` | 2 (Reference) | `DnsRecord` | `/.well-known/scp` endpoint containing DID | 180 days |
-| DNS | `dns` | 2 (Reference) | `DnsRecord` | TXT record at `_scp-verify.<domain>` | 180 days |
+| .well-known | `well-known` | 2 (Reference) | `DnsRecord` | `/.well-known/scp` endpoint carrying the identifier | 180 days |
+| DNS | `dns` | 2 (Reference) | `DnsRecord` | TXT record at `_scp-verify.<domain>` carrying the identifier | 180 days |
 
 **Platform value conventions:**
 
@@ -163,32 +126,32 @@ The following 16 platforms are supported for identity link attestations. New pro
 - Social platforms use their primary domain: `github.com`, `x.com`, `reddit.com`, `bluesky.com`, `telegram.com`.
 - Mastodon instances use the `mastodon:<instance>` format (e.g., `mastodon:mastodon.social`) because the Mastodon API endpoint varies by instance. The `platform_id` field SHOULD contain the Mastodon account URI (`@user@instance`).
 - Package registries use the bare registry name: `npm`, `pypi`. The `platform_handle` field contains the package author username.
-- `.well-known` uses the bare string `well-known`. The `platform_handle` field contains the domain name. The proof is an HTTP GET to `https://<domain>/.well-known/scp` which must return the DID string.
+- `.well-known` uses the bare string `well-known`. The `platform_handle` field contains the domain name. The proof is an HTTP GET to `https://<domain>/.well-known/scp`, which must return the identifier.
 - DNS uses the bare string `dns`. The `platform_handle` field contains the domain name.
 
-**`ChallengeResponse` verification method:** `ChallengeResponse` is listed as a Class 1 (Cryptographic) verification method in §3.5.0. Some platforms in the registry above use it (Telegram, Steam) for bot-verified identity linking. Beyond those platform-specific entries, `ChallengeResponse` is also platform-agnostic — it is a generic mechanism where any verifier (e.g., a context governance engine or another participant) challenges an agent to prove a capability or identity claim via a cryptographic round trip. Any context that wants to verify an agent's capabilities can use `ChallengeResponse` regardless of the platform. The `platform` field in the attestation claim is set to the verifier's choice (e.g., the context ID or verifier's domain), and the `evidence.verifier_did` field identifies the verifier that issued the challenge.
+**`ChallengeResponse` verification method:** the registry above names two platforms that use it, Telegram and Steam, and the mechanism is platform-agnostic beyond them. Any verifier — a context governance engine or another participant — challenges an agent to prove a capability or an identity claim over a cryptographic round trip. The verifier chooses the `platform` value, such as the context id or its own domain, and `evidence.verifier_did` names the verifier that issued the challenge.
 
 **`ChallengeResponse` creation flow:**
 1. A verifier sends a random 32-byte challenge to the subject.
-2. The subject signs the challenge with their SCP signing key (`#active` or `#agent`).
+2. The subject signs the challenge with their Active Signing Key (`#active`).
 3. The SDK constructs the proof: `{ "challenge": "<hex>", "response_signature": "<hex>" }`.
-4. The full `IdentityLinkAttestation` envelope is signed by the subject's DID key.
+4. The full `IdentityLinkAttestation` envelope is signed by the subject's `#active` key.
 
-**`ChallengeResponse` verification:** Verify `response_signature` is valid for `challenge` under the subject's DID signing key. Verify `verifier_did` is a known, trusted verifier.
+**`ChallengeResponse` verification:** Verify `response_signature` is valid for `challenge` under the subject's `#active` key. Verify `verifier_did` is a known, trusted verifier.
 
 **Class 1 (Cryptographic) creation flow:**
 
 1. The SDK initiates an OAuth 2.0 authorization code flow with the OIDC provider. Minimal scope: `openid` only (no `email`, no `profile`). Apple Sign In uses the `sub` claim from the identity token.
 2. On success, the SDK receives the ID token (JWT). It extracts `sub` (subject identifier) and discards the token.
 3. The SDK constructs the proof content: `{ "provider": "<platform>", "subject_id": "<sub>", "verified_at": <unix_s> }`.
-4. The SDK signs the full `IdentityLinkAttestation` envelope (which includes the proof content in `evidence.proof`) with the DID's signing key.
+4. The SDK signs the full `IdentityLinkAttestation` envelope, which includes the proof content in `evidence.proof`, with the identity's `#active` key.
 5. The SDK discards the access token, refresh token, and ID token. Only the signed attestation persists.
 
 **Class 2 (Reference) creation flow:**
 
-1. The user places their DID string in the platform-specific location (profile bio, DNS TXT record).
+1. The user places their identifier, in the text form §3.1 fixes, in the platform-specific location: a profile bio or a DNS TXT record.
 2. The SDK constructs the proof pointer: for `SignedPost`, `{ "post_url": "<url>", "nonce": "<random_hex>", "posted_at": <unix_s> }`; for `DnsRecord`, `{ "domain": "<domain>", "record_name": "_scp-verify" }`.
-3. The SDK signs the full `IdentityLinkAttestation` envelope with the DID's signing key.
+3. The SDK signs the full `IdentityLinkAttestation` envelope with the identity's `#active` key.
 4. The attestation is published. It carries zero trust weight until a consumer fetches and verifies the proof.
 
 ### 3.5.2 Identity Attestation Wire Format
@@ -199,8 +162,8 @@ Identity attestations use the attestation envelope defined in §7.4.1, with iden
  IdentityLinkAttestation {
   id:           String,          // Deterministic ID (see below), hex-encoded
   type:         "identity_link",
-  issuer:       DID,             // The DID claiming the external identity
-  subject:      DID,             // Same as issuer (self-attestation)
+  issuer:       Identifier,      // the identifier claiming the external identity
+  subject:      Identifier,      // same as issuer (self-attestation)
   issued_at:    u64,             // Unix timestamp (s)
   expires_at:   Option<u64>,     // Optional expiry (s). If absent, valid until revoked.
   claim: {
@@ -213,10 +176,10 @@ Identity attestations use the attestation envelope defined in §7.4.1, with iden
     method:         String,      // Verification method: "oauth", "signed_post", "dns_record", "challenge_response"
     proof:          String,           // Method-specific proof data (opaque — see below)
     verified_at:    u64,         // Unix timestamp (s) of last verification
-    verifier_did:   Option<DID>, // DID of the verifier, if third-party verified (challenge_response only)
+    verifier_did:   Option<Identifier>, // the verifier's identifier, where a third party verified (challenge_response only)
   },
   revocation_status: RevocationStatus, // Active or Revoked (§7.4.1). MUST be in signed scope.
-  signature:    Ed25519Signature,  // Signs §9.5.1 canonical hash (see Signature scope below), using issuer's #active or #agent key
+  signature:    P256Signature,     // 64 raw bytes; signs the §9.5.1 canonical hash (see Signature scope below), using issuer's #active key
 }
 ```
 
@@ -226,9 +189,9 @@ Identity attestations use the attestation envelope defined in §7.4.1, with iden
 > (2) cross-implementation canonical hash determinism,
 > (3) verifiers need not understand proof contents to verify signatures.
 
-**Signature scope:** The signature covers the §9.5.1 canonical hash of `(id, attestation_type, issuer, subject, issued_at, expires_at, claim, evidence, revocation_status)` using domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`. String and DID fields use 4-byte BE length-prefixed encoding, `issued_at` uses 8-byte BE u64, `expires_at` uses the absent sentinel when not set, and sub-structures (`claim`, `evidence`, `revocation_status`) are individually serialized as MessagePack (sorted-key encoding) and included as variable-length byte fields. See §25.13 (Vector 26) for the exact construction.
+**Signature scope:** The signature covers the §9.5.1 canonical hash of `(id, attestation_type, issuer, subject, issued_at, expires_at, claim, evidence, revocation_status)` using domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`. String and identifier fields use 4-byte BE length-prefixed encoding, `issued_at` uses 8-byte BE u64, `expires_at` uses the absent sentinel when not set, and sub-structures (`claim`, `evidence`, `revocation_status`) are individually serialized as MessagePack (sorted-key encoding) and included as variable-length byte fields. See §25.13 (Vector 26) for the exact construction.
 
-**Attestation ID construction:** The `id` field is a deterministic, hex-encoded SHA-256 hash derived from the attestation's identifying fields using the canonical hash construction (§9.5.1). The domain separator `"SCP-ATTESTATION-ID-V1:"` prevents cross-protocol collision, and 4-byte big-endian length prefixes on variable-length fields prevent field boundary ambiguity (e.g., platform `"ab"` + handle `"cd"` vs platform `"a"` + handle `"bcd"`).
+**Attestation ID construction:** the `id` field is a hex-encoded SHA-256 digest over the attestation's identifying fields under the canonical hash construction of `09-security-model.md` §9.5.1. The domain separator `"SCP-ATTESTATION-ID-V1:"` keeps the digest from colliding with another protocol's.
 
 ```
 id = hex(SHA-256(
@@ -242,35 +205,35 @@ id = hex(SHA-256(
 
 The `issued_at` timestamp is encoded as 8-byte big-endian for deterministic cross-platform computation. See §25.16 (Vector 29) for a test vector.
 
-**Revocation check:** Verifiers check revocation by resolving the issuer's DID document and looking for an `AttestationRevocations` service endpoint (§18.2.2). The endpoint returns a list of revoked attestation IDs. If the attestation's `id` appears in the list, it is revoked. Additionally, the `revocation_status` field in the attestation itself is checked — if `Revoked`, the attestation is invalid regardless of the revocation endpoint.
+**Revocation check:** Verifiers check revocation by resolving the issuer's service record (§3.10.13) and reading its `AttestationRevocations` pointer (`18-addressability-and-deployment.md` §18.2.2). The pointer's target returns a list of revoked attestation IDs. If the attestation's `id` appears in the list, it is revoked. Additionally, the `revocation_status` field in the attestation itself is checked — if `Revoked`, the attestation is invalid regardless of the revocation endpoint.
 
-### 3.5.3 DID Document Attestation Service Entry
+### 3.5.3 Service-Record Attestation Entry
 
-Identity link attestations are published as service entries in the issuer's DID document. This enables discovery: any party resolving the DID document can enumerate the issuer's identity links without querying a separate registry.
+Identity link attestations are published as entries in the issuer's service record (§3.10.13). This enables discovery: any party resolving the service record can enumerate the issuer's identity links without querying a separate registry.
 
-**Service entry format:**
+**Service-record entry format:**
 
 ```
 Service {
-  id:              "<did>#attestation-<platform>--<index>",  // e.g., "did:dht:z...#attestation-github.com--0"
+  id:              "<identifier>#attestation-<platform>--<index>",
   type:            "ScpIdentityLinkAttestation",
   serviceEndpoint: "<attestation_id>"                       // Hex-encoded attestation ID (§3.5.2)
 }
 ```
 
-**Fragment naming convention:** `attestation-<platform>--<index>` where `<platform>` is the `platform` value from the provider registry (§3.5.1) and `<index>` is a zero-based integer for disambiguation when multiple attestations exist for the same platform (e.g., multiple Mastodon instances).
+**Fragment naming convention:** `attestation-<platform>--<index>`, where `<platform>` is the `platform` value from the provider registry (§3.5.1) and `<index>` is a zero-based integer that disambiguates several attestations for one platform, such as several Mastodon instances.
 
 **Fields:**
 
-- `id`: Full DID URI with fragment. The fragment encodes the platform for human readability. The `<index>` disambiguates multiple attestations for the same platform.
-- `type`: `ScpIdentityLinkAttestation` (constant). Consumers filter DID document services by this type to discover identity link attestations.
-- `serviceEndpoint`: The attestation ID (hex string). Consumers use this to look up the full `IdentityLinkAttestation` from the identity's attestation store (via relay or DHT).
+- `id`: the identifier followed by the fragment. The fragment encodes the platform for a human reader, and `<index>` disambiguates several attestations for one platform.
+- `type`: `ScpIdentityLinkAttestation` (constant). Consumers filter service-record entries by this type to discover identity link attestations.
+- `serviceEndpoint`: The attestation ID (hex string). Consumers use this to look up the full `IdentityLinkAttestation` from the identity's attestation store on a relay.
 
-**Maximum attestations per DID document:** 64. This prevents DID document bloat — each service entry adds to the DID document size, which is replicated across resolvers — while providing enough headroom for users with many platform identities. The limit applies to service entries of type `ScpIdentityLinkAttestation` only; other service types have their own limits.
+**Maximum attestations per service record:** 64. This prevents service-record bloat — each entry adds to the record's size, which is replicated across resolvers — while providing enough headroom for users with many platform identities. The limit applies to service-record entries of type `ScpIdentityLinkAttestation` only; other entry types have their own limits.
 
-**Bridge-layer attestation store limit:** Implementations MUST enforce the same 64-attestation-per-DID cap as the DID document layer. This unified limit ensures consistent behavior across all layers — the DID document and the bridge attestation store share a single bound. The constant `MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID` (defined in `scp-ffi-common`) is the single source of truth for all bridge implementations.
+**Bridge-layer attestation store limit:** a bridge attestation store enforces that same 64-attestation cap, under the constant `MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID` that `scp-ffi-common` defines, so the service record and the store share one bound.
 
-**Lifecycle:** When an attestation is revoked, the corresponding service entry MUST be removed from the DID document. When an attestation is renewed (re-verified), the service entry is unchanged — it still points to the same attestation ID. When an attestation is replaced (new attestation for the same platform+handle), the service entry's `serviceEndpoint` is updated to the new attestation ID.
+**Lifecycle:** When an attestation is revoked, the corresponding entry MUST be removed from the service record. When an attestation is renewed (re-verified), the entry is unchanged — it still points to the same attestation ID. When an attestation is replaced (new attestation for the same platform+handle), the service entry's `serviceEndpoint` is updated to the new attestation ID.
 
 ### 3.5.4 Verification
 
@@ -278,21 +241,21 @@ Verification procedure depends on the attestation class (§3.5.0).
 
 **Class 1 (Cryptographic) verification:**
 
-1. Resolve the issuer's DID document. Extract the `#active` or `#agent` public key.
-2. Verify the Ed25519 signature on the attestation envelope against the issuer's public key.
+1. Resolve the issuer's key state (§3.10.4). Read the public key it lists `Current` in the `#active` role.
+2. Verify the P-256 signature on the attestation envelope against the issuer's public key.
 3. Check `revocation_status` is `Active`. If `Revoked`, reject.
 4. Check `expires_at` (if present). If expired, reject.
 5. Check freshness: if `evidence.verified_at` is older than the renewal interval for the verification method (§3.5.1), the attestation is stale. Stale attestations are degraded (reduced trust weight), not rejected outright.
-6. **Trust the self-attestation.** Because issuer == subject, the DID key signature is sufficient. The attestation asserts "I performed OAuth verification at `verified_at` and the OIDC `sub` was `subject_id`." There is no cryptographic proof that the OAuth flow actually occurred — this is a self-attestation. It is acceptable for identity links because: (a) the claim is minimal, (b) the only use case is linking identities the user actually controls, (c) falsifying a link provides no protocol benefit (social graph import only surfaces genuine contacts).
+6. **Trust the self-attestation.** Because issuer == subject, the `#active` signature is sufficient. The attestation asserts "I performed OAuth verification at `verified_at` and the OIDC `sub` was `subject_id`." There is no cryptographic proof that the OAuth flow actually occurred — this is a self-attestation. It is acceptable for identity links because: (a) the claim is minimal, (b) the only use case is linking identities the user actually controls, (c) falsifying a link provides no protocol benefit (social graph import only surfaces genuine contacts).
 
 **Class 2 (Reference) verification:**
 
 1. Perform steps 1-5 from Class 1 verification (signature, revocation, expiry, freshness).
-2. **Fetch the proof resource.** For `SignedPost`: HTTP GET the `post_url`, confirm the response body contains the issuer's DID string and the nonce. For `DnsRecord`: perform a DNS TXT lookup for `_scp-verify.<domain>`, confirm a record contains the issuer's DID string. DNSSEC validation is RECOMMENDED where the domain supports it.
-3. **If fetch fails or DID is not present:** the attestation is unverified. Treat as if the attestation does not exist for trust evaluation. Do not cache a negative result — transient failures (rate limiting, DNS propagation delays) should not permanently invalidate an attestation.
-4. **If fetch succeeds and DID is present:** the attestation is verified. Cache the result.
+2. **Fetch the proof resource.** For `SignedPost`: HTTP GET the `post_url`, confirm the response body carries the issuer's identifier and the nonce. For `DnsRecord`: perform a DNS TXT lookup for `_scp-verify.<domain>`, confirm a record carries the issuer's identifier. DNSSEC validation is RECOMMENDED where the domain supports it.
+3. **If the fetch fails or the identifier is not present:** the attestation is unverified. Treat as if the attestation does not exist for trust evaluation. Do not cache a negative result — transient failures (rate limiting, DNS propagation delays) should not permanently invalidate an attestation.
+4. **If the fetch succeeds and the identifier is present:** the attestation is verified. Cache the result.
 
-**Where an SCP SDK sits in this flow.** Step 2 belongs to the consumer, as §3.5.1 states for every Class 2 method ("a live external resource that consumers must verify themselves"). An SDK verification operation therefore takes that consumer's fetch outcome as a required input and performs every other step of this list itself. A consumer that fetched the resource and found the issuer's DID in it reports `confirmed`, and the operation returns a verdict. A consumer that fetched nothing reports `not_fetched`, and the operation raises the step-3 state — "unverified", distinct from "rejected" — so a consumer never records a rejection this section forbids caching. A consumer that reports `confirmed` without fetching anything states a falsehood about its own step 2; no SDK can detect that, which is why step 2 names the consumer as the party that performs it.
+**Where an SCP SDK sits in this flow.** Step 2 belongs to the consumer, as §3.5.1 states for every Class 2 method ("a live external resource that consumers must verify themselves"). An SDK verification operation therefore takes that consumer's fetch outcome as a required input and performs every other step of this list itself. A consumer that fetched the resource and found the issuer's identifier in it reports `confirmed`, and the operation returns a verdict. A consumer that fetched nothing reports `not_fetched`, and the operation raises the step-3 state — "unverified", distinct from "rejected" — so a consumer never records a rejection this section forbids caching. A consumer that reports `confirmed` without fetching anything states a falsehood about its own step 2; no SDK can detect that, which is why step 2 names the consumer as the party that performs it.
 
 **Verification cache:**
 
@@ -300,30 +263,9 @@ Verification procedure depends on the attestation class (§3.5.0).
 - TTL: 1 hour. After TTL expires, the consumer MUST re-verify before granting trust weight.
 - Cache key: attestation ID.
 - Cache entries: `{ attestation_id, verified: bool, verified_at: u64, expires_at: u64 }`.
-- Class 1 attestations do not require caching — DID signature verification is deterministic and fast.
+- Class 1 attestations do not require caching, because signature verification is deterministic and fast.
 
-**Renewal intervals** (SHOULD re-verify at these intervals; stale but not expired attestations are degraded, not rejected):
-
-| Platform | Class | Renewal interval | Rationale |
-|----------|-------|-----------------|-----------|
-| `google.com` | 1 | 30 days | OIDC tokens expire; account may be revoked |
-| `apple.com` | 1 | 30 days | OIDC tokens expire; account may be revoked |
-| `microsoft.com` | 1 | 30 days | OIDC tokens expire; account may be revoked |
-| `linkedin.com` | 1 | 30 days | OIDC tokens expire; account may be revoked |
-| `discord.com` | 1 | 30 days | OIDC tokens expire; account may be revoked |
-| `github.com` | 2 | 90 days | Profile bio may be edited; account may be suspended |
-| `x.com` | 2 | 90 days | Profile description may be edited; account may be suspended |
-| `reddit.com` | 2 | 90 days | Profile bio may be edited; account may be suspended |
-| `bluesky.com` | 2 | 90 days | Profile description may be edited; account may be suspended |
-| `mastodon:<instance>` | 2 | 90 days | Profile bio may be edited; instance may be deactivated |
-| `npm` | 2 | 90 days | Profile page may be edited; account may be suspended |
-| `pypi` | 2 | 90 days | Profile page may be edited; account may be suspended |
-| `telegram.com` | 1 | 60 days | ChallengeResponse — no persistent proof; freshness matters |
-| `steam` | 1 | 60 days | ChallengeResponse — no persistent proof; freshness matters |
-| `well-known` | 2 | 180 days | HTTP endpoints are stable; domain ownership changes slowly |
-| `dns` | 2 | 180 days | DNS records are stable; domain ownership changes slowly |
-
-**ChallengeResponse renewal interval:** 60 days. ChallengeResponse attestations not tied to a specific platform (§3.5.1) use this default. For platform-specific ChallengeResponse entries (Telegram, Steam), the renewal interval is listed in the table above.
+**Renewal intervals.** The provider registry of §3.5.1 carries the interval for every platform. A consumer SHOULD re-verify at that interval, and an attestation that is stale but not expired is degraded rather than rejected. The intervals track how fast each proof decays: an OIDC token expires and its account may be revoked, a profile bio is edited and its account suspended, a `ChallengeResponse` leaves no persistent proof at all, and a DNS record or a `.well-known` endpoint changes hands only with its domain. A `ChallengeResponse` attestation that names no platform in that registry renews at 60 days.
 
 ### 3.5.6 Security Considerations
 
@@ -337,117 +279,99 @@ Verification procedure depends on the attestation class (§3.5.0).
 
 ## 3.6 Social Graph
 
-There is no global social graph. No "friends list" primitive. No public follower count. No network-wide structure anyone can query.
+SCP holds no global social graph: no friends list, no public follower count, and no network-wide structure a party can query.
 
-Social graph data **is context state.** Each context already knows its members — their DIDs, their roles, their participation history. This is protocol state: verifiable against the context's event log, persistent, governed by context permissions. The social graph is not stored separately or owned by any agent. It is the sum of membership across contexts.
+**Social graph data is context state.** Each context already knows its members, their roles, and their participation history, and that state is verifiable against the context's event log and governed by the context's permissions (§5.9). No agent owns a separate copy.
 
-A user's view of their own social graph is **assembled from capability-gated queries** against the contexts they participate in. Your agent queries contexts for membership data, computes relationship strength from shared participation (how many contexts, how long, in what roles), and presents the result. The data lives in the contexts. The view is computed. Access is permissioned.
+**A party's view of its own graph is computed, not stored.** The SDK queries the contexts the party participates in through the capability-gated interfaces §7 defines, derives relationship strength from shared participation — how many contexts, over how long, in what roles — and presents the result. The data stays in the contexts and the protocol checks permissions before it answers.
 
-**Social graph sharing is capability-gated.** Sharing your social graph with others — letting someone see which contexts you're in, who you share spaces with — is governed by the same trust and capability model as any other data access. Grants are scoped however you choose:
+**Sharing that view is capability-gated**, under the same model as any other data access (§7.3). A grant is scoped per identifier ("Bob sees my connections, Carol does not"), per capability ("Bob sees that I am in this context and sees no other"), per context ("every member here sees that I am a member and sees nothing else"), or per category ("close contacts see my full list"). The scoping reaches relationship metadata as well as existence: a party may see that two identities share one context without seeing that they share another. No new primitive is required, because graph visibility falls out of the trust equation §1 states, `trust = f(identity, capability, context, metadata)`.
 
-- **Per-identity.** "Bob can see my connections. Carol cannot."
-- **Per-capability scope.** "Bob can see that I'm in this context. Bob cannot see my other contexts."
-- **Per-context.** "Everyone in this context can see that I'm a member. Nobody here can see what other contexts I'm in."
-- **Per-category.** "Close contacts can see my full context list. Everyone else sees nothing."
+**Block and mute live in identity private state** (§3.7), which is persistent, portable, and encrypted.
 
-This extends to relationship metadata — not just whether a connection exists, but the nature of it. Alice might see that you and Bob are both in the cooking quest. She cannot see that you and Bob also share a private finance context, unless you've granted that visibility.
+**Blocking runs at three tiers, each enforced through the same three cryptographic layers** (§9.16, §9.17): a block-list check denies key re-requests to the blocked identity; the blocker's SDK destroys the blocked party's cached keys and plaintext, which is a protocol requirement for a compliant client; and deleting the blocked party's per-member access key revokes that party's access to stored content.
 
-**Access is through capability-gated protocol interfaces.** Social graph data is accessed through the same permission model as any other protocol data. Queries hit capability-gated interfaces; the protocol checks permissions before responding. No special mechanisms, no local caches treated as source of truth. The protocol provides query APIs for assembling and sharing graph views — these are not static data stores but permission-scoped computations over context membership.
+- **Tier 1, identity to identity inside one context, unilateral.** The blocker rotates its sender key to exclude the blocked identity, destroys that identity's cached content, and deletes its access key. It reaches the blocker's own content in that one context and no other member's. Unblocking is forward-only: the blocked party receives future content, and content from before and during the block stays inaccessible because its access keys were destroyed rather than archived.
+- **Tier 2, identity to identity across every shared context.** Stored in identity private state, Tier 2 applies Tier 1 to every context the two identities share at once. The block is bidirectional: both SDKs rotate their sender keys to exclude each other (§9.16.3).
+- **Tier 3, governance-gated, context-level.** Context governance revokes a member's access to all content in the context through the propose-and-approve path of §5.9, under the actions `RevokeAccess`, `RestoreAccess`, and `RotateContentKeys` (ADR-031). Restoration is forward-only.
 
-**No new primitives required.** Social graph visibility falls out of the existing trust equation: `trust = f(identity, capability, context, metadata)`. Capability tokens authorize reading specific slices of your graph. The social graph isn't a separate system with its own privacy model — it's just another resource governed by the same model as everything else.
+Tiers 1 and 2 are per-relationship and Tier 3 is per-context, so a party Tier 3 revoked sees no content in the context while a party Tier 1 blocked still sees every other member's. The three tiers compose: where both a member and governance have revoked one party's access, each revocation is reversed independently.
 
-**Block/mute** is stored in identity private state (§3.7) — persistent, portable, encrypted.
-
-**Blocking** operates at three tiers, each enforced through the same three cryptographic layers (§9.16, §9.17):
-
-- **Layer 1 (key distribution denial):** Block list check denies key re-requests to blocked DIDs.
-- **Layer 2 (SDK-mandated state destruction):** On block event, the blocker's SDK destroys cached keys and plaintext from the blocked party. This is a protocol requirement for compliant clients.
-- **Layer 3 (access key wrapping):** Content keys are wrapped with per-member access keys. Deleting a member's access key = cryptographic revocation of stored content. See §9.17.
-
-**Tier 1: DID-to-DID in-context (per-relationship, unilateral).** Alice blocks Dave in context X. Affects Alice's content in that context only — Dave can still see other members' content. This is the §9.16 sender-side blocking, scoped to a single context. On block: Alice rotates her sender key excluding Dave (Layer 1), Alice's SDK destroys Dave's cached content from Alice (Layer 2), Alice deletes Dave's access key for her content (Layer 3). On unblock: Alice removes Dave from her block list. Forward-only — Dave receives Alice's future content but historical content from before/during the block remains inaccessible (access keys were destroyed, not archived).
-
-**Tier 2: DID-to-DID global (identity-level, cross-context).** Alice blocks Dave everywhere. Stored in identity private state (§3.7). Propagates to all contexts Alice and Dave share — equivalent to Tier 1 applied to every shared context simultaneously. On block: same three layers, applied across all shared contexts. On unblock: same forward-only restoration, across all shared contexts. Blocking is bidirectional: when Alice blocks Dave, both Alice's and Dave's SDKs rotate their sender keys excluding each other (§9.16.3).
-
-**Tier 3: Governance-gated (context-level, all content).** Context governance revokes a member's content access. Goes through GovernanceEngine (propose/approve/reject per §5.9). Affects the target's access to ALL content in the context — not just one member's content. Governance actions: `RevokeAccess { did, access }`, `RestoreAccess { did, capabilities }`, `RotateContentKeys` (see ADR-031). Restoration is forward-only.
-
-**Tier stacking:** All three tiers compose. If both Alice (Tier 1) and governance (Tier 3) have revoked Dave's access, both must be independently reversed for full restoration. Each tier's revocation and restoration is independent.
-
-**Key difference between tiers:** Tiers 1-2 are per-relationship (Alice blocks Dave = Dave can't see Alice's content; Dave can still see Bob's content). Tier 3 is per-context (governance revokes Dave = Dave can't see ANY content in the context).
-
-**Mute** is unidirectional. Alice mutes Dave; Alice no longer sees Dave's content. Dave is unaffected and can still see Alice. Muting is a protocol rule enforced in the SDK — apps built on the SDK inherit this behavior. Because the muter is not adversarial against themselves (they chose the mute), SDK-level enforcement is sufficient; cryptographic exclusion is not required.
+**Mute is unidirectional and enforced in the SDK.** A party that mutes another stops seeing that party's content, and the muted party is unaffected. The muter is not adversarial against itself, so SDK-level enforcement suffices and cryptographic exclusion is not required.
 
 ## 3.7 Identity Private State
 
-A DID has public state (keys, service endpoints, published attestations) and **private state** — encrypted data that only the identity owner can read, replicated for availability and portability.
+An identity has public state — its key-event log, its service record, and its published attestations — and **private state**: encrypted data that only the identity owner can read, replicated for availability and portability.
 
 Context state handles multi-party social data. Identity private state handles single-party personal data. Together they cover every category of protocol-relevant state without requiring anything to live only on a local device.
 
 ```
-Identity (DID)
-├── Public State (DID Document)
-│   ├── Verification methods (ADR-039)
-│   │   ├── #0 — Identity Key (Ed25519, root of trust, offline)
-│   │   ├── #active — Human Signing Key (Ed25519, hardware-backed)
-│   │   └── #agent — Agent Signing Key (Ed25519, optional, software-held, rotatable)
-│   ├── Service endpoints / relay list
-│   └── Published attestations
+Identity
+├── Public State
+│   ├── Key-event log (`09-security-model.md` §9.7.4.2 definitions)
+│   │   ├── the root set — up to MAX_ROOT_SET_SIZE P-256 keys with a threshold
+│   │   ├── #active — the one operational role (P-256)
+│   │   └── the designation of the key that signs the service record
+│   ├── Service record (§3.10.13) — relay list, private-state locations,
+│   │   broadcast advertisements, self-asserted capability URIs, pointers
+│   └── Published attestations (§3.5) — their own signed objects
 │
 └── Private State (encrypted, replicated)
     ├── Block / mute list
     ├── Graph visibility policies (default + per-identity grants)
     ├── Agent configuration defaults (cross-context preferences)
-    ├── Personal annotations on other DIDs
-    ├── Petnames for DIDs and contexts (§22.4) — per-identity, per `SCP` instance (ADR-048)
+    ├── Personal annotations on other identities
+    ├── Petnames for identities and contexts (§22.4) — per-identity, per `SCP` instance (ADR-048)
     ├── Notification preferences
     ├── Draft attestations (not yet published)
     └── (extensible — any identity-level private data)
 ```
 
-**Encryption model.** Private state is encrypted with a dedicated symmetric **Private State Key (PSK)** — an AES-256 key used exclusively for identity private state encryption. The PSK is not derived from any signing key. Ed25519 keys are signing-only — they cannot be used for encryption. The PSK is generated independently and distributed to the identity owner's devices via HPKE (§3.7.2).
+**The human identity's key state names one operational role, `#active`** (`09-security-model.md` §9.7.4.2 definitions). An agent is a separate identity with its own key-event log, which the human's log anchors by cooperative delegation, so no key of an agent's appears in a human's identity. ADR-063, the inception-derived key-event-log identity substrate, supersedes ADR-039, the shared-DID human-agent identity model, and ADR-064, cooperative delegation, is the artifact that writes the replacing model. That model is unspecified as of 2026-09-10 (`00-open-questions.md`), and `09-security-model.md` §9.1 invariant 1 states it.
+
+**Encryption model.** Private state is encrypted with a dedicated symmetric **Private State Key (PSK)** — an AES-256 key used exclusively for identity private state encryption. The PSK is not derived from any signing key. An SCP signing key is an ECDSA key (`09-security-model.md` §9.5) and signs only — it never encrypts. The PSK is generated independently and distributed to the identity owner's devices via HPKE (§3.7.2).
 
 **Cryptographic specification:**
 
 - **Algorithm:** AES-256-GCM (RFC 5116).
-- **Key:** 32-byte random Private State Key (PSK), generated via CSPRNG (e.g., `OsRng`). The PSK is a raw symmetric key — it is not managed through `KeyCustody` (which handles asymmetric Ed25519/X25519 keys). One PSK per identity, shared across all enrolled devices.
+- **Key:** 32-byte random Private State Key (PSK), generated via CSPRNG (e.g., `OsRng`). The PSK is a raw symmetric key — it is not managed through `KeyCustody` (which handles asymmetric P-256 signing and HPKE keys). One PSK per identity, shared across all enrolled devices.
 - **Nonce:** 96-bit (12-byte) random nonce, generated per event via CSPRNG. Each event in the private state log gets a unique nonce. The nonce is stored alongside the ciphertext — it is not secret.
-- **AAD (Additional Authenticated Data):** `did || "scp-private-state-v1" || sequence_number` where `did` is the identity's DID string encoded as 4-byte big-endian length prefix + UTF-8 bytes (per §9.5.1 encoding rules), `"scp-private-state-v1"` is the domain separator as raw UTF-8 bytes (no length prefix — fixed per version), and `sequence_number` is the event's sequence number as 8-byte big-endian u64. AAD binding prevents: (a) ciphertext from one identity being replayed against another, (b) events being reordered within the log, (c) cross-protocol confusion with other AES-256-GCM uses in SCP.
+- **AAD (Additional Authenticated Data):** `identifier_bytes || "scp-private-state-v1" || sequence_number`, where `identifier_bytes` is the identity's 32 raw digest bytes carrying no length prefix, because §9.5.1 gives a fixed-length field none; `"scp-private-state-v1"` is the domain separator as raw UTF-8 bytes, fixed per version and carrying no length prefix; and `sequence_number` is the event's sequence number as an 8-byte big-endian u64. AAD binding prevents: (a) ciphertext from one identity being replayed against another, (b) events being reordered within the log, (c) cross-protocol confusion with other AES-256-GCM uses in SCP.
 - **Domain separator:** `"scp-private-state-v1"`. Distinct from `"scp-sender-key-v1"` (§9.16.2), `"scp-access-key-v1"` (§9.17.1), and all other SCP domain separators.
 
 ```
 Encryption (per event):
   nonce = random(12)
-  aad = len(did) || did || "scp-private-state-v1" || sequence_number
+  aad = identifier_bytes || "scp-private-state-v1" || sequence_number
   (ciphertext, tag) = AES-256-GCM-Seal(PSK, nonce, plaintext_event, aad)
   stored: { nonce, ciphertext, tag, sequence_number }
 
 Decryption (per event):
-  aad = len(did) || did || "scp-private-state-v1" || sequence_number
+  aad = identifier_bytes || "scp-private-state-v1" || sequence_number
   plaintext = AES-256-GCM-Open(PSK, nonce, ciphertext, tag, aad)
   if tag verification fails → reject (tampered or wrong key)
 ```
 
-**Storage model.** Same as context state: encrypted blobs stored on your published relays. Relays see "DID X has encrypted private state." Relays store and serve it. Relays cannot read, modify, or interpret it. This is encryption-as-access-control (§10.5) applied to identity rather than context — the same infrastructure, the same relay behavior, the same trust assumptions.
+**Storage model.** Same as context state: encrypted blobs stored on your published relays. A relay sees that one identifier has encrypted private state. Relays store and serve it. Relays cannot read, modify, or interpret it. This is encryption-as-access-control (§10.5) applied to identity rather than context — the same infrastructure, the same relay behavior, the same trust assumptions.
 
-**Routing ID derivation.** Identity private state blobs are addressed on relays by a deterministic `routing_id` derived from the identity's DID string:
+**Routing ID derivation.** Identity private state blobs are addressed on relays by a deterministic `routing_id`:
 
 ```
 private_state_routing_id = HKDF-SHA-256(
-    ikm:  identity_key_material,      // raw bytes of #0 public key
+    ikm:  private_state_key,          // the 32-byte PSK above, which no relay holds
     salt: SHA-256("scp-private-state-salt-v1"),
-    info: "scp-private-state-v1" || did_string,
+    info: "scp-private-state-v1" || identifier_bytes,
     len:  32
 )
 ```
 
-HKDF (RFC 5869) is used instead of plain SHA-256 to prevent the relay from computing the `routing_id` from a known DID string. With plain `SHA-256("scp:private:" || did_string)`, any relay that knows a DID could identify which routing ID holds that identity's private state, enabling targeted censorship or surveillance. The HKDF derivation requires `identity_key_material` (the `#0` public key bytes), which the relay does not possess unless it has previously resolved the DID — and even then, the derivation is not obvious without knowing the salt and info strings. This provides pseudonymity for private state storage relative to relays that have not correlated the identity.
+**The input is the PSK and never a public value**, and `identifier_bytes` is the identity's 32-byte inception-derived identifier (`09-security-model.md` §9.7.4.2 R13). HKDF (RFC 5869) is used instead of plain SHA-256 so that a relay holding a known identifier cannot compute the routing id and identify which blobs hold that identity's private state. **A root key is the wrong input on two counts**, and this states both rather than leaving a reader to keep the old one: the key-event model gives an identity a root **set** with a threshold rather than one `#0` key, so "the `#0` public key" names no value for an organization; and every root member is public in the log the identity publishes to its own relays, so a derivation over it gives a relay that resolved the identity the routing id for free. The PSK is held by the identity's own devices alone, so a relay that has not been given it cannot address the blobs. **A root recovery therefore moves no routing id**, because the recovery installs a fresh root set and changes no PSK; §3.7.2 states when the PSK itself rotates and what re-addressing that costs.
 
-The domain separation (`"scp-private-state-v1"` info string and `"scp-private-state-salt-v1"` salt) prevents collision with other routing ID derivation schemes: DID document routing uses `SHA-256("scp:did:" || did_string)` (§3.10.2), encrypted context routing uses HKDF from identity key material with `"scp-pseudonym"` (§9.10.4), broadcast context routing uses `SHA-256(context_id)` (§5.14), and context metadata routing uses `HMAC-SHA256(context_metadata_key, context_id || "scp-metadata-v2")` (§9.10.4.B).
+The domain separation (`"scp-private-state-v1"` info string and `"scp-private-state-salt-v1"` salt) prevents collision with other routing ID derivation schemes: key-event record routing uses `SHA-256("scp:did:" || identifier_bytes)` (§3.10.2), encrypted context routing uses HMAC-SHA256 keyed on the per-identity `pseudonym_secret` with `"scp-pseudonym"` (§9.10.4), which is a different secret from the PSK above, broadcast context routing uses `SHA-256(context_id)` (§5.14), and context metadata routing uses `HMAC-SHA256(context_metadata_key, context_id || "scp-metadata-v2")` (§9.10.4.B).
 
-The `IdentityPrivateState` service endpoint in the DID document (see below) lists which relays store the private state. The `routing_id` tells the SDK how to address those blobs on those relays.
+The `IdentityPrivateState` entry of the identity's service record (§3.10.13) lists which relays store the private state. The `routing_id` tells the SDK how to address those blobs on those relays.
 
-**Sync model.** Append-only event log, same pattern as context event logs. Each device appends events ("blocked DID Y at timestamp T", "granted Bob graph visibility at scope Z"). Any device that holds the PSK reconstructs current state from the log. Multi-device consistency: two phones and a laptop all hold the same PSK, all append to the same log, all converge to the same state. See §3.7.2 for how the PSK is distributed to devices.
-
-Most identity private state operations are naturally commutative — "block X" and "block Y" produce the same result regardless of order. Simultaneous updates from multiple devices resolve without conflict in most cases. The event log records all operations; state is derived from the full log.
+**Sync model.** Append-only event log, same pattern as context event logs. Each device appends events, such as "blocked identifier Y at timestamp T" and "granted Bob graph visibility at scope Z". Any device that holds the PSK reconstructs current state from the log. Multi-device consistency: two phones and a laptop all hold the same PSK, all append to the same log, all converge to the same state. See §3.7.2 for how the PSK is distributed to devices.
 
 **Integrity.** The event log is authenticated via an append-only hash chain. Each event entry is hashed as:
 
@@ -468,28 +392,28 @@ The head hash (`event_hash[N-1]`) serves as the integrity root for the entire lo
 
 The domain separator `"SCP-PRIVATE-LOG-V1:"` prevents cross-domain hash collisions with context event logs (which use the construction in §9.5). `event_data` is the serialized event bytes (MessagePack per §17). This is a linear hash chain (not a Merkle tree) because the single-owner case does not require efficient inclusion proofs or consistency proofs — the owner holds the full log and verifies sequentially. Context event logs use the full Merkle tree construction (§9.5) because multi-party verification requires proof exchange. The AES-256-GCM authentication tag provides per-event integrity verification: any modification to ciphertext, nonce, or associated data causes tag verification failure.
 
-**Relationship to context state.** Identity private state is the single-owner degenerate case of context state. Same storage infrastructure. Same integrity model. Same relay interaction. No governance, no roles, no capability ceiling — because it's your data. The protocol doesn't need new infrastructure for this — it's the existing infrastructure with membership count of one and no access control layer (the encryption IS the access control, and only you have the key).
+**Relationship to context state.** Identity private state is the single-owner case of context state: the same storage, the same integrity model, and the same relay interaction, with a membership count of one and no governance, no roles, and no capability ceiling. The encryption is the access control, and the owner alone holds the PSK.
 
 **Protocol-level constants (immutable):**
 
-- **Size constraints.** Less constrained than context state. The single-owner case allows growth (block lists, annotations, agent memory, draft attestations) without imposing storage on other participants. Relays MAY enforce per-DID storage quotas as an operational concern, but the protocol does not mandate minimalism for identity private state.
-- **Relay obligations.** Same storage class and retention as context events. No differentiated commitment — relays treat all encrypted blobs uniformly. A relay that stores context events for a DID stores identity private state under the same terms.
+- **Size constraints.** Less constrained than context state. The single-owner case allows growth (block lists, annotations, agent memory, draft attestations) without imposing storage on other participants. Relays MAY enforce per-identity storage quotas as an operational concern, but the protocol does not mandate minimalism for identity private state.
+- **Relay obligations.** Same storage class and retention as context events. No differentiated commitment — relays treat all encrypted blobs uniformly. A relay that stores context events for an identity stores that identity's private state under the same terms.
 - **Key rotation.** On identity key rotation (§9.12), the PSK is rotated: generate a new PSK, re-encrypt private state events, distribute the new PSK to all enrolled devices via HPKE (§3.7.2). The old PSK is destroyed on all devices after re-encryption completes. For large private state, re-encryption is incremental: most recent events first, backfill in background. Each re-encrypted event receives a fresh random nonce.
-- **Discovery pointer.** Explicit. The DID document includes a service endpoint of type `IdentityPrivateState` listing relays that store private state. This cleanly disambiguates context event fetches from private state fetches without relay-side guessing.
-- **Relay service endpoints.** The DID document includes service endpoints of type `SCPRelay` listing the identity's transport-layer relay URLs — the endpoints where `TransportManager` routes encrypted blobs for this identity. Multiple entries are recommended for suppression resistance (§9.9.2). Self-certified via BEP44 signature (§9.6.3). See §18.2 for the full specification of DID document service endpoint types.
+- **Discovery pointer.** Explicit. The identity's service record (§3.10.13) carries an `IdentityPrivateState` entry listing the relays that store its private state. This cleanly disambiguates context event fetches from private state fetches without relay-side guessing. The key-event log carries no private-state location: the location is transport metadata, so it rides the service record, and changing it appends no key event (`09-security-model.md` §9.6.3).
+- **Relay service endpoints.** The identity's service record (§3.10.13) carries `SCPRelay` entries listing the identity's transport-layer relay URLs — the endpoints where `TransportManager` routes encrypted blobs for this identity. Multiple entries are recommended for suppression resistance (§9.9.2). The designated service key signs that record and the key-event log carries only the designation of that key, so re-pointing a relay warms no root key (`09-security-model.md` §9.6.3, §3.10.13).
 
 ### 3.7.1 Block List Storage
 
 Identity private state stores block lists at two granularities:
 
-**Global block list.** DIDs blocked across all shared contexts (Tier 2). Stored as an append-only event log within identity private state:
+**Global block list.** Identities blocked across every shared context (Tier 2). Stored as an append-only event log within identity private state:
 
-- `BlockDID { target_did, timestamp }` — add DID to global block list.
-- `UnblockDID { target_did, timestamp }` — remove DID from global block list.
+- `BlockDID { target_did, timestamp }` — add an identifier to the global block list.
+- `UnblockDID { target_did, timestamp }` — remove an identifier from the global block list.
 
-The current block list is derived by replaying the event log. Both operations are commutative — "block X" and "block Y" produce the same state regardless of order. Multi-device sync is conflict-free: two devices can independently add blocks, and the union is correct.
+The current block list is derived by replaying the event log, and §3.7.1.1's table states which event types commute.
 
-**Per-context block list.** DIDs blocked in a specific context only (Tier 1). Same event types but scoped:
+**Per-context block list.** Identities blocked in one context only (Tier 1). Same event types but scoped:
 
 - `BlockDIDInContext { target_did, context_id, timestamp }`
 - `UnblockDIDInContext { target_did, context_id, timestamp }`
@@ -504,23 +428,23 @@ Propagation is best-effort and idempotent — if the SDK is offline for some con
 
 **ProtocolRepository methods.** The `Storage` trait (§17) requires these methods for block list persistence:
 
-- `get_global_block_list(did: &DID) -> Result<Vec<DID>>`
-- `is_globally_blocked(blocker: &DID, target: &DID) -> Result<bool>`
-- `get_context_block_list(did: &DID, context_id: &ContextId) -> Result<Vec<DID>>`
-- `is_blocked_in_context(blocker: &DID, target: &DID, context_id: &ContextId) -> Result<bool>`
+- `get_global_block_list(subject: &Identifier) -> Result<Vec<Identifier>>`
+- `is_globally_blocked(blocker: &Identifier, target: &Identifier) -> Result<bool>`
+- `get_context_block_list(subject: &Identifier, context_id: &ContextId) -> Result<Vec<Identifier>>`
+- `is_blocked_in_context(blocker: &Identifier, target: &Identifier, context_id: &ContextId) -> Result<bool>`
 
 These methods derive current state from the identity private state event log. Implementations MAY maintain materialized views for query performance.
 
 **Write operations.** Block list mutations are performed through identity private state events. The SDK provides:
 
-- `add_global_block(blocker: &DID, target: &DID) -> Result<()>` — Appends `BlockDID` event, then propagates to all shared contexts (§9.16.3).
-- `remove_global_block(blocker: &DID, target: &DID) -> Result<()>` — Appends `UnblockDID` event, then propagates forward-only restoration to shared contexts.
-- `add_context_block(blocker: &DID, target: &DID, context_id: &ContextId) -> Result<()>` — Appends `BlockDIDInContext` event, then executes Tier 1 block protocol.
-- `remove_context_block(blocker: &DID, target: &DID, context_id: &ContextId) -> Result<()>` — Appends `UnblockDIDInContext` event, then executes forward-only restoration.
+- `add_global_block(blocker: &Identifier, target: &Identifier) -> Result<()>` — appends a `BlockDID` event, then propagates to every shared context (§9.16.3).
+- `remove_global_block(blocker: &Identifier, target: &Identifier) -> Result<()>` — appends an `UnblockDID` event, then propagates forward-only restoration to the shared contexts.
+- `add_context_block(blocker: &Identifier, target: &Identifier, context_id: &ContextId) -> Result<()>` — appends a `BlockDIDInContext` event, then executes the Tier 1 block protocol.
+- `remove_context_block(blocker: &Identifier, target: &Identifier, context_id: &ContextId) -> Result<()>` — appends an `UnblockDIDInContext` event, then executes forward-only restoration.
 
 Each write triggers sender key rotation (§9.16.3), access key operations (§9.17.5), and SDK-mandated state destruction (§9.16.7) as side effects.
 
-**Conflict resolution for same-target block/unblock.** If two devices simultaneously block and unblock the same target DID, the operations are NOT commutative. Resolution rule: **block wins.** When replaying the event log, if both `BlockDID { target: X }` and `UnblockDID { target: X }` exist with the same timestamp (within 1-second tolerance), the block takes precedence. For events with different timestamps, the later timestamp determines the current state.
+**Conflict resolution for same-target block/unblock.** Where two devices simultaneously block and unblock one target identifier, the operations are NOT commutative. Resolution rule: **block wins.** When replaying the event log, if both `BlockDID { target: X }` and `UnblockDID { target: X }` exist with the same timestamp (within 1-second tolerance), the block takes precedence. For events with different timestamps, the later timestamp determines the current state.
 
 ### 3.7.1.1 Exhaustive Private State Event Types
 
@@ -530,22 +454,22 @@ All identity private state event types, organized by category:
 
 | Event type | Fields | Commutative | Notes |
 |-----------|--------|-------------|-------|
-| `BlockDID` | `target_did: DID, timestamp: u64` | Yes (different targets) | Global block (Tier 2) |
-| `UnblockDID` | `target_did: DID, timestamp: u64` | Yes (different targets) | Global unblock |
-| `BlockDIDInContext` | `target_did: DID, context_id: ContextId, timestamp: u64` | Yes | Per-context block (Tier 1) |
-| `UnblockDIDInContext` | `target_did: DID, context_id: ContextId, timestamp: u64` | Yes | Per-context unblock |
-| `MuteDID` | `target_did: DID, timestamp: u64` | Yes | Global mute |
-| `UnmuteDID` | `target_did: DID, timestamp: u64` | Yes | Global unmute |
-| `MuteDIDInContext` | `target_did: DID, context_id: ContextId, timestamp: u64` | Yes | Per-context mute |
-| `UnmuteDIDInContext` | `target_did: DID, context_id: ContextId, timestamp: u64` | Yes | Per-context unmute |
+| `BlockDID` | `target_did: Identifier, timestamp: u64` | Yes (different targets) | Global block (Tier 2) |
+| `UnblockDID` | `target_did: Identifier, timestamp: u64` | Yes (different targets) | Global unblock |
+| `BlockDIDInContext` | `target_did: Identifier, context_id: ContextId, timestamp: u64` | Yes | Per-context block (Tier 1) |
+| `UnblockDIDInContext` | `target_did: Identifier, context_id: ContextId, timestamp: u64` | Yes | Per-context unblock |
+| `MuteDID` | `target_did: Identifier, timestamp: u64` | Yes | Global mute |
+| `UnmuteDID` | `target_did: Identifier, timestamp: u64` | Yes | Global unmute |
+| `MuteDIDInContext` | `target_did: Identifier, context_id: ContextId, timestamp: u64` | Yes | Per-context mute |
+| `UnmuteDIDInContext` | `target_did: Identifier, context_id: ContextId, timestamp: u64` | Yes | Per-context unmute |
 
 **Graph visibility events:**
 
 | Event type | Fields | Commutative | Notes |
 |-----------|--------|-------------|-------|
-| `SetDefaultGraphVisibility` | `visibility: GraphVisibility, timestamp: u64` | No | Default visibility for all DIDs |
-| `GrantGraphVisibility` | `target_did: DID, scope: VisibilityScope, timestamp: u64` | Yes (different targets) | Per-DID override |
-| `RevokeGraphVisibility` | `target_did: DID, timestamp: u64` | Yes | Remove per-DID override |
+| `SetDefaultGraphVisibility` | `visibility: GraphVisibility, timestamp: u64` | No | Default visibility for every identity |
+| `GrantGraphVisibility` | `target_did: Identifier, scope: VisibilityScope, timestamp: u64` | Yes (different targets) | Per-identity override |
+| `RevokeGraphVisibility` | `target_did: Identifier, timestamp: u64` | Yes | Remove a per-identity override |
 
 **Agent configuration events:**
 
@@ -558,21 +482,21 @@ All identity private state event types, organized by category:
 
 | Event type | Fields | Commutative | Notes |
 |-----------|--------|-------------|-------|
-| `SetAnnotation` | `target_did: DID, key: String, value: String, timestamp: u64` | No (same target+key) | Personal note on a DID |
-| `DeleteAnnotation` | `target_did: DID, key: String, timestamp: u64` | No (same target+key) | Remove annotation |
+| `SetAnnotation` | `target_did: Identifier, key: String, value: String, timestamp: u64` | No (same target+key) | Personal note on an identity |
+| `DeleteAnnotation` | `target_did: Identifier, key: String, timestamp: u64` | No (same target+key) | Remove annotation |
 
 **Petname events (§22.4):**
 
 | Event type | Fields | Commutative | Notes |
 |-----------|--------|-------------|-------|
-| `SetPetname` | `target: PetnameTarget, name: String, timestamp: u64` | No (same target) | `PetnameTarget` = DID or ContextId |
+| `SetPetname` | `target: PetnameTarget, name: String, timestamp: u64` | No (same target) | `PetnameTarget` = an identifier or a `ContextId` |
 | `DeletePetname` | `target: PetnameTarget, timestamp: u64` | No (same target) | Remove petname |
 
 **Notification events:**
 
 | Event type | Fields | Commutative | Notes |
 |-----------|--------|-------------|-------|
-| `SetNotificationPreference` | `scope: NotificationScope, level: NotificationLevel, timestamp: u64` | No (same scope) | `NotificationScope` = Global, PerContext(id), PerDID(did) |
+| `SetNotificationPreference` | `scope: NotificationScope, level: NotificationLevel, timestamp: u64` | No (same scope) | `NotificationScope` = `Global`, `PerContext(id)`, `PerIdentity(identifier)` |
 
 **Attestation draft events:**
 
@@ -586,15 +510,15 @@ All identity private state event types, organized by category:
 
 | Event type | Fields | Commutative | Notes |
 |-----------|--------|-------------|-------|
-| `EnrollDevice` | `device_id: String, device_x25519_pubkey: [u8; 32], device_name: String, enrolled_at: u64` | Yes | New device enrollment |
+| `EnrollDevice` | `device_id: String, device_hpke_pubkey: [u8; 65], device_name: String, enrolled_at: u64` | Yes | New device enrollment |
 | `UnenrollDevice` | `device_id: String, timestamp: u64` | Yes | Device removal |
 
 **Recovery contact events:**
 
 | Event type | Fields | Commutative | Notes |
 |-----------|--------|-------------|-------|
-| `AddRecoveryContact` | `contact_did: DID, timestamp: u64` | Yes | Designate recovery contact |
-| `RemoveRecoveryContact` | `contact_did: DID, timestamp: u64` | Yes | Remove recovery contact |
+| `AddRecoveryContact` | `contact_did: Identifier, timestamp: u64` | Yes | Designate recovery contact |
+| `RemoveRecoveryContact` | `contact_did: Identifier, timestamp: u64` | Yes | Remove recovery contact |
 
 For non-commutative events (same key/target modified from multiple devices), conflict resolution is **last-timestamp-wins** with tie-breaking by lexicographic comparison of the event hash.
 
@@ -602,16 +526,16 @@ For non-commutative events (same key/target modified from multiple devices), con
 
 Identity private state is encrypted with a single PSK shared across all of the identity owner's devices. The challenge: each device has its own hardware-backed keys that cannot be exported (§9.7.2), so the PSK must be distributed TO each device rather than derived FROM a shared secret.
 
-**Device enrollment model.** Each device generates a device-specific X25519 keypair via `KeyCustody::generate_keypair(KeyType::X25519)` at device enrollment time. This keypair is used exclusively for receiving HPKE-wrapped key material (PSK distribution, PSK rotation). The X25519 public key is published in the identity's device registry — an encrypted list within identity private state itself (bootstrapped during identity creation, see below).
+**Device enrollment model.** Each device generates a device-specific DHKEM(P-256) keypair via `KeyCustody::generate_keypair(KeyType::HpkeP256)` at device enrollment time. This keypair is used exclusively for receiving HPKE-wrapped key material (PSK distribution, PSK rotation). The HPKE public key is published in the identity's device registry — an encrypted list within identity private state itself (bootstrapped during identity creation, see below).
 
-**Why not derive from the Identity Key (#0)?** The Identity Key is Ed25519 (signing-only) and its private key "never [leaves] the secure element" (§9.7.2). While Ed25519-to-X25519 conversion is mathematically possible (RFC 7748, birational equivalence between Edwards and Montgomery curves), it requires access to the Ed25519 private key bytes — which hardware security modules (Secure Enclave, Android Keystore) do not export. A design that depends on Ed25519-to-X25519 conversion would fail on every hardware-backed key. The PSK is therefore an independent symmetric key, distributed via HPKE to device-specific X25519 keys that are software-managed through `KeyCustody`.
+**Why not derive the PSK from a root member?** The root is a signing key held in a substrate that never exports it — a passkey by default (`09-security-model.md` §9.7.4.1 item 4) — so no code path can hand a device the private bytes an HPKE key would have to be derived from. A passkey and a secure element each sign and neither performs a Diffie-Hellman agreement on demand, so deriving an encryption key from the root is impossible where the root is held as SCP holds it by default. Each device therefore generates its own DHKEM(P-256) keypair for PSK distribution, and that keypair is device-local, rotatable, and revocable on device removal without touching any identity key.
 
 **Identity creation (first device):**
 
 1. Generate the PSK: 32 random bytes via CSPRNG.
-2. Generate a device-local X25519 keypair via `KeyCustody`.
+2. Generate a device-local DHKEM(P-256) keypair via `KeyCustody`.
 3. Store the PSK locally in the device's secure key store.
-4. Initialize the device registry in identity private state with this device's X25519 public key. The device registry is the first event in the private state log — it is encrypted with the PSK (which only this device holds at this point).
+4. Initialize the device registry in identity private state with this device's HPKE public key. The device registry is the first event in the private state log — it is encrypted with the PSK (which only this device holds at this point).
 5. Publish the encrypted private state to relays.
 
 **Adding a new device (device enrollment):**
@@ -619,31 +543,31 @@ Identity private state is encrypted with a single PSK shared across all of the i
 ```
 Existing device (Device A) enrolls new device (Device B):
 
-1. Device B generates an X25519 keypair via KeyCustody.
-2. Device B presents its X25519 public key to Device A.
+1. Device B generates a DHKEM(P-256) keypair via KeyCustody.
+2. Device B presents its HPKE public key to Device A.
    Transport: out-of-band (QR code, local network, NFC) or via
    a standing bilateral context (§5.12.4) between the human's devices.
 3. Device A verifies the enrollment request (user confirmation required).
-4. Device A wraps the PSK to Device B's X25519 public key via HPKE:
+4. Device A wraps the PSK to Device B's HPKE public key:
    enc, sealed_psk = HPKE-Seal(
      mode: Base,
-     kem: DHKEM(X25519, HKDF-SHA256),
+     kem: DHKEM(P-256, HKDF-SHA256),
      kdf: HKDF-SHA256,
      aead: AES-128-GCM,
-     recipient_pk: device_b_x25519_pubkey,
-     info: "scp-private-state-v1" || len(did) || did || "device-enroll",
+     recipient_pk: device_b_hpke_pubkey,
+     info: "scp-private-state-v1" || identifier_bytes || "device-enroll",
      plaintext: psk
    )
 5. Device A sends (enc, sealed_psk) to Device B via the same channel.
-6. Device B opens the HPKE ciphertext using its X25519 private key,
+6. Device B opens the HPKE ciphertext using its HPKE private key,
    recovering the PSK.
 7. Device A appends a DeviceEnrolled event to the private state log:
-   DeviceEnrolled { device_x25519_pubkey, enrolled_at, enrolled_by_device }
+   DeviceEnrolled { device_hpke_pubkey, enrolled_at, enrolled_by_device }
    This event is encrypted with the PSK (readable by all enrolled devices).
 8. Device B can now decrypt and append to the private state event log.
 ```
 
-**HPKE suite.** Device enrollment and PSK distribution use DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM — the same HPKE suite as MLS (§9.5) and sender key distribution (§9.16.2). The `info` parameter includes the domain separator `"scp-private-state-v1"` concatenated with the DID and purpose string to prevent cross-protocol confusion with sender key HPKE (`"scp-sender-key-v1"`) or access key HPKE (`"scp-access-key-v1"`). The full `info` construction is `"scp-private-state-v1" || len(did) || did || purpose`, where `did` is preceded by a 4-byte big-endian unsigned length prefix (per §9.5.1 encoding rules) and `purpose` is a fixed-version UTF-8 string with no length prefix. The `aad` is empty (the `info` already binds the DID, and a fresh HPKE context — fresh encapsulation — is used per device, so there is no cross-recipient substitution surface).
+**HPKE suite.** Device enrollment and PSK distribution use DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM — the same HPKE suite as MLS (§9.5) and sender key distribution (§9.16.2). The `info` parameter carries the domain separator `"scp-private-state-v1"`, the identifier and the purpose string, which keeps this HPKE context distinct from sender key HPKE (`"scp-sender-key-v1"`) and access key HPKE (`"scp-access-key-v1"`). The full construction is `"scp-private-state-v1" || identifier_bytes || purpose`, where `identifier_bytes` is the identity's 32 raw digest bytes carrying no length prefix and `purpose` is a fixed-version UTF-8 string carrying none either. The `aad` is empty, because the `info` already binds the identifier and each device gets a fresh encapsulation, so no cross-recipient substitution surface exists.
 
 **Purpose strings.** Two purposes are defined, distinguishing the two flows that wrap a PSK to a device key:
 
@@ -654,8 +578,8 @@ The purpose string binds each HPKE ciphertext to its flow, so a `device-enroll` 
 
 **Device removal:**
 
-1. An authorized device appends a `DeviceRemoved { device_x25519_pubkey, removed_at }` event to the private state log.
-2. The removing device rotates the PSK: generates a new PSK, re-wraps it via HPKE to all remaining enrolled devices' X25519 public keys, and appends a `PskRotated { wrapped_keys: Vec<(device_pubkey, hpke_ciphertext)> }` event.
+1. An authorized device appends a `DeviceRemoved { device_hpke_pubkey, removed_at }` event to the private state log.
+2. The removing device rotates the PSK: generates a new PSK, re-wraps it via HPKE to all remaining enrolled devices' HPKE public keys, and appends a `PskRotated { wrapped_keys: Vec<(device_pubkey, hpke_ciphertext)> }` event.
 3. Re-encryption of existing private state events proceeds incrementally under the new PSK (same as key rotation, §3.7 protocol-level constants).
 4. The removed device's cached PSK becomes useless for future events. Historical events encrypted under the old PSK are accessible only if the removed device retained the old PSK locally — the protocol cannot force deletion on an untrusted device (same honest limitation as §9.15).
 
@@ -665,14 +589,14 @@ The device registry is stored within identity private state as a sequence of `De
 
 ```
 DeviceEnrolled {
-    device_x25519_pubkey: [u8; 32],  // X25519 public key for HPKE
+    device_hpke_pubkey: [u8; 65],   // DHKEM(P-256) public key for HPKE
     enrolled_at: u64,                 // Unix timestamp (milliseconds)
-    enrolled_by_device: [u8; 32],     // X25519 pubkey of the enrolling device
+    enrolled_by_device: [u8; 65],     // HPKE pubkey of the enrolling device
     device_label: String,             // Human-readable label ("iPhone", "Laptop")
 }
 
 DeviceRemoved {
-    device_x25519_pubkey: [u8; 32],
+    device_hpke_pubkey: [u8; 65],
     removed_at: u64,
 }
 
@@ -682,7 +606,7 @@ PskRotated {
 }
 
 DeviceWrappedPsk {
-    device_x25519_pubkey: [u8; 32],
+    device_hpke_pubkey: [u8; 65],
     enc: Vec<u8>,           // HPKE encapsulated key
     sealed_psk: Vec<u8>,    // HPKE-sealed PSK
 }
@@ -690,340 +614,724 @@ DeviceWrappedPsk {
 
 **Bootstrap paradox resolution.** The device registry is itself encrypted with the PSK — so how does the first device read it? The first device generated the PSK (step 1 of identity creation) and holds it locally before any private state events exist. The first `DeviceEnrolled` event is encrypted with that PSK. Subsequent devices receive the PSK via HPKE before they need to read the log. There is no circular dependency: the PSK is always distributed out-of-band (HPKE to device key) before the device attempts to read PSK-encrypted events.
 
-**Interaction with trusted device recovery (§3.3).** When a user recovers their identity on a new device via trusted device recovery, the recovery flow includes PSK distribution: the trusted device wraps the current PSK to the new device's X25519 public key via the same HPKE enrollment protocol above. This is the same mechanism as adding a new device — recovery IS enrollment. The recovering device generates a fresh X25519 keypair, the trusted device wraps the PSK, and the new device gains access to the full private state history.
+**Interaction with trusted device recovery (§3.3).** When a user recovers their identity on a new device via trusted device recovery, the recovery flow includes PSK distribution: the trusted device wraps the current PSK to the new device's HPKE public key via the same enrollment protocol above. This is the same mechanism as adding a new device — recovery IS enrollment. The recovering device generates a fresh DHKEM(P-256) keypair, the trusted device wraps the PSK, and the new device gains access to the full private state history.
 
-**Interaction with key rotation (§9.12).** Step 6 of the compromise recovery protocol specifies "re-encrypt identity private state under the new key." With PSK-based encryption, this means: (a) generate a new PSK, (b) wrap the new PSK to all enrolled devices via HPKE, (c) append a `PskRotated` event, (d) re-encrypt existing events under the new PSK incrementally. If the compromise involved a device (device stolen), that device is removed first (device removal protocol above), and the PSK rotation excludes the compromised device's X25519 public key.
+**Interaction with key rotation (§9.12).** Step 6 of the compromise recovery protocol specifies "re-encrypt identity private state under the new key." With PSK-based encryption, this means: (a) generate a new PSK, (b) wrap the new PSK to all enrolled devices via HPKE, (c) append a `PskRotated` event, (d) re-encrypt existing events under the new PSK incrementally. If the compromise involved a device (device stolen), that device is removed first (device removal protocol above), and the PSK rotation excludes the compromised device's HPKE public key.
 
 **ProtocolRepository methods.** The `Storage` trait (§17) requires these additional methods for PSK and device management:
 
-- `store_private_state_key(did: &DID, psk: &Zeroizing<[u8; 32]>) -> Result<(), StoreError>`
-- `load_private_state_key(did: &DID) -> Result<Option<Zeroizing<[u8; 32]>>, StoreError>`
-- `store_device_registry_event(did: &DID, seq: u64, event: &[u8]) -> Result<(), StoreError>`
-- `load_device_registry(did: &DID) -> Result<Vec<DeviceRegistryEvent>, StoreError>`
+- `store_private_state_key(subject: &Identifier, psk: &Zeroizing<[u8; 32]>) -> Result<(), StoreError>`
+- `load_private_state_key(subject: &Identifier) -> Result<Option<Zeroizing<[u8; 32]>>, StoreError>`
+- `store_device_registry_event(subject: &Identifier, seq: u64, event: &[u8]) -> Result<(), StoreError>`
+- `load_device_registry(subject: &Identifier) -> Result<Vec<DeviceRegistryEvent>, StoreError>`
 
 The PSK MUST be stored in the platform's secure key store (Keychain on Apple, Keystore on Android, SQLCipher-encrypted storage on desktop/server — per §17.8 platform-specific key custody). The PSK is zeroized on destruction (`Zeroizing<[u8; 32]>`).
 
-## 3.8 DID Resolution Security
+## 3.8 Resolution Security
 
-DID resolution is the trust root for the entire protocol. If resolution can be MITMed, every layer above — encryption, authentication, capability validation — is compromised. The security properties depend on the DID method:
+Resolution is the trust root for the whole protocol: where an attacker can substitute what a resolution returns, it defeats encryption, authentication and capability validation together.
 
-**did:dht (target method):** Self-certifying. The DID string encodes the public key. DID documents are signed via BEP44 and verifiable against the DID without trusting any intermediary. MITM on resolution is impossible given the correct DID. Stale documents are rejected via sequence numbers. See §9.6 for full specification.
+**The protocol has one identifier method, and it is inception-derived.** An identifier is self-certifying through its key-event log: the identifier is the digest of the inception event's signed preimage and encodes no key (`09-security-model.md` §9.7.4.2 R13). A resolver recomputes the identifier from the served chain's inception event and verifies every later event under R3, so a served record is verifiable against the identifier without trusting any intermediary. MITM on resolution is impossible given the correct identifier. A stale head of the accepted chain is rejected by sequence, and two chains that diverge are settled by fork precedence (R6, R12). See §9.6.1 for the full specification.
 
-**did:web (fallback only):** NOT self-certifying. Security depends on DNS + TLS + server integrity. The SDK MUST use TLS pinning + TOFU (Trust On First Use) + key change alerts to mitigate. did:web exists as a fallback if did:dht libraries prove unusable — not as a planned stepping stone. See §9.6.2 for required mitigations.
+**Key Continuity Verification:** Signal-style safety numbers over two identifiers, which let two parties confirm out of band that each holds the other's correct keys. See `09-security-model.md` §9.11.
 
-**Key Continuity Verification:** Signal-style safety numbers for DIDs, enabling out-of-band verification that two parties have the correct keys for each other. See §9.11.
+### 3.8.1 The Identifier in a Deterministic Derivation
 
-### 3.8.1 Canonical DID string form (deterministic-derivation input)
+**A derivation that two independent parties must reproduce byte for byte consumes the identifier's 32 raw digest bytes** (`09-security-model.md` §9.7.4.2 R13). The `derived_context_id` of §5.15.8 is one such derivation. A fixed-length digest admits exactly one encoding, so two honest parties cannot split onto divergent values, and the length-prefix discipline of `09-security-model.md` §9.5.1 keeps the field boundaries unambiguous whatever the neighbouring fields carry. **A string that is not the canonical form of an inception-derived identifier is rejected at a fail-loud admission gate, with `IdentityError::NonCanonicalIdentifier` (§3.10.10), and never silently coerced**, at every gate that takes an identifier from outside the SDK: without that gate three conforming implementations hash, hex-decode, or left-pad the same bad input, each derives a different value, and the cross-party check fires at the peer while the party holding the bad input believes its identifier valid.
 
-Wherever a DID string feeds a **deterministic hash preimage** — any place two independent resolvers must agree byte-for-byte or they would derive divergent identifiers (e.g. the `derived_context_id` of §5.15.8) — the DID MUST be reduced to its **canonical string form**, the single comparison form DID resolution yields per method.
-
-**Purpose (canonical agreement, not injectivity).** With the §5.15.8 derivation now length-prefixed (§9.5.1), field-boundary injectivity is unconditional **by construction** and does **not** depend on this section. §3.8.1's sole job is **byte-agreement**: both parties MUST feed **byte-identical** DID strings into any shared preimage so they do not split-brain onto divergent identifiers. (Even with length prefixes, two encodings of the *same* logical DID are two distinct byte strings and would length-prefix to two distinct preimages — hence the canonicalization requirement remains load-bearing, but for agreement, not for disambiguating field boundaries.)
-
-- **did:dht** — its self-certifying form: lowercase z-base-32 of the Ed25519 public key (§9.6.1). This is already a single canonical form; no further normalization applies. **The byte-agreement guarantee is AIRTIGHT for did:dht** (the production method): there is exactly one canonical z-base-32 encoding of a given public key, so two honest resolvers cannot diverge.
-- **did:web** — canonicalized per the W3C did:web method, with the specific-id normalized per **RFC 3986 §6.2.2 syntax-based normalization** to a single byte string:
-  - **Percent-encoding normalization** — decode percent-encodings of **unreserved** characters (`ALPHA / DIGIT / "-" / "." / "_" / "~"`, RFC 3986 §6.2.2.2) to their literal form; uppercase the hex digits of each remaining `%XX` triplet (RFC 3986 §6.2.2.1). This normalizes the two hex **digits** of a percent-encoding and is **orthogonal** to the host/scheme alpha-case normalization below — which lowercases literal ALPHA characters, **never** the hex digits of a percent-encoding (RFC 3986 §6.2.2.1 treats percent-encoding hex-digit case and host/scheme alpha-case as disjoint normalizations targeting different characters, so on a percent-encoded host octet they do not overlap: the `%XX` hex digits go uppercase, the unescaped host ALPHA goes lowercase).
-  - **Case normalization** — lowercase the scheme and host (RFC 3986 §6.2.2.1).
-  - **Host (IDN)** — normalize per **RFC 5895 / IDNA2008**: apply **NFC** normalization **before** punycode / A-label conversion; reduce an internationalized host to its A-label (punycode) form; omit the default `:443` port; the authority carries **no trailing dot**.
-  - **Literal `:` separators** of the method-specific identifier are percent-encoded as **`%3A`** — still required even with length-prefixing, because the whole specific-id rides the preimage as one canonical byte string and the two sides must agree on its bytes.
-
-A DID whose method admits **no** canonical string form (no deterministic single comparison form) is **rejected at a fail-loud method-admission gate** — never silently coerced — so a deterministic derivation can never be fed an un-normalizable DID. (This admission gate is about *canonical agreement*, distinct from the retired §5.15.8 colon-freedom assumption, which length-prefixing made unnecessary.)
-
-**did:web residual (disclosed honestly).** did:web is **fallback-only** and **not a planned deployment path** (§3.8). Even with the RFC-3986 + RFC-5895 profile above, byte-agreement for did:web is **best-effort at the exotic margins** — adversarially-constructed hosts/paths can in principle still admit encodings two implementations normalize differently. The protocol does **not** claim did:web agreement is airtight (only did:dht is). The backstop is **defense-in-depth at the receiver**: the §5.15.8 step-4(a0) **Welcome-receipt mismatch guard** re-derives the `derived_context_id` from the receiver's own canonical inputs and **rejects** the Welcome on any mismatch, turning a canonicalization divergence into a clean local rejection rather than a silent split-brain. **Availability dual (disclosed tradeoff).** The same receive-side guard converts an *adversarially-constructed* did:web canonicalization divergence — an attacker who controls a did:web document published under a specific-id that two resolvers normalize differently — into a deterministic, **undiagnosable** pairing-denial: the §5.15.8 indistinguishable-rejection requirement (no existence/decline oracle) is in tension with diagnosability for the legitimate-but-divergent case, so a genuine honest divergence and an adversarial one are equally opaque to the rejecting party. This availability tradeoff is **accepted explicitly**, and it is **bounded**: did:web is fallback-only, and did:dht (the production method) is airtight (above) and entirely unaffected.
+**A preimage that takes the identifier as UTF-8 bytes takes its text form** (§3.1), and `09-security-model.md` §9.5.2 enumerates those preimages.
 
 ## 3.9 Key Lifecycle
 
-Identity keys follow a defined lifecycle: generation (in hardware security modules where available), distribution (via DID document publication), rotation (DID document update with authorization chain from old key), and destruction (for ephemeral context keys). The full key lifecycle specification, including compromise recovery, is in §9.7.4.
+Identity keys follow a defined lifecycle: generation (in the substrates `09-security-model.md` §9.7.4.1 item 4 names), distribution (as key state carried by the identity's key-event log), rotation (a `KeyState` or `RootRecovery` event signed by the standing root set, `09-security-model.md` §9.7.4.2 R3), and destruction (for ephemeral context keys). The full key lifecycle specification, including compromise recovery, is in §9.7.4.
 
-## 3.10 DID Resolution Layers
+## 3.10 Identity Resolution
 
-DID resolution is the trust root for identity verification (§3.8). The current architecture resolves identities exclusively via Mainline DHT — BEP44 signed mutable items stored on BitTorrent's distributed hash table, a network of millions of nodes with over 20 years of operational history. This works, and it works well. But it routes all identity resolution through infrastructure SCP does not control, cannot improve, and cannot guarantee will continue to operate on terms compatible with the protocol's needs.
+Resolution returns a key state the resolver derived from a chain it verified itself. An identity publishes its key-event log to SCP relays through the PUBLISH and QUERY operations ADR-004 defines, at a deterministic routing id, and the protocol runs no second resolution layer, because ADR-063, the inception-derived key-event-log identity substrate, made that log the one source of an identity's key state.
 
-SCP introduces a dual-layer resolution architecture:
+The resolver recomputes the identifier from the inception event, verifies every later event under the standing root, settles a divergence under the root rule, and derives the key state from the latest state-carrying event at or before the head it adopted (`09-security-model.md` §9.6.1, §9.7.4.2 R2, R3, R6 and R8). Every relay is untrusted, and what a validating relay adds is availability rather than a trust input (§3.10.2).
 
-- **Primary: SCP relay-based resolution.** DID documents published to SCP relays via the existing PUBLISH/QUERY operations (ADR-004), addressed by a deterministic `routing_id`. An SCP-native relay validates each DID-record blob it stores and keeps a single highest-sequence slot per `routing_id` (§3.10.2), which is what makes the relay layer suppression-resistant (§3.10.8); foreign transports that cannot validate store the record opaquely and stay correct via client-side verification. Grows with the SCP network.
-- **Fallback: Mainline DHT.** Existing did:dht resolution via BEP44. Works from day one. Transitions from "only path" to "fallback path" as the relay network matures.
+### 3.10.1 Which Relays a Resolution Queries
 
-Both layers are self-certifying: the BEP44 signature on a DID document is verified against the public key encoded in the DID string itself (§9.6.1). The storage backend — whether an SCP relay or a DHT node — is untrusted. Trust derives from the cryptographic binding between the DID and its document, not from the infrastructure serving it. An SCP-native relay MAY additionally validate the records it stores (§3.10.2) — a validating relay keeps a single highest-sequence slot, which resists suppression — but this is an availability property layered on top, never a trust dependency: the resolver re-verifies every record independently and accepts nothing on the relay's word (§3.10.4).
+A resolver queries two disjoint relay sets, in parallel: the identity's own relays, which are the relay entries of the service record this resolver last accepted (§3.10.13, `09-security-model.md` §9.6.3), and the fallback set, which `09-security-model.md` §9.7.4.2's definitions state over the community relay list of `18-addressability-and-deployment.md` §18.5.1. The resolver's recognized operator set is that same shipped list read in its second role. Only the fallback set is available on day one, because a reader learns an identity's own relays only from that identity's service record. The fallback set is where a resolver fetches, which is a reachability property of its own query plan; the recognized set is whose cosigned heads it reads as evidence, which is a policy of its own.
 
-### 3.10.1 Resolution Priority
+**Every relay a first-contact resolution queries carries a proof-of-control obligation**, and the resolver's own QUERY triggers it: the resolver sets `proof_nonce`, the relay answers with a relay proof of control signed under the operator identity its community-relay-list entry declares, and `09-security-model.md` §9.7.4.2 R11 counts only the relays whose proof this resolver verified. Steps 2, 3d and 5 of §3.10.4 carry that obligation through the procedure.
 
-| Layer | Backend | Day-one availability | Latency | SCP dependency |
-|-------|---------|---------------------|---------|----------------|
-| 1 | SCP relays | Low (few relays exist) | Low (relay QUERY, single hop) | Yes |
-| 2 | Mainline DHT | High (millions of nodes) | Higher (DHT traversal, 1-3s typical) | No |
+Parallel query makes resolution latency the latency of the fastest relay that answers. A resolver holding an accepted baseline cancels its remaining queries once one valid response arrives; a resolver holding none satisfies R11's first-contact floor before it ends the resolution.
 
-Resolution strategy: query both layers in parallel. The first valid response wins. "Valid" means the BEP44 signature verifies against the public key encoded in the target DID AND the sequence number is greater than or equal to the last known sequence number for that DID. When both layers return valid documents, the document with the highest sequence number is accepted.
+### 3.10.2 Relay-Based Resolution
 
-Parallel query means resolution latency is `min(relay_latency, dht_latency)`. The slower query is cancelled once the first valid response arrives.
+An identity's key-event log rides in the key-event record frame `09-security-model.md` §9.10.12 states, at `routing_id = SHA-256("scp:did:" ‖ identifier_bytes)` over the identifier's 32 raw digest bytes (`09-security-model.md` §9.7.4.2 R13). That separator keeps the address from colliding with every other routing derivation the protocol runs (§9.10.4, §5.14), and it is why the frame carries no record-kind byte: the address is the type discriminant.
 
-### 3.10.2 Layer 1: SCP Relay-Based Resolution
+**Witnessing is a separate role a relay takes only where an identity designates it.** **First contact and resolution require SCP-native listed relays**, because R11's floor counts only community-relay-list entries serving a relay proof of control (`09-security-model.md` §9.7.4.2 R11), so a party whose only transport is a foreign adapter adopts no head on any first contact. **A verifier still depends on no relay for correctness, because it verifies every event itself**; KERI calls that property end-verifiability in `spec-body` §End-verifiable, "KERI has no security dependency on any other infrastructure".
 
-DID documents are published to SCP relays using the existing PUBLISH/QUERY operations (ADR-004) — no new wire types. A DID document rides in a minimal, fixed-layout **DID-record relay frame** (§9.10.12), addressed by a deterministic `routing_id`. What is new versus a plain opaque blob is a relay *behavior*: an SCP-native relay validates the frame and keeps a single highest-sequence slot per `routing_id`. This is issue #482.
-
-**Routing ID derivation:**
-
-```
-did_routing_id = SHA-256("scp:did:" || did_string)
-```
-
-The `"scp:did:"` domain separator prevents collision with other routing ID derivation schemes in the protocol: encrypted context routing IDs use HKDF from identity key material (§9.10.4), broadcast context routing IDs use `SHA-256(context_id)` (§5.14), and context metadata routing IDs use `HMAC-SHA256(context_metadata_key, context_id || "scp-metadata-v2")` (§9.10.4.B). The domain separator ensures that a DID string can never produce a routing ID that collides with a context ID or metadata address. Because DID records live at their own `routing_id` domain, the address is the type discriminant — the frame carries no magic tag or record-kind byte (§9.10.12).
-
-**Publication** uses the existing PUBLISH operation (ADR-004):
-
-```
-PUBLISH {
-    routing_id: did_routing_id,
-    blob_ttl: 604800,
-    blob: <DID-record relay frame (§9.10.12), carrying (public_key, seq, signature, value)>
-}
-```
-
-**Resolution** uses the existing QUERY operation:
-
-```
-QUERY {
-    routing_id: did_routing_id,
-    since: null,
-    limit: N          // N = 16 (implementation constant)
-}
-```
-
-`limit: N` (N = 16) **dominates `limit: 1`** and costs nothing where it does not help. Against a **validating** SCP-native relay the routing ID is slot-exclusive (below), so exactly one record is returned regardless of `N`. Against a **non-validating or foreign** transport that accumulates multiple blobs per `routing_id`, `limit: N` lets the resolver retrieve up to N candidates and sift them to the highest-sequence *valid* one (§3.10.4 step 5) — defeating an intra-relay shadowing attempt that a single-record fetch would miss, and giving a `DhtMode::Disabled` node (relay-only resolution, which the spec permits) a fighting chance against a non-validating relay. Under an *active* flood on a non-validating relay this remains best-effort (§3.10.8 residual): N candidates may all be junk. The resolver's highest-sequence-valid selection across relays and the DHT (§3.10.4) still returns the freshest genuine record whenever any queried source holds it.
-
-**Relay-side validation (SCP-native relays).** The whole path sits behind the existing per-IP PUBLISH rate limit (ADR-004). On PUBLISH of a blob at a `routing_id`, an SCP-native relay performs the checks **cheapest-first**, so junk is rejected before any expensive work:
-
-1. **Structural decode.** Attempt to decode the blob as a DID-record frame (§9.10.12). A blob that does not decode is not a candidate DID record (it is governed by the slot-exclusivity rule below).
-2. **DID→routing_id binding.** Confirm `SHA-256("scp:did:" || did(public_key)) == routing_id`, where `did(public_key)` is the `did:dht` string derived from the frame's `public_key` (z-base-32, §9.6.1). A frame whose embedded `public_key` does not hash to the `routing_id` it is published at is rejected. This binding is the discriminant that lets a validating relay recognize a DID record without any new wire type or knowledge of `routing_id` semantics — and it is a plain hash, cheaper than a signature verify, so it runs **before** step 3.
-3. **BEP44 signature.** Only for a blob that passed steps 1–2, verify the BEP44 signature over `bencode(seq, value)` against the frame's `public_key`. Ordering the binding check ahead of the signature verify means a mis-addressed or non-frame blob never costs an Ed25519 verify.
-4. **Single highest-sequence slot.** For a frame that passed steps 1–3, keep a **single highest-sequence slot** per `routing_id`: reject a frame whose `seq` is lower than or equal to the stored slot's `seq` **unless** an equal-`seq` frame is byte-identical to the stored record (idempotent TTL refresh), and replace the slot only on a strictly-higher valid `seq`.
-
-**Slot-exclusivity.** A validating relay does not store DID records alongside arbitrary blobs. The moment a binding-valid, signature-valid frame first **establishes a slot** at a `routing_id`, that `routing_id` becomes **slot-exclusive**:
-
-- **(a)** the relay rejects any subsequent PUBLISH at that `routing_id` that is not a binding-valid, `seq`-advancing frame (a non-frame blob, a wrong-binding frame, an invalid signature, or a non-superseding `seq` — all rejected), the sole exception being a byte-identical equal-`seq` republish, which is an idempotent TTL refresh (per single-slot rule 4 above);
-- **(b)** when the slot is first established, the relay **evicts any pre-existing opaque blobs** stored at that `routing_id`;
-- **(c)** QUERY at that `routing_id` returns **only the single slot**;
-- **(d)** the relay **rejects a client-issued DELETE of any stored binding-valid DID-record frame** (the current slot blob in particular) — only a superseding PUBLISH (a strictly-higher-`seq` binding-valid frame) may replace a slot; a client DELETE never removes a genuine record. (Relay-*internal* eviction of superseded frames on establish, rule (b), is not a client DELETE and is unaffected.) Because DELETE addresses a blob by `blob_id` (`= SHA-256(blob)`) rather than by `routing_id`, and the in-memory slot index is a cache that a relay restart or a store-sharing peer node leaves cold, this gate MUST be **storage-derived, not index-derived**: on DELETE the relay reads the blob at `blob_id` and, if it structurally decodes as a DID-record frame that binding- and signature-verifies (a genuine, self-certifying record — the routing_id it binds to is derivable from the frame's own `public_key`), rejects the DELETE regardless of index state. A DID-record frame is content-addressed and self-certifying, so its protected status is reconstructible from the bare blob bytes; this makes rule (d) immune to a cold or unpersisted index. The DELETE gate runs behind the same per-IP rate limit as PUBLISH (the storage read + signature verify it performs must not be an unmetered amplification surface) and **fails closed** on a storage read error (an integrity gate must not let a transient error open a delete).
-
-**Before** the first valid frame, the relay cannot recognize the `routing_id` as DID-domain — `SHA-256` is one-way, so it cannot distinguish a not-yet-claimed DID `routing_id` from any other opaque-blob address. Pre-seeded junk (published *before* the victim's first DID publish) therefore simply sits as ordinary opaque blobs until the first binding-valid frame establishes the slot, at which point rule (b) evicts it. This closes the pre-seeding / non-frame-junk gap: on a validating relay, once the DID owner has published even once, QUERY cannot be made to return anything but the single genuine slot. Slot-exclusivity is a property of a *claimed* slot, and the in-memory slot index can be **cold** (empty) for two distinct reasons that have different consequences:
-
-1. **Blob TTL-expiry** (owner offline past the 6-day republish cycle): the slot record's own blob has expired, so the genuine record is *genuinely absent* from storage. Reversion here is not a suppression bypass — there is nothing to suppress; any attacker blob still fails the resolver's DID-derived-key BEP44 verification, resolution falls through to the DHT, and the owner's next republish re-establishes the slot and re-fires rule (b).
-
-2. **Relay restart or store-sharing peer node** (the slot index is not persisted, so it starts empty even though the durable blob is **still present** in storage): the genuine record is *present*, only the cache forgot it. This is a real, bounded, availability-only window on that one relay until the next binding-valid publish re-warms the index. Two properties keep it availability-only, never integrity: (i) the **read path is storage-authoritative** — QUERY (rule (c)) re-derives the slot from the stored self-certifying frames, so a cold-index QUERY still returns only the genuine highest-`seq` record and never surfaces co-located junk as genuine; and (ii) the **DELETE gate (rule (d)) and establish reconciliation are storage-derived**, so a replayed lower-`seq` genuine frame cannot delete or roll back the present higher-`seq` record even against a cold index. The residual — a junk flood that pushes the genuine record outside a narrow QUERY `limit` window on that single relay before the index warms — is covered by the resolver's highest-`seq`-valid selection across relays + the DHT (§3.10.4). The earlier claim that "the genuine record is already absent" applies **only** to case 1; for case 2 the record is present and the mitigation is the storage-authoritative read/DELETE gates plus multi-source resolution, not absence.
-
-Slot-exclusivity is a relay **storage** behavior (the base relay stores multiple opaque blobs per `routing_id` with no per-`routing_id` cap, ADR-004). This spec section is authoritative for the behavior; the relay-storage mechanics (single highest-`seq` slot, eviction, cold-index reconciliation, the storage-derived DELETE gate) are transcribed in the companion **ADR-004 "DID-Record Slot-Exclusivity" subsection** (implemented under #482 / SCP-RELAYRES-003). The threat-model conclusions — the flood-inert enumeration and the DELETE-rollback vector — are owned by §3.10.8; ADR-004 records how the relay storage layer realizes them.
-
-This mirrors, and extends to a stored public record, the exact check `BRIDGE_REGISTER` already performs on the control plane — Ed25519 signature + the same `SHA-256("scp:did:" || did_string) == routing_id` binding (§10.12.4). It is what Mainline DHT BEP44 nodes already do for mutable items. It is an **availability and anti-suppression measure, never a trust dependency** (see the client-verify property below).
-
-**Relay-side validation is an OPTIONAL capability of SCP-native relays.** The protocol MUST NOT require a validating relay. Foreign transports and adapters (Nostr, Matrix, etc.) that cannot validate treat the frame as an opaque blob; resolution stays correct over them via client-side verification, the DHT, and multi-relay publishing. The suppression-resistance property of the relay layer (§3.10.8) is delivered by validating SCP-native relays; non-validating storage contributes availability only.
-
-**Properties:**
-
-- **Client always re-verifies (relay untrusted).** The resolver ALWAYS verifies the BEP44 signature against the key it derives from the DID string ITSELF (§9.6.1), and never trusts the frame-supplied `public_key` or the relay's acceptance. Relay validation is defense-in-depth for availability; it is never a trust input. A relay that skips, botches, or lies about validation degrades availability only, never integrity.
-- **Why the frame carries `public_key`.** The relay holds only the one-way `routing_id` hash and cannot recover the DID or its key from it — so, exactly as `BRIDGE_REGISTER` carries `public_key` for the relay to verify against (§10.12.4), the DID-record frame carries `public_key` for the relay's binding + signature check. The client ignores this field and verifies with its own DID-derived key.
-- **Self-verifying blob payload.** The frame carries the BEP44 `(value, signature, seq)` triple, not the bare document bytes. Because the signature and sequence travel inside the blob, a resolver verifies the record from the blob alone — no DHT round-trip is required to obtain the signature.
-- **Multi-relay.** A resolver can QUERY any relay that stores the target DID document. Identity owners SHOULD publish to multiple relays — their own relays plus bootstrap relays from the fallback relay list (§18.5.1) — for availability and suppression resistance.
-- **Size budget.** DID documents range from 2-30KB depending on attestation count and service endpoint list. The relay blob size limit is 256KB (ADR-004). Well within bounds.
-- **TTL and republishing.** The maximum relay blob TTL is 604800 seconds (7 days). Identity owners MUST republish to relays at least every 6 days (1-day safety margin). The RepublishManager already handles periodic DHT republishing on a 2-hour cycle; relay republishing adds a separate 6-day cycle for relay-stored DID documents.
-
-### 3.10.3 Layer 2: Mainline DHT (Fallback)
-
-Existing did:dht resolution via BEP44 signed mutable items on Mainline DHT. The mechanism is unchanged from §3.8 and §9.6.1. What changes is its role: from "only resolution path" to "fallback resolution path."
-
-The DHT layer remains essential for:
-
-- **Day-one operation.** The SCP relay network starts small. Most DID documents will not be available on relays until the network grows. DHT availability is immediate.
-- **Resolution of identities not yet publishing to SCP relays.** Older identities or identities using minimal SDK configurations may only publish to DHT. The protocol MUST resolve them.
-- **Resilience when all of an identity's relays are down.** DHT provides a resolution path independent of any specific relay's availability.
-- **Cross-network interoperability.** Any BEP44-capable client can resolve SCP identities without running SCP software. The DHT layer preserves this property.
+**A resolver MAY QUERY any relay that stores the target identity's key-event log**, whether or not the community relay list or that identity's service record names it. What a relay outside those two sets cannot do is count toward the first-contact floor or toward the fallback set.
 
 ### 3.10.4 Resolution Protocol
 
-The full resolution sequence:
+The resolution protocol runs seven steps.
 
-```
-1. Compute did_routing_id = SHA-256("scp:did:" || did_string)
-2. Extract public_key from DID string (z-base-32 decode per did:dht spec)
-3. In parallel:
-   a. QUERY did_routing_id on known SCP relays (existing QUERY operation,
-      ADR-004; the stored blob is a DID-record frame, §9.10.12)
-      (identity's published relays if known, else bootstrap relays from §18.5.1)
-   b. DhtClient.resolve(public_key) on Mainline DHT
-4. For each response, obtain the (value, signature, seq) triple:
-   a. Relay response: decode the DID-record frame (§9.10.12) into
-      (value, signature, seq). DHT response: the triple is native.
-      Framing bytes — including the frame's own public_key — are unsigned
-      and MUST NOT be trusted; only the (value, signature, seq) triple is
-      used, and it is verified against the DID-derived key (step 4b), never
-      the frame-supplied key.
-   b. Verify the BEP44 signature over the BEP44-canonical bencoded buffer
-      bencode(salt?, seq, value) — seq before value, per BEP44 (BitTorrent
-      BEP 44 is authoritative for this ordering) — against public_key
-      (the key derived from the DID string in step 2)
-   c. Verify seq >= last_known_seq for this DID
-5. Accept the valid response with highest sequence number. Within the relay
-   layer, if more than one valid record is returned (a non-validating or
-   foreign relay that accumulated multiple blobs), the resolver takes the
-   highest-seq valid record; across layers, the overall highest-seq valid
-   record wins.
-6. Cache result per §9.10.7 caching policy
-   (24h refresh for active contacts, 7d for inactive)
-```
+1. **Compute the routing id**, `SHA-256("scp:did:" ‖ identifier_bytes)`.
+2. **QUERY in parallel** on the identity's own relays and on the fallback set. The identity's own relays come from the service-record copy the backend holds; `resolve` refreshes that copy through `read_service_record` where it holds none or where the copy is past §9.10.7's caching bound, and where that read returns any `ServiceRecordVerdict` other than `Adopted` — `Rejected`, `Absent` or `Inconclusive` — this step queries the fallback set alone. **One source serves a chain as an ordered sequence of frames, so one QUERY does not necessarily return a whole chain**: the resolver pages the routing id, takes every frame each page returns, and assembles frames into chains itself by predecessor digest. **The walk's cursor, its exhaustion condition and its fetch bound are `09-security-model.md` §9.7.4.2 R9's**, and this step states none of its own. A resolver holding no accepted baseline MUST set `proof_nonce` on every query of that walk, including every page it re-issues, to 32 bytes it drew freshly for that query (`09-security-model.md` §9.10.12); a relay answers with a proof only where the query carried one, and step 5 counts an operator proven only while every page it served carried a proof the resolver verified. A resolver holding a baseline MAY omit the field. The two sets go out together and never one after the other: a resolver holding no service record knows no relay of the identity's own, and a resolver holding one still needs a relay outside that list to reach R11's second operator.
+3. **For each response**: (a) decode the frame and assemble the chain segments the relay served, trusting no framing byte; (b) recompute the identifier from the inception event and discard the response where it differs (`09-security-model.md` §9.7.4.2 R2); (c) verify every event under R3, applying that rule's criterion — whether a relay holding no key could have produced the defect — and never its indicator lists on their own, so the resolver discards the copy and treats the position as unserved where a keyless relay could have produced the defect, and rejects the chain at that event where it could not; (d) where the response carried a relay proof, apply the five checks `09-security-model.md` §9.7.4.2's definitions state and record whether this relay counts as a proven source.
+4. **Settle the surviving chains from the sources the walk read to exhaustion.** A source the walk did not exhaust yields `Inconclusive{MissingEvents}`, and R9's rank-1 early stop is the one exception (`09-security-model.md` §9.7.4.2 R9). Where one chain is a prefix of another, take the longer, and discard a head of the accepted chain at a strictly lower sequence without changing accepted state (`09-security-model.md` §9.7.4.2 R12). Where two chains diverge from a shared prefix, apply fork precedence (R6) and return `Contested` where it ties (R7).
+5. **Satisfy the first-contact floor** where the resolver holds no accepted baseline, **counting a relay only where the walk read it to exhaustion, it served a chain that survived step 3, and step 3d recorded it as a proven source**, and counting distinct 33-byte operator keys rather than declared operator identifiers (`09-security-model.md` §9.7.4.2 R11). A relay that answered with an empty response failed nothing and served nothing, so it counts toward neither number. Otherwise the resolver returns `Inconclusive{SingleSource}` and adopts no head, and that payload separates the relays reached, the operators proven, and the proofs its own clock rejected (`09-security-model.md` §9.7.4.2 R11). A resolver holding an accepted baseline resolves against one relay and this step does not bind it.
+6. **Optionally read cosigned heads as evidence**, by querying `SHA-256("scp:wit:" ‖ identifier_bytes)`; a resolver that skips it returns the same key state (`09-security-model.md` §9.7.4.3).
+7. **Derive the key state** from the latest state-carrying event at or before the adopted head (`09-security-model.md` §9.7.4.2 R8) and cache it under the §9.10.7 caching policy. Resolution yields key state, and the service record settles under its own rules at its own address (§3.10.13).
 
-The relay query in step 3a targets relays in priority order: the identity's own relays (from a previously cached DID document), then bootstrap relays. If the resolver has no prior knowledge of the identity's relays, only bootstrap relays are queried for the relay layer — the DHT layer provides the backup.
+**Two relays serving heads of one chain at one sequence** are compared event by event over each event's preimage digest, never over the chain bytes and never over the framing. Where every position's digests agree the two records are one chain, whether or not their bytes match, because §9.5 admits a hardware signer that draws its own nonce and two encodings of one event are then ordinary. Where the digests differ at any position the two heads are divergent events at one sequence, and step 4 settles them. KERI identifies an event by its digest in the same way, under `spec-body` §SAID fields.
 
-**Cancellation and contradiction semantics:**
-
-The parallel query model (step 3) requires clear rules for when queries are cancelled, how contradictions are resolved, and what happens on failure:
-
-- **First-response optimization.** When the first valid response arrives, the resolver SHOULD continue waiting for the second layer's response for up to 2 seconds (not cancel immediately). This allows the resolver to detect stale documents: if both layers return valid documents, the higher sequence number is authoritative (step 5). Cancelling the slower query immediately would miss a fresher document on the slower layer.
-- **Both layers succeed, same sequence number.** The documents MUST be byte-identical (same key signs both, same content). If they differ despite identical sequence numbers, this indicates a bug in the publishing implementation. The resolver MUST log a warning and accept either document (they should be identical; if not, neither is more authoritative).
-- **Both layers succeed, different sequence numbers.** The higher sequence number is authoritative. The resolver MAY re-publish the fresher document to the layer that returned the stale one (protocol-level healing, §3.10.7).
-- **One layer fails, one succeeds.** The successful response is accepted. The failed layer's error is logged but does not prevent resolution. The resolver does NOT retry the failed layer synchronously — the next resolution cycle (24h for active contacts, 7d for inactive) will attempt both layers again.
-- **Both layers fail.** If a cached document exists and is less than 7 days old, the cached document is returned with a `resolution_source: "cache"` indicator. If no cache exists or the cache is older than 7 days, resolution fails with error `DID_RESOLUTION_FAILED` (code 5010). The resolver MUST NOT fabricate a document.
-- **One layer returns invalid signature.** The response is discarded as if the layer had failed. An invalid signature is logged at WARN level (it may indicate relay tampering). The resolver does not fall back to the invalid document under any circumstances.
-- **Relay blob fails frame decoding.** A relay blob that does not decode as a valid DID-record frame (§9.10.12) — shorter than the 105-byte fixed prefix, carrying an empty `value`, exceeding the bounded `value` length, or an unrecognized `version` — is discarded as if the relay had failed. Malformed framing is never trusted and never partially parsed (§9.10.12 decoder rules); the resolver falls through to the other layer exactly as for an invalid signature.
-- **Timeout.** Each layer query has a 5-second timeout. If a layer does not respond within 5 seconds, it is treated as a failure for that resolution attempt.
+**Where every relay fails**, a cached key state under seven days old is returned as a `Confirmed` verdict carrying the cached head, with `HeadProvenance` unchanged and no relays reached; otherwise resolution fails with `IdentityError::NoRelayReachable` (§3.10.10). `Confirmed` is the verdict because the cached head is a head the party already adopted and re-adopts, which is what that verdict means everywhere else in `09-security-model.md` §9.7.4.2 R14. **The resolver MUST NOT fabricate a key state.** A relay that does not answer within the per-relay timeout is a failure for that attempt, and the resolver falls through to the others rather than retrying it synchronously.
 
 ### 3.10.5 Publishing Protocol
 
-Identity owners publish to both layers on every DID document create or update:
+On appending a key event the owner builds the chain from the inception event to the new head, hands that chain to `publish` (§3.10.10), and submits the new head to its witness set. **`publish` and `publish_service_record` each address the publication set, which is the union of the entries the identity's own accepted service record names and the fallback set** (`09-security-model.md` §9.7.4.2 definitions state the fallback set, and §3.10.13 states the record). **A publisher that holds no accepted service record of its own holds a publication set equal to the fallback set**, which is the case at an identity's first publish. **R10's self-observation cadence fetches over that same set**, and `PublishOutcome` carries one entry per member of it (§3.10.10). Without the union the first of the two relay sets §3.10.1 makes a resolver query would be empty for the life of every identity, and step 3 of §3.2.1 would name an act no method performs. **The backend segments per entry**: it reads each entry's declared `max_blob_size` through `read_policy` and splits the chain into contiguous segments each fitting one frame at that entry, then publishes those frames to that entry in sequence order. `18-addressability-and-deployment.md` §18.3.3 states that the value is the relay's own, so one segmentation for the whole publication set costs the publisher every entry that declares a smaller frame. **Where that entry's declared `max_blob_size` admits no segment of the chain** — a segment carries at least one whole event, so a ceiling below one frame's fixed prefix plus one maximal event admits none — **the publisher sends nothing to that entry and records `EntryResult::NotSent { reason: SegmentTooLarge }` for it**, because `PublishOutcome` names every entry of the publication set exactly once (§3.10.10). **`publish` sends each entry only the events that entry does not hold, starting at the first event it lacks**, which the publisher learns by querying the routing id rather than from its own memory of an acknowledgement, because `09-security-model.md` §9.7.4.2 R10's frame-admission rule refuses a frame that repeats a held event. Submission to a witness gates nothing: the event takes effect at each relying party the moment that party resolves the extended chain, and an identity that designates no witness skips that step (`09-security-model.md` §9.7.4.2 R10, §9.7.4.3). **Appending a key event is not the only publication**: `09-security-model.md` §9.7.4.2 R10's self-observation cadence re-reads every entry of the publication set and states which relation carries a publication and what each one publishes.
 
-```
-On DID document create or update:
-1. Serialize DID document
-2. Sign via BEP44 (Ed25519 signature over the BEP44-canonical bencoded buffer
-   bencode(salt?, seq, value) — the sequence number precedes the value,
-   `3:seqi<seq>e1:v<value>`, per the BEP44 spec, which is authoritative for
-   this ordering; did:dht uses no salt)
-3. In parallel:
-   a. Wrap (public_key, seq, signature, value) in a DID-record frame
-      (§9.10.12) and PUBLISH the frame bytes to SCP relays (own relays +
-      bootstrap relays) via the existing PUBLISH operation, blob_ttl: 604800.
-      The frame is transport framing around `value` — it is NEVER part of the
-      bencoded signed bytes.
-   b. DhtClient.publish(public_key, signature, doc_bytes, seq) to Mainline DHT
-4. RepublishManager schedules:
-   - Relay republishing: every 6 days (blob_ttl is 7 days, 1-day margin)
-   - DHT republishing: every 2 hours (existing cycle, unchanged)
-```
-
-Both layers receive identical document bytes and identical BEP44 signatures. The signed payload is the same regardless of storage backend — this is a direct consequence of the self-certification property. A document retrieved from a relay and a document retrieved from the DHT are byte-identical and verify identically. The DID-record frame wraps `value` for transport but does not enter the signed bytes; the `(value, signature, seq)` triple carried to both layers is byte-identical (§9.10.12).
+**A PUBLISH carrying a key-event record, a service record, a cosigned head or a conflict statement sets the wire's `retain` flag**, and `09-security-model.md` §9.10.12 states what a validating relay and a relay that does not validate each do with that flag. **A relay may stop holding such a record on terms its operator declares** (`09-security-model.md` §9.7.4.2 R9), and R10's self-observation cadence is what returns it.
 
 ### 3.10.6 Anti-Segmentation Invariant
 
-**Publishing to both layers is a MUST, not a SHOULD.** Resolution from both layers is a SHOULD (performance optimization — parallel query is faster but not required for correctness).
+**Publishing to the fallback set is a MUST.** An identity that published only to relays of its own would be resolvable only by a party that already holds its service record, because a first-contact reader knows no relay of that identity to query, so identities would partition into islands reachable by their existing contacts and by nobody else. **A publish cycle that no relay in the fallback set accepted MUST therefore be reported to the caller as a failed publication**, never as a success. Acceptance and not reachability is the term, and **an entry whose result is `Accepted` or `WitnessRefused` accepted the write** (§3.10.10), because a relay that answers a publisher and refuses the write stores nothing, while a witness refusal follows a stored write, and `09-security-model.md` §9.7.4.2 R10 gates confirmed publication on acceptance by at least one fallback-set entry. **An acceptance records that the entry stored the bytes and never that the entry still holds them at a later moment**, because a relay may stop holding what it once held on terms its operator declares (`09-security-model.md` §9.7.4.2 R9). What the controller runs against a later displacement is R10's self-observation cadence, whose arms decide which entries carry a publication and what each one publishes (§3.10.5). The ceremony that destroys spent keys rests on the other half of R10's confirmed publication, the controller's durable retention of the signed event, which no displacement at any relay reaches.
 
-The risk: if the DHT layer works well enough and relay-based resolution is "just faster," developers may skip DHT publishing as unnecessary overhead. If this becomes widespread, identity resolution fragments — some DIDs resolvable only on relays, others only on DHT. A resolver that checks only one layer misses identities published only on the other. The network splits into two resolution namespaces without anyone intending it.
+**A refusal is never a verdict about the identity**, which `09-security-model.md` §9.7.4.2 R9 states with the recourse it names. The recourse is mechanical here because the fallback set comes from the shipped community relay list rather than from relays the identity itself chose (`18-addressability-and-deployment.md` §18.5.1). **Where every entry of the fallback set refuses**, the SDK reports the failed publication with the ceiling that entry declared and the retry interval the publisher's own counter measured, and surfaces the entries to the controller. **The two figures are the ones `EntryResult::Refused` carries** (§3.10.10), and each has its own source: an entry declares `rate_limit_publish` in the `relay_config` object it publishes at `.well-known/scp`, and no entry sends a retry interval at any point of the exchange, because ADR-004's `ERR` message carries no ceiling and no interval. A controller holding a signed reveal-authorized event retains it and resumes the ceremony from `PublishSent` when an entry accepts (`09-security-model.md` §9.7.4.2 R10).
 
-The SDK prevents this by default. RepublishManager publishes to both layers on every cycle. Disabling either layer requires explicit opt-out (`RepublishConfig::disable_dht()` or `RepublishConfig::disable_relay()`) and the SDK MUST log a warning when either is disabled. The warning states: "DID resolution layer disabled. This identity may not be resolvable by all peers."
+**The three MUSTs above read `PublishOutcome`'s per-entry list**, which §3.10.10 declares along with the variants an entry's result takes and the rule that picks one where a cycle sent an entry several frames. A reader of this section therefore learns from that section what a mixed cycle reports, and takes no reading of its own: without one declared rule, an entry that stored the first three frames of a five-frame chain and refused the fourth read as accepted under one binding and as refused under another, and the accepting reading reported a confirmed publication for a chain no relay holds whole.
 
-**The DHT *backend* is a selected provider capability (§17.17).** The rule above governs whether the DHT *layer* is published to; the choice of which DHT *backend implementation* serves that layer is a further instance of the general capability-selection principle in §17.17. In particular, an in-memory DHT backend is a **security nullifier**, not a durability-only development affordance (§17.17.3, SCP-CAPSEL-8013): it silently empties the DHT resolution namespace — the extreme case of the segmentation this invariant forbids — so a rotation or revocation never propagates (§3.9, §3.10.7). It MUST therefore be provably absent from shipped production artifacts (SCP-CAPSEL-8012), and the DHT backend selection MUST be explicit and fail closed (SCP-CAPSEL-8000/8001), never silently defaulted to the in-memory arm.
+**A publish cycle that reached no witness MUST be reported as degraded and never as a failure.** An identity that publishes everywhere and submits to no witness is still resolvable by every stranger and keeps its `09-security-model.md` §9.11 standing at every peer (§9.7.4.3). What it gives up is portability: a cosigned head travels to a party that did not perform the read, and a peer's own relay read does not.
 
 ### 3.10.7 Version Resolution
 
-The BEP44 sequence number is the sole authority for document freshness. The highest valid sequence number wins, regardless of which layer served it. Split-brain is impossible: the sequence number is monotonically increasing, and only the identity owner (holder of the Ed25519 private key) can increment it.
+The sequence orders one chain against its own prefixes, because an event's sequence is its predecessor's plus one and a verifier rejects an event whose sequence is anything else (`09-security-model.md` §9.7.4.2 definitions). Among heads of one chain the highest sequence is the newest, whichever relay served it, and a resolver replaces a stale head by re-publishing the longer chain to the relay that served the shorter one.
 
-Stale documents are detected by comparing the received sequence number against the last known sequence number for that DID. A relay or DHT node serving a stale document is not malicious — it simply has not received the latest publish. The stale document is overwritten on the next republish cycle.
-
-When both layers return valid documents with different sequence numbers, the higher sequence number is authoritative. The resolver SHOULD update its cache and MAY re-publish the fresher document to the layer that returned the stale one (protocol-level healing).
+**The sequence decides nothing between two chains that diverge from a shared prefix**, because each chain's author assigned its own sequence numbers past the fork. Fork precedence settles those (`09-security-model.md` §9.7.4.2 R6), and it may adopt a chain whose head sequence is lower than the head the resolver previously held (R12). KERI reaches the same conclusion about a sequence number in `spec-body` §First Seen Policy, where `sn` is a location and never an arbiter.
 
 ### 3.10.8 Security Analysis
 
-The dual-layer architecture preserves all security properties of §9.6.1 (self-certification) while adding relay-layer resilience:
+**What a community-relay-list entry carries, and what a party may conclude from an operator's key, are `18-addressability-and-deployment.md` §18.5.1's**, so an analysis here of what a misbehaving relay reaches rests on that section's statement of what the list binds.
 
-- **Self-certification preserved.** The BEP44 signature is verified against the public key encoded in the DID string. The storage backend (relay or DHT) is untrusted; the resolver never trusts a relay's acceptance or a frame-supplied key. §9.6.1 properties are unchanged.
-- **Relay serves stale document.** Detected by sequence number comparison. The resolver falls through to other relays or DHT. Stale documents do not compromise security — they delay propagation of key rotations, which is bounded by the republish cycle (6 days for relays, 2 hours for DHT).
-- **Relay unresponsive, slow, or withholding.** Resolution queries all of an identity's relay URLs plus the DHT concurrently, each relay guarded by an independent per-relay timeout (§3.10.4). A single slow, hung, or withholding relay cannot block a result obtained from a faster relay or the DHT, and suppression by any one source does not prevent resolution — multi-relay publishing (§9.9.2) applies to DID documents as it does to context blobs.
-- **Relay serves wrong DID's document.** The BEP44 signature does not verify against the target DID's public key. Rejected immediately. The routing ID is derived from the DID string, but verification is against the DID's key — substitution is cryptographically impossible.
-- **Attacker floods junk at the DID routing ID.** The `routing_id = SHA-256("scp:did:" || did_string)` is publicly derivable, so any party can PUBLISH to it. On a **validating SCP-native relay every flood variant is inert**, because the relay keeps a single highest-sequence slot and makes the `routing_id` slot-exclusive once claimed (§3.10.2):
-  - **Junk frame** (malformed, wrong binding, or bad signature) — rejected at validation; never enters the slot.
-  - **Valid-looking frame with a stale or equal `seq`** — rejected by the single-slot rule; displacing the genuine record requires a higher-`seq` frame signed by the DID's private key, which the attacker does not hold.
-  - **Non-frame opaque junk blob** — rejected once the slot exists (slot-exclusivity rule (a)); QUERY returns only the slot (rule (c)).
-  - **Pre-seeded junk** (published *before* the victim's first DID publish, while the relay cannot yet recognize the `routing_id` as DID-domain since `SHA-256` is one-way) — evicted the moment the first binding-valid frame establishes the slot (rule (b)).
+**Relay misbehavior is availability-only and never integrity on a warm-cache or multi-relay resolution.** Three controls hold that together, each covering one failure mode: the resolver's own chain verification rejects a forged record (`09-security-model.md` §9.6.1, §9.7.4.2 R2 and R3); its sequence check plus fork precedence across relays rejects a stale or replayed genuine record (§3.10.4, §3.10.7); and a relay that verifies a chain before it stores one raises the cost of the cold-cache purge-then-replay rollback.
 
-  This is precisely why the relay layer is suppression-resistant: presence-in-the-QUERY-window is controlled by the validating relay's write rule, not by the attacker's PUBLISH volume or timing.
-- **Attacker DELETEs the slot blob (an integrity vector, closed by the DELETE gate).** DELETE is an unauthenticated relay operation addressing a blob by `blob_id` (`= SHA-256(blob)`), and a DID record is public — so an attacker can compute the genuine record's `blob_id` and issue `DELETE`. Left ungated this is an **integrity** attack, not merely availability: on a cold index (a restarted relay or a store-sharing peer, §3.10.2) the attacker DELETEs the genuine highest-`seq` record from durable storage, then PUBLISHes a captured older lower-`seq` genuine frame; cold-index establish reconciliation, finding the genuine record gone, **establishes that stale newcomer** (it has no higher-`seq` record left in storage to reconcile against) — rolling the victim's DID document back to a rotated-out/revoked key. Note the replayed frame is *owner-signed*, so it passes the client's BEP44 verification; what would otherwise reject it is the client's `seq`-monotonicity check, but that is defeated on a cold-cache first resolution — which is why the relay-side DELETE gate, not client re-verification, is the control that closes this vector. This is closed by **slot-exclusivity rule (d) (§3.10.2): the relay rejects a DELETE of the current slot blob**, and the gate is **storage-derived** (it re-reads and re-verifies the blob's self-certifying bytes), so it holds even against a cold index. The gate is rate-limited (its storage read + signature verify is not an unmetered amplification surface) and fails closed on a storage error. With rule (d), a DELETE cannot purge a genuine record and the rollback is foreclosed.
-- **Suppression resilience (validating SCP-native relays).** With single-slot validation, an attacker cannot evict the genuine record by flooding, and cannot reorder it out of a bounded QUERY window (there is at most one record to return). To prevent resolution, an attacker must suppress the DID document on ALL of an identity's validating relays AND all reachable DHT nodes — the DHT being independently suppression-resistant for the same structural reason (BEP44 nodes validate on write and keep one highest-`seq` slot per key). This "all relays AND the DHT" claim holds for validating relays. **On integrity:** relay misbehavior is availability-only, never integrity, *because* a set of controls hold together, each covering a distinct failure mode — the client's BEP44 re-verification against the DID-derived key (§9.6.1) rejects a **forged** record; the resolver's `seq`-monotonicity + highest-`seq`-across-relays-and-DHT selection (§3.10.4, §3.10.7) rejects a **stale/replayed genuine** record on any warm-cache or multi-source resolution; and the storage-derived, cold-index-immune establish reconciliation + **DELETE gate (rule (d))** close the **cold-cache DELETE-purge-then-replay rollback** that the first two do not cover on a single-source first contact. It is not an unconditional property of the relay: it is delivered by those controls together. A relay that omits them (a foreign/non-validating relay) provides no integrity control of its own — integrity there rests entirely on the client-side checks (§9.6.1 + seq-monotonicity + DHT).
-- **Residual: foreign / non-validating relays are best-effort.** A foreign transport or a non-validating relay that accumulates multiple blobs per `routing_id` can be flooded, and its bounded QUERY window can be made to omit the genuine record. Resolution over such storage alone is therefore best-effort for suppression; the resolver still recovers the genuine record via any validating relay, via multi-relay publishing (§9.9.2), or via the DHT, and its highest-seq-valid selection (§3.10.4) discards the junk. What foreign/non-validating storage contributes is availability, not anti-suppression.
+**On a single-relay first contact the integrity control is the two-proven-operator floor and nothing on the relay.** The last two controls above are relay-side code, so they close nothing against a relay whose operator omits them, and a reader holding no accepted service record takes the whole community relay list as its fallback set, which makes R11's floor a count of distinct proven operators rather than a test against a record that reader has not accepted.
+
+**What two proven operators deliver, and what they do not.** They defeat one dishonest relay. Three inputs defeat them, because a genuine prefix truncated before the event the reader most needs verifies clean at each source and forks nothing for R6 to rank: two genuinely independent operators colluding; one adversary occupying this reader's network path to both; and one party holding a listed operator's private key, which signs a conforming relay proof of control at every relay it answers from and is neither of the first two. `09-security-model.md` §9.7.4.3 states the first of those as a supply-chain risk no protocol check covers, and the resolver-supplied nonce in the relay proof stops a replay while leaving the on-path party untouched.
+
+**Suppression takes an identity's relays down to the floor R11 sets.** To deny every first contact an attacker must reduce the entries that still serve a chain — across the identity's validating relays and the fallback set together, because a resolver reads both — below the two `09-security-model.md` §9.7.4.2 R11's first-contact floor requires. Over a foreign transport that accumulates many blobs at one address, suppression resistance is best-effort: such storage contributes availability, and the resolver's own chain verification discards the junk. **A discarded byte is a byte the fetch bound counted**, because a resolver cannot tell which class a byte belongs to until it has read it (§9.7.4.2 R9), so junk at a routing id spends a first-contact resolver's download allowance whatever the verification then does with it.
 
 ### 3.10.9 Privacy Properties
 
-| Layer | What the backend learns |
-|-------|------------------------|
-| SCP relay | Resolver's IP address queried a specific `routing_id`. The relay can infer which DID is being resolved if the relay knows the DID (it can compute the same `SHA-256("scp:did:" \|\| did_string)` for known DIDs). |
-| Mainline DHT | Resolver's IP address queried a public key. DHT routing traffic makes isolation harder (§9.10.7). |
+**What a resolver can conclude from the relays that answered it is `09-security-model.md` §9.7.4.2 R11's**, and `03-identity.md` §3.10.10's `ResolutionSources` is the value it surfaces, so the exposure this section analyses is the exposure that value records.
 
-Adding relay-based resolution does not degrade privacy relative to DHT-only resolution. It adds one additional observer (the relay operator) who, for identities hosted on that relay, already sees message traffic for that identity. The DID resolution query does not reveal information the relay operator did not already have.
+A relay operator that answers a resolution learns that the resolver's network address queried one routing id, and it computes the same derivation, so it can name the identity for any identity it already knows. An identity's own relay operator learns nothing it did not already hold, because it already carries that identity's message traffic (§9.9.1). R11's floor sends a first contact's queries to community relays under distinct operator keys, so no single operator observes a whole first contact. A resolver that requires network-address anonymity takes the transport-layer measures §9.10.11 states, and the §9.10.7 caching policy bounds how often it queries at all.
 
-Caching policy from §9.10.7 applies to both layers: 24-hour refresh for active contacts, 7-day for inactive. The local Mainline DHT node on desktop (§9.10.7) continues to provide resolution privacy for DHT queries.
+### 3.10.10 IdentityBackend, the Resolution Trait
 
-### 3.10.10 DidResolver Trait
-
-The SDK exposes a unified resolution interface that composes both layers:
+**`IdentityBackend` carries six methods and no others**, and ADR-063, the inception-derived key-event-log identity substrate, names that seam. **`IdentityBackend::resolve` takes the identifier's 32 raw digest bytes and returns a `ResolutionOutcome`**, which carries key state and no document. **`IdentityBackend::read_service_record` performs the service-record read** every resolution's relay discovery depends on (§3.10.1); it returns a `ServiceRecordVerdict`, whose four variants are `Adopted` carrying the record, `Rejected{cause}` carrying why the reader refused it, `Absent`, and `Inconclusive` where the reader holds no accepted record and cannot meet the first-contact floor on its `scp:svc:` query (§3.10.13). **`publish` and `publish_service_record` each return a `PublishOutcome`, defined below beside the other types the trait returns**: a publish cycle addresses every entry of the publication set §3.10.5 names, so its result is a per-entry list and a single error variant carrying one scope cannot express it. **`resolve` performs the service-record read itself**, through `read_service_record`, at the point §3.10.4 step 2 names, and the backend holds the accepted copy, so a caller never sequences two calls to resolve an identifier and calls `read_service_record` only to read the record's own entries. **`read_policy` returns the `DeclaredWritePolicy` one entry declares, and `None` where that entry declares none**, which is what `publish` segments the chain against; and **`fallback_set` returns the entries `read_policy` takes**, because no other method returns one. Every type name and every variant name below is name-bound under the criterion `09-security-model.md` §9.7.4.2's definitions state. `.docs/architecture.md` cites this section for the method set and states which crate implements the seam. **This section also declares the identity handle's write API below, and one further operation on that handle, `observe_self`, which runs one pass of the self-observation cadence `09-security-model.md` §9.7.4.2 R10 states and returns one `EntryObservation` for every entry of the publication set**: how far the SDK reached that entry and, for an entry it read to exhaustion, one `ChainObservation` per chain the entry served. **That operation sits on the identity handle and never on `IdentityBackend`**, because the duty compares what an entry served against the controller's own retained log and no method of that trait returns that log, and because a caller that installs a backend of its own through `IdentityBackendSlot::Custom` reaches a cadence the SDK runs above the trait.
 
 ```rust
-/// Unified DID resolution across SCP relays and Mainline DHT.
-/// Implements the parallel dual-layer resolution protocol (§3.10.4).
-pub trait DidResolver: Send + Sync {
-    fn resolve(&self, did: &str)
-        -> impl Future<Output = Result<Option<ResolvedDidDocument>, IdentityError>> + Send;
-}
-
-/// A resolved DID document with provenance metadata.
-pub struct ResolvedDidDocument {
-    /// The verified DID document.
-    pub document: DidDocument,
-    /// BEP44 sequence number. Monotonically increasing.
-    pub seq: u64,
-    /// Which resolution layer served this document.
-    pub source: ResolutionSource,
-}
-
-/// Provenance of a resolved DID document.
-pub enum ResolutionSource {
-    /// Resolved via QUERY to an SCP relay.
-    ScpRelay { relay_url: String },
-    /// Resolved via Mainline DHT BEP44 lookup.
-    MainlineDht,
-    /// Served from local cache (original source recorded at cache time).
-    Cache,
+impl<S: Storage> Identity<S> {
+    /// Runs one pass of the self-observation cadence
+    /// `09-security-model.md` §9.7.4.2 R10 states, over every entry of the
+    /// publication set §3.10.5 names. Asynchronous, because it fetches from
+    /// every entry and may publish to some of them.
+    pub fn observe_self(&self)
+        -> impl Future<Output = Result<Vec<EntryObservation>, IdentityError>> + Send;
 }
 ```
 
-`DidResolver` composes the relay QUERY path with `DhtClient::resolve()` internally. The existing `DidMethod::resolve()` interface continues to work for single-layer DHT resolution — `DidResolver` is an additive layer, not a replacement. Code that only needs DHT resolution (e.g., interoperability tools) can use `DidMethod` directly.
+**The write API is one method per consequential act on the identity handle, and every event that needs a root threshold goes through one collection flow**: `create`'s inception, `rotate_active` and `set_witnesses`, and the rollover, recovery and abandonment `Recovery::begin` composes. **Under `SignerPlan::ThisSdk` the composing method signs every group with the members this SDK's custody holds, publishes, and returns `EventOutcome::Published` in one call**, refusing with `IdentityError::SignatureSetIncomplete` where those members fall short of a group's threshold. **Under `SignerPlan::Groups` it returns `EventOutcome::AwaitingSignatures`** carrying the unsigned `PendingEvent`, whose preimage binds the signer index list and form list the plan names for each group the kind carries; a group the kind does not carry is empty, and an inception's one group is `installed_root`. **Each holder of a named member, the composer included, calls `Identity::cosign`**, which runs the display confirmation `09-security-model.md` §9.7.4.2 R10's device-boundary paragraph states and returns the `IndexedSignature` of the one member its custody holds. **`cosign` and `attach` each compute the event digest as SHA-256 of `PendingEvent::preimage` and refuse a `PendingEvent` whose `event_digest` differs with `IdentityError::PendingDigestMismatch`.** **`attach` verifies each signature against its group and index, refuses with `IdentityError::SignatureSetIncomplete` where a group falls short of the plan, publishes the signed event, and returns the cycle's `PublishOutcome`**; for a reveal-authorized event it runs R10's ceremony from the `Signed` write through the removal. The application carries a `PendingEvent` and each `IndexedSignature` between the holders' devices, and the protocol defines no transport for them. `Identity::create` composes the inception event and returns the handle beside the flow's outcome. `rotate_active` composes a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` composes a `KeyState` that names the witness set and its witnessing interval. Every composing method refuses a threshold that breaks `09-security-model.md` §9.7.4.1's quorum-overlap rule. `Recovery::begin` (R10) composes the reveal-authorized events, and a compromised root member leaves the root set under a `RootRecovery`, because a `KeyState` drops no root member (R3).
+
+```rust
+impl<S: EncryptedStorage> Identity<S> {
+    /// Composes the inception event under the collection flow above.
+    pub fn create(config: IdentityConfig<S>, signers: SignerPlan)
+        -> impl Future<Output = Result<(Identity<S>, EventOutcome), IdentityError>> + Send;
+
+    /// Composes a `KeyState` under the collection flow above.
+    pub fn rotate_active(&self, reason: RotationReason, signers: SignerPlan)
+        -> impl Future<Output = Result<EventOutcome, IdentityError>> + Send;
+
+    /// Composes a `KeyState` under the collection flow above.
+
+    pub fn set_witnesses(
+        &self,
+        witnesses: Vec<WitnessDesignation>,
+        witnessing_interval: u32,
+        signers: SignerPlan,
+    ) -> impl Future<Output = Result<EventOutcome, IdentityError>> + Send;
+
+    /// Called by any holder of a named member, with that holder's own
+    /// custody, whether or not it holds this identity's handle.
+    pub fn cosign(custody: &KeyCustodySlot, pending: &PendingEvent)
+        -> Result<IndexedSignature, IdentityError>;
+
+    pub fn attach(&self, pending: PendingEvent, signatures: Vec<IndexedSignature>)
+        -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
+}
+
+/// The members that sign one group, each by root-set or next-set index and
+/// by signature form (`09-security-model.md` §9.7.4.2 definitions).
+pub struct GroupSigners { pub members: Vec<(u8, SignatureForm)> }
+
+/// Who signs an event that needs a root threshold. `ThisSdk` signs every
+/// group with this SDK's own members; `Groups` names each group's signer
+/// index list and form list for the preimage to bind.
+pub enum SignerPlan {
+    ThisSdk,
+    Groups { reveal: GroupSigners, installed_root: GroupSigners, standing_root: GroupSigners },
+}
+
+/// What a composing method returns under the collection flow.
+pub enum EventOutcome {
+    Published(PublishOutcome),
+    AwaitingSignatures(PendingEvent),
+}
+
+pub enum SignatureGroup { Reveal, InstalledRoot, StandingRoot }
+
+/// A composed event awaiting its signatures.
+pub struct PendingEvent {
+    pub identifier: [u8; 32],
+    pub preimage: Vec<u8>,
+    pub event_digest: [u8; 32],
+}
+
+/// One member's indexed signature over a pending event, in the layout its
+/// form fixes.
+pub struct IndexedSignature { pub group: SignatureGroup, pub index: u8, pub signature: Vec<u8> }
+
+/// One designated witness: the operator identifier its community-relay-list
+/// entry declares (`09-security-model.md` §9.7.4.2 definitions).
+pub struct WitnessDesignation { pub operator: [u8; 32] }
+
+/// Why `rotate_active` replaces the `#active` key, which decides the replaced
+/// key's condition.
+pub enum RotationReason { Routine, Compromised }
+```
+
+The one unit a section outside this one reproduces, delimited here so it reproduces bytes rather than a paraphrase:
+
+- <!-- scp:fragment id="identity-backend-methods" -->`IdentityBackend` carries six methods and no others, each naming the backend as its receiver: `resolve`, `publish`, `read_service_record`, `publish_service_record`, `read_policy` and `fallback_set`.<!-- scp:end id="identity-backend-methods" -->
+
+
+```rust
+/// Key-state resolution across the SCP relay network (§3.10.4).
+pub trait IdentityBackend: Send + Sync {
+    /// `identifier` is the 32 raw digest bytes of the inception-derived
+    /// identifier (`09-security-model.md` §9.7.4.2 R13), never its text form,
+    /// because every derivation this trait performs consumes the digest.
+    fn resolve(&self, identifier: &[u8; 32])
+        -> impl Future<Output = Result<ResolutionOutcome, IdentityError>> + Send;
+
+    /// Publishes the identity's key-event chain at its routing id (§3.10.5).
+    /// **The cycle addresses every entry of the publication set** — the union
+    /// of the entries the identity's own accepted service record names and the
+    /// fallback set (§3.10.5) — so an identity's own relays receive the chain
+    /// they must hold for §3.10.1's first query set to answer.
+    /// `chain` is the encoded events from the inception event to the head, and
+    /// the backend segments them per entry against that entry's declared
+    /// `max_blob_size` (`18-addressability-and-deployment.md` §18.3.3): the
+    /// value is each relay's own, so a caller that pre-cut one frame slice for
+    /// the whole set would lose every entry declaring a smaller frame. Where
+    /// an entry's declared ceiling admits no segment of the chain the publisher
+    /// sends nothing to that entry and records
+    /// `EntryResult::NotSent { reason: SegmentTooLarge }` for it (§3.10.5).
+    fn publish(&self, identifier: &[u8; 32], chain: &[Vec<u8>])
+        -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
+
+    /// Reads the identity's service record at `SHA-256("scp:svc:" ‖ identifier)`
+    /// under the settlement rules of §3.10.13.
+    fn read_service_record(&self, identifier: &[u8; 32])
+        -> impl Future<Output = Result<ServiceRecordVerdict, IdentityError>> + Send;
+
+    /// Publishes the identity's service record under its designated key
+    /// (§3.10.13), addressing the same publication set `publish` addresses.
+    fn publish_service_record(&self, identifier: &[u8; 32], record: &[u8])
+        -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
+
+    /// Reads one relay entry's declared write policy from the `relay_config`
+    /// object that entry publishes at `.well-known/scp`
+    /// (`18-addressability-and-deployment.md` §18.3.3). `publish` calls this
+    /// for each entry it addresses, because it segments the chain against that
+    /// entry's declared `max_blob_size` (§3.10.5). **`entry` names any relay
+    /// the caller can address**, which `fallback_set` below is one source of
+    /// rather than the bound on. **Returns `None` where that entry declares no
+    /// write policy** — it serves no `.well-known/scp`, serves one carrying no
+    /// `relay_config` member, or serves an object the caller cannot decode —
+    /// and the publisher then applies the defaults
+    /// `18-addressability-and-deployment.md` §18.3.3 states for each absent
+    /// term. **No variant of `IdentityError` names that condition and none is
+    /// added for it**, because an entry declaring no policy is the case
+    /// §18.3.3 admits by marking `relay_config` optional.
+    fn read_policy(&self, entry: &str)
+        -> impl Future<Output = Result<Option<DeclaredWritePolicy>, IdentityError>> + Send;
+
+    /// The fallback-set entries this backend's `IdentityBackendSlot` resolved
+    /// (`18-addressability-and-deployment.md` §18.5.1). `read_policy` takes an
+    /// entry and no other method returns one. **It takes any relay entry the
+    /// caller can address, and this set is one source of such entries rather
+    /// than the bound on them.**
+    fn fallback_set(&self) -> Vec<String>;
+}
+
+/// The error half of this trait's six methods and of the three recovery entry
+/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries sixteen
+/// variants and no others. A refusal the protocol mandates carries one of these
+/// variants, so four bindings mint one code rather than four and a caller tells
+/// a custody choice from a network condition. **The identity half's one refusal reaches a caller through
+/// `EntryResult::Refused` alone**, because a refusal is what one entry answered
+/// and a publish cycle returns one `PublishOutcome` naming every entry of the
+/// publication set exactly once: an error variant carrying one ceiling for a
+/// cycle that read three ceilings discards two of them, and a caller holding
+/// that error reads no per-entry list, which is the list §3.10.6's three MUSTs
+/// read.
+///
+/// The codes take `SCP-IDENT-1100` through `SCP-IDENT-1199`, the first free
+/// hundred-block of the `SCP-IDENT-` range `.docs/standards/sdk-common.md`
+/// reserves: `SCP-IDENT-1000` through `SCP-IDENT-1062` are allocated against
+/// the superseded identity model, and a redesign variant reusing one of those
+/// numbers would fire a caller's handler for a condition it never named.
+pub enum IdentityError {
+    /// SCP-IDENT-1100. No substrate satisfies the independent-residence
+    /// requirement of `09-security-model.md` §9.7.4.1 item 3a, so identity
+    /// creation and every later reveal fail closed.
+    NoIndependentSubstrate,
+    /// SCP-IDENT-1101. The SDK holds a threshold of the standing root, so it
+    /// refuses to sign `standing_root: Lost` (§9.7.4.2 R3).
+    RootThresholdHeld,
+    /// SCP-IDENT-1102. The SDK can reach no source in the fallback set, so it
+    /// refuses to compose a reveal-authorized event (§9.7.4.2 R10).
+    NoFallbackSourceReachable,
+    /// SCP-IDENT-1103. The SDK can observe, in a member of the store set, an
+    /// unpublished reveal-authorized event or a pending `RecoveryHandle` for
+    /// this identity; or its adopted log already reveals the commitment the
+    /// event would reveal; or its handle vanished or changed digest before it
+    /// signed or published; or, as a cosigner, it recorded a commitment the
+    /// event reveals (`09-security-model.md` §9.7.4.2 R10).
+    RevealAlreadyPending,
+    /// SCP-IDENT-1104. The verifier could not persist a contested verdict, its
+    /// retained suffixes, or the accepted-head baseline (§9.7.4.2 R14).
+    PersistFailed,
+    /// SCP-IDENT-1105. Every relay failed and no cached key state is fresh
+    /// enough to return (§3.10.4).
+    NoRelayReachable,
+    /// SCP-IDENT-1106. A string reached an admission gate that is not the
+    /// canonical form of an inception-derived identifier (§3.1).
+    NonCanonicalIdentifier,
+    /// SCP-IDENT-1107. `abort_recovery` found the signed event in the device's
+    /// own store, so it refused to clear the handle; `resume_recovery`
+    /// completes the ceremony (`09-security-model.md` §9.7.4.2 R10).
+    SignedRevealUnpublished,
+    /// SCP-IDENT-1108. The SDK did not reach every member of a non-empty store
+    /// set, whether it reached some members or none, so it refused to compose
+    /// a reveal-authorized event (`09-security-model.md` §9.7.4.2 R10). The
+    /// condition is routine
+    /// on a laptop whose pre-rotation authenticator is absent from its port,
+    /// so a caller routes on this code rather than on
+    /// `NoFallbackSourceReachable`, which names a relay the SDK could not
+    /// reach.
+    StorePartiallyUnreadable,
+    /// SCP-IDENT-1109. A passkey gesture was cancelled or failed while the SDK
+    /// signed a key event (`09-security-model.md` §9.7.4.2 R10).
+    UserVerificationDeclined,
+    /// SCP-IDENT-1110. `resume_recovery` found a handle past `Composed` and no
+    /// signed event in any store it reaches (`09-security-model.md` §9.7.4.2 R10).
+    RecoveryPreimageMissing,
+    /// SCP-IDENT-1111. The custody backend returned an error while the SDK
+    /// signed a key event (`09-security-model.md` §9.7.4.2 R10).
+    CustodySigningFailed,
+    /// SCP-IDENT-1112. `Identity::attach` received signatures that fall short
+    /// of a group the event's `SignerPlan` names (§3.10.10).
+    SignatureSetIncomplete,
+    /// SCP-IDENT-1113. The adopted log does not hold the event the store
+    /// set's last-reveal marker names, and no entry of the publication set
+    /// served it (`09-security-model.md` §9.7.4.2 R10).
+    LastRevealUnadopted { sequence: u64, event_digest: [u8; 32] },
+    /// SCP-IDENT-1114. A `PendingEvent`'s `event_digest` differs from the
+    /// SHA-256 of its `preimage` (§3.10.10).
+    PendingDigestMismatch,
+    /// SCP-IDENT-1115. A root set or next set of more than one member carries
+    /// a threshold at or below half its size (`09-security-model.md` §9.7.4.1).
+    ThresholdAdmitsDisjointQuorums,
+}
+
+/// One relay entry's declared write policy, as that entry publishes it at
+/// `.well-known/scp`. **The type carries three fields and no others**, which
+/// are the three write-policy terms `18-addressability-and-deployment.md`
+/// §18.3.3 states: `max_blob_size`, `max_blob_ttl_seconds` and
+/// `rate_limit_publish`. A relay that serializes this type discloses those
+/// terms and nothing else. Every field's doc names what its absence means and
+/// states no figure of its own. **`max_blob_ttl_seconds` is a term an
+/// identity-half publisher reads and never exercises**, because the four
+/// retained kinds carry no TTL (§3.10.5).
+///
+/// **Where a field's spelling differs from its `relay_config` row's, this
+/// type states the mapping**: `max_blob_ttl_seconds` carries the row
+/// `max_blob_ttl`, spelled with the unit that row declares.
+/// `18-addressability-and-deployment.md` §18.3.3 is the section a reader finds
+/// the wire form of a relay's declaration in.
+pub struct DeclaredWritePolicy {
+    /// The largest blob one PUBLISH may carry, in bytes. Absent means the
+    /// relay declares no ceiling of its own. `publish` segments the chain per
+    /// entry against this value (§3.10.5).
+    pub max_blob_size: Option<u64>,
+    /// The longest TTL the relay accepts on an expiring blob, in seconds.
+    /// Absent means the relay declares no ceiling of its own.
+    pub max_blob_ttl_seconds: Option<u64>,
+    /// Messages per minute per publishing address. Absent takes the default
+    /// `18-addressability-and-deployment.md` §18.3.3 states, and zero turns
+    /// the term off.
+    pub rate_limit_publish: Option<u64>,
+}
+
+/// What one publish cycle over the publication set did (§3.10.5, §3.10.6):
+/// the union of the entries the identity's own accepted service record names
+/// and the fallback set. The cycle addresses every member, so the outcome is
+/// one per-entry list and no partition of whole-cycle arms: **every entry of
+/// the publication set appears in `per_entry` exactly once, so `per_entry` is
+/// the declared value a caller reads the publication set from**, and "did any
+/// entry accept" is a question the caller derives from the list rather than an
+/// arm this type has to choose. A caller that needs the fallback-set half
+/// alone intersects `per_entry` with `fallback_set`.
+pub struct PublishOutcome {
+    pub per_entry: Vec<EntryOutcome>,
+    /// False where no designated witness accepted the head this cycle, which
+    /// includes a cycle whose witnesses each answered `WitnessRefused`. The SDK
+    /// reports such a cycle as degraded and never as a failure, which is the
+    /// third MUST of §3.10.6 and the one a value on an error arm cannot carry.
+    pub witnessed: bool,
+}
+
+/// One publication-set entry's answer. `entry` holds the relay URL, which is
+/// the unit `ResolutionSources::relays_reached` holds.
+///
+/// **One entry answers once per frame, and `result` carries the strictest of
+/// those answers**: `Accepted` names an entry that stored every frame the
+/// cycle sent it, and an entry that refused, failed on, or could not be
+/// reached for any one frame carries that answer instead. Without the rule an
+/// entry that stored three frames of five and refused the fourth reads as
+/// `Accepted` under one binding and as `Refused` under another, and the
+/// `Accepted` reading reports a confirmed publication for a chain no relay
+/// holds whole.
+pub struct EntryOutcome {
+    pub entry: String,
+    pub result: EntryResult,
+}
+
+/// What one entry answered. Every SDK binding carries the type name and all
+/// six variant names verbatim.
+pub enum EntryResult {
+    /// The entry stored the write.
+    Accepted,
+    /// The entry answered ADR-004's `4020` RATE_LIMITED. **This variant
+    /// carries the rate-limit payload itself and reads no `scope` and no
+    /// `value` off the wire**, because ADR-004's `ERR` message carries neither
+    /// field. The publisher fills the
+    /// payload from what it already holds, and each figure has its own source:
+    /// the ceiling is the `rate_limit_publish` term that entry declared and
+    /// `read_policy` returned, and the retry interval is the wait the
+    /// publisher's own counter measured. §3.10.6 obliges the SDK to surface
+    /// both figures.
+    Refused { ceiling_per_minute: u64, retry_after_seconds: u64 },
+    /// The entry answered and named no declared term, carrying the wire code
+    /// it sent: `4040` DID_RECORD_REJECTED, which a publisher meets when it
+    /// sends a later segment first, `4010` BLOB_TOO_LARGE, which it meets when
+    /// it segmented against a stale `max_blob_size`, `5001` STORAGE_FULL,
+    /// which is the refusal `09-security-model.md` §9.7.4.2 R9's seam sentence
+    /// permits a relay to make on terms its operator declares, and `5000` and
+    /// `5002`. **`4020` reaches `Refused` and reaches no other variant.**
+    /// Without this variant one binding recorded such an answer as
+    /// `Unreachable`, which says the entry answered nothing, and another
+    /// recorded it as `Refused` with a ceiling the relay never sent.
+    Failed { code: u16 },
+    /// The entry answered nothing.
+    Unreachable,
+    /// The publisher sent the entry nothing (§3.10.5), so the entry sent no
+    /// code.
+    NotSent { reason: NotSentReason },
+    /// The entry stored the write and its witness refused to cosign, with one
+    /// of the codes `09-security-model.md` §9.7.4.3 states, `4050` through
+    /// `4053`. `last_cosigned_head` carries the digest a `4050` answer carries
+    /// and is absent otherwise. §3.10.6 counts this variant as an acceptance.
+    WitnessRefused { code: u16, last_cosigned_head: Option<[u8; 32]> },
+}
+
+/// Why the publisher sent an entry nothing.
+pub enum NotSentReason {
+    /// The entry's declared `max_blob_size` admits no segment of the chain.
+    SegmentTooLarge,
+}
+
+/// What one pass of the self-observation cadence observed at one entry of the
+/// publication set. `observe_self` returns one per entry, exactly once.
+pub struct EntryObservation {
+    pub entry: String,
+    pub reach: EntryReach,
+}
+
+/// How far the SDK reached one entry, and the act `09-security-model.md`
+/// §9.7.4.2 R10 names for each reach.
+pub enum EntryReach {
+    /// The entry answered nothing. The SDK alerted and published nothing.
+    Unreachable,
+    /// The SDK stopped before R9's page walk read the entry to exhaustion.
+    /// The SDK alerted, named the entry, and published nothing.
+    Unexhausted,
+    /// The page walk read the entry to exhaustion: one observation per chain
+    /// the entry served. An empty entry, and an entry whose frames chain to
+    /// nothing, each yield one observation whose `relation` is `Absent`.
+    Answered(Vec<ChainObservation>),
+}
+
+/// The relation the SDK decided for one chain an answered entry served, and
+/// what it did about it.
+pub struct ChainObservation {
+    /// The head digest of the chain's valid prefix; absent under `Absent`.
+    pub head: Option<[u8; 32]>,
+    pub relation: ChainRelation,
+    /// The entry's answer to the re-publication the relation's arm sent;
+    /// absent where the arm publishes nothing.
+    pub republished: Option<EntryResult>,
+    /// True where R10 obliged an alert for this chain.
+    pub alerted: bool,
+}
+
+/// The five relations `09-security-model.md` §9.7.4.2 R10 names, which that
+/// rule decides over each chain's valid prefix.
+pub enum ChainRelation {
+    Absent,
+    Identical,
+    Superseded,
+    Extending(ExtendingAct),
+    Diverged,
+}
+
+/// What the extending arm did with the served chain.
+pub enum ExtendingAct {
+    /// The chain carried no `RootRecovery{Lost}` the SDK did not author, and
+    /// the SDK adopted the whole valid prefix.
+    Adopted,
+    /// The SDK adopted the prefix before the first such event and withheld
+    /// that event and every event past it.
+    Withheld,
+}
+
+/// Every resolution returns one of the six verdicts of
+/// `09-security-model.md` §9.7.4.2 R14, so a caller routes the verdict and
+/// computes the `09-security-model.md` §9.11 standing from it. An `Err` is a
+/// local failure, a storage or persistence error, and never a verdict.
+pub struct ResolutionOutcome {
+    pub verdict: ResolutionVerdict,
+    /// Present on `Confirmed` and `Adopted`, absent on every other verdict.
+    /// `KeyState` here is the derived key state `09-security-model.md`
+    /// §9.7.4.2's definitions define, and this section cites that definition
+    /// and writes no field list and no second definition of it. That same name
+    /// spells the event kind
+    /// `EventKind::KeyState`, which is a variant of a different type and is
+    /// the event a chain carries rather than the state a chain derives.
+    pub key_state: Option<KeyState>,
+    pub sources: ResolutionSources,
+}
+
+/// What a resolution learned about its sources, in the units R11's
+/// first-contact floor counts: 33-byte SEC1 compressed operator keys, never
+/// 32-byte declared operator identifiers.
+pub struct ResolutionSources {
+    pub relays_reached: Vec<String>,
+    /// The relays the resolver reached and did not read to exhaustion
+    /// (`09-security-model.md` §9.7.4.2 R9's page walk). R11's floor counts
+    /// none of them.
+    pub unexhausted: Vec<String>,
+    /// The operator key the shipped community relay list
+    /// (`18-addressability-and-deployment.md` §18.5.1) declares for each entry
+    /// the resolver reached. That list is the field's source: no method of
+    /// this trait returns a declared operator key, so an entry the resolver
+    /// reached that the list does not name contributes no value here. R11's
+    /// floor reads `proven` and never this field.
+    pub declared: Vec<[u8; 33]>,
+    /// The operator key each verified relay proof of control verified under,
+    /// checked by the five checks `09-security-model.md` §9.7.4.2's
+    /// definitions state, for a source the walk read to exhaustion alone.
+    /// R11's floor counts the distinct values here.
+    pub proven: Vec<[u8; 33]>,
+    /// The record the party assigned from the source it used for the head it
+    /// adopted. On the cached return §3.10.4 states — every relay failed and a
+    /// cached key state comes back `Confirmed` — this carries the value an
+    /// earlier resolution recorded, beside an empty `relays_reached` and an
+    /// empty `proven`. No rule reads the record, so the difference is a
+    /// reader's and not a verifier's.
+    pub head_provenance: HeadProvenance,
+}
+
+/// What a service-record read returned (§3.10.13). `Adopted` carries the
+/// record's encoded bytes, which is the form the designated key's signature
+/// covers and the form `publish_service_record` takes.
+pub enum ServiceRecordVerdict {
+    /// The record's encoded bytes. A reader holding a `Contested` resolution
+    /// verdict returns the retained record here where that record still meets
+    /// both conditions §3.10.13 states, and the caller reads the contest off
+    /// the resolution verdict it already holds.
+    Adopted { record: Vec<u8> },
+    Rejected { cause: ServiceRecordRejection },
+    Absent,
+    /// The reader holds no accepted record and could not meet the
+    /// first-contact floor on its `scp:svc:` query (§3.10.13). The three
+    /// fields are the payload `09-security-model.md` §9.7.4.2 R14's
+    /// `SingleSource` cause carries, written here directly and under no
+    /// `InconclusiveCause` discriminator: a service record occupies no
+    /// position on any chain, so `MissingEvents`'s sequence range and
+    /// `CopyDefect`'s `at_event` have no referent in this read and an
+    /// exhaustive match would handle two arms no rule can reach.
+    Inconclusive {
+        reached_sources: u32,
+        proven_sources: u32,
+        clock_skew_rejected: u32,
+    },
+}
+
+/// Why a reader refused a service record it verified (§3.10.13). Each variant
+/// names one refusal that section states.
+pub enum ServiceRecordRejection {
+    /// The record carries more than `MAX_SERVICE_RECORD_ENTRIES` entries
+    /// (`09-security-model.md` §9.18.17).
+    TooManyEntries,
+    /// The record's sequence is the maximum representable value.
+    SequenceExhausted,
+    /// The record's sequence is at or below the reader's high-water mark for
+    /// this identifier and this designated key.
+    StaleSequence,
+    /// The signature does not verify against the designated key.
+    SignatureInvalid,
+    /// The reader holds two signature-valid records at one sequence.
+    Equivocation,
+    /// The identity's resolution returned `Contested` and the reader holds no
+    /// retained record meeting both conditions of §3.10.13's contested
+    /// paragraph, so it routes on nothing. Where it does hold one, the read
+    /// returns that record as `Adopted`.
+    IdentityContested,
+}
+```
+
+**This section declares `ResolutionVerdict`, `InconclusiveCause`, `TieClass` and `SequenceRange`, each field carrying a type, and `09-security-model.md` §9.7.4.2 R14 states the rule that selects a verdict and declares no type.** A head is named by its 32-byte preimage digest and a position by its sequence, so `at_event` and `fork_position` are sequences and `head`, `heads`, `shared_prefix_head` and `accepted_head` are digests.
+
+```rust
+/// The six verdicts a resolution returns (`09-security-model.md` §9.7.4.2
+/// R14). Every SDK binding carries the type name and all six variant names
+/// verbatim.
+pub enum ResolutionVerdict {
+    /// The candidate head equals the accepted head at an equal sequence.
+    Confirmed,
+    /// The verifier replaced its baseline. `baseline_decreased` is true where
+    /// the adopted head sits at a lower sequence than the head it replaced.
+    Adopted { head: [u8; 32], baseline_decreased: bool },
+    /// R6 ranked two suffixes as a tie and R7 classified it. `residue` counts
+    /// the candidates the verifier could not retain under R9's bounds.
+    Contested {
+        tie: TieClass,
+        heads: Vec<[u8; 32]>,
+        shared_prefix_head: [u8; 32],
+        fork_position: u64,
+        residue: u32,
+    },
+    /// The verifier reached no verdict on the bytes it read.
+    Inconclusive { cause: InconclusiveCause },
+    /// An event failed R1 through R4 at this sequence.
+    Invalid { at_event: u64 },
+    /// The candidate head sat at a strictly lower sequence on the accepted
+    /// chain, so the verifier changed no stored state.
+    Discarded { accepted_head: [u8; 32] },
+}
+
+/// Why a resolution was inconclusive (`09-security-model.md` §9.7.4.2 R14).
+pub enum InconclusiveCause {
+    /// The verifier holds no event for the sequences `range` names.
+    /// `failed_sources` holds the relay URLs that failed to serve, and it is
+    /// empty where R9's fetch bound stopped the verifier itself.
+    MissingEvents { range: SequenceRange, failed_sources: Vec<String> },
+    /// A copy-level defect sits at this sequence.
+    CopyDefect { at_event: u64 },
+    /// The resolution did not meet R11's first-contact floor.
+    SingleSource {
+        reached_sources: u32,
+        proven_sources: u32,
+        clock_skew_rejected: u32,
+    },
+}
+
+/// How R7 classified a tie (`09-security-model.md` §9.7.4.2 R7).
+pub enum TieClass {
+    Rank1Terminal,
+    Rank2Terminal,
+    Rank3Pending,
+}
+
+/// The sequences a verifier holds no event for. `from` is absent where the
+/// verifier holds an event at every sequence of the chain it assembled, which
+/// is what a verifier that read a complete chain and stopped while reading
+/// beyond it holds. `to` is absent where the stop left the chain's head
+/// sequence unknown (`09-security-model.md` §9.7.4.2 R9's fetch bound).
+pub struct SequenceRange {
+    pub from: Option<u64>,
+    pub to: Option<u64>,
+}
+```
+
+`HeadProvenance` is the type `09-security-model.md` §9.7.4.2's definitions fix. A resolver assigns `head_provenance` from the source of the head it adopted, under the assignment those definitions state, so `TwoOperatorRead` counts the distinct operator keys in `proven` and never declared operator identifiers.
+
+**The outcome carries the verdict rather than an `Option`**, because `09-security-model.md` §9.6.4 maps `Contested`, `Inconclusive` and `Invalid` to three different standings and a caller holding one absent value cannot tell them apart. **It records the operator key each entry declared and the key each proof verified under**, because R11 counts a source only where its proof verified and two relay URLs, or two declared operator identifiers, may sit under one operator key.
 
 ### 3.10.11 Bootstrap and Network Growth
 
-The dual-layer architecture is designed to be self-reinforcing as the SCP network grows:
-
-- **Day one.** DHT dominates. Relay-layer queries mostly fail because few relays exist and few identities have published DID documents to relays. Resolution latency is DHT latency. The protocol works identically to the pre-§3.10 architecture.
-- **Growth.** More relays come online. More identities publish to relays. Relay-layer resolution begins succeeding more often, and faster than DHT traversal. DHT queries still run in parallel as backup.
-- **Maturity.** Relay-layer resolution is primary for most identities. DHT latency becomes irrelevant because relay responses arrive first. DHT serves as an availability backstop and interoperability bridge for non-SCP clients.
-- **DHT is never removed.** The cost of maintaining DHT publishing is one BEP44 put every 2 hours — negligible. The benefit is permanent: a resolution path that works even if every SCP relay is unreachable. Removing it would violate the anti-segmentation invariant (§3.10.6).
+On day one an identity publishes its chain to the community relay list and lists no relay of its own, so every first contact reads two entries of that list under distinct operator keys. As identities publish to relays of their own, a resolver holding a baseline reaches one of those first and the fallback set carries less of the load. A first contact still reads community relays whatever the identity's service record names (`09-security-model.md` §9.7.4.2 R11), so growth changes what R11's floor costs in latency and never whether an identity can meet it.
 
 ### 3.10.12 Phase Integration
 
-| Component | Phase | Crate | Notes |
-|-----------|-------|-------|-------|
-| `did_routing_id` derivation | Phase 1 patch | `scp-core` | Pure function, no dependencies. SHA-256 of domain-separated DID string. |
-| DID document PUBLISH to relays | Phase 2 | `scp-core` | RepublishManager gains relay publishing cycle alongside existing DHT cycle. |
-| DID document QUERY from relays | Phase 2 | `scp-core` | Extends existing DID resolution path with relay QUERY before/parallel to DHT. |
-| `DidResolver` trait | Phase 2 | `scp-core` | Unified interface composing relay + DHT resolution. |
-| Parallel dual-layer resolution | Phase 2 | `scp-core` | Orchestration of parallel queries with first-valid-wins semantics. |
-| DID-record relay frame (§9.10.12) | Phase 2 (#482) | `scp-protocol` | Deterministic binary encode/decode of the minimal fixed-layout DID-record frame (`DidRecordV1`). Pure sync wasm-compatible type; consumed by the relay publisher + DID resolver in `scp-identity` and by the relay-side validation path. |
+The routing derivation is a pure function in `scp-core`; the key-event record frame is a deterministic encoder and decoder in `scp-protocol` (`09-security-model.md` §9.10.12); publication, multi-relay QUERY, and the `IdentityBackend` of §3.10.10 are the relay publisher and key-state resolver in `scp-identity`. `.docs/architecture.md` states the crate layout, and this section adds no rule.
 
-## 3.11 DID Authentication for External Services (SCPID)
+### 3.10.13 The Service Record
 
-SCP identities can authenticate to services outside the protocol. A relying party — SCP-native or not — can verify that a request comes from the holder of a specific DID without joining a context, understanding MLS, or running SCP infrastructure. The only requirement is the ability to resolve a `did:dht` document (a single DHT lookup) and verify an Ed25519 signature.
 
-This is analogous to "Sign in with Ethereum" (EIP-4361) but simpler: no blockchain state, no gas, no wallet abstraction. The DID document is the identity provider, self-certified via BEP44 signatures on the DHT.
+**The wire frame that carries this record, and the two further retained frames beside it, are `09-security-model.md` §9.10.12's**, so an implementer reading this section for the record's contents reads that one for the bytes it travels in.
 
-**Relationship to existing DID-auth patterns.** SCP already uses DID-signed requests internally for context reader authentication (§6.2.2B) and handle outlet requests (§22.3.1). SCPID extracts and generalizes this pattern into a standalone protocol that external services can implement without SCP SDK dependencies.
+**What the record carries.** An identity's service record carries at most `MAX_SERVICE_RECORD_ENTRIES` entries (`09-security-model.md` §9.18.17). **The record's reader is what enforces that cap**: it rejects a record carrying more entries, whatever its signature, and returns `ServiceRecordVerdict::Rejected{TooManyEntries}` (§3.10.10). The cap binds this reader and no key event, because the record is separately addressed, separately signed, and occupies no position on any chain, so `09-security-model.md` §9.7.4.2 R3 carries no service-record clause. A resolver therefore opens no more concurrent queries against an identity's own relays than the cap admits; without it a signed record naming one third-party host in five thousand `SCPRelay` entries is a fan-out primitive every resolution fires. It carries every transport and service field that identity publishes: its `SCPRelay` entries, the relays holding its encrypted private state, its broadcast-context advertisements, its self-asserted capability URIs, the pointer to its context-hosted participation statements, and the pointer to its attestation revocation status (`18-addressability-and-deployment.md` §18.2.2 enumerates the entry types). Those capability URIs are the self-asserted third of what the retired `SCPCapabilities` entry carried (`18-addressability-and-deployment.md` §18.2.2A); a verifier-signed challenge-verification record is an attestation (§7.3.4), and economic metadata belongs to `19-economic-governance.md` §19.9. **The record carries no key, no key condition, and no witness parameter**: a root signature covers each of those in the key-event log, and a reader that found one here would be reading key state from a key weaker than the root. KERI draws the same line, carrying endpoint and role metadata in signed reply records outside the log (`spec-body` §Reply Message Body).
+
+**The record's bytes.** A service record is `(identifier, sequence, entries)`, and its signature preimage is
+
+```
+SHA-256("SCP-SERVICE-RECORD-V1:" ‖ identifier ‖ sequence ‖ entries)
+```
+
+under the `09-security-model.md` §9.5.1 construction: the 32-byte identifier raw, `sequence` as an 8-byte big-endian `u64`, and `entries` under the repeated-field rule. **Each entry encodes as its three strings under the variable-length rule, in the order `id`, `type`, `serviceEndpoint`.** No entry carries a type discriminator, because `type` is that discriminator. Without this encoding two bindings compute two preimages over one record and neither's signature verifies at the other. `09-security-model.md` §9.18.2 registers the separator, `09-security-model.md` §9.7.1 classifies the record in the attestation class, and `25-test-vectors.md` §25.28 pins the bytes.
+
+**Where the record lives.** A service record is addressed at `SHA-256("scp:svc:" ‖ identifier_bytes)` over the identifier's 32 raw digest bytes (`09-security-model.md` §9.7.4.2 R13), distinct from the key-event record's address, so one QUERY returns records of one kind.
+
+**Who signs it.** The record carries a signature by the operational key the latest state-carrying key event designates for the service-record role, never by a root member. A reader verifies in two steps and never one: it verifies the key-event log under `09-security-model.md` §9.7.4.2 R2 and R3, reads the designation out of the verified chain, then verifies the record's signature against the designated key (`09-security-model.md` §9.6.3). R3 rejects a state-carrying event whose designation names a key that event does not list `Current`, so the designated key is always one the current key state lists.
+
+**A reader holding no accepted service record applies the first-contact floor to the record**, setting `proof_nonce` on its `scp:svc:` query as §3.10.4 step 2 requires on the key-event one, and returns the verdict §3.10.10 declares for a reader that cannot meet the floor. §3.10.10 states that verdict's shape and this paragraph states no field of it. A single relay can serve a genuine record truncated to an older sequence exactly as it can serve a truncated chain, and such a reader holds no high-water mark to compare against.
+
+**How a reader settles two copies: last writer wins on the record's own sequence**, which is monotonic and unrelated to the log's. A reader rejects a record at the maximum representable value, so no writer exhausts the space. **The high-water mark is keyed to the pair (identifier, the 33 public-key bytes the designation resolved to)**: a mark scoped to the identifier alone would let one record written at a high sequence by a briefly held key block the controller's own recovery record forever. **The mark resets when the key state lists different bytes `Current` in the designated role**, so a routine rotation resets it and the reader accepts the first record the new key signs at any sequence. **This pair key is a reader's acceptance test**, so a party designating a fresh key on every `KeyState` plants no second stored record while each reader still refuses a stale one. The reset is sound because a root signature covers the event listing those bytes and the replaced key's holder cannot produce one. **Fork precedence does not apply here and MUST NOT be applied**: a service record has no reveal-authorized event class, so no legitimate update lowers the sequence, and two signature-valid records at one sequence are the designated key's holder equivocating. A reader holding two such records rejects both and reports the identity's transport metadata as unresolved.
+
+**A reader holding a `Contested` verdict accepts no new service record** for that identity, because a contested identity has no adopted key state and therefore no authorized designation. It keeps routing on the last record it accepted before it observed any divergent-suffix event, and only while that record's designated key is `Current` in the shared prefix's key state; `read_service_record` returns that retained record as `Adopted` (§3.10.10), and the caller reads the contest off the resolution verdict it already holds. Where no record it holds meets both conditions it routes on nothing and says so, returning `Rejected{IdentityContested}`, with the caching bound suspended for that identity. Freezing on a record the divergence's author wrote would hand routing to whichever claimant published last, and reporting every contested identity unroutable would let any party that contests an identity cut its transport.
+
+**A reader MUST NOT route to a relay URL from a cached copy past the caching bound** of §9.10.7: it re-resolves, and where it cannot it reports the identity as unroutable. A stale service record loses an identity its reachability and costs it none of its key state, because key state comes from the log.
+
+**What changing the record costs, and what it does not.** A relay-endpoint change, a private-state relocation, and a capability-URI edit are each one service-record write signed by the designated operational key. Each appends no key event and changes no key state, so the root set stays cold across every change to an identity's transport configuration, which is the property the split exists to deliver. KERI draws the same line: changing an endpoint is a reply record and not a key event.
+
+**What an attacker holding the designated key can and cannot do.** It can substitute the relay list and re-point traffic. It cannot empty the fallback set of a first-contact resolver, which takes the whole community relay list, and it cannot change a key, a key's condition, the witness set, or the designation itself. Re-pointing is fail-closed rather than a substitution of identity, because MLS group keys and not relay reachability enforce membership. **It can also deny the identity's transport metadata**: two signature-valid records at one sequence make every reader that holds both report the metadata unresolved, under the settlement rule above. That denial reaches transport metadata and reaches no key, no condition, and no membership, and a first-contact resolver still takes the whole community relay list.
+
+**The witness layer covers the key-event log alone and covers this record not at all** (`09-security-model.md` §9.7.4.3). Four things defend the record against a relay serving a genuine copy truncated to an older sequence: the record's own signature under the designated key, its monotonic sequence read against the reader's high-water mark, the first-contact floor above, and the caching bound above.
+
+## 3.11 Identity Authentication for External Services (SCPID)
+
+SCP identities can authenticate to services outside the protocol. A relying party, SCP-native or not, verifies that a request comes from the holder of one identifier without joining a context, understanding MLS, or running SCP infrastructure. It needs one capability: resolve an SCP identity's key-event log from an SCP relay and verify a P-256 signature.
+
+This is analogous to "Sign in with Ethereum" (EIP-4361) but simpler: no blockchain state, no gas, no wallet abstraction. The identity's key-event log is the identity provider, self-certifying because the identifier is the digest of its inception event (`09-security-model.md` §9.6.1).
+
+**Relationship to the protocol's own signed requests.** SCP already signs requests under `#active` for context reader authentication (§6.2.2B [no such section]) and for handle outlet requests (§22.3.1). SCPID extracts and generalizes this pattern into a standalone protocol that external services can implement without SCP SDK dependencies.
 
 ### 3.11.1 Protocol Overview
 
 ```
-Client (DID holder)                    Relying Party (service)
+Client (identifier holder)             Relying Party (service)
        |                                       |
        |  1. GET /auth/challenge                |
        | ------------------------------------>  |
@@ -1031,20 +1339,20 @@ Client (DID holder)                    Relying Party (service)
        |  2. { nonce, audience, expires_at }    |
        | <------------------------------------  |
        |                                       |
-       |  3. Sign challenge with #active/#agent |
+       |  3. Sign challenge with #active        |
        |                                       |
        |  4. POST /auth/verify                  |
        |     { did, signing_key_id, signature, ts }     |
        | ------------------------------------>  |
        |                                       |
-       |  5. Resolve DID -> verify signature     |
+       |  5. Resolve the identifier, verify sig |
        |                                       |
        |  6. { authenticated: true, did }       |
        | <------------------------------------  |
        |                                       |
 ```
 
-The protocol is stateless from the client's perspective. The relying party issues a challenge, the client signs it, and the relying party verifies the signature against the DID document's public key. No session state is established at the protocol level — session management (cookies, tokens, etc.) is the relying party's concern.
+The protocol is stateless from the client's perspective. The relying party issues a challenge, the client signs it, and the relying party verifies the signature against the public key the identity's current key state lists in the named role. No session state is established at the protocol level — session management (cookies, tokens, etc.) is the relying party's concern.
 
 ### 3.11.2 Challenge Format
 
@@ -1078,29 +1386,29 @@ The client constructs and signs the response:
 ```
 ScpIdResponse {
     protocol:       String,   // "scpid/1.0" — MUST reject unrecognized versions
-    did:            DID,      // The signer's DID
-    signing_key_id: String,   // Verification method ID: "#active" or "#agent"
+    did:            Identifier, // the signer's identifier
+    signing_key_id: String,   // the role that signed: "#active"
     nonce:          [u8; 32], // Echo of the challenge nonce
     audience:       String,   // Echo of the challenge audience
     signed_at:      u64,      // Unix timestamp (ms) when the client signed
-    signature:      [u8; 64], // Ed25519 signature over the signed content
+    signature:      [u8; 64], // P-256 signature (r || s) over the signed content
 }
 ```
 
 **Signed content construction:**
 
-The signed content follows the §9.5.1 canonical hash construction: SHA-256 of domain-separated, length-prefixed fields. The Ed25519 signature is over the 32-byte hash, not the raw concatenation.
+The signed content follows the §9.5.1 canonical hash construction: SHA-256 of domain-separated, length-prefixed fields. The P-256 signature is over the 32-byte hash, not the raw concatenation.
 
 ```
 signed_bytes = SHA-256(
     "SCP-DID-AUTH-V1:"
-    || BE32(len(did))              || did              // signer's DID, UTF-8
-    || BE32(len(signing_key_id))   || signing_key_id   // "#active" or "#agent", UTF-8
+    || BE32(len(did))              || did              // the signer's identifier, UTF-8
+    || BE32(len(signing_key_id))   || signing_key_id   // "#active", UTF-8
     || nonce                                            // 32 bytes, fixed (no length prefix per §9.5.1)
     || BE32(len(audience))         || audience          // audience URI, UTF-8
     || signed_at as u64 BE                              // 8 bytes, big-endian
 )
-signature = Ed25519_sign(private_key, signed_bytes)
+signature = P256_ECDSA_sign(private_key, signed_bytes)   // RFC 6979 nonce, low-s
 ```
 
 **SCPID signed content field order:**
@@ -1113,12 +1421,12 @@ signature = Ed25519_sign(private_key, signed_bytes)
 | 4 | `audience` | 4-byte BE length prefix + UTF-8 bytes |
 | 5 | `signed_at` | 8-byte big-endian u64 |
 
-The domain separator `"SCP-DID-AUTH-V1:"` prevents cross-protocol signature reuse. The SHA-256 wrap aligns with the majority SCP signing pattern (InnerEnvelope, BroadcastEnvelope, sender keys, access keys, sync structures, claims). The `did` and `signing_key_id` fields bind the signature to the signer's identity and key role, preventing signature transplant across DIDs and key confusion between `#active` and `#agent`.
+**This preimage takes the identifier as UTF-8 bytes in the text form §3.1 fixes**, and `09-security-model.md` §9.5.2 enumerates it among the preimages that take that form. The domain separator `"SCP-DID-AUTH-V1:"` prevents cross-protocol signature reuse. The SHA-256 wrap aligns with the majority SCP signing pattern (InnerEnvelope, BroadcastEnvelope, sender keys, access keys, sync structures, claims). The `did` and `signing_key_id` fields bind the signature to the signer's identifier and to the role that produced it, so a relying party cannot be shown a signature transplanted from another identity or presented under a role that did not sign.
 
-**Signing key selection:**
+**Signing key and signing identity:**
 
-- `#active` — human-initiated authentication. Biometric-protected, appropriate for sensitive actions.
-- `#agent` — agent-initiated authentication. Software-held, no biometric gate. Appropriate for autonomous background operations. The relying party MAY distinguish between `#active` and `#agent` values of `signing_key_id` for authorization decisions (e.g., requiring `#active` for account-level changes). Because `signing_key_id` is included in the signed content (§3.11.3), this distinction is cryptographically authenticated — a signature produced with `#agent` cannot be presented as `#active`.
+- `#active` — the identity's one operational signing key (`09-security-model.md` §9.7.4.2 definitions). A human identity signs an SCPID response under it, and the custody substrate holding it supplies whatever local gate it offers, such as a biometric prompt.
+- A delegated agent identity signs its own SCPID responses under its own `#active`. A relying party tells an agent from a human by the responding identifier and never by a fragment, because a delegated identity's key state names the delegator that anchors it (`09-security-model.md` §9.7.4.2 definitions). The delegation model states how a verifier checks that anchor, and it is unspecified as of 2026-09-10 (`00-open-questions.md`), so a verifier rejects every chain that claims delegation and no delegated agent identity resolves today.
 
 ### 3.11.4 Verification Procedure
 
@@ -1133,24 +1441,30 @@ The relying party verifies a response:
    not URI normalization.
 4. Check the challenge has not expired: current_time <= expires_at.
    Check signed_at is within the challenge's [issued_at, expires_at] window.
-5. Resolve the DID document:
-   a. Resolve did via DHT (BEP44 lookup) or SCP relay QUERY (§3.10.4).
-   b. Verify the BEP44 signature on the DID document (§9.6.1).
-   c. Cache policy: the DID document MUST be fresh — fetched within the last
-      300 seconds or cached with valid TTL. Stale documents MUST trigger
-      a fresh resolution.
-6. Extract the public key for signing_key_id from the DID document's
-   verificationMethod array.
-7. Confirm signing_key_id is one of "#active" or "#agent". Reject any
-   other value with KEY_NOT_AUTHORIZED.
-8. Confirm signing_key_id is listed in the DID document's "authentication"
-   relationship. Reject if not.
+5. Resolve the identity's key state:
+   a. QUERY the identity's routing ID on SCP relays (§3.10.4).
+   b. Recompute the identifier from the served chain's inception event and
+      verify every event of the chain (§9.6.1); derive the key state from
+      the chain's latest state-carrying event (`09-security-model.md`
+      §9.7.4.2 R8), which is what a resolution yields
+      (`09-security-model.md` §9.6.1).
+   c. Cache policy: the key state MUST be fresh — resolved within the last
+      300 seconds. A stale key state MUST trigger a fresh resolution.
+6. Read the public key the key state lists `Current` in the role
+   signing_key_id names.
+7. Confirm signing_key_id is "#active". Reject any other value
+   with KEY_NOT_AUTHORIZED. A human identity's key state names one
+   operational role (`09-security-model.md` §9.1 invariant 1), so
+   "#active" is the only role a relying party accepts here.
+8. Confirm the key state lists that key `Current`
+   (`09-security-model.md` §9.7.4.2 definitions). Reject if not.
 9. Reconstruct signed_bytes from did, signing_key_id, nonce, audience,
    signed_at per §3.11.3 (SHA-256 of canonical concatenation).
-10. Verify the Ed25519 (PureEdDSA, RFC 8032 §5.1.6) signature over
+10. Verify the P-256 ECDSA signature (FIPS 186-5, low-`s` enforced) over
     signed_bytes using the extracted public key.
 11. If all checks pass: the request is authenticated as originating from
-    the holder of the DID's signing_key_id verification method.
+    the holder of the key the key state lists `Current` in the role
+    signing_key_id names.
 ```
 
 **Error responses.** The relying party SHOULD return structured errors:
@@ -1160,14 +1474,14 @@ The relying party verifies a response:
 | Nonce unknown, mismatched, or expired | `CHALLENGE_EXPIRED` | `SCP-IDENT-1030` |
 | Audience mismatch | `AUDIENCE_MISMATCH` | `SCP-IDENT-1031` |
 | `signed_at` outside challenge window or challenge expired | `TIMESTAMP_INVALID` | `SCP-IDENT-1032` |
-| DID resolution failed | `DID_RESOLUTION_FAILED` | `SCP-IDENT-1033` |
-| `signing_key_id` not `#active`/`#agent` or not in `authentication` | `KEY_NOT_AUTHORIZED` | `SCP-IDENT-1034` |
+| Resolution failed | `DID_RESOLUTION_FAILED` | `SCP-IDENT-1033` |
+| `signing_key_id` is not `#active` | `KEY_NOT_AUTHORIZED` | `SCP-IDENT-1034` |
 | Signature verification failed | `SIGNATURE_INVALID` | `SCP-IDENT-1035` |
-| DID document stale (> 300s, refresh failed) | `DID_DOCUMENT_STALE` | `SCP-IDENT-1036` |
+| Key state stale (> 300s, refresh failed) | `KEY_STATE_STALE` | `SCP-IDENT-1036` |
 | Key custody or signing operation failed | `SIGNING_FAILED` | `SCP-IDENT-1037` |
 | Input validation failure | `INVALID_INPUT` | `SCP-IDENT-1038` |
 
-**Error response guidance.** Relying parties SHOULD NOT return specific error codes to untrusted clients. Return a generic failure (e.g., HTTP 401 with `"authentication_failed"`) for all verification failures. Specific `SCP-IDENT-103x` codes are for server-side logging and debugging only. Exposing which step failed provides a verification oracle that helps attackers enumerate valid DIDs and probe key configurations.
+**Error response guidance.** Relying parties SHOULD NOT return specific error codes to untrusted clients. Return a generic failure (e.g., HTTP 401 with `"authentication_failed"`) for all verification failures. Specific `SCP-IDENT-103x` codes are for server-side logging and debugging only. Exposing which step failed provides a verification oracle that helps an attacker enumerate valid identifiers and probe key configurations.
 
 ### 3.11.5 Wire Format
 
@@ -1188,7 +1502,7 @@ The relying party verifies a response:
 ```json
 {
   "protocol": "scpid/1.0",
-  "did": "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+  "did": "<the signer's identifier, in the text form 03 §3.1 fixes>",
   "signing_key_id": "#active",
   "nonce": "<64 hex chars>",
   "audience": "https://app.example.com",
@@ -1203,19 +1517,19 @@ The `protocol` field identifies the authentication scheme and version. Relying p
 
 ### 3.11.6 Security Properties
 
-**Replay prevention.** The nonce is single-use. The relying party MUST track issued nonces and reject any nonce presented more than once. Nonce storage can be pruned after `expires_at` — expired challenges are rejected regardless of nonce state. For distributed relying parties (multiple server instances behind a load balancer), nonce storage MUST use a strongly-consistent data store (e.g., Redis with NX-SET, database with unique constraint). Eventually-consistent stores risk double-acceptance. Alternatively, bind the challenge to a specific server instance using HMAC: `nonce = HMAC-SHA-256(server_secret, random_bytes || issued_at)`, verified without shared state. In this case, the relying party reconstructs the `ScpIdChallenge` from the HMAC nonce and stored parameters before passing it to `scpid_verify`.
+**Replay prevention.** The nonce is single-use. The relying party MUST track issued nonces and reject any nonce presented more than once, and it MAY prune a nonce after `expires_at`, because it rejects an expired challenge whatever the nonce state says. A relying party spread over several server instances MUST hold that nonce store in a strongly-consistent data store, such as Redis with NX-SET or a database with a unique constraint, because an eventually-consistent store accepts one nonce twice. Alternatively, bind the challenge to a specific server instance using HMAC: `nonce = HMAC-SHA-256(server_secret, random_bytes || issued_at)`, verified without shared state. In this case, the relying party reconstructs the `ScpIdChallenge` from the HMAC nonce and stored parameters before passing it to `scpid_verify`.
 
 **Audience binding.** The `audience` field is included in the signed content. A signature produced for `https://app-a.example.com` does not verify for `https://app-b.example.com`. This prevents cross-service signature relay attacks where an attacker presents a legitimate signature obtained from one service to another. Audience comparison MUST be exact byte-for-byte string comparison, not URI normalization. The relying party MUST publish its canonical audience URI and the client MUST use it verbatim. This matches the OIDC `aud` claim comparison model.
 
 **Timestamp freshness.** The `signed_at` timestamp must fall within the challenge's validity window (`issued_at` <= `signed_at` <= `expires_at`). This bounds the useful lifetime of a stolen challenge to the challenge's expiry window.
 
-**No bearer tokens.** The protocol does not produce a bearer token. Each authentication is a fresh challenge-response cycle. Session management (issuing a JWT, setting a cookie, etc.) is the relying party's responsibility and is explicitly outside this protocol's scope. This means a compromised session token does not compromise the DID — re-authentication requires the private key.
+**No bearer tokens.** The protocol does not produce a bearer token. Each authentication is a fresh challenge-response cycle. Session management (issuing a JWT, setting a cookie, etc.) is the relying party's responsibility and is explicitly outside this protocol's scope. A compromised session token therefore does not compromise the identity, because re-authentication requires the private key.
 
-**Key compromise recovery.** If `#active` is compromised, the identity owner rotates it via DID document update signed by `#0` (§9.12). After rotation, the old key is no longer in the DID document's `authentication` relationship. Verification step 7 rejects signatures from the old key. Recovery latency is bounded by DID document propagation time (republish cycle: 2 hours for DHT, 6 days for relays, or immediate via manual republish).
+**Key compromise recovery.** Where `#active` is compromised, the standing root signs a `KeyState` (`09-security-model.md` §9.7.4.2 R3) whose key list carries a fresh `#active` `Current` and does not carry the compromised key at all, and a verifier reads that key's condition by replaying the log (`09-security-model.md` §9.7.4.2 R8, §9.12). After the rotation the old key is no longer `Current`, so verification step 7 rejects its signatures, and content it signed is accepted only under §9.7.1's boundary rule. Recovery latency is bounded by key-event-log propagation to the identity's relays and by the 5-minute resolution-freshness bound of §9.7.1 check 2.
 
 **MITM resistance.** SCPID does not provide channel binding. If the transport between client and relying party is compromised (no TLS), an attacker can intercept and replay the challenge-response in real time. Relying parties MUST serve challenges and accept responses over TLS. The audience field mitigates relay attacks across services but does not replace transport-layer encryption.
 
-**Agent vs. human distinction.** The `signing_key_id` field tells the relying party whether a human (`#active`, biometric-gated) or an agent (`#agent`, software-held) signed the challenge. Because `signing_key_id` is included in the signed content (§3.11.3), this distinction is cryptographically authenticated. The relying party can enforce authorization policies based on this distinction — e.g., requiring `#active` for destructive operations and accepting `#agent` for routine API access.
+**Agent vs. human distinction.** The responding identity tells the relying party whether a human or an agent signed the challenge: a human identity signs under its own `#active`, and an agent signs under the `#active` of its own delegated identity, whose key state names the human identity that anchors it (`09-security-model.md` §9.7.4.2 definitions). The `did` field is inside the signed content (§3.11.3), so the distinction is cryptographically authenticated. The relying party can enforce authorization policies on it — requiring a human identity for destructive operations and accepting a delegated agent identity for routine API access. **No delegated agent identity resolves today**, because `09-security-model.md` §9.7.4.2 R3 rejects every chain whose `delegator` field is nonzero until the delegation model is specified, which it is not as of 2026-09-10 (`00-open-questions.md`), so this paragraph states the distinction that model will carry.
 
 ### 3.11.7 Relationship to Context Membership
 
@@ -1223,17 +1537,17 @@ SCPID and context membership are independent authentication mechanisms for diffe
 
 | | SCPID | Context membership |
 |---|---|---|
-| **Proves** | Control of a DID's signing key | Membership in an MLS group |
+| **Proves** | Control of an identity's `#active` key | Membership in an MLS group |
 | **Scope** | Per-request, stateless | Persistent, epoch-based |
 | **Use case** | HTTP APIs, webhooks, external services | Protocol operations within a context |
-| **Requires SCP SDK** | No (only DID resolution + Ed25519) | Yes (MLS, key packages, group state) |
+| **Requires SCP SDK** | No (key-state resolution and P-256 ECDSA) | Yes (MLS, key packages, group state) |
 | **Session state** | None (relying party's concern) | MLS epoch (protocol-managed) |
 
-An SCP-native app will typically use **context membership** for protocol operations (messaging, governance, outlet invocation) and **SCPID** for HTTP API endpoints (REST APIs, webhooks, OAuth callbacks) that need to authenticate requests from DID holders outside the MLS channel.
+An SCP-native app will typically use **context membership** for protocol operations (messaging, governance, outlet invocation) and **SCPID** for HTTP API endpoints (REST APIs, webhooks, OAuth callbacks) that need to authenticate requests from identifier holders outside the MLS channel.
 
 ### 3.11.8 SDK API Surface
 
-The SDK provides functions for all three protocol roles. SCPID operations use `ScpIdError` rather than `IdentityError` to keep protocol-level authentication errors separate from identity-layer concerns (DID resolution, key management). This avoids polluting `scp-identity`'s error type with SCPID-specific variants.
+The SDK provides functions for all three protocol roles. **The three signatures below take and return the identifier's 32 raw digest bytes and never its text form**, because the SDK encodes the text form of §3.1 itself where the `"SCP-DID-AUTH-V1:"` challenge of §3.11.3 needs it, so no binding encodes one of its own. SCPID operations use `ScpIdError` rather than `IdentityError`, which keeps protocol-level authentication errors separate from the identity layer's own concerns, resolution and key management. This avoids polluting `scp-identity`'s error type with SCPID-specific variants.
 
 **Challenge generation (relying party):**
 
@@ -1251,15 +1565,16 @@ pub fn scpid_challenge(
 **Challenge signing (client):**
 
 ```rust
-/// Sign an SCPID challenge using the specified verification method.
+/// Sign an SCPID challenge under the named operational role.
 ///
 /// Constructs signed_bytes per §3.11.3 (SHA-256 of canonical concatenation
-/// including did and signing_key_id), signs with Ed25519, returns the response.
+/// including the identifier and signing_key_id), signs with P-256 ECDSA, returns
+/// the response. §3.11.3 states the deferral that preimage waits on.
 pub async fn scpid_sign(
     custody: &impl KeyCustody,
     signing_key: &KeyHandle,
-    did: &str,
-    signing_key_id: SigningKeyId,  // Active or Agent (from scp-identity)
+    identifier: &[u8; 32],
+    signing_key_id: SigningKeyId,  // Active — the identity's one operational role
     challenge: &ScpIdChallenge,
 ) -> Result<ScpIdResponse, ScpIdError>;
 ```
@@ -1270,44 +1585,44 @@ pub async fn scpid_sign(
 /// Verify an SCPID response against the original challenge.
 ///
 /// Performs the full 11-step verification procedure (§3.11.4): nonce match,
-/// audience match, timestamp window, DID resolution, key extraction,
-/// signing_key_id constraint, authentication relationship check,
-/// signed_bytes reconstruction, Ed25519 signature verification.
+/// audience match, timestamp window, key-state resolution, key extraction,
+/// signing_key_id constraint, condition check, signed_bytes reconstruction,
+/// and P-256 signature verification.
 ///
 /// The caller MUST ensure the challenge has not been previously consumed
 /// (single-use enforcement). The function checks the response against the
 /// challenge but does not track cross-request nonce state.
 pub async fn scpid_verify(
-    resolver: &dyn DidResolver,
+    backend: &impl IdentityBackend,
     response: &ScpIdResponse,
     challenge: &ScpIdChallenge,
 ) -> Result<ScpIdAuthentication, ScpIdError>;
 
 pub struct ScpIdAuthentication {
-    pub did: String,
+    pub identifier: [u8; 32],
     pub signing_key_id: SigningKeyId,
     pub signed_at: u64,
 }
 ```
 
 **Non-SCP relying parties** can implement verification without the SCP SDK. The only dependencies are:
-1. A `did:dht` resolver (BEP44 lookup — libraries exist for most languages).
+1. An SCP relay QUERY client and the key-event-log verification of §9.6.1 (recompute the identifier, verify every event).
 2. SHA-256 (standard, available everywhere).
-3. An Ed25519 signature verifier (PureEdDSA per RFC 8032 §5.1.6).
+3. A P-256 ECDSA signature verifier (FIPS 186-5) that rejects a high-`s` signature.
 4. JSON parsing.
 
-This is intentional. SCPID is designed to be implementable by services that have no other relationship with SCP.
+That list is the whole dependency set, so a service with no other relationship to SCP can implement verification.
 
 ### 3.11.9 Implementation Notes for Non-SCP Relying Parties
 
-A service that wants to accept SCP DID authentication without running SCP software:
+A service that wants to accept SCP identity authentication without running SCP software:
 
-1. **DID resolution.** Use any `did:dht` resolver library. The DID document is a BEP44 signed mutable item on Mainline DHT. Libraries: `did-dht` (Rust), `@decentralized-identity/did-dht` (JS), or raw BEP44 lookups via any DHT client. For SCPID verification, DID documents MUST be cached for no more than 300 seconds. The general §3.10.4 caching policy (24h/7d) does NOT apply to SCPID verification — authentication requires current key state.
+1. **Key-state resolution.** QUERY the identity's routing ID, `SHA-256("scp:did:" || identifier_bytes)`, on the SCP relays the identity's service record lists (§3.10.13) and on the community relays of §18.5.1; each stored blob is a key-event record frame (§9.10.12) whose `value` carries a segment of the identity's key-event log. Assemble the chain, recompute the identifier from its inception event, verify every event, and derive the key state from the latest state-carrying event (§9.6.1). A relying party that holds no prior chain for the identity reads two community-relay-list entries under distinct **33-byte operator keys**, comparing the entries' own `key` bytes and never their declared operator identifiers, because one party holding one listed key can answer as two declared identities (`09-security-model.md` §9.7.4.2 R11); one of the two is in the fallback set. For SCPID verification, a resolved key state MUST be cached for no more than 300 seconds. The general §3.10.4 caching policy (24h/7d) does NOT apply to SCPID verification — authentication requires current key state.
 
-2. **DID document parsing.** The document is W3C DID Core JSON (§18.2.2A). Extract the `verificationMethod` array and `authentication` relationship. Match `signing_key_id` to a verification method, confirm it appears in `authentication`, extract `publicKeyMultibase`. Decoding: strip the `z` prefix (multibase indicator for base58btc), base58btc-decode the remainder to get the raw 32-byte Ed25519 public key.
+2. **Reading the key from the key state.** The key state lists every key `Current` at the adopted position, by role and by condition, and lists no other key (`09-security-model.md` §9.7.4.2 definitions). Match `signing_key_id` to the role the key state names, confirm the key state lists that key `Current`, and read its 33-byte SEC1 compressed P-256 public key. A relying party needing an earlier key's condition replays the log instead (`09-security-model.md` §9.7.4.2 R8). It parses no identity document and needs none, because the protocol publishes an identity's keys in the key-event log alone (ADR-063, the inception-derived key-event-log identity substrate).
 
-3. **Signature verification.** Reconstruct `signed_bytes` per §3.11.3: concatenate the domain separator `"SCP-DID-AUTH-V1:"`, length-prefixed `did`, length-prefixed `signing_key_id`, raw 32-byte `nonce`, length-prefixed `audience`, and 8-byte big-endian `signed_at`. Compute SHA-256 of the concatenation. Verify the Ed25519 signature (PureEdDSA, RFC 8032 §5.1.6) over the resulting 32-byte hash. Standard libraries: `ring`, `ed25519-dalek` (Rust), `tweetnacl` (JS), `pynacl` (Python), `Crypto.Sign` (Swift).
+3. **Signature verification.** Reconstruct `signed_bytes` per §3.11.3, whose preimage takes the identifier as UTF-8 bytes in the text form §3.1 fixes: concatenate the domain separator `"SCP-DID-AUTH-V1:"`, length-prefixed identifier, length-prefixed `signing_key_id`, raw 32-byte `nonce`, length-prefixed `audience`, and 8-byte big-endian `signed_at`. Compute SHA-256 of the concatenation. Verify the P-256 ECDSA signature over the resulting 32-byte hash, rejecting a high-`s` value (`09-security-model.md` §9.5). Standard libraries: `ring` and `p256` (Rust), the Web Crypto API's `ECDSA` with `P-256` (JS), `cryptography` (Python), and CryptoKit's `P256.Signing` (Swift).
 
 4. **Nonce management.** Store issued nonces with their `expires_at`. Reject duplicates. Prune expired entries. For distributed deployments, use a strongly-consistent store or HMAC-based nonce generation (§3.11.6).
 
-No SCP SDK, no MLS, no context management, no relay connections. The entire verification path is: one DHT lookup + one JSON parse + one SHA-256 + one Ed25519 verify.
+No SCP SDK, no MLS, and no context management. The verification path is: two relay QUERYs, the chain verification of §9.6.1, one JSON parse, one SHA-256, and one P-256 verify.

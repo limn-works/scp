@@ -8,7 +8,7 @@ before it held.
 
 1. **Store the revocation where the revoked party cannot clear it.** The first version
    recorded the ban on the membership-scoped `read_exclusion_list`, which the banned member's
-   own `leave` clears, so a banned DID could self-leave and replay a retained UCAN. The ban now
+   own `leave` clears, so a banned member could self-leave and replay a retained UCAN. The ban now
    lives in `banned_subscribers` on `BroadcastContext`, cleared only by an authority
    `RestoreAccess` and persisted fail-closed in the snapshot. Never co-locate a revocation
    with state the revoked party's own lifecycle mutates.

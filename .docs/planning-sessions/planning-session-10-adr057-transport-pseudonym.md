@@ -15,6 +15,15 @@
   - **Pseudonym-derivation ALGORITHM shared; NATIVE reaches it, BROWSER does not (yet).** The §9.10.4.A HKDF-SHA-256 derivation (`scp-platform/src/pseudonym.rs`, `derive_pseudonym_secret`/`derive_pseudonym_keypair`) is exposed on the `KeyCustody::derive_pseudonym` port (`scp-platform/src/traits.rs` ~line 418) and reached by the **native** runtime. The **browser does NOT reach it today** — verified: `crates/scp-client-wasm/src/custody.rs`'s `JsKeyCustody` has NO `derivePseudonym` method (only `did`/`sign`/`getPublicKey`/`generateKeypair`/`destroyKey`/`dhAgree`, all labeled unwired seams); `scp-client-wasm`'s `Cargo.toml` has **no** `scp-platform` dependency; a grep for `pseudonym`/`Pseudonym` across `scp-client-wasm`/`scp-client` returns **zero** hits. Byte-parity, once a browser seam exists, is pinned by the §25.19 KAT (`pseudonym.rs` `derive_pseudonym_keypair_known_answer_vectors`) — but parity presupposes existence, which is a **prerequisite not yet built** (see T-1 and Sequencing). **Resolved 2026-07-16: Option A** — the browser derives in Rust over the wasm-held key via the shared `scp-crypto::pseudonym` factoring (the derivation moved out of `scp-platform`); see the ADR-057 [Amendment (2026-07-16 — Option A)](../adrs/ADR-057-in-browser-client-over-shared-mls.md). The KAT reference now lives at `crates/scp-crypto/src/pseudonym.rs`.
 - Spec: §9.10.4 (per-context pseudonyms + announcement/reserved-RID rules), §9.10.4.A (pseudonym derivation), §5.12.3 (invitation bundle), §10.15.3 (WebSocket relay baseline), §25.19 (pseudonym KAT vectors).
 
+> **Annotation, 2026-09-13.** Everything below is the record as its author wrote it on the
+> date this file carries, restored unedited. The identity model it reads — Ed25519 and the identifier written as a `did:` string — was
+> replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity substrate,
+> whose rules `.docs/specs/09-security-model.md` §9.7.4.2 and `.docs/specs/03-identity.md`
+> §3.10 carry, and whose curve Alec settled on 2026-09-10 as ECDSA on NIST P-256
+> (`.docs/specs/09-security-model.md` §9.5). A record of what a named party read on a named
+> date states what that party read, so this annotation records what replaced the model and
+> no sentence below is edited to match.
+
 ## Context / how this was scoped
 
 The 2026-07-15 session (D4) settled the transport *seam*: an injected `JsSocket` port, WebSocket-first. It deliberately did **not** settle what the browser puts on that seam. Two design questions were left open, and both are DOA-grade (a wrong answer is a permanent privacy or interop regression):

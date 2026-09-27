@@ -149,12 +149,12 @@ at the FFI boundary; length mismatches return `ScpError::Validation`.
 - **Swift** — `SCP.withStorage(StorageConfig.sqlite(path:key:))`.
 - **Kotlin** — `SCP.withStorage(StorageConfig.Sqlite(path, key))`.
 
-### 5. UniFFI `ContextManager` requires a local DID (#1342)
+### 5. UniFFI `ContextManager` requires a local identity (#1342)
 
 `FfiBridgeCrypto` is deleted. The UniFFI bridge constructs
 `NodeMlsFactory::new(did)` exactly like PyO3 and NAPI. Every context
 operation (`context_create`, `context_join`, `context_import`) requires
-a DID to have been registered via `scp.registerLocalDid(…)` first.
+an identity to have been registered via `scp.registerLocalDid(…)` first.
 
 - **Swift / Kotlin** — calling a context operation before
   `scp.registerLocalDid(...)` returns
@@ -191,8 +191,8 @@ invariant (N adapters before suspend → N adapters after resume) holds.
 
 ### 7. `register_local_did` returns `Result<(), ScpError>` (UniFFI, #1342)
 
-Previously infallible. Now returns `ScpError::Validation` when the DID
-string fails `Did::from_str` parsing. Callers must `try`/handle the
+Previously infallible. Now returns `ScpError::Validation` when the
+argument fails `Did::from_str` parsing. Callers must `try`/handle the
 error.
 
 ### 8. Python extension `Vec<u8>` returns are `bytes` (PyO3 0.24 upgrade)
@@ -227,7 +227,7 @@ scp = SCP(storage={"type": "sqlite",
 
 Read-only monotonic identifier assigned at construction. Every handle
 type (`ContextHandle`, `Identity`, `UcanToken`, `MessageReceiver`,
-`TransportManager`, `RelayHandle`, `NodeHandle`, `DIDDocument`) carries
+`TransportManager`, `RelayHandle`, `NodeHandle`) carries
 the `instance_id` of its owning `SCP`. Every handle-accepting FFI
 function runs a cheap runtime check and returns `SCP-PERM-3030` on
 mismatch. The check is enforced mechanically by

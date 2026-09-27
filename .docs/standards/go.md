@@ -69,7 +69,7 @@ defer ctx.Close()
 - Packages: `lowercase` (single word preferred)
 - Files: `snake_case.go`
 - Test files: `snake_case_test.go`
-- Acronyms: all caps when exported (`DID`, `UCAN`, `MLS`), lowercase when unexported
+- Acronyms: all caps when exported (`UCAN`, `MLS`), lowercase when unexported
 
 ## Testing
 
@@ -81,8 +81,9 @@ func TestNewIdentity(t *testing.T) {
     if err != nil {
         t.Fatalf("NewIdentity failed: %v", err)
     }
-    if !strings.HasPrefix(identity.DID(), "did:dht:") {
-        t.Errorf("expected did:dht: prefix, got %s", identity.DID())
+    // 09-security-model.md §9.7.4.2 R13
+    if len(identity.Identifier()) != 32 {
+        t.Errorf("identifier length = %d, want 32", len(identity.Identifier()))
     }
 }
 

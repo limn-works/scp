@@ -18,12 +18,12 @@ the operational provider cannot recover the pre-rotation key.
 
 ## Migration is the designed exception
 
-`consume(handle)` destroy-and-exports the 32-byte seed, the bytes cross the FFI boundary as
-`Zeroizing<[u8; 32]>`, and `import_ed25519_signing_key` installs them as the new `#0`.
-`Zeroizing` narrows the exposure window and does not close it: a core dump, a debugger, or a
-cold-boot read while the bytes are live captures the seed. Keep the `consume` → `import`
-sequence free of IO, logging, persistence, and copies. A backend where the key never exists
-as raw bytes, such as an HSM, could rewrap inside one substrate and avoid the transit.
+The handoff destroy-and-exports the 32-byte key from the pre-rotation custody adapter, the
+bytes cross the FFI boundary in a `Zeroizing` buffer, and the substrate imports them as the new
+`#0`. `Zeroizing` narrows the exposure window and does not close it: a core dump, a debugger,
+or a cold-boot read while the bytes are live captures the key. Keep the export and the import
+free of IO, logging, persistence, and copies. A backend where the key never exists as raw
+bytes, such as an HSM or a secure element, rewraps inside one substrate and avoids the transit.
 
 ## Rules
 
@@ -34,5 +34,4 @@ as raw bytes, such as an HSM, could rewrap inside one substrate and avoid the tr
 3. State the boundary: isolation holds at rest, and the secret is observable during the
    handoff.
 
-`generate_ephemeral_ed25519_seed` in `crates/scp-ffi/uniffi/src/bridge.rs` carries the code
-comment recording the same boundary.
+`crates/scp-ffi/uniffi/src/bridge.rs` carries the code comment recording the same boundary.

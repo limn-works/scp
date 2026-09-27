@@ -6,6 +6,15 @@
 
 ---
 
+> **Annotation, 2026-09-11.** Everything below is the record as it was written on the date
+> above, restored unedited. The identity model it names — did:dht, the DID document and its
+> verification methods, the shared `#agent` key, the identifier as a `did:` string — was
+> replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity substrate,
+> whose rules `.docs/specs/09-security-model.md` §9.7.4.2 and `.docs/specs/03-identity.md`
+> carry. A record of what a named party read on a named date states what that party read, so
+> this annotation records what replaced it and the text below is not edited to match.
+
+
 ## Origin and Motivation
 
 Alec observed that app generation is becoming trivial — clients and server logic will be generated on-demand from simple prompts. What remains hard is the connective tissue: identity, social relationships, transport, persistence, and trust. He proposed building an open, ecosystem-agnostic infrastructure layer that sits beneath any generated or traditional application.
