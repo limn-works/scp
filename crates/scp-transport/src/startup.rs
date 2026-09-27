@@ -270,8 +270,9 @@ pub fn backend_choice_from_env(binary_feature: &str) -> BackendChoice {
 /// backend's configuration from the environment.
 ///
 /// `choice` comes from [`backend_choice_from_env`], which reads
-/// `SCP_RELAY_STORAGE_BACKEND` and applies the `sqlite` default; this function
-/// reads neither. Its doc comment lists each backend's config variables. Calls
+/// `SCP_RELAY_STORAGE_BACKEND` and applies the `sqlite` default. This function
+/// reads no selection variable and applies no default. The doc comment of
+/// [`backend_choice_from_env`] lists each backend's config variables. Calls
 /// [`std::process::exit`] when the backend's configuration is missing or its
 /// store fails to open.
 ///
