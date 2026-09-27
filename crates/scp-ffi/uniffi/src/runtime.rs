@@ -988,7 +988,9 @@ impl UniffiBridgeInstance {
     /// Reads a context's role state from that context's supervisor actor.
     ///
     /// Every `UniFFI` entry point that decides authorization, membership, a role,
-    /// a capability, or a capability ceiling reads through this function. The
+    /// a capability, or a capability ceiling reads through this function, except
+    /// the media helpers `media_check_capability` and `media_initiate_session`,
+    /// which check a request against a ceiling list the caller passes. The
     /// per-context UCAN state carried a `creator_did` and a `ceiling_strings`
     /// set recorded when THIS bridge registered the context, and a
     /// `ModifyCeiling` governance action left the ceiling granting what the
