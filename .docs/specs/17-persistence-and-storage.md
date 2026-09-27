@@ -592,6 +592,8 @@ Relay blob storage is a provider capability governed by the general capability-s
 | `PostgresBlobStore` | `sqlx` + PostgreSQL | Production/enterprise relays | Phase 5 |
 | `S3BlobStore` | `aws-sdk-s3` (Apache-2.0) | Large-scale relays, cloud deployments | Phase 5 |
 
+The `scp-relay` and `scp-node` binaries compile `PostgresBlobStore` and `S3BlobStore` only when a build selects their `cloud-blobs` cargo feature, which is off by default, because the `sqlx` PostgreSQL client and the AWS S3 client add 56 packages to the `scp-node` dependency graph and 75 to the `scp-relay` graph. A default build therefore carries `SqliteBlobStore`, `RedbBlobStore` and `InMemoryBlobStore`. When an operator selects `postgres` or `s3` for a binary built without `cloud-blobs`, the binary MUST fail closed under SCP-CAPSEL-8001: it reports that the requested backend is not compiled into the binary, names the `cloud-blobs` feature that compiles it, and exits before it opens any store. It MUST NOT substitute another backend. `scripts/check-shipped-feature-graph.sh` fails when a shipped artifact's resolved feature set contains `scp-transport/postgres-blob` or `scp-transport/s3-blob`, because its allowlist omits both.
+
 ### Why redb
 
 Pure Rust (no C/C++ dependency), stable on-disk format (v3), active maintenance, better write performance than SQLite for KV workloads. Fills the gap between SQLite (personal) and PostgreSQL (production). Replaces sled in all spec references — sled is in perpetual beta with an unstable on-disk format, violating the "no DOA decisions" tenet.
