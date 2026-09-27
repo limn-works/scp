@@ -996,7 +996,7 @@ mod xctx_streaming_saga_tests {
         "governance:propose",
     ];
 
-    /// Drives `context_id` to a real non-active (`Closed`) lifecycle state through
+    /// Drives `context_id` to a real non-active (`Closing`) lifecycle state through
     /// the REAL supervisor close path — the exact `LifecycleCommand::CloseContext`
     /// dispatch the bridge's close uses — so a subsequent
     /// `supervisor.read_context_state(context_id)` returns a non-`Active` state.
@@ -1004,7 +1004,7 @@ mod xctx_streaming_saga_tests {
     /// what the streaming-saga open's active-state guard now reads. `initiator_did`
     /// must be the creator of a context created with a `ContextClose`-bearing
     /// ceiling (see [`CLOSEABLE_STREAMING_CEILING`]).
-    async fn drive_context_closed(
+    async fn drive_context_closing(
         bi: &Arc<crate::runtime::UniffiBridgeInstance>,
         context_id: &str,
         initiator_did: &str,
@@ -1085,7 +1085,7 @@ mod xctx_streaming_saga_tests {
             )
             .await
             .expect("context_create (target) should succeed");
-        drive_context_closed(&bi, &handle_a.context_id(), &hosted_caller).await;
+        drive_context_closing(&bi, &handle_a.context_id(), &hosted_caller).await;
 
         // Precondition: the authoritative supervisor state is non-active — this is
         // what the guard reads, proving the test drives a REAL Closing/Closed
@@ -1145,7 +1145,7 @@ mod xctx_streaming_saga_tests {
             )
             .await
             .expect("context_create (target 2) should succeed");
-        drive_context_closed(&bi, &handle_d.context_id(), &hosted_caller).await;
+        drive_context_closing(&bi, &handle_d.context_id(), &hosted_caller).await;
 
         let (caller, outlet, input, nonce, ucan) = open_args(hosted_caller, outlet_id);
         let err = outlet_streaming_saga_open_impl(

@@ -1354,7 +1354,7 @@ mod xctx_streaming_saga_tests {
             .expect("context_create should succeed")
     }
 
-    /// Drives `context_id` to a real non-active (`Closed`) lifecycle state through
+    /// Drives `context_id` to a real non-active (`Closing`) lifecycle state through
     /// the REAL supervisor close path — the exact `LifecycleCommand::CloseContext`
     /// dispatch the bridge's close uses — so a subsequent
     /// `supervisor.read_context_state(context_id)` returns a non-`Active` state.
@@ -1362,7 +1362,7 @@ mod xctx_streaming_saga_tests {
     /// streaming-saga open's active-state guard now reads. `initiator_did` must be
     /// the creator of a context created with a `ContextClose`-bearing ceiling (see
     /// `create_closeable_saga_context`).
-    async fn drive_context_closed(
+    async fn drive_context_closing(
         bi: &std::sync::Arc<NapiBridgeInstance>,
         context_id: &str,
         initiator_did: &str,
@@ -1419,7 +1419,7 @@ mod xctx_streaming_saga_tests {
         // the authoritative guard must reject it.
         let handle_a = create_closeable_saga_context(&bi, &owner_identity).await;
         let handle_b = create_closeable_saga_context(&bi, &owner_identity).await;
-        drive_context_closed(&bi, &handle_a.context_id(), &hosted_caller).await;
+        drive_context_closing(&bi, &handle_a.context_id(), &hosted_caller).await;
 
         // Precondition: the authoritative supervisor state is non-active. This is
         // what the guard reads — proving the test drives a REAL Closing/Closed
@@ -1466,7 +1466,7 @@ mod xctx_streaming_saga_tests {
         // only the target axis is non-active.
         let handle_c = create_closeable_saga_context(&bi, &owner_identity).await;
         let handle_d = create_closeable_saga_context(&bi, &owner_identity).await;
-        drive_context_closed(&bi, &handle_d.context_id(), &hosted_caller).await;
+        drive_context_closing(&bi, &handle_d.context_id(), &hosted_caller).await;
 
         let err = Box::pin(outlet_streaming_saga_open_on(
             &bi,

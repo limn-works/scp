@@ -56,8 +56,10 @@ const fn context_state_str(state: &scp_core::context::ContextState) -> &'static 
 /// Rejects an operation unless a context's supervisor actor reports `Active`.
 ///
 /// `verb` names the operation in the error a caller receives, so
-/// `require_active_context(bi, id, "join")` produces "cannot join context in
-/// 'closed' state -- context must be 'active'".
+/// `require_active_context(bi, id, "join", codes::CTX_2013)` produces a
+/// `ContextError` carrying `SCP-CTX-2013` and "cannot join context in
+/// 'closed' state -- context must be 'active'". `code` is the operation's own
+/// code, the one the NAPI and `UniFFI` gates attach for the same operation.
 ///
 /// The state comes from [`crate::runtime::live_context_state`], which queries
 /// the context's supervisor actor. Reading
@@ -69,15 +71,20 @@ fn require_active_context(
     bi: &crate::runtime::PyBridgeInstance,
     context_id: &str,
     verb: &str,
+    code: &str,
 ) -> PyResult<()> {
     let state = crate::runtime::live_context_state(bi, context_id)?;
     if matches!(state, scp_core::context::ContextState::Active) {
         return Ok(());
     }
     let state_name = context_state_str(&state);
-    Err(PyRuntimeError::new_err(format!(
-        "cannot {verb} context in '{state_name}' state -- context must be 'active'"
-    )))
+    Err(crate::error::ScpPyError::ContextError {
+        message: format!(
+            "cannot {verb} context in '{state_name}' state -- context must be 'active'"
+        ),
+        code: code.to_owned(),
+    }
+    .into())
 }
 
 // ---------------------------------------------------------------------------
@@ -132,15 +139,18 @@ impl PyContextHandle {
     /// add a mailbox round-trip to every call). Per ADR-049 §10, the next
     /// per-context operation reads the supervisor and refuses a context whose
     /// actor the watchdog poisoned or found crashed; polling this getter may
-    /// still report the last-known non-terminal state. An operation with a
-    /// bridge lifecycle gate (join, leave, send, receive, every outlet entry
-    /// point that decides authorization, and every UCAN entry point) refuses a
-    /// poisoned context with its own error code, not `SCP-CTX-2134`. An
-    /// operation the supervisor answers without a bridge lifecycle
-    /// gate returns `SCP-CTX-2134` `ContextPoisoned`, and any supervisor read
-    /// during the crashed or mid-respawn window returns `SCP-CTX-2135`
-    /// `ActorCrashed`. Operator recovery from a poisoned context is
-    /// `clear_poison` / process restart, not an SDK call.
+    /// still report the last-known non-terminal state. Join, leave, send, and
+    /// receive refuse a poisoned context with the operation's own code
+    /// (`SCP-CTX-2013`, `SCP-CTX-2015`, `SCP-CTX-2019`, `SCP-CTX-2021`), not
+    /// `SCP-CTX-2134`, and surface a crashed or mid-respawn actor as
+    /// `SCP-CTX-2135` `ActorCrashed`. Every UCAN entry point and every outlet
+    /// entry point that decides authorization refuses a poisoned, crashed, or
+    /// busy context with one text that withholds the lifecycle state and the
+    /// entry point's own code, because those gates run before the caller is
+    /// authorized. An operation the supervisor answers without a bridge
+    /// lifecycle gate returns `SCP-CTX-2134` `ContextPoisoned`. Operator
+    /// recovery from a poisoned context is `clear_poison` / process restart,
+    /// not an SDK call.
     #[getter]
     fn state(&self) -> PyResult<String> {
         let guard = self
@@ -2577,7 +2587,7 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(identity_did)?;
-        require_active_context(bi, &handle.context_id, "join")?;
+        require_active_context(bi, &handle.context_id, "join", codes::CTX_2013)?;
 
         // Parse optional spending UCAN JWT for AND-composition (join cost).
         let spending_ucan = spending_ucan_jwt
@@ -3217,7 +3227,7 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(identity_did)?;
-        require_active_context(bi, &handle.context_id, "leave")?;
+        require_active_context(bi, &handle.context_id, "leave", codes::CTX_2015)?;
 
         // Delegate leave to the shared ContextManager for membership tracking.
         {
@@ -3540,7 +3550,7 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(identity_did)?;
-        require_active_context(bi, &handle.context_id, "send to")?;
+        require_active_context(bi, &handle.context_id, "send to", codes::CTX_2019)?;
 
         // Extract payload bytes: must be bytes or str.
         let payload_bytes: Vec<u8> = if payload.is_instance_of::<pyo3::types::PyBytes>() {
@@ -3634,7 +3644,7 @@ impl crate::scp::PyScp {
     pub fn context_receive(&self, handle: &PyContextHandle) -> PyResult<PyMessageReceiver> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        require_active_context(bi, &handle.context_id, "receive from")?;
+        require_active_context(bi, &handle.context_id, "receive from", codes::CTX_2021)?;
 
         let (tx, rx) = mpsc::channel::<PyMessage>(crate::runtime::RECEIVE_BUFFER_CAPACITY);
         let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
@@ -8050,7 +8060,8 @@ mod tests {
             .expect_err("join must refuse a closed context");
         assert!(
             join.to_string()
-                .contains("cannot join context in 'closing'"),
+                .contains("cannot join context in 'closing'")
+                && join.to_string().contains(codes::CTX_2013),
             "join reported: {join}"
         );
 
@@ -8060,7 +8071,8 @@ mod tests {
         assert!(
             leave
                 .to_string()
-                .contains("cannot leave context in 'closing'"),
+                .contains("cannot leave context in 'closing'")
+                && leave.to_string().contains(codes::CTX_2015),
             "leave reported: {leave}"
         );
 
@@ -8071,7 +8083,8 @@ mod tests {
         });
         assert!(
             send.to_string()
-                .contains("cannot send to context in 'closing'"),
+                .contains("cannot send to context in 'closing'")
+                && send.to_string().contains(codes::CTX_2019),
             "send reported: {send}"
         );
 
@@ -8082,7 +8095,8 @@ mod tests {
         assert!(
             receive
                 .to_string()
-                .contains("cannot receive from context in 'closing'"),
+                .contains("cannot receive from context in 'closing'")
+                && receive.to_string().contains(codes::CTX_2021),
             "receive reported: {receive}"
         );
 

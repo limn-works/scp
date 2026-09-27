@@ -1476,7 +1476,7 @@ fn create_closeable_test_context(bi: &PyBridgeInstance, creator_did: &str) -> St
 /// `supervisor.read_context_state(context_id)` returns `Some(Closing)` — a
 /// non-`Active` answer the streaming-saga open's active-state guard refuses. `initiator_did` must be the creator of a context created with a
 /// `ContextClose`-bearing ceiling (see `create_closeable_test_context`).
-fn drive_context_closed(bi: &PyBridgeInstance, context_id: &str, initiator_did: &str) {
+fn drive_context_closing(bi: &PyBridgeInstance, context_id: &str, initiator_did: &str) {
     use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
 
     let rt = test_runtime();
@@ -2143,7 +2143,7 @@ fn xctx_streaming_saga_open_rejects_non_active_context() {
         let caller_ctx = create_closeable_test_context(bi, &owner);
         let target_ctx = create_closeable_test_context(bi, &owner);
         let outlet_id = register_saga_outlet(py, &scp, &target_ctx, &owner);
-        drive_context_closed(bi, &caller_ctx, &owner);
+        drive_context_closing(bi, &caller_ctx, &owner);
 
         let err = scp
             .outlet_streaming_saga_open(
@@ -2182,7 +2182,7 @@ fn xctx_streaming_saga_open_rejects_non_active_context() {
         let caller_ctx2 = create_closeable_test_context(bi, &owner);
         let target_ctx2 = create_closeable_test_context(bi, &owner);
         let outlet_id2 = register_saga_outlet(py, &scp, &target_ctx2, &owner);
-        drive_context_closed(bi, &target_ctx2, &owner);
+        drive_context_closing(bi, &target_ctx2, &owner);
 
         let err = scp
             .outlet_streaming_saga_open(
@@ -3285,7 +3285,7 @@ fn xctx_unary_saga_rejects_non_active_context() {
         let caller_ctx = create_closeable_test_context(bi, &owner);
         let target_ctx = create_closeable_test_context(bi, &owner);
         let outlet_id = register_saga_outlet(py, &scp, &target_ctx, &owner);
-        drive_context_closed(bi, &caller_ctx, &owner);
+        drive_context_closing(bi, &caller_ctx, &owner);
 
         let err = scp
             .outlet_invoke_cross_context_saga(
@@ -3314,7 +3314,7 @@ fn xctx_unary_saga_rejects_non_active_context() {
         let caller_ctx2 = create_closeable_test_context(bi, &owner);
         let target_ctx2 = create_closeable_test_context(bi, &owner);
         let outlet_id2 = register_saga_outlet(py, &scp, &target_ctx2, &owner);
-        drive_context_closed(bi, &target_ctx2, &owner);
+        drive_context_closing(bi, &target_ctx2, &owner);
 
         let err = scp
             .outlet_invoke_cross_context_saga(

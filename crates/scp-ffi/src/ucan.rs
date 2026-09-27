@@ -226,6 +226,22 @@ impl PyCapabilityValidation {
     }
 }
 
+/// Refuses to issue a UCAN in `context_id` unless this bridge holds the
+/// context's `FfiBridgeState`, whose revocation list `ucan_revoke` writes and
+/// `ucan_validate` reads.
+///
+/// `ucan_mint` and `ucan_delegate` read nothing else from that state, so
+/// without this check they would issue a token for a context whose state this
+/// bridge never registered or already released, and `ucan_revoke` on this
+/// bridge could not revoke that token.
+fn require_revocable_ucan_context(
+    bi: &crate::runtime::PyBridgeInstance,
+    context_id: &str,
+) -> PyResult<()> {
+    crate::runtime::with_context(bi, context_id, |_| Ok(()))?;
+    Ok(())
+}
+
 /// Refuses a UCAN entry point unless `context_id`'s supervisor actor reports
 /// `Active`.
 ///
@@ -587,6 +603,7 @@ impl crate::scp::PyScp {
         // minted (#339). Both come from the supervisor actor: a `ModifyCeiling`
         // narrows what a mint may grant, and a context no actor serves refuses.
         require_active_ucan_context(bi, context_id, "mint a UCAN in context")?;
+        require_revocable_ucan_context(bi, context_id)?;
         let live_role_state = crate::runtime::live_role_state(bi, context_id)?;
         let creator_did = live_role_state.creator_did.clone();
         let live_ceiling_strings = live_role_state.ceiling().to_ucan_string_set();
@@ -700,6 +717,7 @@ impl crate::scp::PyScp {
         // BEFORE the parent parse: an unknown or actor-less context refuses on its
         // own account rather than on the shape of a caller-supplied token.
         require_active_ucan_context(bi, context_id, "delegate a UCAN in context")?;
+        require_revocable_ucan_context(bi, context_id)?;
         let ceiling_strings = crate::runtime::live_ceiling_strings(bi, context_id)?;
 
         // Parse the parent token.
@@ -1321,8 +1339,12 @@ mod tests {
     // `SCP-CTX-2023` and withholds the lifecycle state.
     // `every_ucan_entry_point_refuses_a_resident_actor_that_is_not_active`
     // covers the gate's other arm: an actor that still holds role state but
-    // reports `Closing`. The `*_compares_against_the_supervisor_ceiling` tests
+    // reports `Closing`. The e2e_bridge.rs tests
+    // `ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling`
+    // and `ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling`
     // prove which ceiling value step 8 compares against.
+    // `ucan_mint_and_delegate_refuse_a_context_this_bridge_holds_no_state_for`
+    // covers the revocable-state check mint and delegate run after the gate.
     // -----------------------------------------------------------------------
 
     /// Builds a `PyScp` whose context has FFI state but NO supervisor actor, so
@@ -1356,6 +1378,67 @@ mod tests {
             "the refusal must come from the lifecycle gate: {message}"
         );
         crate::runtime::remove_context(&scp.inner, &ctx_id);
+    }
+
+    /// `ucan_mint` and `ucan_delegate` refuse a context the supervisor serves as
+    /// `Active` when this bridge holds no `FfiBridgeState` for it, the state an
+    /// import or a restore leaves on this bridge. `ucan_revoke` writes the
+    /// revocation list that state holds, so a token either call issued there
+    /// could not be revoked on this bridge.
+    #[test]
+    fn ucan_mint_and_delegate_refuse_a_context_this_bridge_holds_no_state_for() {
+        let creator = "did:dht:z6MkUcanNoBridgeState";
+        crate::init_runtime().ok();
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        let bi = &*scp.inner;
+        let ctx_id = format!("ucan-no-bridge-state-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_for_test(
+            bi,
+            &ctx_id,
+            creator,
+            &["messages:read", "messages:write"],
+        );
+        assert!(
+            matches!(
+                crate::runtime::read_live_context_state(bi, &ctx_id),
+                Ok(Some(scp_core::context::ContextState::Active))
+            ),
+            "the fixture must leave the actor Active, so only the state check refuses"
+        );
+
+        let refusals: [(&str, PyResult<()>); 2] = [
+            (
+                "mint",
+                scp.ucan_mint(
+                    &ctx_id,
+                    "did:dht:z6MkUcanNoBridgeStateAudience",
+                    vec!["messages:write".to_owned()],
+                    None,
+                )
+                .map(drop),
+            ),
+            (
+                "delegate",
+                scp.ucan_delegate(
+                    &ctx_id,
+                    creator,
+                    "did:dht:z6MkUcanNoBridgeStateAudience",
+                    "aaa.bbb.ccc",
+                    vec!["messages:write".to_owned()],
+                )
+                .map(drop),
+            ),
+        ];
+        for (entry_point, result) in refusals {
+            let message = format!(
+                "{}",
+                result.expect_err("a context with no bridge state must refuse")
+            );
+            assert!(
+                message.contains("not found in FFI state registry"),
+                "{entry_point} must refuse at the bridge-state check: {message}"
+            );
+        }
     }
 
     /// Drives `context_id`'s supervisor actor from `Active` to `Closing` through
