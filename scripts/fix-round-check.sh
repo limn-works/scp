@@ -637,14 +637,19 @@ PYEOF
 # ["server"]` in the manifest of each of scp-ffi, scp-ffi-napi and scp-ffi-uniffi, so the
 # `cargo check` above already compiles every module that feature gates.
 #
-# Four CI commands compile the `cloud-blobs` features of scp-node and scp-relay, one
-# package per command, and each has an entry here: the `rust-clippy` job lints each
-# package over every target, adding `testing` for scp-node, and the
+# Four CI lint and test commands compile the `cloud-blobs` features of scp-node and
+# scp-relay, one package per command, and each has an entry here: the `rust-clippy` job
+# lints each package over every target, adding `testing` for scp-node, and the
 # `rust-test-optional-features` job leaves `testing` off and builds only each package's
-# backend-selection test target. CI and this list keep the two packages apart because
-# cargo unifies scp-transport's features across every package one invocation builds: a
-# joint command compiles the PostgreSQL and S3 backends into one package through the
-# other package's `cloud-blobs`.
+# backend-selection test target. Those four commands and this list keep the two packages
+# apart because cargo unifies scp-transport's features across every package one
+# invocation builds: a joint command compiles the PostgreSQL and S3 backends into one
+# package through the other package's `cloud-blobs`, and so hides that package's own
+# mis-wired `cloud-blobs`. The `cargo test --doc` and `cargo doc` commands of the
+# `rust-doc` job, and the `cargo doc` command of `.github/workflows/docs.yml`, turn on
+# `scp-node/cloud-blobs` and `scp-relay/cloud-blobs` together on purpose: rustdoc needs
+# only `postgres_blob.rs` and `s3_blob.rs` compiled, and either package's feature
+# compiles them. No entry here mirrors those three commands.
 EXTRA_FEATURE_CHECKS=(
     "scp-transport|quic,http3,udp,coap"
     "scp-transport|combined,local-cache"
@@ -743,7 +748,9 @@ else
         read -r -a extra_target_args <<< "${extra_targets:---all-targets}"
         for c in "${CRATES[@]}"; do
             [[ $c == "$extra_pkg" ]] || continue
-            run_step "compile($extra_pkg:$extra_features)" \
+            # The label carries an entry's target flags, because two entries can name
+            # the same package and features and differ only in their targets.
+            run_step "compile($extra_pkg:$extra_features${extra_targets:+ $extra_targets})" \
                 cargo check -p "$extra_pkg" "${extra_target_args[@]}" --features "$extra_features"
             break
         done

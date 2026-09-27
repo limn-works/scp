@@ -795,8 +795,8 @@ fi
 
 # ── Case 13b: each binary's cloud-blobs feature in checks of its own ─────────────────
 #
-# CI compiles the PostgreSQL and S3 blob backends of the two binaries in one command per
-# package. The `rust-clippy` job runs `cargo clippy -p scp-node --features cloud-blobs,testing
+# CI lints and tests the PostgreSQL and S3 blob backends of the two binaries in one
+# command per package. The `rust-clippy` job runs `cargo clippy -p scp-node --features cloud-blobs,testing
 # --all-targets` and `cargo clippy -p scp-relay --features cloud-blobs --all-targets`, and the
 # `rust-test-optional-features` job runs `cargo nextest run -p scp-node --features cloud-blobs
 # --test storage_backend_selection` and `cargo nextest run -p scp-relay --features cloud-blobs
@@ -805,10 +805,14 @@ fi
 # other package and hide that package's own mis-wired `cloud-blobs`. The test-lane checks
 # name their test target rather than `--all-targets` because scp-node's `website` example
 # and `integration` test compile only under `testing`, so an `--all-targets` check without
-# it fails on targets that CI command never builds.
+# it fails on targets that CI command never builds. The `rust-doc` job and
+# `.github/workflows/docs.yml` turn on both packages' `cloud-blobs` in one command, because
+# rustdoc needs only the backend modules compiled; this script mirrors no rustdoc command.
 #
 # The mutations it kills: deleting any of the four scp-node and scp-relay entries from
-# EXTRA_FEATURE_CHECKS, or merging two of them back into one two-package check.
+# EXTRA_FEATURE_CHECKS, merging two of them back into one two-package check, or dropping an
+# entry's target flags from its summary label, which gives the two scp-relay checks one
+# label.
 FIXTURE13B="$WORK/binary-cloud-blobs"
 build_fixture "$FIXTURE13B"
 for crate in scp-node scp-relay; do
@@ -834,6 +838,15 @@ for expected in \
         report "case 13b runs \`$expected\`" 0 ""
     else
         report "case 13b runs \`$expected\`" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13B.harness/cargo.log")"
+    fi
+done
+for label in \
+    'compile(scp-relay:cloud-blobs) ok' \
+    'compile(scp-relay:cloud-blobs --test storage_backend) ok'; do
+    if grep -qF -- "$label" "$FIXTURE13B.harness/out.txt"; then
+        report "case 13b's summary names \`$label\`" 0 ""
+    else
+        report "case 13b's summary names \`$label\`" 1 "output tail: $(tail -n 20 "$FIXTURE13B.harness/out.txt")"
     fi
 done
 if grep -qE -- '-p scp-node -p scp-relay [^|]*cloud-blobs' "$FIXTURE13B.harness/cargo.log"; then
