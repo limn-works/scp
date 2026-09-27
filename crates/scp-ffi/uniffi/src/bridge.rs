@@ -13568,19 +13568,6 @@ impl Scp {
             .spawn(async move {
                 validate_outlet_name(&definition.name)?;
 
-                // The supervisor actor answers the lifecycle question, never
-                // the handle's cached state — see
-                // `UniffiBridgeInstance::require_active_context_before_authz`.
-                bi.require_active_context_before_authz(
-                    &handle.context_id,
-                    "register outlet in context",
-                    |msg| ScpError::Outlet {
-                        msg,
-                        code: codes::OUTLET_6003.to_owned(),
-                    },
-                )
-                .await?;
-
                 let input_schema: serde_json::Value =
                     serde_json::from_str(&definition.input_schema_json).map_err(|e| {
                         ScpError::Validation {
@@ -13655,6 +13642,21 @@ impl Scp {
                         payee: c.payee.into(),
                         cost_formula: c.cost_formula,
                     });
+
+                // The pure input checks above refuse a malformed definition
+                // before the lifecycle gate, in the order the PyO3 bridge uses.
+                // The supervisor actor answers the lifecycle question, never
+                // the handle's cached state — see
+                // `UniffiBridgeInstance::require_active_context_before_authz`.
+                bi.require_active_context_before_authz(
+                    &handle.context_id,
+                    "register outlet in context",
+                    |msg| ScpError::Outlet {
+                        msg,
+                        code: codes::OUTLET_6003.to_owned(),
+                    },
+                )
+                .await?;
 
                 let core_registration = scp_core::context::outlets::OutletRegistration {
                     outlet_id: outlet_id.clone(),
@@ -14682,7 +14684,7 @@ impl Scp {
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
     ///
-    /// Carries no lifecycle gate, unlike the nine outlet entry points that
+    /// Carries no lifecycle gate, unlike the outlet entry points that
     /// decide an authorization question: this one releases one session entry
     /// the handle itself owns, and refusing that release in a `Closing` or
     /// `Expired` context would strand the entry until the handle drops. The
@@ -14895,7 +14897,7 @@ impl Scp {
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
     ///
-    /// Carries no lifecycle gate, unlike the nine outlet entry points that
+    /// Carries no lifecycle gate, unlike the outlet entry points that
     /// decide an authorization question: this one reads no context state and
     /// grants nothing. It builds an `InterfaceRevoked` event from the interface
     /// id and the clock and hands it back for the caller to distribute, so
@@ -20198,8 +20200,9 @@ mod tests {
     }
 
     /// A close's release that lands after an import returned the id to
-    /// `Active` clears its own mark, so the imported context keeps UCAN state;
-    /// a release against an id no actor serves keeps the mark.
+    /// `Active` clears its own mark and removes nothing, so the imported
+    /// context keeps the revocations it recorded; a release against an id no
+    /// actor serves keeps the mark.
     #[test]
     #[cfg(feature = "testing")]
     fn close_release_clears_its_mark_when_the_supervisor_reports_active() {
@@ -20212,16 +20215,26 @@ mod tests {
             .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
             .expect("context_create should succeed");
         let active = handle.context_id();
+        scp.inner.ensure_ucan_registered(&active);
+        scp.inner
+            .with_ucan_state(&active, |state| {
+                state
+                    .revocation_list
+                    .revoke("revoked-after-import".to_owned());
+            })
+            .expect("the Active context must have UCAN state");
 
         assert!(
             !rt.block_on(scp.inner.release_ucan_state_unless_readmitted(&active)),
             "a release on an Active context must report the readmit"
         );
         assert!(!scp.inner.released_contexts.contains_key(&active));
-        scp.inner.ensure_ucan_registered(&active);
-        assert!(
-            scp.inner.with_ucan_state(&active, |_| ()).is_some(),
-            "the Active context must get its UCAN state back"
+        assert_eq!(
+            scp.inner.with_ucan_state(&active, |state| state
+                .revocation_list
+                .is_revoked("revoked-after-import")),
+            Some(true),
+            "a revocation the Active context recorded must survive the release"
         );
 
         let absent = scp_ffi_common::generate_context_id();
@@ -20229,6 +20242,41 @@ mod tests {
         assert!(
             scp.inner.released_contexts.contains_key(&absent),
             "a release on an id no actor serves must keep the mark"
+        );
+    }
+
+    /// A readmit that clears the release mark before the close's removal takes
+    /// the registry shard lock leaves the readmitted context's state in place;
+    /// while the mark stands, the removal takes the state.
+    #[test]
+    fn close_removal_skips_state_a_readmit_already_claimed() {
+        let scp = scp_test();
+        let ctx_id = scp_ffi_common::generate_context_id();
+        scp.inner.ensure_ucan_registered(&ctx_id);
+        scp.inner
+            .with_ucan_state(&ctx_id, |state| {
+                state
+                    .revocation_list
+                    .revoke("revoked-after-readmit".to_owned());
+            })
+            .expect("the registered context must have UCAN state");
+
+        scp.inner.released_contexts.insert(ctx_id.clone(), ());
+        scp.inner.readmit_context(&ctx_id);
+        scp.inner.remove_ucan_state_while_released(&ctx_id);
+        assert_eq!(
+            scp.inner.with_ucan_state(&ctx_id, |state| state
+                .revocation_list
+                .is_revoked("revoked-after-readmit")),
+            Some(true),
+            "the readmitted context's revocation must survive the removal"
+        );
+
+        scp.inner.released_contexts.insert(ctx_id.clone(), ());
+        scp.inner.remove_ucan_state_while_released(&ctx_id);
+        assert!(
+            scp.inner.with_ucan_state(&ctx_id, |_| ()).is_none(),
+            "the removal must take the state while the mark stands"
         );
     }
 
@@ -20937,6 +20985,22 @@ mod tests {
             operator_did: identity.did(),
             cost: None,
         };
+        // A malformed definition is refused by its input check before the
+        // lifecycle gate runs, as on the PyO3 bridge.
+        let malformed = rt
+            .block_on(scp.outlet_register(
+                Arc::clone(&dead),
+                OutletDefinition {
+                    name: "uniffi-despawned-malformed-probe".to_owned(),
+                    input_schema_json: "not valid json{{{".to_owned(),
+                    ..definition.clone()
+                },
+            ))
+            .expect_err("a malformed definition must be refused");
+        assert!(
+            matches!(&malformed, ScpError::Validation { code, .. } if code == codes::VALID_7035),
+            "the input check must answer before the lifecycle gate, got {malformed:?}"
+        );
         let refusals: Vec<(&str, &str, Result<(), ScpError>)> = vec![
             (
                 "register",
@@ -26147,7 +26211,7 @@ mod tests {
 
     /// `ucan_mint` must work over callback custody (production path): the minted
     /// token's detached Ed25519 signature verifies against the custody's
-    /// `#active` public key. Pins that `ucan_mint_impl` is un-gated and signs
+    /// `#active` public key. Pins that `ucan_mint_impl`, past its lifecycle gate, signs
     /// through the `UniffiKeyCustody::Callback` entry this instance's identity
     /// registry holds for the live context creator.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -26234,7 +26298,7 @@ mod tests {
     /// `ucan_delegate` must work over callback custody (production path): a child
     /// token delegated from a callback-minted parent verifies against its
     /// delegator identity's `#active` public key. Pins that
-    /// `ucan_delegate_impl` is un-gated and signs through whichever callback
+    /// `ucan_delegate_impl`, past its lifecycle gate, signs through whichever callback
     /// custody an identity custody registry holds for that delegator.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ucan_delegate_works_over_callback_custody() {

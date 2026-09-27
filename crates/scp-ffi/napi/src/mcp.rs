@@ -476,7 +476,6 @@ async fn run_mcp_stdio_server(
 // ---------------------------------------------------------------------------
 
 /// Per-bridge-instance implementation of [`Scp::mcp_server_create`](crate::scp::Scp::mcp_server_create).
-#[allow(clippy::unused_async)]
 pub(crate) async fn mcp_server_create_on(
     bi: &NapiBridgeInstance,
     config: NapiMcpServerConfig,
@@ -498,6 +497,40 @@ pub(crate) async fn mcp_server_create_on(
             code: codes::TRANS_5011.to_owned(),
         }
         .into());
+    }
+
+    // Serving requires that every served context is `Active` and that the
+    // identity is a member of it, both read from each context's supervisor
+    // actor, as the PyO3 and UniFFI serve entry points require. The checks run
+    // once, when the server starts, so they refuse an agent the supervisor
+    // removed before this call; they do not stop one it removes afterwards.
+    for ctx_id in &config.context_ids {
+        crate::runtime::require_active_context_before_authz(
+            bi,
+            ctx_id,
+            &format!("serve context '{ctx_id}'"),
+            |message| ScpNapiError::Transport {
+                message,
+                code: codes::TRANS_5001.to_owned(),
+            },
+        )
+        .await?;
+        let role_state = crate::runtime::live_role_state(bi, ctx_id)
+            .await
+            .map_err(|e| ScpNapiError::Transport {
+                message: format!("cannot serve context '{ctx_id}': {e}"),
+                code: codes::TRANS_5001.to_owned(),
+            })?;
+        if !role_state.members.contains(config.identity_did.as_str()) {
+            return Err(ScpNapiError::Transport {
+                message: format!(
+                    "cannot serve context '{ctx_id}': '{}' is not a member of it",
+                    config.identity_did
+                ),
+                code: codes::TRANS_5001.to_owned(),
+            }
+            .into());
+        }
     }
 
     let provider = McpNapiBridgeProvider {
@@ -928,6 +961,46 @@ pub(crate) fn mcp_get_stdio_allowlist_on(
 mod tests {
     use super::*;
     use crate::runtime::NapiBridgeInstance;
+
+    /// `mcp_server_create_on` refuses a context no supervisor actor serves
+    /// with the withheld lifecycle text, and refuses an identity that is not
+    /// a member of a served context, as the `PyO3` and `UniFFI` serve entry
+    /// points do.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_refuses_an_absent_actor_and_a_non_member() {
+        let bi = NapiBridgeInstance::new_napi();
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let creator = "did:key:z6MkNapiServeCreator";
+        let config = |identity: &str, ctx_id: &str| NapiMcpServerConfig {
+            identity_did: identity.to_owned(),
+            context_ids: vec![ctx_id.to_owned()],
+            transport: "stdio".to_owned(),
+        };
+
+        let absent = format!("napi-serve-absent-{}", uuid::Uuid::new_v4());
+        let Err(err) = mcp_server_create_on(&bi, config(creator, &absent)).await else {
+            panic!("a context no actor serves must refuse the serve");
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                && text.contains(codes::TRANS_5001),
+            "the refusal must come from the lifecycle gate: {text}"
+        );
+
+        let served = format!("napi-serve-active-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_for_test(&bi, &served, creator, &[]).await;
+        let Err(err) =
+            mcp_server_create_on(&bi, config("did:key:z6MkNapiServeOutsider", &served)).await
+        else {
+            panic!("an identity outside the context must not serve it");
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("is not a member of it") && text.contains(codes::TRANS_5001),
+            "the refusal must come from the membership check: {text}"
+        );
+    }
 
     /// WU6: Two-instance regression test — disabling enforcement via the
     /// public `mcp_disable_stdio_allowlist_on` entry point on one instance

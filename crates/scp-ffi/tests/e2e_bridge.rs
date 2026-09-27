@@ -262,6 +262,10 @@ fn context_create_registers_in_runtime() {
 
     let creator = runtime::live_role_state(&bi, &ctx_id).unwrap().creator_did;
     assert_eq!(creator, did);
+    assert!(
+        runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_ok(),
+        "register_context must leave FFI bridge state for the context"
+    );
 }
 
 #[test]
@@ -1449,8 +1453,9 @@ fn create_test_context_with_id(bi: &PyBridgeInstance, creator_did: &str, context
 }
 
 /// Creates a registered context under a fresh 64-hex id whose CREATOR holds the
-/// `ContextClose` capability, so the creator can later drive it `Closed` through
-/// the REAL supervisor close path. Returns the generated id.
+/// `ContextClose` capability, so the creator can later drive it out of `Active`
+/// (into `Closing`) through the REAL supervisor close path. Returns the
+/// generated id.
 ///
 /// `default_ceiling()` carries `context:close`, and
 /// [`create_test_context_with_id`] now seeds the supervisor with that ceiling,
@@ -1462,13 +1467,14 @@ fn create_closeable_test_context(bi: &PyBridgeInstance, creator_did: &str) -> St
     context_id
 }
 
-/// Drives a registered context to a NON-active (`Closed`) lifecycle state through
-/// the REAL supervisor close path — the exact `LifecycleCommand::CloseContext`
-/// dispatch the bridge's `context_close` uses. The per-context actor stays alive
-/// reporting `Closed` (close is non-terminal for the actor; ADR-049 §10), so a
-/// subsequent `supervisor.read_context_state(context_id)` returns
-/// `Some(Closed)` — exactly what the streaming-saga open's active-state guard
-/// reads. `initiator_did` must be the creator of a context created with a
+/// Drives a registered context to a NON-active (`Closing`) lifecycle state
+/// through the REAL supervisor close path — the exact
+/// `LifecycleCommand::CloseContext` dispatch the bridge's `context_close` uses.
+/// `ttl::close_context` moves the context from `Active` to `Closing`, and the
+/// per-context actor stays alive reporting `Closing` (close is non-terminal for
+/// the actor; ADR-049 §10), so a subsequent
+/// `supervisor.read_context_state(context_id)` returns `Some(Closing)` — a
+/// non-`Active` answer the streaming-saga open's active-state guard refuses. `initiator_did` must be the creator of a context created with a
 /// `ContextClose`-bearing ceiling (see `create_closeable_test_context`).
 fn drive_context_closed(bi: &PyBridgeInstance, context_id: &str, initiator_did: &str) {
     use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};

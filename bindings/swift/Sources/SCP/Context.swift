@@ -236,9 +236,11 @@ public actor Context {
             // fallback. The fallback is `.poisoned` (NOT `.active`): a handle
             // whose state cannot be read, or that reports an unrecognized
             // string, must never present as a live/usable context. Per ADR-049
-            // §10 the next per-context operation reads the supervisor and
-            // refuses a crashed or poisoned context; this cached getter is
-            // best-effort and fails safe to a non-active state.
+            // §10 this cached getter is best-effort and fails safe to a
+            // non-active state. While it reads anything but `.active`, `send`,
+            // `join`, `leave`, `messages`, and the economic-policy calls throw
+            // without calling the bridge; `close()` calls the bridge, which
+            // reads the supervisor.
             state = Context.mapStateString((try? handle.state()) ?? "poisoned")
         }
     }
@@ -248,10 +250,14 @@ public actor Context {
     /// An unrecognized or unreadable state fails safe to ``ContextState/poisoned``
     /// rather than ``ContextState/active``: per ADR-049 §10 the cached
     /// ``state`` getter is best-effort, and an unknown context must never be
-    /// reported as live. The next per-context operation reads the supervisor
-    /// and refuses a crashed or poisoned context: an operation the bridge gates
-    /// on the lifecycle state refuses with its own error code, and an
-    /// operation the supervisor answers without that gate returns
+    /// reported as live. While the cached value is not ``ContextState/active``,
+    /// `send`, `join`, `leave`, `messages`, `setEconomicPolicy`, and
+    /// `getEconomicPolicy` throw a local context error without calling the
+    /// bridge, and only `close()` reaches the bridge. While it is
+    /// ``ContextState/active``, each operation reaches the bridge, which reads
+    /// the supervisor and refuses a crashed or poisoned context: an operation
+    /// the bridge gates on the lifecycle state refuses with its own error
+    /// code, and an operation the supervisor answers without that gate returns
     /// `SCP-CTX-2134` (poisoned) or `SCP-CTX-2135` (crashed). This getter
     /// reports neither.
     static func mapStateString(_ stateString: String) -> ContextState {

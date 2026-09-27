@@ -894,6 +894,28 @@ pub struct CrashWindow {
     respawning: bool,
 }
 
+/// The bootstrap scope [`Supervisor::begin_bootstrap_window`] returns. When
+/// it drops, an id an actor now serves keeps a fresh budget, and an id no
+/// actor serves gets its prior [`CrashWindow`] back.
+pub(in crate::context) struct BootstrapCrashWindow<'a> {
+    supervisor: &'a Supervisor,
+    context_id: String,
+    prior: Option<CrashWindow>,
+}
+
+impl Drop for BootstrapCrashWindow<'_> {
+    fn drop(&mut self) {
+        match self.prior.take() {
+            Some(prior) if self.supervisor.lookup(&self.context_id).is_none() => {
+                self.supervisor
+                    .crash_windows
+                    .insert(self.context_id.clone(), prior);
+            }
+            _ => self.supervisor.end_replace_window(&self.context_id),
+        }
+    }
+}
+
 impl CrashWindow {
     /// Record a crash at `now_ms` and return whether the context is now
     /// poisoned.
@@ -3112,11 +3134,12 @@ impl Supervisor {
                 // this op's crypto-init and actor registration. See
                 // `bootstrap_spawn_lock`.
                 let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
-                // (Re)creating this id is a fresh start: drop ALL stale crash
-                // history (including a stale poison) so the fresh actor begins
+                // (Re)creating this id is a fresh start: the fresh actor begins
                 // with a clean budget and does not inherit a previous
-                // instance's crash count or sticky poison (ADR-049 §10).
-                self.reset_crash_window(&context_id);
+                // instance's crash count or sticky poison (ADR-049 §10). A
+                // create that registers no actor restores that history when
+                // `_crash_window` drops.
+                let _crash_window = self.begin_bootstrap_window(&context_id);
                 // ADR-049 Phase 2A finalization: bootstrap now builds the
                 // actor-shape `ActorDeps` (self-sourced from the
                 // supervisor's provider slots, scoped to the creator's
@@ -3312,10 +3335,11 @@ impl Supervisor {
                 // strictly inside this guard, never the reverse. See
                 // `bootstrap_spawn_lock`.
                 let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
-                // Importing (re-establishing) this id is a fresh start: drop
-                // ALL stale crash history (including a stale poison) so the
-                // imported actor begins with a clean budget (ADR-049 §10).
-                self.reset_crash_window(&context_id);
+                // Importing (re-establishing) this id is a fresh start: the
+                // imported actor begins with a clean budget, free of stale
+                // crash history and a stale poison (ADR-049 §10); a failed
+                // import restores that history.
+                let crash_window = self.begin_bootstrap_window(&context_id);
                 // Defense in depth: track whether `build_actor_deps` will
                 // newly spawn this identity's key-package store, so a
                 // post-verification import failure (e.g. epoch-floor
@@ -3351,12 +3375,11 @@ impl Supervisor {
                 ));
                 let import_result = tokio::time::timeout(LIFECYCLE_TIMEOUT, fut).await;
                 // `import_context` marks the replace gap when it despawns a
-                // prior actor (`despawn_for_replace`). The imported actor is
-                // registered on success, and on failure or timeout no actor
-                // will be, so the gap is over on every arm. The actor
-                // registers before this clear, which
-                // `read_context_state_checked` relies on.
-                self.end_replace_window(&context_id);
+                // prior actor (`despawn_for_replace`). `crash_window` ends
+                // that gap when it drops, before the reply: the imported actor
+                // registers before the marker clears, which
+                // `read_context_state_checked` relies on, and a failed import
+                // gets the id's prior crash window back.
                 let (outcome, reply_result) = match import_result {
                     Ok(Ok(handle)) => (Outcome::ok_mutated(()), Ok(handle)),
                     Ok(Err(e)) => {
@@ -3381,6 +3404,7 @@ impl Supervisor {
                         (Outcome::err_mutated(sketch), Err(err))
                     }
                 };
+                drop(crash_window);
                 let _ = reply.send(reply_result);
                 outcome
             }
@@ -4868,8 +4892,21 @@ impl Supervisor {
         // identical to create/import); neither `despawn_actor`,
         // `build_actor_deps`, nor `restore_context` re-acquires
         // `bootstrap_spawn_lock`, so this is re-entrancy- and deadlock-free.
-        let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+        let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+        self.respawn_from_snapshot_locked(ctx_id, owning_did, &bootstrap_guard)
+            .await
+    }
 
+    /// Body of [`Self::respawn_from_snapshot`], run by a caller that already
+    /// holds `bootstrap_spawn_lock`; the guard parameter proves it.
+    /// [`Self::clear_poison`] takes the lock itself so that it clears the
+    /// poison flag and sets the respawn marker under the lock.
+    async fn respawn_from_snapshot_locked(
+        self: &Arc<Self>,
+        ctx_id: &str,
+        owning_did: &DID,
+        _bootstrap_guard: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<(), ContextError> {
         // Mark the transient respawn window BEFORE despawning the stale actor.
         // Between the despawn below and re-registration, a concurrent
         // per-context dispatch would `lookup`-miss a context that genuinely
@@ -5271,21 +5308,26 @@ impl Supervisor {
         ctx_id: &str,
         owning_did: &DID,
     ) -> Result<(), ContextError> {
-        // Clear the window first so the single retry starts from a clean
-        // budget. `entry().or_default()` then `clear()` resets both the
-        // deque and the sticky flag. The same guard sets the respawn marker:
-        // `respawn_from_snapshot` sets it only after it acquires
-        // `bootstrap_spawn_lock`, and until then this context has no actor
-        // and no poison flag. Without the marker,
-        // `read_context_state_checked` reports that wait as `Ok(None)`, the
-        // answer on which the FFI bridges' `context_close` skips its
-        // `ContextClose` check and releases the context's bridge state.
+        // Take `bootstrap_spawn_lock` BEFORE touching the window. While this
+        // call waits for the lock the sticky poison flag still stands, so
+        // `read_context_state_checked` reports the wait as `Poisoned`, never as
+        // `Ok(None)`, the answer on which the FFI bridges' `context_close`
+        // skips its `ContextClose` check and releases the context's bridge
+        // state. Every writer of the respawn marker holds this lock, so no
+        // create, import, or join bootstrap for the same id can clear the
+        // marker set below.
+        let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+        // Clear the window so the single retry starts from a clean budget.
+        // `entry().or_default()` then `clear()` resets both the deque and the
+        // sticky flag, and the same guard sets the respawn marker, so no read
+        // falls between the clear and the marker.
         {
             let mut entry = self.crash_windows.entry(ctx_id.to_owned()).or_default();
             entry.clear();
             entry.mark_respawning();
         }
-        self.respawn_from_snapshot(ctx_id, owning_did).await
+        self.respawn_from_snapshot_locked(ctx_id, owning_did, &bootstrap_guard)
+            .await
     }
 
     /// Operator action (ADR-049 §10): clear a per-identity KeyPackage actor's
@@ -5375,9 +5417,9 @@ impl Supervisor {
     /// per-context state. With the marker the gap reads as
     /// [`ContextError::ActorCrashed`], the same answer a crash-respawn gap
     /// gives. The marker is set before the despawn so no read falls between
-    /// the two. The supervisor's `ImportContext` arm clears it through
-    /// [`Self::end_replace_window`] on every exit, after the imported actor
-    /// registers or the import fails.
+    /// the two. The [`BootstrapCrashWindow`] the supervisor's
+    /// `ImportContext` arm holds clears it on every exit, after the imported
+    /// actor registers or the import fails.
     pub(in crate::context) async fn despawn_for_replace(&self, context_id: &str) -> bool {
         // Drop the DashMap guard before the `.await` below (the workspace
         // denies `await_holding_lock`).
@@ -5388,11 +5430,14 @@ impl Supervisor {
         self.despawn_actor(context_id).await
     }
 
-    /// Clear the replace-gap marker [`Self::despawn_for_replace`] set, and
-    /// drop the context's [`CrashWindow`] entry when the marker was its only
-    /// content. A no-op when no entry exists (an import that replaced no
-    /// actor). Called under `bootstrap_spawn_lock`, which every respawn also
-    /// holds, so no respawn's marker is cleared here.
+    /// Clear the respawn marker a bootstrap set ([`Self::begin_bootstrap_window`]
+    /// or [`Self::despawn_for_replace`]), and drop the context's
+    /// [`CrashWindow`] entry when the marker was its only content. A no-op
+    /// when no entry exists (a bootstrap of an id with no crash history that
+    /// replaced no actor). Called by [`BootstrapCrashWindow`]'s drop under
+    /// `bootstrap_spawn_lock`. Every writer of the respawn marker holds that
+    /// lock (`respawn_from_snapshot` and `clear_poison` included), so no
+    /// respawn's marker is cleared here.
     fn end_replace_window(&self, context_id: &str) {
         if let Some(mut window) = self.crash_windows.get_mut(context_id) {
             window.clear_respawning();
@@ -5502,21 +5547,47 @@ impl Supervisor {
             .remove_if(context_id, |_, window| !window.is_poisoned());
     }
 
-    /// Unconditionally drop a context's [`CrashWindow`] entry on an explicit
-    /// (re)create / import / standing-recreate of the id (ADR-049 §10).
+    /// Start a fresh crash budget for an explicit (re)create / import /
+    /// standing-recreate / Welcome-join bootstrap of the id (ADR-049 §10).
     ///
-    /// Unlike [`Self::reap_crash_window`], this removes the entry EVEN IF it
-    /// is poisoned: deliberately (re)creating or importing a context id is a
-    /// fresh start that resets the crash budget. Without this, a re-created
-    /// context with a deterministic id (e.g. a standing-pair id) would
-    /// inherit the prior instance's sticky `poisoned = true` and re-poison on
-    /// its very first panic, or inherit a partial crash count and poison
-    /// early. The fresh actor must begin with a clean budget.
+    /// Deliberately (re)creating or importing a context id is a fresh start
+    /// that resets the crash budget, poisoned or not. Without the reset, a
+    /// re-created context with a deterministic id (e.g. a standing-pair id)
+    /// would inherit the prior instance's sticky `poisoned = true` and
+    /// re-poison on its very first panic, or inherit a partial crash count and
+    /// poison early.
     ///
-    /// Called under `bootstrap_spawn_lock` at the create / import / standing
-    /// bootstrap sites, before the new actor is spawned.
-    pub(in crate::context) fn reset_crash_window(&self, context_id: &str) {
-        self.crash_windows.remove(context_id);
+    /// The reset swaps any existing window for one that holds only the
+    /// respawn marker, in one map operation, so from here until the bootstrap
+    /// ends [`Self::read_context_state_checked`] reports the id as
+    /// `ActorCrashed`, never as `Ok(None)`. The returned guard ends the
+    /// window when it drops: when an actor serves the id, it clears the
+    /// marker and reaps the now-empty window; when none does (the bootstrap
+    /// failed), it puts the prior window back, so a poisoned or
+    /// respawn-failed context that a failed import or create left without an
+    /// actor still reads as `Poisoned` or `ActorCrashed`.
+    ///
+    /// Called under `bootstrap_spawn_lock`, and the caller keeps the guard
+    /// inside that lock's scope. Every writer of the respawn marker holds the
+    /// same lock, so the guard never clears or restores over a marker another
+    /// respawn set.
+    pub(in crate::context) fn begin_bootstrap_window(
+        &self,
+        context_id: &str,
+    ) -> BootstrapCrashWindow<'_> {
+        let prior = match self.crash_windows.entry(context_id.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                let mut fresh = CrashWindow::default();
+                fresh.mark_respawning();
+                Some(std::mem::replace(occupied.get_mut(), fresh))
+            }
+            dashmap::mapref::entry::Entry::Vacant(_) => None,
+        };
+        BootstrapCrashWindow {
+            supervisor: self,
+            context_id: context_id.to_owned(),
+            prior,
+        }
     }
 
     /// Dispatch a [`StandingCommand`] — mailbox-first for variants that
@@ -11003,7 +11074,7 @@ impl Supervisor {
                 "poisoned standing context auto-revived on re-contact"
             );
         }
-        self.reset_crash_window(&context_id);
+        let _crash_window = self.begin_bootstrap_window(&context_id);
         let params = scp_protocol::context::templates::template_params(
             &scp_protocol::context::TemplateId::BilateralPersistent,
         );
@@ -14289,12 +14360,12 @@ impl Supervisor {
                     //    register order (step 4 then step 5) is deliberate and durability-safe
                     //    under `bootstrap_spawn_lock` + Precheck A/D; it must NOT be reordered
                     //    (a persist-after-register would open a crash window that loses the
-                    //    context). Drop any stale crash-window state
-                    //    for this id FIRST (under `bootstrap_spawn_lock`, mirroring the
-                    //    create / import / standing bootstraps): a previously-poisoned+despawned
-                    //    same-id context must not leave the freshly-spawned joiner actor
-                    //    inheriting a sticky poison window.
-                    self.reset_crash_window(&context_id);
+                    //    context). Start a fresh crash window for this id FIRST (under
+                    //    `bootstrap_spawn_lock`, mirroring the create / import / standing
+                    //    bootstraps): a previously-poisoned+despawned same-id context must
+                    //    not leave the freshly-spawned joiner actor inheriting a sticky
+                    //    poison window. A failed spawn gets the prior window back.
+                    let _crash_window = self.begin_bootstrap_window(&context_id);
                     let owned_deps = deps.clone_for_spawn();
                     if let Err(e) = self.spawn_actor_with_state(state, owned_deps, None).await {
                         let _ = deps.persistence.delete_context(&context_id).await;
@@ -21515,13 +21586,15 @@ mod tests {
         );
     }
 
-    /// While `clear_poison` waits on `bootstrap_spawn_lock`, the context has
-    /// no actor and no poison flag. The checked lifecycle read must report
-    /// that wait as `ActorCrashed`, never as `Ok(None)`: the FFI bridges'
-    /// `context_close` treats `Ok(None)` as "already closed" and skips the
-    /// `ContextClose` check.
+    /// `clear_poison` touches the crash window only once it holds
+    /// `bootstrap_spawn_lock`, so while it waits for the lock the sticky
+    /// poison flag stands and the checked lifecycle read reports `Poisoned`,
+    /// never `Ok(None)`: the FFI bridges' `context_close` treats `Ok(None)` as
+    /// "already closed" and skips the `ContextClose` check. A bootstrap that
+    /// holds the lock meanwhile cannot clear a marker `clear_poison` has not
+    /// set yet.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn clear_poison_wait_for_the_spawn_lock_reads_as_crashed_not_absent() {
+    async fn clear_poison_wait_for_the_spawn_lock_reads_as_poisoned_not_absent() {
         let clock = Arc::new(TestClock::new(1_700_000_000));
         let clock_dyn: Arc<dyn Clock> = clock.clone();
         let sup =
@@ -21532,13 +21605,6 @@ mod tests {
             .entry(ctx_key.clone())
             .or_default()
             .poisoned = true;
-        assert!(
-            matches!(
-                sup.read_context_state_checked(&ctx_key).await,
-                Ok(Some(scp_protocol::context::ContextState::Poisoned))
-            ),
-            "a poisoned context with no actor reads as Poisoned"
-        );
 
         // Another lifecycle operation holds the global spawn lock.
         let spawn_guard = sup.bootstrap_spawn_lock.lock().await;
@@ -21547,19 +21613,18 @@ mod tests {
             let ctx_key = ctx_key.clone();
             tokio::spawn(async move { sup.clear_poison(&ctx_key, &owning).await })
         };
-        let cleared = wait_until(std::time::Duration::from_secs(5), || {
-            !sup.is_context_poisoned(&ctx_key)
-        })
-        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(
-            cleared,
-            "clear_poison must clear the poison flag before it takes the lock"
+            !task.is_finished(),
+            "clear_poison must wait for the spawn lock"
         );
-
         let read = sup.read_context_state_checked(&ctx_key).await;
         assert!(
-            matches!(read, Err(ContextError::ActorCrashed(_))),
-            "the clear_poison wait must read as ActorCrashed, got {read:?}"
+            matches!(
+                read,
+                Ok(Some(scp_protocol::context::ContextState::Poisoned))
+            ),
+            "the clear_poison wait must read as Poisoned, got {read:?}"
         );
 
         drop(spawn_guard);
@@ -21567,6 +21632,50 @@ mod tests {
         assert!(
             matches!(respawn, Err(ContextError::ActorCrashed(_))),
             "the respawn with no snapshot fails, got {respawn:?}"
+        );
+    }
+
+    /// A bootstrap over a poisoned id reads as `ActorCrashed` while it runs,
+    /// and one that registers no actor (a failed import or create) puts the
+    /// poisoned window back, so the context never reads as `Ok(None)`. A
+    /// bootstrap over an id with no crash history leaves no window behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_bootstrap_restores_the_prior_crash_window() {
+        let clock = Arc::new(TestClock::new(1_700_000_000));
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let poisoned = hex::encode([0xDEu8; 32]);
+        sup.crash_windows
+            .entry(poisoned.clone())
+            .or_default()
+            .poisoned = true;
+
+        let window = sup.begin_bootstrap_window(&poisoned);
+        assert!(
+            !sup.is_context_poisoned(&poisoned),
+            "the bootstrap starts the new actor on a clean budget"
+        );
+        let during = sup.read_context_state_checked(&poisoned).await;
+        assert!(
+            matches!(during, Err(ContextError::ActorCrashed(_))),
+            "a bootstrap in progress must read as ActorCrashed, got {during:?}"
+        );
+        drop(window);
+        let after = sup.read_context_state_checked(&poisoned).await;
+        assert!(
+            matches!(
+                after,
+                Ok(Some(scp_protocol::context::ContextState::Poisoned))
+            ),
+            "a bootstrap that registered no actor must restore the poison, got {after:?}"
+        );
+
+        let clean = hex::encode([0xDFu8; 32]);
+        drop(sup.begin_bootstrap_window(&clean));
+        assert!(
+            !sup.crash_windows.contains_key(&clean),
+            "a bootstrap over an id with no crash history leaves no window"
         );
     }
 

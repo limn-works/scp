@@ -263,23 +263,6 @@ pub(crate) async fn outlet_register_on(
     crate::napi_check_handle!(&bi.core, handle);
     validate_outlet_name(&definition.name).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    // The supervisor actor answers the lifecycle question, never the
-    // handle's cached string — see `crate::runtime::require_active_context_before_authz`.
-    crate::runtime::require_active_context_before_authz(
-        bi,
-        &handle.context_id(),
-        "register outlet in context",
-        |msg| ScpNapiError::Outlet {
-            message: msg,
-            code: codes::OUTLET_6003.to_owned(),
-        },
-    )
-    .await
-    .map_err(napi::Error::from)?;
-
-    // Ensure UCAN state is registered so the outlet registry is available.
-    crate::runtime::ensure_registered(bi, handle)?;
-
     let context_id = handle.context_id();
 
     // Build a scp-core OutletRegistration from the NAPI definition.
@@ -311,6 +294,25 @@ pub(crate) async fn outlet_register_on(
             },
         )
         .transpose()?;
+
+    // The pure input checks above refuse a malformed definition before the
+    // lifecycle gate, in the order the PyO3 bridge uses. The supervisor
+    // actor answers the lifecycle question, never the
+    // handle's cached string — see `crate::runtime::require_active_context_before_authz`.
+    crate::runtime::require_active_context_before_authz(
+        bi,
+        &handle.context_id(),
+        "register outlet in context",
+        |msg| ScpNapiError::Outlet {
+            message: msg,
+            code: codes::OUTLET_6003.to_owned(),
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
+
+    // Ensure UCAN state is registered so the outlet registry is available.
+    crate::runtime::ensure_registered(bi, handle)?;
 
     let core_registration = scp_core::context::outlets::OutletRegistration {
         outlet_id,

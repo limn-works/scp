@@ -1257,38 +1257,61 @@ impl UniffiBridgeInstance {
     /// Releases a closed context's per-context UCAN state and marks the id so
     /// [`Self::ensure_ucan_registered`] does not rebuild it.
     ///
-    /// `Scp::context_close` is the only caller. The mark goes in before the
-    /// entry comes out, and [`Self::ensure_ucan_registered`] reads the mark
-    /// while it holds the entry's shard lock, so no rebuild lands after this
-    /// call returns.
+    /// The mark goes in before the entry comes out, and
+    /// [`Self::ensure_ucan_registered`] reads the mark while it holds the
+    /// entry's shard lock, so no rebuild lands after this call returns.
     pub fn release_ucan_state(&self, context_id: &str) {
         self.released_contexts.insert(context_id.to_owned(), ());
-        self.remove_ucan_state(context_id);
+        self.remove_ucan_state_while_released(context_id);
+    }
+
+    /// Removes `context_id`'s UCAN state and its known-context entry, only
+    /// while the release mark stands.
+    ///
+    /// The mark check and both removals run under the registry entry's shard
+    /// lock, which [`Self::readmit_context`] also takes, so a readmit that
+    /// clears the mark first leaves the readmitted context's state in place,
+    /// and a readmit that comes second finds the state already gone.
+    pub(crate) fn remove_ucan_state_while_released(&self, context_id: &str) {
+        use dashmap::mapref::entry::Entry;
+
+        let entry = self.ucan_registry.entry(context_id.to_owned());
+        if !self.released_contexts.contains_key(context_id) {
+            return;
+        }
+        if let Entry::Occupied(occupied) = entry {
+            occupied.remove();
+        }
+        self.core.remove_known_context(context_id);
     }
 
     /// Clears the release mark [`Self::release_ucan_state`] left for
     /// `context_id`, so the next call builds fresh state for it.
     ///
     /// The import, restore, and Welcome-join paths call this after the
-    /// supervisor serves the id again. The fresh state holds an empty
-    /// revocation list and a fresh nonce tracker: this bridge keeps
-    /// revocations in process memory, so they survive neither a close
-    /// followed by a re-import nor a process restart.
+    /// supervisor serves the id again. It clears the mark under the registry
+    /// entry's shard lock, the lock a close's removal holds while it checks
+    /// the mark. The fresh state holds an empty revocation list and a fresh
+    /// nonce tracker: this bridge keeps revocations in process memory, so they
+    /// survive neither a close followed by a re-import nor a process restart.
     pub fn readmit_context(&self, context_id: &str) {
+        let _shard = self.ucan_registry.entry(context_id.to_owned());
         self.released_contexts.remove(context_id);
     }
 
-    /// Runs [`Self::release_ucan_state`], then re-reads the supervisor.
+    /// Marks `context_id` released, re-reads the supervisor, and removes the
+    /// context's UCAN state only when the re-read does not report `Active`.
     ///
     /// A close decides from a lifecycle read taken before it releases, so an
     /// import or restore can return the id to `Active`, and readmit it, in
     /// between. The import readmits only after the actor reports `Active`, so a
     /// re-read after the mark went in that reports `Active` means the release
-    /// landed on the readmitted context: this clears the mark again and returns
-    /// `false`. Any other answer, a failed read included, keeps the mark and
-    /// returns `true`.
+    /// would land on the readmitted context: this clears the mark, removes
+    /// nothing, and returns `false`, so the readmitted context keeps its
+    /// revocation list and nonce tracker. Any other answer, a failed read
+    /// included, removes the state while the mark stands and returns `true`.
     pub async fn release_ucan_state_unless_readmitted(&self, context_id: &str) -> bool {
-        self.release_ucan_state(context_id);
+        self.released_contexts.insert(context_id.to_owned(), ());
         if matches!(
             self.read_live_context_state(context_id).await,
             Ok(Some(scp_core::context::ContextState::Active))
@@ -1296,6 +1319,7 @@ impl UniffiBridgeInstance {
             self.readmit_context(context_id);
             return false;
         }
+        self.remove_ucan_state_while_released(context_id);
         true
     }
 

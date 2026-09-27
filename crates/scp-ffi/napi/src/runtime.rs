@@ -1804,36 +1804,62 @@ pub fn ensure_registered(
 /// Releases a closed context's [`UcanContextState`] and marks the id so
 /// [`ensure_registered`] does not rebuild it.
 ///
-/// `context_close_on` is the only caller. The mark goes in before the entry
-/// comes out; [`ensure_registered`] reads the mark while it holds the entry's
-/// shard lock, so no rebuild lands after this call returns.
+/// The mark goes in before the entry comes out; [`ensure_registered`] reads the
+/// mark while it holds the entry's shard lock, so no rebuild lands after this
+/// call returns.
 pub fn release_context(bi: &NapiBridgeInstance, context_id: &str) {
     bi.released_contexts.insert(context_id.to_owned(), ());
-    remove_context(bi, context_id);
+    remove_context_while_released(bi, context_id);
+}
+
+/// Removes `context_id`'s [`UcanContextState`] and its known-context entry,
+/// only while the release mark stands.
+///
+/// The mark check and both removals run under the registry entry's shard lock,
+/// which [`readmit_context`] also takes, so a readmit that clears the mark
+/// first leaves the readmitted context's state in place, and a readmit that
+/// comes second finds the state already gone.
+pub(crate) fn remove_context_while_released(bi: &NapiBridgeInstance, context_id: &str) {
+    use dashmap::mapref::entry::Entry;
+
+    let entry = ucan_registry(bi).entry(context_id.to_owned());
+    if !bi.released_contexts.contains_key(context_id) {
+        return;
+    }
+    if let Entry::Occupied(occupied) = entry {
+        occupied.remove();
+    }
+    bi.core.remove_known_context(context_id);
 }
 
 /// Clears the release mark [`release_context`] left for `context_id`, so the
 /// next UCAN, outlet, or event-log call builds fresh state for it.
 ///
 /// The import, restore, and Welcome-join paths call this after the supervisor
-/// serves the id again. The fresh state holds an empty revocation list and a
-/// fresh nonce tracker: this bridge keeps revocations in process memory, so
-/// they survive neither a close followed by a re-import nor a process restart.
+/// serves the id again. It clears the mark under the registry entry's shard
+/// lock, the lock a close's removal holds while it checks the mark. The fresh
+/// state holds an empty revocation list and a fresh nonce tracker: this bridge
+/// keeps revocations in process memory, so they survive neither a close
+/// followed by a re-import nor a process restart.
 pub fn readmit_context(bi: &NapiBridgeInstance, context_id: &str) {
+    let _shard = ucan_registry(bi).entry(context_id.to_owned());
     bi.released_contexts.remove(context_id);
 }
 
-/// Runs [`release_context`], then re-reads the supervisor.
+/// Marks `context_id` released, re-reads the supervisor, and removes the
+/// context's bridge state only when the re-read does not report `Active`.
 ///
 /// A close decides from a lifecycle read taken before it releases, so an
 /// import or restore can return the id to `Active`, and readmit it, in
 /// between. The import readmits only after the actor reports `Active`, so a
 /// re-read after the mark went in that reports `Active` means the release
-/// landed on the readmitted context: this clears the mark again and returns
-/// `false`. Any other answer, a failed read included, keeps the mark and
-/// returns `true`.
+/// would land on the readmitted context: this clears the mark, removes
+/// nothing, and returns `false`, so the readmitted context keeps its
+/// revocation list, nonce tracker, outlets, and sessions. Any other answer, a
+/// failed read included, removes the state while the mark stands and returns
+/// `true`.
 pub async fn release_context_unless_readmitted(bi: &NapiBridgeInstance, context_id: &str) -> bool {
-    release_context(bi, context_id);
+    bi.released_contexts.insert(context_id.to_owned(), ());
     if matches!(
         read_live_context_state(bi, context_id).await,
         Ok(Some(scp_core::context::ContextState::Active))
@@ -1841,6 +1867,7 @@ pub async fn release_context_unless_readmitted(bi: &NapiBridgeInstance, context_
         readmit_context(bi, context_id);
         return false;
     }
+    remove_context_while_released(bi, context_id);
     true
 }
 

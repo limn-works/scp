@@ -3485,8 +3485,15 @@ impl crate::scp::PyScp {
         }
 
         // Close succeeded (or was idempotently already closed). Remove the
-        // FFI bridge state → bridge outlet dispatch fails closed for this id.
-        crate::runtime::remove_context(bi, &handle.context_id);
+        // FFI bridge state → bridge outlet dispatch fails closed for this id,
+        // unless an import or restore returned the id to `Active` after the
+        // lifecycle read above.
+        if !crate::runtime::release_context_unless_readmitted(bi, &handle.context_id) {
+            return Err(PyRuntimeError::new_err(
+                "the context returned to Active through an import or restore while this close \
+                 ran; the imported context stays open and keeps its state on this bridge",
+            ));
+        }
 
         // Transition directly to "closed" (skipping "closing" for the bridge
         // layer -- the full runtime will implement the cooperative closing window).
@@ -7986,6 +7993,35 @@ mod tests {
             *handle.state.lock().unwrap(),
             "active",
             "the fixture depends on the first handle's string staying stale"
+        );
+    }
+
+    /// A close's release that lands while the supervisor serves the id as
+    /// `Active` (an import or restore returned it after the close's lifecycle
+    /// read) removes nothing, so the live context keeps its bridge state; a
+    /// release against an id no actor serves removes the state.
+    #[test]
+    fn close_release_keeps_the_state_of_a_context_the_supervisor_reports_active() {
+        let creator = "did:dht:z6MkPyReleaseActiveCreator";
+        let (scp, handle) = lifecycle_fixture("pyrelact", creator);
+        assert!(
+            !crate::runtime::release_context_unless_readmitted(&scp.inner, &handle.context_id),
+            "a release on an Active context must report the readmit"
+        );
+        assert!(
+            crate::runtime::with_context(&scp.inner, &handle.context_id, |_| Ok(())).is_ok(),
+            "the Active context must keep its bridge state"
+        );
+
+        let absent = format!("pyrelabs{}", "0".repeat(56));
+        crate::runtime::register_context(&scp.inner, &absent, creator, &[])
+            .expect("fixture registration");
+        assert!(crate::runtime::release_context_unless_readmitted(
+            &scp.inner, &absent
+        ));
+        assert!(
+            crate::runtime::with_context(&scp.inner, &absent, |_| Ok(())).is_err(),
+            "a release on an id no actor serves must remove the bridge state"
         );
     }
 

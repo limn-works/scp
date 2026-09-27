@@ -3031,7 +3031,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
      *
-     * Carries no lifecycle gate, unlike the nine outlet entry points that
+     * Carries no lifecycle gate, unlike the outlet entry points that
      * decide an authorization question: this one reads no context state and
      * grants nothing. It builds an `InterfaceRevoked` event from the interface
      * id and the clock and hands it back for the caller to distribute, so
@@ -3159,7 +3159,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
      *
-     * Carries no lifecycle gate, unlike the nine outlet entry points that
+     * Carries no lifecycle gate, unlike the outlet entry points that
      * decide an authorization question: this one releases one session entry
      * the handle itself owns, and refusing that release in a `Closing` or
      * `Expired` context would strand the entry until the handle drops. The
@@ -6255,7 +6255,7 @@ open func outletInterfaceExpose(handle: ContextHandle, outletId: String, targetC
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
      *
-     * Carries no lifecycle gate, unlike the nine outlet entry points that
+     * Carries no lifecycle gate, unlike the outlet entry points that
      * decide an authorization question: this one reads no context state and
      * grants nothing. It builds an `InterfaceRevoked` event from the interface
      * id and the clock and hands it back for the caller to distribute, so
@@ -6458,7 +6458,7 @@ open func outletRegister(handle: ContextHandle, definition: OutletDefinition)asy
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
      *
-     * Carries no lifecycle gate, unlike the nine outlet entry points that
+     * Carries no lifecycle gate, unlike the outlet entry points that
      * decide an authorization question: this one releases one session entry
      * the handle itself owns, and refusing that release in a `Closing` or
      * `Expired` context would strand the entry until the handle drops. The

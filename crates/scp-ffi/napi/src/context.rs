@@ -6170,8 +6170,9 @@ mod tests {
     }
 
     /// A close's release that lands after an import returned the id to
-    /// `Active` clears its own mark, so the imported context keeps UCAN state;
-    /// a release against an id no actor serves keeps the mark.
+    /// `Active` clears its own mark and removes nothing, so the imported
+    /// context keeps the revocations it recorded; a release against an id no
+    /// actor serves keeps the mark.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_release_clears_its_mark_when_the_supervisor_reports_active() {
@@ -6181,21 +6182,67 @@ mod tests {
         let creator = "did:key:z6MkNapiReleaseActiveCreator";
         crate::runtime::create_supervisor_context_for_test(&bi, &active, creator, &[]).await;
         crate::runtime::register_test_context(&bi, &active);
+        crate::runtime::with_context(&bi, &active, |rt| {
+            rt.core
+                .revocation_list
+                .revoke("revoked-after-import".to_owned());
+            Ok(())
+        })
+        .expect("the Active context must have UCAN state");
 
         assert!(
             !crate::runtime::release_context_unless_readmitted(&bi, &active).await,
             "a release on an Active context must report the readmit"
         );
         assert!(!bi.released_contexts.contains_key(&active));
-        let handle = active_handle_for(&bi, &active, creator);
-        crate::runtime::ensure_registered(&bi, &handle)
-            .expect("the Active context must get its UCAN state back");
+        assert!(
+            crate::runtime::with_context(&bi, &active, |rt| {
+                Ok(rt.core.revocation_list.is_revoked("revoked-after-import"))
+            })
+            .expect("the release must leave the Active context's UCAN state in place"),
+            "a revocation the Active context recorded must survive the release"
+        );
 
         let absent = format!("napi-release-absent-{}", uuid::Uuid::new_v4());
         assert!(crate::runtime::release_context_unless_readmitted(&bi, &absent).await);
         assert!(
             bi.released_contexts.contains_key(&absent),
             "a release on an id no actor serves must keep the mark"
+        );
+    }
+
+    /// A readmit that clears the release mark before the close's removal takes
+    /// the registry shard lock leaves the readmitted context's state in place;
+    /// while the mark stands, the removal takes the state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_removal_skips_state_a_readmit_already_claimed() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let ctx_id = format!("napi-release-race-{}", uuid::Uuid::new_v4());
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        crate::runtime::with_context(&bi, &ctx_id, |rt| {
+            rt.core
+                .revocation_list
+                .revoke("revoked-after-readmit".to_owned());
+            Ok(())
+        })
+        .expect("the registered context must have UCAN state");
+
+        bi.released_contexts.insert(ctx_id.clone(), ());
+        crate::runtime::readmit_context(&bi, &ctx_id);
+        crate::runtime::remove_context_while_released(&bi, &ctx_id);
+        assert!(
+            crate::runtime::with_context(&bi, &ctx_id, |rt| {
+                Ok(rt.core.revocation_list.is_revoked("revoked-after-readmit"))
+            })
+            .expect("a readmitted context's UCAN state must survive the removal"),
+            "the readmitted context's revocation must survive the removal"
+        );
+
+        bi.released_contexts.insert(ctx_id.clone(), ());
+        crate::runtime::remove_context_while_released(&bi, &ctx_id);
+        assert!(
+            crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_err(),
+            "the removal must take the state while the mark stands"
         );
     }
 
@@ -6810,6 +6857,33 @@ mod tests {
             "register reported: {register}"
         );
 
+        // A malformed definition is refused by its input check before the
+        // lifecycle gate runs, as on the PyO3 bridge.
+        let malformed = crate::outlets::outlet_register_on(
+            &bi,
+            &handle,
+            crate::outlets::NapiOutletDefinition {
+                name: "napi-no-actor-malformed-probe".to_owned(),
+                description: "a malformed fixture outlet".to_owned(),
+                kind: crate::outlets::NapiOutletKind::Action,
+                input_schema_json: "not valid json{{{".to_owned(),
+                output_schema_json: r#"{"type":"object"}"#.to_owned(),
+                test_vectors_json: None,
+                implementation_hash: None,
+                operator_did: creator.to_owned(),
+                cost: None,
+            },
+        )
+        .await
+        .expect_err("a malformed definition must be refused");
+        assert!(
+            malformed.to_string().contains("input_schema_json")
+                && !malformed
+                    .to_string()
+                    .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "the input check must answer before the lifecycle gate, got: {malformed}"
+        );
+
         let expose = crate::outlets::outlet_interface_expose_on(
             &bi,
             &handle,
@@ -6900,7 +6974,7 @@ mod tests {
         let text = err.to_string();
         assert!(
             text.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
-                && text.contains(codes::OUTLET_6005),
+                && text.contains(scp_ffi_common::error_codes::OUTLET_6005),
             "the refusal must come from the lifecycle gate: {text}"
         );
         assert!(
@@ -7063,7 +7137,7 @@ mod tests {
             let text = err.to_string();
             assert!(
                 text.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
-                    && text.contains(codes::OUTLET_6005),
+                    && text.contains(scp_ffi_common::error_codes::OUTLET_6005),
                 "the refusal must carry the withheld text and the caller's code ({fault}): {text}"
             );
             assert!(
