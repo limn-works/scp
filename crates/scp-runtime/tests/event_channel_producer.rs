@@ -280,9 +280,8 @@ async fn supervisor_send_emits_stripped_message_sent_to_subscriber() {
 
 /// A live `Supervisor` emitting a SECURITY/AUDIT event — `MemberLeft` — reaches a
 /// `subscribe_events()` subscriber with the correct shape. The `MessageSent`
-/// test above proves the channel carries application traffic; this proves an
-/// actual audit event reaches the channel, which is the security-relevant
-/// guarantee the Merkle event log depends on.
+/// test above proves the channel carries application traffic; this proves the
+/// channel also carries an audit event to any embedder that subscribes.
 ///
 /// Driving a leave is the simplest deterministic audit-event producer: the
 /// context creator (alice) leaves her own context, which emits a payload-free
