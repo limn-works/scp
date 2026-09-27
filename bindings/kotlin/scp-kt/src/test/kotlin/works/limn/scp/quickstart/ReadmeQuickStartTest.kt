@@ -2,8 +2,11 @@
 // verbatim, so a reader who copies that block runs code this suite proved.
 //
 // The block between the two marker comments is the README's `suspend fun main`
-// body, unchanged. What surrounds it is the harness a README reader gets from
-// process exit instead: the DID assertion and the shutdown. A change to either
+// body, unchanged. A second test checks the README's import block: it reads
+// `bindings/kotlin/README.md` and loads every class the quick start imports,
+// so an import naming a type the SDK does not declare fails here. What
+// surrounds the block is the harness a README reader gets from process exit
+// instead: the DID assertion and the shutdown. A change to either
 // copy that the other does not mirror fails review, so the README stops
 // drifting from what runs.
 //
@@ -26,7 +29,9 @@ import uniffi.scp.StorageConfig
 import works.limn.scp.SCP
 import works.limn.scp.bridge.CoroutineBridge
 import works.limn.scp.conformance.ConformanceStubBindings
+import java.io.File
 import kotlin.test.assertTrue
+import kotlin.test.fail
 import kotlin.time.Duration.Companion.seconds
 
 class ReadmeQuickStartTest {
@@ -59,6 +64,36 @@ class ReadmeQuickStartTest {
             ioDispatcher = Dispatchers.IO,
             cpuDispatcher = Dispatchers.Default,
         )
+
+    @Test
+    fun `every class the README quick start imports exists`() {
+        // Gradle runs tests with the `scp-kt` project directory as `user.dir`.
+        val readme = File(System.getProperty("user.dir")).resolve("../README.md").canonicalFile
+        assertTrue(readme.isFile, "README not found at $readme")
+        val quickStart =
+            readme
+                .readText()
+                .substringAfter("## Quick Start")
+                .substringAfter("```kotlin")
+                .substringBefore("```")
+        val imports =
+            quickStart
+                .lines()
+                .map(String::trim)
+                .filter { it.startsWith("import ") }
+                .map { it.removePrefix("import ").trim() }
+        assertTrue(imports.isNotEmpty(), "the README quick start imports nothing")
+        val loader = javaClass.classLoader
+        val unresolved =
+            imports.filter { name ->
+                // `initialize = false` loads the class without running the
+                // UniFFI static initializer, so no native library is needed.
+                runCatching { Class.forName(name, false, loader) }.isFailure
+            }
+        if (unresolved.isNotEmpty()) {
+            fail("the README quick start imports types this SDK does not declare: $unresolved")
+        }
+    }
 
     @Test
     fun `the README quick start runs end to end`() {

@@ -16,13 +16,13 @@ dependencies {
 ## Quick Start
 
 ```kotlin
-import works.limn.scp.CeilingPolicy
-import works.limn.scp.ContextMode
-import works.limn.scp.ContextParams
-import works.limn.scp.GovernanceModel
-import works.limn.scp.MemoryScope
+import uniffi.scp.CeilingPolicy
+import uniffi.scp.ContextMode
+import uniffi.scp.ContextParams
+import uniffi.scp.GovernanceModel
+import uniffi.scp.MemoryScope
+import uniffi.scp.StorageConfig
 import works.limn.scp.SCP
-import works.limn.scp.StorageConfig
 
 suspend fun main() {
     // Every call routes through an SCP instance (ADR-048). Name a storage
@@ -104,7 +104,8 @@ cargo build -p scp-ffi-uniffi --features testing
 ```
 
 `ReadmeQuickStartTest` in `scp-kt`'s test source set runs the block above
-verbatim, so this README stops drifting from what runs.
+verbatim and loads every class the block imports, so this README stops
+drifting from what runs.
 
 ## Requirements
 
