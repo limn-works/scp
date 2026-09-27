@@ -1,4 +1,4 @@
-// Scp.kt — Kotlin SDK caller-owned SCP instance wrapper (#1549 Phase 4, ADR-048).
+// SCP.kt — Kotlin SDK caller-owned SCP instance wrapper (#1549 Phase 4, ADR-048).
 //
 // Each [SCP] wraps an independent UniFFI `Scp` opaque object (generated from
 // `crates/scp-ffi/uniffi/src/scp.rs`). The class owns its own
@@ -20,7 +20,7 @@
 //
 // Provenance: #1549, ADR-048, master plan decision 4 (SDK-facing class name).
 
-@file:Suppress("MatchingDeclarationName", "TooManyFunctions")
+@file:Suppress("TooManyFunctions")
 
 package works.limn.scp
 
@@ -39,9 +39,11 @@ import uniffi.scp.InviteMemberOutcome
 import uniffi.scp.KeyCustodyProvider
 import uniffi.scp.McpAllowlistState
 import uniffi.scp.McpInvokeResult
-import uniffi.scp.McpServerConfig
 import uniffi.scp.McpOutletInfo
+import uniffi.scp.McpServerConfig
 import uniffi.scp.MessageListener
+import uniffi.scp.OutletDefinition
+import uniffi.scp.OutletVerificationResult
 import uniffi.scp.Proof
 import uniffi.scp.PublishResult
 import uniffi.scp.ReconnectReport
@@ -51,8 +53,6 @@ import uniffi.scp.SealedInvitation
 import uniffi.scp.SqliteKeyMaterial
 import uniffi.scp.StorageConfig
 import uniffi.scp.SyncPolicyResult
-import uniffi.scp.OutletDefinition
-import uniffi.scp.OutletVerificationResult
 import uniffi.scp.TransportManager
 import uniffi.scp.TransportStatus
 import uniffi.scp.TrustScoreResult
@@ -627,8 +627,10 @@ class SCP internal constructor(
      * material so the importing member routes under its OWN routing ID rather
      * than inheriting the exporter's local-instance pseudonym.
      */
-    suspend fun contextImport(data: ByteArray, importerIdentity: Identity): String =
-        inner.contextImport(data = data, importerIdentity = importerIdentity)
+    suspend fun contextImport(
+        data: ByteArray,
+        importerIdentity: Identity,
+    ): String = inner.contextImport(data = data, importerIdentity = importerIdentity)
 
     /** Forwards to [NativeScp.contextIsMember] on [inner]. */
     suspend fun contextIsMember(
@@ -847,8 +849,7 @@ class SCP internal constructor(
      *
      * Forwards to [NativeScp.reserveKeyPackage] on [inner].
      */
-    suspend fun reserveKeyPackage(identity: Identity): ReservedKeyPackage =
-        inner.reserveKeyPackage(identity = identity)
+    suspend fun reserveKeyPackage(identity: Identity): ReservedKeyPackage = inner.reserveKeyPackage(identity = identity)
 
     /**
      * Invites a member to an existing context, producing a sealed, signed
@@ -1017,8 +1018,9 @@ class SCP internal constructor(
      * *responded* — NOT that the payment is valid; scan `valid`/`all_valid`
      * for payment validity.
      */
-    suspend fun economyVerifyPaymentReceipts(receiptsJson: String): String =
-        inner.economyVerifyPaymentReceipts(receiptsJson = receiptsJson)
+    suspend fun economyVerifyPaymentReceipts(receiptsJson: String): String {
+        return inner.economyVerifyPaymentReceipts(receiptsJson = receiptsJson)
+    }
 
     /**
      * Forwards to [NativeScp.evaluateInvitation] on [inner].
@@ -1261,8 +1263,10 @@ class SCP internal constructor(
      * non-`null` [testingSeed] is only valid for `custody == "in_memory"`;
      * other custody types reject it with `SCP-VALID-7009`.
      */
-    suspend fun identityCreate(custody: String, testingSeed: ByteArray? = null): Identity =
-        inner.identityCreate(custody = custody, testingSeed = testingSeed)
+    suspend fun identityCreate(
+        custody: String,
+        testingSeed: ByteArray? = null,
+    ): Identity = inner.identityCreate(custody = custody, testingSeed = testingSeed)
 
     /** Forwards to [NativeScp.identityCreateLinkAttestation] on [inner]. */
     @Suppress("LongParameterList")
@@ -2485,7 +2489,10 @@ class SCP internal constructor(
          *   Passed to the Rust side as `dir.absolutePath`.
          * @param passphrase Human-chosen passphrase.
          */
-        fun withSqlite(dir: File, passphrase: String): SCP =
+        fun withSqlite(
+            dir: File,
+            passphrase: String,
+        ): SCP =
             SCP(
                 NativeScp.withStorage(
                     StorageConfig.Sqlite(

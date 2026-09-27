@@ -21,10 +21,10 @@
 
 package works.limn.scp
 
+import uniffi.scp.ScpException
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
-import uniffi.scp.ScpException
 
 class ErrorCodeTest {
     companion object {
@@ -39,29 +39,32 @@ class ErrorCodeTest {
 
     @Test
     fun `pre-rotation handle-not-found code round-trips through Identity`() {
-        val ex = ScpException.Identity(
-            msg = "pre-rotation handle not found",
-            code = PRE_ROTATION_HANDLE_NOT_FOUND_CODE,
-        )
+        val ex =
+            ScpException.Identity(
+                msg = "pre-rotation handle not found",
+                code = PRE_ROTATION_HANDLE_NOT_FOUND_CODE,
+            )
         assertEquals(PRE_ROTATION_HANDLE_NOT_FOUND_CODE, ex.code)
         assertEquals("pre-rotation handle not found", ex.msg)
     }
 
     @Test
     fun `pre-rotation unavailable code round-trips through Identity`() {
-        val ex = ScpException.Identity(
-            msg = "hardware key not connected",
-            code = PRE_ROTATION_UNAVAILABLE_CODE,
-        )
+        val ex =
+            ScpException.Identity(
+                msg = "hardware key not connected",
+                code = PRE_ROTATION_UNAVAILABLE_CODE,
+            )
         assertEquals(PRE_ROTATION_UNAVAILABLE_CODE, ex.code)
     }
 
     @Test
     fun `pre-rotation user-declined code round-trips through Identity`() {
-        val ex = ScpException.Identity(
-            msg = "user declined",
-            code = PRE_ROTATION_USER_DECLINED_CODE,
-        )
+        val ex =
+            ScpException.Identity(
+                msg = "user declined",
+                code = PRE_ROTATION_USER_DECLINED_CODE,
+            )
         assertEquals(PRE_ROTATION_USER_DECLINED_CODE, ex.code)
     }
 
@@ -73,19 +76,21 @@ class ErrorCodeTest {
 
     @Test
     fun `pre-rotation invalid-callback code round-trips through Identity`() {
-        val ex = ScpException.Identity(
-            msg = "handle is empty",
-            code = PRE_ROTATION_INVALID_CALLBACK_CODE,
-        )
+        val ex =
+            ScpException.Identity(
+                msg = "handle is empty",
+                code = PRE_ROTATION_INVALID_CALLBACK_CODE,
+            )
         assertEquals(PRE_ROTATION_INVALID_CALLBACK_CODE, ex.code)
     }
 
     @Test
     fun `pre-rotation commitment-mismatch code round-trips through Identity`() {
-        val ex = ScpException.Identity(
-            msg = "commitment mismatch",
-            code = PRE_ROTATION_COMMITMENT_MISMATCH_CODE,
-        )
+        val ex =
+            ScpException.Identity(
+                msg = "commitment mismatch",
+                code = PRE_ROTATION_COMMITMENT_MISMATCH_CODE,
+            )
         assertEquals(PRE_ROTATION_COMMITMENT_MISMATCH_CODE, ex.code)
     }
 
@@ -100,14 +105,15 @@ class ErrorCodeTest {
 
     @Test
     fun `each pre-rotation code is catchable as ScpException and preserved`() {
-        val cases = listOf(
-            "handle_not_found" to PRE_ROTATION_HANDLE_NOT_FOUND_CODE,
-            "unavailable" to PRE_ROTATION_UNAVAILABLE_CODE,
-            "user_declined" to PRE_ROTATION_USER_DECLINED_CODE,
-            "storage" to PRE_ROTATION_STORAGE_CODE,
-            "invalid_callback_response" to PRE_ROTATION_INVALID_CALLBACK_CODE,
-            "commitment_mismatch" to PRE_ROTATION_COMMITMENT_MISMATCH_CODE,
-        )
+        val cases =
+            listOf(
+                "handle_not_found" to PRE_ROTATION_HANDLE_NOT_FOUND_CODE,
+                "unavailable" to PRE_ROTATION_UNAVAILABLE_CODE,
+                "user_declined" to PRE_ROTATION_USER_DECLINED_CODE,
+                "storage" to PRE_ROTATION_STORAGE_CODE,
+                "invalid_callback_response" to PRE_ROTATION_INVALID_CALLBACK_CODE,
+                "commitment_mismatch" to PRE_ROTATION_COMMITMENT_MISMATCH_CODE,
+            )
         for ((name, expectedCode) in cases) {
             try {
                 throw ScpException.Identity(msg = "pre-rotation $name", code = expectedCode)

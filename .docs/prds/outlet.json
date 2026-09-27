@@ -505,7 +505,7 @@
         "bindings/swift/Sources/SCP/Context.swift",
         "bindings/swift/Sources/SCP/Types.swift",
         "bindings/swift/Tests/SCPTests/ToolsTests.swift",
-        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/SCP.kt",
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Types.kt",
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/bridge/CoroutineBridge.kt"
       ],
@@ -553,7 +553,7 @@
         "Python: git mv scp_sdk/tools.py \u2192 scp_sdk/outlets.py and tests/test_tools.py \u2192 tests/test_outlets.py; introduce OutletNamespace / SessionsNamespace / OffersNamespace; implement the InvocationHandle union (awaitable + async iterable); implement caveats helpers; regenerate _scp_core.pyi",
         "TypeScript: git mv src/tools.ts \u2192 src/outlets.ts and tests/tools.test.ts \u2192 tests/outlets.test.ts; define OutletNamespace/OutletSessionsNamespace/OutletOffersNamespace classes; implement InvocationHandle (PromiseLike + AsyncIterable); implement caveats helpers; rely on SCP-OUT-031 for instanceof preservation; import the resulting sealed-hierarchy types",
         "Swift: git mv Sources/SCP/Tools.swift \u2192 Sources/SCP/Outlets.swift and the test file; implement InvocationHandle (AsyncSequence + await .aggregate); implement Caveats static helpers",
-        "Kotlin: rename tool to outlet in Scp.kt, Types.kt, CoroutineBridge.kt; implement OutletNamespace interface (NOT 'OutletsApi' \u2014 renamed for cross-SDK parity per simplifier MAJOR 25) and its sub-interfaces; implement InvocationHandle (aggregate() + asFlow()); implement Caveats helpers",
+        "Kotlin: rename tool to outlet in SCP.kt, Types.kt, CoroutineBridge.kt; implement OutletNamespace interface (NOT 'OutletsApi' \u2014 renamed for cross-SDK parity per simplifier MAJOR 25) and its sub-interfaces; implement InvocationHandle (aggregate() + asFlow()); implement Caveats helpers",
         "Cross-SDK: regenerate the SDK capability matrix; add README + docs updates; confirm every SDK CI suite green"
       ],
       "blockedBy": [

@@ -22,13 +22,14 @@ import kotlin.test.assertTrue
 class IdentityAttestationTest {
     @Test
     fun `construction with defaults`() {
-        val att = IdentityAttestation(
-            id = "abc123",
-            platform = "github.com",
-            platformHandle = "alice",
-            verificationMethod = "did:dht:z6Mk...#active",
-            verifiedAt = 1_700_000_000L,
-        )
+        val att =
+            IdentityAttestation(
+                id = "abc123",
+                platform = "github.com",
+                platformHandle = "alice",
+                verificationMethod = "did:dht:z6Mk...#active",
+                verifiedAt = 1_700_000_000L,
+            )
         assertEquals("abc123", att.id)
         assertEquals("github.com", att.platform)
         assertEquals("alice", att.platformHandle)
@@ -41,18 +42,20 @@ class IdentityAttestationTest {
 
     @Test
     fun `construction with all fields`() {
-        val att = IdentityAttestation(
-            id = "def456",
-            platform = "x.com",
-            platformHandle = "bob",
-            verificationMethod = "did:dht:z6Mk...#agent",
-            verifiedAt = 1_700_000_000L,
-            revocationStatus = RevocationStatus.Revoked(
-                revokedAt = 1_700_000_100L,
-                reason = "compromised",
-            ),
-            platformId = "12345",
-        )
+        val att =
+            IdentityAttestation(
+                id = "def456",
+                platform = "x.com",
+                platformHandle = "bob",
+                verificationMethod = "did:dht:z6Mk...#agent",
+                verifiedAt = 1_700_000_000L,
+                revocationStatus =
+                    RevocationStatus.Revoked(
+                        revokedAt = 1_700_000_100L,
+                        reason = "compromised",
+                    ),
+                platformId = "12345",
+            )
         assertEquals("revoked", att.revocationStatus.status)
         assertEquals("12345", att.platformId)
         val revoked = att.revocationStatus as RevocationStatus.Revoked
@@ -68,10 +71,11 @@ class IdentityAttestationTest {
 
     @Test
     fun `RevocationStatus Revoked`() {
-        val rs = RevocationStatus.Revoked(
-            revokedAt = 1_700_000_100L,
-            reason = "test",
-        )
+        val rs =
+            RevocationStatus.Revoked(
+                revokedAt = 1_700_000_100L,
+                reason = "test",
+            )
         assertEquals("revoked", rs.status)
         assertEquals(1_700_000_100L, rs.revokedAt)
         assertEquals("test", rs.reason)
@@ -92,52 +96,57 @@ class IdentityAttestationTest {
 
     @Test
     fun equality() {
-        val att1 = IdentityAttestation(
-            id = "abc123",
-            platform = "github.com",
-            platformHandle = "alice",
-            verificationMethod = "did:dht:z6Mk...#active",
-            verifiedAt = 1_700_000_000L,
-        )
-        val att2 = IdentityAttestation(
-            id = "abc123",
-            platform = "github.com",
-            platformHandle = "alice",
-            verificationMethod = "did:dht:z6Mk...#active",
-            verifiedAt = 1_700_000_000L,
-        )
+        val att1 =
+            IdentityAttestation(
+                id = "abc123",
+                platform = "github.com",
+                platformHandle = "alice",
+                verificationMethod = "did:dht:z6Mk...#active",
+                verifiedAt = 1_700_000_000L,
+            )
+        val att2 =
+            IdentityAttestation(
+                id = "abc123",
+                platform = "github.com",
+                platformHandle = "alice",
+                verificationMethod = "did:dht:z6Mk...#active",
+                verifiedAt = 1_700_000_000L,
+            )
         assertEquals(att1, att2)
     }
 
     @Test
     fun inequality() {
-        val att1 = IdentityAttestation(
-            id = "abc123",
-            platform = "github.com",
-            platformHandle = "alice",
-            verificationMethod = "did:dht:z6Mk...#active",
-            verifiedAt = 1_700_000_000L,
-        )
-        val att2 = IdentityAttestation(
-            id = "def456",
-            platform = "github.com",
-            platformHandle = "alice",
-            verificationMethod = "did:dht:z6Mk...#active",
-            verifiedAt = 1_700_000_000L,
-        )
+        val att1 =
+            IdentityAttestation(
+                id = "abc123",
+                platform = "github.com",
+                platformHandle = "alice",
+                verificationMethod = "did:dht:z6Mk...#active",
+                verifiedAt = 1_700_000_000L,
+            )
+        val att2 =
+            IdentityAttestation(
+                id = "def456",
+                platform = "github.com",
+                platformHandle = "alice",
+                verificationMethod = "did:dht:z6Mk...#active",
+                verifiedAt = 1_700_000_000L,
+            )
         assertNotEquals(att1, att2)
     }
 
     @Test
     fun `data class copy preserves fields`() {
-        val att = IdentityAttestation(
-            id = "abc123",
-            platform = "github.com",
-            platformHandle = "alice",
-            verificationMethod = "did:dht:z6Mk...#active",
-            verifiedAt = 1_700_000_000L,
-            platformId = "42",
-        )
+        val att =
+            IdentityAttestation(
+                id = "abc123",
+                platform = "github.com",
+                platformHandle = "alice",
+                verificationMethod = "did:dht:z6Mk...#active",
+                verifiedAt = 1_700_000_000L,
+                platformId = "42",
+            )
         val renewed = att.copy(verifiedAt = 1_800_000_000L)
         assertEquals("abc123", renewed.id)
         assertEquals(1_800_000_000L, renewed.verifiedAt)
@@ -146,7 +155,8 @@ class IdentityAttestationTest {
 
     @Test
     fun `fromJson parses Active revocation status string`() {
-        val json = """
+        val json =
+            """
             {
                 "id": "abc123",
                 "platform": "github.com",
@@ -155,7 +165,7 @@ class IdentityAttestationTest {
                 "verified_at": 1700000000,
                 "revocation_status": "Active"
             }
-        """.trimIndent()
+            """.trimIndent()
         val att = IdentityAttestation.fromJson(json)
         assertEquals("abc123", att.id)
         assertEquals("github.com", att.platform)
@@ -168,7 +178,8 @@ class IdentityAttestationTest {
 
     @Test
     fun `fromJson parses Revoked revocation status object`() {
-        val json = """
+        val json =
+            """
             {
                 "id": "def456",
                 "platform": "x.com",
@@ -183,7 +194,7 @@ class IdentityAttestationTest {
                 },
                 "platform_id": "12345"
             }
-        """.trimIndent()
+            """.trimIndent()
         val att = IdentityAttestation.fromJson(json)
         assertEquals("def456", att.id)
         val revoked = att.revocationStatus as RevocationStatus.Revoked
@@ -194,7 +205,8 @@ class IdentityAttestationTest {
 
     @Test
     fun `fromJson parses missing revocation status as Active`() {
-        val json = """
+        val json =
+            """
             {
                 "id": "ghi789",
                 "platform": "linkedin.com",
@@ -202,7 +214,7 @@ class IdentityAttestationTest {
                 "verification_method": "did:dht:z6Mk...#active",
                 "verified_at": 1700000000
             }
-        """.trimIndent()
+            """.trimIndent()
         val att = IdentityAttestation.fromJson(json)
         assertTrue(att.revocationStatus is RevocationStatus.Active)
     }
@@ -255,13 +267,14 @@ class IdentityAttestationTest {
 
     @Test
     fun `toString includes key fields`() {
-        val att = IdentityAttestation(
-            id = "abc123",
-            platform = "github.com",
-            platformHandle = "alice",
-            verificationMethod = "did:dht:z6Mk...#active",
-            verifiedAt = 1_700_000_000L,
-        )
+        val att =
+            IdentityAttestation(
+                id = "abc123",
+                platform = "github.com",
+                platformHandle = "alice",
+                verificationMethod = "did:dht:z6Mk...#active",
+                verifiedAt = 1_700_000_000L,
+            )
         val str = att.toString()
         assert(str.contains("abc123"))
         assert(str.contains("github.com"))
