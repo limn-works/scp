@@ -357,7 +357,7 @@ pub struct CoreFields {
     /// Per-context member budget trackers for economic governance.
     ///
     /// Keyed by context ID. Created lazily on first access via
-    /// [`with_economy_budget`] / [`with_economy_budget_mut`]. Budget trackers
+    /// [`Self::with_economy_budget`] / [`Self::with_economy_budget_mut`]. Budget trackers
     /// are NOT removed automatically when contexts are closed -- call
     /// [`Self::remove_economy_state`] for cleanup in long-running processes.
     economy_budgets: DashMap<String, MemberBudgetTracker>,
@@ -387,7 +387,7 @@ pub struct CoreFields {
     /// (BEP44 signature verification, self-certification, sequence number
     /// tracking, caching).
     ///
-    /// Initialized by [`set_did_resolver`] when the identity layer is first
+    /// Initialized by [`Self::set_did_resolver`] when the identity layer is first
     /// set up. `None` until `identity_create` initializes it.
     ///
     /// See #311 for the unification design.
@@ -396,7 +396,7 @@ pub struct CoreFields {
     /// Shared DHT client backing the production DID resolver.
     ///
     /// Retained on the instance so that `identity_create` publishes freshly
-    /// minted DID documents into the *same* [`FfiDhtClient`] the resolver reads
+    /// minted DID documents into the *same* [`FfiDhtClient`](crate::dht::FfiDhtClient) the resolver reads
     /// from. Without this, an identity's document is only registered in the local
     /// identity registry and is never resolvable via the resolver — so any code
     /// path that resolves the DID to verify a signature (UCAN validation,
@@ -404,21 +404,21 @@ pub struct CoreFields {
     /// public key for DID".
     ///
     /// Set by the same idempotent resolver-initialization path that calls
-    /// [`set_did_resolver`]; the resolver and this client are the same `Arc`.
+    /// [`Self::set_did_resolver`]; the resolver and this client are the same `Arc`.
     /// `None` until the identity layer is first set up.
     ///
-    /// The shipped [`FfiDhtClient`] is the real Mainline `PkarrDhtClient`; the
+    /// The shipped [`FfiDhtClient`](crate::dht::FfiDhtClient) is the real Mainline `PkarrDhtClient`; the
     /// in-memory arm exists only under `testing` (ADR-062 §Decision 1).
     dht_client: OnceLock<Arc<crate::dht::FfiDhtClient>>,
 
     /// The DID-resolution cache shared with the production DID resolver.
     ///
-    /// Stored alongside [`dht_client`] and the resolver itself (the SAME
+    /// Stored alongside [`Self::dht_client`] and the resolver itself (the SAME
     /// `Arc<DidCache>` the `DualLayerResolver` was built over). The resolver
     /// caches resolved documents with a multi-day TTL; when a locally held
     /// identity is mutated (key rotation, agent-key add/rotate/remove,
     /// migration) and its higher-sequence document is re-published into
-    /// [`dht_client`], the matching cache entry must be invalidated so the
+    /// [`Self::dht_client`], the matching cache entry must be invalidated so the
     /// next resolution re-reads the fresh document instead of serving the
     /// stale, pre-mutation one. `None` until the identity layer is first set
     /// up.
@@ -476,10 +476,10 @@ pub struct CoreFields {
     /// relays does this bridge intend to be connected to".
     ///
     /// Populated via [`Self::add_relay_url`]. Entries removed via
-    /// [`remove_relay_url`] (explicit disconnect). Retrieved as a
+    /// [`Self::remove_relay_url`] (explicit disconnect). Retrieved as a
     /// deduplicated snapshot via [`Self::pending_relay_urls`]. Preserved across
     /// `suspend()` / `resume()` cycles so callers can reconnect.
-    /// Cleared in full by [`shutdown()`] and [`clear_relay_urls`].
+    /// Cleared in full by [`Self::shutdown`].
     relay_urls: Mutex<HashSet<String>>,
 
     // -----------------------------------------------------------------
@@ -499,13 +499,13 @@ pub struct CoreFields {
     cancel: CancellationToken,
 
     /// Cancellation signal scoped to the **current reconnect generation**
-    /// — fired on [`suspend`] and [`shutdown`] so any in-flight
-    /// [`reconnect_transport_if_pending`] dial can drop its
+    /// — fired on [`Self::suspend`] and [`Self::shutdown`] so any in-flight
+    /// [`Self::reconnect_transport_if_pending`] dial can drop its
     /// half-connected socket instead of completing against a torn-down
     /// instance (#1696).
     ///
     /// Rotated (old one cancelled, fresh one installed) on each
-    /// `suspend()`. [`reconnect_transport_if_pending`] clones the token
+    /// `suspend()`. [`Self::reconnect_transport_if_pending`] clones the token
     /// once at entry and races each `NativeRelayAdapter::connect_sourced`
     /// against `token.cancelled()`. If suspend fires mid-dial, the
     /// `.await` resolves with the cancellation branch and the pending
@@ -783,7 +783,7 @@ impl CoreFields {
     /// Emergency, non-blocking task cancellation for use from `Drop`.
     ///
     /// Drop must never block or `.await`, so the graceful
-    /// [`shutdown_core_async`] path is unavailable. This helper does the
+    /// [`Self::shutdown_core_async`] path is unavailable. This helper does the
     /// minimum safe cleanup:
     ///
     /// 1. Fires [`CancellationToken::cancel`] so any task `select!`ing on
@@ -1489,7 +1489,7 @@ impl CoreFields {
     /// `is_shutdown()` check is performed twice — once fast-path before
     /// acquiring the lock, and once after — to close the TOCTOU window
     /// between the first check and the insert (symmetric with
-    /// [`register_shutdown_hook`]).
+    /// [`Self::register_shutdown_hook`]).
     ///
     /// If the `relay_urls` mutex is poisoned (a previous caller panicked
     /// while holding it), the URL is silently dropped and a warning is
@@ -2363,7 +2363,7 @@ impl CoreFields {
     /// Returns the shared DHT client backing the DID resolver, if initialized.
     ///
     /// Used by `identity_create` to publish freshly minted DID documents into
-    /// the same [`FfiDhtClient`] the resolver reads from, so the DID is
+    /// the same [`FfiDhtClient`](crate::dht::FfiDhtClient) the resolver reads from, so the DID is
     /// resolvable for signature verification.
     #[must_use]
     pub fn dht_client(&self) -> Option<&Arc<crate::dht::FfiDhtClient>> {
@@ -2372,8 +2372,8 @@ impl CoreFields {
 
     /// Stores the shared DHT client backing the DID resolver.
     ///
-    /// Called once during identity system setup, alongside [`set_did_resolver`],
-    /// with the SAME [`FfiDhtClient`] `Arc` the resolver was built over.
+    /// Called once during identity system setup, alongside [`Self::set_did_resolver`],
+    /// with the SAME [`FfiDhtClient`](crate::dht::FfiDhtClient) `Arc` the resolver was built over.
     /// Subsequent calls are no-ops (`OnceLock` guarantees single
     /// initialization).
     pub fn set_dht_client(&self, client: Arc<crate::dht::FfiDhtClient>) {
@@ -2396,8 +2396,8 @@ impl CoreFields {
 
     /// Stores the DID-resolution cache backing the DID resolver.
     ///
-    /// Called once during identity system setup, alongside [`set_did_resolver`]
-    /// and [`set_dht_client`], with the SAME `Arc<DidCache>` the resolver was
+    /// Called once during identity system setup, alongside [`Self::set_did_resolver`]
+    /// and [`Self::set_dht_client`], with the SAME `Arc<DidCache>` the resolver was
     /// built over. Subsequent calls are no-ops (`OnceLock` guarantees single
     /// initialization).
     pub fn set_resolver_cache(&self, cache: Arc<scp_identity::cache::DidCache>) {
@@ -2501,7 +2501,7 @@ impl CoreFields {
     /// Must only be called after `self.shutdown` has been swapped to `true`.
     /// Clears transport, flushes persistence (inside `flush_budget` when
     /// called from the async path, or with no bound from the sync path
-    /// via [`blocking_run_shutdown_side_effects`]), drops MLS groups +
+    /// via [`Self::blocking_run_shutdown_side_effects`]), drops MLS groups +
     /// sender keys, clears bridge-owned registries, and runs any registered
     /// shutdown hooks. Infallible: lock poisoning, hook panics, and flush
     /// timeouts are logged and cleanup continues — shutdown must finish
@@ -2565,7 +2565,7 @@ impl CoreFields {
         self.finish_shutdown_cleanup();
     }
 
-    /// Non-async sibling of [`run_shutdown_side_effects`] used by the sync
+    /// Non-async sibling of [`Self::run_shutdown_side_effects`] used by the sync
     /// [`shutdown`](Self::shutdown) path.
     ///
     /// The sync path has no deadline — it is a terminal, infallible

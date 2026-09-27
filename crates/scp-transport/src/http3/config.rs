@@ -354,12 +354,14 @@ impl Http3Config {
     /// Returns [`TransportError::ConnectionFailed`] if the TLS configuration
     /// is invalid (e.g., certificate/key mismatch).
     pub fn build_rustls_config(&self) -> Result<rustls::ServerConfig, TransportError> {
-        // Pin the ring crypto provider explicitly rather than relying on the
-        // process default. When a binary links both the `ring` and `aws-lc-rs`
-        // rustls providers (e.g. via aws-sdk / reqwest pulling aws-lc-rs
-        // alongside our ring backend), `ServerConfig::builder()` has no
-        // unambiguous default and panics. SCP is ring-only, so name the
-        // provider directly. Mirrors the QUIC listener fix.
+        // Name the ring crypto provider rather than taking the process default.
+        // `ServerConfig::builder()` reads whichever provider the process installed, or the
+        // one provider the binary's rustls links when exactly one is compiled in, and it
+        // panics when two are. No feature combination of this workspace links a second
+        // provider any more — scp-node stopped pulling aws-lc-rs through instant-acme, and
+        // scp-transport's S3 client builds its connector on rustls-ring — so the bare
+        // builder would resolve ring today. Naming it keeps that true whatever a future
+        // dependency links.
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut tls_config = rustls::ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()

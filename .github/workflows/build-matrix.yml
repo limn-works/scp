@@ -37,6 +37,7 @@ jobs:
   rust:
     name: Rust (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -134,6 +135,7 @@ jobs:
   python-wheels:
     name: Python wheel (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -178,6 +180,7 @@ jobs:
   python-sdist:
     name: Python sdist
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -206,6 +209,7 @@ jobs:
   typescript-napi:
     name: TypeScript NAPI (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -286,6 +290,7 @@ jobs:
     name: Swift XCFramework
     # Pinned: Package.swift requires swift-tools-version 6.2; macos-latest (macOS 15) only ships 6.1
     runs-on: macos-26
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -331,9 +336,18 @@ jobs:
             target/x86_64-apple-ios/release/libscp_ffi_uniffi.a \
             -output target/universal-ios-sim/release/libscp_ffi_uniffi.a
 
+      # `--release --target aarch64-apple-darwin` names the directory the "Build for
+      # macOS (aarch64)" step above already filled, so this command compiles the bindgen
+      # binary alone and reuses that step's ~650 dependencies. Without both flags cargo
+      # compiles the same crate graph a second time, under the dev profile, into
+      # `target/debug` — six minutes on this runner, measured on run 34724307976 of the
+      # same shape in ci.yml. `cargo run` executes what it builds, and this runner is
+      # arm64, so the triple it names is the host's. The library it reads is the one that
+      # step built, so the bindings match the dylib the XCFramework ships.
+      # `scripts/check-workflow-compile-steps.py` holds every uniffi-bindgen step to this.
       - name: Generate UniFFI Swift bindings
         run: |
-          cargo run -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
+          cargo run --release --target aarch64-apple-darwin -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
             --library target/aarch64-apple-darwin/release/libscp_ffi_uniffi.dylib \
             --language swift \
             --out-dir bindings/swift/Sources/SCP
@@ -384,6 +398,7 @@ jobs:
   kotlin-aar:
     name: Kotlin AAR
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -405,6 +420,13 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # Google withdrew `tools`, the obsolete Android SDK Tools package,
+          # from the SDK repository, and `tools platform-tools` is this
+          # action's default package list, so the action exits 1 and never
+          # puts sdkmanager on PATH. The two Kotlin jobs in ci.yml carry the
+          # same input and state the failure in full.
+          packages: platform-tools
 
       - name: Install Android NDK
         run: sdkmanager "ndk;27.2.12479018"
@@ -423,10 +445,18 @@ jobs:
             cargo build --release --target "$target" -p scp-ffi-uniffi
           done
 
+      # The four builds above are Android triples and this runner is x86_64 Linux, so no
+      # step before this one produces a library the host can load, and `cargo run` has to
+      # compile the crate graph for the host once. It does so under the dev profile,
+      # cargo's cheapest, into `target/debug`, and the `--library` it reads is the cdylib
+      # that same compile wrote: uniffi-bindgen reads the UniFFI metadata symbols the
+      # crate exports, which the profile does not change. The path this step named
+      # before, `target/release/libscp_ffi_uniffi.so`, was written by no step in this job.
+      # `scripts/check-workflow-compile-steps.py` holds every uniffi-bindgen step to this.
       - name: Generate Kotlin bindings
         run: |
           cargo run -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
-            --library target/release/libscp_ffi_uniffi.so \
+            --library target/debug/libscp_ffi_uniffi.so \
             --language kotlin \
             --out-dir bindings/kotlin/src/main/kotlin
 
@@ -462,6 +492,7 @@ jobs:
   cbindgen:
     name: C ABI (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -519,6 +550,7 @@ jobs:
   aggregate:
     name: Aggregate artifacts
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs:
       - rust
       - python-wheels

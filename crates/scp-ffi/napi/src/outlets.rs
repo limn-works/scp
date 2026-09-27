@@ -254,7 +254,7 @@ fn validate_implementation_hash(bytes: Option<&[u8]>) -> napi::Result<[u8; 32]> 
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`outlet_register`].
+/// Per-bridge-instance implementation of [`Scp::outlet_register`](crate::scp::Scp::outlet_register).
 pub(crate) async fn outlet_register_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -362,7 +362,7 @@ pub(crate) async fn outlet_register_on(
     Ok(registered_id)
 }
 
-/// Per-bridge-instance implementation of [`outlet_invoke`].
+/// Per-bridge-instance implementation of [`Scp::outlet_invoke`](crate::scp::Scp::outlet_invoke).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn outlet_invoke_on(
     bi: &crate::runtime::NapiBridgeInstance,
@@ -550,7 +550,7 @@ pub(crate) async fn outlet_invoke_on(
     })
 }
 
-/// Per-bridge-instance implementation of [`outlet_verify`].
+/// Per-bridge-instance implementation of [`Scp::outlet_verify`](crate::scp::Scp::outlet_verify).
 pub(crate) async fn outlet_verify_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -620,7 +620,7 @@ pub(crate) async fn outlet_verify_on(
 // Cross-context outlet invocation
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`outlet_invoke_cross_context`].
+/// Per-bridge-instance implementation of [`Scp::outlet_invoke_cross_context`](crate::scp::Scp::outlet_invoke_cross_context).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn outlet_invoke_cross_context_on(
     bi: &crate::runtime::NapiBridgeInstance,
@@ -1147,7 +1147,7 @@ pub(crate) async fn outlet_invoke_cross_context_saga_on(
 // Stateful outlet sessions (spec section 6.2.1)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`outlet_session_create`].
+/// Per-bridge-instance implementation of [`Scp::outlet_session_create`](crate::scp::Scp::outlet_session_create).
 pub(crate) async fn outlet_session_create_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -1214,7 +1214,7 @@ pub(crate) async fn outlet_session_create_on(
     .map_err(napi::Error::from)
 }
 
-/// Per-bridge-instance implementation of [`outlet_session_invoke`].
+/// Per-bridge-instance implementation of [`Scp::outlet_session_invoke`](crate::scp::Scp::outlet_session_invoke).
 pub(crate) async fn outlet_session_invoke_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -1355,7 +1355,7 @@ pub(crate) async fn outlet_session_invoke_on(
     })
 }
 
-/// Per-bridge-instance implementation of [`outlet_session_close`].
+/// Per-bridge-instance implementation of [`Scp::outlet_session_close`](crate::scp::Scp::outlet_session_close).
 ///
 /// Carries no lifecycle gate, unlike the nine outlet entry points that decide
 /// an authorization question: this one releases one session entry the bridge
@@ -1388,7 +1388,7 @@ pub(crate) async fn outlet_session_close_on(
 // Bidirectional consent protocol (spec §6.2.0.1)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`outlet_interface_expose`].
+/// Per-bridge-instance implementation of [`Scp::outlet_interface_expose`](crate::scp::Scp::outlet_interface_expose).
 pub(crate) async fn outlet_interface_expose_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -1471,7 +1471,7 @@ pub(crate) async fn outlet_interface_expose_on(
     .map_err(napi::Error::from)
 }
 
-/// Per-bridge-instance implementation of [`outlet_interface_accept`].
+/// Per-bridge-instance implementation of [`Scp::outlet_interface_accept`](crate::scp::Scp::outlet_interface_accept).
 pub(crate) async fn outlet_interface_accept_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -1535,7 +1535,7 @@ pub(crate) async fn outlet_interface_accept_on(
     .map_err(napi::Error::from)
 }
 
-/// Per-bridge-instance implementation of [`outlet_interface_revoke`].
+/// Per-bridge-instance implementation of [`Scp::outlet_interface_revoke`](crate::scp::Scp::outlet_interface_revoke).
 ///
 /// Carries no lifecycle gate, unlike the nine outlet entry points that decide
 /// an authorization question: this one reads no context state and grants

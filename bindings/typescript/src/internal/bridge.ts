@@ -586,6 +586,7 @@ export interface Bridge {
   identityVerifyLinkAttestation(
     attestationJson: string,
     issuerPublicKeyHex: string,
+    referenceProof: string,
   ): Promise<boolean>;
 
   // Recovery and custody migration (spec §9.12, §3.2.1)

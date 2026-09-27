@@ -1109,8 +1109,11 @@ pub const MIGRATION_REPUBLISH_INTERVAL_SECS: u64 = 60 * 60;
 ///
 /// # Cancellation
 ///
-/// The returned [`MigrationHandle`] can be used to cancel the background task.
-/// The task also stops if the handle is dropped.
+/// A caller stops the background task by calling
+/// [`MigrationHandle::cancel`] on the returned handle. Dropping the handle
+/// does NOT stop the task: [`MigrationHandle`] holds a
+/// [`tokio::task::AbortHandle`], which releases the permission to abort when
+/// it drops and leaves the spawned task running until the runtime shuts down.
 pub struct MigrationRepublisher<D: DhtClient> {
     dht_client: Arc<D>,
     interval_secs: u64,
@@ -1118,8 +1121,10 @@ pub struct MigrationRepublisher<D: DhtClient> {
 
 /// Handle to a running migration republish task.
 ///
-/// Dropping the handle or calling [`cancel`](Self::cancel) stops the
-/// background republish task.
+/// [`cancel`](Self::cancel) stops the background republish task. Dropping
+/// this handle does NOT stop it — the inner [`tokio::task::AbortHandle`]
+/// only releases the permission to abort when it drops, so the spawned task
+/// keeps republishing until the runtime shuts down.
 pub struct MigrationHandle {
     abort_handle: tokio::task::AbortHandle,
 }

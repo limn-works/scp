@@ -39,7 +39,8 @@ pub use challenge::{
     verify_challenge_verification,
 };
 pub use custody_violation::{
-    ActionCategory, CounterAttestation, CustodyViolationError, CustodyViolationType,
+    ActionCategory, COUNTER_ATTESTATION_DOMAIN, CUSTODY_VIOLATION_DOMAIN, CounterAttestation,
+    CustodyViolationError, CustodyViolationResult, CustodyViolationType,
     ScpCustodyViolationAttestation, classify_action, enforce_category_a,
 };
 pub use participation::{
@@ -491,6 +492,17 @@ pub struct TrustInput {
     /// Declared consequence rules (Layer 4).
     pub consequence_structure: Vec<consequence::ConsequenceRule>,
 
-    /// Threshold counts per attestation type: `(met, required)`.
+    /// Threshold counts per attestation type: `(valid, required)`.
+    ///
+    /// A first element is `ThresholdResult::valid_count` — how many attestors
+    /// an aggregation admitted — not `ThresholdResult::met`. Spec §7.3.5
+    /// admits an attestor only when that attestor's attestation names an
+    /// evaluated subject, names that attestor as its own issuer, carries a
+    /// verifying signature, and carries a DID no admitted attestor already
+    /// used. A threshold is met when a first element reaches a second AND an
+    /// independence score reaches its own threshold; this pair carries no
+    /// independence score, so a consumer that needs a met-or-not verdict calls
+    /// [`check_threshold_attestation`](attestation::check_threshold_attestation)
+    /// directly.
     pub threshold_counts: HashMap<AttestationType, (u32, u32)>,
 }

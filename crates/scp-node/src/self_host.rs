@@ -593,7 +593,7 @@ fn colocated_resolve_vm_on_dedicated_thread<R: scp_identity::resolver::DidResolv
 /// `key_resolver` is the REAL document-derived governance resolver (built via
 /// [`colocated_document_vm_key_resolver`] over a [`DualLayerResolver`](scp_identity::DualLayerResolver)
 /// that shares the node's [`DidCache`](scp_identity::DidCache)). It is passed
-/// straight into [`Supervisor::with_providers`], so the co-located participant
+/// straight into [`Supervisor::with_providers`](scp_core::context::supervisor::Supervisor::with_providers), so the co-located participant
 /// verifies governance votes against each voter's published verification method
 /// — never the `|_, _| None` stub the bundled path used to ship (ADR-053 / spec
 /// §10.17).

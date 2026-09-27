@@ -581,6 +581,8 @@ When the address includes a scope, the scope determines the resolution path:
 - **No `.` in scope** (`alice@cooking-community`): two-hop scope-based resolution (§22.3.5). First, resolve the scope name to a context ID via `scope_lookup` on bootstrap context(s), with the SDK-local scope cache as a fast path. Then resolve the handle within the target context via `handle_lookup`. The SDK queries ALL configured scope registries and returns all results with provenance (each result carries `scope_registry_id` and `scope_registry_source` in its `ResolutionPath`). The first-priority match (per the SDK's bootstrap configuration priority order) is the default, but disagreements across registries are surfaced as warnings to the consumer. This is the secure option — silent disagreement suppression would hide registry compromise or squatting.
 - **`.` in scope** (`alice@example.com`): domain-first with attestation fallback (§22.6.2). If the domain serves `.well-known/scp` with the handle, that answer wins with `DomainVerified`. If not, attestation fallback is tried. The result carries its trust level, so the consumer knows which path succeeded.
 
+A scoped resolution whose resolver holds no context for that scope queried no handle registry, so it reports the handle-registry layer under §22.8.2a rather than reporting that a registry answered and held no entry.
+
 ### 22.8.2 Unscoped Resolution
 
 When the address has no scope (`alice` or `@alice`), the resolver searches all paths:
@@ -593,17 +595,47 @@ When the address has no scope (`alice` or `@alice`), the resolver searches all p
    a. Check domain handles for configured domains
    b. Query known contexts with discovery outlets via handle_lookup
    c. Query attestation indexes via attestation_lookup
+   Each layer answers with results, or answers LayerUnavailable when this
+   deployment reaches no such layer. A layer whose configuration names nothing
+   to query — no context with discovery outlets, no domain — is
+   LayerUnavailable too, and the resolver records it without issuing a query
+   (§22.8.2a)
 
-3. Collect results, deduplicate by DID
+3. Collect results, deduplicate by DID. Collect each distinct
+   LayerUnavailable once, comparing layer AND reason
 
 4. Evaluate:
-   a. No results → AddressError::NotFound
+   a. No results, a read happened against every consulted layer →
+      AddressError::NotFound
+   a'. No results, nobody read at least one layer →
+      AddressError::LayersUnavailable { address, layers }
    b. One DID found via single path → return with that path's trust level
    c. One DID found via multiple paths → return with trust_level:
       MultiLayerCorroborated { sources: [all agreeing paths] }
    d. Multiple DIDs found → return all as separate AddressResolution entries,
       each with its own trust level. Client presents options (§22.8.3)
+
+5. Return AddressResolutionOutcome { resolutions, unavailable_layers } —
+   the collected LayerUnavailable entries travel with the results, not only
+   with the failures
 ```
+
+#### 22.8.2a Unread Layers
+
+A resolver MUST distinguish a layer that answered and held no binding from a layer nobody read. A deployment that reaches no `attestation_lookup` outlet (§22.5.1) queries no attestation index, and a deployment that fetches no `.well-known/scp` document (§22.6.1) reads no domain handle map. Reporting zero results for either would tell the caller that no participant registered that handle, which the deployment never established.
+
+**The criterion:** a layer belongs in `unavailable_layers` when this resolution read nothing from that layer, whatever stopped the read. A layer belongs in the results instead when this resolution read the layer and the layer held zero entries.
+
+Two conditions satisfy that criterion, and an implementation MUST record both:
+
+- The querier reaches no such layer. It MUST answer `LayerUnavailable { layer, reason }` and MUST NOT answer an empty result list.
+- The resolver's own configuration names nothing to query for that layer: no context for the scope the address carries, no context with discovery outlets at all, or no domain. The resolver MUST record `LayerUnavailable` itself, without issuing a query.
+
+`AddressResolver.resolve` MUST carry every distinct `LayerUnavailable` it collected into `AddressResolutionOutcome.unavailable_layers`, on a resolution that found bindings as well as on one that found none. Two entries are the same entry when they carry the same `layer` AND the same `reason`, so querying one layer once per configured domain yields one entry, while two unmade queries against one layer with different reasons stay as two entries.
+
+A caller reads `unavailable_layers` before acting on the top-ranked entry in `resolutions`. §22.8.2 ranks by trust level, so a caller that cannot see which higher-trust layers went unread cannot tell whether the top-ranked entry is the strongest binding or only the strongest binding somebody looked for.
+
+The two failure modes carry different error codes at the SDK boundary. `SCP-VALID-7091` reports `AddressError::NotFound` — a read happened against every consulted layer, and none held a binding, so the binding is absent. `SCP-VALID-7136` reports `AddressError::LayersUnavailable` — no layer held a binding and nobody read at least one layer, so a capability is absent. A caller retries `SCP-VALID-7136` against a deployment that holds the missing capability; retrying `SCP-VALID-7091` against any deployment returns the same answer.
 
 ### 22.8.3 Collision and Disambiguation
 
@@ -621,7 +653,7 @@ The protocol does not prevent name collisions — it surfaces them transparently
 
 ### 22.8.4 Resolution Caching
 
-The SDK caches resolution results locally to avoid redundant network calls. Cache entries are keyed by normalized address string, with per-layer TTLs: petnames are indefinite (user-managed); domain handles follow HTTP caching semantics (~1 hour); context handles are short-lived (~15 minutes); scope entries use ~15 minutes (matching context handles — scope entries are more stable than individual handles but should still be refreshed to detect re-registrations); attestation handles match attestation renewal intervals (§7.3.6). Cache misses trigger fresh resolution. Cache hits with expired TTL trigger background re-resolution (return cached result immediately, verify in background). Cache implementation details are specified in `.docs/scaffold/`.
+The SDK caches whole `AddressResolutionOutcome` values locally to avoid redundant network calls. A cache entry holds both `resolutions` and `unavailable_layers`, and a cache hit replays both: an entry that dropped `unavailable_layers` would tell the caller that every layer answered when no layer had. Cache entries are keyed by normalized address string, with per-layer TTLs: petnames are indefinite (user-managed); domain handles follow HTTP caching semantics (~1 hour); context handles are short-lived (~15 minutes); scope entries use ~15 minutes (matching context handles — scope entries are more stable than individual handles but should still be refreshed to detect re-registrations); attestation handles match attestation renewal intervals (§7.3.6). Cache misses trigger fresh resolution. Cache hits with expired TTL trigger background re-resolution (return cached result immediately, verify in background). Cache implementation details are specified in `.docs/scaffold/`.
 
 ### 22.8.5 SDK Surface
 
@@ -629,7 +661,10 @@ The SDK caches resolution results locally to avoid redundant network calls. Cach
 // Parse and resolve any human-readable address
 SCP.Address.resolve(
   address: "alice@cooking-community"
-) → [AddressResolution]
+) → AddressResolutionOutcome {
+      resolutions: [AddressResolution],        // highest trust first
+      unavailable_layers: [LayerUnavailable]   // layers nobody read
+    }
 
 // Register a handle in a context with discovery outlets
 SCP.Address.register(
@@ -671,8 +706,10 @@ SCP.Address.deregisterScope(
 SCP.Address.resolveInContext(
   handle: "alice",
   discoveryContext: cookingCommunityID
-) → [AddressResolution]
+) → AddressResolutionOutcome
 ```
+
+The three FFI bridges return that outcome as one JSON object with two keys, `resolutions` and `unavailable_layers`. Both keys are always present; `unavailable_layers` holds an empty array when every consulted layer answered, so a caller parses one shape whatever happened.
 
 ## 22.9 Wire Type Extensions
 
@@ -1013,6 +1050,20 @@ Admin removal via governance produces standard governance events (§5.9), not `S
 |---------|-----|--------|-----------|
 | `Identity` | `"Identity"` | `did: String`, `trust_level: TrustLevel`, `resolution_path: ResolutionPath` | Resolved to a DID. |
 | `Context` | `"Context"` | `context_id: String`, `relay_urls: Vec<String>`, `mode: String`, `trust_level: TrustLevel`, `resolution_path: ResolutionPath` | Resolved to a context. `mode` is `"encrypted"` or `"broadcast"`. |
+
+**`AddressResolutionOutcome`** — What one resolution found, plus which layers nobody read. The value `AddressResolver.resolve` returns (§22.8.2a).
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `resolutions` | `Vec<AddressResolution>` | Yes | Bindings the resolution found, sorted by trust rank, highest first. Never empty: resolution returns `NotFound` or `LayersUnavailable` instead of an empty list. |
+| `unavailable_layers` | `Vec<LayerUnavailable>` | Yes | Every layer nobody read, each distinct `layer`-and-`reason` pair recorded once (§22.8.2a). One layer appears more than once when two reads against it went unmade for different reasons. Empty when a read happened against every consulted layer. |
+
+**`LayerUnavailable`** — A resolution layer nobody read during this resolution: either the querier reaches no such layer, or the resolver's configuration named nothing to query there.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `layer` | `ResolutionLayer` | Yes | Layer nobody read. |
+| `reason` | `String` | Yes | Why nobody read that layer — the outlet this deployment invokes for nobody, the fetch it performs for nothing, or the context or domain its configuration never named. |
 
 **`TrustLevel`** — Tagged enum indicating binding strength. Not strictly ordered (§22.7).
 

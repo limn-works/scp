@@ -1,6 +1,6 @@
 # Construction Pattern Standard
 
-This standard **enacts the Agent-first API design builder tenet** (CLAUDE.md) and **ADR-052 (Unified Construction Pattern)**. It is the enforced, mechanical form of the tenet: where the tenet states the goal (every public API optimized for first-pass LLM authorability), this document gives the rules a structural check can verify and an agent can follow without a compile-retry loop.
+This standard **enacts the Agent-first API design builder tenet** (AGENTS.md) and **ADR-052 (Unified Construction Pattern)**. It is the enforced, mechanical form of the tenet: where the tenet states the goal (every public API optimized for first-pass LLM authorability), this document gives the rules a structural check can verify and an agent can follow without a compile-retry loop.
 
 It governs **every developer-facing construction entry point** in the SDK surface — Node, Relay, `host_site`, Context, Identity — in **all five languages** (Rust core + Python, TypeScript, Swift, Kotlin). It does not govern internal-only constructors that no SDK author calls.
 
@@ -207,7 +207,7 @@ ContextConfig {
 
 `ContextCreation` makes the template-vs-explicit XOR a **required enum**. This replaces the Rust `create_context().template().build()` fluent builder and aligns Rust to the options-object that Python/TS/Swift already use — eliminating the `sdk-common.md` Context-creation divergence. Entry: `<manager>.create(ContextConfig)` — the verb-`create` method on the live `Supervisor`/ContextManager (see the Context receiver carve-out under the entry-verb rule for why a context is created within an existing manager runtime rather than via a bare `Context::create`); the language SDKs surface it as a method on their SDK handle.
 
-The `peer` carried by `ContextCreation::Template { template, peer }` is the bilateral counterparty for the invitation step. The invitation/Welcome-delivery that actually adds the peer is a higher SDK layer; until it is wired, the core `create` entry **rejects a supplied peer loudly** (a typed `BilateralPeerNotSupported` error) rather than silently dropping it — a config field is never accepted and then ignored (CLAUDE.md "no silent" tenet). `peer: None` is the supported form at this layer.
+The `peer` carried by `ContextCreation::Template { template, peer }` is the bilateral counterparty for the invitation step. The invitation/Welcome-delivery that actually adds the peer is a higher SDK layer; until it is wired, the core `create` entry **rejects a supplied peer loudly** (a typed `BilateralPeerNotSupported` error) rather than silently dropping it — a config field is never accepted and then ignored (AGENTS.md "no silent" tenet). `peer: None` is the supported form at this layer.
 
 ### Identity — `IdentityConfig`
 
@@ -238,11 +238,10 @@ The same config object and its enums map identically across all five language SD
 
 ## Related artifacts
 
-- **CLAUDE.md → Agent-first API design** (builder tenet) — the goal this standard enacts.
-- **CLAUDE.md → "enforce mechanically"** — why this lives as a structural check, not prose.
+- **AGENTS.md → Agent-first API design** (builder tenet) — the goal this standard enacts.
+- **AGENTS.md → "enforce mechanically"** — why this lives as a structural check, not prose.
 - **ADR-052 (Unified Construction Pattern)** — the worked decision, rationale, and rejected alternatives.
 - **ADR-032 §AC-6** — superseded by ADR-052; the original `ApplicationNode` builder mandate.
 - **ADR-049 (lock-free-read invariant)** — why providers stay enum-selectors, never boxed `dyn`.
 - **architecture.md §2.5** — injection-through-initializers, preserved; the config object is the initializer.
 - **sdk-common.md → Context Creation** — rewritten to the `ContextConfig` options-object form to match this standard.
-- **`.docs/lessons/llm-first-config-objects-over-typestate.md`** — the evergreen reasoning.

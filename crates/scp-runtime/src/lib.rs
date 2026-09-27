@@ -1,6 +1,5 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
-#![deny(rustdoc::broken_intra_doc_links)]
 //! Async runtime orchestration for SCP (Shared Context Protocol).
 //!
 //! `scp-runtime` contains the async orchestration and stateful logic that all

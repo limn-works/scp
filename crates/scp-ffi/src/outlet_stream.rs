@@ -7,15 +7,15 @@
 //! and [`StreamSessionHandle`] into six `PyScp` methods plus two pure 1:1
 //! wrappers:
 //!
-//! - [`PyScp::outlet_stream_open`] — open a stream (Commit-transition:
+//! - [`PyScp::outlet_stream_open`](crate::scp::PyScp::outlet_stream_open) — open a stream (Commit-transition:
 //!   returns a `StreamHandleId` PROMPTLY; NEVER blocks until terminal).
-//! - [`PyScp::outlet_stream_poll_next`] — drain one chunk (`None` == closed).
-//! - [`PyScp::outlet_stream_grant_credit`] — apply an invoker-signed grant.
-//! - [`PyScp::outlet_stream_cancel`] — sign+apply a cancel at the
+//! - [`PyScp::outlet_stream_poll_next`](crate::scp::PyScp::outlet_stream_poll_next) — drain one chunk (`None` == closed).
+//! - [`PyScp::outlet_stream_grant_credit`](crate::scp::PyScp::outlet_stream_grant_credit) — apply an invoker-signed grant.
+//! - [`PyScp::outlet_stream_cancel`](crate::scp::PyScp::outlet_stream_cancel) — sign+apply a cancel at the
 //!   runtime-derived cursor.
-//! - [`PyScp::outlet_stream_terminate`] — force a framework terminal.
-//! - [`PyScp::outlet_stream_verify_chunk_signature`] /
-//!   [`PyScp::outlet_stream_compute_caveats_binding`] — pure wrappers.
+//! - [`PyScp::outlet_stream_terminate`](crate::scp::PyScp::outlet_stream_terminate) — force a framework terminal.
+//! - [`PyScp::outlet_stream_verify_chunk_signature`](crate::scp::PyScp::outlet_stream_verify_chunk_signature) /
+//!   [`PyScp::outlet_stream_compute_caveats_binding`](crate::scp::PyScp::outlet_stream_compute_caveats_binding) — pure wrappers.
 //!
 //! # Two CRITICAL invariants enforced here
 //!

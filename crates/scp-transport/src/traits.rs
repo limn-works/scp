@@ -281,7 +281,7 @@ pub trait TransportAdapter: Send + Sync {
     /// DID-record frame is not an outer envelope (§9.10.12). Returns up to
     /// `limit` blobs (§3.10.2 resolves DID records with `limit = 16`).
     ///
-    /// Unlike [`query`](TransportAdapter::query) / [`subscribe`], this path
+    /// Unlike [`query`](TransportAdapter::query) / [`subscribe`](TransportAdapter::subscribe), this path
     /// **bypasses the live-subscription redelivery dedup**: a one-shot public
     /// record resolution needs every candidate on every call, whereas the dedup
     /// LRU exists to suppress duplicate live redeliveries and would wrongly drop

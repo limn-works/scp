@@ -1,0 +1,11 @@
+name: Bad
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: extra
+          shared-key: workspace-debug
+          save-if: ${{ github.ref == 'refs/heads/main' }}

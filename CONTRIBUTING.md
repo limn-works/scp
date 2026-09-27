@@ -18,16 +18,17 @@ Read `.docs/architecture.md` for system overview and `.docs/specs/` for protocol
    git worktree add .worktrees/<branch-name> -b <type>/<description>
    ```
 3. **Write code.** Follow the standards for your language. No stubs, no partial implementations.
-4. **Run CI locally** before pushing:
+4. **Run a quick local check** before pushing: `cargo fmt --all`, `cargo clippy` with the CI feature set scoped to the crates your change touches, the tests of those crates, and the gate scripts your change affects. For example, a change to `scp-runtime` alone runs:
    ```bash
    cargo fmt --all
-   cargo clippy --workspace --all-targets \
-     --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing \
+   cargo clippy -p scp-runtime --all-targets \
+     --features scp-runtime/testing,scp-runtime/saga-witness-test-mint \
      -- -D warnings
-   ./scripts/test.sh
+   cargo nextest run -p scp-runtime \
+     --features scp-runtime/testing,scp-runtime/saga-witness-test-mint
    ```
 5. **Commit atomically** with conventional commit messages.
-6. **Push and open a PR.**
+6. **Push and open a PR.** CI runs the full gate set on the pushed head. Fix every failing job before the PR merges.
 
 ## Commits
 

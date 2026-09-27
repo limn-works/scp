@@ -323,7 +323,7 @@ scp/
 │   │
 │   ├── scp-testing/           # Network simulation test harness (§16, dev-dependency)
 │   │   ├── clock.rs           # SimulatedClock (manual time control)
-│   │   ├── relay/             # InMemoryRelay, BlobStore, BehaviorMode, SubscriptionRegistry
+│   │   ├── relay/             # InMemoryRelay, BehaviorMode, SubscriptionRegistry
 │   │   ├── transport.rs       # InMemoryTransport (TransportAdapter over InMemoryRelay)
 │   │   ├── simulator/         # NetworkSimulator, SimulatedIdentity, NetworkTopology
 │   │   ├── builder.rs         # ScenarioBuilder (fluent API for test setup)
@@ -895,7 +895,7 @@ Each optional transport module uses `#[cfg(feature = "...")]` for conditional co
 
 ## 3. Language Binding Design
 
-**Agent-first design criterion (governs every binding).** The SDK's primary author is an LLM, so first-pass LLM authorability is *the* design criterion for the public API — not idiomatic-language-for-its-own-sake. Every developer-facing construction entry point (Node, Relay, `host_site`, Context, Identity) is one flat named-field config object plus one entry function, with an **identical shape across all five bindings**: required choices are required fields (often enums), consequential choices are enums rather than booleans, and there are no silent security defaults. This is the **Agent-first API design** builder tenet (CLAUDE.md). Per "enforce mechanically," the tenet is enacted by artifacts and tooling, not prose: the rules live in `.docs/standards/construction.md`, the decision and rejected alternatives in ADR-052, and a structural check (plus the `EncryptedStorage` compile-time split and its structural test) holds the line. See §2.5 — the config object is the initializer through which the injected subsystems flow, so this criterion does not weaken injection-through-initializers; it is its developer-facing surface.
+**Agent-first design criterion (governs every binding).** The SDK's primary author is an LLM, so first-pass LLM authorability is *the* design criterion for the public API — not idiomatic-language-for-its-own-sake. Every developer-facing construction entry point (Node, Relay, `host_site`, Context, Identity) is one flat named-field config object plus one entry function, with an **identical shape across all five bindings**: required choices are required fields (often enums), consequential choices are enums rather than booleans, and there are no silent security defaults. This is the **Agent-first API design** builder tenet (AGENTS.md). Per "enforce mechanically," the tenet is enacted by artifacts and tooling, not prose: the rules live in `.docs/standards/construction.md`, the decision and rejected alternatives in ADR-052, and a structural check (plus the `EncryptedStorage` compile-time split and its structural test) holds the line. See §2.5 — the config object is the initializer through which the injected subsystems flow, so this criterion does not weaken injection-through-initializers; it is its developer-facing surface.
 
 ### 3.1 Python SDK (Primary — Agent Ecosystem)
 
@@ -1040,7 +1040,7 @@ Build:
   • scp-core/identity/ — DID creation (did:dht)
   • scp-core/clock.rs — Clock trait + SystemClock (§16.3)
   • scp-transport/native/ — SCP native relay adapter (single relay)
-  • scp-transport/native/blob_store.rs — BlobStore trait (§16.4.1)
+  • scp-transport/native/storage.rs — BlobStorage trait (§17.1)
   • scp-platform/testing/ — In-memory key storage (delete_prefix, exists — §17.2)
   • scp-core/store/ — Skeleton ProtocolRepository (§17.4)
   • scp-core/crypto/mls/storage.rs — MlsStorageBridge (§17.9)
@@ -1094,7 +1094,7 @@ Test:
   • Context state persists across process restarts (SqliteStorage)
   • ProtocolRepository integration tests: lifecycle, nonces, event range queries (§17.13)
   • MlsStorageBridge tests (§16.13.8) gated against SqliteStorage
-  • All new Storage/BlobStore adapters pass conformance suites
+  • All new Storage/BlobStorage adapters pass conformance suites
   • Block enforcement: assert_block_enforced (§16.10.6) — sender key rotation
     prevents blocked identity from decrypting, other members unaffected
   • Broadcast mode: author publishes broadcast-key-encrypted content, subscriber

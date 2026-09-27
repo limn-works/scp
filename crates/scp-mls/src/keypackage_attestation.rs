@@ -46,7 +46,7 @@
 //! 32-byte hash. The **`0xFF03` extension body** is the same eight fields in the
 //! same order **without** the domain separator, followed by the raw 64-byte
 //! signature. A byte-exact known-answer vector is §25.23 Vector 37, pinned by the
-//! [`tests::vector_37_*`] tests below.
+//! `tests::vector_37_*` unit tests below.
 //!
 //! See spec §9.5.2 (field table + wire format) and §9.7.1 (the full model).
 

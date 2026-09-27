@@ -731,6 +731,93 @@ async fn self_host_redeploy_with_unique_deploy_ids_keeps_site_served() {
     );
 }
 
+/// §18.11.11 of `.docs/specs/18-addressability-and-deployment.md`, empty
+/// deploy: a commit whose blob scan matches nothing fails and leaves the
+/// serving index in place.
+///
+/// A caller reaches this state by passing a `deploy_id` that no publish used,
+/// by committing before any publish ran, or by committing after every
+/// published blob expired. Before this test existed, `commit_deploy` built an
+/// empty `PathIndex`, swapped it in, and pushed the live deploy into history,
+/// so every path the site served began answering 404.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_deploy_matching_no_blob_fails_and_leaves_the_site_served() {
+    let built = build_self_host_node().await;
+    let node_did = built.node.identity().did().to_owned();
+    let context_id = self_host_context_id(&node_did);
+    let routing_hex = scp_node::routing_id_hex(&context_id);
+    let site_path = format!("/scp/broadcast/{routing_hex}/site/index.html");
+
+    let deployer = build_deployer(&built, &context_id).await;
+    deploy_through(&deployer, &built, "selfhost-empty-deploy-baseline").await;
+    assert_eq!(
+        projection_status(&built.node, &site_path).await,
+        200,
+        "the site must be served before the empty commit"
+    );
+    let served_before = fetch_projection_body(&built.node, &site_path).await;
+
+    // No publish ever used this deploy id, so the scan matches no blob.
+    let error = built
+        .node
+        .commit_deploy(&context_id, "selfhost-deploy-nobody-published")
+        .await
+        .expect_err("a commit that matched no blob must fail");
+    let message = error.to_string();
+    assert!(
+        message.contains("selfhost-deploy-nobody-published"),
+        "the error must name the deploy id that matched nothing: {message}"
+    );
+    assert!(
+        message.contains("matched no staged asset"),
+        "the error must say the scan matched no staged asset: {message}"
+    );
+
+    // The pointer never moved: the same bytes still serve at the same path.
+    assert_eq!(
+        projection_status(&built.node, &site_path).await,
+        200,
+        "an empty commit must leave the serving path index in place"
+    );
+    let served_after = fetch_projection_body(&built.node, &site_path).await;
+    assert_eq!(
+        served_before, served_after,
+        "an empty commit must not change the bytes the site serves"
+    );
+
+    // A further real deploy still commits, so the refusal left no wedged state.
+    deploy_through(&deployer, &built, "selfhost-empty-deploy-followup").await;
+    assert_eq!(
+        projection_status(&built.node, &site_path).await,
+        200,
+        "a real deploy after a refused empty commit must still serve the site"
+    );
+}
+
+/// Fetches `path` from the node's broadcast projection router, returning the
+/// response body bytes.
+async fn fetch_projection_body(
+    node: &scp_node::ApplicationNode<SqliteStorage>,
+    path: &str,
+) -> Vec<u8> {
+    let router = node.broadcast_projection_router();
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri(path)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    resp.into_body()
+        .collect()
+        .await
+        .expect("body should collect")
+        .to_bytes()
+        .to_vec()
+}
+
 /// Regression: the production binary's storage wiring must NOT open the root
 /// `SQLite` database twice.
 ///

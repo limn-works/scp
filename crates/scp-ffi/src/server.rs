@@ -177,7 +177,7 @@ fn auto_wire_context_manager(
 /// (spec §12.10.5).
 ///
 /// This is the `PyO3` reference bridge's node-startup wire. The production
-/// `Supervisor` built by [`crate::runtime`]'s `build_supervisor` always enables
+/// `Supervisor` built by `crate::runtime`'s `build_supervisor` always enables
 /// its event channel, so `subscribe_events()` yields a receiver. Delegates the
 /// subscribe → wire → supervise block to the shared
 /// [`RunningNode::wire_and_supervise_context_events`] seam so all three bridges
@@ -187,9 +187,9 @@ fn auto_wire_context_manager(
 /// # Precondition (identical across all three bridges)
 ///
 /// One-shot wiring at node startup gates on the shared
-/// [`CoreFields::check_ready`]: skip (log, never fail startup) if the instance
+/// [`CoreFields::check_ready`](scp_ffi_common::bridge_instance::CoreFields::check_ready): skip (log, never fail startup) if the instance
 /// is suspended OR shut down, then fetch the supervisor via
-/// [`CoreFields::try_supervisor`]. All three bridges (`PyO3`, `NAPI`, `UniFFI`)
+/// [`CoreFields::try_supervisor`](scp_ffi_common::bridge_instance::CoreFields::try_supervisor). All three bridges (`PyO3`, `NAPI`, `UniFFI`)
 /// use this same `check_ready()` + `try_supervisor()` pair so they make the SAME
 /// decision about when to wire — rather than the general-purpose `supervisor(bi)`
 /// accessor, whose warn-on-shutdown-and-proceed semantics suit per-op dispatch
@@ -1043,12 +1043,22 @@ mod tests {
             "RunningNode enable should succeed: {result:?}"
         );
 
-        // commit_deploy — will fail because no blobs exist but should return
-        // a proper error, not panic.
         let cd_result = rt().block_on(inner.commit_deploy("dispatch-ctx", "deploy-abc"));
-        // This will return an error about no assets or similar — the important
-        // thing is that dispatch works and doesn't panic.
-        assert!(cd_result.is_ok() || cd_result.is_err());
+        // Code above projected this context, which holds no staged blob, so
+        // §18.11.11 of `.docs/specs/18-addressability-and-deployment.md` makes
+        // this an empty deploy, which fails. Dispatch reached this node, which
+        // the error text proves: an unprojected context reports "not
+        // projected" instead, as
+        // `commit_deploy_on_unprojected_context_returns_error` pins. An
+        // earlier assertion read `is_ok() || is_err()`, which every value
+        // satisfies.
+        let message = cd_result
+            .expect_err("an empty deploy fails rather than swapping in an empty path index")
+            .to_string();
+        assert!(
+            message.contains("matched no staged asset"),
+            "dispatch must reach the projected context and refuse the empty deploy: {message}"
+        );
 
         // disable
         rt().block_on(inner.disable_broadcast_projection("dispatch-ctx"));

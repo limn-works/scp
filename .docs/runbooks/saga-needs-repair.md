@@ -4,7 +4,8 @@
 has parked in the `NeedsRepair` state. This runbook covers detecting it, understanding why
 restart-driven replay resolves most cases automatically, and recognizing the residual
 cases that need a human. For the FSM and phase semantics, see
-`.docs/lessons/saga-prepare-commit-abort.md`.
+ADR-049 §3 (`.docs/adrs/ADR-049-actor-per-context.md`) and
+`crates/scp-runtime/src/context/supervisor/saga_journal.rs`.
 
 ## Symptom
 

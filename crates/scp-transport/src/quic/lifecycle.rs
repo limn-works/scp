@@ -1102,8 +1102,18 @@ mod tests {
         let store = SessionTicketStore::new();
         let manager = QuicLifecycleManager::new(TransportProfile::Desktop, store);
 
-        // Should not panic -- just verify the config is created.
-        let _config = manager.build_client_config();
+        // `build_client_config` applies this manager's keepalive interval,
+        // which `quinn::TransportConfig::default()` leaves unset, so both
+        // configs must differ. An earlier version bound that result to
+        // `_config` and asserted nothing, so a body returning quinn's default
+        // config would have passed.
+        let config = manager.build_client_config();
+        assert_ne!(
+            format!("{config:?}"),
+            format!("{:?}", quinn::TransportConfig::default()),
+            "build_client_config must apply its keepalive interval rather than \
+             return quinn's default transport config"
+        );
     }
 
     #[test]

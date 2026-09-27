@@ -3,7 +3,7 @@
 //! Exposes SCP media session lifecycle and signaling to Python:
 //!
 //! - Session lifecycle: [`py_media_initiate_session`], [`py_media_join_session`],
-//!   [`PyScp::py_media_activate_session`], [`PyScp::py_media_end_session`]
+//!   [`PyScp::py_media_activate_session`](crate::scp::PyScp::py_media_activate_session), [`PyScp::py_media_end_session`](crate::scp::PyScp::py_media_end_session)
 //! - Signaling: [`py_media_create_offer`], [`py_media_create_answer`],
 //!   [`py_media_create_ice_candidate`], [`py_media_create_session_end`],
 //!   [`py_media_send_signaling`], [`py_media_verify_sender_attribution`]

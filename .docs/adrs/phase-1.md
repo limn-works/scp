@@ -933,7 +933,7 @@ None. This is foundational. The traits it implements are defined in `scp-platfor
    - `public_key(key_handle) -> PublicKey`: Returns the public key for a handle (Ed25519 or X25519).
    - `destroy_key(key_handle) -> ()`: Removes the private key from the internal map. Subsequent operations with this handle fail.
    - `dh_agree(key_handle, peer_public) -> SharedSecret`: Performs X25519 ECDH. Returns error for Ed25519 handles.
-   - `derive_pseudonym(key_handle, context_id) -> PseudonymKeypair`: Computes `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`, derives an Ed25519 keypair from the first 32 bytes of the HMAC output (interpreted as an RFC-8032 seed). Returns error for X25519 handles. The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — using public key bytes would be a membership-enumeration oracle (§9.10.4.A). For software custody (InMemory, Apple software, Android software) `pseudonym_secret = HKDF-SHA256(ed25519_private_seed, salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic and pinned by §25.19 vectors. For hardware custody (Apple Secure Enclave, Android Keystore TEE API 33+) the private key is non-exportable, so `pseudonym_secret` is a device-local value computed inside the secure boundary (e.g. Android uses `SHA-256(TEE_sign("scp-pseudonym-secret-v1"))`); hardware pseudonyms are device-local by design. See `.docs/lessons/kotlin/android-tee-pseudonym-derivation.md`.
+   - `derive_pseudonym(key_handle, context_id) -> PseudonymKeypair`: Computes `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`, derives an Ed25519 keypair from the first 32 bytes of the HMAC output (interpreted as an RFC-8032 seed). Returns error for X25519 handles. The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — using public key bytes would be a membership-enumeration oracle (§9.10.4.A). For software custody (InMemory, Apple software, Android software) `pseudonym_secret = HKDF-SHA256(ed25519_private_seed, salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic and pinned by §25.19 vectors. For hardware custody (Apple Secure Enclave, Android Keystore TEE API 33+) the private key is non-exportable, so `pseudonym_secret` is a device-local value computed inside the secure boundary (e.g. Android uses `SHA-256(TEE_sign("scp-pseudonym-secret-v1"))`); hardware pseudonyms are device-local by design. See §9.10.4.A of `.docs/specs/09-security-model.md`.
    - `custody_type(key_handle) -> CustodyType::InMemory`.
    - Optionally accepts a seed for deterministic key generation in tests.
 
@@ -1004,7 +1004,7 @@ pub trait KeyCustody: Send + Sync {
     /// device-local value computed inside the secure boundary (e.g. Android uses
     /// SHA-256(TEE_sign("scp-pseudonym-secret-v1"))). Hardware pseudonyms are therefore
     /// device-local BY DESIGN, not cross-platform identical.
-    /// See .docs/lessons/kotlin/android-tee-pseudonym-derivation.md.
+    /// See §9.10.4.A of .docs/specs/09-security-model.md.
     ///
     /// The returned PseudonymKeypair is always software-managed (derived output).
     /// Returns an error if the key handle refers to an X25519 key.
@@ -1299,7 +1299,7 @@ DidDocument.verification_method = [
 
 3. **Verifier validation.** Network-level enforcement: all conformant verifiers reject Category A actions (DID document modifications) signed by `#agent`. Non-conformant SDKs can produce these signatures, but they cannot propagate through the network. The attempt is both rejected and logged as a custody violation.
 
-4. **Custody attestation.** At identity creation, the DID document includes a `ScpKeyCustodyAttestation` service entry declaring key custody model (`hardware-biometric` vs `software`) with optional platform attestation proof (Apple App Attest / Android Key Attestation). Unambiguous violations (Category A attempts with `#agent`, attestation mismatches with hardware proof) are permanently logged as `ScpCustodyViolationAttestation` records. DID owners can publish counter-attestations for reputation restoration. Absence of attestation is itself a signal.
+4. **Custody attestation.** At identity creation, the DID document includes a `ScpKeyCustodyAttestation` service entry declaring key custody model (`hardware-biometric`, `hardware-pin`, or `software`), and the entry may carry a platform attestation proof (Apple App Attest / Android Key Attestation). §27.4.4 of the attestations spec states what a consumer reads off that declaration; this layer states no reading rule of its own, and the Amendment (2026-08-25) at the end of this ADR records the human ruling §27.4.4 states. Unambiguous violations (Category A attempts with `#agent`, attestation mismatches with hardware proof) are permanently logged as `ScpCustodyViolationAttestation` records. DID owners can publish counter-attestations for reputation restoration. Absence of attestation is itself a signal.
 
 5. **Behavioral signals.** Soft trust signal only — feeds into trust function (§7.1), NOT logged as violations. Timing patterns, usage anomalies, and interaction patterns provide supplementary context for trust evaluation. Explicitly excluded from violation records due to false positive risk.
 
@@ -1387,3 +1387,15 @@ Agent key compromise (most common case — agent runtime is less secure than dev
 18. `CounterAttestation` type for reputation restoration.
 19. All FFI bridges (PyO3, NAPI, UniFFI) expose agent key creation, rotation, and status.
 20. Integration test: create identity with agent key → mint scoped UCAN → join MLS group with agent credential → send message → verify at recipient → rotate agent key → verify credential update.
+
+### Amendment (2026-08-25): an unproven hardware custody declaration reads as software
+
+Alec ruled, verbatim: "either the platform proof is attached and verified, or the custody model reads as software no matter what string was written."
+
+The ruling governs Enforcement Stack layer 4 above, which stated no rule for reading a custody declaration. The ruling binds because Alec made it, not because of which file records it. §27.4.4 of the attestations spec (`.docs/specs/27-attestations.md`) states it in four clauses and §27.3.4 of the same spec restates it beside the record's construction; open question OQ-38 of that spec asks a human which file finally holds F4's normative text, and the ruling travels with those sections wherever that answer sends them. Layer 4 above now cites those clauses and states no reading rule of its own, so this ADR and the spec cannot drift apart on the rule's wording.
+
+What the clauses settle for this ADR: a `ScpKeyCustodyAttestation` entry declaring `hardware-biometric` or `hardware-pin` for a key raises no consumer's reading of that key's custody above `software` unless the entry carries a platform attestation proof and a verification of that proof returns a pass. In every case that pass does not cover, the consumer reads `software`. A declaration of `software` needs no proof. The proof stays optional for a hardware declaration too: an entry that carries none parses, and clause 2 gives every consumer `software` for the key that entry declares. Alec's sentence names no party as the verifier, this ADR names none, and open question OQ-2 of the attestations spec asks a human which party runs the verification.
+
+No SCP implementation verifies a `ScpKeyCustodyAttestation` platform proof today, so every hardware declaration published today reads as `software`. What such a verification would check, and what its pass would establish, are open questions OQ-2, OQ-29, and OQ-51 of the attestations spec.
+
+Layer 4's remaining sentences stand unchanged. This amendment decides what a written hardware declaration is worth; it decides nothing about a DID document that carries no custody entry, and "Absence of attestation is itself a signal" keeps its meaning.

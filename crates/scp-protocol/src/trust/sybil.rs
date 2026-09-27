@@ -49,8 +49,13 @@ use serde::{Deserialize, Serialize};
 
 use scp_did::DID;
 
+use scp_clock::Clock;
+
 use super::AttestationType;
-use super::attestation::{AttestorInfo, ThresholdRequirement, check_threshold_attestation};
+use super::attestation::{
+    AttestationRevocationChecker, AttestorInfo, DidPublicKeyResolver, ThresholdCheckInput,
+    ThresholdRequirement, check_threshold_attestation,
+};
 
 // ---------------------------------------------------------------------------
 // TrustSignalCategory — the 6 composable signal types from §9.3
@@ -731,6 +736,42 @@ pub enum SybilResistanceError {
 // evaluate_sybil_resistance — check a DID's signals against context policy
 // ---------------------------------------------------------------------------
 
+/// Endorsement attestors plus the two capabilities that verify their
+/// attestations.
+///
+/// [`evaluate_sybil_resistance`] takes this struct as one optional unit because
+/// a caller that supplies no attestors needs neither a resolver nor a clock,
+/// while a caller that supplies attestors needs both: `check_threshold_attestation`
+/// counts an endorsement only after it verifies that endorsement's signature,
+/// and verifying a signature requires an issuer key and a current time.
+pub struct EndorsementEvidence<'a> {
+    /// The candidate endorsers, before deduplication and verification.
+    pub attestors: &'a [AttestorInfo],
+
+    /// Resolves each endorser's DID to the Ed25519 public key that must have
+    /// signed that endorser's attestation.
+    pub resolver: &'a dyn DidPublicKeyResolver,
+
+    /// Supplies the time that decides each endorsement's expiry. A caller that
+    /// also passes `current_time` to [`evaluate_sybil_resistance`] reads both
+    /// values from one source: `current_time` weights signal freshness, and
+    /// this clock decides attestation expiry.
+    pub clock: &'a dyn Clock,
+
+    /// Answers whether an issuer revoked an endorsement, and reaches
+    /// `check_threshold_attestation` so a revoked endorsement stops counting
+    /// toward endorsement independence.
+    ///
+    /// SECURITY (one rule, one answer). `aggregate_trust_input` builds a checker
+    /// from a context's persisted revocation list before it computes threshold
+    /// counts, and both paths call `check_threshold_attestation`. A caller that
+    /// passes `None` here therefore gives one endorsement two answers: revoked
+    /// on the aggregation path, and still counting on this Sybil path. Pass the
+    /// same checker a context's revocation list backs. `None` states that a
+    /// caller holds no revocation list at all, which is the only case it covers.
+    pub revocation_checker: Option<&'a dyn AttestationRevocationChecker>,
+}
+
 /// Evaluates a DID's trust signals against a context's Sybil resistance policy.
 ///
 /// Returns `Ok(())` if the DID satisfies all policy requirements, or the first
@@ -750,10 +791,12 @@ pub enum SybilResistanceError {
 /// * `assessment` — The DID's aggregated trust signals.
 /// * `policy` — The context's Sybil resistance policy.
 /// * `current_time` — Unix timestamp (seconds) for freshness evaluation.
-/// * `attestors` — Optional slice of attestor information for endorsement
-///   independence evaluation. Required when the policy includes an endorsement
-///   `RequiredSignal` with `threshold_requirement`. Pass `None` when
-///   endorsement independence checking is not needed (existing callers).
+/// * `endorsements` — Optional [`EndorsementEvidence`] for endorsement
+///   independence evaluation: the candidate attestors, the resolver that
+///   supplies their issuer keys, and the clock that decides their expiry.
+///   Required when the policy includes an endorsement `RequiredSignal` with
+///   `threshold_requirement`. Pass `None` when endorsement independence
+///   checking is not needed (existing callers).
 ///
 /// # Errors
 ///
@@ -767,7 +810,7 @@ pub fn evaluate_sybil_resistance(
     assessment: &IdentityDepthAssessment,
     policy: &ContextSybilPolicy,
     current_time: u64,
-    attestors: Option<&[AttestorInfo]>,
+    endorsements: Option<&EndorsementEvidence<'_>>,
 ) -> Result<(), SybilResistanceError> {
     // 1. Check device attestation requirement.
     if policy.require_device_attestation
@@ -840,7 +883,7 @@ pub fn evaluate_sybil_resistance(
     }
 
     // 5. Endorsement independence check (§22.13.3).
-    check_endorsement_independence(assessment, policy, attestors)?;
+    check_endorsement_independence(assessment, policy, endorsements)?;
 
     Ok(())
 }
@@ -850,10 +893,18 @@ pub fn evaluate_sybil_resistance(
 /// For each required signal with category Endorsement and a
 /// `threshold_requirement`, invokes [`check_threshold_attestation`] to verify
 /// that endorsers are independently trustworthy — not a Sybil ring.
+///
+/// `check_threshold_attestation` binds each endorsement to the evaluated
+/// subject DID and to its endorser's own issuer DID, verifies its signature,
+/// and counts repeat DIDs once, so this function passes the caller's attestors
+/// through unfiltered. An earlier revision filtered them here as well; two
+/// copies of one rule drift apart, and the copy that the aggregation path never
+/// ran is exactly the gap that let duplicate attestors inflate a threshold
+/// count.
 fn check_endorsement_independence(
     assessment: &IdentityDepthAssessment,
     policy: &ContextSybilPolicy,
-    attestors: Option<&[AttestorInfo]>,
+    endorsements: Option<&EndorsementEvidence<'_>>,
 ) -> Result<(), SybilResistanceError> {
     for req in &policy.required_signals {
         let (TrustSignalCategory::Endorsement, Some(threshold)) =
@@ -861,43 +912,26 @@ fn check_endorsement_independence(
         else {
             continue;
         };
-        let att =
-            attestors.ok_or_else(
-                || SybilResistanceError::EndorsementIndependenceInsufficient {
-                    reason: "attestors required for endorsement independence \
+        let evidence = endorsements.ok_or_else(|| {
+            SybilResistanceError::EndorsementIndependenceInsufficient {
+                reason: "attestors required for endorsement independence \
                          check but not provided"
-                        .into(),
-                    independence_score: 0.0,
-                    threshold: threshold.independence_threshold(),
-                    valid_count: 0,
-                    required_count: threshold.required_count(),
-                },
-            )?;
-        // Filter attestors to only those whose attestation subject matches the
-        // DID being evaluated AND whose attestation issuer matches their own
-        // DID. Without the subject check, an attacker could submit endorsement
-        // attestations for a different DID. Without the issuer check, an
-        // attacker could claim attestations issued by someone else.
-        //
-        // Deduplicate by DID to prevent the same attestor from being counted
-        // multiple times (e.g., submitting the same endorsement 5 times should
-        // not satisfy a 3-of-5 threshold).
-        let mut seen_dids = std::collections::HashSet::new();
-        let subject_attestors: Vec<AttestorInfo> = att
-            .iter()
-            .filter(|a| {
-                a.attestation
-                    .as_ref()
-                    .is_some_and(|att| att.subject == assessment.subject_did && att.issuer == a.did)
-            })
-            .filter(|a| seen_dids.insert(a.did.clone()))
-            .cloned()
-            .collect();
-        let result = check_threshold_attestation(
-            &AttestationType::Endorsement,
-            &subject_attestors,
-            threshold,
-        );
+                    .into(),
+                independence_score: 0.0,
+                threshold: threshold.independence_threshold(),
+                valid_count: 0,
+                required_count: threshold.required_count(),
+            }
+        })?;
+        let result = check_threshold_attestation(&ThresholdCheckInput {
+            attestation_type: &AttestationType::Endorsement,
+            subject_did: &assessment.subject_did,
+            attestors: evidence.attestors,
+            requirement: threshold,
+            resolver: evidence.resolver,
+            clock: evidence.clock,
+            revocation_checker: evidence.revocation_checker,
+        });
         if !result.met {
             let count_ok = result.valid_count >= result.required_count;
             let reason = if count_ok {
@@ -976,8 +1010,13 @@ pub fn evaluate_earned_capacity(
 mod tests {
     use std::collections::HashSet;
 
+    use ed25519_dalek::{Signer, SigningKey};
+    use scp_clock::TestClock;
+    use sha2::{Digest, Sha256};
+
     use super::*;
-    use crate::trust::{Attestation, AttestationType, RevocationStatus};
+    use crate::trust::attestation::canonical_attestation_bytes;
+    use crate::trust::{Attestation, AttestationType, RevocationStatus, TrustError};
 
     fn did(s: &str) -> DID {
         DID::from(s)
@@ -988,9 +1027,72 @@ mod tests {
         1_768_435_200
     }
 
-    /// Creates an `Attestation` of type `Endorsement` for testing.
+    /// Derives a signing key from a DID string, so [`DerivedKeyResolver`]
+    /// recomputes the matching public key from that DID alone and every test
+    /// endorsement carries a signature that verifies.
+    fn key_for_did(issuer: &str) -> SigningKey {
+        let digest = Sha256::digest(issuer.as_bytes());
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&digest);
+        SigningKey::from_bytes(&seed)
+    }
+
+    /// Resolver that derives each DID's public key with [`key_for_did`].
+    struct DerivedKeyResolver;
+
+    impl DidPublicKeyResolver for DerivedKeyResolver {
+        fn resolve_public_key(&self, resolved_did: &str) -> Result<Vec<u8>, TrustError> {
+            Ok(key_for_did(resolved_did)
+                .verifying_key()
+                .to_bytes()
+                .to_vec())
+        }
+    }
+
+    /// Carries the resolver and the clock that
+    /// [`evaluate_sybil_resistance`] needs to verify endorsements.
+    struct EndorsementHarness {
+        resolver: DerivedKeyResolver,
+        clock: TestClock,
+    }
+
+    impl EndorsementHarness {
+        fn new() -> Self {
+            Self {
+                resolver: DerivedKeyResolver,
+                clock: TestClock::new(now()),
+            }
+        }
+
+        fn evidence<'a>(&'a self, attestors: &'a [AttestorInfo]) -> EndorsementEvidence<'a> {
+            EndorsementEvidence {
+                attestors,
+                resolver: &self.resolver,
+                clock: &self.clock,
+                revocation_checker: None,
+            }
+        }
+
+        /// Same evidence, plus a revocation checker, so a test can observe a
+        /// revoked endorsement dropping out of an independence check.
+        fn evidence_with_revocations<'a>(
+            &'a self,
+            attestors: &'a [AttestorInfo],
+            checker: &'a dyn AttestationRevocationChecker,
+        ) -> EndorsementEvidence<'a> {
+            EndorsementEvidence {
+                attestors,
+                resolver: &self.resolver,
+                clock: &self.clock,
+                revocation_checker: Some(checker),
+            }
+        }
+    }
+
+    /// Creates an `Attestation` of type `Endorsement`, signed by the key that
+    /// [`key_for_did`] derives from `issuer`.
     fn make_endorsement_attestation(issuer: &str, subject: &str, issued_at: u64) -> Attestation {
-        Attestation {
+        let mut attestation = Attestation {
             id: format!("endorse-{issuer}-{subject}"),
             attestation_type: AttestationType::Endorsement,
             issuer: did(issuer),
@@ -1002,8 +1104,11 @@ mod tests {
             renewal_interval: None,
             renewed_at: None,
             revocation_status: RevocationStatus::Active,
-            signature: vec![0u8; 64], // dummy signature for tests
-        }
+            signature: vec![],
+        };
+        let canonical = canonical_attestation_bytes(&attestation).unwrap();
+        attestation.signature = key_for_did(issuer).sign(&canonical).to_bytes().to_vec();
+        attestation
     }
 
     /// Creates a set of 3 independent attestors with no shared contexts
@@ -1447,7 +1552,16 @@ mod tests {
         let assessment = make_deep_assessment(now());
         let policy = ContextSybilPolicy::high_trust();
         let attestors = make_independent_attestors(now());
-        assert!(evaluate_sybil_resistance(&assessment, &policy, now(), Some(&attestors)).is_ok());
+        let harness = EndorsementHarness::new();
+        assert!(
+            evaluate_sybil_resistance(
+                &assessment,
+                &policy,
+                now(),
+                Some(&harness.evidence(&attestors))
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1757,7 +1871,13 @@ mod tests {
         let assessment = make_deep_assessment(now());
         let policy = ContextSybilPolicy::high_trust();
         let attestors = make_independent_attestors(now());
-        let result = evaluate_sybil_resistance(&assessment, &policy, now(), Some(&attestors));
+        let harness = EndorsementHarness::new();
+        let result = evaluate_sybil_resistance(
+            &assessment,
+            &policy,
+            now(),
+            Some(&harness.evidence(&attestors)),
+        );
         assert!(
             result.is_ok(),
             "independent attestors should pass: {result:?}"
@@ -1769,7 +1889,13 @@ mod tests {
         let assessment = make_deep_assessment(now());
         let policy = ContextSybilPolicy::high_trust();
         let attestors = make_colluding_attestors(now());
-        let result = evaluate_sybil_resistance(&assessment, &policy, now(), Some(&attestors));
+        let harness = EndorsementHarness::new();
+        let result = evaluate_sybil_resistance(
+            &assessment,
+            &policy,
+            now(),
+            Some(&harness.evidence(&attestors)),
+        );
         assert!(
             matches!(
                 result,
@@ -1921,7 +2047,13 @@ mod tests {
         ];
 
         let policy = ContextSybilPolicy::high_trust();
-        let result = evaluate_sybil_resistance(&assessment, &policy, now(), Some(&attestors));
+        let harness = EndorsementHarness::new();
+        let result = evaluate_sybil_resistance(
+            &assessment,
+            &policy,
+            now(),
+            Some(&harness.evidence(&attestors)),
+        );
         assert!(
             matches!(
                 result,
@@ -1974,7 +2106,13 @@ mod tests {
         ];
 
         let policy = ContextSybilPolicy::high_trust();
-        let result = evaluate_sybil_resistance(&assessment, &policy, now(), Some(&attestors));
+        let harness = EndorsementHarness::new();
+        let result = evaluate_sybil_resistance(
+            &assessment,
+            &policy,
+            now(),
+            Some(&harness.evidence(&attestors)),
+        );
         // high_trust requires 2 of 3, but only 1 attestation is for the correct subject
         assert!(
             matches!(
@@ -2030,7 +2168,13 @@ mod tests {
         ];
 
         let policy = ContextSybilPolicy::high_trust();
-        let result = evaluate_sybil_resistance(&assessment, &policy, now(), Some(&attestors));
+        let harness = EndorsementHarness::new();
+        let result = evaluate_sybil_resistance(
+            &assessment,
+            &policy,
+            now(),
+            Some(&harness.evidence(&attestors)),
+        );
         // high_trust requires 2 of 3, but Alice's attestation (issued by Bob) is
         // filtered out, leaving only 2 valid attestors which should pass.
         assert!(
@@ -2080,7 +2224,13 @@ mod tests {
         ];
 
         let policy = ContextSybilPolicy::high_trust();
-        let result = evaluate_sybil_resistance(&assessment, &policy, now(), Some(&attestors));
+        let harness = EndorsementHarness::new();
+        let result = evaluate_sybil_resistance(
+            &assessment,
+            &policy,
+            now(),
+            Some(&harness.evidence(&attestors)),
+        );
         assert!(
             matches!(
                 result,
@@ -2140,8 +2290,13 @@ mod tests {
             threshold_requirement: Some(ThresholdRequirement::new(2, 3, 0.5)),
         }];
 
-        let result =
-            evaluate_sybil_resistance(&assessment, &policy, now(), Some(&colluding_attestors));
+        let harness = EndorsementHarness::new();
+        let result = evaluate_sybil_resistance(
+            &assessment,
+            &policy,
+            now(),
+            Some(&harness.evidence(&colluding_attestors)),
+        );
         assert!(
             matches!(
                 result,
@@ -2180,7 +2335,13 @@ mod tests {
             threshold_requirement: Some(ThresholdRequirement::new(3, 5, 0.3)),
         }];
 
-        let result = evaluate_sybil_resistance(&assessment, &policy, now(), Some(&attestors));
+        let harness = EndorsementHarness::new();
+        let result = evaluate_sybil_resistance(
+            &assessment,
+            &policy,
+            now(),
+            Some(&harness.evidence(&attestors)),
+        );
         assert!(
             matches!(
                 result,
@@ -2204,11 +2365,94 @@ mod tests {
             threshold_requirement: Some(ThresholdRequirement::new(2, 3, 0.5)),
         }];
 
-        let result =
-            evaluate_sybil_resistance(&assessment, &policy, now(), Some(&independent_attestors));
+        let harness = EndorsementHarness::new();
+        let result = evaluate_sybil_resistance(
+            &assessment,
+            &policy,
+            now(),
+            Some(&harness.evidence(&independent_attestors)),
+        );
         assert!(
             result.is_ok(),
             "min_strength=0 with independent attestors should pass: {result:?}"
+        );
+    }
+
+    /// Revokes exactly one `(issuer, attestation id)` pair, matching the
+    /// issuer-scoping requirement on [`AttestationRevocationChecker`].
+    struct RevokesOneEndorsement {
+        issuer: DID,
+        attestation_id: String,
+    }
+
+    impl AttestationRevocationChecker for RevokesOneEndorsement {
+        fn check_revocation(&self, attestation_id: &str, issuer: &DID) -> Option<u64> {
+            if attestation_id == self.attestation_id && *issuer == self.issuer {
+                Some(1)
+            } else {
+                None
+            }
+        }
+    }
+
+    /// SECURITY (one rule, one answer — issue #2335 bug-catcher item 10).
+    /// `aggregate_trust_input` hands `check_threshold_attestation` a checker
+    /// built from a context's revocation list, so a revoked endorsement stops
+    /// counting toward a threshold there. This Sybil path calls the same
+    /// function, so a revoked endorsement must stop counting toward endorsement
+    /// independence too. The control assertion (the same attestors, no checker)
+    /// proves the three endorsements otherwise satisfy the requirement, so the
+    /// failure below is attributable to the revocation alone.
+    #[test]
+    fn a_revoked_endorsement_stops_counting_toward_endorsement_independence() {
+        let assessment = make_deep_assessment(now());
+        let attestors = make_independent_attestors(now());
+
+        let mut policy = ContextSybilPolicy::casual();
+        policy.required_signals = vec![RequiredSignal {
+            category: TrustSignalCategory::Endorsement,
+            min_strength: 0,
+            max_age_secs: 365 * 24 * 3600,
+            // Every one of the three endorsements is needed, so losing one
+            // fails the requirement.
+            threshold_requirement: Some(ThresholdRequirement::new(3, 3, 0.5)),
+        }];
+
+        let harness = EndorsementHarness::new();
+
+        // Control: all three endorsements count while nothing revokes them.
+        let unrevoked = evaluate_sybil_resistance(
+            &assessment,
+            &policy,
+            now(),
+            Some(&harness.evidence(&attestors)),
+        );
+        assert!(
+            unrevoked.is_ok(),
+            "three independent endorsements satisfy a 3-of-3 requirement: {unrevoked:?}"
+        );
+
+        // One endorser's own endorsement is revoked, so two remain.
+        let revoked_attestation = attestors[0]
+            .attestation
+            .as_ref()
+            .expect("the harness builds every attestor with an attestation");
+        let checker = RevokesOneEndorsement {
+            issuer: revoked_attestation.issuer.clone(),
+            attestation_id: revoked_attestation.id.clone(),
+        };
+        let result = evaluate_sybil_resistance(
+            &assessment,
+            &policy,
+            now(),
+            Some(&harness.evidence_with_revocations(&attestors, &checker)),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(SybilResistanceError::EndorsementIndependenceInsufficient { .. })
+            ),
+            "a revoked endorsement must not count toward endorsement independence: {result:?}"
         );
     }
 }

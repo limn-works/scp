@@ -44,8 +44,21 @@ def story_to_markdown(story: dict) -> str:
     if story.get("details"):
         lines.append("## Details")
         lines.append("")
-        lines.append(story["details"])
-        lines.append("")
+        details = story["details"]
+        if isinstance(details, dict):
+            # The PRD standard types `details` as an object. Render one
+            # subsection per key so a multi-key details block stays readable
+            # and nothing is dropped.
+            for key, value in details.items():
+                lines.append(f"### {key}")
+                lines.append("")
+                lines.append(
+                    value if isinstance(value, str) else json.dumps(value, indent=2)
+                )
+                lines.append("")
+        else:
+            lines.append(details)
+            lines.append("")
 
     # Files
     if story.get("files"):
