@@ -10760,8 +10760,21 @@
       "status": "in-progress",
       "files": [
         "crates/scp-crypto/src/p256.rs",
+        "crates/scp-crypto/src/kdf.rs",
+        "crates/scp-crypto/src/pseudonym.rs",
         "crates/scp-crypto/src/lib.rs",
-        "crates/scp-platform/src/key_custody.rs",
+        "crates/scp-platform/src/traits.rs",
+        "crates/scp-ffi/common/src/custody_parse.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "crates/scp-ffi/uniffi/src/p256_host.rs",
+        "crates/scp-ffi/src/custody.rs",
+        "crates/scp-ffi/napi/src/custody.rs",
+        "bindings/typescript/src/internal/custody-adapter.ts",
+        "bindings/python/scp_sdk/scp.py",
+        "bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift",
+        "bindings/swift/Sources/SCP/Platform/P256Pseudonym.swift",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidKeyCustody.kt",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/P256Pseudonym.kt",
         "crates/scp-mls/src/lib.rs"
       ],
       "description": "Architecture slice S0 of the key-event-log identity substrate. ADR-063 moves every SCP key to ECDSA over NIST P-256 with SHA-256, and `09-security-model.md` §9.5 states the encoding and verification rules. This story adds P-256 to the wasm-safe `scp-crypto` crate and to `KeyCustody`, and moves MLS to RFC 9420 ciphersuite 2, HPKE to DHKEM(P-256), and UCAN to ES256. The key-event preimage types are SCP-308.",
@@ -10774,6 +10787,10 @@
         "`KeyCustody` generates, holds and signs with P-256 keys, and `grep -rn -i 'ed25519' crates/scp-platform/src` prints nothing",
         "MLS groups use RFC 9420 ciphersuite 2, HPKE uses DHKEM(P-256) under RFC 9180 Base mode, and a UCAN carries an ES256 signature: one round-trip test per protocol (`09-security-model.md` §9.5)",
         "`cargo check -p scp-crypto --target wasm32-unknown-unknown` exits 0",
+        "A host `KeyCustodyProvider.derive_pseudonym` and `derive_rotatable_pseudonym` return a structured result carrying the 33-byte SEC1 compressed P-256 pseudonym point and the pseudonym's key id, in the UniFFI, PyO3 and napi bridges (`09-security-model.md` §9.10.4)",
+        "Each bridge binds a host pseudonym only when `get_public_key(key_id)` returns the same 33 bytes, and fails with `SCP-IDENT-1055` otherwise: a test per bridge",
+        "A pseudonym key signs only a 32-byte digest, and each bridge verifies the host's 64-byte `r‖s` strictly, rejecting a high-`s` signature: a test per bridge (`09-security-model.md` §9.5)",
+        "The §25.19 Vector 30 and 31 v1 and v2 routing ids reproduce in Rust, Swift and Kotlin custody, and the Vector 30 v1 routing id reproduces through the TypeScript and Python bridges (`25-test-vectors.md` §25.19)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
@@ -10791,6 +10808,10 @@
         {
           "file": ".docs/specs/09-security-model.md",
           "section": "#### 9.18.1 Cryptographic Primitives"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.4 Per-Context Pseudonyms"
         },
         {
           "file": ".docs/adrs/ADR-063-inception-derived-identity-key-event-log.md",
