@@ -225,25 +225,37 @@ function nativeFreeFn<T>(name: keyof NativeAddon): T {
 /**
  * Maps an error `loadNativeAddon` threw to the error `loadAddon` throws.
  *
- * An installed addon that failed to load keeps the loader's
- * `SCP-VALID-7082`, so a caller can tell it apart from absence. Every
- * other loader error — the platform package is missing — becomes
- * `ValidationError` with the absence code `SCP-VALID-7081`, the code the
- * loader and the Python SDK use for the same condition.
+ * Only the loader's absence error — an `ScpError` carrying
+ * `SCP-VALID-7081`, which the loader throws when the platform package does
+ * not resolve — becomes absence: a `ValidationError` with that code and the
+ * reinstall instruction, the code the Python SDK uses for the same
+ * condition. Every other `ScpError`, the loader's `SCP-VALID-7082` among
+ * them, is returned unchanged. Any other thrown value is a failure the
+ * loader did not classify, raised while an addon package may well be
+ * installed, so it becomes an `ScpError` with the load-failure code
+ * `SCP-VALID-7082` and never counts as absence.
  *
  * @internal
  */
 export function addonLoadError(cause: unknown): ScpError {
-  if (cause instanceof ScpError && cause.code === NATIVE_ADDON_LOAD_FAILED_CODE) {
+  const underlying = (cause as Error)?.message ?? String(cause);
+  if (cause instanceof ScpError && cause.code === NATIVE_ADDON_ABSENT_CODE) {
+    return new ValidationError(
+      `Native addon is not installed: ${underlying}. ` +
+        "Ensure the matching @limn-works/scp-ts-napi-* platform package is " +
+        "installed, then reinstall with `bun install`.",
+      NATIVE_ADDON_ABSENT_CODE,
+    );
+  }
+  if (cause instanceof ScpError) {
     return cause;
   }
-  const underlying = (cause as Error)?.message ?? String(cause);
-  return new ValidationError(
-    `Native addon is not installed: ${underlying}. ` +
-      "Ensure the matching @limn-works/scp-ts-napi-* platform package is " +
-      "installed, then reinstall with `bun install`.",
-    NATIVE_ADDON_ABSENT_CODE,
+  const error = new ScpError(
+    `Native addon failed to load: ${underlying}.`,
+    NATIVE_ADDON_LOAD_FAILED_CODE,
   );
+  Object.defineProperty(error, "cause", { value: cause, enumerable: false });
+  return error;
 }
 
 /**

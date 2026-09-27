@@ -82,6 +82,26 @@ describe("SCP wrapper mapping of loader errors", () => {
     expect(mapped.code).toBe(NATIVE_ADDON_ABSENT_CODE);
     expect(mapped.message).toContain("bun install");
   });
+
+  test("an unclassified loader error is a load failure, never absence", () => {
+    const cause = new Error("libc probe failed");
+    const mapped = addonLoadError(cause);
+    expect(mapped).toBeInstanceOf(ScpError);
+    expect(mapped).not.toBeInstanceOf(ValidationError);
+    expect(mapped.code).toBe(NATIVE_ADDON_LOAD_FAILED_CODE);
+    expect((mapped as Error & { cause?: unknown }).cause).toBe(cause);
+  });
+
+  test("a thrown non-Error value is a load failure, never absence", () => {
+    const mapped = addonLoadError("abi mismatch");
+    expect(mapped.code).toBe(NATIVE_ADDON_LOAD_FAILED_CODE);
+    expect(mapped.message).toContain("abi mismatch");
+  });
+
+  test("an ScpError with another code is returned unchanged", () => {
+    const other = new ScpError("unsupported runtime", "SCP-VALID-7005");
+    expect(addonLoadError(other)).toBe(other);
+  });
 });
 
 describe("native-load codes", () => {
