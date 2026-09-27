@@ -25,11 +25,15 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-FRAGMENT_OPEN = re.compile(r'^[ \t]*<!--[ \t]+scp:fragment[ \t]+id="([A-Za-z0-9._-]+)"[ \t]+-->[ \t]*$')
+FRAGMENT_OPEN = re.compile(
+    r'^[ \t]*<!--[ \t]+scp:fragment[ \t]+id="([A-Za-z0-9._-]+)"[ \t]+-->[ \t]*$'
+)
 INCLUDE_OPEN = re.compile(
     r'^[ \t]*<!--[ \t]+scp:include[ \t]+id="([A-Za-z0-9._-]+)"[ \t]+from="([^"]+)"[ \t]+-->[ \t]*$'
 )
-MARKER_END = re.compile(r'^[ \t]*<!--[ \t]+scp:end[ \t]+id="([A-Za-z0-9._-]+)"[ \t]+-->[ \t]*$')
+MARKER_END = re.compile(
+    r'^[ \t]*<!--[ \t]+scp:end[ \t]+id="([A-Za-z0-9._-]+)"[ \t]+-->[ \t]*$'
+)
 ANY_MARKER = re.compile(r"<!--\s*scp:(fragment|include|end)\b")
 
 # A Markdown table cell holds no line break, so a configuration-table row and a
@@ -121,10 +125,19 @@ def scan_file(path: Path, text: str) -> tuple[list[Fragment], list[Include]]:
             inline_includes = list(INCLUDE_INLINE.finditer(line))
             if inline_fragments or inline_includes:
                 for match in inline_fragments:
-                    fragments.append(Fragment(match.group(1), path, index, match.group(2)))
+                    fragments.append(
+                        Fragment(match.group(1), path, index, match.group(2))
+                    )
                 for match in inline_includes:
                     includes.append(
-                        Include(match.group(1), match.group(2), path, index, index, match.group(3))
+                        Include(
+                            match.group(1),
+                            match.group(2),
+                            path,
+                            index,
+                            index,
+                            match.group(3),
+                        )
                     )
                 stripped = INCLUDE_INLINE.sub("", FRAGMENT_INLINE.sub("", line))
                 if ANY_MARKER.search(stripped):
@@ -145,7 +158,9 @@ def scan_file(path: Path, text: str) -> tuple[list[Fragment], list[Include]]:
                     f"is still open at line {open_marker.open_line}"
                 )
             if fragment_match is not None:
-                open_marker = _OpenMarker("fragment", fragment_match.group(1), None, index)
+                open_marker = _OpenMarker(
+                    "fragment", fragment_match.group(1), None, index
+                )
             else:
                 assert include_match is not None
                 open_marker = _OpenMarker(
@@ -157,17 +172,19 @@ def scan_file(path: Path, text: str) -> tuple[list[Fragment], list[Include]]:
         if end_match is not None:
             if open_marker is None:
                 raise MarkerError(
-                    f"{path}:{index}: `scp:end id=\"{end_match.group(1)}\"` closes a marker nothing opened"
+                    f'{path}:{index}: `scp:end id="{end_match.group(1)}"` closes a marker nothing opened'
                 )
             if end_match.group(1) != open_marker.fragment_id:
                 raise MarkerError(
-                    f"{path}:{index}: `scp:end id=\"{end_match.group(1)}\"` closes "
+                    f'{path}:{index}: `scp:end id="{end_match.group(1)}"` closes '
                     f"`{open_marker.fragment_id}`, opened at line {open_marker.open_line}"
                 )
             joined = "\n".join(body)
             if open_marker.kind == "fragment":
                 fragments.append(
-                    Fragment(open_marker.fragment_id, path, open_marker.open_line, joined)
+                    Fragment(
+                        open_marker.fragment_id, path, open_marker.open_line, joined
+                    )
                 )
             else:
                 source = open_marker.source
@@ -215,7 +232,11 @@ def collect(root: Path) -> tuple[dict[str, Fragment], list[Include], list[str]]:
 
     for path in iter_doc_files(root):
         text = path.read_text(encoding="utf-8")
-        if "scp:fragment" not in text and "scp:include" not in text and "scp:end" not in text:
+        if (
+            "scp:fragment" not in text
+            and "scp:include" not in text
+            and "scp:end" not in text
+        ):
             continue
         try:
             file_fragments, file_includes = scan_file(path, text)
@@ -237,7 +258,11 @@ def collect(root: Path) -> tuple[dict[str, Fragment], list[Include], list[str]]:
 
 
 def _expand_inline(
-    line: str, fragments: dict[str, Fragment], path: Path, line_number: int, errors: list[str]
+    line: str,
+    fragments: dict[str, Fragment],
+    path: Path,
+    line_number: int,
+    errors: list[str],
 ) -> str:
     """Rewrite every one-line include on `line` with the bytes its fragment holds."""
 
@@ -269,7 +294,9 @@ def _expand_inline(
     return INCLUDE_INLINE.sub(replace, line)
 
 
-def expand(text: str, fragments: dict[str, Fragment], path: Path) -> tuple[str, list[str]]:
+def expand(
+    text: str, fragments: dict[str, Fragment], path: Path
+) -> tuple[str, list[str]]:
     """Rewrite every include body in `text` with the bytes its fragment holds."""
     errors: list[str] = []
     lines = text.split("\n")
@@ -292,7 +319,9 @@ def expand(text: str, fragments: dict[str, Fragment], path: Path) -> tuple[str, 
                 break
             end_index += 1
         if end_index >= len(lines):
-            errors.append(f"{path}:{index + 1}: include `{fragment_id}` opens and no `scp:end` closes it")
+            errors.append(
+                f"{path}:{index + 1}: include `{fragment_id}` opens and no `scp:end` closes it"
+            )
             out.append(line)
             index += 1
             continue
@@ -308,7 +337,7 @@ def expand(text: str, fragments: dict[str, Fragment], path: Path) -> tuple[str, 
         owner = str(fragment.path)
         if not owner.endswith(declared.lstrip("./")):
             errors.append(
-                f"{path}:{index + 1}: include names `from=\"{declared}\"` and fragment `{fragment_id}` "
+                f'{path}:{index + 1}: include names `from="{declared}"` and fragment `{fragment_id}` '
                 f"sits in {fragment.path}"
             )
         out.append(line)

@@ -61,7 +61,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from doc_includes import collect, expand  # noqa: E402
+from doc_includes import collect, expand
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCS_ROOT = REPO_ROOT / ".docs"
@@ -81,7 +81,10 @@ def site_lines(root: Path, includes: list) -> list[str]:
     for include in includes:
         key = (include.path.relative_to(root).as_posix(), include.fragment_id)
         counts[key] = counts.get(key, 0) + 1
-    return [f"{path}\t{fragment_id}\t{count}" for (path, fragment_id), count in sorted(counts.items())]
+    return [
+        f"{path}\t{fragment_id}\t{count}"
+        for (path, fragment_id), count in sorted(counts.items())
+    ]
 
 
 def read_lock(root: Path) -> list[str] | None:
@@ -250,12 +253,12 @@ def self_test() -> int:
                 "owner.md": (
                     "| term | default |\n|---|---|\n"
                     '| `rate_limit_publish` | <!-- scp:fragment id="probe-five" -->'
-                    "6,000 per minute<!-- scp:end id=\"probe-five\" --> |\n"
+                    '6,000 per minute<!-- scp:end id="probe-five" --> |\n'
                 ),
                 "site.md": (
                     "| term | default |\n|---|---|\n"
                     '| `rate_limit_publish` | <!-- scp:include id="probe-five" from="owner.md" -->'
-                    "6,000 a minute<!-- scp:end id=\"probe-five\" --> |\n"
+                    '6,000 a minute<!-- scp:end id="probe-five" --> |\n'
                 ),
             },
             "differs from the fragment",
@@ -279,7 +282,7 @@ def self_test() -> int:
                 ),
                 "site.md": (
                     '| cell | <!-- scp:include id="probe-six" from="owner.md" -->'
-                    "line a<!-- scp:end id=\"probe-six\" --> |\n"
+                    'line a<!-- scp:end id="probe-six" --> |\n'
                 ),
             },
             "spans more than one line",
@@ -316,7 +319,10 @@ def self_test() -> int:
             _plant(root, files)
             failures = run_scan(root)
             if not any(expected in failure for failure in failures):
-                print(f"SELF-TEST FAILED: {name}: no failure carried {expected!r}", file=sys.stderr)
+                print(
+                    f"SELF-TEST FAILED: {name}: no failure carried {expected!r}",
+                    file=sys.stderr,
+                )
                 for failure in failures:
                     print(f"  reported: {failure}", file=sys.stderr)
                 failed = True
@@ -329,7 +335,10 @@ def self_test() -> int:
             _plant(root, files, lock=lock)
             failures = run_scan(root)
             if not any(expected in failure for failure in failures):
-                print(f"SELF-TEST FAILED: {name}: no failure carried {expected!r}", file=sys.stderr)
+                print(
+                    f"SELF-TEST FAILED: {name}: no failure carried {expected!r}",
+                    file=sys.stderr,
+                )
                 for failure in failures:
                     print(f"  reported: {failure}", file=sys.stderr)
                 failed = True
@@ -371,8 +380,16 @@ def self_test() -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--self-test", action="store_true", help="plant each condition and assert it is caught")
-    parser.add_argument("--write-lock", action="store_true", help="regenerate the include-site lock file")
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="plant each condition and assert it is caught",
+    )
+    parser.add_argument(
+        "--write-lock",
+        action="store_true",
+        help="regenerate the include-site lock file",
+    )
     parser.add_argument("--root", default=str(DOCS_ROOT), help="directory to scan")
     args = parser.parse_args()
 
@@ -409,7 +426,9 @@ def main() -> int:
     print(f"fragments defined: {len(fragments)}")
     print(f"include directives: {len(includes)}")
     print(f"include-site lock lines: {len(site_lines(source, includes))}")
-    print("every include body equals the fragment its directive names, and the tree matches the lock")
+    print(
+        "every include body equals the fragment its directive names, and the tree matches the lock"
+    )
     return 0
 
 

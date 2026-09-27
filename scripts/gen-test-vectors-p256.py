@@ -1668,7 +1668,10 @@ def emit_key_event_signatures() -> None:
     )
     emit("vector_50.field_9_sentinel", "00000000")
     emit("vector_50.field_12_sentinel", "00000000")
-    emit("vector_50.key_state_bytes", len(vector_key_state(KEY_STATE_WITNESSING_INTERVAL)))
+    emit(
+        "vector_50.key_state_bytes",
+        len(vector_key_state(KEY_STATE_WITNESSING_INTERVAL)),
+    )
     emit("vector_50.preimage_len", len(preimage_50))
     emit_hex("vector_50.preimage", preimage_50)
     emit_hex("vector_50.preimage_digest", digest_50)
@@ -1825,9 +1828,7 @@ def emit_custody_registry_key_state() -> None:
     emit("vector_51.root_set_size", len(CUSTODY_ROOT_KEYS))
     emit("vector_51.root_threshold", 1)
     for index, (name, value) in enumerate(CUSTODY_VALUES):
-        key = (
-            CUSTODY_ROOT_KEYS[index] if index < 8 else CUSTODY_ACTIVE_KEY
-        )
+        key = CUSTODY_ROOT_KEYS[index] if index < 8 else CUSTODY_ACTIVE_KEY
         emit(f"vector_51.custody.{name}", f"0x{value:02x}")
         emit_hex(f"vector_51.key.{name}", key.compressed)
     emit_hex("vector_51.prerotation_key_compressed", CUSTODY_PREROTATION_KEY.compressed)
@@ -1835,7 +1836,9 @@ def emit_custody_registry_key_state() -> None:
     emit_hex("vector_51.inception_preimage_digest", inception_digest)
     emit_hex("vector_51.identifier", identifier)
     emit_hex("vector_51.routing_id", sha256(b"scp:did:" + identifier))
-    emit("vector_51.key_state_bytes", len(custody_key_state(CUSTODY_INTERVAL_KEY_STATE)))
+    emit(
+        "vector_51.key_state_bytes", len(custody_key_state(CUSTODY_INTERVAL_KEY_STATE))
+    )
     emit("vector_51.preimage_len", len(preimage))
     emit_hex("vector_51.preimage", preimage)
     emit_hex("vector_51.preimage_digest", digest)
@@ -1933,8 +1936,14 @@ def emit_witness_and_relay_objects() -> None:
     designating_digest = INCEPTION_DIGEST
 
     def cosigned_head(
-        label, sequence, event_digest, previous, observed_at, seed,
-        seed_event=designating_digest, seed_observed_at=COSIGN_OBSERVED_AT,
+        label,
+        sequence,
+        event_digest,
+        previous,
+        observed_at,
+        seed,
+        seed_event=designating_digest,
+        seed_observed_at=COSIGN_OBSERVED_AT,
         key=REF_KEY_2,
     ):
         # §9.7.4.3: `seed` is 0x01 on the first head a witness cosigns for a
@@ -2045,9 +2054,7 @@ def emit_witness_and_relay_objects() -> None:
     head_b = sha256(b"scp-25-fault-proof-successor-b")
     emit_hex("vector_46.shared_previous_cosigned_digest", baseline)
     cosigned_head("vector_46a", 21, head_a, baseline, COSIGN_OBSERVED_AT, seed=0x00)
-    cosigned_head(
-        "vector_46b", 21, head_b, baseline, COSIGN_OBSERVED_AT + 1, seed=0x00
-    )
+    cosigned_head("vector_46b", 21, head_b, baseline, COSIGN_OBSERVED_AT + 1, seed=0x00)
     assert head_a != head_b, "vector_46: the two heads must differ"
 
     emit_community_relay_list()
@@ -2103,9 +2110,9 @@ def emit_community_relay_list() -> None:
         emit(f"vector_49.entry_{index}.url", url)
         emit(f"vector_49.entry_{index}.free", "true" if free else "false")
     assert any(free for *_, free in RELAY_LIST_ENTRIES), "§18.5.1: one free entry"
-    assert len({key for _, key, *_ in RELAY_LIST_ENTRIES}) == len(
-        RELAY_LIST_ENTRIES
-    ), "§18.5.1: two entries whose `key` bytes are equal are one operator"
+    assert len({key for _, key, *_ in RELAY_LIST_ENTRIES}) == len(RELAY_LIST_ENTRIES), (
+        "§18.5.1: two entries whose `key` bytes are equal are one operator"
+    )
     emit("vector_49.document_len", len(document))
     emit("vector_49.document", document.decode())
     emit_hex("vector_49.document_bytes", document)
@@ -2205,7 +2212,9 @@ COSIGNS_ACTIVE_KEY = keypair_from_seed(
     sha256(b"scp-25-recovery-cosigns-active"), TEST_VECTOR_KEY_LABEL, "CoSigns #active"
 )
 COSIGNS_NEXT_KEY = keypair_from_seed(
-    sha256(b"scp-25-recovery-cosigns-next"), TEST_VECTOR_KEY_LABEL, "CoSigns next member"
+    sha256(b"scp-25-recovery-cosigns-next"),
+    TEST_VECTOR_KEY_LABEL,
+    "CoSigns next member",
 )
 LOST_ROOT_KEY = keypair_from_seed(
     sha256(b"scp-25-recovery-lost-root"), TEST_VECTOR_KEY_LABEL, "Lost K' member"
@@ -2318,13 +2327,17 @@ def sign_group(key: KeyPair, digest: bytes, label: str) -> bytes:
     return sig
 
 
-def rank_first_reveal(digest: bytes, signatures: list[bytes], root_group_index: int | None) -> int:
+def rank_first_reveal(
+    digest: bytes, signatures: list[bytes], root_group_index: int | None
+) -> int:
     """R6 over a suffix whose first event reveals the standing commitment: rank 1
     where that event carries a root signature verifying against the root standing
     at its predecessor, which is Vector 41's reference key, and rank 2 otherwise."""
     if root_group_index is None:
         return 2
-    return 1 if ecdsa_verify(REF_KEY_1.point, digest, signatures[root_group_index]) else 2
+    return (
+        1 if ecdsa_verify(REF_KEY_1.point, digest, signatures[root_group_index]) else 2
+    )
 
 
 def scp_text_form(identifier: bytes) -> str:
@@ -2332,7 +2345,9 @@ def scp_text_form(identifier: bytes) -> str:
 
 
 def emit_reveal_ranking_and_text_form() -> None:
-    section("§25.29 Reveal-authorized events, an R6 ranking, and the identifier's text form")
+    section(
+        "§25.29 Reveal-authorized events, an R6 ranking, and the identifier's text form"
+    )
     identifier = INCEPTION_IDENTIFIER
     predecessor = INCEPTION_DIGEST
     standing = sha256(PREROTATION_SEPARATOR + REF_KEY_3.compressed)
@@ -2347,7 +2362,10 @@ def emit_reveal_ranking_and_text_form() -> None:
     emit_hex("vector_53.consumed_commitment", standing)
     emit_hex("vector_53.revealed_key", REF_KEY_3.compressed)
     emit_hex("vector_53.next_key", ROLLOVER_NEXT_KEY.compressed)
-    emit_hex("vector_53.next_commitment", sha256(PREROTATION_SEPARATOR + ROLLOVER_NEXT_KEY.compressed))
+    emit_hex(
+        "vector_53.next_commitment",
+        sha256(PREROTATION_SEPARATOR + ROLLOVER_NEXT_KEY.compressed),
+    )
     emit("vector_53.preimage_len", len(pre53))
     emit_hex("vector_53.preimage", pre53)
     emit_hex("vector_53.preimage_digest", d53)
@@ -2357,8 +2375,14 @@ def emit_reveal_ranking_and_text_form() -> None:
     emit_hex("vector_53.signature_field", reveal53 + root53)
 
     # --- Vector 54: a `RootRecovery{CoSigns}`. ---
-    pre54 = recovery_preimage(identifier, predecessor, STANDING_ROOT_COSIGNS,
-                              COSIGNS_ROOT_KEY, COSIGNS_ACTIVE_KEY, COSIGNS_NEXT_KEY)
+    pre54 = recovery_preimage(
+        identifier,
+        predecessor,
+        STANDING_ROOT_COSIGNS,
+        COSIGNS_ROOT_KEY,
+        COSIGNS_ACTIVE_KEY,
+        COSIGNS_NEXT_KEY,
+    )
     d54 = sha256(pre54)
     sigs54 = [
         sign_group(REF_KEY_3, d54, "vector_54.reveal"),
@@ -2368,8 +2392,14 @@ def emit_reveal_ranking_and_text_form() -> None:
     emit_hex("vector_54.installed_root_key", COSIGNS_ROOT_KEY.compressed)
     emit_hex("vector_54.active_key", COSIGNS_ACTIVE_KEY.compressed)
     emit_hex("vector_54.next_key", COSIGNS_NEXT_KEY.compressed)
-    emit_hex("vector_54.next_commitment", sha256(PREROTATION_SEPARATOR + COSIGNS_NEXT_KEY.compressed))
-    emit("vector_54.key_state_bytes", len(recovery_key_state(COSIGNS_ROOT_KEY, COSIGNS_ACTIVE_KEY)))
+    emit_hex(
+        "vector_54.next_commitment",
+        sha256(PREROTATION_SEPARATOR + COSIGNS_NEXT_KEY.compressed),
+    )
+    emit(
+        "vector_54.key_state_bytes",
+        len(recovery_key_state(COSIGNS_ROOT_KEY, COSIGNS_ACTIVE_KEY)),
+    )
     emit("vector_54.preimage_len", len(pre54))
     emit_hex("vector_54.preimage", pre54)
     emit_hex("vector_54.preimage_digest", d54)
@@ -2380,8 +2410,14 @@ def emit_reveal_ranking_and_text_form() -> None:
     emit_hex("vector_54.signature_field", b"".join(sigs54))
 
     # --- Vector 55: a `RootRecovery{Lost}`. ---
-    pre55 = recovery_preimage(identifier, predecessor, STANDING_ROOT_LOST,
-                              LOST_ROOT_KEY, LOST_ACTIVE_KEY, LOST_NEXT_KEY)
+    pre55 = recovery_preimage(
+        identifier,
+        predecessor,
+        STANDING_ROOT_LOST,
+        LOST_ROOT_KEY,
+        LOST_ACTIVE_KEY,
+        LOST_NEXT_KEY,
+    )
     d55 = sha256(pre55)
     sigs55 = [
         sign_group(REF_KEY_3, d55, "vector_55.reveal"),
@@ -2390,7 +2426,10 @@ def emit_reveal_ranking_and_text_form() -> None:
     emit_hex("vector_55.installed_root_key", LOST_ROOT_KEY.compressed)
     emit_hex("vector_55.active_key", LOST_ACTIVE_KEY.compressed)
     emit_hex("vector_55.next_key", LOST_NEXT_KEY.compressed)
-    emit_hex("vector_55.next_commitment", sha256(PREROTATION_SEPARATOR + LOST_NEXT_KEY.compressed))
+    emit_hex(
+        "vector_55.next_commitment",
+        sha256(PREROTATION_SEPARATOR + LOST_NEXT_KEY.compressed),
+    )
     emit("vector_55.preimage_len", len(pre55))
     emit_hex("vector_55.preimage", pre55)
     emit_hex("vector_55.preimage_digest", d55)

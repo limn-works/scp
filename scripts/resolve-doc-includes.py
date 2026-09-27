@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from doc_includes import collect, expand  # noqa: E402
+from doc_includes import collect, expand
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCS_ROOT = REPO_ROOT / ".docs"
@@ -26,7 +26,9 @@ DOCS_ROOT = REPO_ROOT / ".docs"
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="report differences and write nothing")
+    parser.add_argument(
+        "--check", action="store_true", help="report differences and write nothing"
+    )
     parser.add_argument("--root", default=str(DOCS_ROOT), help="directory to scan")
     args = parser.parse_args()
 
