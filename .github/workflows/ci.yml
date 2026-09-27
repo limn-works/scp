@@ -64,10 +64,14 @@ env:
 #   workspace-release `target/release` on Linux — pyo3-module, which runs
 #                     `maturin develop --release`, and napi-addon, which runs
 #                     `cargo build -p scp-ffi-napi --release`. Those two jobs are the
-#                     only members: python-test, typescript-check, bridge-parity and
-#                     bridge-parity-swift ran one of those commands each and now
-#                     download what the producers upload, so none of them runs cargo
-#                     and none of them reads a cargo cache. The two members write one
+#                     only members. python-test, typescript-check and bridge-parity
+#                     ran one or both of those commands and belonged to this group;
+#                     they now download what the producers upload, so none of them
+#                     runs cargo and none of them reads a cargo cache.
+#                     bridge-parity-kotlin belonged to it for its `maturin develop
+#                     --release`; it now downloads the PyO3 module and restores
+#                     workspace-debug for its one remaining cargo command, the
+#                     dev-profile `scp-ffi-uniffi` build. The two members write one
 #                     directory under two feature resolutions and share one entry,
 #                     which pyo3-module writes. `maturin develop` builds package
 #                     scp-ffi, so that entry holds the dependency tree both bridges
