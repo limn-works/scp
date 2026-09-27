@@ -573,7 +573,7 @@ class TestCapability:
         assert Capability.METADATA_EDIT.value == "metadata:edit"
 
     def test_variant_count(self) -> None:
-        assert len(Capability) == 19
+        assert len(Capability) == 18
 
     def test_outlet_call_parameterised(self) -> None:
         cap = Capability.outlet_call("my-outlet-id")
