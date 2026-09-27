@@ -628,6 +628,10 @@ PYEOF
 # Each entry runs as its own `cargo check`, the way CI runs each as its own command. One
 # invocation carrying every feature would resolve a feature unification no CI command
 # resolves, so a failure it reported would answer a question the merge gate never asks.
+# For the same reason an entry names every package its CI command names: the part before
+# `|` is a comma-separated package list, each becomes one `-p`, and the entry runs when
+# this run selected any one of them. An entry naming more than one package spells each
+# feature as `package/feature`, as its CI command does.
 #
 # `server` is absent from this list although three CI commands name it: `default =
 # ["server"]` in the manifest of each of scp-ffi, scp-ffi-napi and scp-ffi-uniffi, so the
@@ -637,8 +641,7 @@ EXTRA_FEATURE_CHECKS=(
     "scp-transport|combined,local-cache"
     "scp-testing|sqlite"
     "scp-transport|sqlite-blob,redb-blob,postgres-blob,s3-blob,startup"
-    "scp-node|cloud-blobs,testing"
-    "scp-relay|cloud-blobs"
+    "scp-node,scp-relay|scp-node/cloud-blobs,scp-node/testing,scp-relay/cloud-blobs"
 )
 
 # The packages the `wasm-protocol` job of `.github/workflows/ci.yml` compiles for
@@ -724,14 +727,22 @@ else
     fi
 
     for entry in "${EXTRA_FEATURE_CHECKS[@]}"; do
-        extra_pkg=${entry%%|*}
+        extra_pkgs=${entry%%|*}
         extra_features=${entry#*|}
-        for c in "${CRATES[@]}"; do
-            [[ $c == "$extra_pkg" ]] || continue
-            run_step "compile($extra_pkg:$extra_features)" \
-                cargo check -p "$extra_pkg" --all-targets --features "$extra_features"
-            break
+        IFS=, read -r -a extra_pkg_list <<< "$extra_pkgs"
+        extra_selected=false
+        declare -a extra_pkg_args=()
+        for p in "${extra_pkg_list[@]}"; do
+            extra_pkg_args+=(-p "$p")
+            for c in "${CRATES[@]}"; do
+                [[ $c == "$p" ]] && extra_selected=true
+            done
         done
+        if $extra_selected; then
+            run_step "compile($extra_pkgs:$extra_features)" \
+                cargo check "${extra_pkg_args[@]}" --all-targets --features "$extra_features"
+        fi
+        unset extra_pkg_args
     done
 
     NOTES+=("the reverse dependencies of $crate_list: cargo check -p compiles the packages it names and none of their dependents, so a changed public signature compiles here and fails to compile its dependents in the rust-clippy job of .github/workflows/ci.yml")

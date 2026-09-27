@@ -782,6 +782,40 @@ else
     report "case 13 compiles the cloud blob backends the rust-clippy job lints" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13.harness/cargo.log")"
 fi
 
+# ── Case 13b: an extra-feature check that names two packages ─────────────────────────
+#
+# The `rust-clippy` job lints the PostgreSQL and S3 blob backends of both binaries in one
+# command, `cargo clippy -p scp-node -p scp-relay --features
+# scp-node/cloud-blobs,scp-node/testing,scp-relay/cloud-blobs`, so scp-relay's
+# `cloud-blobs` build always unifies with scp-node's `testing`. A branch that changed
+# scp-relay alone must compile that same unification, not scp-relay by itself.
+#
+# The mutations it kills: deleting the combined scp-node/scp-relay entry from
+# EXTRA_FEATURE_CHECKS, or splitting it back into one `cargo check` per package.
+FIXTURE13B="$WORK/two-package-extra-features"
+build_fixture "$FIXTURE13B"
+mkdir -p "$FIXTURE13B/crates/scp-relay/src"
+printf '[package]\nname = "scp-relay"\nversion = "0.0.0"\n' > "$FIXTURE13B/crates/scp-relay/Cargo.toml"
+printf '// fixture source\n' > "$FIXTURE13B/crates/scp-relay/src/lib.rs"
+fixture_commit "$FIXTURE13B" crates/scp-relay/src/lib.rs
+run_fixture "$FIXTURE13B"
+rc=$(cat "$FIXTURE13B.harness/rc.txt")
+if [[ $rc -eq 0 ]]; then
+    report "case 13b exits 0 when the cloud-blobs compile passes" 0 ""
+else
+    report "case 13b exits 0 when the cloud-blobs compile passes" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE13B.harness/out.txt")"
+fi
+if grep -qF 'check -p scp-node -p scp-relay --all-targets --features scp-node/cloud-blobs,scp-node/testing,scp-relay/cloud-blobs' "$FIXTURE13B.harness/cargo.log"; then
+    report "case 13b compiles both binaries' cloud-blobs features in the one command the rust-clippy job runs" 0 ""
+else
+    report "case 13b compiles both binaries' cloud-blobs features in the one command the rust-clippy job runs" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13B.harness/cargo.log")"
+fi
+if grep -qE 'check -p scp-relay --all-targets --features [^|]*cloud-blobs' "$FIXTURE13B.harness/cargo.log"; then
+    report "case 13b starts no scp-relay-only cloud-blobs compile, which no CI command runs" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13B.harness/cargo.log")"
+else
+    report "case 13b starts no scp-relay-only cloud-blobs compile, which no CI command runs" 0 ""
+fi
+
 # ── Case 14: the gate whose diff range holds no uncommitted edit ─────────────────────
 #
 # `scripts/check-cross-layer.sh` decides from `git diff <merge base with origin/main>…HEAD`
