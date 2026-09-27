@@ -6228,7 +6228,7 @@ impl Supervisor {
     /// the saga never observes an unauthenticated caller (a mismatch surfaces
     /// the registered caller-axis terminal `SCP-SAGA-13050`). The co-resident
     /// core path has no untrusted leg; the FFI seam is where the authenticated
-    /// principal is bound (per the ADR-049 §3a discipline and the CLAUDE.md
+    /// principal is bound (per the ADR-049 §3a discipline and the AGENTS.md
     /// integration checklist: function → `Supervisor` → FFI → SDK →
     /// `pipeline_wiring` assertion).
     ///
@@ -14328,7 +14328,7 @@ impl Supervisor {
         local_pseudonym: Option<[u8; 32]>,
     ) -> Result<crate::context::ContextHandle, scp_protocol::context::builder::ContextCreationError>
     {
-        // Fail loud, never silent (CLAUDE.md "no silent" tenet): a supplied
+        // Fail loud, never silent (AGENTS.md "no silent" tenet): a supplied
         // bilateral peer cannot be honored here because invitation/Welcome
         // delivery lives in a higher SDK layer. `into_params` carries the peer
         // out so callers that own the invitation path can lower the config

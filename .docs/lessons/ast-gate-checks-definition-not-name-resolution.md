@@ -1,52 +1,77 @@
 # A Mechanical Check Earns Its Keep Only Against an Attacker Who Cannot Edit the Check
 
-The terminal lesson of this saga is the one in the title: a bespoke source-text gate over `OwnedIdentityDid`'s definition added *zero* marginal security, because the only attacker it constrained — an insider with commit access to `identity_capability.rs` — could equally edit the gate, its self-test, or its CI wiring. The boundary is held instead by the compiler (type system + two module lints) and code review. The road to that conclusion produced a sequence of sharper sub-lessons, beginning with the soundness boundary of *what* such a gate could ever check (its definition shape, never use-site name resolution) and ending with *whether* to build one at all. They are recorded below in the order they were learned.
+## The rules
 
-**Rule (the first sub-lesson: a gate checks the type DEFINITION, never use-site name resolution)**: A defense-in-depth CI gate over source text must be **sound and bounded**: it may only assert structural facts about a type's *definition* (visibility, fields, the closed set of constructors, derives, presence of `deny(unsafe_code)`). The moment a gate tries to verify a *use-site* property — "does this argument resolve to the trusted binding, unshadowed?" — it is reimplementing the compiler's name resolution in an AST walker, which is an **unbounded arms race** and must not be attempted. When the type system already enforces the security property soundly, the gate's job is the narrow definition-shape invariant the type system does *not* give you (e.g. "no second arbitrary-input constructor was added"), and nothing more.
+1. **Before building a source-text check, ask whether its own threat model can defeat it.**
+   When the only attacker the check constrains is an insider with commit access, and that
+   insider can equally edit the check, its self-test, or its CI wiring, the check adds zero
+   security over the type system plus code review. It is maintenance cost presented as
+   defense in depth.
+2. **Prefer the compiler.** Make the forbidden thing uncompilable: a private field, a
+   restricted constructor, no `DerefMut`, a `#![deny(...)]` module lint. The compiler is
+   sound, it converges, and it does not rot as the language grammar grows.
+3. **A gate may check a definition, never use-site name resolution.** A gate can soundly
+   assert facts about how one item is defined: its visibility, its fields, its closed set of
+   constructors, the item kinds a file may hold. A gate that asks "does this argument at this
+   call site resolve to the trusted binding?" is reimplementing name resolution in an AST
+   walker, and every review pass will find one more binding form that rebinds the name.
+4. **A gate is a positive whitelist that fails closed.** It enumerates the permitted shapes
+   and rejects everything else by kind. A denylist of forbidden spellings never closes.
+5. **A second, weaker check of a property something else already proves soundly has negative
+   value.** Ask what already proves the property — the compiler, `cargo tree`, a
+   cryptographic check — and add a gate only for a residual that nothing else expresses.
+6. **Review-pass count is a convergence signal.** More than about three passes that each find
+   a new spelling of the same bypass means the approach is wrong. The merge-blocking bar for
+   a defense-in-depth gate is a compiling counterexample that evades it, not a theoretical
+   spelling that does not compile.
 
-**Context**: `OwnedIdentityDid` (ADR-049 §5, spec §9.4.1) is a capability token proving an actor's identity owns it. Its unforgeability is enforced **by the type system**: the sole arbitrary-`DID` constructor `issue_for_actor` is `pub(super)`, the `did` field is private (so no struct-literal construction outside the defining module), and the crate is `deny(unsafe_code)`. Every reviewer confirmed, every pass, that **no compiling forgery reachable from outside the module exists** — the boundary holds without any gate.
+## Where these rules came from
 
-A tree-sitter source-text gate (a `scripts/` Python scanner over the capability definition) was added as defense-in-depth over the source text. It then grew to **6,000+ lines** across ~17 review passes because it tried to verify the *build site* (`OwnedIdentityDid::issue_for_actor(owning_did.clone())` in `Supervisor::build_actor_deps`) — specifically that the mint argument `owning_did` resolves to the trusted function parameter and is not shadowed. That is a name-resolution property. Re-deriving it in tree-sitter meant enumerating every Rust binding form that can rebind a name: `let`/`match`/`if let`/`while let`/`for`/closure params/struct-shorthand/`const`/`static`/nested `fn`/`use`-alias/glob-`use`/`macro_rules!` invocations/proc-macro attributes/custom `#[derive]`/path-qualified attributes. Each review pass found the *next* spelling, because the approach is structurally non-convergent. The cost was severe and out of all proportion to the (zero, given the type system) marginal security: 17 passes, a reviewer subagent that rogue-created and armed auto-merge on a non-clean pass, repeated agent crashes on the oversized file, and silent `Edit`-tool no-ops on it. Several "bypasses" being closed were not even compilable (they required a custom proc-macro crate that does not exist in the tree).
+- A tree-sitter scanner over `OwnedIdentityDid` (ADR-049 §5) grew past 6,000 lines across
+  about 17 review passes chasing shadowed-binding spellings at the one site that mints the
+  token, and was deleted. The Class-S fail-closed source-text gate reached 4,354 lines
+  chasing mutation spellings before a type-shape design in `ClassSCell` replaced it.
+- Two integration tests parsed their own `Cargo.toml` to prove that no non-dev edge enables
+  `scp-identity/testing`. Each review round found another manifest spelling. Both readers
+  were deleted, because `scripts/check-shipped-feature-graph.sh` already resolves the
+  shipped feature set with `cargo tree` and rejects the feature whatever spelling enables it.
 
-**Fix**: Deleted the name-resolution machinery entirely and reduced the gate to a **sound, bounded, single-file kernel** that checks only the *definition* of `OwnedIdentityDid` in `identity_capability.rs` as a **frozen positive-whitelist shape** (rejecting any deviation by construction, rather than denylisting forgeries by name), plus one presence assertion:
+## How `OwnedIdentityDid` is held today
 
-- **Module-item whitelist** — enumerate the file's module-level items; permit ONLY `use` declarations, exactly one `struct OwnedIdentityDid`, exactly one inherent `impl OwnedIdentityDid`, and exactly one `#[cfg(test)] mod tests`. Any other item is rejected **by its item kind** (a `type` alias, a free fn, a second/trait/path-qualified impl, a const/static/macro/trait) — never by matching a forgery's name, so aliasing and path-qualification cannot evade it. This is the categorical closer the denylist-by-name lacked.
-- struct name-visibility exactly `pub(in crate::context)` (never `pub`/`pub(crate)`); single **private** field `did: DID`; struct attributes restricted to bare inert built-ins (no derive at all — closes every forbidden derive at once, including one hidden behind an interleaved `///` doc-comment, because attributes are read from the grammar, not from a contiguous-adjacency run);
-- the one inherent impl contains EXACTLY `issue_for_actor` (`pub(super)`, one by-value param), `reissue` (`pub(in crate::context)`, params exactly `&self`), `as_did` (`pub(in crate::context)`, params exactly `&self`) with exact return types. The exact-parameter-list assertion rejects an aliased-DID-param minter (`reissue(&self, o: Owner)`) without resolving `Owner` — this is the **sole-minter invariant**, the one thing the type system does *not* prevent (an insider adding a second minter inside the module);
-- `deny(unsafe_code)`/`forbid(unsafe_code)` present in `supervisor/mod.rs`, asserted by **parsing the inner attribute** (a commented-out or string occurrence does not count).
+`OwnedIdentityDid` (`crates/scp-runtime/src/context/supervisor/identity_capability.rs`)
+proves that an actor's identity owns the actor. Three layers hold it, with different reach:
 
-Construction confinement from there is the **type system's** job, not the gate's — the gate never inspects the build site or any call site.
+- **Type system, against all outsiders.** The `did` field is private and the minting
+  constructor `issue_for_actor` is `pub(super)`, so code outside the supervisor module can
+  hold or borrow a token and cannot construct one.
+- **Module lints, against the insider move review misses most.**
+  `#![deny(non_local_definitions)]` in `supervisor/mod.rs` makes a second minter hidden as an
+  `impl` block inside a function body a compile error, and `#![deny(unsafe_code)]` blocks
+  `transmute` fabrication.
+- **Code review, against every other insider edit.** A new constructor, a second top-level
+  `impl`, a widened visibility, or an added derive all compile. The file is small, so each
+  shows as a visible diff.
 
-**Lesson**: Three durable takeaways.
+## Traps in type-shape enforcement
 
-1. **Soundness boundary.** An AST gate can soundly assert facts about a *definition* (a finite, single-file shape). It cannot soundly assert *use-site* dataflow or name resolution — those are compiler-level computations, and approximating them in tree-sitter is an infinite regress. Draw the line at the definition.
+These come from the Class-S migration (ADR-049 §9).
 
-   Do not over-apply this. Bounded, definition-SIDE source-text checks are legitimately sound and SHOULD be kept — including a **frozen-shape positive whitelist** over a single file that enumerates the permitted module-level item *kinds* and the exact shape of the one struct and the one impl. Such a whitelist can soundly reject *same-file* `type` aliases (the alias item kind is simply not on the list) and *path-qualified impls* (`impl self::Cap` — normalize to the final path segment), because these are definition-side structural facts, not use-site resolution: the gate never traces whether the alias is later *used* to mint, it just refuses to admit the alias item at all. The forbidden class is specifically **use-site name resolution** — tracing whether a particular *argument* at a *call/build site* resolves to a trusted binding across control flow and rebinding forms — which is unbounded. Over-*cutting* a sound definition-side check is the opposite, equal-and-opposite failure: an earlier draft of this very gate dropped the same-file alias ban during the rewrite and had to restore it, because a `type Cap = OwnedIdentityDid; fn forge(d: DID) -> Cap { Cap { did: d } }` in the file is a real same-file forgery that the item-kind whitelist closes soundly and cheaply.
-
-2. **Redundant enforcement is negative value.** When the type system already enforces a property *soundly* (visibility + private field + `deny(unsafe_code)`), a second, weaker, source-text re-check of the *same* property is not "defense in depth" — it is a maintenance liability that will rot against language-syntax evolution and gives a false sense of additional security. "Enforce mechanically" is already satisfied by the type system; add a gate only for the residual invariant the type system genuinely misses.
-
-3. **Review-pass count is a convergence signal.** More than ~3 passes on one artifact that keep surfacing "a new spelling of the same bypass" means the *approach* is non-convergent — stop and reframe, do not grind. The correct blocking bar for a defense-in-depth gate is **a compiling, type-system-evading forgery**, not a theoretical AST-spelling gap (especially one that cannot compile). Findings that fail that bar are not merge-blockers.
-
-## Terminal resolution: the gate was DROPPED for compiler enforcement
-
-The bounded, single-file kernel above was the right *correction* to the unbounded gate — but it was not the terminal answer. The gate was ultimately **deleted entirely** (the `scripts/` Python scanner, its fixture, and the dedicated CI job all removed) in favor of enforcement by the type system plus two module lints:
-
-- the private `did` field + `pub(super)` `issue_for_actor` constructor (the type system: nameable ≠ constructible);
-- `#![deny(unsafe_code)]` at `supervisor/mod.rs` (blocks transmute / unsafe-`Send` fabrication);
-- `#![deny(non_local_definitions)]` at `supervisor/mod.rs` — which turns one vector the type system did *not* cover (a nested `impl OwnedIdentityDid { .. }` smuggled into a method body — a second minter authored from inside the module, applied globally by Rust and easy to miss buried in a long fn / closure / `const{}` / `async{}` block) into a hard **compile error**.
-
-**The lint is not a 1:1 replacement for the deleted gate — and that is fine.** The boundary is held by **three layers with distinct coverage**, none of which is the whole picture alone:
-
-1. **Type system (absolute — all outsiders).** The private `did` field makes `Self { did }` an `E0451` error outside the defining module; `pub(super) issue_for_actor` is unreachable outside the supervisor module. No outsider can construct or mint, period.
-2. **Compiler lints (the insider vector review is worst at).** `#![deny(non_local_definitions)]` makes a body-nested second minter a hard compile error — that is review's blind spot (a global-effect impl hidden in a function body). `#![deny(unsafe_code)]` blocks `transmute` / unsafe-`Send` fabrication. Precisely: the lint closes the *body-nested* second minter; it does **not** catch a *module-level* second `impl` block, nor a one-token visibility widen of `issue_for_actor` — those compile cleanly.
-3. **Code review (visible-diff insider edits).** The remaining ways to weaken the boundary — adding a new constructor method, adding a top-level *second inherent* `impl`, adding a top-level *trait* `impl` whose method mints, adding a module-level *free fn* that constructs via the in-module struct literal, widening `issue_for_actor`'s `pub(super)`, widening the `pub(in crate::context)` visibility of `reissue`/`as_did`, adding a forbidden derive or a `pub` field — all compile cleanly but are visible diffs to the small single-struct / single-impl file, owned by code review. The lint does *not* reach any of these; "no second minter of *any* form" is the review-owned invariant the deleted scanner's whitelist used to assert mechanically, not a complete compiler backstop. (That is the same review that owns any insider edit — and which an insider could equally subvert by editing a gate, which is exactly why a gate adds no marginal security here.)
-
-So the lint closed the *one* class the AST gate had spent four review passes chasing in tree-sitter (the body-nested minter) — soundly, at the compiler — but the module-level second impl and the visibility widen were always review-covered, just as a forbidden derive always was. The deeper, capstone lesson, prior to building *any* mechanical source-text check: **ask whether the check's own threat model can defeat the check.** The only attacker against `OwnedIdentityDid`'s definition shape is an insider with commit access to `identity_capability.rs` — but that same insider can equally edit the gate script, its self-test, or its CI wiring. So the gate's marginal security over `type system + compiler lints + code review` is *zero*. A mechanical check earns its keep only when it constrains an attacker who *cannot* edit the check; when the attacker can edit both, the check is pure maintenance liability dressed as defense-in-depth. Prefer compiler/type-system enforcement: it is sound, convergent, and (unlike a source-text scanner) does not rot against language-syntax evolution. Reach for a bespoke scanner only for a residual invariant that neither the type system, an existing compiler lint, nor visible-diff review can express — and here, no such residual exists.
-
-## The same class in Cargo manifests: pull request #2462, the scp-testing helpers feature
-
-The gate above read Rust source text. Pull request #2462, which moved the `helpers` module of `crates/scp-testing` behind a feature so that the Python and Swift builds resolve one feature set and share build artifacts, grew the same non-convergent shape in a different medium. Two integration tests — `crates/scp-runtime/tests/identity_config_cross_path.rs` and `crates/scp-ffi/common/tests/dht_capability_injection.rs` — parsed their own `Cargo.toml` and asserted that no non-dev edge in it activates `scp-identity/testing`, the feature that swaps scp-identity's fail-closed identity-creation arm for one minting an in-memory pre-rotation custody backend. Reading a manifest for a dependency edge means enumerating the spellings cargo accepts: `dep?/feature`, a rename through a `package` field, a second feature that the `testing` list then names, a `[dependencies]` or `[build-dependencies]` entry, and any of those under a `[target.<cfg>]` table. One review round closed five of those spellings one at a time. The next round found a sixth, a workspace-inherited feature list, and found that each reader read two of the six crates its own failure message named.
-
-`scripts/check-shipped-feature-graph.sh`, the shipped-artifact feature-graph gate, already proved the production consequence by construction. That gate resolves ten shipped artifact configurations with `cargo tree -e features,no-dev --target all`, takes the union of the two renderings cargo offers, and fails on any resolved SCP-crate feature that its allowlist does not name. The allowlist names `scp-identity/default` and `scp-identity/production-dht` and no `testing` feature of any crate, so an edge that turned `testing` on for a shipped artifact fails the gate whatever spelling the edge uses: the gate reads what cargo resolved and reads no manifest. Both manifest readers, the 177-line block they duplicated between them, and `check_identity_manifest_readers_match` in `scripts/tests/ci-gate/ci_gate_selftest.py`, which compared the two copies byte for byte, were deleted.
-
-The criterion that decided the deletion is point 2 of the Lesson section above: the property already had a sound proof, so a second reader of the same property, in weaker form, was negative value. Two indicators pointed at that criterion before the sixth spelling arrived, and neither indicator decides on its own: a check whose body is a list of accepted spellings, and a review-pass count above three where each pass adds one more spelling. When a check needs a seventh case, look for the tool that resolves the question — for a cargo feature, `cargo tree` resolves it, and for a Rust name, the compiler resolves it.
+- **The perimeter is the view constructors.** A best-effort view that binds a Class-S field
+  by name gets `&` only because of the destination field type; changing `&'a` to `&'a mut`
+  in one place re-arms mutation. Guard each such field with a `compile_fail` doctest, not
+  with a text scanner over the constructors.
+- **A `Drop` guard with `debug_assert!` does nothing in release builds.** Move semantics are
+  the real backstop: a consuming `commit(self)` makes double-commit a type error.
+- **Couple the obligation to the mutation.** A mutator that returns a `bool` the caller must
+  turn into a persist obligation lets a caller mutate and forget. Take the obligation sink as
+  a required parameter and arm it inside the mutator.
+- **State a structural guarantee for the view that lacks the accessor, never globally.**
+  "The best-effort view has no grow accessor" is a compile-time fact. "Growth happens only
+  through the consequence view" is false when a `pub` method reaches the same mutation, and
+  that sentence stops a reviewer from looking for the persist that makes the other path safe.
+- **A method-resolution witness is not a negative guarantee.** A test that relies on "an
+  inherent method beats a trait method" to detect an added method misses any added method
+  whose receiver or arity makes it non-viable at the witness call site, such as an
+  `&mut self` method with arguments. An injected `fn suspend_all(&mut self, did)` compiled
+  with every such witness green. `assert_not_impl_any!` over a trait is a real negative
+  check; coupling over inherent-versus-trait resolution is not.

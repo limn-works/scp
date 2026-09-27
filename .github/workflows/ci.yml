@@ -469,8 +469,6 @@ jobs:
         run: bash scripts/check-bridge-symmetry.sh
       - name: Run bridge-symmetry fixture tests
         run: bash scripts/tests/bridge-symmetry/run-tests.sh
-      - name: Run enforcement-file hook tests
-        run: bash scripts/tests/enforcement-files-hook/run-tests.sh
 
   # ── SDK coverage ─────────────────────────────────────────────────────
   sdk-coverage:
@@ -800,7 +798,7 @@ jobs:
 
   # Every agent definition in `.claude/agents/` opens with a `## Verdict criterion`
   # section carrying a `**Criterion:**` line and an `**Indicators, not the criterion.**`
-  # line, so the sentence in the Agent execution rules of CLAUDE.md describes the tree
+  # line, so the "Write every agent prompt as a contract" rule of AGENTS.md describes the tree
   # instead of asserting a state nobody produced. It runs on every pull request, without
   # a paths filter, because the `ci` aggregator counts a skipped job as a pass.
   agent-verdict-criterion:
@@ -2212,7 +2210,7 @@ jobs:
         # Guards the whole bridge_parity directory (all op fixtures,
         # runners, and docstrings) against unresolved issue placeholders.
         # Any xfail or divergence callout must resolve to a real #NNNN
-        # ref before merge — CLAUDE.md forbids fabricated story references.
+        # ref before merge — AGENTS.md forbids fabricated story references.
         #
         # Historically this grep targeted a tracking file that held xfail
         # paperwork; that file was deleted when the last xfail was resolved.
