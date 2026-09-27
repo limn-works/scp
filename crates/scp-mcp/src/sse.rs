@@ -77,6 +77,15 @@ use crate::server::{ContextEventPump, ContextProvider, McpServer, McpServerForTr
 /// Default retry interval (milliseconds) sent to SSE clients.
 const DEFAULT_RETRY_MS: u64 = 3000;
 
+/// How long a new `GET /sse` waits for the session it evicted to release the
+/// slot before it gives up with `409 Conflict`.
+///
+/// Eviction ends the old stream at its next poll, and hyper drops the body,
+/// and with it the session permit, as soon as the stream ends. hyper polls
+/// the body only while it can buffer output for the socket, so an old
+/// connection whose buffers are full can hold the slot past this bound.
+const EVICTION_WAIT: Duration = Duration::from_secs(5);
+
 /// Configuration for the SSE transport server.
 ///
 /// `Debug` is implemented by hand so that formatting a config with `{:?}`
@@ -307,12 +316,31 @@ pub(crate) struct AppState<P: ContextProvider> {
     /// and cancel them with its own `resources/unsubscribe`.
     ///
     /// Rather than pretend to multiplex, the endpoint is structurally
-    /// single-session: the second concurrent `GET /sse` is refused with
-    /// `409 Conflict`. When the first client's stream is dropped, the session
-    /// state is reset and only *then* is the permit released (the reset task
-    /// carries the permit — see [`SessionGuard`]), so the next client is never
-    /// admitted while a stale reset is still pending.
+    /// single-session: a new `GET /sse` evicts the live session (see
+    /// [`Self::session_evict`]) and is admitted only after that session's
+    /// stream has been dropped. When a stream is dropped, the session state is
+    /// reset and only *then* is the permit released (the reset task carries
+    /// the permit — see [`SessionGuard`]), so the next client is never
+    /// admitted while a stale reset is still pending, and never while the
+    /// previous stream's broadcast receiver still exists.
     session_slot: Arc<tokio::sync::Semaphore>,
+    /// Ends the live session's stream when cancelled.
+    ///
+    /// A peer that vanishes without a FIN or RST leaves its stream open: the
+    /// 15 s keep-alive writes land in the kernel send buffer and succeed until
+    /// the TCP retransmission timeout, minutes later. Without eviction that
+    /// dead stream would hold the slot for the whole period and refuse every
+    /// reconnect. Every request here has passed the bearer check, so the
+    /// newest admission is the token holder reconnecting and takes the slot.
+    session_evict: std::sync::Mutex<CancellationToken>,
+}
+
+/// Replaces the stored eviction token with a fresh one for a newly admitted
+/// session and returns it.
+fn install_evict_token(slot: &std::sync::Mutex<CancellationToken>) -> CancellationToken {
+    let mut current = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    *current = CancellationToken::new();
+    current.clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -340,6 +368,7 @@ fn router_with_pump<P: ContextProvider + 'static>(
         notifier: McpNotifier::new(config),
         retry_ms: config.retry_ms,
         session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+        session_evict: std::sync::Mutex::new(CancellationToken::new()),
     });
 
     let pump = pump.map(|pump| tokio::spawn(pump_events(Arc::clone(&state), pump.into_receiver())));
@@ -407,8 +436,8 @@ async fn bearer_auth_middleware(
 ///
 /// # Sessions
 ///
-/// The endpoint serves one MCP session at a time; a second concurrent
-/// `GET /sse` is refused with `409 Conflict`. See [`AppState::session_slot`].
+/// The endpoint serves one MCP session at a time; a new `GET /sse` evicts the
+/// live session and takes its place. See [`AppState::session_slot`].
 ///
 /// # Errors
 ///
@@ -474,13 +503,51 @@ async fn sse_handler<P: ContextProvider + 'static>(
     // can read `scp://{ctx}/members` and drive `tools/call` as the agent
     // identity. The token is therefore the only thing that separates the
     // intended client from any other process that can reach the bind address.
-    let Ok(permit) = Arc::clone(&state.session_slot).try_acquire_owned() else {
-        tracing::warn!("MCP SSE: refusing a second concurrent session");
-        return (
-            StatusCode::CONFLICT,
-            "an MCP session is already active on this endpoint",
-        )
-            .into_response();
+    //
+    // A busy slot is evicted, never waited out: a peer that vanished without
+    // closing its connection would otherwise hold the slot until TCP gives up
+    // (see `AppState::session_evict`). The new admission waits for the
+    // evicted stream to drop, which frees the permit only after the reset and
+    // after the old broadcast receiver is gone.
+    let free = {
+        let mut current = state
+            .session_evict
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match Arc::clone(&state.session_slot).try_acquire_owned() {
+            // Install this session's token under the same lock, so a
+            // concurrent admission can only ever cancel the current session.
+            Ok(permit) => {
+                *current = CancellationToken::new();
+                Some((permit, current.clone()))
+            }
+            Err(_) => {
+                current.cancel();
+                None
+            }
+        }
+    };
+    let (permit, evict) = match free {
+        Some(admitted) => admitted,
+        None => {
+            tracing::info!("MCP SSE: evicting the live session for a new admission");
+            match tokio::time::timeout(
+                EVICTION_WAIT,
+                Arc::clone(&state.session_slot).acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => (permit, install_evict_token(&state.session_evict)),
+                _ => {
+                    tracing::warn!("MCP SSE: the evicted session did not release the slot");
+                    return (
+                        StatusCode::CONFLICT,
+                        "an MCP session is already active on this endpoint",
+                    )
+                        .into_response();
+                }
+            }
+        }
     };
 
     // Every session begins from a clean slate by sequencing, not scheduling
@@ -540,8 +607,18 @@ async fn sse_handler<P: ContextProvider + 'static>(
         }
     });
 
+    // `None` ends the stream: the content side sends it after its last event
+    // (a `Lagged` receiver ends early), the eviction side sends it when a
+    // newer admission cancels this session.
     let initial = tokio_stream::once(Ok(endpoint_event));
-    let stream = initial.chain(message_stream);
+    let content = initial
+        .chain(message_stream)
+        .map(Some)
+        .chain(tokio_stream::once(None));
+    let evicted = tokio_stream::once(())
+        .then(move |()| evict.clone().cancelled_owned())
+        .map(|()| None);
+    let stream = content.merge(evicted).map_while(|frame| frame);
 
     // Hold a session guard for the lifetime of the stream. When the client
     // disconnects the stream is dropped, dropping the guard, which resets the
@@ -905,6 +982,7 @@ mod tests {
             notifier: McpNotifier::new(&test_config()),
             retry_ms: DEFAULT_RETRY_MS,
             session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            session_evict: std::sync::Mutex::new(CancellationToken::new()),
         });
         state
             .session_slot
@@ -1175,6 +1253,7 @@ mod tests {
             notifier: McpNotifier::new(&test_config()),
             retry_ms: DEFAULT_RETRY_MS,
             session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            session_evict: std::sync::Mutex::new(CancellationToken::new()),
         });
 
         // A client attaches to the SSE stream.
@@ -1213,6 +1292,7 @@ mod tests {
             notifier: McpNotifier::new(&test_config()),
             retry_ms: DEFAULT_RETRY_MS,
             session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            session_evict: std::sync::Mutex::new(CancellationToken::new()),
         });
 
         let mut client = state.notifier.tx.subscribe();
@@ -1320,53 +1400,66 @@ mod tests {
 
     /// An `McpServer` *is* one MCP session — one `initialized` flag, one
     /// negotiated capability set, one subscription registry — and every
-    /// server→client message goes out on one shared broadcast. Admitting a
-    /// second concurrent client would silently share all of that: B would
-    /// inherit A's handshake, receive A's JSON-RPC responses, see updates for
-    /// A's subscriptions, and cancel them with its own `resources/unsubscribe`.
+    /// server→client message goes out on one shared broadcast. Two live
+    /// clients would silently share all of that, so a new `GET /sse` evicts
+    /// the live session instead of multiplexing.
     ///
-    /// The endpoint therefore refuses the second session rather than
-    /// pretending to multiplex.
+    /// The first client here stands in for a peer that vanished without a
+    /// FIN or RST: something keeps polling its body and no write ever fails,
+    /// so only eviction can end it. Refusing the reconnect instead would lock
+    /// the token holder out until TCP gave up on the dead connection.
     #[tokio::test]
-    async fn second_concurrent_sse_session_is_refused() {
+    async fn new_sse_admission_evicts_the_live_session() {
         use tower::ServiceExt;
 
         let router = auth_router();
 
-        // First client attaches and holds its stream open.
         let first = router
             .clone()
             .oneshot(authed().uri("/sse").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
+        // Drain the first body the way hyper does for a connection whose
+        // writes keep succeeding.
+        let drained = tokio::spawn(async move {
+            let mut body = first.into_body().into_data_stream();
+            while let Some(Ok(_)) = body.next().await {}
+        });
 
-        // Second concurrent client is refused while the first is live.
-        let second = router
-            .clone()
-            .oneshot(authed().uri("/sse").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let second = tokio::time::timeout(
+            Duration::from_secs(10),
+            router
+                .clone()
+                .oneshot(authed().uri("/sse").body(Body::empty()).unwrap()),
+        )
+        .await
+        .expect("admission must not hang on the evicted session")
+        .unwrap();
         assert_eq!(
             second.status(),
-            StatusCode::CONFLICT,
-            "a second concurrent MCP session must be refused, not silently shared"
+            StatusCode::OK,
+            "a reconnect must evict the stale session, not be refused"
         );
+        tokio::time::timeout(Duration::from_secs(5), drained)
+            .await
+            .expect("the evicted session's stream must end")
+            .unwrap();
 
-        // Once the first stream is dropped the slot frees for the next client.
-        drop(first);
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let third = router
-            .oneshot(authed().uri("/sse").body(Body::empty()).unwrap())
+        // The new session owns the slot: a POST is accepted into it.
+        let ping = serde_json::json!({"jsonrpc": "2.0", "method": "ping", "id": 1}).to_string();
+        let post = router
+            .oneshot(
+                authed()
+                    .method("POST")
+                    .uri("/message")
+                    .body(Body::from(ping))
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(
-            third.status(),
-            StatusCode::OK,
-            "the session slot must be released when the client disconnects"
-        );
+        assert_eq!(post.status(), StatusCode::ACCEPTED);
+        drop(second);
     }
 
     /// Helper: send a request through the router and return the status code.
@@ -1661,6 +1754,7 @@ mod tests {
             notifier: McpNotifier::new(&test_config()),
             retry_ms: DEFAULT_RETRY_MS,
             session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            session_evict: std::sync::Mutex::new(CancellationToken::new()),
         });
 
         // First client attaches through the real handler, then disconnects,
@@ -1911,6 +2005,7 @@ mod tests {
             notifier: McpNotifier::new(&test_config()),
             retry_ms: DEFAULT_RETRY_MS,
             session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            session_evict: std::sync::Mutex::new(CancellationToken::new()),
         });
 
         // A client attaches; the handler subscribes its broadcast receiver.
