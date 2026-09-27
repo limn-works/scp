@@ -41,7 +41,7 @@ Two questions catch it:
 - Could the parts come from two different producers, and would this validator
   notice? Assemble that hybrid by hand and run the validator on it.
 
-## How this repository catches it
+## How to catch it
 
 Write the cross-part comparison as its own named step, and give it a test that
 builds the hybrid the check exists to reject.
@@ -55,6 +55,9 @@ deleted with `verify`. App Attest check 6 of `09-security-model.md` §9.3.1,
 reading a device attestation, now states the comparison that verifier has to
 make: a credential ID unequal to `SHA-256` of the credential certificate's
 public key returns `Rejected{KeyIdMismatch}`.
+No test or gate in this repository catches this defect class today. When the
+identity workstream builds that verifier, give check 6 a test that builds the
+hybrid above.
 
 ## Related
 
