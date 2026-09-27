@@ -88,11 +88,11 @@
 #     `#[cfg(feature = "quic")]` module compiles nothing and reports `compile ok`.
 #
 #     Case 13b changes a file under `crates/scp-node/` and one under `crates/scp-relay/`,
-#     and asserts that the run compiles each package's `cloud-blobs` feature in checks of
-#     its own, one per CI command: each package over every target, scp-node's with
-#     `testing`, as the `rust-clippy` job does, and each package over its backend-selection
-#     test target, as the `rust-test-optional-features` job does. It also asserts that no
-#     check names both packages with `cloud-blobs` on.
+#     and asserts that the run compiles each package's `cloud-blobs` feature in a check of
+#     its own over every target, scp-node's with `testing`, as the `rust-clippy` job does;
+#     that check also compiles the backend-selection test target the
+#     `rust-test-optional-features` job builds under the same features. It also asserts
+#     that no check names both packages with `cloud-blobs` on.
 #
 #     Case 14 leaves one edit uncommitted and asserts that the summary names
 #     `scripts/check-cross-layer.sh` as the gate whose diff range holds no uncommitted edit.
@@ -802,15 +802,14 @@ fi
 # --test storage_backend_selection` and `cargo nextest run -p scp-relay --features cloud-blobs
 # --test storage_backend`. A joint command would let cargo unify scp-transport's features
 # across both packages, so one package's `cloud-blobs` would compile the backends into the
-# other package and hide that package's own mis-wired `cloud-blobs`. The test-lane checks
-# name their test target rather than `--all-targets` because the CI command they mirror
-# builds only that target. The `rust-doc` job and `.github/workflows/docs.yml` turn on both packages' `cloud-blobs` in one command, because
+# other package and hide that package's own mis-wired `cloud-blobs`. Each package's
+# `--all-targets` check compiles the test target its test-lane command builds, under the
+# same features, so no separate check mirrors the test lane. The `rust-doc` job and
+# `.github/workflows/docs.yml` turn on both packages' `cloud-blobs` in one command, because
 # rustdoc needs only the backend modules compiled; this script mirrors no rustdoc command.
 #
-# The mutations it kills: deleting any of the four scp-node and scp-relay entries from
-# EXTRA_FEATURE_CHECKS, merging two of them back into one two-package check, or dropping an
-# entry's target flags from its summary label, which gives the two scp-relay checks one
-# label.
+# The mutations it kills: deleting either the scp-node or the scp-relay entry from
+# EXTRA_FEATURE_CHECKS, or merging the two into one two-package check.
 FIXTURE13B="$WORK/binary-cloud-blobs"
 build_fixture "$FIXTURE13B"
 for crate in scp-node scp-relay; do
@@ -829,22 +828,11 @@ else
 fi
 for expected in \
     'check -p scp-node --all-targets --features cloud-blobs,testing' \
-    'check -p scp-relay --all-targets --features cloud-blobs' \
-    'check -p scp-node --test storage_backend_selection --features cloud-blobs,testing' \
-    'check -p scp-relay --test storage_backend --features cloud-blobs'; do
+    'check -p scp-relay --all-targets --features cloud-blobs'; do
     if grep -qF -- "$expected" "$FIXTURE13B.harness/cargo.log"; then
         report "case 13b runs \`$expected\`" 0 ""
     else
         report "case 13b runs \`$expected\`" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13B.harness/cargo.log")"
-    fi
-done
-for label in \
-    'compile(scp-relay:cloud-blobs) ok' \
-    'compile(scp-relay:cloud-blobs --test storage_backend) ok'; do
-    if grep -qF -- "$label" "$FIXTURE13B.harness/out.txt"; then
-        report "case 13b's summary names \`$label\`" 0 ""
-    else
-        report "case 13b's summary names \`$label\`" 1 "output tail: $(tail -n 20 "$FIXTURE13B.harness/out.txt")"
     fi
 done
 if grep -qE -- '-p scp-node -p scp-relay [^|]*cloud-blobs' "$FIXTURE13B.harness/cargo.log"; then
