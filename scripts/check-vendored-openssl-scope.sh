@@ -12,16 +12,21 @@
 # Presence: `wheel_triple_occurrences` runs one `cargo tree --target <triple>` per
 # wheel triple, keeping build edges because `openssl-src` is a build-dependency of
 # `openssl-sys`. `scripts/check-shipped-feature-graph.sh` exempts that one function
-# from its rule that every `cargo tree` under scripts/ names `--target all`, and it
-# holds the function's text to a pinned hash, so an edit to the function cancels the
-# exemption. The function takes only the triple from its caller and reads the
-# package and features from wheel_line, which runs the script FEATURE_GRAPH_GATE
-# names. This file sets FEATURE_GRAPH_GATE to that owner gate, and only
-# run_fixtures overrides it, with a planted gate. The pin holds neither wheel_line
-# nor FEATURE_GRAPH_GATE, so a call that overrides FEATURE_GRAPH_GATE or redefines
-# wheel_line resolves another configuration on one triple and still passes the
-# owner gate's rule; review of this file is what keeps every call of the function
-# the wheel's presence proof.
+# from its rule that every `cargo tree` under scripts/ names `--target all` while
+# the text from that function's first line to the end of this file hashes to the
+# value it pins, so an edit anywhere in that text cancels the exemption. The
+# function takes only the triple from its caller and reads the package and
+# features from wheel_line, which runs the script FEATURE_GRAPH_GATE names. The
+# pinned text defines the function, wheel_line, is_feature_selection and count_in,
+# assigns VENDOR_CRATE and FEATURE_GRAPH_GATE, and ends with the lines that run
+# this gate: run_fixtures in a subshell, whose planted-gate overrides cannot reach
+# the parent, then `readonly` on those four functions and two variables, then
+# run_gate. A definition or assignment above the pinned text is replaced by the
+# pinned one, and one that run_gate makes, or a call that sets FEATURE_GRAPH_GATE
+# for itself, fails on the readonly name. The pin does not hold the commands those
+# functions run (cargo, bash, grep): a function of such a name defined anywhere in
+# this file shadows the command, and an alias defined above the pinned text, with
+# `shopt -s expand_aliases`, rewrites a word in it. Bash can forbid neither.
 # Absence: `--target all` for every entry that gate's `--print-artifacts` writes
 # except the wheel's (`--print-wheel-entries`), and `--workspace` for every tracked
 # Cargo.toml cargo treats as a workspace root: one that declares a `workspace` table
@@ -97,56 +102,6 @@ for item in matrix["include"]:
     out += ["x86_64-apple-darwin", "aarch64-apple-darwin"] if t == "universal2-apple-darwin" else [t]
 print("\n".join(out))
 PYTHON
-
-# is_feature_selection <entry arguments>: succeed when every token is
-# --no-default-features, --all-features, or --features <value>. A resolver flag such
-# as `--prune openssl-src` would otherwise empty the graph this gate counts, so a
-# flag-shaped token fails in the value slot too. The value's feature-name grammar is
-# cargo's to check: a malformed list fails `cargo tree`, and the count then fails.
-is_feature_selection() {
-  local token want_list=0
-  for token in $1; do
-    if [[ "$want_list" -eq 1 ]]; then
-      [[ "$token" != -* ]] || { echo "a shipped configuration names a flag where a feature list belongs: '$token'" >&2; return 1; }
-      want_list=0
-    elif [[ "$token" == "--features" ]]; then want_list=1
-    elif [[ "$token" != "--no-default-features" && "$token" != "--all-features" ]]; then
-      echo "a shipped configuration names a cargo argument this gate does not build: '$token'" >&2; return 1
-    fi
-  done
-  [[ "$want_list" -eq 0 ]] || { echo "a shipped configuration ends with '--features'" >&2; return 1; }
-}
-
-# count_in <tree>: how many `openssl-src` lines a `cargo tree --prefix none` graph holds.
-count_in() { printf '%s\n' "$1" | grep -cE "^${VENDOR_CRATE} v" || true; }
-
-# wheel_line: the one `<pyproject path>\t<package>|<feature arguments>` line the
-# owner gate's `--print-wheel-entries` writes, after checking that it is one line
-# whose arguments are a feature selection. A print mode that exits non-zero fails,
-# so a partial list is never read.
-wheel_line() {
-  local line
-  line="$(bash "$FEATURE_GRAPH_GATE" --print-wheel-entries)" || return 1
-  [[ "$(printf '%s\n' "$line" | grep -c .)" -eq 1 ]] || { echo "FAIL — expected one wheel entry, got: $line" >&2; return 1; }
-  is_feature_selection "${line#*|}" || return 1
-  printf '%s\n' "$line"
-}
-
-# wheel_triple_occurrences <triple>: the wheel's graph on one triple. The package
-# and features come from wheel_line, never from the caller's arguments. The owner
-# gate exempts this function from its `--target all` rule while the function's
-# text hashes to the value it pins; the header above states what that pin does
-# not hold. A cargo failure fails the count.
-wheel_triple_occurrences() {
-  local triple="$1" entry tree
-  local -a args=()
-  entry="$(wheel_line)" || return 1
-  entry="${entry#*$'\t'}"
-  read -r -a args <<<"${entry#*|}"
-  tree="$(cargo tree -p "${entry%%|*}" ${args[@]+"${args[@]}"} --target "$triple" -e no-dev --prefix none --format '{p}')" ||
-    { echo "cargo tree failed for ${entry%%|*} on $triple" >&2; return 1; }
-  count_in "$tree"
-}
 
 # all_target_occurrences <cargo tree argument>...: a graph over every triple. A
 # cargo failure fails the count, because zero is the verdict absence passes on.
@@ -253,6 +208,13 @@ run_fixtures() {
   FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_triple_occurrences aarch64-apple-darwin scp-node --no-default-features >/dev/null
   same "$(cat "$ARGV_LOG")" "tree -p scp-ffi --features extension-module,vendored-openssl --target aarch64-apple-darwin -e no-dev --prefix none --format {p}"
   expect "a caller's package and feature arguments do not reach the one-triple resolution" PASS $?
+  # The readonly lines at the end of this file, applied here in a subshell: after
+  # them a call that sets FEATURE_GRAPH_GATE for itself, and a redefinition of
+  # wheel_line, fail instead of resolving another configuration.
+  ( readonly FEATURE_GRAPH_GATE; FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_triple_occurrences aarch64-apple-darwin ) >/dev/null 2>&1
+  expect "after readonly, a call that overrides FEATURE_GRAPH_GATE FAILS" FAIL $?
+  ( readonly -f wheel_line; eval 'wheel_line() { printf "x\tscp-node|\n"; }' ) >/dev/null 2>&1
+  expect "after readonly -f, a redefinition of wheel_line FAILS" FAIL $?
   scenario() { # <label> <want>
     out="$(FEATURE_GRAPH_GATE="$dir/gate.sh" WHEEL_MATRIX_FILE="$dir/m.yml" run_gate 2>&1)"; expect "$1" "$2" $?
   }
@@ -288,7 +250,67 @@ run_fixtures() {
   echo "   FIXTURES: $fixture_failures failed."; return 1
 }
 
+# Everything from the next line to the end of this file is the text the owner gate
+# pins (see the header): the one per-triple function, every input it reads, and the
+# lines that run this gate. A definition above this point of any name defined here
+# is replaced here; the header names what the pin does not hold.
+#
+# wheel_triple_occurrences <triple>: the wheel's graph on one triple. The package
+# and features come from wheel_line, never from the caller's arguments. A cargo
+# failure fails the count.
+wheel_triple_occurrences() {
+  local triple="$1" entry tree
+  local -a args=()
+  entry="$(wheel_line)" || return 1
+  entry="${entry#*$'\t'}"
+  read -r -a args <<<"${entry#*|}"
+  tree="$(cargo tree -p "${entry%%|*}" ${args[@]+"${args[@]}"} --target "$triple" -e no-dev --prefix none --format '{p}')" ||
+    { echo "cargo tree failed for ${entry%%|*} on $triple" >&2; return 1; }
+  count_in "$tree"
+}
+
+# wheel_line: the one `<pyproject path>\t<package>|<feature arguments>` line the
+# owner gate's `--print-wheel-entries` writes, after checking that it is one line
+# whose arguments are a feature selection. A print mode that exits non-zero fails,
+# so a partial list is never read.
+wheel_line() {
+  local line
+  line="$(bash "$FEATURE_GRAPH_GATE" --print-wheel-entries)" || return 1
+  [[ "$(printf '%s\n' "$line" | grep -c .)" -eq 1 ]] || { echo "FAIL — expected one wheel entry, got: $line" >&2; return 1; }
+  is_feature_selection "${line#*|}" || return 1
+  printf '%s\n' "$line"
+}
+
+# is_feature_selection <entry arguments>: succeed when every token is
+# --no-default-features, --all-features, or --features <value>. A resolver flag such
+# as `--prune openssl-src` would otherwise empty the graph this gate counts, so a
+# flag-shaped token fails in the value slot too. The value's feature-name grammar is
+# cargo's to check: a malformed list fails `cargo tree`, and the count then fails.
+is_feature_selection() {
+  local token want_list=0
+  for token in $1; do
+    if [[ "$want_list" -eq 1 ]]; then
+      [[ "$token" != -* ]] || { echo "a shipped configuration names a flag where a feature list belongs: '$token'" >&2; return 1; }
+      want_list=0
+    elif [[ "$token" == "--features" ]]; then want_list=1
+    elif [[ "$token" != "--no-default-features" && "$token" != "--all-features" ]]; then
+      echo "a shipped configuration names a cargo argument this gate does not build: '$token'" >&2; return 1
+    fi
+  done
+  [[ "$want_list" -eq 0 ]] || { echo "a shipped configuration ends with '--features'" >&2; return 1; }
+}
+
+# count_in <tree>: how many `openssl-src` lines a `cargo tree --prefix none` graph holds.
+count_in() { printf '%s\n' "$1" | grep -cE "^${VENDOR_CRATE} v" || true; }
+
+VENDOR_CRATE="openssl-src"
+FEATURE_GRAPH_GATE="scripts/check-shipped-feature-graph.sh"
 echo "==> vendored-OpenSSL scope: $VENDOR_CRATE reaches the PyPI wheel's configuration and no other configuration this repository ships"
-run_fixtures || exit 1
+# The fixtures run in a subshell, so a definition or assignment they make cannot
+# reach run_gate. The readonly lines then fail any later assignment to these names,
+# a temporary one on a call included, and any redefinition of these functions.
+( run_fixtures ) || exit 1
 [[ "${1:-}" == "--self-test" ]] && exit 0
+readonly VENDOR_CRATE FEATURE_GRAPH_GATE
+readonly -f wheel_triple_occurrences wheel_line is_feature_selection count_in
 run_gate
