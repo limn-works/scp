@@ -6254,7 +6254,8 @@ mod tests {
         crate::runtime::release_context(&bi, &ctx_id);
         crate::runtime::readmit_context(&bi, &ctx_id);
 
-        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("the supervisor is initialized"));
+        let sup =
+            Arc::clone(crate::runtime::supervisor(&bi).expect("the supervisor is initialized"));
         let err = super::tear_down_vanished_join(&bi, &sup, &ctx_id).await;
         assert!(
             matches!(err, crate::error::ScpNapiError::Context { ref code, .. } if code == codes::CTX_2040),
@@ -6897,7 +6898,10 @@ mod tests {
         let leave = super::context_leave_on(&bi, &handle, creator.to_owned())
             .await
             .expect_err("leave must refuse a closing context");
-        assert!(leave.to_string().contains(closing), "leave reported: {leave}");
+        assert!(
+            leave.to_string().contains(closing),
+            "leave reported: {leave}"
+        );
         let send = super::context_send_on(&bi, &handle, creator.to_owned(), b"hi".to_vec(), None)
             .await
             .expect_err("send must refuse a closing context");

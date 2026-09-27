@@ -1745,16 +1745,15 @@ pub fn live_role_state(
     // A busy, crashed, or poisoned actor surfaces as its own `ContextError`
     // (`ActorBusy`, `ActorCrashed`, `ContextPoisoned`), never as an absent
     // context, so a caller knows to retry.
-    block_on_supervisor_query(async move { sup.get_role_state_checked(&ctx).await })??
-    .ok_or_else(|| {
-        ScpPyError::ContextError {
+    block_on_supervisor_query(async move { sup.get_role_state_checked(&ctx).await })??.ok_or_else(
+        || ScpPyError::ContextError {
             message: format!(
                 "context '{context_id}' has no live supervisor role state — refusing to \
                  authorize against an absent membership record"
             ),
             code: scp_ffi_common::error_codes::CTX_2023.to_owned(),
-        }
-    })
+        },
+    )
 }
 
 /// Reads a context's lifecycle state from that context's supervisor actor.
@@ -3762,8 +3761,7 @@ mod tests {
     #[test]
     #[cfg(feature = "testing")]
     fn live_role_state_reports_an_unreachable_actor_as_busy_not_absent() {
-        let (bi, ctx_id) =
-            live_state_fixture("live-role-busy", "did:dht:z6MkLiveRoleBusy", &[]);
+        let (bi, ctx_id) = live_state_fixture("live-role-busy", "did:dht:z6MkLiveRoleBusy", &[]);
         live_role_state(&bi, &ctx_id).expect("the fixture's actor answers");
         supervisor(&bi)
             .expect("supervisor")
