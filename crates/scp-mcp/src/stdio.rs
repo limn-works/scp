@@ -32,6 +32,14 @@ pub enum StdioError {
     /// An I/O error occurred reading from stdin or writing to stdout.
     #[error("stdio I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// A line reached [`MAX_LINE_BYTES`] without a terminator. The loop stops
+    /// rather than act on a truncated message, and reports the stop as an
+    /// error so a host cannot mistake it for the client closing stdin.
+    #[error("stdio line exceeds the {limit} byte limit")]
+    LineTooLong {
+        /// The byte limit the line reached.
+        limit: u64,
+    },
 }
 
 /// Aborts a spawned task when dropped.
@@ -183,8 +191,9 @@ impl StdioNotifier {
 /// Runs the MCP server over stdio (stdin/stdout, line-delimited JSON).
 ///
 /// Reads JSON-RPC messages line-by-line from stdin, dispatches them to the
-/// server, and writes responses to stdout. Runs until stdin is closed (EOF)
-/// or a line exceeds [`MAX_LINE_BYTES`].
+/// server, and writes responses to stdout. Runs until stdin is closed (EOF),
+/// which returns `Ok(())`, or until a line exceeds [`MAX_LINE_BYTES`], which
+/// returns [`StdioError::LineTooLong`].
 ///
 /// # Resource subscriptions
 ///
@@ -218,7 +227,11 @@ impl StdioNotifier {
 ///
 /// # Errors
 ///
-/// Returns [`StdioError::Io`] if an I/O error occurs on stdin or stdout.
+/// Returns [`StdioError::Io`] if an I/O error occurs on stdin or stdout, or if
+/// a line within the limit is not valid UTF-8. Returns
+/// [`StdioError::LineTooLong`] if a line reaches [`MAX_LINE_BYTES`] without a
+/// terminator; the check runs on the raw bytes before UTF-8 decoding, so a cap
+/// that falls inside a multibyte character reports the same error.
 pub async fn run_stdio<P: ContextProvider + 'static>(
     server: McpServerForTransport<P>,
 ) -> Result<(), StdioError> {
@@ -384,13 +397,17 @@ where
     R: tokio::io::AsyncRead + Unpin + Send,
     C: ClientChannel,
 {
-    let mut line = String::new();
+    let mut raw = Vec::new();
 
     loop {
-        line.clear();
+        raw.clear();
+        // Raw bytes first: the cap check must run before UTF-8 decoding,
+        // because a cap that falls inside a multibyte character would
+        // otherwise surface as a decoding error rather than as the oversize
+        // line it is.
         let bytes_read = {
             let mut bounded = (&mut reader).take(MAX_LINE_BYTES);
-            bounded.read_line(&mut line).await?
+            bounded.read_until(b'\n', &mut raw).await?
         };
         if bytes_read == 0 {
             // EOF -- stdin closed, exit cleanly.
@@ -398,10 +415,14 @@ where
         }
         // Exactly at the cap with no terminator means the line was truncated;
         // rejecting beats acting on a partial message.
-        if bytes_read as u64 == MAX_LINE_BYTES && !line.ends_with('\n') {
+        if bytes_read as u64 == MAX_LINE_BYTES && raw.last() != Some(&b'\n') {
             tracing::warn!("MCP stdio: line exceeds {MAX_LINE_BYTES} byte limit, stopping");
-            break;
+            return Err(StdioError::LineTooLong {
+                limit: MAX_LINE_BYTES,
+            });
         }
+        let line = std::str::from_utf8(&raw)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -765,8 +786,8 @@ mod tests {
     }
 
     /// A line that hits `MAX_LINE_BYTES` with no terminator was truncated;
-    /// acting on a partial message is worse than stopping. This path had no
-    /// coverage at all.
+    /// acting on a partial message is worse than stopping, and the stop is
+    /// reported as `LineTooLong` so a host can tell it from a clean EOF.
     #[tokio::test]
     async fn read_loop_stops_on_a_truncated_over_long_line() {
         // A well-formed prefix, then an unterminated flood that trips the cap.
@@ -777,7 +798,11 @@ mod tests {
 
         let server = shared_server();
         // `ping` is allowed pre-initialization, so the first line answers.
-        let output = process_lines(&server, &input).await;
+        let (result, output) = run_loop(&server, &input).await;
+        assert!(
+            matches!(result, Err(StdioError::LineTooLong { limit }) if limit == MAX_LINE_BYTES),
+            "an over-long line must end the loop with LineTooLong, got {result:?}"
+        );
 
         let text = String::from_utf8(output).unwrap();
         let lines: Vec<&str> = text.lines().collect();
@@ -788,6 +813,47 @@ mod tests {
         );
         let resp: JsonRpcResponse = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(resp.id, RequestId::Number(7));
+    }
+
+    /// The cap is checked on raw bytes before UTF-8 decoding: a cap that falls
+    /// inside a multibyte character is still an over-long line, not an I/O
+    /// decoding error.
+    #[tokio::test]
+    async fn read_loop_reports_line_too_long_when_the_cap_splits_a_character() {
+        let cap = usize::try_from(MAX_LINE_BYTES).expect("cap fits in usize on test targets");
+        // Two ASCII bytes, then 3-byte characters: the cap lands mid-character
+        // because `cap - 2` is not a multiple of 3.
+        assert_ne!(
+            (cap - 2) % 3,
+            0,
+            "the fixture must split a character at the cap"
+        );
+        let mut input = vec![b'x', b'x'];
+        while input.len() <= cap {
+            input.extend_from_slice("\u{20ac}".as_bytes());
+        }
+
+        let (result, output) = run_loop(&shared_server(), &input).await;
+        assert!(
+            matches!(result, Err(StdioError::LineTooLong { .. })),
+            "a cap inside a multibyte character must report LineTooLong, got {result:?}"
+        );
+        assert!(
+            output.is_empty(),
+            "nothing may be dispatched from a truncated line"
+        );
+    }
+
+    /// Drives the REAL `read_loop_from` and returns its result with everything
+    /// it wrote, for tests that assert on how the loop ended.
+    async fn run_loop<P: ContextProvider>(
+        server: &Arc<tokio::sync::Mutex<McpServer<P>>>,
+        input: &[u8],
+    ) -> (Result<(), StdioError>, Vec<u8>) {
+        let channel = VecSink::default();
+        let result = read_loop_from(server, BufReader::new(input), &channel).await;
+        let output = channel.lines.lock().await.clone();
+        (result, output)
     }
 
     /// Drives the REAL `read_loop_from` — the loop `run_stdio` runs — over an

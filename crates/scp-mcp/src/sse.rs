@@ -9,11 +9,15 @@
 //!
 //! - `GET /sse` -- SSE stream for server-to-client messages (responses,
 //!   notifications). The server sends an initial `endpoint` event with the
-//!   POST URL, then streams `message` events containing JSON-RPC responses.
+//!   POST URL, `/message?sessionId=<id>`, where `<id>` is a random value minted
+//!   for that admission. It then streams `message` events containing JSON-RPC
+//!   responses.
 //!   Each event carries a sequential `id:` field for wire framing and
 //!   diagnostics only — it does not support resume (see below).
-//! - `POST /message` -- Accepts JSON-RPC requests from the client. Responses
-//!   are delivered via the SSE stream, not in the HTTP response body.
+//! - `POST /message?sessionId=<id>` -- Accepts JSON-RPC requests from the
+//!   client whose SSE stream is still live under that `sessionId`, and refuses
+//!   every other POST with `409 Conflict`. Responses are delivered via the SSE
+//!   stream, not in the HTTP response body.
 //!
 //! ## Reconnection
 //!
@@ -53,7 +57,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
@@ -217,7 +221,6 @@ impl Default for ShutdownHandle {
 /// ids exist for wire framing and diagnostics only: reconnection is a full
 /// resync into a freshly reset session (see the module docs), so there is no
 /// replay machinery and no resume path for the ids to serve.
-#[derive(Clone)]
 pub(crate) struct McpNotifier {
     /// Broadcast sender for SSE messages to connected clients.
     ///
@@ -230,17 +233,15 @@ pub(crate) struct McpNotifier {
     /// 1. every server→client emission's **broadcast is serialized inside** that
     ///    mutex's critical section, and every principal-content-bearing emission
     ///    is also *computed* under it (see [`message_handler`] and
-    ///    [`pump_events`]; the parse-error arm is the sole compute-before-lock
-    ///    case, and its echoed input carries no principal content), and
+    ///    [`pump_events`]), and
     /// 2. [`reset_session`](McpServer::reset_session) runs under the *same*
     ///    mutex at admission (see [`sse_handler`]).
     ///
-    /// Even in the interleaving where a POST parked on the lock acquires it
-    /// just after a reset, `handle_request` then runs with `initialized ==
-    /// false` and returns only a "not initialized" error carrying no principal
-    /// content — so no prior session's decrypted data (member lists, tool
-    /// outputs, resource reads) can cross to the next client on this shared
-    /// channel.
+    /// A POST parked on the lock that acquires it just after a reset finds
+    /// its `sessionId` no longer live (see [`AppState::live_session`]) and is
+    /// refused before dispatch, so no prior session's decrypted data (member
+    /// lists, tool outputs, resource reads) can cross to the next client on
+    /// this shared channel.
     ///
     /// **Load-bearing:** this safety holds only while `reset_session` stays
     /// atomic w.r.t. the server lock *and* emission never moves outside it. If
@@ -255,7 +256,7 @@ pub(crate) struct McpNotifier {
     /// notifications — require. Two concurrent broadcasts may publish out of
     /// id order; nothing observes or depends on wire-order ids because
     /// resume does not exist.
-    next_event_id: Arc<AtomicU64>,
+    next_event_id: AtomicU64,
 }
 
 impl McpNotifier {
@@ -264,7 +265,7 @@ impl McpNotifier {
         let (tx, _rx) = broadcast::channel(config.channel_capacity);
         Self {
             tx,
-            next_event_id: Arc::new(AtomicU64::new(1)),
+            next_event_id: AtomicU64::new(1),
         }
     }
 
@@ -307,7 +308,8 @@ impl McpNotifier {
 pub(crate) struct AppState<P: ContextProvider> {
     /// The MCP server, protected by a mutex for concurrent access.
     server: Mutex<McpServer<P>>,
-    /// The server→client push fabric, shared with any external event pump.
+    /// The server→client push fabric. The POST handler and the event pump both
+    /// reach it through this `AppState`; nothing holds a separate copy.
     notifier: McpNotifier,
     /// Retry interval in milliseconds sent to SSE clients.
     retry_ms: u64,
@@ -344,6 +346,35 @@ pub(crate) struct AppState<P: ContextProvider> {
     /// its stream ends: without this link one attached client would keep
     /// [`run_sse`] from returning, and keep the pump and this state alive.
     shutdown: CancellationToken,
+    /// The `sessionId` of the live SSE stream, or `None` when no stream is
+    /// attached.
+    ///
+    /// Admission writes it while holding `state.server`, after the reset. A
+    /// dropped [`SessionGuard`] clears it synchronously, before the permit
+    /// moves into the reset task, so the interval between a stream ending and
+    /// its reset running has no live session. [`message_handler`] compares the
+    /// POST's `sessionId` against it while holding `state.server`, so a POST
+    /// from an evicted or disconnected client, and a POST that arrives after
+    /// its stream is gone, is refused before it can run against the session.
+    live_session: std::sync::Mutex<Option<String>>,
+}
+
+impl<P: ContextProvider> AppState<P> {
+    /// Whether `presented` names the live SSE session.
+    fn is_live_session(&self, presented: Option<&str>) -> bool {
+        let live = self
+            .live_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        matches!((live.as_deref(), presented), (Some(live), Some(presented)) if live == presented)
+    }
+}
+
+/// Mints a fresh 128-bit `sessionId` for one SSE admission.
+fn mint_session_id() -> String {
+    let mut id = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
+    hex::encode(id)
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +405,7 @@ fn router_with_pump<P: ContextProvider + 'static>(
         session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         session_evict: std::sync::Mutex::new(CancellationToken::new()),
         shutdown,
+        live_session: std::sync::Mutex::new(None),
     });
 
     let pump = pump.map(|pump| tokio::spawn(pump_events(Arc::clone(&state), pump.into_receiver())));
@@ -457,12 +489,20 @@ pub async fn run_sse<P: ContextProvider + 'static>(
     // so no pairing check is needed here.
     let (server, pump) = server.into_parts();
 
-    let (router, pump) = router_with_pump(server, &config, pump, shutdown.token.clone());
-    // Hold the pump under a guard that aborts it on EVERY exit from this future:
-    // a bind error, graceful shutdown, *and* the cancellation-drop when a bridge
-    // aborts the task running `run_sse`. A bare `JoinHandle` dropped without
-    // `abort()` only detaches the task, which — holding an `Arc<AppState>` —
-    // would outlive the server and pin the whole session alive.
+    // Every session's eviction token descends from `server_token`. The drop
+    // guard cancels it on EVERY exit from this future, including the
+    // cancellation-drop when a bridge aborts the task running `run_sse`. axum
+    // serves each connection on its own spawned task, which dropping `serve`
+    // does not stop, so without this an attached SSE stream would outlive the
+    // server: still sending keep-alives, still holding its subscriptions, with
+    // no pump left to serve them.
+    let server_token = shutdown.token.child_token();
+    let _sessions_guard = server_token.clone().drop_guard();
+    let (router, pump) = router_with_pump(server, &config, pump, server_token);
+    // Hold the pump under a guard that aborts it on every exit from this future,
+    // for the same reason: a bare `JoinHandle` dropped without `abort()` only
+    // detaches the task, which — holding an `Arc<AppState>` — would outlive the
+    // server.
     let _pump_guard = pump.map(crate::stdio::AbortOnDrop);
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
@@ -570,14 +610,25 @@ async fn sse_handler<P: ContextProvider + 'static>(
     // with no principal content until re-`initialize`), the broadcast channel
     // shared across sessions never leaks one principal's decrypted responses to
     // the next.
-    state.server.lock().await.reset_session();
+    //
+    // The new `sessionId` goes live under the same lock, after the reset, and
+    // the broadcast receiver is subscribed there too: from this point a POST
+    // is dispatched only if it names this admission.
+    let session_id = mint_session_id();
+    let mut server = state.server.lock().await;
+    server.reset_session();
+    *state
+        .live_session
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session_id.clone());
+    let rx = state.notifier.tx.subscribe();
+    // Released only once the session is live and its receiver subscribed.
+    drop(server);
 
     let endpoint_event = Event::default()
         .event("endpoint")
-        .data("/message")
+        .data(format!("/message?sessionId={session_id}"))
         .retry(Duration::from_millis(state.retry_ms));
-
-    let rx = state.notifier.tx.subscribe();
 
     // A client that falls behind the broadcast channel has lost events that
     // nothing can reconstruct. Rather than skipping the gap silently — a
@@ -633,6 +684,7 @@ async fn sse_handler<P: ContextProvider + 'static>(
     let guard = SessionGuard {
         state: Arc::clone(&state),
         permit: Some(permit),
+        session_id,
     };
     let stream = stream.map(move |event| {
         let _keep_alive = &guard;
@@ -654,9 +706,13 @@ async fn sse_handler<P: ContextProvider + 'static>(
 /// SSE broadcast channel. Returns `202 Accepted` to the HTTP client since
 /// the actual response is delivered via SSE.
 ///
-/// Requires a live session (`GET /sse`): the response goes out on the SSE
-/// broadcast, so accepting a request with no session attached would drop the
-/// response unheard.
+/// Requires the POST's `sessionId` query parameter to name the live SSE
+/// session (see [`AppState::live_session`]). The response goes out on the SSE
+/// broadcast, so a request from a client whose stream is gone would run
+/// against the session and have its response dropped unheard, and a request
+/// from an evicted client would run against the next client's session and
+/// have its response delivered to that client. Both are refused with
+/// `409 Conflict` before dispatch.
 ///
 /// The response is computed *and* broadcast inside one `state.server` critical
 /// section. That lock is the one `sse_handler`'s `reset_session` and the next
@@ -669,26 +725,13 @@ async fn sse_handler<P: ContextProvider + 'static>(
 /// result (member lists, tool outputs, resource reads) to a *different*, later
 /// client.
 ///
-/// The "computed under the lock" half is exact for the request and notification
-/// arms; the parse-error arm is the one exception — its response is parsed
-/// *before* the lock and only the broadcast is serialized under it. That is
-/// sound because the echoed input carries no session state or principal content
-/// (see the inner comment on that arm), so only the send needs ordering.
+/// Every arm, the parse-error arm included, parses, computes and broadcasts
+/// after the lock is taken and the `sessionId` checked.
 async fn message_handler<P: ContextProvider + 'static>(
     State(state): State<Arc<AppState<P>>>,
+    Query(query): Query<MessageQuery>,
     body: String,
 ) -> impl IntoResponse {
-    // The permit is held by `SessionGuard` for the lifetime of the SSE stream,
-    // so a full slot means no client is attached.
-    if state.session_slot.available_permits() > 0 {
-        return StatusCode::CONFLICT;
-    }
-
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return StatusCode::BAD_REQUEST;
-    }
-
     // Every response is computed AND broadcast inside a single `state.server`
     // critical section. That lock is the one `sse_handler`'s `reset_session`
     // and the next admission also take, so a send ordered under it lands before
@@ -699,9 +742,21 @@ async fn message_handler<P: ContextProvider + 'static>(
     // and subscribed, delivering this principal's decrypted result to a
     // different, later client. `broadcast` is synchronous, so holding the tokio
     // mutex across it crosses no `.await`.
+    let mut server = state.server.lock().await;
+
+    // Checked under the lock admission writes the live `sessionId` under, so
+    // the POST runs against the session it names or not at all.
+    if !state.is_live_session(query.session_id.as_deref()) {
+        return StatusCode::CONFLICT;
+    }
+
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+
     match parse_sse_incoming(trimmed) {
         Ok(SseIncoming::Request(req)) => {
-            let mut server = state.server.lock().await;
             if let Some(resp) = server.handle_request(&req)
                 && let Ok(json) = serde_json::to_string(&resp)
             {
@@ -717,23 +772,29 @@ async fn message_handler<P: ContextProvider + 'static>(
                 id: RequestId::Number(synthetic_id.cast_signed()),
             };
             // Notifications produce no response; nothing to broadcast.
-            let mut server = state.server.lock().await;
             server.handle_request(&synthetic);
         }
         Err(err_response) => {
             // A parse error echoes only the caller's own malformed input, but
-            // it is still a server->client message on the shared broadcast.
-            // Order it under the server lock like every other response so the
-            // discipline is uniform: message_handler never broadcasts outside
-            // the lock that reset_session and the next admission serialize on.
-            let _server = state.server.lock().await;
+            // it is still a server->client message on the shared broadcast, so
+            // it goes out under the server lock like every other response.
             if let Ok(json) = serde_json::to_string(&err_response) {
                 state.notifier.broadcast(json);
             }
         }
     }
+    // Released only after the broadcast, for the ordering described above.
+    drop(server);
 
     StatusCode::ACCEPTED
+}
+
+/// Query parameters of `POST /message`.
+#[derive(serde::Deserialize)]
+struct MessageQuery {
+    /// The `sessionId` the `endpoint` event handed this client.
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -817,10 +878,25 @@ struct SessionGuard<P: ContextProvider + 'static> {
     /// `Drop` (which gets `&mut self`) can move it out; it is `Some` for the
     /// guard's entire lifetime.
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// The `sessionId` this stream's admission made live.
+    session_id: String,
 }
 
 impl<P: ContextProvider + 'static> Drop for SessionGuard<P> {
     fn drop(&mut self) {
+        // Retire the `sessionId` now, synchronously: the reset below runs
+        // later, and until it does the permit is still held, so a POST in that
+        // interval must find no live session rather than run against this one.
+        {
+            let mut live = self
+                .state
+                .live_session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if live.as_deref() == Some(self.session_id.as_str()) {
+                *live = None;
+            }
+        }
         let permit = self.permit.take();
         // `Drop` is synchronous and the reset needs the async server mutex, so
         // hand the work — carrying the permit — to the runtime: the session
@@ -977,10 +1053,14 @@ mod tests {
         config
     }
 
-    /// Shared state with the single-session slot ALREADY CLAIMED, standing in
-    /// for a live `GET /sse` client. `message_handler` refuses requests with no
-    /// session attached, since their responses would otherwise be broadcast
-    /// with no client listening and silently dropped.
+    /// The `sessionId` [`test_state`] makes live.
+    const TEST_SESSION: &str = "test-session";
+
+    /// Shared state with the single-session slot ALREADY CLAIMED and
+    /// [`TEST_SESSION`] live, standing in for a live `GET /sse` client.
+    /// `message_handler` refuses a POST that does not name the live session,
+    /// since its response would otherwise be broadcast to no client, or to a
+    /// different one.
     fn test_state() -> Arc<AppState<MockProvider>> {
         let state = Arc::new(AppState {
             server: Mutex::new(McpServer::new(MockProvider::default())),
@@ -989,6 +1069,7 @@ mod tests {
             session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             session_evict: std::sync::Mutex::new(CancellationToken::new()),
             shutdown: CancellationToken::new(),
+            live_session: std::sync::Mutex::new(Some(TEST_SESSION.to_owned())),
         });
         state
             .session_slot
@@ -996,6 +1077,39 @@ mod tests {
             .expect("fresh state must have a free session slot")
             .forget();
         state
+    }
+
+    /// The `POST /message` query naming session `id`.
+    fn session(id: &str) -> Query<MessageQuery> {
+        Query(MessageQuery {
+            session_id: Some(id.to_owned()),
+        })
+    }
+
+    /// Reads an admitted session's stream up to its `endpoint` event and
+    /// returns the `sessionId` that event names, with the rest of the stream.
+    /// Holding the returned stream keeps the session attached.
+    async fn session_id_of(
+        response: axum::response::Response,
+    ) -> (String, axum::body::BodyDataStream) {
+        const KEY: &str = "sessionId=";
+        let mut body = response.into_body().into_data_stream();
+        let mut seen = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(start) = seen.find(KEY) {
+                let rest = &seen[start + KEY.len()..];
+                if let Some(end) = rest.find(['\r', '\n']) {
+                    return (rest[..end].to_owned(), body);
+                }
+            }
+            let bytes = tokio::time::timeout_at(deadline, body.next())
+                .await
+                .expect("the session never sent its endpoint event")
+                .expect("the session stream ended before its endpoint event")
+                .expect("the session stream failed");
+            seen.push_str(&String::from_utf8_lossy(&bytes));
+        }
     }
 
     // -- parse_sse_incoming ---------------------------------------------------
@@ -1261,6 +1375,7 @@ mod tests {
             session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             session_evict: std::sync::Mutex::new(CancellationToken::new()),
             shutdown: CancellationToken::new(),
+            live_session: std::sync::Mutex::new(None),
         });
 
         // A client attaches to the SSE stream.
@@ -1301,6 +1416,7 @@ mod tests {
             session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             session_evict: std::sync::Mutex::new(CancellationToken::new()),
             shutdown: CancellationToken::new(),
+            live_session: std::sync::Mutex::new(None),
         });
 
         let mut client = state.notifier.tx.subscribe();
@@ -1384,8 +1500,6 @@ mod tests {
     /// server its host believes has stopped.
     #[tokio::test]
     async fn run_sse_shuts_down_with_a_session_attached() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         let (event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
         let (server, pump) = McpServer::with_event_source(MockProvider::default(), event_rx);
         let bundle = McpServerForTransport(TransportBundle::Wired(server, pump));
@@ -1400,33 +1514,9 @@ mod tests {
         let handle = ShutdownHandle::new();
         let task = tokio::spawn(run_sse(bundle, config, handle.clone()));
 
-        // Attach a session over a real connection and wait for its endpoint
-        // event, which proves the response stream is open.
-        let mut conn = None;
-        for _ in 0..100 {
-            if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
-                conn = Some(stream);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let mut conn = conn.expect("run_sse never started listening");
-        conn.write_all(
-            b"GET /sse HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer shutdown-secret\r\n\r\n",
-        )
-        .await
-        .unwrap();
-        let mut seen = Vec::new();
-        let mut buf = [0u8; 1024];
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !String::from_utf8_lossy(&seen).contains("event: endpoint") {
-                let n = conn.read(&mut buf).await.unwrap();
-                assert!(n > 0, "the SSE connection closed before its endpoint event");
-                seen.extend_from_slice(&buf[..n]);
-            }
-        })
-        .await
-        .expect("the SSE session never received its endpoint event");
+        // Attach a session over a real connection; its endpoint event proves
+        // the response stream is open.
+        let conn = attach_session(addr, "shutdown-secret").await;
         assert_eq!(event_tx.receiver_count(), 1, "the pump must be running");
 
         handle.shutdown();
@@ -1441,6 +1531,44 @@ mod tests {
             "the pump must stop when run_sse returns"
         );
         drop(conn);
+    }
+
+    /// Connects to the `run_sse` server at `addr`, opens `GET /sse` with
+    /// `Connection: close`, and returns the connection once the session's
+    /// `endpoint` event has arrived.
+    async fn attach_session(addr: SocketAddr, token: &str) -> tokio::net::TcpStream {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut conn = None;
+        for _ in 0..100 {
+            if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
+                conn = Some(stream);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut conn = conn.expect("run_sse never started listening");
+        conn.write_all(
+            format!(
+                "GET /sse HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n\
+                 Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 1024];
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !String::from_utf8_lossy(&seen).contains("event: endpoint") {
+                let n = conn.read(&mut buf).await.unwrap();
+                assert!(n > 0, "the SSE connection closed before its endpoint event");
+                seen.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await
+        .expect("the SSE session never received its endpoint event");
+        conn
     }
 
     // -- Auth middleware -------------------------------------------------------
@@ -1494,12 +1622,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
+        let (first_id, mut first_body) = session_id_of(first).await;
         // Drain the first body the way hyper does for a connection whose
         // writes keep succeeding.
-        let drained = tokio::spawn(async move {
-            let mut body = first.into_body().into_data_stream();
-            while let Some(Ok(_)) = body.next().await {}
-        });
+        let drained =
+            tokio::spawn(async move { while let Some(Ok(_)) = first_body.next().await {} });
 
         let second = tokio::time::timeout(
             Duration::from_secs(10),
@@ -1520,20 +1647,87 @@ mod tests {
             .expect("the evicted session's stream must end")
             .unwrap();
 
-        // The new session owns the slot: a POST is accepted into it.
-        let ping = serde_json::json!({"jsonrpc": "2.0", "method": "ping", "id": 1}).to_string();
-        let post = router
-            .oneshot(
+        let (second_id, second) = session_id_of(second).await;
+        assert_ne!(
+            first_id, second_id,
+            "each admission mints its own sessionId"
+        );
+
+        // The evicted client can still reach the server, but its POSTs must not
+        // run against the session that replaced it: they would cancel the new
+        // client's subscriptions and put its own responses on the new client's
+        // stream.
+        let post = |id: String| {
+            let ping = serde_json::json!({"jsonrpc": "2.0", "method": "ping", "id": 1}).to_string();
+            router.clone().oneshot(
                 authed()
                     .method("POST")
-                    .uri("/message")
+                    .uri(format!("/message?sessionId={id}"))
                     .body(Body::from(ping))
                     .unwrap(),
             )
-            .await
-            .unwrap();
-        assert_eq!(post.status(), StatusCode::ACCEPTED);
+        };
+        assert_eq!(
+            post(first_id).await.unwrap().status(),
+            StatusCode::CONFLICT,
+            "a POST from the evicted session must be refused"
+        );
+        // The new session owns the slot: a POST naming it is accepted into it.
+        assert_eq!(
+            post(second_id).await.unwrap().status(),
+            StatusCode::ACCEPTED
+        );
         drop(second);
+    }
+
+    /// A POST that reaches the server lock after its stream has dropped, but
+    /// before the dropped guard's reset task has run, must be refused. The
+    /// reset task still holds the session permit in that interval, so the
+    /// permit count alone would report a client attached, and the POST would
+    /// run against the session and return `202 Accepted` for a response no
+    /// receiver exists to deliver.
+    #[tokio::test]
+    async fn post_after_its_stream_dropped_is_refused_while_the_reset_is_pending() {
+        let state = Arc::new(AppState {
+            server: Mutex::new(McpServer::new(MockProvider::default())),
+            notifier: McpNotifier::new(&test_config()),
+            retry_ms: DEFAULT_RETRY_MS,
+            session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            session_evict: std::sync::Mutex::new(CancellationToken::new()),
+            shutdown: CancellationToken::new(),
+            live_session: std::sync::Mutex::new(None),
+        });
+        let admitted = sse_handler(State(Arc::clone(&state))).await;
+        assert_eq!(admitted.status(), StatusCode::OK);
+        let (id, stream) = session_id_of(admitted).await;
+
+        // Hold the server lock and queue the POST on it while the stream is
+        // still attached, so the POST acquires the lock before the reset task
+        // the stream's drop spawns (tokio's mutex is FIFO).
+        let lock = state.server.lock().await;
+        let ping = serde_json::json!({"jsonrpc": "2.0", "method": METHOD_PING, "id": 1});
+        let handler = tokio::spawn(message_handler(
+            State(Arc::clone(&state)),
+            session(&id),
+            ping.to_string(),
+        ));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        drop(stream);
+        assert_eq!(
+            state.session_slot.available_permits(),
+            0,
+            "the pending reset task must still hold the permit"
+        );
+
+        drop(lock);
+        let status = handler.await.unwrap().into_response().status();
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a POST whose stream is gone must be refused, not accepted and dropped"
+        );
     }
 
     /// The newest admission wins when admissions queue behind a session that
@@ -1883,6 +2077,7 @@ mod tests {
             session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             session_evict: std::sync::Mutex::new(CancellationToken::new()),
             shutdown: CancellationToken::new(),
+            live_session: std::sync::Mutex::new(None),
         });
 
         // First client attaches through the real handler, then disconnects,
@@ -1906,6 +2101,7 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
+        let (second_id, second) = session_id_of(second).await;
 
         // The second session immediately handshakes and subscribes through the
         // real POST path — exactly the window the old race wiped.
@@ -1927,10 +2123,14 @@ mod tests {
                 "id": 2
             }),
         ] {
-            let status = message_handler(State(Arc::clone(&state)), body.to_string())
-                .await
-                .into_response()
-                .status();
+            let status = message_handler(
+                State(Arc::clone(&state)),
+                session(&second_id),
+                body.to_string(),
+            )
+            .await
+            .into_response()
+            .status();
             assert_eq!(status, StatusCode::ACCEPTED);
         }
         assert_eq!(state.server.lock().await.subscription_count(), 1);
@@ -1973,6 +2173,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
+        let (first_id, first) = session_id_of(first).await;
 
         let init_body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -1990,7 +2191,7 @@ mod tests {
             .oneshot(
                 authed()
                     .method("POST")
-                    .uri("/message")
+                    .uri(format!("/message?sessionId={first_id}"))
                     .header("content-type", "application/json")
                     .body(Body::from(init_body))
                     .unwrap(),
@@ -2086,6 +2287,7 @@ mod tests {
         // server lock; spawn the handler so it can park on the lock we hold.
         let handler = tokio::spawn(message_handler(
             State(Arc::clone(&state)),
+            session(TEST_SESSION),
             "not valid json".to_owned(),
         ));
 
@@ -2135,6 +2337,7 @@ mod tests {
             session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             session_evict: std::sync::Mutex::new(CancellationToken::new()),
             shutdown: CancellationToken::new(),
+            live_session: std::sync::Mutex::new(None),
         });
 
         // A client attaches; the handler subscribes its broadcast receiver.
@@ -2192,21 +2395,30 @@ mod tests {
 
     /// The SSE twin of the stdio pump-abort test: aborting the task running
     /// `run_sse` (the drop a bridge's shutdown `select!` performs) must abort
-    /// the event pump, not detach it. The pump holds the only receiver on the
-    /// event channel, so its death is observable as `receiver_count` falling
-    /// to zero; a detached pump would hold that receiver forever.
+    /// the event pump, not detach it, and must end every attached session's
+    /// stream. The pump holds the only receiver on the event channel, so its
+    /// death is observable as `receiver_count` falling to zero; a detached pump
+    /// would hold that receiver forever. axum serves each connection on its own
+    /// task, which the abort does not stop, so an attached stream ends only if
+    /// the abort cancels it: otherwise it would keep its subscriptions with no
+    /// pump left to serve them.
     #[tokio::test]
     async fn aborting_run_sse_tears_down_the_pump() {
+        use tokio::io::AsyncReadExt;
+
         let (event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
         let (server, pump) = McpServer::with_event_source(MockProvider::default(), event_rx);
         let bundle = McpServerForTransport(TransportBundle::Wired(server, pump));
-        let config = SseConfig::new("127.0.0.1:0".parse().unwrap());
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut config = SseConfig::new(addr);
+        config.auth_token = "abort-secret".to_owned();
 
         let task = tokio::spawn(run_sse(bundle, config, ShutdownHandle::new()));
-
-        // Let the server bind and spawn its pump; the pump task now owns the
-        // channel's only receiver.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // `Connection: close`, so the connection closes once the stream ends.
+        let mut conn = attach_session(addr, "abort-secret").await;
         assert!(!task.is_finished(), "run_sse exited before it was aborted");
         assert_eq!(event_tx.receiver_count(), 1);
 
@@ -2227,5 +2439,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(event_tx.receiver_count(), 0);
+
+        // The attached session's stream must end, closing the connection.
+        let mut buf = [0u8; 1024];
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while conn.read(&mut buf).await.unwrap_or(0) > 0 {}
+        })
+        .await
+        .expect("an attached SSE stream outlived the aborted run_sse");
     }
 }
