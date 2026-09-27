@@ -221,10 +221,11 @@ class ServerTest {
     @Test
     fun `every stop method on a lifecycle-owning type suspends`() {
         for (type in listOf(Relay::class.java, Node::class.java, SCP::class.java)) {
-            val stopMethods = type.declaredMethods.filter { method ->
-                method.name.substringBefore('$').substringBefore('-') in
-                    setOf("shutdown", "close", "stop", "dispose")
-            }
+            val stopMethods =
+                type.declaredMethods.filter { method ->
+                    method.name.substringBefore('$').substringBefore('-') in
+                        setOf("shutdown", "close", "stop", "dispose")
+                }
             assertTrue(
                 stopMethods.isNotEmpty(),
                 "${type.simpleName} must declare a stop method",
@@ -243,12 +244,13 @@ class ServerTest {
     }
 
     @Test
-    fun `shutdown marks a node shut down`() = runTest(testDispatcher) {
-        val node = createNode()
-        assertFalse(node.isShutdown)
-        node.shutdown()
-        assertTrue(node.isShutdown)
-    }
+    fun `shutdown marks a node shut down`() =
+        runTest(testDispatcher) {
+            val node = createNode()
+            assertFalse(node.isShutdown)
+            node.shutdown()
+            assertTrue(node.isShutdown)
+        }
 }
 
 // ---------------------------------------------------------------------------
