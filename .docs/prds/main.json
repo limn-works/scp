@@ -631,12 +631,12 @@
       ],
       "description": "Implement identity creation in the scp-identity crate, over the wasm-safe identity data model in scp-did. The module handles creation, verification, and key-state management. An identity's first key event is its inception event, and the identifier is SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage) — 32 raw digest bytes that encode no key, which is what makes the identifier self-certifying (security spec §9.7.4.2 R13). The module abstracts the identity backend behind the `IdentityBackend` seam `03-identity.md` §3.10.10 states, which carries six methods; that section names them and this story states no list of its own, because a second list drifts from the declaration it copies. The shipped crate carries `generate_ephemeral_ed25519_seed`, which names the superseded curve; the code workstream that moves the key material to P-256 renames it, and this story names it as it ships today rather than inventing a name no author chose (ADR-054). Creation takes two custody providers: key_custody holds the operational keys, and pre_rotation_custody holds the pre-rotation key, because §9.7.4.1 item 3 forbids the operational provider from holding the recovery key. Where no substrate satisfies §9.7.4.1 item 3a's independent-residence requirement, every creation path fails closed with IdentityError::NoIndependentSubstrate (SCP-IDENT-1100, `03-identity.md` §3.10.10). Publication and resolution are SCP-007; rotation is SCP-008.",
       "acceptanceCriteria": [
-        "`Identity::create(config)` returns `Result<(Identity<S>, PublishOutcome), IdentityError>`, publishing the inception event in the same call, and generates the root member (#0) and the Active Signing Key (#active) as ECDSA P-256 keypairs in the custody the config names (`03-identity.md` §3.10.10, §9.5, §9.7.4.2 definitions)",
+        "`Identity::create(config, signers)` returns `Result<(Identity<S>, PendingEvent), IdentityError>`, composing the inception event with its root group under `signers.installed_root`, and generates the root member (#0) and the Active Signing Key (#active) as ECDSA P-256 keypairs in the custody the config names; `Identity::attach` publishes it (`03-identity.md` §3.10.10, §9.5, §9.7.4.2 definitions)",
         "The identity-creation path draws the pre-rotation seed from key_custody.generate_ephemeral_ed25519_seed(), hands it to pre_rotation_custody.store_committed_pre_rotation_key, and never writes the pre-rotation private key into key_custody — §9.7.4.1 item 3 (storage isolation) forbids the operational provider from holding it",
         "The identity-creation path computes the pre-rotation commitment as SHA-256(\"SCP-PREROTATION-COMMITMENT-V1:\" || pre_rotation_public_key) over the 33-byte SEC1 compressed point (§9.7.4.2 definitions)",
         "The identity-creation path derives the identifier as SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage), with the preimage's identifier and predecessor-digest fields all-zero, and stores those 32 raw digest bytes on the ScpIdentity (§9.7.4.2 R13)",
         "The identity-creation path builds the key state the inception event carries: the standing root with its threshold and each member's custody type, the Active Signing Key in the #active role, the standing commitment list with its next threshold, the witness set with its interval, the service-key designation, and the all-zero delegator (§9.7.4.2 definitions)",
-        "The returned `Identity<S>` carries the identifier, the operational key handles (never raw private keys), and the pre-rotation commitment, and the returned `PublishOutcome` names every entry of the publication set (`03-identity.md` §3.10.10)",
+        "The returned `Identity<S>` carries the identifier, the operational key handles (never raw private keys), and the pre-rotation commitment, and `attach` over the returned `PendingEvent` returns a `PublishOutcome` naming every entry of the publication set (`03-identity.md` §3.10.10)",
         "verify_did(identifier, inception_event) -> bool recomputes SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage) and compares it to the identifier (§9.7.4.2 R2 — local, no network call)",
         "The identity backend seam is `IdentityBackend`, carrying the six methods `03-identity.md` §3.10.10 names and no others — `resolve`, `publish`, `read_service_record`, `publish_service_record`, `read_policy` and `fallback_set`",
         "ScpIdentity declares exactly four public fields: identity_key (KeyHandle), active_signing_key (KeyHandle), pre_rotation_commitment ([u8; 32]), identifier ([u8; 32])",
@@ -649,7 +649,7 @@
       "actionItems": [
         "Create crates/scp-identity/src/lib.rs with the crate root, the ScpIdentity struct, the IdentityBackend trait, the IdentityError enum, and re-exports",
         "Define ScpIdentity with identity_key, active_signing_key, pre_rotation_commitment, and identifier fields",
-        "Define IdentityBackend with the six methods `03-identity.md` §3.10.10 names, and `Identity::create` returning `(Identity<S>, PublishOutcome)`",
+        "Define IdentityBackend with the six methods `03-identity.md` §3.10.10 names, and `Identity::create` returning `(Identity<S>, PendingEvent)`",
         "Implement the relay-network IdentityBackend in crates/scp-identity/src/dht.rs, with the identity-creation path signing the inception event under the root member it installs",
         "Implement verify_did in crates/scp-identity/src/dht.rs — recompute the identifier from the inception preimage and compare",
         "Implement the key-state snapshot in crates/scp-did/src/document.rs — standing root, operational roles, standing commitment, witness set, designation, delegator",
@@ -802,7 +802,7 @@
         "A `Browser` SDK under a platform account that syncs the credential composes no reveal: a test runs the `Browser` profile with a syncing platform account and asserts `IdentityError::StorePartiallyUnreadable` and no signature (`09-security-model.md` §9.7.4.2 R10).",
         "A `largeBlob` store joins the store set only after a write lands at the credential's designation, and a write that does not land removes that member alone: a test fails the write and asserts that the next compose reads the platform-account member and not the `largeBlob` member (`09-security-model.md` §9.7.4.2 R10).",
         "The ceremony's first step runs a self-observation pass and adopts what the extending arm adopts: a test completes a `CommitmentRollover` on one device, then calls `begin` on a second device whose retained log lacks it, and asserts that the second device adopts the rollover and reveals the next commitment rather than the one the rollover consumed (`09-security-model.md` §9.7.4.2 R10)",
-        "An SDK refuses with `IdentityError::RevealAlreadyPending` to compose a reveal of a commitment an event of its adopted log already reveals: a test asserts the refusal and that nothing is signed (`09-security-model.md` §9.7.4.2 R10)",
+        "The consumed-commitment rule holds with reserve members: a test builds a 2-of-4 next set whose rollover reveals two members and re-commits the other two, then calls `begin` on a device whose adopted log carries that rollover, composing at the rollover's predecessor, and asserts `IdentityError::RevealAlreadyPending` and no signature (`09-security-model.md` §9.7.4.2 R10)",
         "No unwrap() or expect() in library code."
       ],
       "actionItems": [
@@ -10654,7 +10654,7 @@
     },
     {
       "id": "SCP-305",
-      "title": "Implement the recovery entry points: identity.recovery(), begin, cosign, attach, load_pending_recovery, resume_recovery and abort_recovery",
+      "title": "Implement the recovery entry points: identity.recovery(), begin, load_pending_recovery, resume_recovery and abort_recovery",
       "gate": "gate-kel",
       "priority": "P0",
       "severity": "critical",
@@ -10663,7 +10663,7 @@
         "crates/scp-identity/src/recovery.rs",
         "crates/scp-identity/src/lib.rs"
       ],
-      "description": "Implement the ceremony's six entry points on the `Recovery` type that `09-security-model.md` §9.7.4.2 R10 declares, obtained through `identity.recovery()` over the identity's own persistence, custody and backend slots. `RecoveryPhase` has four values, `Composed`, `Signed`, `PublishSent` and `Confirmed`, and the ceremony removes the handle from every member of the store set once, after the spent keys are destroyed at `Confirmed`. `abort_recovery` refuses with `IdentityError::SignedRevealUnpublished` (SCP-IDENT-1107, `03-identity.md` §3.10.10) where the device's own store holds the signed event, and clears the handle otherwise. The ceremony's event composition is SCP-008; the bridge exports are SCP-314. `begin` composes a `PendingEvent` under a caller-supplied `SignerPlan`, each holder of a named member returns its `IndexedSignature` through `cosign`, and `attach` checks the set and completes the ceremony; the application carries `PendingEvent` and the signatures between holders.",
+      "description": "Implement the ceremony's four entry points on the `Recovery` type that `09-security-model.md` §9.7.4.2 R10 declares, obtained through `identity.recovery()` over the identity's own persistence, custody and backend slots. `RecoveryPhase` has four values, `Composed`, `Signed`, `PublishSent` and `Confirmed`, and the ceremony removes the handle from every member of the store set once, after the spent keys are destroyed at `Confirmed`. `abort_recovery` refuses with `IdentityError::SignedRevealUnpublished` (SCP-IDENT-1107, `03-identity.md` §3.10.10) where the device's own store holds the signed event, and clears the handle otherwise. The ceremony's event composition is SCP-008; the bridge exports are SCP-314. `begin` composes a `PendingEvent`, and SCP-312's `Identity::cosign` and `Identity::attach` complete it.",
       "acceptanceCriteria": [
         "`Recovery::begin(kind, signers)` runs the ceremony order from its first step through the `Composed` handle write and returns a `PendingEvent` whose preimage binds each group's signer index list and form list from `signers`; `RecoveryKind::RootRecovery(declaration)` sets `standing_root` to the declaration and `begin` refuses `Lost` with `RootThresholdHeld` where the SDK holds a threshold of the standing root: one test per kind (`09-security-model.md` §9.7.4.2 R10)",
         "`RecoveryKind` declares exactly the variants `CommitmentRollover`, `RootRecovery(StandingRootDeclaration)` and `Abandon` (`09-security-model.md` §9.7.4.2 R10)",
@@ -10675,13 +10675,13 @@
         "At `Signed` or a later phase `abort_recovery` returns `IdentityError::SignedRevealUnpublished` and leaves the handle in every member, whether or not this device's own store holds the signed event, except that a device whose adopted log carries the event the handle names removes the handle: a test per case, the first run on a second device that holds no signed event (`09-security-model.md` §9.7.4.2 R10)",
         "At `Composed`, `abort_recovery` removes the handle from every member on any device, after which `load_pending_recovery` returns `None`: a test aborts from a second device (`09-security-model.md` §9.7.4.2 R10)",
         "`abort_recovery` returns a `RemovalOutcome` carrying one `StoreRemoval` per member reached, and a removal that does not land yields `removed: false` and a surfaced condition: a test fails one member's removal and asserts both (`09-security-model.md` §9.7.4.2 R10)",
-        "Two holders of a 2-of-3 standing root complete a `RootRecovery{CoSigns}`: the composer calls `begin`, each holder calls `cosign` on its own device, and `attach` publishes an event whose standing-root group carries both signatures; a second test passes one signature and asserts `IdentityError::SignatureSetIncomplete` (SCP-IDENT-1112) and no `Signed` write (`09-security-model.md` §9.7.4.2 R10)",
+        "Two holders of a 2-of-3 standing root complete a `RootRecovery{CoSigns}`: the composer calls `begin`, each holder calls `Identity::cosign` on its own device, and `Identity::attach` publishes an event whose standing-root group carries both signatures and writes the `Signed` handle only after both verify (`09-security-model.md` §9.7.4.2 R10, `03-identity.md` §3.10.10)",
         "An SDK re-reads the handle immediately before it signs and immediately before it publishes: a test removes the handle from another device between `begin` and `attach`, and a second test replaces it with another digest before the publish; each asserts `IdentityError::RevealAlreadyPending` and no signature or publish (`09-security-model.md` §9.7.4.2 R10)",
         "`resume_recovery` on an SDK whose own store holds no preimage under the handle's digest returns `IdentityError::RecoveryPreimageMissing` (SCP-IDENT-1110), and signs and publishes nothing: a test asserts all three (`09-security-model.md` §9.7.4.2 R10)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
-        "Implement `begin`, `cosign` and `attach` over a `SignerPlan`, and the handle re-read before signing and publishing.",
+        "Implement `begin` over a `SignerPlan`, and the handle re-read before signing and publishing.",
         "Implement `Recovery::begin` over SCP-008's composition, selecting the event kind from `RecoveryKind`.",
         "Declare `RecoveryPhase`, `RecoveryHandle`, `CredentialStore`, `StoreRemoval`, `RemovalOutcome`, `RecoveryCompletion` and `Recovery` as §9.7.4.2 R10 declares them.",
         "Add `Identity::recovery` and build `Recovery` from the identity's own slots.",
@@ -10691,7 +10691,7 @@
         "Write crash-injection tests at every phase and the abort and resume tests the acceptance criteria name."
       ],
       "blockedBy": [
-        "SCP-008"
+        "SCP-312"
       ],
       "sources": [
         {
@@ -10994,19 +10994,20 @@
         "crates/scp-identity/src/write.rs",
         "crates/scp-identity/src/lib.rs"
       ],
-      "description": "The write API `03-identity.md` §3.10.10 declares: `Identity::create`, which returns the handle beside the inception cycle's `PublishOutcome`, and `rotate_active` and `set_witnesses`, each of which signs a `KeyState` and returns its cycle's `PublishOutcome`. The reveal-authorized events go through `Recovery::begin`, which SCP-305 implements, and SCP-008 implements the event composition these operations call.",
+      "description": "The write API `03-identity.md` §3.10.10 declares. Every event that needs a root threshold is composed as a `PendingEvent`: `Identity::create` composes the inception event, `rotate_active` and `set_witnesses` each compose a `KeyState`, and `Recovery::begin` (SCP-305) composes the reveal-authorized events. Each holder of a named member calls `Identity::cosign`, and `Identity::attach` checks the signatures and publishes. SCP-008 implements the event composition these operations call.",
       "acceptanceCriteria": [
-        "`Identity<S>` declares `create`, `rotate_active` and `set_witnesses` with the signatures `03-identity.md` §3.10.10 declares, and each non-constructor returns `Result<PublishOutcome, IdentityError>`: a compile test calls each",
-        "`rotate_active(RotationReason::Routine)` signs a `KeyState` under the standing root that installs a fresh `#active` key and drops the replaced key as `Superseded`, and `rotate_active(RotationReason::Compromised)` drops it as `Compromised{from: N}` with N equal to that event's own sequence: a test per reason asserts the replaced key's entry (`03-identity.md` §3.10.10, `09-security-model.md` §9.7.4.2 R8)",
-        "A `KeyState` the write API signs lists the entries it keeps `Current` in their existing order and then the entries it drops in their existing order: a test decodes the rotated snapshot and asserts that order (`09-security-model.md` §9.7.4.2 definitions)",
-        "`set_witnesses` signs a `KeyState` naming the given witness set and witnessing interval and changes no commitment: a test asserts the snapshot fields and the unchanged commitment (`09-security-model.md` §9.7.4.2 R1)",
-        "A cancelled or failed passkey gesture returns `IdentityError::UserVerificationDeclined` (SCP-IDENT-1109), and a custody backend error while signing returns `IdentityError::CustodySigningFailed` (SCP-IDENT-1111), each signing nothing: a test per case (`03-identity.md` §3.10.10)",
-        "Each operation publishes through `IdentityBackend::publish` and returns its `PublishOutcome`: a test asserts the per-entry list (`03-identity.md` §3.10.10)",
+        "`Identity<S>` declares `create`, `rotate_active`, `set_witnesses`, `cosign` and `attach` with the signatures `03-identity.md` §3.10.10 declares: a compile test calls each",
+        "An organization identity with a 2-of-3 root held on three officers' devices is created: one officer calls `create`, two call `cosign` with their own custody, and `attach` publishes an inception event whose root group carries both signatures; a second test passes one signature and asserts `IdentityError::SignatureSetIncomplete` (SCP-IDENT-1112) and no publish (`03-identity.md` §3.10.10)",
+        "`rotate_active(RotationReason::Routine, ..)` composes a `KeyState` that installs a fresh `#active` key and drops the replaced key as `Superseded`, and `RotationReason::Compromised` drops it as `Compromised{from: N}` with N equal to that event's own sequence: a test per reason asserts the replaced key's entry after `attach` (`03-identity.md` §3.10.10, `09-security-model.md` §9.7.4.2 R8)",
+        "A `KeyState` the write API composes lists the entries it keeps `Current` in their existing order and then the entries it drops in their existing order: a test decodes the rotated snapshot and asserts that order (`09-security-model.md` §9.7.4.2 definitions)",
+        "`set_witnesses` composes a `KeyState` naming the given witness set and witnessing interval and changes no commitment: a test asserts the snapshot fields and the unchanged commitment (`09-security-model.md` §9.7.4.2 R1)",
+        "`cosign` returns the `IndexedSignature` of the one named member its custody holds; a cancelled or failed passkey gesture returns `IdentityError::UserVerificationDeclined` (SCP-IDENT-1109), and a custody backend error returns `IdentityError::CustodySigningFailed` (SCP-IDENT-1111): a test per case (`03-identity.md` §3.10.10)",
+        "`attach` publishes through `IdentityBackend::publish` and returns its `PublishOutcome`: a test asserts the per-entry list (`03-identity.md` §3.10.10)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
-        "Implement `create`, `rotate_active` and `set_witnesses` over SCP-008's composition.",
-        "Map a declined gesture and a custody error to their `IdentityError` variants.",
+        "Implement `create`, `rotate_active` and `set_witnesses` as composers over SCP-008's event composition.",
+        "Implement `cosign` over a holder's own custody and `attach` with group verification.",
         "Write one test per acceptance criterion."
       ],
       "blockedBy": [
@@ -11086,7 +11087,7 @@
       ],
       "description": "Architecture slice S11. PyO3, UniFFI and napi export identical identity and recovery functions, and each SDK wraps them under the names the shared scaffold's naming table gives, including `identity.recovery()` and `observe_self`. Every name-bound enumeration keeps the spec's PascalCase in every language. This satisfies the integration checklist's second, third and fifth checks.",
       "acceptanceCriteria": [
-        "PyO3, UniFFI and napi each export `identity_create`, `identity_resolve`, `identity_publish`, `identity_read_service_record`, `identity_publish_service_record`, `identity_read_policy`, `identity_fallback_set`, `identity_observe_self`, `identity_rotate_active`, `identity_set_witnesses` and the `recovery_*` functions, `recovery_begin`, `recovery_cosign` and `recovery_attach` included: `ffi_conformance.rs` asserts each export on each bridge",
+        "PyO3, UniFFI and napi each export `identity_create`, `identity_resolve`, `identity_publish`, `identity_read_service_record`, `identity_publish_service_record`, `identity_read_policy`, `identity_fallback_set`, `identity_observe_self`, `identity_rotate_active`, `identity_set_witnesses`, `identity_cosign`, `identity_attach` and the `recovery_*` functions, `recovery_begin` included: `ffi_conformance.rs` asserts each export on each bridge",
         "Each SDK wraps each export under the name the shared scaffold's naming table gives: a test per SDK calls each wrapper",
         "`EntryReach`, `ChainRelation`, `ExtendingAct`, `EntryResult`, `NotSentReason`, `RecoveryPhase`, `RecoveryKind`, `SignatureGroup`, `RotationReason` and `ResolutionVerdict` carry their spec variant names verbatim in every SDK: a conformance test compares the variant names across the five languages (`03-identity.md` §3.10.10)",
         "One conformance fixture of identity operations replays in Rust, Python, TypeScript, Swift and Kotlin with identical results",
