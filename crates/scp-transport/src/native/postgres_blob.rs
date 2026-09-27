@@ -114,12 +114,8 @@ impl PostgresBlobStore {
             .await
             .map_err(|e| StorageError::Internal(format!("postgres connect: {e}")))?;
 
-        // Create schema (idempotent). `SCHEMA_SQL` holds three statements, and
-        // `sqlx::query` sends its text as one prepared statement, which
-        // PostgreSQL rejects with "cannot insert multiple commands into a
-        // prepared statement". `sqlx::raw_sql` sends the text over the simple
-        // query protocol, which accepts several statements in one string.
-        sqlx::raw_sql(SCHEMA_SQL)
+        // Create schema (idempotent).
+        sqlx::query(SCHEMA_SQL)
             .execute(&pool)
             .await
             .map_err(|e| StorageError::Internal(format!("postgres schema: {e}")))?;
@@ -364,13 +360,8 @@ fn optional_bytes_to_array32(bytes: Option<Vec<u8>>) -> Result<Option<[u8; 32]>,
 // Setup:
 //   createdb scp_test_blobs
 //
-// Every test below is #[ignore]d, because each one connects to a running
-// `PostgreSQL` instance. On its Linux leg, job rust-test-optional-features in
-// .github/workflows/ci.yml starts a `PostgreSQL` container and runs every one
-// of them with `--run-ignored ignored-only --test-threads 1`: each test empties
-// the shared `blobs` table before it runs, so two running at once would delete
-// each other's rows. Locally, run them against a server you started yourself,
-// with the command above and `--test-threads=1`.
+// The tests are #[ignore]d by default because they require a running `PostgreSQL`
+// instance. CI runs them in a job that provisions a `PostgreSQL` service container.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {

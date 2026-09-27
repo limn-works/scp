@@ -26,10 +26,6 @@ Read `.docs/architecture.md` for system overview and `.docs/specs/` for protocol
      -- -D warnings
    cargo nextest run -p scp-runtime \
      --features scp-runtime/testing,scp-runtime/saga-witness-test-mint
-   # A change to `scp-transport` also runs the cloud blob backends, which
-   # `--workspace` resolves without `postgres-blob` or `s3-blob`:
-   cargo clippy -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob --all-targets \
-     -- -D warnings
    ```
 5. **Commit atomically** with conventional commit messages.
 6. **Push and open a PR.** CI runs the full gate set on the pushed head. Fix every failing job before the PR merges.

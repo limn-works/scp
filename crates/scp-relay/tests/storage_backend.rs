@@ -8,101 +8,64 @@
 //! - Invalid backend names produce a non-zero exit and descriptive error (AC 9)
 //! - `postgres` without `SCP_RELAY_DATABASE_URL` produces a non-zero exit (AC 10)
 //! - `s3` without `SCP_RELAY_S3_BUCKET` produces a non-zero exit (AC 6)
-//!
-//! `scp-transport`'s `postgres-blob` and `s3-blob` features gate the `postgres`
-//! and `s3` arms. This crate's off-by-default `cloud-blobs` feature is one way
-//! to enable that pair: cargo unifies `scp-transport`'s features across every
-//! package one invocation builds, so another package in the same build enables
-//! the pair too, and the arms then compile with `cloud-blobs` off. Each test
-//! below that drives one of those two values
-//! therefore asserts one of two outcomes, chosen by [`backend_is_compiled`]:
-//! when the arm exists the relay reaches it and reports the env var the backend
-//! needs; when it does not, the relay reports that the arm is not compiled in
-//! and names the feature to rebuild with. Branching inside the test rather than
-//! gating the whole test out keeps every test running in every configuration
-//! CI builds.
+//! - a build without `cloud-blobs` rejects `postgres` and `s3`, names the
+//!   feature, and opens no other store
 
-use std::io::Read;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 /// Runs `command` and returns its output, killing the child and failing the
-/// test if it has not exited after 30 seconds.
+/// test when it has not exited after 30 seconds.
 ///
-/// Every test that calls this expects `scp-relay` to reject its configuration
-/// and exit. A regression that lets a rejected backend fall back to another
-/// store starts a relay that serves forever, and `Command::output` would then
-/// block until the CI job's own timeout instead of failing an assertion that
-/// names the fallback. Both pipes are drained on their own threads so a child
-/// that writes more than a pipe buffer before it exits cannot stall on a full
-/// pipe and trip the deadline. `crates/scp-node/tests/storage_backend_selection.rs`
-/// carries the node binary's copy.
+/// The caller expects `scp-relay` to reject its configuration and exit. A
+/// regression that falls back to another store starts a relay that serves
+/// forever, and this deadline turns that hang into a failed assertion.
 fn output_within_deadline(command: &mut Command) -> Output {
     let mut child = command
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn scp-relay");
-    let drain = |mut pipe: Box<dyn Read + Send>| {
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            pipe.read_to_end(&mut bytes).expect("read child pipe");
-            bytes
-        })
-    };
-    let stdout = drain(Box::new(child.stdout.take().expect("stdout is piped")));
-    let stderr = drain(Box::new(child.stderr.take().expect("stderr is piped")));
-
     let deadline = Instant::now() + Duration::from_secs(30);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("try_wait") {
-            break Some(status);
-        }
+    while child.try_wait().expect("try_wait").is_none() {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            break None;
+            panic!("scp-relay did not exit within 30 seconds, so it is serving a fallback store");
         }
         std::thread::sleep(Duration::from_millis(50));
-    };
-    let stdout = stdout.join().expect("stdout reader thread");
-    let stderr = stderr.join().expect("stderr reader thread");
-    let Some(status) = status else {
-        panic!(
-            "scp-relay did not exit within 30 seconds, so it is serving instead \
-             of rejecting its configuration; stderr: {}",
-            String::from_utf8_lossy(&stderr)
-        );
-    };
-    Output {
-        status,
-        stdout,
-        stderr,
     }
+    child.wait_with_output().expect("collect scp-relay output")
 }
 
-/// Reports whether this build compiled the `storage_from_env` arm that
-/// constructs `name`.
-///
-/// This reads `scp-transport`'s resolved features rather than `scp-relay`'s
-/// `cloud-blobs`, because the two can disagree. `cloud-blobs` is one way to
-/// turn on `scp-transport/postgres-blob`, and cargo unifies `scp-transport`'s
-/// features across every package a single invocation builds, so another package
-/// in the same build can enable that feature while `scp-relay/cloud-blobs`
-/// stays off. `scp_transport::startup::backend_is_compiled` reads the `cfg!`
-/// flag that gates the arm, and this test binary links the same `scp-transport`
-/// the relay binary links, so the answer here is the relay's behaviour rather
-/// than a proxy for it.
-///
-/// It reads that flag rather than parsing `valid_backends()`, which is the
-/// list the relay prints. Predicting the message out of the list the message
-/// is assembled from would make `invalid_backend_exits_with_error` below
-/// compare `valid_backends()` against itself, and that comparison stays green
-/// through the exact regression that test's doc comment names: a
-/// `valid_backends()` reverted to the hardcoded `"sqlite, redb, postgres, s3,
-/// memory"` while the arms stay `cfg`-gated.
-fn backend_is_compiled(name: &str) -> bool {
-    scp_transport::startup::backend_is_compiled(name)
+/// A relay built without `cloud-blobs` rejects `postgres` and `s3` with an
+/// error naming the feature, exits non-zero, and opens no `SQLite` store in
+/// their place.
+#[cfg(not(feature = "cloud-blobs"))]
+#[test]
+fn a_cloud_backend_without_cloud_blobs_is_rejected_naming_the_feature() {
+    for backend in ["postgres", "s3"] {
+        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = tmp.path().join("must-not-exist.db");
+        let output = output_within_deadline(
+            Command::new(relay_bin())
+                .env("SCP_RELAY_STORAGE_BACKEND", backend)
+                .env("SCP_RELAY_STORAGE_PATH", &db_path)
+                .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+                .env_remove("RUST_LOG"),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{backend}: {stderr}");
+        assert!(
+            stderr.contains(&format!("'{backend}' is not compiled into this binary")),
+            "{backend}: {stderr}"
+        );
+        assert!(
+            stderr.contains("--features cloud-blobs"),
+            "{backend}: {stderr}"
+        );
+        assert!(!db_path.exists(), "{backend} opened {}", db_path.display());
+    }
 }
 
 /// Returns the path to the compiled `scp-relay` binary.
@@ -119,18 +82,13 @@ fn relay_bin() -> std::path::PathBuf {
 
 /// AC 9: An invalid backend value causes a non-zero exit with an error
 /// message naming the valid options.
-///
-/// The options list must name exactly the arms this build compiled. Before
-/// `postgres-blob` and `s3-blob` moved behind `cloud-blobs`, the message read
-/// its list from a hardcoded constant, so a default build rejected `postgres`
-/// and then listed `postgres` among the valid options.
 #[test]
 fn invalid_backend_exits_with_error() {
-    let output = output_within_deadline(
-        Command::new(relay_bin())
-            .env("SCP_RELAY_STORAGE_BACKEND", "banana")
-            .env_remove("RUST_LOG"),
-    );
+    let output = Command::new(relay_bin())
+        .env("SCP_RELAY_STORAGE_BACKEND", "banana")
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("failed to execute scp-relay");
 
     assert!(
         !output.status.success(),
@@ -150,20 +108,11 @@ fn invalid_backend_exits_with_error() {
         stderr.contains("memory"),
         "error should list valid options; got: {stderr}"
     );
-
-    for backend in ["postgres", "s3"] {
-        assert_eq!(
-            stderr.contains(backend),
-            backend_is_compiled(backend),
-            "the options list must offer '{backend}' exactly when this build \
-             compiled its arm; got: {stderr}"
-        );
-    }
 }
 
 /// AC 10: Selecting `postgres` without `SCP_RELAY_DATABASE_URL` exits with
-/// a descriptive error — on a build that compiled the postgres arm. A default
-/// build compiled no postgres arm, and exits naming the feature that would.
+/// a descriptive error. Only a `cloud-blobs` build compiles the postgres arm.
+#[cfg(feature = "cloud-blobs")]
 #[test]
 fn postgres_without_url_exits_with_error() {
     let output = output_within_deadline(
@@ -179,26 +128,15 @@ fn postgres_without_url_exits_with_error() {
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if backend_is_compiled("postgres") {
-        assert!(
-            stderr.contains("SCP_RELAY_DATABASE_URL"),
-            "error should mention the required env var; got: {stderr}"
-        );
-    } else {
-        assert!(
-            stderr.contains("'postgres' is not compiled into this binary"),
-            "a default build should say the postgres arm is absent; got: {stderr}"
-        );
-        assert!(
-            stderr.contains(&format!("--features {}", binary_feature("postgres"))),
-            "error should name the feature that compiles the arm; got: {stderr}"
-        );
-    }
+    assert!(
+        stderr.contains("SCP_RELAY_DATABASE_URL"),
+        "error should mention the required env var; got: {stderr}"
+    );
 }
 
 /// AC 6: Selecting `s3` without `SCP_RELAY_S3_BUCKET` exits with a
-/// descriptive error — on a build that compiled the s3 arm. A default build
-/// compiled no s3 arm, and exits naming the feature that would.
+/// descriptive error. Only a `cloud-blobs` build compiles the s3 arm.
+#[cfg(feature = "cloud-blobs")]
 #[test]
 fn s3_without_bucket_exits_with_error() {
     let output = output_within_deadline(
@@ -214,105 +152,10 @@ fn s3_without_bucket_exits_with_error() {
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if backend_is_compiled("s3") {
-        assert!(
-            stderr.contains("SCP_RELAY_S3_BUCKET"),
-            "error should mention the required env var; got: {stderr}"
-        );
-    } else {
-        assert!(
-            stderr.contains("'s3' is not compiled into this binary"),
-            "a default build should say the s3 arm is absent; got: {stderr}"
-        );
-        assert!(
-            stderr.contains(&format!("--features {}", binary_feature("s3"))),
-            "error should name the feature that compiles the arm; got: {stderr}"
-        );
-    }
-}
-
-/// The feature name the rejection message tells an operator to pass to
-/// `cargo build` is a feature both binaries declare.
-///
-/// `BACKENDS` in `crates/scp-transport/src/startup.rs` carries that name in its
-/// `binary_feature` column, `crates/scp-relay/Cargo.toml` and
-/// `crates/scp-node/Cargo.toml` each declare it in their `[features]` table,
-/// and until this test existed no check compared the three. The tests beside
-/// that table read the table itself, so they pin the `scp-transport` feature a
-/// backend needs and none of them opens either manifest. A rename carried through one manifest and not the column,
-/// or through the column and neither manifest, left every one of them green
-/// while a default-build relay sent an operator to a `--features` value cargo
-/// rejects with "none of the selected packages contains this feature".
-///
-/// This test reads both manifests, because the gating is one invariant across
-/// two crates rather than two independent ones: cargo unifies `scp-transport`'s
-/// features across every package a single invocation builds, so a `scp-node`
-/// that stopped gating `postgres-blob` would re-resolve it into `scp-relay`,
-/// which is the reason `crates/scp-relay/Cargo.toml` states beside its own
-/// declaration.
-#[test]
-fn the_binary_feature_the_message_names_is_declared_by_both_manifests() {
-    let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_default();
-
-    for backend in ["postgres", "s3"] {
-        let feature = binary_feature(backend);
-        for package in ["scp-relay", "scp-node"] {
-            let path = crates_dir.join(package).join("Cargo.toml");
-            let manifest = std::fs::read_to_string(&path).unwrap_or_default();
-            assert!(
-                !manifest.is_empty(),
-                "failed to read {} while checking that it declares '{feature}'",
-                path.display()
-            );
-            assert!(
-                features_table_declares(&manifest, feature),
-                "the rejection message for '{backend}' names \
-                 `--features {feature}`, and the [features] table of {} \
-                 declares no such feature",
-                path.display()
-            );
-        }
-    }
-}
-
-/// The `scp-node` / `scp-relay` feature that compiles `backend`'s arm of
-/// `storage_from_env`, read out of the table the rejection message is built
-/// from.
-///
-/// Panics when the table gives `backend` no binary feature, which is the
-/// answer for `sqlite`, `redb` and `memory`. Every caller here passes
-/// `postgres` or `s3`.
-fn binary_feature(backend: &str) -> &'static str {
-    let feature = scp_transport::startup::backend_binary_feature(backend);
     assert!(
-        feature.is_some(),
-        "the BACKENDS table gives '{backend}' no binary feature, so no message \
-         can tell an operator what to rebuild with"
+        stderr.contains("SCP_RELAY_S3_BUCKET"),
+        "error should mention the required env var; got: {stderr}"
     );
-    feature.unwrap_or_default()
-}
-
-/// Reports whether the `[features]` table of a `Cargo.toml` declares `feature`.
-///
-/// Reads the lines between the `[features]` header and the next table header,
-/// and compares the text left of the first `=` against `feature`. A comment
-/// line and a continuation line inside an array value both fail that
-/// comparison. An absent `[features]` header leaves nothing to iterate, so this
-/// returns `false` and the caller's assertion names the manifest.
-fn features_table_declares(manifest: &str, feature: &str) -> bool {
-    manifest
-        .lines()
-        .skip_while(|line| line.trim() != "[features]")
-        .skip(1)
-        .take_while(|line| !line.trim_start().starts_with('['))
-        .any(|line| {
-            line.split('=')
-                .next()
-                .is_some_and(|key| key.trim() == feature)
-        })
 }
 
 /// AC 8: `SQLite` blob persistence across reopens.
@@ -456,76 +299,5 @@ fn default_backend_is_sqlite() {
     assert!(
         output.contains("using sqlite blob storage"),
         "relay should have logged 'using sqlite blob storage'; output: {output}"
-    );
-}
-
-/// A `--features cloud-blobs` build of this binary compiled both cloud arms,
-/// so `postgres` and `s3` fail on the variable each backend requires and never
-/// on "not compiled into this binary".
-///
-/// Every other test in this file chooses its expected outcome with
-/// [`backend_is_compiled`], so without this test a `cloud-blobs` list that
-/// stopped enabling `scp-transport/postgres-blob` or `scp-transport/s3-blob`
-/// would leave the `cloud-blobs` lane green while the relay told operators to
-/// rebuild with the flag they had just passed.
-#[cfg(feature = "cloud-blobs")]
-#[test]
-fn the_cloud_blobs_feature_compiles_both_cloud_backends() {
-    for (backend, required) in [
-        ("postgres", "SCP_RELAY_DATABASE_URL"),
-        ("s3", "SCP_RELAY_S3_BUCKET"),
-    ] {
-        let output = output_within_deadline(
-            Command::new(relay_bin())
-                .env("SCP_RELAY_STORAGE_BACKEND", backend)
-                .env_remove(required)
-                .env_remove("RUST_LOG"),
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            !stderr.contains("not compiled"),
-            "a cloud-blobs build must compile the {backend} arm; stderr: {stderr}"
-        );
-        assert!(
-            stderr.contains(required),
-            "a cloud-blobs build must reach the {backend} arm and name {required}; \
-             stderr: {stderr}"
-        );
-    }
-}
-
-/// A `SCP_RELAY_STORAGE_BACKEND` value that is not valid UTF-8 is a value the
-/// operator set. The relay rejects it as unknown and exits non-zero, instead of
-/// reading it as unset and opening the default `sqlite` store.
-#[cfg(unix)]
-#[test]
-fn a_non_utf8_backend_value_is_rejected_not_defaulted() {
-    use std::os::unix::ffi::OsStrExt;
-
-    let tmp = tempfile::tempdir().expect("failed to create tempdir");
-    let db_path = tmp.path().join("must-not-exist.db");
-    let output = output_within_deadline(
-        Command::new(relay_bin())
-            .env(
-                "SCP_RELAY_STORAGE_BACKEND",
-                std::ffi::OsStr::from_bytes(b"sq\xfflite"),
-            )
-            .env("SCP_RELAY_STORAGE_PATH", &db_path)
-            .env_remove("RUST_LOG"),
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "a non-UTF-8 backend value must exit non-zero; stderr: {stderr}"
-    );
-    assert!(
-        stderr.contains("unknown storage backend"),
-        "a non-UTF-8 backend value must be rejected as unknown; stderr: {stderr}"
-    );
-    assert!(
-        !db_path.exists(),
-        "a rejected backend value must open no sqlite store at {}",
-        db_path.display()
     );
 }

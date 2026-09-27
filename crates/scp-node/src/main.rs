@@ -126,44 +126,9 @@ fn parse_cli_from(
     }
 }
 
-/// Writes the usage text `--help` prints.
-///
-/// Two parts of the `ENVIRONMENT VARIABLES` section vary with the features this
-/// build resolved, and both read `scp_transport::startup` rather than naming a
-/// backend:
-///
-/// 1. The `SCP_RELAY_STORAGE_BACKEND` line interpolates
-///    [`scp_transport::startup::valid_backends`], the list
-///    `scp_transport::startup::storage_from_env` interpolates when it rejects a
-///    value, so the accepted list and the rejection message cannot disagree.
-/// 2. The three variables that configure the two cloud backends —
-///    `SCP_RELAY_DATABASE_URL`, `SCP_RELAY_S3_BUCKET` and `SCP_RELAY_S3_PREFIX`
-///    — print only when [`scp_transport::startup::backend_is_compiled`] answers
-///    that this build compiled the arm each one configures.
-///
-/// A list written out here drifts the moment a backend's gating feature
-/// changes: the backend line named `postgres` and `s3` unconditionally until
-/// `scp-node` put both behind its off-by-default `cloud-blobs` feature, so a
-/// default build told an operator to use a backend it then refused to
-/// construct, and the three cloud variables went on documenting how to
-/// configure `backend=postgres` two lines under a list that no longer offered
-/// `postgres`.
-fn help_text() -> String {
-    // Each string opens with a newline, so an absent backend leaves no blank
-    // line behind in the rendered help.
-    let postgres_vars = if startup::backend_is_compiled("postgres") {
-        "\n    SCP_RELAY_DATABASE_URL      PostgreSQL connection URL (required when backend=postgres)"
-    } else {
-        ""
-    };
-    let s3_vars = if startup::backend_is_compiled("s3") {
-        "\n    SCP_RELAY_S3_BUCKET         S3 bucket name (required when backend=s3)\
-         \n    SCP_RELAY_S3_PREFIX         S3 key prefix (default: blobs/)"
-    } else {
-        ""
-    };
-
-    format!(
+/// Prints usage information and exits with code 0.
+fn print_help() -> ! {
+    eprintln!(
         "\
 scp-node — SCP application node
 
@@ -215,14 +180,12 @@ ENVIRONMENT VARIABLES:
     SCP_STORAGE_KEY             Hex-encoded 32-byte SQLCipher encryption key
                                 (auto-generated and stored if not set)
     SCP_RELAY_BIND_ADDR         Relay bind address (default: 0.0.0.0:9000)
-    SCP_RELAY_STORAGE_BACKEND   Blob storage backend for relay, one of: {backends}
-                                (default: sqlite). On any other value the relay prints
-                                the cargo feature that compiles that backend, or reports
-                                the value as unknown, then exits 1. --self-host exits 1
-                                on postgres or s3; --ephemeral ignores the
-                                variable and keeps blobs in memory. See
-                                docs/guides/relay-operations.md for the cloud backends.
-    SCP_RELAY_STORAGE_PATH      Path for sqlite/redb blob storage (default: ./scp-relay.db){postgres_vars}{s3_vars}
+    SCP_RELAY_STORAGE_BACKEND   Blob storage backend for relay: sqlite (default), redb,
+                                postgres, s3 (both need --features cloud-blobs), memory
+    SCP_RELAY_STORAGE_PATH      Path for sqlite/redb blob storage (default: ./scp-relay.db)
+    SCP_RELAY_DATABASE_URL      PostgreSQL connection URL (required when backend=postgres)
+    SCP_RELAY_S3_BUCKET         S3 bucket name (required when backend=s3)
+    SCP_RELAY_S3_PREFIX         S3 key prefix (default: blobs/)
     SCP_RELAY_MAX_BLOB_SIZE     Max blob size in bytes (default: 262144)
     SCP_RELAY_MAX_BLOB_TTL      Max blob TTL in seconds (default: 604800)
     SCP_RELAY_MAX_CONNECTIONS   Max total connections (default: 1000)
@@ -230,14 +193,8 @@ ENVIRONMENT VARIABLES:
     SCP_RELAY_RATE_LIMIT        Publish rate limit per second (default: 100)
     SCP_RELAY_LOG_LEVEL         Log level (default: info)
     SCP_RELAY_LOG_FORMAT        Log format: 'json' or 'pretty' (default: pretty)
-    RUST_LOG                    Override log level (takes precedence over SCP_RELAY_LOG_LEVEL)",
-        backends = startup::valid_backends()
-    )
-}
-
-/// Prints usage information and exits with code 0.
-fn print_help() -> ! {
-    eprintln!("{}", help_text());
+    RUST_LOG                    Override log level (takes precedence over SCP_RELAY_LOG_LEVEL)"
+    );
     std::process::exit(0);
 }
 
@@ -512,26 +469,6 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     let domain = require_domain();
     let http_addr = node_http_addr();
 
-    // Every environment value this function rejects is read here, before the
-    // storage directory, the root key file, the two SQLCipher databases, or
-    // the blob store exist, so a rejected value exits with nothing written.
-    // Explicit parse: a typo (e.g. "memroy") must NOT silently fall through to
-    // the production DHT, which would publish the host's address to the
-    // network. `disabled` is a `--self-host` value: a full relay node must
-    // publish its DID to be discoverable.
-    let dht_mode = parse_dht_mode_or_exit();
-    if matches!(dht_mode, scp_node::DhtMode::Disabled) {
-        tracing::error!(
-            "DhtMode::Disabled is not a full-relay-node mode — the node must publish its DID. \
-             Use --self-host for a non-publishing hosted site."
-        );
-        std::process::exit(1);
-    }
-    // `SCP_RELAY_STORAGE_BACKEND`: a backend this build did not compile, an
-    // unknown value, or a missing required variable.
-    startup::check_storage_selection_from_env();
-    // `tests/storage_backend_selection.rs` pins both checks to this position.
-
     // Validate the storage path upfront before attempting to open databases.
     let resolved_path = resolve_storage_path_or_exit(storage_path);
     validate_storage_path_or_exit(&resolved_path);
@@ -543,16 +480,6 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // is alive would fail with an advisory-lock conflict (os error 35).
     let (storage_dir, _storage_key, node_storage_arc, custody) =
         init_persistent_storage(storage_path).await;
-
-    // Persistent mode: operator-configured durable blob backend (default
-    // SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` / `SCP_RELAY_STORAGE_PATH`
-    // — the same explicit selection relay-only mode makes (SCP-CAPINJECT-010).
-    // The selection was checked above; this call opens the store. It runs after
-    // the node storage exists, so a failure of the open itself (an unreachable
-    // database, an unwritable blob path) leaves the node's key file, which the
-    // next start reads back, and a failure of the node storage leaves no blob
-    // database.
-    let blob_storage = startup::storage_from_env().await;
 
     tracing::info!(
         domain = %domain,
@@ -569,10 +496,19 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
         scp_node::self_host::StorageSequenceStore::new(Arc::clone(&node_storage_arc)),
     );
 
-    match dht_mode {
-        // Rejected before any storage was written, above; this arm keeps the
-        // match exhaustive and fails closed if ever reached.
-        scp_node::DhtMode::Disabled => std::process::exit(1),
+    // Explicit parse: a typo (e.g. "memroy") must NOT silently fall through to
+    // the production DHT, which would publish the host's address to the network.
+    match parse_dht_mode_or_exit() {
+        // `parse_dht_mode_or_exit` never returns `Disabled` for the full relay
+        // node (it exits with guidance to use `--self-host`); this arm exists
+        // only to keep the match exhaustive and fails closed if ever reached.
+        scp_node::DhtMode::Disabled => {
+            tracing::error!(
+                "DhtMode::Disabled is not a full-relay-node mode — the node must publish its DID. \
+                 Use --self-host for a non-publishing hosted site."
+            );
+            std::process::exit(1);
+        }
         #[cfg(feature = "testing")]
         scp_node::DhtMode::Memory => {
             tracing::warn!(
@@ -592,7 +528,11 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 custody,
                 did_method,
                 Arc::clone(&node_storage_arc),
-                blob_storage,
+                // Persistent mode: operator-configured durable blob backend
+                // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
+                // `SCP_RELAY_STORAGE_PATH` — the same explicit selection
+                // relay-only mode makes (SCP-CAPINJECT-010).
+                startup::storage_from_env().await,
             )
             .await;
         }
@@ -620,7 +560,10 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 custody,
                 did_method,
                 Arc::clone(&node_storage_arc),
-                blob_storage,
+                // Persistent mode: operator-configured durable blob backend
+                // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
+                // `SCP_RELAY_STORAGE_PATH` (SCP-CAPINJECT-010).
+                startup::storage_from_env().await,
             )
             .await;
         }
@@ -767,21 +710,17 @@ fn env_flag_is_truthy(value: Option<&str>) -> bool {
 }
 
 /// Writes the error `--self-host` exits with when `SCP_RELAY_STORAGE_BACKEND`
-/// names `postgres` or `s3`, or returns `None`.
+/// names `postgres` or `s3`, or returns `None` for every other value.
 ///
-/// `--self-host` opens its blob store with `SQLite` under its storage directory
-/// and constructs no other backend, so a `postgres` or `s3` selection would
-/// otherwise be dropped and the operator would get a `SQLite` store in place of
-/// the cloud store selected, which §17.7 of the persistence spec forbids. The
-/// rejected set is every backend a binary cargo feature gates
-/// ([`startup::backend_binary_feature`]), matched case-insensitively as the
-/// full node matches it, and it is the same in every build, because
-/// `--self-host` opens neither cloud store even when `cloud-blobs` compiles it.
-/// Every other value, `redb` and `memory` included, leaves `--self-host`
-/// running on `SQLite` as it ran before `cloud-blobs` existed.
+/// `--self-host` opens only a `SQLite` blob store, in every build. Without this
+/// check, an operator who selected `postgres` or `s3` would get a `SQLite`
+/// store in its place. Every other value leaves `--self-host` on `SQLite`, as
+/// it ran before `cloud-blobs` existed.
 fn self_host_backend_conflict(selected: Option<&str>) -> Option<String> {
     let value = selected?;
-    startup::backend_binary_feature(&value.to_lowercase())?;
+    if !matches!(value.to_lowercase().as_str(), "postgres" | "s3") {
+        return None;
+    }
     Some(format!(
         "error: --self-host stores blobs in SQLite under its storage directory and \
          cannot use SCP_RELAY_STORAGE_BACKEND='{value}'. Unset the variable, or run \
@@ -806,8 +745,8 @@ fn self_host_backend_conflict(selected: Option<&str>) -> Option<String> {
 /// (share it out-of-band). `memory` is valid with NAT probing on or off. See the
 /// startup banner.
 async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf>) {
-    // Checked before the banner, the sockets and the storage directory exist.
-    if let Some(message) = self_host_backend_conflict(startup::storage_backend_var().as_deref()) {
+    let selected = std::env::var("SCP_RELAY_STORAGE_BACKEND").ok();
+    if let Some(message) = self_host_backend_conflict(selected.as_deref()) {
         eprintln!("{message}");
         std::process::exit(1);
     }
@@ -1221,109 +1160,10 @@ async fn main() {
 mod tests {
     use super::*;
 
-    /// `--help` offers exactly the blob backends this build compiled, because
-    /// the help text interpolates the same `startup::valid_backends()` that
-    /// `startup::storage_from_env` interpolates when it rejects a value.
-    ///
-    /// `startup.rs` declares each backend's gating feature once, in its
-    /// `BACKENDS` table, and its tests read that table, so none of them reaches
-    /// this binary's help text. That help text held its own
-    /// hardcoded list of backend names until this assertion existed, which is
-    /// the drift that made a default build print `postgres` among the accepted
-    /// values while `storage_from_env` refused to construct it.
-    ///
-    /// The assertion goes red when someone writes the names out here again in
-    /// any build that leaves a backend feature off, because the hardcoded list
-    /// then offers a name `valid_backends()` omits. Job rust-test in
-    /// `.github/workflows/ci.yml` runs this test at default features, where
-    /// `postgres-blob` and `s3-blob` are both off, so a hardcoded five-name
-    /// list fails there. A build that resolves both cloud features makes
-    /// `valid_backends()` equal that same five-name list, and this assertion
-    /// cannot separate an interpolation from a literal that matches it, so it
-    /// passes in that configuration either way. It stays green when a new
-    /// backend joins the `BACKENDS` table, because the help text and the
-    /// expectation read the one function.
+    /// `--self-host` rejects `postgres` and `s3` in any case, and leaves every
+    /// other value to run on `SQLite` as before.
     #[test]
-    fn the_help_text_offers_exactly_the_backends_this_build_compiled() {
-        let help = help_text();
-        let derived = format!(
-            "Blob storage backend for relay, one of: {}",
-            startup::valid_backends()
-        );
-
-        assert!(
-            help.contains(&derived),
-            "the --help line for SCP_RELAY_STORAGE_BACKEND must interpolate \
-             startup::valid_backends(), so it names a backend exactly when this \
-             build compiled that backend's constructor; expected a line \
-             reading '{derived}', and the help text read:\n{help}"
-        );
-    }
-
-    /// `--help` documents a cloud backend's configuration variables exactly when
-    /// this build compiled that backend's arm of `startup::storage_from_env`.
-    ///
-    /// The three lines below `SCP_RELAY_STORAGE_PATH` described how to
-    /// configure `backend=postgres` and `backend=s3` in every build, including
-    /// the default build whose `SCP_RELAY_STORAGE_BACKEND` line two lines above
-    /// them offers neither value and whose relay exits 1 on either. An operator
-    /// who read `SCP_RELAY_DATABASE_URL` as available set it, set the backend,
-    /// and got "'postgres' is not compiled into this binary".
-    ///
-    /// Each assertion is an equality rather than a presence check, so it fails
-    /// in both directions: a line reinstated unconditionally fails at default
-    /// features, and a line dropped from a `cloud-blobs` build fails there. Job
-    /// rust-test-optional-features in `.github/workflows/ci.yml` runs this
-    /// binary's unit tests under `--features cloud-blobs`, which is the lane
-    /// that reaches the second direction.
-    #[test]
-    fn the_help_text_documents_a_cloud_backend_only_when_it_is_compiled() {
-        let help = help_text();
-
-        assert_eq!(
-            help.contains("SCP_RELAY_DATABASE_URL"),
-            startup::backend_is_compiled("postgres"),
-            "--help must document SCP_RELAY_DATABASE_URL exactly when this \
-             build compiled the postgres arm; the help text read:\n{help}"
-        );
-
-        for var in ["SCP_RELAY_S3_BUCKET", "SCP_RELAY_S3_PREFIX"] {
-            assert_eq!(
-                help.contains(var),
-                startup::backend_is_compiled("s3"),
-                "--help must document {var} exactly when this build compiled \
-                 the s3 arm; the help text read:\n{help}"
-            );
-        }
-
-        // A conditional line is spliced into the format string rather than
-        // written in it, so the splice carries the four-space indent every
-        // other ENVIRONMENT VARIABLES line starts with, and leaves no blank
-        // line behind when a backend is absent.
-        for var in [
-            "SCP_RELAY_DATABASE_URL",
-            "SCP_RELAY_S3_BUCKET",
-            "SCP_RELAY_S3_PREFIX",
-        ] {
-            assert_eq!(
-                help.contains(&format!("\n    {var}")),
-                help.contains(var),
-                "{var} must start at the same column as every other \
-                 environment variable; the help text read:\n{help}"
-            );
-        }
-        assert!(
-            !help.contains("\n\n    SCP_RELAY_MAX_BLOB_SIZE"),
-            "an absent cloud backend must leave no blank line behind; the help \
-             text read:\n{help}"
-        );
-    }
-
-    /// `--self-host` opens only `SQLite`, so it rejects `postgres` and `s3` in
-    /// any case with a message naming the value, and leaves every other value,
-    /// which it ignored before `cloud-blobs` existed, to run on `SQLite`.
-    #[test]
-    fn self_host_rejects_a_backend_it_does_not_open() {
+    fn self_host_rejects_a_cloud_backend() {
         for value in ["postgres", "s3", "POSTGRES", "S3"] {
             let message = self_host_backend_conflict(Some(value));
             assert!(
@@ -1334,20 +1174,8 @@ mod tests {
             );
         }
         assert_eq!(self_host_backend_conflict(None), None);
-        for value in [
-            "sqlite",
-            "SQLite",
-            "redb",
-            "memory",
-            "banana",
-            "",
-            "sq\u{fffd}lite",
-        ] {
-            assert_eq!(
-                self_host_backend_conflict(Some(value)),
-                None,
-                "--self-host must keep running on SQLite for '{value}', as it did on main"
-            );
+        for value in ["sqlite", "redb", "memory", "banana"] {
+            assert_eq!(self_host_backend_conflict(Some(value)), None, "{value}");
         }
     }
 
