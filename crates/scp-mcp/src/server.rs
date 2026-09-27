@@ -128,9 +128,10 @@ impl ResourceKind {
     /// definition:
     ///
     /// - [`Self::Events`] and [`Self::Members`] require `messages:read`. Per
-    ///   spec §5.3.1's role table an `observer`, whose sole capability is
-    ///   `messages:read`, "can see all content and membership", so that grant
-    ///   is the authority to read the event stream and the roster.
+    ///   the contexts spec's role table (§5.5.1, Default Role Set) an
+    ///   `observer`, whose sole capability is `messages:read`, "can see all
+    ///   content and membership", so that grant is the authority to read the
+    ///   event stream and the roster.
     /// - [`Self::Tools`] requires membership only. Its contents are the
     ///   capability-filtered tool list, so a member with no tool capabilities
     ///   reads `[]` instead of a denial.
@@ -322,10 +323,11 @@ pub trait ContextProvider: Send + Sync {
     /// and MUST be answered from real context state, not stubbed:
     ///
     /// - [`ResourceKind::Events`] and [`ResourceKind::Members`] project the
-    ///   context's event stream and roster. Per spec §5.3.1's role table an
-    ///   `observer` — whose only capability is `messages:read` — "can see all
-    ///   content and membership", so `Capability::MessagesRead` is the grant
-    ///   these two require.
+    ///   context's event stream and roster. Per the contexts spec's role
+    ///   table (§5.5.1, Default Role Set) an `observer` — whose only
+    ///   capability is `messages:read` — "can see all content and
+    ///   membership", so `Capability::MessagesRead` is the grant these two
+    ///   require.
     /// - [`ResourceKind::Tools`] needs no separate grant: its *contents* are
     ///   the same capability-filtered list `tools/list` returns, so an agent
     ///   with no tool capabilities reads an empty array rather than being
@@ -413,8 +415,9 @@ pub struct McpServer<P: ContextProvider> {
     /// context this client never saw". A `Mutex` because the pump holds
     /// `&self`.
     served_contexts: std::sync::Mutex<HashSet<ContextId>>,
-    /// The [`ContextView`] of each served context as of the last list
-    /// response, subscribe, or notification that told the client about it.
+    /// The [`ContextView`] of each served context as the client last saw
+    /// it: `tools/list` writes the tools half, `resources/list` the readable
+    /// half, and a pump evaluation both halves (see [`Self::record_view`]).
     ///
     /// [`Self::notifications_for_event`] sends the `tools/list_changed` +
     /// `resources/list_changed` pair and the `scp://{ctx}/tools` update only
@@ -612,7 +615,8 @@ impl<P: ContextProvider> McpServer<P> {
     /// [`Self::handle_request`] with nothing delivering notifications. It is
     /// therefore public only under this crate's `testing` feature, which the
     /// bridges enable for their own unit tests and no shipped artifact
-    /// resolves; everywhere else it is crate-private.
+    /// resolves. Every other build does not compile it, and
+    /// `wired_pair` is the crate-private constructor there.
     #[cfg(any(test, feature = "testing"))]
     pub fn with_event_source(
         provider: P,
@@ -882,11 +886,22 @@ impl<P: ContextProvider> McpServer<P> {
             Err(msg) => return internal_error(request.id.clone(), &msg),
         };
         let mut tools: Vec<ToolDefinition> = Vec::new();
-        for context_id in served {
-            match self.visible_tools(&context_id) {
-                Ok(visible) => tools.extend(visible),
+        let mut listed: Vec<(&ContextId, Value)> = Vec::new();
+        for context_id in &served {
+            match self.visible_tools(context_id) {
+                Ok(visible) => {
+                    if let Ok(value) = serde_json::to_value(&visible) {
+                        listed.push((context_id, value));
+                    }
+                    tools.extend(visible);
+                }
                 Err(msg) => return internal_error(request.id.clone(), &msg),
             }
+        }
+        // Record the tools half of each context's view only, because this
+        // response carries no resource list.
+        for (context_id, value) in listed {
+            self.record_view(&served, context_id, |view| view.tools = value);
         }
 
         let result = ToolsListResult {
@@ -1093,7 +1108,9 @@ impl<P: ContextProvider> McpServer<P> {
             Ok(served) => served,
             Err(msg) => return internal_error(request.id.clone(), &msg),
         };
+        let mut listed: Vec<(&ContextId, Vec<ResourceKind>)> = Vec::new();
         for context_id in &served {
+            let mut readable = Vec::new();
             for kind in RESOURCE_KINDS {
                 match self.resource_access(&served, context_id, kind) {
                     Ok(()) => {}
@@ -1102,6 +1119,7 @@ impl<P: ContextProvider> McpServer<P> {
                     }
                     Err(ResourceDenial::NotParticipant | ResourceDenial::Denied(_)) => continue,
                 }
+                readable.push(kind);
                 resources.push(ResourceDefinition {
                     uri: kind.uri(context_id),
                     name: format!("{context_id} {}", kind.display_name()),
@@ -1109,6 +1127,12 @@ impl<P: ContextProvider> McpServer<P> {
                     mime_type: Some("application/json".to_owned()),
                 });
             }
+            listed.push((context_id, readable));
+        }
+        // Record the readable half of each context's view only, because this
+        // response carries no tool list.
+        for (context_id, readable) in listed {
+            self.record_view(&served, context_id, |view| view.readable = readable);
         }
 
         let result = ResourcesListResult {
@@ -1271,11 +1295,13 @@ impl<P: ContextProvider> McpServer<P> {
         }
 
         self.subscriptions.insert(params.uri);
-        // Record the context's view, so a later event notifies this client
-        // only when that view changes. A failed read records nothing, which
-        // makes the next event notify.
+        // The subscribe response carries neither list, so it overwrites no
+        // recorded half. It records a view only when none is recorded, which
+        // means the client holds neither list of this context and no cached
+        // list can go stale. A failed read records nothing, which makes the
+        // next event notify.
         if let Ok(served) = self.provider.active_context_ids() {
-            self.refresh_view(&served, &context_id);
+            self.record_view(&served, &context_id, |_| {});
         }
 
         JsonRpcResponse::success(
@@ -1574,10 +1600,53 @@ impl<P: ContextProvider> McpServer<P> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extend(active.iter().cloned());
-        for context_id in &active {
-            self.refresh_view(&active, context_id);
-        }
         Ok(active)
+    }
+
+    /// Applies `listed` to the [`ContextView`] recorded for `context_id`.
+    /// `listed` writes the half of the view that a response just gave the
+    /// client, and nothing else.
+    ///
+    /// When no view is recorded, the client holds no list of this context
+    /// from this session, so this first records the provider's current view
+    /// and then applies `listed`. A half recorded that way cannot hide a
+    /// change from the client, because the client has no cached list of that
+    /// half. When the current view cannot be read, nothing is recorded, and
+    /// the next event notifies.
+    ///
+    /// A handler must never overwrite a half its response did not carry: the
+    /// pump compares the recorded view with the current one, so a half
+    /// refreshed without the client re-reading it would suppress the
+    /// list-changed pair for a change the client never saw.
+    fn record_view(
+        &self,
+        served: &[ContextId],
+        context_id: &str,
+        listed: impl FnOnce(&mut ContextView),
+    ) {
+        let recorded = self
+            .client_views
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(context_id);
+        let fresh = if recorded {
+            None
+        } else {
+            match self.context_view(served, context_id) {
+                Some(view) => Some(view),
+                None => return,
+            }
+        };
+        let mut views = self
+            .client_views
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(view) = fresh {
+            views.insert(context_id.to_owned(), view);
+        }
+        if let Some(view) = views.get_mut(context_id) {
+            listed(view);
+        }
     }
 
     /// Reads `context_id`'s current [`ContextView`], records it in
@@ -3446,6 +3515,83 @@ mod tests {
                 .notifications_for_event("ctx_a", &members_and_tools_event())
                 .is_empty(),
             "an unchanged view must not produce the list-changed pair or a tools update"
+        );
+    }
+
+    fn list_changed_pair_sent(notifs: &[JsonRpcNotification]) -> bool {
+        let methods: Vec<&str> = notifs.iter().map(|n| n.method.as_str()).collect();
+        methods.contains(&protocol::METHOD_TOOLS_LIST_CHANGED)
+            && methods.contains(&protocol::METHOD_RESOURCES_LIST_CHANGED)
+    }
+
+    /// The actor applies a capability change before the pump sees its event,
+    /// so a request can be served in between. A `resources/list` or a
+    /// `resources/subscribe` in that window gives the client no tool list,
+    /// and must leave the tool change for the pump to announce.
+    #[test]
+    fn a_request_without_the_tool_list_does_not_absorb_a_tool_change() {
+        for absorb in ["resources/list", "resources/subscribe"] {
+            let mut server = subscribing_server(MockProvider::default());
+            let list = make_request(protocol::METHOD_TOOLS_LIST, None);
+            assert!(server.handle_request(&list).unwrap().error.is_none());
+
+            // The grant changes before the pump evaluates its event.
+            server
+                .provider
+                .denied_capabilities
+                .push(("ctx_a".to_owned(), BUILTIN_TOOLS[0].tool_name().to_owned()));
+            if absorb == "resources/list" {
+                let req = make_request(protocol::METHOD_RESOURCES_LIST, None);
+                assert!(server.handle_request(&req).unwrap().error.is_none());
+            } else {
+                subscribe(&mut server, "scp://ctx_a/events");
+            }
+
+            let notifs = server.notifications_for_event("ctx_a", &members_and_tools_event());
+            assert!(
+                list_changed_pair_sent(&notifs),
+                "{absorb} must not absorb a tool change the client never re-read"
+            );
+        }
+    }
+
+    /// The mirror case: a `tools/list` gives the client no resource list, so
+    /// it must leave a change to the readable resource kinds for the pump to
+    /// announce.
+    #[test]
+    fn a_tool_list_does_not_absorb_a_readable_resource_change() {
+        let mut server = subscribing_server(MockProvider::default());
+        let list = make_request(protocol::METHOD_RESOURCES_LIST, None);
+        assert!(server.handle_request(&list).unwrap().error.is_none());
+
+        server
+            .provider
+            .denied_resources
+            .push(("ctx_a".to_owned(), ResourceKind::Members));
+        let tools = make_request(protocol::METHOD_TOOLS_LIST, None);
+        assert!(server.handle_request(&tools).unwrap().error.is_none());
+
+        let notifs = server.notifications_for_event("ctx_a", &members_and_tools_event());
+        assert!(
+            list_changed_pair_sent(&notifs),
+            "tools/list must not absorb a resource change the client never re-read"
+        );
+    }
+
+    /// A list response records the half it carried, so a later event that
+    /// changes nothing the client holds stays silent.
+    #[test]
+    fn an_event_after_both_lists_with_no_change_is_silent() {
+        let mut server = subscribing_server(MockProvider::default());
+        for method in [protocol::METHOD_TOOLS_LIST, protocol::METHOD_RESOURCES_LIST] {
+            let req = make_request(method, None);
+            assert!(server.handle_request(&req).unwrap().error.is_none());
+        }
+        assert!(
+            !list_changed_pair_sent(
+                &server.notifications_for_event("ctx_a", &members_and_tools_event())
+            ),
+            "an unchanged view must not produce the list-changed pair"
         );
     }
 

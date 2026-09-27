@@ -1162,113 +1162,103 @@ mod tests {
         assert!(pump.is_none(), "no event source means no pump");
     }
 
+    /// Posts `body` through the shipped [`message_handler`] as the live
+    /// session, and returns the HTTP status it answers.
+    async fn post(state: &Arc<AppState<MockProvider>>, body: serde_json::Value) -> StatusCode {
+        message_handler(
+            State(Arc::clone(state)),
+            session(TEST_SESSION),
+            body.to_string(),
+        )
+        .await
+        .into_response()
+        .status()
+    }
+
+    fn initialize_body(id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": METHOD_INITIALIZE,
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test" }
+            },
+            "id": id
+        })
+    }
+
+    /// Reads the next broadcast frame as a JSON-RPC response.
+    async fn next_response(
+        rx: &mut tokio::sync::broadcast::Receiver<(u64, String)>,
+    ) -> JsonRpcResponse {
+        let (_id, json) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("message_handler broadcast no response")
+            .expect("the broadcast channel closed");
+        serde_json::from_str(&json).expect("the broadcast frame is not a JSON-RPC response")
+    }
+
+    fn nothing_broadcast(rx: &mut tokio::sync::broadcast::Receiver<(u64, String)>) -> bool {
+        matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        )
+    }
+
     #[tokio::test]
     async fn message_handler_processes_initialize() {
         let state = test_state();
         let mut rx = state.notifier.tx.subscribe();
 
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": METHOD_INITIALIZE,
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": { "name": "test" }
-            },
-            "id": 1
-        })
-        .to_string();
+        assert_eq!(post(&state, initialize_body(1)).await, StatusCode::ACCEPTED);
 
-        let response = match parse_sse_incoming(&body).unwrap() {
-            SseIncoming::Request(req) => {
-                let mut srv = state.server.lock().await;
-                srv.handle_request(&req)
-            }
-            SseIncoming::Notification(_) => None,
-        };
-
-        assert!(response.is_some());
-        let resp = response.unwrap();
+        let resp = next_response(&mut rx).await;
+        assert!(resp.error.is_none(), "initialize failed: {:?}", resp.error);
         assert!(resp.result.is_some());
         assert_eq!(resp.id, RequestId::Number(1));
-
-        let json = serde_json::to_string(&resp).unwrap();
-        state.notifier.broadcast(json.clone());
-
-        let (_id, received) = rx.recv().await.unwrap();
-        assert_eq!(received, json);
+        assert!(state.server.lock().await.is_initialized());
     }
 
     #[tokio::test]
     async fn message_handler_processes_ping() {
         let state = test_state();
+        let mut rx = state.notifier.tx.subscribe();
 
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": METHOD_PING,
-            "id": 42
-        })
-        .to_string();
+        let ping = serde_json::json!({ "jsonrpc": "2.0", "method": METHOD_PING, "id": 42 });
+        assert_eq!(post(&state, ping).await, StatusCode::ACCEPTED);
 
-        let response = match parse_sse_incoming(&body).unwrap() {
-            SseIncoming::Request(req) => {
-                let mut srv = state.server.lock().await;
-                srv.handle_request(&req)
-            }
-            SseIncoming::Notification(_) => None,
-        };
-
-        let resp = response.unwrap();
+        let resp = next_response(&mut rx).await;
         assert!(resp.result.is_some());
         assert_eq!(resp.id, RequestId::Number(42));
     }
 
+    /// A notification puts nothing on the stream, even when the server
+    /// answers its synthetic request with an error: before `initialize`, the
+    /// server rejects every method but `initialize` and `ping`, and
+    /// `message_handler` must discard that rejection.
     #[tokio::test]
     async fn message_handler_handles_notification() {
         let state = test_state();
+        let mut rx = state.notifier.tx.subscribe();
+        let initialized = serde_json::json!({ "jsonrpc": "2.0", "method": METHOD_INITIALIZED });
 
-        let init_body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": METHOD_INITIALIZE,
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": { "name": "test" }
-            },
-            "id": 0
-        })
-        .to_string();
-        if let SseIncoming::Request(req) = parse_sse_incoming(&init_body).unwrap() {
-            let mut srv = state.server.lock().await;
-            srv.handle_request(&req);
-        }
+        assert_eq!(
+            post(&state, initialized.clone()).await,
+            StatusCode::ACCEPTED
+        );
+        assert!(
+            nothing_broadcast(&mut rx),
+            "a notification must not put the server's rejection on the stream"
+        );
 
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": METHOD_INITIALIZED
-        })
-        .to_string();
-
-        let result = match parse_sse_incoming(&body).unwrap() {
-            SseIncoming::Request(req) => {
-                let mut srv = state.server.lock().await;
-                srv.handle_request(&req)
-            }
-            SseIncoming::Notification(notif) => {
-                let synthetic_id = state.notifier.next_id();
-                let synthetic = JsonRpcRequest {
-                    jsonrpc: notif.jsonrpc,
-                    method: notif.method,
-                    params: notif.params,
-                    id: RequestId::Number(synthetic_id.cast_signed()),
-                };
-                let mut srv = state.server.lock().await;
-                srv.handle_request(&synthetic);
-                None
-            }
-        };
-
-        assert!(result.is_none());
+        assert_eq!(post(&state, initialize_body(0)).await, StatusCode::ACCEPTED);
+        next_response(&mut rx).await;
+        assert_eq!(post(&state, initialized).await, StatusCode::ACCEPTED);
+        assert!(
+            nothing_broadcast(&mut rx),
+            "a notification must not put a response on the stream"
+        );
     }
 
     #[test]
@@ -2012,51 +2002,30 @@ mod tests {
 
     // -- Synthetic request IDs ------------------------------------------------
 
+    /// `message_handler` draws each notification's synthetic request id from
+    /// the event-id counter, so two notifications take two distinct ids and
+    /// broadcast nothing.
     #[tokio::test]
     async fn synthetic_notification_ids_are_unique() {
         let state = test_state();
+        let mut rx = state.notifier.tx.subscribe();
+        assert_eq!(post(&state, initialize_body(0)).await, StatusCode::ACCEPTED);
+        next_response(&mut rx).await;
 
-        // Send two notifications and verify the counter advances
-        let init_body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": METHOD_INITIALIZE,
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": { "name": "test" }
-            },
-            "id": 0
-        })
-        .to_string();
-        if let SseIncoming::Request(req) = parse_sse_incoming(&init_body).unwrap() {
-            let mut srv = state.server.lock().await;
-            srv.handle_request(&req);
+        let before = state.notifier.next_event_id.load(Ordering::SeqCst);
+        let initialized = serde_json::json!({ "jsonrpc": "2.0", "method": METHOD_INITIALIZED });
+        for _ in 0..2 {
+            assert_eq!(
+                post(&state, initialized.clone()).await,
+                StatusCode::ACCEPTED
+            );
         }
-
-        // First notification uses next_event_id (starts at 1)
-        let id1 = state.notifier.next_event_id.load(Ordering::SeqCst);
-        let notif_body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": METHOD_INITIALIZED
-        })
-        .to_string();
-        if let SseIncoming::Notification(notif) = parse_sse_incoming(&notif_body).unwrap() {
-            let synthetic_id = state.notifier.next_id();
-            assert_eq!(synthetic_id, id1);
-
-            // Verify the ID is correctly assigned
-            let request = JsonRpcRequest {
-                jsonrpc: notif.jsonrpc,
-                method: notif.method,
-                params: notif.params,
-                id: RequestId::Number(synthetic_id.cast_signed()),
-            };
-            assert_eq!(request.id, RequestId::Number(id1.cast_signed()));
-        }
-
-        // Second call produces a different ID
-        let id2 = state.notifier.next_event_id.fetch_add(1, Ordering::SeqCst);
-        assert_ne!(id1, id2);
+        assert_eq!(
+            state.notifier.next_event_id.load(Ordering::SeqCst),
+            before + 2,
+            "each notification must draw exactly one fresh id"
+        );
+        assert!(nothing_broadcast(&mut rx));
     }
 
     // -- Session reset sequencing ---------------------------------------------
