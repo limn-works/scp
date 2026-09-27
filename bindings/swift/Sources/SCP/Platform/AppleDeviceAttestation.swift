@@ -235,7 +235,8 @@
         /// 2. Computes `clientDataHash = SHA-256(clientDataJSON)` where
         ///    `clientDataJSON = {"challenge":"<b64>","deviceId":"<b64>","type":"scp-device-attestation-v1"}`.
         /// 3. Calls `DCAppAttestService.attestKey(_:clientDataHash:)`.
-        /// 4. Returns the raw CBOR attestation bytes.
+        /// 4. Returns the 32-byte key identifier, base64-decoded, followed by
+        ///    the raw CBOR attestation-object bytes Apple signed.
         ///
         /// On simulator or on a device where App Attest is unavailable, this
         /// method throws `AttestationError.unsupported` and returns no bytes.
@@ -243,7 +244,8 @@
         /// - Parameters:
         ///   - challenge: Server-issued random challenge bytes.
         ///   - deviceId: Stable device/identity identifier bytes.
-        /// - Returns: Raw CBOR attestation-object bytes that Apple signed.
+        /// - Returns: The 32-byte App Attest key identifier followed by the raw
+        ///   CBOR attestation-object bytes that Apple signed.
         /// - Throws: `AttestationError.unsupported` when
         ///   `DCAppAttestService.isSupported` is `false`.
         ///   `AttestationError.keyAlreadyAttested` when Apple already attested
@@ -256,6 +258,8 @@
         ///   App Attest service; this method keeps that key, so a retry reaches
         ///   Apple with a key Apple already saw.
         ///   `AttestationError.serviceError` for every other App Attest error.
+        ///   `AttestationError.internalError` when the stored key ID does not
+        ///   base64-decode to 32 bytes; this method then never calls Apple.
         ///   `classify(_:keyId:operation:)` states which condition each
         ///   `DCError.invalidKey` maps to.
         func attestReportingAttestationError(
@@ -286,7 +290,15 @@
                 } catch {
                     return .failure(.serviceError(error.localizedDescription))
                 }
+                // Clause 5 of ADR-025 acceptance criterion 3 compares the
+                // credential ID against this 32-byte identifier, so the token
+                // carries it ahead of the attestation object. The check runs
+                // before `attestKey`, because Apple attests a key once.
+                guard let keyIdBytes = Data(base64Encoded: keyId), keyIdBytes.count == 32 else {
+                    return .failure(.internalError("the App Attest key ID does not base64-decode to 32 bytes"))
+                }
                 return await self.requestAttestation(keyId: keyId, clientDataHash: clientDataHash)
+                    .map { keyIdBytes + $0 }
             }
             return try outcome.get()
         }
