@@ -2951,21 +2951,10 @@ fn b3_webhook_dispatch_wired() {
 /// `notifications/resources/updated` — a false guarantee on a shipped path,
 /// plus a three-way divergence between bridges.
 ///
-/// # Why this is no longer a source-text gate
+/// # What the types enforce and what this test checks
 ///
-/// The first fix derived the advertisement from a `subscriptions_enabled` bool
-/// that a public `enable_subscriptions()` setter could flip on any server, so
-/// three `str::contains` assertions stood in for the invariant: that the flag
-/// was never hard-coded, that the provider seam stayed deleted, and that both
-/// transports called the setter next to the pump. Those were a weaker,
-/// source-text restatement of a property the type system can hold outright,
-/// which `CLAUDE.md` names as an anti-pattern ("Enforce mechanically … the type
-/// system — not documentation") and which the ast-gate lesson calls
-/// non-convergent.
-///
-/// One crate-private `scp-mcp` constructor now returns `(McpServer,
-/// ContextEventPump)` and is the *only* thing that sets the flag;
-/// `enable_subscriptions` is gone.
+/// One crate-private `scp-mcp` constructor returns `(McpServer,
+/// ContextEventPump)` and is the *only* code that sets the advertisement flag.
 /// A server that advertises the capability and a pump that delivers it are one
 /// value produced by one call, so:
 ///
@@ -2977,12 +2966,11 @@ fn b3_webhook_dispatch_wired() {
 ///   and the pair constructor `with_event_source` is public only under
 ///   `scp-mcp`'s `testing` feature, which no shipped artifact resolves.
 ///
-/// The three string-search assertions were therefore REMOVED as redundant with
-/// a strictly stronger compile-time guarantee (the one legitimate reason to
-/// remove an enforcement assertion). What remains below is the part the type
-/// system genuinely cannot see: that each bridge *sources* its receiver from
-/// the Supervisor and hands it to a transport, rather than passing `None` and
-/// honestly-but-uselessly advertising nothing.
+/// The compiler holds those properties, so this test does not restate them as
+/// source-text checks. It checks the part the type system cannot see: that
+/// each bridge *sources* its receiver from the Supervisor and hands it to a
+/// transport, rather than passing `None` and honestly-but-uselessly
+/// advertising nothing.
 #[test]
 fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
     // Every bridge must obtain the Supervisor receiver and construct its
@@ -3118,16 +3106,11 @@ fn production_source(src: &str) -> &str {
 /// bridge answers from context role state rather than a stand-in.
 #[test]
 fn mcp_resource_access_is_answered_from_real_role_state() {
-    // The former negative assertion — `!server_src.contains("format!(\"resource:{")`
-    // — was removed as redundant with a strictly stronger compile-time
-    // guarantee (the one legitimate reason to drop an enforcement assertion).
     // `ContextProvider::validate_resource_access` takes a typed `ResourceKind`,
     // not a string, so no `resource:{kind}` capability name can be synthesized
-    // from it at all; a source-text denylist chasing one spelling of a
-    // now-unrepresentable value is exactly the negative-value redundancy the
-    // over-engineering guard names. The positive wiring pins below — that each
-    // bridge answers from the real capability catalogue — are the part the
-    // types cannot see and are retained.
+    // from it; this test carries no source-text check for that spelling. The
+    // pins below check what the types cannot see: that each bridge answers
+    // from the real capability catalogue.
     for (bridge, src) in [
         (
             "PyO3",

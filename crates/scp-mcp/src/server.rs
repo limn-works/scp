@@ -379,9 +379,8 @@ impl std::fmt::Debug for ContextEventPump {
 /// `Wired { 0: server, .. }`.) Within `scp-mcp`, the field⟺variant
 /// correspondence is established at that single construction site — not
 /// enforced by the type system — and cross-checked by a `debug_assert!` in
-/// [`Self::into_parts`]. The old transports re-checked this pairing at entry and
-/// failed closed on a mismatch; that runtime guard is gone because, on
-/// production paths, the bundle is only ever built at the one site
+/// [`Self::into_parts`]. The transports perform no runtime pairing check: on
+/// production paths the bundle is only ever built at the one site
 /// ([`McpServer::with_optional_event_source`]) that keeps field and variant in
 /// sync — the sole hand-constructions are `#[cfg(test)]`, which that
 /// `debug_assert!` covers.
