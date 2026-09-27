@@ -30,9 +30,10 @@ metrics-exporter-prometheus = { workspace = true }
 tempfile = "3"
 
 [features]
-# The same feature as `scp-node`'s `cloud-blobs`. Both crates gate the two
-# backends, because cargo unifies `scp-transport`'s features across every
-# package one invocation builds.
+# The same feature as `scp-node`'s `cloud-blobs`. scp-relay depends on
+# scp-transport directly, so `cargo build -p scp-relay --features cloud-blobs`,
+# the operator build `docs/guides/relay-operations.md` names, needs this crate's
+# own feature to compile the PostgreSQL and S3 backends.
 cloud-blobs = ["scp-transport/postgres-blob", "scp-transport/s3-blob"]
 
 [lints]

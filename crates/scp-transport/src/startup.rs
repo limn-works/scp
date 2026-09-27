@@ -269,7 +269,7 @@ pub fn backend_choice_from_env(binary_feature: &str) -> BackendChoice {
 /// | `s3` | S3-compat | `SCP_RELAY_S3_BUCKET` (required) + AWS env | |
 /// | `memory` | In-memory | — | |
 ///
-/// # Panics
+/// # Backend availability
 ///
 /// Backend arms are compiled only when the corresponding feature is enabled
 /// (`sqlite-blob`, `redb-blob`, `postgres-blob`, `s3-blob`), and a
@@ -278,6 +278,13 @@ pub fn backend_choice_from_env(binary_feature: &str) -> BackendChoice {
 /// off-by-default `cloud-blobs` feature. A request for `postgres` or `s3` in
 /// a build without it exits in [`backend_choice_from_env`] and never reaches
 /// this function, so it never falls back to another backend.
+///
+/// # Process exit
+///
+/// The function does not panic. When the chosen backend's required variable
+/// (`SCP_RELAY_DATABASE_URL` or `SCP_RELAY_S3_BUCKET`) is unset, it prints the
+/// error to stderr; when the store fails to open, it logs the error through
+/// `tracing`. Either way it exits the process with status 1.
 #[cfg_attr(
     not(any(feature = "postgres-blob", feature = "s3-blob")),
     expect(
