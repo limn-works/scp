@@ -516,40 +516,34 @@ async fn sse_handler<P: ContextProvider + 'static>(
             .session_evict
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match Arc::clone(&state.session_slot).try_acquire_owned() {
+        if let Ok(permit) = Arc::clone(&state.session_slot).try_acquire_owned() {
             // Install this session's token under the same lock, so a
             // concurrent admission can only ever cancel the current session.
-            Ok(permit) => {
-                *current = CancellationToken::new();
-                Some((permit, current.clone()))
-            }
-            Err(_) => {
-                current.cancel();
-                None
-            }
+            *current = CancellationToken::new();
+            Some((permit, current.clone()))
+        } else {
+            current.cancel();
+            None
         }
     };
-    let (permit, evict) = match free {
-        Some(admitted) => admitted,
-        None => {
-            tracing::info!("MCP SSE: evicting the live session for a new admission");
-            match tokio::time::timeout(
-                EVICTION_WAIT,
-                Arc::clone(&state.session_slot).acquire_owned(),
+    let (permit, evict) = if let Some(admitted) = free {
+        admitted
+    } else {
+        tracing::info!("MCP SSE: evicting the live session for a new admission");
+        let Ok(Ok(permit)) = tokio::time::timeout(
+            EVICTION_WAIT,
+            Arc::clone(&state.session_slot).acquire_owned(),
+        )
+        .await
+        else {
+            tracing::warn!("MCP SSE: the evicted session did not release the slot");
+            return (
+                StatusCode::CONFLICT,
+                "an MCP session is already active on this endpoint",
             )
-            .await
-            {
-                Ok(Ok(permit)) => (permit, install_evict_token(&state.session_evict)),
-                _ => {
-                    tracing::warn!("MCP SSE: the evicted session did not release the slot");
-                    return (
-                        StatusCode::CONFLICT,
-                        "an MCP session is already active on this endpoint",
-                    )
-                        .into_response();
-                }
-            }
-        }
+                .into_response();
+        };
+        (permit, install_evict_token(&state.session_evict))
     };
 
     // Every session begins from a clean slate by sequencing, not scheduling
