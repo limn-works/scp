@@ -66,7 +66,7 @@ Requires Swift 6.2. macOS ships 6.1 -- install 6.2 via [swift.org](https://swift
 
 ## Feature Flags
 
-CI's `rust-clippy` job runs five `cargo clippy` commands. The first lints the workspace with the features that enable in-memory key custody and the test-only grants. The workspace sweep leaves every optional scp-transport feature off, so the other four lint the optional network transports and the PostgreSQL and S3 blob backends, which scp-node and scp-relay compile only under their off-by-default `cloud-blobs` feature. Run the commands that cover the crates your change touches; together they give CI parity:
+CI's `rust-clippy` job runs five `cargo clippy` commands. The first lints the workspace with the features that enable in-memory key custody and the test-only grants. The workspace sweep compiles scp-transport with only the features a workspace member's dependency declaration requests (`sqlite-blob`, `redb-blob` and `startup`), and leaves the optional network transports and the `postgres-blob` and `s3-blob` features off, so the other four lint the optional network transports and the PostgreSQL and S3 blob backends, which scp-node and scp-relay compile only under their off-by-default `cloud-blobs` feature. Run the commands that cover the crates your change touches; together they give CI parity:
 
 ```bash
 cargo clippy --workspace --all-targets \
