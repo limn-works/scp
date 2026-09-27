@@ -777,22 +777,26 @@ impl<S: Storage> Identity<S> {
 }
 ```
 
-**The write API is one method per consequential act on the identity handle, and every event that needs a root threshold is composed as a `PendingEvent` and completed by `attach`.** The composing method returns the unsigned event, whose preimage binds the signer index list and form list its `SignerPlan` names for each group the kind carries; a group the kind does not carry is empty, and an inception's one group is `installed_root`. **Each holder of a named member, the composer included, calls `Identity::cosign`**, which runs the display confirmation `09-security-model.md` §9.7.4.2 R10's device-boundary paragraph states and returns the `IndexedSignature` of the one member its custody holds. **`attach` verifies each signature against its group and index, refuses with `IdentityError::SignatureSetIncomplete` where a group falls short of the plan, publishes the signed event, and returns the cycle's `PublishOutcome`**; for a reveal-authorized event it runs R10's ceremony from the `Signed` write through the removal. The application carries a `PendingEvent` and each `IndexedSignature` between the holders' devices, and the protocol defines no transport for them. `Identity::create` composes the inception event and returns the handle beside it. `rotate_active` composes a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` composes a `KeyState` that names the witness set and its witnessing interval. `Recovery::begin` (R10) composes the reveal-authorized events, and a compromised root member leaves the root set under a `RootRecovery`, because a `KeyState` drops no root member (R3).
+**The write API is one method per consequential act on the identity handle, and every event that needs a root threshold goes through one collection flow**: `create`'s inception, `rotate_active` and `set_witnesses`, and the rollover, recovery and abandonment `Recovery::begin` composes. **Under `SignerPlan::ThisSdk` the composing method signs every group with the members this SDK's custody holds, publishes, and returns `EventOutcome::Published` in one call**, refusing with `IdentityError::SignatureSetIncomplete` where those members fall short of a group's threshold. **Under `SignerPlan::Groups` it returns `EventOutcome::AwaitingSignatures`** carrying the unsigned `PendingEvent`, whose preimage binds the signer index list and form list the plan names for each group the kind carries; a group the kind does not carry is empty, and an inception's one group is `installed_root`. **Each holder of a named member, the composer included, calls `Identity::cosign`**, which runs the display confirmation `09-security-model.md` §9.7.4.2 R10's device-boundary paragraph states and returns the `IndexedSignature` of the one member its custody holds. **`attach` verifies each signature against its group and index, refuses with `IdentityError::SignatureSetIncomplete` where a group falls short of the plan, publishes the signed event, and returns the cycle's `PublishOutcome`**; for a reveal-authorized event it runs R10's ceremony from the `Signed` write through the removal. The application carries a `PendingEvent` and each `IndexedSignature` between the holders' devices, and the protocol defines no transport for them. `Identity::create` composes the inception event and returns the handle beside the flow's outcome. `rotate_active` composes a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` composes a `KeyState` that names the witness set and its witnessing interval. `Recovery::begin` (R10) composes the reveal-authorized events, and a compromised root member leaves the root set under a `RootRecovery`, because a `KeyState` drops no root member (R3).
 
 ```rust
 impl<S: EncryptedStorage> Identity<S> {
+    /// Composes the inception event under the collection flow above.
     pub fn create(config: IdentityConfig<S>, signers: SignerPlan)
-        -> impl Future<Output = Result<(Identity<S>, PendingEvent), IdentityError>> + Send;
+        -> impl Future<Output = Result<(Identity<S>, EventOutcome), IdentityError>> + Send;
 
+    /// Composes a `KeyState` under the collection flow above.
     pub fn rotate_active(&self, reason: RotationReason, signers: SignerPlan)
-        -> impl Future<Output = Result<PendingEvent, IdentityError>> + Send;
+        -> impl Future<Output = Result<EventOutcome, IdentityError>> + Send;
+
+    /// Composes a `KeyState` under the collection flow above.
 
     pub fn set_witnesses(
         &self,
         witnesses: Vec<WitnessDesignation>,
         witnessing_interval: u32,
         signers: SignerPlan,
-    ) -> impl Future<Output = Result<PendingEvent, IdentityError>> + Send;
+    ) -> impl Future<Output = Result<EventOutcome, IdentityError>> + Send;
 
     /// Called by any holder of a named member, with that holder's own
     /// custody, whether or not it holds this identity's handle.
@@ -807,11 +811,18 @@ impl<S: EncryptedStorage> Identity<S> {
 /// by signature form (`09-security-model.md` §9.7.4.2 definitions).
 pub struct GroupSigners { pub members: Vec<(u8, SignatureForm)> }
 
-/// The signer index list and form list of each group the preimage binds.
-pub struct SignerPlan {
-    pub reveal: GroupSigners,
-    pub installed_root: GroupSigners,
-    pub standing_root: GroupSigners,
+/// Who signs an event that needs a root threshold. `ThisSdk` signs every
+/// group with this SDK's own members; `Groups` names each group's signer
+/// index list and form list for the preimage to bind.
+pub enum SignerPlan {
+    ThisSdk,
+    Groups { reveal: GroupSigners, installed_root: GroupSigners, standing_root: GroupSigners },
+}
+
+/// What a composing method returns under the collection flow.
+pub enum EventOutcome {
+    Published(PublishOutcome),
+    AwaitingSignatures(PendingEvent),
 }
 
 pub enum SignatureGroup { Reveal, InstalledRoot, StandingRoot }
@@ -902,7 +913,7 @@ pub trait IdentityBackend: Send + Sync {
 }
 
 /// The error half of this trait's six methods and of the three recovery entry
-/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries thirteen
+/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries fourteen
 /// variants and no others. A refusal the protocol mandates carries one of these
 /// variants, so four bindings mint one code rather than four and a caller tells
 /// a custody choice from a network condition. **The identity half's one refusal reaches a caller through
@@ -960,8 +971,8 @@ pub enum IdentityError {
     /// SCP-IDENT-1109. A passkey gesture was cancelled or failed while the SDK
     /// signed a key event (`09-security-model.md` §9.7.4.2 R10).
     UserVerificationDeclined,
-    /// SCP-IDENT-1110. `resume_recovery` found a handle and no composed
-    /// preimage in this SDK's own store (`09-security-model.md` §9.7.4.2 R10).
+    /// SCP-IDENT-1110. `resume_recovery` found a handle past `Composed` and no
+    /// signed event in any store it reaches (`09-security-model.md` §9.7.4.2 R10).
     RecoveryPreimageMissing,
     /// SCP-IDENT-1111. The custody backend returned an error while the SDK
     /// signed a key event (`09-security-model.md` §9.7.4.2 R10).
@@ -969,6 +980,10 @@ pub enum IdentityError {
     /// SCP-IDENT-1112. `Identity::attach` received signatures that fall short
     /// of a group the event's `SignerPlan` names (§3.10.10).
     SignatureSetIncomplete,
+    /// SCP-IDENT-1113. The adopted log does not hold the event the store
+    /// set's last-reveal marker names, and no entry of the publication set
+    /// served it (`09-security-model.md` §9.7.4.2 R10).
+    LastRevealUnadopted { sequence: u64, event_digest: [u8; 32] },
 }
 
 /// One relay entry's declared write policy, as that entry publishes it at
