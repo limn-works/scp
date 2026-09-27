@@ -132,13 +132,26 @@ impl CallbackKeyRegistry {
         Ok(self.lock()?.get(&handle.id()).cloned())
     }
 
-    /// Forgets a handle after the host destroyed its key.
+    /// Removes and returns a handle's entry before the host destroys its
+    /// key, so a host that reuses the id for a concurrent generation cannot
+    /// have its new registration removed afterwards.
     ///
     /// # Errors
     ///
     /// [`PlatformError::CustodyError`] if the registry lock is poisoned.
-    pub fn remove(&self, handle: &KeyHandle) -> Result<(), PlatformError> {
-        self.lock()?.remove(&handle.id());
+    pub fn take(&self, handle: &KeyHandle) -> Result<Option<RegisteredKey>, PlatformError> {
+        Ok(self.lock()?.remove(&handle.id()))
+    }
+
+    /// Puts back an entry [`Self::take`] removed, after the host failed to
+    /// destroy the key. An entry registered for the id in the meantime is
+    /// kept.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::CustodyError`] if the registry lock is poisoned.
+    pub fn restore(&self, handle: &KeyHandle, key: RegisteredKey) -> Result<(), PlatformError> {
+        self.lock()?.entry(handle.id()).or_insert(key);
         Ok(())
     }
 }
@@ -250,19 +263,20 @@ pub fn p256_host_signature(
     )))
 }
 
-/// Parses a P-256 peer public key for [`KeyType::HpkeP256`] key agreement
-/// and returns the 65-byte uncompressed encoding the host receives.
+/// Validates an [`KeyType::HpkeP256`] peer and returns the bytes the host
+/// receives.
+///
+/// The check is [`scp_platform::traits::hpke_p256_peer`]: exactly the 65-byte
+/// uncompressed point (RFC 9180 §7.1.1).
 ///
 /// # Errors
 ///
-/// [`PlatformError::CustodyError`] when `peer_public` is not a valid SEC1
-/// P-256 point.
+/// [`PlatformError::CustodyError`] when `peer_public` is not a valid 65-byte
+/// uncompressed P-256 point.
 pub fn p256_peer_for_host(
     peer_public: &[u8],
 ) -> Result<[u8; UNCOMPRESSED_POINT_LEN], PlatformError> {
-    P256PublicKey::from_sec1(peer_public)
-        .map(|pk| pk.to_uncompressed())
-        .map_err(|e| PlatformError::CustodyError(format!("P-256 peer public key: {e}")))
+    scp_platform::traits::hpke_p256_peer(peer_public).map(|pk| pk.to_uncompressed())
 }
 
 /// Requires a 32-byte X25519 peer public key.
@@ -331,10 +345,13 @@ pub fn legacy_public_key(
 /// `KeyCustody::generate_keypair` over a host provider.
 ///
 /// Asks the host for a key of `key_type`, and for a P-256 type fetches and
-/// validates its public key before registering the handle. When that
-/// validation fails the host key is destroyed, so no unusable key is left
-/// behind; the validation error is returned either way (with the destroy
-/// failure appended when the destroy also fails).
+/// validates its public key before registering the handle. When the key id
+/// is not numeric or the P-256 public key fails validation, the host key is
+/// destroyed, so no unusable key is left behind; the rejection error is
+/// returned either way (with the destroy failure appended when the destroy
+/// also fails). A key id the registry already holds is rejected without a
+/// destroy, because destroying that id would destroy the live key this
+/// adapter already registered under it.
 ///
 /// # Errors
 ///
@@ -356,31 +373,37 @@ where
     DF: Future<Output = Result<(), PlatformError>>,
 {
     let key_id = host_generate(key_type_str(key_type)).await?;
-    let handle = crate::custody_parse::parse_handle("generate_keypair", &key_id)?;
-    let registered = match key_type {
-        KeyType::Ed25519 => RegisteredKey::Ed25519,
-        KeyType::X25519 => RegisteredKey::X25519,
-        KeyType::P256Signing | KeyType::HpkeP256 => {
-            let validated = match host_get_public_key(key_id.clone()).await {
-                Ok(bytes) => p256_public_key("get_public_key", key_type, &bytes),
-                Err(e) => Err(e),
-            };
-            match validated {
-                Ok(pk) if key_type == KeyType::P256Signing => RegisteredKey::P256Signing(pk),
-                Ok(pk) => RegisteredKey::HpkeP256(pk),
-                Err(e) => {
-                    return Err(match host_destroy(key_id).await {
-                        Ok(()) => e,
-                        Err(destroy_err) => PlatformError::CustodyError(format!(
-                            "{e}; destroying the rejected host key also failed: {destroy_err}"
-                        )),
-                    });
-                }
-            }
+    let validated = async {
+        let handle = crate::custody_parse::parse_handle("generate_keypair", &key_id)?;
+        let registered = match key_type {
+            KeyType::Ed25519 => RegisteredKey::Ed25519,
+            KeyType::X25519 => RegisteredKey::X25519,
+            KeyType::P256Signing => RegisteredKey::P256Signing(p256_public_key(
+                "get_public_key",
+                key_type,
+                &host_get_public_key(key_id.clone()).await?,
+            )?),
+            KeyType::HpkeP256 => RegisteredKey::HpkeP256(p256_public_key(
+                "get_public_key",
+                key_type,
+                &host_get_public_key(key_id.clone()).await?,
+            )?),
+        };
+        Ok::<_, PlatformError>((handle, registered))
+    }
+    .await;
+    match validated {
+        Ok((handle, registered)) => {
+            registry.register(handle, registered)?;
+            Ok(handle)
         }
-    };
-    registry.register(handle, registered)?;
-    Ok(handle)
+        Err(e) => Err(match host_destroy(key_id).await {
+            Ok(()) => e,
+            Err(destroy_err) => PlatformError::CustodyError(format!(
+                "{e}; destroying the rejected host key also failed: {destroy_err}"
+            )),
+        }),
+    }
 }
 
 /// `KeyCustody::sign` over a host provider.
@@ -483,8 +506,12 @@ where
     )?))
 }
 
-/// `KeyCustody::destroy_key` over a host provider: the registry forgets the
-/// handle only after the host destroyed the key.
+/// `KeyCustody::destroy_key` over a host provider.
+///
+/// The registry entry is taken before the host call, so a host that reuses
+/// the id for a concurrent generation keeps its new registration; if the
+/// host fails to destroy the key, the entry is restored and the host error
+/// returned.
 ///
 /// # Errors
 ///
@@ -498,8 +525,16 @@ where
     D: FnOnce(String) -> DF,
     DF: Future<Output = Result<(), PlatformError>>,
 {
-    host_destroy(key.id().to_string()).await?;
-    registry.remove(key)
+    let taken = registry.take(key)?;
+    match host_destroy(key.id().to_string()).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if let Some(entry) = taken {
+                registry.restore(key, entry)?;
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Refuses an Ed25519-only operation (`ed25519_to_x25519_agree`,
@@ -519,11 +554,20 @@ pub fn require_ed25519(
     }
 }
 
-#[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
-mod tests {
-    use super::*;
-    use scp_crypto::p256::{P256SigningKey, sign_prehash_rfc6979};
+/// A software P-256 host for bridge tests.
+///
+/// It answers the host callbacks the way a conforming platform keystore does,
+/// and signs with a high `s` in DER, so a test proves the adapter normalises
+/// what a real host may return.
+#[cfg(any(test, feature = "testing"))]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::missing_panics_doc)]
+pub mod fake_host {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use scp_crypto::p256::{P256PublicKey, P256SigningKey, ecdh_p256, sign_prehash_rfc6979};
+    use scp_platform::error::PlatformError;
 
     /// The P-256 group order `n`, big-endian.
     const N: [u8; 32] = [
@@ -533,7 +577,8 @@ mod tests {
     ];
 
     /// `n - s` for a big-endian `s < n`.
-    fn negate(s: &[u8]) -> [u8; 32] {
+    #[must_use]
+    pub fn negate(s: &[u8]) -> [u8; 32] {
         let mut out = [0u8; 32];
         let mut borrow = 0i16;
         for i in (0..32).rev() {
@@ -564,12 +609,126 @@ mod tests {
         out
     }
 
-    fn der(r: &[u8], s: &[u8]) -> Vec<u8> {
+    /// DER `SEQUENCE { r, s }` of two big-endian integers.
+    #[must_use]
+    pub fn der(r: &[u8], s: &[u8]) -> Vec<u8> {
         let body = [der_int(r), der_int(s)].concat();
         let mut out = vec![0x30, u8::try_from(body.len()).unwrap()];
         out.extend_from_slice(&body);
         out
     }
+
+    /// Host state: every key it holds by id, and the last peer it was sent.
+    #[derive(Default)]
+    pub struct FakeP256Host {
+        keys: Mutex<HashMap<String, P256SigningKey>>,
+        hpke: Mutex<std::collections::HashSet<String>>,
+        next: AtomicUsize,
+        /// The peer bytes of the most recent `dh_agree` call.
+        pub last_peer: Mutex<Option<Vec<u8>>>,
+    }
+
+    impl FakeP256Host {
+        fn key(&self, key_id: &str) -> Result<P256SigningKey, PlatformError> {
+            let scalar = self
+                .keys
+                .lock()
+                .unwrap()
+                .get(key_id)
+                .ok_or(PlatformError::KeyNotFound)?
+                .to_scalar_bytes();
+            P256SigningKey::from_scalar_bytes(&scalar)
+                .map_err(|e| PlatformError::CustodyError(e.to_string()))
+        }
+
+        /// `generate_keypair`: P-256 types only; numeric ids from 1.
+        ///
+        /// # Errors
+        ///
+        /// A key type other than `p256` or `hpke-p256`.
+        pub fn generate_keypair(&self, key_type: &str) -> Result<String, PlatformError> {
+            if key_type != "p256" && key_type != "hpke-p256" {
+                return Err(PlatformError::CustodyError(format!(
+                    "fake host holds P-256 keys only, not {key_type}"
+                )));
+            }
+            // Ids never repeat, even after a destroy.
+            let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+            let key = P256SigningKey::from_scalar_bytes(&[u8::try_from(id).unwrap() + 0x40; 32])
+                .expect("a repeated byte below n is a valid scalar");
+            self.keys.lock().unwrap().insert(id.to_string(), key);
+            if key_type == "hpke-p256" {
+                self.hpke.lock().unwrap().insert(id.to_string());
+            }
+            Ok(id.to_string())
+        }
+
+        /// `get_public_key`: the SEC1 point the host contract names, compressed
+        /// for `p256` and uncompressed for `hpke-p256`.
+        ///
+        /// # Errors
+        ///
+        /// An unknown key id.
+        pub fn get_public_key(&self, key_id: &str) -> Result<Vec<u8>, PlatformError> {
+            let public = self.key(key_id)?.public_key();
+            if self.hpke.lock().unwrap().contains(key_id) {
+                Ok(public.to_uncompressed().to_vec())
+            } else {
+                Ok(public.to_compressed().to_vec())
+            }
+        }
+
+        /// `sign`: RFC 6979 over the 32-byte digest, returned as DER with the
+        /// high `s` (`n - s`).
+        ///
+        /// # Errors
+        ///
+        /// An unknown key id, or a message that is not 32 bytes.
+        pub fn sign(&self, key_id: &str, message: &[u8]) -> Result<Vec<u8>, PlatformError> {
+            let digest: [u8; 32] = message
+                .try_into()
+                .map_err(|_| PlatformError::CustodyError("digest must be 32 bytes".into()))?;
+            let raw = sign_prehash_rfc6979(&self.key(key_id)?, &digest)
+                .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            Ok(der(&raw[..32], &negate(&raw[32..])))
+        }
+
+        /// `dh_agree`: the ECDH x-coordinate with the peer, which the host
+        /// parses as any SEC1 point, so the adapter alone enforces the
+        /// uncompressed form.
+        ///
+        /// # Errors
+        ///
+        /// An unknown key id, or a peer that is not a curve point.
+        pub fn dh_agree(&self, key_id: &str, peer: &[u8]) -> Result<Vec<u8>, PlatformError> {
+            *self.last_peer.lock().unwrap() = Some(peer.to_vec());
+            let peer = P256PublicKey::from_sec1(peer)
+                .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            Ok(ecdh_p256(&self.key(key_id)?, &peer).to_vec())
+        }
+
+        /// `destroy_key`.
+        ///
+        /// # Errors
+        ///
+        /// An unknown key id.
+        pub fn destroy_key(&self, key_id: &str) -> Result<(), PlatformError> {
+            self.keys
+                .lock()
+                .unwrap()
+                .remove(key_id)
+                .map(|_| ())
+                .ok_or(PlatformError::KeyNotFound)
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::fake_host::{der, negate};
+    use super::*;
+    use scp_crypto::p256::{P256SigningKey, sign_prehash_rfc6979};
 
     fn key_and_sig() -> (P256SigningKey, [u8; 32], [u8; 64]) {
         let key = P256SigningKey::from_scalar_bytes(&[0x11u8; 32]).unwrap();
@@ -676,9 +835,14 @@ mod tests {
             .unwrap()
             .public_key();
         assert_eq!(
-            p256_peer_for_host(&pk.to_compressed()).unwrap(),
+            p256_peer_for_host(&pk.to_uncompressed()).unwrap(),
             pk.to_uncompressed()
         );
+        // RFC 9180 §7.1.1: only the 65-byte uncompressed point.
+        assert!(p256_peer_for_host(&pk.to_compressed()).is_err());
+        let mut bad_prefix = pk.to_uncompressed();
+        bad_prefix[0] = 0x05;
+        assert!(p256_peer_for_host(&bad_prefix).is_err());
         assert!(p256_peer_for_host(&[4u8; 65]).is_err());
         assert!(p256_peer_for_host(&[]).is_err());
         assert!(x25519_peer(&[0u8; 32]).is_ok());
@@ -709,7 +873,156 @@ mod tests {
             Some(RegisteredKey::Ed25519)
         ));
         assert!(registry.register(h, RegisteredKey::X25519).is_err());
-        registry.remove(&h).unwrap();
+        registry.take(&h).unwrap();
         assert!(registry.get(&h).unwrap().is_none());
+    }
+
+    type Log = std::sync::Mutex<Vec<String>>;
+
+    async fn generate_with(
+        registry: &CallbackKeyRegistry,
+        key_type: KeyType,
+        key_id: &str,
+        public_key: Result<Vec<u8>, PlatformError>,
+        destroyed: &Log,
+    ) -> Result<KeyHandle, PlatformError> {
+        let key_id = key_id.to_owned();
+        generate_keypair(
+            registry,
+            key_type,
+            |_| async move { Ok(key_id) },
+            |_| async move { public_key },
+            |id| async move {
+                destroyed.lock().unwrap().push(id);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A7: every generation the adapter rejects destroys the host key it was
+    /// handed: a non-numeric id (for each key type), a malformed P-256 public
+    /// key, and a failing public-key fetch. An accepted key is not destroyed.
+    #[tokio::test]
+    async fn rejected_generation_destroys_the_host_key() {
+        type Case = (KeyType, &'static str, Result<Vec<u8>, PlatformError>);
+        let valid = P256SigningKey::from_scalar_bytes(&[5u8; 32])
+            .unwrap()
+            .public_key();
+        let cases: Vec<Case> = vec![
+            (KeyType::Ed25519, "not-a-number", Ok(vec![])),
+            (KeyType::X25519, "", Ok(vec![])),
+            (
+                KeyType::P256Signing,
+                "-1",
+                Ok(valid.to_compressed().to_vec()),
+            ),
+            (
+                KeyType::HpkeP256,
+                "0x10",
+                Ok(valid.to_uncompressed().to_vec()),
+            ),
+            (
+                KeyType::P256Signing,
+                "11",
+                Ok(valid.to_uncompressed().to_vec()),
+            ),
+            (KeyType::HpkeP256, "12", Ok(valid.to_compressed().to_vec())),
+            // x = 2^256 - 1 is not a field element.
+            (
+                KeyType::P256Signing,
+                "13",
+                Ok([&[0x02][..], &[0xFF; 32]].concat()),
+            ),
+            (
+                KeyType::HpkeP256,
+                "14",
+                Err(PlatformError::CustodyError("host get failed".into())),
+            ),
+        ];
+        for (key_type, key_id, public_key) in cases {
+            let registry = CallbackKeyRegistry::new();
+            let destroyed = Log::default();
+            let result = generate_with(&registry, key_type, key_id, public_key, &destroyed).await;
+            assert!(
+                matches!(result, Err(PlatformError::CustodyError(_))),
+                "{key_type:?} {key_id:?}: {result:?}"
+            );
+            assert_eq!(
+                *destroyed.lock().unwrap(),
+                vec![key_id.to_owned()],
+                "{key_type:?} {key_id:?} must be destroyed"
+            );
+        }
+
+        let registry = CallbackKeyRegistry::new();
+        let destroyed = Log::default();
+        let handle = generate_with(
+            &registry,
+            KeyType::P256Signing,
+            "15",
+            Ok(valid.to_compressed().to_vec()),
+            &destroyed,
+        )
+        .await
+        .unwrap();
+        assert_eq!(handle.id(), 15);
+        assert!(destroyed.lock().unwrap().is_empty());
+
+        // A reused id is rejected without destroying the live key under it.
+        let again = generate_with(&registry, KeyType::Ed25519, "15", Ok(vec![]), &destroyed).await;
+        assert!(matches!(again, Err(PlatformError::CustodyError(_))));
+        assert!(destroyed.lock().unwrap().is_empty());
+        assert!(matches!(
+            registry.get(&handle).unwrap(),
+            Some(RegisteredKey::P256Signing(_))
+        ));
+    }
+
+    /// A6: the entry is taken before the host destroy, so a generation that
+    /// reuses the id while the destroy is in flight keeps its registration;
+    /// a failed destroy restores the entry.
+    #[tokio::test]
+    async fn destroy_takes_before_the_host_call_and_restores_on_failure() {
+        let registry = CallbackKeyRegistry::new();
+        let h = KeyHandle::new(21);
+        registry.register(h, RegisteredKey::X25519).unwrap();
+
+        // The host fails: the entry comes back.
+        let failed = destroy_key(&registry, &h, |_| async {
+            Err(PlatformError::CustodyError("host destroy failed".into()))
+        })
+        .await;
+        assert!(matches!(failed, Err(PlatformError::CustodyError(_))));
+        assert!(matches!(
+            registry.get(&h).unwrap(),
+            Some(RegisteredKey::X25519)
+        ));
+
+        // During the host call the id is already free, and a concurrent
+        // generation that reuses it survives the destroy's completion.
+        destroy_key(&registry, &h, |_| {
+            assert!(registry.get(&h).unwrap().is_none());
+            registry.register(h, RegisteredKey::Ed25519).unwrap();
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            registry.get(&h).unwrap(),
+            Some(RegisteredKey::Ed25519)
+        ));
+
+        // A failed destroy never overwrites an entry registered meanwhile.
+        destroy_key(&registry, &h, |_| {
+            registry.register(h, RegisteredKey::X25519).unwrap();
+            async { Err(PlatformError::CustodyError("host destroy failed".into())) }
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            registry.get(&h).unwrap(),
+            Some(RegisteredKey::X25519)
+        ));
     }
 }

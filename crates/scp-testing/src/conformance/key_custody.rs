@@ -1,6 +1,6 @@
 //! Key custody conformance test macro.
 //!
-//! The `key_custody_conformance` macro generates 8 test cases that validate
+//! The `key_custody_conformance` macro generates 10 test cases that validate
 //! any `KeyCustody` implementation against the
 //! protocol specification (ADR-006):
 //!
@@ -8,18 +8,24 @@
 //! 2. `destroy_prevents_sign` — generate, destroy, attempt sign -> error
 //! 3. `distinct_handles` — generate two keypairs, handles are different
 //! 4. `sign_with_invalid_handle_errors` — sign with non-existent handle -> error
-//! 5. `p256_generate_sign_verify` — P-256 signing key: 33-byte public key, a
-//!    32-byte digest signature that verifies strictly (low-`s`)
+//! 5. `p256_generate_sign_verify` — P-256 signing key: 33-byte public key;
+//!    signatures over 64 distinct 32-byte digests all verify strictly
+//!    (low-`s`); data that is not 32 bytes is refused with `CustodyError`
 //! 6. `hpke_p256_dh_agree_matches_ecdh` — HPKE P-256 key: 65-byte public key,
 //!    `dh_agree` equals `ecdh_p256` from the peer side
 //! 7. `hpke_p256_dh_agree_rejects_off_curve_peer` — a 65-byte point off the
-//!    curve is refused
+//!    curve is refused with `CustodyError`
 //! 8. `p256_wrong_key_type` — signing with an HPKE key, or key agreement with
 //!    a signing key, yields `WrongKeyType`
+//! 9. `hpke_p256_dh_agree_rejects_non_uncompressed_peer` — valid coordinates
+//!    under a `0x05` or `0x02` prefix, and the 33-byte compressed point, are
+//!    refused with `CustodyError` (RFC 9180 §7.1.1)
+//! 10. `p256_destroy_prevents_use` — destroyed P-256 keys of both types can
+//!     no longer sign, agree, or report a public key
 //!
 //! See ADR-006 in `.docs/adrs/phase-1.md` for the platform adapter design.
 
-/// Generates 8 conformance tests for a `KeyCustody` implementation.
+/// Generates 10 conformance tests for a `KeyCustody` implementation.
 ///
 /// # Arguments
 ///
@@ -162,16 +168,32 @@ macro_rules! key_custody_conformance {
                     "a P-256 signing key's public key is the compressed point"
                 );
 
-                let digest = [0xC3u8; 32];
-                let signature = custody
-                    .sign(&handle, &digest)
-                    .await
-                    .expect("sign should succeed");
-                $crate::conformance::key_custody::test_helpers::verify_p256_prehash_strict(
-                    public_key.as_bytes(),
-                    &digest,
-                    signature.as_bytes(),
-                );
+                // 64 distinct digests: RFC 6979 gives a high raw `s` for
+                // about half of them, so all of them verifying strictly shows
+                // the low-`s` normalisation (a lone digest passes by luck
+                // half the time).
+                for i in 0..64u8 {
+                    let digest = [i; 32];
+                    let signature = custody
+                        .sign(&handle, &digest)
+                        .await
+                        .expect("sign should succeed");
+                    $crate::conformance::key_custody::test_helpers::verify_p256_prehash_strict(
+                        public_key.as_bytes(),
+                        &digest,
+                        signature.as_bytes(),
+                    );
+                }
+
+                for data in [&[0u8; 31][..], &[0u8; 33][..], &[][..], b"not a digest"] {
+                    let result = custody.sign(&handle, data).await;
+                    assert!(
+                        matches!(result, Err(scp_platform::PlatformError::CustodyError(_))),
+                        "P-256 signing of {} bytes must be CustodyError, got {:?}",
+                        data.len(),
+                        result.map(|_| ())
+                    );
+                }
             }
 
             #[tokio::test]
@@ -217,8 +239,91 @@ macro_rules! key_custody_conformance {
                     $crate::conformance::key_custody::test_helpers::off_curve_p256_point();
                 let result = custody.dh_agree(&handle, &off_curve).await;
                 assert!(
-                    result.is_err(),
-                    "dh_agree must refuse a 65-byte point that is not on P-256"
+                    matches!(result, Err(scp_platform::PlatformError::CustodyError(_))),
+                    "dh_agree must refuse a 65-byte point that is not on P-256 with \
+                     CustodyError, got {:?}",
+                    result.map(|_| ())
+                );
+            }
+
+            #[tokio::test]
+            async fn hpke_p256_dh_agree_rejects_non_uncompressed_peer() {
+                let custody = $factory;
+                let handle = custody
+                    .generate_keypair(KeyType::HpkeP256)
+                    .await
+                    .expect("generate_keypair(HpkeP256) should succeed");
+                let public_key = custody
+                    .public_key(&handle)
+                    .await
+                    .expect("public_key should succeed");
+                let (peer, _) =
+                    $crate::conformance::key_custody::test_helpers::p256_peer_and_shared_secret(
+                        public_key.as_bytes(),
+                    );
+                let mut prefix_05 = peer.clone();
+                prefix_05[0] = 0x05;
+                let mut prefix_02 = peer.clone();
+                prefix_02[0] = 0x02;
+                let compressed =
+                    $crate::conformance::key_custody::test_helpers::compress_p256_point(&peer);
+                for (label, bad) in [
+                    ("0x05 prefix", prefix_05),
+                    ("0x02 prefix on 65 bytes", prefix_02),
+                    ("33-byte compressed", compressed),
+                ] {
+                    let result = custody.dh_agree(&handle, &bad).await;
+                    assert!(
+                        matches!(result, Err(scp_platform::PlatformError::CustodyError(_))),
+                        "dh_agree must refuse a {label} peer with CustodyError, got {:?}",
+                        result.map(|_| ())
+                    );
+                }
+            }
+
+            #[tokio::test]
+            async fn p256_destroy_prevents_use() {
+                let custody = $factory;
+                let signing = custody
+                    .generate_keypair(KeyType::P256Signing)
+                    .await
+                    .expect("generate_keypair(P256Signing) should succeed");
+                let hpke = custody
+                    .generate_keypair(KeyType::HpkeP256)
+                    .await
+                    .expect("generate_keypair(HpkeP256) should succeed");
+                let hpke_public = custody
+                    .public_key(&hpke)
+                    .await
+                    .expect("public_key should succeed");
+                let (peer, _) =
+                    $crate::conformance::key_custody::test_helpers::p256_peer_and_shared_secret(
+                        hpke_public.as_bytes(),
+                    );
+                custody
+                    .destroy_key(&signing)
+                    .await
+                    .expect("destroy_key(P256Signing) should succeed");
+                custody
+                    .destroy_key(&hpke)
+                    .await
+                    .expect("destroy_key(HpkeP256) should succeed");
+
+                assert!(
+                    custody.sign(&signing, &[0u8; 32]).await.is_err(),
+                    "a destroyed P-256 signing key must not sign"
+                );
+                assert!(
+                    custody.public_key(&signing).await.is_err(),
+                    "a destroyed P-256 signing key has no public key"
+                );
+                assert!(
+                    custody.dh_agree(&hpke, &peer).await.is_err(),
+                    "a destroyed HPKE P-256 key must not agree"
+                );
+                assert!(
+                    custody.public_key(&hpke).await.is_err(),
+                    "a destroyed HPKE P-256 key has no public key"
                 );
             }
 
@@ -337,6 +442,20 @@ pub mod test_helpers {
             .expect("0x2A.. is a valid scalar");
         let shared = scp_crypto::p256::ecdh_p256(&peer, &own);
         (peer.public_key().to_uncompressed().to_vec(), *shared)
+    }
+
+    /// The 33-byte compressed encoding of a 65-byte uncompressed point.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `uncompressed` is not a valid P-256 point.
+    #[allow(clippy::expect_used)]
+    #[must_use]
+    pub fn compress_p256_point(uncompressed: &[u8]) -> Vec<u8> {
+        scp_crypto::p256::P256PublicKey::from_sec1(uncompressed)
+            .expect("a valid P-256 point")
+            .to_compressed()
+            .to_vec()
     }
 
     /// A 65-byte uncompressed SEC1 encoding (`0x04 ‖ x ‖ y`) of a point that

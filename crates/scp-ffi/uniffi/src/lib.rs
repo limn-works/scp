@@ -341,7 +341,9 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// key, `message` is a 32-byte prehash and the result is raw `r || s`
     /// (64 bytes) or DER (`SecKeyCreateSignature` / `java.security.Signature`
     /// output); the bridge normalises it to low-s and verifies it strictly
-    /// against the key's public key, and any mismatch is an error.
+    /// against the key's public key, and any mismatch is an error. A software
+    /// host MUST derive the ECDSA nonce by RFC 6979 with SHA-256; a hardware
+    /// host (Secure Enclave, `StrongBox`/TEE) may use a random nonce.
     async fn sign(&self, key_id: String, message: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 
     /// Return the public key bytes for `key_id`: 32 bytes (Ed25519, X25519),

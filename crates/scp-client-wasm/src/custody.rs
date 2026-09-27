@@ -63,8 +63,13 @@ mod wasm_impl {
         /// signature bytes. The private key never leaves JS/WebCrypto.
         ///
         /// For a `"p256"` key, `data` is the 32-byte digest and the result is
-        /// either the 64-byte raw `r ‖ s` or DER; the Rust caller converts
-        /// DER, normalises to low-`s` and verifies before accepting it.
+        /// either the 64-byte raw `r ‖ s` or DER. No Rust caller exists yet:
+        /// whoever wires one MUST route it through
+        /// `scp_ffi_common::callback_custody::sign` (with
+        /// `callback_custody::generate_keypair` for key creation), which
+        /// converts DER, normalises to low-`s`, verifies strictly and rejects
+        /// every malformed return; calling this binding directly skips all of
+        /// that.
         ///
         /// `data` is passed **by value** (an owned `Vec<u8>`), so wasm-bindgen
         /// marshals it as a JS-owned `Uint8Array` copy detached from wasm linear
@@ -111,8 +116,10 @@ mod wasm_impl {
 
         /// Performs DH agreement against `peer_public`, returning the 32-byte
         /// shared secret: X25519 for an `"x25519"` key (32-byte peer), P-256
-        /// ECDH for an `"hpke-p256"` key (65-byte uncompressed SEC1 peer,
-        /// validated on the curve by the Rust caller).
+        /// ECDH for an `"hpke-p256"` key (65-byte uncompressed SEC1 peer). No
+        /// Rust caller exists yet: whoever wires one MUST route it through
+        /// `scp_ffi_common::callback_custody::dh_agree`, which validates the
+        /// peer point and the 32-byte result.
         ///
         /// `peer_public` is passed **by value** (an owned `Vec<u8>`) for the same
         /// owned-copy-detached-from-wasm-memory reason as [`JsKeyCustody::sign`] —

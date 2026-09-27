@@ -438,9 +438,10 @@ pub trait KeyCustody: Send + Sync {
     /// the curve.
     ///
     /// - [`KeyType::X25519`]: `peer_public` is the 32-byte X25519 key.
-    /// - [`KeyType::HpkeP256`]: `peer_public` is a SEC1 P-256 point (33 or 65
-    ///   bytes) that must be on the curve and not the identity; the result is
-    ///   the ECDH x-coordinate.
+    /// - [`KeyType::HpkeP256`]: `peer_public` is exactly the 65-byte
+    ///   uncompressed SEC1 point (`0x04 || x || y`, RFC 9180 §7.1.1
+    ///   `SerializePublicKey`), on the curve and not the identity; a
+    ///   compressed point is rejected. The result is the ECDH x-coordinate.
     ///
     /// Returns the 32-byte shared secret. The private key never leaves the
     /// custody boundary — the scalar multiplication happens inside the adapter.
@@ -1088,20 +1089,45 @@ pub(crate) fn sign_p256_digest(
         .map_err(|e| PlatformError::CustodyError(format!("P-256 signing: {e}")))
 }
 
-/// Performs ECDH between a software [`KeyType::HpkeP256`] key and a SEC1 peer
-/// point: the shared [`KeyCustody::dh_agree`] path of every software backend.
+/// Parses the peer public key of a [`KeyType::HpkeP256`] key agreement.
+///
+/// The peer must be exactly the 65-byte uncompressed SEC1 point
+/// `0x04 || x || y` (RFC 9180 §7.1.1), on the curve and not the identity.
+/// Every backend and bridge uses this one check.
 ///
 /// # Errors
 ///
-/// [`PlatformError::CustodyError`] when `peer_public` is not a valid P-256
-/// point (wrong length or prefix, off the curve, or the identity).
+/// [`PlatformError::CustodyError`] on any other length, a prefix other than
+/// `0x04`, an off-curve point, or the identity.
+pub fn hpke_p256_peer(
+    peer_public: &[u8],
+) -> Result<scp_crypto::p256::P256PublicKey, PlatformError> {
+    use scp_crypto::p256::UNCOMPRESSED_POINT_LEN;
+    if peer_public.len() != UNCOMPRESSED_POINT_LEN || peer_public[0] != 0x04 {
+        return Err(PlatformError::CustodyError(format!(
+            "an HPKE P-256 peer public key is the {UNCOMPRESSED_POINT_LEN}-byte uncompressed \
+             point (0x04 || x || y), got {} bytes",
+            peer_public.len()
+        )));
+    }
+    scp_crypto::p256::P256PublicKey::from_sec1(peer_public)
+        .map_err(|e| PlatformError::CustodyError(format!("P-256 peer public key: {e}")))
+}
+
+/// Performs ECDH between a software [`KeyType::HpkeP256`] key and a peer
+/// that passes [`hpke_p256_peer`]: the shared [`KeyCustody::dh_agree`] path
+/// of every software backend.
+///
+/// # Errors
+///
+/// [`PlatformError::CustodyError`] when `peer_public` fails
+/// [`hpke_p256_peer`].
 #[cfg(feature = "software_platform")]
 pub(crate) fn p256_dh_agree(
     key: &scp_crypto::p256::P256SigningKey,
     peer_public: &[u8],
 ) -> Result<SharedSecret, PlatformError> {
-    let peer = scp_crypto::p256::P256PublicKey::from_sec1(peer_public)
-        .map_err(|e| PlatformError::CustodyError(format!("P-256 peer public key: {e}")))?;
+    let peer = hpke_p256_peer(peer_public)?;
     let shared = scp_crypto::p256::ecdh_p256(key, &peer);
     Ok(SharedSecret::new(*shared))
 }

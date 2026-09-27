@@ -1109,6 +1109,44 @@ mod tests {
         );
     }
 
+    /// A9: a pinned key and digest whose raw RFC 6979 signature has a high
+    /// `s`. The custody must return the low-s form, which differs from the
+    /// raw signature and verifies strictly.
+    #[tokio::test]
+    async fn p256_sign_normalises_a_pinned_high_s_signature() {
+        use p256::ecdsa::signature::hazmat::PrehashSigner;
+        let seed = [7u8; 32];
+        let mut scalar = [0u8; 32];
+        rand::rngs::StdRng::from_seed(seed).fill_bytes(&mut scalar);
+        let raw_signer = p256::ecdsa::SigningKey::from_slice(&scalar).unwrap();
+
+        let digest = [HIGH_S_DIGEST_BYTE; 32];
+        let raw: p256::ecdsa::Signature = raw_signer.sign_prehash(&digest).unwrap();
+        assert!(
+            raw.normalize_s().is_some(),
+            "the pinned digest's raw RFC 6979 s must be high"
+        );
+
+        let custody = InMemoryKeyCustody::from_seed_bytes(seed);
+        let handle = custody
+            .generate_keypair(KeyType::P256Signing)
+            .await
+            .unwrap();
+        let pk = P256PublicKey::from_sec1(custody.public_key(&handle).await.unwrap().as_bytes())
+            .unwrap();
+        let sig = custody.sign(&handle, &digest).await.unwrap();
+        assert_ne!(sig.as_bytes(), raw.to_bytes().as_slice());
+        assert_eq!(
+            sig.as_bytes(),
+            raw.normalize_s().unwrap().to_bytes().as_slice()
+        );
+        verify_prehash_strict(&pk, &digest, sig.as_bytes()).unwrap();
+    }
+
+    /// First byte `b` such that the digest `[b; 32]` gives a high raw `s`
+    /// under the key `StdRng::from_seed([7; 32])` draws first.
+    const HIGH_S_DIGEST_BYTE: u8 = 0;
+
     #[tokio::test]
     async fn p256_signing_key_signs_digests_only() {
         let custody = InMemoryKeyCustody::new();
@@ -1120,9 +1158,13 @@ mod tests {
         assert_eq!(pk_bytes.as_bytes().len(), 33);
         let pk = P256PublicKey::from_sec1(pk_bytes.as_bytes()).unwrap();
 
-        let digest = [0x42u8; 32];
-        let sig = custody.sign(&handle, &digest).await.unwrap();
-        verify_prehash_strict(&pk, &digest, sig.as_bytes()).unwrap();
+        // 64 distinct digests: RFC 6979 yields a high raw s for about half,
+        // so every one verifying strictly shows the low-s normalisation.
+        for i in 0..64u8 {
+            let digest = [i; 32];
+            let sig = custody.sign(&handle, &digest).await.unwrap();
+            verify_prehash_strict(&pk, &digest, sig.as_bytes()).unwrap();
+        }
 
         assert!(matches!(
             custody.sign(&handle, &[0u8; 33]).await,
@@ -1147,19 +1189,19 @@ mod tests {
 
         let peer = P256SigningKey::from_scalar_bytes(&[3u8; 32]).unwrap();
         let expected = scp_crypto::p256::ecdh_p256(&peer, &own_pk);
-        for encoding in [
-            peer.public_key().to_uncompressed().to_vec(),
-            peer.public_key().to_compressed().to_vec(),
-        ] {
-            let shared = custody.dh_agree(&handle, &encoding).await.unwrap();
-            assert_eq!(shared.as_bytes(), &*expected);
-        }
+        let shared = custody
+            .dh_agree(&handle, &peer.public_key().to_uncompressed())
+            .await
+            .unwrap();
+        assert_eq!(shared.as_bytes(), &*expected);
 
-        // Off-curve 65-byte point, a 32-byte X25519-style key, and the empty
-        // slice are all refused.
+        // A compressed point (RFC 9180 §7.1.1 takes only the uncompressed
+        // form), an off-curve 65-byte point, a 32-byte X25519-style key, and
+        // the empty slice are all refused.
+        let compressed = peer.public_key().to_compressed();
         let mut off_curve = peer.public_key().to_uncompressed();
         off_curve[64] ^= 1;
-        for bad in [off_curve.as_slice(), &[9u8; 32], &[]] {
+        for bad in [&compressed[..], off_curve.as_slice(), &[9u8; 32], &[]] {
             assert!(matches!(
                 custody.dh_agree(&handle, bad).await,
                 Err(PlatformError::CustodyError(_))

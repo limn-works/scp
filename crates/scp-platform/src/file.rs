@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! ┌────────────────────────────────────────────────┐
-//! │ version: u8          (1 byte, currently 0x01)  │
+//! │ version: u8          (1 byte, currently 0x02)  │
 //! │ argon2id_salt: [u8]  (16 bytes)                │
 //! ├────────────────────────────────────────────────┤
 //! │ entry_count: u32 LE  (4 bytes)                 │
@@ -33,7 +33,11 @@
 //! The Argon2id salt is generated once when the file is created and reused
 //! for all entries. Each entry has a unique AES-256-GCM nonce. The
 //! ciphertext is the 32-byte private key encrypted under AES-256-GCM;
-//! the tag (16 bytes) is appended by the AEAD. A P-256 entry's 32 bytes are
+//! the tag (16 bytes) is appended by the AEAD. The AEAD's associated data is
+//! `version || key_type || entry_index (u32 BE)`, so flipping an entry's type
+//! byte or moving an entry to another position fails decryption instead of
+//! reinterpreting the key. `destroy_key` re-encrypts every entry whose index
+//! shifts. A P-256 entry's 32 bytes are
 //! the big-endian scalar; it is rejected when decrypted if it is zero or not
 //! below the group order `n`.
 //!
@@ -74,7 +78,11 @@ use crate::traits::{
 // ---------------------------------------------------------------------------
 
 /// Current file format version.
-const FORMAT_VERSION: u8 = 0x01;
+///
+/// Version 0x02 binds each entry's type byte and index into the AES-256-GCM
+/// associated data; version 0x01 files are refused (SCP has no deployed
+/// key files to migrate).
+const FORMAT_VERSION: u8 = 0x02;
 
 /// Argon2id salt length in bytes.
 const SALT_LEN: usize = 16;
@@ -435,11 +443,45 @@ impl FileKeyCustody {
         crate::kdf::derive_argon2id_key(passphrase.as_bytes(), salt)
     }
 
-    /// Encrypts a 32-byte private key using AES-256-GCM with a fresh nonce.
+    /// The AES-256-GCM associated data for an entry:
+    /// `FORMAT_VERSION || key_type || entry_index (u32 BE)`.
+    fn entry_aad(key_type: u8, entry_index: usize) -> Result<[u8; 6], PlatformError> {
+        let index = u32::try_from(entry_index).map_err(|_| {
+            PlatformError::CustodyError(format!("entry index {entry_index} exceeds u32"))
+        })?;
+        let mut aad = [0u8; 6];
+        aad[0] = FORMAT_VERSION;
+        aad[1] = key_type;
+        aad[2..].copy_from_slice(&index.to_be_bytes());
+        Ok(aad)
+    }
+
+    /// Encrypts one on-disk entry (`key_type || nonce || ciphertext+tag`)
+    /// with a fresh nonce, binding the type byte and index as associated
+    /// data.
+    fn encrypt_entry(
+        &self,
+        key_type: u8,
+        entry_index: usize,
+        plaintext: &[u8; KEY_LEN],
+    ) -> Result<Vec<u8>, PlatformError> {
+        let (nonce, ciphertext) = self.encrypt_key(key_type, entry_index, plaintext)?;
+        let mut entry = Vec::with_capacity(ENTRY_SIZE);
+        entry.push(key_type);
+        entry.extend_from_slice(&nonce);
+        entry.extend_from_slice(&ciphertext);
+        Ok(entry)
+    }
+
+    /// Encrypts a 32-byte private key using AES-256-GCM with a fresh nonce
+    /// and the entry's associated data ([`Self::entry_aad`]).
     fn encrypt_key(
         &self,
+        key_type: u8,
+        entry_index: usize,
         plaintext: &[u8; KEY_LEN],
     ) -> Result<([u8; NONCE_LEN], Vec<u8>), PlatformError> {
+        let aad = Self::entry_aad(key_type, entry_index)?;
         let cipher = Aes256Gcm::new_from_slice(self.derived_key.as_ref())
             .map_err(|e| PlatformError::CustodyError(format!("cipher init failed: {e}")))?;
 
@@ -448,20 +490,45 @@ impl FileKeyCustody {
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = cipher
-            .encrypt(nonce, plaintext.as_ref())
+            .encrypt(
+                nonce,
+                aes_gcm::aead::Payload {
+                    msg: plaintext.as_ref(),
+                    aad: &aad,
+                },
+            )
             .map_err(|e| PlatformError::CustodyError(format!("encryption failed: {e}")))?;
 
         Ok((nonce_bytes, ciphertext))
     }
 
-    /// Decrypts a key entry from the file at the given entry index.
+    /// Decrypts a key entry from the file at the given entry index. The
+    /// entry's type byte and `entry_index` are authenticated as associated
+    /// data, so a flipped type byte or a moved entry fails here.
     fn decrypt_entry(
         &self,
         data: &[u8],
         entry_index: usize,
     ) -> Result<Zeroizing<[u8; KEY_LEN]>, PlatformError> {
-        let offset = HEADER_SIZE + entry_index * ENTRY_SIZE;
-        // Skip key_type byte (1 byte).
+        self.decrypt_entry_as(data, entry_index, entry_index)
+    }
+
+    /// Decrypts the entry stored at `position` whose associated data names
+    /// `aad_index` (they differ only while `destroy_key` re-encrypts shifted
+    /// entries).
+    fn decrypt_entry_as(
+        &self,
+        data: &[u8],
+        position: usize,
+        aad_index: usize,
+    ) -> Result<Zeroizing<[u8; KEY_LEN]>, PlatformError> {
+        let offset = HEADER_SIZE + position * ENTRY_SIZE;
+        if data.len() < offset + ENTRY_SIZE {
+            return Err(PlatformError::CustodyError(format!(
+                "key file truncated at entry {position}"
+            )));
+        }
+        let aad = Self::entry_aad(data[offset], aad_index)?;
         let nonce_start = offset + 1;
         let ct_start = nonce_start + NONCE_LEN;
         let ct_end = ct_start + KEY_LEN + TAG_LEN;
@@ -472,10 +539,21 @@ impl FileKeyCustody {
         let cipher = Aes256Gcm::new_from_slice(self.derived_key.as_ref())
             .map_err(|e| PlatformError::CustodyError(format!("cipher init failed: {e}")))?;
 
-        let plaintext =
-            Zeroizing::new(cipher.decrypt(nonce, ciphertext_and_tag).map_err(|_| {
-                PlatformError::CustodyError("decryption failed (wrong passphrase?)".into())
-            })?);
+        let plaintext = Zeroizing::new(
+            cipher
+                .decrypt(
+                    nonce,
+                    aes_gcm::aead::Payload {
+                        msg: ciphertext_and_tag,
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| {
+                    PlatformError::CustodyError(
+                        "decryption failed (wrong passphrase, or a tampered or moved entry)".into(),
+                    )
+                })?,
+        );
 
         let mut key_bytes = Zeroizing::new([0u8; KEY_LEN]);
         if plaintext.len() != KEY_LEN {
@@ -518,13 +596,9 @@ impl FileKeyCustody {
 
         let new_index = current_count as usize;
 
-        // Encrypt the key.
-        let (nonce, ciphertext) = self.encrypt_key(private_key)?;
-
-        // Build the entry: key_type + nonce + ciphertext+tag.
-        data.push(key_type.to_byte());
-        data.extend_from_slice(&nonce);
-        data.extend_from_slice(&ciphertext);
+        // Encrypt the key, binding its type byte and index.
+        let entry = self.encrypt_entry(key_type.to_byte(), new_index, private_key)?;
+        data.extend_from_slice(&entry);
 
         // Update entry count.
         let new_count = current_count + 1;
@@ -804,13 +878,22 @@ impl KeyCustody for FileKeyCustody {
             // Write updated entry count.
             new_data.extend_from_slice(&new_count.to_le_bytes());
 
-            // Copy all entries except the removed one.
+            // Copy entries before the removed one unchanged. Every entry
+            // after it moves down one index, and the index is part of its
+            // associated data, so each is decrypted under its old index and
+            // re-encrypted (fresh nonce) under its new one.
             for i in 0..current_count as usize {
                 if i == removed_index {
                     continue;
                 }
                 let entry_offset = HEADER_SIZE + i * ENTRY_SIZE;
-                new_data.extend_from_slice(&data[entry_offset..entry_offset + ENTRY_SIZE]);
+                if i < removed_index {
+                    new_data.extend_from_slice(&data[entry_offset..entry_offset + ENTRY_SIZE]);
+                } else {
+                    let key_bytes = self.decrypt_entry_as(&data, i, i)?;
+                    let entry = self.encrypt_entry(data[entry_offset], i - 1, &key_bytes)?;
+                    new_data.extend_from_slice(&entry);
+                }
             }
 
             // Commit to disk BEFORE mutating the in-memory map. If
@@ -1681,15 +1764,27 @@ mod tests {
         assert_eq!(custody.public_key(&sign_handle).await.unwrap(), sign_pub);
         assert_eq!(custody.public_key(&hpke_handle).await.unwrap(), hpke_pub);
 
+        // 64 distinct digests: RFC 6979 gives a high raw s for about half of
+        // them, so every one verifying strictly shows low-s normalisation.
         let pk = scp_crypto::p256::P256PublicKey::from_sec1(sign_pub.as_bytes()).unwrap();
+        for i in 0..64u8 {
+            let digest = [i; 32];
+            let sig = custody.sign(&sign_handle, &digest).await.unwrap();
+            scp_crypto::p256::verify_prehash_strict(&pk, &digest, sig.as_bytes()).unwrap();
+        }
         let digest = [0x22u8; 32];
-        let sig = custody.sign(&sign_handle, &digest).await.unwrap();
-        scp_crypto::p256::verify_prehash_strict(&pk, &digest, sig.as_bytes()).unwrap();
 
         let peer = P256SigningKey::from_scalar_bytes(&[6u8; 32]).unwrap();
         let own = scp_crypto::p256::P256PublicKey::from_sec1(hpke_pub.as_bytes()).unwrap();
+        // An HPKE P-256 peer is exactly the 65-byte uncompressed point.
+        assert!(matches!(
+            custody
+                .dh_agree(&hpke_handle, &peer.public_key().to_compressed())
+                .await,
+            Err(PlatformError::CustodyError(_))
+        ));
         let shared = custody
-            .dh_agree(&hpke_handle, &peer.public_key().to_compressed())
+            .dh_agree(&hpke_handle, &peer.public_key().to_uncompressed())
             .await
             .unwrap();
         assert_eq!(
@@ -1720,6 +1815,92 @@ mod tests {
                 expected: KeyType::Ed25519,
                 actual: KeyType::HpkeP256
             })
+        ));
+    }
+
+    /// A1: the type byte is authenticated. Rewriting an Ed25519 entry's type
+    /// byte to X25519 makes it undecryptable instead of reinterpreting it.
+    #[tokio::test]
+    async fn flipped_entry_type_byte_fails_decryption() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let custody = FileKeyCustody::new(&path, "pass").unwrap();
+        custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        drop(custody);
+
+        let mut data = std::fs::read(&path).unwrap();
+        assert_eq!(data[HEADER_SIZE], KEY_TYPE_ED25519);
+        data[HEADER_SIZE] = KEY_TYPE_X25519;
+        std::fs::write(&path, &data).unwrap();
+
+        let custody = FileKeyCustody::new(&path, "pass").unwrap();
+        let handle = KeyHandle::new(1);
+        assert!(matches!(
+            custody.public_key(&handle).await,
+            Err(PlatformError::CustodyError(_))
+        ));
+        assert!(matches!(
+            custody.dh_agree(&handle, &[9u8; 32]).await,
+            Err(PlatformError::CustodyError(_))
+        ));
+    }
+
+    /// A1: the entry index is authenticated. Swapping two entries on disk
+    /// makes both undecryptable; destroying an earlier entry re-encrypts the
+    /// shifted ones so they still decrypt after reopening.
+    #[tokio::test]
+    async fn swapped_entries_fail_decryption_and_destroy_reencrypts_shifted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let custody = FileKeyCustody::new(&path, "pass").unwrap();
+        let a = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let b = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let c = custody
+            .generate_keypair(KeyType::P256Signing)
+            .await
+            .unwrap();
+        let b_pub = custody.public_key(&b).await.unwrap();
+        let c_pub = custody.public_key(&c).await.unwrap();
+        custody.destroy_key(&a).await.unwrap();
+        // Still readable in-process after the rewrite.
+        assert_eq!(custody.public_key(&b).await.unwrap(), b_pub);
+        assert_eq!(custody.public_key(&c).await.unwrap(), c_pub);
+        drop(custody);
+
+        // Reopened: the shifted entries decrypt under their new indices.
+        let custody = FileKeyCustody::new(&path, "pass").unwrap();
+        assert_eq!(custody.public_key(&KeyHandle::new(1)).await.unwrap(), b_pub);
+        assert_eq!(custody.public_key(&KeyHandle::new(2)).await.unwrap(), c_pub);
+        drop(custody);
+
+        // Swap the two remaining entries (the type bytes move with them).
+        let mut data = std::fs::read(&path).unwrap();
+        let (first, second) =
+            data[HEADER_SIZE..HEADER_SIZE + 2 * ENTRY_SIZE].split_at_mut(ENTRY_SIZE);
+        first.swap_with_slice(second);
+        std::fs::write(&path, &data).unwrap();
+
+        let custody = FileKeyCustody::new(&path, "pass").unwrap();
+        for id in [1, 2] {
+            assert!(matches!(
+                custody.public_key(&KeyHandle::new(id)).await,
+                Err(PlatformError::CustodyError(_))
+            ));
+        }
+    }
+
+    /// A1: a version 0x01 file (no associated data) is refused.
+    #[tokio::test]
+    async fn version_one_key_file_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let mut data = vec![0x01u8];
+        data.extend_from_slice(&[0u8; SALT_LEN]);
+        data.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&path, &data).unwrap();
+        assert!(matches!(
+            FileKeyCustody::new(&path, "pass"),
+            Err(PlatformError::CustodyError(_))
         ));
     }
 

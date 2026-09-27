@@ -93,6 +93,8 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 scp-ffi-common = { path = "../common", features = ["testing", "custody"] }
+# The P-256 flow test verifies adapter output against scp-crypto directly.
+scp-crypto = { path = "../../scp-crypto" }
 # This bridge constructs `InMemoryDhtClient` in its own tests (identity.rs,
 # scp.rs) which is gated behind `scp-dht/testing`; activate it for this crate's
 # test build (ADR-062 §Decision 1). `scp-dht/testing` never appears in a

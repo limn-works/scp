@@ -158,9 +158,12 @@ impl SqliteKeyCustody {
                 max_id = id;
             }
 
-            let data = storage.retrieve(key_path).await?.ok_or_else(|| {
+            // The row holds the private key: wrap it before anything else so
+            // every exit path (including the length and type errors below)
+            // wipes it.
+            let data = Zeroizing::new(storage.retrieve(key_path).await?.ok_or_else(|| {
                 PlatformError::StorageError(format!("key {id} listed but not found"))
-            })?;
+            })?);
 
             if data.len() != 33 {
                 return Err(PlatformError::StorageError(format!(
@@ -761,6 +764,57 @@ mod tests {
         }
     }
 
+    /// A11: destroying a P-256 key (either type) deletes its row, so it is
+    /// gone after a reload while a sibling key survives.
+    #[tokio::test]
+    async fn destroyed_p256_keys_are_gone_after_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [0x42u8; 32];
+        let (sign_handle, hpke_handle, kept, kept_pub);
+        {
+            let storage = SqliteStorage::new(dir.path(), &key).unwrap();
+            let custody = SqliteKeyCustody::new(storage).await.unwrap();
+            sign_handle = custody
+                .generate_keypair(KeyType::P256Signing)
+                .await
+                .unwrap();
+            hpke_handle = custody.generate_keypair(KeyType::HpkeP256).await.unwrap();
+            kept = custody
+                .generate_keypair(KeyType::P256Signing)
+                .await
+                .unwrap();
+            kept_pub = custody.public_key(&kept).await.unwrap();
+            custody.destroy_key(&sign_handle).await.unwrap();
+            custody.destroy_key(&hpke_handle).await.unwrap();
+            assert!(matches!(
+                custody.sign(&sign_handle, &[0u8; 32]).await,
+                Err(PlatformError::KeyNotFound)
+            ));
+        }
+        {
+            let storage = SqliteStorage::new(dir.path(), &key).unwrap();
+            for handle in [sign_handle, hpke_handle] {
+                assert!(
+                    storage
+                        .retrieve(&format!("{KEY_PREFIX}{}", handle.id()))
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            let custody = SqliteKeyCustody::new(storage).await.unwrap();
+            assert!(matches!(
+                custody.public_key(&sign_handle).await,
+                Err(PlatformError::KeyNotFound)
+            ));
+            assert!(matches!(
+                custody.dh_agree(&hpke_handle, &[4u8; 65]).await,
+                Err(PlatformError::KeyNotFound)
+            ));
+            assert_eq!(custody.public_key(&kept).await.unwrap(), kept_pub);
+        }
+    }
+
     #[tokio::test]
     async fn dh_agree_works() {
         let dir = tempfile::tempdir().unwrap();
@@ -854,10 +908,14 @@ mod tests {
             assert_eq!(custody.public_key(&sign_handle).await.unwrap(), sign_pub);
             assert_eq!(custody.public_key(&hpke_handle).await.unwrap(), hpke_pub);
 
+            // 64 distinct digests: about half have a high raw RFC 6979 s,
+            // so every one verifying strictly shows low-s normalisation.
             let pk = scp_crypto::p256::P256PublicKey::from_sec1(sign_pub.as_bytes()).unwrap();
-            let digest = [0x11u8; 32];
-            let sig = custody.sign(&sign_handle, &digest).await.unwrap();
-            scp_crypto::p256::verify_prehash_strict(&pk, &digest, sig.as_bytes()).unwrap();
+            for i in 0..64u8 {
+                let digest = [i; 32];
+                let sig = custody.sign(&sign_handle, &digest).await.unwrap();
+                scp_crypto::p256::verify_prehash_strict(&pk, &digest, sig.as_bytes()).unwrap();
+            }
 
             let peer = P256SigningKey::from_scalar_bytes(&[5u8; 32]).unwrap();
             let own = scp_crypto::p256::P256PublicKey::from_sec1(hpke_pub.as_bytes()).unwrap();

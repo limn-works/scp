@@ -415,6 +415,8 @@ impl FfiKeyCustody {
 /// - `sign(key_id: str, message: bytes) -> bytes` — a 64-byte Ed25519 sig;
 ///   for a `"p256"` key, `message` is the 32-byte digest and the result is
 ///   raw `r ‖ s` or DER, which the bridge normalises to low-`s` and verifies.
+///   A software host MUST derive the ECDSA nonce by RFC 6979 with SHA-256; a
+///   hardware host (Secure Enclave, `StrongBox`/TEE) may use a random nonce.
 /// - `get_public_key(key_id: str) -> bytes` — 32 bytes (Ed25519 / X25519),
 ///   33 (compressed SEC1, `"p256"`) or 65 (uncompressed SEC1, `"hpke-p256"`).
 /// - `destroy_key(key_id: str) -> None`.
@@ -793,6 +795,37 @@ class BadP256Custody(P256Custody):
         if self._types.get(key_id) == 'p256':
             return bytes([1]) * 64
         return super().sign(key_id, message)
+
+# SEC 2 P-256 point 2G, SEC1-compressed (the Rust test checks this constant).
+TWO_G_COMPRESSED = bytes.fromhex('037cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978')
+
+class WrongLengthCustody(P256Custody):
+    '''Returns a wrong length from every host call the bridge checks: a
+    33-byte X25519 shared secret, a 72-byte Ed25519 signature, a 31-byte
+    Ed25519 public key, and, after a P-256 key is generated (public key G),
+    a different valid point (2G) for it.'''
+
+    def __init__(self):
+        super().__init__()
+        self._served = set()
+
+    def dh_agree(self, key_id, peer_public):
+        return bytes([3]) * 33
+
+    def sign(self, key_id, message):
+        if self._types.get(key_id) == 'ed25519':
+            return bytes([5]) * 72
+        return super().sign(key_id, message)
+
+    def get_public_key(self, key_id):
+        t = self._types.get(key_id)
+        if t == 'ed25519':
+            return bytes([6]) * 31
+        if t == 'p256':
+            if key_id in self._served:
+                return TWO_G_COMPRESSED
+            self._served.add(key_id)
+        return super().get_public_key(key_id)
 ";
 
     /// Builds a `FfiKeyCustody::Callback` wrapping a freshly-constructed
@@ -869,14 +902,16 @@ class BadP256Custody(P256Custody):
         // The fake's key is d = 1, so ecdh_p256(peer, G) is the peer's x.
         let peer = P256SigningKey::from_scalar_bytes(&[9u8; 32]).expect("scalar");
         let shared = custody
-            .dh_agree(&handle, &peer.public_key().to_compressed())
+            .dh_agree(&handle, &peer.public_key().to_uncompressed())
             .await
-            .expect("dh_agree with a compressed peer");
+            .expect("dh_agree with an uncompressed peer");
         assert_eq!(shared.as_bytes(), &*ecdh_p256(&peer, &own));
 
+        // Only the 65-byte uncompressed point is accepted (RFC 9180 §7.1.1).
+        let compressed = peer.public_key().to_compressed();
         let mut off_curve = peer.public_key().to_uncompressed();
         off_curve[64] ^= 1;
-        for bad in [&off_curve[..], &[9u8; 32][..], &[][..]] {
+        for bad in [&compressed[..], &off_curve[..], &[9u8; 32][..], &[][..]] {
             assert!(matches!(
                 custody.dh_agree(&handle, bad).await,
                 Err(PlatformError::CustodyError(_))
@@ -906,6 +941,58 @@ class BadP256Custody(P256Custody):
             .expect("p256 key with a valid public key");
         assert!(matches!(
             custody.sign(&handle, &[1u8; 32]).await,
+            Err(PlatformError::CustodyError(_))
+        ));
+    }
+
+    /// A10: every wrong-length or changed host return reaching the shared
+    /// flows is a `CustodyError`, never a value.
+    #[tokio::test]
+    async fn ffi_custody_callback_rejects_wrong_length_host_returns() {
+        use scp_crypto::p256::P256SigningKey;
+        let mut two = [0u8; 32];
+        two[31] = 2;
+        let two_g = hex::encode(
+            P256SigningKey::from_scalar_bytes(&two)
+                .expect("2 is a valid scalar")
+                .public_key()
+                .to_compressed(),
+        );
+        assert_eq!(
+            two_g, "037cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978",
+            "the fake's changed key must be a valid point, so only the change is rejected"
+        );
+
+        let custody = fake_callback_custody_of(c"WrongLengthCustody");
+        let x = custody
+            .generate_keypair(KeyType::X25519)
+            .await
+            .expect("x25519 key");
+        assert!(matches!(
+            custody.dh_agree(&x, &[9u8; 32]).await,
+            Err(PlatformError::CustodyError(_))
+        ));
+
+        let ed = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("ed25519 key");
+        assert!(matches!(
+            custody.sign(&ed, b"message").await,
+            Err(PlatformError::CustodyError(_))
+        ));
+        assert!(matches!(
+            custody.public_key(&ed).await,
+            Err(PlatformError::CustodyError(_))
+        ));
+
+        // Generation sees G; every later fetch returns 2G.
+        let p = custody
+            .generate_keypair(KeyType::P256Signing)
+            .await
+            .expect("p256 key validated against G at generation");
+        assert!(matches!(
+            custody.public_key(&p).await,
             Err(PlatformError::CustodyError(_))
         ));
     }

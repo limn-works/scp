@@ -21288,6 +21288,151 @@ mod tests {
         );
     }
 
+    // ----- P-256 through the callback-custody adapter -----
+
+    /// A `KeyCustodyProvider` over the shared software P-256 host, so the
+    /// round trip runs through `CallbackKeyCustody` and the shared flows.
+    struct FakeP256Provider(Arc<scp_ffi_common::callback_custody::fake_host::FakeP256Host>);
+
+    fn fake_host_err(e: &scp_platform::error::PlatformError) -> ScpError {
+        ScpError::Context {
+            msg: e.to_string(),
+            code: codes::CTX_2050.to_owned(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::KeyCustodyProvider for FakeP256Provider {
+        async fn sign(&self, key_id: String, message: Vec<u8>) -> Result<Vec<u8>, ScpError> {
+            self.0
+                .sign(&key_id, &message)
+                .map_err(|e| fake_host_err(&e))
+        }
+
+        async fn get_public_key(&self, key_id: String) -> Result<Vec<u8>, ScpError> {
+            self.0
+                .get_public_key(&key_id)
+                .map_err(|e| fake_host_err(&e))
+        }
+
+        async fn destroy_key(&self, key_id: String) -> Result<(), ScpError> {
+            self.0.destroy_key(&key_id).map_err(|e| fake_host_err(&e))
+        }
+
+        async fn generate_keypair(&self, key_type: String) -> Result<String, ScpError> {
+            self.0
+                .generate_keypair(&key_type)
+                .map_err(|e| fake_host_err(&e))
+        }
+
+        async fn dh_agree(
+            &self,
+            key_id: String,
+            peer_public: Vec<u8>,
+        ) -> Result<Vec<u8>, ScpError> {
+            self.0
+                .dh_agree(&key_id, &peer_public)
+                .map_err(|e| fake_host_err(&e))
+        }
+
+        async fn derive_pseudonym(
+            &self,
+            _key_id: String,
+            _context_id: Vec<u8>,
+        ) -> Result<Vec<u8>, ScpError> {
+            Err(ScpError::Context {
+                msg: "derive_pseudonym not supported by FakeP256Provider".to_owned(),
+                code: codes::CTX_2050.to_owned(),
+            })
+        }
+
+        fn custody_type(&self, _key_id: String) -> String {
+            "software".to_owned()
+        }
+    }
+
+    /// A13: P-256 sign and HPKE `dh_agree` through `CallbackKeyCustody`. The
+    /// host signs with a high `s` in DER; the adapter must return the raw
+    /// low-`s` signature that strictly verifies. The host must receive the
+    /// peer as the 65-byte uncompressed point, and a compressed peer never
+    /// reaches it.
+    #[tokio::test]
+    async fn callback_custody_p256_sign_and_dh_agree_round_trip() {
+        use scp_crypto::p256::{
+            P256PublicKey, P256SigningKey, ecdh_p256, normalize_low_s, verify_prehash_strict,
+        };
+        use scp_platform::KeyCustody;
+        use scp_platform::traits::KeyType;
+
+        let host = Arc::new(scp_ffi_common::callback_custody::fake_host::FakeP256Host::default());
+        let custody = CallbackKeyCustody::new(Box::new(FakeP256Provider(Arc::clone(&host))));
+
+        let signer = custody
+            .generate_keypair(KeyType::P256Signing)
+            .await
+            .expect("p256 generation");
+        let public = P256PublicKey::from_sec1(
+            custody
+                .public_key(&signer)
+                .await
+                .expect("p256 public key")
+                .as_bytes(),
+        )
+        .expect("a valid point");
+        for i in 0u8..16 {
+            let digest = [i; 32];
+            let sig: [u8; 64] = custody
+                .sign(&signer, &digest)
+                .await
+                .expect("p256 sign")
+                .as_bytes()
+                .try_into()
+                .expect("raw r || s");
+            assert_eq!(normalize_low_s(&sig).expect("valid"), sig, "low s");
+            verify_prehash_strict(&public, &digest, &sig).expect("strict verify");
+        }
+        assert!(matches!(
+            custody.sign(&signer, b"not a digest").await,
+            Err(scp_platform::error::PlatformError::CustodyError(_))
+        ));
+
+        let hpke = custody
+            .generate_keypair(KeyType::HpkeP256)
+            .await
+            .expect("hpke-p256 generation");
+        let hpke_public = P256PublicKey::from_sec1(
+            custody
+                .public_key(&hpke)
+                .await
+                .expect("hpke public key")
+                .as_bytes(),
+        )
+        .expect("a valid point");
+        let peer = P256SigningKey::from_scalar_bytes(&[0x33; 32]).expect("scalar");
+        let peer_point = peer.public_key().to_uncompressed();
+        let shared = custody
+            .dh_agree(&hpke, &peer_point)
+            .await
+            .expect("hpke dh_agree");
+        assert_eq!(shared.as_bytes(), ecdh_p256(&peer, &hpke_public).as_slice());
+        assert_eq!(
+            host.last_peer.lock().expect("lock").as_deref(),
+            Some(peer_point.as_slice())
+        );
+
+        *host.last_peer.lock().expect("lock") = None;
+        assert!(matches!(
+            custody
+                .dh_agree(&hpke, &peer.public_key().to_compressed())
+                .await,
+            Err(scp_platform::error::PlatformError::CustodyError(_))
+        ));
+        assert!(
+            host.last_peer.lock().expect("lock").is_none(),
+            "a compressed peer must be rejected before the host call"
+        );
+    }
+
     // ----- Context export signing via sign-only custody (§23.16.8) -----
 
     /// A deliberately **sign-only** `KeyCustodyProvider`: it signs and exposes a
@@ -26244,6 +26389,9 @@ mod tests {
     /// Mints a Class 1 (`oauth`) link attestation on a fresh identity and
     /// returns an `Scp` bound to that identity's bridge instance, that
     /// identity's attestation JSON, and its `#active` key as hex.
+    ///
+    /// Needs the `testing` feature: minting runs on in-memory custody.
+    #[cfg(feature = "testing")]
     async fn minted_link_attestation() -> (Arc<crate::scp::Scp>, String, String) {
         let scp = scp_test();
         let identity = scp
@@ -26290,6 +26438,7 @@ mod tests {
         (scp, attestation_json, active_hex)
     }
 
+    #[cfg(feature = "testing")]
     #[test]
     fn per_instance_link_verification_accepts_a_key_the_did_document_publishes() {
         runtime().block_on(async {
@@ -26324,6 +26473,7 @@ mod tests {
     /// Passing a key nobody signed with does NOT exhibit that gap — a
     /// signature check rejects it either way — so this test forges rather than
     /// mutating a key.
+    #[cfg(feature = "testing")]
     #[test]
     fn per_instance_link_verification_rejects_an_attacker_supplied_key_and_attestation() {
         use ed25519_dalek::{Signer, SigningKey};

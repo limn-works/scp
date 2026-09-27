@@ -57,7 +57,9 @@ pub struct NapiKeyCustodyProvider {
     /// `(keyId: string, message: Uint8Array) => Uint8Array` — 64-byte sig.
     /// For a `"p256"` key `message` is a 32-byte prehash and the result is
     /// raw `r || s` (64 bytes) or DER; Rust normalises to low-s and verifies
-    /// it strictly against the key's public key, rejecting any mismatch.
+    /// it strictly against the key's public key, rejecting any mismatch. A
+    /// software host MUST derive the ECDSA nonce by RFC 6979 with SHA-256; a
+    /// hardware host may use a random nonce.
     #[napi(ts_type = "(keyId: string, message: Uint8Array) => Uint8Array")]
     pub sign: Function<'static, (String, Vec<u8>), Vec<u8>>,
     /// `(keyId: string) => Uint8Array` — 32 public-key bytes (Ed25519 /
@@ -677,5 +679,106 @@ mod tests {
             .await
             .expect("ephemeral seed via enum");
         assert_eq!(seed.len(), 32);
+    }
+}
+
+/// A13: the P-256 round trip through the shared flows this adapter calls.
+///
+/// A `ThreadsafeFunction` needs a live Node.js runtime, so these closures
+/// stand in for the `call_async` closures of [`NapiCallbackKeyCustody`], one
+/// per callback, with the same argument shapes. The TypeScript SDK test covers
+/// the JS side.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod p256_flow_tests {
+    use scp_crypto::p256::{
+        P256PublicKey, P256SigningKey, ecdh_p256, normalize_low_s, verify_prehash_strict,
+    };
+    use scp_ffi_common::callback_custody::{
+        self as flow, CallbackKeyRegistry, fake_host::FakeP256Host,
+    };
+    use scp_platform::error::PlatformError;
+    use scp_platform::traits::KeyType;
+
+    async fn generate(
+        registry: &CallbackKeyRegistry,
+        host: &FakeP256Host,
+        key_type: KeyType,
+    ) -> scp_platform::traits::KeyHandle {
+        flow::generate_keypair(
+            registry,
+            key_type,
+            |type_str| async move { host.generate_keypair(type_str) },
+            |key_id| async move { host.get_public_key(&key_id) },
+            |key_id| async move { host.destroy_key(&key_id) },
+        )
+        .await
+        .expect("p256 generation")
+    }
+
+    #[tokio::test]
+    async fn napi_callback_flow_p256_sign_and_dh_agree_round_trip() {
+        let host = FakeP256Host::default();
+        let registry = CallbackKeyRegistry::new();
+        let host = &host;
+
+        let signer = generate(&registry, host, KeyType::P256Signing).await;
+        let public = P256PublicKey::from_sec1(
+            flow::public_key(&registry, &signer, |key_id| async move {
+                host.get_public_key(&key_id)
+            })
+            .await
+            .expect("public key")
+            .as_bytes(),
+        )
+        .expect("a valid point");
+        for i in 0u8..16 {
+            let digest = [i; 32];
+            let sig: [u8; 64] =
+                flow::sign(&registry, &signer, &digest, |key_id, data| async move {
+                    host.sign(&key_id, &data)
+                })
+                .await
+                .expect("sign")
+                .as_bytes()
+                .try_into()
+                .expect("raw r || s");
+            assert_eq!(normalize_low_s(&sig).expect("valid"), sig, "low s");
+            verify_prehash_strict(&public, &digest, &sig).expect("strict verify");
+        }
+
+        let hpke = generate(&registry, host, KeyType::HpkeP256).await;
+        let hpke_public = P256PublicKey::from_sec1(
+            flow::public_key(&registry, &hpke, |key_id| async move {
+                host.get_public_key(&key_id)
+            })
+            .await
+            .expect("public key")
+            .as_bytes(),
+        )
+        .expect("a valid point");
+        let peer = P256SigningKey::from_scalar_bytes(&[0x33; 32]).expect("scalar");
+        let peer_point = peer.public_key().to_uncompressed();
+        let shared = flow::dh_agree(&registry, &hpke, &peer_point, |key_id, p| async move {
+            host.dh_agree(&key_id, &p)
+        })
+        .await
+        .expect("dh_agree");
+        assert_eq!(shared.as_bytes(), ecdh_p256(&peer, &hpke_public).as_slice());
+        assert_eq!(
+            host.last_peer.lock().expect("lock").as_deref(),
+            Some(peer_point.as_slice())
+        );
+
+        *host.last_peer.lock().expect("lock") = None;
+        let compressed = peer.public_key().to_compressed();
+        assert!(matches!(
+            flow::dh_agree(&registry, &hpke, &compressed, |key_id, p| async move {
+                host.dh_agree(&key_id, &p)
+            })
+            .await,
+            Err(PlatformError::CustodyError(_))
+        ));
+        assert!(host.last_peer.lock().expect("lock").is_none());
     }
 }
