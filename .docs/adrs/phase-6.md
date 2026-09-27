@@ -29,9 +29,11 @@ Phase 1-5 ADRs
 
 ## ADR-027: Android Platform Adapter
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling) — see the amendment below.
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling) and 2026-09-27 (the device-attestation binding and the named verifier) — see the amendments below.
 
 **Amendment (2026-09-10 — every SCP key is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. This ADR's Rationale called hardware-backed Ed25519 at API 33 and above "a direct win over Apple, where Secure Enclave's P-256 limitation forces software key storage". **That paragraph is withdrawn.** The gap it named came from SCP's own curve choice and not from either vendor's hardware: Apple's Secure Enclave performs P-256 operations, Android Keystore has held P-256 keys in the Trusted Execution Environment since API 23, and SCP signed with a curve only one of the two implemented. Under the ruling both adapters hold every SCP signing key in hardware, and ADR-025, the Apple platform adapter, carries the matching amendment. Two further consequences follow for this ADR. The Bouncy Castle software fallback for API levels 26 through 32 has nothing left to fall back from, because Keystore holds a P-256 signing key at every API level this SDK supports; it survives only for key agreement below API 31, which is the first level at which Keystore performs ECDH. And the root member is held by a passkey through the platform's credential provider (`09-security-model.md` §9.7.4.1 item 4), so `AndroidKeyCustody` neither generates nor stores it.
+
+**Amendment (2026-09-27 — the Play Integrity request binds the identifier and the context challenge, and the package's verifier vouches for the token).** `09-security-model.md` §9.3.1, reading a device attestation, owns the construction and the reader's procedure, and this ADR carries them into the Android adapter. First, the adapter issues a Standard integrity request whose `requestHash` is the lowercase hexadecimal form of the binding digest, which the Rust core computes and passes as the shipped trait's `challenge`, `D = SHA-256("SCP-DEVICE-ATTESTATION-V1:" ‖ BE32(56) ‖ identifier_text ‖ BE32(n) ‖ context_id ‖ challenge)`, where `identifier_text` is the identifier's `scp:` text form, `context_id` is the UTF-8 bytes of the context's id, and `challenge` is the context's 32-byte `device_attestation_challenge`. That replaces the `Base64(SHA-256(clientDataJSON))` nonce of acceptance criterion 7, which named no identifier. The code block this ADR carried also contradicted its own text: the text names the Standard API, and the code called the Classic API's `IntegrityTokenRequest.builder().setNonce(nonce)`. The code block below now calls the Standard API. Second, no peer can decode a Standard token, because Google decodes one only for the Cloud project linked to the requesting app. The verifier for a package is therefore the party whose Cloud project Google links to it, in practice the app's developer, and a context that weights Play Integrity lists each accepted package with its signing-certificate digest and that verifier's identifier in `ContextSybilPolicy.accepted_android_packages`, which governance sets. The verifier publishes a `PlayIntegrityVerifier` entry in its own service record carrying the package name, its Cloud project number and an HTTPS URL, and the owner sends the token to that URL in one HTTPS `POST` whose JSON request and response §9.3.1 defines byte for byte. The verifier decodes the token, checks `requestHash`, that `requestPackageName` and `appIntegrity.packageName` equal the request's package name, `PLAY_RECOGNIZED`, a single `certificateSha256Digest`, and `MEETS_DEVICE_INTEGRITY`, and signs a verdict under `"SCP-PLAY-INTEGRITY-VERDICT-V1:"` that carries the package name's SHA-256 and the signing certificate's digest. Each reader checks that pair against the context's `accepted_android_packages`. The SDK publishes the token and the verdict together in one `ScpDeviceAttestation` service-record entry, and a reader that cannot verify the verdict returns `Unverifiable` and counts no signal. Third, the assertion path carries the assertion digest `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" ‖ BE32(len(m)) ‖ m)` and no longer routes through `attest` with an empty device ID, so no assertion token's `requestHash` equals the hexadecimal form of a `D`. Fourth, the SDK builds the adapter for each call with the Cloud project number the verifier's `PlayIntegrityVerifier` entry carries, because the verifier can decode no token requested under another project, and a reader's `Verified` for a Play Integrity entry is trust in that verifier and no platform proof it checks. The context accepts or changes a package's verifier only by a governance action its event log records. The shipped `AndroidDeviceAttestation` still builds the JSON document; story SCP-111 of `.docs/prds/main.json` stands in progress until it changes, and story SCP-316 implements the reader.
 
 ### Context
 
@@ -211,32 +213,57 @@ class AndroidKeyCustody : KeyCustodyProvider {
 
 **`AndroidDeviceAttestation.kt` — Play Integrity Standard API:**
 
-```kotlin
-class AndroidDeviceAttestation(private val context: Context) : DeviceAttestationProvider {
+The sample implements the shipped UniFFI trait `DeviceAttestationProvider` (`crates/scp-ffi/uniffi/src/lib.rs`), whose methods are `attest(challenge, device_id)` and `assert_request(request_hash)`. The Rust caller computes the binding digest `D` of `09-security-model.md` §9.3.1 and passes it where the trait takes `challenge`, and computes the assertion digest `A` and passes it as `request_hash`. The adapter hashes neither again, hashes no identifier, and does not read `device_id`. Every failure leaves the adapter as `ScpException`, as the shipped `AndroidDeviceAttestation.kt` does for the Play Integrity errors it catches, because a UniFFI callback that throws any other exception panics the Rust caller; the sample's `wrapped` also converts a missing Google Play services installation and a failed `require`. Open question OQ-22 of `27-attestations.md` §27.7, which of the two shipped traits is normative, stays open, and this sample decides nothing about it. `cloudProjectNumber` is the Google Cloud project number in the `PlayIntegrityVerifier` entry of the verifier the context's `accepted_android_packages` names for the app's package, and the SDK constructs the adapter with it for each call: Google decodes a Standard token only for the Cloud project it was requested under, so a token requested under any other project is one the verifier cannot decode.
 
-    override suspend fun attest(challenge: ByteArray, deviceId: ByteArray): ByteArray {
-        val clientDataJSON = "{\"challenge\":\"${Base64.encodeToString(challenge, Base64.NO_WRAP)}\",\"deviceId\":\"${Base64.encodeToString(deviceId, Base64.NO_WRAP)}\",\"type\":\"scp-device-attestation-v1\"}"
-        val nonce = Base64.encodeToString(
-            MessageDigest.getInstance("SHA-256").digest(clientDataJSON.toByteArray(Charsets.UTF_8)),
-            Base64.NO_WRAP
-        )
-        val integrityTokenResponse = withContext(Dispatchers.IO) {
-            IntegrityManagerFactory.create(context)
-                .requestIntegrityToken(
-                    IntegrityTokenRequest.builder()
-                        .setNonce(nonce)
+```kotlin
+class AndroidDeviceAttestation(
+    private val context: Context,
+    // The package verifier's Google Cloud project number, from its PlayIntegrityVerifier
+    // service-record entry (09-security-model.md §9.3.1).
+    private val cloudProjectNumber: Long,
+) : DeviceAttestationProvider {
+
+    // challenge = D, computed by the Rust caller; deviceId is not read (OQ-22 stays open).
+    override suspend fun attest(challenge: ByteArray, deviceId: ByteArray): ByteArray =
+        wrapped { requestStandardToken(challenge, "challenge must be the 32-byte binding digest D") }
+
+    // requestHash = A = SHA-256("SCP-DEVICE-ASSERTION-V1:" || BE32(len(m)) || m), computed by the Rust caller.
+    override suspend fun assertRequest(requestHash: ByteArray): ByteArray =
+        wrapped { requestStandardToken(requestHash, "requestHash must be the 32-byte assertion digest A") }
+
+    // A UniFFI callback that throws anything but ScpException panics the Rust caller, so every
+    // failure (missing Play services, an IllegalArgumentException from require) leaves as ScpException.
+    private suspend fun wrapped(block: suspend () -> ByteArray): ByteArray =
+        try {
+            block()
+        } catch (e: ScpException) {
+            throw e
+        } catch (e: Exception) {
+            throw ScpException("Play Integrity token request failed", CODE_ATTESTATION_FAILED, e)
+        }
+
+    private suspend fun requestStandardToken(digest: ByteArray, sizeMessage: String): ByteArray {
+        require(digest.size == 32) { sizeMessage }
+        val hex = digest.joinToString("") { "%02x".format(it) }
+        val provider = withContext(Dispatchers.IO) {
+            IntegrityManagerFactory.createStandard(context)
+                .prepareIntegrityToken(
+                    PrepareIntegrityTokenRequest.builder()
+                        .setCloudProjectNumber(cloudProjectNumber)
                         .build()
                 )
                 .await()
         }
-        // Return the integrity token (JWT) for server-side verification
-        return integrityTokenResponse.token().toByteArray(Charsets.UTF_8)
+        val response = provider.request(
+            StandardIntegrityTokenRequest.builder().setRequestHash(hex).build()
+        ).await()
+        // For attest, the SDK POSTs this token to the package verifier's HTTPS URL for a
+        // verdict, then publishes token and verdict in the context's one ScpDeviceAttestation entry.
+        return response.token().toByteArray(Charsets.UTF_8)
     }
 
-    override suspend fun assert(requestHash: ByteArray): ByteArray {
-        // Play Integrity does not have a per-request assertion flow equivalent to App Attest assertions.
-        // For assertion-equivalent use cases, a fresh Standard integrity token is requested.
-        return attest(challenge = requestHash, deviceId = ByteArray(0))
+    companion object {
+        internal const val CODE_ATTESTATION_FAILED = "SCP-ATTEST-9001"
     }
 }
 ```
@@ -440,12 +467,17 @@ dependencies {
    - **pseudonym_secret definition (IMPORTANT):** The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — public key bytes are public and would be a membership-enumeration oracle (§9.10.4.A). For a **software** key (Bouncy Castle), `pseudonym_secret = HKDF-SHA256(p256_private_scalar, salt="scp-pseudonym-secret-v1", info="", len=32)`, byte-identical to Rust `derive_pseudonym_secret()`, so software pseudonyms are cross-platform deterministic (pinned by §25.19 vectors). For **hardware** keys (Keystore TEE), private key bytes are non-exportable, so `pseudonym_secret` is an associated 32-byte symmetric key generated inside the TEE at `generate_keypair` — a device-local secret, never `SHA-256` over a signature, because an ECDSA hardware signer draws its own nonce and would yield a different secret on every call (§9.5 of the security-model spec). **Hardware pseudonyms are device-local by design** and are intentionally NOT identical across devices or to the software vectors; cross-device pseudonym identity is not a protocol requirement, since the TEE key never leaves the device. This matches ADR-006 acceptance criterion 6 (§9.10.4.A).
 
 7. **`AndroidDeviceAttestation.attest(challenge, deviceId)`:**
-   - Calls Play Integrity Standard API via `IntegrityManagerFactory.create(context).requestIntegrityToken(...)`.
-   - Nonce is `Base64(SHA-256(clientDataJSON))` where `clientDataJSON = '{"challenge":"<base64(challenge)>","deviceId":"<base64(deviceId)>","type":"scp-device-attestation-v1"}'` (fields in this exact order, RFC 4648 base64 NO_WRAP).
-   - Returns raw integrity token bytes (JWT for server-side verification).
+   - Implements the shipped UniFFI trait method `attest(challenge, device_id)`. The Rust caller passes the binding digest `D` of `09-security-model.md` §9.3.1 as `challenge`; the adapter rejects a `challenge` that is not 32 bytes and does not read `deviceId`. OQ-22 of `27-attestations.md` §27.7, the choice of trait, stays open.
+   - Calls the Play Integrity Standard API through `IntegrityManagerFactory.createStandard(context)`, `prepareIntegrityToken` with the `cloudProjectNumber` of the package verifier's `PlayIntegrityVerifier` entry, and `StandardIntegrityTokenProvider.request`.
+   - `requestHash` is the lowercase hexadecimal form of `D`. (Amended 2026-09-27; this criterion previously set a Classic `nonce` of `Base64(SHA-256(clientDataJSON))` that named no identifier.)
+   - Returns the raw integrity token bytes. The SDK obtains a verdict for the token by one HTTPS `POST` to the URL in the package verifier's `PlayIntegrityVerifier` entry, in the §9.3.1 request format, and publishes both as the context's one `play-integrity` entry in the §9.3.1 format. No peer decodes the token; each reader verifies the verdict and returns `DeviceAttestationVerdict`, and a `Verified` from it is trust in the package's verifier.
+   - The SDK requests a new token and verdict before the entry passes the context's `device_attestation_max_age_secs`, and when its own entry reads `Rejected{VerdictSignatureInvalid}` after the verifier rotates its key.
+   - Every failure, a missing Google Play services installation and a `challenge` of the wrong size included, throws `ScpException` with code `SCP-ATTEST-9001`, because a UniFFI callback that throws any other exception panics the Rust caller.
+   - On a device without Google Play services, `attest` throws and the SDK publishes no entry, so a reader returns `Absent`.
 
-8. **`AndroidDeviceAttestation.assert(requestHash)`:**
-   - Issues a fresh Standard integrity token using `requestHash` as the challenge.
+8. **`AndroidDeviceAttestation.assertRequest(requestHash)`:**
+   - Implements the shipped UniFFI trait method `assert_request(request_hash)`. The Rust caller passes the assertion digest `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" ‖ BE32(len(m)) ‖ m)` of `09-security-model.md` §9.3.1, never the caller's bytes, so no assertion's `requestHash` equals the hexadecimal form of any `D`.
+   - Issues a fresh Standard integrity token whose `requestHash` is the lowercase hexadecimal form of `A`. It does not route through `attest`. (Amended 2026-09-27.)
    - Returns integrity token bytes.
 
 9. **`AndroidPushProvider.register()`:**
@@ -466,7 +498,7 @@ dependencies {
     - `deletePrefix(prefix)` returns count of deleted keys.
 
 12. **`AndroidPlatformAdapter.make(context)`:**
-    - Constructs `AndroidKeyCustody`, `AndroidDeviceAttestation`, `AndroidPushProvider`, `AndroidStorage`.
+    - Constructs `AndroidKeyCustody`, `AndroidDeviceAttestation` (for each call, with the `cloudProjectNumber` of the package verifier's `PlayIntegrityVerifier` entry), `AndroidPushProvider`, `AndroidStorage`.
     - Returns assembled adapter. Throws `ScpException` with descriptive message if any provider fails to initialize (e.g., Play Integrity unavailable, FCM not configured).
     - Called by Kotlin SDK `SCP.create(context, custody = "platform")`.
 
@@ -490,7 +522,7 @@ bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/ 
 | File | Functions |
 |------|-----------|
 | `AndroidKeyCustody.kt` | `generateKeypair`, `sign`, `publicKey`, `destroyKey`, `dhAgree`, `derivePseudonym`, `custodyType` + internal helpers |
-| `AndroidDeviceAttestation.kt` | `attest`, `assert` |
+| `AndroidDeviceAttestation.kt` | `attest`, `assertRequest` |
 | `AndroidPushProvider.kt` | `register`, `handleNotification` |
 | `AndroidStorage.kt` | `store`, `retrieve`, `delete`, `listKeys`, `deletePrefix`, `exists` + `getOrCreateStorageKey`, `openEncryptedDatabase` |
 | `PlatformAdapter.kt` | `make` |
