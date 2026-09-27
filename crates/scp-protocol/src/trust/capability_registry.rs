@@ -2,7 +2,7 @@
 //!
 //! Compile-time constant maps from [`CapabilityUri`] string representations to
 //! [`RegistryEntry`] metadata. The registry contains 28 protocol-defined
-//! challenge capabilities across 10 categories and 5 system capabilities.
+//! challenge capabilities across 10 categories and 4 system capabilities.
 //!
 //! Note: `scp:capability:outlet-integrity/v1` is NOT included — it is an
 //! attestation type (§7.4.2), not a challenge-testable capability. See #407.
@@ -403,15 +403,15 @@ static PROTOCOL_REGISTRY: LazyLock<HashMap<String, RegistryEntry>> = LazyLock::n
 });
 
 // ---------------------------------------------------------------------------
-// System registry (5 system capabilities)
+// System registry (4 system capabilities)
 // ---------------------------------------------------------------------------
 
-/// The system capability registry: 5 protocol-level feature flags for node
+/// The system capability registry: 4 protocol-level feature flags for node
 /// roles, keyed by their full URI string.
 ///
 /// Per ADR-041 and §7.3.4.3.
 static SYSTEM_REGISTRY: LazyLock<HashMap<String, RegistryEntry>> = LazyLock::new(|| {
-    let mut m = HashMap::with_capacity(5);
+    let mut m = HashMap::with_capacity(4);
 
     m.insert(
         "scp:system:mls-group-management".into(),
@@ -429,12 +429,8 @@ static SYSTEM_REGISTRY: LazyLock<HashMap<String, RegistryEntry>> = LazyLock::new
         "scp:system:relay-operation".into(),
         entry("system", "Relay node.", None),
     );
-    m.insert(
-        "scp:system:bridge-operation".into(),
-        entry("system", "Platform bridge.", None),
-    );
 
-    debug_assert_eq!(m.len(), 5, "SYSTEM_REGISTRY must contain exactly 5 entries");
+    debug_assert_eq!(m.len(), 4, "SYSTEM_REGISTRY must contain exactly 4 entries");
     m
 });
 
@@ -580,8 +576,8 @@ mod tests {
     }
 
     #[test]
-    fn system_registry_contains_exactly_5_entries() {
-        assert_eq!(SYSTEM_REGISTRY.len(), 5);
+    fn system_registry_contains_exactly_4_entries() {
+        assert_eq!(SYSTEM_REGISTRY.len(), 4);
     }
 
     // -----------------------------------------------------------------------
@@ -629,12 +625,11 @@ mod tests {
         "scp:capability:source-attribution/v1",
     ];
 
-    const ALL_SYSTEM_URIS: [&str; 5] = [
+    const ALL_SYSTEM_URIS: [&str; 4] = [
         "scp:system:mls-group-management",
         "scp:system:key-rotation",
         "scp:system:governance-participation",
         "scp:system:relay-operation",
-        "scp:system:bridge-operation",
     ];
 
     // -----------------------------------------------------------------------

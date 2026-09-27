@@ -16,7 +16,6 @@
  * See ADR-022 in `.docs/adrs/phase-4.md`, ADR-048, and ADR-055.
  */
 
-import type { BridgeMode, ShadowStatus } from "../bridge";
 import { mapBridgeError } from "../errors";
 import type { SCP } from "../scp";
 import type {
@@ -422,39 +421,6 @@ export interface Bridge {
     identityDid: string,
     epoch: number,
   ): Promise<Checkpoint>;
-
-  // Bridge Connector
-  bridgeRegister(
-    contextId: string,
-    operatorDid: string,
-    governanceDid: string,
-    platform: string,
-    mode: BridgeMode,
-  ): {
-    bridge_id: string;
-    operator_did: string;
-    platform: string;
-    mode: BridgeMode;
-    status: string;
-    context_id: string;
-  };
-  bridgeEvaluateTrust(
-    isBridged: boolean,
-    isNativeTransport: boolean,
-    shadowStatus: ShadowStatus,
-  ): number;
-  bridgeCreateShadow(
-    bridgeId: string,
-    platformHandle: string,
-    bridgeMode: BridgeMode,
-    contextId: string | undefined,
-  ): {
-    shadow_id: string;
-    platform_handle: string;
-    bridge_id: string;
-    attributed_role: string;
-    provenance_status: ShadowStatus;
-  };
 
   // Discovery
   discoveryParseAddress(address: string): string;
@@ -937,9 +903,9 @@ export async function getBridge(scp: SCP): Promise<Bridge> {
  * for non-bundled / dev-server usage.
  *
  * Intended use: construct a mock `Bridge` with spy stubs for specific
- * operations (e.g. `bridgeEvaluateTrust`), then call
- * `__setBridgeForTests(scp, mockBridge)` before invoking module-level helpers
- * (`evaluateTrust`, `bridgeCreateShadow`, …) under test.
+ * operations (e.g. `identityMigrate`), then call
+ * `__setBridgeForTests(scp, mockBridge)` before invoking the `SCP` methods
+ * that route to them (`scp.identityMigrate`, …) under test.
  *
  * @internal Phase 4 PR 4 — used by `identity-lifecycle.test.ts` routing tests.
  */

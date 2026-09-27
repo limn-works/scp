@@ -1,6 +1,6 @@
 {
   "project": "scp",
-  "description": "Agent Capability Registry: URI namespace for agent capabilities (ADR-041), unifying ChallengeType and CapabilityEntry under structured URIs. Three authorities: scp:capability:* (protocol-defined, reserved), {identifier}:capability:* (identity-scoped custom), scp:system:* (protocol feature flags). 28 challenge capabilities + 5 system capabilities. SDK validation rejects unknown protocol-scoped URIs. Context admission requirements reference capability URIs with verification levels.",
+  "description": "Agent Capability Registry: URI namespace for agent capabilities (ADR-041), unifying ChallengeType and CapabilityEntry under structured URIs. Three authorities: scp:capability:* (protocol-defined, reserved), {identifier}:capability:* (identity-scoped custom), scp:system:* (protocol feature flags). 28 challenge capabilities + 4 system capabilities. SDK validation rejects unknown protocol-scoped URIs. Context admission requirements reference capability URIs with verification levels.",
   "gates": [
     {
       "id": "gate-uri-parser",
@@ -103,7 +103,7 @@
     },
     {
       "id": "SCP-ACR-002",
-      "title": "Implement protocol capability registry with 28 challenge + 5 system capabilities",
+      "title": "Implement protocol capability registry with 28 challenge + 4 system capabilities",
       "gate": "gate-uri-parser",
       "priority": "P0",
       "severity": "critical",
@@ -112,11 +112,11 @@
         "crates/scp-core/src/trust/capability_registry.rs",
         "crates/scp-core/src/trust/mod.rs"
       ],
-      "description": "Implement the protocol capability registry per ADR-041 and §7.3.4.3. The registry is a compile-time constant map from CapabilityUri to RegistryEntry containing category, description, and optional parameter schema (serde_json::Value). The registry contains 28 challenge capabilities across 10 categories and 5 system capabilities. Provides lookup_protocol_capability(uri) -> Option<&RegistryEntry> and is_known_protocol_capability(uri) -> bool. The validate_capability_uri(uri) function rejects unknown scp:capability:* URIs while accepting all valid identity-scoped URIs. This is the SDK enforcement point described in §7.3.4.2.",
+      "description": "Implement the protocol capability registry per ADR-041 and §7.3.4.3. The registry is a compile-time constant map from CapabilityUri to RegistryEntry containing category, description, and optional parameter schema (serde_json::Value). The registry contains 28 challenge capabilities across 10 categories and 4 system capabilities. Provides lookup_protocol_capability(uri) -> Option<&RegistryEntry> and is_known_protocol_capability(uri) -> bool. The validate_capability_uri(uri) function rejects unknown scp:capability:* URIs while accepting all valid identity-scoped URIs. This is the SDK enforcement point described in §7.3.4.2.",
       "acceptanceCriteria": [
         "RegistryEntry struct has fields: category (String), description (String), parameter_schema (Option<serde_json::Value>)",
         "PROTOCOL_REGISTRY contains exactly 27 entries with CapabilityUri::Protocol variants",
-        "SYSTEM_REGISTRY contains exactly 5 entries with CapabilityUri::System variants",
+        "SYSTEM_REGISTRY contains exactly 4 entries with CapabilityUri::System variants",
         "lookup_protocol_capability returns Some for 'scp:capability:prompt-injection-resistance/v1'",
         "lookup_protocol_capability returns None for 'scp:capability:nonexistent/v1'",
         "is_known_protocol_capability returns true for all 28 protocol capabilities",
@@ -124,7 +124,7 @@
         "validate_capability_uri accepts all 28 protocol capabilities",
         "validate_capability_uri accepts arbitrary identity-scoped capabilities without registry lookup",
         "validate_capability_uri rejects unknown scp:capability:* URIs with UnknownProtocolCapability error",
-        "validate_capability_uri accepts all 5 system capabilities",
+        "validate_capability_uri accepts all 4 system capabilities",
         "Parameterized capabilities (latency-compliance, multilingual, mathematical-reasoning, code-generation, code-review) have non-None parameter_schema",
         "Registry entries are grouped by category: safety-security (4), schema-compliance (3), behavioral-compliance (4), operational (3), spending-commerce (2), reasoning-logic (3), code (2), recall-fidelity (2), bias-fairness (2), factual-hallucination (3)",
         "Tests verify round-trip: every registry entry's URI parses back to the same CapabilityUri"
@@ -132,7 +132,7 @@
       "actionItems": [
         "Define RegistryEntry struct",
         "Build PROTOCOL_REGISTRY as a static/const map (phf or lazy_static HashMap) with all 27 entries",
-        "Build SYSTEM_REGISTRY with all 5 entries",
+        "Build SYSTEM_REGISTRY with all 4 entries",
         "Implement lookup_protocol_capability and is_known_protocol_capability",
         "Implement validate_capability_uri that enforces scp:capability:* reservation",
         "Add parameter schemas for parameterized capabilities",
@@ -302,9 +302,9 @@
       "files": [
         "crates/scp-core/src/discovery/did_capabilities.rs"
       ],
-      "description": "Extend the service record's capability advertising to support system capabilities (scp:system:*). System capabilities use the same SCPCapabilities service endpoint format as challenge capabilities but with the scp:system: prefix. The parse_capability_endpoint function already handles this via the CapabilityUri parser (SCP-ACR-005), but this story ensures system capabilities are properly represented, documented, and tested. System capabilities describe node roles (relay-operation, bridge-operation, etc.) and are not subject to challenge-response verification. Contexts and peers discover system capabilities by resolving the service record.",
+      "description": "Extend the service record's capability advertising to support system capabilities (scp:system:*). System capabilities use the same SCPCapabilities service endpoint format as challenge capabilities but with the scp:system: prefix. The parse_capability_endpoint function already handles this via the CapabilityUri parser (SCP-ACR-005), but this story ensures system capabilities are properly represented, documented, and tested. System capabilities describe node roles (relay-operation, etc.) and are not subject to challenge-response verification. Contexts and peers discover system capabilities by resolving the service record.",
       "acceptanceCriteria": [
-        "parse_capability_endpoint('scp:capabilities:scp:system:relay-operation,scp:system:bridge-operation') returns two valid CapabilityUri::System entries",
+        "parse_capability_endpoint('scp:capabilities:scp:system:relay-operation') returns one valid CapabilityUri::System entry",
         "CapabilityEntry can contain a mix of Protocol, DidScoped, and System capabilities",
         "Tests verify a service record with system capabilities resolves correctly via resolve_capabilities",
         "Tests verify deduplication works across Protocol, DidScoped, and System variants",

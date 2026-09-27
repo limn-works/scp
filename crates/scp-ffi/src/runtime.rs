@@ -71,7 +71,6 @@ use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
 use scp_event_log::EventLog;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore;
-use scp_ffi_common::credentials::FfiCredentialStore;
 // Re-export `CoreFields` at `crate::runtime::CoreFields` so the
 // `pyscp_check_handle!` macro can refer to it as
 // `$crate::runtime::CoreFields`.
@@ -717,39 +716,6 @@ impl PyBridgeInstance {
         &self.mcp_client_registry
     }
 
-    /// Selects this instance's **durable** bridge credential store from the
-    /// chosen storage backend, or `None` if storage has not yet been selected.
-    ///
-    /// The credential store is derived on demand from the SAME per-instance
-    /// [`StorageProvider`] the supervisor's `mls_storage` / saga journal derive
-    /// from (spec §17.6) — so a `Sqlite` selection persists bridge tokens across
-    /// restart and an encrypted-in-memory selection keeps them encrypted at
-    /// rest. Because `StorageProvider` is not itself `EncryptedStorage` (the
-    /// sealed marker lives in `scp-platform`), the concrete inner
-    /// `EncryptedStorage` handle is dispatched per variant, exactly as
-    /// `build_persistence_provider` does for `ProtocolRepository`.
-    ///
-    /// Returns `None` only in the storage-before-selection window; production
-    /// `PyScp` construction always goes through
-    /// [`PyBridgeInstance::with_storage_py`], which selects storage first. The
-    /// caller ([`crate::bridge_connector`]) maps `None` to a fail-closed error
-    /// emitted as `SCP-CTX-2105` (`codes::CTX_2105`) — never a silent in-memory
-    /// fallback. This satisfies requirement SCP-CAPSEL-8001 (spec §17.17.1,
-    /// "selection fails closed"); note SCP-CAPSEL-8001 is a classification
-    /// requirement, not the emitted error code. There is no in-memory arm on
-    /// this shipped path (ADR-062 §Decision 5, SCP-CAPINJECT-009).
-    #[must_use]
-    pub fn credential_store(&self) -> Option<FfiCredentialStore> {
-        match self.storage_provider()? {
-            StorageProvider::InMemoryEncrypted(handle) => {
-                Some(FfiCredentialStore::durable_from_handle(Arc::clone(handle)))
-            }
-            StorageProvider::Sqlite(handle) => {
-                Some(FfiCredentialStore::durable_from_handle(Arc::clone(handle)))
-            }
-        }
-    }
-
     /// Returns a reference to the connected-relay URL slot.
     ///
     /// Distinct from `CoreFields::pending_relay_url`: this field tracks the
@@ -887,7 +853,7 @@ impl Drop for PyBridgeInstance {
 /// See issue #329.
 ///
 /// The `local_did` is consumed only by `NodeMlsFactory::new` — the
-/// `BridgeInstance` itself carries no DID (spec §12.2.3).
+/// `BridgeInstance` itself carries no DID.
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 /// If the manager is already initialized with a different DID, a warning is logged.
@@ -941,7 +907,7 @@ pub fn init_context_manager_with(
 ) {
     // `_local_did` is retained in the signature for API stability: callers
     // construct `crypto` with the DID before calling into this function
-    // (it is the `NodeMlsFactory` that carries the DID; see spec §12.2.3).
+    // (it is the `NodeMlsFactory` that carries the DID).
     if bi.core.has_supervisor() {
         return;
     }
@@ -1204,11 +1170,14 @@ pub(crate) fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn Context
 /// ADR-049 — the FFI bridge no longer touches `ContextManager` at all.
 /// Bounded capacity of the supervisor's `ContextEvent` broadcast channel.
 ///
-/// Every production supervisor built here enables this channel so that local
-/// context events can be consumed by external sinks — notably the node's
-/// outbound webhook dispatcher (spec §12.10.5), wired in
-/// [`PyScp::node_start_in_memory`](crate::scp::PyScp::node_start_in_memory)/`node_start_local`. Lagging consumers
-/// drop the oldest events (logged, never panics); `1024` is the documented
+/// Every production supervisor built here enables this channel, so
+/// `Supervisor::subscribe_events` returns a receiver. No export of this bridge
+/// and no SDK wrapper calls `subscribe_events`, and the bridge drops its own
+/// receiver at construction, so no production caller receives these events and
+/// the channel discards every event the actors emit. A receiver that falls more than
+/// this many events behind loses the oldest ones and gets
+/// `RecvError::Lagged` from its next `recv`; nothing else records the loss, so
+/// each subscriber must handle `Lagged` itself. `1024` is the documented
 /// default shared across all three FFI bridges.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
@@ -1217,12 +1186,12 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// only handle returned to the bridge layer.
 ///
 /// The event broadcast channel is always enabled (capacity
-/// [`EVENT_CHANNEL_CAPACITY`]) so downstream consumers — e.g. the node webhook
-/// dispatcher — can subscribe via
-/// [`Supervisor::subscribe_events`](scp_core::context::supervisor::Supervisor::subscribe_events).
-/// When no consumer subscribes, emitting into the channel is a cheap no-op: the
-/// retained sender has no receivers, so `send` returns `Err` and the event is
-/// simply dropped without blocking context operations.
+/// [`EVENT_CHANNEL_CAPACITY`]), so
+/// [`Supervisor::subscribe_events`](scp_core::context::supervisor::Supervisor::subscribe_events)
+/// returns a receiver. Nothing on this bridge calls it (see
+/// [`EVENT_CHANNEL_CAPACITY`]). While the channel has no receiver, emitting into
+/// it costs little: `send` returns `Err` and the event is dropped without
+/// blocking context operations.
 ///
 /// The supervisor's `mls_storage` consumer (the `OpenMLS` storage view) is
 /// derived from the bridge instance's single chosen Storage:
@@ -1252,9 +1221,9 @@ fn build_supervisor(
     // once for both.
     let durable = durable_providers_from_bi(bi)?;
     // Enable the event broadcast channel so `subscribe_events()` yields a
-    // receiver for the node webhook dispatcher (§12.10.5). The unused receiver
-    // is dropped immediately; the retained sender keeps the channel open so
-    // later subscribers (wired at node startup) observe subsequent events.
+    // receiver. The unused receiver is dropped immediately; the retained
+    // sender keeps the channel open so later subscribers observe subsequent
+    // events.
     let (event_tx, _rx) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
     // Wire the production VM-aware governance key resolver when a DID resolver
     // is configured; otherwise fail closed with the always-`None` resolver so
@@ -1709,8 +1678,7 @@ pub fn remove_ffi_state(bi: &PyBridgeInstance, context_id: &str) {
     ffi_state_registry(bi).remove(context_id);
     // Clean up known-context discovery entry via CoreFields.
     bi.core.remove_known_context(context_id);
-    // Clean up per-context bridge connector state and economy state via CoreFields.
-    bi.core.remove_bridge_state(context_id);
+    // Clean up per-context economy state via CoreFields.
     bi.core.remove_economy_state(context_id);
 }
 
@@ -3183,8 +3151,7 @@ mod tests {
     /// `register_context` accepts a well-formed custom ceiling entry, an explicit
     /// `{resource}:*` wildcard, the parameterized `outlet:call:{outlet_id}`
     /// built-in, and a built-in supplied in its canonical UCAN wire spelling
-    /// (`outlet_call:*`, `context_child:create`, `bridging:*`,
-    /// `outlet_call:{id}`). Pins the regression where a UCAN-form built-in entry
+    /// (`outlet_call:*`, `context_child:create`, `outlet_call:{id}`). Pins the regression where a UCAN-form built-in entry
     /// — the canonical stored ceiling spelling — was misparsed to a `Custom`
     /// lookalike and rejected with `InvalidCeilingCategory`.
     #[test]
@@ -3198,7 +3165,6 @@ mod tests {
             "outlet_call:*",
             "outlet_call:calc",
             "context_child:create",
-            "bridging:*",
         ] {
             let bi = PyBridgeInstance::new_py();
             let ctx_id = unique_ctx_id("good-ceiling");

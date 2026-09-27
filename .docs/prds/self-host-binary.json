@@ -222,7 +222,7 @@
     },
     {
       "id": "SHB-005",
-      "title": "Release the NAT mapping on shutdown and keep dev/bridge endpoints loopback-only",
+      "title": "Release the NAT mapping on shutdown and keep dev endpoints loopback-only",
       "gate": "gate-self-host-1",
       "priority": "P1",
       "severity": "major",
@@ -231,19 +231,19 @@
         "crates/scp-node/src/main.rs",
         "crates/scp-node/src/dev_api.rs"
       ],
-      "description": "Self-host mode opens an inbound NAT port mapping (§10.12.2). On clean shutdown the mapping MUST be released so the operator's router does not retain a stale public forward after the process exits (`release_self_host_mappings` in `crates/scp-node/src/main.rs` removes the mapping on each mapper); when no mapper is present (the non-`upnp` build) the release is a safe no-op. Separately, the node's dev/control and bridge endpoints MUST NOT be exposed to the public internet by self-host mode: the dev API restricts itself to loopback hosts (`dev_api::ALLOWED_HOSTS = [\"localhost\", \"127.0.0.1\", \"[::1]\"]`), and the self-host public surface (§10.12.11 'Origin-root mount') never mounts the relay upgrade (`/scp/v1`) or bridge routes (`/v1/scp/bridge/*`). This is the teardown + endpoint-exposure hardening story.",
+      "description": "Self-host mode opens an inbound NAT port mapping (§10.12.2). On clean shutdown the mapping MUST be released so the operator's router does not retain a stale public forward after the process exits (`release_self_host_mappings` in `crates/scp-node/src/main.rs` removes the mapping on each mapper); when no mapper is present (the non-`upnp` build) the release is a safe no-op. Separately, the node's dev/control endpoints MUST NOT be exposed to the public internet by self-host mode: the dev API restricts itself to loopback hosts (`dev_api::ALLOWED_HOSTS = [\"localhost\", \"127.0.0.1\", \"[::1]\"]`), and the self-host public surface (§10.12.11 'Origin-root mount') never mounts the relay upgrade (`/scp/v1`). This is the teardown + endpoint-exposure hardening story.",
       "acceptanceCriteria": [
         "On clean shutdown the self-host path releases the port mapping on every mapper: test `release_self_host_mappings_removes_mapping_on_both_mappers` asserts both the UPnP and NAT-PMP mappers' remove is invoked for the served port (via recording mappers)",
         "When no mapper is present (non-`upnp` build, both handles `None`), the release is a clean no-op: test `release_self_host_mappings_noop_when_no_mappers` completes without panicking",
         "`grep -q 'ALLOWED_HOSTS' crates/scp-node/src/dev_api.rs` confirms the loopback-only host allowlist (`[\"localhost\", \"127.0.0.1\", \"[::1]\"]`) is enforced for the dev API",
-        "Self-host mode does NOT expose the relay/bridge endpoints on the public surface: test `self_host_public_surface_excludes_relay_and_bridge` asserts over a real bound listener that the site route serves while `/scp/v1` and `/v1/scp/bridge/*` are NOT routed (fall through to 404)"
+        "Self-host mode does NOT expose the relay endpoint on the public surface: test `self_host_public_surface_excludes_relay` asserts over a real bound listener that the site route serves while `/scp/v1` is NOT routed (fall through to 404)"
       ],
       "actionItems": [
         "Hold the PortMapper handles from the no_domain build and release the mapping in the self-host shutdown sequence (`release_self_host_mappings`)",
         "Make release a safe no-op when no mapper is present (non-upnp build)",
         "Keep the dev API bind loopback-only under self-host mode (`ALLOWED_HOSTS`)",
-        "Ensure the self-host public surface does not mount the relay upgrade or bridge routes",
-        "Add tests: release_self_host_mappings_removes_mapping_on_both_mappers, release_self_host_mappings_noop_when_no_mappers, self_host_public_surface_excludes_relay_and_bridge"
+        "Ensure the self-host public surface does not mount the relay upgrade",
+        "Add tests: release_self_host_mappings_removes_mapping_on_both_mappers, release_self_host_mappings_noop_when_no_mappers, self_host_public_surface_excludes_relay"
       ],
       "blockedBy": [
         "SHB-002"
@@ -358,16 +358,16 @@
         "crates/scp-node/src/lib.rs",
         "crates/scp-node/src/http.rs"
       ],
-      "description": "§10.17 defines two participant deployment shapes; SHB-002 ships the BUNDLED (co-located) shape. This story ENABLES/VERIFIES the EXTERNAL shape with ZERO new node API: an SDK participant client in a separate process reaches this node's relay over the EXISTING controls — the node's TLS-terminated `PublicSurface::Full` public surface (§10.12.11), the bind address, and the `TlsMode` (§10.12.6: loopback ws:// same-box, wss:// off-host) — exactly as for any client of the relay's `/scp/v1` route. There is NO dedicated listener toggle, admission token, or pre-shared secret: relays are anonymous, DHT-auto-discovered dumb pipes that participants do not hand-pick, so an admission/allowlist token is at odds with the relay model (§10.4). Abuse prevention for an open wss:// relay is provided by the relay's EXISTING rate limiting and abuse controls (§10.4 — `PublishRateLimiter` + `ConnectionTracker` + the `/scp/v1` semaphore) together with relay economics (§19.8 Relay Monetization, including `rate_limit_publish`), which together satisfy §10.4's 'rate limiting and abuse prevention' requirement. Access control for an external participant remains CRYPTOGRAPHIC, not transport-level: the relay is a protocol-unaware dumb pipe (§10.4) and the participant's authority to read or write context content is enforced by MLS group membership + UCAN (encryption-as-access-control) — a non-member connecting to `/scp/v1` sees only ciphertext. This story MUST NOT weaken SHB-005: dev/control (dev_api ALLOWED_HOSTS loopback-only) and bridge routes (`/v1/scp/bridge/*`) stay loopback-only and are never mounted on a public surface.",
+      "description": "§10.17 defines two participant deployment shapes; SHB-002 ships the BUNDLED (co-located) shape. This story ENABLES/VERIFIES the EXTERNAL shape with ZERO new node API: an SDK participant client in a separate process reaches this node's relay over the EXISTING controls — the node's TLS-terminated `PublicSurface::Full` public surface (§10.12.11), the bind address, and the `TlsMode` (§10.12.6: loopback ws:// same-box, wss:// off-host) — exactly as for any client of the relay's `/scp/v1` route. There is NO dedicated listener toggle, admission token, or pre-shared secret: relays are anonymous, DHT-auto-discovered dumb pipes that participants do not hand-pick, so an admission/allowlist token is at odds with the relay model (§10.4). Abuse prevention for an open wss:// relay is provided by the relay's EXISTING rate limiting and abuse controls (§10.4 — `PublishRateLimiter` + `ConnectionTracker` + the `/scp/v1` semaphore) together with relay economics (§19.8 Relay Monetization, including `rate_limit_publish`), which together satisfy §10.4's 'rate limiting and abuse prevention' requirement. Access control for an external participant remains CRYPTOGRAPHIC, not transport-level: the relay is a protocol-unaware dumb pipe (§10.4) and the participant's authority to read or write context content is enforced by MLS group membership + UCAN (encryption-as-access-control) — a non-member connecting to `/scp/v1` sees only ciphertext. This story MUST NOT weaken SHB-005: dev/control (dev_api ALLOWED_HOSTS loopback-only) stays loopback-only and is never mounted on a public surface.",
       "acceptanceCriteria": [
         "The external participant shape works over the existing public surface AND access stays cryptographic: test `external_participant_access_is_cryptographic` deploys a broadcast context, connects a non-member external client to the real `/scp/v1` route over `PublicSurface::Full` with NO token (asserts the upgrade is accepted and proxied), and asserts that same client's content surface — the relay's entire stored blob view — contains only ciphertext (no site plaintext marker), while the MLS-member projection path serves the same content as plaintext",
-        "SHB-005 isolation holds: test `self_host_public_surface_excludes_relay_and_bridge` still passes, proving the read-only self-host (`PublicSurface::SelfHost`) public surface never mounts `/scp/v1` or `/v1/scp/bridge/*`, and CI command `grep -q 'ALLOWED_HOSTS' crates/scp-node/src/dev_api.rs` returns true (loopback-only dev host allowlist unchanged)"
+        "SHB-005 isolation holds: test `self_host_public_surface_excludes_relay` still passes, proving the read-only self-host (`PublicSurface::SelfHost`) public surface never mounts `/scp/v1`, and CI command `grep -q 'ALLOWED_HOSTS' crates/scp-node/src/dev_api.rs` returns true (loopback-only dev host allowlist unchanged)"
       ],
       "actionItems": [
         "Confirm `/scp/v1` (`http::relay_router` / `ws_upgrade_handler`) is mounted on `PublicSurface::Full` via `build_scp_router_with_surface` -> `build_merged_router` and NOT on `PublicSurface::SelfHost`, so an external participant reaches it over the existing Full surface with no token (no new listener toggle, no admission gating)",
         "Confirm abuse prevention is the relay's existing controls: the `/scp/v1` upgrade acquires the `Semaphore` permit and the relay enforces `PublishRateLimiter` + `ConnectionTracker` (crates/scp-transport/src/relay/rate_limit.rs), with relay economics per §19.8 — no admission/allowlist token is added",
         "Add test `external_participant_access_is_cryptographic`: connect a non-member external client to `/scp/v1` over `PublicSurface::Full` with no token (assert accepted), then assert the relay's stored blob view is ciphertext while the MLS-member projection path returns the content as plaintext",
-        "Keep dev/control (ALLOWED_HOSTS loopback-only) and bridge routes unmounted on any public surface (do not regress SHB-005); keep `self_host_public_surface_excludes_relay_and_bridge` passing"
+        "Keep dev/control (ALLOWED_HOSTS loopback-only) unmounted on any public surface (do not regress SHB-005); keep `self_host_public_surface_excludes_relay` passing"
       ],
       "blockedBy": [
         "SHB-002"

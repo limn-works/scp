@@ -2,8 +2,8 @@
 //!
 //! These tests exercise the public API surface of `scp-ffi` from an
 //! integration test crate. They cover: identity registry, context
-//! lifecycle, outlets, UCAN, event log, discovery, provenance, bridge
-//! trust, sync, and trust engine.
+//! lifecycle, outlets, UCAN, event log, discovery, provenance, sync, and
+//! trust engine.
 //!
 //! For `ContextManager` methods that require complex types (`join_context`,
 //! `leave_context`), membership is set up via the manager's internal
@@ -1042,117 +1042,6 @@ fn provenance_attach_rejects_invalid_memory_scope() {
             None,
         );
         assert!(r.is_err());
-    });
-}
-
-// ============================================================================
-// Bridge trust evaluation
-// ============================================================================
-
-#[test]
-fn bridge_evaluate_trust_native_native() {
-    setup();
-    assert_eq!(
-        _scp_core::bridge_connector::py_bridge_evaluate_trust(false, true, "shadow").unwrap(),
-        3
-    );
-}
-
-#[test]
-fn bridge_evaluate_trust_native_bridged() {
-    setup();
-    assert_eq!(
-        _scp_core::bridge_connector::py_bridge_evaluate_trust(false, false, "shadow").unwrap(),
-        2
-    );
-}
-
-#[test]
-fn bridge_evaluate_trust_shadow_bridged() {
-    setup();
-    assert_eq!(
-        _scp_core::bridge_connector::py_bridge_evaluate_trust(true, false, "shadow").unwrap(),
-        0
-    );
-}
-
-#[test]
-fn bridge_evaluate_trust_claimed_bridged() {
-    setup();
-    assert_eq!(
-        _scp_core::bridge_connector::py_bridge_evaluate_trust(true, false, "claimed").unwrap(),
-        1
-    );
-}
-
-#[test]
-fn bridge_register_succeeds_with_separate_governance_did() {
-    // py_bridge_register now takes a separate governance_did parameter,
-    // so providing distinct operator and governance DIDs should succeed.
-    setup();
-    Python::with_gil(|py| {
-        let r = _scp_core::bridge_connector::py_bridge_register(
-            py,
-            "ctx-br",
-            "did:key:op",
-            "did:key:gov",
-            "discord",
-            "relay",
-            None,
-            None,
-            10_000,
-            "",
-            "",
-            "",
-        );
-        assert!(
-            r.is_ok(),
-            "Registration with distinct governance DID should succeed"
-        );
-    });
-}
-
-#[test]
-fn bridge_register_rejects_self_approval() {
-    // approve_registration rejects self-approval. This test verifies that
-    // constraint is enforced when governance_did == operator_did.
-    setup();
-    Python::with_gil(|py| {
-        let r = _scp_core::bridge_connector::py_bridge_register(
-            py,
-            "ctx-br-self",
-            "did:key:op",
-            "did:key:op",
-            "discord",
-            "relay",
-            None,
-            None,
-            10_000,
-            "",
-            "",
-            "",
-        );
-        assert!(r.is_err(), "Self-approval should be rejected");
-    });
-}
-
-#[test]
-fn bridge_create_shadow_returns_dict() {
-    setup();
-    Python::with_gil(|py| {
-        let r = _scp_core::scp::PyScp::new_in_memory_for_test()
-            .bridge_create_shadow(py, "bridge-d", "@user#1234", "relay", "ctx-sh")
-            .unwrap();
-        let d = r.bind(py);
-        let sid: String = d.get_item("shadow_id").unwrap().unwrap().extract().unwrap();
-        assert!(!sid.is_empty());
-        let h: String = d
-            .get_item("platform_handle")
-            .unwrap()
-            .unwrap()
-            .extract()
-            .unwrap();
-        assert_eq!(h, "@user#1234");
     });
 }
 

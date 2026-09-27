@@ -566,7 +566,6 @@ class TestCapability:
         assert Capability.CONTEXT_CLOSE.value == "context:close"
         assert Capability.CHILD_CONTEXT_CREATE.value == "context:child:create"
         assert Capability.OUTLET_INTERFACE.value == "outlet:interface"
-        assert Capability.BRIDGING.value == "bridging"
         assert Capability.MEDIA_VOICE.value == "media:voice"
         assert Capability.MEDIA_VIDEO.value == "media:video"
         assert Capability.MEDIA_SCREEN_SHARE.value == "media:screen_share"
@@ -574,7 +573,7 @@ class TestCapability:
         assert Capability.METADATA_EDIT.value == "metadata:edit"
 
     def test_variant_count(self) -> None:
-        assert len(Capability) == 19
+        assert len(Capability) == 18
 
     def test_outlet_call_parameterised(self) -> None:
         cap = Capability.outlet_call("my-outlet-id")

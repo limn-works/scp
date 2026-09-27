@@ -7,12 +7,10 @@
     clippy::large_futures
 )]
 //! Producer-side integration coverage for the `Supervisor` event channel
-//! (ADR-049 §12a, spec §12.10.5).
+//! (ADR-049 §12a).
 //!
-//! The structural `pipeline_wiring` assertions prove the consumer wire exists,
-//! and `scp-node/tests/webhook_event_wiring.rs` proves the node-side consumer
-//! delivers a `ContextEvent` fed onto the broadcast channel. This file closes
-//! the remaining half: that a **live** `Supervisor` — built with its event
+//! The structural `pipeline_wiring` assertions prove every FFI bridge enables
+//! the channel. This file proves that a **live** `Supervisor` — built with its event
 //! channel enabled and driving a real context operation — actually emits a
 //! `ContextEvent` onto the channel a `subscribe_events()` receiver observes,
 //! and that the emitted event is payload-stripped (no decrypted plaintext, no
@@ -280,12 +278,10 @@ async fn supervisor_send_emits_stripped_message_sent_to_subscriber() {
     observed.expect("a MessageSent event must reach the subscriber before timeout");
 }
 
-/// A live `Supervisor` emitting a SECURITY/AUDIT event — `MemberLeft`, one of
-/// the variants the lag-warning flags as critical (spec §12.10.5) — reaches a
+/// A live `Supervisor` emitting a SECURITY/AUDIT event — `MemberLeft` — reaches a
 /// `subscribe_events()` subscriber with the correct shape. The `MessageSent`
-/// test above proves the channel carries application traffic; this proves an
-/// actual audit event reaches the channel, which is the security-relevant
-/// guarantee the webhook dispatcher and Merkle event log both depend on.
+/// test above proves the channel carries application traffic; this proves the
+/// channel also carries an audit event to any embedder that subscribes.
 ///
 /// Driving a leave is the simplest deterministic audit-event producer: the
 /// context creator (alice) leaves her own context, which emits a payload-free
@@ -347,7 +343,7 @@ async fn supervisor_leave_emits_member_left_audit_event_to_subscriber() {
 
 /// A `Supervisor` built without the event channel (the `test_supervisor` /
 /// `for_query_shim` shape) returns `None` from `subscribe_events()` rather than
-/// panicking — the defensive branch the FFI wiring relies on (ADR-049 §12a).
+/// panicking — the branch every subscriber must handle (ADR-049 §12a).
 #[tokio::test]
 async fn supervisor_without_channel_yields_no_subscriber() {
     let supervisor = scp_runtime::context::test_supervisor(

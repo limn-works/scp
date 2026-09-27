@@ -163,7 +163,7 @@ The `did` parameter in `handle_deregister` is explicit rather than inferred from
      "signing_key_id": "#active"          // which verification method signed
    }
    ```
-5. **Writer verification.** The writer derives the `requester_did`'s key state by replaying its key-event log (`03-identity.md` §3.10.4), takes the key that state names in the `signing_key_id` role, and verifies the P-256 signature over the reconstructed `signed_content`. If verification fails, the request is rejected with a `BRIDGE_NOT_AUTHORIZED` error. The writer MUST hold a key state resolved within the last 300 seconds or cached under a valid bound (§9.10.7).
+5. **Writer verification.** The writer derives the `requester_did`'s key state by replaying its key-event log (`03-identity.md` §3.10.4), takes the key that state names in the `signing_key_id` role, and verifies the P-256 signature over the reconstructed `signed_content`. If verification fails, the request is rejected with code `SCP-OUTLET-6110`, slug `authorization.denied` (§5.4.4). The writer MUST hold a key state resolved within the last 300 seconds or cached under a valid bound (§9.10.7).
 
 **Two-tier model.** Handle outlets follow the same two-tier architecture as existing discovery outlets (§6.2.2B [no such section]). Writers (MLS members) process handle registrations. Readers (identity-authenticated, unbounded) perform handle lookups. Registration is a write operation processed by writers; lookup is a read operation available to all.
 

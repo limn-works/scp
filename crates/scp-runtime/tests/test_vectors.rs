@@ -782,38 +782,6 @@ fn vector_21_fingerprint_without_agent_key() {
 }
 
 // ---------------------------------------------------------------------------
-// §25.10 Claim Validation Vectors
-// ---------------------------------------------------------------------------
-
-#[test]
-fn vector_22_shadow_claim_hash() {
-    println!("=== Vector 22: Shadow Claim Hash ===");
-
-    let shadow_id = b"shadow-alice-x-12345";
-    let claimant_did = b"did:dht:z6MkClaim";
-    let context_id = b"bridge-test-context";
-    let timestamp: u64 = 1_700_000_000;
-
-    let bytes = canonical_hash_bytes(
-        b"SCP-CLAIM-V1:",
-        &[
-            CanonicalField::VarBytes(shadow_id),
-            CanonicalField::VarBytes(claimant_did),
-            CanonicalField::VarBytes(context_id),
-            CanonicalField::U64(timestamp),
-        ],
-    )
-    .unwrap();
-
-    println!("  Canonical hash input length: {} bytes", bytes.len());
-    // 13 (domain) + (4+20) + (4+17) + (4+19) + 8 = 13 + 24 + 21 + 23 + 8 = 89
-    assert_eq!(bytes.len(), 89);
-
-    let hash: [u8; 32] = Sha256::digest(&bytes).into();
-    print_vec("Claim canonical hash", &hash);
-}
-
-// ---------------------------------------------------------------------------
 // §25.11 Proposal ID Vectors
 // ---------------------------------------------------------------------------
 
@@ -1284,6 +1252,7 @@ fn domain_separators_are_all_unique() {
         "SCP-VOTE-V1:",
         "SCP-RESET-REQUEST-V1:",
         "SCP-KEY-CONTINUITY-V1:",
+        // Retired (bridge connectors cut 2026-09-26); reserved, never reuse.
         "SCP-CLAIM-V1:",
         "SCP-PROPOSAL-V1:",
         "SCP-ATTESTATION-V1:",
@@ -1326,6 +1295,7 @@ fn domain_separators_are_all_unique() {
         "scp-private-state-v1",
         "scp-private-state-salt-v1",
         "scp-media-key-v1",
+        // Retired (bridge connectors cut 2026-09-26); reserved, never reuse.
         "scp-bridge-credential-v1",
         "scp-pseudonym-secret-v1",
         "scp-participation-statement-v1",

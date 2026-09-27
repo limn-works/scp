@@ -539,7 +539,7 @@ SDKs MUST reject any `scp:capability:*` URI not present in the signed protocol r
 scp:system:{kebab-case-name}
 ```
 
-System capabilities declare what a node does (e.g., relay operation, bridge operation), not what an agent can prove. They are not subject to challenge-response verification.
+System capabilities declare what a node does (e.g., relay operation), not what an agent can prove. They are not subject to challenge-response verification.
 
 #### 7.3.4.2 Anti-Spoofing
 
@@ -607,7 +607,6 @@ The initial protocol registry defines 28 challenge capabilities across 10 catego
 - `scp:system:key-rotation` — Key rotation operations.
 - `scp:system:governance-participation` — Governance proposal/vote.
 - `scp:system:relay-operation` — Relay node.
-- `scp:system:bridge-operation` — Platform bridge.
 
 **Challenge suite specifications.** Each protocol-defined challenge capability has a corresponding test suite specification that defines the minimum test case set, pass threshold, and scoring methodology. Test suites are versioned independently of the capability URI version — a `v1` capability can have multiple suite versions (e.g., `2026.1`, `2026.2`) as test cases are refined.
 
@@ -1031,7 +1030,6 @@ Attestation is not a feature of any single section of SCP — it is a primitive 
 - **Contexts (§5):** Role assignments are attestations by governance about an agent's permissions. Outlet registrations include integrity attestations.
 - **Trust (§7):** Capability tokens (UCAN) are delegation attestations. Endorsements are trust attestations. Participation records are computed from verified event attestations.
 - **Security (§9):** Provenance chains are sequences of attestations about where data came from. Provenance is a core protocol principle (§1) — all non-private data carries verifiable origin.
-- **Bridges (§12):** Shadow identity claims are bridge operator attestations. Identity claiming is a self-attestation verified against the shadow.
 
 The common envelope format (§7.4.1) unifies these under a single verifiable structure. The verification mechanics are the same regardless of attestation type: check signature, check evidence, check expiry, check revocation. What varies is the claim content and how it's evaluated.
 

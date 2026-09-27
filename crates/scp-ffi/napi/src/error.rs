@@ -588,28 +588,6 @@ impl From<scp_core::discovery::DiscoveryError> for ScpNapiError {
     }
 }
 
-impl From<scp_core::bridge::registration::BridgeRegistrationError> for ScpNapiError {
-    fn from(e: scp_core::bridge::registration::BridgeRegistrationError) -> Self {
-        Self::Context {
-            message: format!(
-                "bridge registration failed: {e} — verify bridge configuration and permissions"
-            ),
-            code: codes::CTX_2009.to_owned(),
-        }
-    }
-}
-
-impl From<scp_core::bridge::shadow::ShadowError> for ScpNapiError {
-    fn from(e: scp_core::bridge::shadow::ShadowError) -> Self {
-        Self::Context {
-            message: format!(
-                "shadow context operation failed: {e} — check bridge state and context permissions"
-            ),
-            code: codes::CTX_2010.to_owned(),
-        }
-    }
-}
-
 impl From<scp_platform::PlatformError> for ScpNapiError {
     fn from(e: scp_platform::PlatformError) -> Self {
         Self::Crypto {

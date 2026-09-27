@@ -11,8 +11,6 @@
 
 #![forbid(unsafe_code)]
 
-pub mod bridge_auth;
-pub mod bridge_handlers;
 pub mod config;
 pub mod dev_api;
 pub mod dns_provider;
@@ -23,7 +21,6 @@ mod published_state;
 mod republish;
 pub mod self_host;
 pub mod tls;
-pub mod webhook;
 mod well_known;
 
 use std::collections::HashMap;
@@ -131,20 +128,20 @@ pub const DEFAULT_PROJECTION_RATE_LIMIT: u32 = 60;
 /// [`Full`](PublicSurface::Full) protocol surface. The `--self-host`
 /// website-hosting mode serves the restricted [`SelfHost`](PublicSurface::SelfHost)
 /// surface so the public bind exposes only the read-only website projection
-/// and never the relay upgrade or bridge routes (§10.12.8).
+/// and never the relay upgrade (§10.12.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicSurface {
     /// Full protocol surface: `.well-known/scp`, the `/scp/v1` relay
-    /// WebSocket upgrade, broadcast projection (`/scp/broadcast/*`), the
-    /// bridge routes (`/v1/scp/bridge/*`), ACME challenges, and the
-    /// virtual-host fallback. Used by every run mode except `--self-host`.
+    /// WebSocket upgrade, broadcast projection (`/scp/broadcast/*`), ACME
+    /// challenges, and the virtual-host fallback. Used by every run mode
+    /// except `--self-host`.
     Full,
     /// Restricted website surface for `--self-host`: `.well-known/scp`, the
     /// broadcast projection endpoints (`/scp/broadcast/*`, including
     /// `/feed`, `/messages`, and `/site`), and the virtual-host fallback —
-    /// and nothing else. The relay upgrade/bridge (`/scp/v1`) and the bridge
-    /// routes (`/v1/scp/bridge/*`) are NOT mounted, so an anonymous internet
-    /// client cannot reach the node's relay or bridge through the public bind.
+    /// and nothing else. The relay upgrade/bridge (`/scp/v1`) is NOT mounted,
+    /// so an anonymous internet client cannot reach the node's relay or bridge
+    /// through the public bind.
     SelfHost,
 }
 
@@ -436,55 +433,6 @@ impl<S: Storage> ApplicationNode<S> {
         self.state.live_state.get().relay_url
     }
 
-    /// Returns a clonable handle to this node's outbound webhook dispatcher.
-    ///
-    /// The dispatcher fans context events out to registered bridge webhook
-    /// endpoints (spec §12.2.1, §12.10.5). It is fed by two producers:
-    ///
-    /// 1. The inbound HTTP relay endpoint (`POST /v1/scp/bridge/webhook`),
-    ///    which reconciles platform-originated events.
-    /// 2. The local `Supervisor` event channel, wired via
-    ///    [`wire_context_events`](Self::wire_context_events).
-    #[must_use]
-    pub fn webhook_dispatcher(&self) -> Arc<crate::webhook::WebhookDispatcher> {
-        self.state.bridge_state.webhook_dispatcher()
-    }
-
-    /// Spawns a background task that forwards local `Supervisor` events to
-    /// this node's [`WebhookDispatcher`](crate::webhook::WebhookDispatcher).
-    ///
-    /// This is the production wire for SCP-to-platform webhook delivery
-    /// (§12.10.5): when a context the node hosts emits an event (message
-    /// received/sent, member joined/left, governance action), the event is
-    /// translated and dispatched to every registered webhook target matching
-    /// that context.
-    ///
-    /// The caller supplies a fresh broadcast receiver obtained from
-    /// [`Supervisor::subscribe_events`](scp_core::context::supervisor::Supervisor::subscribe_events).
-    /// The returned [`JoinHandle`](tokio::task::JoinHandle) owns the consumer
-    /// task; the caller MUST retain or supervise it so the task is aborted on
-    /// shutdown (otherwise it runs until the `Supervisor` — and therefore the
-    /// broadcast sender — is dropped, which closes the channel and stops the
-    /// consumer cleanly).
-    ///
-    /// # Fail-safe
-    ///
-    /// Webhook delivery is best-effort. A slow or unreachable webhook endpoint
-    /// cannot block or crash context operations: the broadcast channel drops
-    /// the oldest events for lagging consumers (logged, never panics), and the
-    /// dispatcher performs HTTP I/O on its own spawned tasks with bounded
-    /// retries.
-    #[must_use]
-    pub fn wire_context_events(
-        &self,
-        events: tokio::sync::broadcast::Receiver<(
-            String,
-            scp_core::context::membership::ContextEvent,
-        )>,
-    ) -> tokio::task::JoinHandle<()> {
-        crate::webhook::spawn_event_consumer(events, self.webhook_dispatcher())
-    }
-
     /// Returns the TLS certificate resolver for ACME hot-reload.
     ///
     /// Returns `Some` in domain mode when TLS is active, `None` in
@@ -633,13 +581,13 @@ impl<S: Storage> ApplicationNode<S> {
     ///
     /// [`PublicSurface::Full`] exposes the complete protocol surface:
     /// `.well-known/scp`, the `/scp/v1` relay WebSocket upgrade, the broadcast
-    /// projection endpoints (`/scp/broadcast/*`), the bridge routes
-    /// (`/v1/scp/bridge/*`), ACME challenges, and the virtual-host fallback.
+    /// projection endpoints (`/scp/broadcast/*`), ACME challenges, and the
+    /// virtual-host fallback.
     ///
     /// [`PublicSurface::SelfHost`] exposes ONLY the read-only website surface:
     /// `.well-known/scp`, the broadcast projection endpoints, and the
-    /// virtual-host fallback. The relay upgrade/bridge (`/scp/v1`) and the
-    /// bridge routes (`/v1/scp/bridge/*`) are deliberately NOT mounted — in
+    /// virtual-host fallback. The relay upgrade/bridge (`/scp/v1`) is
+    /// deliberately NOT mounted — in
     /// self-host mode the node's loopback relay is reached in-process over
     /// `127.0.0.1` and must never be exposed to anonymous internet clients on
     /// the public bind (§10.12.8; exposing `/scp/v1` would let an anonymous
@@ -660,19 +608,7 @@ impl<S: Storage> ApplicationNode<S> {
         match surface {
             PublicSurface::Full => {
                 let relay_rt = http::relay_router(Arc::clone(&self.state));
-                let (bridge, bridge_webhook) = http::build_bridge_routers(
-                    &self.state.bridge_state,
-                    self.state.bridge_lookup.as_ref(),
-                );
-                http::build_merged_router(
-                    app_router,
-                    well_known,
-                    relay_rt,
-                    projection,
-                    bridge,
-                    bridge_webhook,
-                    &self.state,
-                )
+                http::build_merged_router(app_router, well_known, relay_rt, projection, &self.state)
             }
             PublicSurface::SelfHost => {
                 http::build_self_host_router(app_router, well_known, projection, &self.state)
@@ -788,8 +724,8 @@ impl<S: Storage> ApplicationNode<S> {
     ///
     /// [`PublicSurface::SelfHost`] mounts ONLY the read-only website
     /// projection surface (`.well-known/scp`, `/scp/broadcast/*`, and the
-    /// virtual-host fallback) — the relay upgrade (`/scp/v1`) and bridge
-    /// routes (`/v1/scp/bridge/*`) are not exposed on the background listener
+    /// virtual-host fallback) — the relay upgrade (`/scp/v1`) is not exposed
+    /// on the background listener
     /// (§10.12.8). All other behavior (no TLS, no dev API, double-serve
     /// prevention, shutdown via the node's cancellation token) is identical to
     /// [`serve_background`](Self::serve_background).
@@ -3262,16 +3198,6 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         "application node started (domain mode, TLS active)"
     );
 
-    // Build the production bridge auth lookup, hydrating from storage.
-    // The audience URL is the HTTPS base URL for this node (spec 12.10.2).
-    let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
-        Arc::clone(&storage),
-        format!("https://{domain}"),
-    ));
-    if let Err(e) = bridge_lookup.load_from_storage().await {
-        tracing::warn!(error = %e, "failed to load bridge auth cache from storage — starting with empty cache");
-    }
-
     // Start this node's self-DID republish cycle (ADR-003 §2). Below every
     // fallible step in this builder, so no `?` leaves arms to tear down.
     let republish = start_node_republish_cycle(&did_method, &live_state).await;
@@ -3302,8 +3228,6 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         acme_challenges,
         hostname_index: tokio::sync::RwLock::new(HashMap::new()),
         default_site_routing_id: std::sync::RwLock::new(None),
-        bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
-        bridge_lookup: Some(bridge_lookup),
         #[cfg(feature = "quic")]
         publish_rate_limiter,
         #[cfg(feature = "quic")]
@@ -3627,23 +3551,6 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         ))
     };
 
-    // Bridge auth lookup — audience is the relay URL in no-domain mode (spec
-    // 12.10.2). Deliberately a SNAPSHOT, not a clone of the slot: the audience is
-    // this node's stable JWT-validation identity, not its reachability address.
-    // `load_from_storage` persists it once (`bridge/config/audience`) and never
-    // overwrites it, so it is already pinned across restarts — and making it
-    // follow a NAT tier change would silently invalidate every bridge credential
-    // an operator had already minted against the old value. The domain builder
-    // makes the same distinction visible: there the audience is
-    // `https://<domain>`, which is not the relay URL at all.
-    let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
-        Arc::clone(&storage),
-        live_state.get().relay_url,
-    ));
-    if let Err(e) = bridge_lookup.load_from_storage().await {
-        tracing::warn!(error = %e, "failed to load bridge auth cache from storage — starting with empty cache");
-    }
-
     let state = Arc::new(http::NodeState {
         did: identity.did.clone(),
         live_state: live_state.clone(),
@@ -3670,8 +3577,6 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         acme_challenges: None,
         hostname_index: tokio::sync::RwLock::new(HashMap::new()),
         default_site_routing_id: std::sync::RwLock::new(None),
-        bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
-        bridge_lookup: Some(bridge_lookup),
         // No-domain mode is plaintext `ws://` (no cert), so QUIC is not served (§10.14.3).
         #[cfg(feature = "quic")]
         publish_rate_limiter,

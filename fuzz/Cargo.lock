@@ -2448,7 +2448,6 @@ name = "scp-runtime"
 version = "0.1.0-beta.2"
 dependencies = [
  "aes",
- "aes-gcm",
  "arc-swap",
  "async-trait",
  "base64",
@@ -2457,7 +2456,6 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "hex",
- "hkdf",
  "jsonschema",
  "lru",
  "metrics",

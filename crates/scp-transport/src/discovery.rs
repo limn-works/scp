@@ -75,9 +75,7 @@ const DISCOVERY_FAILURE_TTL: Duration = Duration::from_secs(10);
 /// The cache is keyed by relay URL; without a bound it would grow one entry per
 /// distinct relay URL seen for the lifetime of the
 /// [`TransportSelector`](crate::selection::TransportSelector). An LRU bound caps
-/// memory while keeping the hot set of recently-dialed relays resident. 256 is
-/// the same bound scp-node's webhook dispatcher uses for an analogous per-URL
-/// registry.
+/// memory while keeping the hot set of recently-dialed relays resident.
 const MAX_CACHED_RELAYS: usize = 256;
 
 /// Outcome of a transports lookup for a relay.
@@ -400,8 +398,7 @@ impl RelayTransportDiscovery {
                     // hostile relay 30x-bounce the fetch to an internal service
                     // (SSRF) or to a cleartext `http://` target. Refuse all
                     // redirects; a 3xx then hits the `!is_success()` branch and
-                    // falls open to the WebSocket baseline. Matches the hardened
-                    // precedent in scp-node's webhook dispatcher.
+                    // falls open to the WebSocket baseline.
                     .redirect(reqwest::redirect::Policy::none())
                     // Never downgrade the discovery fetch to `http://`: QUIC
                     // mandates TLS 1.3, and a cleartext fetch is exactly the

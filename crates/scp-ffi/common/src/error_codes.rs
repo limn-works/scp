@@ -384,10 +384,6 @@ pub const CTX_2006: &str = "SCP-CTX-2006";
 pub const CTX_2007: &str = "SCP-CTX-2007";
 /// Context receive failed.
 pub const CTX_2008: &str = "SCP-CTX-2008";
-/// Context close failed.
-pub const CTX_2009: &str = "SCP-CTX-2009";
-/// Context export/import failed.
-pub const CTX_2010: &str = "SCP-CTX-2010";
 /// Context mode error.
 pub const CTX_2011: &str = "SCP-CTX-2011";
 /// Context manager error.
@@ -571,36 +567,6 @@ pub const CTX_2136: &str = "SCP-CTX-2136";
 ///
 /// Maps from `ContextError::NothingToRestore`.
 pub const CTX_2137: &str = "SCP-CTX-2137";
-/// Bridge connector context creation error.
-pub const CTX_2100: &str = "SCP-CTX-2100";
-/// Bridge connector context join error.
-pub const CTX_2101: &str = "SCP-CTX-2101";
-/// Bridge connector context send error.
-pub const CTX_2102: &str = "SCP-CTX-2102";
-/// Bridge connector context leave error.
-pub const CTX_2103: &str = "SCP-CTX-2103";
-/// Bridge connector context close error.
-pub const CTX_2104: &str = "SCP-CTX-2104";
-/// Bridge connector broadcast subscribe error.
-pub const CTX_2105: &str = "SCP-CTX-2105";
-/// Bridge connector broadcast unsubscribe error.
-pub const CTX_2106: &str = "SCP-CTX-2106";
-/// Bridge connector broadcast publish error.
-pub const CTX_2107: &str = "SCP-CTX-2107";
-/// Bridge connector broadcast block error.
-pub const CTX_2108: &str = "SCP-CTX-2108";
-/// Bridge connector broadcast key request error.
-pub const CTX_2109: &str = "SCP-CTX-2109";
-/// Bridge connector broadcast admission error.
-pub const CTX_2110: &str = "SCP-CTX-2110";
-/// Bridge connector governance action error.
-pub const CTX_2111: &str = "SCP-CTX-2111";
-/// Bridge connector TTL expiry error.
-pub const CTX_2112: &str = "SCP-CTX-2112";
-/// Bridge connector TTL extension error.
-pub const CTX_2113: &str = "SCP-CTX-2113";
-/// Bridge connector context import error.
-pub const CTX_2114: &str = "SCP-CTX-2114";
 /// Media context error.
 pub const CTX_2500: &str = "SCP-CTX-2500";
 /// Media context key export error.
@@ -965,24 +931,31 @@ pub const VALID_7047: &str = "SCP-VALID-7047";
 pub const VALID_7048: &str = "SCP-VALID-7048";
 /// Transport proof validation error.
 pub const VALID_7049: &str = "SCP-VALID-7049";
-/// Bridge connector DID validation error.
+/// General input validation error with no single subject.
+///
+/// The bridges emit it from unrelated checks, for example an unparseable
+/// provenance JSON string and the NAPI economy input validator.
 pub const VALID_7050: &str = "SCP-VALID-7050";
-/// Bridge connector context ID validation error.
+/// General validation error with no single subject.
+///
+/// The bridges emit it from unrelated checks, for example a provenance
+/// record that fails to serialize.
 pub const VALID_7051: &str = "SCP-VALID-7051";
-/// Bridge connector payload validation error.
+/// General validation error with no single subject.
+///
+/// The bridges emit it from unrelated checks, for example a failed trust
+/// aggregation.
 pub const VALID_7052: &str = "SCP-VALID-7052";
-/// Bridge connector admission validation error.
+/// General validation error with no single subject.
+///
+/// The bridges emit it from unrelated checks, for example a provenance
+/// record that fails to serialize for hashing.
 pub const VALID_7053: &str = "SCP-VALID-7053";
-/// Bridge connector key validation error.
+/// General validation error with no single subject.
+///
+/// No Rust bridge emits it; the Kotlin server wrapper emits it for a
+/// missing field in node-info JSON.
 pub const VALID_7054: &str = "SCP-VALID-7054";
-/// Bridge connector broadcast key validation error.
-pub const VALID_7055: &str = "SCP-VALID-7055";
-/// Bridge connector epoch validation error.
-pub const VALID_7056: &str = "SCP-VALID-7056";
-/// Bridge connector governance validation error.
-pub const VALID_7057: &str = "SCP-VALID-7057";
-/// Bridge connector import validation error.
-pub const VALID_7058: &str = "SCP-VALID-7058";
 /// Participation record validation error (§7.3.2).
 pub const VALID_7059: &str = "SCP-VALID-7059";
 /// Discovery validation error.

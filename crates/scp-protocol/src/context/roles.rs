@@ -104,8 +104,6 @@ pub enum Capability {
     ChildContextCreate,
     /// Cross-context outlet interface exposure (spec section 6.2).
     OutletInterface,
-    /// Bridge connector participation (spec section 12).
-    Bridging,
     /// Real-time voice communication via delegated media transport (spec section 10.9.1).
     MediaVoice,
     /// Real-time video communication via delegated media transport (spec section 10.9.1).
@@ -175,15 +173,15 @@ impl Capability {
     /// `"outlet:register"`, `"member:invite"`, `"member:remove"`,
     /// `"role:assign"`, `"governance:propose"`, `"governance:vote"`,
     /// `"context:close"`, `"context:child:create"`, `"outlet:interface"`,
-    /// `"bridging"`, `"media:voice"`, `"media:video"`, `"media:screen_share"`,
+    /// `"media:voice"`, `"media:video"`, `"media:screen_share"`,
     /// `"member:ban"`, `"metadata:edit"`.
     ///
     /// It ALSO recognizes the **UCAN wire form** (the `{resource}:{action}`
     /// output of [`ucan_capability_name`](Self::ucan_capability_name), §7.3.4)
     /// for the multi-segment built-ins whose spelling differs from colon form:
     /// `"outlet_query:*"` (== `OutletQueryAll`), `"outlet_call:*"`
-    /// (== `OutletCallAll`), `"context_child:create"` (== `ChildContextCreate`),
-    /// and `"bridging:*"` (== `Bridging`). Recognizing these is what lets a
+    /// (== `OutletCallAll`), and `"context_child:create"` (== `ChildContextCreate`).
+    /// Recognizing these is what lets a
     /// context's STORED ceiling (kept in canonical UCAN form) round-trip back to
     /// the proper built-in enum.
     ///
@@ -255,7 +253,6 @@ impl Capability {
             "context:close" => Some(Self::ContextClose),
             "context:child:create" | "context_child:create" => Some(Self::ChildContextCreate),
             "outlet:interface" => Some(Self::OutletInterface),
-            "bridging" | "bridging:*" => Some(Self::Bridging),
             "media:voice" => Some(Self::MediaVoice),
             "media:video" => Some(Self::MediaVideo),
             "media:screen_share" => Some(Self::MediaScreenShare),
@@ -318,7 +315,6 @@ impl Capability {
             Self::ContextClose => std::borrow::Cow::Borrowed("context:close"),
             Self::ChildContextCreate => std::borrow::Cow::Borrowed("context:child:create"),
             Self::OutletInterface => std::borrow::Cow::Borrowed("outlet:interface"),
-            Self::Bridging => std::borrow::Cow::Borrowed("bridging"),
             Self::MediaVoice => std::borrow::Cow::Borrowed("media:voice"),
             Self::MediaVideo => std::borrow::Cow::Borrowed("media:video"),
             Self::MediaScreenShare => std::borrow::Cow::Borrowed("media:screen_share"),
@@ -342,7 +338,6 @@ impl Capability {
     /// - `messages:write`          -> `("messages", "write")`
     /// - `context:close`           -> `("context", "close")`
     /// - `role:assign`             -> `("role", "assign")`
-    /// - `bridging`                -> `("bridging", "*")`
     ///
     /// The returned strings are suitable for constructing
     /// [`CapabilityUri`](crate::crypto::ucan::capability::CapabilityUri) values
@@ -411,10 +406,6 @@ impl Capability {
             Self::OutletInterface => (
                 std::borrow::Cow::Borrowed("outlet"),
                 std::borrow::Cow::Borrowed("interface"),
-            ),
-            Self::Bridging => (
-                std::borrow::Cow::Borrowed("bridging"),
-                std::borrow::Cow::Borrowed("*"),
             ),
             Self::MediaVoice => (
                 std::borrow::Cow::Borrowed("media"),
@@ -593,7 +584,6 @@ impl std::fmt::Display for Capability {
             Self::ContextClose => write!(f, "context:close"),
             Self::ChildContextCreate => write!(f, "context:child:create"),
             Self::OutletInterface => write!(f, "outlet:interface"),
-            Self::Bridging => write!(f, "bridging"),
             Self::MediaVoice => write!(f, "media:voice"),
             Self::MediaVideo => write!(f, "media:video"),
             Self::MediaScreenShare => write!(f, "media:screen_share"),
@@ -869,7 +859,6 @@ const BUILTIN_CEILING_CATEGORIES: &[&str] = &[
     "media:voice",
     "media:video",
     "media:screen_share",
-    "bridging",
     "outlet:interface",
     "context:child:create",
     "governance:propose",
@@ -936,7 +925,6 @@ const BUILTIN_CAPABILITIES: &[Capability] = &[
     Capability::ContextClose,
     Capability::ChildContextCreate,
     Capability::OutletInterface,
-    Capability::Bridging,
     Capability::MediaVoice,
     Capability::MediaVideo,
     Capability::MediaScreenShare,
@@ -2649,7 +2637,6 @@ mod tests {
             Capability::ContextClose,
             Capability::ChildContextCreate,
             Capability::OutletInterface,
-            Capability::Bridging,
             Capability::MediaVoice,
             Capability::MediaVideo,
             Capability::MediaScreenShare,
@@ -4017,7 +4004,6 @@ mod tests {
             "media:voice",
             "media:video",
             "media:screen_share",
-            "bridging",
             "outlet:interface",
             "context:child:create",
             "governance:propose",
@@ -4208,7 +4194,7 @@ mod tests {
     /// its UCAN wire spelling, always yielding the proper built-in variant (never
     /// a `Custom` lookalike) — the multi-segment built-ins whose UCAN form differs
     /// from colon form (`outlet_query:*`, `outlet_call:*`, `outlet_call:{id}`,
-    /// `context_child:create`, `bridging:*`) plus a representative sample of the
+    /// `context_child:create`) plus a representative sample of the
     /// identical-spelling built-ins. Without this, a context's STORED (canonical
     /// UCAN-form) ceiling re-parses to a `Custom` and fails re-validation
     /// (`InvalidCeilingCategory: outlet_call:* is malformed`), breaking context
@@ -4228,7 +4214,6 @@ mod tests {
             Capability::new("context:child:create"),
             Some(Capability::ChildContextCreate)
         );
-        assert_eq!(Capability::new("bridging"), Some(Capability::Bridging));
         assert_eq!(
             Capability::new("outlet:call:calc"),
             Some(Capability::OutletCall("calc".to_owned()))
@@ -4251,7 +4236,6 @@ mod tests {
             Capability::new("context_child:create"),
             Some(Capability::ChildContextCreate)
         );
-        assert_eq!(Capability::new("bridging:*"), Some(Capability::Bridging));
         assert_eq!(
             Capability::new("outlet_call:calc"),
             Some(Capability::OutletCall("calc".to_owned()))
@@ -4283,7 +4267,7 @@ mod tests {
     /// malformed custom is rejected in either parse. Mirrors the create-path
     /// `Capability::new(entry).validate_as_ceiling_entry()` the bridges run, and
     /// pins the regression: the canonical UCAN spellings (`outlet_call:*`,
-    /// `outlet_query:*`, `context_child:create`, `bridging:*`, `outlet_call:{id}`)
+    /// `outlet_query:*`, `context_child:create`, `outlet_call:{id}`)
     /// and the user-facing colon spellings must BOTH pass; underscore-resource
     /// customs and stray-wildcard / multi-colon customs must still fail.
     #[test]
@@ -4296,14 +4280,12 @@ mod tests {
             "outlet:call:calc",
             "outlet:query:calc",
             "context:child:create",
-            "bridging",
             "media:screen_share",
             // UCAN wire spellings (canonical stored form).
             "outlet_call:*",
             "outlet_query:*",
             "outlet_call:calc",
             "context_child:create",
-            "bridging:*",
             // Well-formed customs.
             "payments:approve",
             "payments:*",
@@ -4367,7 +4349,6 @@ mod tests {
                 | Capability::ContextClose
                 | Capability::ChildContextCreate
                 | Capability::OutletInterface
-                | Capability::Bridging
                 | Capability::MediaVoice
                 | Capability::MediaVideo
                 | Capability::MediaScreenShare
@@ -4385,14 +4366,14 @@ mod tests {
         }
         assert_eq!(
             BUILTIN_CAPABILITIES.len(),
-            19,
-            "BUILTIN_CAPABILITIES should hold all 19 non-parameterized built-ins"
+            18,
+            "BUILTIN_CAPABILITIES should hold all 18 non-parameterized built-ins"
         );
     }
 
     /// `validate_ucan_ceiling_string` accepts the canonical UCAN spelling of
     /// every built-in (including the underscore forms `outlet_query:*`,
-    /// `outlet_call:*`, `context_child:create`, `bridging:*`) plus parameterized
+    /// `outlet_call:*`, `context_child:create`) plus parameterized
     /// outlet invokes and well-formed customs — and rejects malformed entries and
     /// non-canonical COLON-form built-ins.
     #[test]
@@ -4425,28 +4406,6 @@ mod tests {
         }
     }
 
-    /// The enum-form entry point: a `Custom` carrying a built-in's spelling
-    /// (`bridging:*`, whose canonical UCAN form is the [`Capability::Bridging`]
-    /// built-in) is rejected. The rejection comes from the `validate_as_ceiling_entry`
-    /// re-resolution check — `Capability::new("bridging:*")` resolves to the
-    /// `Bridging` variant (not a `Custom`) — which is the sole authoritative §5.3.1.1
-    /// "No privileged-built-in collision" mechanism, so the reason is the "names a
-    /// built-in" §5.3.1.1 guard. (A `Custom("bridging:*")` is constructed only by
-    /// bypassing `new`, e.g. via untrusted deserialization — exactly the surface this
-    /// guard defends.)
-    #[test]
-    fn validate_as_ceiling_entry_rejects_custom_colliding_with_builtin() {
-        let err = Capability::Custom("bridging:*".to_owned())
-            .validate_as_ceiling_entry()
-            .expect_err("Custom(\"bridging:*\") names the Bridging built-in");
-        let CeilingEntryError::InvalidCeilingCategory { entry, reason } = err;
-        assert_eq!(entry, "bridging:*");
-        assert!(
-            reason.contains("names a built-in") && reason.contains("§5.3.1.1"),
-            "rejection must be the §5.3.1.1 built-in-collision guard (reason was {reason:?})"
-        );
-    }
-
     /// A non-colliding well-formed custom is still accepted on BOTH validators —
     /// the collision backstop must not over-reject. `payments:read` and `payments:*`
     /// do not project onto any built-in.
@@ -4460,25 +4419,13 @@ mod tests {
         }
     }
 
-    /// `Capability::new("bridging:*")` resolves to the `Bridging` enum variant (not
-    /// `Custom`), so the normal colon `create_context` path is unaffected by the
-    /// collision backstop — the backstop only matters for raw ceiling STRINGS that
-    /// bypass `Capability::new`.
-    #[test]
-    fn capability_new_bridging_wildcard_resolves_to_builtin_not_custom() {
-        assert_eq!(Capability::new("bridging:*"), Some(Capability::Bridging));
-        assert_eq!(Capability::new("bridging"), Some(Capability::Bridging));
-    }
-
     /// A built-in's own UCAN string is accepted as a BUILT-IN by the UCAN-form
     /// validator (matched by rule 1 BEFORE the shared custom grammar core is
     /// reached), so a legitimate built-in is never misclassified as a custom on the
-    /// UCAN/import path. `bridging:*` is the worked example.
+    /// UCAN/import path.
     #[test]
     fn validate_ucan_ceiling_string_accepts_builtin_form_not_false_rejected() {
-        validate_ucan_ceiling_string("bridging:*")
-            .expect("built-in UCAN form `bridging:*` must be accepted on the UCAN path");
-        // Every built-in's UCAN form likewise validates (early-exclusion by rule 1).
+        // Every built-in's UCAN form validates (early-exclusion by rule 1).
         for cap in BUILTIN_CAPABILITIES {
             let ucan = cap.ucan_capability_name();
             validate_ucan_ceiling_string(&ucan).unwrap_or_else(|e| {
@@ -4533,7 +4480,7 @@ mod tests {
     }
 
     /// The §5.3.1.1 guard covers EVERY built-in spelling a `Custom` could carry —
-    /// not just `outlet:call:*` and `bridging:*`. For every built-in, both its
+    /// not just `outlet:call:*`. For every built-in, both its
     /// user-facing colon spelling ([`Capability::name`]) and its canonical UCAN
     /// spelling ([`Capability::ucan_capability_name`]), wrapped in a `Custom`, must
     /// be rejected by the re-resolution backstop. This is the general property the
@@ -4614,51 +4561,23 @@ mod tests {
         }
         for resource in &shadowable {
             let wildcard = format!("{resource}:*");
-            // `bridging` is the one shadowable resource whose `{resource}:*` is ALSO a
-            // built-in's own canonical UCAN form (`Bridging` == `bridging:*`). For it,
-            // `Custom("bridging:*")` is rejected one rule earlier — by the no-collision
-            // re-resolution rule (it resolves to `Bridging`), reason "names a built-in"
-            // — and the raw UCAN-import string `bridging:*` is the LEGITIMATE built-in
-            // form and is accepted. Every other shadowable resource has no `{r}:*`
-            // built-in, so it is caught by the wildcard-shadow rule on every surface.
-            let wildcard_is_builtin_form = BUILTIN_CAPABILITIES
-                .iter()
-                .any(|c| c.ucan_capability_name() == wildcard);
 
-            // Enum entry point: rejected on both paths (collision OR shadow).
+            // Enum entry point: rejected by the wildcard-shadow rule.
             let err = Capability::Custom(wildcard.clone())
                 .validate_as_ceiling_entry()
                 .expect_err("custom wildcard over a built-in resource must be rejected");
             let CeilingEntryError::InvalidCeilingCategory { reason, .. } = err;
-            if wildcard_is_builtin_form {
-                assert!(
-                    reason.contains("names a built-in"),
-                    "{wildcard:?} is itself a built-in UCAN form; must be rejected by the \
-                     no-collision rule (reason {reason:?})"
-                );
-            } else {
-                assert!(
-                    reason.contains("shadows a built-in"),
-                    "rejection of {wildcard:?} must be the wildcard-shadow rule (reason {reason:?})"
-                );
-            }
+            assert!(
+                reason.contains("shadows a built-in"),
+                "rejection of {wildcard:?} must be the wildcard-shadow rule (reason {reason:?})"
+            );
 
-            // UCAN-import raw string: a `{r}:*` that is a legitimate built-in form is
-            // accepted (it IS the built-in, no `Custom` wrapper, no masquerade);
-            // otherwise it must be rejected by the wildcard-shadow rule.
+            // UCAN-import raw string: rejected by the wildcard-shadow rule.
             let ucan_result = validate_ucan_ceiling_string(&wildcard);
-            if wildcard_is_builtin_form {
-                assert!(
-                    ucan_result.is_ok(),
-                    "{wildcard:?} is the legitimate built-in UCAN form and must be accepted on \
-                     the import path; got {ucan_result:?}"
-                );
-            } else {
-                assert!(
-                    ucan_result.is_err(),
-                    "UCAN-import validator must reject wildcard-shadow {wildcard:?}"
-                );
-            }
+            assert!(
+                ucan_result.is_err(),
+                "UCAN-import validator must reject wildcard-shadow {wildcard:?}"
+            );
 
             // Deserialize boundary: a `Custom` wrapper is always rejected (the wrapper
             // is the masquerade surface, regardless of which §5.3.1.1 rule fires).
@@ -4703,14 +4622,10 @@ mod tests {
     /// `validate_entries` boundary. This is the exact attack surface the HIGH finding
     /// described: `Capability` derives a plain `Deserialize` with no normalization,
     /// so `{"Custom":"outlet:call:*"}` deserializes verbatim; the type-level
-    /// validating `Deserialize` must refuse to materialize it. `bridging:*` is
-    /// included so the deserialize guard is shown to catch the whole family — like
-    /// the other masquerade strings, it is rejected by the `validate_as_ceiling_entry`
-    /// re-resolution check (`Capability::new("bridging:*")` resolves to the `Bridging`
-    /// built-in), not by the custom grammar (which `bridging:*` satisfies).
+    /// validating `Deserialize` must refuse to materialize it.
     #[test]
     fn ceiling_deserialize_rejects_custom_naming_builtin() {
-        for masquerade in ["outlet:call:*", "outlet:call:calc", "bridging:*"] {
+        for masquerade in ["outlet:call:*", "outlet:call:calc"] {
             // `CapabilityCeiling::new` does NOT validate (validation happens at the
             // write/deserialize boundary), so this constructs the exact bytes a
             // non-conformant peer could sign and export.
@@ -5256,13 +5171,6 @@ mod tests {
     }
 
     #[test]
-    fn ucan_resource_action_bridging() {
-        let (resource, action) = Capability::Bridging.ucan_resource_action();
-        assert_eq!(resource.as_ref(), "bridging");
-        assert_eq!(action.as_ref(), "*");
-    }
-
-    #[test]
     fn ucan_resource_action_from_name_string() {
         // Parsing from the canonical colon name produces the correct UCAN pair.
         let cap = Capability::new("outlet:call:*").expect("valid wildcard");
@@ -5301,7 +5209,6 @@ mod tests {
             Capability::OutletCall("calc".to_owned()).ucan_capability_name(),
             "outlet_call:calc"
         );
-        assert_eq!(Capability::Bridging.ucan_capability_name(), "bridging:*");
         assert_eq!(
             Capability::OutletRegister.ucan_capability_name(),
             "outlet:register"
@@ -5361,7 +5268,6 @@ mod tests {
             Capability::ContextClose,
             Capability::ChildContextCreate,
             Capability::OutletInterface,
-            Capability::Bridging,
             Capability::MediaVoice,
             Capability::MediaVideo,
             Capability::MediaScreenShare,

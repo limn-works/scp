@@ -2372,23 +2372,16 @@ impl Supervisor {
     /// Returns `None` if no event channel was configured (the FFI bridges enable
     /// it unconditionally for production supervisors; a supervisor built without
     /// the `event_tx` argument — e.g. via `Self::for_query_shim` — yields
-    /// `None`). This is the public surface used by FFI node-startup paths to
-    /// drive the outbound webhook dispatcher (spec §12.10.5).
+    /// `None`).
+    ///
+    /// No production code in this repository calls this method, so every event
+    /// the actors emit is dropped unless an embedder subscribes. A receiver
+    /// that falls behind the channel capacity gets `RecvError::Lagged` and must
+    /// handle it itself; nothing else records the lost events.
     ///
     /// Message payloads on the channel are stripped of plaintext before sending
     /// (see [`crate::context::state::strip_event_payload`]) — subscribers
     /// observe metadata only, never decrypted content.
-    ///
-    /// # Delivery scope
-    ///
-    /// The subscribe → map → dispatch path is wired end-to-end, but the
-    /// outbound webhook dispatcher's *target registration* is not yet wired to
-    /// an operator-facing surface. Until such a surface registers webhook URLs
-    /// and signing keys, the dispatcher holds no targets and outbound delivery
-    /// is a no-op fan-out: events reach the dispatcher but are delivered to
-    /// nobody. End-to-end delivery is therefore gated on a future
-    /// operator-config API; this method's contract (fresh receiver, stripped
-    /// payloads, post-subscription semantics) is unaffected by that gap.
     #[must_use]
     pub fn subscribe_events(
         &self,

@@ -120,7 +120,6 @@ macro_rules! napi_check_handle {
     }};
 }
 
-pub mod bridge_connector;
 pub mod context;
 pub mod custody;
 pub mod discovery;

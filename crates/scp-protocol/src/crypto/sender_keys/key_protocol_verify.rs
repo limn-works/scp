@@ -20,8 +20,6 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
 
-#[cfg(test)]
-use super::generate_sender_key;
 use super::{SenderKey, SenderKeyError};
 use crate::crypto::hpke;
 use crate::serde_util::{serde_hpke_sealed_48, serde_pubkey_32, serde_signature_64};
@@ -1083,94 +1081,6 @@ pub(super) fn verify_ed25519_signature(
             }
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Bridge shadow sender key distribution (SCP-BCH-011, §12.6.1)
-// ---------------------------------------------------------------------------
-
-/// Parameters for handling a sender key request for a shadow identity
-/// routed to the bridge operator.
-pub struct BridgeShadowKeyParams<'a> {
-    /// The shadow's sender key to distribute (from `SenderKeyStore`).
-    pub shadow_sender_key: &'a SenderKey,
-    /// The bridge operator's DID.
-    pub bridge_operator_did: &'a str,
-    /// The shadow DID being requested.
-    pub shadow_did: &'a str,
-    /// The context ID.
-    pub context_id: &'a str,
-}
-
-/// Handles a sender key request for a shadow identity.
-///
-/// The bridge operator retrieves the shadow's sender key from
-/// `SenderKeyStore` and wraps it via HPKE to the requester's wrapping
-/// key. Uses the `"scp-sender-key-v1"` domain separation label
-/// per §9.16.2.
-///
-/// # Arguments
-///
-/// - `requester_wrapping_pubkey` -- The requesting member's X25519
-///   wrapping public key (32 bytes).
-/// - `params` -- Bridge shadow key parameters.
-///
-/// # Returns
-///
-/// `(hpke_sealed_key, enc)` -- The HPKE ciphertext (`ct = ciphertext || tag`,
-/// 48 bytes) and the HPKE encapsulated key (`enc`, 32-byte ephemeral X25519
-/// public key). The AEAD nonce is internal per RFC 9180.
-///
-/// # Errors
-///
-/// Returns `SenderKeyError::HpkeEncryptionFailed` if HPKE wrapping fails.
-pub fn handle_bridge_shadow_key_request(
-    requester_wrapping_pubkey: &[u8; 32],
-    params: &BridgeShadowKeyParams<'_>,
-) -> Result<([u8; 48], [u8; 32]), SenderKeyError> {
-    let (sealed_vec, ephemeral_pub) = hpke_seal_sender_key(
-        params.shadow_sender_key.as_bytes(),
-        requester_wrapping_pubkey,
-        params.context_id,
-        params.shadow_did,
-        0, // Shadow keys are initial distribution (epoch 0)
-    )?;
-
-    // Convert to fixed-size array (32-byte key + 16-byte AEAD tag = 48 bytes).
-    let sealed_arr: [u8; 48] = sealed_vec.as_slice().try_into().map_err(|_| {
-        SenderKeyError::HpkeEncryptionFailed(format!(
-            "expected 48 bytes from HPKE seal, got {}",
-            sealed_vec.len()
-        ))
-    })?;
-
-    Ok((sealed_arr, ephemeral_pub))
-}
-
-/// Returns all shadow DIDs that have sender keys in the store for a
-/// given context. Used by members joining a bridged context to discover
-/// which shadows to request keys from.
-///
-/// # Arguments
-///
-/// - `store` -- The sender key store.
-/// - `context_id` -- The context to enumerate.
-/// - `shadow_prefix` -- Prefix for shadow DIDs (e.g., `"shadow:"`).
-///
-/// # Returns
-///
-/// A list of shadow DIDs in the context that have sender keys.
-#[must_use]
-pub fn list_shadow_sender_key_dids(
-    store: &super::SenderKeyStore,
-    context_id: &str,
-    shadow_prefix: &str,
-) -> Vec<String> {
-    store
-        .get_all(context_id)
-        .into_keys()
-        .filter(|did| did.starts_with(shadow_prefix))
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2237,88 +2147,6 @@ mod tests {
                 "expected {expected_variant} variant, got: {variant}"
             );
         }
-    }
-
-    // Bridge shadow sender key distribution (SCP-BCH-011)
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn bridge_shadow_key_request_roundtrip() {
-        let shadow_key = generate_sender_key();
-        let (recipient_pub, recipient_secret) = generate_wrapping_keypair();
-
-        let params = BridgeShadowKeyParams {
-            shadow_sender_key: &shadow_key,
-            bridge_operator_did: "did:dht:z6MkOperator",
-            shadow_did: "shadow:bridge-001:user-alice",
-            context_id: "ctx-bridge-test",
-        };
-
-        let (sealed, ephemeral_pub) =
-            handle_bridge_shadow_key_request(&recipient_pub, &params).unwrap();
-
-        // ct is exactly 48 bytes: 32-byte key + 16-byte AEAD tag.
-        assert_eq!(sealed.len(), 48);
-
-        // Unwrap via the HPKE open path (epoch 0 for shadow keys).
-        let recovered = hpke_open_sender_key(
-            &sealed,
-            &ephemeral_pub,
-            &recipient_secret,
-            "ctx-bridge-test",
-            "shadow:bridge-001:user-alice",
-            0,
-        )
-        .unwrap();
-        assert_eq!(recovered.as_bytes(), shadow_key.as_bytes());
-    }
-
-    #[test]
-    fn bridge_shadow_key_domain_separation() {
-        // Verify that HPKE_INFO (domain separation label) is "scp-sender-key-v1".
-        assert_eq!(HPKE_INFO_PREFIX, b"scp-sender-key-v1");
-    }
-
-    #[test]
-    fn bridge_shadow_key_request_nonexistent_shadow_key_fails() {
-        // Should succeed — it's a well-formed request. The "nonexistent"
-        // check would happen at a higher layer (SenderKeyStore lookup).
-        let shadow_key = generate_sender_key();
-        let (recipient_pub, _) = generate_wrapping_keypair();
-
-        let params = BridgeShadowKeyParams {
-            shadow_sender_key: &shadow_key,
-            bridge_operator_did: "did:dht:z6MkOperator",
-            shadow_did: "shadow:nonexistent",
-            context_id: "ctx-test",
-        };
-
-        let result = handle_bridge_shadow_key_request(&recipient_pub, &params);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn list_shadow_sender_key_dids_filters_by_prefix() {
-        use crate::crypto::sender_keys::SenderKeyStore;
-
-        let mut store = SenderKeyStore::new();
-        store.set_unchecked("ctx-1", "shadow:bridge-001:alice", generate_sender_key());
-        store.set_unchecked("ctx-1", "shadow:bridge-001:bob", generate_sender_key());
-        store.set_unchecked("ctx-1", "did:dht:z6MkNative", generate_sender_key());
-
-        let shadow_dids = list_shadow_sender_key_dids(&store, "ctx-1", "shadow:");
-        assert_eq!(shadow_dids.len(), 2);
-        assert!(shadow_dids.contains(&"shadow:bridge-001:alice".to_owned()));
-        assert!(shadow_dids.contains(&"shadow:bridge-001:bob".to_owned()));
-    }
-
-    #[test]
-    fn list_shadow_sender_key_dids_empty_context() {
-        use crate::crypto::sender_keys::SenderKeyStore;
-
-        let store = SenderKeyStore::new();
-        let dids = list_shadow_sender_key_dids(&store, "ctx-empty", "shadow:");
-        assert!(dids.is_empty());
     }
 
     // -------------------------------------------------------------------

@@ -172,7 +172,6 @@ impl CapabilityEntry {
                 }
                 ("roles", "admin", _) => capabilities.push(Capability::RoleAssign),
                 ("context", "admin", _) => capabilities.push(Capability::ContextClose),
-                ("bridging", _, _) => capabilities.push(Capability::Bridging),
                 ("media", "voice", _) => capabilities.push(Capability::MediaVoice),
                 ("media", "video", _) => capabilities.push(Capability::MediaVideo),
                 ("media", "screen_share", _) => capabilities.push(Capability::MediaScreenShare),
@@ -601,15 +600,6 @@ impl ScopedHandle {
     /// Returns `SandboxError::CapabilityDenied` if `ContextClose` is not granted.
     pub fn check_context_close(&self) -> Result<(), SandboxError> {
         self.check_capability(&Capability::ContextClose)
-    }
-
-    /// Checks `Bridging` capability.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SandboxError::CapabilityDenied` if `Bridging` is not granted.
-    pub fn check_bridging(&self) -> Result<(), SandboxError> {
-        self.check_capability(&Capability::Bridging)
     }
 
     /// Checks `MetadataEdit` capability.
@@ -1615,12 +1605,6 @@ mod tests {
     }
 
     #[test]
-    fn scoped_handle_check_bridging_granted() {
-        let handle = make_scoped_handle(vec![Capability::Bridging]);
-        assert!(handle.check_bridging().is_ok());
-    }
-
-    #[test]
     fn scoped_handle_check_metadata_edit_granted() {
         let handle = make_scoped_handle(vec![Capability::MetadataEdit]);
         assert!(handle.check_metadata_edit().is_ok());
@@ -1683,7 +1667,6 @@ mod tests {
         assert!(handle.check_member_remove().is_err());
         assert!(handle.check_role_assign().is_err());
         assert!(handle.check_context_close().is_err());
-        assert!(handle.check_bridging().is_err());
         assert!(handle.check_metadata_edit().is_err());
         assert!(handle.check_member_ban().is_err());
         assert!(handle.check_child_context_create().is_err());
@@ -1997,11 +1980,11 @@ mod tests {
 
         let err = SandboxError::CeilingExceeded {
             denied_capabilities: vec![DeniedCapability {
-                capability: Capability::Bridging,
+                capability: Capability::MemberBan,
                 reason: DenialReason::NotInCeiling,
             }],
         };
-        assert!(err.to_string().contains("bridging"));
+        assert!(err.to_string().contains("member:ban"));
     }
 
     // -----------------------------------------------------------------------

@@ -414,15 +414,14 @@ async fn projection_status(node: &scp_node::ApplicationNode<SqliteStorage>, path
 }
 
 /// FIX 1 (security): the self-host PUBLIC surface must expose ONLY the
-/// read-only website projection — never the relay upgrade (`/scp/v1`) nor the
-/// bridge routes (`/v1/scp/bridge/*`).
+/// read-only website projection — never the relay upgrade (`/scp/v1`).
 ///
 /// Builds the restricted self-host router via `serve_background_with_surface`
 /// against a real bound listener, then asserts over the wire that the site
-/// route serves while `/scp/v1` and `/v1/scp/bridge/shadow` are NOT routed
-/// (they fall through to the virtual-host fallback -> 404).
+/// route serves while `/scp/v1` is NOT routed (it falls through to the
+/// virtual-host fallback -> 404).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn self_host_public_surface_excludes_relay_and_bridge() {
+async fn self_host_public_surface_excludes_relay() {
     let built = build_self_host_node().await;
     let node_did = built.node.identity().did().to_owned();
     let context_id = self_host_context_id(&node_did);
@@ -474,22 +473,6 @@ async fn self_host_public_surface_excludes_relay_and_bridge() {
         "relay upgrade `/scp/v1` must NOT be reachable on the self-host public surface, \
          got {}",
         relay.status()
-    );
-
-    // -- The bridge routes `/v1/scp/bridge/*` are NOT routed publicly. --
-    let bridge = client
-        .post(format!("{base}/v1/scp/bridge/shadow"))
-        .header("content-type", "application/json")
-        .body("{}")
-        .send()
-        .await
-        .expect("bridge probe should complete");
-    assert_eq!(
-        bridge.status().as_u16(),
-        404,
-        "bridge route `/v1/scp/bridge/shadow` must NOT be reachable on the self-host \
-         public surface, got {}",
-        bridge.status()
     );
 
     built.node.shutdown();
@@ -1288,8 +1271,8 @@ async fn skip_nat_probe_uses_loopback_relay_url_without_probing() {
 /// absent) while the site projection serves — and the SAME GET on the `Full`
 /// surface IS routed (non-404, the WebSocket extractor rejecting a plain GET),
 /// proving the self-host 404 is genuine route absence, not a generic rejection.
-/// (The companion `self_host_public_surface_excludes_relay_and_bridge` covers
-/// the bridge routes and the full surface/site detail; this test deliberately
+/// (The companion `self_host_public_surface_excludes_relay` covers
+/// the full surface/site detail; this test deliberately
 /// keeps the surface half tight and adds the relay-loopback binding the other
 /// test lacks.)
 ///
