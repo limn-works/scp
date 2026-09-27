@@ -642,13 +642,13 @@
         func attestReportsAlreadyAttested() async throws {
             let harness = makeAdapter(attested: true)
 
-            do {
+            do throws(AttestationError) {
                 _ = try await harness.adapter.attestReportingAttestationError(
                     challenge: Data([0x01]),
                     deviceId: Data([0x02])
                 )
                 Issue.record("attest returned bytes for a key Apple already attested")
-            } catch let error as AttestationError {
+            } catch {
                 guard case .keyAlreadyAttested = error else {
                     Issue.record("attest threw \(error) instead of AttestationError.keyAlreadyAttested")
                     return
@@ -676,12 +676,12 @@
         func assertRequestReportsNotAttested() async throws {
             let harness = makeAdapter(attested: false)
 
-            do {
+            do throws(AttestationError) {
                 _ = try await harness.adapter.assertRequestReportingAttestationError(
                     requestHash: Data(repeating: 0xAB, count: 32)
                 )
                 Issue.record("assertRequest returned bytes for an unattested key")
-            } catch let error as AttestationError {
+            } catch {
                 guard case .keyNotAttested = error else {
                     Issue.record("assertRequest threw \(error) instead of AttestationError.keyNotAttested")
                     return
@@ -730,19 +730,17 @@
                 attested: false
             )
 
-            do {
+            do throws(AttestationError) {
                 _ = try await harness.adapter.attestReportingAttestationError(
                     challenge: Data([0x01]),
                     deviceId: Data([0x02])
                 )
                 Issue.record("attest returned bytes while Apple's service was unavailable")
-            } catch let error as AttestationError {
+            } catch {
                 guard case .serverUnavailable = error else {
                     Issue.record("attest threw \(error) instead of AttestationError.serverUnavailable")
                     return
                 }
-            } catch {
-                Issue.record("attest threw \(error) instead of an AttestationError")
             }
 
             // `DCError.h` says to retry that attestation later using this same
