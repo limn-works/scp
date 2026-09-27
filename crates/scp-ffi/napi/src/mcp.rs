@@ -1281,9 +1281,9 @@ mod tests {
         );
     }
 
-    /// Positive half of #1341. `McpServer::with_event_source` is the only
-    /// constructor that sets the flag, and it yields the pump in the same
-    /// call. The server then advertises the capability, accepts the
+    /// Positive half of #1341. `McpServer::with_event_source` (public only
+    /// under `scp-mcp/testing`) builds the flag and the pump in one call, the
+    /// same pair `with_optional_event_source(Some(rx))` seals into its bundle. The server then advertises the capability, accepts the
     /// subscription, and `notifications_for_event` — the function the pump
     /// drives for each received `ContextEvent` — emits a real
     /// `notifications/resources/updated` for the subscribed URI.

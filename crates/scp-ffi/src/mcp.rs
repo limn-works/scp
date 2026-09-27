@@ -3954,9 +3954,10 @@ mod tests {
             .expect("supervisor must be attached after setup_test_context")
             .subscribe_events()
             .expect("the PyO3 supervisor must expose a context event receiver");
-        // `with_event_source` is what `with_optional_event_source(Some(rx))`
-        // routes to; the bundle's `into_parts` is crate-private to scp-mcp,
-        // so cross-crate tests use the lower-level pair constructor.
+        // `with_event_source` builds the same server-and-pump pair that
+        // `with_optional_event_source(Some(rx))` seals into its opaque bundle;
+        // it is public only under `scp-mcp/testing`, which this crate enables
+        // from `[dev-dependencies]`.
         let (mut server, _pump) =
             McpServer::with_event_source(pyo3_mcp_provider(&bi, &ctx_id, creator), receiver);
 

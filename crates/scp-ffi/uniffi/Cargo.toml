@@ -94,6 +94,9 @@ zeroize = { workspace = true }
 z-base-32 = { workspace = true }
 
 [dev-dependencies]
+# The MCP subscription tests build a wired server with
+# `McpServer::with_event_source`, public only under `scp-mcp/testing`.
+scp-mcp = { path = "../../scp-mcp", features = ["testing"] }
 # Tests need InMemoryKeyCustody — enable the `testing` feature for dev-deps.
 scp-platform = { path = "../../scp-platform", features = ["testing"] }
 # Test seams (`install_seedable_resolver`) construct

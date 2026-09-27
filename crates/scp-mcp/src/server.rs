@@ -307,8 +307,8 @@ pub struct McpServer<P: ContextProvider> {
     subscriptions: HashSet<String>,
     /// Whether a real runtime event source is wired to this server.
     ///
-    /// Set only by [`McpServer::with_event_source`], which is the *only*
-    /// constructor that yields a [`ContextEventPump`] — so the flag cannot be
+    /// Set only by `McpServer::wired_pair`, which is the *only* constructor
+    /// that yields a [`ContextEventPump`] — so the flag cannot be
     /// true without the machinery that honours it existing, and cannot be
     /// false while that machinery exists. It decides every promise this server
     /// makes that only the pump can keep: `resources.subscribe`,
@@ -317,11 +317,11 @@ pub struct McpServer<P: ContextProvider> {
     event_source_wired: bool,
 }
 
-/// The receiving half of a wired [`ContextEvent`] source, produced by
-/// [`McpServer::with_event_source`] together with the server it feeds.
+/// The receiving half of a wired [`ContextEvent`] source, produced together
+/// with the server it feeds.
 ///
-/// **Pairing holds by construction.** [`McpServer::with_event_source`] is the
-/// only way to obtain a server that advertises `resources.subscribe: true`, and
+/// **Pairing holds by construction.** One crate-private constructor is the only
+/// way to obtain a server that advertises `resources.subscribe: true`, and
 /// it always hands back the pump alongside it — there is no setter that could
 /// produce the flag without the pump, or the pump without the flag.
 /// [`McpServer::with_optional_event_source`] folds the two into a single
@@ -361,36 +361,54 @@ impl std::fmt::Debug for ContextEventPump {
 /// enum makes the invariant **advertised ⟺ pump present** hold *by
 /// construction*:
 ///
-/// - [`Self::Wired`] holds a server whose `event_source_wired` flag is `true`
-///   *and* the pump — produced together by [`McpServer::with_event_source`].
-/// - [`Self::Unwired`] holds a server whose flag is `false` and no pump.
+/// - `TransportBundle::Wired` holds a server whose `event_source_wired` flag
+///   is `true` *and* the pump — produced together by one constructor.
+/// - `TransportBundle::Unwired` holds a server whose flag is `false` and no
+///   pump.
 ///
 /// No transport or downstream (cross-crate) caller can separate a server's
 /// `resources.subscribe` advertisement from its delivery pump: the advertisement
-/// rides the server's `event_source_wired` *field* while the pump rides the enum
-/// *variant*, and [`McpServer::with_optional_event_source`] is the sole builder
-/// that ties the two together, [`Self::into_parts`] is `pub(crate)`, and the
-/// variants are `#[non_exhaustive]` so no external caller can assemble one by
-/// hand. Within `scp-mcp`, the field⟺variant correspondence is established at
-/// that single construction site — not enforced by the type system — and
-/// cross-checked by a `debug_assert!` in [`Self::into_parts`]. The old transports
-/// re-checked this pairing at entry and failed closed on a mismatch; that runtime
-/// guard is gone because, on production paths, the bundle is only ever built at
-/// the one site ([`McpServer::with_optional_event_source`]) that keeps field and
-/// variant in sync — the sole hand-constructions are `#[cfg(test)]`, which that
+/// rides the server's `event_source_wired` *field* while the pump rides the
+/// `TransportBundle` *variant*, and [`McpServer::with_optional_event_source`]
+/// is the sole builder that ties the two together. The bundle is an opaque
+/// struct whose one field is `pub(crate)`, so a caller outside `scp-mcp` can
+/// neither assemble one by hand nor destructure one to take the wired server
+/// out; [`Self::into_parts`] is `pub(crate)` and the transports are its only
+/// consumers. (A public enum with `#[non_exhaustive]` variants would not do:
+/// another crate can still destructure such a variant with
+/// `Wired { 0: server, .. }`.) Within `scp-mcp`, the field⟺variant
+/// correspondence is established at that single construction site — not
+/// enforced by the type system — and cross-checked by a `debug_assert!` in
+/// [`Self::into_parts`]. The old transports re-checked this pairing at entry and
+/// failed closed on a mismatch; that runtime guard is gone because, on
+/// production paths, the bundle is only ever built at the one site
+/// ([`McpServer::with_optional_event_source`]) that keeps field and variant in
+/// sync — the sole hand-constructions are `#[cfg(test)]`, which that
 /// `debug_assert!` covers.
+///
+/// A caller in another crate cannot reach the field:
+///
+/// ```compile_fail,E0616
+/// fn take_server<P: scp_mcp::server::ContextProvider>(
+///     bundle: scp_mcp::server::McpServerForTransport<P>,
+/// ) {
+///     let _ = bundle.0;
+/// }
+/// ```
 #[must_use = "hand this to a transport (run_stdio / run_sse) — dropping it leaves \
               a wired server's pump unspawned and resources.subscribe advertised \
               with nothing delivering notifications"]
-pub enum McpServerForTransport<P: ContextProvider> {
+pub struct McpServerForTransport<P: ContextProvider>(pub(crate) TransportBundle<P>);
+
+/// The two shapes an [`McpServerForTransport`] can hold. Crate-private, so no
+/// caller outside `scp-mcp` can build or take apart either shape.
+pub(crate) enum TransportBundle<P: ContextProvider> {
     /// A server with no event source: advertises `resources.subscribe: false`
     /// and carries no pump.
-    #[non_exhaustive]
     Unwired(McpServer<P>),
     /// A server wired to a live event source: advertises
     /// `resources.subscribe: true` and carries the pump that delivers its
     /// notifications.
-    #[non_exhaustive]
     Wired(McpServer<P>, ContextEventPump),
 }
 
@@ -402,8 +420,8 @@ impl<P: ContextProvider> McpServerForTransport<P> {
     /// single `match` here is what lets `run_stdio`/`run_sse` take the bundle as
     /// one atomic argument.
     pub(crate) fn into_parts(self) -> (McpServer<P>, Option<ContextEventPump>) {
-        match self {
-            Self::Unwired(server) => {
+        match self.0 {
+            TransportBundle::Unwired(server) => {
                 // Defense-in-depth: the field⟺variant correspondence is
                 // established at the sole construction site
                 // (`with_optional_event_source`), not by the type system. Trip an
@@ -414,7 +432,7 @@ impl<P: ContextProvider> McpServerForTransport<P> {
                 );
                 (server, None)
             }
-            Self::Wired(server, pump) => {
+            TransportBundle::Wired(server, pump) => {
                 debug_assert!(
                     server.event_source_wired(),
                     "Wired bundle must hold a server that advertises resources.subscribe"
@@ -427,9 +445,9 @@ impl<P: ContextProvider> McpServerForTransport<P> {
 
 impl<P: ContextProvider> std::fmt::Debug for McpServerForTransport<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unwired(_) => f.write_str("McpServerForTransport::Unwired"),
-            Self::Wired(..) => f.write_str("McpServerForTransport::Wired"),
+        match self.0 {
+            TransportBundle::Unwired(_) => f.write_str("McpServerForTransport::Unwired"),
+            TransportBundle::Wired(..) => f.write_str("McpServerForTransport::Wired"),
         }
     }
 }
@@ -441,7 +459,7 @@ impl<P: ContextProvider> McpServer<P> {
     /// `resources.listChanged: false` and `tools.listChanged: false`, and
     /// rejects `resources/subscribe` with a typed error. There is no method
     /// that flips those flags afterwards — to serve subscriptions, construct
-    /// with [`Self::with_event_source`] instead.
+    /// with [`Self::with_optional_event_source`] instead.
     #[must_use]
     pub fn new(provider: P) -> Self {
         Self {
@@ -464,11 +482,24 @@ impl<P: ContextProvider> McpServer<P> {
     /// there is no setter to desynchronize them.
     ///
     /// Prefer [`Self::with_optional_event_source`], which returns the
-    /// transport-ready bundle. This lower-level constructor exists for
-    /// cross-crate tests that inspect [`Self::event_source_wired`] directly; the
-    /// returned [`ContextEventPump`] cannot be handed to a transport.
-    #[doc(hidden)]
+    /// transport-ready bundle. This lower-level constructor returns the server
+    /// and its pump as two values that no transport accepts, so a caller holding
+    /// the server could answer `resources/subscribe` through
+    /// [`Self::handle_request`] with nothing delivering notifications. It is
+    /// therefore public only under this crate's `testing` feature, which the
+    /// bridges enable for their own unit tests and no shipped artifact
+    /// resolves; everywhere else it is crate-private.
+    #[cfg(any(test, feature = "testing"))]
     pub fn with_event_source(
+        provider: P,
+        rx: broadcast::Receiver<(String, ContextEvent)>,
+    ) -> (Self, ContextEventPump) {
+        Self::wired_pair(provider, rx)
+    }
+
+    /// Builds the wired server and its pump. The one place the
+    /// `event_source_wired` flag is set to `true`.
+    fn wired_pair(
         provider: P,
         rx: broadcast::Receiver<(String, ContextEvent)>,
     ) -> (Self, ContextEventPump) {
@@ -487,10 +518,9 @@ impl<P: ContextProvider> McpServer<P> {
     ///
     /// Convenience for bridge code holding
     /// `Option<broadcast::Receiver<(String, ContextEvent)>>` from
-    /// `Supervisor::subscribe_events()`: `Some` routes to
-    /// [`Self::with_event_source`] and yields [`McpServerForTransport::Wired`]
-    /// (server-with-flag-true paired with its pump); `None` routes to
-    /// [`Self::new`] and yields [`McpServerForTransport::Unwired`]
+    /// `Supervisor::subscribe_events()`: `Some` yields
+    /// `TransportBundle::Wired` (server-with-flag-true paired with its pump);
+    /// `None` routes to [`Self::new`] and yields `TransportBundle::Unwired`
     /// (server-with-flag-false, no pump). The advertised capability and the pump
     /// that honours it travel as one value, so a transport cannot receive one
     /// without the other.
@@ -500,10 +530,10 @@ impl<P: ContextProvider> McpServer<P> {
     ) -> McpServerForTransport<P> {
         match rx {
             Some(rx) => {
-                let (server, pump) = Self::with_event_source(provider, rx);
-                McpServerForTransport::Wired(server, pump)
+                let (server, pump) = Self::wired_pair(provider, rx);
+                McpServerForTransport(TransportBundle::Wired(server, pump))
             }
-            None => McpServerForTransport::Unwired(Self::new(provider)),
+            None => McpServerForTransport(TransportBundle::Unwired(Self::new(provider))),
         }
     }
 

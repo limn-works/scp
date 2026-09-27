@@ -464,6 +464,7 @@ mod tests {
     use super::*;
     use crate::protocol::{METHOD_INITIALIZE, METHOD_INITIALIZED, METHOD_PING};
     use crate::server::ContextEventPump;
+    use crate::server::TransportBundle;
 
     // -- parse_incoming -------------------------------------------------------
 
@@ -908,7 +909,7 @@ mod tests {
         let (event_tx, server, pump) = wired_subscribed_server("scp://ctx_a/events");
         // The wired server and its pump travel to the transport as one bundle,
         // exactly as `run_stdio` receives them from `with_optional_event_source`.
-        let bundle = McpServerForTransport::Wired(server, pump);
+        let bundle = McpServerForTransport(TransportBundle::Wired(server, pump));
         let channel = VecSink::default();
 
         // A reader that never reaches EOF: stdin stays "open" so `serve_stdio`

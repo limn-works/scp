@@ -25,6 +25,12 @@ subtle = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 
+[features]
+# Makes `McpServer::with_event_source` public, so the FFI bridges' unit tests
+# can build a wired server and drive `handle_request` on it. The bridges enable
+# it from `[dev-dependencies]` only, so no shipped artifact resolves it.
+testing = []
+
 [dev-dependencies]
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

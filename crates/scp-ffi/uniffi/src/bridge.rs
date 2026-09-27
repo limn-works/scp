@@ -23564,9 +23564,10 @@ mod tests {
         let bi = Arc::new(crate::runtime::UniffiBridgeInstance::new_uniffi());
         live_context(&bi, "ctx-sub").await;
 
-        // `with_event_source` is the ONLY constructor that sets the flag, and
-        // it hands back the pump in the same call — the advertisement and the
-        // delivery machinery cannot be set independently.
+        // `with_event_source` (public only under `scp-mcp/testing`) builds the
+        // same server-and-pump pair `with_optional_event_source(Some(rx))` seals
+        // into its bundle — the advertisement and the delivery machinery come
+        // from one call and cannot be set independently.
         let (mut server, _pump) = scp_mcp::server::McpServer::with_event_source(
             McpUniFfiBridgeProvider {
                 bi: Arc::downgrade(&bi),

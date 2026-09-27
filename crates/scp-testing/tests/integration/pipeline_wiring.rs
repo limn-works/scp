@@ -2963,16 +2963,19 @@ fn b3_webhook_dispatch_wired() {
 /// system — not documentation") and which the ast-gate lesson calls
 /// non-convergent.
 ///
-/// `McpServer::with_event_source` now returns `(McpServer, ContextEventPump)`
-/// and is the *only* thing that sets the flag; `enable_subscriptions` is gone.
+/// One crate-private `scp-mcp` constructor now returns `(McpServer,
+/// ContextEventPump)` and is the *only* thing that sets the flag;
+/// `enable_subscriptions` is gone.
 /// A server that advertises the capability and a pump that delivers it are one
 /// value produced by one call, so:
 ///
 /// - the advertisement cannot be hard-coded — no literal reaches the field;
 /// - it cannot be enabled without a receiver — there is no other constructor
 ///   that sets it;
-/// - the pump cannot be forgotten — `ContextEventPump` is `#[must_use]` and a
-///   transport is the only thing that can consume it.
+/// - the pump cannot be separated from the server outside `scp-mcp` — the
+///   `McpServerForTransport` bundle is opaque, only a transport can consume it,
+///   and the pair constructor `with_event_source` is public only under
+///   `scp-mcp`'s `testing` feature, which no shipped artifact resolves.
 ///
 /// The three string-search assertions were therefore REMOVED as redundant with
 /// a strictly stronger compile-time guarantee (the one legitimate reason to
@@ -2996,26 +2999,93 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
         ("NAPI", napi_mcp_src),
         ("UniFFI", uniffi_mcp_src),
     ] {
-        // Scope the source-text search to the PRODUCTION portion — everything
-        // before the trailing `#[cfg(test)]\nmod tests { ... }`. Each bridge's
-        // own unit tests call `subscribe_events()` and construct wired servers,
-        // so a whole-file `contains` would stay green even if a real regression
-        // moved the wiring out of the serve function and only a test still named
-        // the symbol. `mod tests {` is the single conventional test-module
-        // marker in all three files; the production serve functions precede it.
-        let prod = production_source(src);
+        // Search the PRODUCTION code only: everything before the trailing
+        // `#[cfg(test)]\nmod tests { ... }`, with comment lines removed. Each
+        // bridge's unit tests and its comments name the same symbols, so a bare
+        // `contains` over the file stayed green after the real call was deleted.
+        let code = production_code(src);
         assert!(
-            prod.contains("subscribe_events()"),
+            code.contains("let context_events = match")
+                && code.contains("Ok(supervisor) => supervisor.subscribe_events(),"),
             "{bridge} MCP serve must obtain the Supervisor ContextEvent receiver \
-             on its PRODUCTION path (a test-module occurrence does not count)"
+             on its PRODUCTION path (a comment or test-module occurrence does not count)"
         );
         assert!(
-            prod.contains("with_optional_event_source"),
-            "{bridge} MCP serve must build its McpServer through the constructor \
+            code.contains("McpServer::with_optional_event_source(provider, context_events)"),
+            "{bridge} MCP serve must hand the Supervisor receiver to the constructor \
              that pairs the advertised capability with the pump that honours it — \
-             McpServer::new would silently downgrade to resources.subscribe: false"
+             passing `None`, or building with McpServer::new, silently downgrades to \
+             resources.subscribe: false"
         );
     }
+}
+
+/// The gate above must go red when the wiring it pins is deleted and only a
+/// comment or a `None` receiver remains. Each case below is the regression the
+/// gate exists to catch, written the way a real edit would leave the source.
+#[test]
+fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
+    let wired = "fn serve() {\n    // `subscribe_events()` returns `None` only for ...\n    \
+                 let context_events = match rt.supervisor() {\n        \
+                 Ok(supervisor) => supervisor.subscribe_events(),\n        Err(_) => None,\n    };\n    \
+                 let server =\n        McpServer::with_optional_event_source(provider, context_events);\n}\n\
+                 mod tests {\n    fn t() { let _ = supervisor.subscribe_events(); }\n}\n";
+    let code = production_code(wired);
+    assert!(code.contains("Ok(supervisor) => supervisor.subscribe_events(),"));
+    assert!(code.contains("McpServer::with_optional_event_source(provider, context_events)"));
+
+    let call_deleted = wired.replace(
+        "Ok(supervisor) => supervisor.subscribe_events(),",
+        "Ok(_) => None,",
+    );
+    let code = production_code(&call_deleted);
+    assert!(
+        !code.contains("subscribe_events()"),
+        "neither the comment nor the test module may satisfy the receiver assertion: {code}"
+    );
+
+    let none_passed = wired.replace(
+        "with_optional_event_source(provider, context_events)",
+        "with_optional_event_source(provider, None)",
+    );
+    assert!(
+        !production_code(&none_passed)
+            .contains("McpServer::with_optional_event_source(provider, context_events)"),
+        "a `None` receiver must not satisfy the constructor assertion"
+    );
+
+    let doc_only = "/// `Events` require `Capability::MessagesRead` per spec.\n\
+                    fn check() -> bool { rt.role_state.members.contains(agent) }\n";
+    assert!(!checks_messages_read(&production_code(doc_only)));
+    let real = "fn check() -> bool {\n    rt.role_state\n        \
+                .member_has_capability(agent_did, &Capability::MessagesRead)\n}\n";
+    assert!(checks_messages_read(&production_code(real)));
+}
+
+/// Returns the production code of a Rust source file as one whitespace-collapsed
+/// line: everything before the trailing `#[cfg(test)] mod tests { ... }`, with
+/// every line that is only a comment (`//`, `///`, `//!`) removed.
+///
+/// Source-text wiring gates must be satisfiable neither by a bridge's own unit
+/// tests nor by prose that names the symbol. Collapsing whitespace lets one
+/// pattern match a call rustfmt wraps across lines.
+fn production_code(src: &str) -> String {
+    production_source(src)
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether `code` (from [`production_code`]) calls `member_has_capability` with
+/// `&Capability::MessagesRead` as its capability argument.
+fn checks_messages_read(code: &str) -> bool {
+    code.match_indices("member_has_capability(").any(|(at, _)| {
+        code[at..]
+            .find(')')
+            .is_some_and(|end| code[at..=at + end].ends_with(", &Capability::MessagesRead)"))
+    })
 }
 
 /// Returns the production portion of a Rust source file: everything before the
@@ -3072,13 +3142,14 @@ fn mcp_resource_access_is_answered_from_real_role_state() {
             include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs"),
         ),
     ] {
-        // Scope to the PRODUCTION portion, exactly as the event-source gate
-        // above does: PyO3's and UniFFI's test modules also name
-        // `Capability::MessagesRead`, so a whole-file `contains` would stay
-        // green if the production authorization path regressed and only a test
-        // still named the symbol.
+        // Search PRODUCTION code with comments removed, exactly as the
+        // event-source gate above does: PyO3's and UniFFI's test modules and
+        // NAPI's doc comments also name `Capability::MessagesRead`, so a
+        // whole-file `contains` stayed green after the real check was deleted.
+        // The search requires the
+        // `member_has_capability(.., &Capability::MessagesRead)` call itself.
         assert!(
-            production_source(src).contains("Capability::MessagesRead"),
+            checks_messages_read(&production_code(src)),
             "{bridge} must authorize the events/members resources against the real \
              capability catalogue (spec §5.3.1: `messages:read` is what lets an \
              observer see content and membership) on its PRODUCTION path — a \

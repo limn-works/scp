@@ -813,6 +813,7 @@ fn parse_sse_incoming(body: &str) -> Result<SseIncoming, Box<JsonRpcResponse>> {
 mod tests {
     use super::*;
     use crate::protocol::{METHOD_INITIALIZE, METHOD_INITIALIZED, METHOD_PING};
+    use crate::server::TransportBundle;
     use crate::server::{ContextOutletInfo, MemberInfo};
     use scp_core::context::membership::ContextEvent;
 
@@ -1250,7 +1251,7 @@ mod tests {
         let handle = ShutdownHandle::new();
 
         let run_handle = handle.clone();
-        let bundle = McpServerForTransport::Unwired(server);
+        let bundle = McpServerForTransport(TransportBundle::Unwired(server));
         let task = tokio::spawn(async move { run_sse(bundle, config, run_handle).await });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1947,7 +1948,7 @@ mod tests {
     async fn aborting_run_sse_tears_down_the_pump() {
         let (event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
         let (server, pump) = McpServer::with_event_source(MockProvider::default(), event_rx);
-        let bundle = McpServerForTransport::Wired(server, pump);
+        let bundle = McpServerForTransport(TransportBundle::Wired(server, pump));
         let config = SseConfig::new("127.0.0.1:0".parse().unwrap());
 
         let task = tokio::spawn(run_sse(bundle, config, ShutdownHandle::new()));
