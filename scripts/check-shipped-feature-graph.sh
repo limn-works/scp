@@ -819,7 +819,7 @@ resolve_default_members_testing_crate() {
 #   `scp-ffi-common feature "server"` line at all.
 #
 #   This control runs BEFORE the artifact loop, so a resolver that has gone blind
-#   cannot print nine OK lines ahead of its own failure. Renaming that feature
+#   cannot print ten OK lines ahead of its own failure. Renaming that feature
 #   must break this control loudly; re-point the witness at another own-table
 #   activation rather than deleting the control.
 # ---------------------------------------------------------------------------

@@ -48,7 +48,7 @@ build-backend = "maturin"
 [project]
 name = "scp-python"
 description = "Shared Context Protocol SDK — identity, encryption, contexts, tools for AI agents"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 # license = TBD
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -77,7 +77,10 @@ manifest-path = "../../crates/scp-ffi/Cargo.toml"
 features = ["extension-module", "vendored-openssl"]
 
 [tool.ruff]
-target-version = "py312"
+# The floor `requires-python` names: ruff reports syntax newer than the target
+# (PEP 695 `type X` and `def f[T]` among it), so code the 3.10 and 3.11 wheels
+# cannot import fails lint.
+target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
@@ -101,7 +104,7 @@ known-first-party = ["scp_sdk"]
 
 [tool.mypy]
 strict = true
-python_version = "3.12"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

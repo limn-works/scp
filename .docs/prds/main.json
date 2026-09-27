@@ -2887,7 +2887,7 @@
         "`py.typed` PEP 561 marker file exists.",
         "`pyproject.toml` declares package metadata, version, Python >=3.10 constraint, optional dependencies `[langchain]` and `[mcp]`.",
         "maturin builds the `_scp_core` extension into the `scp_sdk` package directory.",
-        "Users on a platform and CPython minor a wheel covers (CPython 3.10-3.13 on Linux with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64) install with `pip install scp-python` — no Rust toolchain required. Anywhere else pip builds the sdist, which compiles OpenSSL and needs a Rust toolchain and a full perl, plus make on Linux and macOS.",
+        "Users on a platform and CPython minor a wheel covers (CPython 3.10-3.13 on Linux x86_64 and aarch64 with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64) install with `pip install scp-python` — no Rust toolchain required. Anywhere else pip builds the sdist, which compiles OpenSSL and needs a Rust toolchain and a full perl, plus make on Linux and macOS.",
         "Full PEP 484 type hints throughout all modules."
       ],
       "actionItems": [

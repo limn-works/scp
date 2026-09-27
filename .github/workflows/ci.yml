@@ -1836,7 +1836,7 @@ jobs:
         run: |
           cd bindings/python
           maturin build --out dist -i python3.10 python3.12 --locked
-      - name: Install each wheel and import the extension without a system OpenSSL
+      - name: Install each wheel, import the extension, and check it names no dynamic libssl or libcrypto
         run: |
           set -euo pipefail
           for py in python3.10 python3.12; do
@@ -1844,7 +1844,10 @@ jobs:
             "/tmp/venv-$py/bin/pip" install --no-index --find-links bindings/python/dist scp-python
             so="$(cd /tmp && "/tmp/venv-$py/bin/python" -c 'import scp_sdk._scp_core as m; print(m.__file__)')"
             echo "$py imported $so"
-            if readelf -d "$so" | grep -E 'NEEDED.*(libcrypto|libssl)'; then
+            # Captured first: a readelf failure then aborts under `set -e`,
+            # where inside the `if` pipeline it would read as "no OpenSSL".
+            dynamic="$(readelf -d "$so")"
+            if printf '%s\n' "$dynamic" | grep -E 'NEEDED.*(libcrypto|libssl)'; then
               echo "::error::$so links OpenSSL dynamically; the wheel must carry the vendored build"
               exit 1
             fi

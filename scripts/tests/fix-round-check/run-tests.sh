@@ -871,11 +871,12 @@ fi
 
 # ── Case 17: a branch that changed a workflow file ───────────────────────────────────
 #
-# Three gates the runner holds read a workflow file, each for rules of its own and none as
+# Four gates the runner holds read a workflow file, each for rules of its own and none as
 # coverage of a workflow edit: `scripts/check-workflow-compile-steps.py` for its
 # cache-group and bindgen rules, `scripts/check-toolchain-wiring.sh` for its
-# container-build and paths-filter rules, and `scripts/check-shipped-feature-graph.sh` for
-# the cargo invocations that ship an artifact. The `ci-workflow-selftest` job runs two
+# container-build and paths-filter rules, `scripts/check-shipped-feature-graph.sh` for
+# the cargo invocations that ship an artifact, and `scripts/check-vendored-openssl-scope.sh`
+# for the python-wheels matrix of build-matrix.yml. The `ci-workflow-selftest` job runs two
 # suites over those files that no gate duplicates, so a run whose only output about a
 # changed workflow was `gates N/N passed` would read as full coverage of that edit.
 #

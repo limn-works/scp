@@ -200,7 +200,7 @@ ruff check bindings/python/
 mypy bindings/python/scp_sdk/ --strict
 
 # Build extension (dev mode), from the directory whose pyproject.toml holds [tool.maturin]
-cd bindings/python && maturin develop --release
+(cd bindings/python && maturin develop --release)
 
 # Run tests
 pytest bindings/python/tests/ -v
@@ -208,15 +208,15 @@ pytest bindings/python/tests/ -v
 # Run async tests
 pytest bindings/python/tests/ -v --asyncio-mode=auto
 
-# Build wheel
-maturin build --release
+# Build wheel, from the same directory
+(cd bindings/python && maturin build --release)
 
 # Build wheels for all platforms (CI: job python-wheels in .github/workflows/build-matrix.yml,
 # from bindings/python; Linux legs run in the manylinux_2_28 container)
-maturin build --release --target x86_64-unknown-linux-gnu -i python3.10 python3.11 python3.12 python3.13
-maturin build --release --target aarch64-unknown-linux-gnu -i python3.10 python3.11 python3.12 python3.13
-maturin build --release --target universal2-apple-darwin -i python3.10 python3.11 python3.12 python3.13
-maturin build --release --target x86_64-pc-windows-msvc -i python3.10 python3.11 python3.12 python3.13
+(cd bindings/python && maturin build --release --target x86_64-unknown-linux-gnu -i python3.10 python3.11 python3.12 python3.13)
+(cd bindings/python && maturin build --release --target aarch64-unknown-linux-gnu -i python3.10 python3.11 python3.12 python3.13)
+(cd bindings/python && maturin build --release --target universal2-apple-darwin -i python3.10 python3.11 python3.12 python3.13)
+(cd bindings/python && maturin build --release --target x86_64-pc-windows-msvc -i python3.10 python3.11 python3.12 python3.13)
 ```
 
 ## CI Matrix
@@ -235,7 +235,7 @@ maturin build --release --target x86_64-pc-windows-msvc -i python3.10 python3.11
 
 ## Platform Wheels
 
-maturin builds binary wheels with the Rust extension embedded. Users on a platform and CPython minor a wheel covers (CPython 3.10-3.13 on Linux with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64) install with `pip install scp-python` — no Rust toolchain required. Anywhere else pip builds the sdist, which compiles OpenSSL and needs a Rust toolchain and a full perl, plus make on Linux and macOS.
+maturin builds binary wheels with the Rust extension embedded. Users on a platform and CPython minor a wheel covers (CPython 3.10-3.13 on Linux x86_64 and aarch64 with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64) install with `pip install scp-python` — no Rust toolchain required. Anywhere else pip builds the sdist, which compiles OpenSSL and needs a Rust toolchain and a full perl, plus make on Linux and macOS.
 
 | Platform | Architecture | Wheel tag |
 |----------|-------------|-----------|
