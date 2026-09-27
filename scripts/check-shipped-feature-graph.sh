@@ -1102,51 +1102,39 @@ assert_every_pipeline_reader_consumes_its_input() {
 #   in the file TARGET_ALL_EXEMPT_FILE: the PyPI wheel's presence proof, which has
 #   to resolve one triple at a time because the union over every triple admits an
 #   `openssl-src` edge that only a triple the wheel does not ship for compiles.
-#   The exemption covers a `cargo tree` line that names `--target` and sits between
-#   that function's `name() {` line and its closing `}` line, in the one file whose
-#   path equals TARGET_ALL_EXEMPT_FILE. A second definition of the function in that
-#   file cancels the exemption, and so does a body the range cannot close on a bare
-#   `}`: a line inside it that opens another function, or a line other than exactly
-#   `}` whose closing braces, read left to right, outnumber its opening braces at
-#   some point. A closing `}` is one at the line start or after `;` or `&`, the
-#   places bash accepts one; an opening `{` is one at the line start or after `;`,
-#   `&`, `|`, or `(`, followed by a space. That covers an indented `  }`, `} >&2`,
-#   `} # ...`, and an inline `  x; }`, each of which can close the function early
-#   and let the first bare `}` belong to a later construct. A balanced one-line
-#   group such as `{ echo x; return 1; }` keeps the exemption, and a spelling this
-#   count misreads cancels it. The function
-#   resolves the wheel entry `--print-wheel-entries` writes and takes only a triple
-#   from its caller, so every call of it is the wheel's presence proof. Every other
-#   line, including a line elsewhere in that file and a same-named function in
-#   another file, still has to name `--target all`.
+#   The exemption covers every `cargo tree` line that sits between
+#   that function's `name() {` line and the first following line that is exactly
+#   `}`, in the one file whose path equals TARGET_ALL_EXEMPT_FILE, and only while the
+#   text of those lines, both included, hashes to TARGET_ALL_EXEMPT_BLOB. The pin
+#   is a positive whitelist: it admits the one text pinned here and nothing else,
+#   so an edit anywhere in that text, including a closing brace spelled `) }`,
+#   `fi }`, or `; }` that ends the function before the bare `}`, changes the hash
+#   and cancels the exemption. A second `name() {` line in that file cancels it
+#   too. After an edit to the function, recompute the pin with
+#   `sed -n '<start>,<end>p' scripts/check-vendored-openssl-scope.sh | git hash-object --stdin`
+#   and have a human approve the new value. The pin holds the function's text and
+#   not its callers: the function reads its package and features through
+#   wheel_line from the script FEATURE_GRAPH_GATE names, and a caller can override
+#   that variable or redefine wheel_line, which the pinned text does not stop.
+#   Every other line, including a line elsewhere in that file and a same-named
+#   function in another file, still has to name `--target all`.
 TARGET_ALL_EXEMPT_FILE="scripts/check-vendored-openssl-scope.sh"
 TARGET_ALL_EXEMPT_FUNCTION="wheel_triple_occurrences"
+TARGET_ALL_EXEMPT_BLOB="7a45488a38cb652a067ff8b6a9785d852032c763"
 
 # target_all_exempt_range <file>
-#   Emit "<start> <end>", the line numbers of TARGET_ALL_EXEMPT_FUNCTION's
-#   `name() {` line and its first following `}` line, when the file defines that
-#   function exactly once and no line between them opens a function or, read left
-#   to right, closes a brace group it did not open; emit nothing otherwise, which
-#   leaves every line under the rule.
+#   Emit "<start> <end>", the line numbers of TARGET_ALL_EXEMPT_FUNCTION's one
+#   `name() {` line and of the first following line that is exactly `}`, when the
+#   text between them, both included, hashes to TARGET_ALL_EXEMPT_BLOB. Emit nothing
+#   otherwise, which leaves every line under the rule.
 target_all_exempt_range() {
-  local line n=0 defs=0 start="" end="" broken=0 rest depth
-  local fn_def='^[[:space:]]*(function[[:space:]]+[A-Za-z_]|[A-Za-z_][A-Za-z0-9_:.-]*[[:space:]]*\(\))'
-  local brace_tok='(^|[;&])[[:space:]]*(\})|(^|[;&|(])[[:space:]]*\{[[:space:]]'
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    n=$((n + 1))
-    if [[ "$line" == "${TARGET_ALL_EXEMPT_FUNCTION}() {" ]]; then defs=$((defs + 1)); start=$n; end=""; continue; fi
-    if [[ -n "$start" && -z "$end" ]]; then
-      if [[ "$line" == "}" ]]; then end=$n; continue; fi
-      if [[ "$line" =~ $fn_def ]]; then broken=1; fi
-      rest="$line"; depth=0
-      while [[ "$rest" =~ $brace_tok ]]; do
-        if [[ -n "${BASH_REMATCH[2]}" ]]; then depth=$((depth - 1)); else depth=$((depth + 1)); fi
-        if (( depth < 0 )); then broken=1; break; fi
-        rest="${rest#*"${BASH_REMATCH[0]}"}"
-      done
-    fi
-  done < "$1"
-  if [[ "$defs" -eq 1 && -n "$end" && "$broken" -eq 0 ]]; then echo "$start $end"; fi
+  local start end
+  start="$(grep -nxF "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$1" | cut -d: -f1 || true)"
+  [[ "$start" =~ ^[0-9]+$ ]] || return 0
+  end="$(awk -v s="$start" 'NR > s && $0 == "}" { print NR; exit }' "$1")"
+  [[ -n "$end" ]] || return 0
+  [[ "$(sed -n "${start},${end}p" "$1" | git hash-object --stdin)" == "$TARGET_ALL_EXEMPT_BLOB" ]] || return 0
+  echo "$start $end"
 }
 
 assert_every_cargo_tree_resolves_every_target() {
@@ -1163,7 +1151,7 @@ assert_every_cargo_tree_resolves_every_target() {
     if [[ -n "$range" && -n "$offenders" ]]; then
       start="${range% *}"; end="${range#* }"; kept=""
       while IFS= read -r offender; do
-        if (( ${offender%%:*} > start && ${offender%%:*} < end )) && [[ "$offender" == *"--target "* ]]; then continue; fi
+        if (( ${offender%%:*} > start && ${offender%%:*} < end )); then continue; fi
         kept="$kept$offender"$'\n'
       done <<<"$offenders"
       offenders="${kept%$'\n'}"
@@ -1185,53 +1173,62 @@ assert_every_cargo_tree_resolves_every_target() {
   echo "   ok   — every cargo tree invocation under scripts/ resolves every target triple"
 }
 
+# target_all_rule_in <dir>: run the `--target all` rule from <dir>, exit 0 on a pass.
+target_all_rule_in() {
+  ( cd "$1" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" )
+}
+
 # assert_target_all_exemption_names_one_site
 #   CRITERION: the `--target all` rule above passes a per-triple `cargo tree` inside
-#   TARGET_ALL_EXEMPT_FUNCTION of TARGET_ALL_EXEMPT_FILE, and fails the same call in
-#   any other file or anywhere else in that file. Each case plants a scripts/ tree
-#   and runs the rule from the directory holding it.
+#   TARGET_ALL_EXEMPT_FUNCTION of TARGET_ALL_EXEMPT_FILE while that function's text
+#   hashes to TARGET_ALL_EXEMPT_BLOB, and fails a per-triple `cargo tree` in any
+#   other file, anywhere else in that file, or in an edited copy of the function.
+#   Each case plants a scripts/ tree and runs the rule from the directory holding it.
 assert_target_all_exemption_names_one_site() {
-  echo ">> fixture: the --target all rule exempts one named function in one named file and nothing else"
+  echo ">> fixture: the --target all rule exempts one pinned function in one named file and nothing else"
   # The planted lines spell the command through $cargo, so this file's own text
-  # carries no per-triple invocation for the rule to read.
-  local plant rc per_triple no_target cargo=cargo
+  # carries no per-triple invocation for the rule to read. The pinned function comes
+  # from the tracked file, so the first case also proves the pin matches it.
+  local plant rc per_triple range fn head count_line cargo=cargo
   per_triple="  tree=\"\$($cargo tree -p x --target \"\$triple\" -e no-dev)\""
-  no_target="  tree=\"\$($cargo tree -p x -e no-dev)\""
+  range="$(target_all_exempt_range "$TARGET_ALL_EXEMPT_FILE")"
+  if [[ -z "$range" ]]; then
+    echo "   FAIL — $TARGET_ALL_EXEMPT_FILE holds no ${TARGET_ALL_EXEMPT_FUNCTION} whose text hashes to TARGET_ALL_EXEMPT_BLOB"
+    fixture_failures=$((fixture_failures + 1))
+    return
+  fi
+  fn="$(sed -n "${range% *},${range#* }p" "$TARGET_ALL_EXEMPT_FILE")"
+  head="$(printf '%s\n' "$fn" | sed '$d' | grep -vxF '  count_in "$tree"')"
+  count_line="$(printf '%s\n' "$fn" | grep -cxF '  count_in "$tree"' || true)"
+  expect "(target-all exemption) the pinned function holds exactly one count_in line, which the closer cases rewrite" "PASS" "$([[ "$count_line" -eq 1 ]]; echo $?)"
   plant="$(mktemp -d)"; mkdir -p "$plant/scripts"
-  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$per_triple" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
-  ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
-  expect "(target-all exemption) the named function in the named file passes a per-triple cargo tree" "PASS" "$rc"
-  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$per_triple" '}' > "$plant/scripts/other-gate.sh"
-  ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
+  printf '%s\n' "$fn" > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  target_all_rule_in "$plant"; rc=$?
+  expect "(target-all exemption) the pinned function in the named file passes its per-triple cargo tree" "PASS" "$rc"
+  printf '%s\n' "$fn" > "$plant/scripts/other-gate.sh"
+  target_all_rule_in "$plant"; rc=$?
   expect "(target-all exemption) the same function in another file under scripts/ FAILS" "FAIL" "$rc"
   rm -f "$plant/scripts/other-gate.sh"
-  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$per_triple" '}' 'other() {' "$per_triple" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
-  ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
+  printf '%s\n' "$fn" 'other() {' "$per_triple" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  target_all_rule_in "$plant"; rc=$?
   expect "(target-all exemption) a per-triple cargo tree elsewhere in the named file FAILS" "FAIL" "$rc"
-  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$no_target" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
-  ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
-  expect "(target-all exemption) a cargo tree naming no --target inside the named function FAILS" "FAIL" "$rc"
-  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$per_triple" '}' "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$per_triple" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
-  ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
-  expect "(target-all exemption) a second definition of the named function cancels the exemption" "FAIL" "$rc"
-  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$per_triple" '  }' 'other() {' "$per_triple" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
-  ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
-  expect "(target-all exemption) an indented closing brace does not stretch the exemption over the next function" "FAIL" "$rc"
-  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$per_triple" '} # end' '{' "$per_triple" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
-  ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
-  expect "(target-all exemption) a closing brace with a trailing comment does not stretch the exemption over a later brace group" "FAIL" "$rc"
-  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" 'function other {' "$per_triple" '}' '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
-  ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
-  expect "(target-all exemption) a function defined inside the named function cancels the exemption" "FAIL" "$rc"
-  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$per_triple" '  { true; }' '  x || { echo "${e#*|}" >&2; return 1; }' '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
-  ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
-  expect "(target-all exemption) one-line brace groups and a \${e#*|} expansion inside the named function keep the exemption" "PASS" "$rc"
-  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" '  local t="$1"; }' "$per_triple" '{ :' '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
-  ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
-  expect "(target-all exemption) a body closed inline by '; }' does not stretch the exemption over a later brace group" "FAIL" "$rc"
-  printf '%s\n' "${TARGET_ALL_EXEMPT_FUNCTION}() {" '  local t="$1"; }; { :' "$per_triple" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
-  ( cd "$plant" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" ); rc=$?
-  expect "(target-all exemption) a body closed inline with a group opened after it on the same line cancels the exemption" "FAIL" "$rc"
+  printf '%s\n' "$fn" "$fn" > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  target_all_rule_in "$plant"; rc=$?
+  expect "(target-all exemption) a second definition of the function cancels the exemption" "FAIL" "$rc"
+  printf '%s\n' "$(printf '%s\n' "$fn" | sed '$d')" "$per_triple" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  target_all_rule_in "$plant"; rc=$?
+  expect "(target-all exemption) a line added to the function's body cancels the exemption" "FAIL" "$rc"
+  # Each closer below ends the function on its own line, so the first bare `}`
+  # belongs to a later top-level group that holds a per-triple cargo tree.
+  printf '%s\n' "$head" '  (count_in "$tree") }' '{' "$per_triple" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  target_all_rule_in "$plant"; rc=$?
+  expect "(target-all exemption) a body closed by ') }' does not stretch the exemption over a later brace group" "FAIL" "$rc"
+  printf '%s\n' "$head" '  if true; then count_in "$tree"; fi }' '{ :' "$per_triple" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  target_all_rule_in "$plant"; rc=$?
+  expect "(target-all exemption) a body closed by 'fi }' does not stretch the exemption over a later brace group" "FAIL" "$rc"
+  printf '%s\n' "$head" '  echo "( { "; count_in "$tree"; }' '{ :' "$per_triple" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  target_all_rule_in "$plant"; rc=$?
+  expect "(target-all exemption) a quoted '{ ' before an inline '; }' does not stretch the exemption over a later brace group" "FAIL" "$rc"
   rm -rf "$plant"
 }
 

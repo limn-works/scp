@@ -12,10 +12,16 @@
 # Presence: `wheel_triple_occurrences` runs one `cargo tree --target <triple>` per
 # wheel triple, keeping build edges because `openssl-src` is a build-dependency of
 # `openssl-sys`. `scripts/check-shipped-feature-graph.sh` exempts that one function
-# by name from its rule that every `cargo tree` under scripts/ names `--target all`.
-# The function reads the package and features from `--print-wheel-entries` itself
-# and takes only the triple from its caller, so no call of it can resolve another
-# configuration on one triple.
+# from its rule that every `cargo tree` under scripts/ names `--target all`, and it
+# holds the function's text to a pinned hash, so an edit to the function cancels the
+# exemption. The function takes only the triple from its caller and reads the
+# package and features from wheel_line, which runs the script FEATURE_GRAPH_GATE
+# names. This file sets FEATURE_GRAPH_GATE to that owner gate, and only
+# run_fixtures overrides it, with a planted gate. The pin holds neither wheel_line
+# nor FEATURE_GRAPH_GATE, so a call that overrides FEATURE_GRAPH_GATE or redefines
+# wheel_line resolves another configuration on one triple and still passes the
+# owner gate's rule; review of this file is what keeps every call of the function
+# the wheel's presence proof.
 # Absence: `--target all` for every entry that gate's `--print-artifacts` writes
 # except the wheel's (`--print-wheel-entries`), and `--workspace` for every tracked
 # Cargo.toml cargo treats as a workspace root: one that declares a `workspace` table
@@ -125,9 +131,10 @@ wheel_line() {
 }
 
 # wheel_triple_occurrences <triple>: the wheel's graph on one triple. The package
-# and features come from wheel_line, never from the caller, so every call is the
-# wheel's presence proof; the owner gate exempts this function from its
-# `--target all` rule on that ground. A cargo failure fails the count.
+# and features come from wheel_line, never from the caller's arguments. The owner
+# gate exempts this function from its `--target all` rule while the function's
+# text hashes to the value it pins; the header above states what that pin does
+# not hold. A cargo failure fails the count.
 wheel_triple_occurrences() {
   local triple="$1" entry tree
   local -a args=()
@@ -242,6 +249,12 @@ run_fixtures() {
   printf '%s\n' "$out" | grep -F "FAIL — x86_64-pc-windows-msvc reaches 0" >/dev/null; expect "(presence) it names that triple" PASS $?
   FAKE_VENDORS=scp-node scenario "(absence) run_gate FAILS when another shipped configuration reaches $VENDOR_CRATE" FAIL
   printf '%s\n' "$out" | grep -F "FAIL — scp-node| reaches 1" >/dev/null; expect "(absence) it names scp-node" PASS $?
+  # The absence loop skips the wheel entry by exact match. Vendoring the scp-ffi
+  # bridge entry fails the run, so a skip widened to every scp-ffi entry goes red;
+  # vendoring the wheel entry over every triple passes, so a removed skip goes red.
+  FAKE_VENDORS=server scenario "(absence) run_gate FAILS when a non-wheel scp-ffi entry reaches $VENDOR_CRATE" FAIL
+  printf '%s\n' "$out" | grep -F "FAIL — scp-ffi|--no-default-features --features server reaches 1" >/dev/null; expect "(absence) it names that scp-ffi entry" PASS $?
+  FAKE_VENDORS=extension-module,vendored-openssl scenario "(absence) run_gate skips only the wheel entry, which reaches $VENDOR_CRATE over every triple" PASS
   FAKE_VENDORS=--workspace scenario "(absence) run_gate FAILS when a workspace resolution reaches $VENDOR_CRATE" FAIL
   FAKE_VENDORS=scaffolds/relay/Cargo.toml scenario "(absence) run_gate resolves a workspace root no list names" FAIL
   printf '%s\n' "$out" | grep -F "FAIL — the scaffolds/relay/Cargo.toml workspace reaches 1" >/dev/null; expect "(absence) it names that root" PASS $?
