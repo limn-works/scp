@@ -724,7 +724,7 @@ The resolution protocol runs seven steps.
 
 ### 3.10.5 Publishing Protocol
 
-On appending a key event the owner builds the chain from the inception event to the new head, hands that chain to `publish` (§3.10.10), and submits the new head to its witness set. **`publish` and `publish_service_record` each address the publication set, which is the union of the entries the identity's own accepted service record names and the fallback set** (`09-security-model.md` §9.7.4.2 definitions state the fallback set, and §3.10.13 states the record). **A publisher that holds no accepted service record of its own holds a publication set equal to the fallback set**, which is the case at an identity's first publish. **R10's self-observation cadence fetches over that same set**, and `PublishOutcome` carries one entry per member of it (§3.10.10). Without the union the first of the two relay sets §3.10.1 makes a resolver query would be empty for the life of every identity, and step 3 of §3.2.1 would name an act no method performs. **The backend segments per entry**: it reads each entry's declared `max_blob_size` through `read_policy` and splits the chain into contiguous segments each fitting one frame at that entry, then publishes those frames to that entry in sequence order. `18-addressability-and-deployment.md` §18.3.3 states that the value is the relay's own, so one segmentation for the whole publication set costs the publisher every entry that declares a smaller frame. **Where that entry's declared `max_blob_size` admits no segment of the chain** — a segment carries at least one whole event, so a ceiling below one frame's fixed prefix plus one maximal event admits none — **the publisher sends nothing to that entry and records `EntryResult::NotSent { reason: SegmentTooLarge }` for it**, because `PublishOutcome` names every entry of the publication set exactly once (§3.10.10). **The publisher's remedy for a rejected segment is to publish from the first segment that entry does not hold**, which it learns by querying the routing id rather than from its own memory of an acknowledgement. Submission to a witness gates nothing: the event takes effect at each relying party the moment that party resolves the extended chain, and an identity that designates no witness skips that step (`09-security-model.md` §9.7.4.2 R10, §9.7.4.3). **Appending a key event is not the only publication**: `09-security-model.md` §9.7.4.2 R10's self-observation cadence re-reads every entry of the publication set and states which relation carries a publication and what each one publishes.
+On appending a key event the owner builds the chain from the inception event to the new head, hands that chain to `publish` (§3.10.10), and submits the new head to its witness set. **`publish` and `publish_service_record` each address the publication set, which is the union of the entries the identity's own accepted service record names and the fallback set** (`09-security-model.md` §9.7.4.2 definitions state the fallback set, and §3.10.13 states the record). **A publisher that holds no accepted service record of its own holds a publication set equal to the fallback set**, which is the case at an identity's first publish. **R10's self-observation cadence fetches over that same set**, and `PublishOutcome` carries one entry per member of it (§3.10.10). Without the union the first of the two relay sets §3.10.1 makes a resolver query would be empty for the life of every identity, and step 3 of §3.2.1 would name an act no method performs. **The backend segments per entry**: it reads each entry's declared `max_blob_size` through `read_policy` and splits the chain into contiguous segments each fitting one frame at that entry, then publishes those frames to that entry in sequence order. `18-addressability-and-deployment.md` §18.3.3 states that the value is the relay's own, so one segmentation for the whole publication set costs the publisher every entry that declares a smaller frame. **Where that entry's declared `max_blob_size` admits no segment of the chain** — a segment carries at least one whole event, so a ceiling below one frame's fixed prefix plus one maximal event admits none — **the publisher sends nothing to that entry and records `EntryResult::NotSent { reason: SegmentTooLarge }` for it**, because `PublishOutcome` names every entry of the publication set exactly once (§3.10.10). **`publish` sends each entry only the events that entry does not hold, starting at the first event it lacks**, which the publisher learns by querying the routing id rather than from its own memory of an acknowledgement, because `09-security-model.md` §9.7.4.2 R10's frame-admission rule refuses a frame that repeats a held event. Submission to a witness gates nothing: the event takes effect at each relying party the moment that party resolves the extended chain, and an identity that designates no witness skips that step (`09-security-model.md` §9.7.4.2 R10, §9.7.4.3). **Appending a key event is not the only publication**: `09-security-model.md` §9.7.4.2 R10's self-observation cadence re-reads every entry of the publication set and states which relation carries a publication and what each one publishes.
 
 **A PUBLISH carrying a key-event record, a service record, a cosigned head or a conflict statement sets the wire's `retain` flag**, and `09-security-model.md` §9.10.12 states what a validating relay and a relay that does not validate each do with that flag. **A relay may stop holding such a record on terms its operator declares** (`09-security-model.md` §9.7.4.2 R9), and R10's self-observation cadence is what returns it.
 
@@ -777,7 +777,7 @@ impl<S: Storage> Identity<S> {
 }
 ```
 
-**The write API is one method per consequential act on the identity handle, and each returns the `PublishOutcome` of the publish cycle that carries the event it signed.** `Identity::create` signs and publishes the inception event and returns the handle beside that outcome. `rotate_active` signs a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` signs a `KeyState` that names the witness set and its witnessing interval. A compromised root member leaves the root set under `recovery().begin(RecoveryKind::RootRecovery)`, because a `KeyState` drops no root member (`09-security-model.md` §9.7.4.2 R3). `09-security-model.md` §9.7.4.2 R10 declares `Recovery::begin` and `RecoveryKind`, which compose and sign the reveal-authorized events.
+**The write API is one method per consequential act on the identity handle, and each returns the `PublishOutcome` of the publish cycle that carries the event it signed.** `Identity::create` signs and publishes the inception event and returns the handle beside that outcome. `rotate_active` signs a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` signs a `KeyState` that names the witness set and its witnessing interval. A compromised root member leaves the root set under `recovery().begin(RecoveryKind::RootRecovery(..), ..)`, because a `KeyState` drops no root member (`09-security-model.md` §9.7.4.2 R3). `09-security-model.md` §9.7.4.2 R10 declares the reveal-authorized acts: `Recovery::begin` composes a `PendingEvent`, each root or next-set holder returns its `IndexedSignature` through `Recovery::cosign`, and `Recovery::attach` completes the ceremony.
 
 ```rust
 impl<S: EncryptedStorage> Identity<S> {
@@ -866,7 +866,7 @@ pub trait IdentityBackend: Send + Sync {
 }
 
 /// The error half of this trait's six methods and of the three recovery entry
-/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries twelve
+/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries thirteen
 /// variants and no others. A refusal the protocol mandates carries one of these
 /// variants, so four bindings mint one code rather than four and a caller tells
 /// a custody choice from a network condition. **The identity half's one refusal reaches a caller through
@@ -895,8 +895,9 @@ pub enum IdentityError {
     NoFallbackSourceReachable,
     /// SCP-IDENT-1103. The SDK can observe, in a member of the store set, an
     /// unpublished reveal-authorized event or a pending `RecoveryHandle` for
-    /// this identity (`09-security-model.md` §9.7.4.2 R10, which states the
-    /// ceremony's one removal point).
+    /// this identity; or its adopted log already reveals the commitment the
+    /// event would reveal; or its handle vanished or changed digest before it
+    /// signed or published (`09-security-model.md` §9.7.4.2 R10).
     RevealAlreadyPending,
     /// SCP-IDENT-1104. The verifier could not persist a contested verdict, its
     /// retained suffixes, or the accepted-head baseline (§9.7.4.2 R14).
@@ -929,6 +930,9 @@ pub enum IdentityError {
     /// SCP-IDENT-1111. The custody backend returned an error while the SDK
     /// signed a key event (`09-security-model.md` §9.7.4.2 R10).
     CustodySigningFailed,
+    /// SCP-IDENT-1112. `Recovery::attach` received signatures that fall short
+    /// of a group its `SignerPlan` names (`09-security-model.md` §9.7.4.2 R10).
+    SignatureSetIncomplete,
 }
 
 /// One relay entry's declared write policy, as that entry publishes it at
