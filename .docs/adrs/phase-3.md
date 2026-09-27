@@ -37,7 +37,7 @@ Build order: ADR-013 (depends on all Phase 1 + Phase 2 Rust crates) --> ADR-014 
 
 The Python SDK is the most critical language binding for SCP. The agent ecosystem — LangChain, CrewAI, AutoGen, custom agents — is overwhelmingly Python (architecture.md section 3.1). If agents cannot `import scp`, the protocol does not exist to them. The bridge layer is the boundary between the Rust protocol engine (scp-core, scp-transport, scp-platform) and the Python world. It must expose core SCP types and operations to Python without leaking Rust concepts, while bridging async runtimes (tokio on the Rust side, asyncio on the Python side).
 
-PyO3 is the established Rust-Python FFI framework, and maturin is the standard build tool for PyO3 projects. Together they produce Python wheels with the compiled Rust binary embedded — users run `pip install scp-python` and get a working binary extension with zero Rust toolchain requirement (architecture.md section 3.1).
+PyO3 is the established Rust-Python FFI framework, and maturin is the standard build tool for PyO3 projects. Together they produce Python wheels with the compiled Rust binary embedded — users on a platform and CPython minor a wheel covers run `pip install scp-python` and get a working binary extension with no Rust toolchain (architecture.md section 3.1).
 
 ### Decision
 
@@ -162,8 +162,8 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
     - `maturin build --release` produces optimized wheels.
     - `maturin publish` uploads to PyPI.
     - CI builds wheels for Linux (manylinux_2_28 x86_64 + aarch64), macOS (universal2), Windows (x86_64).
-      The Linux floor is glibc 2.28, not manylinux2014's 2.17: the manylinux2014 image is CentOS 7, which can build neither `ring` and `aws-lc-sys` (they need glibc 2.18 and a newer gcc) nor the OpenSSL that `openssl-src` compiles into the wheel's SQLCipher.
-    - Users on a platform and CPython minor a wheel covers (CPython 3.10-3.13 on Linux x86_64 and aarch64 with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64) install with `pip install scp-python` — no Rust toolchain required. Anywhere else pip builds the sdist, which compiles OpenSSL and needs a Rust toolchain and a full perl, plus make on Linux and macOS.
+      The Linux floor is glibc 2.28, not manylinux2014's 2.17: the manylinux2014 image is CentOS 7, which can build neither `ring` (it needs glibc 2.18 and a newer gcc) nor the OpenSSL that `openssl-src` compiles into the wheel's SQLCipher.
+    - Users on a platform and CPython minor a wheel covers (CPython 3.10-3.13 on Linux x86_64 and aarch64 with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64) install with `pip install scp-python` — no Rust toolchain required. On any other platform with CPython 3.10-3.13, pip builds the sdist, which compiles OpenSSL and needs a Rust toolchain and a full perl, plus make on Linux and macOS. CPython 3.14 and newer cannot install: the locked PyO3 0.24 builds for CPython 3.13 at most, so the sdist build fails there.
 
 ### Scope
 

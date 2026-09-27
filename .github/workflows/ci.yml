@@ -420,7 +420,7 @@ jobs:
           save-if: false
       # `maturin_artifact_entry` parses each maturin project file and its Cargo.toml
       # with `tomllib`, which the Python standard library has held since 3.11, and
-      # it fails when no interpreter on PATH imports it.
+      # it fails when python3.12 on PATH cannot import it.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -441,7 +441,7 @@ jobs:
           save-if: false
       # `maturin_artifact_entry` parses each maturin project file and its Cargo.toml
       # with `tomllib`, which the Python standard library has held since 3.11, and
-      # it fails when no interpreter on PATH imports it.
+      # it fails when python3.12 on PATH cannot import it.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

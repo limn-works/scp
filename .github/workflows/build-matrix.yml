@@ -138,14 +138,15 @@ jobs:
   #   - maturin in CI finds no python by itself, so every leg names its
   #     interpreters (`-i`). Without abi3 a wheel serves one CPython minor, so
   #     each leg builds one wheel per minor that bindings/python/pyproject.toml
-  #     declares (requires-python >= 3.10, classifiers 3.10-3.13); a minor with
-  #     no wheel falls back to the sdist. The sdist builds with the same
+  #     declares (requires-python >= 3.10, classifiers 3.10-3.13); a platform with
+  #     no wheel falls back to the sdist. CPython 3.14 and newer cannot install:
+  #     the locked PyO3 0.24 builds for CPython 3.13 at most. The sdist builds with the same
   #     `vendored-openssl` feature, so installing it compiles OpenSSL through
   #     openssl-src: it needs a Rust toolchain and a full perl on the
   #     installing machine, plus make on Linux and macOS; NASM on Windows is
   #     optional, since openssl-src configures `no-asm` when it finds none.
   #   - manylinux 2_28, not 2014: CentOS 7 (EOL) can build neither
-  #     ring/aws-lc-sys (glibc >= 2.18, newer gcc) nor vendored OpenSSL.
+  #     ring (glibc >= 2.18, newer gcc) nor vendored OpenSSL.
   #   - x86_64 2_28 container ships a minimal perl that openssl-src's
   #     Configure rejects -> install the full perl distribution. The aarch64
   #     leg is an Ubuntu-based rust-cross image (complete perl, NO dnf) — a
