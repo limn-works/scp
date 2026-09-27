@@ -372,7 +372,10 @@ Format: `{action}_{condition_or_expected_result}`.
 cargo fmt --all -- --check
 
 # Lint
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant -- -D warnings
+
+# Lint the optional network transports, which --workspace leaves off.
+cargo clippy -p scp-transport --features quic,http3,udp,coap --all-targets -- -D warnings
 
 # Lint the PostgreSQL and S3 blob backends. scp-node and scp-relay compile them
 # only under their off-by-default `cloud-blobs` feature, so the --workspace
@@ -435,7 +438,7 @@ Every push to a PR branch. Target: < 3 minutes.
 | Job | Runs on | Command |
 |-----|---------|---------|
 | fmt | ubuntu-latest | `cargo fmt --all -- --check` |
-| clippy | ubuntu-latest | `cargo clippy --workspace --all-targets -- -D warnings`, then the three `cloud-blobs` lint commands the CI Commands section above gives |
+| clippy | ubuntu-latest | The five `cargo clippy` commands the CI Commands section above gives: the workspace sweep, the optional-transport lint, and the three commands that lint the PostgreSQL and S3 blob backends |
 | test | ubuntu-latest, macos-latest | `cargo nextest run --workspace`. Job `rust-test-optional-features` in `.github/workflows/ci.yml` runs the three `cloud-blobs` test commands the CI Commands section above gives. |
 | build-release | ubuntu-latest, macos-latest, windows-latest | `cargo build --workspace --release` |
 | doc | ubuntu-latest | The `cargo test --workspace --doc`, then the `cargo doc`, that the CI Commands section above gives. A table cell holds no fenced block, and `scripts/tests/ci-gate/ci_gate_selftest.py` compares a documented `cargo doc` against job `rust-doc` in `.github/workflows/ci.yml` only where a shell block encloses it, so this row names that command rather than repeating its flags. |

@@ -554,7 +554,7 @@ blob_store_conformance!({
 | `PostgresBlobStore` | `crates/scp-transport/src/native/postgres_blob.rs` | Scalable production backend | `postgres` (needs `cloud-blobs`) |
 | `S3BlobStore` | `crates/scp-transport/src/native/s3_blob.rs` | Object storage | `s3` (needs `cloud-blobs`) |
 
-The `BlobStorageBackend` enum wraps all five implementations. The relay binary selects the backend via the `SCP_RELAY_STORAGE_BACKEND` environment variable (default: `sqlite`). `scp-relay` and `scp-node` compile the `postgres` and `s3` backends only under their off-by-default `cloud-blobs` feature. See [Relay Operations](relay-operations.md) for configuration details.
+The `BlobStorageBackend` enum has one variant per implementation in the table. Every variant except `InMemory` exists only when its scp-transport feature is compiled: `sqlite-blob`, `redb-blob`, `postgres-blob`, or `s3-blob`. `scp-relay` and `scp-node` always enable `sqlite-blob` and `redb-blob`, and enable `postgres-blob` and `s3-blob` only under their off-by-default `cloud-blobs` feature, so a default build of either binary wraps three of the five implementations and has no `postgres` or `s3` backend. The relay binary selects the backend via the `SCP_RELAY_STORAGE_BACKEND` environment variable (default: `sqlite`). See [Relay Operations](relay-operations.md) for configuration details.
 
 ---
 

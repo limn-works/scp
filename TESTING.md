@@ -66,12 +66,16 @@ Requires Swift 6.2. macOS ships 6.1 -- install 6.2 via [swift.org](https://swift
 
 ## Feature Flags
 
-CI runs clippy and tests with four feature flags that enable in-memory key custody for testing. Always use these locally for CI parity:
+CI's `rust-clippy` job runs five `cargo clippy` commands. The first lints the workspace with the features that enable in-memory key custody and the test-only grants. The workspace sweep leaves every optional scp-transport feature off, so the other four lint the optional network transports and the PostgreSQL and S3 blob backends, which scp-node and scp-relay compile only under their off-by-default `cloud-blobs` feature. Run the commands that cover the crates your change touches; together they give CI parity:
 
 ```bash
 cargo clippy --workspace --all-targets \
-  --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing \
+  --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant \
   -- -D warnings
+cargo clippy -p scp-transport --features quic,http3,udp,coap --all-targets -- -D warnings
+cargo clippy -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings
+cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings
+cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings
 ```
 
 Production builds for iOS and Android must **never** enable `testing`.
@@ -82,7 +86,7 @@ Before pushing, run the rows for the languages your change touches, scoping the 
 
 | Language | Format | Lint |
 |----------|--------|------|
-| Rust | `cargo fmt --all` | `cargo clippy --workspace --all-targets --features ...` (see above) |
+| Rust | `cargo fmt --all` | the `cargo clippy` commands in Feature Flags above |
 | Python | `python3.12 -m ruff format .` | `python3.12 -m ruff check .` |
 | TypeScript | `bun run format` | `bun run lint` + `bun run check` |
 | Kotlin | (auto via ktlint) | `./gradlew detekt` |
