@@ -54,10 +54,11 @@ env:
 #                     rust-build-uniffi-production, kotlin-test,
 #                     fail-closed-pre-rotation, shipped-feature-graph,
 #                     vendored-openssl-scope, fix-round-check-selftest, and
-#                     python-wheel-build, which compiles scp-ffi as a cdylib with
-#                     `extension-module,vendored-openssl`, a resolution no other
-#                     member produces; and rust-doc (its `cargo test --doc`) in part,
-#                     as the paragraph after this list says.
+#                     python-wheel-build for its registry alone: its build step sets
+#                     RUSTFLAGS, which rust-test does not, and cargo fingerprints
+#                     RUSTFLAGS into every unit, so no restored artifact matches; and
+#                     rust-doc (its `cargo test --doc`) in part, as the paragraph
+#                     after this list says.
 #   workspace-check   `target/debug` under check mode — rust-clippy, whose five
 #                     `cargo clippy` commands compile every dependency to an `.rmeta`,
 #                     and rust-doc in part (its `cargo doc --no-deps`, whose dependency
@@ -1890,6 +1891,10 @@ jobs:
             3.10
             3.12
       - uses: dtolnay/rust-toolchain@stable
+      # This job reads the `workspace-debug` cache group for its registry alone:
+      # the build step's RUSTFLAGS differs from job rust-test's, which sets none,
+      # and cargo fingerprints RUSTFLAGS into every unit, so each restored
+      # artifact is stale and the wheel build compiles every crate itself.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-debug

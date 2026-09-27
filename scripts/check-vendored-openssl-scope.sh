@@ -41,9 +41,9 @@
 # claims, because none sits above it or each one above lists it under `exclude`. A
 # new workspace root is so resolved without anyone listing it. The one exclusion is
 # NOT_SHIPPED_ROOTS below. Every resolution reads the versions the root Cargo.lock
-# pins: the root workspace's under --locked, and a root without a Cargo.lock of its own
-# through workspace_occurrences, which fails when that root needs a version the root
-# Cargo.lock does not pin.
+# pins: the root workspace's under --locked, and a root without a git-tracked Cargo.lock
+# of its own through workspace_occurrences, which fails when that root needs a version
+# the root Cargo.lock does not pin.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -132,15 +132,23 @@ if extra:
 PYTHON
 
 # workspace_occurrences <root manifest>: the every-triple count for the workspace that
-# manifest heads, resolved from versions the root Cargo.lock pins. A root holding its
-# own Cargo.lock resolves under --locked. A root without one (each scaffold and template
-# ignores its own) resolves from a copy of the root Cargo.lock, which the subshell body
-# removes on exit, so cargo keeps each version that copy pins. The lock the resolution
-# leaves must then pin no registry package the root Cargo.lock does not, so a version
-# the crates.io index chose on the day of the run fails the count instead of deciding it.
+# manifest heads, resolved from versions the root Cargo.lock pins. A root whose own
+# Cargo.lock git tracks resolves under --locked. A root without one (each scaffold and
+# template ignores its own) resolves from a copy of the root Cargo.lock, so cargo keeps
+# each version that copy pins. An untracked Cargo.lock already there (a local build's,
+# or one a killed run left) is set aside for the resolution, never read, and the subshell
+# body puts it back on exit, or removes the copy when there was none. The lock the
+# resolution leaves must then pin no registry package the root Cargo.lock does not, so a
+# version the crates.io index chose on the day of the run fails the count instead of
+# deciding it.
 workspace_occurrences() (
   lock="${1%Cargo.toml}Cargo.lock"; locked=--locked
-  if [[ ! -e "$lock" ]]; then locked=""; trap 'rm -f "$lock"' EXIT; cp Cargo.lock "$lock"; fi
+  if ! git ls-files --error-unmatch -- "$lock" >/dev/null 2>&1; then
+    locked=""; saved="$(mktemp)"
+    if [[ -e "$lock" ]]; then cp -p "$lock" "$saved"; trap 'mv -f "$saved" "$lock"' EXIT
+    else trap 'rm -f "$lock" "$saved"' EXIT; fi
+    cp Cargo.lock "$lock"
+  fi
   n="$(all_target_occurrences ${locked:+"$locked"} --manifest-path "$1" --workspace)" || exit 1
   py -c "$LOCK_SUBSET_PROGRAM" "$lock" Cargo.lock || exit 1
   echo "$n"
@@ -253,12 +261,21 @@ run_fixtures() {
   FAKE_BROKEN=1 all_target_occurrences --workspace >/dev/null 2>&1; expect "a cargo that exits non-zero FAILS rather than counting zero" FAIL $?
   mkdir -p "$dir/ws/own" "$dir/ws/bare"; printf '%s\n' '[[package]]' 'name = "a"' 'version = "1.0.0"' 'source = "registry+x"' > "$dir/ws/Cargo.lock"
   cp "$dir/ws/Cargo.lock" "$dir/ws/own/Cargo.lock"; : > "$ARGV_LOG"
+  git -C "$dir/ws" init -q && git -C "$dir/ws" add Cargo.lock own/Cargo.lock
   (cd "$dir/ws" && workspace_occurrences bare/Cargo.toml && workspace_occurrences own/Cargo.toml) >/dev/null
   same "$(cut -d' ' -f1-3 "$ARGV_LOG" | paste -sd'|' -)" "tree --manifest-path bare/Cargo.toml|tree --locked --manifest-path"
-  expect "a root without a Cargo.lock resolves from a copy of the root one, and a root holding one resolves under --locked" PASS $?
+  expect "a root without a Cargo.lock resolves from a copy of the root one, and a root whose own git tracks resolves under --locked" PASS $?
   [[ ! -e "$dir/ws/bare/Cargo.lock" && -e "$dir/ws/own/Cargo.lock" ]]; expect "the copied Cargo.lock is removed and a root's own is kept" PASS $?
   (cd "$dir/ws" && FAKE_DRIFT=bare/Cargo.lock workspace_occurrences bare/Cargo.toml) >/dev/null 2>&1
   expect "a resolution that pins a registry package the root Cargo.lock does not FAILS" FAIL $?
+  # An untracked stale lock pins a package the root Cargo.lock does not: read under
+  # --locked it would fail the subset check, so a pass proves it was set aside.
+  printf '%s\n' '[[package]]' 'name = "stale"' 'version = "0.0.1"' 'source = "registry+x"' > "$dir/ws/bare/Cargo.lock"
+  : > "$ARGV_LOG"; (cd "$dir/ws" && workspace_occurrences bare/Cargo.toml) >/dev/null 2>&1
+  expect "a root holding an untracked Cargo.lock resolves from a copy of the root one, not from that lock" PASS $?
+  same "$(cut -d' ' -f1-3 "$ARGV_LOG")" "tree --manifest-path bare/Cargo.toml"; expect "it resolves without --locked" PASS $?
+  grep -qF '"stale"' "$dir/ws/bare/Cargo.lock"; expect "the untracked Cargo.lock is put back afterwards" PASS $?
+  rm -f "$dir/ws/bare/Cargo.lock"
 
   # run_gate against a planted owner gate and matrix.
   wheel="$(printf 'bindings/python/pyproject.toml\tscp-ffi|--features extension-module,vendored-openssl')"

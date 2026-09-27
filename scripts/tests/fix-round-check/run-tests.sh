@@ -243,9 +243,9 @@ trap 'rm -rf "$WORK"' EXIT
 # `scripts/check-vendored-openssl-scope.sh` read this repository and case 3 fails when any
 # of the three gates rejects the tree. `cargo tree` takes no build lock: measured at 12.9
 # seconds and 391 ms for the first two gates while another worktree held it. The
-# vendored-OpenSSL gate resolves every workspace root, a root without a Cargo.lock from a
-# copy of the root one, so the network can slow case 3 or fail it but cannot change the
-# gate's verdict.
+# vendored-OpenSSL gate resolves every workspace root, a root without a tracked Cargo.lock
+# from a copy of the root one, so the network can slow case 3 or turn a pass into a fail,
+# never a fail into a pass.
 #
 # WHAT THE STUBBED STEPS STILL PROVE. These cases test what the script does with a step's
 # exit code, not whether cargo formats correctly. `.github/workflows/ci.yml` runs the real

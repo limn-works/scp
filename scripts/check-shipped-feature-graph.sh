@@ -1143,7 +1143,7 @@ assert_every_pipeline_reader_consumes_its_input() {
 #   name `--target all`.
 TARGET_ALL_EXEMPT_FILE="scripts/check-vendored-openssl-scope.sh"
 TARGET_ALL_EXEMPT_FUNCTION="wheel_triple_occurrences"
-TARGET_ALL_EXEMPT_BLOB="903486f8d39aecf93e5fcc220cf78afdc43fe6da"
+TARGET_ALL_EXEMPT_BLOB="fbd297b7a6bc2fa2aa7130c35506961d4c5ebfc3"
 
 # target_all_exempt_range <file>
 #   Emit "<start> <end>", the line numbers of TARGET_ALL_EXEMPT_FUNCTION's one
@@ -1214,7 +1214,7 @@ target_all_rule_repinned_in() {
 #   other file, anywhere else in that file, or in a copy edited anywhere, run_gate
 #   above the function and a line after the function included.
 #   Each case plants a scripts/ tree and runs the rule from the directory holding it.
-#   The earlier-line and second-definition cases run under
+#   The earlier-line, later-line and second-definition cases run under
 #   target_all_rule_repinned_in, so the range, not a changed hash, turns them red.
 #   The closer cases turn red only through the pin: under a repin, a body closed by
 #   `) }` stretches the range over the later brace group.
@@ -1260,10 +1260,13 @@ assert_target_all_exemption_names_one_site() {
   rm -f "$plant/scripts/other-gate.sh"
   printf '%s\n' "$prefix" "$fn" 'true' "$rest" > "$plant/$TARGET_ALL_EXEMPT_FILE"
   target_all_rule_repinned_in "$plant"; rc=$?
-  expect "(target-all exemption) under a repin, an edited copy whose one per-triple line sits in the function passes, so the repinned cases below can go green" "PASS" "$rc"
+  expect "(target-all exemption) under a repin, an edited copy whose per-triple lines all sit in the function passes, so the repinned cases below can go green" "PASS" "$rc"
   printf '%s\n' "$prefix" 'other() {' "$per_triple" '}' "$fn" "$rest" > "$plant/$TARGET_ALL_EXEMPT_FILE"
   target_all_rule_repinned_in "$plant"; rc=$?
   expect "(target-all exemption) a per-triple cargo tree earlier in the named file FAILS" "FAIL" "$rc"
+  printf '%s\n' "$prefix" "$fn" 'other() {' "$per_triple" '}' "$rest" > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  target_all_rule_repinned_in "$plant"; rc=$?
+  expect "(target-all exemption) a per-triple cargo tree later in the named file FAILS" "FAIL" "$rc"
   printf '%s\n' "$prefix" "$fn" "$fn" "$rest" > "$plant/$TARGET_ALL_EXEMPT_FILE"
   target_all_rule_repinned_in "$plant"; rc=$?
   expect "(target-all exemption) a second definition of the function cancels the exemption" "FAIL" "$rc"
