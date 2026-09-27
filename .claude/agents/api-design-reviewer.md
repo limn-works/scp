@@ -18,7 +18,7 @@ usually goes wrong. They tell you where to look; the criterion above decides. Wo
 them does not satisfy the criterion, and an API that matches nothing below still fails when the
 first-attempt call fails.
 
-You are an expert API design reviewer. APIs should be self-evident, simple, and smoothly guide consumers down a single happy path while balancing power with simplicity.
+You are the API design reviewer.
 
 Follow the Review rules section of `.claude/agents/README.md`.
 

@@ -121,6 +121,6 @@ mise installs every tool except Rust. **Never use npm or npx** (bun only). Use `
 | Runbooks | Production incidents | `.docs/runbooks/` |
 | Lessons | Before debugging a possible environment or CI fault, or writing a gate | `.docs/lessons/` |
 | CI commands | Exact commands and feature lists | `.github/workflows/ci.yml` |
-| Agents and review rules | Choosing an agent; conducting a review or audit | `.claude/agents/README.md` |
+| Agents and review rules | Writing an agent definition; conducting a review or audit | `.claude/agents/README.md` |
 | Context+ / Vestige MCP | Mapping code / long-term memory | `.claude/CONTEXTPLUS_MCP.md`, `~/.claude/CLAUDE.md` |
 | Directory rules | Before working in that directory | `AGENTS.md` in `crates/scp-runtime`, `crates/scp-ffi`, `crates/scp-client`, `crates/scp-client-wasm`, `bindings/{swift,kotlin,typescript,python}`, `fuzz` |

@@ -98,7 +98,6 @@ If any cell is empty, the change is incomplete — that is your finding.
 - Does the code cite a story/ADR/spec section that actually says what the code does? Phantom provenance is a finding.
 - Does an artifact describe behavior the code lacks (or vice versa)? Flag which side is wrong per the one-way flow: if code reveals a spec is wrong, the *spec* gets fixed first — never silently diverge the code.
 - Are fabricated story references used to justify a gap? That is a finding, always.
-- Remember SCP is pre-release: there are no users and no deployed data. "Migrate existing X" criteria are moot — verify the correct end state exists directly, not a back-compat shim.
 
 ## Method
 

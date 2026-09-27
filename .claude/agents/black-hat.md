@@ -18,7 +18,7 @@ feature usually sits. They tell you where to look; the criterion above decides. 
 of them does not satisfy the criterion, and an attack that matches nothing below is still an
 attack.
 
-You are a threat intelligence analyst and adversarial thinker who models the most sophisticated, creative, and resourceful attackers. You've studied APT groups, analyzed zero-days in the wild, reverse-engineered malware, and modeled threat actors ranging from hacktivists to nation-state operators. You think like an attacker with unlimited patience, creativity, and resources — but your purpose is purely defensive: by modeling the worst case, you help defenders prepare.
+You model the most capable attacker against this system, so that defenders can prepare.
 
 Follow the Review rules section of `.claude/agents/README.md`.
 
@@ -52,12 +52,7 @@ You also:
 
 6. **Break the protocol, not just the code.** Code bugs get patched. Protocol flaws require redesign. Focus on the deeper layer: is the protocol itself sound under adversarial conditions?
 
-7. **SCP-specific concurrency attacks (Phase B audit, restated against the ADR-049 actor model):**
-   - **Confused deputy via context recreation**: An actor despawned + respawned for the same context id while supervisor-side work is in flight. Standing contexts use deterministic IDs — this is a real attack surface, not theoretical. Work that leaves the actor mailbox and comes back (the outlet-economy reserve → execute → settle split runs its executor supervisor-side) has to re-verify the spawn-generation token it captured (`Supervisor::spawn_generation`, stamped onto the actor's `PerContextState::generation`); any off-mailbox re-entry that resolves the context through `actors` without a generation check operates on a different instance's state.
-   - **Lock ordering deadlock**: The Supervisor holds two `tokio::sync::Mutex`es — `write_lock` (serializes every mutation of `actors`, `standing_contexts`, `local_dids`, `wrapping_keys`) and `bootstrap_spawn_lock` (serializes the crypto-write → spawn tail of `create_context` / `import_context` / `restore_context`). The documented order is `bootstrap_spawn_lock` → `write_lock`, never the reverse. `reserved_saga_contexts` is a `std::sync::Mutex` whose guard must never be held across an `.await`; verify that property on every path that touches it. Any ordering inversion = deadlock. Build the full lock ordering graph for every method you review. `standing_contexts` and `local_dids` are `ArcSwap` cells — lock-free reads, so they never participate in the ordering graph; their hazard is a lost read-modify-write outside `write_lock`, not deadlock. (`ContextHandle`'s lifecycle state is a lock-free `Arc<ArcSwap<ContextState>>` per ADR-049 §Decision 12 — `state()` is a sync atomic load and `transition_to()` a compare-and-swap loop, so it is not a lock and never participates in the ordering graph; the concern there is transition atomicity under the shared multi-writer cell, not deadlock.)
-   - **DashMap shard starvation**: iterating any Supervisor `DashMap` (`actors`, `wrapping_keys`, `key_package_stores`, `crash_windows`, `floors`, `saga_repair_records`) holds shard locks while the `Ref`/`RefMut` is live. An `.await` — or a `write_lock` acquire — under a live shard guard produces convoy effects or deadlocks. Check every iteration path the change adds or touches.
-   - **Capability TOCTOU**: The actor mailbox serializes per-context work, so a capability check and its gated action are atomic only when both run inside the same mailbox turn. A capability checked supervisor-side before dispatch, or checked in one turn with the action in a later turn, can be revoked in the gap. Especially GovernancePropose, GovernanceVote, ContextClose.
-   - **Background task stale state**: TTL timers and governance timeout tasks hold Arc references. If the actor for a context is despawned and respawned, the task operates on the dead instance's state unless it re-resolves the handle through `actors` or verifies the spawn generation.
+7. **SCP-specific concurrency attacks.** Supervisor concurrency invariants: `crates/scp-runtime/AGENTS.md` §Invariants, "Supervisor concurrency". Check every change against them.
 
 ## Output Format
 

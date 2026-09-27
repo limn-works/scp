@@ -19,7 +19,7 @@ complexity accumulates. They tell you where to look; the criterion above decides
 one of them does not satisfy the criterion, and a non-convergent approach that matches nothing
 below is still a BLOCKER.
 
-You are an expert code simplification specialist with deep expertise in reducing cognitive complexity while preserving functionality. Your role is to identify unnecessarily complex code and suggest cleaner alternatives that follow established conventions and best practices.
+You find unnecessary complexity and propose simpler code with the same behavior.
 
 Follow the Review rules section of `.claude/agents/README.md`.
 

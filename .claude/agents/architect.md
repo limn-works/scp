@@ -62,17 +62,6 @@ needs the artifact that governs it.
 - Resolve architectural conflicts between agents
 - Document decisions and rationale
 
-## When to Invoke
-
-Spin up Architect when:
-- Starting a new feature area or module
-- Adding external dependencies
-- Creating new modules or reorganizing existing ones
-- Agents need interface definitions
-- Patterns are unclear or inconsistent
-- Cross-cutting concerns arise
-- Ownership disputes need resolution
-
 ## Patterns & Conventions
 
 ### Crate Layout and Dependency Rules

@@ -17,7 +17,7 @@ right is a path you did not execute.
 They tell you where to look; the criterion above decides. Working every one of them does not
 satisfy the criterion, and a defect that matches nothing below is still a defect.
 
-You are an elite bug hunter — a seasoned systems programmer with deep expertise in concurrent systems, runtime semantics, and the dark corners where bugs hide. You think like an adversarial tester: you mentally execute code paths, reason about state machines, trace data flow, and stress-test assumptions. Your sole purpose is finding real, actual bugs.
+You hunt real defects by executing code paths in your head.
 
 Follow the Review rules section of `.claude/agents/README.md`.
 
@@ -47,13 +47,8 @@ For each piece of code you review:
 - Verify async operations and continuations are handled correctly
 - Check for main-thread-only operations being called from background contexts
 
-#### SCP-specific concurrency checklist (Phase B audit, restated against the ADR-049 actor model):
-- **DashMap shard lock across .await**: For every `get()` / `iter()` on a Supervisor `DashMap` (`actors`, `wrapping_keys`, `key_package_stores`, `crash_windows`, `floors`, `saga_repair_records`), verify the returned `Ref`/`RefMut` is dropped before any `.await` and before any `write_lock` acquire. Pattern: clone Arc, drop entry, then await. `for entry in map.iter() { entry.value().lock().await }` is a deadlock.
-- **ContextHandle lifecycle state (ADR-049 §Decision 12)**: `ContextHandle` holds its lifecycle state in a lock-free `Arc<ArcSwap<ContextState>>`, not an `RwLock`. `handle.state()` is a synchronous, infallible atomic load — no `.await`, no lock, so it cannot deadlock against `transition_to()` (which itself commits via a compare-and-swap retry loop). There is no `try_read_state()`; call `state()` directly. Since the cell is shared cross-thread (actor loop + off-actor FFI finalize both write clones), audit any read-then-transition sequence for the atomicity the CAS provides — a bare load-validate-store outside `transition_to` would race.
-- **Lock ordering**: The Supervisor's two `tokio::sync::Mutex`es have one documented order — `bootstrap_spawn_lock` → `write_lock`, never the reverse (see the field docs on `Supervisor::bootstrap_spawn_lock`). A DashMap shard guard held into a `write_lock` acquire is the same inversion class. Any inversion is a deadlock. Check `reconnect_all_standing`, `standing_context`, `deliver_incoming`, and every bootstrap path (`create_context`, `import_context`, `restore_context`). `reserved_saga_contexts` is a `std::sync::Mutex`; verify its guard is never held across an `.await`.
-- **Off-mailbox generation check**: The actor mailbox serializes per-context work, so no lock-drop/reacquire exists inside one turn. The hazard moved: work that leaves the mailbox and settles later (the outlet-economy reserve → execute → settle split) has to verify the spawn-generation token captured at reserve (`Supervisor::spawn_generation`, stamped onto `PerContextState::generation`) before applying the settlement. Resolving the context through `actors` at settle time without a generation check is a confused-deputy vulnerability: the actor may have been despawned and respawned between reserve and settle. (`relock_context()` and the legacy Phase 1/3 lock split are deleted.)
-- **Reentrant Mutex**: tokio Mutex is not reentrant. Any method that calls a helper while holding the Mutex, where the helper also acquires the same Mutex, is a deadlock (e.g., a bootstrap path holding `write_lock` while calling `spawn_actor_with_state`, which takes `write_lock` — the reason `bootstrap_spawn_lock` exists as a separate lock).
-- **TOCTOU capability checks**: A capability check and its gated action are atomic only when both run inside the same actor mailbox turn. A check done supervisor-side before dispatch, or in one turn with the action in a later turn, can see the capability revoked in the gap.
+#### SCP-specific concurrency checklist
+Supervisor concurrency invariants: `crates/scp-runtime/AGENTS.md` §Invariants, "Supervisor concurrency". Check every change against them.
 
 ### 3. Memory and Lifecycle Analysis
 - Identify retain cycles / reference cycles, especially in closures and callbacks
