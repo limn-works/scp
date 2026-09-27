@@ -369,6 +369,55 @@ impl McpNapiBridgeProvider {
     }
 }
 
+/// Replaces this bridge's copy of `context_id`'s role state
+/// (`UcanContextState.role_state`) with the actor's before an MCP
+/// authorization reads it.
+///
+/// Only the bridge's own join, leave and governance calls resync that copy. A
+/// change the actor applies from an inbound commit, such as another admin
+/// revoking this agent's `messages:read` or removing it, never reaches the copy
+/// by itself, so a gate reading the copy unrefreshed keeps authorizing the
+/// agent after the revocation. The `UniFFI` provider asks the actor on every
+/// read for the same reason.
+///
+/// With no supervisor attached there is no actor and no inbound path, so the
+/// copy is the context's only role state and is read as it stands.
+///
+/// # Errors
+///
+/// Fails when the actor does not hold the context or cannot be asked; the
+/// caller then denies, because it cannot learn the current role state.
+fn refresh_role_state(bi: &NapiBridgeInstance, context_id: &str) -> Result<(), String> {
+    let Some(supervisor) = bi.core.try_supervisor() else {
+        return Ok(());
+    };
+    let supervisor = Arc::clone(supervisor);
+    let id = context_id.to_owned();
+    let query = async move { supervisor.get_role_state(&id).await };
+    let live = match tokio::runtime::Handle::try_current() {
+        // Inside the MCP transport task: the actor runs on this runtime's
+        // other workers while this one blocks.
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(query))
+        }
+        // A current-thread runtime would have to run the actor on the thread
+        // this call blocks.
+        Ok(_) => {
+            return Err(format!(
+                "cannot read the role state of context '{context_id}' from a \
+                 current-thread runtime"
+            ));
+        }
+        Err(_) => crate::runtime().block_on(query),
+    }
+    .ok_or_else(|| format!("context '{context_id}' is not held by the supervisor"))?;
+    crate::runtime::with_context(bi, context_id, |rt| {
+        rt.role_state = live;
+        Ok(())
+    })
+    .map_err(|e| format!("{e}"))
+}
+
 /// Why the NAPI MCP server lists no tools and refuses every `tools/call`: the
 /// bridge has no synchronous path from `ContextProvider::invoke_outlet` to an
 /// outlet handler, so it reports the capability as absent rather than
@@ -387,10 +436,11 @@ impl ContextProvider for McpNapiBridgeProvider {
         self.context_ids
             .iter()
             .filter(|id| {
-                crate::runtime::with_context(&bi, id, |rt| {
-                    Ok(rt.role_state.members.contains(&self.agent_did))
-                })
-                .unwrap_or(false)
+                refresh_role_state(&bi, id).is_ok()
+                    && crate::runtime::with_context(&bi, id, |rt| {
+                        Ok(rt.role_state.members.contains(&self.agent_did))
+                    })
+                    .unwrap_or(false)
             })
             .cloned()
             .collect()
@@ -398,6 +448,7 @@ impl ContextProvider for McpNapiBridgeProvider {
 
     fn agent_role(&self, context_id: &str) -> Option<String> {
         let bi = self.upgrade_bi().ok()?;
+        refresh_role_state(&bi, context_id).ok()?;
         crate::runtime::with_context(&bi, context_id, |rt| {
             Ok(rt
                 .role_state
@@ -465,6 +516,7 @@ impl ContextProvider for McpNapiBridgeProvider {
         resource: scp_mcp::server::ResourceKind,
     ) -> Result<(), String> {
         let bi = self.upgrade_bi()?;
+        refresh_role_state(&bi, context_id)?;
         resource_access_from_role_state(&bi, context_id, &self.agent_did, resource)
     }
 
@@ -475,6 +527,7 @@ impl ContextProvider for McpNapiBridgeProvider {
         // A dropped bridge or an unreadable context is an error, never an
         // empty roster.
         let bi = self.upgrade_bi()?;
+        refresh_role_state(&bi, context_id)?;
         crate::runtime::with_context(&bi, context_id, |rt| {
             Ok(rt
                 .role_state
@@ -1454,6 +1507,72 @@ mod tests {
         );
     }
 
+    /// With a supervisor attached, every MCP gate answers from the actor's
+    /// role state, not from the bridge's copy. The copy is resynced only by the
+    /// bridge's own join, leave and governance calls, so a revocation or
+    /// removal the actor applies from an inbound commit leaves the copy still
+    /// granting. Here the copy names the agent as a member and the actor holds
+    /// no such context — the state after the actor drops a context the agent
+    /// was removed from — so every gate must deny.
+    #[test]
+    fn provider_gates_follow_the_actor_not_the_bridge_copy_napi() {
+        use scp_mcp::server::{ContextProvider as _, ResourceKind};
+
+        let (bi, _server) = napi_mcp_fixture();
+        let provider = || McpNapiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: AGENT_DID.to_owned(),
+            context_ids: vec![SUB_CTX.to_owned()],
+        };
+
+        // No supervisor: the copy is the context's only role state.
+        assert_eq!(provider().active_context_ids(), vec![SUB_CTX.to_owned()]);
+        assert!(
+            provider()
+                .validate_resource_access(SUB_CTX, ResourceKind::Events)
+                .is_ok()
+        );
+        assert!(provider().context_members(SUB_CTX).is_ok());
+        assert!(provider().agent_role(SUB_CTX).is_some());
+
+        // The actor now exists and does not hold the context; the copy still
+        // names the agent as a member.
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        assert!(crate::runtime::supervisor(&bi).is_ok());
+
+        assert!(
+            provider().active_context_ids().is_empty(),
+            "a context the actor does not hold must drop out of the served set"
+        );
+        for kind in [
+            ResourceKind::Events,
+            ResourceKind::Members,
+            ResourceKind::Tools,
+        ] {
+            let denial = provider()
+                .validate_resource_access(SUB_CTX, kind)
+                .expect_err("the bridge copy must not grant what the actor does not");
+            assert!(
+                denial.contains("not held by the supervisor"),
+                "the {kind:?} denial must come from the actor query, got: {denial}"
+            );
+        }
+        assert!(provider().context_members(SUB_CTX).is_err());
+        assert!(provider().agent_role(SUB_CTX).is_none());
+
+        // The production shape: the MCP transport task on the multi-thread
+        // runtime, where the query blocks one worker while the actor runs.
+        let spawned = provider();
+        let rt = crate::runtime();
+        let served = rt
+            .block_on(rt.spawn(async move { spawned.active_context_ids() }))
+            .unwrap();
+        assert!(
+            served.is_empty(),
+            "the transport task must see the actor's role state too"
+        );
+    }
+
     /// Wiring guard for #1341: `mcp_server_create_on` sources its receiver
     /// from `Supervisor::subscribe_events()`. Every NAPI supervisor path
     /// enables the broadcast channel (`build_supervisor_arc`), so that call
@@ -1476,8 +1595,8 @@ mod tests {
     /// A missing `Supervisor` degrades ONLY the subscription capability — it
     /// must not fail MCP serving outright.
     ///
-    /// `tools/*` and `resources/list|read` are served from the FFI bridge
-    /// state, not the supervisor, so denying them over an unavailable optional
+    /// With no supervisor, `tools/*` and `resources/list|read` are served from
+    /// the FFI bridge state alone, so denying them over an unavailable optional
     /// feature would be a regression. The honest outcome is
     /// `resources.subscribe: false` plus a typed rejection of
     /// `resources/subscribe` — never a silent accept.

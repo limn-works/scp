@@ -326,9 +326,10 @@ pub struct McpServer<P: ContextProvider> {
     /// been told about.
     ///
     /// [`Self::notifications_for_event`] reads it when an event arrives for a
-    /// context that `active_context_ids()` no longer returns. The bridges
-    /// apply a membership change or a close before the pump evaluates the
-    /// event that announced it, so the live set alone cannot tell "the event
+    /// context that `active_context_ids()` no longer returns. Every bridge
+    /// provider answers from the actor's role state, and the actor applies a
+    /// membership change or a close before it emits the event that announces
+    /// it, so the live set alone cannot tell "the event
     /// that removed a context this client listed" from "an event for a
     /// context this client never saw". A `Mutex` because the pump holds
     /// `&self`.

@@ -655,6 +655,60 @@ impl FfiBridgeProvider {
             "bridge instance has been dropped — MCP provider cannot service request".to_owned()
         })
     }
+
+    /// Replaces this bridge's copy of `context_id`'s role state
+    /// (`FfiBridgeState.role_state`) with the actor's before an MCP
+    /// authorization reads it.
+    ///
+    /// Only the bridge's own join, leave and governance calls resync that copy.
+    /// A change the actor applies from an inbound commit, such as another admin
+    /// revoking this agent's `messages:read` or removing it, never reaches the
+    /// copy by itself, so a gate reading the copy unrefreshed keeps authorizing
+    /// the agent after the revocation. The `UniFFI` provider asks the actor on
+    /// every read for the same reason.
+    ///
+    /// With no supervisor attached there is no actor and no inbound path, so
+    /// the copy is the context's only role state and is read as it stands.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the actor does not hold the context or cannot be asked; the
+    /// caller then denies, because it cannot learn the current role state.
+    fn refresh_role_state(
+        bi: &crate::runtime::PyBridgeInstance,
+        context_id: &str,
+    ) -> Result<(), String> {
+        let Some(supervisor) = bi.core.try_supervisor() else {
+            return Ok(());
+        };
+        let supervisor = Arc::clone(supervisor);
+        let id = context_id.to_owned();
+        let query = async move { supervisor.get_role_state(&id).await };
+        let live = match tokio::runtime::Handle::try_current() {
+            // Inside the MCP transport task: the actor runs on this runtime's
+            // other workers while this one blocks.
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(query))
+            }
+            // A current-thread runtime would have to run the actor on the
+            // thread this call blocks.
+            Ok(_) => {
+                return Err(format!(
+                    "cannot read the role state of context '{context_id}' from a \
+                     current-thread runtime"
+                ));
+            }
+            Err(_) => crate::runtime()
+                .map_err(|e| format!("{e}"))?
+                .block_on(query),
+        }
+        .ok_or_else(|| format!("context '{context_id}' is not held by the supervisor"))?;
+        crate::runtime::with_context(bi, context_id, |rt| {
+            rt.role_state = live;
+            Ok(())
+        })
+        .map_err(|e| format!("{e}"))
+    }
 }
 
 impl ContextProvider for FfiBridgeProvider {
@@ -668,10 +722,11 @@ impl ContextProvider for FfiBridgeProvider {
         self.context_ids
             .iter()
             .filter(|id| {
-                crate::runtime::with_context(&bi, id, |rt| {
-                    Ok(rt.role_state.members.contains(&self.agent_did))
-                })
-                .unwrap_or(false)
+                Self::refresh_role_state(&bi, id).is_ok()
+                    && crate::runtime::with_context(&bi, id, |rt| {
+                        Ok(rt.role_state.members.contains(&self.agent_did))
+                    })
+                    .unwrap_or(false)
             })
             .cloned()
             .collect()
@@ -682,6 +737,7 @@ impl ContextProvider for FfiBridgeProvider {
         // Silently returns None if the bridge has been dropped — matches the
         // "unknown context" fallback semantics of this trait method.
         let bi = self.upgrade_bi().ok()?;
+        Self::refresh_role_state(&bi, context_id).ok()?;
         crate::runtime::with_context(&bi, context_id, |rt| {
             let role = rt
                 .role_state
@@ -731,6 +787,9 @@ impl ContextProvider for FfiBridgeProvider {
         // dropped, fail fast with a deterministic error rather than
         // silently accepting the capability.
         let bi = self.upgrade_bi()?;
+        // Both checks below read the context's role state, so bring it up to
+        // the actor's first.
+        Self::refresh_role_state(&bi, context_id)?;
         // Primary check: UCAN token validation via the full 11-step ADR-016
         // pipeline. Verifies the token grants the outlet's kind-appropriate stem
         // — outlet_query:{outlet_name}/outlet_query:* for Query outlets,
@@ -1174,6 +1233,7 @@ impl ContextProvider for FfiBridgeProvider {
         use scp_mcp::server::ResourceKind;
 
         let bi = self.upgrade_bi()?;
+        Self::refresh_role_state(&bi, context_id)?;
         crate::runtime::with_context(&bi, context_id, |rt| {
             // `Events` and `Members` require `messages:read`: per spec §5.3.1's
             // role table an `observer` — whose sole capability is
@@ -1215,6 +1275,7 @@ impl ContextProvider for FfiBridgeProvider {
         // A dropped bridge or an unreadable context is an error, never an
         // empty roster.
         let bi = self.upgrade_bi()?;
+        Self::refresh_role_state(&bi, context_id)?;
         crate::runtime::with_context(&bi, context_id, |rt| {
             let members = rt
                 .role_state
@@ -2592,8 +2653,8 @@ mod tests {
         // inside the provider upgrades successfully (#1549 round-2).
         let bi = __bi();
         let creator = "did:dht:z6MkTest";
-        let live_a = setup_test_context(&bi, creator, false);
-        let live_b = setup_test_context(&bi, creator, false);
+        let live_a = setup_unsupervised_context(&bi, creator, false);
+        let live_b = setup_unsupervised_context(&bi, creator, false);
 
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -2656,6 +2717,11 @@ mod tests {
     /// Registers a context in the runtime registry and optionally adds an outlet.
     /// Returns a unique context ID to avoid collisions with parallel tests.
     ///
+    /// Attaches a supervisor, as `register_context` does, and the supervisor
+    /// does not hold the context, so the provider's role-state gates deny it
+    /// (see `provider_gates_follow_the_actor_not_the_bridge_copy_pyo3`). Tests
+    /// of those gates use [`setup_unsupervised_context`].
+    ///
     /// Callers must pass the same `bi` they use for subsequent registry lookups;
     /// each `PyBridgeInstance` has its own `instance_id` and context registry.
     fn setup_test_context(
@@ -2663,9 +2729,21 @@ mod tests {
         creator_did: &str,
         with_outlet: bool,
     ) -> String {
+        crate::runtime::init_context_manager_for_test(bi);
+        setup_unsupervised_context(bi, creator_did, with_outlet)
+    }
+
+    /// [`setup_test_context`] without the supervisor: with no actor, the FFI
+    /// copy of the role state is the context's only role state, so the
+    /// provider's gates read it as it stands.
+    fn setup_unsupervised_context(
+        bi: &crate::runtime::PyBridgeInstance,
+        creator_did: &str,
+        with_outlet: bool,
+    ) -> String {
         // Use a unique context ID to avoid collisions across parallel tests.
         let ctx_id = crate::types::generate_random_id("test-mcp");
-        crate::runtime::register_context(bi, &ctx_id, creator_did, &[]).unwrap();
+        crate::runtime::register_ffi_state(bi, &ctx_id, creator_did, &[]).unwrap();
 
         if with_outlet {
             crate::runtime::with_context(bi, &ctx_id, |rt| {
@@ -2722,7 +2800,7 @@ mod tests {
     fn ffi_bridge_provider_validate_capability_rejects_missing_ucan() {
         let creator = "did:dht:z6MkCreatorValCap";
         let bi = __bi();
-        let ctx_id = setup_test_context(&bi, creator, true);
+        let ctx_id = setup_unsupervised_context(&bi, creator, true);
 
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -2757,7 +2835,7 @@ mod tests {
     fn ffi_bridge_provider_validate_capability_rejects_unauthorized() {
         let creator = "did:dht:z6MkCreatorValCapReject";
         let bi = __bi();
-        let ctx_id = setup_test_context(&bi, creator, true);
+        let ctx_id = setup_unsupervised_context(&bi, creator, true);
 
         // Add a member with no OutletCall capability.
         let member = "did:dht:z6MkMemberNoInvoke";
@@ -2817,7 +2895,7 @@ mod tests {
         let bi = __bi();
         // Register the context WITHOUT the default calculator outlet — we add a
         // Query-kind one explicitly below.
-        let ctx_id = setup_test_context(&bi, creator, false);
+        let ctx_id = setup_unsupervised_context(&bi, creator, false);
 
         // Register a QUERY-kind outlet and add a member holding ONLY the
         // Action-class OutletCall grant.
@@ -3843,7 +3921,7 @@ mod tests {
 
         let creator = "did:dht:z6MkCreatorResAccess";
         let bi = __bi();
-        let ctx_id = setup_test_context(&bi, creator, false);
+        let ctx_id = setup_unsupervised_context(&bi, creator, false);
 
         let provider = pyo3_mcp_provider(&bi, &ctx_id, creator);
         for kind in [
@@ -3908,7 +3986,7 @@ mod tests {
     fn mcp_subscribe_rejected_when_no_event_source_wired_pyo3() {
         let creator = "did:dht:z6MkSubUnwired";
         let bi = __bi();
-        let ctx_id = setup_test_context(&bi, creator, false);
+        let ctx_id = setup_unsupervised_context(&bi, creator, false);
         let uri = format!("scp://{ctx_id}/events");
 
         let mut server = McpServer::new(pyo3_mcp_provider(&bi, &ctx_id, creator));
@@ -3953,16 +4031,16 @@ mod tests {
     fn mcp_subscribe_delivers_notifications_when_event_source_wired_pyo3() {
         let creator = "did:dht:z6MkSubWired";
         let bi = __bi();
-        // `setup_test_context` attaches the supervisor (register_context →
-        // init_context_manager_for_test), whose event broadcast channel is
-        // always enabled.
-        let ctx_id = setup_test_context(&bi, creator, false);
+        let ctx_id = setup_unsupervised_context(&bi, creator, false);
         let uri = format!("scp://{ctx_id}/events");
 
-        let receiver = crate::runtime::supervisor(&bi)
-            .expect("supervisor must be attached after setup_test_context")
-            .subscribe_events()
-            .expect("the PyO3 supervisor must expose a context event receiver");
+        // A channel of the supervisor's event type stands in for its receiver;
+        // `supervisor_yields_context_event_receiver_for_mcp_pyo3` pins that the
+        // supervisor yields one.
+        let (_event_tx, receiver) = tokio::sync::broadcast::channel::<(
+            String,
+            scp_core::context::membership::ContextEvent,
+        )>(16);
         // `with_event_source` builds the same server-and-pump pair that
         // `with_optional_event_source(Some(rx))` seals into its opaque bundle;
         // it is public only under `scp-mcp/testing`, which this crate enables
@@ -4120,5 +4198,119 @@ mod tests {
 
         // agent_did is provider-local and does not touch the weak at all.
         assert_eq!(provider.agent_did(), "did:dht:z6MkDropped");
+    }
+
+    /// With a supervisor attached, every MCP gate answers from the actor's
+    /// role state, not from the bridge's copy. The copy is resynced only by the
+    /// bridge's own join, leave and governance calls, so a revocation or
+    /// removal the actor applies from an inbound commit leaves the copy still
+    /// granting. Here the copy names the agent as a member and the actor holds
+    /// no such context — the state after the actor drops a context the agent
+    /// was removed from — so every gate must deny.
+    #[test]
+    fn provider_gates_follow_the_actor_not_the_bridge_copy_pyo3() {
+        use scp_mcp::server::ResourceKind;
+
+        crate::init_runtime().ok();
+        let agent = "did:dht:z6MkActorBackedAgent";
+        let bi = __bi();
+        let ctx_id = setup_unsupervised_context(&bi, agent, false);
+        let provider = pyo3_mcp_provider(&bi, &ctx_id, agent);
+
+        // No supervisor: the copy is the context's only role state.
+        assert_eq!(provider.active_context_ids(), vec![ctx_id.clone()]);
+        assert!(provider.context_members(&ctx_id).is_ok());
+        assert!(provider.agent_role(&ctx_id).is_some());
+        assert!(
+            provider
+                .validate_resource_access(&ctx_id, ResourceKind::Events)
+                .is_ok()
+        );
+
+        // The actor now exists and does not hold the context; the copy still
+        // names the agent as a member.
+        crate::runtime::init_context_manager_for_test(&bi);
+        assert!(crate::runtime::supervisor(&bi).is_ok());
+
+        assert!(
+            provider.active_context_ids().is_empty(),
+            "a context the actor does not hold must drop out of the served set"
+        );
+        for kind in [
+            ResourceKind::Events,
+            ResourceKind::Members,
+            ResourceKind::Tools,
+        ] {
+            let denial = provider
+                .validate_resource_access(&ctx_id, kind)
+                .expect_err("the bridge copy must not grant what the actor does not");
+            assert!(
+                denial.contains("not held by the supervisor"),
+                "the {kind:?} denial must come from the actor query, got: {denial}"
+            );
+        }
+        assert!(provider.context_members(&ctx_id).is_err());
+        assert!(provider.agent_role(&ctx_id).is_none());
+
+        // The production shape: the MCP transport task on the multi-thread
+        // runtime, where the query blocks one worker while the actor runs.
+        let spawned = pyo3_mcp_provider(&bi, &ctx_id, agent);
+        let rt = crate::runtime().unwrap();
+        let served = rt
+            .block_on(rt.spawn(async move { spawned.active_context_ids() }))
+            .unwrap();
+        assert!(
+            served.is_empty(),
+            "the transport task must see the actor's role state too"
+        );
+
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// Wiring guard for #1341, mirroring the NAPI and UniFFI tests:
+    /// `py_mcp_serve` sources its receiver from `Supervisor::subscribe_events()`,
+    /// and `crate::runtime::build_supervisor` enables the broadcast channel, so
+    /// that call must yield `Some`. Were it to regress to `None`, every PyO3
+    /// MCP server would silently advertise `resources.subscribe: false`.
+    #[test]
+    fn supervisor_yields_context_event_receiver_for_mcp_pyo3() {
+        crate::init_runtime().ok();
+        let bi = __bi();
+        crate::runtime::init_context_manager_for_test(&bi);
+
+        let supervisor =
+            crate::runtime::supervisor(&bi).expect("supervisor must be attached after init");
+        assert!(
+            supervisor.subscribe_events().is_some(),
+            "the PyO3 supervisor must expose a context event receiver so MCP \
+             resource subscriptions are wired rather than advertised-and-dropped"
+        );
+    }
+
+    /// A missing `Supervisor` degrades ONLY the subscription capability — it
+    /// must not fail MCP serving outright. Drives the production entry point:
+    /// were `py_mcp_serve` to propagate the missing-supervisor error
+    /// (`supervisor(bi)?`), the serve call would return `Err`.
+    #[test]
+    fn missing_supervisor_degrades_subscriptions_not_the_whole_server_pyo3() {
+        crate::init_runtime().ok();
+        let agent = "did:dht:z6MkNoSupervisorAgent";
+        let bi = __bi();
+        let ctx_id = setup_unsupervised_context(&bi, agent, false);
+        assert!(
+            crate::runtime::supervisor(&bi).is_err(),
+            "precondition: this instance has no supervisor attached"
+        );
+
+        let scp = crate::scp::PyScp {
+            inner: Arc::clone(&bi),
+        };
+        let handle = scp
+            .py_mcp_serve(agent, vec![ctx_id.clone()], "sse", None)
+            .expect("a missing supervisor must degrade subscriptions, not fail MCP serving");
+        scp.py_mcp_server_stop(&handle)
+            .expect("the server created without a supervisor must stop cleanly");
+
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 }
