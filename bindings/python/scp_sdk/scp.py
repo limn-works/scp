@@ -123,9 +123,10 @@ class KeyCustodyProvider(Protocol):
     def sign(self, key_id: str, message: bytes) -> bytes:
         """Sign ``message`` under ``key_id``.
 
-        An Ed25519 key returns the 64-byte signature. A ``"p256"`` key
-        receives a 32-byte digest and returns raw ``r || s`` (64 bytes) or
-        DER; the bridge normalises it to low-s and verifies it strictly
+        An Ed25519 key returns the 64-byte signature. A ``"p256"`` key, or a
+        pseudonym key id from :meth:`derive_pseudonym`, receives a 32-byte
+        digest (§9.5.1, no second hash) and returns raw ``r || s`` (64 bytes)
+        or DER; the bridge normalises it to low-s and verifies it strictly
         against the key's public key, and any mismatch is an error. A
         software implementation MUST derive the ECDSA nonce by RFC 6979 with
         SHA-256; a hardware keystore may use a random nonce.
@@ -135,9 +136,11 @@ class KeyCustodyProvider(Protocol):
     def get_public_key(self, key_id: str) -> bytes:
         """Return the public key of ``key_id``.
 
-        32 bytes for Ed25519 and X25519, the 33-byte compressed SEC1 point
-        for ``"p256"``, the 65-byte uncompressed SEC1 point for
-        ``"hpke-p256"``. Any other length is an error.
+        32 bytes for Ed25519 and X25519; the 33-byte compressed SEC1 point
+        for ``"p256"`` and for a pseudonym key id (byte-identical to the
+        ``public_key`` :meth:`derive_pseudonym` returned for it); the 65-byte
+        uncompressed SEC1 point for ``"hpke-p256"``. Any other length is an
+        error.
         """
         ...
 
@@ -154,43 +157,43 @@ class KeyCustodyProvider(Protocol):
         """
         ...
 
-    def derive_pseudonym(self, key_id: str, context_id: bytes) -> bytes:
-        """Derive a context-scoped pseudonym keypair (v1, static).
+    def derive_pseudonym(self, key_id: str, context_id: bytes) -> tuple[bytes, str]:
+        """Derive a context-scoped P-256 pseudonym keypair (v1, static; §9.10.4).
 
-        Returns ``public_key_bytes (32) || key_id_utf8`` — the 32-byte
-        pseudonym public key concatenated with the UTF-8 numeric id of the
-        derived signing key.
+        Returns ``(public_key, key_id)``: the 33-byte SEC1 compressed P-256
+        pseudonym point and the numeric id of its signing key. The bridge
+        rejects (``SCP-IDENT-1055``) a point that is not a valid compressed
+        P-256 point, and a key id whose :meth:`get_public_key` differs from it.
 
-        Canonical recipe (all custody backends MUST produce identical bytes)::
+        Canonical recipe (all software custody backends MUST produce identical
+        bytes; ``ikm`` is the identity private key material, the 32-byte
+        Ed25519 seed until slice S12)::
 
             pseudonym_secret = HKDF-SHA256(
-                ikm=ed25519_private_seed, salt=b"scp-pseudonym-secret-v1",
-                info=b"", length=32)
+                ikm=ikm, salt=b"scp-pseudonym-secret-v1", info=b"", length=32)
             seed = HMAC-SHA256(pseudonym_secret, context_id + b"scp-pseudonym")
-            pseudonym_keypair = Ed25519_keygen(seed[:32])
+            d = int(HKDF-Expand-SHA256(
+                prk=seed, info=b"SCP-PSEUDONYM-P256-V1", length=48)) % (n - 1) + 1
+            public_key = SEC1_compressed(d * G)
         """
         ...
 
     def derive_rotatable_pseudonym(
         self, key_id: str, context_id: bytes, pseudonym_epoch: int
-    ) -> bytes:
-        """Derive a rotatable, epoch-scoped pseudonym keypair (v2).
+    ) -> tuple[bytes, str]:
+        """Derive a rotatable, epoch-scoped P-256 pseudonym keypair (v2).
 
-        Returns the same ``public_key_bytes (32) || key_id_utf8`` shape as
+        Returns ``(public_key, key_id)``, checked as for
         :meth:`derive_pseudonym`. Including the rotation epoch in the HMAC
         derivation produces a different pseudonym per epoch within the same
         context, mitigating relay-side pseudonym correlation.
 
-        Canonical recipe (all custody backends MUST produce identical bytes)::
+        Canonical recipe: as :meth:`derive_pseudonym`, with::
 
-            pseudonym_secret = HKDF-SHA256(
-                ikm=ed25519_private_seed, salt=b"scp-pseudonym-secret-v1",
-                info=b"", length=32)
             seed = HMAC-SHA256(
                 pseudonym_secret,
                 context_id + pseudonym_epoch.to_bytes(8, "big")
                 + b"scp-pseudonym-v2")
-            pseudonym_keypair = Ed25519_keygen(seed[:32])
 
         The ``"scp-pseudonym-v2"`` domain separator differs from the v1
         ``"scp-pseudonym"`` so epoch 0 produces a distinct pseudonym from the

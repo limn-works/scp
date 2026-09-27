@@ -75,25 +75,39 @@ pub struct NapiKeyCustodyProvider {
     /// point.
     #[napi(ts_type = "(keyId: string, peerPublic: Uint8Array) => Uint8Array")]
     pub dh_agree: Function<'static, (String, Vec<u8>), Vec<u8>>,
-    /// `(keyId: string, contextId: Uint8Array) => Uint8Array` —
-    /// `publicKey(33, compressed P-256) || keyIdUtf8`.
-    #[napi(ts_type = "(keyId: string, contextId: Uint8Array) => Uint8Array")]
-    pub derive_pseudonym: Function<'static, (String, Vec<u8>), Vec<u8>>,
-    /// `(keyId: string, contextId: Uint8Array, pseudonymEpoch: bigint) => Uint8Array`
-    /// — canonical rotatable v2 pseudonym; returns `publicKey(33) || keyIdUtf8`.
-    /// The provider performs the canonical derivation (HMAC key is the
-    /// private-derived `pseudonym_secret`, domain `"scp-pseudonym-v2"`); the
-    /// bridge does NOT synthesize the preimage.
+    /// `(keyId: string, contextId: Uint8Array) => { publicKey, keyId }` —
+    /// the §9.10.4 v1 pseudonym: `publicKey` is the 33-byte compressed P-256
+    /// point and `keyId` the numeric handle of the pseudonym key. The bridge
+    /// requires `getPublicKey(keyId)` to return the same 33 bytes.
     #[napi(
-        ts_type = "(keyId: string, contextId: Uint8Array, pseudonymEpoch: bigint) => Uint8Array"
+        ts_type = "(keyId: string, contextId: Uint8Array) => { publicKey: Uint8Array; keyId: string }"
     )]
-    pub derive_rotatable_pseudonym: Function<'static, (String, Vec<u8>, u64), Vec<u8>>,
+    pub derive_pseudonym: Function<'static, (String, Vec<u8>), NapiPseudonymResult>,
+    /// `(keyId: string, contextId: Uint8Array, pseudonymEpoch: bigint) => { publicKey, keyId }`
+    /// — the §9.10.4 rotatable v2 pseudonym, same return shape as
+    /// `derivePseudonym`. The provider performs the canonical derivation
+    /// (HMAC key is the private-derived `pseudonym_secret`, domain
+    /// `"scp-pseudonym-v2"`); the bridge does NOT synthesize the preimage.
+    #[napi(
+        ts_type = "(keyId: string, contextId: Uint8Array, pseudonymEpoch: bigint) => { publicKey: Uint8Array; keyId: string }"
+    )]
+    pub derive_rotatable_pseudonym: Function<'static, (String, Vec<u8>, u64), NapiPseudonymResult>,
     /// `(keyId: string) => Uint8Array` — 32 raw private-seed bytes.
     #[napi(ts_type = "(keyId: string) => Uint8Array")]
     pub export_signing_key_bytes: Function<'static, String, Vec<u8>>,
     /// `(keyId: string) => string` — `"hardware"` / `"software"` / `"in_memory"`.
     #[napi(ts_type = "(keyId: string) => string")]
     pub custody_type: Function<'static, String, String>,
+}
+
+/// A host pseudonym derivation result: the 33-byte compressed P-256 point and
+/// the key id of the pseudonym key, as separate fields (§9.10.4).
+#[napi(object)]
+pub struct NapiPseudonymResult {
+    /// 33-byte SEC1 compressed P-256 public key.
+    pub public_key: Vec<u8>,
+    /// Numeric key id of the pseudonym key, as a decimal string.
+    pub key_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,11 +130,16 @@ struct CallbackTsfns {
     destroy_key: ThreadsafeFunction<String, (), String, napi::Status, false>,
     dh_agree:
         ThreadsafeFunction<(String, Vec<u8>), Vec<u8>, (String, Vec<u8>), napi::Status, false>,
-    derive_pseudonym:
-        ThreadsafeFunction<(String, Vec<u8>), Vec<u8>, (String, Vec<u8>), napi::Status, false>,
+    derive_pseudonym: ThreadsafeFunction<
+        (String, Vec<u8>),
+        NapiPseudonymResult,
+        (String, Vec<u8>),
+        napi::Status,
+        false,
+    >,
     derive_rotatable_pseudonym: ThreadsafeFunction<
         (String, Vec<u8>, u64),
-        Vec<u8>,
+        NapiPseudonymResult,
         (String, Vec<u8>, u64),
         napi::Status,
         false,
@@ -284,6 +303,12 @@ impl KeyCustody for NapiCallbackKeyCustody {
                     .await
                     .map_err(|e| Self::map_call_err("sign", &e))
             },
+            |key_id| async move {
+                t.get_public_key
+                    .call_async(key_id)
+                    .await
+                    .map_err(|e| Self::map_call_err("get_public_key", &e))
+            },
         )
         .await
     }
@@ -335,13 +360,26 @@ impl KeyCustody for NapiCallbackKeyCustody {
         key: &KeyHandle,
         context_id: &[u8],
     ) -> Result<PseudonymKeypair, PlatformError> {
-        let bytes = self
-            .tsfns
-            .derive_pseudonym
-            .call_async((key.id().to_string(), context_id.to_vec()))
-            .await
-            .map_err(|e| Self::map_call_err("derive_pseudonym", &e))?;
-        scp_ffi_common::custody_parse::unpack_pseudonym("derive_pseudonym", &bytes)
+        let t = &self.tsfns;
+        scp_ffi_common::callback_custody::derive_pseudonym(
+            &self.registry,
+            "derive_pseudonym",
+            key,
+            |key_id| async move {
+                t.derive_pseudonym
+                    .call_async((key_id, context_id.to_vec()))
+                    .await
+                    .map(|r| (r.public_key, r.key_id))
+                    .map_err(|e| Self::map_call_err("derive_pseudonym", &e))
+            },
+            |key_id| async move {
+                t.get_public_key
+                    .call_async(key_id)
+                    .await
+                    .map_err(|e| Self::map_call_err("get_public_key", &e))
+            },
+        )
+        .await
     }
 
     async fn derive_rotatable_pseudonym(
@@ -359,13 +397,26 @@ impl KeyCustody for NapiCallbackKeyCustody {
         // the v1 platform adapter does not re-append its own "scp-pseudonym"
         // domain separator (which would corrupt the v2 domain). Mirrors the
         // UniFFI / PyO3 CallbackKeyCustody contract.
-        let bytes = self
-            .tsfns
-            .derive_rotatable_pseudonym
-            .call_async((key.id().to_string(), context_id.to_vec(), pseudonym_epoch))
-            .await
-            .map_err(|e| Self::map_call_err("derive_rotatable_pseudonym", &e))?;
-        scp_ffi_common::custody_parse::unpack_pseudonym("derive_rotatable_pseudonym", &bytes)
+        let t = &self.tsfns;
+        scp_ffi_common::callback_custody::derive_pseudonym(
+            &self.registry,
+            "derive_rotatable_pseudonym",
+            key,
+            |key_id| async move {
+                t.derive_rotatable_pseudonym
+                    .call_async((key_id, context_id.to_vec(), pseudonym_epoch))
+                    .await
+                    .map(|r| (r.public_key, r.key_id))
+                    .map_err(|e| Self::map_call_err("derive_rotatable_pseudonym", &e))
+            },
+            |key_id| async move {
+                t.get_public_key
+                    .call_async(key_id)
+                    .await
+                    .map_err(|e| Self::map_call_err("get_public_key", &e))
+            },
+        )
+        .await
     }
 
     async fn ed25519_to_x25519_agree(
@@ -734,15 +785,23 @@ mod p256_flow_tests {
         .expect("a valid point");
         for i in 0u8..16 {
             let digest = [i; 32];
-            let sig: [u8; 64] =
-                flow::sign(&registry, &signer, &digest, |key_id, data| async move {
-                    host.sign(&key_id, &data)
-                })
-                .await
-                .expect("sign")
-                .as_bytes()
-                .try_into()
-                .expect("raw r || s");
+            let sig: [u8; 64] = flow::sign(
+                &registry,
+                &signer,
+                &digest,
+                |key_id, data| async move { host.sign(&key_id, &data) },
+                // A minted handle needs no lookup; one would fail the sign.
+                |_| async {
+                    Err(scp_platform::error::PlatformError::CustodyError(
+                        "unexpected get_public_key lookup".into(),
+                    ))
+                },
+            )
+            .await
+            .expect("sign")
+            .as_bytes()
+            .try_into()
+            .expect("raw r || s");
             assert_eq!(normalize_low_s(&sig).expect("valid"), sig, "low s");
             verify_prehash_strict(&public, &digest, &sig).expect("strict verify");
         }

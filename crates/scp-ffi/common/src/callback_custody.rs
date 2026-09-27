@@ -11,9 +11,14 @@
 //! - [`key_type_str`] maps a [`KeyType`] to the host protocol string.
 //! - [`CallbackKeyRegistry`] records the [`KeyType`] of every handle the
 //!   adapter minted, and for P-256 keys the public key the host reported at
-//!   generation. A handle the adapter did not mint (a pseudonym handle, or one
-//!   minted by another adapter instance) is unregistered and follows the
-//!   32-byte family rules below.
+//!   generation, and every pseudonym handle it derived as a P-256 signing key
+//!   bound to the host's point ([`derive_pseudonym`]). A handle the adapter
+//!   neither minted nor derived (a host key from an earlier session) is
+//!   resolved for `sign`, `public_key` and pseudonym derivation through the
+//!   host's `get_public_key` ([`resolve`]): 33 bytes bind a P-256 signing key
+//!   at that point, 32 bytes an Ed25519 key, and a host that has no such key
+//!   fails the operation. Every other operation on an unregistered handle is
+//!   [`PlatformError::KeyNotFound`] with no host call.
 //! - [`p256_public_key`] requires the exact SEC1 length per type and a valid
 //!   curve point.
 //! - [`p256_host_signature`] accepts a host signature as raw `r ‖ s` or DER,
@@ -31,7 +36,9 @@ use scp_crypto::p256::{
     normalize_low_s, verify_prehash_strict,
 };
 use scp_platform::error::PlatformError;
-use scp_platform::traits::{KeyHandle, KeyType, PublicKey, SharedSecret, Signature};
+use scp_platform::traits::{
+    KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret, Signature,
+};
 
 /// The host-protocol string for a key type, passed to the provider's
 /// `generate_keypair`.
@@ -67,6 +74,16 @@ impl RegisteredKey {
             Self::X25519 => KeyType::X25519,
             Self::P256Signing(_) => KeyType::P256Signing,
             Self::HpkeP256(_) => KeyType::HpkeP256,
+        }
+    }
+
+    /// Whether two entries name the same key (P-256 entries by point).
+    fn same_key(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Ed25519, Self::Ed25519) | (Self::X25519, Self::X25519) => true,
+            (Self::P256Signing(a), Self::P256Signing(b))
+            | (Self::HpkeP256(a), Self::HpkeP256(b)) => a == b,
+            _ => false,
         }
     }
 
@@ -122,8 +139,40 @@ impl CallbackKeyRegistry {
         }
     }
 
-    /// The registered key for a handle, or `None` if this adapter did not
-    /// mint it.
+    /// Binds a handle the adapter learned after the fact: a derived pseudonym
+    /// or a host key resolved through `get_public_key` ([`resolve`]).
+    ///
+    /// Both are deterministic lookups a host may answer twice (a repeated
+    /// derivation, or two concurrent resolutions), so an id already bound to
+    /// the same key is accepted and the existing entry returned. Any other
+    /// occupant of the id is an error.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::CustodyError`] if the id is held by another key or a
+    /// different point, or the registry lock is poisoned.
+    pub fn bind(
+        &self,
+        method: &str,
+        handle: KeyHandle,
+        key: RegisteredKey,
+    ) -> Result<RegisteredKey, PlatformError> {
+        match self.lock()?.entry(handle.id()) {
+            std::collections::hash_map::Entry::Occupied(slot) if slot.get().same_key(&key) => {
+                Ok(slot.get().clone())
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                Err(PlatformError::CustodyError(format!(
+                    "KeyCustodyProvider.{method}: key_id {} is already bound to another key",
+                    handle.id()
+                )))
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => Ok(slot.insert(key).clone()),
+        }
+    }
+
+    /// The registered key for a handle, or `None` if this adapter neither
+    /// minted nor derived it.
     ///
     /// # Errors
     ///
@@ -293,8 +342,7 @@ pub fn x25519_peer(peer_public: &[u8]) -> Result<[u8; 32], PlatformError> {
     })
 }
 
-/// Checks a host signature for an Ed25519 key, or an unregistered handle
-/// (such as a pseudonym): both sign with a 64-byte signature.
+/// Checks a host signature for an Ed25519 key: exactly 64 bytes.
 ///
 /// # Errors
 ///
@@ -309,23 +357,13 @@ pub fn legacy_signature(host_signature: Vec<u8>) -> Result<Signature, PlatformEr
     Ok(Signature::new(host_signature))
 }
 
-/// Checks a host public key for an Ed25519 or X25519 key (32 bytes), or for
-/// an unregistered handle (32 bytes, or a 33-byte compressed P-256 point for
-/// a pseudonym handle).
+/// Checks a host public key for an Ed25519 or X25519 key: exactly 32 bytes.
 ///
 /// # Errors
 ///
-/// [`PlatformError::CustodyError`] on any other length or an invalid point.
-pub fn legacy_public_key(
-    registered: Option<KeyType>,
-    host_bytes: Vec<u8>,
-) -> Result<PublicKey, PlatformError> {
-    let ok = match (registered, host_bytes.len()) {
-        (_, 32) => true,
-        (None, COMPRESSED_POINT_LEN) => P256PublicKey::from_sec1(&host_bytes).is_ok(),
-        _ => false,
-    };
-    if !ok {
+/// [`PlatformError::CustodyError`] on any other length.
+pub fn legacy_public_key(host_bytes: Vec<u8>) -> Result<PublicKey, PlatformError> {
+    if host_bytes.len() != 32 {
         return Err(PlatformError::CustodyError(format!(
             "KeyCustodyProvider.get_public_key returned {} bytes that are not a valid public key",
             host_bytes.len()
@@ -406,84 +444,141 @@ where
     }
 }
 
+/// The registered key for `key`, resolving a handle this adapter neither
+/// minted nor derived through the host's `get_public_key`.
+///
+/// A host keeps its keys across adapter instances, so a handle from an earlier
+/// session is still the host's key. The host protocol has no key-type call,
+/// so the type comes from the public-key length: 33 bytes (a compressed
+/// point) bind a P-256 signing key at that point, so its signatures are
+/// verified strictly; 32 bytes bind an Ed25519 key. Agreement keys are never
+/// resolved: an X25519 key is also 32 bytes, and binding it as Ed25519 only
+/// lets it reach Ed25519 operations the host then refuses. Returns the entry
+/// and the host's bytes, or `None` for the bytes when the handle was already
+/// registered.
+///
+/// # Errors
+///
+/// The host's own error when it has no such key (a conforming host reports
+/// [`PlatformError::KeyNotFound`]); [`PlatformError::CustodyError`] for any
+/// other length, an invalid point, or an id bound concurrently to another
+/// key; or a poisoned registry.
+pub async fn resolve<P, PF>(
+    registry: &CallbackKeyRegistry,
+    key: &KeyHandle,
+    host_get_public_key: P,
+) -> Result<(RegisteredKey, Option<Vec<u8>>), PlatformError>
+where
+    P: FnOnce(String) -> PF,
+    PF: Future<Output = Result<Vec<u8>, PlatformError>>,
+{
+    if let Some(registered) = registry.get(key)? {
+        return Ok((registered, None));
+    }
+    let bytes = host_get_public_key(key.id().to_string()).await?;
+    let found = match bytes.len() {
+        COMPRESSED_POINT_LEN => RegisteredKey::P256Signing(p256_public_key(
+            "get_public_key",
+            KeyType::P256Signing,
+            &bytes,
+        )?),
+        32 => RegisteredKey::Ed25519,
+        n => {
+            return Err(PlatformError::CustodyError(format!(
+                "KeyCustodyProvider.get_public_key returned {n} bytes for unregistered key_id \
+                 {}, expected 33 (p256) or 32 (ed25519)",
+                key.id()
+            )));
+        }
+    };
+    Ok((registry.bind("get_public_key", *key, found)?, Some(bytes)))
+}
+
 /// `KeyCustody::sign` over a host provider.
 ///
-/// A registered P-256 signing key signs a 32-byte digest and its host result
-/// passes [`p256_host_signature`]. An Ed25519 key or an unregistered handle
-/// passes `data` through and must get 64 bytes back. A key-agreement key is
-/// [`PlatformError::WrongKeyType`] without a host call.
+/// A registered P-256 signing key (generated or a derived pseudonym) signs a
+/// 32-byte digest and its host result passes [`p256_host_signature`]. An
+/// Ed25519 key passes `data` through and must get 64 bytes back. A
+/// key-agreement key is [`PlatformError::WrongKeyType`] without a host sign
+/// call. An unregistered handle is first [`resolve`]d.
 ///
 /// # Errors
 ///
 /// Any host error; [`PlatformError::WrongKeyType`] or
-/// [`PlatformError::CustodyError`] as above.
-pub async fn sign<S, SF>(
+/// [`PlatformError::CustodyError`] as above and in [`resolve`].
+pub async fn sign<S, SF, P, PF>(
     registry: &CallbackKeyRegistry,
     key: &KeyHandle,
     data: &[u8],
     host_sign: S,
+    host_get_public_key: P,
 ) -> Result<Signature, PlatformError>
 where
     S: FnOnce(String, Vec<u8>) -> SF,
     SF: Future<Output = Result<Vec<u8>, PlatformError>>,
+    P: FnOnce(String) -> PF,
+    PF: Future<Output = Result<Vec<u8>, PlatformError>>,
 {
     let key_id = key.id().to_string();
-    match registry.get(key)? {
-        Some(RegisteredKey::P256Signing(pk)) => {
+    match resolve(registry, key, host_get_public_key).await?.0 {
+        RegisteredKey::P256Signing(pk) => {
             let digest = p256_digest(data)?;
             let host_sig = host_sign(key_id, digest.to_vec()).await?;
             p256_host_signature(&pk, &digest, &host_sig)
         }
-        Some(k @ RegisteredKey::X25519) => Err(k.wrong_type(KeyType::Ed25519)),
-        Some(k @ RegisteredKey::HpkeP256(_)) => Err(k.wrong_type(KeyType::P256Signing)),
-        Some(RegisteredKey::Ed25519) | None => {
-            legacy_signature(host_sign(key_id, data.to_vec()).await?)
-        }
+        k @ RegisteredKey::X25519 => Err(k.wrong_type(KeyType::Ed25519)),
+        k @ RegisteredKey::HpkeP256(_) => Err(k.wrong_type(KeyType::P256Signing)),
+        RegisteredKey::Ed25519 => legacy_signature(host_sign(key_id, data.to_vec()).await?),
     }
 }
 
-/// `KeyCustody::public_key` over a host provider, with exact lengths per
-/// registered type (see [`p256_registered_public_key`] and
-/// [`legacy_public_key`]).
+/// `KeyCustody::public_key` over a host provider.
+///
+/// Lengths are exact per registered type (see [`p256_registered_public_key`]
+/// and [`legacy_public_key`]). An unregistered handle is [`resolve`]d, and
+/// the host is asked once.
 ///
 /// # Errors
 ///
-/// Any host error; [`PlatformError::CustodyError`] for a malformed or
-/// changed key.
+/// Any host error; or [`PlatformError::CustodyError`] for a malformed or
+/// changed key, and as in [`resolve`].
 pub async fn public_key<P, PF>(
     registry: &CallbackKeyRegistry,
     key: &KeyHandle,
     host_get_public_key: P,
 ) -> Result<PublicKey, PlatformError>
 where
-    P: FnOnce(String) -> PF,
+    // `Sync` so the borrow held across `resolve` keeps the future `Send`.
+    P: Fn(String) -> PF + Sync,
     PF: Future<Output = Result<Vec<u8>, PlatformError>>,
 {
-    let registered = registry.get(key)?;
-    let bytes = host_get_public_key(key.id().to_string()).await?;
+    let (registered, bytes) = match resolve(registry, key, &host_get_public_key).await? {
+        (registered, Some(bytes)) => (registered, bytes),
+        (registered, None) => (registered, host_get_public_key(key.id().to_string()).await?),
+    };
     match registered {
-        Some(RegisteredKey::P256Signing(pk)) => {
+        RegisteredKey::P256Signing(pk) => {
             p256_registered_public_key(KeyType::P256Signing, &pk, &bytes)
         }
-        Some(RegisteredKey::HpkeP256(pk)) => {
-            p256_registered_public_key(KeyType::HpkeP256, &pk, &bytes)
-        }
-        other => legacy_public_key(other.map(|k| k.key_type()), bytes),
+        RegisteredKey::HpkeP256(pk) => p256_registered_public_key(KeyType::HpkeP256, &pk, &bytes),
+        RegisteredKey::Ed25519 | RegisteredKey::X25519 => legacy_public_key(bytes),
     }
 }
 
 /// `KeyCustody::dh_agree` over a host provider.
 ///
 /// A registered HPKE P-256 key requires a valid SEC1 peer point and sends
-/// the host its 65-byte uncompressed form. An X25519 key or an unregistered
-/// handle requires a 32-byte peer. A signing key is
-/// [`PlatformError::WrongKeyType`] without a host call. The host must return
-/// exactly 32 bytes, which are zeroized once copied.
+/// the host its 65-byte uncompressed form. An X25519 key requires a 32-byte
+/// peer. A signing key (a pseudonym included) is
+/// [`PlatformError::WrongKeyType`] and an unknown handle
+/// [`PlatformError::KeyNotFound`], both without a host call. The host must
+/// return exactly 32 bytes, which are zeroized once copied.
 ///
 /// # Errors
 ///
-/// Any host error; [`PlatformError::WrongKeyType`] or
-/// [`PlatformError::CustodyError`] as above.
+/// Any host error; [`PlatformError::KeyNotFound`],
+/// [`PlatformError::WrongKeyType`] or [`PlatformError::CustodyError`] as
+/// above.
 pub async fn dh_agree<H, HF>(
     registry: &CallbackKeyRegistry,
     key: &KeyHandle,
@@ -498,7 +593,8 @@ where
         Some(RegisteredKey::HpkeP256(_)) => p256_peer_for_host(peer_public)?.to_vec(),
         Some(k @ RegisteredKey::Ed25519) => return Err(k.wrong_type(KeyType::X25519)),
         Some(k @ RegisteredKey::P256Signing(_)) => return Err(k.wrong_type(KeyType::HpkeP256)),
-        Some(RegisteredKey::X25519) | None => x25519_peer(peer_public)?.to_vec(),
+        Some(RegisteredKey::X25519) => x25519_peer(peer_public)?.to_vec(),
+        None => return Err(PlatformError::KeyNotFound),
     };
     let shared = zeroize::Zeroizing::new(host_dh_agree(key.id().to_string(), peer).await?);
     Ok(SharedSecret::new(crate::custody_parse::expect_32(
@@ -538,20 +634,76 @@ where
 }
 
 /// Refuses an Ed25519-only operation (`ed25519_to_x25519_agree`,
-/// `export_ed25519_signing_key`) on a handle this adapter minted as another
-/// type. Unregistered handles pass, and the host decides.
+/// `export_ed25519_signing_key`) on a handle that is not a registered Ed25519
+/// key. Pseudonym derivation checks the same through [`resolve`].
 ///
 /// # Errors
 ///
-/// [`PlatformError::WrongKeyType`], or a poisoned registry.
+/// [`PlatformError::KeyNotFound`] for an unknown handle,
+/// [`PlatformError::WrongKeyType`] for another type, or a poisoned registry.
 pub fn require_ed25519(
     registry: &CallbackKeyRegistry,
     key: &KeyHandle,
 ) -> Result<(), PlatformError> {
     match registry.get(key)? {
-        Some(RegisteredKey::Ed25519) | None => Ok(()),
+        Some(RegisteredKey::Ed25519) => Ok(()),
         Some(k) => Err(k.wrong_type(KeyType::Ed25519)),
+        None => Err(PlatformError::KeyNotFound),
     }
+}
+
+/// `KeyCustody::derive_pseudonym` and `derive_rotatable_pseudonym` over a
+/// host provider.
+///
+/// `key` must be an Ed25519 identity key, registered or [`resolve`]d. The host returns the
+/// pseudonym as separate `(public_key, key_id)` fields; the point must be a
+/// 33-byte compressed P-256 point, the key id numeric, and the host's own
+/// `get_public_key(key_id)` must return the same bytes. The handle is then
+/// registered as a P-256 signing key bound to that point, so its `sign`
+/// goes through [`p256_host_signature`] and its `dh_agree` is
+/// [`PlatformError::WrongKeyType`].
+///
+/// # Errors
+///
+/// [`PlatformError::WrongKeyType`] for `key`, or as in [`resolve`]; any host
+/// error; [`PlatformError::CustodyError`] for a malformed
+/// return, a point the host's `get_public_key` does not confirm, or a key id
+/// already bound to another key.
+pub async fn derive_pseudonym<H, HF, P, PF>(
+    registry: &CallbackKeyRegistry,
+    method: &str,
+    key: &KeyHandle,
+    host_derive: H,
+    host_get_public_key: P,
+) -> Result<PseudonymKeypair, PlatformError>
+where
+    H: FnOnce(String) -> HF,
+    HF: Future<Output = Result<(Vec<u8>, String), PlatformError>>,
+    // `Sync` so the borrow held across `resolve` keeps the future `Send`.
+    P: Fn(String) -> PF + Sync,
+    PF: Future<Output = Result<Vec<u8>, PlatformError>>,
+{
+    match resolve(registry, key, &host_get_public_key).await?.0 {
+        RegisteredKey::Ed25519 => {}
+        other => return Err(other.wrong_type(KeyType::Ed25519)),
+    }
+    let (public_key, key_id) = host_derive(key.id().to_string()).await?;
+    let pseudonym = crate::custody_parse::parse_pseudonym(method, &public_key, &key_id)?;
+    let host_public_key = host_get_public_key(key_id).await?;
+    if host_public_key.as_slice() != pseudonym.public_key().as_bytes() {
+        return Err(PlatformError::CustodyError(format!(
+            "KeyCustodyProvider.{method}: get_public_key(key_id) does not match the derived \
+             pseudonym point"
+        )));
+    }
+    let point = P256PublicKey::from_sec1(&public_key)
+        .map_err(|e| PlatformError::CustodyError(format!("KeyCustodyProvider.{method}: {e}")))?;
+    registry.bind(
+        method,
+        *pseudonym.key_handle(),
+        RegisteredKey::P256Signing(point),
+    )?;
+    Ok(pseudonym)
 }
 
 /// A software P-256 host for bridge tests.
@@ -626,6 +778,8 @@ pub mod fake_host {
         next: AtomicUsize,
         /// The peer bytes of the most recent `dh_agree` call.
         pub last_peer: Mutex<Option<Vec<u8>>>,
+        /// How many `sign` calls reached the host.
+        pub sign_calls: AtomicUsize,
     }
 
     impl FakeP256Host {
@@ -685,6 +839,7 @@ pub mod fake_host {
         ///
         /// An unknown key id, or a message that is not 32 bytes.
         pub fn sign(&self, key_id: &str, message: &[u8]) -> Result<Vec<u8>, PlatformError> {
+            self.sign_calls.fetch_add(1, Ordering::Relaxed);
             let digest: [u8; 32] = message
                 .try_into()
                 .map_err(|_| PlatformError::CustodyError("digest must be 32 bytes".into()))?;
@@ -853,13 +1008,362 @@ mod tests {
     fn legacy_lengths() {
         assert!(legacy_signature(vec![0u8; 64]).is_ok());
         assert!(legacy_signature(vec![0u8; 72]).is_err());
-        assert!(legacy_public_key(Some(KeyType::Ed25519), vec![0u8; 32]).is_ok());
-        assert!(legacy_public_key(Some(KeyType::Ed25519), vec![0u8; 33]).is_err());
+        assert!(legacy_public_key(vec![0u8; 32]).is_ok());
         let pk = P256SigningKey::from_scalar_bytes(&[1u8; 32])
             .unwrap()
             .public_key();
-        assert!(legacy_public_key(None, pk.to_compressed().to_vec()).is_ok());
-        assert!(legacy_public_key(None, vec![0xABu8; 33]).is_err());
+        assert!(
+            legacy_public_key(pk.to_compressed().to_vec()).is_err(),
+            "a P-256 point is never an Ed25519 or X25519 key"
+        );
+    }
+
+    /// A registry holding identity key 1 (Ed25519) and pseudonym 7, derived
+    /// through the shared flow from a host whose pseudonym key is `key`.
+    async fn registry_with_pseudonym(key: &P256SigningKey) -> CallbackKeyRegistry {
+        let registry = CallbackKeyRegistry::new();
+        registry
+            .register(KeyHandle::new(1), RegisteredKey::Ed25519)
+            .unwrap();
+        let point = key.public_key().to_compressed().to_vec();
+        let p2 = point.clone();
+        let derived = derive_pseudonym(
+            &registry,
+            "derive_pseudonym",
+            &KeyHandle::new(1),
+            |id| async move {
+                assert_eq!(id, "1");
+                Ok((point, "7".to_owned()))
+            },
+            move |id| {
+                let p2 = p2.clone();
+                async move {
+                    assert_eq!(id, "7");
+                    Ok(p2)
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(derived.key_handle().id(), 7);
+        registry
+    }
+
+    /// B4: a pseudonym handle is a registered P-256 signing key. Its host's
+    /// DER high-s signature comes out raw low-s and strictly verifies; a junk
+    /// 64-byte signature is rejected; `dh_agree` is `WrongKeyType`. A
+    /// registered handle never asks the host for its public key before
+    /// signing.
+    #[tokio::test]
+    async fn pseudonym_handles_use_the_registry_path() {
+        let key = P256SigningKey::from_scalar_bytes(&[0x21u8; 32]).unwrap();
+        let registry = registry_with_pseudonym(&key).await;
+        let handle = KeyHandle::new(7);
+        let digest = [0x5au8; 32];
+
+        let raw = sign_prehash_rfc6979(&key, &digest).unwrap();
+        let high_der = der(&raw[..32], &negate(&raw[32..]));
+        let sig = sign(
+            &registry,
+            &handle,
+            &digest,
+            |id, data| async move {
+                assert_eq!((id.as_str(), data.as_slice()), ("7", digest.as_slice()));
+                Ok(high_der)
+            },
+            no_lookup,
+        )
+        .await
+        .expect("a high-s DER host signature is accepted");
+        assert_eq!(sig.as_bytes(), &raw, "raw low-s out");
+        let sig64: [u8; 64] = sig.as_bytes().try_into().unwrap();
+        verify_prehash_strict(&key.public_key(), &digest, &sig64).unwrap();
+
+        assert!(matches!(
+            sign(
+                &registry,
+                &handle,
+                &digest,
+                |_, _| async { Ok(vec![0x11u8; 64]) },
+                no_lookup
+            )
+            .await,
+            Err(PlatformError::CustodyError(_))
+        ));
+        assert!(matches!(
+            sign(
+                &registry,
+                &handle,
+                b"not a digest",
+                |_, _| async { panic!("no host call for a non-digest") },
+                no_lookup
+            )
+            .await,
+            Err(PlatformError::CustodyError(_))
+        ));
+        assert!(matches!(
+            dh_agree(&registry, &handle, &[9u8; 32], |_, _| async {
+                panic!("no host call for a signing key")
+            })
+            .await,
+            Err(PlatformError::WrongKeyType {
+                expected: KeyType::HpkeP256,
+                actual: KeyType::P256Signing
+            })
+        ));
+        let point = key.public_key().to_compressed().to_vec();
+        assert_eq!(
+            public_key(&registry, &handle, |_| {
+                let p = point.clone();
+                async move { Ok(p) }
+            })
+            .await
+            .unwrap()
+            .as_bytes(),
+            point.as_slice()
+        );
+    }
+
+    /// A lookup a test expects never to happen.
+    #[allow(clippy::unused_async)]
+    async fn no_lookup(_: String) -> Result<Vec<u8>, PlatformError> {
+        panic!("no get_public_key lookup for a registered handle")
+    }
+
+    /// A handle this adapter never minted or derived (a host key from an
+    /// earlier session) is resolved through `get_public_key`: a 33-byte point
+    /// binds a P-256 signing key whose signatures are verified strictly, 32
+    /// bytes an Ed25519 key, and a host without the key fails the operation
+    /// with no sign call. Any other length is refused and binds nothing.
+    /// `dh_agree` and the Ed25519-only operations never resolve.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn unregistered_handles_resolve_through_get_public_key() {
+        let key = P256SigningKey::from_scalar_bytes(&[0x21u8; 32]).unwrap();
+        let point = key.public_key().to_compressed().to_vec();
+        let digest = [0x5au8; 32];
+        let raw = sign_prehash_rfc6979(&key, &digest).unwrap();
+        let lookup = |bytes: Vec<u8>| {
+            move |id: String| {
+                let bytes = bytes.clone();
+                async move {
+                    assert_eq!(id, "42");
+                    Ok(bytes)
+                }
+            }
+        };
+        let n = KeyHandle::new(42);
+
+        // A fresh adapter still verifies strictly: junk is refused, and a
+        // high-s DER signature comes out raw low-s.
+        let registry = CallbackKeyRegistry::new();
+        assert!(matches!(
+            sign(
+                &registry,
+                &n,
+                &digest,
+                |_, _| async { Ok(vec![0x11u8; 64]) },
+                lookup(point.clone())
+            )
+            .await,
+            Err(PlatformError::CustodyError(_))
+        ));
+        let high_der = der(&raw[..32], &negate(&raw[32..]));
+        let fresh = CallbackKeyRegistry::new();
+        let sig = sign(
+            &fresh,
+            &n,
+            &digest,
+            |_, _| async move { Ok(high_der) },
+            lookup(point.clone()),
+        )
+        .await
+        .expect("a resolved P-256 key signs");
+        assert_eq!(sig.as_bytes(), &raw);
+        assert!(matches!(
+            fresh.get(&n).unwrap(),
+            Some(RegisteredKey::P256Signing(pk)) if pk == key.public_key()
+        ));
+        assert!(matches!(
+            sign(
+                &fresh,
+                &n,
+                b"not a digest",
+                |_, _| async { panic!("no host call for a non-digest") },
+                no_lookup
+            )
+            .await,
+            Err(PlatformError::CustodyError(_))
+        ));
+
+        // 32 bytes: an Ed25519 key, signed by pass-through.
+        let registry = CallbackKeyRegistry::new();
+        let sig = sign(
+            &registry,
+            &n,
+            b"message",
+            |_, data| async move {
+                assert_eq!(data, b"message");
+                Ok(vec![3u8; 64])
+            },
+            lookup(vec![7u8; 32]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sig.as_bytes(), &[3u8; 64]);
+        assert!(matches!(
+            registry.get(&n).unwrap(),
+            Some(RegisteredKey::Ed25519)
+        ));
+
+        // The host has no such key: its error, no sign call, nothing bound.
+        let registry = CallbackKeyRegistry::new();
+        assert!(matches!(
+            sign(
+                &registry,
+                &n,
+                &digest,
+                |_, _| async { panic!("no sign call for a key the host lacks") },
+                |_| async { Err(PlatformError::KeyNotFound) }
+            )
+            .await,
+            Err(PlatformError::KeyNotFound)
+        ));
+        assert!(matches!(
+            public_key(&registry, &n, |_| async { Err(PlatformError::KeyNotFound) }).await,
+            Err(PlatformError::KeyNotFound)
+        ));
+        // Another length (here an HPKE point) binds nothing.
+        let hpke = key.public_key().to_uncompressed().to_vec();
+        assert!(matches!(
+            public_key(&registry, &n, lookup(hpke)).await,
+            Err(PlatformError::CustodyError(_))
+        ));
+        assert!(registry.get(&n).unwrap().is_none());
+        // public_key resolves with one host call.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let p = point.clone();
+        let got = public_key(&registry, &n, |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p = p.clone();
+            async move { Ok(p) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(got.as_bytes(), point.as_slice());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let unknown = KeyHandle::new(99);
+        assert!(matches!(
+            dh_agree(&registry, &unknown, &[9u8; 32], |_, _| async {
+                panic!("no host call for an unknown handle")
+            })
+            .await,
+            Err(PlatformError::KeyNotFound)
+        ));
+        assert!(matches!(
+            require_ed25519(&registry, &unknown),
+            Err(PlatformError::KeyNotFound)
+        ));
+    }
+
+    /// B2/B3: derivation needs an Ed25519 key, registered or resolved; the host's
+    /// `get_public_key(key_id)` must confirm the point; a repeated derivation
+    /// may return the same id for the same point, but an id held by another
+    /// key or point is rejected. A rejected derivation registers nothing.
+    #[tokio::test]
+    async fn derive_pseudonym_binds_and_rejects() {
+        let key = P256SigningKey::from_scalar_bytes(&[0x21u8; 32]).unwrap();
+        let other = P256SigningKey::from_scalar_bytes(&[0x22u8; 32]).unwrap();
+        let point = key.public_key().to_compressed().to_vec();
+        let other_point = other.public_key().to_compressed().to_vec();
+        let registry = registry_with_pseudonym(&key).await;
+        registry
+            .register(KeyHandle::new(2), RegisteredKey::X25519)
+            .unwrap();
+        let derive = |from: u64, pk: Vec<u8>, id: &'static str, host_pk: Vec<u8>| {
+            let registry = &registry;
+            async move {
+                derive_pseudonym(
+                    registry,
+                    "derive_rotatable_pseudonym",
+                    &KeyHandle::new(from),
+                    |_| async move { Ok((pk, id.to_owned())) },
+                    move |_| {
+                        let host_pk = host_pk.clone();
+                        async move { Ok(host_pk) }
+                    },
+                )
+                .await
+            }
+        };
+
+        // Same id, same point: accepted.
+        derive(1, point.clone(), "7", point.clone()).await.unwrap();
+        // Same id, another point; an id held by an identity key.
+        for (id, pk) in [("7", &other_point), ("1", &other_point)] {
+            let msg = derive(1, pk.clone(), id, pk.clone()).await.unwrap_err();
+            assert!(msg.to_string().contains("already bound"), "{msg}");
+        }
+        // The host's own public key disagrees: nothing is registered.
+        let msg = derive(1, other_point.clone(), "8", point.clone())
+            .await
+            .unwrap_err();
+        assert!(msg.to_string().contains("does not match"), "{msg}");
+        assert!(registry.get(&KeyHandle::new(8)).unwrap().is_none());
+        // A 32-byte (Ed25519-era) pseudonym.
+        assert!(matches!(
+            derive(1, vec![2u8; 32], "8", vec![2u8; 32]).await,
+            Err(PlatformError::CustodyError(_))
+        ));
+        // The source key must be a registered Ed25519 key.
+        assert!(matches!(
+            derive(2, point.clone(), "8", point.clone()).await,
+            Err(PlatformError::WrongKeyType { .. })
+        ));
+        assert!(matches!(
+            derive(7, point.clone(), "8", point.clone()).await,
+            Err(PlatformError::WrongKeyType { .. })
+        ));
+        // An unregistered source resolves through get_public_key: the
+        // host lacks it, it is a P-256 key, or it is an Ed25519 key.
+        assert!(matches!(
+            derive_pseudonym(
+                &registry,
+                "derive_pseudonym",
+                &KeyHandle::new(99),
+                |_| async { panic!("no derivation from a key the host lacks") },
+                |_| async { Err(PlatformError::KeyNotFound) },
+            )
+            .await,
+            Err(PlatformError::KeyNotFound)
+        ));
+        assert!(matches!(
+            derive(98, point.clone(), "8", point.clone()).await,
+            Err(PlatformError::WrongKeyType { .. })
+        ));
+        let p = point.clone();
+        let derived = derive_pseudonym(
+            &registry,
+            "derive_pseudonym",
+            &KeyHandle::new(97),
+            |_| async move { Ok((p, "9".to_owned())) },
+            |id| {
+                let bytes = if id == "97" {
+                    vec![5u8; 32]
+                } else {
+                    point.clone()
+                };
+                async move { Ok(bytes) }
+            },
+        )
+        .await
+        .expect("a resolved Ed25519 identity derives");
+        assert_eq!(derived.key_handle().id(), 9);
+        assert!(matches!(
+            registry.get(&KeyHandle::new(97)).unwrap(),
+            Some(RegisteredKey::Ed25519)
+        ));
     }
 
     #[test]
@@ -901,7 +1405,7 @@ mod tests {
     }
 
     /// A7: every generation the adapter rejects destroys the host key it was
-    /// handed: a non-numeric id (for each key type), a malformed P-256 public
+    /// handed: a non-canonical id (for each key type), a malformed P-256 public
     /// key, and a failing public-key fetch. An accepted key is not destroyed.
     #[tokio::test]
     async fn rejected_generation_destroys_the_host_key() {

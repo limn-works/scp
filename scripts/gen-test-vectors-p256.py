@@ -1280,6 +1280,7 @@ def emit_hash_only_vectors() -> None:
 
 PSEUDONYM_SECRET_SALT = b"scp-pseudonym-secret-v1"
 PSEUDONYM_SCALAR_LABEL = b"SCP-PSEUDONYM-P256-V1"
+PSEUDONYM_ROUTING_PREFIX = b"scp-pseudonym-routing-v1:"
 
 PSEUDONYM_SEEDS = [
     ("vector_30", bytes.fromhex("01" * 32)),
@@ -1318,8 +1319,16 @@ def emit_pseudonym_derivation() -> None:
         emit_hex(f"{label}.pseudonym_secret", secret)
         emit_hex(f"{label}.context_seed_v1", seed_v1)
         emit_hex(f"{label}.pseudonym_public_v1", key_v1.compressed)
+        emit_hex(
+            f"{label}.routing_id_v1",
+            sha256(PSEUDONYM_ROUTING_PREFIX + key_v1.compressed),
+        )
         emit_hex(f"{label}.context_seed_v2", seed_v2)
         emit_hex(f"{label}.pseudonym_public_v2", key_v2.compressed)
+        emit_hex(
+            f"{label}.routing_id_v2",
+            sha256(PSEUDONYM_ROUTING_PREFIX + key_v2.compressed),
+        )
 
 
 def emit_pseudonym_announcement() -> None:

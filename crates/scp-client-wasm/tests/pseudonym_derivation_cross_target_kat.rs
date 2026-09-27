@@ -19,7 +19,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use scp_crypto::p256::P256SigningKey;
-use scp_crypto::pseudonym::{derive_pseudonym_keypair, derive_pseudonym_secret};
+use scp_crypto::pseudonym::{
+    derive_pseudonym_keypair, derive_pseudonym_secret, pseudonym_routing_id,
+};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_test::wasm_bindgen_test;
@@ -45,6 +47,8 @@ struct DerivationVector {
     secret: &'static str,
     v1_pub: &'static str,
     v2_pub: &'static str,
+    v1_routing: &'static str,
+    v2_routing: &'static str,
 }
 
 /// §25.19 Vector 30 — identity seed `0x01 × 32`.
@@ -54,6 +58,8 @@ const VECTOR_30: DerivationVector = DerivationVector {
     secret: "b88e781bb954a6681abc9016f8f69939f0e624311aeaa7e8f1b145857f58de82",
     v1_pub: "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72",
     v2_pub: "0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479",
+    v1_routing: "b7faa05dea2cef1b7aff6a48fa5b7b9ffe217b25f3152d78d597bb9078e98307",
+    v2_routing: "b19754a5e88c993683f99e48646ba518cba80dec0693f920c5671263650b6ae9",
 };
 
 /// §25.19 Vector 31 — identity seed `0x9d, 0x01..0x1f`.
@@ -63,6 +69,8 @@ const VECTOR_31: DerivationVector = DerivationVector {
     secret: "17ef25ad3e5be8adad38c4c5a1c68d3daca80015e81bdcae2ae8940645774739",
     v1_pub: "0239f7c3213f3567183fd2fcf7aec6c884bc70e0e694c42053284a4b5ebef4fe2d",
     v2_pub: "037967cfe8d3111cdd72288ea3f444c15b710300323162fec63ca9036af73754e3",
+    v1_routing: "cab5ff45d21b6d0425fa7657e89fc68514965cbb4ca2b9549f4ccf430d581e7c",
+    v2_routing: "3c0ac4dec86c0dafe38195a7b66cdfec6b0ae0d44834c6e8b6b6129e097b5e27",
 };
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -115,6 +123,11 @@ fn assert_pseudonym_derivation_cross_target_vectors() {
             vector.v1_pub,
             "v1 pseudonym public key diverged from the §25.19 golden vector"
         );
+        assert_eq!(
+            to_hex(&pseudonym_routing_id(&v1)),
+            vector.v1_routing,
+            "v1 pseudonym_routing_id diverged from the §25.19 golden vector"
+        );
 
         // (4) v2 (rotatable, epoch = 1) pseudonym public key matches the golden.
         let v2 = derive_pseudonym_keypair(&ikm, KAT_CONTEXT_ID, Some(1))
@@ -125,6 +138,11 @@ fn assert_pseudonym_derivation_cross_target_vectors() {
             to_hex(&v2),
             vector.v2_pub,
             "v2 (epoch=1) pseudonym public key diverged from the §25.19 golden vector"
+        );
+        assert_eq!(
+            to_hex(&pseudonym_routing_id(&v2)),
+            vector.v2_routing,
+            "v2 (epoch=1) pseudonym_routing_id diverged from the §25.19 golden vector"
         );
     }
 }

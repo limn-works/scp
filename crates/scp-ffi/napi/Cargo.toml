@@ -93,14 +93,15 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 scp-ffi-common = { path = "../common", features = ["testing", "custody"] }
-# The P-256 flow test verifies adapter output against scp-crypto directly.
-scp-crypto = { path = "../../scp-crypto" }
 # This bridge constructs `InMemoryDhtClient` in its own tests (identity.rs,
 # scp.rs) which is gated behind `scp-dht/testing`; activate it for this crate's
 # test build (ADR-062 §Decision 1). `scp-dht/testing` never appears in a
 # non-testing feature list.
 scp-dht = { path = "../../scp-dht", features = ["testing"] }
 tempfile = "3"
+# The P-256 flow test verifies adapter output against scp-crypto directly, and
+# the routing-id tests recompute the §9.10.4 pseudonym independently.
+scp-crypto = { path = "../../scp-crypto" }
 # Provides weak C stubs for napi runtime symbols so the test binary
 # can link without a Node.js runtime. Kept as a dev-dependency so
 # the cdylib build NEVER sees these stubs (if they leaked into the

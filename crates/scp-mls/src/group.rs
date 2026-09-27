@@ -111,7 +111,7 @@ impl Deref for EagerDropSigner {
 /// `openmls_basic_credential::SignatureKeyPair` stores the ED25519 private key as
 /// `ed25519_dalek::SigningKey::to_bytes()` — the 32-byte RFC-8032 seed (see its
 /// `SignatureKeyPair::new` ED25519 arm), exactly the form
-/// [`ed25519_dalek::SigningKey::from_bytes`] consumes. Its `private()` accessor
+/// `ed25519_dalek::SigningKey::from_bytes` consumes. Its `private()` accessor
 /// is `test-utils`-gated (unavailable in a shipped build), so this production
 /// path recovers the seed through the type's own `serde` derive — the identical
 /// name-tagged `MessagePack` form `ProviderSignerDump` already serializes the

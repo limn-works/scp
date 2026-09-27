@@ -55,34 +55,26 @@ pub fn expect_32(method: &str, bytes: &[u8]) -> Result<[u8; 32], PlatformError> 
 
 /// Length of the pseudonym public key a provider returns: a SEC1 compressed
 /// P-256 point (§9.10.4).
-pub const PSEUDONYM_PUBLIC_KEY_LEN: usize = 33;
+pub const PSEUDONYM_PUBLIC_KEY_LEN: usize = scp_crypto::p256::COMPRESSED_POINT_LEN;
 
-/// Unpacks a `derive_pseudonym`-style return (`[pubkey(33) || key_id_utf8]`,
-/// where `pubkey` is the SEC1 compressed P-256 pseudonym point) into a
-/// validated [`PseudonymKeypair`].
+/// Validates a structured `derive_pseudonym`-style return (`public_key`,
+/// `key_id`) into a [`PseudonymKeypair`].
+///
+/// The host returns the two fields separately; no byte-splitting happens here,
+/// so a key id can never be read as part of the point or the reverse.
 ///
 /// # Errors
 ///
-/// Returns [`PlatformError::CustodyError`] if `bytes` is shorter than 34 bytes,
-/// the key-id portion is not valid UTF-8, the key-id is not numeric, or the
-/// public key is not a valid compressed P-256 point (a provider still
-/// returning a 32-byte Ed25519 pseudonym fails here).
-pub fn unpack_pseudonym(method: &str, bytes: &[u8]) -> Result<PseudonymKeypair, PlatformError> {
-    if bytes.len() <= PSEUDONYM_PUBLIC_KEY_LEN {
-        return Err(PlatformError::CustodyError(format!(
-            "KeyCustodyProvider.{method} returned {} bytes, expected at least 34 \
-             (33-byte compressed P-256 public key + key_id)",
-            bytes.len()
-        )));
-    }
-    let (public_key_bytes, key_id_bytes) = bytes.split_at(PSEUDONYM_PUBLIC_KEY_LEN);
-    let key_id_str = std::str::from_utf8(key_id_bytes).map_err(|_| {
-        PlatformError::CustodyError(format!(
-            "KeyCustodyProvider.{method} key_id portion is not valid UTF-8"
-        ))
-    })?;
-    let key_id = parse_handle(method, key_id_str)?;
-    PseudonymKeypair::new(public_key_bytes, key_id)
+/// Returns [`PlatformError::CustodyError`] if `key_id` is not numeric or
+/// `public_key` is not a 33-byte SEC1 compressed point on P-256 (a provider
+/// still returning a 32-byte Ed25519 pseudonym fails here).
+pub fn parse_pseudonym(
+    method: &str,
+    public_key: &[u8],
+    key_id: &str,
+) -> Result<PseudonymKeypair, PlatformError> {
+    let handle = parse_handle(method, key_id)?;
+    PseudonymKeypair::new(public_key, handle)
         .map_err(|e| PlatformError::CustodyError(format!("KeyCustodyProvider.{method}: {e}")))
 }
 
@@ -142,84 +134,92 @@ mod tests {
         }
     }
 
+    fn custody_msg(err: PlatformError) -> String {
+        match err {
+            PlatformError::CustodyError(msg) => msg,
+            other => panic!("expected CustodyError, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn unpack_pseudonym_accepts_pubkey_plus_key_id() {
-        let mut bytes = REFERENCE_POINT.to_vec();
-        bytes.extend_from_slice(b"123");
-        let pseudo = unpack_pseudonym("derive_pseudonym", &bytes).expect("valid pseudonym unpacks");
+    fn parse_pseudonym_accepts_point_and_key_id() {
+        let pseudo = parse_pseudonym("derive_pseudonym", &REFERENCE_POINT, "123")
+            .expect("valid pseudonym parses");
         assert_eq!(pseudo.public_key().as_bytes(), &REFERENCE_POINT);
         assert_eq!(pseudo.key_handle().id(), 123);
     }
 
+    /// Every malformed point reaches a distinct rejection path in
+    /// `P256PublicKey::from_sec1` (length, prefix, curve equation).
     #[test]
-    fn unpack_pseudonym_rejects_invalid_point() {
-        // A legacy 32-byte Ed25519 pseudonym + key id: the first 33 bytes are
-        // not a compressed P-256 point (prefix 0xAB), so it fails closed.
-        let mut legacy = vec![0xABu8; 32];
-        legacy.extend_from_slice(b"12");
-        assert!(matches!(
-            unpack_pseudonym("derive_pseudonym", &legacy),
-            Err(PlatformError::CustodyError(_))
-        ));
-        // A valid prefix with x = 2^256 - 1, which is not a field element.
-        let mut not_field = vec![0x02u8];
-        not_field.extend_from_slice(&[0xFFu8; 32]);
-        not_field.extend_from_slice(b"7");
-        assert!(matches!(
-            unpack_pseudonym("derive_pseudonym", &not_field),
-            Err(PlatformError::CustodyError(_))
-        ));
+    fn parse_pseudonym_rejects_invalid_points() {
+        let reject = |bytes: &[u8]| {
+            custody_msg(
+                parse_pseudonym("derive_pseudonym", bytes, "7")
+                    .expect_err("invalid point rejected"),
+            )
+        };
+        // Wrong lengths: 32 (a legacy Ed25519 key) and 34.
+        assert_eq!(
+            reject(&REFERENCE_POINT[1..]),
+            "KeyCustodyProvider.derive_pseudonym: custody error: pseudonym public key must be a \
+             33-byte compressed P-256 point, got 32 bytes"
+        );
+        let mut long = REFERENCE_POINT.to_vec();
+        long.push(0x00);
+        assert!(reject(&long).contains("got 34 bytes"));
+        // Bad prefix: 33 bytes led by 0x04 (the uncompressed tag).
+        let mut bad_prefix = REFERENCE_POINT;
+        bad_prefix[0] = 0x04;
+        assert!(reject(&bad_prefix).contains("invalid leading byte 0x04"));
+        // Off-curve x: x = 1 is a field element, but 1 - 3 + b is a quadratic
+        // non-residue mod p, so no y exists.
+        let mut off_curve = [0u8; 33];
+        off_curve[0] = 0x02;
+        off_curve[32] = 0x01;
+        assert!(reject(&off_curve).contains("not on the curve"));
+        // x = 2^256 - 1 is not a field element at all.
+        let mut not_field = [0xFFu8; 33];
+        not_field[0] = 0x02;
+        assert!(reject(&not_field).contains("not on the curve"));
+    }
+
+    /// The fail-open counterexample against the old concatenated return: a
+    /// 32-byte Ed25519 key `K` with key id `"22"` concatenated to `K || "22"`,
+    /// whose first 33 bytes `K || 0x32` happen to be a valid P-256 point, so the
+    /// split parse accepted it as a pseudonym with handle 2. With separate fields
+    /// the 32-byte key is rejected on length, and a host that forwards the
+    /// concatenated point anyway fails the `public_key(key_id)` binding.
+    #[test]
+    fn legacy_concatenation_counterexample_is_rejected() {
+        let legacy_key: [u8; 32] = [
+            0x02, 0x6e, 0x34, 0x0b, 0x9c, 0xff, 0xb3, 0x7a, 0x98, 0x9c, 0xa5, 0x44, 0xe6, 0xbb,
+            0x78, 0x0a, 0x2c, 0x78, 0x90, 0x1d, 0x3f, 0xb3, 0x37, 0x38, 0x76, 0x85, 0x11, 0xa3,
+            0x06, 0x17, 0xaf, 0xa0,
+        ];
+        let msg = custody_msg(
+            parse_pseudonym("derive_pseudonym", &legacy_key, "22").expect_err("32 bytes rejected"),
+        );
+        assert!(msg.contains("got 32 bytes"), "{msg}");
+
+        // The old split's first 33 bytes are a valid point; the
+        // `public_key(key_id)` binding in `callback_custody::derive_pseudonym`
+        // rejects a host that forwards them (tested there).
+        let mut old_split_point = legacy_key.to_vec();
+        old_split_point.push(b'2');
+        parse_pseudonym("derive_pseudonym", &old_split_point, "2")
+            .expect("the old split's first 33 bytes are a valid point");
     }
 
     #[test]
-    fn unpack_pseudonym_rejects_short_input() {
-        let bytes = REFERENCE_POINT; // exactly 33 — no key_id, below the 34 minimum.
-        let err =
-            unpack_pseudonym("derive_pseudonym", &bytes).expect_err("33-byte input has no key_id");
-        match err {
-            PlatformError::CustodyError(msg) => {
-                assert_eq!(
-                    msg,
-                    "KeyCustodyProvider.derive_pseudonym returned 33 bytes, expected at least 34 \
-                     (33-byte compressed P-256 public key + key_id)"
-                );
-            }
-            other => panic!("expected CustodyError, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn unpack_pseudonym_rejects_non_utf8_key_id() {
-        let mut bytes = REFERENCE_POINT.to_vec();
-        // 0xFF is an invalid UTF-8 lead byte.
-        bytes.push(0xFF);
-        let err =
-            unpack_pseudonym("derive_pseudonym", &bytes).expect_err("non-utf8 key_id is rejected");
-        match err {
-            PlatformError::CustodyError(msg) => {
-                assert_eq!(
-                    msg,
-                    "KeyCustodyProvider.derive_pseudonym key_id portion is not valid UTF-8"
-                );
-            }
-            other => panic!("expected CustodyError, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn unpack_pseudonym_rejects_non_numeric_key_id() {
-        let mut bytes = REFERENCE_POINT.to_vec();
-        bytes.extend_from_slice(b"xyz");
-        let err = unpack_pseudonym("derive_rotatable_pseudonym", &bytes)
-            .expect_err("non-numeric key_id is rejected");
-        match err {
-            PlatformError::CustodyError(msg) => {
-                assert_eq!(
-                    msg,
-                    "KeyCustodyProvider.derive_rotatable_pseudonym returned a non-numeric key_id: xyz"
-                );
-            }
-            other => panic!("expected CustodyError, got {other:?}"),
-        }
+    fn parse_pseudonym_rejects_non_numeric_key_id() {
+        let msg = custody_msg(
+            parse_pseudonym("derive_rotatable_pseudonym", &REFERENCE_POINT, "xyz")
+                .expect_err("non-numeric key_id is rejected"),
+        );
+        assert_eq!(
+            msg,
+            "KeyCustodyProvider.derive_rotatable_pseudonym returned a non-numeric key_id: xyz"
+        );
     }
 }

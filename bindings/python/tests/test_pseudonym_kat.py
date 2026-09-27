@@ -3,16 +3,16 @@
 Spec §9.10.4.A (algorithm) and §25.19 vectors 30 & 31 (pinned outputs).
 
 Software-custody pseudonym derivation is cross-platform deterministic: every
-SDK (Rust, Swift, Kotlin, TypeScript, Python) MUST reproduce the exact
-public-key bytes the spec pins for a given identity seed, ``context_id``, and
-epoch. This test exercises the pure-Python canonical recipe in
-:mod:`tests.pseudonym_recipe` and asserts the resulting bytes equal the spec
-literals — both the static (v1) and rotatable (v2, epoch 1) keys, plus a
-v1-vs-v2 distinctness check.
+SDK (Rust, Swift, Kotlin, TypeScript, Python) MUST reproduce the exact bytes
+the spec pins for a given identity key, ``context_id``, and epoch. This test
+runs the pure-Python canonical recipe in :mod:`tests.pseudonym_recipe` and
+asserts every intermediate and output equals the spec literal: the identity
+scalar, ``pseudonym_secret``, both context seeds, both 33-byte compressed P-256
+public keys, and both routing ids.
 
-The recipe is stdlib-only (HKDF/HMAC via :mod:`hashlib`/:mod:`hmac`, Ed25519 via
-a compact RFC 8032 implementation), so this KAT runs under plain ``pytest`` with
-no native extension built.
+The recipe is stdlib-only (HKDF/HMAC via :mod:`hashlib`/:mod:`hmac`, P-256 via a
+compact affine implementation), so this KAT runs under plain ``pytest`` with no
+native extension built.
 """
 
 from __future__ import annotations
@@ -21,58 +21,91 @@ import pytest
 
 from .pseudonym_recipe import (
     canonical_pseudonym_public_key,
+    canonical_pseudonym_seed,
     canonical_rotatable_pseudonym_public_key,
+    canonical_rotatable_pseudonym_seed,
+    p256_sign_prehash,
+    pseudonym_routing_id,
+    pseudonym_scalar,
+    pseudonym_secret,
+    seed_to_scalar,
 )
 
 # §25.19 context_id, shared by both vectors.
 CONTEXT_ALPHA = b"context-alpha"
 
-# §25.19 vectors. Seeds and expected public keys taken verbatim from the spec.
-# Each entry: (name, ed25519_seed, v1_pubkey_hex, v2_epoch1_pubkey_hex).
+# §25.2 label that maps a vector's identity seed to its identity scalar.
+IDENTITY_LABEL = b"SCP-TEST-VECTOR-KEY-V1"
+
+# §25.19 vectors, every value copied verbatim from the spec.
 VECTORS = [
-    (
-        "Vector 30 (seed 0x01 x 32)",
-        bytes([0x01] * 32),
-        "fddc04882a48aa39888f6dbec622f9c5aa6f06b2e40820a69a2e0e89b5f09ac2",
-        "43e50a947c4b2be44f871e309c7edc64afaf4207b9a589c9b01f61c01158090f",
-    ),
-    (
-        "Vector 31 (seed 0x9d,0x01..0x1f)",
-        bytes([0x9D]) + bytes(range(0x01, 0x20)),
-        "ff6e2e909a008318f97bb2c26c1d787ceb9aa2996f746766335e10ba7e2213cc",
-        "edd47319719e2350d1db9488e0189f2405267d7dc243489cfd9aa6f3ac3fc639",
-    ),
+    {
+        "name": "Vector 30 (seed 0x01 x 32)",
+        "seed": bytes([0x01] * 32),
+        "scalar": "32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64",
+        "secret": "b88e781bb954a6681abc9016f8f69939f0e624311aeaa7e8f1b145857f58de82",
+        "seed_v1": "47ea801c24e8a4d577f04837eca0674fbbf160127fa2d1a4bb1420150b0a048b",
+        "v1": "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72",
+        "rid_v1": "b7faa05dea2cef1b7aff6a48fa5b7b9ffe217b25f3152d78d597bb9078e98307",
+        "seed_v2": "6ab63aa150992ff032f6963c31dc9f5a8bd4e9518516f9fbd3bea7bc07f64b38",
+        "v2": "0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479",
+        "rid_v2": "b19754a5e88c993683f99e48646ba518cba80dec0693f920c5671263650b6ae9",
+    },
+    {
+        "name": "Vector 31 (seed 0x9d,0x01..0x1f)",
+        "seed": bytes([0x9D]) + bytes(range(0x01, 0x20)),
+        "scalar": "65d56a863d03d31ea15ade82f677058d5bbe53afedc6ff7d2b8846aa25a1bc2b",
+        "secret": "17ef25ad3e5be8adad38c4c5a1c68d3daca80015e81bdcae2ae8940645774739",
+        "seed_v1": "5157d14a2362044199ba88d66d6a52a4bfbe0598ebe921c5fb9c362d3bebaedd",
+        "v1": "0239f7c3213f3567183fd2fcf7aec6c884bc70e0e694c42053284a4b5ebef4fe2d",
+        "rid_v1": "cab5ff45d21b6d0425fa7657e89fc68514965cbb4ca2b9549f4ccf430d581e7c",
+        "seed_v2": "8133a9d716dcbe729b1f447ac0efccf3795e8bf28da2db4744090d0316ead730",
+        "v2": "037967cfe8d3111cdd72288ea3f444c15b710300323162fec63ca9036af73754e3",
+        "rid_v2": "3c0ac4dec86c0dafe38195a7b66cdfec6b0ae0d44834c6e8b6b6129e097b5e27",
+    },
 ]
 
-
-@pytest.mark.parametrize(("name", "seed", "v1_hex", "v2_hex"), VECTORS)
-def test_v1_static_pseudonym_matches_spec(name: str, seed: bytes, v1_hex: str, v2_hex: str) -> None:
-    """The v1 (static) pseudonym public key matches the §25.19 literal."""
-    public_key = canonical_pseudonym_public_key(seed, CONTEXT_ALPHA)
-    assert public_key.hex() == v1_hex, name
+IDS = [v["name"] for v in VECTORS]
 
 
-@pytest.mark.parametrize(("name", "seed", "v1_hex", "v2_hex"), VECTORS)
-def test_v2_rotatable_pseudonym_matches_spec(
-    name: str, seed: bytes, v1_hex: str, v2_hex: str
-) -> None:
-    """The v2 (rotatable, epoch 1) pseudonym public key matches §25.19."""
-    public_key = canonical_rotatable_pseudonym_public_key(seed, CONTEXT_ALPHA, 1)
-    assert public_key.hex() == v2_hex, name
+def _ikm(vector: dict) -> bytes:
+    return seed_to_scalar(IDENTITY_LABEL, vector["seed"]).to_bytes(32, "big")
 
 
-@pytest.mark.parametrize(("name", "seed", "v1_hex", "v2_hex"), VECTORS)
-def test_v1_and_v2_derive_distinct_keys(name: str, seed: bytes, v1_hex: str, v2_hex: str) -> None:
-    """The v1 and v2 derivations yield distinct keys (domain separation)."""
-    v1 = canonical_pseudonym_public_key(seed, CONTEXT_ALPHA)
-    v2 = canonical_rotatable_pseudonym_public_key(seed, CONTEXT_ALPHA, 1)
-    assert v1 != v2, name
+@pytest.mark.parametrize("vector", VECTORS, ids=IDS)
+def test_identity_scalar_and_secret_match_spec(vector: dict) -> None:
+    """The §25.2 identity scalar and the pseudonym_secret match §25.19."""
+    ikm = _ikm(vector)
+    assert ikm.hex() == vector["scalar"]
+    assert pseudonym_secret(ikm).hex() == vector["secret"]
 
 
-def test_both_spec_vectors_present_and_well_formed() -> None:
-    """Both §25.19 vectors are present and produce 32-byte public keys."""
-    assert len(VECTORS) == 2
-    for _name, seed, _v1, _v2 in VECTORS:
-        assert len(seed) == 32
-        assert len(canonical_pseudonym_public_key(seed, CONTEXT_ALPHA)) == 32
-        assert len(canonical_rotatable_pseudonym_public_key(seed, CONTEXT_ALPHA, 1)) == 32
+@pytest.mark.parametrize("vector", VECTORS, ids=IDS)
+def test_v1_static_pseudonym_matches_spec(vector: dict) -> None:
+    """The v1 context seed, public key, and routing id match §25.19."""
+    ikm = _ikm(vector)
+    assert canonical_pseudonym_seed(ikm, CONTEXT_ALPHA).hex() == vector["seed_v1"]
+    public_key = canonical_pseudonym_public_key(ikm, CONTEXT_ALPHA)
+    assert public_key.hex() == vector["v1"]
+    assert pseudonym_routing_id(public_key).hex() == vector["rid_v1"]
+
+
+@pytest.mark.parametrize("vector", VECTORS, ids=IDS)
+def test_v2_rotatable_pseudonym_matches_spec(vector: dict) -> None:
+    """The v2 (epoch 1) context seed, public key, and routing id match §25.19."""
+    ikm = _ikm(vector)
+    assert canonical_rotatable_pseudonym_seed(ikm, CONTEXT_ALPHA, 1).hex() == vector["seed_v2"]
+    public_key = canonical_rotatable_pseudonym_public_key(ikm, CONTEXT_ALPHA, 1)
+    assert public_key.hex() == vector["v2"]
+    assert pseudonym_routing_id(public_key).hex() == vector["rid_v2"]
+
+
+def test_prehash_signature_is_low_s_and_64_bytes() -> None:
+    """The fixture signer emits the §9.5.1 64-byte low-s form."""
+    n = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+    ikm = _ikm(VECTORS[0])
+    d = pseudonym_scalar(canonical_pseudonym_seed(ikm, CONTEXT_ALPHA))
+    for i in range(16):
+        sig = p256_sign_prehash(d, bytes([i]) * 32)
+        assert len(sig) == 64
+        assert int.from_bytes(sig[32:], "big") <= (n - 1) // 2

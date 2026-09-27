@@ -15,7 +15,8 @@
 // The HMAC key is a private-derived `pseudonym_secret`, NEVER the public key
 // (public-key keying would be a membership-enumeration oracle). For software
 // custody, `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
-// salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic; for
+// salt="scp-pseudonym-secret-v1")` until slice S12, which is cross-platform
+// deterministic; for
 // hardware custody (Secure Enclave) it is a device-local secret and the
 // pseudonym is device-local by design. The earlier ADR-027 amendment proposing
 // public-key keying was rejected.
@@ -23,6 +24,8 @@
 // v1 (static):   seed = HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")
 // v2 (rotatable): seed = HMAC-SHA256(pseudonym_secret,
 //                          contextId || BE64(epoch) || "scp-pseudonym-v2")
+// d = HKDF-Expand-SHA256(seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n - 1) + 1;
+// the pseudonym public key is the 33-byte compressed P-256 point d * G.
 //
 // See spec §9.10.4.A, §9.10.4.1, §25.19, ADR-025 (Apple Platform Adapter), and
 // ADR-006 (KeyCustody trait).
@@ -252,8 +255,8 @@
 
             // Cleanup
             try await custody.destroyKey(handle)
-            try await custody.destroyKey(first.handle)
-            // second.handle is deterministic and equals first.handle, so already destroyed
+            try await custody.destroyKey(first.keyId)
+            // second.keyId is deterministic and equals first.keyId, so already destroyed
         }
 
         @Test("derivePseudonym produces different keys for different contexts")
@@ -270,8 +273,8 @@
 
             // Cleanup
             try await custody.destroyKey(handle)
-            try await custody.destroyKey(pseudoA.handle)
-            try await custody.destroyKey(pseudoB.handle)
+            try await custody.destroyKey(pseudoA.keyId)
+            try await custody.destroyKey(pseudoB.keyId)
         }
 
         @Test("derivePseudonym with X25519 key throws wrongKeyType")
@@ -284,24 +287,43 @@
             try await custody.destroyKey(handle)
         }
 
-        @Test("derived pseudonym handle can sign and verify")
+        @Test("derived pseudonym handle signs a digest with low-s P-256 ECDSA")
         func derivedPseudonymCanSign() async throws {
             let identityHandle = try await custody.generateKeypair(keyType: "ed25519")
             let pseudonym = try await custody.derivePseudonym(
                 identityHandle, contextId: Data("context-1".utf8)
             )
+            #expect(pseudonym.publicKey.count == 33)
+            #expect(try await custody.publicKey(pseudonym.keyId) == pseudonym.publicKey)
 
-            let message = Data("pseudonym signed message".utf8)
-            let signature = try await custody.sign(pseudonym.handle, data: message)
+            let publicKey = try P256.Signing.PublicKey(compressedRepresentation: pseudonym.publicKey)
+            // (n - 1) / 2, the largest low-s value (§9.5.1).
+            let halfOrderHex = Array("7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a8")
+            let halfOrder = Data(stride(from: 0, to: 64, by: 2).compactMap {
+                UInt8(String(halfOrderHex[$0 ..< $0 + 2]), radix: 16)
+            })
+            #expect(halfOrder.count == 32)
+            for index in 0 ..< 16 {
+                let digest = SHA256.hash(data: Data("pseudonym message \(index)".utf8))
+                let signature = try await custody.sign(pseudonym.keyId, data: Data(digest))
+                #expect(signature.count == 64)
+                let ecdsa = try P256.Signing.ECDSASignature(rawRepresentation: signature)
+                #expect(publicKey.isValidSignature(ecdsa, for: digest), "signature must verify")
+                #expect(
+                    signature.suffix(32).lexicographicallyPrecedes(halfOrder)
+                        || signature.suffix(32) == halfOrder,
+                    "s must be in the low half"
+                )
+            }
 
-            // Verify
-            let publicKey = try Curve25519.Signing.PublicKey(rawRepresentation: pseudonym.publicKey)
-            let isValid = publicKey.isValidSignature(signature, for: message)
-            #expect(isValid, "pseudonym signature must verify against pseudonym public key")
+            // A pseudonym key signs only a 32-byte digest.
+            await #expect(throws: PlatformError.self) {
+                _ = try await custody.sign(pseudonym.keyId, data: Data("12 bytes....".utf8))
+            }
 
             // Cleanup
             try await custody.destroyKey(identityHandle)
-            try await custody.destroyKey(pseudonym.handle)
+            try await custody.destroyKey(pseudonym.keyId)
         }
 
         // MARK: - custodyType
@@ -363,8 +385,8 @@
 
             // Cleanup
             try await custody.destroyKey(handle)
-            try await custody.destroyKey(first.handle)
-            // second.handle is deterministic and equals first.handle, so already destroyed
+            try await custody.destroyKey(first.keyId)
+            // second.keyId is deterministic and equals first.keyId, so already destroyed
         }
 
         @Test("deriveRotatablePseudonym produces different keys for different epochs")
@@ -384,14 +406,14 @@
                 "different epochs must produce different pseudonyms"
             )
             #expect(
-                epoch1.handle != epoch2.handle,
+                epoch1.keyId != epoch2.keyId,
                 "different epochs must occupy distinct Keychain handle slots"
             )
 
             // Cleanup
             try await custody.destroyKey(handle)
-            try await custody.destroyKey(epoch1.handle)
-            try await custody.destroyKey(epoch2.handle)
+            try await custody.destroyKey(epoch1.keyId)
+            try await custody.destroyKey(epoch2.keyId)
         }
 
         @Test("deriveRotatablePseudonym with X25519 key throws wrongKeyType")
@@ -405,6 +427,33 @@
             // Cleanup
             try await custody.destroyKey(handle)
         }
+
+        /// One §25.19 pseudonym vector: identity seed, identity scalar (the ikm),
+        /// and the v1 and v2 (epoch 1) points over "context-alpha".
+        struct PseudonymVector {
+            let seed: Data
+            let scalar: String
+            let staticPoint: String
+            let rotatedPoint: String
+        }
+
+        /// §25.19 vectors 30 and 31. The identity seed maps to the ikm scalar via
+        /// the §25.2 label "SCP-TEST-VECTOR-KEY-V1"; every hex value is copied
+        /// verbatim from the spec.
+        static let pseudonymVectors: [PseudonymVector] = [
+            PseudonymVector(
+                seed: Data(repeating: 0x01, count: 32),
+                scalar: "32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64",
+                staticPoint: "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72",
+                rotatedPoint: "0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479"
+            ),
+            PseudonymVector(
+                seed: Data([0x9D] + [UInt8](1 ... 31)),
+                scalar: "65d56a863d03d31ea15ade82f677058d5bbe53afedc6ff7d2b8846aa25a1bc2b",
+                staticPoint: "0239f7c3213f3567183fd2fcf7aec6c884bc70e0e694c42053284a4b5ebef4fe2d",
+                rotatedPoint: "037967cfe8d3111cdd72288ea3f444c15b710300323162fec63ca9036af73754e3"
+            )
+        ]
 
         /// Cross-platform known-answer test (KAT) for pseudonym derivation.
         ///
@@ -424,39 +473,22 @@
         func pseudonymKnownAnswerVectors() async throws {
             let contextId = Data("context-alpha".utf8)
 
-            // §25.19 V30: identity seed = 0x01 repeated 32 times.
-            let seedV30 = Data(repeating: 0x01, count: 32)
-            let v1ExpectedV30 = try hexToData(
-                "fddc04882a48aa39888f6dbec622f9c5aa6f06b2e40820a69a2e0e89b5f09ac2"
-            )
-            let v2ExpectedV30 = try hexToData(
-                "43e50a947c4b2be44f871e309c7edc64afaf4207b9a589c9b01f61c01158090f"
-            )
+            for vector in Self.pseudonymVectors {
+                let ikm = try hexToData(vector.scalar)
+                let v1Expected = try hexToData(vector.staticPoint)
+                let v2Expected = try hexToData(vector.rotatedPoint)
+                #expect(
+                    P256Pseudonym.seedToScalar(label: "SCP-TEST-VECTOR-KEY-V1", seed: vector.seed)
+                        == ikm,
+                    "seed-to-scalar must reproduce the §25.19 identity scalar"
+                )
 
-            // §25.19 V31: identity seed = 0x9D, then 0x01, 0x02, ..., 0x1F.
-            var seedV31 = Data([0x9D])
-            seedV31.append(contentsOf: [UInt8](1 ... 31))
-            let v1ExpectedV31 = try hexToData(
-                "ff6e2e909a008318f97bb2c26c1d787ceb9aa2996f746766335e10ba7e2213cc"
-            )
-            let v2ExpectedV31 = try hexToData(
-                "edd47319719e2350d1db9488e0189f2405267d7dc243489cfd9aa6f3ac3fc639"
-            )
-
-            for (seedBytes, v1Expected, v2Expected) in [
-                (seedV30, v1ExpectedV30, v2ExpectedV30),
-                (seedV31, v1ExpectedV31, v2ExpectedV31)
-            ] {
-                #expect(seedBytes.count == 32, "identity seed must be 32 bytes")
-
-                // Derive the public key from the seed for metadata caching.
-                let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: seedBytes)
-                let publicKeyBytes = signingKey.publicKey.rawRepresentation
-
-                // Store the known seed as an Ed25519 identity key in Keychain.
+                // Store the ikm as the Ed25519 identity seed the derivation reads.
+                let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: ikm)
                 let handle = UUID().uuidString
                 try custody.storePrivateKeyBytes(
-                    seedBytes, for: handle, keyType: .ed25519, publicKeyBytes: publicKeyBytes
+                    ikm, for: handle, keyType: .ed25519,
+                    publicKeyBytes: signingKey.publicKey.rawRepresentation
                 )
 
                 // v1 (static) pseudonym.
@@ -483,8 +515,8 @@
 
                 // Cleanup
                 try await custody.destroyKey(handle)
-                try await custody.destroyKey(staticPseudonym.handle)
-                try await custody.destroyKey(rotatablePseudonym.handle)
+                try await custody.destroyKey(staticPseudonym.keyId)
+                try await custody.destroyKey(rotatablePseudonym.keyId)
             }
         }
 

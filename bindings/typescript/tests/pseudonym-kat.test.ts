@@ -1,220 +1,117 @@
 /**
- * Byte-level Known-Answer Test (KAT) for cross-platform per-context pseudonym
- * derivation (spec §9.10.4.A, §25.19 vectors 30 & 31).
+ * Byte-level Known-Answer Test (KAT) for per-context pseudonym derivation
+ * (spec §9.10.4.A, §25.19 vectors 30 & 31).
  *
- * Software-custody pseudonym derivation is cross-platform deterministic: every
- * SDK (Rust, Swift, Kotlin, TypeScript) MUST reproduce the exact public-key
- * bytes the spec pins for a given identity seed, `context_id`, and epoch
- * (§25.19). This test re-implements the canonical recipe in pure JS using
- * `node:crypto` and asserts the resulting bytes equal the spec literals — both
- * the static (v1) and rotatable (v2, epoch 1) keys.
+ * Every SDK MUST reproduce the bytes §25.19 pins. This test runs the shared
+ * TypeScript recipe in `./pseudonym-recipe` and asserts every intermediate and
+ * output equals the spec literal: the identity scalar, `pseudonym_secret`, both
+ * context seeds, both 33-byte compressed P-256 public keys, and both routing
+ * ids. The §25.19 vectors map the identity seed to a scalar with the §25.2
+ * label `"SCP-TEST-VECTOR-KEY-V1"`; that 32-byte scalar is the ikm.
  *
- * Canonical recipe (spec §25.19, matching `crates/scp-crypto/src/pseudonym.rs`):
- *   pseudonym_secret  = HKDF-SHA256(ikm = ed25519_seed, salt = "scp-pseudonym-secret-v1",
- *                                   info = "", len = 32)
- *   context_seed_v1   = HMAC-SHA256(secret, context_id || "scp-pseudonym")
- *   context_seed_v2   = HMAC-SHA256(secret, context_id || BE64(epoch) || "scp-pseudonym-v2")
- *   pseudonym_pub_key = Ed25519_keygen(context_seed[0..32]).public_key
- *
- * Pure JS — no native NAPI addon required — so it runs under plain `bun test`.
- * The fixture is the same `KeyCustodyProvider` shape the bridge drives, proving
- * the TS SDK's documented custody contract derives the canonical bytes.
+ * Pure JS (`node:crypto` plus BigInt), so it runs under plain `bun test`.
  */
 
 import { describe, expect, test } from "bun:test";
-import * as crypto from "node:crypto";
 
-import type { KeyCustodyProvider } from "../src/scp";
+import {
+  bigIntTo32,
+  bytesToBigInt,
+  P256_N,
+  p256Compressed,
+  p256SignPrehash,
+  pseudonymRoutingId,
+  pseudonymScalar,
+  pseudonymSecret,
+  pseudonymSeedV1,
+  pseudonymSeedV2,
+  seedToScalar,
+} from "./pseudonym-recipe";
 
-// 16-byte Ed25519 PKCS8 DER prefix; prepended to a 32-byte seed yields a valid
-// PKCS8 encoding that `crypto.createPrivateKey` accepts (the OKP JWK import path
-// would additionally require the public `x`, which we do not have yet).
-const ED25519_PKCS8_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
-
-const PSEUDONYM_SECRET_SALT = "scp-pseudonym-secret-v1";
-const PSEUDONYM_V1_INFO = "scp-pseudonym";
-const PSEUDONYM_V2_INFO = "scp-pseudonym-v2";
-
-/**
- * Canonical software-custody fixture implementing {@link KeyCustodyProvider}.
- *
- * Keys are seeded deterministically via {@link storeSeed} so the KAT can pin a
- * known identity seed (§25.19 vectors) rather than a random one.
- */
-class CanonicalKeychain implements KeyCustodyProvider {
-  #seeds = new Map<string, Uint8Array>();
-  #next = 1;
-
-  /** Register a known 32-byte Ed25519 seed and return its opaque id. */
-  storeSeed(seed: Uint8Array): string {
-    const kid = String(this.#next++);
-    this.#seeds.set(kid, new Uint8Array(seed));
-    return kid;
-  }
-
-  generateKeypair(_keyType: string): string {
-    const { privateKey } = crypto.generateKeyPairSync("ed25519");
-    const jwk = privateKey.export({ format: "jwk" }) as { d: string };
-    return this.storeSeed(new Uint8Array(Buffer.from(jwk.d, "base64url")));
-  }
-
-  #keyObjectFromSeed(seed: Uint8Array): crypto.KeyObject {
-    const der = Buffer.concat([ED25519_PKCS8_PREFIX, Buffer.from(seed)]);
-    return crypto.createPrivateKey({ key: der, format: "der", type: "pkcs8" });
-  }
-
-  #publicKeyFromSeed(seed: Uint8Array): Buffer {
-    const jwk = crypto.createPublicKey(this.#keyObjectFromSeed(seed)).export({ format: "jwk" }) as {
-      x: string;
-    };
-    return Buffer.from(jwk.x, "base64url");
-  }
-
-  sign(keyId: string, message: Uint8Array): Uint8Array {
-    return new Uint8Array(crypto.sign(null, Buffer.from(message), this.#keyObject(keyId)));
-  }
-
-  #keyObject(keyId: string): crypto.KeyObject {
-    const seed = this.#seeds.get(keyId);
-    if (seed === undefined) throw new Error(`unknown key id: ${keyId}`);
-    return this.#keyObjectFromSeed(seed);
-  }
-
-  getPublicKey(keyId: string): Uint8Array {
-    const seed = this.#seeds.get(keyId);
-    if (seed === undefined) throw new Error(`unknown key id: ${keyId}`);
-    return new Uint8Array(this.#publicKeyFromSeed(seed));
-  }
-
-  destroyKey(keyId: string): void {
-    this.#seeds.delete(keyId);
-  }
-
-  dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array {
-    // Not exercised by the KAT; a deterministic stand-in keeps the surface
-    // complete (pseudonym derivation does not depend on it).
-    const seed = this.#seeds.get(keyId) ?? new Uint8Array(32);
-    return new Uint8Array(
-      crypto
-        .createHash("sha256")
-        .update(Buffer.from(seed))
-        .update(Buffer.from(peerPublic))
-        .digest(),
-    );
-  }
-
-  #pseudonymSecret(keyId: string): Buffer {
-    const seed = this.#seeds.get(keyId);
-    if (seed === undefined) throw new Error(`unknown key id: ${keyId}`);
-    return Buffer.from(
-      crypto.hkdfSync(
-        "sha256",
-        Buffer.from(seed),
-        Buffer.from(PSEUDONYM_SECRET_SALT),
-        Buffer.alloc(0),
-        32,
-      ),
-    );
-  }
-
-  #registerContextSeed(contextSeed: Buffer): Uint8Array {
-    const pub = this.#publicKeyFromSeed(contextSeed);
-    const kid = String(this.#next++);
-    this.#seeds.set(kid, new Uint8Array(contextSeed));
-    return new Uint8Array(Buffer.concat([pub, Buffer.from(kid, "utf-8")]));
-  }
-
-  derivePseudonym(keyId: string, contextId: Uint8Array): Uint8Array {
-    const data = Buffer.concat([Buffer.from(contextId), Buffer.from(PSEUDONYM_V1_INFO)]);
-    const contextSeed = crypto
-      .createHmac("sha256", this.#pseudonymSecret(keyId))
-      .update(data)
-      .digest();
-    return this.#registerContextSeed(contextSeed);
-  }
-
-  deriveRotatablePseudonym(
-    keyId: string,
-    contextId: Uint8Array,
-    pseudonymEpoch: bigint,
-  ): Uint8Array {
-    const be = Buffer.alloc(8);
-    be.writeBigUInt64BE(pseudonymEpoch);
-    const data = Buffer.concat([Buffer.from(contextId), be, Buffer.from(PSEUDONYM_V2_INFO)]);
-    const contextSeed = crypto
-      .createHmac("sha256", this.#pseudonymSecret(keyId))
-      .update(data)
-      .digest();
-    return this.#registerContextSeed(contextSeed);
-  }
-
-  exportSigningKeyBytes(keyId: string): Uint8Array {
-    const seed = this.#seeds.get(keyId);
-    if (seed === undefined) throw new Error(`unknown key id: ${keyId}`);
-    return new Uint8Array(seed);
-  }
-
-  custodyType(_keyId: string): string {
-    return "software";
-  }
-}
-
-// Extract the 32-byte public key from the `publicKey(32) || keyIdUtf8` blob the
-// provider returns.
-function pseudonymPublicKeyHex(blob: Uint8Array): string {
-  return Buffer.from(blob.subarray(0, 32)).toString("hex");
-}
-
-// §25.19 context_id, shared by both vectors.
 const CONTEXT_ALPHA = new Uint8Array(Buffer.from("context-alpha", "utf-8"));
+const IDENTITY_LABEL = "SCP-TEST-VECTOR-KEY-V1";
 
-// §25.19 vectors. Seeds and expected public keys taken verbatim from the spec.
 interface Kat {
   name: string;
   seed: Uint8Array;
+  scalar: string;
+  secret: string;
+  seedV1: string;
   v1: string;
-  v2Epoch1: string;
+  ridV1: string;
+  seedV2: string;
+  v2: string;
+  ridV2: string;
 }
 
+// §25.19 vectors, every value copied verbatim from the spec.
 const VECTORS: readonly Kat[] = [
   {
     name: "Vector 30 (seed 0x01 x 32)",
     seed: new Uint8Array(Buffer.alloc(32, 0x01)),
-    v1: "fddc04882a48aa39888f6dbec622f9c5aa6f06b2e40820a69a2e0e89b5f09ac2",
-    v2Epoch1: "43e50a947c4b2be44f871e309c7edc64afaf4207b9a589c9b01f61c01158090f",
+    scalar: "32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64",
+    secret: "b88e781bb954a6681abc9016f8f69939f0e624311aeaa7e8f1b145857f58de82",
+    seedV1: "47ea801c24e8a4d577f04837eca0674fbbf160127fa2d1a4bb1420150b0a048b",
+    v1: "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72",
+    ridV1: "b7faa05dea2cef1b7aff6a48fa5b7b9ffe217b25f3152d78d597bb9078e98307",
+    seedV2: "6ab63aa150992ff032f6963c31dc9f5a8bd4e9518516f9fbd3bea7bc07f64b38",
+    v2: "0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479",
+    ridV2: "b19754a5e88c993683f99e48646ba518cba80dec0693f920c5671263650b6ae9",
   },
   {
     name: "Vector 31 (seed 0x9d,0x01..0x1f)",
     seed: new Uint8Array(
       Buffer.from("9d0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "hex"),
     ),
-    v1: "ff6e2e909a008318f97bb2c26c1d787ceb9aa2996f746766335e10ba7e2213cc",
-    v2Epoch1: "edd47319719e2350d1db9488e0189f2405267d7dc243489cfd9aa6f3ac3fc639",
+    scalar: "65d56a863d03d31ea15ade82f677058d5bbe53afedc6ff7d2b8846aa25a1bc2b",
+    secret: "17ef25ad3e5be8adad38c4c5a1c68d3daca80015e81bdcae2ae8940645774739",
+    seedV1: "5157d14a2362044199ba88d66d6a52a4bfbe0598ebe921c5fb9c362d3bebaedd",
+    v1: "0239f7c3213f3567183fd2fcf7aec6c884bc70e0e694c42053284a4b5ebef4fe2d",
+    ridV1: "cab5ff45d21b6d0425fa7657e89fc68514965cbb4ca2b9549f4ccf430d581e7c",
+    seedV2: "8133a9d716dcbe729b1f447ac0efccf3795e8bf28da2db4744090d0316ead730",
+    v2: "037967cfe8d3111cdd72288ea3f444c15b710300323162fec63ca9036af73754e3",
+    ridV2: "3c0ac4dec86c0dafe38195a7b66cdfec6b0ae0d44834c6e8b6b6129e097b5e27",
   },
 ] as const;
 
+const hex = (b: Uint8Array): string => Buffer.from(b).toString("hex");
+const ikmOf = (vec: Kat): Uint8Array => bigIntTo32(seedToScalar(IDENTITY_LABEL, vec.seed));
+
 describe("per-context pseudonym derivation KAT (§25.19)", () => {
   for (const vec of VECTORS) {
-    test(`${vec.name}: v1 static pseudonym matches spec bytes`, () => {
-      const kc = new CanonicalKeychain();
-      const keyId = kc.storeSeed(vec.seed);
-      const blob = kc.derivePseudonym(keyId, CONTEXT_ALPHA);
-      expect(pseudonymPublicKeyHex(blob)).toBe(vec.v1);
+    test(`${vec.name}: identity scalar and pseudonym_secret match spec`, () => {
+      const ikm = ikmOf(vec);
+      expect(hex(ikm)).toBe(vec.scalar);
+      expect(hex(pseudonymSecret(ikm))).toBe(vec.secret);
     });
 
-    test(`${vec.name}: v2 rotatable pseudonym (epoch 1) matches spec bytes`, () => {
-      const kc = new CanonicalKeychain();
-      const keyId = kc.storeSeed(vec.seed);
-      const blob = kc.deriveRotatablePseudonym(keyId, CONTEXT_ALPHA, 1n);
-      expect(pseudonymPublicKeyHex(blob)).toBe(vec.v2Epoch1);
+    test(`${vec.name}: v1 seed, point and routing id match spec`, () => {
+      const ikm = ikmOf(vec);
+      const seed = pseudonymSeedV1(ikm, CONTEXT_ALPHA);
+      expect(hex(seed)).toBe(vec.seedV1);
+      const point = p256Compressed(pseudonymScalar(seed));
+      expect(hex(point)).toBe(vec.v1);
+      expect(hex(pseudonymRoutingId(point))).toBe(vec.ridV1);
     });
 
-    test(`${vec.name}: v1 and v2 derive distinct keys`, () => {
-      const kc = new CanonicalKeychain();
-      const keyId = kc.storeSeed(vec.seed);
-      const v1 = pseudonymPublicKeyHex(kc.derivePseudonym(keyId, CONTEXT_ALPHA));
-      const v2 = pseudonymPublicKeyHex(kc.deriveRotatablePseudonym(keyId, CONTEXT_ALPHA, 1n));
-      expect(v1).not.toBe(v2);
+    test(`${vec.name}: v2 (epoch 1) seed, point and routing id match spec`, () => {
+      const ikm = ikmOf(vec);
+      const seed = pseudonymSeedV2(ikm, CONTEXT_ALPHA, 1n);
+      expect(hex(seed)).toBe(vec.seedV2);
+      const point = p256Compressed(pseudonymScalar(seed));
+      expect(hex(point)).toBe(vec.v2);
+      expect(hex(pseudonymRoutingId(point))).toBe(vec.ridV2);
     });
   }
+
+  test("the fixture signer emits the §9.5.1 64-byte low-s form", () => {
+    const [v30] = VECTORS;
+    if (v30 === undefined) throw new Error("no vectors");
+    const d = pseudonymScalar(pseudonymSeedV1(ikmOf(v30), CONTEXT_ALPHA));
+    for (let i = 0; i < 16; i++) {
+      const sig = p256SignPrehash(d, new Uint8Array(32).fill(i));
+      expect(sig.length).toBe(64);
+      expect(bytesToBigInt(sig.subarray(32)) <= (P256_N - 1n) / 2n).toBe(true);
+    }
+  });
 });

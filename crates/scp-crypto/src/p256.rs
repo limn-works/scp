@@ -551,6 +551,57 @@ mod tests {
         out
     }
 
+    /// `(n − 1)/2`, the largest `s` §9.5 admits.
+    const HALF_N_HEX: &str = "7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a8";
+    /// `(n + 1)/2`, the smallest high `s`.
+    const HALF_N_PLUS_ONE_HEX: &str =
+        "7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a9";
+
+    /// Builds a key and a VALID signature over `digest` whose `s` is exactly
+    /// `s_hex`: with nonce `k = 1`, `R = G` and `r = G.x mod n`, so choosing
+    /// `d = (s − z) / r` makes `s = k⁻¹(z + r·d)` hold.
+    fn key_with_signature_s(digest: &[u8; 32], s_hex: &str) -> (P256PublicKey, [u8; 64]) {
+        use p256::elliptic_curve::PrimeField;
+        use p256::elliptic_curve::ops::Reduce;
+        use p256::elliptic_curve::point::AffineCoordinates;
+        use p256::{AffinePoint, FieldBytes, Scalar, U256};
+
+        let s_bytes: [u8; 32] = h(s_hex);
+        let s = Option::<Scalar>::from(Scalar::from_repr(FieldBytes::from(s_bytes))).unwrap();
+        let z = <Scalar as Reduce<U256>>::reduce_bytes(&FieldBytes::from(*digest));
+        let r = <Scalar as Reduce<U256>>::reduce_bytes(&AffinePoint::GENERATOR.x());
+        let d = (s - z) * Option::<Scalar>::from(r.invert()).unwrap();
+        let key = P256SigningKey::from_scalar_bytes(&d.to_repr().into()).unwrap();
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(&r.to_repr());
+        sig[32..].copy_from_slice(&s_bytes);
+        (key.public_key(), sig)
+    }
+
+    /// The §9.5 boundary: `s = (n − 1)/2` is low and passes strict
+    /// verification; `s = (n + 1)/2` is high, so strict returns `HighS` while
+    /// lenient accepts the same valid signature.
+    #[test]
+    fn strict_low_s_boundary_is_exact() {
+        let digest: [u8; 32] = Sha256::digest(b"low-s boundary").into();
+
+        let (pk, sig) = key_with_signature_s(&digest, HALF_N_HEX);
+        verify_prehash_lenient(&pk, &digest, &sig).unwrap();
+        assert_eq!(verify_prehash_strict(&pk, &digest, &sig), Ok(()));
+        assert_eq!(normalize_low_s(&sig).unwrap(), sig);
+
+        let (pk, sig) = key_with_signature_s(&digest, HALF_N_PLUS_ONE_HEX);
+        verify_prehash_lenient(&pk, &digest, &sig).unwrap();
+        assert_eq!(
+            verify_prehash_strict(&pk, &digest, &sig),
+            Err(P256Error::HighS)
+        );
+        // n − (n+1)/2 = (n−1)/2.
+        let normalized = normalize_low_s(&sig).unwrap();
+        assert_eq!(normalized[32..], h::<32>(HALF_N_HEX));
+        assert_eq!(verify_prehash_strict(&pk, &digest, &normalized), Ok(()));
+    }
+
     /// RFC 6979 Appendix A.2.5, P-256 with SHA-256. SCP signs a 32-byte digest
     /// with `h1 = digest` (§25.1); with `digest = SHA-256(message)` that is
     /// exactly the RFC's computation, so the RFC's `r` must reproduce, and `s`

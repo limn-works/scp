@@ -25,10 +25,11 @@ import hashlib
 import pytest
 
 from .pseudonym_recipe import (
-    canonical_pseudonym_blob,
     canonical_pseudonym_seed,
-    canonical_rotatable_pseudonym_blob,
     canonical_rotatable_pseudonym_seed,
+    p256_compressed,
+    p256_sign_prehash,
+    pseudonym_scalar,
 )
 
 # ---------------------------------------------------------------------------
@@ -131,6 +132,8 @@ class _FakeKeychain:
 
     def __init__(self) -> None:
         self._seeds: dict[str, bytes] = {}
+        # Pseudonym key id -> P-256 private scalar (§9.10.4).
+        self._pseudonyms: dict[str, int] = {}
         self._next = 1
 
     def generate_keypair(self, key_type: str) -> str:
@@ -142,41 +145,45 @@ class _FakeKeychain:
         return kid
 
     def sign(self, key_id: str, message: bytes) -> bytes:
+        if key_id in self._pseudonyms:
+            # A pseudonym key signs a 32-byte digest: 64-byte low-s r || s.
+            return p256_sign_prehash(self._pseudonyms[key_id], bytes(message))
         return ed25519_sign(self._seeds[key_id], bytes(message))
 
     def get_public_key(self, key_id: str) -> bytes:
+        if key_id in self._pseudonyms:
+            return p256_compressed(self._pseudonyms[key_id])
         return ed25519_publickey(self._seeds[key_id])
 
     def destroy_key(self, key_id: str) -> None:
         self._seeds.pop(key_id, None)
+        self._pseudonyms.pop(key_id, None)
 
     def dh_agree(self, key_id: str, peer_public: bytes) -> bytes:
         # Not exercised by identity_create_with_custody; a deterministic
         # stand-in keeps the protocol surface complete.
         return hashlib.sha256(self._seeds[key_id] + bytes(peer_public)).digest()
 
-    def derive_pseudonym(self, key_id: str, context_id: bytes) -> bytes:
-        # Canonical v1 recipe (§9.10.4.A): HKDF-derived secret, then
-        # HMAC(context_id || "scp-pseudonym"). Register the derived signing
-        # key under a fresh id and return ``public_key (32) || key_id_utf8``.
-        seed = canonical_pseudonym_seed(self._seeds[key_id], context_id)
+    def _register_pseudonym(self, seed: bytes) -> tuple[bytes, str]:
+        d = pseudonym_scalar(seed)
         kid = str(self._next)
         self._next += 1
-        self._seeds[kid] = seed
-        return canonical_pseudonym_blob(self._seeds[key_id], context_id, kid)
+        self._pseudonyms[kid] = d
+        return p256_compressed(d), kid
+
+    def derive_pseudonym(self, key_id: str, context_id: bytes) -> tuple[bytes, str]:
+        # Canonical v1 recipe (§9.10.4.A) over the Ed25519 identity seed (the
+        # native interim ikm until S12). Registers the P-256 pseudonym key under
+        # a fresh id and returns ``(public_key (33), key_id)``.
+        return self._register_pseudonym(canonical_pseudonym_seed(self._seeds[key_id], context_id))
 
     def derive_rotatable_pseudonym(
         self, key_id: str, context_id: bytes, pseudonym_epoch: int
-    ) -> bytes:
+    ) -> tuple[bytes, str]:
         # Canonical v2 recipe (§9.10.4.A): HMAC(context_id || epoch_BE ||
-        # "scp-pseudonym-v2"). Same blob shape as the v1 path.
+        # "scp-pseudonym-v2"). Same return shape as the v1 path.
         seed = canonical_rotatable_pseudonym_seed(self._seeds[key_id], context_id, pseudonym_epoch)
-        kid = str(self._next)
-        self._next += 1
-        self._seeds[kid] = seed
-        return canonical_rotatable_pseudonym_blob(
-            self._seeds[key_id], context_id, pseudonym_epoch, kid
-        )
+        return self._register_pseudonym(seed)
 
     def export_signing_key_bytes(self, key_id: str) -> bytes:
         return self._seeds[key_id]

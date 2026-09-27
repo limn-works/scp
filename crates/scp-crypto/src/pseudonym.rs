@@ -26,7 +26,7 @@
 //! would be a membership enumeration oracle.
 
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -75,7 +75,8 @@ fn context_seed(
     context_id: &[u8],
     epoch: Option<u64>,
 ) -> Zeroizing<[u8; 32]> {
-    let mac_result = <Hmac<Sha256> as Mac>::new_from_slice(pseudonym_secret.as_slice());
+    // hmac 0.13 with `zeroize`: the keyed inner/outer SHA-256 states wipe on drop.
+    let mac_result = <Hmac<Sha256> as KeyInit>::new_from_slice(pseudonym_secret.as_slice());
     assert!(mac_result.is_ok(), "HMAC-SHA256 accepts keys of any length");
     let mut seed = Zeroizing::new([0u8; 32]);
     if let Ok(mut mac) = mac_result {
@@ -87,8 +88,7 @@ fn context_seed(
                 mac.update(PSEUDONYM_V2_DOMAIN);
             }
         }
-        // Copy out and wipe via `[u8]: Zeroize`, which holds whether or not
-        // `generic-array`'s `zeroize` feature is unified in.
+        // `CtOutput` zeroizes on drop; the extracted array is wiped explicitly.
         let mut hmac_bytes = mac.finalize().into_bytes();
         seed.copy_from_slice(&hmac_bytes[..32]);
         hmac_bytes.as_mut_slice().zeroize();
@@ -129,6 +129,20 @@ pub fn pseudonym_routing_id(context_pseudonym: &[u8; COMPRESSED_POINT_LEN]) -> [
 mod tests {
     use super::*;
 
+    /// Compile-time pin for review item "zeroize HMAC/HKDF state": the SHA-256
+    /// core that `Hmac<Sha256>` and `Hkdf<Sha256>` key with the pseudonym
+    /// secret or PRK, the block buffer, and the MAC output all wipe on drop.
+    /// Dropping the `zeroize` feature from sha2/hmac fails this to compile.
+    #[test]
+    fn secret_bearing_hash_state_zeroizes_on_drop() {
+        fn assert_zod<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zod::<Sha256>();
+        assert_zod::<
+            hmac::digest::block_api::Buffer<<Sha256 as hmac::digest::block_api::CoreProxy>::Core>,
+        >();
+        assert_zod::<hmac::digest::CtOutput<Hmac<Sha256>>>();
+    }
+
     fn h<const N: usize>(s: &str) -> [u8; N] {
         hex::decode(s).unwrap().try_into().unwrap()
     }
@@ -145,8 +159,10 @@ mod tests {
             secret: &'static str,
             seed_v1: &'static str,
             pub_v1: &'static str,
+            rid_v1: &'static str,
             seed_v2: &'static str,
             pub_v2: &'static str,
+            rid_v2: &'static str,
         }
         let vectors = [
             V {
@@ -155,8 +171,10 @@ mod tests {
                 secret: "b88e781bb954a6681abc9016f8f69939f0e624311aeaa7e8f1b145857f58de82",
                 seed_v1: "47ea801c24e8a4d577f04837eca0674fbbf160127fa2d1a4bb1420150b0a048b",
                 pub_v1: "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72",
+                rid_v1: "b7faa05dea2cef1b7aff6a48fa5b7b9ffe217b25f3152d78d597bb9078e98307",
                 seed_v2: "6ab63aa150992ff032f6963c31dc9f5a8bd4e9518516f9fbd3bea7bc07f64b38",
                 pub_v2: "0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479",
+                rid_v2: "b19754a5e88c993683f99e48646ba518cba80dec0693f920c5671263650b6ae9",
             },
             V {
                 seed: "9d0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
@@ -164,8 +182,10 @@ mod tests {
                 secret: "17ef25ad3e5be8adad38c4c5a1c68d3daca80015e81bdcae2ae8940645774739",
                 seed_v1: "5157d14a2362044199ba88d66d6a52a4bfbe0598ebe921c5fb9c362d3bebaedd",
                 pub_v1: "0239f7c3213f3567183fd2fcf7aec6c884bc70e0e694c42053284a4b5ebef4fe2d",
+                rid_v1: "cab5ff45d21b6d0425fa7657e89fc68514965cbb4ca2b9549f4ccf430d581e7c",
                 seed_v2: "8133a9d716dcbe729b1f447ac0efccf3795e8bf28da2db4744090d0316ead730",
                 pub_v2: "037967cfe8d3111cdd72288ea3f444c15b710300323162fec63ca9036af73754e3",
+                rid_v2: "3c0ac4dec86c0dafe38195a7b66cdfec6b0ae0d44834c6e8b6b6129e097b5e27",
             },
         ];
         let ctx = b"context-alpha";
@@ -182,9 +202,13 @@ mod tests {
             assert_eq!(hex::encode(*context_seed(&secret, ctx, Some(1))), v.seed_v2);
 
             let k1 = derive_pseudonym_keypair(&ikm, ctx, None).unwrap();
-            assert_eq!(hex::encode(k1.public_key().to_compressed()), v.pub_v1);
+            let p1 = k1.public_key().to_compressed();
+            assert_eq!(hex::encode(p1), v.pub_v1);
+            assert_eq!(hex::encode(pseudonym_routing_id(&p1)), v.rid_v1);
             let k2 = derive_pseudonym_keypair(&ikm, ctx, Some(1)).unwrap();
-            assert_eq!(hex::encode(k2.public_key().to_compressed()), v.pub_v2);
+            let p2 = k2.public_key().to_compressed();
+            assert_eq!(hex::encode(p2), v.pub_v2);
+            assert_eq!(hex::encode(pseudonym_routing_id(&p2)), v.rid_v2);
         }
     }
 

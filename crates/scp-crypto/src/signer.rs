@@ -2,11 +2,14 @@
 //!
 //! [`ScpSigner`] lets protocol code sign without holding raw key material:
 //! production paths back it with a `KeyCustody` handle, so no private key
-//! crosses a crate or FFI boundary. In S0 no shipped path calls it yet; the
+//! crosses a crate or FFI boundary. [`P256SigningKey`] implements it for
+//! software keys. In S0 no shipped path calls it yet; the
 //! per-crate migration off `&ed25519_dalek::SigningKey` parameters follows in
 //! later PRs, and S12 swaps the implementation to P-256.
 
 use core::future::Future;
+
+use crate::p256::{P256SigningKey, sign_prehash_rfc6979};
 
 /// The signature algorithm an [`ScpSigner`] produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,29 +66,32 @@ pub trait ScpSigner: Send + Sync {
     fn sign(&self, msg: &[u8]) -> impl Future<Output = Result<[u8; 64], SignError>> + Send;
 }
 
+/// The software P-256 signer: a locally held [`P256SigningKey`].
+///
+/// `sign` takes the 32-byte §9.5.1 digest and returns the low-`s` raw
+/// signature; any other input length is [`SignError::InvalidDigestLength`].
+impl ScpSigner for P256SigningKey {
+    fn algorithm(&self) -> SigAlg {
+        SigAlg::EcdsaP256Sha256
+    }
+
+    fn public_key(&self) -> Vec<u8> {
+        Self::public_key(self).to_compressed().to_vec()
+    }
+
+    async fn sign(&self, msg: &[u8]) -> Result<[u8; 64], SignError> {
+        let digest: &[u8; 32] = msg
+            .try_into()
+            .map_err(|_| SignError::InvalidDigestLength(msg.len()))?;
+        sign_prehash_rfc6979(self, digest).map_err(|e| SignError::Backend(e.to_string()))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::p256::{P256PublicKey, P256SigningKey, sign_prehash_rfc6979, verify_prehash_strict};
-
-    /// A software P-256 signer, to pin the trait's contract in a test.
-    struct LocalP256(P256SigningKey);
-
-    impl ScpSigner for LocalP256 {
-        fn algorithm(&self) -> SigAlg {
-            SigAlg::EcdsaP256Sha256
-        }
-        fn public_key(&self) -> Vec<u8> {
-            self.0.public_key().to_compressed().to_vec()
-        }
-        async fn sign(&self, msg: &[u8]) -> Result<[u8; 64], SignError> {
-            let digest: [u8; 32] = msg
-                .try_into()
-                .map_err(|_| SignError::InvalidDigestLength(msg.len()))?;
-            sign_prehash_rfc6979(&self.0, &digest).map_err(|e| SignError::Backend(e.to_string()))
-        }
-    }
+    use crate::p256::{P256PublicKey, verify_prehash_strict};
 
     fn block_on<F: Future>(f: F) -> F::Output {
         use core::pin::pin;
@@ -94,21 +100,32 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
         match f.as_mut().poll(&mut cx) {
             Poll::Ready(v) => v,
-            Poll::Pending => panic!("local signer future must be ready on first poll"),
+            Poll::Pending => panic!("software signer future must be ready on first poll"),
         }
     }
 
+    /// The shipped `P256SigningKey` signer honours the trait contract: the
+    /// 33-byte compressed key, strict-verifiable low-`s` signatures that match
+    /// the direct RFC 6979 path, and a typed error for a non-digest input.
     #[test]
-    fn p256_signer_contract() {
-        let signer = LocalP256(P256SigningKey::from_seed(b"t", &[5u8; 32]).unwrap());
-        assert_eq!(signer.algorithm(), SigAlg::EcdsaP256Sha256);
-        let pk = P256PublicKey::from_sec1(&signer.public_key()).unwrap();
+    fn p256_signing_key_signer_contract() {
+        let key = P256SigningKey::from_seed(b"t", &[5u8; 32]).unwrap();
+        assert_eq!(ScpSigner::algorithm(&key), SigAlg::EcdsaP256Sha256);
+        let encoded = ScpSigner::public_key(&key);
+        assert_eq!(encoded.len(), 33);
+        let pk = P256PublicKey::from_sec1(&encoded).unwrap();
+        assert_eq!(pk, key.public_key());
+
         let digest = [0x11u8; 32];
-        let sig = block_on(signer.sign(&digest)).unwrap();
+        let sig = block_on(ScpSigner::sign(&key, &digest)).unwrap();
         verify_prehash_strict(&pk, &digest, &sig).unwrap();
-        assert_eq!(
-            block_on(signer.sign(b"not a digest")),
-            Err(SignError::InvalidDigestLength(12))
-        );
+        assert_eq!(sig, sign_prehash_rfc6979(&key, &digest).unwrap());
+
+        for bad in [&b""[..], &[0u8; 31][..], &[0u8; 33][..], b"not a digest"] {
+            assert_eq!(
+                block_on(ScpSigner::sign(&key, bad)),
+                Err(SignError::InvalidDigestLength(bad.len()))
+            );
+        }
     }
 }
