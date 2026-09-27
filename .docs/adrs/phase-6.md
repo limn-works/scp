@@ -3629,7 +3629,7 @@ These invariants are the governance artifact for the fuzzing infrastructure. Eve
 | I9 | Different `(context_id, sender_did)` → different AAD | T17 |
 | I10 | Different `InnerEnvelopeParams` → different canonical hash | T16 |
 
-I4 and I5 are blocked on clock injection into `InMemoryNonceTracker` (see `.docs/lessons/in-memory-nonce-tracker-system-clock.md`).
+I4 and I5 are blocked on clock injection into `InMemoryNonceTracker`.
 
 ### Rejected Alternatives
 

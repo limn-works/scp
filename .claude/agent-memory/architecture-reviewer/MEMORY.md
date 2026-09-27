@@ -43,7 +43,7 @@ Committing real UniFFI-generated ScpBindings.swift alongside hand-written placeh
 - Generated TransportStatus is a struct, hand-written is an enum
 - Generated ContextState has 5 states (creating/active/closing/closed/expired), hand-written has 2
 - Generated UcanToken is a class (object handle with raw pointer), hand-written is a struct
-Any story that replaces placeholder bindings with real generated ones MUST reconcile or remove hand-written types in the same commit. See `.docs/lessons/swift/uniffi-generated-type-conflicts.md`.
+Any story that replaces placeholder bindings with real generated ones MUST reconcile or remove hand-written types in the same commit.
 
 ### Event-log single-model unification (ADR-011 amendment)
 See [eventlog-unification-adr011](eventlog_unification_adr011.md) — runtime+protocol+WASM share one `scp_event_log::EventLog` (RFC 6962); single proof seam (`with_log`/replay equivalence); closed 76-variant EventType taxonomy w/ frozen tags 0-35; consequence engine dual-decodes typed-positional + legacy-JSON; deferred emit-site (#A) boundary safe; dead `app_sandbox::format_bind/unbind_event` string formatters should be deleted with the App emit-site wiring.

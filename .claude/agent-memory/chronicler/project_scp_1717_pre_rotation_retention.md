@@ -20,6 +20,6 @@ Three commits at HEAD of `worktree-scp-1717-wasm-rotate-key` (2026-04-27):
 
 **Lessons captured this PR:**
 - `.docs/lessons/behavioral-invariant-must-be-asserted-on-every-bridge.md` (new) — matrix-name parity is not byte parity.
-- `.docs/lessons/hash-commitment-preimage-lifetime.md` (new) — generalizes pre-rotation-key-must-be-stored-at-creation across all hash-then-reveal schemes in SCP.
+- `.docs/lessons/hash-commitment-preimage-lifetime.md` (new) — absorbed the former lesson on storing the pre-rotation key at creation and generalizes it across all hash-then-reveal schemes in SCP.
 
 **CLAUDE.md addition pending:** Integration checklist item 6: every bridge emitting a wire artifact with a spec-defined cryptographic invariant must have a behavioral assertion recomputing the invariant from emitted bytes.

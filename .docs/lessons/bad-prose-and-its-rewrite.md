@@ -71,9 +71,7 @@ merged spec resolves — because the spec withdrew the section, or because the a
 the number out of a draft — writes the literal marker `[no such section]` after the
 reference on every line that carries the reference. One marker exempts the occurrence
 beside it and no other occurrence, so a reader reaching any of them stops looking. This
-file marks all four of its occurrences above. The saga-admission lesson,
-`.docs/lessons/saga-admission-and-topology-guards.md`, marks the one occurrence it carries
-of the section number that the withdrawn broadcast hosting handshake used.
+file marks all four of its occurrences above.
 
 ## The failure mode this example names
 

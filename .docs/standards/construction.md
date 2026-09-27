@@ -245,4 +245,3 @@ The same config object and its enums map identically across all five language SD
 - **ADR-049 (lock-free-read invariant)** — why providers stay enum-selectors, never boxed `dyn`.
 - **architecture.md §2.5** — injection-through-initializers, preserved; the config object is the initializer.
 - **sdk-common.md → Context Creation** — rewritten to the `ContextConfig` options-object form to match this standard.
-- **`.docs/lessons/llm-first-config-objects-over-typestate.md`** — the evergreen reasoning.
