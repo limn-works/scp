@@ -15,14 +15,25 @@ ed25519-dalek = { workspace = true }
 # Pseudonym derivation (§9.10.4.A): HKDF-SHA-256 pseudonym secret + HMAC-SHA-256
 # per-context keypair derivation. All pure RustCrypto primitives already in the
 # wasm tree, so `scp-crypto` stays wasm-safe with the derivation moved here.
-hkdf = { workspace = true }
-hmac = { workspace = true }
-sha2 = { workspace = true }
+#
+# scp-crypto pins the RustCrypto 0.13/0.11 line instead of the workspace's
+# hkdf 0.12 / hmac 0.12 / sha2 0.10, because only the newer line zeroizes the
+# HMAC and hash state (`zeroize` features) that holds the pseudonym secret and
+# the seed_to_scalar PRK. No type from these crates crosses scp-crypto's API.
+hkdf = "0.13"
+hmac = { version = "0.13", features = ["zeroize"] }
+sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
 zeroize = { workspace = true }
 # P-256 primitives (§9.5, §9.10.4): signing, strict/lenient verification, ECDH,
 # SEC1 point validation, and the FIPS 186-5 A.2.1 seed-to-scalar step.
 p256 = { workspace = true }
 thiserror = { workspace = true }
+
+# p256's ecdsa (via signature/rand_core) and the workspace ed25519-dalek pull
+# getrandom 0.2, which fails to compile on wasm32-unknown-unknown without a
+# backend. Select the JS backend there, as scp-protocol and scp-client do.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 rand = { workspace = true }

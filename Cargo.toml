@@ -131,8 +131,10 @@ hmac = "0.12"
 sha2 = "0.10"
 hkdf = "0.12"
 # P-256 (§9.5): ECDSA with RFC 6979 nonces, ECDH, and SEC1 point validation.
-# `default-features = false` drops `pem`/`std` (pkcs8 and PEM stay out, and the
-# crate stays no_std-clean for wasm32). `alloc` is the only std-adjacent feature.
+# `default-features = false` drops `pem`/`std`, so pkcs8 and PEM stay out;
+# `alloc` is the only std-adjacent feature. The crate is not no_std-clean on
+# wasm32: ecdsa pulls getrandom 0.2, so every wasm32 consumer (scp-crypto
+# included) selects getrandom's `js` backend.
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "alloc"] }
 uuid = { version = "1", features = ["v4", "v7"] }
 # No `libcrux-provider`. That feature does one thing — add the optional dependency

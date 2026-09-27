@@ -26,7 +26,7 @@
 //! would be a membership enumeration oracle.
 
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -75,7 +75,8 @@ fn context_seed(
     context_id: &[u8],
     epoch: Option<u64>,
 ) -> Zeroizing<[u8; 32]> {
-    let mac_result = <Hmac<Sha256> as Mac>::new_from_slice(pseudonym_secret.as_slice());
+    // hmac 0.13 with `zeroize`: the keyed inner/outer SHA-256 states wipe on drop.
+    let mac_result = <Hmac<Sha256> as KeyInit>::new_from_slice(pseudonym_secret.as_slice());
     assert!(mac_result.is_ok(), "HMAC-SHA256 accepts keys of any length");
     let mut seed = Zeroizing::new([0u8; 32]);
     if let Ok(mut mac) = mac_result {
@@ -87,8 +88,7 @@ fn context_seed(
                 mac.update(PSEUDONYM_V2_DOMAIN);
             }
         }
-        // Copy out and wipe via `[u8]: Zeroize`, which holds whether or not
-        // `generic-array`'s `zeroize` feature is unified in.
+        // `CtOutput` zeroizes on drop; the extracted array is wiped explicitly.
         let mut hmac_bytes = mac.finalize().into_bytes();
         seed.copy_from_slice(&hmac_bytes[..32]);
         hmac_bytes.as_mut_slice().zeroize();
@@ -128,6 +128,20 @@ pub fn pseudonym_routing_id(context_pseudonym: &[u8; COMPRESSED_POINT_LEN]) -> [
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// Compile-time pin for review item "zeroize HMAC/HKDF state": the SHA-256
+    /// core that `Hmac<Sha256>` and `Hkdf<Sha256>` key with the pseudonym
+    /// secret or PRK, the block buffer, and the MAC output all wipe on drop.
+    /// Dropping the `zeroize` feature from sha2/hmac fails this to compile.
+    #[test]
+    fn secret_bearing_hash_state_zeroizes_on_drop() {
+        fn assert_zod<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zod::<Sha256>();
+        assert_zod::<
+            hmac::digest::block_api::Buffer<<Sha256 as hmac::digest::block_api::CoreProxy>::Core>,
+        >();
+        assert_zod::<hmac::digest::CtOutput<Hmac<Sha256>>>();
+    }
 
     fn h<const N: usize>(s: &str) -> [u8; N] {
         hex::decode(s).unwrap().try_into().unwrap()

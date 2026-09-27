@@ -111,9 +111,14 @@ fn check_signature(pk: &P256PublicKey, digest: &[u8; 32], sig: &[u8], valid: boo
     let strict = verify_prehash_strict(pk, digest, sig);
     if valid {
         lenient.unwrap_or_else(|e| panic!("tcId {id}: lenient rejected a valid signature: {e}"));
+        // Fixed-width big-endian byte order is integer order, so this compares
+        // the full integer `s` against (n − 1)/2.
+        let high_s = sig[32..] > HALF_N[..];
         match strict {
-            Ok(()) => assert!(sig[32] < 0x80, "tcId {id}"),
-            Err(P256Error::HighS) => {}
+            Ok(()) => assert!(!high_s, "tcId {id}: strict accepted s > (n-1)/2"),
+            Err(P256Error::HighS) => {
+                assert!(high_s, "tcId {id}: strict called s <= (n-1)/2 high");
+            }
             Err(e) => panic!("tcId {id}: strict rejected a valid low-s signature: {e}"),
         }
     } else {
@@ -127,6 +132,12 @@ fn check_signature(pk: &P256PublicKey, digest: &[u8; 32], sig: &[u8], valid: boo
         );
     }
 }
+
+/// `(n − 1)/2` for P-256, the largest `s` §9.5 admits (SEC 2 `n`, halved).
+const HALF_N: [u8; 32] = [
+    0x7f, 0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xde, 0x73, 0x7d, 0x56, 0xd3, 0x8b, 0xcf, 0x42, 0x79, 0xdc, 0xe5, 0x61, 0x7e, 0x31, 0x92, 0xa8,
+];
 
 fn group_key(g: &Value) -> P256PublicKey {
     assert_eq!(g["sha"], "SHA-256");
