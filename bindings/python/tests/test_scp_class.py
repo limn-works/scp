@@ -463,3 +463,30 @@ def test_identity_create_requires_a_custody_selection() -> None:
         assert custody.default is inspect.Parameter.empty, (
             f"{method_name} must require a custody selection; found default {custody.default!r}"
         )
+
+
+@pytest.mark.parametrize("custody", [None, "", "   "])
+@pytest.mark.parametrize("method_name", ["identity_create", "identity_create_with_agent_key"])
+async def test_identity_create_rejects_an_absent_custody_selection(
+    method_name: str, custody: Any
+) -> None:
+    """An absent custody selection raises ``SCP-IDENT-1064`` before the bridge runs.
+
+    The type hint cannot stop ``None`` or an empty string. The TypeScript SDK
+    answers both with ``SCP-IDENT-1064``, so this SDK does too, and the native
+    bridge is never called. Deleting ``_require_custody_selection`` sends the
+    value to the mocked bridge, which then returns instead of raising, so this
+    test fails.
+    """
+    from unittest.mock import patch
+
+    from scp_sdk.errors import IdentityError
+
+    mock_cls = MagicMock()
+    with patch("scp_sdk.scp._native_cls", return_value=mock_cls):
+        wrapper = WrapperSCP(storage={"type": "in_memory"})
+    native = mock_cls.with_storage.return_value
+    with pytest.raises(IdentityError) as excinfo:
+        await getattr(wrapper, method_name)(custody)
+    assert excinfo.value.code == "SCP-IDENT-1064"
+    getattr(native, method_name).assert_not_called()

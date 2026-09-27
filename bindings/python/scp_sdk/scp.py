@@ -398,6 +398,31 @@ def _to_invite_outcome(raw: Any) -> InviteMemberOutcome:
     )
 
 
+def _require_custody_selection(custody: object) -> str:
+    """Return the custody name a caller selected, or raise ``SCP-IDENT-1064``.
+
+    Persistence spec §17.17.1 (``SCP-CAPSEL-8000``) requires an explicit
+    custody selection. The type hint cannot stop a caller who passes ``None``
+    or an empty string, so this guard reports that absent selection with the
+    code the TypeScript SDK's ``requireCustodySelection`` reports. An
+    unrecognized name still reaches the bridge, which answers
+    ``SCP-VALID-7005``.
+    """
+    from scp_sdk.errors import IdentityError
+
+    name = custody.value if isinstance(custody, CustodyType) else custody
+    if not isinstance(name, str) or name.strip() == "":
+        raise IdentityError(
+            'custody selection is required: pass "file" to hold keys in an encrypted '
+            "file this process owns ($HOME/.scp/keys.bin under SCP_KEY_PASSPHRASE), "
+            "use SCP.identity_create_with_custody to wire a KeyCustodyProvider, or "
+            'pass "in_memory" on a build carrying the testing feature. There is no '
+            "default custody backend.",
+            "SCP-IDENT-1064",
+        )
+    return name
+
+
 class SCP:
     """Caller-owned SCP instance — the sole public SDK entry point.
 
@@ -732,7 +757,7 @@ class SCP:
         """
         from scp_sdk.identity import Identity
 
-        custody_str = custody.value if isinstance(custody, CustodyType) else custody
+        custody_str = _require_custody_selection(custody)
         raw = await asyncio.to_thread(self._native.identity_create, custody_str)
         return Identity(raw)
 
@@ -744,7 +769,7 @@ class SCP:
         """
         from scp_sdk.identity import Identity
 
-        custody_str = custody.value if isinstance(custody, CustodyType) else custody
+        custody_str = _require_custody_selection(custody)
         raw = await asyncio.to_thread(self._native.identity_create_with_agent_key, custody_str)
         return Identity(raw)
 
