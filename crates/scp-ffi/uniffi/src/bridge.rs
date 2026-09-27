@@ -20176,17 +20176,18 @@ mod tests {
         let identity = rt
             .block_on(scp.identity_create("in_memory".to_owned(), None))
             .expect("identity_create failed");
-        let sup = Arc::clone(
-            scp.inner
-                .context_manager_or_error()
-                .expect("test supervisor must be attached"),
-        );
 
         for mid_respawn in [true, false] {
             let handle = rt
                 .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
                 .expect("context_create should succeed");
             let context_id = handle.context_id();
+            // `context_create` attaches the supervisor on its first call.
+            let sup = Arc::clone(
+                scp.inner
+                    .context_manager_or_error()
+                    .expect("test supervisor must be attached"),
+            );
             if mid_respawn {
                 rt.block_on(sup.test_hold_context_mid_respawn(&context_id));
             } else {
