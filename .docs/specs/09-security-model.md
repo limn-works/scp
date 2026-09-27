@@ -1829,7 +1829,7 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash, sign
 | `"SCP-CHALLENGE-REQ-V1:"` | Trust challenge request signing | §7.4 |
 | `"SCP-CHALLENGE-RESP-V1:"` | Trust challenge response signing | §7.4 |
 | `"SCP-CHALLENGE-VERIFY-V1:"` | Trust challenge verification signing | §7.4 |
-| `"SCP-BRIDGE-REGISTER-V1:"` | Bridge relay registration signing | §12 |
+| `"SCP-BRIDGE-REGISTER-V1:"` | Bridge relay registration signing | §10.12.4 |
 | `"SCP-PRIVATE-LOG-V1:"` | Private state event hash chain | §3.7 |
 | `"SCP-PUSH-REGISTER-V1:"` | Push notification registration signing | §22.11.4 |
 | `"SCP-PUSH-DEREGISTER-V1:"` | Push notification deregistration signing | §22.11.4 |

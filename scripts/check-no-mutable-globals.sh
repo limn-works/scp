@@ -114,7 +114,6 @@ fi
 ALLOWLIST=(
     # Crypto / constants
     BIP39_ENGLISH                   # why: 2048-word BIP-39 wordlist, `&'static [&str; 2048]` constant.
-    CREDENTIAL_HKDF_SALT            # why: domain-separation salt for bridge credential HKDF — pure constant derived from a fixed seed at import.
     PROTOCOL_REGISTRY               # why: protocol capability registry — frozen lookup table of compile-time-known resources (§Trust registry, LazyLock<HashMap>).
     SYSTEM_REGISTRY                 # why: protocol system-action registry — frozen lookup table of compile-time-known system actions.
 
