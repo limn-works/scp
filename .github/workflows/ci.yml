@@ -1306,7 +1306,10 @@ jobs:
       # and each one empties it first, so `--test-threads 1` runs them one at a
       # time; the S3 tests each write under a random prefix. `--no-tests=fail`
       # fails the step when the filter matches no test, so a module rename
-      # cannot turn this step into a pass that ran nothing.
+      # cannot turn this step into a pass that ran nothing. The `MinIO` image
+      # comes from `pgsty/minio`, a community build of the upstream server,
+      # because the `minio/minio` repository on Docker Hub no longer exists and
+      # `docker run` answers a pull from it with "pull access denied".
       - name: Run the PostgreSQL and S3 blob backend tests against live services
         if: runner.os == 'Linux'
         env:
@@ -1321,7 +1324,7 @@ jobs:
             -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=scp_test_blobs postgres:16
           docker run -d --name scp-minio -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
+            pgsty/minio:RELEASE.2026-08-04T00-00-00Z server /data
           timeout 120 bash -c 'until docker exec scp-postgres pg_isready -U postgres -d scp_test_blobs; do sleep 2; done'
           timeout 120 bash -c 'until curl -sf http://localhost:9000/minio/health/live; do sleep 2; done'
           aws --endpoint-url "$S3_TEST_ENDPOINT" s3 mb "s3://$S3_TEST_BUCKET"
