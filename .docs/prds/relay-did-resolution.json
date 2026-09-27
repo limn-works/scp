@@ -78,6 +78,20 @@
       "stories": [
         "SCP-RELAYRES-011"
       ]
+    },
+    {
+      "id": "gate-relayres-12",
+      "name": "Relay-list record and relay_list outlet",
+      "stories": [
+        "SCP-RELAYRES-012"
+      ]
+    },
+    {
+      "id": "gate-relayres-13",
+      "name": "Relay-list pointer reader replacing FALLBACK_RELAYS",
+      "stories": [
+        "SCP-RELAYRES-013"
+      ]
     }
   ],
   "stories": [
@@ -480,11 +494,11 @@
         "crates/scp-node/src/lib.rs",
         "crates/scp-transport/src/config.rs"
       ],
-      "description": "SCP-RELAYRES-006 binds the ONE relay the self-host node runs itself (§18.5.2). This story adds the relays it does NOT run: the identity's own external relays and the bootstrap/fallback set, which is what §3.10.2 \"Multi-relay\" requires (\"Identity owners SHOULD publish to multiple relays — their own relays plus bootstrap relays from the fallback relay list (§18.5.1) — for availability and suppression resistance\") and what §3.10.4 step 3a queries (\"identity's published relays if known, else bootstrap relays from §18.5.1\"). Two independent gaps make the §18.5.1 chain dead today: (1) `NodeConfig` (crates/scp-node/src/config.rs) has NO relay-URL field — `bind_addr` is the relay SERVER's listen address, not a client relay set — so §18.5.1 level 1 (\"Explicit configuration. Relay URLs provided directly in TransportConfig at SDK initialization\") is unreachable from the node surface; (2) `DefaultRelayResolver` and `FALLBACK_RELAYS` (crates/scp-transport/src/config.rs) implement all five levels and are unit-tested, and `DefaultRelayResolver`/`ResolveRelays` are re-exported from crates/scp-transport/src/lib.rs — but the resolver is never CONSTRUCTED outside its own unit tests, so no shipped code path ever runs the chain. This story: (a) add an explicit `relay_urls: Vec<String>` field to `NodeConfig`, defaulted to empty by `NodeConfig::defaults` and threaded END-TO-END — explicitly NOT the carried-but-dropped shape `dht_gateways` currently has (that field is documented as \"carried but not yet threaded end-to-end\" and dropped in `split_config`; repeating it here would ship a config knob that silently does nothing); (b) drive `DefaultRelayResolver` from the node with level 1 = the new field and levels 2-5 wired to their real providers, logging the §18.5.1 warning when the chain falls through to the hardcoded fallback list; (c) open one `NativeRelayAdapter` connection per resolved relay URL and bind each onto the SAME shared `TransportRelayPublisher` and `TransportRelayQuerier` instances SCP-RELAYRES-006 established — one connection set feeding both halves, additively with the loopback binding; (d) pass the full resolved set (loopback + external + bootstrap) as the `DualLayerResolver`'s bootstrap-relay list. A relay that fails to connect is skipped and logged, never bound and never fatal (§3.10.8 \"Relay unresponsive, slow, or withholding\": a single bad relay must not block resolution or startup). Scope boundary: WHEN a DID record is published (create/update vs the republish cycle) is SCP-RELAYRES-004 (republish) and SCP-RELAYRES-008 (create/update); this story owns WHICH relays receive it.",
+      "description": "SCP-RELAYRES-006 binds the ONE relay the self-host node runs itself (§18.5.2). This story adds the relays it does NOT run: the identity's own external relays and the bootstrap/fallback set, which is what §3.10.2 \"Multi-relay\" requires (\"Identity owners SHOULD publish to multiple relays — their own relays plus bootstrap relays from the fallback relay list (§18.5.1) — for availability and suppression resistance\") and what §3.10.4 step 3a queries (\"identity's published relays if known, else bootstrap relays from §18.5.1\"). Two independent gaps make the §18.5.1 chain dead today: (1) `NodeConfig` (crates/scp-node/src/config.rs) has NO relay-URL field — `bind_addr` is the relay SERVER's listen address, not a client relay set — so §18.5.1 level 1 (\"Explicit configuration. Relay URLs provided directly in TransportConfig at SDK initialization\") is unreachable from the node surface; (2) `DefaultRelayResolver` and `FALLBACK_RELAYS` (crates/scp-transport/src/config.rs) implement all five levels and are unit-tested, and `DefaultRelayResolver`/`ResolveRelays` are re-exported from crates/scp-transport/src/lib.rs — but the resolver is never CONSTRUCTED outside its own unit tests, so no shipped code path ever runs the chain. This story: (a) add an explicit `relay_urls: Vec<String>` field to `NodeConfig`, defaulted to empty by `NodeConfig::defaults` and threaded END-TO-END — explicitly NOT the carried-but-dropped shape `dht_gateways` currently has (that field is documented as \"carried but not yet threaded end-to-end\" and dropped in `split_config`; repeating it here would ship a config knob that silently does nothing); (b) drive `DefaultRelayResolver` from the node with level 1 = the new field and levels 2-5 wired to their real providers, logging the §18.5.1 warning when the chain falls through to the community relay list, which SCP-RELAYRES-013 supplies from the relay-list context in place of the hardcoded `FALLBACK_RELAYS`; (c) open one `NativeRelayAdapter` connection per resolved relay URL and bind each onto the SAME shared `TransportRelayPublisher` and `TransportRelayQuerier` instances SCP-RELAYRES-006 established — one connection set feeding both halves, additively with the loopback binding; (d) pass the full resolved set (loopback + external + bootstrap) as the `DualLayerResolver`'s bootstrap-relay list. A relay that fails to connect is skipped and logged, never bound and never fatal (§3.10.8 \"Relay unresponsive, slow, or withholding\": a single bad relay must not block resolution or startup). Scope boundary: WHEN a DID record is published (create/update vs the republish cycle) is SCP-RELAYRES-004 (republish) and SCP-RELAYRES-008 (create/update); this story owns WHICH relays receive it.",
       "acceptanceCriteria": [
         "`NodeConfig` gains an explicit relay-URL field: `grep -n 'pub relay_urls' crates/scp-node/src/config.rs` matches a `Vec<String>` field, `NodeConfig::defaults` initialises it to an empty vec (grep the initialiser), and the field is threaded end-to-end — a test builds a node with `relay_urls: vec![reachable_url]` and asserts that URL is bound on BOTH the shared publisher and the shared querier after start (it is not dropped in `split_config` the way `dht_gateways` is).",
         "§18.5.1 chain has a production caller: `grep -rn 'DefaultRelayResolver' crates/scp-node/src` matches at least one non-test line; a test asserts level 1 (explicit `relay_urls`) short-circuits levels 2-5 (no DID-document, `.well-known`, or peer lookup is performed when explicit URLs are supplied).",
-        "Level-5 fallback warns: a test with no explicit URLs and no level 2-4 provider result asserts the resolver returns the `FALLBACK_RELAYS` entries AND emits the §18.5.1 fallback warning (\"The SDK SHOULD warn when falling back to default relays\").",
+        "Level-5 fallback warns: a test with no explicit URLs and no level 2-4 provider result asserts the resolver returns the URLs of the community relay list the SDK holds (SCP-RELAYRES-013) AND emits the §18.5.1 warning (\"the community relay list, last, with a warning\").",
         "Every resolved relay is bound, not just the first: a test with three reachable resolved relay URLs asserts the shared `TransportRelayPublisher`'s observability count accessor (SCP-RELAYRES-006) reports exactly 3, all three URLs are bound on the querier, and a single `RelayPublisher::publish` reaches all three — the returned `RelayPublishOutcome` is `accepted == 3, attempted == 3` and every one of the three recording relays holds the frame (§3.10.2 \"Multi-relay\", multi-relay publishing for suppression resistance).",
         "Resolver queries the resolved set, not just the loopback: the node's `DualLayerResolver` is constructed with the full resolved relay URL set — a test where a DID's record exists ONLY on an external relay asserts it resolves with `ResolutionSource::ScpRelay { relay_url }` equal to that external relay's URL (§3.10.4 step 3a).",
         "A failing relay is skipped, never phantom-bound, never fatal: a test with one reachable and one unreachable relay URL asserts the node still starts, the observability count accessor reports exactly 1, the unreachable URL has NO binding on either the publisher or the querier, and the connect failure is logged (§3.10.8 — one bad relay cannot block a result from another).",
@@ -493,13 +507,14 @@
       ],
       "actionItems": [
         "Add `pub relay_urls: Vec<String>` to `NodeConfig` (crates/scp-node/src/config.rs), initialise it to an empty vec in `NodeConfig::defaults`, and thread it through `split_config` and the node build path end-to-end — do not repeat the carried-but-dropped `dht_gateways` shape.",
-        "Construct and drive `DefaultRelayResolver` (crates/scp-transport/src/config.rs) from the node: level 1 from the new `relay_urls`, levels 2-4 from the node's DID resolver / `.well-known` fetcher / peer provider, level 5 the hardcoded fallback with the §18.5.1 warning.",
+        "Construct and drive `DefaultRelayResolver` (crates/scp-transport/src/config.rs) from the node: level 1 from the new `relay_urls`, levels 2-4 from the node's DID resolver / `.well-known` fetcher / peer provider, level 5 the community relay list SCP-RELAYRES-013 supplies, with the §18.5.1 warning.",
         "Open one `NativeRelayAdapter` connection per resolved relay URL and bind each onto the SAME shared `TransportRelayPublisher` and `TransportRelayQuerier` instances from SCP-RELAYRES-006 (additive to the loopback binding); skip and log any URL that fails to connect.",
         "Pass the full resolved relay URL set (loopback + external + bootstrap) as the `DualLayerResolver` bootstrap-relay argument in crates/scp-node/src/self_host.rs.",
         "Write the config-threading, level-1-short-circuit, level-5-warning, multi-bind, external-relay-resolution, and unreachable-relay tests; run full CI + review roster."
       ],
       "blockedBy": [
-        "SCP-RELAYRES-006"
+        "SCP-RELAYRES-006",
+        "SCP-RELAYRES-013"
       ],
       "sources": [
         {
@@ -522,7 +537,7 @@
       "details": {
         "phase": "2",
         "feature": "issue #482 — relay-based DID resolution (Model B)",
-        "revives_dead_code": "DefaultRelayResolver + FALLBACK_RELAYS (crates/scp-transport/src/config.rs) — written, unit-tested and re-exported from scp-transport's lib.rs, but never constructed outside their own unit tests before this story",
+        "revives_dead_code": "DefaultRelayResolver (crates/scp-transport/src/config.rs) — written, unit-tested and re-exported from scp-transport's lib.rs, but never constructed outside its own unit tests before this story. FALLBACK_RELAYS is not revived: SCP-RELAYRES-013 deletes it, because the SDK ships no relay list (§18.5.1).",
         "anti_pattern_to_avoid": "NodeConfig.dht_gateways is carried but dropped in split_config; relay_urls MUST be threaded end-to-end, not shape-complete-only"
       }
     },
@@ -736,6 +751,125 @@
         {
           "file": ".docs/adrs/phase-1.md",
           "section": "## ADR-004: SCP Native Relay Protocol"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-RELAYRES-012",
+      "title": "Implement the relay-list record: its type, the governor's signature under SCP-RELAY-LIST-V1, the five acceptance checks, and the relay_list Query outlet that serves it",
+      "gate": "gate-relayres-12",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/relay_list.rs",
+        "crates/scp-protocol/src/lib.rs",
+        "crates/scp-protocol/tests/relay_list_vector.rs",
+        "crates/scp-node/src/relay_list_outlet.rs",
+        "crates/scp-node/src/lib.rs"
+      ],
+      "description": "`18-addressability-and-deployment.md` §18.5.1 replaces the relay list the SDK shipped with a pointer to a relay-list context that Limn governs, under Alec's ruling of 2026-09-27, which ADR-063's register records. This story builds the record that context serves and the outlet that serves it; SCP-RELAYRES-013 builds the reader. The record carries `context_id` (32 bytes), `sequence` (u64, 1 on the first record), `governor` (32 bytes), `entries` (the entries document, a JSON array whose entries carry `operator`, `key`, `url` and `free` in that order, lowercase hexadecimal, no insignificant whitespace) and a 64-byte signature by the governor's `#active` key over `SHA-256(\"SCP-RELAY-LIST-V1:\" ‖ context_id ‖ sequence ‖ governor ‖ SHA-256(entries))`, which `09-security-model.md` §9.18.2 registers and §9.7.1 classifies under the attestation class. The `relay_list` outlet is a Query outlet (`05-contexts.md` §5.4.2) with empty input that returns the context's current record, and it answers a request carrying no requester signature because a first-launch reader has published no key-event log. The five acceptance checks are §18.5.1's: `context_id` equals the pointer's, `governor` equals the pinned identifier, the signature verifies against the governor's `Current` `#active` key, `sequence` exceeds the highest accepted, and `entries` parses.",
+      "acceptanceCriteria": [
+        "`crates/scp-protocol/src/relay_list.rs` declares `RelayListRecord` with the fields `context_id: [u8; 32]`, `sequence: u64`, `governor: [u8; 32]`, `entries: String` and `signature: [u8; 64]`, and `RelayListEntry` with `operator: [u8; 32]`, `key: [u8; 33]`, `url: String` and `free: bool`: `grep -n 'pub struct RelayListRecord' crates/scp-protocol/src/relay_list.rs` matches",
+        "The signature preimage function returns the 122 bytes Vector 49 of `25-test-vectors.md` prints, its canonical hash, and a signature that verifies under §25.2's secondary key: a known-answer test in `crates/scp-protocol/tests/relay_list_vector.rs` reproduces the preimage, the canonical hash and the entries digest byte for byte (`18-addressability-and-deployment.md` §18.5.1)",
+        "The entries encoder emits the 415-byte document Vector 49 prints for its two fixture entries, and the parser rejects a document whose members appear out of order, whose hexadecimal is uppercase, or that carries insignificant whitespace: one test per case",
+        "`accept_relay_list_record` returns a typed rejection for each of the five §18.5.1 checks: a record for another context id, a record naming another governor, a signature that fails against the governor's `Current` `#active` key, a sequence at or below the highest accepted, and an unparseable `entries`; one test per check asserts the rejection variant and that the held list is unchanged",
+        "A record signed by a key the governor's key state lists `Superseded` or `Retired` fails the signature check on arrival, because the attestation class of `09-security-model.md` §9.7.1 admits the current key alone: a test asserts it",
+        "The `relay_list` outlet registers as `OutletKind::Query` with an empty input schema, returns the context's current record, and answers a request that carries no requester signature: a test invokes it with no signature and decodes a record that passes the five checks",
+        "`scp-protocol` gains no tokio dependency: `cargo tree -p scp-protocol -e normal` lists no `tokio`",
+        "No unwrap() or expect() in library code",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present"
+      ],
+      "actionItems": [
+        "Add `relay_list.rs` to scp-protocol with the record and entry types, the entries encoder and strict parser, the preimage function under `SCP-RELAY-LIST-V1:`, and `accept_relay_list_record` with one typed rejection per check.",
+        "Reproduce Vector 49 in a known-answer test.",
+        "Register the `relay_list` Query outlet in scp-node so a governor's node serves the context's current record, answering unsigned requests.",
+        "Write the rejection tests and the outlet round-trip test."
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.5.1 The Community Relay List and Bootstrap Priority Order"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.18.2 Domain Separators"
+        },
+        {
+          "file": ".docs/specs/25-test-vectors.md",
+          "section": "### Vector 49: the relay-list record"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.2 Outlet Classification (Query vs Action)"
+        },
+        {
+          "file": ".docs/adrs/ADR-063-inception-derived-identity-key-event-log.md",
+          "section": "### Executor calls on record"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-RELAYRES-013",
+      "title": "Ship the relay-list pointer in place of FALLBACK_RELAYS: fetch and accept the governor-signed record, resolve the governor at first launch, void a record signed by a compromised governor key, and delete the free-relay check",
+      "gate": "gate-relayres-13",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/config.rs",
+        "crates/scp-identity/src/relay_list_reader.rs",
+        "crates/scp-identity/src/lib.rs",
+        "crates/scp-transport/src/relay/wellknown.rs",
+        "crates/scp-runtime/tests/economy_integration.rs"
+      ],
+      "description": "`18-addressability-and-deployment.md` §18.5.1: the SDK ships no relay list, only a pointer — the `scp://context/<id>?relay=…` address of the relay-list context and Limn's identifier pinned as its governor — identical in every binding because every binding reaches it through the Rust core. This story replaces `FALLBACK_RELAYS` (crates/scp-transport/src/config.rs) with that pointer and the list the reader accepts through it. The reader fetches the record from the `relay_list` outlet (SCP-RELAYRES-012) on every launch and at least once per `DEFAULT_WITNESSING_INTERVAL`, from every relay the pointer names and every relay its held list names; accepts a record only under the five checks; replaces its whole list on acceptance; resolves the governor at first launch from the pointer's relays with `03-identity.md` §3.10.4 step 5 omitted and records no baseline from that resolution, then resolves the governor again under R11's floor against the accepted list; and, where a later key state for the governor lists the key that signed the held record `Compromised`, discards the record and its sequence floor. A reader that reaches none of the pointer's relays holds no list and reaches no first contact. The pointer's two values are the ones Limn's created relay-list context carries: a build without them fails closed with a typed error and never ships a placeholder. The story also deletes `validate_bootstrap_has_free_relay` (crates/scp-transport/src/relay/wellknown.rs) and the `invariant_8_bootstrap_list_has_free_relay` test, because `19-economic-governance.md` §19.14 invariant 8 now states that no protocol rule requires a free relay.",
+      "acceptanceCriteria": [
+        "`FALLBACK_RELAYS` is gone: `git grep -n FALLBACK_RELAYS -- crates` returns nothing, and level 5 of `DefaultRelayResolver` returns the URLs of the list the reader holds",
+        "The pointer is one Rust value carrying the relay-list context's `scp://context/` address and the governor identifier, and a build that lacks either value returns a typed error from the reader rather than a list: a test builds the reader with no pointer and asserts the error",
+        "A reader holding no accepted record yields an empty fallback set and a first-contact resolution returns `Inconclusive{SingleSource}`: a test serves no relay-list record and asserts both (`09-security-model.md` §9.7.4.2 R11)",
+        "The reader accepts a valid record and replaces its whole list, and discards each of the five rejected cases while keeping its held list: one test per case, driven through the `relay_list` outlet of SCP-RELAYRES-012",
+        "At first launch the reader resolves the governor from the pointer's relays without R11's floor and records no accepted baseline, then resolves the governor again with R11's floor against the accepted list: a test asserts the first resolution adopts a chain served by one relay and that the governor's stored baseline is absent until the second resolution",
+        "A later governor key state that lists the held record's signing key `Compromised` makes the reader discard the record and its sequence floor and accept a lower-sequence record signed under the current key; a key state listing that key `Superseded` or `Retired` leaves the held record and floor in place: one test per case",
+        "The reader fetches on launch and again after `DEFAULT_WITNESSING_INTERVAL` under an injected clock, from every pointer relay and every held-list relay: a test counts the fetches per relay",
+        "`validate_bootstrap_has_free_relay` and `invariant_8_bootstrap_list_has_free_relay` are deleted: `git grep -n 'validate_bootstrap_has_free_relay\\|invariant_8_bootstrap_list_has_free_relay' -- crates` returns nothing",
+        "No unwrap() or expect() in library code",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present"
+      ],
+      "actionItems": [
+        "Replace `FALLBACK_RELAYS` with the relay-list pointer and route level 5 of `DefaultRelayResolver` through the reader's held list.",
+        "Implement the reader in scp-identity: fetch from the `relay_list` outlet, run SCP-RELAYRES-012's acceptance checks, persist the held record and its floor, and refresh on the injected clock.",
+        "Implement the first-launch governor resolution with step 5 omitted and no stored baseline, and the second resolution under R11.",
+        "Implement the compromised-key rule on every governor key-state adoption.",
+        "Delete `validate_bootstrap_has_free_relay` and the invariant-8 test."
+      ],
+      "blockedBy": [
+        "SCP-RELAYRES-012",
+        "SCP-241"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.5.1 The Community Relay List and Bootstrap Priority Order"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.4 Resolution Protocol"
+        },
+        {
+          "file": ".docs/specs/19-economic-governance.md",
+          "section": "## 19.14 Invariants"
+        },
+        {
+          "file": ".docs/adrs/ADR-063-inception-derived-identity-key-event-log.md",
+          "section": "### Executor calls on record"
         }
       ],
       "details": {}

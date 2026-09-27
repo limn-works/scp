@@ -531,7 +531,7 @@ Relay economics are SEPARATE from context economics — different trust model. R
 
 **Payment flow:** Agent evaluates relay config (visible before connecting) → selects compatible adapter → authorizes per-action → relay verifies + captures.
 
-**Free relays MUST exist.** Bootstrap relay list (§18.5, priority level 5) MUST include free relays. Self-hosted relays (§10.2, §10.4), community relays, and bundled relays remain free. Economic config is optional. Absence = free.
+**Economic config is optional, and its absence means free.** Self-hosted relays (§10.2, §10.4) remain free. No protocol rule requires the community relay list to carry a free relay: whether it carries one is Limn's list policy, outside the protocol (`18-addressability-and-deployment.md` §18.5.1).
 
 **Relay selection:** `TransportManager` (ADR-012) already selects by reliability + latency. Economic governance adds cost as a third criterion. Market pressure: agents prefer cheaper relays, creating competition.
 
@@ -598,7 +598,7 @@ SCP.Identity.configureAdapter(adapter) → ()
 
 **Relay trust:** Paid relays remain untrusted — they see opaque blobs. Relay payment is for transport, not content access. Encryption-as-access-control (§9) unchanged. A relay that charges for storage cannot read what it stores.
 
-**Payment-as-gatekeeper risk:** If ALL relays require payment, free users are excluded. Mitigation: free relays MUST exist in the bootstrap relay list (`18-addressability-and-deployment.md` §18.5.1). This is a protocol invariant, not a suggestion. The fallback relay list shipped with the SDK MUST include at least one free relay. §19.8 states what that invariant does and does not bound.
+**Payment-as-gatekeeper risk:** If ALL relays require payment, free users are excluded. No protocol rule mitigates that risk. An identity can publish to a relay it runs itself (§10.2), and whether the community relay list carries a free relay is Limn's list policy, outside the protocol (`18-addressability-and-deployment.md` §18.5.1).
 
 ## 19.13 Phase Integration
 
@@ -615,7 +615,7 @@ Community payment adapters (x402, Lightning, SPL, Stripe) are **Phase 4+** — e
 5. **Payment adapters are substitutable — no single rail privileged.** The `PaymentAdapter` trait treats all payment rails equally. Protocol correctness does not depend on any specific adapter.
 6. **Economic policy mutable by default, optional immutability lock is voluntary.** Unlike ceiling policy (immutable by default), economic policy is governed by default. Creators may voluntarily lock pricing at creation.
 7. **Payment data inside encrypted envelope — relays never see payment metadata** for context-level economics. Relay-level payments are visible to the relay (necessary for relay to verify) but not to other relays or contexts.
-8. **Free relays MUST always exist in bootstrap list.** The SDK's fallback relay list (`18-addressability-and-deployment.md` §18.5.1) MUST include free relays. This is a protocol invariant that puts no price on basic protocol operation (§19.8).
+8. **No protocol rule requires a free relay to exist.** Whether the community relay list (`18-addressability-and-deployment.md` §18.5.1) carries an entry whose `free` member is true is Limn's list policy, outside the protocol, and ADR-063, the inception-derived identity over a key-event log, records the ruling that moved it there.
 9. **Auto-accept never applies to paid contexts.** No auto-accept policy configuration (§5.12.2) can override this. Agents never silently incur costs.
 
 ## 19.15 Wire Format Tables

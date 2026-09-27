@@ -1258,7 +1258,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 | Infrastructure | Who runs it | Why it works without Limn |
 |---|---|---|
 | Transport relays | Users, communities, anyone | SCP native relay is trivially self-hostable. Existing infrastructure (Nostr relays, Hyperswarm, libp2p, Matrix homeservers) also works. Multiple transports, no single dependency. |
-| Identity resolution | The SCP relay network and the shipped community relay list | Every relay is untrusted, and a verifier recomputes the identifier from the inception bytes, so **correctness** rests on no relay and any relay substitutes for any other. **Reaching a first contact** is the one exception: a party holding no baseline for an identifier obtains the chain from two entries of the shipped community relay list under distinct operator keys, and a relay outside that list counts for nothing (`09-security-model.md` §9.7.4.2 R11). The list changes only at an SDK release. Limn curates it, and its entry criterion is open (§18.5.1). |
+| Identity resolution | The SCP relay network and the community relay list, which a relay-list context serves | Every relay is untrusted, and a verifier recomputes the identifier from the inception bytes, so **correctness** rests on no relay and any relay substitutes for any other. **Reaching a first contact** is the one exception: a party holding no baseline for an identifier obtains the chain from two entries of the community relay list under distinct operator keys, and a relay outside that list counts for nothing (`09-security-model.md` §9.7.4.2 R11). The SDK ships a pointer to the relay-list context and no list; Limn governs that context and curates the list, and a party accepts a list record only under the governor's signature (§18.5.1). **This row depends on Limn in one respect:** a party keeps the list it last accepted if Limn stops, and a party that has never fetched the list reaches no first contact once no relay the pointer names serves the context. |
 | SDK packages | PyPI, npm, crates.io | Standard open-source package distribution. Forkable. |
 | Key storage | User devices | Secure Enclave, Android Keystore, WebCrypto. On-device. |
 
@@ -1266,7 +1266,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 
 | Non-infrastructure | Why |
 |---|---|
-| Central relay | No privileged relay. Every relay is untrusted, and any relay substitutes for any other on the correctness of a resolution; the shipped community relay list is privileged for a first contact alone, under the row above. |
+| Central relay | No privileged relay. Every relay is untrusted, and any relay substitutes for any other on the correctness of a resolution; the community relay list is privileged for a first contact alone, under the row above. |
 | User database | An identifier is the digest of an inception event its holder composed. No registry of users. |
 | Key server | Keys are in hardware security modules on user devices. |
 | Application server | Apps are client-side. SDK handles everything. |

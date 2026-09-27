@@ -1243,7 +1243,7 @@ pub struct RefundConfirmation {
 - Pricing formula divergence between payer and receiver (due to metric observation timing) creates retry overhead, even with the `CostInsufficient` metric snapshot mechanism.
 
 **Protocol invariants established:**
-- Free relays MUST always exist in the bootstrap list — economic gatekeeping is a protocol violation.
+- ~~Free relays MUST always exist in the bootstrap list — economic gatekeeping is a protocol violation.~~ **Withdrawn 2026-09-27.** Alec ruled that the free-entry obligation is Limn's list policy and no protocol rule, and ADR-063's register entry on the relay-list pointer records the ruling.
 - Auto-accept never applies to paid contexts — agents never silently incur costs.
 - Free operation is default — no economic policy = free.
 - Payment data inside encrypted envelope — relays never see context-level payment metadata.
@@ -1280,4 +1280,4 @@ pub struct RefundConfirmation {
 11. `PaymentReceipt` events recorded in context event log with Merkle inclusion proofs.
 12. `.well-known/scp` relay config parsing accepts optional `economic` object with `per_publish`, `per_byte_stored`, `payment_adapters`, `payee` fields.
 13. `paid-service` and `paid-broadcast` context templates defined with required economic policy fields.
-14. Free relays exist in the default bootstrap relay list — at least one relay in the SDK's fallback list has no `economic` config.
+14. ~~Free relays exist in the default bootstrap relay list — at least one relay in the SDK's fallback list has no `economic` config.~~ **Withdrawn 2026-09-27**, with the free-relay invariant above: the SDK ships no relay list (`18-addressability-and-deployment.md` §18.5.1), and whether the community relay list carries a free relay is Limn's list policy.

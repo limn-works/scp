@@ -705,7 +705,7 @@
         "Idempotent: a frame whose event digests all match the chain's leaves what the relay holds unchanged, which is a relay's own write rule and which ADR-065, the relay ADR, pending, states; the tag `archive/kel-combined-pre-split` preserves the combined text",
         "A PUBLISH at the `scp:did:` kind sets `retain: true` and a validating relay gives the record no TTL (§9.10.12)",
         "Failure handling: exponential backoff on publish failure: 30s, 1m, 2m, 4m, 8m, 16m, capped at 30m",
-        "Each retry re-reads the fallback set from the shipped community relay list (§18.5.1)",
+        "Each retry re-reads the fallback set from the community relay list the SDK last accepted from the relay-list context (§18.5.1)",
         "After 6 consecutive failures, emit a publish-degraded warning to the application layer",
         "The self-observation cadence starts when an identity is loaded (Identity::load or Identity::create) and stops when that identity is unloaded or the SDK shuts down, and the SDK runs exactly one cadence loop per loaded identity: a test loads one identity, counts the cadence tasks the identity module spawned for it, and asserts one (`09-security-model.md` §9.7.4.2 R10)",
         "Each cadence pass fetches from every entry of the publication set `03-identity.md` §3.10.5 names, on every launch and at least once per witnessing interval, and `Identity::observe_self` returns one `EntryObservation` per entry of that set, each entry exactly once (`03-identity.md` §3.10.10)",
@@ -8037,11 +8037,11 @@
         "crates/scp-transport/src/config.rs",
         "crates/scp-transport/src/manager.rs"
       ],
-      "description": "Implement TransportConfig and the relay bootstrap resolution chain as specified in §18.5 and ADR-032. TransportConfig is the configuration struct passed to TransportManager at initialization, providing explicit relay URLs, optional bootstrap domain, and dedup configuration.\n\nThe ResolveRelays trait implements the bootstrap priority chain: explicit config → service record → .well-known/scp → peer relay discovery → fallback relay list. This closes the relay discovery open question from §00.\n\nThis story modifies crates/scp-transport/src/manager.rs to accept TransportConfig at initialization. Both this story and SCP-033 modify manager.rs — SCP-033 adds multi-relay routing on top of the TransportConfig foundation laid here.",
+      "description": "Implement TransportConfig and the relay bootstrap resolution chain as specified in §18.5 and ADR-032. TransportConfig is the configuration struct passed to TransportManager at initialization, providing explicit relay URLs, optional bootstrap domain, and dedup configuration.\n\nThe ResolveRelays trait implements the bootstrap priority chain: explicit config → service record → .well-known/scp → peer relay discovery → the community relay list (§18.5.1). This closes the relay discovery open question from §00.\n\nThis story modifies crates/scp-transport/src/manager.rs to accept TransportConfig at initialization. Both this story and SCP-033 modify manager.rs — SCP-033 adds multi-relay routing on top of the TransportConfig foundation laid here.",
       "acceptanceCriteria": [
         "TransportConfig struct with fields: relay_urls (Vec<Url>), bootstrap_domain (Option<String>), dedup_cache_size (usize, default 10_000), dedup_cache_ttl (Duration, default 1 hour)",
         "ResolveRelays trait with async method resolve() -> Result<Vec<Url>, TransportError>",
-        "DefaultRelayResolver implements ResolveRelays with the priority chain: (1) explicit relay_urls from TransportConfig, (2) service record SCPRelay entries, (3) .well-known/scp relay URL from bootstrap_domain, (4) peer relay discovery from shared contexts, (5) hardcoded fallback relay list",
+        "DefaultRelayResolver implements ResolveRelays with the priority chain: (1) explicit relay_urls from TransportConfig, (2) service record SCPRelay entries, (3) .well-known/scp relay URL from bootstrap_domain, (4) peer relay discovery from shared contexts, (5) the community relay list (§18.5.1); SCP-RELAYRES-013 replaces the hardcoded `FALLBACK_RELAYS` this story shipped with the list the SDK accepts from the relay-list context",
         "Each priority level is tried in order — first level yielding at least one reachable relay is used",
         "TransportManager::new accepts TransportConfig parameter",
         "TransportManager uses resolved relays for its adapter pool",
@@ -8050,7 +8050,7 @@
         "Unit test: resolve with empty relay_urls falls through to service record resolution",
         "Unit test: resolve with bootstrap_domain fetches .well-known/scp and extracts relay URL",
         "Unit test: TransportManager::new accepts TransportConfig and initializes correctly",
-        "SDK logs a warning when relay resolution falls through to the hardcoded fallback relay list (§18.5.1 SHOULD)"
+        "SDK logs a warning when relay resolution falls through to the community relay list (§18.5.1)"
       ],
       "actionItems": [
         "Create crates/scp-transport/src/config.rs with TransportConfig struct",
@@ -8079,7 +8079,7 @@
         }
       ],
       "details": {
-        "bootstrapPriorityChain": "1. Explicit configuration (relay_urls in TransportConfig)\n2. Service record resolution (SCPRelay service entries)\n3. .well-known/scp resolution (from bootstrap_domain)\n4. Peer relay discovery (overlapping relay sets from shared contexts)\n5. Fallback relay list (hardcoded community relays)",
+        "bootstrapPriorityChain": "1. Explicit configuration (relay_urls in TransportConfig)\n2. Service record resolution (SCPRelay service entries)\n3. .well-known/scp resolution (from bootstrap_domain)\n4. Peer relay discovery (overlapping relay sets from shared contexts)\n5. The community relay list (§18.5.1), which the SDK fetches from the relay-list context its pointer names",
         "fileConflictNote": "Both SCP-144 and SCP-033 modify crates/scp-transport/src/manager.rs. SCP-144 adds TransportConfig acceptance; SCP-033 completes multi-relay routing on top. Sequential execution required — SCP-033 is blocked by SCP-144.",
         "implementationNotes": "Language: Rust. Async runtime: tokio. The ResolveRelays trait is async to support network operations (DHT resolution, HTTP fetch). The DefaultRelayResolver holds references to IdentityManager (for identity resolution) and an HTTP client (for .well-known/scp fetch)."
       }
@@ -9008,7 +9008,7 @@
         "crates/scp-transport/src/relay/wellknown.rs",
         "crates/scp-transport/src/manager.rs"
       ],
-      "description": "Implement relay economic config extension to .well-known/scp (§19.8, §18.3.3) and cost-aware relay selection in TransportManager.\n\n§19.8 Relay Economic Config extends .well-known/scp (§18.3.3):\n```json\n{\n  \"relay_config\": {\n    \"max_blob_size\": 262144,\n    \"max_blob_ttl\": 86400,\n    \"rate_limit_publish\": 100,\n    \"economic\": {\n      \"currency\": \"USD\",\n      \"per_publish\": 10,\n      \"per_byte_stored\": 1,\n      \"payment_adapters\": [\"x402\", \"lightning\"],\n      \"payee\": \"<the relay operator's identifier, in the text form 03 §3.1 fixes>\"\n    }\n  }\n}\n```\n\nRelay economics are SEPARATE from context economics — different trust model. Relays are transport (dumb pipes, §9.9). Context pricing is application-level (inside encrypted envelope, invisible to relays).\n\nFree relays MUST exist. Bootstrap relay list (§18.5, priority level 5) MUST include free relays. Self-hosted relays (§10.2, §10.4), community relays, and bundled relays remain free. Economic config is optional. Absence = free.\n\nRelay selection: TransportManager (ADR-012) already selects by reliability + latency. Economic governance adds cost as a third criterion. Market pressure: agents prefer cheaper relays, creating competition.\n\nPayment flow: Agent evaluates relay config (visible before connecting) -> selects compatible adapter -> authorizes per-action -> relay verifies + captures.\n\nAmount values in .well-known/scp are serialized as JSON integers in the smallest currency unit specified by currency. Decimal string representations are NOT valid — all amounts are integers. The currency field determines the interpretation scale.",
+      "description": "Implement relay economic config extension to .well-known/scp (§19.8, §18.3.3) and cost-aware relay selection in TransportManager.\n\n§19.8 Relay Economic Config extends .well-known/scp (§18.3.3):\n```json\n{\n  \"relay_config\": {\n    \"max_blob_size\": 262144,\n    \"max_blob_ttl\": 86400,\n    \"rate_limit_publish\": 100,\n    \"economic\": {\n      \"currency\": \"USD\",\n      \"per_publish\": 10,\n      \"per_byte_stored\": 1,\n      \"payment_adapters\": [\"x402\", \"lightning\"],\n      \"payee\": \"<the relay operator's identifier, in the text form 03 §3.1 fixes>\"\n    }\n  }\n}\n```\n\nRelay economics are SEPARATE from context economics — different trust model. Relays are transport (dumb pipes, §9.9). Context pricing is application-level (inside encrypted envelope, invisible to relays).\n\nNo protocol rule requires a free relay to exist: whether the community relay list carries one is Limn's list policy (`18-addressability-and-deployment.md` §18.5.1, `19-economic-governance.md` §19.14 invariant 8).\n\nRelay selection: TransportManager (ADR-012) already selects by reliability + latency. Economic governance adds cost as a third criterion. Market pressure: agents prefer cheaper relays, creating competition.\n\nPayment flow: Agent evaluates relay config (visible before connecting) -> selects compatible adapter -> authorizes per-action -> relay verifies + captures.\n\nAmount values in .well-known/scp are serialized as JSON integers in the smallest currency unit specified by currency. Decimal string representations are NOT valid — all amounts are integers. The currency field determines the interpretation scale.",
       "acceptanceCriteria": [
         "RelayEconomicConfig struct defined with field: per_publish (Option<Amount>) — cost per publish action",
         "RelayEconomicConfig struct defined with field: per_byte_stored (Option<Amount>) — cost per byte stored",
@@ -9021,21 +9021,21 @@
         "Parsing: .well-known/scp JSON without economic field treated as free relay (no error)",
         "TransportManager relay selection adds cost as third criterion alongside reliability and latency",
         "TransportManager prefers cheaper relays when reliability and latency are comparable",
-        "Free relay MUST exist check: SDK's fallback bootstrap relay list validated to include at least one free relay",
-        "Free relay invariant: startup validation warns or errors if no free relay in bootstrap list",
+        "Withdrawn 2026-09-27: `19-economic-governance.md` §19.14 invariant 8 now states that no protocol rule requires a free relay, and whether the community relay list carries one is Limn's list policy (`18-addressability-and-deployment.md` §18.5.1); SCP-RELAYRES-013 deletes the check this criterion added. (was: Free relay MUST exist check: SDK's fallback bootstrap relay list validated to include at least one free relay)",
+        "Withdrawn 2026-09-27: `19-economic-governance.md` §19.14 invariant 8 now states that no protocol rule requires a free relay, and whether the community relay list carries one is Limn's list policy (`18-addressability-and-deployment.md` §18.5.1); SCP-RELAYRES-013 deletes the check this criterion added. (was: Free relay invariant: startup validation warns or errors if no free relay in bootstrap list)",
         "Relay economic terms visible before connecting — agent inspects .well-known/scp before selecting relay",
         "Unit test: RelayEconomicConfig serialize/deserialize roundtrip",
         "Unit test: .well-known/scp parsing with economic field produces correct RelayEconomicConfig",
         "Unit test: .well-known/scp parsing without economic field produces None for economic config",
         "Unit test: TransportManager selects cheaper relay when reliability/latency are equal",
-        "Unit test: bootstrap relay list validation detects missing free relay"
+        "Withdrawn 2026-09-27: `19-economic-governance.md` §19.14 invariant 8 now states that no protocol rule requires a free relay, and whether the community relay list carries one is Limn's list policy (`18-addressability-and-deployment.md` §18.5.1); SCP-RELAYRES-013 deletes the check this criterion added. (was: Unit test: bootstrap relay list validation detects missing free relay)"
       ],
       "actionItems": [
         "Define RelayEconomicConfig struct in crates/scp-transport/src/relay/config.rs",
         "Extend existing relay_config parsing in wellknown.rs to handle optional economic field",
         "Implement JSON deserialization for the economic object (per_publish, per_byte_stored as amount+currency pairs)",
         "Add cost as third criterion in TransportManager relay selection logic in manager.rs",
-        "Implement free relay MUST exist validation in bootstrap relay list initialization",
+        "Withdrawn 2026-09-27: `19-economic-governance.md` §19.14 invariant 8 now states that no protocol rule requires a free relay, and whether the community relay list carries one is Limn's list policy (`18-addressability-and-deployment.md` §18.5.1); SCP-RELAYRES-013 deletes the check this criterion added. (was: Implement free relay MUST exist validation in bootstrap relay list initialization)",
         "Implement relay economic terms inspection (available before connecting)",
         "Write unit tests for config parsing (with and without economic field), relay selection, and bootstrap validation",
         "Re-export RelayEconomicConfig from appropriate module"
@@ -9061,7 +9061,7 @@
       ],
       "details": {
         "ADR-033 criterion 12": ".well-known/scp relay config parsing accepts optional economic object with per_publish, per_byte_stored, payment_adapters, payee fields.",
-        "ADR-033 criterion 14": "Free relays exist in the default bootstrap relay list — at least one relay in the SDK's fallback list has no economic config.",
+        "ADR-033 criterion 14": "Withdrawn 2026-09-27 in `.docs/adrs/phase-3.md` ADR-033, with the free-relay invariant it tested.",
         "Relay trust model": "Paid relays remain untrusted — they see opaque blobs. Relay payment is for transport, not content access. Encryption-as-access-control (§9) unchanged. A relay that charges for storage cannot read what it stores.",
         "JSON structure": "The economic field is nested inside relay_config. Fields: per_publish (amount+currency), per_byte_stored (amount+currency), payment_adapters (array of adapter ID strings), payee (DID string)."
       },
@@ -9139,7 +9139,7 @@
       "files": [
         "crates/scp-core/tests/economy_integration.rs"
       ],
-      "description": "End-to-end integration test covering ALL 9 invariants from §19.14.\n\n§19.14 Invariants:\n1. Economic policy visible before opt-in (legibility). Economic terms are part of context metadata (§5.7), visible to any identity that inspects the context before joining.\n2. No implicit spending — spending UCAN always required. Protocol NEVER authorizes expenditure without an explicit, valid spending UCAN from the payer's delegation chain.\n3. Free operation is default — no economic policy = free. Contexts without EconomicPolicy are free. Relays without economic in relay_config are free. Outlets without cost metadata are free.\n4. Receipts are provenance records — every payment is traceable and verifiable. Payment receipts are recorded in context event logs and participate in the provenance chain (§7.7).\n5. Payment adapters are substitutable — no single rail privileged. The PaymentAdapter trait treats all payment rails equally. Protocol correctness does not depend on any specific adapter.\n6. Economic policy mutable by default, optional immutability lock is voluntary. Unlike ceiling policy (immutable by default), economic policy is governed by default. Creators may voluntarily lock pricing at creation.\n7. Payment data inside encrypted envelope — relays never see payment metadata for context-level economics.\n8. Free relays MUST always exist in bootstrap list. The SDK's fallback relay list (§18.5) MUST include free relays. This is a protocol invariant that prevents economic gatekeeping of basic protocol operation.\n9. Auto-accept never applies to paid contexts. No auto-accept policy configuration (§5.12.2) can override this. Agents never silently incur costs.\n\nIntegration flow: create context with EconomicPolicy -> register outlet with cost -> grant spending UCAN -> send paid message -> verify receipt in event log -> test auto-accept rejection -> test SpendingCapabilityRequired -> test dynamic pricing -> test anti-spam escalation -> verify free relay exists.",
+      "description": "End-to-end integration test covering ALL 9 invariants from §19.14.\n\n§19.14 Invariants:\n1. Economic policy visible before opt-in (legibility). Economic terms are part of context metadata (§5.7), visible to any identity that inspects the context before joining.\n2. No implicit spending — spending UCAN always required. Protocol NEVER authorizes expenditure without an explicit, valid spending UCAN from the payer's delegation chain.\n3. Free operation is default — no economic policy = free. Contexts without EconomicPolicy are free. Relays without economic in relay_config are free. Outlets without cost metadata are free.\n4. Receipts are provenance records — every payment is traceable and verifiable. Payment receipts are recorded in context event logs and participate in the provenance chain (§7.7).\n5. Payment adapters are substitutable — no single rail privileged. The PaymentAdapter trait treats all payment rails equally. Protocol correctness does not depend on any specific adapter.\n6. Economic policy mutable by default, optional immutability lock is voluntary. Unlike ceiling policy (immutable by default), economic policy is governed by default. Creators may voluntarily lock pricing at creation.\n7. Payment data inside encrypted envelope — relays never see payment metadata for context-level economics.\n8. No protocol rule requires a free relay to exist. Whether the community relay list (`18-addressability-and-deployment.md` §18.5.1) carries an entry whose `free` member is true is Limn's list policy (reworded 2026-09-27).\n9. Auto-accept never applies to paid contexts. No auto-accept policy configuration (§5.12.2) can override this. Agents never silently incur costs.\n\nIntegration flow: create context with EconomicPolicy -> register outlet with cost -> grant spending UCAN -> send paid message -> verify receipt in event log -> test auto-accept rejection -> test SpendingCapabilityRequired -> test dynamic pricing -> test anti-spam escalation -> verify free relay exists.",
       "acceptanceCriteria": [
         "Invariant 1 test: Create context with EconomicPolicy, inspect context metadata before joining — economic terms visible",
         "Invariant 2 test: Attempt paid action without spending UCAN — SpendingCapabilityRequired error returned",
@@ -9152,7 +9152,7 @@
         "Invariant 6 test: Create context with locked: false, update economic policy via governance — succeeds",
         "Invariant 6 test: Create context with locked: true, attempt economic policy update — rejected",
         "Invariant 7 test: Complete paid action, inspect relay-visible data — no payment metadata leaked outside encrypted envelope",
-        "Invariant 8 test: Validate SDK's bootstrap relay list includes at least one free relay (no economic config)",
+        "Withdrawn 2026-09-27: `19-economic-governance.md` §19.14 invariant 8 now states that no protocol rule requires a free relay, and whether the community relay list carries one is Limn's list policy (`18-addressability-and-deployment.md` §18.5.1); SCP-RELAYRES-013 deletes the check this criterion added. (was: Invariant 8 test: Validate SDK's bootstrap relay list includes at least one free relay (no economic config))",
         "Invariant 9 test: Create paid context, configure auto-accept policy, receive invitation — invitation NOT auto-accepted",
         "Integration flow: create context with EconomicPolicy including per_message cost and PricingFormula",
         "Integration flow: register outlet with per-invocation cost in the context",
@@ -9161,7 +9161,7 @@
         "Integration flow: invoke paid outlet — cost includes context + outlet cost, receipt recorded",
         "Integration flow: dynamic pricing — increase SenderVelocity, verify cost increases at threshold boundaries",
         "Integration flow: anti-spam escalation — send messages at escalating rate, verify cost steps up per SenderVelocity thresholds",
-        "Integration flow: verify free relay exists in bootstrap list",
+        "Withdrawn 2026-09-27: `19-economic-governance.md` §19.14 invariant 8 now states that no protocol rule requires a free relay, and whether the community relay list carries one is Limn's list policy (`18-addressability-and-deployment.md` §18.5.1); SCP-RELAYRES-013 deletes the check this criterion added. (was: Integration flow: verify free relay exists in bootstrap list)",
         "All tests use TestAdapter — no real payment rails"
       ],
       "actionItems": [
@@ -9173,7 +9173,7 @@
         "Write integration flow test: full lifecycle from context creation through paid message and outlet invocation",
         "Write integration flow test: dynamic pricing with SenderVelocity escalation",
         "Write integration flow test: anti-spam cost escalation at threshold boundaries",
-        "Write integration flow test: free relay bootstrap list validation",
+        "Withdrawn 2026-09-27: `19-economic-governance.md` §19.14 invariant 8 now states that no protocol rule requires a free relay, and whether the community relay list carries one is Limn's list policy (`18-addressability-and-deployment.md` §18.5.1); SCP-RELAYRES-013 deletes the check this criterion added. (was: Write integration flow test: free relay bootstrap list validation)",
         "Ensure all tests are #[tokio::test] async tests",
         "Ensure all tests use TestAdapter, not real payment rails"
       ],
@@ -9202,7 +9202,7 @@
         }
       ],
       "details": {
-        "9 invariants from §19.14": "1. Economic policy visible before opt-in (legibility). 2. No implicit spending — spending UCAN always required. 3. Free operation is default — no economic policy = free. 4. Receipts are provenance records — every payment traceable and verifiable. 5. Payment adapters substitutable — no single rail privileged. 6. Economic policy mutable by default, optional immutability lock voluntary. 7. Payment data inside encrypted envelope — relays never see payment metadata. 8. Free relays MUST always exist in bootstrap list. 9. Auto-accept never applies to paid contexts.",
+        "9 invariants from §19.14": "1. Economic policy visible before opt-in (legibility). 2. No implicit spending — spending UCAN always required. 3. Free operation is default — no economic policy = free. 4. Receipts are provenance records — every payment traceable and verifiable. 5. Payment adapters substitutable — no single rail privileged. 6. Economic policy mutable by default, optional immutability lock voluntary. 7. Payment data inside encrypted envelope — relays never see payment metadata. 8. No protocol rule requires a free relay to exist (reworded 2026-09-27; the free-entry obligation is Limn's list policy). 9. Auto-accept never applies to paid contexts.",
         "TestAdapter usage": "All integration tests use TestAdapter — in-memory, no real money. seed_balance() for setup, payment_adapter_conformance!() already validates adapter correctness separately."
       },
       "result": "40 integration tests covering all 9 invariants from §19.14. Tests cover: economic policy legibility, spending UCAN requirement, free-default operation, receipt provenance, adapter substitutability, policy mutability/lock, envelope privacy, free relay bootstrap, auto-accept rejection, dynamic pricing, anti-spam escalation."

@@ -288,7 +288,7 @@
         "crates/scp-transport/src/relay/stun_service.rs",
         "crates/scp-transport/src/relay/mod.rs"
       ],
-      "description": "Any SCP relay MAY serve as a STUN endpoint (§10.12.3). STUN service is lightweight, stateless, and uses a single UDP socket. Bootstrap relays (§18.5) MUST include at least one STUN-capable relay. Self-hosted relays MAY also offer STUN, creating a self-reinforcing network where more relays means more STUN servers available for NAT probing. Phase 3 component.",
+      "description": "Any SCP relay MAY serve as a STUN endpoint (§10.12.3). STUN service is lightweight, stateless, and uses a single UDP socket. Whether the community relay list (§18.5.1) carries a STUN-capable relay is Limn's list policy and no protocol rule (reworded 2026-09-27; ADR-063's register entry on the relay-list pointer records it). Self-hosted relays MAY also offer STUN, creating a self-reinforcing network where more relays means more STUN servers available for NAT probing. Phase 3 component.",
       "acceptanceCriteria": [
         "Relay exposes optional STUN service on a configurable UDP port",
         "STUN service handles RFC 8489 Binding requests and returns XOR-MAPPED-ADDRESS",
