@@ -217,16 +217,11 @@ class JoinFromWelcomeTest {
                 // to the creator out of band.
                 val reservation = scp.reserveKeyPackage(invitee)
 
-                // A creator seals its bundle to an invitee's #active key
-                // (Ed25519 -> X25519), resolved from that invitee's DID
-                // document. A locally-created invitee resolves here, so a
-                // fully-sealed outcome is reachable from this UniFFI SDK and
-                // this method asserts it. An earlier revision instead asserted
-                // a SCP-CTX-2001 resolution failure and described a UniFFI
-                // bridge that never publishes a minted DID document to a
-                // resolver-visible store; this file's own header already
-                // described that happy path as reachable, so that expectation
-                // outlived whatever behaviour it described.
+                // The creator seals the bundle to the invitee's #active key
+                // (Ed25519 -> X25519), which the runtime resolves from the
+                // invitee's DID document. `inviteMember` returns the sealed
+                // bundle, which is the same wire type the joiner passes to
+                // `contextJoinFromWelcome`.
                 val outcome =
                     scp.inviteMember(
                         identity = creator,
@@ -246,7 +241,8 @@ class JoinFromWelcomeTest {
                 // (`spawn_from_welcome_tests`): one instance cannot self-join
                 // its own context, because first-writer-wins rejects a second
                 // actor for the same context id.
-                val sealed = (outcome as InviteMemberOutcome.Sealed).bundle
+                val sealedOutcome = outcome as InviteMemberOutcome.Sealed
+                val sealed = sealedOutcome.bundle
                 assertEquals(
                     ctx.contextId(),
                     sealed.contextId,
@@ -268,6 +264,13 @@ class JoinFromWelcomeTest {
                 assertTrue(
                     sealed.ciphertext.isNotEmpty(),
                     "the sealed Welcome ciphertext must be non-empty",
+                )
+                // No relay URL was supplied, so the runtime published nothing
+                // and the caller delivers the bundle itself.
+                assertEquals(
+                    false,
+                    sealedOutcome.delivered,
+                    "with no relay configured the runtime cannot publish the bundle",
                 )
             } finally {
                 scp.shutdown(shutdownBridge(), 1.seconds)

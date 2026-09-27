@@ -160,9 +160,8 @@ async def context(alice):
 ### Test naming
 
 ```python
-async def test_identity_create_returns_valid_did():
-    identity = await Identity.create(custody="in_memory")
-    assert identity.did.startswith("did:dht:")
+async def test_identity_create_returns_a_32_byte_identifier(alice):
+    assert len(alice.identifier) == 32  # 09-security-model.md §9.7.4.2 R13
 
 async def test_context_send_requires_active_state():
     ...

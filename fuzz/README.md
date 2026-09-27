@@ -230,7 +230,7 @@ in the libFuzzer logs plateaus at a low number, check that:
    cargo fuzz run fuzz_my_target -- -max_total_time=60
    ```
 
-See `fuzz/.claude/CLAUDE.md` for the full agent-facing checklist.
+See `fuzz/AGENTS.md` for the rules an agent working on the fuzz crate must follow.
 
 ## Crash Workflow
 

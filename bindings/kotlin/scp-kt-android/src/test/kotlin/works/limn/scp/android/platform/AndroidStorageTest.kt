@@ -37,6 +37,7 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import java.util.TreeMap
+import kotlin.reflect.KFunction1
 
 /**
  * In-memory implementation of [StorageProvider] for contract testing.
@@ -45,49 +46,37 @@ import java.util.TreeMap
  * lexicographic ordering on listKeys, prefix-based matching, and cursor-style
  * retrieval. This implementation validates the StorageProvider contract without
  * requiring Android runtime dependencies.
- *
- * Every method holds [lock] for its whole body, because conformance case 12
- * (`concurrent_access`) stores from eight threads at once and `TreeMap` is not
- * thread-safe: concurrent `put` calls on a red-black tree drop entries and can leave
- * a node graph that a later read walks incorrectly. Production [AndroidStorage]
- * serializes that same way, through a single SQLCipher `SQLiteDatabase` connection.
  */
 class InMemoryStorageProvider : StorageProvider {
 
-    /** Monitor guarding [data]. Mirrors single-connection serialization AndroidStorage gets from SQLCipher. */
-    private val lock = Any()
-
     // TreeMap provides natural lexicographic ordering, matching SQLCipher's
-    // ORDER BY key ASC behavior.
+    // ORDER BY key ASC behavior. TreeMap is not thread-safe, and the
+    // StorageProvider contract requires concurrent callers not to interfere
+    // (conformance case 12, concurrent_access), so every operation holds [lock].
+    private val lock = Any()
     private val data = TreeMap<String, ByteArray>()
 
     override fun set(key: String, data: ByteArray) {
         synchronized(lock) { this.data[key] = data.copyOf() }
     }
 
-    override fun get(key: String): ByteArray? {
-        return synchronized(lock) { data[key]?.copyOf() }
-    }
+    override fun get(key: String): ByteArray? = synchronized(lock) { data[key]?.copyOf() }
 
     override fun delete(key: String) {
         synchronized(lock) { data.remove(key) }
     }
 
-    override fun listKeys(prefix: String): List<String> {
-        return synchronized(lock) { data.keys.filter { it.startsWith(prefix) } }
-    }
+    override fun listKeys(prefix: String): List<String> =
+        synchronized(lock) { data.keys.filter { it.startsWith(prefix) } }
 
-    override fun deletePrefix(prefix: String): Long {
-        return synchronized(lock) {
+    override fun deletePrefix(prefix: String): Long =
+        synchronized(lock) {
             val keysToDelete = data.keys.filter { it.startsWith(prefix) }
             keysToDelete.forEach { data.remove(it) }
             keysToDelete.size.toLong()
         }
-    }
 
-    override fun exists(key: String): Boolean {
-        return synchronized(lock) { data.containsKey(key) }
-    }
+    override fun exists(key: String): Boolean = synchronized(lock) { data.containsKey(key) }
 }
 
 /**
@@ -468,16 +457,15 @@ class AndroidStorageTest {
         }
 
         @Test
-        fun `getOrCreateStorageKey takes no parameters and returns a ByteArray`() {
-            // Kotlin appends a module suffix to an `internal` function's JVM name
-            // (getOrCreateStorageKey$scp_kt_android_debug), so getDeclaredMethod given a
-            // Kotlin name never resolves it and throws NoSuchMethodException. Match on
-            // whatever precedes that suffix, then assert a signature ADR-027 names.
-            val method = AndroidStorage::class.java.declaredMethods
-                .single { it.name.substringBefore('$') == "getOrCreateStorageKey" }
-            assertNotNull(method)
-            assertEquals(0, method.parameterCount)
-            assertEquals(ByteArray::class.java, method.returnType)
+        fun `getOrCreateStorageKey is accessible for integration testing`() {
+            // Verify the method exists on the production class with the signature
+            // `AndroidStorage.() -> ByteArray` (calling it throws without Android
+            // Keystore). The method is `internal`, so the Kotlin compiler mangles its
+            // JVM name with the module name and a reflective lookup of the source name
+            // finds nothing; the typed function reference checks the signature at
+            // compile time instead.
+            val method: KFunction1<AndroidStorage, ByteArray> = AndroidStorage::getOrCreateStorageKey
+            assertEquals("getOrCreateStorageKey", method.name)
         }
 
         @Test

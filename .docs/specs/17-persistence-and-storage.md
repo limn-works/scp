@@ -28,7 +28,7 @@ BlobStorage trait (store/get/query/delete/purge_expired with routing_id + TTL)
 Backend adapter (SQLite, redb, PostgreSQL, S3-compatible, in-memory)
 ```
 
-The `BlobStore` trait (defined in `scp-transport/native/`) handles encrypted message blobs with routing metadata and time-to-live semantics. Relay operators choose a backend based on deployment scale.
+The `BlobStorage` trait (defined in `scp-transport/native/storage.rs`) handles encrypted message blobs with routing metadata and time-to-live semantics. Relay operators choose a backend based on deployment scale.
 
 ### Why Thin Trait + Thick Protocol Layer
 
@@ -81,9 +81,9 @@ All keys follow `{namespace}/{entity_id}/{sub_key}` with `/` as the hierarchy se
 _meta/schema_version
 scp/identity
 
-identity/{did}/document
+identity/{did}/key_event_log
+identity/{did}/service_record
 identity/{did}/active_signing_key
-identity/{did}/agent_signing_key
 identity/{did}/private_state/{seq:020d}
 identity/{did}/block_list_events
 identity/{did}/adapter_credentials/{adapter_id}
@@ -126,7 +126,7 @@ context/{context_id}/spending_ucan/{token_id}
 wrapping_key/{context_id}/{did}/public
 wrapping_key/{context_id}/{did}/secret
 
-did_cache/{did}
+key_event_log_cache/{did}
 tofu/{did}
 key_package/{sha256_hex(relay_url)}/{index}
 relay_score/{sha256_hex(relay_url)}
@@ -138,7 +138,7 @@ tls/private_key
 mls/{context_id}/...
 ```
 
-**Identity bootstrap key.** The `scp/identity` key stores a `StoredValue<PersistedIdentity>` containing the node's `ScpIdentity` and `DidDocument`. This is a top-level singleton key (no entity ID) because it is read during identity bootstrap before any DID is known. Written via the `Storage` trait directly, not through `ProtocolRepository` domain methods (see §17.4 for the exception rationale).
+**Identity bootstrap key.** The `scp/identity` key stores a `StoredValue<PersistedIdentity>` for the node's own identity. This is a top-level singleton key (no entity ID) because it is read during identity bootstrap before any DID is known. Written via the `Storage` trait directly, not through `ProtocolRepository` domain methods (see §17.4 for the exception rationale).
 
 **Zero-padded sequences.** Event sequence numbers and private state sequence numbers use `:020d` formatting (20-digit zero-padded decimal). This ensures lexicographic ordering matches numeric ordering, enabling efficient range queries via `list_keys`. Example: event 42 is stored at `context/{id}/event/00000000000000000042`.
 
@@ -230,10 +230,10 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn load_merkle_event_log_entries(&self, context_id: &str) -> Result<Option<Vec<EventLogEntry>>, StoreError>;
     pub async fn delete_merkle_event_log_entries(&self, context_id: &str) -> Result<(), StoreError>;
 
-    // --- DID cache ---
-    pub async fn cache_did_document(&self, did: &DID, doc: &[u8], expires_at: u64) -> Result<(), StoreError>;
+    // --- Resolved key-event-log cache ---
+    pub async fn cache_key_event_log(&self, did: &DID, log: &[u8], expires_at: u64) -> Result<(), StoreError>;
     // `now` parameter enables testable expiry checks without hidden clock dependencies.
-    pub async fn load_cached_did_document(&self, did: &DID, now: u64) -> Result<Option<Vec<u8>>, StoreError>;
+    pub async fn load_cached_key_event_log(&self, did: &DID, now: u64) -> Result<Option<Vec<u8>>, StoreError>;
 
     // --- TOFU records ---
     pub async fn store_tofu_record(&self, did: &DID, record: &[u8]) -> Result<(), StoreError>;
@@ -255,8 +255,10 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn list_relay_scores(&self) -> Result<Vec<(String, Vec<u8>)>, StoreError>;
 
     // --- Identity ---
-    pub async fn store_identity_document(&self, did: &DID, doc: &[u8]) -> Result<(), StoreError>;
-    pub async fn load_identity_document(&self, did: &DID) -> Result<Option<Vec<u8>>, StoreError>;
+    pub async fn store_key_event_log(&self, did: &DID, log: &[u8]) -> Result<(), StoreError>;
+    pub async fn load_key_event_log(&self, did: &DID) -> Result<Option<Vec<u8>>, StoreError>;
+    pub async fn store_service_record(&self, did: &DID, record: &[u8]) -> Result<(), StoreError>;
+    pub async fn load_service_record(&self, did: &DID) -> Result<Option<Vec<u8>>, StoreError>;
     pub async fn store_identity_private_state(&self, did: &DID, seq: u64, state: &[u8]) -> Result<(), StoreError>;
     pub async fn load_identity_private_state(&self, did: &DID, seq: u64) -> Result<Option<Vec<u8>>, StoreError>;
 
@@ -306,7 +308,7 @@ scp-core/src/store/
     mod.rs          # ProtocolRepository struct, StoreError type, re-exports
     context.rs      # Context state, params, membership, sender keys
     event_log.rs    # Event log persistence, tree nodes, roots
-    identity.rs     # Identity documents, private state, TOFU, DID cache
+    identity.rs     # Key-event logs, service records, private state, TOFU, resolved-log cache
     nonce.rs        # UCAN nonce tracking, pruning
     tls.rs          # TLS certificate chain + private key (§18.6.3)
     outlets.rs        # Outlet registration, sessions
@@ -335,9 +337,9 @@ Every value written by `ProtocolRepository` is wrapped in `StoredValue`. On read
 **Context export integrity (signed snapshot).** A portable `ContextExport` (the serialized form produced for backup, migration, or device transfer) carries TWO independent integrity protections, both verified on import before any state is restored:
 
 1. **Event-log Merkle chain** — the serialized event-log entries are hash-chained and the export records the Merkle root; import recomputes and compares it (tamper detection on the event history).
-2. **Signed snapshot** — the *entire* embedded context snapshot is bound by an Ed25519 `snapshot_signature`, computed and verified **exactly as specified in §23.16.8 (Signed Context Export)**: Ed25519 over `SHA-256("SCP-CONTEXT-EXPORT-V1:" || scope-tag-byte || JCS(ContextSnapshot))`, where `scope-tag-byte` is the single export-scope discriminant (`0x00` for `Full`, `0x01` for `Public`) placed immediately after the domain separator and before the JCS bytes, and `JCS` is the RFC 8785 canonical-JSON serialization of the whole snapshot. Binding the scope byte into the preimage means a tampered envelope `scope` field fails signature verification by construction (§23.16.8, ADR-050). The export domain separator `"SCP-CONTEXT-EXPORT-V1:"` is deliberately distinct from the §23.16.4 sync-delta separator `"SCP-CONTEXT-SNAPSHOT-V1:"` so that an export signature can never be confused with a sync-delta signature under the same creator key (§9.18.2). The signature is produced by the snapshot's `creator_did` `#active`/`#agent` custody key (ADR-039); on import the verifying key is resolved from `creator_did`, the envelope's `exporter_did` MUST equal `creator_did`, and the signature MUST verify before any state is restored. The signature covers every trusted field the importer restores verbatim — role ceilings, member/suspended capabilities, role assignments, threshold signers and value, governance model configuration, economic policy, consequence rules, read-exclusion list, access-key store, pending ceiling modification, and outlet registrations — not only membership and parameters. A subset hash (such as the §23.16.4 sync-delta recipe) would leave those fields forgeable and MUST NOT be used for export. Per-instance anti-abuse and accounting state carried in the snapshot is signed but intentionally wiped or sanitized on import (§23.16.8).
+2. **Signed snapshot** — the *entire* embedded context snapshot is bound by a P-256 `snapshot_signature`, computed and verified **exactly as specified in §23.16.8 (Signed Context Export)**: a P-256 signature over `SHA-256("SCP-CONTEXT-EXPORT-V3:" || scope-tag-byte || key_state_head || BE32(len(JCS)) || JCS(ContextSnapshot))`, where `scope-tag-byte` is the single export-scope discriminant (`0x00` for `Full`, `0x01` for `Public`) placed immediately after the domain separator, `key_state_head` is the signer's 32-byte key-state anchor (`09-security-model.md` §9.7.1, the log-anchored evidence class), and `JCS` is the RFC 8785 canonical-JSON serialization of the whole snapshot. Binding the scope byte into the preimage means a tampered envelope `scope` field fails signature verification by construction (§23.16.8, ADR-050). The export domain separator `"SCP-CONTEXT-EXPORT-V3:"` is deliberately distinct from the §23.16.4 sync-delta separator `"SCP-CONTEXT-SNAPSHOT-V3:"` so that an export signature can never be confused with a sync-delta signature under the same creator key (§9.18.2). The signature is produced by the custody key backing the `#active` key the snapshot's `creator_did` listed `Current` at the anchored position, and no other key of that identity may sign an export (§23.16.8); on import the verifying key is resolved from `creator_did` and the signed anchor under the log-anchored evidence class, the envelope's `exporter_did` MUST equal `creator_did`, and the signature MUST verify before any state is restored. The signature covers every trusted field the importer restores verbatim — role ceilings, member/suspended capabilities, role assignments, threshold signers and value, governance model configuration, economic policy, consequence rules, read-exclusion list, access-key store, pending ceiling modification, and outlet registrations — not only membership and parameters. A subset hash (such as the §23.16.4 sync-delta recipe) would leave those fields forgeable and MUST NOT be used for export. Per-instance anti-abuse and accounting state carried in the snapshot is signed but intentionally wiped or sanitized on import (§23.16.8).
 
-The export format `version` is incremented when this integrity envelope changes (the scope-bound full-snapshot signed construction is native export `version` 4); imports reject any version that is not the current signed format with a dedicated *version* error surfaced as `SCP-CTX-2094`, which is distinct from a signature-verification failure (`SCP-CTX-2093`). See §23.16.8 for the canonical construction and the importer's normative verification and authorization requirements, and §23.17 for the sequence-floor invariants that imports must additionally enforce.
+The export format `version` is incremented when this integrity envelope changes, and §23.16.8 states the current value; imports reject any version that is not the current signed format with a dedicated *version* error surfaced as `SCP-CTX-2094`, which is distinct from a signature-verification failure (`SCP-CTX-2093`). See §23.16.8 for the canonical construction and the importer's normative verification and authorization requirements, and §23.17 for the sequence-floor invariants that imports must additionally enforce.
 
 **Encryption at rest** is a platform concern enforced at compile time by the sealed `EncryptedStorage` marker trait.
 
@@ -372,7 +374,7 @@ The seal mechanism uses a `pub(crate)` supertrait (`Sealed`) that external code 
 
 `EncryptingAdapter<S: Storage>` (defined in `scp-platform/src/encrypting_adapter.rs`) wraps any `Storage` implementation with per-value AES-256-GCM encryption, making it satisfy the sealed `EncryptedStorage` bound without requiring the inner backend to encrypt natively.
 
-**Key management:** The adapter is initialized with a 32-byte AES-256 key wrapped in `Zeroizing<[u8; 32]>` (cleared on drop). For ephemeral/FFI usage, the key is generated via `OsRng`. For persistent usage, the key should be derived from identity key material (see §17.6 SQLCipher key derivation).
+**Key management:** The adapter is initialized with a 32-byte AES-256 key wrapped in `Zeroizing<[u8; 32]>` (cleared on drop). For ephemeral/FFI usage, the key is generated via `OsRng`. For persistent usage, the key derives from the database key (see §17.6 SQLCipher key derivation).
 
 **Wire format:** Each stored value is:
 
@@ -409,6 +411,10 @@ The `allow_unencrypted_storage` feature flag in `scp-core` exposes `ProtocolRepo
 
 Production code (FFI bridges, application nodes, SDK wrappers) must NOT enable this feature. If a production backend does not natively encrypt, wrap it in `EncryptingAdapter` instead.
 
+`scripts/check-shipped-feature-graph.sh` enforces that prohibition mechanically. It resolves each shipped artifact's complete SCP-crate feature set with dev-dependencies excluded, and fails when that set contains any feature its allowlist omits. That allowlist omits `scp-core/allow_unencrypted_storage`, `scp-node/allow_unencrypted_storage`, and `scp-runtime/allow_unencrypted_storage`, and that gate's `assert_allowlist_has_no_nullifier` fixture fails when an edit adds one of those three names back.
+
+Per-package resolution alone does not settle a shipped binary's contents, because cargo's resolver 2 unifies normal-dependency features per invocation rather than per package. A command that builds several workspace members at once resolves a union no per-package check inspects. `crates/scp-testing` carries `testing` and `allow_unencrypted_storage` on normal dependency edges, so a workspace-wide `cargo build` once compiled `ProtocolRepository::new_for_testing` into every FFI bridge cdylib. Two mechanisms close that path: root `Cargo.toml` omits `crates/scp-testing` from `default-members`, and the gate resolves a bare `cargo build` at that root as a sixth artifact, so a member that unifies a nullifier into its siblings fails. A shipped artifact therefore compiles no `ProtocolRepository::new_for_testing` at all, because a `cfg` that admits it is off.
+
 The `Storage` trait operates on opaque bytes. Platform-specific encryption happens below:
 
 | Platform | Mechanism | Notes |
@@ -433,7 +439,7 @@ In-memory storage — `InMemoryStorage` and `EncryptingAdapter<InMemoryStorage>`
 
 In-memory storage loses all state on process restart. For SCP, that state includes MLS group state, identity keys, the event log, and provenance records. Losing it on restart contradicts the durability and provenance tenets directly: a restarted node would silently lose its cryptographic membership, its append-only audit trail, and its identity. Production deployments MUST use a durable, encrypted backend — `SqliteStorage` (SQLCipher) is the default.
 
-Under the §17.17 classification, in-memory storage is a **durability-only affordance** (SCP-CAPSEL-8010/8011), not a security nullifier: it forgets state but presents no false guarantee. It fails closed — a restarted node with lost state simply has no state; it cannot silently answer as though the state were intact. It is therefore explicitly selectable in any build, but — like every durability-only arm — never a default, never a fallback, and never the only reachable storage arm in a shipped SDK. Contrast the in-memory DHT backend (§17.17.3), which fails *open* and is a nullifier.
+Under the §17.17 classification, in-memory storage is a **durability-only affordance** (SCP-CAPSEL-8010/8011), not a security nullifier: it forgets state but presents no false guarantee. It fails closed — a restarted node with lost state simply has no state; it cannot silently answer as though the state were intact. It is therefore explicitly selectable in any build, but — like every durability-only arm — never a default, never a fallback, and never the only reachable storage arm in a shipped SDK. Contrast the in-memory identity-resolution backend (§17.17.3), which fails *open* and is a nullifier.
 
 ### Storage Selection Is Mandatory
 
@@ -464,24 +470,24 @@ CREATE TABLE kv (
 
 `WITHOUT ROWID` uses a clustered index on the primary key, which is optimal for KV workloads (no secondary rowid lookup). WAL mode enables concurrent readers with one writer. The schema is intentionally minimal — all structure lives in the key convention, not the table schema.
 
-**SQLCipher key derivation.** The SQLCipher encryption key is derived from identity key material using HKDF-SHA-256 (RFC 5869), NOT used directly as a signing key:
+**SQLCipher key derivation.** The SQLCipher encryption key is derived from a dedicated database key using HKDF-SHA-256 (RFC 5869), NOT used directly as a signing key:
 
 ```
-ikm  = identity_key_private_bytes          // 32 bytes, #0 Identity Key from platform key custody
+ikm  = database_key_bytes                  // 32 bytes, generated in platform key custody
 salt = SHA-256("SCP-SQLCIPHER-KEY-V1")     // fixed salt, 32 bytes
-info = "scp-sqlcipher:" || did             // DID as UTF-8 bytes — binds key to specific identity
+info = "scp-sqlcipher:" || identifier      // 32 digest bytes — binds key to one identity
 prk  = HKDF-Extract(salt, ikm)            // 32 bytes
 okm  = HKDF-Expand(prk, info, 32)         // 32 bytes — SQLCipher PRAGMA key
 derived_key = hex_encode(okm)             // 64 hex characters, passed via raw-key syntax (x'..')
 ```
 
-The `ikm` is the raw private key bytes of the `#0` Identity Key, retrieved from platform key custody (iOS Keychain, Android Keystore, macOS Keychain, or OS keyring). The HKDF domain separation (`"SCP-SQLCIPHER-KEY-V1"`) ensures the derived key is distinct from any signing key, preventing cross-protocol attacks. The DID in the `info` parameter binds the database to a specific identity — databases for different identities on the same device use different encryption keys.
+The `ikm` is a 32-byte database key platform key custody generates (iOS Keychain, Android Keystore, macOS Keychain, or OS keyring), and is never a root member's private key, which its default passkey custody does not export (`09-security-model.md` §9.7.4.1 item 4). The HKDF domain separation (`"SCP-SQLCIPHER-KEY-V1"`) ensures the derived key is distinct from any signing key, preventing cross-protocol attacks. The identifier in the `info` parameter binds the database to one identity — databases for different identities on the same device use different encryption keys.
 
-This HKDF-from-identity-key derivation is the **raw-key mode**: the caller supplies 32 bytes of key material (the `#0` identity key bytes) and the SQLCipher PRAGMA key is derived deterministically from them. Raw-key mode is the default and is unchanged by the passphrase mode defined below.
+This derivation is the **raw-key mode**: the caller supplies the 32 database-key bytes and the SQLCipher PRAGMA key is derived deterministically from them. Raw-key mode is the default and is unchanged by the passphrase mode defined below.
 
 #### Passphrase Key-Derivation Mode
 
-Some SDK callers supply a human-chosen passphrase rather than raw key material (for example, a CLI or desktop deployment with no platform key custody and no `#0` identity key available at database-open time). For these callers, the SQLCipher PRAGMA key MAY instead be derived from a passphrase using **Argon2id**. The caller selects exactly one derivation mode: raw-key (above) or passphrase. The two modes are mutually exclusive — supplying both is a validation error.
+Some SDK callers supply a human-chosen passphrase rather than raw key material (for example, a CLI or desktop deployment with no platform key custody and no database key available at database-open time). For these callers, the SQLCipher PRAGMA key MAY instead be derived from a passphrase using **Argon2id**. The caller selects exactly one derivation mode: raw-key (above) or passphrase. The two modes are mutually exclusive — supplying both is a validation error.
 
 Passphrase derivation MUST use the following parameters, which are NORMATIVE and MUST be identical to the platform key-custody Argon2id parameters (§17.8, `FileKeyCustody`):
 
@@ -559,7 +565,7 @@ A **custodial remote thin client** — the node holding the protocol engine, MLS
 
 ### PostgreSQL Is NOT First-Party for Client Storage
 
-The client SDK does not need Postgres — SQLite covers all native platforms including server-side agents. Server-side deployments wanting Postgres can implement the 6-method trait trivially. PostgreSQL IS first-party for `BlobStore` (relay storage) — see section 17.7.
+The client SDK does not need Postgres — SQLite covers all native platforms including server-side agents. Server-side deployments wanting Postgres can implement the 6-method trait trivially. PostgreSQL IS first-party for the `BlobStorage` trait (relay storage) — see section 17.7.
 
 ### FilesystemStorage
 
@@ -587,6 +593,8 @@ Relay blob storage is a provider capability governed by the general capability-s
 | `RedbBlobStore` | redb (pure Rust B-tree DB) | Medium relays, embedded scenarios | Phase 2 |
 | `PostgresBlobStore` | `sqlx` + PostgreSQL | Production/enterprise relays | Phase 5 |
 | `S3BlobStore` | `aws-sdk-s3` (Apache-2.0) | Large-scale relays, cloud deployments | Phase 5 |
+
+`PostgresBlobStore` and `S3BlobStore` are compiled only into a relay or node binary built with that binary's `cloud-blobs` feature, which is off by default. The default build and the container image carry neither, so an operator who selects `postgres` or `s3` builds the binary with `--features cloud-blobs`. A binary whose build did not compile the selected backend fails closed on that selection, with an error that names the missing feature, and opens no other store (SCP-CAPSEL-8000/8001). The rule applies to each backend on its own, so a build that compiled only one of the two fails closed when the other is selected. Cargo unifies `scp-transport`'s features across every package one invocation builds, so one binary's `cloud-blobs` compiles both backends into the other binary when a single invocation builds both. `scp-node --self-host` stores blobs only in SQLite, so it exits on either selection in every build, with an error that names `--self-host` rather than the feature. `scp-node --ephemeral`, which only a `testing` build compiles, stores blobs only in memory and exits on either selection the same way, with an error that names `--ephemeral`. The two backends stay out of the default build because of what they add to it: the `sqlx` PostgreSQL client and the AWS S3 client pull in crates the default build does not otherwise carry. On `x86_64-unknown-linux-gnu`, the container image's target, `cargo tree -p <binary> -e normal --prefix none` lists 72 more distinct crates for `scp-relay` with `cloud-blobs` than without it (354 against 282), and 56 more for `scp-node` (396 against 340), measured on 2026-09-27. A shipped artifact that needs neither backend should not compile, audit, or ship those crates, and an operator who needs one opts in at build time.
 
 ### Why redb
 
@@ -653,33 +661,35 @@ The `BlobStorage` trait provides streaming variants of `store` and `get` for bac
 
 ## 17.8 Platform-Specific Key Custody
 
-Key custody is NOT part of this spec — it is the existing `KeyCustody` trait (ADR-006). Referenced here for completeness of the persistence picture:
+Key custody is the `KeyCustody` trait ADR-006 defines, named here for completeness of the persistence picture. Its backend selection is mandatory, fails closed, and is never defaulted (§17.17). Its in-memory arm holds plaintext keys, so it is a **security nullifier** rather than a durability-only affordance and must be provably absent from a shipped production artifact (SCP-CAPSEL-8012, realized by ADR-062, capability injection).
 
-Key custody is a provider capability governed by the general capability-selection principle (§17.17): the backend selection is mandatory and fails closed (SCP-CAPSEL-8000/8001) and the runtime never defaults it (SCP-CAPSEL-8002). Its in-memory arm (`InMemoryKeyCustody`, plaintext keys) is a **security nullifier**, not a durability-only affordance, and so must be provably absent from shipped production artifacts (SCP-CAPSEL-8012) — the realization is downstream in ADR-062.
-
-| Platform | Key Storage | Key Types | Notes |
+| Platform | Key storage | Key types | Notes |
 |----------|-------------|-----------|-------|
-| iOS/macOS | Apple Keychain (generic password items) | Ed25519, X25519 (software-backed) | Secure Enclave only supports P-256; Ed25519 keys are software-backed in Keychain |
-| Android | Android Keystore (TEE-backed, API 33+ for Ed25519) | Ed25519, X25519 | StrongBox available but dramatically slow — opt-in only |
-| Browser | WebCrypto + IndexedDB (non-extractable CryptoKey) | Ed25519 (Chrome 113+, Firefox 130+, Safari 17+) | Ephemeral in incognito |
-| Python/Node/Server | Software keys in SQLCipher-encrypted SQLite | Ed25519, X25519 | No hardware key store on typical servers |
-| Testing | `InMemoryKeyCustody` | Ed25519, X25519 | Already defined (ADR-006) |
+| iOS and macOS | the Secure Enclave for a signing key; a passkey in the platform provider for a root or pre-rotation key; the Keychain for HPKE keys | P-256 signing, DHKEM(P-256) | The enclave holds a P-256 key in hardware, signs, performs key agreement, and exports no private key. A passkey is the default custody of a root-set member and of a pre-rotation key (`09-security-model.md` §9.7.4.1 item 4). An HPKE keypair the enclave cannot agree on is software-backed in the Keychain |
+| Android | the Keystore for a signing key; a passkey through the platform provider for a root or pre-rotation key | P-256 signing, DHKEM(P-256) | The Keystore has held P-256 in hardware since API 23, so no API-level floor applies. StrongBox is available, dramatically slower, and opt-in |
+| Browser | WebCrypto with IndexedDB, holding a non-extractable key; WebAuthn for a root or pre-rotation key | P-256 signing, DHKEM(P-256) | Every current browser supports ECDSA over P-256. Storage is ephemeral in a private window |
+| Python, Node, and server hosts | software keys in SQLCipher-encrypted SQLite, or an HSM under a separate principal | P-256 signing, DHKEM(P-256) | The headless profile exposes no passkey API, so the headless table of `09-security-model.md` §9.7.4.1 item 4 governs its pre-rotation custody |
+| Testing | `InMemoryKeyCustody` | P-256 signing, DHKEM(P-256) | Defined in ADR-006, barred from a shipped artifact above |
+
+**Where a pending recovery handle lives.** `09-security-model.md` §9.7.4.2 R10 states the store set a pending `RecoveryHandle` lives in, which is keyed on the identity's pre-rotation credential, and states when the credential's `largeBlob` store joins that set. This section's own local store is the set where the credential syncs through neither synced member.
+
+**What each member holds.** **Every member holds the `RecoveryHandle` and the `LastRevealMarker`** `09-security-model.md` §9.7.4.2 R10 declares, and the handle is at the width `RECOVERY_HANDLE_BYTES` registers (`09-security-model.md` §9.18.17), which is why an authenticator's large-blob array and never the object's own size is what bounds what the set can hold. **The handle, as `09-security-model.md` §9.7.4.2 R10 declares it**: <!-- scp:include id="recovery-handle-declaration" from=".docs/specs/09-security-model.md" -->**`RecoveryHandle` is one enum whose variants are `FixesCommitment` and `Abandons`, each carrying the identity's 32-byte identifier, a `RecoveryPhase`, and the 32-byte preimage digest of the composed event, and `RecoveryPhase`'s four values are `Composed`, `Signed`, `PublishSent` and `Confirmed`.**<!-- scp:end id="recovery-handle-declaration" --> It carries the composed preimage and the signed event never, because <!-- scp:fragment id="large-blob-arithmetic" -->CTAP 2.1 floors an authenticator's whole large-blob array at 1,024 bytes across every credential it holds, and `MAX_EVENT_BYTES` is 65,536, so a duty to write the event itself would ask for a write between one and two orders of magnitude larger than the store.<!-- scp:end id="large-blob-arithmetic" --> **The composed preimage, the next commitment list and the next threshold sit in this section's own local store, and the signed event also sits in the platform account's store where that member exists, each keyed on that digest**, and `09-security-model.md` §9.7.4.2 R10 states what an SDK whose local store holds no preimage under a handle's digest does.
+
+**`09-security-model.md` §9.7.4.2 R10 states the ceremony's one removal point**, after the spent keys are destroyed at `Confirmed`, and states the arm for a removal and for a `largeBlob` write that does not land.
 
 ### FileKeyCustody Argon2id Parameters
 
-The software-key custody backend for non-HSM platforms (`FileKeyCustody`, the universal fallback used by the Python/Node/Server row above) derives an AES-256 wrapping key from a passphrase using Argon2id. Its parameters are the canonical Argon2id parameterization for the codebase and MUST be:
+`FileKeyCustody`, the software-key backend behind the headless row above, derives an AES-256 wrapping key from a passphrase with Argon2id. **A single Argon2id parameterization is REQUIRED across the codebase**, and an implementation MUST NOT define a second, divergent parameter set: two parameterizations derive two keys from one passphrase, so one of them cannot decrypt what the other wrote. The SQLCipher passphrase key-derivation mode of §17.6 draws from the same parameter source.
 
 ```
 algorithm  = Argon2id
-version    = 0x13                              // Argon2 v1.3
-m_cost     = 65536                             // 65536 KiB = 64 MiB memory
-t_cost     = 3                                 // 3 iterations
-p_cost     = 1                                 // parallelism = 1
-output_len = 32                                // 32-byte derived key
-salt       = per-file 16-byte salt             // generated once, persisted with the custody file
+version    = 0x13                    // Argon2 v1.3
+m_cost     = 65536                   // 65536 KiB = 64 MiB memory
+t_cost     = 3                       // 3 iterations
+p_cost     = 1                       // parallelism = 1
+output_len = 32                      // 32-byte derived key
+salt       = per-file 16-byte salt   // generated once, persisted with the custody file
 ```
-
-These are the same parameters the SQLCipher passphrase key-derivation mode (§17.6) MUST use. A single Argon2id parameterization is REQUIRED across the codebase: both the `FileKeyCustody` passphrase-to-wrapping-key derivation and the SQLCipher passphrase-to-PRAGMA-key derivation MUST draw from one shared parameter source. Implementations MUST NOT define a second, divergent Argon2id parameter set.
 
 ## 17.9 OpenMLS StorageProvider Bridge
 
@@ -728,18 +738,18 @@ The exact sub-prefix structure follows OpenMLS's `StorageProvider` method signat
 `MlsStorageBridge` (§17.9) implements the OpenMLS `StorageProvider` trait for fine-grained per-item persistence under the `mls/{context_id}/...` key prefix. A complete MLS crypto context also includes state that lives outside the OpenMLS `StorageProvider` contract:
 
 - **Sender keys and sender key store** — per-member symmetric keys for the sender key layer (ADR-001, §23)
-- **X25519 wrapping keypair** — HPKE encapsulation key for sender key distribution
-- **MLS signer** (`SignatureKeyPair`) — Ed25519 signing credential used by OpenMLS
+- **DHKEM(P-256) wrapping keypair** — HPKE encapsulation key for sender key distribution
+- **MLS signer** (`SignatureKeyPair`) — P-256 signing credential used by OpenMLS under RFC 9420 ciphersuite 2
 - **Member wrapping keys** — per-member AES-256 keys for sender key wrapping
 - **Sender key epoch** — monotonic counter tracking sender key rotation
 
-Per ADR-049, this state is owned by the per-context actor (`PerContextState.mode`) — encrypted contexts carry an MLS+sender-key variant, broadcast contexts carry a per-author-key variant. The narrow backend traits `MlsBackend` and `HpkeBackend` (architecture.md §2.5.3) provide stateless primitives over this state; state serialization is an inherent concern of the state itself, not the trait.
+Per ADR-049, this state is owned by the per-context actor (`PerContextState.mode`) — encrypted contexts carry an MLS+sender-key variant, broadcast contexts carry a per-author-key variant. The narrow backend traits `MlsBackend` and `HpkeBackend` (architecture.md §2.5.3 [no such section]) provide stateless primitives over this state; state serialization is an inherent concern of the state itself, not the trait.
 
 Two inherent operations on the encrypted-mode state handle snapshot serialization atomically:
 
 - **`export_crypto_state(context_id) -> Vec<u8>`** — Serializes the full crypto state for a context into an opaque `MlsCryptoSnapshot` blob (MessagePack). This includes the OpenMLS in-memory storage entries, the signer, sender keys, wrapping keys, and epoch metadata. Sensitive key material (signer bytes, sender keys, wrapping secret key, MLS storage entries) is zeroized from the intermediate snapshot struct immediately after serialization.
 
-- **`restore_crypto_state(context_id, data) -> Result<()>`** — Deserializes the snapshot blob and reconstructs the full crypto state: rebuilds the `InMemoryMlsProvider` with persisted storage entries, loads the MLS group via `MlsGroup::load`, restores the signer to OpenMLS's key store, reconstructs the sender key store and member wrapping keys, and restores the X25519 wrapping keypair. Intermediate buffers are zeroized after deserialization via `drain()` and explicit `zeroize()` calls.
+- **`restore_crypto_state(context_id, data) -> Result<()>`** — Deserializes the snapshot blob and reconstructs the full crypto state: rebuilds the `InMemoryMlsProvider` with persisted storage entries, loads the MLS group via `MlsGroup::load`, restores the signer to OpenMLS's key store, reconstructs the sender key store and member wrapping keys, and restores the DHKEM(P-256) wrapping keypair. Intermediate buffers are zeroized after deserialization via `drain()` and explicit `zeroize()` calls.
 
 The snapshot blob is stored in `ContextSnapshot.mls_crypto_state` and persisted alongside the rest of the context state in `context/{context_id}/full_snapshot`. On context restoration, the blob is restored before the per-context actor resumes so that its MLS group and sender keys are available for subsequent encrypt/decrypt operations.
 
@@ -807,10 +817,10 @@ The following are explicitly named as "build your own" — not first-party, but 
 
 | Technology | Trait | Notes |
 |------------|-------|-------|
-| RocksDB | `BlobStore` | Best for extremely write-heavy relays. C++ dependency, heavy binary. |
-| LMDB (heed/heed3) | `Storage` or `BlobStore` | Best read performance. heed3 has encryption-at-rest. C dependency. |
-| MySQL/MariaDB | `BlobStore` | One sqlx feature flag away from the PostgreSQL adapter. |
-| Valkey (Redis fork, BSD-3) | -- | Cache layer in front of persistent BlobStore. Not a direct adapter. |
+| RocksDB | `BlobStorage` | Best for extremely write-heavy relays. C++ dependency, heavy binary. |
+| LMDB (heed/heed3) | `Storage` or `BlobStorage` | Best read performance. heed3 has encryption-at-rest. C dependency. |
+| MySQL/MariaDB | `BlobStorage` | One sqlx feature flag away from the PostgreSQL adapter. |
+| Valkey (Redis fork, BSD-3) | -- | Cache layer in front of a persistent `BlobStorage` backend. Not a direct adapter. |
 
 **Explicitly excluded:** sled (perpetual beta, unstable on-disk format), LevelDB (superseded by RocksDB), FoundationDB/TiKV (cluster-only, too heavy for protocol-level storage), DuckDB (OLAP, wrong use case), Redis (non-OSI license since 2024 — use Valkey instead).
 
@@ -877,7 +887,7 @@ These test the protocol layer's use of storage, not the storage adapters themsel
 | `nonce_pruning` | Record nonce with short expiry, advance time, prune, verify nonce is gone |
 | `membership_roundtrip` | Store membership, load, verify role matches |
 | `sender_key_roundtrip` | Store sender key, load, verify key matches |
-| `did_cache_roundtrip` | Cache DID document, load, verify matches |
+| `key_state_cache_roundtrip` | Cache key state, load, verify matches |
 | `relay_score_list` | Store scores for 3 relays, list all, verify all returned |
 | `mls_group_state_roundtrip` | Create MLS group, persist via `MlsStorageBridge` (§17.9), reload, verify group state matches |
 | `mls_state_isolated_per_context` | Two contexts with MLS groups via `MlsStorageBridge`, verify state does not leak between contexts |
@@ -994,7 +1004,7 @@ For each unresolved saga:
 
 ## 17.17 Capability Selection Is Mandatory, Fails Closed, and Never Defaults
 
-Storage (§17.6) is one instance of a rule that governs **every provider capability** in SCP. A *provider capability* is any pluggable dependency the system resolves to a concrete implementation at construction time and that carries a runtime "which implementation?" choice: client storage (§17.6), relay blob storage (§17.7), DID/DHT resolution (§3.10), credential storage, key custody (§17.8), device attestation, and the relay querier are the current set. Each such capability falls under the normative rule stated here.
+Storage (§17.6) is one instance of a rule that governs **every provider capability** in SCP. A *provider capability* is any pluggable dependency the system resolves to a concrete implementation at construction time and that carries a runtime "which implementation?" choice: client storage (§17.6), relay blob storage (§17.7), identity resolution (`03-identity.md` §3.10), the witness per-subject store (§17.17.4), credential storage, key custody (§17.8), device attestation, and the relay querier are the current set. Each such capability falls under the normative rule stated here.
 
 §17.6 ("First-Party Storage Adapters") is the **first and canonical instance** of this rule. The sub-rules it states for storage — *Storage Selection Is Mandatory*, *Storage Selection Fails Closed*, *The Runtime Never Defaults Storage*, and *In-Memory Storage Is Dev/Test-Only* — are the storage specialization of the general requirements below. Storage got this discipline first; every other provider capability is held to the same standard.
 
@@ -1012,7 +1022,7 @@ These three requirements are exactly the three §17.6 states for storage, lifted
 
 ### 17.17.2 Security Classification of Development Arms
 
-Many capabilities ship a development/in-memory arm — an implementation intended for testing, CI, or local development. Every such arm MUST be classified, and its classification decides how — and whether — it may exist in a shipped production artifact. The classification is **mandatory before the capability ships**: every provider capability enumerated in §17.17 (client storage, relay blob storage, DID/DHT resolution, credential storage, key custody, device attestation, relay querier) MUST have its development arm classified as durability-only or nullifier before that capability is present on any shipped path. A capability shipping with an *unclassified* development arm — one whose classification has never been recorded, so no one has decided whether it is a nullifier — is itself a violation of this section, independent of what the arm later turns out to be: the absence of a classification is a decision not made, which SCP-CAPSEL-8000's "no silent selection" forbids at the classification level.
+Many capabilities ship a development/in-memory arm — an implementation intended for testing, CI, or local development. Every such arm MUST be classified, and its classification decides how — and whether — it may exist in a shipped production artifact. The classification is **mandatory before the capability ships**: every provider capability enumerated in §17.17 (client storage, relay blob storage, identity resolution, the witness per-subject store, credential storage, key custody, device attestation, relay querier) MUST have its development arm classified as durability-only or nullifier before that capability is present on any shipped path. A capability shipping with an *unclassified* development arm — one whose classification has never been recorded, so no one has decided whether it is a nullifier — is itself a violation of this section, independent of what the arm later turns out to be: the absence of a classification is a decision not made, which SCP-CAPSEL-8000's "no silent selection" forbids at the classification level.
 
 **SCP-CAPSEL-8010 — Every development arm carries exactly one of two classifications.** A capability's in-memory/development arm is either:
 
@@ -1027,15 +1037,29 @@ The classification is a property of *what the arm destroys*, not of how convenie
 
 > **ID note.** The classification IDs SCP-CAPSEL-8010/8011/8012/8013 are internal to this section and intentionally do NOT parallel the unrelated, pre-existing `SCP-STORAGE-8010`..`SCP-STORAGE-8013` block (browser/`scp-client-wasm` snapshot error codes, `sdk-common.md`). Only SCP-CAPSEL-8000 deliberately mirrors SCP-STORAGE-8000 (both name the storage-selection-mandatory rule). Do not read the matching `801x` suffixes as a cross-reference — there is no relationship between the two `801x` ranges.
 
-### 17.17.3 The DHT Backend Is an Instance — and Its In-Memory Arm Is a Nullifier
+### 17.17.3 Identity Resolution Is an Instance — and Its In-Memory Arm Is a Nullifier
 
-DID/DHT resolution (§3.10) is a provider capability, so its backend selection is governed by §17.17.1 exactly as storage is: a shipped SDK must select its DHT backend explicitly, must fail closed when a production DHT backend is unsatisfiable, and must not let the runtime default one.
+Identity resolution (`03-identity.md` §3.10) — reading an identity's key-event log from the SCP relay network and the store a relay keeps it in — is a provider capability, so its backend selection is governed by §17.17.1 exactly as storage is: a shipped SDK must select its resolver and its relay-side record store explicitly, must fail closed when a production backend is unsatisfiable, and must not let the runtime default one.
 
-**SCP-CAPSEL-8013 — In-memory DHT resolution is a security nullifier, categorically more dangerous than in-memory storage.** An in-memory DHT backend preserves the self-certification authenticity of any record it happens to hold (§3.10.8) — but **reachability and freshness are network properties**, and an in-memory backend destroys both: a publish reaches no peer, and a resolve sees no peer's writes. Under it, publishing to the DHT layer silently no-ops — a key rotation or revocation (§3.9 rotation-is-publication) is written into a process-local map no other resolver ever consults. The harm is *not* that rotation can never propagate: in a deployment whose relay layer (§3.10.2) is healthy, the rotation still propagates via relays and §3.10.7 highest-sequence-wins still defeats a stale DHT record. The harm is twofold and precise:
+**SCP-CAPSEL-8013 — An in-memory identity-resolution backend is a security nullifier, categorically more dangerous than in-memory storage.** Such a backend preserves the self-certification of any key-event record it happens to hold — the resolver still recomputes the identifier from the inception event and verifies every event (`09-security-model.md` §9.6.1) — but **reachability and freshness are network properties**, and an in-memory backend destroys both: a publish reaches no peer, and a resolve sees no peer's writes. Under it, publishing a key event silently no-ops — a rotation or a `Compromised{from: N}` assertion (`09-security-model.md` §9.7.1) lands in a process-local map no other resolver ever consults. The harm is twofold and precise:
 
-- **Silent false success.** The SDK reports a successful publish while one of the two layers §3.10.6 mandates received nothing. This is categorically different from the *explicit, warned* DHT opt-out §3.10.6 permits (`disable_dht()`, which logs "DID resolution layer disabled. This identity may not be resolvable by all peers."): that opt-out is a legible, consented reduction of reach; an in-memory DHT backend is an unwarned misrepresentation of what was published. The nullifier is the *silence*, not the reduced reach.
-- **Loss of dual-layer suppression resilience (§3.10.8).** With a real DHT, an attacker must suppress a document on ALL of an identity's relays AND the DHT to prevent resolution. An in-memory DHT contributes nothing to that redundancy, collapsing the required attack to relay-only suppression — and leaving any resolver that must fall back to the DHT (all of an identity's relays unreachable, §3.10.3; or a non-SCP BEP44 client that reaches only the DHT, §3.10.6) with stale-or-absent data that still verifies by signature.
+- **Silent false success.** The SDK reports a successful publish while no relay received the record. The identity spec's anti-segmentation invariant makes publication to the identity's own relays and to the bootstrap fallback set a MUST and requires a cycle that no fallback relay accepted to be reported to the caller as a failed publication (`03-identity.md` §3.10); an in-memory arm reports the opposite, so the controller believes a chain is resolvable that no stranger can reach. The nullifier is the *silence*, not the reduced reach.
+- **Loss of the suppression resistance the relay layer supplies.** Against real relays an attacker must reduce the entries that still serve a chain — across an identity's own relays and the fallback set together, because a resolver reads both — below the two R11's first-contact floor requires, and a first contact that does not meet that floor returns `Inconclusive{SingleSource}` rather than a key state (`09-security-model.md` §9.7.4.2 R11). An in-memory arm contributes nothing to that redundancy: it presents one process-local source as though it were the network, so a resolver reads a stale-or-absent key state that still verifies by signature and a first contact never learns it had one source.
 
-Because its publish reports success while doing nothing and its resolve contributes no freshness, an in-memory DHT arm fails **open** on the DHT layer. That is the sharp contrast with in-memory storage (§17.6), which fails **closed**: a restarted node with lost state cannot silently present a false guarantee, it simply has no state. An in-memory DHT arm is therefore a **security nullifier**, not a durability-only affordance, and is governed by SCP-CAPSEL-8012 (provably absent from shipped production artifacts), not SCP-CAPSEL-8011.
+Because its publish reports success while doing nothing and its resolve contributes no freshness, an in-memory identity-resolution arm fails **open**. That is the sharp contrast with in-memory storage (§17.6), which fails **closed**: a restarted node with lost state cannot silently present a false guarantee, it simply has no state. An in-memory identity-resolution arm is therefore a **security nullifier**, not a durability-only affordance, and is governed by SCP-CAPSEL-8012 (provably absent from shipped production artifacts), not SCP-CAPSEL-8011.
 
-This is the determination the general rule exists to force. Two capabilities can each offer an "in-memory" arm, and one (storage) is a legitimate development affordance while the other (DHT) is a shipped-artifact security hole. Uniformly treating both as "just the dev backend" is the error §17.17 closes: the durability-only-vs-nullifier classification MUST be made explicitly, per capability, against the property that capability is responsible for — never assumed uniform across capabilities because they share the label "in-memory."
+This is the determination the general rule exists to force. Two capabilities can each offer an "in-memory" arm, and one (storage) is a legitimate development affordance while the other (identity resolution) is a shipped-artifact security hole. Uniformly treating both as "just the dev backend" is the error §17.17 closes: the durability-only-vs-nullifier classification MUST be made explicitly, per capability, against the property that capability is responsible for — never assumed uniform across capabilities because they share the label "in-memory."
+
+
+### 17.17.4 The Witness's Per-Subject Store Is an Instance — and Its In-Memory Arm Is a Nullifier
+
+A relay an identity designates as a witness keeps the durable per-subject record `09-security-model.md` §9.7.4.3 states, for at most the subjects §9.18.17's `MAX_SUBJECTS_PER_WITNESS` row registers. A witness that lost one field of that record cosigns a fork it would otherwise refuse, so the record's durability is what this section governs. That store is a provider capability, so §17.17.1 governs its backend selection exactly as it governs storage.
+
+**SCP-CAPSEL-8014 — an in-memory witness per-subject store is a security nullifier.** The store is the input to the one check that carries the witness layer's security property: a witness refuses to cosign a chain that does not carry the head it last cosigned. A witness that lost that record and cosigns anyway signs a fork, so the arm keeps producing signatures while those signatures stop meaning what they claim. The harm has the two parts SCP-CAPSEL-8013 names for identity resolution:
+
+- **Silent false success.** The requester receives a valid signature and nothing in the exchange reports that the check ran against an empty store. The nullifier is the silence.
+- **Loss of the equivocation evidence the layer supplies.** Against a durable store a party that forks a subject's chain below a cosigned head is refused and a conflict statement records the attempt; against a store that restarts empty that party waits for a restart, and no conflict statement records anything.
+
+**The arm fails open**, so SCP-CAPSEL-8012 governs it — provably absent from a shipped production artifact — rather than SCP-CAPSEL-8011, and the shipped-feature-graph gate of ADR-062, capability injection, therefore sees the witness store as a classified capability.
+
+**Re-seeding rescues no in-memory arm.** A witness that lost its store cannot enumerate the subjects whose heads it published, because each head's address derives from its subject's identifier, so §9.7.4.3's case 1 seeds it from the chain the requester offers. An arm that starts empty takes that path on every restart, refuses nothing, and re-seeds from the next divergent chain. A durable arm carries its floor across a restart and refuses it.

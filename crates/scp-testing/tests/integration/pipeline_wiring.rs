@@ -134,6 +134,18 @@ const COMMON_BROADCAST_SRC: &str =
 const BRIDGE_INSTANCE_SRC: &str =
     include_str!("../../../../crates/scp-ffi/common/src/bridge_instance.rs");
 
+// Node builder source — owns `build_domain_inner` and `build_no_domain_inner`,
+// the two bodies every `Node::start` path funnels through.
+// `every_node_start_path_starts_the_self_did_republish_cycle` pins ADR-003 §2
+// step "republishing starts when an identity is loaded" to both of them, so a
+// node can no longer publish its DID document once and never refresh it.
+const NODE_BUILDER_SRC: &str = include_str!("../../../../crates/scp-node/src/lib.rs");
+
+// Node self-host source — where the republish cycle used to be constructed. The
+// same assertion checks it constructs none now, because two cycles over one
+// BEP44 record would give its monotonic sequence two independent writers.
+const NODE_SELF_HOST_SRC: &str = include_str!("../../../../crates/scp-node/src/self_host.rs");
+
 // Transport layer sources for Batch 3 assertions
 const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/native/adapter.rs");
 
@@ -1450,7 +1462,7 @@ fn restore_on_startup_runs_restore_before_replay() {
 // in-crate caller could name `restore_all_contexts(&sup)` via UFCS (no
 // `.restore_all_contexts()` substring) plus a no-op `restore_on_startup` shadow
 // and still pass this gate. Hardening the in-crate locator with more spellings is
-// a non-convergent denylist (CLAUDE.md).
+// a non-convergent denylist (`.claude/agents/README.md` §Review rules).
 //
 // `restore_all_contexts` is `pub(crate)`, so no out-of-crate bridge can name the
 // bare leg at all — a cross-crate `Supervisor::restore_all_contexts(&sup)` call
@@ -3551,7 +3563,7 @@ fn pipeline_active_assertions_never_decrease() {
         .filter(|line| line.trim() == "#[test]")
         .count();
     let ignored = source.matches("#[ignore = \"").count();
-    let meta_tests = 3; // this test + claude_md_enforcement_sections_present + no_stale_ignores
+    let meta_tests = 3; // this test + agents_md_enforcement_sections_present + no_stale_ignores
     let active = total_tests - ignored - meta_tests;
     assert!(
         active >= MIN_ACTIVE_PIPELINE_ASSERTIONS,
@@ -3633,18 +3645,119 @@ fn no_stale_ignores() {
     assert!(stale.is_empty(), "Stale ignores:\n  {}", stale.join("\n  "));
 }
 
-/// Verifies that CLAUDE.md contains the required enforcement sections.
+// ---------------------------------------------------------------------------
+// ADR-003 §2 — the node's own DID-record keep-alive
+// ---------------------------------------------------------------------------
+
+/// ADR-003 §2 of `.docs/adrs/phase-1.md` states that republishing "starts when
+/// an identity is loaded". `Node::start` loads an identity, and every one of its
+/// paths ends in `build_domain_inner` (the `Reach::Domain` TLS-success arm) or
+/// `build_no_domain_inner` (`Reach::NatTraversal`, `Reach::Tunnel`,
+/// `Reach::Local`, and the `Reach::Domain` TLS-failure fall-through). Both must
+/// therefore start the cycle.
+///
+/// Each assertion pins a call with its real arguments: the DHT client comes from
+/// the node's own `DidMethod`, and the record source is a live view of the slot
+/// the startup publish just seeded. Naming `start_self_did_republishing` without
+/// calling it satisfies none of them.
+///
+/// Against the pre-fix code these assertions fail: the cycle was constructed in
+/// `self_host::serve_hosted_site`, so a node the self-hosting serve loop did not
+/// wrap — `start_node_in_memory` and `start_node_local`, the FFI bridges' two
+/// node front doors — published its DID document once and never re-put it.
+/// Mainline DHT nodes expire a BEP44 record that nobody re-puts, so every
+/// identity that document names stops resolving.
+#[test]
+fn every_node_start_path_starts_the_self_did_republish_cycle() {
+    for builder in ["build_domain_inner", "build_no_domain_inner"] {
+        assert!(
+            fn_body_contains(
+                NODE_BUILDER_SRC,
+                builder,
+                "start_node_republish_cycle(&did_method, &live_state)"
+            ),
+            "{builder} must start this node's self-DID republish cycle over the \
+             DID method it just published with and the slot that publish seeded \
+             (ADR-003 §2)"
+        );
+    }
+    assert!(
+        fn_body_contains(
+            NODE_BUILDER_SRC,
+            "start_node_republish_cycle",
+            "republish::start_self_did_republishing("
+        ),
+        "start_node_republish_cycle must actually start the cycle, not merely \
+         name it"
+    );
+    assert!(
+        fn_body_contains(
+            NODE_BUILDER_SRC,
+            "start_node_republish_cycle",
+            "did_method.dht_client()"
+        ),
+        "the cycle must keep the record alive through the DHT client the node's \
+         own DidMethod published it with, never a second client passed alongside"
+    );
+    assert!(
+        fn_body_contains(
+            NODE_BUILDER_SRC,
+            "start_node_republish_cycle",
+            "live_state.subscribe()"
+        ),
+        "the cycle must read a LIVE view of the published-record slot, so a NAT \
+         tier change re-points both arms at the record it produced instead of \
+         leaving them on a superseded sequence"
+    );
+
+    // One node, one cycle. Counted rather than pattern-matched: two managers
+    // would re-put one BEP44 record under two independently-held sequences, and
+    // the lower-seq put loses, so whichever cycle falls behind stops keeping the
+    // record alive while still reporting success. `start_self_did_republishing`
+    // is `pub` inside its private module, so any module in `scp-node` could call
+    // it; the count says how many do.
+    let call_sites = NODE_BUILDER_SRC
+        .matches("start_self_did_republishing(")
+        .count()
+        + NODE_SELF_HOST_SRC
+            .matches("start_self_did_republishing(")
+            .count();
+    assert_eq!(
+        call_sites, 1,
+        "exactly one function may start the cycle, and \
+         `start_node_republish_cycle` is it"
+    );
+
+    assert!(
+        NODE_BUILDER_SRC.contains("republish: Arc<dyn republish::RepublishCycle>,"),
+        "ApplicationNode must hold the cycle in a non-optional field, so a node \
+         carries exactly one by construction rather than by a caller remembering \
+         to start one"
+    );
+    assert!(
+        fn_body_contains(
+            NODE_BUILDER_SRC,
+            "shutdown",
+            "self.republish.stop_and_wait()"
+        ),
+        "ApplicationNode::shutdown must stop both arms; an arm that outlived \
+         shutdown would keep asserting this node's address on the DHT for the \
+         life of the process (§10.12.1)"
+    );
+}
+
+/// Verifies that the root AGENTS.md contains the required enforcement sections.
 /// These sections instruct agents to check integration wiring before
 /// writing code and to never weaken enforcement files.
 #[test]
-fn claude_md_enforcement_sections_present() {
-    let claude_md = include_str!("../../../../CLAUDE.md");
+fn agents_md_enforcement_sections_present() {
+    let agents_md = include_str!("../../../../AGENTS.md");
     assert!(
-        claude_md.contains("Integration checklist (MANDATORY"),
-        "CLAUDE.md must contain the 'Integration checklist (MANDATORY' section"
+        agents_md.contains("Integration checklist (MANDATORY"),
+        "AGENTS.md must contain the 'Integration checklist (MANDATORY' section"
     );
     assert!(
-        claude_md.contains("NEVER modify enforcement files"),
-        "CLAUDE.md must contain the 'NEVER modify enforcement files' section"
+        agents_md.contains("NEVER modify enforcement files"),
+        "AGENTS.md must contain the 'NEVER modify enforcement files' section"
     );
 }

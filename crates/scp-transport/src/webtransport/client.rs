@@ -61,6 +61,7 @@ use crate::subscription::{
     MAX_TRANSPORT_SUBSCRIPTIONS, SubscriptionError, TransportSubscriptionMap,
 };
 use crate::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
+use scp_relay_client::relay_error_text;
 use scp_relay_client::{ClientMessage, RelayMessage};
 
 /// A boxed, pinned, `Send`-safe future -- the return type for all
@@ -876,9 +877,9 @@ impl TransportAdapter for WebTransportAdapter {
                         QuicRelayFrame::Ok { blob_id: None, .. } => {
                             Ok(BlobId::from_sha256(&envelope.routing_id))
                         }
-                        QuicRelayFrame::Err { code, msg } => Err(TransportError::SendFailed(
-                            format!("relay error {code}: {msg}"),
-                        )),
+                        QuicRelayFrame::Err { code, msg } => {
+                            Err(TransportError::SendFailed(relay_error_text(code, &msg)))
+                        }
                         _ => Err(TransportError::ProtocolError(
                             "unexpected response to PUBLISH".to_owned(),
                         )),
@@ -906,9 +907,9 @@ impl TransportAdapter for WebTransportAdapter {
                         RelayMessage::Ok { blob_id: None, .. } => {
                             Ok(BlobId::from_sha256(&envelope.routing_id))
                         }
-                        RelayMessage::Err { code, msg, .. } => Err(TransportError::SendFailed(
-                            format!("relay error {code}: {msg}"),
-                        )),
+                        RelayMessage::Err { code, msg, .. } => {
+                            Err(TransportError::SendFailed(relay_error_text(code, &msg)))
+                        }
                         _ => Err(TransportError::ProtocolError(
                             "unexpected response to PUBLISH".to_owned(),
                         )),
@@ -1245,7 +1246,8 @@ impl TransportAdapter for WebTransportAdapter {
                                         }
                                         QuicRelayFrame::Err { code, msg } => {
                                             return Err(TransportError::ProtocolError(format!(
-                                                "query error {code}: {msg}"
+                                                "query {}",
+                                                relay_error_text(code, &msg)
                                             )));
                                         }
                                         _ => {}
@@ -1356,9 +1358,9 @@ impl TransportAdapter for WebTransportAdapter {
                     let response = self.wt_request_response(&frame).await?;
 
                     match response {
-                        QuicRelayFrame::Err { code, msg } => Err(TransportError::SendFailed(
-                            format!("relay error {code}: {msg}"),
-                        )),
+                        QuicRelayFrame::Err { code, msg } => {
+                            Err(TransportError::SendFailed(relay_error_text(code, &msg)))
+                        }
                         // Best-effort: treat all non-error responses as success.
                         _ => Ok(()),
                     }
@@ -1375,9 +1377,9 @@ impl TransportAdapter for WebTransportAdapter {
                     let response = self.ws_request_response(msg, ref_id).await?;
 
                     match response {
-                        RelayMessage::Err { code, msg, .. } => Err(TransportError::SendFailed(
-                            format!("relay error {code}: {msg}"),
-                        )),
+                        RelayMessage::Err { code, msg, .. } => {
+                            Err(TransportError::SendFailed(relay_error_text(code, &msg)))
+                        }
                         // Best-effort: treat all non-error responses as success.
                         _ => Ok(()),
                     }
@@ -1507,7 +1509,7 @@ fn relay_frame_to_event(frame: QuicRelayFrame) -> Option<TransportEvent> {
             _ => None,
         },
         QuicRelayFrame::Err { code, msg } => Some(TransportEvent::Error(
-            TransportError::ProtocolError(format!("relay error {code}: {msg}")),
+            TransportError::ProtocolError(relay_error_text(code, &msg)),
         )),
         QuicRelayFrame::Ok { .. } => None,
     }

@@ -12,7 +12,6 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import works.limn.scp.bridge.CoroutineBridge
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -70,29 +69,19 @@ data class TrackedContext(
  * neither blocks on coroutine machinery, so a caller running on a single-threaded
  * dispatcher cannot deadlock on them.
  *
- * @param cleanupDispatcher Dispatcher that runs the cleanup coroutine [onCleared] launches.
- *   That coroutine calls [CoroutineBridge.ContextBridge.leave], which dispatches its own FFI
- *   call onto the bridge's IO dispatcher. Defaults to [Dispatchers.IO]. A test injects the
- *   same `TestDispatcher` it gave [CoroutineBridge], so `advanceUntilIdle()` runs the cleanup
- *   coroutine and every `leave` call the coroutine makes.
- *
  * A Java subclass calls `super()`, so this class must keep a zero-argument JVM constructor.
- * Two rules supply one today, and `javap` on a compiled class reports an identical
- * constructor set under either: Kotlin emits a parameterless constructor whenever every
- * primary-constructor parameter carries a default, and `@JvmOverloads` emits one overload per
- * defaulted parameter. `@JvmOverloads` therefore adds nothing at one parameter; it starts
- * adding intermediate overloads as soon as a second defaulted parameter appears, which is why
- * it stays. Neither rule survives a parameter added without a default, so
  * `ScpViewModelTest.ScpViewModel exposes a zero-argument constructor to Java callers` asserts
  * that constructor by reflection.
  */
-abstract class ScpViewModel @JvmOverloads constructor(
-    cleanupDispatcher: CoroutineDispatcher = Dispatchers.IO,
-) : ViewModel() {
+abstract class ScpViewModel : ViewModel() {
 
     private val contextsLock = Any()
     private val activeContexts = mutableListOf<TrackedContext>()
-    private val cleanupScope = CoroutineScope(SupervisorJob() + cleanupDispatcher)
+
+    // `Dispatchers.Unconfined` starts the cleanup coroutine on the thread that calls
+    // [onCleared] and keeps it there only until the first `leave` suspends into the
+    // bridge's I/O dispatcher, so [onCleared] returns without waiting on an FFI call.
+    private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
 
     /**
      * Register a context for automatic cleanup on ViewModel clear.
@@ -136,8 +125,9 @@ abstract class ScpViewModel @JvmOverloads constructor(
      *   does stop them, because that exception reports that this cleanup coroutine was
      *   cancelled, and a coroutine must never swallow its own cancellation.
      *
-     * What this method does not guarantee: that a submitted coroutine has started, or that
-     * `leave` calls have finished. Cleanup is best-effort — those calls run to completion only
+     * What this method does not guarantee: that `leave` calls have finished. The cleanup
+     * coroutine starts on the calling thread and leaves it at the first `leave`, which
+     * suspends into the bridge's I/O dispatcher. Cleanup is best-effort — those calls run to completion only
      * if a process outlives them. Blocking until they finish is not an option: [onCleared] runs
      * on an Android main thread, and blocking that thread on FFI calls both risks an ANR and
      * deadlocks whenever an injected dispatcher schedules its work onto a blocked thread.
@@ -146,8 +136,8 @@ abstract class ScpViewModel @JvmOverloads constructor(
      * [onCleared] is called, so a coroutine launched there would be dropped without running.
      * [onCleared] does not cancel [cleanupScope] afterwards. A [SupervisorJob] whose children
      * have all completed holds no thread, no handle, and no memory a cancellation would
-     * release, and `cleanupDispatcher` belongs to whoever constructed this ViewModel, so
-     * cancelling that job frees nothing. Cancelling it would instead make every later
+     * release, and [Dispatchers.Unconfined] owns no thread, so cancelling that job frees
+     * nothing. Cancelling it would instead make every later
      * [cleanupScope] launch a silent no-op, which drops `leave` for any context that
      * [trackContext] registers after a first [onCleared] call.
      */
@@ -185,8 +175,8 @@ abstract class ScpViewModel @JvmOverloads constructor(
      * That standard is why this method returns [Unit] rather than rethrowing, and why
      * [onCleared] keeps calling `leave` on remaining contexts after one fails.
      *
-     * Runs on `cleanupDispatcher`, inside a cleanup coroutine, after [onCleared] has already
-     * returned. It must not block that thread, for a reason
+     * Runs inside a cleanup coroutine, on whichever thread the bridge's I/O dispatcher resumed
+     * that coroutine on, after [onCleared] has already returned. It must not block that thread, for a reason
      * `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` states.
      *
      * A throw from an override propagates into that cleanup coroutine and stops `leave` calls

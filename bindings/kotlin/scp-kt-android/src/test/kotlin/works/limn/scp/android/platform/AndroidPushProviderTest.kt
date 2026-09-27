@@ -12,7 +12,6 @@
 
 package works.limn.scp.android.platform
 
-import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Before
 import org.junit.Test
@@ -22,12 +21,9 @@ import org.robolectric.annotation.Config
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 
-// Robolectric supplies a real application Context on a host JVM. An earlier revision
-// constructed this provider with `(null as Any?) as Context`, which Kotlin compiles into an
-// `Intrinsics` null check that throws NullPointerException on every construction, so all 14
-// methods below failed as soon as this module ran its JUnit 5 classes at all.
-// `isReturnDefaultValues = true` does not rescue that cast: it stubs android.jar methods and
-// leaves Kotlin's own null check in place.
+// AndroidPushProvider takes a non-null Context. Kotlin checks the cast
+// `null as Context` at runtime and throws NullPointerException, so these tests
+// run under Robolectric, which supplies an application Context on the host JVM.
 @RunWith(RobolectricTestRunner::class)
 @Config(manifest = Config.NONE, sdk = [35])
 class AndroidPushProviderTest {
@@ -36,8 +32,7 @@ class AndroidPushProviderTest {
 
     @Before
     fun setUp() {
-        val context: Context = ApplicationProvider.getApplicationContext()
-        provider = AndroidPushProvider(context)
+        provider = AndroidPushProvider(ApplicationProvider.getApplicationContext())
     }
 
     // -----------------------------------------------------------------------

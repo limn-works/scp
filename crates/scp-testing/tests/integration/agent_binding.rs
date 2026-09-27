@@ -396,30 +396,55 @@ async fn custody_violation_attestation() {
 
 #[tokio::test]
 async fn counter_attestation() {
-    let counter = CounterAttestation {
-        subject_did: DID::from("did:dht:z6MkSubject"),
-        violation_reference: "sha256:abc123".to_owned(),
-        explanation: "Agent was compromised, key has been rotated".to_owned(),
-        timestamp: 1_700_001_000,
-        signature: vec![0xEF; 64],
-    };
+    // Spec section §9.5.2 derives `violation_reference` from a contested
+    // record's signing hash, so a counter-claim is built against a record
+    // rather than around an identifier a caller invented.
+    let contested = ScpCustodyViolationAttestation::new(
+        DID::from("did:dht:z6MkSubject"),
+        1_700_000_500,
+        CustodyViolationType::CategoryAViolation {
+            action: "did_document_update".to_owned(),
+            signer_key_id: SigningKeyId::Agent,
+            signature_evidence: vec![0xAB; 64],
+        },
+        vec![0xCD; 64],
+        DID::from("did:dht:z6MkVerifier"),
+    )
+    .expect("a well-formed violation record must build");
+
+    let counter = CounterAttestation::referencing(
+        &contested,
+        "Agent was compromised, key has been rotated".to_owned(),
+        1_700_001_000,
+        vec![0xEF; 64],
+    )
+    .expect("a counter-attestation with well-formed fields must build");
 
     assert_eq!(counter.subject_did.as_ref(), "did:dht:z6MkSubject");
-    assert_eq!(counter.violation_reference, "sha256:abc123");
+    assert_eq!(
+        counter.violation_reference,
+        contested
+            .signing_hash()
+            .expect("a violation record must produce a signing hash"),
+        "a counter-claim's reference equals a contested record's signing hash"
+    );
     assert_eq!(counter.timestamp, 1_700_001_000);
     assert_eq!(counter.signature.len(), 64);
 
-    // Counter-attestation must be signed by #active key (human authorization).
-    // This is a structural requirement — the signature field exists.
+    // ADR-039 acceptance criterion 18 assigns a counter-claim signature to
+    // `#active`. This record carries no `signing_key_id`, because a subject
+    // naming its own fragment inside a record it signs proves nothing; a
+    // verifier that resolves `#active` enforces that assignment instead.
     assert!(
         !counter.signature.is_empty(),
         "counter-attestation must have a signature"
     );
 
-    // Validate method should accept well-formed counter-attestation.
-    let result = counter.validate();
+    // A shape check accepts a well-formed record and establishes nothing about
+    // who signed it.
+    let result = counter.validate_field_shape();
     assert!(
         result.is_ok(),
-        "well-formed counter-attestation must pass validation: {result:?}"
+        "well-formed counter-attestation must pass a shape check: {result:?}"
     );
 }

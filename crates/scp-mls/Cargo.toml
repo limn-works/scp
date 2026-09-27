@@ -31,7 +31,11 @@ scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
 # a `SigningKey` to feed `scp_crypto::pseudonym::derive_pseudonym_keypair`.
 ed25519-dalek = { workspace = true }
 
-openmls = { workspace = true, features = ["libcrux-provider", "js"] }
+# `js` is declared in the wasm32 section below, not here. openmls refuses to compile for
+# wasm32 without it (`compile_error!` at openmls-0.8.1/src/lib.rs:148) and on every other
+# target it adds `fluvio-wasm-timer`, which openmls imports only under
+# `#[cfg(target_arch = "wasm32")]`, plus that crate's `parking_lot` 0.11 and `instant`.
+openmls = { workspace = true }
 openmls_traits = { workspace = true }
 openmls_basic_credential = { workspace = true }
 openmls_rust_crypto = { workspace = true }
@@ -48,19 +52,17 @@ zeroize = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-# wasm32 backends: mirror scp-protocol/Cargo.toml. openmls's `js` feature pulls
-# fluvio-wasm-timer + getrandom/wasm_js for KeyPackage Lifetime wall-clock time.
-# The root .cargo/config.toml already sets getrandom_backend="wasm_js" globally
-# for the wasm32 target, so no per-crate config is needed.
+# wasm32 backends: mirror scp-protocol/Cargo.toml. The root .cargo/config.toml already
+# sets getrandom_backend="wasm_js" globally for the wasm32 target, so no per-crate config
+# is needed. See ADR-057 Prerequisite 1.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# openmls reads the current time for a KeyPackage Lifetime through fluvio-wasm-timer on
+# wasm32 and through std::time elsewhere, and its `js` feature is what supplies that crate
+# plus a getrandom 0.3 wasm_js backend. openmls's lib.rs raises `compile_error!` when a
+# wasm32 build leaves the feature off, so this target section is where it belongs.
+openmls = { workspace = true, features = ["js"] }
 getrandom = { version = "0.2", features = ["js"] }
 getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
-# getrandom 0.4 is pulled transitively via the openmls libcrux provider
-# (openmls_libcrux_crypto → hpke-rs-libcrux → rand 0.10 → getrandom 0.4). Unlike
-# openmls's own `js` feature (which only wires getrandom 0.3's wasm_js), this
-# major version needs its wasm_js feature enabled here so the wasm32 build has a
-# randomness backend. See ADR-057 Prerequisite 1.
-getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 uuid = { version = "1", features = ["v4", "js"] }
 
 [dev-dependencies]

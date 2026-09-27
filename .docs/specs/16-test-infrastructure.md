@@ -31,7 +31,7 @@ crates/
       builder.rs             # ScenarioBuilder
       helpers.rs             # Test utility helpers
       test_adapter.rs        # Test adapter utilities
-      blob_store_tests.rs    # BlobStore conformance tests
+      blob_store_tests.rs    # BlobStorage conformance tests
       fullstack/             # Full-stack integration test harness
         mod.rs
         crypto.rs            # Crypto integration tests
@@ -192,7 +192,7 @@ Simplified in-memory relay for testing. No WebSocket, no network I/O. Stores blo
 
 ### 16.4.1 StoredBlob
 
-Blobs are stored directly in the relay's internal `HashMap`. No separate `BlobStore` trait — the relay manages its own storage inline.
+Blobs are stored directly in the relay's internal `HashMap`. The in-memory relay does not implement the `BlobStorage` trait, which §17.1 of the persistence and storage spec names in its relay storage stack, because the relay manages its own storage inline.
 
 ```rust
 /// scp-testing/src/relay/mod.rs
@@ -474,15 +474,15 @@ The `subscribe()` implementation wraps the relay's `mpsc::UnboundedReceiver<Rela
 
 ## 16.6 SimulatedIdentity
 
-Wraps identity primitives (DID, key custody, storage, protocol repository) into a single container for convenient test setup. Does NOT create real MLS groups, transport connections, or sender key stores — those are complex and should be used directly in integration tests. This is a lightweight identity container, not a full participant harness.
+Wraps identity primitives (the identifier, key custody, storage, protocol repository) into a single container for convenient test setup. Does NOT create real MLS groups, transport connections, or sender key stores — those are complex and should be used directly in integration tests. This is a lightweight identity container, not a full participant harness.
 
 ```rust
 /// scp-testing/src/simulator/identity.rs
 
 /// A test identity with custody, storage, and protocol repository pre-wired.
 pub struct SimulatedIdentity {
-    /// The DID for this identity.
-    did: DID,
+    /// This identity's identifier.
+    did: Identifier,
     /// Key custody provider.
     custody: Arc<InMemoryKeyCustody>,
     /// Direct storage access for tests.
@@ -499,13 +499,13 @@ impl SimulatedIdentity {
     /// separately for direct test access.
     pub fn new(
         label: impl Into<String>,
-        did: DID,
+        did: Identifier,
         custody: Arc<InMemoryKeyCustody>,
         storage: InMemoryStorage,
     ) -> Self;
 
-    /// Returns a reference to this identity's DID.
-    pub const fn did(&self) -> &DID;
+    /// Returns a reference to this identity's identifier.
+    pub const fn did(&self) -> &Identifier;
 
     /// Returns the human-readable label for this identity.
     pub fn label(&self) -> &str;
@@ -530,7 +530,7 @@ Maps identities to reachable relays. Supports dynamic partitioning and per-link 
 
 /// Network topology configuration.
 pub struct NetworkTopology {
-    /// Map from identity DID to set of reachable relay names.
+    /// Map from identity identifier to set of reachable relay names.
     reachability: RwLock<HashMap<String, HashSet<String>>>,
     /// Per-link configuration (identity, relay) -> LinkConfig.
     link_configs: RwLock<HashMap<(String, String), LinkConfig>>,
@@ -595,7 +595,7 @@ pub struct NetworkSimulator {
     pub clock: Arc<SimulatedClock>,
     /// Named relays.
     pub relays: HashMap<String, Arc<InMemoryRelay>>,
-    /// Simulated identities, keyed by DID.
+    /// Simulated identities, keyed by identifier.
     pub identities: HashMap<String, SimulatedIdentity>,
     /// Network topology.
     pub topology: NetworkTopology,
@@ -614,7 +614,7 @@ impl NetworkSimulator {
     /// Get a relay by name.
     pub fn relay(&self, name: &str) -> Option<&Arc<InMemoryRelay>>;
 
-    /// Get a simulated identity by DID.
+    /// Get a simulated identity by identifier.
     pub fn identity(&self, did: &str) -> Option<&SimulatedIdentity>;
 
     /// Get a mutable reference to a simulated identity.
@@ -1255,8 +1255,10 @@ macro_rules! push_conformance {
 ```rust
 /// scp-testing/src/conformance/blob_store.rs
 
-/// Generates a test module verifying the `BlobStore` trait contract
-/// (§16.4.1; see §17.7 for the full first-party adapter roster).
+/// Generates a test module verifying the `BlobStorage` trait contract
+/// (§17.11 of the persistence and storage spec, the extension points section,
+/// which states the 5 required methods, the 2 streaming methods that carry
+/// default implementations, and the 19 tests this macro generates).
 ///
 /// Usage:
 /// ```rust
@@ -1450,7 +1452,7 @@ Meta-tests that verify the simulation framework is correct before trusting it fo
 | `builder_creates_contexts` | All specified contexts have MLS groups with correct members |
 | `builder_distributes_sender_keys` | All context members have sender keys for all other members |
 | `builder_full_mesh_connects_all` | `full_mesh()` connects every identity to every relay |
-| `builder_deterministic_with_same_seed` | Same seed produces identical simulator state (DID strings, key material) |
+| `builder_deterministic_with_same_seed` | Same seed produces identical simulator state (identifiers, key material) |
 
 ### 16.13.6 Determinism
 
@@ -1473,7 +1475,7 @@ Tests that verify the protocol layer's typed domain methods (§17.4) correctly p
 | `nonce_pruning` | Record nonce with short expiry, advance clock, prune, verify nonce is gone |
 | `membership_roundtrip` | Store membership, load, verify role matches |
 | `sender_key_roundtrip` | Store sender key, load, verify key matches |
-| `did_cache_roundtrip` | Cache DID document, load, verify matches |
+| `key_state_cache_roundtrip` | Cache key state, load, verify matches |
 | `relay_score_list` | Store scores for 3 relays, list all, verify all returned |
 
 ### 16.13.8 MlsStorageBridge Correctness
@@ -1517,7 +1519,7 @@ All preset scenarios (§16.11) are meta-tested: each builds successfully, produc
 | `preset_five_party_group_builds` | `five_party_group` returns a simulator with 5 identities, correct MLS epoch |
 | `preset_suppression_scenario_builds` | `suppression_scenario` returns a simulator with suppressing relay behavior |
 | `preset_equivocation_scenario_builds` | `equivocation_scenario` returns a simulator with equivocating relay behavior |
-| `preset_scenarios_deterministic` | Each preset called twice with same seed produces identical DID strings and relay state |
+| `preset_scenarios_deterministic` | Each preset called twice with same seed produces identical identifiers and relay state |
 
 ## 16.14 Cross-Reference Map
 
@@ -1546,7 +1548,7 @@ Every simulation component maps to a specific protocol mechanism or threat:
 | `key_custody_conformance!()` | ADR-006 | KeyCustody contract |
 | `attestation_conformance!()` | ADR-006 | DeviceAttestation contract |
 | `push_conformance!()` | ADR-006 | Push contract |
-| `blob_store_conformance!()` | §16.4.1, §17.7 | BlobStore contract (5 methods, TTL, concurrent access) |
+| `blob_store_conformance!()` | §17.11 | BlobStorage contract (5 methods, TTL, concurrent access) |
 | `payment_adapter_conformance!()` | §19.2, §19.2.6 | PaymentAdapter contract (authorize/capture/void/verify/refund, error conditions) |
 | ProtocolRepository integration tests | §17.4, §17.13 | Protocol-layer persistence correctness |
 | MlsStorageBridge tests | §17.9 | OpenMLS state persistence through ProtocolRepository |

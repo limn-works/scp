@@ -17,7 +17,7 @@ path = "src/bin/uniffi-bindgen.rs"
 
 [features]
 default = ["server"]
-# Shared relay/node startup code. Pulls in scp-node and scp-platform/filesystem.
+# Shared relay/node startup code. Pulls in scp-node.
 server = ["scp-ffi-common/server", "dep:scp-node"]
 # Single test-harness feature (ADR-062 §Decision 6): folds in every in-memory
 # nullifier double. `scp-platform/testing` compiles `InMemoryKeyCustody`/
@@ -59,7 +59,12 @@ scp-identity = { path = "../../scp-identity", features = ["production-dht"] }
 scp-dht = { path = "../../scp-dht", features = ["production-dht"] }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common", features = ["custody"] }
-scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }
+# Default features only. Both node front doors in `scp_ffi_common::server` reach
+# a production `Node::start`, whose sealed `EncryptedStorage` bound this
+# bridge's two storage handles satisfy, so this edge adds nothing on top.
+# `scripts/check-shipped-feature-graph.sh` rejects any feature added here that
+# its allowlist omits (ADR-062 §Decision 6).
+scp-node = { path = "../../scp-node", optional = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 rmp-serde = { workspace = true }
@@ -74,7 +79,7 @@ rmp-serde = { workspace = true }
 # `EncryptingAdapter` in `build_event_log_provider` (#1447 / #484). The
 # `testing` crate-feature above adds `scp-platform/testing` for
 # dev/test/desktop builds only (ADR-062 §Decision 6).
-scp-platform = { path = "../../scp-platform", features = ["software_platform", "encrypting", "filesystem", "sqlite"] }
+scp-platform = { path = "../../scp-platform", features = ["software_platform", "encrypting", "sqlite"] }
 scp-mcp = { path = "../../scp-mcp" }
 scp-transport = { path = "../../scp-transport" }
 ed25519-dalek = { workspace = true }

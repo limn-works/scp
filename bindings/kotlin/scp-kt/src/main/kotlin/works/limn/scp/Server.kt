@@ -61,7 +61,7 @@ interface ServerBindings {
     fun relayStartLocal(dataDir: String): String
 
     /**
-     * Starts a full application node with in-memory storage.
+     * Starts a full application node with encrypted in-memory storage.
      *
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh identity.
      * @return JSON-encoded node handle with `relayUrl`, `relayPort`, and `did` fields.
@@ -69,14 +69,18 @@ interface ServerBindings {
     fun nodeStartInMemory(identityDid: String? = null): String
 
     /**
-     * Starts a full application node with file-backed storage.
+     * Starts a full application node on this instance's own storage backend.
      *
      * @param dataDir Directory for persistent storage.
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh identity.
      * @param passphrase Passphrase for Argon2id key derivation. Required when identityDid is null.
      * @return JSON-encoded node handle with `relayUrl`, `relayPort`, and `did` fields.
      */
-    fun nodeStartLocal(dataDir: String, identityDid: String? = null, passphrase: String? = null): String
+    fun nodeStartLocal(
+        dataDir: String,
+        identityDid: String? = null,
+        passphrase: String? = null,
+    ): String
 
     /**
      * Shuts down a relay identified by its handle JSON.
@@ -142,7 +146,11 @@ interface ServerBindings {
      * @param deployId The deploy identifier (hex).
      * @return The number of assets in the committed deploy.
      */
-    fun nodeCommitDeploy(handleJson: String, contextId: String, deployId: String): Int
+    fun nodeCommitDeploy(
+        handleJson: String,
+        contextId: String,
+        deployId: String,
+    ): Int
 
     /**
      * Rolls back to a previous deploy for a projected context.
@@ -151,7 +159,11 @@ interface ServerBindings {
      * @param contextId The projected context ID.
      * @param deployId The deploy identifier to roll back to.
      */
-    fun nodeRollbackDeploy(handleJson: String, contextId: String, deployId: String)
+    fun nodeRollbackDeploy(
+        handleJson: String,
+        contextId: String,
+        deployId: String,
+    )
 
     /**
      * Deactivates HTTP broadcast projection for a context.
@@ -159,7 +171,10 @@ interface ServerBindings {
      * @param handleJson JSON-encoded node handle.
      * @param contextId The context ID to stop projecting.
      */
-    fun nodeDisableSiteProjection(handleJson: String, contextId: String)
+    fun nodeDisableSiteProjection(
+        handleJson: String,
+        contextId: String,
+    )
 
     /**
      * Starts the HTTP server in the background.
@@ -168,7 +183,10 @@ interface ServerBindings {
      * @param bindAddr Socket address to bind (e.g. "127.0.0.1:8080"), or null for default.
      * @return The actual bound address as a string.
      */
-    fun nodeServe(handleJson: String, bindAddr: String?): String
+    fun nodeServe(
+        handleJson: String,
+        bindAddr: String?,
+    ): String
 
     /**
      * Returns the HTTP URL of the background server.
@@ -345,14 +363,12 @@ class Node internal constructor(
      * @return The actual bound address as a string.
      * @throws BridgeException if the server is already running or binding fails.
      */
-    suspend fun serve(bindAddr: String? = null): String =
-        bridge.serve(this, bindAddr)
+    suspend fun serve(bindAddr: String? = null): String = bridge.serve(this, bindAddr)
 
     /**
      * Returns the HTTP URL of the background server, or null if not serving.
      */
-    suspend fun httpUrl(): String? =
-        bridge.httpUrl(this)
+    suspend fun httpUrl(): String? = bridge.httpUrl(this)
 
     // Broadcast deployment lifecycle (SCP-296, spec section 18.11.8)
 
@@ -413,8 +429,10 @@ class Node internal constructor(
      * @return The number of assets in the committed deploy.
      * @throws BridgeException if the context is not projected or commit fails.
      */
-    suspend fun commitDeploy(contextId: String, deployId: String): Int =
-        bridge.commitDeploy(this, contextId, deployId)
+    suspend fun commitDeploy(
+        contextId: String,
+        deployId: String,
+    ): Int = bridge.commitDeploy(this, contextId, deployId)
 
     /**
      * Rolls back to a previous deploy for a projected context (section 18.11.11).
@@ -425,7 +443,10 @@ class Node internal constructor(
      * @param deployId The deploy identifier to roll back to.
      * @throws BridgeException if the context is not projected or deploy not found.
      */
-    suspend fun rollbackDeploy(contextId: String, deployId: String) {
+    suspend fun rollbackDeploy(
+        contextId: String,
+        deployId: String,
+    ) {
         bridge.rollbackDeploy(this, contextId, deployId)
     }
 
@@ -445,14 +466,16 @@ class Node internal constructor(
 
     companion object {
         /**
-         * Starts a full application node with in-memory storage.
+         * Starts a full application node with encrypted in-memory storage.
          *
          * When [identityDid] is provided, the node uses the pre-existing
          * identity instead of generating a fresh one. This enables identity
          * portability -- the same DID persists across node restarts.
          *
-         * Auto-wires in-memory key custody, in-memory storage, in-memory DHT
-         * client, self-signed TLS, and a relay on an OS-assigned port.
+         * Auto-wires encrypted in-memory storage (ephemeral), self-signed TLS,
+         * and a relay on an OS-assigned port. A build carrying a test-harness
+         * feature also auto-wires in-memory key custody and an in-memory DHT
+         * client; a shipped build fails closed instead when `identity` is absent.
          *
          * @param bridge The [ServerBridge] providing FFI access.
          * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
@@ -464,7 +487,7 @@ class Node internal constructor(
         ): Node = bridge.startNodeInMemory(identityDid)
 
         /**
-         * Starts a full application node with file-backed storage.
+         * Starts a full application node on this instance's own storage backend.
          *
          * When [identityDid] is provided, the node uses the pre-existing
          * identity. When `null`, the node creates or reloads a persistent
@@ -549,7 +572,7 @@ class ServerBridge internal constructor(
         }
 
     /**
-     * Starts a full application node with in-memory storage.
+     * Starts a full application node with encrypted in-memory storage.
      *
      * When [identityDid] is provided, the node uses the pre-existing
      * identity instead of generating a fresh one.
@@ -571,14 +594,18 @@ class ServerBridge internal constructor(
         }
 
     /**
-     * Starts a full application node with file-backed storage.
+     * Starts a full application node on this instance's own storage backend.
      *
      * @param dataDir Directory for persistent storage.
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
      * @param passphrase Passphrase for Argon2id key derivation. Required when identityDid is null.
      * @return A [Node] with [Node.relayUrl] and [Node.did] populated.
      */
-    suspend fun startNodeLocal(dataDir: String, identityDid: String? = null, passphrase: String? = null): Node =
+    suspend fun startNodeLocal(
+        dataDir: String,
+        identityDid: String? = null,
+        passphrase: String? = null,
+    ): Node =
         bridge.ffiCall {
             val json = bindings.nodeStartLocal(dataDir, identityDid, passphrase)
             val info = parseNodeInfo(json)
@@ -623,20 +650,20 @@ class ServerBridge internal constructor(
     internal suspend fun serve(
         node: Node,
         bindAddr: String?,
-    ): String = bridge.ffiCall {
-        bindings.nodeServe(node.handleJson, bindAddr)
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.nodeServe(node.handleJson, bindAddr)
+        }
 
     /**
      * Returns the HTTP URL of the background server, or null if not serving.
      *
      * @param node The running node.
      */
-    internal suspend fun httpUrl(
-        node: Node,
-    ): String? = bridge.ffiCall {
-        bindings.nodeHttpUrl(node.handleJson)
-    }
+    internal suspend fun httpUrl(node: Node): String? =
+        bridge.ffiCall {
+            bindings.nodeHttpUrl(node.handleJson)
+        }
 
     // Broadcast deployment lifecycle (SCP-296, spec section 18.11.8)
 
@@ -696,9 +723,10 @@ class ServerBridge internal constructor(
         node: Node,
         contextId: String,
         deployId: String,
-    ): Int = bridge.ffiCall {
-        bindings.nodeCommitDeploy(node.handleJson, contextId, deployId)
-    }
+    ): Int =
+        bridge.ffiCall {
+            bindings.nodeCommitDeploy(node.handleJson, contextId, deployId)
+        }
 
     /**
      * Rolls back to a previous deploy for a projected context.

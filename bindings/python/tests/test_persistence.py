@@ -120,8 +120,9 @@ def test_sqlite_rejects_mismatched_key() -> None:
     silently lose access to persisted state. After commit
     ``9fa80e13c`` (`fix(ffi): propagate SqliteStorage::new failure
     from with_storage`) the bridge surfaces the `SQLCipher` key
-    mismatch as a ``ValidationError`` (``SCP-VALID-7005``) rather than
-    silently returning an in-memory instance.
+    mismatch as a ``ValidationError`` (``SCP-STORAGE-8004``) rather than
+    silently returning an in-memory instance. All three bridges report
+    that one code for a failed durable-backend open.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         scp1 = SCP(storage={"type": "sqlite", "path": tmpdir, "key": _SQLITE_KEY})
@@ -132,8 +133,12 @@ def test_sqlite_rejects_mismatched_key() -> None:
         # key as "file is not a database". The PyO3 bridge wraps that
         # in `ScpPyError::Validation` → `scp_sdk.ValidationError`.
         wrong_key = b"\x11" * 32
-        with pytest.raises(_scp_core.ValidationError):
+        with pytest.raises(_scp_core.ValidationError) as exc_info:
             SCP(storage={"type": "sqlite", "path": tmpdir, "key": wrong_key})
+        assert "SCP-STORAGE-8004" in str(exc_info.value), (
+            "a rejected key is a storage-open failure, and all three bridges "
+            f"report SCP-STORAGE-8004 for it: {exc_info.value}"
+        )
 
         # Reopen with the correct key — the original encrypted state
         # must still be intact (the failed mismatched-key attempt

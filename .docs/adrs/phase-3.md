@@ -49,7 +49,7 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
 - **maturin over setuptools-rust:** maturin is purpose-built for PyO3/Rust-Python projects. It handles cross-compilation, wheel building for multiple platforms (manylinux, macOS universal2, Windows), and integrates with PyPI publishing. setuptools-rust requires more configuration and has fewer CI/CD integrations.
 - **Sync bridge with GIL release over native async:** PyO3 0.23 supports `async fn` in `#[pyfunction]` (experimental), but it holds the GIL during `Future::poll` and does not integrate with the tokio runtime — polling happens on the Python event loop thread, not on tokio worker threads. The `py.allow_threads(|| rt.block_on(...))` pattern releases the GIL for the entire duration of the async operation and runs on the shared tokio thread pool, providing superior concurrency. The deprecated `pyo3-asyncio` crate is not needed.
 - **Flat function surface:** The bridge layer is deliberately flat (no deep class hierarchies). Each Python-visible function maps to one Rust function. The Pythonic API (context managers, method chaining, iterators) is built in the pure Python wrapper layer (ADR-014), not in the FFI bridge. This keeps the bridge thin and testable.
-- **Opaque types over data transfer:** SCP types like `Identity`, `ContextHandle`, and `MlsGroup` contain crypto state that must not be serialized to Python objects. They are exposed as opaque PyO3 classes with getter methods for safe fields (DID string, context ID, state) and no access to internal key material.
+- **Opaque types over data transfer:** SCP types like `Identity`, `ContextHandle`, and `MlsGroup` contain crypto state that must not be serialized to Python objects. They are exposed as opaque PyO3 classes with getter methods for safe fields (identifier string, context ID, state) and no access to internal key material.
 
 ### Implementation
 
@@ -63,7 +63,7 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
 
 ### Dependencies
 
-- **All Phase 1 ADRs (ADR-001 through ADR-007):** The bridge exposes MLS operations, envelope creation, DID identity, transport, sender keys, and platform adapters to Python.
+- **All Phase 1 ADRs (ADR-001 through ADR-007):** The bridge exposes MLS operations, envelope creation, identity, transport, sender keys, and platform adapters to Python.
 - **All Phase 2 ADRs (ADR-008 through ADR-012):** The bridge exposes context lifecycle, role/UCAN enforcement, outlet registration/invocation, event log queries, and multi-transport routing to Python.
 
 ### Acceptance Criteria
@@ -92,11 +92,10 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
    }
    ```
 
-   - `py_identity_create(custody) -> PyIdentity` — creates a new DID identity. `custody` is a string: `"platform"`, `"in_memory"`.
-   - `py_identity_load(did) -> PyIdentity` — loads an existing identity from storage.
-   - `py_identity_resolve(did) -> PyDIDDocument` — resolves a DID to its document.
+   - `py_identity_create(custody) -> PyIdentity` — creates a new identity. `custody` is a string: `"platform"`, `"in_memory"`.
+   - `py_identity_load(identifier) -> PyIdentity` — loads an existing identity from storage.
+   - `py_identity_resolve(identifier) -> PyResolutionOutcome` — resolves an identifier to its key state.
    - `py_identity_rotate_active_key(identity) -> PyIdentity` — rotates the identity's Active Signing Key (`#active`).
-   - `py_identity_rotate_agent_key(identity) -> PyIdentity` — rotates (or provisions) the identity's Agent Signing Key (`#agent`). See ADR-039.
 
 3. **Context bridge functions:**
    - `py_context_create(identity, params) -> PyContextHandle` — creates a context. `params` is a Python dict converted to `ContextParams`.
@@ -172,7 +171,7 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
 | File | Purpose |
 |------|---------|
 | `crates/scp-ffi/src/lib.rs` | PyO3 module definition, `#[pymodule]` entry point, tokio runtime initialization |
-| `crates/scp-ffi/src/identity.rs` | `PyIdentity`, `PyDIDDocument` classes, identity bridge functions |
+| `crates/scp-ffi/src/identity.rs` | `PyIdentity`, `PyResolutionOutcome` classes, identity bridge functions |
 | `crates/scp-ffi/src/context.rs` | `PyContextHandle`, `PyContextParams` classes, context bridge functions |
 | `crates/scp-ffi/src/outlets.rs` | Outlet bridge functions, `PyOutletRegistration`, `PyOutletVerificationResult` |
 | `crates/scp-ffi/src/transport.rs` | Transport bridge functions, `PyTransportStatus` |
@@ -226,7 +225,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
 
    ```python
    class Identity:
-       did: str
+       identifier: bytes
        custody_type: str
 
        @classmethod
@@ -235,7 +234,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
            ...
 
        @classmethod
-       async def load(cls, did: str) -> "Identity":
+       async def load(cls, identifier: bytes) -> "Identity":
            """Load an existing identity from storage."""
            ...
 
@@ -248,13 +247,13 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
            """Rotate this identity's key. Returns updated Identity."""
            ...
 
-       async def resolve(self, did: str) -> "DIDDocument":
-           """Resolve another identity's DID document."""
+       async def resolve(self, identifier: bytes) -> "ResolutionOutcome":
+           """Resolve another identity's key state."""
            ...
    ```
 
    - `Identity.create()` is the entry point. Custody parameter defaults to `"platform"`.
-   - All `Identity` instances expose `.did` (string), `.custody_type` (string).
+   - All `Identity` instances expose `.identifier` (32 bytes), `.custody_type` (string).
    - Sync wrappers (`create_sync`, `load_sync`) use `asyncio.run()`.
 
 2. **`Context` class with async context manager:**
@@ -346,7 +345,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
        description: str
        input_schema: dict       # JSON Schema
        output_schema: dict      # JSON Schema
-       operator: Identity | str # DID string or Identity object
+       operator: Identity | bytes # identifier bytes or Identity object
        test_vectors: list[TestVector] | None = None
        implementation_hash: bytes | None = None
    ```
@@ -486,7 +485,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
 | File | Purpose |
 |------|---------|
 | `scp_sdk/__init__.py` | Package root, re-exports, version, top-level convenience |
-| `scp_sdk/identity.py` | `Identity` class, `DIDDocument`, identity operations |
+| `scp_sdk/identity.py` | `Identity` class, `ResolutionOutcome`, identity operations |
 | `scp_sdk/context.py` | `Context` class, `Membership`, async context manager, message streaming |
 | `scp_sdk/outlets.py` | `OutletDefinition`, `TestVector`, `OutletVerification` dataclasses |
 | `scp_sdk/trust.py` | `evaluate_trust()`, `TrustEvaluation` dataclass |
@@ -518,7 +517,7 @@ Implement the MCP adapter as the `scp-mcp` crate (Rust) with a Python interface 
 
 ### Rationale
 
-- **MCP server as the model-facing surface:** The model calls MCP tools. The adapter translates each tool call into an SCP context operation (message send, outlet invocation, event log query). The model never handles DIDs, UCANs, encryption, or transport. This separation is critical — it means every existing MCP-compatible model works with SCP with zero integration effort (spec section 8.5).
+- **MCP server as the model-facing surface:** The model calls MCP tools. The adapter translates each tool call into an SCP context operation (message send, outlet invocation, event log query). The model never handles identifiers, UCANs, encryption, or transport. This separation is critical — it means every existing MCP-compatible model works with SCP with zero integration effort (spec section 8.5).
 - **Capability filtering at the adapter:** MCP has no access control concept — all configured tools are available. SCP outlets are capability-gated by role. The adapter resolves this by querying the agent's UCAN capabilities and exposing only permitted outlets to the model. Outlets the agent lacks capability for are invisible to the model (spec section 8.5, "capability filtering happens at the agent").
 - **Context-namespaced tools:** Tools are namespaced by context: `context_a/send_message`, `context_a/guide_assistant`, `context_b/schedule_meeting`. This gives the model a flat tool surface that implicitly encodes context scoping. The adapter parses the namespace prefix, routes to the correct context, and handles the SCP protocol mechanics.
 - **Dual transport: stdio and SSE:** MCP supports two transport modes. stdio (standard input/output) is the default for local integrations (Claude Code, Cursor). SSE (Server-Sent Events over HTTP) supports remote and web-based integrations. The adapter supports both.
@@ -638,7 +637,7 @@ Implement the MCP adapter as the `scp-mcp` crate (Rust) with a Python interface 
 
    ```bash
    # Start SCP as an MCP server from the command line
-   scp-mcp serve --identity <did> --relay <relay_url> --transport stdio
+   scp-mcp serve --identity <identifier> --relay <relay_url> --transport stdio
    ```
 
    - The `scp-mcp` CLI binary starts an MCP server for a given SCP identity.
@@ -665,7 +664,11 @@ Implement the MCP adapter as the `scp-mcp` crate (Rust) with a Python interface 
 
 ## ADR-016: UCAN Validation
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, left one operational role. A verifier resolves an issuer's public key from that issuer's key state, a `kid` names the role `#active`, and a human delegates to its agent's own identifier rather than to a second key on its own (`09-security-model.md` §9.1 invariant 1, `03-identity.md` §3.10.4).
+
+**Amendment (2026-09-10 — UCAN tokens are ES256 and the validation module verifies P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. UCAN tokens are signed with ES256 in place of EdDSA, so this ADR's validation module verifies an ECDSA signature on P-256, its token `signature` field carries the type `P256Signature`, its issuing step signs with a P-256 key, and its library note names the `p256` crate. The mandatory-nonce requirement, the delegation-chain walk, and the caveat-attenuation rules are untouched.
 
 ### Context
 
@@ -675,7 +678,7 @@ Phase 2 (ADR-009) defined the role assignment and capability ceiling enforcement
 
 ### Decision
 
-Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, building on the ADR-009 foundation) with full exposure through the PyO3 bridge (ADR-013) to Python. The validation module handles: UCAN token parsing, Ed25519 signature chain verification, capability matching against context ceilings, nonce uniqueness enforcement, revocation checking, expiry verification, and attenuation chain verification. The Python SDK exposes validation as both an explicit API (`scp_sdk.ucan.validate()`) and an implicit enforcement layer (every `Context.send()`, `Context.invoke()`, etc. validates capabilities internally).
+Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, building on the ADR-009 foundation) with full exposure through the PyO3 bridge (ADR-013) to Python. The validation module handles: UCAN token parsing, P-256 signature chain verification, capability matching against context ceilings, nonce uniqueness enforcement, revocation checking, expiry verification, and attenuation chain verification. The Python SDK exposes validation as both an explicit API (`scp_sdk.ucan.validate()`) and an implicit enforcement layer (every `Context.send()`, `Context.invoke()`, etc. validates capabilities internally).
 
 ### Rationale
 
@@ -688,7 +691,7 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
 ### Implementation
 
 - **Language:** Rust
-- **Library:** `rs-ucan` crate (or `ucan` crate — must support UCAN 0.10+ with mandatory nonce field). If no crate supports mandatory nonces, implement UCAN parsing and validation directly using `serde_json`, `ed25519-dalek`, and `base64`. [Note: replaced by native impl in scp-core/src/crypto/ucan/]
+- **Library:** `rs-ucan` crate (or `ucan` crate — must support UCAN 0.10+ with mandatory nonce field). If no crate supports mandatory nonces, implement UCAN parsing and validation directly using `serde_json`, `p256`, and `base64`. [Note: replaced by native impl in scp-core/src/crypto/ucan/]
 - **Crate:** `scp-core`
 - **Module:** `scp-core/crypto/ucan/` (extends the ADR-009 structure)
 - **Nonce storage:** In-memory `HashSet<String>` per context with 24-hour pruning, backed by `scp-platform` Storage trait for persistence across restarts.
@@ -698,7 +701,7 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
 
 - **ADR-013 (PyO3 Bridge):** UCAN validation is exposed to Python via bridge functions (`py_ucan_validate`, `py_ucan_mint`, `py_ucan_revoke`).
 - **ADR-009 (Roles/UCAN):** ADR-009 defined the role assignment and ceiling enforcement architecture. ADR-016 implements the complete validation pipeline that ADR-009 calls into.
-- **ADR-003 (DID):** UCAN token signatures are verified against DID public keys. Delegation chains reference DIDs. Validation requires DID resolution for public key lookup.
+- **ADR-003 (identity creation):** UCAN token signatures verify against an issuer's public key. Delegation chains reference identifiers, and validation resolves each identifier's key state to find that key (`03-identity.md` §3.10.4).
 - **ADR-008 (Context):** UCAN validation is context-scoped. The capability ceiling, nonce tracker, and revocation list are per-context state.
 
 ### Acceptance Criteria
@@ -709,24 +712,23 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
    pub struct UcanToken {
        pub header: UcanHeader,
        pub payload: UcanPayload,
-       pub signature: Ed25519Signature,
+       pub signature: P256Signature,
        pub encoded: String,            // Original encoded token (for signature verification)
    }
 
    pub struct UcanHeader {
-       pub alg: String,                // "EdDSA"
+       pub alg: String,                // "ES256"
        pub typ: String,                // "JWT" (UCAN is JWT-based)
        pub ucv: String,                // UCAN version, "0.10.0"
-       pub kid: Option<String>,        // Key ID per RFC 7515 (ADR-039): identifies the issuer's
-                                       // verification method (e.g., "#active", "#agent"). When
-                                       // present, verifiers resolve the public key from the
-                                       // issuer's DID document using this VM ID. When absent,
-                                       // defaults to "#active".
+       pub kid: Option<String>,        // Key ID per RFC 7515: names the issuer's operational
+                                       // role, "#active". When present, verifiers resolve the
+                                       // public key from the issuer's key state under that
+                                       // role. When absent, defaults to "#active".
    }
 
    pub struct UcanPayload {
-       pub iss: String,                // Issuer DID
-       pub aud: String,                // Audience DID
+       pub iss: String,                // Issuer identifier
+       pub aud: String,                // Audience identifier
        pub exp: u64,                   // Expiration (Unix timestamp)
        pub nbf: Option<u64>,           // Not-before (Unix timestamp)
        pub nnc: String,                // Nonce (mandatory, spec §9.5)
@@ -743,10 +745,10 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
 
 2. **`validate_ucan(context, token, required_capability) -> Result<(), UcanError>`:**
    - **Step 1 — Parse:** Decode the JWT-format UCAN token. Reject malformed tokens.
-   - **Step 2 — Signature verification:** Verify the Ed25519 signature on the token. The signature covers `base64url(header).base64url(payload)`. If the header contains `kid` (ADR-039), resolve the correct public key from the issuer's DID document using that verification method ID. If `kid` is absent, default to `#active`. At every link in the delegation chain, the `kid` (if present) identifies which key signed that particular token.
+   - **Step 2 — Signature verification:** Verify the P-256 signature on the token. The signature covers `base64url(header).base64url(payload)`. If the header contains `kid`, resolve the public key from the issuer's key state under the operational role it names. If `kid` is absent, default to `#active`. At every link in the delegation chain, the `kid` (if present) identifies which key signed that particular token.
    - **Step 3 — Chain verification:** For each proof CID in `prf`, resolve the parent UCAN, verify its signature, and verify the parent's `aud` matches this token's `iss` (delegation chain integrity). Recurse until reaching a root token (empty `prf`).
-   - **Step 4 — Root issuer:** Verify the root token's `iss` is the context creator's DID. Agent keys (`#agent`) cannot issue root UCANs — root UCAN issuance requires `#active` (the human signing key). This ensures human accountability at the root of every delegation chain (ADR-039).
-   - **Step 5 — Audience:** Verify the token's `aud` matches the presenting agent's DID. Self-delegation (`iss == aud`) is valid when the token's `fct` contains `scp_key_scope` (ADR-039), indicating key-scope delegation (e.g., `fct.scp_key_scope: "#agent"` delegates authority from the human's `#active` key to their own `#agent` key on the same DID).
+   - **Step 4 — Root issuer:** Verify the root token's `iss` is the context creator's identifier. This ensures human accountability at the root of every delegation chain.
+   - **Step 5 — Audience:** Verify the token's `aud` matches the presenting agent's identifier. A human delegates to its agent by issuing to that agent's own identifier, so `iss == aud` carries no key scope.
    - **Step 6 — Capability match:** Verify the token's `att` includes the `required_capability`. Capability matching supports wildcards (`scp:ctx:*/messages:write` matches any context).
    - **Step 7 — Attenuation:** Verify each delegation in the chain narrows or preserves capabilities (never widens). A child token cannot grant capabilities its parent does not have.
    - **Step 8 — Ceiling:** Verify every capability the token grants is within the context's immutable capability ceiling — not only the invoked capability. The token's entire attestation set (`att`) is checked; a token carrying any out-of-ceiling attestation is rejected even if the invoked capability is itself within the ceiling.
@@ -757,15 +759,15 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
 
 3. **`mint_ucan(issuer, audience, capabilities, context_id, expiry, signing_key_ref) -> UcanToken`:**
    - Creates a new UCAN token.
-   - The `signing_key_ref` parameter (ADR-039) identifies which verification method to sign with (e.g., `"#active"` or `"#agent"`). This value is stored in the UCAN header as `kid`.
+   - The `signing_key_ref` parameter names the operational role to sign with, `"#active"`. This value is stored in the UCAN header as `kid`.
    - Generates a unique nonce in `{unix_millis}-{hex16}` format (Unix millisecond timestamp, hyphen, 16 random bytes hex-encoded). This matches the validation format in Step 9.
    - Constructs the `att` array from the `capabilities` list, scoped to the context: `"scp:ctx:{context_id}/{capability}"`.
-   - Signs with the issuer's Ed25519 key identified by `signing_key_ref`.
+   - Signs with the issuer's P-256 key identified by `signing_key_ref`.
    - Returns the signed token.
 
 4. **`delegate_ucan(parent_token, delegator, delegatee, attenuated_capabilities) -> UcanToken`:**
    - Creates a delegated UCAN.
-   - Verifies `delegator` DID matches `parent_token.aud`.
+   - Verifies the `delegator` identifier matches `parent_token.aud`.
    - Verifies `attenuated_capabilities` is a subset of `parent_token.att` (attenuation, never widening).
    - Sets `prf` to include the parent token's CID.
    - Signs with the delegator's key.
@@ -967,7 +969,7 @@ The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with
     → {"result": 21}
     The MCP adapter (ADR-015) parses the context namespace, validates UCAN,
     routes through scp-core outlet invocation, returns the result via JSON-RPC.
-    The model never saw a DID, UCAN token, MLS group, or relay.
+    The model never saw an identifier, UCAN token, MLS group, or relay.
 
 11. Verify event log from Python:
     events = await ctx.event_log.query(event_type="outlet_invoked")
@@ -994,7 +996,9 @@ This test proves: pip install works without Rust, the 20-line agent works, async
 
 > **Note:** ADR-033 is numbered non-sequentially because it was added as a cross-cutting concern after the original phase numbering. It lives in the Phase 3 document because its scope (payment adapters, spending UCANs, economic policy) extends the UCAN and context systems specified in ADR-009/ADR-016. See also ADR-032 in phase-2.md.
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — the governance signature is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The `signature` field on this ADR's signed governance structure carries the type `P256Signature`. No other sentence of this ADR names a curve, so the ruling reaches its wire type and no decision in it.
 
 ### Context
 
@@ -1002,13 +1006,13 @@ The agent economy needs protocol-level economic infrastructure. SaaS companies a
 
 Prior art: Dwork & Naor (1992) computational spam prevention, Hashcash (1997) proof-of-work for email, x402 (2025) machine-to-machine payments on Base/Solana, L402 Lightning + Macaroons for API access, Stripe machine payments (2025), EIP-1559 algorithmic dynamic pricing.
 
-No existing standard combines UCAN delegation chains with payment semantics. L402/Macaroons have spending caveats but not DID-based delegation. ILP/GNAP has payment authorization but not capability-chain attenuation. SCP is the first to define spending-scoped UCAN capabilities.
+No existing standard combines UCAN delegation chains with payment semantics. L402/Macaroons have spending caveats but not identity-based delegation. ILP/GNAP has payment authorization but not capability-chain attenuation. SCP is the first to define spending-scoped UCAN capabilities.
 
 ### Decision
 
 1. **Payment adapter trait** following the transport adapter pattern (ADR-005): `PaymentAdapter` with `authorize`, `capture`, `void`, `verify`, `refund` methods. `AdapterCapabilities` struct declares supported features. `payment_adapter_conformance!()` macro validates implementations. `TestAdapter` in-memory reference ships with SDK.
 
-2. **Spending UCAN** as new capability type: `SpendingCapability` with `max_per_action`, `max_total`, `currency`, `time_window`, `allowed_adapters`. AND-composed with action UCANs — both required for paid actions. Standard UCAN attenuation and revocation rules apply. Agents sign spending UCANs with `#agent` via self-delegation: `iss == aud` with `fct.scp_key_scope: "#agent"` (ADR-039). This allows agents to authorize spending within delegated limits without requiring the human's `#active` key for each transaction.
+2. **Spending UCAN** as new capability type: `SpendingCapability` with `max_per_action`, `max_total`, `currency`, `time_window`, `allowed_adapters`. AND-composed with action UCANs — both required for paid actions. Standard UCAN attenuation and revocation rules apply. An agent signs a spending UCAN with the `#active` key of its own identity, under a UCAN the human issued to that identifier, so the agent authorizes spending within delegated limits without the human's key for each transaction. **Amended 2026-09-10:** ADR-063, inception-derived self-certifying identity over a key-event log, overturned the shared-identity self-delegation this bullet described (`09-security-model.md` §9.1 invariant 1).
 
 3. **Formula-based dynamic pricing** (EIP-1559-inspired): `PricingFormula` with `base_cost`, `variables` (linear/step), `cap`, `floor`. Observable metrics: `ContextMessageRate`, `MemberCount`, `RelayQueueDepth`, `TimeOfDay`, `SenderVelocity`, `StorageUsage`. Both sides evaluate independently — deterministic, no oracle.
 
@@ -1063,7 +1067,7 @@ pub enum PaidActionType {
 pub trait PaymentAdapter: Send + Sync {
     fn adapter_id(&self) -> &str;
     fn capabilities(&self) -> AdapterCapabilities;
-    async fn authorize(&self, payer: &DID, payee: &DID, amount: Amount,
+    async fn authorize(&self, payer: &[u8; 32], payee: &[u8; 32], amount: Amount,
         currency: CurrencyCode, metadata: PaymentMetadata,
     ) -> Result<PaymentAuthorization, PaymentError>;
     async fn capture(&self, auth: &PaymentAuthorization) -> Result<PaymentReceipt, PaymentError>;
@@ -1092,7 +1096,7 @@ pub struct PaymentMetadata {
 
 pub struct PaymentAuthorization {
     pub auth_id: [u8; 32],
-    pub payer: DID, pub payee: DID,
+    pub payer: [u8; 32], pub payee: [u8; 32],
     pub amount: Amount, pub currency: CurrencyCode,
     pub adapter_id: String,
     pub created_at: u64, pub expires_at: u64,
@@ -1117,7 +1121,7 @@ pub struct EconomicPolicy {
     pub cost_schedule: CostSchedule,
     pub payment_adapters: Vec<PaymentAdapterRef>,
     pub pricing_formula: Option<PricingFormula>,
-    pub payee: DID,
+    pub payee: [u8; 32],
 }
 
 pub struct CostSchedule {
@@ -1173,21 +1177,22 @@ pub struct SpendingCapability {
 
 pub struct PaymentReceipt {
     pub receipt_id: [u8; 32],
-    pub payer: DID, pub payee: DID,
+    pub payer: [u8; 32], pub payee: [u8; 32],
     pub amount: Amount, pub currency: CurrencyCode,
     pub action_type: PaidActionType,
     pub context_id: Option<ContextId>,
     pub adapter_id: String,
     pub adapter_proof: Vec<u8>,
     pub timestamp: u64,
-    pub signature: Ed25519Signature,
+    pub signature: P256Signature,
 }
 
-pub struct VerificationResult {
-    pub valid: bool, pub adapter_id: String,
-    pub verified_amount: Amount, pub verified_currency: CurrencyCode,
-    pub verification_timestamp: u64,
-}
+// VerificationResult: `19-economic-governance.md` §19.2.1 declares it field by
+// field. A relay passes its own declared payee, currency and price into
+// `PaymentAdapter::verify` and reads the terms the adapter answers with, so the
+// type carries answers to the relay's questions rather than the receipt's own
+// fields.
+pub struct VerificationResult { /* §19.2.1 */ }
 
 pub struct RefundConfirmation {
     pub refund_id: [u8; 32], pub original_receipt_id: [u8; 32],
@@ -1227,7 +1232,7 @@ pub struct RefundConfirmation {
 - Every paid action generates a `PaymentReceipt` in the context event log — full economic provenance.
 - Anti-spam becomes economic: `SenderVelocity` metric with step pricing makes bulk spam a P&L decision.
 - Relay operators can monetize transport without accessing content (dumb pipe model preserved).
-- UCAN spending delegation is a novel contribution — first standard to combine DID-based delegation chains with payment semantics.
+- UCAN spending delegation is a novel contribution — first standard to combine identity-based delegation chains with payment semantics.
 - Agents never silently incur costs — auto-accept never applies to paid contexts.
 
 **Negative (acknowledged trade-offs):**
@@ -1238,7 +1243,7 @@ pub struct RefundConfirmation {
 - Pricing formula divergence between payer and receiver (due to metric observation timing) creates retry overhead, even with the `CostInsufficient` metric snapshot mechanism.
 
 **Protocol invariants established:**
-- Free relays MUST always exist in the bootstrap list — economic gatekeeping is a protocol violation.
+- ~~Free relays MUST always exist in the bootstrap list — economic gatekeeping is a protocol violation.~~ **Withdrawn 2026-09-27.** Alec ruled that the free-entry obligation is Limn's list policy and no protocol rule, and ADR-063's register entry on the relay-list pointer records the ruling.
 - Auto-accept never applies to paid contexts — agents never silently incur costs.
 - Free operation is default — no economic policy = free.
 - Payment data inside encrypted envelope — relays never see context-level payment metadata.
@@ -1254,7 +1259,7 @@ pub struct RefundConfirmation {
 
 ### Dependencies
 
-- ADR-002 (DID identity) — DIDs as payer/payee identifiers in all payment operations
+- ADR-002 (identity) — identifiers as payer and payee in all payment operations
 - ADR-005 (transport trait) — pattern for adapter trait design; relay economic config extends transport layer
 - ADR-008 (context lifecycle) — economic policy is a context setting governed through context governance
 - ADR-009 (roles/capabilities) — spending capability as new UCAN type, AND-composed with action UCANs
@@ -1275,4 +1280,4 @@ pub struct RefundConfirmation {
 11. `PaymentReceipt` events recorded in context event log with Merkle inclusion proofs.
 12. `.well-known/scp` relay config parsing accepts optional `economic` object with `per_publish`, `per_byte_stored`, `payment_adapters`, `payee` fields.
 13. `paid-service` and `paid-broadcast` context templates defined with required economic policy fields.
-14. Free relays exist in the default bootstrap relay list — at least one relay in the SDK's fallback list has no `economic` config.
+14. ~~Free relays exist in the default bootstrap relay list — at least one relay in the SDK's fallback list has no `economic` config.~~ **Withdrawn 2026-09-27**, with the free-relay invariant above: the SDK ships no relay list (`18-addressability-and-deployment.md` §18.5.1), and whether the community relay list carries a free relay is Limn's list policy.

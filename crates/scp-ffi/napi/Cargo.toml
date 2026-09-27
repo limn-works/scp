@@ -12,7 +12,7 @@ crate-type = ["cdylib", "lib"]
 
 [features]
 default = ["server"]
-# Shared relay/node startup code. Pulls in scp-node and scp-platform/filesystem.
+# Shared relay/node startup code. Pulls in scp-node.
 server = ["scp-ffi-common/server", "dep:scp-node"]
 # Testing-only affordances (see scp-ffi/Cargo.toml for rationale). MUST NOT
 # be enabled in production builds; the parity harness (ADR-046) enables it.
@@ -70,7 +70,12 @@ scp-identity = { path = "../../scp-identity" }
 scp-dht = { path = "../../scp-dht", features = ["production-dht"] }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common", features = ["custody"] }
-scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }
+# Default features only. Both node front doors in `scp_ffi_common::server` reach
+# a production `Node::start`, whose sealed `EncryptedStorage` bound this
+# bridge's two storage handles satisfy, so this edge adds nothing on top.
+# `scripts/check-shipped-feature-graph.sh` rejects any feature added here that
+# its allowlist omits (ADR-062 §Decision 6).
+scp-node = { path = "../../scp-node", optional = true }
 # Production dep line: durability-only `in-memory-storage` (the shippable
 # `{"type":"in_memory"}` storage affordance, SCP-CAPSEL-8011) plus
 # `software_platform` for the crypto primitives — NEVER `testing` (ADR-062
@@ -78,7 +83,7 @@ scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], 
 # NOT reachable in production: production pre-rotation create FAILS CLOSED with a
 # typed `IdentityError` (SCP-IDENT-1059) rather than mint `InMemoryPreRotationCustody`.
 # The `testing` crate-feature adds `scp-platform/testing` on top for test builds.
-scp-platform = { path = "../../scp-platform", features = ["software_platform", "in-memory-storage", "encrypting", "filesystem", "sqlite"] }
+scp-platform = { path = "../../scp-platform", features = ["software_platform", "in-memory-storage", "encrypting", "sqlite"] }
 scp-mcp = { path = "../../scp-mcp" }
 scp-testing = { path = "../../scp-testing", optional = true }
 scp-transport = { path = "../../scp-transport" }

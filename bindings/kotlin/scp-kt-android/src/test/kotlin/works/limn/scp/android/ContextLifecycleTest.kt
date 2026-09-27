@@ -9,12 +9,12 @@ package works.limn.scp.android
 
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.testing.TestLifecycleOwner
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
@@ -29,21 +29,18 @@ import kotlin.test.assertTrue
 @OptIn(ExperimentalCoroutinesApi::class)
 class ContextLifecycleTest {
 
-    // `asLifecycleFlow` delegates to `Flow.flowWithLifecycle`, which calls
-    // `Lifecycle.repeatOnLifecycle` and so switches to `Dispatchers.Main.immediate`. A plain
-    // JVM unit test carries no Android main looper, so without this dispatcher every method
-    // below fails inside `MissingMainCoroutineDispatcher` before it collects anything.
-    // Installing a TestDispatcher as Main also hands `runTest` that dispatcher's scheduler,
-    // so `advanceUntilIdle()` drives lifecycle dispatch and flow collection together.
-    private val mainDispatcher = UnconfinedTestDispatcher()
-
+    // `flowWithLifecycle` runs `repeatOnLifecycle`, which switches to
+    // `Dispatchers.Main.immediate`. A local JVM unit test has no Android main looper,
+    // so without a test Main dispatcher every collection fails with "Module with the
+    // Main dispatcher had failed to initialize". `runTest` then shares this
+    // dispatcher's scheduler, which the per-test `UnconfinedTestDispatcher` joins.
     @BeforeEach
-    fun setUpMainDispatcher() {
-        Dispatchers.setMain(mainDispatcher)
+    fun setUp() {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
     }
 
     @AfterEach
-    fun tearDownMainDispatcher() {
+    fun tearDown() {
         Dispatchers.resetMain()
     }
 

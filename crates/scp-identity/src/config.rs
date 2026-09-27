@@ -9,19 +9,39 @@
 //!
 //! # Relationship to the other identity-creation paths
 //!
-//! Today identities are created in two other places, both of which this module
-//! **reuses rather than duplicates**:
+//! Two other places create identities, and this module **reuses rather than
+//! duplicates** both:
 //!
 //! - Inside a Node, via `IdentitySource::{Generate, Persisted}` →
 //!   [`DidMethod::create`] (`crates/scp-node/src/config.rs`).
 //! - At the FFI boundary, via the three `identity_create*` bridge entry points
 //!   (`crates/scp-ffi/src/identity.rs`).
 //!
-//! All of these — and this module — funnel into the same [`DidMethod::create`]
-//! call, minting a fresh per-identity [`InMemoryPreRotationCustody`] for the
-//! cold-storage pre-rotation key exactly as the existing paths do (the
-//! construction-standard `IdentityConfig` shape carries no separate
-//! pre-rotation slot, so the internal mint is the established behaviour).
+//! # Pre-rotation custody — a shipped build creates no identity at all
+//!
+//! [`DidMethod::create`] commits a mandatory pre-rotation commitment (the
+//! identity spec §9.7.4.1 §3, which makes that commitment mandatory at
+//! creation), so every path named above — and this module — needs a
+//! `scp_platform::PreRotationCustody` backend. No such
+//! backend ships. The tree holds one implementation, `InMemoryPreRotationCustody`.
+//! `scp-platform` compiles that implementation only under its own `testing`
+//! feature, because §17.17.2 of the persistence spec, which classifies a
+//! dev-only construct as a security nullifier, forbids it on a shipped path
+//! (ADR-062, capability injection and prove-absent dev backends, §Decision 6).
+//!
+//! A shipped (no-`testing`) build therefore mints nothing, and reaches
+//! [`DidMethod::create`] on none of these paths. This module's `create_inner`
+//! returns [`IdentityError::NoPreRotationBackend`], which every bridge surfaces
+//! as the error code `SCP-IDENT-1059`. The Node builder and the three FFI
+//! `identity_create*` entry points return that same typed error before minting.
+//! Only a `testing` build mints a fresh per-identity `InMemoryPreRotationCustody`,
+//! and `create_inner` performs that mint internally, because the
+//! construction-standard `IdentityConfig` shape carries no pre-rotation slot for
+//! a caller to fill. `create_inner` documents the full contract, and the
+//! `ephemeral_create_fails_closed_*` and `persisted_create_fails_closed_*` tests
+//! in this file execute it. Issue #1729, production `PreRotationCustody`
+//! backends, and the pre-rotation custody realization RFC, #2130, track the real
+//! backends.
 //!
 //! # Agent signing keys
 //!
@@ -325,8 +345,12 @@ impl Identity {
 /// Every identity commits a pre-rotation commitment at creation (spec §9.7.4.1
 /// §3 — mandatory, not optional), which requires a
 /// [`PreRotationCustody`](scp_platform::PreRotationCustody) backend. The only
-/// implementation that exists today is [`InMemoryPreRotationCustody`], a
-/// §17.17.2 security nullifier now gated to the test harness (`testing`) only.
+/// implementation that exists today is `scp_platform::testing::InMemoryPreRotationCustody`,
+/// a §17.17.2 security nullifier now gated to the test harness (`testing`) only.
+/// That name is written here without an intra-doc link on purpose: this function
+/// compiles in every build and the import that brings the type into scope carries
+/// `#[cfg(feature = "testing")]`, so a link would resolve in a `testing` doc build
+/// and fail `rustdoc::broken_intra_doc_links` in a shipped one.
 ///
 /// - **`testing` build:** mints a fresh per-identity `InMemoryPreRotationCustody`
 ///   (as the Node builder and every FFI `identity_create*` path do). Per spec
@@ -344,7 +368,7 @@ impl Identity {
 /// - **shipped (no-`testing`) build:** there is NO real pre-rotation backend, so
 ///   creation FAILS CLOSED with [`IdentityError::NoPreRotationBackend`] rather
 ///   than silently minting the nullifier. Masking a missing production backend
-///   with a dev stand-in would ship a false durability guarantee (CLAUDE.md
+///   with a dev stand-in would ship a false durability guarantee (AGENTS.md
 ///   builder tenet "No dev/test-only stand-ins in production"). A real backend is
 ///   tracked by #1729 / RFC #2130; non-committing create (Option A, #1553) is out
 ///   of scope and would violate spec §9.7.4.1.

@@ -57,7 +57,7 @@ subscription that a different caller had just opened.
 
 ## Why a coordinator rather than a file-scope registry
 
-`CLAUDE.md` states "Inject every dependency through an initializer. Never reach for a singleton",
+`AGENTS.md` states "inject dependencies through initializers, never use a singleton",
 and `scripts/check-no-kotlin-mutable-globals.sh` states that this SDK holds no implicit
 per-process mutable state. An `object` singleton in `StateHolders.kt` would carry that state
 across mounts and would also carry it across every unrelated caller in one process, so a caller

@@ -88,10 +88,10 @@ pub enum StorageConfig {
 /// are wrapped in `Zeroizing` so they are wiped from memory on drop. This
 /// mirrors the `PyO3` and `UniFFI` bridges' `SqliteKeyMaterial`.
 ///
-/// - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`] directly (raw-key
+/// - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`](scp_platform::sqlite::SqliteStorage::new) directly (raw-key
 ///   mode; the existing, unchanged path).
 /// - [`SqliteKeyMaterial::Passphrase`] feeds
-///   [`SqliteStorage::with_passphrase`], which derives the `SQLCipher` PRAGMA
+///   [`SqliteStorage::with_passphrase`](scp_platform::sqlite::SqliteStorage::with_passphrase), which derives the `SQLCipher` PRAGMA
 ///   key from the passphrase via the shared Argon2id parameterization with a
 ///   persisted per-database salt sidecar.
 #[derive(Clone)]
@@ -442,8 +442,8 @@ impl NapiBridgeInstance {
     ///   backed by the same encrypted in-memory store as the event log
     ///   (dev/test affordance; spec §17.6).
     /// - [`StorageConfig::Sqlite`] — opens a `SQLCipher`-encrypted database at
-    ///   `{path}/scp.db`. The raw-key path feeds [`SqliteStorage::new`]; the
-    ///   passphrase path feeds [`SqliteStorage::with_passphrase`] (Argon2id;
+    ///   `{path}/scp.db`. The raw-key path feeds [`SqliteStorage::new`](scp_platform::sqlite::SqliteStorage::new); the
+    ///   passphrase path feeds [`SqliteStorage::with_passphrase`](scp_platform::sqlite::SqliteStorage::with_passphrase) (Argon2id;
     ///   spec §17.6). The ONE `Arc<SqliteStorage>` backs the context-snapshot
     ///   persistence bridge, the Merkle event log + trust aggregation
     ///   repository, AND the supervisor's `mls_storage` `OpenMLS` view, so all

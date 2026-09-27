@@ -32,9 +32,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 FFI_CRATE_DIR="$REPO_ROOT/crates/scp-ffi/uniffi"
 FFI_LIB_NAME="libscp_ffi_uniffi.a"
 
-# Cargo target directory (respect CARGO_TARGET_DIR if set)
-TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
-
 # Apple targets
 TARGET_IOS="aarch64-apple-ios"
 TARGET_IOS_SIM_ARM="aarch64-apple-ios-sim"
@@ -48,7 +45,6 @@ XCFRAMEWORK_OUTPUT="$SCRIPT_DIR/ScpFFI.xcframework"
 
 # Header and bindings output directories
 HEADER_DIR="$SCRIPT_DIR/Headers"
-HEADER_FILE="$HEADER_DIR/ScpFFI.h"
 MODULE_MAP="$HEADER_DIR/module.modulemap"
 BINDINGS_DIR="$SCRIPT_DIR/Sources/SCP/Internal"
 
@@ -132,6 +128,15 @@ command -v cargo >/dev/null 2>&1 || die "cargo not found. Install the Rust toolc
 command -v xcodebuild >/dev/null 2>&1 || die "xcodebuild not found. Install Xcode command-line outlets."
 command -v lipo >/dev/null 2>&1 || die "lipo not found. Install Xcode command-line outlets."
 
+# Cargo target directory. Cargo resolves it from `CARGO_TARGET_DIR`, then
+# `build.target-dir` in any `.cargo/config.toml` it reads, then `<workspace>/target`,
+# so this script asks cargo instead of assuming `$REPO_ROOT/target`: a machine whose
+# `~/.cargo/config.toml` points every worktree at one shared directory builds the
+# libraries outside this checkout. `cargo metadata --no-deps` compiles nothing.
+TARGET_DIR=$(cargo metadata --manifest-path "$FFI_CRATE_DIR/Cargo.toml" --format-version 1 --no-deps \
+    | sed -nE 's/.*"target_directory":"([^"]*)".*/\1/p')
+[ -n "$TARGET_DIR" ] || die "cargo metadata named no target directory for $FFI_CRATE_DIR"
+
 # Verify all Rust targets are installed
 for target in "${ALL_TARGETS[@]}"; do
     if ! rustup target list --installed | grep -q "^${target}$"; then
@@ -162,8 +167,32 @@ fi
 # ---------------------------------------------------------------------------
 
 log "Generating Swift bindings and C header via uniffi-bindgen"
+
+# Build the bindgen binary out of the artifacts step 1 just produced, wherever the
+# machine can execute what that step built.
+#
+# Cargo keys its artifact directory on the profile and on whether the command passes
+# `--target`, and it shares nothing across two directories. Step 1 compiles this crate
+# and its ~650 dependencies under the release profile into
+# `target/aarch64-apple-darwin/release`. A `cargo run` that passes neither flag compiles
+# the same crate graph a second time, under the dev profile, into `target/debug`.
+# Measured on CI run 34724307976: step 1 took 13m45s and this command took a further
+# 6m02s, of which the bindgen binary itself is a few seconds of the total.
+#
+# `cargo run` executes what it builds, so this holds only where the host runs the triple
+# step 1 named. On an Intel Mac it does not, and the flags stay empty there: the command
+# builds a host binary as before, and the dev XCFramework it goes on to produce is
+# arm64-only on either machine.
+# Written as a word-split string rather than an array because macOS ships bash 3.2,
+# where `"${empty[@]}"` under `set -u` aborts the script.
+BINDGEN_PROFILE_FLAGS=""
+if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+    BINDGEN_PROFILE_FLAGS="--release --target $TARGET_MACOS_ARM"
+fi
+
 # shellcheck disable=SC2086
 cargo run \
+    $BINDGEN_PROFILE_FLAGS \
     -p scp-ffi-uniffi \
     --bin uniffi-bindgen \
     $EXTRA_FEATURES \

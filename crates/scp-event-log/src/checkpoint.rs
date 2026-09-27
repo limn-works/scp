@@ -64,7 +64,7 @@ const CHECKPOINT_TIME_INTERVAL_SECS: u64 = 600; // 10 minutes
 /// This is the single canonical checkpoint type for the workspace. It is
 /// transmitted on the wire (the §9.9.3 checkpoint-exchange message carries a
 /// `MessagePack`-serialized value through the inner-envelope pipeline) and
-/// embedded in [`crate::sync`]-layer equivocation evidence, so it derives the
+/// embedded in the runtime's sync-layer equivocation evidence, so it derives the
 /// full serde + equality surface those uses require. `deny_unknown_fields`
 /// rejects adversarial extra fields at the deserialization boundary;
 /// `serde_bytes` encodes the signature as a compact `MessagePack` binary blob.

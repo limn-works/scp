@@ -1,6 +1,6 @@
 # The one place this repository names the nightly the standalone fuzz crate compiles on.
 # `fuzz/` sits outside the workspace, and cargo-fuzz only runs on nightly (see the Fuzzing
-# row of CLAUDE.md's toolchain table), so stable cannot supply it.
+# row of AGENTS.md's toolchain table), so stable cannot supply it.
 #
 # WHO READS IT.
 #   - `.github/workflows/fuzz.yml` reads the channel below in its `toolchain` job and
@@ -21,7 +21,7 @@
 # applies the toolchain file of the directory the command runs in, and cargo-fuzz refuses
 # to run on stable. Every documented fuzz invocation therefore runs from inside this
 # directory — `cd fuzz && cargo fuzz run <target>` — which is why no command in `fuzz/`,
-# in `fuzz/README.md`, or in `fuzz/.claude/CLAUDE.md` names a channel.
+# in `fuzz/README.md`, or in `fuzz/AGENTS.md` names a channel.
 #
 # That directory rule holds only while nothing exports `RUSTUP_TOOLCHAIN`, which overrides
 # a toolchain file entirely. `.mise.toml` names no Rust version and installs no Rust

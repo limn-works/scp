@@ -131,7 +131,8 @@ pub struct BroadcastKeyEpochAdvance {
     pub author_did: String,
     /// The new epoch number after rotation.
     pub new_epoch: u64,
-    /// Unix timestamp in milliseconds when the rotation occurred.
+    /// Millisecond timestamp of the key rotation. Currently unconsumed — no
+    /// production wire message or event-log leaf reads this field.
     pub timestamp: u64,
 }
 

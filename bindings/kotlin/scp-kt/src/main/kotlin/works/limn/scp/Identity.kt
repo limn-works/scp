@@ -17,7 +17,6 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
-import kotlinx.serialization.json.longOrNull
 import works.limn.scp.bridge.BridgeException
 import works.limn.scp.bridge.CoroutineBridge
 
@@ -197,19 +196,27 @@ interface IdentityAdvancedBindings {
     ): Boolean
 
     /**
-     * Verifies the Ed25519 signature on an identity link attestation.
+     * Verifies an identity link attestation per spec §3.5.4.
      *
-     * The issuer's public key cannot be reliably extracted from the DID string
-     * because attestations are signed with `#active` or `#agent` keys
-     * (spec section 3.5.2), not the `#0` identity key embedded in the DID.
+     * A verifier resolves an issuer's DID document and takes a signing key
+     * from it (§3.5.4 step 1), because attestations are signed with `#active`
+     * or `#agent` keys (spec section 3.5.2), not the `#0` identity key
+     * embedded in a DID. [issuerPublicKeyHex] states which key a caller
+     * believes belongs to this issuer, and a verifier checks that statement
+     * against an issuer's resolved document rather than trusting it.
      *
      * @param attestationJson JSON string of the attestation.
      * @param issuerPublicKeyHex Hex-encoded Ed25519 public key of the issuer.
+     * @param referenceProof `"confirmed"` when this caller fetched the class 2
+     *   proof resource `evidence.proof` names and found this issuer's DID in
+     *   it (§3.5.4 Class 2 step 2), `"not_fetched"` when this caller fetched
+     *   nothing. A class 1 (`did_control`) attestation ignores this argument.
      * @return true if valid.
      */
     fun identityVerifyLinkAttestation(
         attestationJson: String,
         issuerPublicKeyHex: String,
+        referenceProof: String,
     ): Boolean
 }
 
@@ -238,8 +245,9 @@ class IdentityAdvancedBridge internal constructor(
      * @param custody Key custody method.
      * @return Opaque identity handle with agent key.
      */
-    suspend fun createWithAgentKey(custody: CustodyType): Long =
-        bridge.ffiCall { bindings.identityCreateWithAgentKey(custody.rawValue) }
+    suspend fun createWithAgentKey(custody: CustodyType): Long {
+        return bridge.ffiCall { bindings.identityCreateWithAgentKey(custody.rawValue) }
+    }
 
     /**
      * Creates a new identity with an agent signing key (ADR-039).
@@ -249,8 +257,9 @@ class IdentityAdvancedBridge internal constructor(
      * @param custody Key custody method: "in_memory", "platform", or "software".
      * @return Opaque identity handle with agent key.
      */
-    suspend fun createWithAgentKey(custody: String = "in_memory"): Long =
-        bridge.ffiCall { bindings.identityCreateWithAgentKey(custody) }
+    suspend fun createWithAgentKey(custody: String = "in_memory"): Long {
+        return bridge.ffiCall { bindings.identityCreateWithAgentKey(custody) }
+    }
 
     /**
      * Adds an agent signing key to an existing identity (ADR-039).
@@ -258,8 +267,9 @@ class IdentityAdvancedBridge internal constructor(
      * @param identityHandle Handle from identity create or load.
      * @return Updated opaque identity handle with agent key.
      */
-    suspend fun addAgentKey(identityHandle: Long): Long =
-        bridge.ffiCall { bindings.identityAddAgentKey(identityHandle) }
+    suspend fun addAgentKey(identityHandle: Long): Long {
+        return bridge.ffiCall { bindings.identityAddAgentKey(identityHandle) }
+    }
 
     /**
      * Rotates the agent signing key for an identity (ADR-039).
@@ -267,8 +277,9 @@ class IdentityAdvancedBridge internal constructor(
      * @param identityHandle Handle from identity create or load.
      * @return Updated opaque identity handle with new agent key.
      */
-    suspend fun rotateAgentKey(identityHandle: Long): Long =
-        bridge.ffiCall { bindings.identityRotateAgentKey(identityHandle) }
+    suspend fun rotateAgentKey(identityHandle: Long): Long {
+        return bridge.ffiCall { bindings.identityRotateAgentKey(identityHandle) }
+    }
 
     /**
      * Removes the agent signing key from an identity (ADR-039).
@@ -276,8 +287,9 @@ class IdentityAdvancedBridge internal constructor(
      * @param identityHandle Handle from identity create or load.
      * @return Updated opaque identity handle without agent key.
      */
-    suspend fun removeAgentKey(identityHandle: Long): Long =
-        bridge.ffiCall { bindings.identityRemoveAgentKey(identityHandle) }
+    suspend fun removeAgentKey(identityHandle: Long): Long {
+        return bridge.ffiCall { bindings.identityRemoveAgentKey(identityHandle) }
+    }
 
     /**
      * Migrates an identity to a new DID.
@@ -340,8 +352,9 @@ class IdentityAdvancedBridge internal constructor(
      * @param identityHandle Handle from identity create.
      * @return Base64-encoded device attestation token.
      */
-    suspend fun attestDevice(identityHandle: Long): String =
-        bridge.ffiCall { bindings.identityAttestDevice(identityHandle) }
+    suspend fun attestDevice(identityHandle: Long): String {
+        return bridge.ffiCall { bindings.identityAttestDevice(identityHandle) }
+    }
 
     /**
      * Verifies a device attestation token.
@@ -445,8 +458,7 @@ class IdentityAdvancedBridge internal constructor(
      * @param did The DID string.
      * @return JSON array string of attestation objects.
      */
-    suspend fun linkAttestations(did: String): String =
-        bridge.ffiCall { bindings.identityLinkAttestations(did) }
+    suspend fun linkAttestations(did: String): String = bridge.ffiCall { bindings.identityLinkAttestations(did) }
 
     /**
      * Removes an identity link attestation by its ID.
@@ -458,25 +470,38 @@ class IdentityAdvancedBridge internal constructor(
     suspend fun removeLinkAttestation(
         did: String,
         attestationId: String,
-    ): Boolean =
-        bridge.ffiCall { bindings.identityRemoveLinkAttestation(did, attestationId) }
+    ): Boolean = bridge.ffiCall { bindings.identityRemoveLinkAttestation(did, attestationId) }
 
     /**
-     * Verifies the Ed25519 signature on an identity link attestation.
+     * Verifies an identity link attestation per spec §3.5.4.
      *
-     * The issuer's public key cannot be reliably extracted from the DID string
-     * because attestations are signed with `#active` or `#agent` keys
-     * (spec section 3.5.2), not the `#0` identity key embedded in the DID.
+     * A verifier resolves an issuer's DID document and takes a signing key
+     * from it (§3.5.4 step 1), because attestations are signed with `#active`
+     * or `#agent` keys (spec section 3.5.2), not the `#0` identity key
+     * embedded in a DID. [issuerPublicKeyHex] states which key a caller
+     * believes belongs to this issuer, and a verifier checks that statement
+     * against an issuer's resolved document rather than trusting it.
      *
      * @param attestationJson JSON string of the attestation.
      * @param issuerPublicKeyHex Hex-encoded Ed25519 public key of the issuer.
+     * @param referenceProof `"confirmed"` when this caller fetched the class 2
+     *   proof resource `evidence.proof` names and found this issuer's DID in
+     *   it (§3.5.4 Class 2 step 2), `"not_fetched"` when this caller fetched
+     *   nothing. A class 1 (`did_control`) attestation ignores this argument.
      * @return true if valid.
      */
     suspend fun verifyLinkAttestation(
         attestationJson: String,
         issuerPublicKeyHex: String,
+        referenceProof: String,
     ): Boolean =
-        bridge.ffiCall { bindings.identityVerifyLinkAttestation(attestationJson, issuerPublicKeyHex) }
+        bridge.ffiCall {
+            bindings.identityVerifyLinkAttestation(
+                attestationJson,
+                issuerPublicKeyHex,
+                referenceProof,
+            )
+        }
 }
 
 // ---------------------------------------------------------------------------
@@ -586,22 +611,23 @@ data class IdentityAttestation(
          */
         fun fromJsonObject(obj: JsonObject): IdentityAttestation {
             val rsElement = obj["revocation_status"]
-            val revocationStatus = when {
-                rsElement == null -> RevocationStatus.Active
-                rsElement is JsonPrimitive && rsElement.content == "Active" -> RevocationStatus.Active
-                rsElement is JsonObject && rsElement.containsKey("Revoked") -> {
-                    val revoked = rsElement["Revoked"]!!.jsonObject
-                    RevocationStatus.Revoked(
-                        revokedAt = revoked["revoked_at"]!!.jsonPrimitive.long,
-                        reason = revoked["reason"]?.jsonPrimitive?.content,
+            val revocationStatus =
+                when {
+                    rsElement == null -> RevocationStatus.Active
+                    rsElement is JsonPrimitive && rsElement.content == "Active" -> RevocationStatus.Active
+                    rsElement is JsonObject && rsElement.containsKey("Revoked") -> {
+                        val revoked = rsElement["Revoked"]!!.jsonObject
+                        RevocationStatus.Revoked(
+                            revokedAt = revoked["revoked_at"]!!.jsonPrimitive.long,
+                            reason = revoked["reason"]?.jsonPrimitive?.content,
+                        )
+                    }
+                    else -> throw IllegalArgumentException(
+                        "Unrecognized revocation_status JSON shape: $rsElement. " +
+                            "Expected JsonPrimitive(\"Active\") or JsonObject({\"Revoked\": {...}}). " +
+                            "Failing closed rather than defaulting to Active.",
                     )
                 }
-                else -> throw IllegalArgumentException(
-                    "Unrecognized revocation_status JSON shape: $rsElement. " +
-                        "Expected JsonPrimitive(\"Active\") or JsonObject({\"Revoked\": {...}}). " +
-                        "Failing closed rather than defaulting to Active.",
-                )
-            }
             return IdentityAttestation(
                 id = obj["id"]!!.jsonPrimitive.content,
                 platform = obj["platform"]!!.jsonPrimitive.content,
@@ -614,12 +640,10 @@ data class IdentityAttestation(
         }
 
         /** Parse an [IdentityAttestation] from a bridge JSON string. */
-        fun fromJson(json: String): IdentityAttestation =
-            fromJsonObject(Json.parseToJsonElement(json).jsonObject)
+        fun fromJson(json: String): IdentityAttestation = fromJsonObject(Json.parseToJsonElement(json).jsonObject)
 
         /** Parse a list of [IdentityAttestation] from a bridge JSON array string. */
         fun listFromJson(json: String): List<IdentityAttestation> =
             Json.parseToJsonElement(json).jsonArray.map { fromJsonObject(it.jsonObject) }
     }
 }
-

@@ -468,15 +468,9 @@ async fn main() {
                 }
             };
 
-            // Initialize BEP44 sequence number from persistent store / DHT.
-            let did = node.identity().did().to_owned();
-            if let Err(e) = did_method.initialize_sequence(&did).await {
-                tracing::error!(
-                    error = %e,
-                    "failed to initialize BEP44 sequence -- DID publishing may fail"
-                );
-            }
-
+            // The builder bootstraps the BEP44 publish-sequence counter before
+            // its startup publish (see `initialize_sequence_for_mode` in
+            // scp-node), so no post-build sequence initialization is needed here.
             tracing::info!(
                 did = %node.identity().did(),
                 relay_url = %node.relay_url(),
@@ -512,14 +506,9 @@ async fn main() {
                 }
             };
 
-            let did = node.identity().did().to_owned();
-            if let Err(e) = did_method.initialize_sequence(&did).await {
-                tracing::error!(
-                    error = %e,
-                    "failed to initialize BEP44 sequence -- DID publishing may fail"
-                );
-            }
-
+            // The builder bootstraps the BEP44 publish-sequence counter before
+            // its startup publish (see `initialize_sequence_for_mode` in
+            // scp-node), so no post-build sequence initialization is needed here.
             tracing::info!(
                 did = %node.identity().did(),
                 relay_url = %node.relay_url(),

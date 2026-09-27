@@ -29,6 +29,90 @@ members = [
     "crates/scp-ffi/napi-test-stubs",
 ]
 
+# Every member except `crates/scp-testing`, which a bare `cargo build` at this
+# root must not compile.
+#
+# `scp-testing` is a `publish = false` test harness. Its `scp-core` and
+# `scp-platform` edges carry `allow_unencrypted_storage` / `testing` as NORMAL
+# dependencies, because four modules name testing-gated items at lib level,
+# outside any feature gate: `fullstack/node.rs` calls
+# `Supervisor::test_install_access_key`, `handle_sender_key_request`,
+# `land_sender_key_response` and `inspect_incoming_inner`, each
+# `#[cfg(feature = "testing")]` in scp-runtime; `simulator/identity.rs` calls
+# `ProtocolRepository::new_for_testing`; and `builder.rs`, `fullstack/node.rs`
+# and `simulator/mod.rs` name `scp_platform::testing` and
+# `scp_platform::in_memory`. Its `scp-identity`, `scp-dht` and `scp-node`
+# `[dependencies]` edges are optional and carry no such feature: `helpers.rs` is
+# the only module naming `scp_identity`, `scp_dht` and `scp_node`, `lib.rs`
+# compiles it under this crate's `testing` feature, which turns on all three
+# edges and names `scp-identity/testing` and `scp-dht/testing`,
+# and only this crate's own integration tests call the
+# `Node::start_for_testing` that `scp-node/allow_unencrypted_storage` gates. All
+# three features ride on `crates/scp-testing/Cargo.toml`'s `[dev-dependencies]`
+# entries instead, and its self entry there is the one edge that turns its
+# `testing` feature on; cargo resolves those entries only when it builds that
+# crate's own test targets. ADR-062 §Decision 1 states its invariant for one
+# feature: "`scp-dht/testing` MUST NOT appear in any **default / non-testing**
+# feature list — only in `testing` features and dev-dependencies." It states no
+# such rule for `scp-identity/testing` or `scp-node/allow_unencrypted_storage`,
+# so moving those two off the normal edges is this manifest's choice, not a rule
+# the ADR states.
+#
+# This paragraph claims nothing about the rest of the workspace, where each of
+# the three has its own routes: `crates/scp-ffi/Cargo.toml`'s `testing` feature
+# names `scp-dht/testing`; the `[dev-dependencies]` entries of
+# `crates/scp-runtime/Cargo.toml` and `crates/scp-ffi/common/Cargo.toml` name
+# `scp-identity/testing`; and `crates/scp-node/Cargo.toml`'s `testing` feature
+# names `allow_unencrypted_storage`, which `crates/scp-ffi/common/Cargo.toml`
+# reaches through `scp-node?/testing`. What proves no SHIPPED artifact resolves
+# any of them is `scripts/check-shipped-feature-graph.sh`, which resolves each
+# shipped configuration with `cargo tree -e features,no-dev` and fails on any
+# resolved feature its allowlist does not name.
+# Resolver 2 unifies normal-dependency features across every package one
+# invocation builds, so a workspace-wide `cargo build` still resolves
+# `scp-platform/testing` for every member, both through the `scp-platform` edge
+# above and through the `scp-core` edge above, because `scp-runtime/testing`
+# names that feature too. `scp-platform/testing` gates the whole
+# `scp_platform::testing` module, which holds `InMemoryKeyCustody`,
+# `InMemoryDeviceAttestation` and `InMemoryPreRotationCustody`; the same
+# unification resolves `allow_unencrypted_storage`, which compiles
+# `ProtocolRepository::new_for_testing`. Such a build puts all four into each
+# FFI bridge cdylib — binaries `.github/workflows/build-matrix.yml` uploads and
+# `.github/workflows/release.yml` Authenticode-signs. Excluding one member here
+# removes that unification path, and
+# `scripts/check-shipped-feature-graph.sh` asserts a default-members build
+# resolves nothing outside its permitted-production allowlist.
+#
+# A test run still covers `scp-testing`: CI passes `--workspace` explicitly,
+# which overrides this list.
+default-members = [
+    "crates/scp-clock",
+    "crates/scp-crypto",
+    "crates/scp-did",
+    "crates/scp-dht",
+    "crates/scp-platform",
+    "crates/scp-identity",
+    "crates/scp-event-log",
+    "crates/scp-protocol",
+    "crates/scp-relay-client",
+    "crates/scp-mls",
+    "crates/scp-client",
+    "crates/scp-client-wasm",
+    "crates/scp-relay-mock",
+    "crates/scp-runtime",
+    "crates/scp-core",
+    "crates/scp-transport",
+    "crates/scp-mcp",
+    "crates/scp-media",
+    "crates/scp-node",
+    "crates/scp-relay",
+    "crates/scp-ffi",
+    "crates/scp-ffi/common",
+    "crates/scp-ffi/uniffi",
+    "crates/scp-ffi/napi",
+    "crates/scp-ffi/napi-test-stubs",
+]
+
 [workspace.package]
 edition = "2024"
 repository = "https://github.com/limn/scp"
@@ -47,7 +131,17 @@ hmac = "0.12"
 sha2 = "0.10"
 hkdf = "0.12"
 uuid = { version = "1", features = ["v4", "v7"] }
-openmls = { version = "0.8", features = ["libcrux-provider"] }
+# No `libcrux-provider`. That feature does one thing — add the optional dependency
+# `openmls_libcrux_crypto` (openmls 0.8.1 Cargo.toml, `[features] libcrux-provider`) — and
+# openmls itself names that crate only under `#[cfg(test)]` and
+# `#[cfg(feature = "libcrux-provider")]`. No file in this repository names libcrux, and
+# every SCP call site takes a provider: `scp-runtime`'s `ScpMlsProvider` wraps
+# `openmls_rust_crypto::RustCrypto` (crates/scp-runtime/src/crypto/mls/storage.rs) and
+# `scp-mls`'s `InMemoryMlsProvider` aliases `openmls_rust_crypto::OpenMlsRustCrypto`
+# (crates/scp-mls/src/lib.rs). Enabling it compiled 23 libcrux crates, 2 hax crates,
+# `openmls_libcrux_crypto` and `hpke-rs-libcrux` into every build, and carried eleven
+# RUSTSEC advisories that `deny.toml` had to ignore.
+openmls = { version = "0.8" }
 openmls_traits = "0.5"
 openmls_basic_credential = "0.5"
 openmls_rust_crypto = "0.5"
@@ -103,6 +197,20 @@ wasm-bindgen-test = "0.3"
 js-sys = "0.3"
 web-sys = "0.3"
 serde-wasm-bindgen = "0.6"
+
+# CRITERION: an intra-doc link that resolves to nothing is an error in every member
+# of this workspace, on every `cargo doc` cargo runs for it.
+# Cargo applies a lint level per package and a member receives this table only
+# through its own `[lints] workspace = true`, so `check_rustdoc_lint_reaches_every_member`
+# in scripts/tests/ci-gate/ci_gate_selftest.py reads every `[workspace] members` entry
+# above and fails when one omits that line. The level is `forbid` because rustc honours
+# a source-level `#![allow(rustdoc::broken_intra_doc_links)]` against a `deny` and
+# rejects one against a `forbid`, so no crate can lower the level from inside its own
+# source. Before this table, `crates/scp-runtime/src/lib.rs` alone declared the lint as
+# a crate attribute, and job rust-doc in .github/workflows/ci.yml exited 0 over 271
+# unresolved intra-doc links in the other crate directories.
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

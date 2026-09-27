@@ -4,6 +4,15 @@
 
 # Specification Underspecification Audit: §4 (Agents) and §5 (Contexts)
 
+> **Annotation, 2026-09-11.** This file is the record as its author wrote it on the date it
+> carries, restored unedited. The identity model it reads — did:dht, the DID document and its
+> verification methods, the shared `#agent` key, the identifier as a `did:` string — was
+> replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity substrate,
+> whose rules `.docs/specs/09-security-model.md` §9.7.4.2 and `.docs/specs/03-identity.md`
+> carry. A record of what a named party read on a named date states what that party read, so
+> this annotation records what replaced the model and no sentence below is edited to match.
+
+
 ## Executive Summary
 
 Both specifications are well-written design documents that communicate intent clearly. However, they are **design documents, not protocol specifications**. An independent implementor reading only these files would face dozens of ambiguities requiring guesswork. The most severe gaps are in §5, which describes complex state machines, wire formats, and multi-party coordination protocols without providing the deterministic detail needed for interoperability. §4 is shorter and more conceptual, but still contains several claims about protocol-level enforcement with no specification of how that enforcement works mechanically.

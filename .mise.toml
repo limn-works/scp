@@ -23,7 +23,16 @@
 # `tools.rust =`, a quoted key, an inline table — reaches the same answer.
 # `fuzz/build.rs` fails the fuzz build when a `RUSTUP_TOOLCHAIN` from any other
 # source puts that crate on a compiler `fuzz/rust-toolchain.toml` does not name, and
-# `scripts/hooks/pre-commit` does the same for the workspace before it runs cargo. See
+# `scripts/check-resolved-rustc.sh` does the same for the workspace — as the gate's fourth
+# check, as the first thing `scripts/hooks/pre-commit` runs, and inside
+# `scripts/setup-toolchain.sh`.
+#
+# Emptying the `rust` key out of this file does not empty it out of a shell that already
+# read another copy. mise loads a configuration file from every ancestor of the directory a
+# command runs in, and the agent worktrees under `.claude/worktrees/` sit inside this
+# repository, so a checkout of this file that still names a Rust version exports
+# `RUSTUP_TOOLCHAIN` into every worktree beneath it. `mise tool rust` prints the file a
+# value came from under `Config Source`. See
 # `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`.
 
 [tools]

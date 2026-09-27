@@ -1,56 +1,38 @@
-# Process-Global Policy State Is a Realm-Local RCE Pivot
+# Process-Global State Behind a Per-Instance Bridge Crosses Tenants
 
-## Problem
+Several `SCP` instances can live in one process, for example a server serving many users
+(ADR-048). Any mutable process-global state reachable from a bridge method is then shared
+between them, however clean the per-instance facade looks.
 
-After the multi-instance refactor migrated bridge state into per-`BridgeInstance` `CoreFields`, a process-global `OnceLock<Mutex<StdioAllowlist>>` survived inside `crates/scp-mcp/src/allowlist.rs` — a *depended-on* crate, not the bridge itself. The `scp_mcp::allowlist::*` free functions (`configure`, `disable_enforcement`, `reset`, `get_state`, `validate_command`) all read and wrote that singleton.
+## Two forms
 
-Each FFI bridge faithfully forwarded its `mcp_*_stdio_allowlist` methods to those free fns. The per-instance facade was clean; the policy underneath was global. Calling `scp.mcpDisableStdioAllowlist()` on **any** `SCP` instance unrestricted subprocess spawning across **every** other instance in the same process. From there, `scp.mcpClientConnectStdio(["sh", "-c", "..."])` on any instance executes — a realm-local RCE pivot.
+- **Data leakage.** The PyO3 bridge once kept contexts, known-context metadata, the relay
+  connection, and identity routing secrets in `OnceLock<DashMap<…>>` statics, so one tenant
+  could reach another's contexts and routing secrets. PyO3 now keeps that state in
+  per-instance `BridgeInstance` fields, as NAPI and UniFFI always did.
+- **Authority leakage.** After that migration, `crates/scp-mcp/src/allowlist.rs` still held
+  the MCP stdio allowlist in a `OnceLock<Mutex<StdioAllowlist>>`. Calling
+  `mcpDisableStdioAllowlist()` on any instance disabled subprocess-spawn enforcement for every
+  instance, so `mcpClientConnectStdio(["sh", "-c", …])` then ran on any of them: a
+  realm-local remote-code-execution pivot. The allowlist now lives in `CoreFields` as
+  `mcp_allowlist`, reached through `with_mcp_allowlist`.
 
-This is structurally distinct from the [single-tenant FFI registry](./ffi-global-registry-single-tenant.md) lesson:
+## Why the gate missed it
 
-- **Registry leakage** is about cross-tenant *data* visibility (context IDs, identity routing secrets) through shared-key lookup.
-- **Policy leakage** is about cross-tenant *authority* — one tenant's policy decision (turn off the allowlist) immediately reshapes every other tenant's enforcement surface.
-
-The detection heuristic differs too: registry leakage shows up as `static REGISTRY: OnceLock<DashMap<...>>` in bridge source. Policy leakage hides one crate deeper.
-
-## Why the existing detection misses it
-
-`scripts/check-no-bridge-globals.sh` scans `crates/scp-ffi/{src,napi/src,uniffi/src,common/src}` only. The MCP allowlist singleton lived in `crates/scp-mcp/src/allowlist.rs` — **outside the gate's scan path**. The gate was correct for its scope, but a per-instance refactor at the bridge layer didn't catch the policy-state regression hiding in the depended-on crate.
-
-This is the load-bearing class of bug: clean per-instance bridges that delegate to a depended-on crate can re-export process-global semantics through a per-instance API. The bridge's accessor lies; the underlying state is shared.
-
-## Detection heuristic for reviewers
-
-After migrating bridges to per-instance `CoreFields`, audit every depended-on crate the bridges call into. The patterns to grep for:
-
-```
-grep -rn 'OnceLock<.*Mutex' crates/scp-mcp/ crates/scp-platform/ crates/scp-transport/ ...
-grep -rn 'LazyLock<.*Mutex' crates/scp-mcp/ ...
-grep -rn '^static .*: Mutex' crates/scp-mcp/ ...
-grep -rn '^static .*: RwLock' crates/scp-mcp/ ...
-```
-
-Pay particular attention to crates that expose **policy** decisions: allowlists, deny lists, capability ceilings, rate limits, nonce caches, cooldowns. Each of these is a per-instance concern even if it looks like a process invariant — the moment you have two tenants in one process, "process invariant" means "tenant A controls tenant B's policy."
-
-`check-no-bridge-globals.sh` should not be widened to scan all crates (that produces noise on legitimate process state). Instead, every PR that promotes a bridge to per-instance must explicitly enumerate the depended-on policies and either (a) prove they have no shared mutable state, or (b) hoist them into `CoreFields` alongside the bridge state.
+`scripts/check-no-bridge-globals.sh` scans the bridge source directories under
+`crates/scp-ffi/` only, and the singleton sat one crate deeper. Widening the gate to every
+crate would flag legitimate process state, so the check is a review obligation: a change
+that makes a bridge per-instance enumerates the policies the bridge's dependencies hold
+(allowlists, deny lists, capability ceilings, rate limits, nonce caches, cooldowns) and
+either shows they hold no shared mutable state or moves them into `CoreFields`.
 
 ## Fix pattern
 
-1. Hoist the policy state into `CoreFields` as an owned `Mutex<PolicyType>` (not an `Arc<Mutex<PolicyType>>` — owned-by-value forbids accidental sharing).
-2. Add a `pub const fn policy_name(&self) -> &Mutex<PolicyType>` accessor on `CoreFields`. Mirror it on the `BridgeInstanceCore` trait if the spawn path or other plumbing needs the raw `&Mutex` for cross-module passing.
-3. Add a `with_policy_name<T>(&self, f: impl FnOnce(&mut PolicyType) -> T) -> Result<T, GuardError>` helper on `CoreFields` for the common single-op-then-drop case. The closure-shape forces the guard to drop before any FFI / GIL / `await` work runs.
-4. Document the lock-ordering rule on the field's doc-comment AND on the trait method's doc-comment AND on the helper's doc-comment. Three repetitions are not redundant — bridge authors will only see one of them depending on entry point.
-5. Delete the global. Hard-delete, not deprecation-shim. Per "no DOA decisions": if the new shape is correct, the old shape should not coexist.
-6. Plumb any audit-log identifiers (e.g. `instance_id: u64`) through the policy methods so multi-tenant operators can identify which tenant invoked the policy change. The bridge layer reads `bi.core.instance_id()` and passes it through.
-7. Two-instance regression test in **every** bridge: construct two `*BridgeInstance` (or `Scp`) instances, mutate policy on instance A, assert instance B is unaffected. The test must drive the **public** SDK method, not reach into `core.policy_name().lock().unwrap()` directly — the latter doesn't catch a regression where the public method silently locks the wrong mutex.
-
-## Reference
-
-- PR #1725 — landed the per-instance MCP stdio allowlist migration.
-- `crates/scp-mcp/src/allowlist.rs` — the `OnceLock<Mutex<StdioAllowlist>>` was deleted; `StdioAllowlist` is now an owned struct.
-- `crates/scp-ffi/common/src/bridge_instance.rs::CoreFields::mcp_allowlist` — the new home, plus the `with_mcp_allowlist` helper.
-- ADR-048 §1 multi-instance neutrality is the upstream principle this lesson grounds in.
-
-## Lesson
-
-A clean per-instance bridge facade is necessary but not sufficient. Audit the depended-on crates. A `OnceLock<Mutex<...>>` two layers down can re-export process-global semantics through a per-instance API, and the bridge-globals gate won't catch it. Policy state is per-instance state; treat it the same way as data state.
+- Hold the policy in `CoreFields` by value (`Mutex<Policy>`, never `Arc<Mutex<Policy>>`), with
+  a closure helper (`with_<policy>(|p| …)`) so the guard drops before any FFI, GIL, or
+  `await` work.
+- Delete the global outright; do not leave a deprecation shim.
+- Pass the instance id into policy methods so an operator can tell which tenant changed a
+  policy.
+- Add a two-instance test in every bridge that changes the policy on instance A through the
+  public SDK method and asserts instance B is unaffected.

@@ -18,6 +18,16 @@ For concrete public-deployment recipes (direct IP / tunnel / reverse proxy), see
 > Ground truth in this doc was established by direct code audit (file:line cited
 > inline) on 2026-06-13.
 
+> **Annotation, 2026-09-11.** The ground-truth table below cites files and symbols as a code
+> audit read them on 2026-06-13, and it is restored unedited. The identity model those
+> citations name — did:dht, the DID document, the `DidDht` and `DidResolver` types — was
+> replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity substrate,
+> whose seam is `IdentityBackend` (`.docs/specs/03-identity.md` §3.10.10). The crates have not
+> been rewritten to that model, so the citations still name what the tree defines; a reader
+> comparing this guide against the specifications reads the specifications for the protocol
+> and this guide for what shipped.
+
+
 ---
 
 ## 1. What "a website on SCP" actually is
@@ -254,7 +264,7 @@ reusable diagnostic — see §6.)*
 ## 5. Build plan
 
 > Governed by the artifact flow (specs → ADRs → stories → code). Each code change
-> goes through a worktree + the full review roster per `CLAUDE.md`.
+> goes through a worktree + the full review roster per `AGENTS.md`.
 
 **Governance (verified):** **No new ADR.** §10.12.2 + §10.12.8 and ADR-032
 (Addressability/Deployment), ADR-035 (broadcast projection), ADR-042

@@ -7,11 +7,13 @@
 
 package works.limn.scp.android
 
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
 import works.limn.scp.bridge.CancellationHandle
 import works.limn.scp.bridge.CoroutineBridge
 import works.limn.scp.bridge.MessageCallback
 import works.limn.scp.bridge.NativeBindings
-import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -58,7 +60,7 @@ class ScpViewModelTest {
 
     @Test
     fun `onCleared calls leave on all tracked contexts`() = runTest(testDispatcher) {
-        val viewModel = TestScpViewModel(testDispatcher)
+        val viewModel = TestScpViewModel()
         val ctx1 = TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge)
         val ctx2 = TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge)
 
@@ -74,11 +76,26 @@ class ScpViewModelTest {
         assertTrue(stubBindings.leaveCalledHandles.contains(2L))
     }
 
+    // The bridge's I/O dispatcher here is the test scheduler, which runs only when the
+    // test advances it. A blocking onCleared would wait on that scheduler from the
+    // thread that advances it and never return.
+    @Test
+    fun `onCleared returns before leave runs on the bridge dispatcher`() = runTest(testDispatcher) {
+        val viewModel = TestScpViewModel()
+        viewModel.trackContext(TrackedContext(handle = 7L, identityHandle = 1L, bridge = bridge))
+
+        viewModel.callOnCleared()
+        assertTrue(stubBindings.leaveCalledHandles.isEmpty(), "leave ran before the dispatcher advanced")
+
+        advanceUntilIdle()
+        assertEquals(listOf(7L), stubBindings.leaveCalledHandles)
+    }
+
     @Test
     fun `onCleared continues cleanup even if one leave throws`() = runTest(testDispatcher) {
         stubBindings.leaveThrowsForHandle = 1L
 
-        val viewModel = TestScpViewModel(testDispatcher)
+        val viewModel = TestScpViewModel()
         viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge))
         viewModel.trackContext(TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge))
         advanceUntilIdle()
@@ -97,7 +114,7 @@ class ScpViewModelTest {
     fun `onCleanupFailure receives every leave failure`() = runTest(testDispatcher) {
         stubBindings.leaveThrowsForHandle = 1L
 
-        val viewModel = TestScpViewModel(testDispatcher)
+        val viewModel = TestScpViewModel()
         val ctx1 = TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge)
         val ctx2 = TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge)
         viewModel.trackContext(ctx1)
@@ -126,7 +143,7 @@ class ScpViewModelTest {
     fun `onCleanupFailure never receives a cancellation`() = runTest(testDispatcher) {
         stubBindings.leaveCancelsForHandle = 1L
 
-        val viewModel = TestScpViewModel(testDispatcher)
+        val viewModel = TestScpViewModel()
         viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge))
         viewModel.trackContext(TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge))
         advanceUntilIdle()
@@ -147,7 +164,7 @@ class ScpViewModelTest {
 
     @Test
     fun `untrackContext prevents leave on cleared`() = runTest(testDispatcher) {
-        val viewModel = TestScpViewModel(testDispatcher)
+        val viewModel = TestScpViewModel()
         val ctx = TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge)
 
         viewModel.trackContext(ctx)
@@ -163,7 +180,7 @@ class ScpViewModelTest {
 
     @Test
     fun `onCleared with no tracked contexts does not throw`() = runTest(testDispatcher) {
-        val viewModel = TestScpViewModel(testDispatcher)
+        val viewModel = TestScpViewModel()
         viewModel.callOnCleared()
         advanceUntilIdle()
 
@@ -172,7 +189,7 @@ class ScpViewModelTest {
 
     @Test
     fun `trackContext returns the same context for chaining`() = runTest(testDispatcher) {
-        val viewModel = TestScpViewModel(testDispatcher)
+        val viewModel = TestScpViewModel()
         val ctx = TrackedContext(handle = 42L, identityHandle = 1L, bridge = bridge)
         val returned = viewModel.trackContext(ctx)
         assertEquals(ctx, returned)
@@ -184,7 +201,7 @@ class ScpViewModelTest {
     // assertEquals reports [1] against an expected empty list.
     @Test
     fun `onCleared clears the active contexts list`() = runTest(testDispatcher) {
-        val viewModel = TestScpViewModel(testDispatcher)
+        val viewModel = TestScpViewModel()
         viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge))
         advanceUntilIdle()
 
@@ -210,7 +227,7 @@ class ScpViewModelTest {
     @Test
     fun `a context tracked after onCleared is still left by a later onCleared`() =
         runTest(testDispatcher) {
-            val viewModel = TestScpViewModel(testDispatcher)
+            val viewModel = TestScpViewModel()
             viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge))
             advanceUntilIdle()
 
@@ -226,9 +243,8 @@ class ScpViewModelTest {
         }
 
     // A Java subclass of ScpViewModel calls `super()`, so a zero-argument JVM constructor is
-    // part of this artifact's published surface. Kotlin emits one because every
-    // primary-constructor parameter carries a default; adding a parameter without a default
-    // removes it and fails this method.
+    // part of this artifact's published surface. Adding a primary-constructor parameter
+    // without a default removes it and fails this method.
     @Test
     fun `ScpViewModel exposes a zero-argument constructor to Java callers`() {
         val parameterCounts = ScpViewModel::class.java.declaredConstructors
@@ -238,43 +254,18 @@ class ScpViewModelTest {
             parameterCounts.contains(0),
             "expected a zero-argument constructor, found arities $parameterCounts",
         )
-        assertTrue(
-            parameterCounts.contains(1),
-            "expected a one-argument constructor, found arities $parameterCounts",
-        )
     }
 
-    @Test
-    fun `onCleared returns before the leave calls run`() = runTest(testDispatcher) {
-        val viewModel = TestScpViewModel(testDispatcher)
-        viewModel.trackContext(TrackedContext(handle = 7L, identityHandle = 7L, bridge = bridge))
-        advanceUntilIdle()
-
-        viewModel.callOnCleared()
-
-        // StandardTestDispatcher queues the cleanup coroutine without running it, so an
-        // onCleared that waited for leave could not have reached this line.
-        assertTrue(
-            stubBindings.leaveCalledHandles.isEmpty(),
-            "onCleared returned, and no leave has run yet",
-        )
-
-        advanceUntilIdle()
-
-        assertEquals(listOf(7L), stubBindings.leaveCalledHandles)
-    }
 }
 
 /**
- * Concrete [ScpViewModel] subclass for testing. Exposes [onCleared] via [callOnCleared].
+ * Concrete [ScpViewModel] subclass for testing.
  *
- * @param cleanupDispatcher The dispatcher [ScpViewModel.onCleared] runs its `leave` calls on.
- *   Each test passes the same `TestDispatcher` it gave the [CoroutineBridge], so
- *   `advanceUntilIdle()` runs the cleanup coroutine and the `leave` calls it makes.
+ * [callOnCleared] clears the view model through a [ViewModelStore], so the call runs
+ * the same `ViewModel.clear()` Android runs: `clear()` cancels `viewModelScope` and then
+ * calls [onCleared]. Calling [onCleared] directly would skip the cancellation.
  */
-private class TestScpViewModel(
-    cleanupDispatcher: CoroutineDispatcher,
-) : ScpViewModel(cleanupDispatcher) {
+private class TestScpViewModel : ScpViewModel() {
     /** Every (context, cause) pair that [onCleanupFailure] received, in call order. */
     val cleanupFailures = mutableListOf<Pair<TrackedContext, Throwable>>()
 
@@ -283,7 +274,15 @@ private class TestScpViewModel(
     }
 
     fun callOnCleared() {
-        onCleared()
+        val store = ViewModelStore()
+        val self = this
+        val factory =
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T = self as T
+            }
+        ViewModelProvider(store, factory)[TestScpViewModel::class.java]
+        store.clear()
     }
 }
 

@@ -11,6 +11,7 @@ package works.limn.scp
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import works.limn.scp.bridge.CoroutineBridge
 
@@ -189,7 +190,10 @@ interface DiscoveryBindings {
 
     // Address resolution (§22.8)
 
-    /** Resolves an address via multi-path resolution. Returns JSON array. */
+    /**
+     * Resolves an address via multi-path resolution. Returns a JSON object
+     * with `resolutions` and `unavailable_layers`.
+     */
     fun addressResolve(
         ownerDid: String,
         address: String,
@@ -245,8 +249,9 @@ class DiscoveryBridge internal constructor(
      * @param address The address string to normalize.
      * @return Normalized address string.
      */
-    suspend fun normalizeAddress(address: String): String =
-        bridge.ffiCall { bindings.discoveryNormalizeAddress(address) }
+    suspend fun normalizeAddress(address: String): String {
+        return bridge.ffiCall { bindings.discoveryNormalizeAddress(address) }
+    }
 
     /**
      * Discovers contexts from a DID string or `scp://` URI.
@@ -391,8 +396,7 @@ class DiscoveryBridge internal constructor(
      * @param ownerDid DID of the identity that owns this petname map.
      * @return The count of DID petnames.
      */
-    suspend fun petnameDidCount(ownerDid: String): UInt =
-        bridge.ffiCall { bindings.petnameDidCount(ownerDid) }
+    suspend fun petnameDidCount(ownerDid: String): UInt = bridge.ffiCall { bindings.petnameDidCount(ownerDid) }
 
     /**
      * Returns the number of context petnames for an owner.
@@ -400,8 +404,7 @@ class DiscoveryBridge internal constructor(
      * @param ownerDid DID of the identity that owns this petname map.
      * @return The count of context petnames.
      */
-    suspend fun petnameContextCount(ownerDid: String): UInt =
-        bridge.ffiCall { bindings.petnameContextCount(ownerDid) }
+    suspend fun petnameContextCount(ownerDid: String): UInt = bridge.ffiCall { bindings.petnameContextCount(ownerDid) }
 
     // Handle registry operations (§22.3.1)
 
@@ -496,7 +499,13 @@ class DiscoveryBridge internal constructor(
     ): String =
         bridge.ffiCall {
             bindings.scopeRegister(
-                scopeContextId, name, targetContextId, relayUrls, registrantDid, description, tags,
+                scopeContextId,
+                name,
+                targetContextId,
+                relayUrls,
+                registrantDid,
+                description,
+                tags,
             )
         }
 
@@ -540,21 +549,66 @@ class DiscoveryBridge internal constructor(
      * @param ownerDid DID of the identity whose petname map to consult.
      * @param address The address string to resolve.
      * @param knownContextsJson Optional JSON object mapping context IDs to names.
-     * @return List of parsed AddressResolution JSON elements.
+     * @return Resolutions found, paired with every layer this build could not query.
      */
     suspend fun addressResolve(
         ownerDid: String,
         address: String,
         knownContextsJson: String? = null,
-    ): List<JsonElement> {
+    ): AddressResolutionOutcome {
         val json =
             bridge.ffiCall {
                 bindings.addressResolve(ownerDid, address, knownContextsJson)
             }
-        return Json.parseToJsonElement(json).jsonArray.toList()
+        val outcome = Json.parseToJsonElement(json).jsonObject
+        return AddressResolutionOutcome(
+            resolutions = outcome.getValue("resolutions").jsonArray.toList(),
+            unavailableLayers =
+                outcome.getValue("unavailable_layers").jsonArray.map { entry ->
+                    val fields = entry.jsonObject
+                    UnavailableResolutionLayer(
+                        layer = fields.getValue("layer").jsonPrimitive.content,
+                        reason = fields.getValue("reason").jsonPrimitive.content,
+                    )
+                },
+        )
     }
 }
 
+/**
+ * One address resolution: the bindings it found, and the layers nobody queried.
+ *
+ * Spec section 22.8.2 ranks [resolutions] by trust level, so a caller reads
+ * [unavailableLayers] before acting on the first entry: a layer that never
+ * answered may hold a binding that outranks every binding in [resolutions].
+ *
+ * @property resolutions AddressResolution JSON elements, highest trust first.
+ * @property unavailableLayers Every layer nobody queried, each distinct
+ *   layer-and-reason pair once. One layer name appears more than once when two
+ *   queries against it went unmade for different reasons.
+ */
+data class AddressResolutionOutcome(
+    val resolutions: List<JsonElement>,
+    val unavailableLayers: List<UnavailableResolutionLayer>,
+) {
+    /** True when every layer resolution consulted answered. */
+    val everyLayerAnswered: Boolean get() = unavailableLayers.isEmpty()
+}
+
+/**
+ * A resolution layer nobody queried — either this build reaches no such layer,
+ * or its configuration named nothing to query there.
+ *
+ * @property layer Layer name: `Petname`, `HandleRegistry`, `Attestation`, `Domain`,
+ *   or `MultiLayerCorroborated`.
+ * @property reason Why nobody queried that layer.
+ */
+data class UnavailableResolutionLayer(
+    val layer: String,
+    val reason: String,
+)
+
 /** Parses a JSON string containing an array of strings into a `List<String>`. */
-private fun parseJsonStringArray(json: String): List<String> =
-    Json.parseToJsonElement(json).jsonArray.map { it.jsonPrimitive.content }
+private fun parseJsonStringArray(json: String): List<String> {
+    return Json.parseToJsonElement(json).jsonArray.map { it.jsonPrimitive.content }
+}

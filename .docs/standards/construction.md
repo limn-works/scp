@@ -1,6 +1,6 @@
 # Construction Pattern Standard
 
-This standard **enacts the Agent-first API design builder tenet** (CLAUDE.md) and **ADR-052 (Unified Construction Pattern)**. It is the enforced, mechanical form of the tenet: where the tenet states the goal (every public API optimized for first-pass LLM authorability), this document gives the rules a structural check can verify and an agent can follow without a compile-retry loop.
+This standard **enacts the Agent-first API design builder tenet** (AGENTS.md) and **ADR-052 (Unified Construction Pattern)**. It is the enforced, mechanical form of the tenet: where the tenet states the goal (every public API optimized for first-pass LLM authorability), this document gives the rules a structural check can verify and an agent can follow without a compile-retry loop.
 
 It governs **every developer-facing construction entry point** in the SDK surface — Node, Relay, `host_site`, Context, Identity — in **all five languages** (Rust core + Python, TypeScript, Swift, Kotlin). It does not govern internal-only constructors that no SDK author calls.
 
@@ -64,7 +64,7 @@ For each entry point, one choice is designated **security-critical**. It must be
 - **Node / host_site:** publishing an address to the DHT discloses location/IP. The security-critical direction is **disclosure**, and only `DhtMode::Production` discloses. `dht: DhtMode` defaults to `Disabled` (no publish) — the fail-safe, non-disclosing value — and `DhtMode::Production` is the deliberate, explicit opt-in that publishes the address. `Disabled` is DHT-*layer*-off: it never publishes, and its resolution arm is honestly empty (`Ok(None)`, never a fabricated or in-memory answer) — unlike the former `Memory` default, whose in-memory client is a §17.17.3 *resolve* nullifier and is now **test-harness-only** (compiled only under `feature = "testing"`; ADR-062 §Decision 1). Because `Disabled` never discloses, **`DhtMode::Disabled` is always valid for every `Reach`**, including a publishing-capable `Reach` (`Domain`, `NatTraversal`): `NatTraversal` (or `Domain`) + `Disabled` is a legitimate, *more-private* config — "publicly reachable, but the address is not published to the DHT; share it out-of-band" — and is never rejected. Erroring on the fail-safe direction would itself violate M2 by nudging callers toward the disclosing one. M2 is satisfied purely by the default direction (`Disabled`) and the explicit-opt-in requirement for `Production`; there is **no** "publishing `Reach` + `Disabled` ⇒ error" rule, because `Disabled` never silently discloses — the one failure M2 guards against. (The genuinely-contradictory TLS checks below — `Domain` + `Plaintext`, `Acme` on a non-`Domain` reach — are unaffected and remain loud errors.)
 - **Site TLS:** `TlsMode::Plaintext` is never a default. A config that omits TLS does not silently serve plaintext on a public reach.
 - **Identity:** the security-critical choice is whether to **persist key material**. `persistence: None` (an ephemeral identity, no key material at rest) is the fail-safe default; persisting is the explicit `Some(StorageSlot)` choice, never reached by omission. When persistence *is* chosen, the slot is `EncryptedStorage`-bound — persisting is encrypted-only (see the EncryptedStorage compile-time split). This is the same model as a Node's persisted identity, which persists into the Node's own `storage` slot; the only difference is the source of the slot — Node reuses `NodeConfig.storage`, standalone Identity names its own `IdentityConfig.persistence`.
-- **Relay:** the security-critical choice is the `BridgeRole` selection. `bridge: BridgeRole` defaults to `Disabled` (the fail-safe — a relay that brokers nothing); `Enabled` is an explicit opt-in never reached by omission. `BridgeRole::Enabled` carries no payload: brokering authenticates each `BRIDGE_REGISTER` by an Ed25519 signature over the DID-to-routing-ID mapping (SCP-247, §10.12.4), so enabling the broker role requires no shared secret. The relay's `bridge_secret` field is a **separate, orthogonal** concern — the internal-relay WebSocket connection-admission secret (`Authorization: Bearer`), set independently of the broker role (e.g. a Node sets `bridge_secret` on a relay that brokers nothing) — and is not part of the construction-pattern surface.
+- **Relay:** the security-critical choice is the `BridgeRole` selection. `bridge: BridgeRole` defaults to `Disabled` (the fail-safe — a relay that brokers nothing); `Enabled` is an explicit opt-in never reached by omission. `BridgeRole::Enabled` carries no payload: brokering authenticates each `BRIDGE_REGISTER` by a P-256 signature over the identifier-to-routing-id mapping (SCP-247, §10.12.4), so enabling the broker role requires no shared secret. The relay's `bridge_secret` field is a **separate, orthogonal** concern — the internal-relay WebSocket connection-admission secret (`Authorization: Bearer`), set independently of the broker role (e.g. a Node sets `bridge_secret` on a relay that brokers nothing) — and is not part of the construction-pattern surface.
 - **Context:** the security-critical choice is the `ContextCreation` Template-vs-Explicit selection itself — a required enum with no default, so M2 applies **per-variant**: within `Explicit`, the permission `ceiling` is a required field (no over-broad default ceiling), and `Template` resolves only to the named template's fail-safe parameters.
 
 > **Un-mechanizable carve-out (human-review).** "A `Template` resolves only to fail-safe parameters" is a property of the template **data**, not of config **shape** — the structural check `scripts/check-construction-pattern.py` (AC-9) inspects type/field structure, so it **cannot** verify what values a named template expands to. This clause is therefore enforced by human review, exactly like the M1 boolean carve-out (whether a surviving `bool` is "genuinely binary state with no behavioral fork" is also a judgment the check cannot make) and the M2 default-*direction* judgment (the check sees that a default exists but cannot judge whether it points at the fail-safe value — Node/Site DHT no-publish, Relay `BridgeRole::Disabled`, Identity ephemeral `persistence: None`). Stating it keeps the mechanical-vs-prose line honest: the check guards config shape; template-data fail-safety, the M1 bool judgment, and the M2 default-direction judgment are the three properties it cannot.
@@ -128,19 +128,21 @@ Consequently identity key material can **never** persist to plaintext, including
 
 ## Providers stay typed enum-selectors — never `dyn`
 
-`KeyCustody`, `Storage`, and `DidMethod` use return-position `impl Trait` in trait (RPITIT) and are **not object-safe**: `Arc<dyn Storage>` does not compile. Config objects therefore carry providers as **typed enum-selectors or concrete types**, never as trait objects.
+`KeyCustody`, `Storage`, and `IdentityBackend` use return-position `impl Trait` in trait (RPITIT) and are **not object-safe**: `Arc<dyn Storage>` does not compile. Config objects therefore carry providers as **typed enum-selectors or concrete types**, never as trait objects.
 
-This is consistent with injection-through-initializers (architecture.md §2.5): the config object **is** the initializer through which custody/storage/DID/transport are injected. The flat shape is the vehicle for dependency injection, not a bypass of it.
+This is consistent with injection-through-initializers (architecture.md §2.5): the config object **is** the initializer through which custody/storage/identity/transport are injected. The flat shape is the vehicle for dependency injection, not a bypass of it.
 
 > Rule: providers are typed enum-selectors / concrete types, never boxed `dyn`. Rationale: ADR-052 Rejected Alternative #2.
 
 ## Storage vocabulary
 
-Three names, three jobs — stated once so they are never conflated:
+Three names, three jobs, so a reader never conflates them:
 
 - **`Storage`** — the raw provider **trait** (the persistence capability itself).
 - **`StorageSlot`** — the **Rust-core config selector enum**. Every core config object carries it (`NodeConfig.storage`, `IdentityConfig.persistence`). It includes the **Rust-only `Custom(concrete)`** variant carrying a caller-supplied Rust `Storage` implementation.
 - **`StorageConfig`** — the **per-FFI-bridge mirror** of `StorageSlot`, exposing only the named/convenience variants (`InMemory`, `Sqlite`). A Rust trait object cannot cross the FFI boundary, so the bridge mirror omits `Custom(concrete)`.
+
+**`IdentityBackendSlot` and `KeyCustodySlot` are the same selector shape for the other two capabilities**, and `IdentityConfig` requires both. `IdentityBackendSlot` carries one named variant, `RelayNetwork`, the `IdentityBackend` of `03-identity.md` §3.10.10 over the SCP relay network, plus the Rust-only `Custom(concrete)`; ADR-063 removed the did:dht backend, so no second named variant exists and a selector with one named variant still states the choice rather than defaulting it. `KeyCustodySlot` carries three named variants plus `Custom(concrete)`: **`Platform`**, the operating system's own key store, which is the Secure Enclave, the Android Keystore or WebCrypto according to the platform; **`File`**, a software key in an encrypted file, which is `FileKeyCustody`; and **`Hardware`**, a key under a separate principal the operational path holds no grant to assume, which is an HSM. `17-persistence-and-storage.md` §17.8's platform table states which substrate each variant selects on each platform, and states no variant name of its own. Each bridge mirrors both as `IdentityBackendConfig` and `KeyCustodyConfig`, omitting `Custom(concrete)` for the reason above.
 
 All core shapes use `StorageSlot`; the bridges mirror it as `StorageConfig`. These are the same selector at two layers, not two different concepts.
 
@@ -175,7 +177,7 @@ Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `No
 
 ### Relay — `RelayConfig`
 
-Already a flat config object. Bring fully in line: `supports_bridge: bool` → `bridge: BridgeRole { Disabled, Enabled }` (M1). `BridgeRole::Enabled` is payload-free — the broker authenticates each `BRIDGE_REGISTER` by Ed25519 signature (SCP-247, §10.12.4), so it needs no config secret. The relay's `bridge_secret: Option<[u8;32]>` stays a **separate, orthogonal** field — the internal-relay WebSocket connection-admission secret, set independently of the broker role — and is therefore out of the construction-pattern surface (not folded into `BridgeRole`). Entry: `Relay::start(RelayConfig, storage)` — the SDK-facing entry, which wraps the internal `RelayServer::new(config, storage)` (see the entry-verb rule). `RelayConfig` may keep `Default` (every field is fail-safe — M4 does not fire), an exception that holds **precisely because** `BridgeRole::default() == Disabled` (its sole security-consequential field has a fail-safe default).
+Already a flat config object. Bring fully in line: `supports_bridge: bool` → `bridge: BridgeRole { Disabled, Enabled }` (M1). `BridgeRole::Enabled` is payload-free and needs no config secret, which the M2 Relay bullet states. The relay's `bridge_secret: Option<[u8;32]>` stays a **separate, orthogonal** field — the internal-relay WebSocket connection-admission secret, set independently of the broker role — and is therefore out of the construction-pattern surface (not folded into `BridgeRole`). Entry: `Relay::start(RelayConfig, storage)` — the SDK-facing entry, which wraps the internal `RelayServer::new(config, storage)` (see the entry-verb rule). `RelayConfig` may keep `Default` (every field is fail-safe — M4 does not fire), an exception that holds **precisely because** `BridgeRole::default() == Disabled` (its sole security-consequential field has a fail-safe default).
 
 ### host_site — `HostSiteConfig`
 
@@ -207,13 +209,13 @@ ContextConfig {
 
 `ContextCreation` makes the template-vs-explicit XOR a **required enum**. This replaces the Rust `create_context().template().build()` fluent builder and aligns Rust to the options-object that Python/TS/Swift already use — eliminating the `sdk-common.md` Context-creation divergence. Entry: `<manager>.create(ContextConfig)` — the verb-`create` method on the live `Supervisor`/ContextManager (see the Context receiver carve-out under the entry-verb rule for why a context is created within an existing manager runtime rather than via a bare `Context::create`); the language SDKs surface it as a method on their SDK handle.
 
-The `peer` carried by `ContextCreation::Template { template, peer }` is the bilateral counterparty for the invitation step. The invitation/Welcome-delivery that actually adds the peer is a higher SDK layer; until it is wired, the core `create` entry **rejects a supplied peer loudly** (a typed `BilateralPeerNotSupported` error) rather than silently dropping it — a config field is never accepted and then ignored (CLAUDE.md "no silent" tenet). `peer: None` is the supported form at this layer.
+The `peer` carried by `ContextCreation::Template { template, peer }` is the bilateral counterparty for the invitation step. The invitation/Welcome-delivery that actually adds the peer is a higher SDK layer; until it is wired, the core `create` entry **rejects a supplied peer loudly** (a typed `BilateralPeerNotSupported` error) rather than silently dropping it — a config field is never accepted and then ignored (AGENTS.md "no silent" tenet). `peer: None` is the supported form at this layer.
 
 ### Identity — `IdentityConfig`
 
 ```
 IdentityConfig<S> {                       // generic over the storage type S, exactly as NodeConfig<S> is
-    method: DidMethodSlot,                // required
+    backend: IdentityBackendSlot,         // required
     custody: KeyCustodySlot,              // required
     persistence: Option<StorageSlot<S>>,  // None = ephemeral identity (fail-safe default; M2). Some(slot) carries S, giving the EncryptedStorage bound somewhere to attach: on the production `Identity::create<S: EncryptedStorage>` path the slot is EncryptedStorage-bound — persisting is encrypted-only, the same seal as `Node::start`.
 }
@@ -238,11 +240,10 @@ The same config object and its enums map identically across all five language SD
 
 ## Related artifacts
 
-- **CLAUDE.md → Agent-first API design** (builder tenet) — the goal this standard enacts.
-- **CLAUDE.md → "enforce mechanically"** — why this lives as a structural check, not prose.
+- **AGENTS.md → Agent-first API design** (builder tenet) — the goal this standard enacts.
+- **AGENTS.md → "enforce mechanically"** — why this lives as a structural check, not prose.
 - **ADR-052 (Unified Construction Pattern)** — the worked decision, rationale, and rejected alternatives.
 - **ADR-032 §AC-6** — superseded by ADR-052; the original `ApplicationNode` builder mandate.
 - **ADR-049 (lock-free-read invariant)** — why providers stay enum-selectors, never boxed `dyn`.
 - **architecture.md §2.5** — injection-through-initializers, preserved; the config object is the initializer.
 - **sdk-common.md → Context Creation** — rewritten to the `ContextConfig` options-object form to match this standard.
-- **`.docs/lessons/llm-first-config-objects-over-typestate.md`** — the evergreen reasoning.

@@ -10,15 +10,23 @@ It sits at a different level than MCP (Anthropic), WebMCP (Google+Microsoft), or
 
 ### The five pillars
 
-#### 1. Identity (DID-based)
+#### 1. Identity (an inception-derived key-event log)
 
-Every actor has a did:dht decentralized identifier rooted in an Ed25519 keypair. The DID string encodes the public key directly — making it self-certifying. Resolution uses BEP44 (Mainline DHT), so
-no centralized registry. Users never see keys; custody is delegated to Secure Enclave, passkeys, or platform accounts.
+An actor's identifier is the digest of its own inception event, so the identifier authenticates the log rather than a registry authenticating the identifier. A verifier derives the current key state by replaying an append-only key-event log whose every event binds its predecessor's digest (`.docs/specs/09-security-model.md` §9.7.4.2). ADR-063, inception-derived self-certifying identity over a key-event log, states why.
 
-The key hierarchy is:
-- Identity key (Ed25519) — derives the DID string, highest-security custody
-- Active signing key (Ed25519, rotatable) — MLS credentials, envelope signatures, UCAN issuance
-- Pre-rotation commitment — SHA-256 of a pre-staged next key, held in cold storage for compromise recovery
+Two authorities sign:
+- **The root** — at most 16 public keys with a signing threshold, so one person runs a 1-of-1 root and an organization runs a threshold its officers jointly satisfy. It signs establishment events and nothing else, which keeps it cold (§9.7.4.2 R3, §9.18.17).
+- **The Active Signing Key** (`#active`) — the one operational key: inner envelopes, MLS credentials, UCAN issuance, the service record. An event the root signs retires it, and the identifier does not change.
+
+Every establishment event commits to the digests of the next root keys before anyone uses them, so a thief holding the current root cannot install a new root set. Installing one takes the **pre-rotation** private key, which lives in a substrate the daily operational path cannot reach. **A thief holding the root does install its own operational keys, and pre-rotation does not stop that** (§9.7.4.2 R8). Where no independent substrate exists, the SDK fails closed (§9.7.4.1).
+
+**The root decides a fork.** Given two valid chains for one identifier, a verifier ranks them by the root authority behind each, and arrival order decides nothing (§9.7.4.2 R6, R7).
+
+**Witnesses watch and report.** An identity designates relays to cosign its log head. A witness runs one check, then signs or refuses, and adjudicates nothing. Its cosigned heads and conflict statements are evidence of equivocation, and no validity rule reads a cosignature, so an identity is usable the moment it publishes its inception event (§9.7.4.3).
+
+**One ciphersuite, ECDSA on NIST P-256 with SHA-256**, no negotiation and no fallback (§9.5). Root custody defaults to a passkey, whose private key no code path exports, so the person manages no key material (§9.7.4.1 item 4).
+
+**Relays carry the log.** A resolver queries the identity's own relays and a fallback set from the community relay list, which the SDK fetches from a relay-list context its shipped pointer names, and every relay a first contact reads proves control of its declared operator identity (`.docs/specs/03-identity.md` §3.10.1, §3.10.4). Transport and service metadata live in a separately signed service record, so a relay-endpoint change appends no key event (§3.10.13).
 
 Identity private state (block lists, graph visibility policies, petnames, preferences) is encrypted to the owner's keys and replicated across relays as an append-only event log — the same
 infrastructure as context state, but membership of one.
@@ -64,7 +72,7 @@ Alice blocks Dave, she rotates her sender key and redistributes to everyone exce
 
 **Message lifecycle (14 security checkpoints):**
 plaintext → UCAN validation → sequence assignment → Merkle append →
-provenance tagging → inner envelope (Ed25519 sign) →
+provenance tagging → inner envelope (ECDSA on P-256 sign) →
 sender-side key encrypt (AES-256-GCM) → bucket padding →
 MLS encrypt → outer envelope (pseudonym routing, NO signature) →
 transport to 3+ relays
@@ -86,7 +94,7 @@ Validation is zero-trust on every action:
 6. Nonce uniqueness check (prevents replay)
 7. For paid actions: spending UCAN present and sufficient
 
-A trusted DID with an expired token is denied. An unknown DID with a valid token is permitted. No exceptions.
+A trusted identifier with an expired token is denied. An unknown identifier with a valid token is permitted. No exceptions.
 
 #### 5. Trust (4-layer model)
 
@@ -148,10 +156,10 @@ crates/
 
 - **Contexts, not channels.** A context is a governed, encrypted, auditable space with its own key material, Merkle log, and outlet surface. It's the security boundary, lifecycle boundary, and governance
 boundary all in one.
-- **Encryption IS access control.** No relay or server enforces membership — the math does. Relays are untrusted: clients verify everything cryptographically and never rely on a relay for access control or correctness. A relay may validate *public, self-certifying* records (e.g. DID documents) to resist suppression, but is never trusted to — and never reads encrypted content.
-- **No operator required.** If Limn disappears tomorrow, SCP works exactly as designed. DID resolution via DHT, relays are commodity storage, governance is per-context.
+- **Encryption IS access control.** No relay or server enforces membership — the math does. Relays are untrusted: clients verify everything cryptographically and never rely on a relay for access control or correctness. A relay may validate a *public, self-certifying* key-event frame, whose chain verifies against its own bytes (`.docs/specs/03-identity.md` §3.10.2), to resist suppression, but is never trusted to, and never reads encrypted content.
+- **No operator required.** If Limn disappears tomorrow, SCP works exactly as designed. Identity resolution replays a log any relay can serve, relays are commodity storage, and governance is per-context.
 - **Provenance everywhere.** Not a feature — a core protocol property. Every message, outlet output, attestation, and cross-context transfer is traceable.
-- **Human accountability.** Every agent chains back to a human DID. The protocol provides the mechanism; contexts decide the requirement.
+- **Human accountability.** Every agent chains back to a human identity. The protocol provides the mechanism; contexts decide the requirement.
 - **Trust decays into validation.** New identities require trust. Established identities are validated by behavioral records from Merkle-verified event logs. The system gets more secure over time.
 
 ### Encryption and MLS — deep dive
@@ -176,29 +184,29 @@ Every SCP context is exactly one MLS group. The mapping is 1:1:
 | Group | Context | One MLS group per context |
 | Member (LeafNode) | Agent in context | One leaf per agent |
 | Epoch | Context epoch | Increments on membership change or key update |
-| LeafNode credential | DID + UCAN | MLS credential field holds the member's DID and context-scoped UCAN |
+| LeafNode credential | Identifier + UCAN | MLS credential field holds the member's identifier and context-scoped UCAN |
 | Welcome message | Context join token | HPKE-encrypted to new member's KeyPackage |
 | KeyPackage | Pre-key bundle | Published to relays, single-use, signed by identity key |
 | Proposal (Add/Remove/Update) | Governance action | Membership changes go through MLS proposals |
 | Commit | Governance commit | Finalizes proposals, advances epoch |
 | Application message | SCP envelope payload | Encrypted content |
 | Delivery Service | SCP relay(s) | Untrusted store-and-forward |
-| Authentication Service | DID resolution + UCAN validation | Fully decentralized — no AS server |
+| Authentication Service | Key-event-log replay + UCAN validation | Fully decentralized — no AS server |
 
-The MLS Authentication Service is where SCP diverges from typical deployments. Most MLS systems have a centralized AS that vouches for member identities. SCP has none. Each participant independently resolves DIDs from the DHT and validates UCAN chains.
+The MLS Authentication Service is where SCP diverges from typical deployments. Most MLS systems have a centralized AS that vouches for member identities. SCP has none. Each participant independently replays each member's key-event log and validates UCAN chains (`.docs/specs/03-identity.md` §3.10.4).
 
 **Ciphersuite — single, non-negotiable:**
 
 ```
-MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519
+MLS_128_DHKEMP256_AES128GCM_SHA256_P256
 ```
 
-- Key agreement: X25519 (HPKE KEM)
+- Key agreement: P-256 ECDH (HPKE KEM)
 - Symmetric encryption: AES-128-GCM (AEAD)
 - Hash: SHA-256
-- Signing: Ed25519
+- Signing: ECDSA on P-256 with SHA-256
 
-No ciphersuite negotiation in v1. No fallback. This eliminates downgrade attacks entirely. DID-to-DID encryption (Welcome messages) uses HPKE with a matching suite: `DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM`.
+No ciphersuite negotiation in v1. No fallback. This eliminates downgrade attacks entirely. Identity-to-identity encryption (Welcome messages) uses HPKE with a matching suite: `DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM`.
 
 #### Forward secrecy
 
@@ -220,30 +228,18 @@ When a member sends an MLS Update (generating a fresh HPKE keypair and ratchetin
 - Periodic Updates every 24 hours for active contexts (configurable — high-security contexts can require 1-hour intervals)
 - Immediate Update after reconnection following offline periods
 - On Active Signing Key rotation, MLS Update in every active context with the new credential
-- On Identity Key migration (new DID), `DidRotationEvent` + MLS Updates in all contexts
+- On a `RootRecovery` (the identifier does not change), MLS Updates in all contexts with the new credential and re-issued attestation, and key-continuity re-verification (§9.11)
 
 The vulnerability window from a key compromise is bounded: forward secrecy protects everything before compromise, PCS heals on the next Update. Maximum exposure = one PCS interval.
 
 #### Key lifecycle
 
 ```
-Identity Key (Ed25519, hardware-backed)
-├── Derives the DID string (immutable)
-├── Signs DID document updates
-├── Signs pre-rotation commitments
-├── NEVER directly encrypts group content
+Root set, Active Signing Key, Pre-Rotation Key (all P-256)
+├── The identity pillar above states each one's authority (§9.7.4.2 R1, R3, R5)
+├── None of the three ever directly encrypts group content
 │
-Active Signing Key (Ed25519, rotatable)
-├── MLS LeafNode credentials
-├── Inner envelope signatures
-├── UCAN issuance
-├── Rotated via DID document update signed by Identity Key
-│
-Pre-Rotation Key (Ed25519, cold storage)
-├── SHA-256(pubkey) published as commitment
-├── Revealed only during Identity Key migration
-│
-MLS Leaf Key (X25519, per-ciphersuite)
+MLS Leaf Key (DHKEM(P-256), per-ciphersuite)
 ├── Generated by MLS library
 ├── Used for MLS tree key agreement
 │
@@ -272,7 +268,7 @@ MLS gives group confidentiality — outsiders can't read. But it doesn't give se
 | Authority needed | None (unilateral) | Admin role or governance |
 | Other members | Unaffected | Epoch advances for everyone |
 
-Each member holds one AES-256-GCM symmetric sender key per context (32 bytes), plus a stable wrapping keypair (X25519) published as an MLS LeafNode extension (`scp_wrapping_key`) for HPKE wrapping during key distribution.
+Each member holds one AES-256-GCM symmetric sender key per context (32 bytes), plus a stable wrapping keypair (DHKEM(P-256)) published as an MLS LeafNode extension (`scp_wrapping_key`) for HPKE wrapping during key distribution.
 
 #### Pull-based key distribution
 
@@ -287,7 +283,7 @@ Sender keys use a pull-based request/response protocol instead of push:
 2. SenderKeyRequest { requester_did, sender_did, epoch, wrapping_pubkey, signature }
    — Directed MLS application message to key holder
    — "Give me your key for epoch N"
-   — wrapping_pubkey is a FRESH ephemeral X25519 key per-request
+   — wrapping_pubkey is a FRESH ephemeral DHKEM(P-256) key per-request
 
 3. SenderKeyResponse { sender_did, epoch, hpke_sealed_key, ephemeral_pubkey }
    — Directed MLS application message to requester
@@ -295,7 +291,7 @@ Sender keys use a pull-based request/response protocol instead of push:
    — O(1) per response
 ```
 
-HPKE wrapping: generate ephemeral X25519 keypair → ECDH with requester's wrapping pubkey → HKDF → AES-128-GCM encrypt the sender key. Recipient-side HPKE open computes the shared secret inside the custody boundary (HSM) — the wrapping private key never leaves KeyCustody.
+HPKE wrapping: generate ephemeral DHKEM(P-256) keypair → ECDH with requester's wrapping pubkey → HKDF → AES-128-GCM encrypt the sender key. Recipient-side HPKE open computes the shared secret inside the custody boundary (HSM) — the wrapping private key never leaves KeyCustody.
 
 #### Block protocol
 
@@ -324,7 +320,7 @@ Plaintext
   ├─  4. Merkle event log append + proof computation
   ├─  5. Provenance metadata attached (for cross-context data)
   │
-  ├─  6. Inner envelope signed: Ed25519 over
+  ├─  6. Inner envelope signed: ECDSA on P-256 over
   │      SHA256(context_id ‖ sender_did ‖ epoch ‖ generation ‖
   │             sequence ‖ timestamp ‖ payload_hash ‖ provenance_hash)
   │
@@ -347,7 +343,7 @@ Plaintext
   ═══════════════ NETWORK (relays see only opaque blobs) ═══════════════
 ```
 
-The two most critical checks are the Ed25519 inner signature and MLS membership_tag — two independent integrity checks (Active Signing Key and MLS epoch secrets), both inside encryption, both member-only verifiable. An attacker must compromise BOTH the identity key AND the MLS group state to forge a message.
+The two most critical checks are the P-256 inner signature and MLS membership_tag — two independent integrity checks (Active Signing Key and MLS epoch secrets), both inside encryption, both member-only verifiable. An attacker must compromise BOTH the identity key AND the MLS group state to forge a message.
 
 #### Three-layer replay prevention
 
@@ -365,7 +361,7 @@ Broadcast contexts replace MLS entirely with per-author AES-256 broadcast keys. 
 |---|---|---|
 | Group encryption | MLS (one group) | None |
 | Content encryption | Per-sender AES-256-GCM + MLS | Per-author AES-256-GCM only |
-| Authentication | Ed25519 signature + MLS membership_tag | Ed25519 signature only |
+| Authentication | P-256 signature + MLS membership_tag | P-256 signature only |
 | Forward secrecy | MLS epoch ratchet | None (mitigated by epoch rotation on block) |
 | Routing ID | HKDF-derived pseudonym (private) | SHA-256(context_id) (public) |
 | Author identity | Inside encrypted payload (hidden) | Visible in BroadcastEnvelope |
@@ -377,18 +373,18 @@ The `BroadcastEnvelope`:
 ```rust
 pub struct BroadcastEnvelope {
     pub context_id: ContextId,
-    pub sender_did: DID,           // visible to relays (authors are public)
+    pub sender_did: Identifier,    // visible to relays (authors are public)
     pub sequence: u64,
     pub key_epoch: u64,
     pub timestamp: u64,
     pub content_hash: [u8; 32],    // SHA-256 of plaintext
     pub content: Vec<u8>,          // AES-256-GCM encrypted
     pub provenance: Option<DataProvenance>,
-    pub signature: Ed25519Signature,
+    pub signature: P256Signature,
 }
 ```
 
-Subscriber registration uses the two-tier model from contexts with discovery tools: a bounded writer tier (MLS members, authors) and an unbounded reader tier (DID-authenticated subscribers). Open broadcasts grant keys on DID authentication alone; gated broadcasts require a `messagesRead` UCAN from the context admin, enabling paid subscriptions, invite-only communities, and tiered access.
+Subscriber registration uses the two-tier model from contexts with discovery tools: a bounded writer tier (MLS members, authors) and an unbounded reader tier (`#active`-authenticated subscribers). Open broadcasts grant keys on that authentication alone; gated broadcasts require a `messagesRead` UCAN from the context admin, enabling paid subscriptions, invite-only communities, and tiered access.
 
 #### Metadata privacy — what relays see
 
@@ -407,7 +403,7 @@ Per-context pseudonyms are derived deterministically:
 
 ```
 context_seed = HMAC-SHA256(identity_key_material, context_id ‖ "scp-pseudonym")
-context_keypair = Ed25519_keygen(context_seed[0..32])
+context_keypair = P256_keygen(seed_to_scalar(context_seed[0..32]))
 context_pseudonym = context_keypair.public_key
 ```
 
@@ -418,15 +414,14 @@ Additional protections:
 - **Cover traffic** — one padded message per relay per 30 seconds (default on), real messages replace dummies
 - **Relay partitioning** — SDK distributes contexts across different relays to minimize overlap
 - **Persistent connections** — desktop maintains constant connections regardless of activity
-- **Local DHT node** — desktop runs a full Mainline DHT node so resolution queries are indistinguishable from routing traffic
 
 #### Relay threat model
 
 Relays are explicitly untrusted:
 
-**CAN:** Read routing metadata (pseudonyms, TTLs, blob sizes). Drop messages (suppression). Delay messages. Replay messages. Equivocate (show different histories to different members). Correlate traffic timing. See broadcast author DIDs.
+**CAN:** Read routing metadata (pseudonyms, TTLs, blob sizes). Drop messages (suppression). Delay messages. Replay messages. Equivocate (show different histories to different members). Correlate traffic timing. See broadcast author identifiers.
 
-**CANNOT:** Forge messages (requires Ed25519 key + MLS secrets). Decrypt content (requires MLS group key + sender-side key). Modify messages (inner signature + membership_tag fail). Inject members (requires HPKE Welcome to joiner's KeyPackage). Read broadcast content (requires author broadcast key).
+**CANNOT:** Forge messages (requires P-256 key + MLS secrets). Decrypt content (requires MLS group key + sender-side key). Modify messages (inner signature + membership_tag fail). Inject members (requires HPKE Welcome to joiner's KeyPackage). Read broadcast content (requires author broadcast key).
 
 Suppression is detected by sequence gap detection, heartbeat messages (60-second intervals in active contexts), and multi-relay cross-checking (publish to 3+ relays, compare delivery — inconsistency after 30s flags the relay).
 
@@ -436,10 +431,10 @@ Equivocation is detected by the Relay Consistency Protocol: periodic signed `Con
 
 | Scenario | Action |
 |---|---|
-| Active Signing Key compromised | `rotate_active_key` — new keypair, DID doc update signed by Identity Key. DID doesn't change. MLS Update in all contexts. |
-| Identity Key compromised | `migrate_identity` — pre-rotation key proves legitimacy. New DID. `DidRotationEvent` in all contexts. |
-| Both compromised, pre-rotation available | Same as Identity Key — pre-rotation key resolves the race |
-| All keys compromised | Social recovery — trusted contacts with admin roles remove + re-add under new identity |
+| Active Signing Key compromised | The root signs one `KeyState` carrying a new key `Current` and the stolen key's `Compromised{from: N}` drop entry (`03-identity.md` §3.2.1 case 1; `09-security-model.md` §9.7.4.2 R8). The identifier is unchanged. MLS Update everywhere. |
+| Root compromised | `RootRecovery` (`09-security-model.md` §9.7.4.2) — the pre-rotation key authorizes, a fresh root is installed, the identifier does not change. MLS Update in all contexts; key-continuity re-verification (§9.11). |
+| Root and `#active` compromised, pre-rotation key intact | Same as a compromised root — the `RootRecovery` installs fresh operational keys too |
+| All keys compromised | Root cannot be recovered — the person establishes a new identity; context admins remove the old identity and admit the new one |
 
 After any recovery: UCAN revocation, KeyPackage rotation, contact notification, identity private state re-encryption. The exposure window is bounded by the PCS interval (default 24hrs, configurable to 1hr).
 
@@ -455,18 +450,18 @@ Creating a context from scratch means specifying a ceiling, roles, governance mo
 | `bilateral-persistent` | Encrypted | Standing DM channel, no expiry. |
 | `coordination` | Encrypted | Time-boxed task context with outlets. Summary memory scope. |
 | `group-discussion` | Encrypted | Group chat with invites. Full persistence. |
-| `public-broadcast` | Broadcast | Open feed — anyone can subscribe on DID authentication alone. |
+| `public-broadcast` | Broadcast | Open feed — anyone can subscribe on `#active` authentication alone. |
 | `gated-broadcast` | Broadcast | Feed with access control — admin issues subscriber UCANs. |
 | `outlet-interface` | Encrypted | Cross-context outlet exposure point. |
 | `paid-service` | Encrypted | Outlet context with per-invocation cost. Extends `outlet-interface`. |
 | `paid-broadcast` | Broadcast | Subscription feed. Extends `gated-broadcast`. |
 | `handle-registry` | Encrypted | Context that serves human-readable handles. |
 
-Templates are protocol constants, not extensible. A template ID in context metadata is a commitment: "this context has exactly these properties." The joining party evaluates a single check — "do I accept this template from this DID at this TTL?" — instead of inspecting six parameters individually.
+Templates are protocol constants, not extensible. A template ID in context metadata is a commitment: "this context has exactly these properties." The joining party evaluates a single check — "do I accept this template from this identity at this TTL?" — instead of inspecting six parameters individually.
 
 #### Auto-accept policies
 
-Agents can configure rules for automatic context acceptance — the SDK joins without human confirmation when conditions are met. The only auto-accept trigger is a DID on the operator's explicit allowlist; co-membership and discoverability are not trust signals. Absent an explicit policy, every invitation prompts the human (default-deny). Example: "auto-accept `bilateral-ephemeral` from DIDs on my allowlist, if TTL is under 10 minutes, at most 5 per hour."
+Agents can configure rules for automatic context acceptance — the SDK joins without human confirmation when conditions are met. The only auto-accept trigger is an identifier on the operator's explicit allowlist; co-membership and discoverability are not trust signals. Absent an explicit policy, every invitation prompts the human (default-deny). Example: "auto-accept `bilateral-ephemeral` from identifiers on my allowlist, if TTL is under 10 minutes, at most 5 per hour."
 
 Two hard rules that cannot be overridden by any policy:
 - **No auto-accept for outlet-bearing contexts.** Outlet access enables cross-context data flow. Auto-accepting it would silently expand the agent's attack surface.
@@ -506,7 +501,7 @@ Protocol-enforced limits:
 
 #### Apps in SCP
 
-An app is not a protocol entity. There is no `App` type, no app DID, no app registration. What people experience as "an app" is a composite of contexts + members + outlets + data. The protocol doesn't model it because the constituent parts are already first-class.
+An app is not a protocol entity. There is no `App` type, no app identity, no app registration. What people experience as "an app" is a composite of contexts + members + outlets + data. The protocol doesn't model it because the constituent parts are already first-class.
 
 State exists at two layers:
 - **Protocol state** — membership, roles, capability tokens, outlet registrations, governance, content history, trust. This belongs to the protocol. It's portable and survives app death.
@@ -516,7 +511,7 @@ This separation is the anti-lock-in mechanism. If you leave an app, you keep you
 
 #### MCP compatibility
 
-SCP integrates with MCP (Model Context Protocol) through a translation layer. The SCP agent runs as an MCP server locally. The AI model sees tools and calls them via JSON-RPC. It has no awareness of SCP — no knowledge of DIDs, encryption, or governance.
+SCP integrates with MCP (Model Context Protocol) through a translation layer. The SCP agent runs as an MCP server locally. The AI model sees tools and calls them via JSON-RPC. It has no awareness of SCP — no knowledge of identifiers, encryption, or governance.
 
 ```
 AI Model (any MCP-speaking model)
@@ -526,7 +521,7 @@ SCP Agent (translation layer)
 Context [outlets, roles, members, governance]
 ```
 
-The agent handles everything SCP-specific: capability filtering (only exposes tools the human's role permits), DID signing, encryption, context routing. Tools from multiple contexts appear as namespaced MCP tools — `context_a/send_message`, `context_b/schedule_meeting`. Any MCP-compatible model (Claude, GPT, Gemini, local models) participates in SCP without modification.
+The agent handles everything SCP-specific: capability filtering (only exposes tools the human's role permits), `#active` signing, encryption, context routing. Tools from multiple contexts appear as namespaced MCP tools — `context_a/send_message`, `context_b/schedule_meeting`. Any MCP-compatible model (Claude, GPT, Gemini, local models) participates in SCP without modification.
 
 ### Discovery and addressing
 
@@ -534,15 +529,15 @@ The agent handles everything SCP-specific: capability filtering (only exposes to
 
 Two complementary discovery channels:
 
-**DID document capabilities** — direct lookup, zero infrastructure. Every agent may publish structured capabilities in their DID document's `service` array. Anyone who knows a DID can resolve the document via Mainline DHT and inspect capabilities. Provides lookup, not search.
+**Service-record capabilities** — direct lookup, zero infrastructure. Every agent may publish self-asserted capability URIs in its service record. Anyone who knows an identifier can resolve that record from the identity's relays and inspect the capabilities (`.docs/specs/03-identity.md` §3.10.13). Provides lookup, not search.
 
-**Contexts with discovery tools** — searchable registries, SCP-native. Standard contexts with open join policies and standardized tools (`agent_search`, `agent_register`, `agent_deregister`). Anyone can create one. Two-tier membership: bounded writers (MLS members who process registrations) and unbounded readers (DID-authenticated, query via tool endpoints without joining the MLS group).
+**Contexts with discovery tools** — searchable registries, SCP-native. Standard contexts with open join policies and standardized tools (`agent_search`, `agent_register`, `agent_deregister`). Anyone can create one. Two-tier membership: bounded writers (MLS members who process registrations) and unbounded readers (`#active`-authenticated, query via tool endpoints without joining the MLS group).
 
-Bootstrap: SDK ships with default bootstrap context IDs (analogous to browser CA lists or DNS root servers). Not privileged — starting points. If all defaults are unavailable, agents fall back to direct DID resolution and manual context ID sharing.
+Bootstrap: SDK ships with default bootstrap context IDs (analogous to browser CA lists or DNS root servers). Not privileged — starting points. If all defaults are unavailable, agents fall back to direct identity resolution and manual context ID sharing.
 
 #### Human-readable addressing
 
-Cryptographic identifiers (`did:dht:z6Mk...`) are the protocol's canonical identifiers, but humans need something speakable. The addressing layer maps human-readable strings to DIDs and context IDs through four resolution paths:
+The protocol's canonical identifier is the 32-byte digest of an inception event, and humans need something speakable. The addressing layer maps human-readable strings to identifiers and context IDs through four resolution paths:
 
 | Path | Format | Authority | Trust level |
 |---|---|---|---|
@@ -551,9 +546,9 @@ Cryptographic identifiers (`did:dht:z6Mk...`) are the protocol's canonical ident
 | **Attestation-backed handles** | `@alice_cooks` or `@alice:github` | External platform + cryptographic attestation | `AttestationVerified` |
 | **Domain handles** | `alice@example.com` | Domain operator via `.well-known/scp` | `DomainVerified` |
 
-Resolution order for unscoped queries: petnames first (local, instant), then all other paths in parallel. If multiple paths find the same DID, the result is `MultiLayerCorroborated`. If different DIDs are found, the user disambiguates once and the selection becomes a petname — resolving the collision permanently.
+Resolution order for unscoped queries: petnames first (local, instant), then all other paths in parallel. If multiple paths find the same identifier, the result is `MultiLayerCorroborated`. If different identifiers are found, the user disambiguates once and the selection becomes a petname — resolving the collision permanently.
 
-Each layer degrades independently. Remove any one and the rest continue working. Petnames always work (zero infrastructure). Discovery handles work with SCP infrastructure only. Domain handles work if DNS exists. The DID remains canonical regardless of which path resolved it.
+Each layer degrades independently. Remove any one and the rest continue working. Petnames always work (zero infrastructure). Discovery handles work with SCP infrastructure only. Domain handles work if DNS exists. The identifier remains canonical regardless of which path resolved it.
 
 ### Economic layer
 
@@ -588,10 +583,10 @@ Combined with the fact that each sybil identity needs its own spending UCAN, ada
 
 The protocol doesn't claim to solve sybil (one person, many identities) — it makes sybil attacks expensive to mount, expensive to sustain, and costly when detected. Three layered mechanisms:
 
-1. **Device attestation.** Hardware-backed attestation (Apple App Attest, Google Play Integrity) ties DID creation to physical devices. One device = one DID. Doesn't prove one human (someone with two phones gets two identities), but makes identity creation cost the price of a device.
+1. **Device attestation.** Hardware-backed attestation (Apple App Attest, Google Play Integrity) ties identity creation to physical devices. One device = one identity. Doesn't prove one human (someone with two phones gets two identities), but makes identity creation cost the price of a device.
 
 2. **Earned capacity.** New identities start limited — restricted context creation, limited participation slots, constrained outlet invocation rates. Capacity grows through participation history and time. Sybil accounts are cheap to create but expensive to make useful.
 
-3. **Context-level thresholds.** Each context sets its own admission requirements — behavioral history, endorsements, attestations. A casual group chat requires just a valid DID. A high-trust financial context might require 6 months of history, 3 independent endorsements, and challenge-verified capabilities.
+3. **Context-level thresholds.** Each context sets its own admission requirements — behavioral history, endorsements, attestations. A casual group chat requires just a valid identity. A high-trust financial context might require 6 months of history, 3 independent endorsements, and challenge-verified capabilities.
 
 These compose: device attestation makes creation expensive, earned capacity makes new identities limited, context thresholds make meaningful participation require real history. And consequences for detected sybil attacks render the accounts single-use — the investment in aging and building history is lost.

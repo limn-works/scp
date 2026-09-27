@@ -60,6 +60,7 @@ use crate::relay_sink::RelaySink;
 use crate::signer::Signer;
 use crate::snapshot::ContextSnapshot;
 use crate::storage::Storage;
+use scp_relay_client::relay_error_text;
 
 /// Pending join material a prospective member retains between generating its
 /// `KeyPackage` and processing the resulting Welcome.
@@ -1210,9 +1211,9 @@ impl ScpClient {
                     Err(e) => Err(e),
                 }
             }
-            RelayMessage::Err { code, msg, .. } => Err(ClientError::Transport(format!(
-                "relay reported error {code}: {msg}"
-            ))),
+            RelayMessage::Err { code, msg, .. } => {
+                Err(ClientError::Transport(relay_error_text(code, &msg)))
+            }
             // OK / EVENT / PONG / BridgeData: control acknowledgements with no
             // driver state to advance in the participant message path.
             RelayMessage::Ok { .. }

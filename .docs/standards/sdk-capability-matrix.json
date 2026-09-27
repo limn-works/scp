@@ -100,7 +100,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Rust core only in phase 1 — recovers a `migrate_identity` partial DHT publish via `DidDht::resume_migration_publish`. SDK callers currently see the `SCP-IDENT-1053` error code without structured plumbing. Per-SDK idiomatic exception types carrying `MigrationPartialState` land in subsequent PRs (ADR-048 §7).",
+          "notes": "Rust core only in phase 1 — recovers a `migrate_identity` partial DHT publish via `DidDht::resume_migration_publish`. SDK callers currently see the `SCP-IDENT-1053` error code without structured plumbing. Per-SDK idiomatic exception types carrying `MigrationPartialState` land in subsequent PRs (ADR-048 §7). Under ADR-063, the inception-derived key-event-log identity substrate, the seam is `IdentityBackend` and a root recovery appends a key event rather than renaming an identifier, so the migration this operation resumes does not exist [superseded 2026-08-30: the shipped code carries the `DidDht` seam and that migration]. This note records what ships today and states no rule of the redesign.",
           "exemptions": {
             "python": "phase-1 surface: structured MigrationPartialState plumbing deferred to per-SDK idiom follow-up (ADR-048 §7)",
             "typescript": "phase-1 surface: structured MigrationPartialState plumbing deferred to per-SDK idiom follow-up (ADR-048 §7)",
@@ -183,15 +183,11 @@
         },
         {
           "name": "verify_attestation",
-          "python": false,
-          "typescript": false,
+          "python": true,
+          "typescript": true,
           "kotlin": true,
-          "swift": false,
-          "exemptions": {
-            "python": "bridge does not export verify_link_attestation",
-            "typescript": "bridge does not export verify_link_attestation",
-            "swift": "UniFFI bridge does not export verify_link_attestation"
-          }
+          "swift": true,
+          "notes": "Identity-link attestation verification per spec §3.5.4. GitHub issue #2335 finding 2 recorded a fail-open here: each bridge verified a caller-supplied attestation against a caller-supplied key, so an attacker who supplied both received true. §3.5.4 step 1 resolves the issuer's key state by replaying its key-event log and takes the signing key the named role lists `Current` (`03-identity.md` §3.5.4, `09-security-model.md` §9.7.4.2 R8), which needs a per-instance resolver [superseded 2026-08-30: the shipped code resolves a DID document instead], and phase D (#1695) deleted every process-wide default bridge instance. So each bridge carries a per-instance method (PyScp::verify_identity_link_attestation, Scp::identity_verify_link_attestation on NAPI and UniFFI) that acquires that resolver and hands every remaining decision to one shared flow, scp_ffi_common::attestation::verify_link_attestation. That flow runs §3.5.4 steps 1 through 5. All four SDK wrappers route to that per-instance method: Python SCP.verify_identity_link_attestation, TypeScript SCP.identityVerifyLinkAttestation (bindings/typescript/src/scp.ts and bindings/typescript/src/internal/native.ts), Kotlin Scp.identityVerifyLinkAttestation forwarding to inner, and Swift SCP.identityVerifyLinkAttestation forwarding to inner, which Identity.verifyLinkAttestation calls. A module-scope free function of the same foreign name stays exported on all three bridges and DECLINES with a typed SCP-IDENT-1060, never a silent verify-valid, so a caller who reaches it by name learns that it performs no §3.5.4 step 1. Each method takes a third argument, reference_proof, carrying a caller's own class 2 fetch outcome: \"confirmed\" reports that a caller fetched the resource evidence.proof names and found this issuer's DID in it (§3.5.4 Class 2 step 2), and \"not_fetched\" raises SCP-IDENT-1062 for a class 2 (signed_post / dns_record) attestation, which §3.5.4 Class 2 step 3 leaves unverified. A class 1 (did_control) attestation ignores that argument, and any string outside those two values raises SCP-IDENT-1044. One condition still raises rather than returning a verdict on every SDK: SCP-IDENT-1061, when an issuer publishes an AttestationRevocations service endpoint (§3.5.2) that no bridge fetches."
         }
       ]
     },
@@ -234,7 +230,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "ADR-049 Phase 2J / FFI-02 Option A creator-side invite: adds an invitee to a SingleAdmin context (unilateral MLS add) and returns an InviteMemberOutcome::Sealed { bundle: SealedInvitation, delivered } — the creator-signed, HPKE-sealed bundle (enc + ciphertext) directly usable as the sealed join input to context_join_from_welcome, plus a delivered flag (true if the runtime published it to the invitee's routing id). Peer of join_from_welcome (step 2's producer). Only SingleAdmin contexts are supported today: a voting / non-SingleAdmin (Threshold/Majority/Unanimity) context throws InvalidState — governed-context invitations are not yet implemented (#2027 adds the governed path additively). PyO3 bridge PyScp::invite_member (scp-ffi/src/context.rs) reaches Supervisor::invite_member; SDK wrapper SCP.invite_member (bindings/python/scp_sdk/scp.py). NAPI bridge export invite_member (scp-ffi/napi/src/scp.rs, delegating to invite_member_on in scp-ffi/napi/src/context.rs) with TS wrapper SCP.inviteMember (bindings/typescript/src/scp.ts); UniFFI export Scp::invite_member (scp-ffi/uniffi/src/bridge.rs) with Swift SCP.inviteMember (bindings/swift/Sources/SCP/Scp.swift) and Kotlin Scp.inviteMember (bindings/kotlin/scp-kt/.../Scp.kt)."
+          "notes": "ADR-049 Phase 2J / FFI-02 Option A creator-side invite: adds an invitee to a SingleAdmin context (unilateral MLS add) and returns an InviteMemberOutcome::Sealed { bundle: SealedInvitation, delivered } — the creator-signed, HPKE-sealed bundle (enc + ciphertext) directly usable as the sealed join input to context_join_from_welcome, plus a delivered flag (true if the runtime published it to the invitee's routing id). Peer of join_from_welcome (step 2's producer). Only SingleAdmin contexts are supported today: a voting / non-SingleAdmin (Threshold/Majority/Unanimity) context throws InvalidState — governed-context invitations are not yet implemented (#2027 adds the governed path additively). PyO3 bridge PyScp::invite_member (scp-ffi/src/context.rs) reaches Supervisor::invite_member; SDK wrapper SCP.invite_member (bindings/python/scp_sdk/scp.py). NAPI bridge export invite_member (scp-ffi/napi/src/scp.rs, delegating to invite_member_on in scp-ffi/napi/src/context.rs) with TS wrapper SCP.inviteMember (bindings/typescript/src/scp.ts); UniFFI export Scp::invite_member (scp-ffi/uniffi/src/bridge.rs) with Swift SCP.inviteMember (bindings/swift/Sources/SCP/Scp.swift) and Kotlin Scp.inviteMember (bindings/kotlin/scp-kt/.../SCP.kt)."
         },
         {
           "name": "leave",
@@ -432,7 +428,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal (spec §23.16.8): ContextExport carries an Ed25519 snapshot_signature over the full-JCS canonical_snapshot_hash = SHA-256(domain SCP-CONTEXT-EXPORT-V1: || scope_tag || JCS(snapshot)) — the entire RFC 8785 canonical snapshot, NOT a 7-field subset recipe (domain distinct from the §23.16.4 sync-delta SCP-CONTEXT-SNAPSHOT-V1:). create_export takes a sign closure supplied by each FFI bridge that signs the export digest via KeyCustody::sign (custody-delegated through a per-bridge export-path signer helper; the private key never crosses the FFI boundary, ADR-006) across PyO3, NAPI, and UniFFI — the raw signing key is never exported. The native export envelope is MessagePack at version 4. No direct SDK call site — invoked transitively from context_export.",
+          "notes": "Internal (spec §23.16.8): ContextExport carries a P-256 snapshot_signature over the preimage `23-sync-and-offline-strategy.md` §23.16.8 states, which Vector 52 of `25-test-vectors.md` pins [superseded 2026-09-13: the shipped code signs an Ed25519 signature over SCP-CONTEXT-EXPORT-V1: || scope_tag || JCS(snapshot), carrying neither key_state_head nor a length prefix] — the entire RFC 8785 canonical snapshot, NOT a 7-field subset recipe (domain distinct from the §23.16.4 sync-delta SCP-CONTEXT-SNAPSHOT-V1:). create_export takes a sign closure supplied by each FFI bridge that signs the export digest via KeyCustody::sign (custody-delegated through a per-bridge export-path signer helper; the private key never crosses the FFI boundary, ADR-006) across PyO3, NAPI, and UniFFI — the raw signing key is never exported. The native export envelope is MessagePack at version 4. No direct SDK call site — invoked transitively from context_export.",
           "exemptions": {
             "python": "internal wiring inside context_export, not a separate SDK operation",
             "typescript": "internal wiring inside context_export, not a separate SDK operation",
@@ -446,7 +442,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal (spec §23.16.8): lifecycle_helpers::import_context takes the exporter VerifyingKey and runs validate_export_for_import, which verify_strict's the snapshot signature (fail SCP-CTX-2093) before the Merkle check. Each FFI bridge resolves the exporter DID's #active/#agent key via IdentityBackedDidResolver (PyO3/NAPI/UniFFI), failing closed when no key resolves. Legacy/unsigned exports rejected at the version gate. No direct SDK call site — invoked transitively from context_import.",
+          "notes": "Internal (spec §23.16.8): lifecycle_helpers::import_context takes the exporter VerifyingKey and runs validate_export_for_import, which verify_strict's the snapshot signature (fail SCP-CTX-2093) before the Merkle check. Each FFI bridge resolves the exporter's #active key through the `IdentityBackend` seam, reading the log-anchored arm of `09-security-model.md` §9.7.4.2 R8, and fails closed when no key resolves [superseded 2026-08-30: the shipped code resolves a DID's #active or #agent key via IdentityBackedDidResolver, and an identity's key state names one operational role and no agent key]. Legacy/unsigned exports rejected at the version gate. No direct SDK call site — invoked transitively from context_import.",
           "exemptions": {
             "python": "internal wiring inside context_import, not a separate SDK operation",
             "typescript": "internal wiring inside context_import, not a separate SDK operation",
@@ -1090,7 +1086,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Every runtime signs the canonical checkpoint payload in-process with the identity's #active Ed25519 key. On TypeScript the NAPI-backed (Node/Bun) runtime signs and surfaces the signature on Checkpoint.signature via bindings/typescript/src/internal/native.ts. Checkpoint is a flat always-signed interface matching the Python/Swift/Kotlin SDKs; the runtime populates the 64-byte (128-hex-char) Ed25519 signature. There is no `signed` discriminant. The byte layout of the signing payload is identical across all bridges (compute_checkpoint_canonical_hash)."
+          "notes": "Every runtime signs the canonical checkpoint payload in-process with the identity's #active key. On TypeScript the NAPI-backed (Node/Bun) runtime signs and surfaces the signature on Checkpoint.signature via bindings/typescript/src/internal/native.ts. Checkpoint is a flat always-signed interface matching the Python/Swift/Kotlin SDKs; the runtime populates the 64-byte (128-hex-char) signature, which is ECDSA on NIST P-256 with SHA-256 (`09-security-model.md` §9.5) [superseded 2026-09-10: the shipped code signs Ed25519]. There is no `signed` discriminant. The byte layout of the signing payload is identical across all bridges (compute_checkpoint_canonical_hash)."
         },
         {
           "name": "checkpoint_by_did",
@@ -1389,7 +1385,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "DID/DHT resolution backend (spec §17.17.3, §3.10.6). The single shipped DHT backend is the real Mainline **Pkarr** client (PkarrDhtClient, scp-dht production-dht) selected by construction in the FFI layer via scp_ffi_common::dht::FfiDhtClient / ClientDhtConfig::into_client (fail-closed). It is an internal provider selected below the SDK surface — the same Pkarr backend underlies every binding — not a per-SDK operation; the in-memory arm is a §17.17.3 nullifier compiled only under `testing` (ADR-062 §Decision 1).",
+          "notes": "Identity resolution backend: the `IdentityBackend` of `03-identity.md` §3.10.10 resolves an identity over the SCP relay network [superseded 2026-08-30: the shipped code resolves over the Mainline distributed hash table, which the redesign removes]. The single shipped DHT backend is the real Mainline **Pkarr** client (PkarrDhtClient, scp-dht production-dht) selected by construction in the FFI layer via scp_ffi_common::dht::FfiDhtClient / ClientDhtConfig::into_client (fail-closed). It is an internal provider selected below the SDK surface — the same Pkarr backend underlies every binding — not a per-SDK operation; the in-memory arm is a §17.17.3 nullifier compiled only under `testing` (ADR-062 §Decision 1).",
           "exemptions": {
             "python": "Pkarr — shipped DHT backend is Pkarr (PkarrDhtClient), selected internally by scp_ffi_common::dht for all bindings; no per-SDK symbol — identity publish/resolve wrap it transitively (identity_create / identity_resolve).",
             "typescript": "Pkarr — shipped DHT backend is Pkarr (PkarrDhtClient), selected internally by scp_ffi_common::dht for all bindings; no per-SDK symbol — identity publish/resolve wrap it transitively (identity_create / identity_resolve).",
@@ -1415,7 +1411,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Structured read-only diagnostic (ADR-059, §7.2.4). All four bindings expose an idiomatic wrapper over the typed CapabilityValidationRecord: Python SCP.ucan_evaluate / evaluate_trust, TypeScript SCP.ucanEvaluate / evaluateTrust, Kotlin SCP.ucanEvaluate / evaluateTrust (Scp.kt, types in Trust.kt), Swift SCP.ucanEvaluate / evaluateTrust (Trust.swift). Per the per-SDK-idiom lesson the record SHAPE is identical (only casing differs); the wrappers are language-idiomatic."
+          "notes": "Structured read-only diagnostic (ADR-059, §7.2.4). All four bindings expose an idiomatic wrapper over the typed CapabilityValidationRecord: Python SCP.ucan_evaluate / evaluate_trust, TypeScript SCP.ucanEvaluate / evaluateTrust, Kotlin SCP.ucanEvaluate / evaluateTrust (SCP.kt, types in Trust.kt), Swift SCP.ucanEvaluate / evaluateTrust (Trust.swift). Per the per-SDK-idiom lesson the record SHAPE is identical (only casing differs); the wrappers are language-idiomatic."
         },
         {
           "name": "mint",

@@ -42,18 +42,21 @@ use scp_clock::Clock;
 use scp_dht::DhtClient;
 // `InMemoryDhtClient` is the §17.17.3 DHT nullifier. Since the cfg-gated DHT
 // construction is now hoisted into `scp_ffi_common::dht::build_ffi_dht_client`,
-// this bridge names the type only in its own `#[cfg(test)]` unit tests — hence
-// the bare `test` gate (the `testing`-feature seam lives in scp-ffi-common now).
-#[cfg(test)]
+// this bridge names the type only in its own unit tests. Every one of those
+// tests carries `#[cfg(feature = "testing")]`, so this import carries the same
+// gate: under a bare `test` gate it goes unused in the shipped configuration
+// that job rust-build-uniffi-production tests, which warns.
+#[cfg(all(test, feature = "testing"))]
 use scp_dht::InMemoryDhtClient;
 use scp_ffi_common::dht::FfiDhtClient;
-// `DidCache` / `DualLayerResolver` / `NoOpRelayQuerier` are named only by the
-// testing-gated DID-resolver-init and DHT-signer helpers (production create
-// fails closed before resolver init — ADR-062 §Decision 6).
-#[cfg(feature = "testing")]
+// `DidCache` / `DualLayerResolver` / `NoOpRelayQuerier` back
+// `ensure_did_resolver_initialized_on`, which every build reaches through
+// `Scp::identity_verify_link_attestation` (spec §3.5.4 step 1 resolves an
+// issuer's DID document) and a testing build also reaches through
+// identity-create (production create fails closed before resolver init —
+// ADR-062 §Decision 6).
 use scp_identity::DidCache;
 use scp_identity::IdentityError;
-#[cfg(feature = "testing")]
 use scp_identity::resolver::{DualLayerResolver, NoOpRelayQuerier};
 
 use scp_did::DidDocument as CoreDidDocument;
@@ -80,7 +83,7 @@ use crate::{decrement_handle_count, increment_handle_count, runtime};
 /// Generates a real MLS key package for a joining member.
 ///
 /// Mirrors the NAPI bridge's `generate_mls_key_package_bytes`: builds an
-/// [`ScpCredential`] from the joiner's DID and TLS-serializes a fresh
+/// [`ScpCredential`](scp_core::crypto::mls::credential::ScpCredential) from the joiner's DID and TLS-serializes a fresh
 /// `KeyPackage` bundle produced by `generate_key_package_with_context_params`.
 /// The output bytes are what `NodeMlsFactory::validate_key_package` and
 /// `NodeMlsFactory::add_member` require — the old `FfiBridgeCrypto` stub
@@ -265,7 +268,7 @@ async fn snapshot_verifying_key_hex<C: KeyCustody>(custody: &C, key: &KeyHandle)
 /// closed**.
 ///
 /// Delegates to the single cfg-gated [`scp_ffi_common::dht::build_ffi_dht_client`]
-/// (shared by all three bridges) and maps its [`DhtInitError`] to a `ScpError`.
+/// (shared by all three bridges) and maps its [`DhtInitError`](scp_ffi_common::dht::DhtInitError) to a `ScpError`.
 /// A shipped (non-`testing`) build constructs the real Mainline Pkarr client; a
 /// malformed gateway or a Mainline build failure surfaces as
 /// [`codes::IDENT_1058`] (dedicated DHT-init-failure code), never an in-memory
@@ -840,20 +843,29 @@ impl KeyCustody for CallbackKeyCustody {
         // # Storage isolation status (spec §9.7.4.1 §3)
         //
         // **Type-level isolation is satisfied** (the bytes never enter
-        // the operational `KeyCustody` provider). **Substrate isolation
-        // is NOT yet satisfied**: the bridge process and the
-        // currently-shipped `InMemoryPreRotationCustody` co-reside in
-        // the same Rust process memory as the operational
-        // `KeyHandle` ID space. A process-memory dump compromises
-        // both.
+        // the operational `KeyCustody` provider). **Substrate
+        // isolation would NOT be satisfied by an in-process
+        // `PreRotationCustody` backend**: such a backend co-resides in
+        // the same Rust process memory as this bridge and the
+        // operational `KeyHandle` ID space, so a single process-memory
+        // dump compromises both, which disqualifies every in-process
+        // backend from satisfying §9.7.4.1 §3.
+        //
+        // No `PreRotationCustody` backend ships at all today. The only
+        // implementation in the tree, `InMemoryPreRotationCustody`, is
+        // a test-harness nullifier in `scp-platform`'s
+        // `#[cfg(feature = "testing")]` `testing` module (ADR-062
+        // §Decision 6). On a shipped (no-`testing`) build the identity
+        // paths fail closed with `SCP-IDENT-1059` via
+        // `no_pre_rotation_backend` rather than substituting it, so a caller
+        // reads the capability as absent rather than as present and weak.
         //
         // Full §9.7.4.1 §3 substrate isolation requires a non-in-memory
         // `PreRotationCustody` backend (FIDO2, passkey-PRF, Apple
         // Keychain entry under a separate access-control class,
         // Android Keystore alias with separate authentication flow,
-        // encrypted offline backup, Shamir, BIP39). Production
-        // backends are a separate workstream — see the
-        // `PreRotationCustodyKind::InMemory` doc-comment.
+        // encrypted offline backup, Shamir, BIP39). Those are tracked
+        // by #1729 / RFC #2130.
         //
         // For HSM-bound platforms where `OsRng` is not the appropriate
         // CSPRNG source, the SDK MUST instead generate pre-rotation
@@ -899,7 +911,7 @@ impl KeyCustody for CallbackKeyCustody {
 impl CallbackKeyCustody {
     /// Exports the raw Ed25519 signing key for the given handle.
     ///
-    /// Delegates to [`KeyCustodyProvider::export_signing_key_bytes`] on the
+    /// Delegates to [`KeyCustodyProvider::export_signing_key_bytes`](crate::KeyCustodyProvider::export_signing_key_bytes) on the
     /// platform callback. Required for governance vote signing.
     pub(crate) async fn export_ed25519_signing_key(
         &self,
@@ -2624,7 +2636,7 @@ pub struct Identity {
     pub(crate) verifying_key_hex: Option<String>,
     /// Monotonic identifier of the bridge instance that minted this handle.
     ///
-    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
+    /// Consumed by [`CoreFields::check_handle`](scp_ffi_common::bridge_instance::CoreFields::check_handle) at
     /// every `#[uniffi::export]` entry that accepts an `Identity`. Mismatches
     /// map to `ScpError::Permission` with code `SCP-PERM-3030`.
     pub(crate) instance_id: u64,
@@ -3346,7 +3358,7 @@ pub struct ContextHandle {
     pub(crate) core_context_params: scp_core::context::ContextParams,
     /// Monotonic identifier of the bridge instance that minted this handle.
     ///
-    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
+    /// Consumed by [`CoreFields::check_handle`](scp_ffi_common::bridge_instance::CoreFields::check_handle) at
     /// every `#[uniffi::export]` entry that accepts a `ContextHandle`.
     /// Mismatches map to `ScpError::Permission` with code `SCP-PERM-3030`.
     pub(crate) instance_id: u64,
@@ -3557,7 +3569,7 @@ pub struct TransportManager {
     pub(crate) bi: Arc<crate::runtime::UniffiBridgeInstance>,
     /// Monotonic identifier of the bridge instance that minted this handle.
     ///
-    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
+    /// Consumed by [`CoreFields::check_handle`](scp_ffi_common::bridge_instance::CoreFields::check_handle) at
     /// every `#[uniffi::export]` entry that accepts a `TransportManager`.
     pub(crate) instance_id: u64,
 }
@@ -4311,32 +4323,35 @@ pub async fn identity_verify_device_attestation(
     identity_verify_device_attestation_impl(did, token_base64).await
 }
 
-/// Verifies the Ed25519 signature on an identity link attestation.
+/// Declines identity link attestation verification at module scope, fail
+/// closed (`SCP-IDENT-1060`).
 ///
-/// Signature verification is a pure function and does not require
-/// in-memory custody — only the issuer's Ed25519 public key. ADR-048 §1:
-/// pure helper, no per-instance state.
+/// This function was documented as a pure helper needing only an issuer's
+/// Ed25519 public key. GitHub issue #2335 finding 2 falsified that premise:
+/// spec §3.5.4 step 1 resolves an issuer's DID document and takes a signing key
+/// from it, so a key a caller supplies is an assertion to check rather than a
+/// source of truth. Checking it needs a per-instance DID resolver, and phase D
+/// (pull request #1695) deleted every process-wide default bridge instance, so
+/// a free function reaches none.
 ///
-/// See spec §3.5.1.
+/// Callers move to `Scp::identity_verify_link_attestation`, which resolves an
+/// issuer's document and runs every §3.5.4 step.
+///
+/// # Errors
+///
+/// Always returns `SCP-IDENT-1060`.
 #[uniffi::export]
 #[allow(clippy::needless_pass_by_value)]
 pub fn identity_verify_link_attestation(
     attestation_json: String,
     issuer_public_key_hex: String,
+    reference_proof: String,
 ) -> Result<bool, ScpError> {
-    use scp_core::identity::attestation::IdentityLinkAttestation;
-
-    let attestation: IdentityLinkAttestation =
-        serde_json::from_str(&attestation_json).map_err(|e| ScpError::Identity {
-            msg: format!("failed to parse attestation JSON: {e}"),
-            code: codes::IDENT_1044.to_owned(),
-        })?;
-
-    let pub_bytes = hex::decode(&issuer_public_key_hex).map_err(|e| ScpError::Identity {
-        msg: format!("invalid issuer_public_key_hex: {e}"),
-        code: codes::IDENT_1044.to_owned(),
-    })?;
-    Ok(attestation.verify_signature(&pub_bytes).is_ok())
+    let _ = (attestation_json, issuer_public_key_hex, reference_proof);
+    Err(ScpError::Identity {
+        msg: scp_ffi_common::attestation::LINK_VERIFY_REQUIRES_INSTANCE.to_owned(),
+        code: codes::IDENT_1060.to_owned(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -4839,14 +4854,14 @@ struct McpUniFfiBridgeProvider {
     ///
     /// # Why `Weak` and not `Arc` (#1549 round-2 bug-catcher)
     ///
-    /// The provider is installed in an [`McpServer`] that lives inside a
+    /// The provider is installed in an [`McpServer`](scp_mcp::server::McpServer) that lives inside a
     /// background task spawned on the shared tokio runtime
     /// (`runtime().spawn(...)`). That task is NOT enrolled in the
     /// per-instance
     /// [`JoinSet`](scp_ffi_common::bridge_instance::CoreFields::task_handle)
     /// aborted by `emergency_cancel_tasks`, so it survives
     /// [`crate::runtime::UniffiBridgeInstance::drop`] unless the caller
-    /// explicitly sends a shutdown via [`mcp_server_stop`].
+    /// explicitly sends a shutdown via [`Scp::mcp_server_stop`](crate::scp::Scp::mcp_server_stop).
     ///
     /// If this field were `Arc<UniffiBridgeInstance>`, the server task
     /// would keep the instance alive forever when the caller forgets to
@@ -4871,7 +4886,7 @@ struct McpUniFfiBridgeProvider {
 }
 
 impl McpUniFfiBridgeProvider {
-    /// Upgrades the stored [`Weak`] to a live [`Arc<UniffiBridgeInstance>`].
+    /// Upgrades the stored [`Weak`](std::sync::Weak) to a live [`Arc<UniffiBridgeInstance>`].
     ///
     /// Returns an error string if the bridge instance has been dropped.
     /// Callers MUST drop the returned `Arc` before the next `.await` so
@@ -5451,7 +5466,7 @@ async fn run_mcp_stdio_server_uniffi(
 // MCP allowlist error mapping
 // ---------------------------------------------------------------------------
 
-/// Maps [`AllowlistError`] to the appropriate [`ScpError`] variant.
+/// Maps [`AllowlistError`](scp_mcp::allowlist::AllowlistError) to the appropriate [`ScpError`] variant.
 ///
 /// Input-validation errors map to `Validation`. Runtime/policy errors
 /// map to `Transport`. Exhaustive match ensures new variants produce
@@ -5521,7 +5536,7 @@ fn mcp_allowlist_lock_poisoned() -> ScpError {
 // See ADR-021 acceptance criterion 6.
 // ---------------------------------------------------------------------------
 
-/// Inner implementation of [`ucan_mint`].
+/// Inner implementation of [`Scp::ucan_mint`](crate::scp::Scp::ucan_mint).
 async fn ucan_mint_impl(
     handle: Arc<ContextHandle>,
     member_did: String,
@@ -5598,7 +5613,7 @@ async fn ucan_mint_impl(
         })?
 }
 
-/// Inner implementation of [`ucan_delegate`].
+/// Inner implementation of [`Scp::ucan_delegate`](crate::scp::Scp::ucan_delegate).
 ///
 /// Signs each delegation with that delegation's own delegator key, which this
 /// function reads from `bi`'s DID-keyed identity custody registry under
@@ -6548,7 +6563,7 @@ pub struct BatchPublishResult {
 // Free functions — events (#387)
 // ---------------------------------------------------------------------------
 
-/// Formats a [`ContextEvent`] as a human-readable string.
+/// Formats a [`ContextEvent`](scp_core::context::membership::ContextEvent) as a human-readable string.
 ///
 /// Consequence events (`ConsequenceTriggered`, `ConsequenceEnforced`) are
 /// formatted with structured key=value pairs for observability. All other
@@ -7205,7 +7220,7 @@ pub fn check_capability_requirements(
 }
 
 /// Builds a `ProtocolRepositoryTrustBridge` over the concrete backend behind a
-/// [`ProtocolRepoVariant`] arm and reads back the subject's verified
+/// [`ProtocolRepoVariant`](scp_ffi_common::bridge_runtime::ProtocolRepoVariant) arm and reads back the subject's verified
 /// attestations. Single source of truth for the per-backend
 /// attestation-sourcing path: both `ProtocolRepoVariant` arms route through this
 /// one generic body (mirroring the `PyO3` bridge's `run_verified_attestations`).
@@ -7232,7 +7247,7 @@ fn run_verified_attestations<S: scp_platform::traits::Storage + 'static>(
 // aggregate_trust_input (§7.3)
 // ---------------------------------------------------------------------------
 
-/// Per-instance equivalent of [`uniffi_append_provenance_event`].
+/// Per-instance replacement for the deleted free function `uniffi_append_provenance_event`.
 ///
 /// Appends a provenance event to the UCAN event log on `bi`. Phase D
 /// (#1695, ADR-048) replaces the prior free function that consulted the
@@ -8016,7 +8031,7 @@ pub fn discovery_normalize_address(address: String) -> String {
 // Shared helper for petname/handle/scope/address_resolve methods on `Scp`.
 use scp_ffi_common::petname_helpers;
 
-/// Parses a [`HandleTarget`] from a JSON string, delegating to `scp-ffi-common`.
+/// Parses a [`HandleTarget`](scp_core::discovery::HandleTarget) from a JSON string, delegating to `scp-ffi-common`.
 fn uniffi_parse_handle_target(
     json: &str,
 ) -> Result<scp_core::discovery::addressing::HandleTarget, ScpError> {
@@ -9038,7 +9053,7 @@ fn parse_scpid_signing_key_id(s: &str) -> Result<scp_did::SigningKeyId, ScpError
     }
 }
 
-/// Maps an [`ScpIdError`] variant to its canonical SCP error code.
+/// Maps an [`ScpIdError`](scp_core::identity::ScpIdError) variant to its canonical SCP error code.
 const fn scpid_error_code(e: &scp_core::identity::ScpIdError) -> &'static str {
     use scp_core::identity::ScpIdError;
     match e {
@@ -9443,15 +9458,21 @@ fn parse_observable_metrics(json: &str) -> Result<scp_core::economy::ObservableM
 
 /// Per-instance DID-resolver initializer.
 ///
-/// Stores the resolver on the caller's [`UniffiBridgeInstance`] rather than
+/// Stores the resolver on the caller's [`UniffiBridgeInstance`](crate::runtime::UniffiBridgeInstance) rather than
 /// any process-wide slot. Invoked lazily on first use by the
 /// [`crate::scp::Scp`] identity methods to keep "init on first use"
 /// semantics scoped to the owning instance.
 ///
-/// Only reached from the testing-gated identity-create paths (production create
-/// fails closed before resolver init — ADR-062 §Decision 6).
-#[cfg(feature = "testing")]
-fn ensure_did_resolver_initialized_on(
+/// Two callers reach this initializer. A testing-gated identity-create path
+/// calls it after minting (production create fails closed before resolver
+/// init — ADR-062 §Decision 6). `Scp::identity_verify_link_attestation` calls
+/// it on every build, because spec §3.5.4 step 1 resolves an issuer's DID
+/// document and a verifying instance need never have created an identity of
+/// its own. Body is production-safe on both paths: it builds a DHT client
+/// through `build_ffi_dht_client`, which constructs a real Mainline Pkarr
+/// client on a shipped build and fails closed rather than substituting an
+/// in-memory one (ADR-062 §Decision 1).
+pub(crate) fn ensure_did_resolver_initialized_on(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     handle: tokio::runtime::Handle,
 ) -> Result<(), ScpError> {
@@ -9515,7 +9536,7 @@ fn ensure_did_resolver_initialized_on(
 /// next resolve reads the fresh document. Best-effort: a no-op when no resolver
 /// cache is wired on this instance.
 ///
-/// Delegates to the shared [`BridgeInstanceCore::invalidate_resolver_cache`]
+/// Delegates to the shared [`CoreFields::invalidate_resolver_cache`](scp_ffi_common::bridge_instance::CoreFields::invalidate_resolver_cache)
 /// (the single implementation of the invalidation body, shared across bridges).
 ///
 /// Only reached from the testing-gated identity rotate/agent-key/migrate paths
@@ -9799,10 +9820,13 @@ impl Scp {
                     // resolver reads from (matching PyO3/NAPI behavior).
                     ensure_did_resolver_initialized_on(&bi, tokio::runtime::Handle::current())?;
                     let dht = DidDht::with_client(rotation_publish_client(&bi)?);
-                    // Mint a fresh per-identity pre-rotation custody (ADR-003 §4b).
-                    // Production callback custody integration is a follow-up
-                    // workstream; in-memory custody is used here so the
-                    // commitment invariant holds for tests and dev/desktop builds.
+                    // Mint a fresh per-identity pre-rotation custody (ADR-003,
+                    // DID creation on did:dht, §4b). This arm compiles only under
+                    // `testing`, so the mint reaches no shipped build of any
+                    // profile, desktop included. It holds the commitment
+                    // invariant for the test harness. Issue #1729, production
+                    // `PreRotationCustody` backends, tracks the substrate a
+                    // shipped build will use instead.
                     let pre_rotation_custody =
                         Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
                     let (identity, document, pre_rotation_handle) = dht
@@ -10024,6 +10048,99 @@ impl Scp {
         let before = entry.len();
         entry.retain(|a| a.id != attestation_id);
         entry.len() < before
+    }
+
+    /// Verifies an identity link attestation per spec §3.5.4.
+    ///
+    /// Acquires this instance's validating DID resolver, then hands every
+    /// remaining decision to the one shared flow all three bridges run,
+    /// `scp_ffi_common::attestation::verify_link_attestation`. That flow
+    /// resolves an issuer's DID document (§3.5.4 step 1), fails closed when
+    /// that document publishes an `AttestationRevocations` service endpoint
+    /// (§3.5.2), and runs structural validation, document-to-issuer binding,
+    /// signature under an `#active` or `#agent` key that document publishes
+    /// (steps 1–2), `revocation_status` (step 3), `expires_at` (step 4), and
+    /// evidence freshness (step 5, which degrades rather than rejects).
+    ///
+    /// A module-level `identity_verify_link_attestation` free function remains
+    /// exported and declines with `SCP-IDENT-1060`: it reaches no bridge
+    /// instance, so it cannot perform §3.5.4 step 1.
+    ///
+    /// # Arguments
+    ///
+    /// * `attestation_json` — JSON string of an `IdentityLinkAttestation`.
+    /// * `issuer_public_key_hex` — Hex-encoded 32-byte Ed25519 public key that
+    ///   a caller asserts belongs to this issuer. This method checks that
+    ///   assertion against an issuer's resolved DID document; it never uses
+    ///   this key as a substitute for that document.
+    /// * `reference_proof` — What this caller did about a class 2
+    ///   (`signed_post` / `dns_record`) proof resource, per spec §3.5.4 Class 2
+    ///   step 2. `"confirmed"` reports that this caller fetched the resource
+    ///   `evidence.proof` names and found this issuer's DID in it, which yields
+    ///   a `true` or a `false`. `"not_fetched"` reports that this caller
+    ///   fetched nothing, which raises `SCP-IDENT-1062` for a class 2
+    ///   attestation. A class 1 (`did_control`) attestation ignores this
+    ///   argument. Any other string raises `SCP-IDENT-1044`.
+    ///
+    /// # Returns
+    ///
+    /// `true` when §3.5.4 steps 1 through 5 pass and a key a caller named is
+    /// one an issuer's document publishes. `false` when a check rejects — a bad
+    /// signature, a revoked or expired attestation, or a key an issuer's
+    /// document does not publish. Stale evidence returns `true`, because
+    /// §3.5.4 step 5 degrades rather than rejects. Every rejection reason
+    /// reaches `tracing` at `info` level.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SCP-IDENT-1044` when the JSON or the hex key is malformed,
+    /// `SCP-IDENT-1060` when an issuer's DID document cannot be resolved,
+    /// `SCP-IDENT-1061` when an issuer publishes an attestation revocation
+    /// list this bridge does not fetch, and `SCP-IDENT-1062` for a Class 2
+    /// (`signed_post` / `dns_record`) attestation whose external proof
+    /// resource this bridge does not fetch. None of those four conditions is
+    /// reported as `false`, because `false` on this surface reads as "forged".
+    pub async fn identity_verify_link_attestation(
+        &self,
+        attestation_json: String,
+        issuer_public_key_hex: String,
+        reference_proof: String,
+    ) -> Result<bool, ScpError> {
+        use scp_ffi_common::attestation::LinkVerifyError;
+
+        /// Maps a shared-flow error onto this bridge's error type.
+        fn to_scp(e: &LinkVerifyError) -> ScpError {
+            ScpError::Identity {
+                msg: e.to_string(),
+                code: e.error_code().to_owned(),
+            }
+        }
+
+        let handle = runtime().handle().clone();
+        let bi = Arc::clone(&self.inner);
+        // `ensure_did_resolver_initialized_on` builds a real Mainline Pkarr
+        // client on a shipped build — a socket bind plus thread spawn — and
+        // this is an async fn, so that work would otherwise block a tokio
+        // worker.
+        let resolver = tokio::task::spawn_blocking(move || {
+            ensure_did_resolver_initialized_on(&bi, handle)?;
+            bi.did_resolver()
+                .ok_or_else(|| to_scp(&LinkVerifyError::ResolverUnavailable))
+        })
+        .await
+        .map_err(|e| ScpError::Identity {
+            msg: format!("tokio task join error while acquiring a DID resolver: {e}"),
+            code: codes::IDENT_1060.to_owned(),
+        })??;
+
+        scp_ffi_common::attestation::verify_link_attestation(
+            &*resolver,
+            &attestation_json,
+            &issuer_public_key_hex,
+            &reference_proof,
+        )
+        .await
+        .map_err(|e| to_scp(&e))
     }
 
     /// Removes a DID from this instance's SCP-side identity registry.
@@ -15540,7 +15657,7 @@ impl Scp {
 
     /// Diagnostic, read-only evaluation of a UCAN token.
     ///
-    /// Counterpart to [`SCP::ucan_validate`]: runs the same 11-step ADR-016
+    /// Counterpart to [`Scp::ucan_validate`](crate::scp::Scp::ucan_validate): runs the same 11-step ADR-016
     /// pipeline via `evaluate_ucan` but returns a structured
     /// [`CapabilityValidationRecord`] (six booleans) instead of failing at the
     /// first error, and never records the token's nonce (read-only probe).
@@ -18507,6 +18624,11 @@ impl Scp {
     // ----- Address resolution -----
 
     /// Per-instance equivalent of the free-function `address_resolve`.
+    ///
+    /// Returns a JSON object with two keys: `resolutions` holds the
+    /// `AddressResolution` objects sorted by trust level, and
+    /// `unavailable_layers` names each layer this build could not query,
+    /// with the reason.
     pub fn address_resolve(
         &self,
         owner_did: String,
@@ -18560,7 +18682,7 @@ impl Scp {
         };
 
         let handle = tokio::runtime::Handle::current();
-        let results = tokio::task::block_in_place(|| {
+        let outcome = tokio::task::block_in_place(|| {
             handle.block_on(async {
                 let mut resolver = scp_core::discovery::AddressResolver::new();
                 let querier = petname_helpers::LocalHandleQuerier::new(&bi.core);
@@ -18576,16 +18698,16 @@ impl Scp {
                     .await
                     .map_err(|e| ScpError::Validation {
                         msg: format!("address resolution failed: {e}"),
-                        code: codes::VALID_7091.to_owned(),
+                        code: petname_helpers::address_resolution_error_code(&e).to_owned(),
                     })
             })
         })?;
 
-        let json_results: Vec<serde_json::Value> = results
-            .iter()
-            .map(petname_helpers::address_resolution_to_json)
-            .collect();
-        serde_json::to_string(&json_results).map_err(|e| ScpError::Validation {
+        // §22.8.2 ranks results by trust level, so a caller reads
+        // `unavailable_layers` to learn which higher-trust layers this build
+        // never queried. Returning the resolution array alone would hide that.
+        let json_outcome = petname_helpers::address_resolution_outcome_to_json(&outcome);
+        serde_json::to_string(&json_outcome).map_err(|e| ScpError::Validation {
             msg: format!("failed to serialize address resolution results: {e}"),
             code: codes::VALID_7092.to_owned(),
         })
@@ -18730,7 +18852,7 @@ impl Scp {
     /// Per-instance equivalent of the free-function `economy_verify_payment_receipts`.
     ///
     /// Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
-    /// dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the
+    /// dispatches an [`EconomyCommand::VerifyPaymentReceipts`](scp_core::context::actor::commands::EconomyCommand::VerifyPaymentReceipts) to the
     /// supervisor, returning a JSON `{"all_valid": <bool>, "results": [...]}`
     /// document with one entry per receipt. Mirrors the `PyO3` reference bridge
     /// exactly. Maximum 10,000 receipts per call.
@@ -19150,6 +19272,279 @@ mod tests {
     /// logic through an owned `Scp` instance.
     fn scp_test() -> Arc<crate::scp::Scp> {
         crate::scp::Scp::new_in_memory_for_test()
+    }
+
+    /// A `KeyCustodyProvider` whose every method returns an error, used to prove
+    /// that `identity_create_with_custody` declines BEFORE it calls the provider.
+    /// A shipped build must reject the create at the pre-rotation check, so a
+    /// provider that can satisfy no request still yields `SCP-IDENT-1059` — never
+    /// a custody error and never an identity.
+    #[cfg(not(feature = "testing"))]
+    struct NeverAnsweringCustodyProvider;
+
+    #[cfg(not(feature = "testing"))]
+    impl NeverAnsweringCustodyProvider {
+        fn refuse(method: &str) -> ScpError {
+            ScpError::Identity {
+                msg: format!(
+                    "NeverAnsweringCustodyProvider::{method} was called — \
+                     identity_create_with_custody must fail closed on the pre-rotation \
+                     check before it reaches the injected custody provider"
+                ),
+                code: codes::IDENT_1003.to_owned(),
+            }
+        }
+    }
+
+    #[cfg(not(feature = "testing"))]
+    #[async_trait::async_trait]
+    impl crate::KeyCustodyProvider for NeverAnsweringCustodyProvider {
+        async fn sign(&self, _key_id: String, _message: Vec<u8>) -> Result<Vec<u8>, ScpError> {
+            Err(Self::refuse("sign"))
+        }
+
+        async fn get_public_key(&self, _key_id: String) -> Result<Vec<u8>, ScpError> {
+            Err(Self::refuse("get_public_key"))
+        }
+
+        async fn destroy_key(&self, _key_id: String) -> Result<(), ScpError> {
+            Err(Self::refuse("destroy_key"))
+        }
+
+        async fn generate_keypair(&self, _key_type: String) -> Result<String, ScpError> {
+            Err(Self::refuse("generate_keypair"))
+        }
+
+        async fn dh_agree(
+            &self,
+            _key_id: String,
+            _peer_public: Vec<u8>,
+        ) -> Result<Vec<u8>, ScpError> {
+            Err(Self::refuse("dh_agree"))
+        }
+
+        async fn derive_pseudonym(
+            &self,
+            _key_id: String,
+            _context_id: Vec<u8>,
+        ) -> Result<Vec<u8>, ScpError> {
+            Err(Self::refuse("derive_pseudonym"))
+        }
+
+        /// The only infallible method on the trait. It reports `"software"`
+        /// because the create path must decline for want of a pre-rotation
+        /// backend, not for want of a recognized custody type.
+        fn custody_type(&self, _key_id: String) -> String {
+            "software".to_owned()
+        }
+    }
+
+    /// ADR-062 §Decision 6 acceptance criterion 5, the `UniFFI` arm: on a shipped
+    /// (no-`testing`) build `identity_create_with_custody` returns the typed
+    /// `SCP-IDENT-1059` error instead of minting an identity, because the tree's
+    /// only `PreRotationCustody` implementation is the `testing`-gated
+    /// `InMemoryPreRotationCustody` nullifier.
+    ///
+    /// This is the per-bridge twin of the `PyO3`
+    /// `identity_create_fails_closed_without_pre_rotation_backend`
+    /// (`crates/scp-ffi/src/scp.rs`) and the NAPI test of the same name
+    /// (`crates/scp-ffi/napi/src/identity.rs`). It asserts more than either of
+    /// those two: a `UniFFI` `KeyCustodyProvider` is a plain Rust trait, so this
+    /// test drives the callback-custody entry point itself and reads
+    /// `SCP-IDENT-1059` off it directly, rather than stopping at the earlier
+    /// custody-unavailable codes those bridges reach.
+    ///
+    /// Gated `#[cfg(not(feature = "testing"))]`, because the FEATURE being off
+    /// selects the fail-closed arm and `test` cfg does not. Job
+    /// rust-build-uniffi-production names this test in its `-E` filter and runs
+    /// it against `--features server`, which is the configuration a released
+    /// Swift/Kotlin SDK compiles.
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn identity_create_with_custody_fails_closed_without_pre_rotation_backend() {
+        let scp = scp_test();
+        let result = runtime()
+            .block_on(scp.identity_create_with_custody(Box::new(NeverAnsweringCustodyProvider)));
+        match result {
+            Ok(_) => panic!(
+                "shipped identity_create_with_custody must FAIL CLOSED — no identity may \
+                 be minted on a production path without a real pre-rotation backend"
+            ),
+            Err(ScpError::Identity { msg, code }) => {
+                assert_eq!(
+                    code,
+                    codes::IDENT_1059,
+                    "expected the pre-rotation fail-closed code SCP-IDENT-1059, got \
+                     code {code} with message: {msg}"
+                );
+            }
+            Err(other) => {
+                panic!("expected ScpError::Identity carrying SCP-IDENT-1059, got: {other:?}")
+            }
+        }
+    }
+
+    /// Every identity operation a released Swift/Kotlin SDK reaches over
+    /// callback custody compiles into a shipped (no-`testing`) library, and
+    /// each states an outcome there. This test names and calls all fourteen of
+    /// them, so re-gating any one on `testing` stops the test target compiling
+    /// that job rust-build-uniffi-production builds. The two callback-custody
+    /// test blocks below claimed that coverage for tests which now carry
+    /// `#[cfg(feature = "testing")]`, and this test replaces it.
+    ///
+    /// `rotate_key`, `identity_migrate` and the three agent-key ops decline
+    /// with `SCP-IDENT-1059`, because their shipped bodies fail closed for
+    /// want of a `PreRotationCustody` backend (ADR-062, capability injection
+    /// and prove-absent dev backends, §Decision 6). `identity_load`,
+    /// `scpid_sign`, `identity_create_link_attestation`,
+    /// `identity_link_attestations`, `identity_remove_link_attestation`,
+    /// `event_log_checkpoint`, `event_log_checkpoint_by_did` and
+    /// `identity_remove*` carry no such severance: each runs its real body
+    /// here, and each declines on the state an externally-loaded handle holds,
+    /// which is no core identity, no retained signing custody and no
+    /// custody-registry entry.
+    #[cfg(not(feature = "testing"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shipped_build_reaches_every_callback_custody_identity_op() {
+        let scp = scp_test();
+        let did = "did:dht:z6MkShippedBuildProbe".to_owned();
+        let identity = scp
+            .identity_load(did.clone())
+            .await
+            .expect("identity_load commits no pre-rotation commitment, so a shipped build loads");
+
+        // `scpid_sign` ships un-severed. An externally-loaded handle carries no
+        // `core_id`, so the real body declines with SCP-IDENT-1010.
+        // `spawn_blocking` because `scpid_sign_impl` reaches
+        // `runtime().block_on` once it resolves custody, and a `block_on` on a
+        // runtime worker thread panics.
+        let challenge =
+            scpid_challenge("https://relying.example".to_owned(), 60).expect("scpid_challenge");
+        let signing_scp = Arc::clone(&scp);
+        let signing_identity = Arc::clone(&identity);
+        let signed = tokio::task::spawn_blocking(move || {
+            signing_scp.scpid_sign(signing_identity, "#active".to_owned(), challenge, None)
+        })
+        .await
+        .expect("spawn_blocking join");
+        match signed {
+            Err(ScpError::Identity { code, .. }) => assert_eq!(
+                code,
+                codes::IDENT_1010,
+                "a loaded handle has no core identity, so shipped scpid_sign must say so"
+            ),
+            other => panic!("expected SCP-IDENT-1010 from shipped scpid_sign, got: {other:?}"),
+        }
+
+        // Five ops ship as symbols whose bodies fail closed: the three
+        // agent-key ops, plus `rotate_key` and `identity_migrate`. Each one
+        // reads or re-mints the pre-rotation commitment, and this tree ships
+        // no `PreRotationCustody` backend to hold that commitment.
+        for (name, result) in [
+            ("add_agent_key", Arc::clone(&identity).add_agent_key().await),
+            (
+                "rotate_agent_key",
+                Arc::clone(&identity).rotate_agent_key().await,
+            ),
+            (
+                "remove_agent_key",
+                Arc::clone(&identity).remove_agent_key().await,
+            ),
+            ("rotate_key", Arc::clone(&identity).rotate_key().await),
+            (
+                "identity_migrate",
+                scp.identity_migrate(Arc::clone(&identity)).await,
+            ),
+        ] {
+            match result {
+                Err(ScpError::Identity { code, .. }) => assert_eq!(
+                    code,
+                    codes::IDENT_1059,
+                    "shipped {name} must decline with the pre-rotation fail-closed code"
+                ),
+                other => panic!("expected SCP-IDENT-1059 from shipped {name}, got: {other:?}"),
+            }
+        }
+
+        // `identity_create_link_attestation` ships un-severed and declines for
+        // want of retained identity state, not for want of the op.
+        match scp
+            .identity_create_link_attestation(
+                Arc::clone(&identity),
+                "github".to_owned(),
+                "octocat".to_owned(),
+                "https://gist.github.com/octocat/deadbeef".to_owned(),
+                "#active".to_owned(),
+                None,
+            )
+            .await
+        {
+            Err(ScpError::Identity { code, .. }) => assert_eq!(
+                code,
+                codes::IDENT_1040,
+                "a loaded handle retains no identity state, so the shipped op must say so"
+            ),
+            other => panic!(
+                "expected SCP-IDENT-1040 from shipped identity_create_link_attestation, \
+                 got: {other:?}"
+            ),
+        }
+
+        // Both event-log checkpoint ops ship un-severed. Each resolves the
+        // signing identity's retained custody first, and an externally-loaded
+        // identity retains none, so each declines with SCP-IDENT-1017.
+        // `event_log_checkpoint_by_did` reaches that resolution only after its
+        // `VALID_7000` binding accepts `did`, which is this identity's own DID.
+        let context = test_handle_for(&scp);
+        match scp
+            .event_log_checkpoint(Arc::clone(&context), Arc::clone(&identity), 1)
+            .await
+        {
+            Err(ScpError::Identity { code, .. }) => assert_eq!(
+                code,
+                codes::IDENT_1017,
+                "a loaded handle retains no signing custody, so shipped \
+                 event_log_checkpoint must say so"
+            ),
+            other => {
+                panic!("expected SCP-IDENT-1017 from shipped event_log_checkpoint, got: {other:?}")
+            }
+        }
+        match scp
+            .event_log_checkpoint_by_did(context, Arc::clone(&identity), did.clone(), 1)
+            .await
+        {
+            Err(ScpError::Identity { code, .. }) => assert_eq!(
+                code,
+                codes::IDENT_1017,
+                "a loaded handle retains no signing custody, so shipped \
+                 event_log_checkpoint_by_did must say so"
+            ),
+            other => panic!(
+                "expected SCP-IDENT-1017 from shipped event_log_checkpoint_by_did, got: {other:?}"
+            ),
+        }
+
+        // The registry ops ship un-severed and read an empty per-instance
+        // registry, because no shipped build can register an identity.
+        assert_eq!(
+            scp.identity_link_attestations(did.clone())
+                .expect("identity_link_attestations must accept a valid DID"),
+            "[]",
+            "a shipped build registers no link attestation for a loaded DID"
+        );
+        assert!(
+            !scp.identity_remove_link_attestation(did.clone(), "attestation-1".to_owned()),
+            "a loaded DID never enters the custody registry, so the shipped op \
+             removes no attestation"
+        );
+        assert!(
+            !scp.identity_remove_if_present(did.clone())
+                .expect("identity_remove_if_present must accept a valid DID"),
+            "a loaded handle never enters the custody registry, so removal reports absence"
+        );
+        scp.identity_remove(did)
+            .expect("identity_remove is unconditional and accepts a valid DID");
     }
 
     // -----------------------------------------------------------------------
@@ -20525,7 +20920,13 @@ mod tests {
         let instance_id = scp.instance_id();
         // Synthetic pre-rotation custody — never inspected by callers that
         // only exercise non-migration paths, but the field is non-optional
-        // so the test handle has to provide something.
+        // so the test handle has to provide something. `Identity` declares
+        // `pre_rotation_custody` `#[cfg(feature = "testing")]`, and
+        // `InMemoryPreRotationCustody` is a §17.17.2 nullifier that
+        // `scp-platform/testing` compiles, so both the binding and the field
+        // carry that gate: without it this helper fails to compile in the
+        // shipped configuration job rust-build-uniffi-production tests.
+        #[cfg(feature = "testing")]
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         Arc::new(Identity {
@@ -20541,6 +20942,7 @@ mod tests {
             bi: Arc::clone(&scp.inner),
             rotation_event_json: None,
             pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+            #[cfg(feature = "testing")]
             pre_rotation_custody,
         })
     }
@@ -22100,6 +22502,15 @@ mod tests {
     /// type used by the bridge function via the global `DID_RESOLVER`. Uses a
     /// shared `InMemoryDhtClient` so the DID published during identity
     /// creation is visible to the verify resolver.
+    ///
+    /// Gated `#[cfg(feature = "testing")]` because `DidCache`,
+    /// `DualLayerResolver`, `NoOpRelayQuerier`, `InMemoryDhtClient`,
+    /// `InMemoryKeyCustody` and `InMemoryPreRotationCustody` all carry that
+    /// gate. Job rust-test enables `scp-ffi-uniffi/testing`, so this test runs
+    /// there exactly as it did before the gate; job
+    /// rust-build-uniffi-production compiles this file with `testing` off and
+    /// needs it skipped.
+    #[cfg(feature = "testing")]
     #[tokio::test]
     async fn scpid_sign_verify_roundtrip_via_identity_backed_resolver() {
         use scp_core::identity::{
@@ -23508,13 +23919,31 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Production (callback-custody) path coverage — NOT gated on
-    // `testing`. These pin the bare-build fix: re-typing the
-    // identity custody registry to the `UniffiKeyCustody` enum un-gated
-    // `scpid_sign`, `identity_create_link_attestation`, and `identity_remove*`
-    // so they ship in the released Swift/Kotlin SDKs and route over callback
-    // (Secure Enclave / Android Keystore) custody. Before the fix these ops
-    // were `#[cfg(testing)]`-gated and silently absent.
+    // Production (callback-custody) path coverage.
+    //
+    // These tests drive `scpid_sign`, `identity_create_link_attestation`,
+    // `identity_remove*` and the three agent-key ops over a callback
+    // (Secure Enclave / Android Keystore) `KeyCustodyProvider` — the custody a
+    // released Swift/Kotlin SDK uses. Re-typing the identity custody registry
+    // to the `UniffiKeyCustody` enum un-gated those ops; before that change
+    // they carried `#[cfg(feature = "testing")]` and were absent from the
+    // shipped library.
+    //
+    // Every test in this block carries `#[cfg(feature = "testing")]`, so job
+    // rust-test runs each of them and job rust-build-uniffi-production compiles
+    // none of them. Each one opens by minting an identity through
+    // `identity_create_with_custody`, and a shipped build declines that call
+    // with SCP-IDENT-1059 because this tree ships no `PreRotationCustody`
+    // backend (ADR-062, capability injection and prove-absent dev backends,
+    // §Decision 6). No test can hold a callback-custody identity in a bare
+    // build, so no assertion below states anything about the shipped
+    // configuration.
+    //
+    // `shipped_build_reaches_every_callback_custody_identity_op` carries the
+    // shipped-configuration half: it names and calls each op above in a
+    // `#[cfg(not(feature = "testing"))]` test, so re-gating any of them on
+    // `testing` fails to compile the test target that job
+    // rust-build-uniffi-production builds.
     // -----------------------------------------------------------------------
 
     /// A full `KeyCustodyProvider` backed by real Ed25519 keys with a
@@ -23628,8 +24057,9 @@ mod tests {
 
     /// `identity_create_with_custody` must register the callback identity in the
     /// per-instance custody registry so `identity_remove_if_present` reports
-    /// `true` on first removal — proving the registry exists and is populated in
-    /// a BARE (no `testing`) build over callback custody.
+    /// `true` on first removal, proving the registry exists and is populated
+    /// over callback custody.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn callback_identity_is_registered_for_remove_if_present() {
         let scp = scp_test();
@@ -23653,8 +24083,11 @@ mod tests {
 
     /// `scpid_sign` must work over callback custody (production path), producing
     /// a response whose signature verifies against the identity's `#active`
-    /// public key. Pins that the op is un-gated and routes through
-    /// `resolve_identity_custody` → `UniffiKeyCustody::Callback`.
+    /// public key. Pins that the op routes through `resolve_identity_custody` →
+    /// `UniffiKeyCustody::Callback`. That the op stays un-gated is pinned by
+    /// `shipped_build_reaches_every_callback_custody_identity_op`, which names
+    /// it in a build carrying no `testing` feature.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scpid_sign_works_over_callback_custody() {
         let scp = scp_test();
@@ -23689,7 +24122,10 @@ mod tests {
     /// (production path): it signs the attestation with the `#active` callback
     /// key and registers the identity, so a subsequent
     /// `identity_remove_link_attestation` (which requires the DID present in the
-    /// custody registry) returns `true`.
+    /// custody registry) returns `true`. That both ops stay un-gated is pinned
+    /// by `shipped_build_reaches_every_callback_custody_identity_op`, which
+    /// calls each of them in a build carrying no `testing` feature.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn link_attestation_create_and_remove_over_callback_custody() {
         let scp = scp_test();
@@ -23726,14 +24162,16 @@ mod tests {
         );
     }
 
-    /// `add_agent_key` must work over callback custody (production path) in a
-    /// BARE (no `testing`) build, returning a handle whose DID
-    /// document and retained identity both carry the new `#agent` key. Before
-    /// the fix this op was `#[cfg(testing)]`-gated and the
-    /// bare build returned SCP-IDENT-1008 unconditionally. Pins that the op
-    /// resolves custody via `resolve_identity_custody` →
+    /// `add_agent_key` must work over callback custody (production path),
+    /// returning a handle whose DID document and retained identity both carry
+    /// the new `#agent` key. Before the fix this op was `#[cfg(testing)]`-gated
+    /// and a bare build returned SCP-IDENT-1008 unconditionally. Pins that the
+    /// op resolves custody via `resolve_identity_custody` →
     /// `UniffiKeyCustody::Callback` and signs the DHT publish with the callback
-    /// key.
+    /// key. A shipped build reaches the op and declines with SCP-IDENT-1059
+    /// instead, which
+    /// `shipped_build_reaches_every_callback_custody_identity_op` asserts.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn add_agent_key_works_over_callback_custody() {
         let scp = scp_test();
@@ -23767,10 +24205,13 @@ mod tests {
         );
     }
 
-    /// `rotate_agent_key` must work over callback custody (production path) in
-    /// a BARE build: it generates a fresh `#agent` key, retires the old one,
-    /// republishes the DID document, and returns a handle that still has an
-    /// agent key (with a different public key than before rotation).
+    /// `rotate_agent_key` must work over callback custody (production path): it
+    /// generates a fresh `#agent` key, retires the old one, republishes the DID
+    /// document, and returns a handle that still has an agent key (with a
+    /// different public key than before rotation). A shipped build reaches the
+    /// op and declines with SCP-IDENT-1059 instead, which
+    /// `shipped_build_reaches_every_callback_custody_identity_op` asserts.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rotate_agent_key_works_over_callback_custody() {
         let scp = scp_test();
@@ -23809,9 +24250,12 @@ mod tests {
         );
     }
 
-    /// `remove_agent_key` must work over callback custody (production path) in
-    /// a BARE build: it strips the `#agent` verification method, republishes
-    /// the DID document, and returns a handle with no agent key.
+    /// `remove_agent_key` must work over callback custody (production path): it
+    /// strips the `#agent` verification method, republishes the DID document,
+    /// and returns a handle with no agent key. A shipped build reaches the op
+    /// and declines with SCP-IDENT-1059 instead, which
+    /// `shipped_build_reaches_every_callback_custody_identity_op` asserts.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remove_agent_key_works_over_callback_custody() {
         let scp = scp_test();
@@ -23849,6 +24293,7 @@ mod tests {
     /// live key custody — the shape of an externally-loaded identity — must
     /// reject `add_agent_key` with SCP-IDENT-1008. Without custody there is no
     /// signing key for the DHT publish, so the op cannot proceed.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn add_agent_key_without_custody_returns_ident_1008() {
         let scp = scp_test();
@@ -23874,6 +24319,11 @@ mod tests {
             bi: Arc::clone(&live.bi),
             rotation_event_json: None,
             pre_rotation_handle: live.pre_rotation_handle,
+            // `Identity` declares this field `#[cfg(feature = "testing")]`, so
+            // the initializer carries the same gate. Without it this test fails
+            // to compile in the shipped configuration job
+            // rust-build-uniffi-production tests.
+            #[cfg(feature = "testing")]
             pre_rotation_custody: Arc::clone(&live.pre_rotation_custody),
         });
 
@@ -23908,6 +24358,13 @@ mod tests {
     /// `DidDht::new()` regression in place, the `publish` below fails with the
     /// signer error and the test fails; with the fix it succeeds and the
     /// `#active` key changes while `#0` and the DID are preserved.
+    ///
+    /// Gated `#[cfg(feature = "testing")]` because `make_dht_with_signer`,
+    /// `InMemoryDhtClient` and `InMemoryPreRotationCustody` all carry that gate.
+    /// Job rust-test enables `scp-ffi-uniffi/testing`, so this test runs there
+    /// exactly as it did before the gate; job rust-build-uniffi-production
+    /// compiles this file with `testing` off and needs it skipped.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rotate_key_signer_is_wired_over_callback_custody() {
         use scp_identity::DidMethod;
@@ -23994,7 +24451,10 @@ mod tests {
     /// whose resolve stage could never see the create-time publish, so this
     /// path failed with `DhtNotFound`. This test now pins the corrected
     /// behavior: rotation succeeds, preserving the DID and the identity key
-    /// `#0` while installing a fresh `#active` key.
+    /// `#0` while installing a fresh `#active` key. A shipped build reaches
+    /// `rotate_key` and declines with SCP-IDENT-1059 instead, which
+    /// `shipped_build_reaches_every_callback_custody_identity_op` asserts.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rotate_key_over_callback_custody_round_trips_via_shared_dht() {
         let scp = scp_test();
@@ -24029,7 +24489,11 @@ mod tests {
     /// subsequent resolve re-queries the DHT and serves the new key. Without the
     /// invalidation the resolver would keep serving the pre-rotation document
     /// (and its retired `#active` key) for the multi-day cache TTL, silently
-    /// defeating rotation's revocation purpose.
+    /// defeating rotation's revocation purpose. A shipped build reaches
+    /// `rotate_key` and declines with SCP-IDENT-1059 before any resolution,
+    /// which `shipped_build_reaches_every_callback_custody_identity_op`
+    /// asserts.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rotate_key_invalidates_resolver_cache() {
         let scp = scp_test();
@@ -24092,7 +24556,11 @@ mod tests {
     /// source identity intact. Because that abort precedes any
     /// `publish_document`, this test cannot observe the migrate DHT-signer fix —
     /// that guard lives in `rotate_key_signer_is_wired_over_callback_custody`,
-    /// which reaches the signer-bearing publish directly.
+    /// which reaches the signer-bearing publish directly. A shipped build
+    /// reaches `identity_migrate` and declines with SCP-IDENT-1059 before the
+    /// seed-import constraint, which
+    /// `shipped_build_reaches_every_callback_custody_identity_op` asserts.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn migrate_over_callback_custody_fails_fast_at_seed_import() {
         let scp = scp_test();
@@ -24132,11 +24600,24 @@ mod tests {
     // the `testing`-only custody and fail-closed
     // (SCP-IDENT-1017) in a bare production build — even when the context
     // creator used platform/callback (OS-keychain / HSM) custody. These tests
-    // pin the production path: in a BARE build (no `testing`),
-    // a callback-custody context handle / identity must sign UCANs and event-log
-    // checkpoints, and the produced UCAN signature must verify against the
-    // custody's `#active` public key. They are NOT cfg-gated, so they run on the
-    // release canary.
+    // pin the production path: a callback-custody context handle or identity
+    // must sign UCANs and event-log checkpoints, and the produced UCAN
+    // signature must verify against the custody's `#active` public key.
+    //
+    // The block splits by how each test obtains its custody. The `ucan_*` tests
+    // build a `ContextHandle` directly through `callback_context_handle`, so
+    // they compile and pass with `testing` off; job
+    // rust-build-uniffi-production names them in its `-E` filter and runs them
+    // on the shipped configuration. The `event_log_checkpoint*` tests mint an
+    // identity through `identity_create_with_custody`, which a shipped build
+    // declines with SCP-IDENT-1059 for want of a `PreRotationCustody` backend
+    // (ADR-062, capability injection and prove-absent dev backends,
+    // §Decision 6), so they carry `#[cfg(feature = "testing")]` and run in job
+    // rust-test alone. `shipped_build_reaches_every_callback_custody_identity_op`
+    // holds `event_log_checkpoint` and `event_log_checkpoint_by_did` in the
+    // shipped compile instead: it calls both with `testing` off, so re-gating
+    // either op stops the test target that job rust-build-uniffi-production
+    // builds from compiling.
     // -----------------------------------------------------------------------
 
     /// Builds a `ContextHandle` carrying a real-Ed25519 [`ProdLikeCustody`]
@@ -24380,8 +24861,13 @@ mod tests {
     /// a real callback-custody identity (created via `identity_create_with_custody`,
     /// carrying `core_id.active_signing_key` in its callback store) signs a
     /// checkpoint, producing a non-empty signature. Pins that
-    /// `event_log_checkpoint_impl` is un-gated and resolves custody via
-    /// `resolve_identity_custody` → `UniffiKeyCustody::Callback`.
+    /// `event_log_checkpoint_impl` resolves custody via
+    /// `resolve_identity_custody` → `UniffiKeyCustody::Callback`. That the op
+    /// stays un-gated is pinned by
+    /// `shipped_build_reaches_every_callback_custody_identity_op`, which calls
+    /// it in a build carrying no `testing` feature and reads SCP-IDENT-1017
+    /// off an identity that retains no custody.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_log_checkpoint_works_over_callback_custody() {
         let scp = scp_test();
@@ -24411,9 +24897,14 @@ mod tests {
     /// `identity_create_with_custody`, carrying `core_id.active_signing_key` in
     /// its callback store) signs a checkpoint attributed to its own DID,
     /// producing a non-empty signature attributed to that same DID. Pins that
-    /// `event_log_checkpoint_by_did_impl` is un-gated and resolves custody via
-    /// `resolve_identity_custody` → `UniffiKeyCustody::Callback` on the bare
-    /// canary, with the `did == identity.did` `VALID_7000` binding satisfied.
+    /// `event_log_checkpoint_by_did_impl` resolves custody via
+    /// `resolve_identity_custody` → `UniffiKeyCustody::Callback`, with the
+    /// `did == identity.did` `VALID_7000` binding satisfied. That the op stays
+    /// un-gated is pinned by
+    /// `shipped_build_reaches_every_callback_custody_identity_op`, which calls
+    /// it in a build carrying no `testing` feature and reads SCP-IDENT-1017
+    /// off an identity that retains no custody.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_log_checkpoint_by_did_works_over_callback_custody() {
         let scp = scp_test();
@@ -25677,5 +26168,176 @@ mod tests {
                 other => panic!("expected SagaAborted (axis a), got {other:?}"),
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity link attestation verification (spec §3.5.4, issue #2335 #2)
+    // -----------------------------------------------------------------------
+
+    /// A module-scope free function reaches no bridge instance, so it cannot
+    /// perform §3.5.4 step 1 (resolve an issuer's DID document) and must
+    /// decline rather than verify a caller-supplied key against a
+    /// caller-supplied attestation.
+    #[test]
+    fn module_scope_link_verification_declines_fail_closed() {
+        let err = identity_verify_link_attestation(
+            "{}".to_owned(),
+            "00".repeat(32),
+            scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED.to_owned(),
+        )
+        .expect_err("module-scope verification must decline");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(codes::IDENT_1060),
+            "module-scope verification must decline with SCP-IDENT-1060, got: {msg}"
+        );
+    }
+
+    /// A malformed argument is a caller error (`SCP-IDENT-1044`), reported
+    /// before any resolution attempt — never a `false` verdict, which would
+    /// say "forged" about an attestation nobody parsed.
+    #[test]
+    fn per_instance_link_verification_rejects_malformed_arguments() {
+        let scp = scp_test();
+        let err = runtime()
+            .block_on(scp.identity_verify_link_attestation(
+                "not json".to_owned(),
+                "00".repeat(32),
+                scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED.to_owned(),
+            ))
+            .expect_err("malformed JSON must raise");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(codes::IDENT_1044),
+            "malformed attestation JSON must raise SCP-IDENT-1044, got: {msg}"
+        );
+    }
+
+    /// Mints a Class 1 (`oauth`) link attestation on a fresh identity and
+    /// returns an `Scp` bound to that identity's bridge instance, that
+    /// identity's attestation JSON, and its `#active` key as hex.
+    async fn minted_link_attestation() -> (Arc<crate::scp::Scp>, String, String) {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("creating an identity must succeed");
+        let did = identity.did();
+        let attestation_json = scp
+            .identity_create_link_attestation(
+                Arc::clone(&identity),
+                "google.com".to_owned(),
+                "alice".to_owned(),
+                r#"{"provider":"google.com","subject_id":"12345","verified_at":1700000000}"#
+                    .to_owned(),
+                "oauth".to_owned(),
+                Some("12345".to_owned()),
+            )
+            .await
+            .expect("minting a link attestation must succeed");
+
+        // Read the `#active` key from the same resolver verification reads
+        // from, so this test names the key an issuer's document publishes
+        // rather than a key it reconstructed some other way.
+        ensure_did_resolver_initialized_on(&scp.inner, runtime().handle().clone())
+            .expect("resolver initialization must succeed");
+        let resolver = scp
+            .inner
+            .did_resolver()
+            .expect("a resolver must exist after initialization");
+        let issuer_document = scp_identity::resolver::DidResolver::resolve(&*resolver, &did)
+            .await
+            .expect("resolving a freshly created identity must not fault")
+            .expect("a freshly created identity must resolve");
+        let multibase = issuer_document
+            .document
+            .verification_method_by_fragment("active")
+            .expect("a DID document must publish an #active verification method")
+            .public_key_multibase
+            .clone();
+        let active_hex = hex::encode(
+            scp_did::decode_multibase_key(&multibase)
+                .expect("a freshly minted #active key must decode"),
+        );
+        (scp, attestation_json, active_hex)
+    }
+
+    #[test]
+    fn per_instance_link_verification_accepts_a_key_the_did_document_publishes() {
+        runtime().block_on(async {
+            let (scp, attestation_json, active_hex) = minted_link_attestation().await;
+            let verified = scp
+                .identity_verify_link_attestation(
+                    attestation_json,
+                    active_hex,
+                    scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED.to_owned(),
+                )
+                .await
+                .expect("verification of a freshly minted attestation must not error");
+            assert!(
+                verified,
+                "an attestation signed by the #active key an issuer's DID document \
+                 publishes must verify (spec §3.5.4)"
+            );
+        });
+    }
+
+    /// Regression pin for GitHub issue #2335 finding 2, in the shape that
+    /// finding names: an attacker supplies BOTH an attestation and the key
+    /// that signs it, keeping an honest issuer's DID in the `issuer` field.
+    ///
+    /// A verifier that calls `attestation.verify_signature(caller_key)` and
+    /// returns that boolean answers `true` here, because the attacker's own
+    /// signature verifies under the attacker's own key. Taking the signing key
+    /// from an issuer's resolved DID document instead answers `false`, because
+    /// that document publishes neither the attacker's key at `#active` nor at
+    /// `#agent`.
+    ///
+    /// Passing a key nobody signed with does NOT exhibit that gap — a
+    /// signature check rejects it either way — so this test forges rather than
+    /// mutating a key.
+    #[test]
+    fn per_instance_link_verification_rejects_an_attacker_supplied_key_and_attestation() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        runtime().block_on(async {
+            let (scp, attestation_json, _active_hex) = minted_link_attestation().await;
+
+            // Forge: keep an honest issuer's DID, re-sign under an attacker's key.
+            let attacker = SigningKey::from_bytes(&[0x07; 32]);
+            let mut forged: scp_core::identity::attestation::IdentityLinkAttestation =
+                serde_json::from_str(&attestation_json).expect("minted attestation must parse");
+            forged.signature = Vec::new();
+            let canonical = forged
+                .canonical_signing_bytes()
+                .expect("canonical bytes must compute");
+            forged.signature = attacker.sign(&canonical).to_bytes().to_vec();
+            let forged_json = serde_json::to_string(&forged).expect("forgery must serialize");
+            let attacker_hex = hex::encode(attacker.verifying_key().to_bytes());
+
+            // The forgery is internally consistent: it verifies under the key
+            // an attacker supplies alongside it.
+            assert!(
+                forged
+                    .verify_signature(&attacker.verifying_key().to_bytes())
+                    .is_ok(),
+                "the forgery must verify under an attacker's own key, or this test \
+                 exercises nothing"
+            );
+
+            let verified = scp
+                .identity_verify_link_attestation(
+                    forged_json,
+                    attacker_hex,
+                    scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED.to_owned(),
+                )
+                .await
+                .expect("verification of a forgery must not error");
+            assert!(
+                !verified,
+                "an attestation an attacker signed with a key an issuer's DID document \
+                 publishes at neither #active nor #agent must not verify (spec §3.5.4 step 1)"
+            );
+        });
     }
 }

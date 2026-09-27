@@ -6,13 +6,38 @@ set -euo pipefail
 STAGED=$(git diff --cached --name-only --diff-filter=ACM)
 [ -z "$STAGED" ] && exit 0
 
+# ── Which files this commit changes, for the language steps ──
+#
+# On a merge commit, `STAGED` lists every file the merged-in branch changed, and the CI of
+# that branch already formatted and linted each of them. A language step runs here only for
+# a file whose staged content differs from what a merged-in head carries: a file this
+# branch changed, or a file the conflict resolution changed. So when `MERGE_HEAD` exists,
+# the language flags below read the files where the staged tree differs from each merged-in
+# head, and a file identical to a merged-in head's copy sets no flag. An octopus merge
+# names several heads in `MERGE_HEAD`; the list is the union over all of them, so a file
+# differing from any one merged-in head still sets its flag.
+#
+# `STAGED` still decides the early exit above, so the toolchain check below runs on every
+# commit that stages a file, merge or not.
+MERGE_HEAD_FILE=$(git rev-parse --git-path MERGE_HEAD)
+if [ -f "$MERGE_HEAD_FILE" ]; then
+  CHANGED=""
+  while IFS= read -r merged_head; do
+    [ -z "$merged_head" ] && continue
+    CHANGED="$CHANGED
+$(git diff --cached --name-only --diff-filter=ACM "$merged_head")"
+  done < "$MERGE_HEAD_FILE"
+else
+  CHANGED=$STAGED
+fi
+
 HAS_RUST=false
 HAS_PYTHON=false
 HAS_TS=false
 HAS_KOTLIN=false
 HAS_SWIFT=false
 
-for f in $STAGED; do
+for f in $CHANGED; do
   case "$f" in
     *.rs) HAS_RUST=true ;;
     bindings/python/*) HAS_PYTHON=true ;;
@@ -26,32 +51,27 @@ done
 #
 # `rust-toolchain.toml` names the Rust version, and rustup applies it to every cargo
 # command run in this directory — unless `RUSTUP_TOOLCHAIN` is set in the environment,
-# which overrides the file entirely. Everything below runs `cargo fmt` and `cargo clippy`,
-# so a shell carrying that variable formats and lints on a compiler the repository does not
-# name, and a new release's lints then appear first in CI, against code nobody changed.
-# That is the outage `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`
-# records.
+# which overrides the file entirely. A shell carrying that variable formats and lints on a
+# compiler the repository does not name, and a new release's lints then appear first in CI,
+# against code nobody changed. That is the outage
+# `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md` records.
 #
-# This is the only place the check can fire: a GitHub runner exports no
-# `RUSTUP_TOOLCHAIN`, so the same assertion in CI reported success forever.
+# `scripts/check-resolved-rustc.sh` holds the comparison, so this hook,
+# `scripts/check-toolchain-wiring.sh`, and `scripts/setup-toolchain.sh` all read one file's
+# answer.
 #
-# The expected version is read out of the pin, so this hook names no version.
-if $HAS_RUST && command -v rustc >/dev/null 2>&1; then
-  PIN_VERSION=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
-    rust-toolchain.toml | head -n 1)
-  ACTIVE_VERSION=$(rustc --version 2>/dev/null | sed -nE 's/^rustc ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')
-  if [ -z "$PIN_VERSION" ]; then
-    echo "  ✗ rust-toolchain.toml names no [toolchain] channel" >&2
-    exit 1
-  elif [ -z "$ACTIVE_VERSION" ]; then
-    echo "  ✗ could not read 'rustc --version', so the active compiler is unknown" >&2
-    exit 1
-  elif [ "$ACTIVE_VERSION" != "$PIN_VERSION" ]; then
-    echo "  ✗ rustc in this shell is $ACTIVE_VERSION; rust-toolchain.toml names $PIN_VERSION." >&2
-    echo "    RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-<unset>} overrides the file when it is set." >&2
-    echo "    Unset it, so rustup reads rust-toolchain.toml and installs the version it names." >&2
-    exit 1
-  fi
+# The check runs on every commit rather than only on a commit staging a `.rs` file. The
+# variable belongs to the shell, not to the staged set: a commit staging `Cargo.toml`,
+# `rust-toolchain.toml`, or a workflow changes how the workspace compiles and stages no
+# `.rs` file at all, and its author ran `cargo clippy` by hand before writing it.
+#
+# git runs a hook with the working tree's top level as the working directory, so the path
+# below is the same relative path every other command in this file uses.
+if ! RESOLVED_RUSTC=$(bash scripts/check-resolved-rustc.sh 2>&1); then
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then echo "  ✗ $line" >&2; fi
+  done <<< "$RESOLVED_RUSTC"
+  exit 1
 fi
 
 # ── Auto-format (best-effort — failures don't block other languages) ──

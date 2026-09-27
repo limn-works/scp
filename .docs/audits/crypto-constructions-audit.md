@@ -2,6 +2,17 @@
 
 > **Line number shift notice:** References to `05-contexts.md` §5.14 (broadcast) are shifted +47 to +64 after PR #296 merged. All findings remain valid.
 
+> **Annotation, 2026-09-13.** This file is the record its author wrote on the date it carries,
+> restored unedited, and a `**Resolution (later)**` line marks each finding the corpus has since
+> closed. The lines on CRYPTO-06 and CRYPTO-07 were added earlier; this annotation adds the
+> lines on CRYPTO-01, CRYPTO-02, CRYPTO-15, CRYPTO-19 and CRYPTO-31. **No finding text, no severity tally, and no
+> line of the executive summary is edited**, so the author's counts and the findings list below
+> still reconcile. The identity model this audit reads — the DID document and its verification
+> methods, the shared `#agent` key, the identifier written as a `did:` string, Ed25519 and
+> X25519 — was replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity
+> substrate, and Alec settled the curve on 2026-09-10 as ECDSA on NIST P-256
+> (`.docs/specs/09-security-model.md` §9.5).
+
 # SCP Cryptographic Specification Audit
 
 ## Executive Summary
@@ -20,6 +31,7 @@ The most serious category of findings involves underspecified constructions wher
 - **What's missing**: The signature formula is `SHA256("SCP-INNER-ENVELOPE-V1:" || context_id || sender_did || epoch || generation_number || sequence_number || timestamp || payload_hash || provenance_hash)`. The `context_id` and `sender_did` are variable-length strings. No length prefixes are specified. A `context_id` of "abc" with `sender_did` of "def" produces the same hash input as `context_id` "ab" with `sender_did` "cdef". The migration proof formula (line 350) correctly uses `len()` as 4-byte BE prefixes for its variable-length fields -- this same pattern is missing from the envelope signatures.
 - **Security impact**: Concatenation ambiguity enables second-preimage attacks where an attacker can construct a different `(context_id, sender_did)` pair that produces the same signature input. This is a forgery vector: a valid signature over one context/sender pair could validate for a different pair. In practice, the exploitation requires finding two valid DID strings whose concatenation matches, which is constrained but not impossible.
 - **Severity**: CRITICAL
+- **Resolution (later)**: Accepted and fixed. The `InnerEnvelope` field table of `09-security-model.md` §9.5.2 carries a 4-byte big-endian length prefix on every variable-length field, under the canonical hash construction §9.5.1 states.
 
 ### [CRYPTO-02] BroadcastEnvelope Signature Hash Lacks Length Prefixes on Variable-Length Fields
 - **Construction**: BroadcastEnvelope canonical hash for Ed25519 signature
@@ -27,6 +39,7 @@ The most serious category of findings involves underspecified constructions wher
 - **What's missing**: Same as CRYPTO-01. The formula `SHA256(context_id || sender_did || sequence || key_epoch || timestamp || content_hash || provenance_hash)` uses raw concatenation of variable-length `context_id` and `sender_did` without length prefixes. Additionally, this formula lacks the domain separator present in InnerEnvelope (`"SCP-INNER-ENVELOPE-V1:"`). There is no `"SCP-BROADCAST-ENVELOPE-V1:"` prefix.
 - **Security impact**: (1) Same concatenation ambiguity as CRYPTO-01. (2) The missing domain separator means the same `(context_id, sender_did, ...)` values produce hash inputs that could collide with other hash constructions in the protocol. A valid broadcast signature could potentially be replayed as an InnerEnvelope signature if the fixed-length fields happen to align. The domain separator on InnerEnvelope prevents InnerEnvelope-to-Broadcast replay, but not the reverse direction.
 - **Severity**: CRITICAL
+- **Resolution (later)**: Accepted and fixed. The `BroadcastEnvelope` field table of `09-security-model.md` §9.5.2 carries a 4-byte big-endian length prefix on every variable-length field, and §9.18.2 registers the separator `"SCP-BROADCAST-ENVELOPE-V1:"`.
 
 ### [CRYPTO-03] Sender Key HPKE Is Not Standard HPKE (RFC 9180) -- Manual Construction Specified
 - **Construction**: Sender key wrapping HPKE
@@ -120,6 +133,7 @@ The most serious category of findings involves underspecified constructions wher
 - **What's missing**: The pre-rotation commitment is `SHA-256(public_key)` -- a bare hash of the 32-byte Ed25519 public key with no domain separator, no length prefix, and no version tag. If any other construction in the protocol hashes a 32-byte value with SHA-256, the commitments could collide in meaning. The migration proof (line 350) correctly uses `"SCP-MIGRATION-V1:"` as a domain separator. The commitment itself should use something like `SHA-256("SCP-PRE-ROTATION-COMMITMENT-V1:" || public_key)`.
 - **Security impact**: In isolation, this is low risk because the commitment is stored in a specific field of the DID document. However, the protocol uses SHA-256 hashes of 32-byte values in multiple places (event hashes, routing IDs, etc.). A commitment value that happens to match another hash could be confused in contexts where the field type is not checked. More importantly, this violates the spec's own domain separation pattern used everywhere else.
 - **Severity**: LOW
+- **Resolution (later)**: Accepted and fixed, under a spelling this finding does not use. The commitment is `SHA-256("SCP-PREROTATION-COMMITMENT-V1:" ‖ pre_rotation_public_key)` over a 33-byte SEC1 compressed point (`09-security-model.md` §9.7.4.2 definitions), which §25.28's Vector 47 pins; the separator carries no hyphen between PRE and ROTATION, so an implementer taking this finding's recommended spelling computes commitments no reveal ever matches.
 
 ### [CRYPTO-16] Sender Key AES-256-GCM Nonce Not Included in Sender Key Wire Format
 - **Construction**: Sender key encrypted message format
@@ -148,6 +162,7 @@ The most serious category of findings involves underspecified constructions wher
 - **What's missing**: The spec says "Private state is encrypted to the identity's own keys" and "Only you hold the decryption key." It does not specify: (1) which algorithm encrypts private state (AES-256-GCM? The MLS ciphersuite's AEAD?); (2) what key encrypts it (derived from Identity Key? Active Key? A dedicated symmetric key?); (3) how the key is derived (HKDF? Direct use?); (4) nonce generation; (5) AAD binding; (6) how re-encryption works on key rotation ("re-encrypted to the new key" -- but which key?). This is a complete specification gap for a construction that protects block lists, graph policies, agent configs, and annotations.
 - **Security impact**: Without a specified encryption scheme, each platform will implement its own, and identity private state will not be portable across platforms or devices. The security properties (authenticated encryption, forward secrecy on rotation) are aspirational but unverifiable.
 - **Severity**: HIGH
+- **Resolution (later)**: Accepted and fixed. `03-identity.md` §3.7, Identity Private State, states the encryption model, and `03-identity.md` §3.10.13, the service record, states where the private state is stored.
 
 ### [CRYPTO-20] Cover Traffic Dummy Flag Not Authenticated
 - **Construction**: Cover traffic real/dummy discrimination
@@ -232,6 +247,7 @@ The most serious category of findings involves underspecified constructions wher
 - **What's missing**: "On identity key rotation (§9.12), private state is re-encrypted to the new key. Single-owner case requires no group redistribution -- the owner re-encrypts and republishes." The spec does not define: (1) what re-encryption means operationally (decrypt with old key, re-encrypt with new key?); (2) whether forward secrecy is provided (is the old key zeroized after re-encryption?); (3) what happens if the device is offline during rotation (stale encrypted blobs on relays); (4) the atomicity requirements (can a crash during re-encryption leave some events encrypted under the old key and some under the new key?).
 - **Security impact**: A crash during re-encryption could leave identity private state in an inconsistent state where some events require the old key (which may have been zeroized) and others require the new key. Data loss of block lists, graph policies, and other identity-critical state.
 - **Severity**: MEDIUM
+- **Resolution (later)**: Accepted and fixed. `03-identity.md` §3.7, Identity Private State, states the rotation procedure, and `03-identity.md` §3.10.13, the service record, states where the private state is stored.
 
 ### [CRYPTO-32] UCAN CID Computation Not Specified in Protocol Spec
 - **Construction**: UCAN revocation CID computation

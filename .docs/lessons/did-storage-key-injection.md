@@ -1,26 +1,12 @@
-# DID Values in Storage Key Construction
+# An Identifier Interpolated Into a Storage Key Can Escape Its Namespace
 
-## Problem
+`DID` (`crates/scp-did/src/lib.rs`) implements `From<&str>` and `From<String>` with no
+character validation. Storage keys use `/` as the hierarchy separator (spec §17.3), and code
+builds keys such as `format!("identity/{did}/state")` (`crates/scp-ffi/src/identity.rs`), so an
+identifier string containing `/` or `../` addresses keys outside its namespace on any backend that
+treats keys hierarchically.
 
-The `DID` type (`scp-core/src/identity/mod.rs`) accepts arbitrary strings via `From<&str>` and `From<String>` with no character validation. When DID values are interpolated into storage keys (e.g., `format!("identity/{did}/adapter_credentials/{adapter_id}")`), a DID containing `/` or `../` sequences can address keys outside the intended namespace.
-
-## Why It Matters
-
-- The `ProtocolRepository` key convention uses `/` as a hierarchy separator (spec section 17.3).
-- Every `ProtocolRepository` domain method that constructs keys from DID values inherits this risk.
-- Current `InMemoryStorage` treats keys as opaque strings (safe), but filesystem-backed or hierarchical storage backends could be vulnerable.
-- The adapter_id side of this is already defended: `validate_adapter()` restricts adapter_id to `[a-zA-Z0-9_-]`.
-
-## Correct Approach
-
-Validate DID strings at the `DID` type level, not piecemeal at each usage site. W3C DID Core syntax: `did:method-name:method-specific-id`. The method-specific-id allows `[a-zA-Z0-9._%-]` and `:` separators but not `/`. A validation constructor on `DID` (e.g., `DID::try_new()`) that rejects strings containing `/` would close this class of issue across the entire codebase.
-
-## Affected Files
-
-- `crates/scp-core/src/identity/mod.rs` -- DID type definition
-- `crates/scp-core/src/store/economy.rs` -- `adapter_credential_key()` constructs keys from DID
-- Any future `ProtocolRepository` domain methods using the `identity/{did}/...` key convention
-
-## Found In
-
-SCP-162 crypto review (adapter credential management).
+Validate at the type, not at each use site. The identifier's text form is `scp:` followed by
+lowercase unpadded base32 (`03-identity.md` §3.1) and never contains `/`, so a checked
+constructor that accepts only that form closes the class for every key builder at once. Adapter ids already get this treatment: `validate_adapter()`
+restricts them to `[a-zA-Z0-9_-]`.

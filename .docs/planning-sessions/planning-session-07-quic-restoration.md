@@ -34,7 +34,7 @@ During parallel coder dispatch, agents given `isolation: "worktree"` had their *
 
 ### Corrections to the original investigation (now reflected below)
 
-- Spec citation for probe/fallback is **§10.14.3 item 4**, not "§10.14.3.4" (no such subsection exists). Advertisement format is **§10.5.1**.
+- Spec citation for probe/fallback is **§10.14.3 item 4**, not §10.14.3.4 [no such section]. Advertisement format is **§10.5.1**.
 - The "~270 lines deleted" figure is closer to **~530 lines restored** (the four type bodies + impls + consts + the `ClientSessionStore` impl); `git show --stat` for PR-1 shows +561 in lifecycle.rs.
 
 ---

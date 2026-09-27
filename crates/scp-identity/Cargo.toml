@@ -14,6 +14,10 @@ categories = ["authentication", "cryptography"]
 scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
 scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2" }
+# The DID-record relay frame (`DidRecordV1`, §9.10.12) lives in the wasm-safe
+# `scp-protocol` leaf. Acyclic: `scp-protocol` depends only on `scp-did` /
+# `scp-event-log`, neither of which depends on `scp-identity`.
+scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
 # Crypto primitives ONLY (ADR-062 §Decision 6). `testing` is NO LONGER enabled
 # here: the standalone identity construction front-end (`config.rs`, ADR-052
 # Phase B-P3e) previously minted an `InMemoryPreRotationCustody` (a §17.17.2
@@ -61,6 +65,9 @@ scp-platform = { path = "../scp-platform", features = ["testing", "encrypting"] 
 # crate's own test build (per-crate `cargo test -p scp-identity`).
 scp-dht = { path = "../scp-dht", features = ["testing"] }
 ed25519-dalek = { workspace = true }
+# Captures `tracing` output so the §3.10.6 layer-disabled MUST can be asserted
+# mechanically (the warning is unconditional, so no callback observes it).
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [lints]
 workspace = true

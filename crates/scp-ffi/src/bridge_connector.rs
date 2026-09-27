@@ -76,7 +76,7 @@ use crate::error::ScpPyError;
 /// Selects the given bridge instance's **durable** credential store, or fails
 /// closed if storage has not been selected.
 ///
-/// The store is derived from the instance's chosen [`StorageProvider`]
+/// The store is derived from the instance's chosen [`StorageProvider`](crate::runtime::StorageProvider)
 /// (ADR-062 §Decision 5, SCP-CAPINJECT-009): a real durable backend that
 /// persists bridge tokens through the same storage the supervisor uses. There
 /// is no in-memory fallback — a missing storage selection is a fail-closed

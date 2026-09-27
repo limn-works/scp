@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::EnvelopeError;
+use crate::trust::custody_violation::CategoryARejection;
 use scp_did::SigningKeyId;
 
 // ---------------------------------------------------------------------------
@@ -403,11 +404,16 @@ pub fn verify_inner_signature(
 /// Call this **after** [`verify_inner_signature`] returns `Ok(true)`. If the
 /// envelope's `signing_key_id` is [`SigningKeyId::Agent`] and the
 /// `action_resource` is a Category A resource (DID document modification),
-/// returns `Err` with the violation details. The caller should reject the
-/// envelope and optionally persist/broadcast the custody violation
-/// attestation.
+/// returns `Err` with a [`CategoryARejection`] that carries both halves ADR-039,
+/// shared-DID human-agent identity model (`.docs/adrs/phase-1.md`),
+/// enforcement-stack layer 3 requires: the rejection a caller surfaces, and the
+/// [`CategoryAViolation`](crate::trust::custody_violation::CustodyViolationType::CategoryAViolation)
+/// record a caller logs, holding `inner.signature` as the observed evidence.
 ///
 /// For Category B actions or Active-key signatures, returns `Ok(())`.
+///
+/// A caller that only rejects the envelope converts the rejection with
+/// `EnvelopeError::from`, which keeps the message and drops the record.
 ///
 /// # Arguments
 ///
@@ -418,26 +424,36 @@ pub fn verify_inner_signature(
 ///
 /// # Errors
 ///
-/// Returns [`EnvelopeError::CategoryAViolation`] if an agent key attempted
-/// a DID document modification.
+/// Returns [`CategoryARejection`] if an agent key attempted a DID document
+/// modification.
 pub fn enforce_inner_envelope_category_a(
     inner: &InnerEnvelope,
     action_resource: &str,
-) -> Result<(), EnvelopeError> {
+) -> Result<(), CategoryARejection> {
     use crate::trust::custody_violation::{classify_action, enforce_category_a};
 
     let category = classify_action(action_resource);
-    if let Err(violation) = enforce_category_a(
+    enforce_category_a(
         inner.signing_key_id,
         category,
         &inner.sender_did,
         &format!("inner envelope action: {action_resource}"),
         &inner.signature,
-    ) {
-        return Err(EnvelopeError::CategoryAViolation(violation.error_message));
-    }
+    )
+    .map_err(CategoryARejection::from)
+}
 
-    Ok(())
+impl From<CategoryARejection> for EnvelopeError {
+    /// Keeps the rejection message and drops the violation record.
+    ///
+    /// A caller that logs the record matches on [`CategoryARejection`] before
+    /// converting, because [`EnvelopeError::CategoryAViolation`] carries a
+    /// string and cannot hold a
+    /// [`CategoryAViolation`](crate::trust::custody_violation::CustodyViolationType::CategoryAViolation)
+    /// record.
+    fn from(rejection: CategoryARejection) -> Self {
+        Self::CategoryAViolation(rejection.error_message().to_owned())
+    }
 }
 
 /// Validates that an inner envelope's version field is compatible (§13.5).
@@ -577,6 +593,84 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+
+    /// Builds an envelope whose `signing_key_id` is `#agent` and whose
+    /// `signature` carries the given byte, for Category A enforcement tests.
+    fn agent_signed_envelope(signature_byte: u8) -> InnerEnvelope {
+        InnerEnvelope {
+            version: SCP_INNER_ENVELOPE_VERSION,
+            context_id: "ctx-1".to_string(),
+            sender_did: "did:dht:alice".to_string(),
+            epoch: 1,
+            generation: 0,
+            sequence: 1,
+            timestamp: 1_700_000_000,
+            message_type: MessageType::Content,
+            payload_hash: [0u8; 32],
+            payload: Vec::new(),
+            provenance: None,
+            provenance_hash: [0u8; 32],
+            signing_key_id: SigningKeyId::Agent,
+            signature: [signature_byte; 64],
+            extensions: HashMap::new(),
+        }
+    }
+
+    /// ADR-039, shared-DID human-agent identity model (`.docs/adrs/phase-1.md`),
+    /// enforcement-stack layer 3 requires a verification point to reject a
+    /// Category A action `#agent` signed and to record it. This test pins the
+    /// recording half: the envelope's own signature bytes reach the
+    /// `signature_evidence` field of the record the rejection carries.
+    #[test]
+    fn enforce_rejection_carries_the_envelope_signature_into_a_record() {
+        use crate::trust::custody_violation::CustodyViolationType;
+
+        let envelope = agent_signed_envelope(0xAB);
+        let rejection = enforce_inner_envelope_category_a(&envelope, "did_document")
+            .expect_err("an agent key must be rejected for did_document");
+
+        assert_eq!(rejection.violator_did(), "did:dht:alice");
+        let violation = rejection
+            .recorded_violation()
+            .expect("an envelope signature is 64 bytes, so the record is conformant");
+        match violation {
+            CustodyViolationType::CategoryAViolation {
+                action,
+                signer_key_id,
+                signature_evidence,
+            } => {
+                assert_eq!(action, "inner envelope action: did_document");
+                assert_eq!(*signer_key_id, SigningKeyId::Agent);
+                assert_eq!(signature_evidence.as_slice(), envelope.signature.as_slice());
+            }
+            CustodyViolationType::AttestationMismatch { .. } => {
+                panic!("Category A enforcement must produce a CategoryAViolation")
+            }
+        }
+    }
+
+    /// A caller that only rejects the envelope converts the rejection into
+    /// [`EnvelopeError::CategoryAViolation`], which keeps the message.
+    #[test]
+    fn enforce_rejection_converts_into_an_envelope_error() {
+        let rejection = enforce_inner_envelope_category_a(&agent_signed_envelope(0xAB), "identity")
+            .expect_err("an agent key must be rejected for identity");
+        let message = rejection.error_message().to_owned();
+
+        match EnvelopeError::from(rejection) {
+            EnvelopeError::CategoryAViolation(text) => assert_eq!(text, message),
+            other => panic!("expected CategoryAViolation, got {other:?}"),
+        }
+    }
+
+    /// A Category B action signed by `#agent` produces no rejection and no
+    /// record.
+    #[test]
+    fn enforce_accepts_agent_key_for_a_category_b_action() {
+        assert!(
+            enforce_inner_envelope_category_a(&agent_signed_envelope(0xAB), "messages").is_ok()
+        );
+    }
 
     #[test]
     fn message_type_discriminator_bytes_are_stable_and_distinct() {

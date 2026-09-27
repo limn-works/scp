@@ -134,14 +134,16 @@ public struct Node: Sendable {
         handle.isShutdown()
     }
 
-    /// Starts a full application node with in-memory storage.
+    /// Starts a full application node with encrypted in-memory storage.
     ///
     /// When `identity` is provided, the node uses the pre-existing identity
     /// instead of generating a fresh one. This enables identity portability --
     /// the same DID persists across node restarts.
     ///
-    /// Auto-wires in-memory key custody, in-memory storage, in-memory DHT
-    /// client, self-signed TLS, and a relay on an OS-assigned port.
+    /// Auto-wires encrypted in-memory storage (ephemeral), self-signed TLS,
+    /// and a relay on an OS-assigned port. A build carrying a test-harness
+    /// feature also auto-wires in-memory key custody and an in-memory DHT
+    /// client; a shipped build fails closed instead when `identity` is absent.
     ///
     /// - Parameters:
     ///   - scp: The SDK-level ``SCP`` instance that will own the minted handle.
@@ -156,7 +158,7 @@ public struct Node: Sendable {
         return Node(handle: handle)
     }
 
-    /// Starts a full application node with file-backed storage.
+    /// Starts a full application node on this instance's own storage backend.
     ///
     /// When `identity` is provided, the node uses the pre-existing identity.
     /// When `nil`, the node creates or reloads a persistent identity via
@@ -164,12 +166,15 @@ public struct Node: Sendable {
     ///
     /// No passphrase is required when `identity` is provided.
     ///
-    /// Opens (or creates) persistent storage at `<dataDir>/storage/` and a
-    /// redb blob database at `<dataDir>/blobs.redb`.
+    /// A node writes protocol state into whichever storage backend `scp` was
+    /// constructed with, so it opens no protocol store of its own. A caller
+    /// wanting a node on a different backend constructs a second ``SCP``.
+    /// `dataDir` holds a redb blob database at `<dataDir>/blobs.redb` and, when
+    /// `identity` is `nil`, a key file at `<dataDir>/identity.key`.
     ///
     /// - Parameters:
     ///   - scp: The SDK-level ``SCP`` instance that will own the minted handle.
-    ///   - dataDir: Directory for persistent storage.
+    ///   - dataDir: Directory holding a blob database and a key file.
     ///   - identity: A pre-existing ``Identity`` to use, or `nil` to generate a fresh one.
     ///   - passphrase: Passphrase for Argon2id key derivation. Required when
     ///     `identity` is `nil`.

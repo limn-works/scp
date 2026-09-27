@@ -56,9 +56,10 @@ try (var identity = Identity.create("in_memory").join();
 ```java
 class IdentityTest {
     @Test
-    void createReturnsIdentityWithValidDid() throws Exception {
+    void createReturnsIdentityWith32ByteIdentifier() throws Exception {
         try (var identity = Identity.create("in_memory").join()) {
-            assertThat(identity.did()).startsWith("did:dht:");
+            // 09-security-model.md §9.7.4.2 R13
+            assertThat(identity.identifier()).hasSize(32);
         }
     }
 

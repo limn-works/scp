@@ -46,7 +46,7 @@ Modes
   regenerated output (and passes set parity) without modifying it; exit 1 on
   any difference. Used by ``scripts/check-pyi-generated.sh`` in CI.
 
-This file is an ENFORCEMENT tool (see CLAUDE.md). Weakening the parity
+This file is an ENFORCEMENT tool (see AGENTS.md). Weakening the parity
 assertions or growing the allowlists to hide real drift requires human
 approval; adding coverage is always fine.
 """

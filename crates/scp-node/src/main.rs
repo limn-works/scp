@@ -181,7 +181,8 @@ ENVIRONMENT VARIABLES:
                                 (auto-generated and stored if not set)
     SCP_RELAY_BIND_ADDR         Relay bind address (default: 0.0.0.0:9000)
     SCP_RELAY_STORAGE_BACKEND   Blob storage backend for relay: sqlite (default), redb,
-                                postgres, s3, memory
+                                postgres, s3 (both need scp-transport's postgres-blob/s3-blob,
+                                which --features cloud-blobs enables), memory
     SCP_RELAY_STORAGE_PATH      Path for sqlite/redb blob storage (default: ./scp-relay.db)
     SCP_RELAY_DATABASE_URL      PostgreSQL connection URL (required when backend=postgres)
     SCP_RELAY_S3_BUCKET         S3 bucket name (required when backend=s3)
@@ -261,7 +262,12 @@ fn resolve_storage_key_or_exit(storage_dir: &std::path::Path) -> Zeroizing<[u8; 
 // Relay blob storage from env
 // ---------------------------------------------------------------------------
 
-// `storage_from_env` is provided by `scp_transport::startup::storage_from_env`.
+// `backend_choice_from_env` and `storage_from_env` are provided by
+// `scp_transport::startup`.
+
+/// This binary's cargo feature that compiles the `postgres` and `s3` blob
+/// backends; a build without it names this feature when it rejects either.
+const CLOUD_BLOBS_FEATURE: &str = "cloud-blobs";
 
 // ---------------------------------------------------------------------------
 // Relay-only mode
@@ -269,6 +275,7 @@ fn resolve_storage_key_or_exit(storage_dir: &std::path::Path) -> Zeroizing<[u8; 
 
 /// Runs a bare relay server (same as `scp-relay` binary).
 async fn run_relay_only() {
+    let backend = startup::backend_choice_from_env(CLOUD_BLOBS_FEATURE);
     let config = startup::relay_config_from_env();
     tracing::info!(
         bind_addr = %config.bind_addr,
@@ -277,7 +284,7 @@ async fn run_relay_only() {
         "starting scp-node in relay-only mode"
     );
 
-    let storage = Arc::new(startup::storage_from_env().await);
+    let storage = Arc::new(startup::storage_from_env(backend).await);
     let server = RelayServer::new(config, storage);
 
     let (handle, local_addr) = match server.start().await {
@@ -326,7 +333,10 @@ fn ephemeral_blob_backend() -> BlobStorageBackend {
 ///
 /// In ephemeral mode, ALL subsystems use in-memory implementations regardless
 /// of environment variable overrides. No mixed mode is permitted — if you want
-/// persistent storage or production DHT, omit the `--ephemeral` flag.
+/// persistent storage or production DHT, omit the `--ephemeral` flag. The mode
+/// exits when `SCP_RELAY_STORAGE_BACKEND` names `postgres` or `s3`, because it
+/// would otherwise keep blobs in memory in place of the store the operator
+/// selected.
 ///
 /// **Test-harness-only.** This path wires the `InMemoryDhtClient` (a §17.17.3
 /// resolve nullifier) and `InMemoryKeyCustody`, so it is compiled only under the
@@ -341,6 +351,7 @@ async fn run_full_node_ephemeral() {
     use scp_platform::in_memory::InMemoryStorage;
     use scp_platform::testing::InMemoryKeyCustody;
 
+    exit_on_ignored_cloud_backend("--ephemeral", EPHEMERAL_STORE);
     let domain = require_domain();
     let http_addr = node_http_addr();
 
@@ -377,8 +388,6 @@ async fn run_full_node_ephemeral() {
         sequence_store,
     ));
 
-    let seq_init_method = Arc::clone(&did_method);
-    let seq_init = scp_node::self_host::make_seq_init(seq_init_method);
     // Wrap InMemoryStorage in EncryptingAdapter to satisfy the
     // EncryptedStorage bound. Ephemeral mode data is lost on restart
     // anyway, so a random key is fine.
@@ -392,7 +401,6 @@ async fn run_full_node_ephemeral() {
         domain,
         http_addr,
         custody,
-        seq_init,
         did_method,
         encrypted_storage,
         // Ephemeral contract: in-memory blob, no persistence, env ignored.
@@ -469,6 +477,10 @@ fn validate_storage_path_or_exit(dir: &std::path::Path) {
 
 /// Runs the full node with persistent `SQLite` storage (production default).
 async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
+    // Parse the blob backend before anything below creates the storage
+    // directory, the storage key, or a store, so a backend this build cannot
+    // serve exits with nothing left on disk.
+    let backend = startup::backend_choice_from_env(CLOUD_BLOBS_FEATURE);
     let domain = require_domain();
     let http_addr = node_http_addr();
 
@@ -518,7 +530,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 "using InMemoryDhtClient — DID documents will NOT be published to the network \
                  (test-harness-only; DhtMode::Disabled is the shipped no-publish value)"
             );
-            let (did_method, seq_init) = scp_node::self_host::build_memory_did_method(
+            let did_method = scp_node::self_host::build_memory_did_method(
                 Arc::clone(&custody),
                 cache,
                 sequence_store,
@@ -529,14 +541,13 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 domain,
                 http_addr,
                 custody,
-                seq_init,
                 did_method,
                 Arc::clone(&node_storage_arc),
                 // Persistent mode: operator-configured durable blob backend
                 // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
                 // `SCP_RELAY_STORAGE_PATH` — the same explicit selection
                 // relay-only mode makes (SCP-CAPINJECT-010).
-                startup::storage_from_env().await,
+                startup::storage_from_env(backend).await,
             )
             .await;
         }
@@ -544,13 +555,13 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
             // DHT HTTP gateways come from the same env var the self-host path
             // reads; the library helper threads them into the pkarr client.
             let dht_gateways = dht_gateways_from_env();
-            let (did_method, seq_init) = match scp_node::self_host::build_production_did_method(
+            let did_method = match scp_node::self_host::build_production_did_method(
                 Arc::clone(&custody),
                 cache,
                 sequence_store,
                 &dht_gateways,
             ) {
-                Ok(pair) => pair,
+                Ok(method) => method,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to build production DID method");
                     std::process::exit(1);
@@ -562,13 +573,12 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 domain,
                 http_addr,
                 custody,
-                seq_init,
                 did_method,
                 Arc::clone(&node_storage_arc),
                 // Persistent mode: operator-configured durable blob backend
                 // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
                 // `SCP_RELAY_STORAGE_PATH` (SCP-CAPINJECT-010).
-                startup::storage_from_env().await,
+                startup::storage_from_env(backend).await,
             )
             .await;
         }
@@ -714,6 +724,53 @@ fn env_flag_is_truthy(value: Option<&str>) -> bool {
     matches!(value, Some("1" | "true"))
 }
 
+/// Writes the error a mode that ignores `SCP_RELAY_STORAGE_BACKEND` exits with
+/// when the variable names `postgres` or `s3`, or returns `None` for every other
+/// value.
+///
+/// `--self-host` opens only a `SQLite` blob store and `--ephemeral` only an
+/// in-memory one, in every build. Without this check, an operator who selected
+/// `postgres` or `s3` would get the mode's own store in its place. Every other
+/// value leaves the mode on its own store, as it ran before `cloud-blobs`
+/// existed. `flag` names the mode and `store` says where it keeps blobs.
+///
+/// The value is parsed by [`startup::BackendChoice::parse`], the parse
+/// `backend_choice_from_env` runs, so the two cannot disagree about which
+/// values name a cloud backend.
+fn fixed_store_backend_conflict(flag: &str, store: &str, selected: Option<&str>) -> Option<String> {
+    let value = selected?;
+    let cloud = match startup::BackendChoice::parse(value) {
+        Ok(choice) => choice.is_cloud(),
+        Err(startup::BackendSelectionError::NotCompiled { .. }) => true,
+        Err(startup::BackendSelectionError::Unknown { .. }) => false,
+    };
+    if !cloud {
+        return None;
+    }
+    Some(format!(
+        "error: {flag} stores blobs {store} and cannot use \
+         SCP_RELAY_STORAGE_BACKEND='{value}'. Unset the variable, or run the full \
+         node or --relay-only, which read it."
+    ))
+}
+
+/// Exits the process with [`fixed_store_backend_conflict`]'s error when
+/// `SCP_RELAY_STORAGE_BACKEND` names `postgres` or `s3`.
+fn exit_on_ignored_cloud_backend(flag: &str, store: &str) {
+    let selected = std::env::var("SCP_RELAY_STORAGE_BACKEND").ok();
+    if let Some(message) = fixed_store_backend_conflict(flag, store, selected.as_deref()) {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
+}
+
+/// Where `--self-host` stores blobs, as its rejection message words it.
+const SELF_HOST_STORE: &str = "in SQLite under its storage directory";
+
+/// Where `--ephemeral` stores blobs, as its rejection message words it.
+#[cfg(any(test, feature = "testing"))]
+const EPHEMERAL_STORE: &str = "in memory";
+
 /// Runs the node in self-host mode, hosting a static site entirely on SCP.
 ///
 /// Reads the self-host configuration from CLI args and environment variables,
@@ -731,6 +788,7 @@ fn env_flag_is_truthy(value: Option<&str>) -> bool {
 /// (share it out-of-band). `memory` is valid with NAT probing on or off. See the
 /// startup banner.
 async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf>) {
+    exit_on_ignored_cloud_backend("--self-host", SELF_HOST_STORE);
     let port: u16 = startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16);
     let plaintext = self_host_plaintext();
     let skip_nat = self_host_skip_nat();
@@ -896,10 +954,11 @@ fn dht_gateways_from_env() -> Vec<String> {
 /// Shared implementation for `run_full_node`, parameterized over DID method
 /// and storage type.
 ///
-/// The `seq_init` callback is invoked with the node's DID string after
-/// `build()` completes, before any publish operation. It calls
-/// `DidDht::initialize_sequence` to recover the BEP44 sequence number from
-/// the persistent store and/or DHT.
+/// The BEP44 publish-sequence counter is bootstrapped INSIDE the node builder
+/// (`build_domain_inner` / `build_no_domain_inner`), ahead of the startup
+/// publish, via [`scp_identity::DidMethod::initialize_sequence`] — so `Node::start`
+/// already publishes at the correct next sequence and no post-build step is
+/// needed here (SCP-RELAYRES-004).
 async fn run_node_with<
     K: scp_platform::KeyCustody + 'static,
     D: scp_identity::DidMethod + 'static,
@@ -908,7 +967,6 @@ async fn run_node_with<
     domain: String,
     http_addr: SocketAddr,
     custody: Arc<K>,
-    seq_init: scp_node::self_host::SeqInitFn,
     did_method: Arc<D>,
     storage: S,
     // The relay's blob backend, selected by each caller at ITS OWN boundary
@@ -917,8 +975,9 @@ async fn run_node_with<
     // (that would re-introduce the SCP-CAPSEL-8002 anti-pattern the story kills,
     // and would break ephemeral mode's all-in-memory contract). Ephemeral mode
     // passes `ephemeral_blob_backend()` (in-memory, no persistence, env-ignoring);
-    // persistent mode passes `startup::storage_from_env()` (durable, default
-    // SQLite, honors env).
+    // persistent mode passes `startup::storage_from_env(backend)` (durable, honors
+    // env). `startup::backend_choice_from_env` chose `backend`, and it defaults to
+    // SQLite.
     blob_storage: BlobStorageBackend,
 ) {
     let use_self_signed = env_flag_is_truthy(env::var("SCP_NODE_TLS_SELF_SIGNED").ok().as_deref());
@@ -1013,12 +1072,9 @@ async fn run_node_with<
         }
     };
 
-    // Initialize BEP44 sequence number from persistent store and/or DHT
-    // BEFORE any publish operation.
-    let did = node.identity().did().to_owned();
-    if let Err(e) = seq_init(did).await {
-        tracing::error!(error = %e, "failed to initialize BEP44 sequence — publishing may fail");
-    }
+    // The BEP44 sequence counter was bootstrapped inside the builder ahead of
+    // the startup publish (SCP-RELAYRES-004), so `Node::start` above already
+    // published at the correct next sequence — no post-build seq step here.
 
     tracing::info!(
         did = %node.identity().did(),
@@ -1144,11 +1200,40 @@ async fn main() {
 mod tests {
     use super::*;
 
+    /// `--self-host` and `--ephemeral` each reject `postgres` and `s3` in any
+    /// case, and leave every other value to run on the mode's own store.
+    #[test]
+    fn a_fixed_store_mode_rejects_a_cloud_backend() {
+        for (flag, store) in [
+            ("--self-host", SELF_HOST_STORE),
+            ("--ephemeral", EPHEMERAL_STORE),
+        ] {
+            for value in ["postgres", "s3", "POSTGRES", "S3"] {
+                let message = fixed_store_backend_conflict(flag, store, Some(value));
+                assert!(
+                    message.as_deref().is_some_and(|m| m.contains(&format!(
+                        "{flag} stores blobs {store} and cannot use SCP_RELAY_STORAGE_BACKEND='{value}'"
+                    ))),
+                    "{flag} must reject '{value}'; got {message:?}"
+                );
+            }
+            assert_eq!(fixed_store_backend_conflict(flag, store, None), None);
+            for value in ["sqlite", "redb", "memory", "banana"] {
+                assert_eq!(
+                    fixed_store_backend_conflict(flag, store, Some(value)),
+                    None,
+                    "{flag} {value}"
+                );
+            }
+        }
+    }
+
     /// Regression guard (SCP-CAPINJECT-010): ephemeral mode MUST select the
     /// in-memory blob backend — no persistence, env overrides ignored. This pins
     /// the ephemeral caller's boundary selection so it cannot silently regress to
-    /// a durable / env-driven backend (`startup::storage_from_env`, which defaults
-    /// to `Sqlite`), which would break the all-in-memory contract documented on
+    /// a durable / env-driven backend (`startup::storage_from_env` on the choice
+    /// `startup::backend_choice_from_env` makes, which defaults to `Sqlite`),
+    /// which would break the all-in-memory contract documented on
     /// `run_full_node_ephemeral` and re-persist blobs to disk. If someone swaps
     /// `ephemeral_blob_backend()` to any non-in-memory backend, this fails.
     #[test]

@@ -5,7 +5,7 @@
 # `rust-toolchain.toml` is the one place this repository names a stable Rust version, and
 # `fuzz/rust-toolchain.toml` the one place it names a nightly. Every consumer derives the
 # version from one of those two files, so no two consumers can disagree. This gate checks
-# the three things a derivation cannot establish on its own.
+# the four things a derivation cannot establish on its own.
 #
 # ── CHECK 1: every container build proves which compiler it resolved ─────────────────
 #
@@ -90,9 +90,11 @@
 # criterion while the gate printed OK: its `rust-docs` job runs
 # `cargo doc --workspace --document-private-items`, which compiles every crate of this
 # workspace on whatever the pin names, and its `docs` filter listed no toolchain file, so
-# a pull request that raised the pin skipped the one job that exercises rustdoc on the new
-# compiler. That workflow's own header records what an unrun `rust-docs` cost once
-# already: three broken intra-doc links rode `main` for ten days.
+# a pull request that raised the pin skipped that job. Job rust-doc in ci.yml runs the
+# same rustdoc command and its `rust` output ORs a `toolchain` filter, so a pin change now
+# reaches rustdoc through the required check as well. That workflow's own header records
+# what an unrun `rust-docs` cost once already: three broken intra-doc links rode `main`
+# for ten days.
 #
 # `on: pull_request: paths:` is the other way a workflow narrows what it runs, and the
 # criterion does not bind it: a required check whose workflow never starts stays pending
@@ -146,9 +148,27 @@
 #   Checks 2c and 2d read `ci.yml` alone, because the `rust` and `fuzz` filters they name
 #   live there and guard the jobs that compile from those files.
 #
+#   2e — THE WORKFLOW FILE, ROUTED TO EVERY LANE IT DEFINES. Every job a paths filter
+#   guards takes its command, its feature list, its matrix and its cache group from the
+#   workflow file that declares it, so that file decides every one of those jobs the way
+#   `.clippy.toml` decides `rust-clippy`. The file satisfies the 2c criterion: a pull
+#   request that rewrites one job's command and changes nothing else is rare, and before
+#   `ci.yml` listed itself such a pull request left every filter output false, skipped the
+#   job, and merged with the `ci` aggregator green over a command nothing had run. Listing
+#   the file in the `rust` filter alone then closed the hole for the Rust lane and left it
+#   open for `python-test`, `typescript-check`, `typescript-wasm-check`,
+#   `scaffold-typescript-web-check`, `kotlin-test`, `swift-build-test` and `fuzz-build`,
+#   each of which takes its command from the same file. The gate therefore reads every
+#   output of the `changes` job of every paths-filtered workflow, reads the filter names
+#   that output's expression refers to, and fails when none of those filters lists the
+#   workflow's own path. An output that ORs the `toolchain` filter in is routed by the one
+#   entry there; the `fuzz` output reads its own filter alone, so the `fuzz` filter holds
+#   the second copy.
+#
 # An `OK` from check 2 is not a claim that the filters are correct. It says the pin reaches
-# every lane of every paths-filtered workflow, and that every root-level file and every
-# cargo configuration file is classified. A `rust` filter stripped of `crates/**` still
+# every lane of every paths-filtered workflow, that every root-level file and every cargo
+# configuration file is classified, and that every lane of every paths-filtered workflow
+# runs when its own workflow file changes. A `rust` filter stripped of `crates/**` still
 # passes, and it does not need this gate: that omission reveals itself.
 #
 # ── CHECK 3: mise names no Rust version source ───────────────────────────────────────
@@ -188,10 +208,35 @@
 # The parse reads `.mise.toml`, the one mise configuration file this repository tracks, and
 # fails when that file is absent.
 #
+# Check 3 reads a file, so it establishes what that file says and nothing about the shell
+# running it. mise is one source of a `RUSTUP_TOOLCHAIN`, and check 4 covers every source.
+#
+# ── CHECK 4: the compiler this shell resolves is the one the pin names ────────────────
+#
+# THE CRITERION: a cargo command run in this repository compiles on the version
+# `rust-toolchain.toml` names. Checks 1 through 3 compare files against files, and a shell
+# whose `RUSTUP_TOOLCHAIN` replaces the pin passes all three while every local
+# `cargo clippy` runs on a compiler this repository does not name — which is the outage
+# `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md` records, reproduced
+# after that lesson was written.
+#
+# `scripts/check-resolved-rustc.sh` holds the comparison, and its header states the two
+# falsifiers it tests and the one state in which it cannot test the second. This gate runs
+# it and quotes each line it prints, so `bash scripts/check-toolchain-wiring.sh` fails in a
+# shell that resolves the wrong compiler.
+#
+# WHERE THIS CHECK HAS A TARGET. A GitHub runner exports no `RUSTUP_TOOLCHAIN` and its
+# checkout has compiled nothing, so in the `enforcement / toolchain wiring` job check 4
+# reports that the environment replaces nothing and that rustup holds no pinned toolchain
+# to compare. The check's target is a developer's or an agent's shell, and that shell runs
+# this gate too, before it pushes. Placing the comparison only in CI is what made an earlier
+# revision of it report success forever, and this gate is not that placement: the same
+# command an agent runs locally fails there.
+#
 # The gate FAILS CLOSED: a missing workflow, a missing filter, a filter with no path
 # entries, a `changes` job with no outputs, an empty root-file listing, an undiscoverable
-# git tree, a `.mise.toml` no TOML parser accepts, and no available TOML parser are each
-# failures, never skipped checks. See
+# git tree, a `.mise.toml` no TOML parser accepts, no available TOML parser, and a missing
+# `scripts/check-resolved-rustc.sh` are each failures, never skipped checks. See
 # `.docs/lessons/coverage-gates-must-fail-closed.md`.
 #
 # Usage: bash scripts/check-toolchain-wiring.sh
@@ -344,8 +389,8 @@ fi
 # claim at face value — it is the one judgement this check cannot make.
 NO_RUST_JOB_READS=(
     # Documentation and licensing. No job compiles from them.
+    "AGENTS.md"
     "CHANGELOG.md"
-    "CLAUDE.md"
     "CONTRIBUTING.md"
     "GETTING-STARTED.md"
     "LICENSE"
@@ -496,7 +541,43 @@ check_pin_reaches_every_lane() {
     done <<< "$outputs"
 }
 
-# 2a/2b — over every workflow a paths filter guards, `ci.yml` among them.
+# 2e for one workflow: every output of its `changes` job reads at least one filter that
+# lists the workflow's own path.
+#
+# The expression of an output names the filters it reads as `steps.filter.outputs.<name>`,
+# and the gate resolves each name against the workflow's own filter block. An output that
+# reads a filter this file cannot find — a name with no block, or a block with no path
+# entries — reports the same way as one whose filters all miss the file: nothing routes
+# the workflow to that lane. `$wf` is the path the workflow listing printed, relative to
+# the repository root, which is the form a filter entry takes.
+check_workflow_routes_itself() {
+    local wf=$1 outputs line output_name output_expr filter_name entries routed
+
+    outputs=$(changes_job_outputs "$wf")
+    # Check 2b reports the absence of outputs; this check has nothing further to read.
+    [[ -n $outputs ]] || return 0
+
+    while IFS= read -r line; do
+        [[ -n $line ]] || continue
+        output_name=${line%%=*}
+        output_expr=${line#*=}
+        routed=0
+        while IFS= read -r filter_name; do
+            [[ -n $filter_name ]] || continue
+            entries=$(filter_entries "$wf" "$filter_name")
+            if routed_by "$wf" "$entries"; then
+                routed=1
+                break
+            fi
+        done < <(grep -oE 'steps\.filter\.outputs\.[A-Za-z0-9_.-]+' <<< "$output_expr" \
+            | sed -E 's/^steps\.filter\.outputs\.//' | sort -u)
+        if [[ $routed -eq 0 ]]; then
+            report "$wf: the 'changes' job's '$output_name' output reads no filter that lists $wf, so a pull request that rewrites a command in this workflow and changes nothing else skips every job that output guards, and each status check reports the skip as a pass. List $wf in the '$TOOLCHAIN_FILTER' filter when that output ORs it in, or in the output's own filter when it does not."
+        fi
+    done <<< "$outputs"
+}
+
+# 2a/2b/2e — over every workflow a paths filter guards, `ci.yml` among them.
 filtered_workflows=$(paths_filter_workflows)
 if [[ -z $filtered_workflows ]]; then
     report "no workflow under $WORKFLOW_DIR/ declares a dorny/paths-filter step, so the gate cannot check that a change to $PIN reaches the jobs that compile on it"
@@ -504,6 +585,7 @@ else
     while IFS= read -r workflow; do
         [[ -n $workflow ]] || continue
         check_pin_reaches_every_lane "$workflow"
+        check_workflow_routes_itself "$workflow"
     done <<< "$filtered_workflows"
 fi
 
@@ -623,10 +705,28 @@ else
     fi
 fi
 
+# ── Check 4 ──────────────────────────────────────────────────────────────────────────
+
+RESOLVED_RUSTC_CHECK="scripts/check-resolved-rustc.sh"
+resolved_rustc_report=""
+
+if [[ ! -f $RESOLVED_RUSTC_CHECK ]]; then
+    report "$RESOLVED_RUSTC_CHECK does not exist, so the gate cannot check which compiler this shell resolves. Checks 1 through 3 compare files against files, and a RUSTUP_TOOLCHAIN in the environment replaces $PIN without changing any of them."
+else
+    # The script prints one line per finding and names no severity, so the gate quotes each
+    # line through `report`, which is what puts a FAIL prefix on it and sets the exit code.
+    if ! resolved_rustc_report=$(bash "$RESOLVED_RUSTC_CHECK" 2>&1); then
+        while IFS= read -r resolved_rustc_line; do
+            if [[ -n $resolved_rustc_line ]]; then report "$resolved_rustc_line"; fi
+        done <<< "$resolved_rustc_report"
+    fi
+fi
+
 if [[ $fail -eq 0 ]]; then
     printf 'OK: every container build asserts it resolved the compiler %s names\n' "$PIN"
-    printf 'OK: every lane of every paths-filtered workflow routes a %s change, and every root-level file and cargo configuration file is routed or declared unread\n' "$PIN"
+    printf 'OK: every lane of every paths-filtered workflow routes a %s change and a change to its own workflow file, and every root-level file and cargo configuration file is routed or declared unread\n' "$PIN"
     printf 'OK: %s names no Rust version source, so rustup resolves each directory from its own toolchain file\n' "$MISE_CONFIG"
+    printf 'OK: %s\n' "$resolved_rustc_report"
     exit 0
 fi
 exit 1

@@ -732,7 +732,7 @@ impl FullStackNode {
     /// For each existing member `incumbent`, the incumbent issues a signed
     /// [`SenderKeyRequest`](scp_core::crypto::sender_keys::SenderKeyRequest)
     /// carrying a FRESH EPHEMERAL wrapping key, the joiner (`self`) answers via
-    /// [`NodeMlsFactory::handle_sender_key_request`](scp_core::crypto::mls::provider::NodeMlsFactory::handle_sender_key_request),
+    /// [`Supervisor::handle_sender_key_request`](scp_core::context::supervisor::Supervisor::handle_sender_key_request),
     /// and the incumbent opens the response with its ephemeral secret and stores
     /// the joiner's key in its OWN provider. This is the real request/response
     /// round trip, not a shortcut: the joiner's response goes through the H1
@@ -993,7 +993,7 @@ impl FullStackNode {
     }
 
     /// Opens a captured ciphertext through the MLS + sender-key + inner-envelope
-    /// layers and returns the decrypted [`InnerEnvelope`] without unwrapping the
+    /// layers and returns the decrypted [`InnerEnvelope`](scp_core::envelope::InnerEnvelope) without unwrapping the
     /// access-key content layer, so tests can inspect `message_type` /
     /// `sequence` / `payload` (e.g. assert a sent heartbeat is tagged
     /// `MessageType::Heartbeat` and carries sequence `0`, §9.9.2).
@@ -1002,7 +1002,7 @@ impl FullStackNode {
     ///
     /// The crypto state is actor-owned (one-way take), so this routes through the
     /// context actor via
-    /// [`Supervisor::inspect_incoming_inner`](scp_core::context::Supervisor::inspect_incoming_inner)
+    /// [`Supervisor::inspect_incoming_inner`](scp_core::context::supervisor::Supervisor::inspect_incoming_inner)
     /// — the actor twin of the deleted provider `open` inspection twin. The actor
     /// handler decrypts through the OWNED crypto state and returns the RAW inner
     /// envelope.
@@ -1092,7 +1092,7 @@ impl FullStackNode {
     ///
     /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): replaces the deleted provider
     /// `open` / `mls_encrypt_management` pickup twins. Each blob is dispatched
-    /// via [`Supervisor::deliver_commit_blob`](scp_core::context::Supervisor::deliver_commit_blob),
+    /// via [`Supervisor::deliver_commit_blob`](scp_core::context::supervisor::Supervisor::deliver_commit_blob),
     /// whose `decrypt_and_dispatch` merges Commits (advancing the MLS epoch) and
     /// installs authenticated sender keys through the same gate-before-install
     /// path production uses. Commits are applied BEFORE sender-key blobs so a
