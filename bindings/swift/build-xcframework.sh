@@ -32,9 +32,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 FFI_CRATE_DIR="$REPO_ROOT/crates/scp-ffi/uniffi"
 FFI_LIB_NAME="libscp_ffi_uniffi.a"
 
-# Cargo target directory (respect CARGO_TARGET_DIR if set)
-TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
-
 # Apple targets
 TARGET_IOS="aarch64-apple-ios"
 TARGET_IOS_SIM_ARM="aarch64-apple-ios-sim"
@@ -48,7 +45,6 @@ XCFRAMEWORK_OUTPUT="$SCRIPT_DIR/ScpFFI.xcframework"
 
 # Header and bindings output directories
 HEADER_DIR="$SCRIPT_DIR/Headers"
-HEADER_FILE="$HEADER_DIR/ScpFFI.h"
 MODULE_MAP="$HEADER_DIR/module.modulemap"
 BINDINGS_DIR="$SCRIPT_DIR/Sources/SCP/Internal"
 
@@ -131,6 +127,15 @@ mkdir -p "$BINDINGS_DIR"
 command -v cargo >/dev/null 2>&1 || die "cargo not found. Install the Rust toolchain."
 command -v xcodebuild >/dev/null 2>&1 || die "xcodebuild not found. Install Xcode command-line outlets."
 command -v lipo >/dev/null 2>&1 || die "lipo not found. Install Xcode command-line outlets."
+
+# Cargo target directory. Cargo resolves it from `CARGO_TARGET_DIR`, then
+# `build.target-dir` in any `.cargo/config.toml` it reads, then `<workspace>/target`,
+# so this script asks cargo instead of assuming `$REPO_ROOT/target`: a machine whose
+# `~/.cargo/config.toml` points every worktree at one shared directory builds the
+# libraries outside this checkout. `cargo metadata --no-deps` compiles nothing.
+TARGET_DIR=$(cargo metadata --manifest-path "$FFI_CRATE_DIR/Cargo.toml" --format-version 1 --no-deps \
+    | sed -nE 's/.*"target_directory":"([^"]*)".*/\1/p')
+[ -n "$TARGET_DIR" ] || die "cargo metadata named no target directory for $FFI_CRATE_DIR"
 
 # Verify all Rust targets are installed
 for target in "${ALL_TARGETS[@]}"; do
