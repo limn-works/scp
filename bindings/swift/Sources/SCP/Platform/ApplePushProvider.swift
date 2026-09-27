@@ -1,14 +1,17 @@
 // ApplePushProvider — APNs push notification registration with opaque silent-push payloads.
 //
-// This file implements the ``PushProvider`` callback interface (defined in
-// `crates/scp-ffi/uniffi/src/lib.rs`) for Apple platforms (iOS 17+, macOS 14+).
+// This file holds the APNs push adapter for Apple platforms (iOS 17+, macOS 14+).
+// ADR-025, the Apple platform adapter, requires this adapter to conform to the
+// UniFFI `PushProvider` callback interface in `crates/scp-ffi/uniffi/src/lib.rs`.
+// The shipped actor does not conform yet (ADR-025 acceptance criterion 4).
 //
 // ## Architecture
 //
-// `ApplePushProvider` is a Swift actor that bridges the asynchronous APNs token
-// delivery lifecycle into the synchronous UniFFI callback interface. It is one of
-// the four platform providers assembled by ``ApplePlatformAdapter`` (ADR-025) and
-// injected into the Rust engine at SDK initialisation.
+// `ApplePushProvider` is a Swift actor that turns the AppDelegate callbacks that
+// deliver an APNs token into one `async` call. ADR-025 has an `ApplePlatformAdapter`
+// assemble the four platform providers and inject them into the Rust engine at SDK
+// initialisation. No `ApplePlatformAdapter` exists yet, so no code injects this
+// actor into the Rust engine.
 //
 // ## APNs Payload Opacity (§10.7)
 //
@@ -88,15 +91,15 @@
 
     /// Actor-isolated APNs push notification provider for the SCP Rust engine.
     ///
-    /// This actor does not conform to the UniFFI-generated `PushProvider`
-    /// protocol (ADR-021): that protocol names its registration method
+    /// ADR-025 in `.docs/adrs/phase-5.md` requires this actor to conform to the
+    /// UniFFI-generated `PushProvider` protocol (ADR-021), and this actor does
+    /// not conform yet: that protocol names its registration method
     /// `registerPush()` and declares `ScpError` as its error type, while this
     /// actor names it `register()` and throws `PushError`. UniFFI panics on the
     /// Rust side when a callback throws a type the callback does not declare,
-    /// so a conformance that let a `PushError` cross the callback would turn
-    /// each rejected payload into a panic.
-    /// Acceptance criterion 4 of ADR-025 in `.docs/adrs/phase-5.md` records
-    /// this.
+    /// so the conformance has to translate each `PushError` to an `ScpError`,
+    /// as `AttestationError.scpError` does for `AppleDeviceAttestation`.
+    /// Acceptance criterion 4 of ADR-025 records this gap.
     ///
     /// ## AppDelegate Integration
     ///
@@ -114,7 +117,7 @@
     /// Usage:
     /// ```swift
     /// let pushProvider = ApplePushProvider()
-    /// // Pass to SCP engine via ApplePlatformAdapter
+    /// let token = try await pushProvider.register()
     /// ```
     public actor ApplePushProvider {
         // MARK: Internal state
@@ -129,10 +132,11 @@
 
         /// Creates a new `ApplePushProvider`.
         ///
-        /// Typically called once by ``ApplePlatformAdapter/make()``.
+        /// ADR-025 has `ApplePlatformAdapter.make()` call this initialiser once.
+        /// That factory does not exist yet.
         public init() {}
 
-        // MARK: PushProvider implementation
+        // MARK: APNs registration and payload handling
 
         /// Register for APNs push notifications and return the device token bytes.
         ///
@@ -141,9 +145,10 @@
         /// ``tokenDidRegister(_:)`` / ``registrationDidFail(_:)``. Races a 30-second
         /// timeout so callers are never blocked indefinitely.
         ///
-        /// - Returns: The raw APNs device token bytes (typically 32 bytes). The caller
-        ///   (the SCP Rust engine via UniFFI) converts these bytes to the hex string
-        ///   that is forwarded to the relay as a `PushToken`.
+        /// - Returns: The raw APNs device token bytes (typically 32 bytes). ADR-025
+        ///   has the SCP Rust engine convert these bytes to the hex string it
+        ///   forwards to the relay as a `PushToken`. No Rust code calls this
+        ///   method yet.
         ///
         /// - Throws:
         ///   - ``PushError/registrationAlreadyInProgress`` if a concurrent call is

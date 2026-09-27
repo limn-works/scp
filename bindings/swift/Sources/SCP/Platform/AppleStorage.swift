@@ -1,14 +1,17 @@
 // AppleStorage — SQLCipher-encrypted SQLite storage with Keychain-protected key.
 //
-// This file implements the ``StorageProvider`` callback interface (defined in
-// `crates/scp-ffi/uniffi/src/lib.rs`) for Apple platforms (iOS 17+, macOS 14+).
+// This file holds the SQLCipher storage adapter for Apple platforms (iOS 17+,
+// macOS 14+). ADR-025, the Apple platform adapter, requires this adapter to conform
+// to the UniFFI `StorageProvider` callback interface in
+// `crates/scp-ffi/uniffi/src/lib.rs`. The shipped actor does not conform yet.
 //
 // ## Architecture
 //
-// `AppleStorage` is an actor that provides thread-safe key-value byte storage
-// to the SCP Rust engine via the UniFFI callback interface mechanism (ADR-021).
-// It is one of the four platform providers assembled by ``ApplePlatformAdapter``
-// (ADR-025) and injected into the Rust engine at SDK initialisation.
+// `AppleStorage` is an actor that provides thread-safe key-value byte storage.
+// ADR-025 has an `ApplePlatformAdapter` assemble the four platform providers and
+// inject them into the Rust engine through the UniFFI callback interfaces (ADR-021).
+// No `ApplePlatformAdapter` exists yet, so no code injects this actor into the Rust
+// engine.
 //
 // ## Storage Backend
 //
@@ -83,13 +86,16 @@
 
     /// Actor-isolated, Keychain-secured storage provider for the SCP Rust engine.
     ///
-    /// Conforms to the UniFFI-generated `StorageProvider` protocol so that it can
-    /// be injected into the engine via the callback interface bridge (ADR-021).
+    /// ADR-025 requires this actor to conform to the UniFFI-generated
+    /// `StorageProvider` protocol (ADR-021), and this actor does not conform
+    /// yet: its methods throw `StorageError`, while that protocol declares
+    /// `ScpError` as its error type, and UniFFI panics on the Rust side when a
+    /// callback throws a type the callback does not declare.
     ///
     /// Usage:
     /// ```swift
     /// let storage = try AppleStorage.open()
-    /// // Pass to SCP engine via ApplePlatformAdapter
+    /// try await storage.set(key: "k", value: Data([1]))
     /// ```
     public actor AppleStorage {
         // MARK: Internal state
@@ -407,7 +413,7 @@
             return String(cString: sqlite3_errmsg(handle))
         }
 
-        // MARK: StorageProvider implementation
+        // MARK: Key-value operations
 
         /// Store `value` under `key`, overwriting any existing value.
         public func set(key: String, value: Data) throws {

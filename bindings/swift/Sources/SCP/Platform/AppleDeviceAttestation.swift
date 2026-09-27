@@ -27,7 +27,9 @@
         /// of a device attestation is expected and is not penalizing, so the
         /// caller presents no attestation rather than presenting a weaker one.
         case unsupported(String)
-        /// The stored App Attest key ID is missing; call `attest` first.
+        /// No App Attest key ID is stored, either because no `attest` call has
+        /// stored one or because the adapter discarded a rejected key's ID;
+        /// call `attest` first.
         case keyNotFound
         /// Apple answered `attestKey` with `DCError.invalidKey` for a key it
         /// had already attested, which a successful assertion with that key
@@ -395,7 +397,9 @@
         ///   `AttestationError.invalidChallenge` when `requestHash` is not 32
         ///   bytes; this method then calls no App Attest method.
         ///   `AttestationError.keyNotFound` when no key ID is stored, which
-        ///   happens when no caller has called `attest` yet.
+        ///   happens when no `attest` call has stored one, and after this
+        ///   adapter discarded a rejected key's ID (`keyRejected`) and no later
+        ///   `attest` call has stored a new one.
         ///   `AttestationError.keyNotAttested` when a key ID is stored and Apple
         ///   attested no key, which makes `attest(challenge:deviceId:)` a
         ///   caller's next call; this method keeps that key.

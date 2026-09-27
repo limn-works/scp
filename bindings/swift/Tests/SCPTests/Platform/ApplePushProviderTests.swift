@@ -4,8 +4,9 @@
 // `.docs/adrs/phase-5.md` states what `handleNotification(payload:)` accepts:
 // the relay sends only `{"aps": {"content-available": 1}}`, and "the adapter
 // enforces opacity on receipt", rejecting "payloads containing any field other
-// than `aps.content-available`". §10.7 of the security-model spec is where that
-// requirement comes from: a payload carrying a context ID, a sender identifier, or
+// than `aps.content-available`". §10.7, notifications and push, of
+// `.docs/specs/10-infrastructure-and-self-hosting.md` is where that requirement
+// comes from: a payload carrying a context ID, a sender identifier, or
 // a message count would hand Apple metadata the protocol keeps encrypted.
 //
 // Each case below names the field it added, the value it changed, or the shape
