@@ -155,7 +155,9 @@ interface DeviceAttestationProvider {
     /**
      * Generate a per-request assertion.
      *
-     * @param requestHash SHA-256 hash of the request data being asserted.
+     * @param requestHash The 32-byte assertion digest `A` of
+     *   `09-security-model.md` §9.3.1 over the request bytes, which the Rust
+     *   caller passes, never the request bytes or their plain SHA-256.
      * @return Platform-specific assertion token bytes.
      * @throws ScpException if assertion fails.
      */

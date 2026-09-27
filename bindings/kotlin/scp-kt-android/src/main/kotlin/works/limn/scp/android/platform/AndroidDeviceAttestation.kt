@@ -119,7 +119,9 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      * Standard integrity token is requested with the request hash as the
      * challenge and an empty device ID.
      *
-     * @param requestHash SHA-256 hash of the request data being asserted.
+     * @param requestHash The 32-byte assertion digest `A` of
+     *   `09-security-model.md` §9.3.1 over the request bytes, which the Rust
+     *   caller passes, never the request bytes or their plain SHA-256.
      * @return Play Integrity token bytes (JWT, UTF-8 encoded).
      * @throws ScpException if the Play Integrity API call fails.
      */
