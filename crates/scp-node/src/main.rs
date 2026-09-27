@@ -218,7 +218,9 @@ ENVIRONMENT VARIABLES:
     SCP_RELAY_STORAGE_BACKEND   Blob storage backend for relay, one of: {backends}
                                 (default: sqlite). On any other value the relay prints
                                 the cargo feature that compiles that backend, or reports
-                                the value as unknown, then exits 1. See
+                                the value as unknown, then exits 1. --self-host exits 1
+                                on any value but sqlite; --ephemeral ignores the
+                                variable and keeps blobs in memory. See
                                 docs/guides/relay-operations.md for the cloud backends.
     SCP_RELAY_STORAGE_PATH      Path for sqlite/redb blob storage (default: ./scp-relay.db){postgres_vars}{s3_vars}
     SCP_RELAY_MAX_BLOB_SIZE     Max blob size in bytes (default: 262144)
@@ -764,6 +766,26 @@ fn env_flag_is_truthy(value: Option<&str>) -> bool {
     matches!(value, Some("1" | "true"))
 }
 
+/// Writes the error `--self-host` exits with when `SCP_RELAY_STORAGE_BACKEND`
+/// names a backend other than `sqlite`, or returns `None`.
+///
+/// `--self-host` opens its blob store with `SQLite` under its storage directory
+/// and constructs no other backend, so a value naming another backend would
+/// otherwise be dropped and the operator would get a different store from the
+/// one selected, which §17.7 of the persistence spec forbids for `postgres` and
+/// `s3`.
+fn self_host_backend_conflict(selected: Option<&str>) -> Option<String> {
+    let value = selected?;
+    if value.eq_ignore_ascii_case("sqlite") {
+        return None;
+    }
+    Some(format!(
+        "error: --self-host stores blobs in SQLite under its storage directory and \
+         cannot use SCP_RELAY_STORAGE_BACKEND='{value}'. Unset the variable, or run \
+         the full node or --relay-only, which read it."
+    ))
+}
+
 /// Runs the node in self-host mode, hosting a static site entirely on SCP.
 ///
 /// Reads the self-host configuration from CLI args and environment variables,
@@ -781,6 +803,13 @@ fn env_flag_is_truthy(value: Option<&str>) -> bool {
 /// (share it out-of-band). `memory` is valid with NAT probing on or off. See the
 /// startup banner.
 async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf>) {
+    // Checked before the banner, the sockets and the storage directory exist.
+    if let Some(message) =
+        self_host_backend_conflict(env::var("SCP_RELAY_STORAGE_BACKEND").ok().as_deref())
+    {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
     let port: u16 = startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16);
     let plaintext = self_host_plaintext();
     let skip_nat = self_host_skip_nat();
@@ -1296,6 +1325,25 @@ mod tests {
     /// to `Sqlite`), which would break the all-in-memory contract documented on
     /// `run_full_node_ephemeral` and re-persist blobs to disk. If someone swaps
     /// `ephemeral_blob_backend()` to any non-in-memory backend, this fails.
+    /// `--self-host` opens only `SQLite`, so it accepts an unset variable and
+    /// `sqlite` in any case, and rejects every other value, `postgres` and `s3`
+    /// included, with a message naming the value.
+    #[test]
+    fn self_host_rejects_a_backend_it_does_not_open() {
+        assert_eq!(self_host_backend_conflict(None), None);
+        assert_eq!(self_host_backend_conflict(Some("sqlite")), None);
+        assert_eq!(self_host_backend_conflict(Some("SQLite")), None);
+        for value in ["postgres", "s3", "redb", "memory", "banana", ""] {
+            let message = self_host_backend_conflict(Some(value));
+            assert!(
+                message
+                    .as_deref()
+                    .is_some_and(|m| m.contains(&format!("SCP_RELAY_STORAGE_BACKEND='{value}'"))),
+                "--self-host must reject '{value}'; got {message:?}"
+            );
+        }
+    }
+
     #[test]
     fn ephemeral_uses_in_memory_blob() {
         assert!(

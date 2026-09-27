@@ -152,3 +152,59 @@ fn an_unusable_storage_path_opens_no_blob_database() {
         blob_db.display()
     );
 }
+
+/// `--self-host` opens only `SQLite`, so `SCP_RELAY_STORAGE_BACKEND=postgres`
+/// or `=s3` exits non-zero, names the value, and leaves no storage directory,
+/// instead of serving from a `SQLite` store the operator did not select.
+///
+/// A regression would start a server that never exits, so the child is killed
+/// after 30 seconds and the test fails on the missing exit.
+#[test]
+fn self_host_rejects_a_cloud_backend_before_writing_storage() {
+    for backend in ["postgres", "s3"] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage_dir = tmp.path().join("node-storage");
+        let mut child = Command::new(node_bin())
+            .arg("--self-host")
+            .current_dir(tmp.path())
+            .env("SCP_STORAGE_PATH", &storage_dir)
+            .env("SCP_RELAY_STORAGE_BACKEND", backend)
+            .env("SCP_NODE_DHT_MODE", "disabled")
+            .env("SCP_NODE_SELF_HOST_NO_NAT", "1")
+            .env("SCP_NODE_SELF_HOST_PORT", "0")
+            .env_remove("RUST_LOG")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn scp-node --self-host");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let output = child.wait_with_output().expect("collect stderr");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            status.is_some_and(|s| !s.success()),
+            "--self-host with SCP_RELAY_STORAGE_BACKEND={backend} must exit \
+             non-zero; status {status:?}, stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("SCP_RELAY_STORAGE_BACKEND='{backend}'")),
+            "the rejection names the requested backend; stderr: {stderr}"
+        );
+        assert!(
+            !storage_dir.exists(),
+            "a rejected {backend} backend must create no storage directory; found {}",
+            storage_dir.display()
+        );
+    }
+}
