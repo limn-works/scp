@@ -94,8 +94,16 @@ lands, build the addon from source with the `testing` feature:
 cargo build -p scp-ffi-napi --release --features testing
 ```
 
-`tests/readme-quickstart.test.ts` runs the block above verbatim, so this README
-stops drifting from what runs.
+`tests/readme-quickstart.test.ts` runs the block above verbatim against a
+`testing` build, so this README stops drifting from what that build runs; no
+test runs it against a published addon.
+
+A `testing` build compiles in every in-memory stand-in a shipped build
+refuses, among them `InMemoryPreRotationCustody`, the in-memory DHT client,
+and `InMemoryKeyCustody`. An identity it creates keeps its pre-rotation
+commitment in process memory, so that commitment is gone when the process
+exits. Use a `testing` build to try the quick start, and never ship an app
+built with it.
 
 ## Runtime Support
 

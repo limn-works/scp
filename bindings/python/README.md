@@ -85,8 +85,16 @@ cd bindings/python
 maturin develop --features scp-core/testing,testing
 ```
 
-`tests/test_readme_quickstart.py` runs the block above verbatim, so this README
-stops drifting from what runs.
+`tests/test_readme_quickstart.py` runs the block above verbatim against a
+`testing` build, so this README stops drifting from what that build runs; no
+test runs it against a published wheel.
+
+A `testing` build compiles in every in-memory stand-in a shipped build
+refuses, among them `InMemoryPreRotationCustody`, the in-memory DHT client,
+and `InMemoryKeyCustody`. An identity it creates keeps its pre-rotation
+commitment in process memory, so that commitment is gone when the process
+exits. Use a `testing` build to try the quick start, and never ship an app
+built with it.
 
 ## Requirements
 

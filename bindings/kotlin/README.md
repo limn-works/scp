@@ -104,8 +104,16 @@ cargo build -p scp-ffi-uniffi --features testing
 ```
 
 `ReadmeQuickStartTest` in `scp-kt`'s test source set runs the block above
-verbatim and loads every class the block imports, so this README stops
-drifting from what runs.
+verbatim against a `testing` build and loads every class the block imports,
+so this README stops drifting from what that build runs; no test runs it
+against a published artifact.
+
+A `testing` build compiles in every in-memory stand-in a shipped build
+refuses, among them `InMemoryPreRotationCustody`, the in-memory DHT client,
+and `InMemoryKeyCustody`. An identity it creates keeps its pre-rotation
+commitment in process memory, so that commitment is gone when the process
+exits. Use a `testing` build to try the quick start, and never ship an app
+built with it.
 
 ## Requirements
 
