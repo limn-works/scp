@@ -16499,11 +16499,14 @@ impl Scp {
         }
 
         // Serving requires that the supervisor reports every served context
-        // `Active`, as `PyO3`'s `py_mcp_serve` requires. The gate withholds the
-        // lifecycle state, because it runs before the server authorizes any
-        // request.
+        // `Active` and counts `identity_did` among its members, as `PyO3`'s
+        // `py_mcp_serve` requires. The lifecycle gate withholds the state,
+        // because it runs before the server authorizes any request. The
+        // membership check runs once, here: the provider's `context_members`,
+        // `context_tools`, and `context_events` do not read membership again.
         let gate_bi = Arc::clone(&self.inner);
         let gate_ids = config.context_ids.clone();
+        let gate_identity = config.identity_did.clone();
         runtime()
             .spawn(async move {
                 for ctx_id in &gate_ids {
@@ -16517,6 +16520,21 @@ impl Scp {
                             },
                         )
                         .await?;
+                    let role_state = gate_bi.live_role_state(ctx_id).await.map_err(|e| {
+                        ScpError::Transport {
+                            msg: format!("cannot serve context '{ctx_id}': {e}"),
+                            code: codes::TRANS_5001.to_owned(),
+                        }
+                    })?;
+                    if !role_state.members.contains(gate_identity.as_str()) {
+                        return Err(ScpError::Transport {
+                            msg: format!(
+                                "cannot serve context '{ctx_id}': '{gate_identity}' is not a \
+                                 member of it"
+                            ),
+                            code: codes::TRANS_5001.to_owned(),
+                        });
+                    }
                 }
                 Ok::<(), ScpError>(())
             })
@@ -19808,10 +19826,9 @@ mod tests {
     // ADR-049 Phase 2J: reserve_key_package / context_join_from_welcome
     // -----------------------------------------------------------------------
 
-    /// Minimal ENCRYPTED single-admin params for the 2J join-side tests.
-    #[cfg(feature = "testing")]
     /// `encrypted_join_test_params` with a ceiling that holds `context:close`,
     /// so the creator can close the context.
+    #[cfg(feature = "testing")]
     fn closable_test_params() -> ContextParams {
         ContextParams {
             ceiling: Some(vec![
@@ -19823,6 +19840,8 @@ mod tests {
         }
     }
 
+    /// Minimal ENCRYPTED single-admin params for the 2J join-side tests.
+    #[cfg(feature = "testing")]
     fn encrypted_join_test_params() -> ContextParams {
         ContextParams {
             mode: ContextMode::Encrypted,
@@ -23837,6 +23856,42 @@ mod tests {
                 if code == codes::TRANS_5001
                     && msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)),
             "the refusal must come from the lifecycle gate: {err:?}"
+        );
+    }
+
+    /// `mcp_server_create` refuses an identity the supervisor does not count
+    /// as a member of an `Active` served context, as `PyO3`'s `py_mcp_serve`
+    /// does. The provider's `context_members` does not read membership again,
+    /// so a server started for an outsider served it the live roster.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn mcp_server_create_refuses_an_identity_the_supervisor_does_not_count_as_a_member() {
+        let rt = runtime();
+        let scp = scp_test();
+        let creator = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let outsider = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&creator), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+
+        let config = McpServerConfig {
+            identity_did: outsider.did(),
+            context_ids: vec![handle.context_id()],
+            transport: "stdio".to_owned(),
+            ucan_token: None,
+            proof_tokens: None,
+        };
+        let err = rt
+            .block_on(scp.mcp_server_create(config))
+            .expect_err("a non-member must not be able to serve the context");
+        assert!(
+            matches!(&err, ScpError::Transport { code, msg }
+                if code == codes::TRANS_5001 && msg.contains("is not a member of it")),
+            "the refusal must say the identity is not a member: {err:?}"
         );
     }
 
