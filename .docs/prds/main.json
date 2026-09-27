@@ -3014,10 +3014,14 @@
         }
       ],
       "details": {
-        "tool_call_example": "{\n    \"jsonrpc\": \"2.0\",\n    \"method\": \"tools/call\",\n    \"params\": {\n        \"name\": \"context_a/guide_assistant\",\n        \"arguments\": { \"query\": \"butter substitute\" }\n    },\n    \"id\": 1\n}"
+        "tool_call_example": "{\n    \"jsonrpc\": \"2.0\",\n    \"method\": \"tools/call\",\n    \"params\": {\n        \"name\": \"context_a/guide_assistant\",\n        \"arguments\": { \"query\": \"butter substitute\" }\n    },\n    \"id\": 1\n}",
+        "audit_note": "Downgraded from done (audit): the NAPI MCP provider in crates/scp-ffi/napi/src/mcp.rs does not implement ContextProvider::invoke_outlet, so its validate_capability refuses every tool, tools/list is empty and tools/call is refused. The tool-invocation criterion is unmet on NAPI. The PyO3 and UniFFI providers run an outlet from tools/call once per server: the server holds the one agent UCAN it was created with, the first tools/call whose outlet runs records that token's nonce (ADR-016 Step 9), and every later check of the token fails as a replay, so tools/list then omits every outlet and tools/call refuses it; the token's nonce also fails the freshness check five minutes after it was minted. The tool-invocation criterion is unmet on those two bridges until a server can present a fresh token per call."
       },
       "result": "MCP server with ContextProvider trait, capability filtering, tool namespacing. 42 tests.",
-      "auditNote": "Downgraded from done (audit): the NAPI MCP provider in crates/scp-ffi/napi/src/mcp.rs does not implement ContextProvider::invoke_outlet, so its validate_capability refuses every tool, tools/list is empty and tools/call is refused. The tool-invocation criterion is unmet on NAPI. The PyO3 and UniFFI providers run an outlet from tools/call once per server: the server holds the one agent UCAN it was created with, the first tools/call whose outlet runs records that token's nonce (ADR-016 Step 9), and every later check of the token fails as a replay, so tools/list then omits every outlet and tools/call refuses it; the token's nonce also fails the freshness check five minutes after it was minted. The tool-invocation criterion is unmet on those two bridges until a server can present a fresh token per call."
+      "blockedByIssues": [
+        2506,
+        2512
+      ]
     },
     {
       "id": "SCP-049",
