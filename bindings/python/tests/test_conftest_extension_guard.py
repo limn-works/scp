@@ -242,43 +242,123 @@ def test_module_guard_reraises_its_own_error_when_the_extension_loads(
     assert caught.value is guard_error
 
 
-def _module_level_skip_reasons(source: str) -> list[ast.expr | None]:
-    """First argument of every ``pytest.skip(..., allow_module_level=True)`` call."""
+def _skip_site_reasons(source: str) -> list[ast.expr | None]:
+    """The reason expression of every skip site in ``source`` that can gate a module or test.
+
+    Three spellings gate a module or a test on the native extension: a
+    ``pytest.skip(reason, allow_module_level=True)`` call, a ``skipif`` marker
+    (its ``reason=`` keyword), and a ``pytest.importorskip(...)`` call. An
+    ``importorskip`` call yields ``None``, because it takes its skip decision
+    from its own import rather than from the loader, so the scan counts every
+    one as an offender. A skip inside a fixture or a test body without
+    ``allow_module_level`` is not collected: the bridge-parity runner fixtures
+    skip on an unbuilt Kotlin or Swift runner, which is not the extension.
+    """
     reasons: list[ast.expr | None] = []
     for node in ast.walk(ast.parse(source)):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "skip"
-            and any(
-                kw.arg == "allow_module_level"
-                and isinstance(kw.value, ast.Constant)
-                and kw.value.value is True
-                for kw in node.keywords
-            )
-        ):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        keywords = {kw.arg: kw.value for kw in node.keywords}
+        if node.func.attr == "importorskip":
+            reasons.append(None)
+        elif node.func.attr == "skipif":
+            reasons.append(keywords.get("reason"))
+        elif node.func.attr == "skip":
+            module_level = keywords.get("allow_module_level")
+            if not (isinstance(module_level, ast.Constant) and module_level.value is True):
+                continue
             reasons.append(node.args[0] if node.args else None)
     return reasons
 
 
-def _is_absence_reason(reason: ast.expr | None) -> bool:
+def _is_absence_call(expr: ast.expr | None) -> bool:
     return (
-        isinstance(reason, ast.Call)
-        and isinstance(reason.func, ast.Name)
-        and reason.func.id == "skip_reason_if_extension_absent"
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
+        and expr.func.id == "skip_reason_if_extension_absent"
     )
 
 
-def test_every_module_level_skip_takes_its_reason_from_the_absence_check() -> None:
-    """CRITERION: every module-level skip under `bindings/python/tests` takes its
-    reason from `skip_reason_if_extension_absent`, so no module skips over a
-    present extension that failed to load or lacks an export the module calls."""
-    offenders = [
-        path.name
-        for path in sorted(Path(conftest.__file__).parent.glob("*.py"))
-        if not all(_is_absence_reason(r) for r in _module_level_skip_reasons(path.read_text()))
+def _is_absence_reason(reason: ast.expr | None, source: str = "") -> bool:
+    """Whether ``reason`` comes from ``skip_reason_if_extension_absent``.
+
+    A direct call qualifies. So does a module variable (optionally written
+    ``name or ""``, the form a ``skipif`` marker needs) when every value
+    ``source`` assigns to it is ``None`` or a direct call and at least one is a
+    call: the ``_NATIVE_SKIP_REASON`` shape in ``test_join_from_welcome.py``.
+    """
+    if _is_absence_call(reason):
+        return True
+    if isinstance(reason, ast.BoolOp) and isinstance(reason.op, ast.Or):
+        reason = reason.values[0]
+    if not isinstance(reason, ast.Name) or not source:
+        return False
+    values = [
+        node.value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        and node.value is not None
+        and any(
+            isinstance(t, ast.Name) and t.id == reason.id
+            for t in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        )
     ]
+    return any(_is_absence_call(v) for v in values) and all(
+        _is_absence_call(v) or (isinstance(v, ast.Constant) and v.value is None) for v in values
+    )
+
+
+def _scanned_test_files() -> list[Path]:
+    return sorted(Path(conftest.__file__).parent.rglob("*.py"))
+
+
+def test_every_module_level_skip_takes_its_reason_from_the_absence_check() -> None:
+    """CRITERION: every skip site under `bindings/python/tests` that can gate a
+    module or a test on the native extension — `pytest.skip(...,
+    allow_module_level=True)`, a `skipif` marker, `pytest.importorskip` — takes
+    its reason from `skip_reason_if_extension_absent`, so no module or test
+    skips over a present extension that failed to load or lacks an export it
+    calls. The walk is recursive, so `tests/bridge_parity/` is covered."""
+    offenders = []
+    for path in _scanned_test_files():
+        source = path.read_text()
+        if not all(_is_absence_reason(r, source) for r in _skip_site_reasons(source)):
+            offenders.append(str(path.relative_to(Path(conftest.__file__).parent)))
     assert offenders == []
+
+
+def test_the_skip_scan_reads_the_bridge_parity_package() -> None:
+    """The scan's file set includes the subpackage the bridge-parity jobs run."""
+    tests_dir = Path(conftest.__file__).parent
+    scanned = {path.relative_to(tests_dir).parts[0] for path in _scanned_test_files()}
+    assert "bridge_parity" in scanned
+
+
+def test_the_skip_scan_accepts_the_skipif_shape_that_consults_the_loader() -> None:
+    """POSITIVE CONTROL: the `skipif` guard in test_join_from_welcome.py passes."""
+    source = (Path(conftest.__file__).parent / "test_join_from_welcome.py").read_text()
+    reasons = _skip_site_reasons(source)
+    assert reasons
+    assert all(_is_absence_reason(r, source) for r in reasons)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'pytest.importorskip("_scp_core")\n',
+        "def test_x():\n    pytest.importorskip('scp_sdk._scp_core')\n",
+        "_HAS = hasattr(_scp_core, 'x')\n"
+        "native = pytest.mark.skipif(not _HAS, reason='no native')\n",
+        "_REASON = None\ntry:\n    import x\nexcept Exception:\n"
+        "    _REASON = 'not available'\n"
+        "native = pytest.mark.skipif(_REASON is not None, reason=_REASON or '')\n",
+    ],
+)
+def test_the_skip_scan_rejects_importorskip_and_a_hand_written_skipif(source: str) -> None:
+    """NEGATIVE CONTROL: the other skip spellings fail the scan unless they consult the loader."""
+    reasons = _skip_site_reasons(source)
+    assert len(reasons) == 1
+    assert not _is_absence_reason(reasons[0], source)
 
 
 def test_the_skip_scan_rejects_a_hand_written_reason() -> None:
@@ -288,6 +368,6 @@ def test_the_skip_scan_rejects_a_hand_written_reason() -> None:
         "except (ImportError, AttributeError):\n"
         '    pytest.skip("not available", allow_module_level=True)\n'
     )
-    reasons = _module_level_skip_reasons(source)
+    reasons = _skip_site_reasons(source)
     assert len(reasons) == 1
-    assert not _is_absence_reason(reasons[0])
+    assert not _is_absence_reason(reasons[0], source)
