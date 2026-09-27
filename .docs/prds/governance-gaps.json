@@ -120,8 +120,8 @@
         "GovernanceAction::RestoreReadAccess { did: DID } variant exists",
         "classify_action in mls_integration.rs returns MlsImpact::MembershipChange for RevokeReadAccess (encrypted mode removes from MLS group)",
         "classify_action returns MlsImpact::NoMlsChange for RestoreReadAccess (re-add is a separate flow)",
-        "Conflict detection: two RevokeReadAccess targeting the same DID conflict",
-        "Conflict detection: RevokeReadAccess and RestoreReadAccess for the same DID conflict",
+        "Conflict detection: two RevokeReadAccess targeting one identifier conflict",
+        "Conflict detection: RevokeReadAccess and RestoreReadAccess for one identifier conflict",
         "All existing governance tests pass",
         "New variants have rustdoc referencing §5.9 and ADR-031"
       ],
@@ -246,11 +246,11 @@
       "description": "Add governance-directed subscriber ban to BroadcastContext. Unlike per-author blocking (which is unilateral), governance bans remove the subscriber from the registry AND add them to ALL authors' block lists simultaneously. All authors MUST rotate keys after a governance ban (mandatory KeyEpochAdvance). This mirrors RevokeReadAccess semantics in encrypted contexts (MLS group removal), adapted for broadcast's per-author key model. Does NOT check ceiling — that's the ContextManager's responsibility (SCP-GG-006).",
       "acceptanceCriteria": [
         "BroadcastContext::governance_ban_subscriber(did) removes subscriber from self.subscribers",
-        "governance_ban_subscriber adds the DID to every author's block list in self.authors",
+        "governance_ban_subscriber adds the identifier to every author's block list in self.authors",
         "governance_ban_subscriber increments epoch and generates new key for every author",
-        "governance_ban_subscriber returns a GovernanceBanResult containing: banned DID, list of author DIDs that rotated, new epochs per author",
+        "governance_ban_subscriber returns a GovernanceBanResult containing: the banned identifier, the author identifiers that rotated, new epochs per author",
         "governance_ban_subscriber returns MemberNotFound if subscriber not in registry",
-        "BroadcastContext::governance_unban_subscriber(did) removes the DID from every author's block list",
+        "BroadcastContext::governance_unban_subscriber(did) removes the identifier from every author's block list",
         "governance_unban_subscriber does NOT re-register the subscriber (they must re-register manually)",
         "governance_unban_subscriber does NOT rotate keys (unban is access restoration, not revocation)",
         "Test: ban subscriber with 3 authors — all 3 block lists updated, all 3 keys rotated",
@@ -380,7 +380,7 @@
       "files": [
         "crates/scp-node/src/projection.rs"
       ],
-      "description": "Enforce access control on projection endpoints based on admission mode and projection policy. For gated contexts, extract UCAN from Authorization: Bearer <token> header and validate via the same validate_messages_read_ucan() pipeline used in handle_key_request(). For open contexts, serve without auth (current behavior). Per-author overrides in ProjectionPolicy can narrow or specify rules per author DID. Gated projection endpoints use Cache-Control: private (CDN must not cache authenticated content). Reuse validate_messages_read_ucan() from broadcast.rs.",
+      "description": "Enforce access control on projection endpoints based on admission mode and projection policy. For gated contexts, extract UCAN from Authorization: Bearer <token> header and validate via the same validate_messages_read_ucan() pipeline used in handle_key_request(). For open contexts, serve without auth (current behavior). Per-author overrides in ProjectionPolicy narrow the rule per author identifier. Gated projection endpoints use Cache-Control: private (CDN must not cache authenticated content). Reuse validate_messages_read_ucan() from broadcast.rs.",
       "acceptanceCriteria": [
         "feed_handler: when admission == Open, serves without auth (current behavior unchanged)",
         "feed_handler: when admission == Gated, extracts Authorization: Bearer <token> header",
@@ -390,7 +390,7 @@
         "message_handler: same auth behavior as feed_handler",
         "Gated feed responses use Cache-Control: private, max-age=30 (not public)",
         "Gated per-message responses use Cache-Control: private, immutable, max-age=31536000 (not public)",
-        "Per-author projection override: if ProjectionPolicy has override for author DID of requested content, that rule applies instead of default",
+        "Per-author projection override: if ProjectionPolicy has an override for the requested content's author identifier, that rule applies instead of the default",
         "Per-author override Public on a Gated context is rejected during enable_broadcast_projection (ceiling constraint)",
         "Test: open context serves feed without auth",
         "Test: gated context rejects feed without Authorization header (401)",

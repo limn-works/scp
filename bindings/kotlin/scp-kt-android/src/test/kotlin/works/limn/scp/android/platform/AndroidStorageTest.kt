@@ -37,6 +37,7 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import java.util.TreeMap
+import kotlin.reflect.KFunction1
 
 /**
  * In-memory implementation of [StorageProvider] for contract testing.
@@ -49,34 +50,33 @@ import java.util.TreeMap
 class InMemoryStorageProvider : StorageProvider {
 
     // TreeMap provides natural lexicographic ordering, matching SQLCipher's
-    // ORDER BY key ASC behavior.
+    // ORDER BY key ASC behavior. TreeMap is not thread-safe, and the
+    // StorageProvider contract requires concurrent callers not to interfere
+    // (conformance case 12, concurrent_access), so every operation holds [lock].
+    private val lock = Any()
     private val data = TreeMap<String, ByteArray>()
 
     override fun set(key: String, data: ByteArray) {
-        this.data[key] = data.copyOf()
+        synchronized(lock) { this.data[key] = data.copyOf() }
     }
 
-    override fun get(key: String): ByteArray? {
-        return data[key]?.copyOf()
-    }
+    override fun get(key: String): ByteArray? = synchronized(lock) { data[key]?.copyOf() }
 
     override fun delete(key: String) {
-        data.remove(key)
+        synchronized(lock) { data.remove(key) }
     }
 
-    override fun listKeys(prefix: String): List<String> {
-        return data.keys.filter { it.startsWith(prefix) }
-    }
+    override fun listKeys(prefix: String): List<String> =
+        synchronized(lock) { data.keys.filter { it.startsWith(prefix) } }
 
-    override fun deletePrefix(prefix: String): Long {
-        val keysToDelete = data.keys.filter { it.startsWith(prefix) }
-        keysToDelete.forEach { data.remove(it) }
-        return keysToDelete.size.toLong()
-    }
+    override fun deletePrefix(prefix: String): Long =
+        synchronized(lock) {
+            val keysToDelete = data.keys.filter { it.startsWith(prefix) }
+            keysToDelete.forEach { data.remove(it) }
+            keysToDelete.size.toLong()
+        }
 
-    override fun exists(key: String): Boolean {
-        return data.containsKey(key)
-    }
+    override fun exists(key: String): Boolean = synchronized(lock) { data.containsKey(key) }
 }
 
 /**
@@ -458,10 +458,14 @@ class AndroidStorageTest {
 
         @Test
         fun `getOrCreateStorageKey is accessible for integration testing`() {
-            // Verify the method exists on the production class (will throw at runtime
-            // without Android Keystore, but the method signature is correct)
-            val method = AndroidStorage::class.java.getDeclaredMethod("getOrCreateStorageKey")
-            assertNotNull(method)
+            // Verify the method exists on the production class with the signature
+            // `AndroidStorage.() -> ByteArray` (calling it throws without Android
+            // Keystore). The method is `internal`, so the Kotlin compiler mangles its
+            // JVM name with the module name and a reflective lookup of the source name
+            // finds nothing; the typed function reference checks the signature at
+            // compile time instead.
+            val method: KFunction1<AndroidStorage, ByteArray> = AndroidStorage::getOrCreateStorageKey
+            assertEquals("getOrCreateStorageKey", method.name)
         }
 
         @Test

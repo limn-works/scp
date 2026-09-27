@@ -48,7 +48,7 @@ bindings/swift/
   Package.swift                   # SPM package definition
   Sources/
     SCP/
-      Identity.swift              # Identity class, DIDDocument
+      Identity.swift              # Identity class
       Context.swift               # Context actor, Membership
       Tools.swift                 # ToolDefinition, TestVector structs
       Trust.swift                 # evaluateTrust(), TrustEvaluation
@@ -145,17 +145,21 @@ xcodebuild -create-xcframework \
 
 ```swift
 public struct Identity: Sendable {
-    public let did: String
-    public let custodyType: String
+    public let identifier: Data
+    public let custodyType: CustodyType
 
     private let handle: IdentityHandle
 
-    public static func create(custody: String = "platform") async throws -> Identity {
-        let handle = try await ScpBindings.identityCreate(custody: custody)
-        return Identity(did: handle.did(), custodyType: handle.custodyType(), handle: handle)
+    /// `IdentityConfig` is the three-slot config object
+    /// `.docs/standards/construction.md` states. Its `custody` slot carries the
+    /// bridge's `KeyCustodyConfig` and carries no default, because that slot
+    /// decides where an identity's private key lives.
+    public static func create(config: IdentityConfig) async throws -> Identity {
+        let handle = try await ScpBindings.identityCreate(config: config)
+        return Identity(identifier: handle.identifier(), custodyType: handle.custodyType(), handle: handle)
     }
 
-    public static func load(did: String) async throws -> Identity { ... }
+    public static func load(identifier: Data) async throws -> Identity { ... }
 
     public func rotateKey() async throws -> Identity { ... }
 }
@@ -191,7 +195,7 @@ extension ScpError: LocalizedError {
 
 ```swift
 public struct Message: Sendable {
-    public let senderDid: String
+    public let senderIdentifier: Data
     public let content: Data
     public let timestamp: TimeInterval
     public let sequence: Int64
@@ -204,7 +208,7 @@ public struct ToolDefinition: Sendable {
     public let description: String
     public let inputSchema: String    // JSON string
     public let outputSchema: String   // JSON string
-    public let operatorDid: String
+    public let operatorIdentifier: Data
     public let testVectors: [TestVector]?
     public let implementationHash: Data?
 }

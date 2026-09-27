@@ -210,12 +210,12 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 1
 fi
 
-# `timeout` bounds the `cargo metadata` call below and each of the 29 gates, so 30 call
+# `timeout` bounds the `cargo metadata` call below and each of the 30 gates, so 31 call
 # sites depend on it. macOS ships neither `timeout` nor `gtimeout`, Homebrew's coreutils
 # supplies both names, and `.mise.toml` provisions neither, so a checkout that installed
 # only the prerequisites README.md lists has no such program. Without this guard every gate
-# would exit 127, and the run would print 29 blocks reading "timeout: command not found"
-# and report 29 enforcement violations that do not exist.
+# would exit 127, and the run would print 30 blocks reading "timeout: command not found"
+# and report 30 enforcement violations that do not exist.
 TIMEOUT=timeout
 command -v "$TIMEOUT" >/dev/null 2>&1 || TIMEOUT=gtimeout
 if ! command -v "$TIMEOUT" >/dev/null 2>&1; then
@@ -223,7 +223,7 @@ if ! command -v "$TIMEOUT" >/dev/null 2>&1; then
     exit 1
 fi
 
-# The interpreter ten of the gates below run under, and the one that reads the dependency
+# The interpreter eleven of the gates below run under, and the one that reads the dependency
 # declarations out of `cargo metadata`'s JSON for the compile step's feature set. It is
 # resolved here rather than beside the gate list because the compile step runs first.
 PYTHON=python3.12
@@ -491,7 +491,7 @@ UNRUN_LANES=(
     "bindings/swift/|SwiftLint, SwiftFormat and swift build, which the swift-lint and swift-build-test jobs of .github/workflows/ci.yml run"
     "fuzz/|cargo check inside fuzz/ on the nightly fuzz/rust-toolchain.toml names, which the fuzz-build job of .github/workflows/ci.yml runs"
     ".github/|scripts/tests/ci-gate/run-tests.sh, which the ci-workflow-selftest job of .github/workflows/ci.yml runs and whose ci_gate_selftest.py asserts the job structure this repository's own workflow files declare, and scripts/tests/fix-round-check/run-tests.sh, which the fix-round-check-selftest job runs and whose case 23 reads .github/workflows/ci.yml itself, so adding a suite invocation to that file turns that case red. Those two are every suite a change under .github/ can turn red: every other suite the ci-workflow-selftest, toolchain-wiring and workflow-compile-steps jobs run feeds its gate a workflow file its own fixture wrote. Three gates this run did start read a workflow file, each for rules of its own and none as coverage of a workflow edit: scripts/check-workflow-compile-steps.py reads every workflow for its cache-group and bindgen rules, scripts/check-toolchain-wiring.sh reads them for its container-build and paths-filter rules, and scripts/check-shipped-feature-graph.sh reads build-matrix.yml and release.yml for the cargo invocations that ship an artifact"
-    "scripts/|the ten suites that .github/workflows/ci.yml runs over this directory: scripts/tests/cross-layer/run-tests.sh in the cross-layer job, scripts/tests/bridge-symmetry/run-tests.sh in the bridge-symmetry job, scripts/test_check_sdk_coverage.py and scripts/tests/call-invariants/ in the sdk-coverage job, scripts/tests/toolchain-wiring/run-tests.sh and scripts/tests/workflow-compile-steps/run-tests.sh in the toolchain-wiring job, scripts/tests/fix-round-check/run-tests.sh in the fix-round-check-selftest job, scripts/tests/agent-verdict-criterion/run-tests.sh in the agent-verdict-criterion job, and scripts/tests/ci-gate/run-tests.sh and scripts/tests/signing-guard/run-tests.sh in the ci-workflow-selftest job. Running a gate below against this repository's own files is not running that gate's fixture suite, which is the program that proves the gate still rejects what it exists to reject"
+    "scripts/|the eleven suites that .github/workflows/ci.yml runs over this directory: scripts/tests/cross-layer/run-tests.sh in the cross-layer job, scripts/tests/bridge-symmetry/run-tests.sh in the bridge-symmetry job, scripts/test_check_sdk_coverage.py and scripts/tests/call-invariants/ in the sdk-coverage job, scripts/tests/toolchain-wiring/run-tests.sh, scripts/tests/pre-commit-merge/run-tests.sh and scripts/tests/workflow-compile-steps/run-tests.sh in the toolchain-wiring job, scripts/tests/fix-round-check/run-tests.sh in the fix-round-check-selftest job, scripts/tests/agent-verdict-criterion/run-tests.sh in the agent-verdict-criterion job, and scripts/tests/ci-gate/run-tests.sh and scripts/tests/signing-guard/run-tests.sh in the ci-workflow-selftest job. Running a gate below against this repository's own files is not running that gate's fixture suite, which is the program that proves the gate still rejects what it exists to reject"
 )
 
 if [[ $changed_rc -eq 0 ]]; then
@@ -766,8 +766,8 @@ run_step format cargo fmt --all -- --check
 # cost is reading repository files and, for one gate, resolving a dependency graph. Every
 # gate that compiles or links belongs to CI, which runs it on the pushed head.
 #
-# WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 30 files named
-# `check-*`. This list names 29 of them, and GATES_NOT_RUN below names the other one with
+# WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 31 files named
+# `check-*`. This list names 30 of them, and GATES_NOT_RUN below names the other one with
 # the reason it is absent. Neither count is load-bearing: the loop below globs
 # `scripts/check-*` off the disk and fails the run on any file neither array names, so a
 # gate this repository gains and this list does not reports itself instead of going
@@ -784,6 +784,8 @@ run_step format cargo fmt --all -- --check
 # `scripts/check-toolchain-wiring.sh`, which this list already held, and it reads every
 # workflow file with PyYAML while starting no subprocess. It rejected this script's own CI
 # job once, for a `Swatinem/rust-cache` step that named no cache group.
+# `scripts/check-doc-includes.py` joined after that: the `doc-includes` job of
+# `.github/workflows/ci.yml` runs it, and it reads only `.docs/` with the standard library.
 GATES=(
     scripts/check-agent-verdict-criterion.sh
     scripts/check-block-in-place.py
@@ -794,6 +796,7 @@ GATES=(
     scripts/check-cross-layer.sh
     scripts/check-deleted-primitives.sh
     scripts/check-doc-citations.py
+    scripts/check-doc-includes.py
     scripts/check-error-codes.sh
     scripts/check-handle-affinity.sh
     scripts/check-handler-no-panic.sh

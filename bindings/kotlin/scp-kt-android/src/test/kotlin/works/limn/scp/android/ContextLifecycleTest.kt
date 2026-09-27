@@ -9,6 +9,7 @@ package works.limn.scp.android
 
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.testing.TestLifecycleOwner
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -16,13 +17,32 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.setMain
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ContextLifecycleTest {
+
+    // `flowWithLifecycle` runs `repeatOnLifecycle`, which switches to
+    // `Dispatchers.Main.immediate`. A local JVM unit test has no Android main looper,
+    // so without a test Main dispatcher every collection fails with "Module with the
+    // Main dispatcher had failed to initialize". `runTest` then shares this
+    // dispatcher's scheduler, which the per-test `UnconfinedTestDispatcher` joins.
+    @BeforeEach
+    fun setUp() {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+    }
+
+    @AfterEach
+    fun tearDown() {
+        Dispatchers.resetMain()
+    }
 
     @Test
     fun `asLifecycleFlow completes when owner reaches DESTROYED`() = runTest {

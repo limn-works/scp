@@ -72,13 +72,51 @@ val uniffiBindingsDir = file("src/main/kotlin/works/limn/scp/internal")
 //     `kotlin-docs` job in `.github/workflows/docs.yml`, neither of which
 //     installs a Rust toolchain or caches a cargo target directory.
 
+// The directory cargo compiles into. Cargo resolves it from `CARGO_TARGET_DIR`, then
+// `build.target-dir` in any `.cargo/config.toml` it reads, then `<workspace>/target`,
+// so a machine whose `~/.cargo/config.toml` points every worktree at one shared
+// directory builds the cdylib outside this checkout. Asking `cargo metadata` gets the
+// directory cargo actually used. The provider runs only when a task reads it, so
+// the lint and docs jobs, which install no Rust toolchain, never invoke cargo.
+val cargoTargetDir: Provider<String> =
+    providers
+        .exec {
+            workingDir = rootProject.projectDir.parentFile.parentFile
+            commandLine(
+                "cargo",
+                "metadata",
+                "--manifest-path",
+                "crates/scp-ffi/uniffi/Cargo.toml",
+                "--format-version",
+                "1",
+                "--no-deps",
+            )
+        }.standardOutput.asText
+        .map { json ->
+            val metadata = groovy.json.JsonSlurper().parseText(json) as Map<*, *>
+            metadata["target_directory"] as? String
+                ?: throw GradleException("cargo metadata named no target_directory")
+        }
+
+// Passes `-Djna.library.path` to the test JVM. A named class with an `@Input`
+// property, rather than a lambda, lets Gradle fingerprint the argument for
+// up-to-date checks.
+class JnaLibraryPath(
+    @get:Input val cargoTargetDir: Provider<String>,
+) : CommandLineArgumentProvider {
+    override fun asArguments(): Iterable<String> {
+        val dir = cargoTargetDir.get()
+        return listOf("-Djna.library.path=$dir/debug${File.pathSeparator}$dir/release")
+    }
+}
+
 tasks.test {
     useJUnitPlatform()
 
     // JNA needs to find `libscp_ffi_uniffi.{dylib,so,dll}` to load the
-    // UniFFI-generated bindings. The Rust cdylib is built to the
-    // workspace's `target/{debug,release}` directory. Point JNA at
-    // both candidate paths so the tests run without the caller having
+    // UniFFI-generated bindings. The Rust cdylib is built to the `debug` or
+    // `release` directory under cargo's target directory (see `cargoTargetDir`
+    // above). Point JNA at both so the tests run without the caller having
     // to set `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH` manually.
     //
     // PersistenceTest and ScpClassTest skip themselves via
@@ -86,17 +124,7 @@ tasks.test {
     // runtime, fresh checkout without a cargo build yet). This just
     // lets them run locally after `cargo build -p scp-ffi-uniffi` or
     // `./scripts/generate-uniffi-kotlin.sh` (which builds the lib).
-    //
-    // Matches CI (`.github/workflows/ci.yml`) which sets
-    // `LD_LIBRARY_PATH` to `target/debug` before `./gradlew test`.
-    // Here we do it structurally in Gradle so local dev matches CI.
-    val workspaceRoot = rootProject.projectDir.parentFile.parentFile
-    val candidates =
-        listOf(
-            "${workspaceRoot}/target/debug",
-            "${workspaceRoot}/target/release",
-        )
-    systemProperty("jna.library.path", candidates.joinToString(File.pathSeparator))
+    jvmArgumentProviders.add(JnaLibraryPath(cargoTargetDir))
 }
 
 detekt {
@@ -210,11 +238,12 @@ tasks.register<Exec>("generateUniffiBindings") {
     // Production consumers leave it unset so the testing surface is not linked
     // into release binaries.
     val extraFeatures = providers.gradleProperty("scp.uniffi.extraFeatures").getOrElse("")
-    val featuresArg = if (extraFeatures.isEmpty()) {
-        "--features=testing"
-    } else {
-        "--features=testing,$extraFeatures"
-    }
+    val featuresArg =
+        if (extraFeatures.isEmpty()) {
+            "--features=testing"
+        } else {
+            "--features=testing,$extraFeatures"
+        }
     commandLine("./scripts/generate-uniffi-kotlin.sh", featuresArg)
     // Invalidate on any Rust change under the uniffi crate so stale bindings never compile.
     inputs.files(fileTree(rootProject.projectDir.parentFile.parentFile.resolve("crates/scp-ffi/uniffi/src")))
@@ -249,7 +278,10 @@ tasks.matching { it.name == "compileKotlin" }.configureEach {
 // puts the task under the rule, because the generator's output directory sits
 // inside that root. The hand-written sources are always on disk, so the gate
 // reports the same set whether or not the generator has ever run.
-fun isOrderedAfter(consumer: Task, producer: Task): Boolean {
+fun isOrderedAfter(
+    consumer: Task,
+    producer: Task,
+): Boolean {
     val visited = mutableSetOf<Task>()
     val pending = ArrayDeque<Task>()
     pending.addLast(consumer)

@@ -7,6 +7,9 @@
 
 package works.limn.scp.android
 
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
 import works.limn.scp.bridge.CancellationHandle
 import works.limn.scp.bridge.CoroutineBridge
 import works.limn.scp.bridge.MessageCallback
@@ -65,6 +68,21 @@ class ScpViewModelTest {
         assertEquals(2, stubBindings.leaveCalledHandles.size)
         assertTrue(stubBindings.leaveCalledHandles.contains(1L))
         assertTrue(stubBindings.leaveCalledHandles.contains(2L))
+    }
+
+    // The bridge's I/O dispatcher here is the test scheduler, which runs only when the
+    // test advances it. A blocking onCleared would wait on that scheduler from the
+    // thread that advances it and never return.
+    @Test
+    fun `onCleared returns before leave runs on the bridge dispatcher`() = runTest(testDispatcher) {
+        val viewModel = TestScpViewModel()
+        viewModel.trackContext(TrackedContext(handle = 7L, identityHandle = 1L, bridge = bridge))
+
+        viewModel.callOnCleared()
+        assertTrue(stubBindings.leaveCalledHandles.isEmpty(), "leave ran before the dispatcher advanced")
+
+        advanceUntilIdle()
+        assertEquals(listOf(7L), stubBindings.leaveCalledHandles)
     }
 
     @Test
@@ -135,11 +153,23 @@ class ScpViewModelTest {
 }
 
 /**
- * Concrete [ScpViewModel] subclass for testing. Exposes [onCleared] via [callOnCleared].
+ * Concrete [ScpViewModel] subclass for testing.
+ *
+ * [callOnCleared] clears the view model through a [ViewModelStore], so the call runs
+ * the same `ViewModel.clear()` Android runs: `clear()` cancels `viewModelScope` and then
+ * calls [onCleared]. Calling [onCleared] directly would skip the cancellation.
  */
 private class TestScpViewModel : ScpViewModel() {
     fun callOnCleared() {
-        onCleared()
+        val store = ViewModelStore()
+        val self = this
+        val factory =
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T = self as T
+            }
+        ViewModelProvider(store, factory)[TestScpViewModel::class.java]
+        store.clear()
     }
 }
 

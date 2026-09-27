@@ -30,7 +30,7 @@ SCP is an open protocol for the agentic Internet: DID identity, governed context
 
 **Asking the human a question, and ending a turn:**
 - Ask when the answer changes what you do next and nothing you can read settles it: two readings lead to materially different work, the next action is destructive or visible outside the repository, or the plan leaves the decision to the human. Make every other judgment call yourself and say which call you made.
-- Before you ask, search the shipped code, the human's earlier words in this conversation, the persistent memory, and the plan of record, in that order, reading each for the rule that governs; a question they answer costs the human a reply and stops the work.
+- Before you ask, search the plan of record, the shipped code, the human's earlier words in this conversation, and the persistent memory, in that order, reading each for the rule that governs; a question they answer costs the human a reply and stops the work.
 - Do everything that does not depend on the answer first, and ask at the end of a turn that delivers that progress. When a wrong guess is cheap to undo, proceed and state the assumption.
 - Ask one decision per question, with the options, what each changes, and your recommendation (AskUserQuestion for discrete options).
 - When the human describes a problem, asks a question, or thinks out loud, report your assessment and stop; fix only when asked.
@@ -43,6 +43,8 @@ SCP is an open protocol for the agentic Internet: DID identity, governed context
 **Artifact flow (INVARIANT):** plans → specs → ADRs → stories → source code, one way. Code does not inform specs, and a story never reshapes an ADR. When code shows a spec is wrong, stop, fix the spec and everything downstream, then resume; fix an unimplementable story first. Code that diverges from the artifacts it cites is phantom provenance.
 
 **Workflow:**
+- **Read the plan of record first (MANDATORY when one covers the work).** The plan of record is the one plan file a workstream keeps in `~/.claude/plans/`. A plan covers the work when the work belongs to its workstream; the plan's tracks, story IDs, branches, and pull requests are indicators. Before any other search and before dispatching an agent, list `~/.claude/plans/` and read every plan that covers the task; re-read it after a compaction. Its settled rows are instructions.
+- Search Vestige at the start of every task, before editing a crate or module, and before debugging an error; fall back to Flex when Vestige has nothing. `.claude/MEMORY_STORES.md` says which memory store to read and write for each kind of fact.
 - Enter plan mode for three or more steps or an architectural question. Read the language's `.docs/standards/` file before coding; cite `.docs/`.
 - A correction becomes a lesson only when it is "either contextually important for this project, evergreen, a true learning we shouldn't waste time rediscovering, high signal, technical, or non-obvious" (the human's words). Write the lesson in the most relevant location: a nested `AGENTS.md`, a standard, or `.docs/lessons/`.
 - Give each subagent exactly one task. Tell it where to look; do not paste artifacts into its prompt.
@@ -122,5 +124,6 @@ mise installs every tool except Rust. **Never use npm or npx** (bun only). Use `
 | Lessons | Before debugging a possible environment or CI fault, or writing a gate | `.docs/lessons/` |
 | CI commands | Exact commands and feature lists | `.github/workflows/ci.yml` |
 | Agents and review rules | Writing an agent definition; conducting a review or audit | `.claude/agents/README.md` |
-| Context+ / Vestige MCP | Mapping code / long-term memory | `.claude/CONTEXTPLUS_MCP.md`, `~/.claude/CLAUDE.md` |
+| Context+ MCP | Mapping code | `.claude/CONTEXTPLUS_MCP.md` |
+| Memory stores | Which of the plan of record, the repository, Vestige, Flex, and agent memory to read or write, and when; auto-memory is off | `.claude/MEMORY_STORES.md`, `~/.claude/CLAUDE.md` |
 | Directory rules | Before working in that directory | `AGENTS.md` in `crates/scp-runtime`, `crates/scp-ffi`, `crates/scp-client`, `crates/scp-client-wasm`, `bindings/{swift,kotlin,typescript,python}`, `fuzz` |

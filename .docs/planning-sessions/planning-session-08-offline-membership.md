@@ -5,6 +5,15 @@
 **Status:** Decided — awaiting execution (queued behind the ADR-057 in-flight slices; see the corrective-slice list in `.docs/adrs/ADR-057-in-browser-client-over-shared-mls.md`).
 **Provenance:** spec §9.6.2 KeyPackage lifecycle + §9.9.2 suppression detection (`.docs/specs/09-security-model.md`), §23 sync/offline strategy incl. §23.4.1 Welcome fast-forward and §23.5.2 Tier-3 reset (`.docs/specs/23-sync-and-offline-strategy.md`), §5.6 membership lifecycle + §5.4 presence-only state (`.docs/specs/05-contexts.md`), §10.8.1 multi-device + §10.9 presence-as-tool (`.docs/specs/10-infrastructure-and-self-hosting.md`), ADR-029 (`.docs/adrs/phase-6.md`), ADR-057 Consequences (deferred presence bullet). RFC 9420 §10 (last-resort KeyPackages).
 
+> **Annotation, 2026-09-13.** Everything below is the record as its author wrote it on the
+> date this file carries, restored unedited. The identity model it reads — the identifier written as a `did:` string — was
+> replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity substrate,
+> whose rules `.docs/specs/09-security-model.md` §9.7.4.2 and `.docs/specs/03-identity.md`
+> §3.10 carry, and whose curve Alec settled on 2026-09-10 as ECDSA on NIST P-256
+> (`.docs/specs/09-security-model.md` §9.5). A record of what a named party read on a named
+> date states what that party read, so this annotation records what replaced the model and
+> no sentence below is edited to match.
+
 ## How this question was re-scoped
 
 ADR-057 deferred a "Presence ADR" for the browser client. Two corrections were made in this session before any decision:

@@ -12,7 +12,7 @@ bindings/python/
   scp_sdk/
     __init__.py                 # Re-exports: Identity, Context, ToolDefinition, ScpError, __version__
     py.typed                    # PEP 561 marker for type checkers
-    identity.py                 # Identity class, DIDDocument
+    identity.py                 # Identity class
     context.py                  # Context class, Membership, async context manager
     tools.py                    # ToolDefinition, TestVector dataclasses
     trust.py                    # evaluate_trust(), TrustEvaluation
@@ -120,19 +120,23 @@ Bridge functions in Rust use `py_` prefix:
 
 ```rust
 #[pyfunction]
-fn py_identity_create<'py>(py: Python<'py>, custody: &str) -> PyResult<Bound<'py, PyAny>> { ... }
+fn py_identity_create<'py>(py: Python<'py>, config: IdentityConfig) -> PyResult<Bound<'py, PyAny>> { ... }
 ```
 
-Python wrappers call these without the prefix:
+Python wrappers call these without the prefix. **`Identity.create` takes the three-slot config object `.docs/standards/construction.md` states, and `custody` carries the bridge's `KeyCustodyConfig` and carries no default**, because that slot decides where an identity's private key lives:
 
 ```python
 from scp_sdk._scp_core import py_identity_create
 
 class Identity:
     @classmethod
-    async def create(cls, custody: str = "platform") -> Identity:
-        raw = await py_identity_create(custody)
+    async def create(cls, config: IdentityConfig) -> Identity:
+        raw = await py_identity_create(config)
         return cls(raw)
+
+# IdentityConfig(backend=IdentityBackendConfig.RELAY_NETWORK,
+#                custody=KeyCustodyConfig.PLATFORM,   # required; no default
+#                persistence=None)                    # ephemeral
 ```
 
 ### Opaque types
@@ -148,10 +152,12 @@ pub struct PyIdentity {
 #[pymethods]
 impl PyIdentity {
     #[getter]
-    fn did(&self) -> &str { &self.inner.did }
+    fn identifier(&self) -> &[u8] { &self.inner.identifier }
 
+    /// `CustodyType` is name-bound, so the getter returns the enumeration and
+    /// never a bare string (`09-security-model.md` §9.7.4.2 definitions).
     #[getter]
-    fn custody_type(&self) -> &str { self.inner.custody_type.as_str() }
+    fn custody_type(&self) -> CustodyType { self.inner.custody_type }
 }
 ```
 
