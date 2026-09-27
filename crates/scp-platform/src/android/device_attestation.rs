@@ -6,12 +6,13 @@
 //! This module documents the Rust-side contract and re-exports the trait types
 //! that the Kotlin adapter implements.
 //!
-//! # Play Integrity Standard API (ADR-027)
+//! # Play Integrity request (ADR-027)
 //!
-//! Standard integrity requests return a verdict signed by Google's servers,
-//! sufficient for SCP's attestation purpose. Classic attestation (APK certificate
-//! chain) is not used -- it has stricter rate limits and is designed for offline
-//! scenarios SCP does not have.
+//! The Kotlin adapter requests a Classic integrity token, passing a nonce
+//! through `IntegrityTokenRequest.builder().setNonce(nonce)`. ADR-027 requires
+//! a Standard integrity request whose `requestHash` is the lowercase
+//! hexadecimal form of the binding digest, and story SCP-111 tracks that
+//! change.
 //!
 //! See ADR-027 in `.docs/adrs/phase-6.md` for the full design rationale.
 

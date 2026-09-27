@@ -135,7 +135,8 @@ enum class WakeSignal {
  * Platform trait for device attestation.
  *
  * Abstracts device-level attestation token generation behind a uniform interface.
- * The Android implementation uses the Play Integrity Standard API.
+ * The Android implementation requests a Classic Play Integrity token; ADR-027
+ * requires a Standard request, and story SCP-111 tracks that change.
  *
  * This interface mirrors the Rust `DeviceAttestation` trait in `scp-platform/src/traits.rs`.
  *

@@ -12,35 +12,36 @@ import kotlinx.coroutines.withContext
 import java.security.MessageDigest
 
 /**
- * Android implementation of [DeviceAttestationProvider] using the Play Integrity
- * Standard API.
+ * Android implementation of [DeviceAttestationProvider] using Play Integrity.
  *
- * ## Play Integrity Standard API
+ * ## Classic request, Standard required
  *
- * Standard integrity requests return a verdict signed by Google's servers,
- * sufficient for SCP's attestation purpose. Classic attestation (APK certificate
- * chain) is not used -- it requires a dedicated Google Play Developer API call per
- * attestation with stricter rate limits and is designed for offline scenarios SCP
- * does not have. Standard is lower-cost, lower-latency, and simpler.
+ * This adapter requests a Classic Play Integrity token: it passes a nonce
+ * through `IntegrityTokenRequest.builder().setNonce(nonce)`. ADR-027's
+ * 2026-09-27 amendment requires a Standard integrity request whose
+ * `requestHash` is the lowercase hexadecimal form of the binding digest `D`,
+ * and story SCP-111 tracks that change.
  *
- * ## Attestation flow (per ADR-027)
+ * ## Attestation flow as shipped
  *
  * 1. Construct `clientDataJSON` from the challenge, device ID, and attestation type.
  * 2. Compute `nonce = Base64(SHA-256(clientDataJSON))`.
- * 3. Request a standard integrity token from Play Integrity with the nonce.
- * 4. Return the integrity token JWT bytes for server-side verification.
+ * 3. Request a Classic integrity token from Play Integrity with the nonce.
+ * 4. Return the integrity token JWT bytes.
  *
  * ## Thread safety
  *
  * All I/O operations run on [Dispatchers.IO] via [withContext]. The class holds
  * no mutable state and is safe for concurrent use.
  *
- * ## Server-side verification
+ * ## Verification
  *
- * The returned integrity token is a JWT that must be verified server-side via
- * the Google Play Integrity API. The relay reconstructs the `clientDataJSON`
- * with the same fixed-field-order formula to verify the nonce embedded in the
- * integrity token.
+ * Google decodes an integrity token only for the Cloud project linked to the
+ * requesting app. Under ADR-027's 2026-09-27 amendment, the package's verifier,
+ * named in the context's `accepted_android_packages`, decodes the token and
+ * signs a verdict, and each reader checks that verdict; §9.3.1 of
+ * `09-security-model.md` defines the procedure, and story SCP-316 implements
+ * the reader.
  *
  * See ADR-027 in `.docs/adrs/phase-6.md` and `crates/scp-ffi/uniffi/src/lib.rs`
  * `DeviceAttestationProvider`.
@@ -60,9 +61,6 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      * encoded JWT bytes. ADR-027 acceptance criterion 7 requires a Standard
      * token whose `requestHash` is the lowercase hexadecimal form of the
      * binding digest `D`; story SCP-111 tracks that change.
-     *
-     * The relay reconstructs this JSON with the same fixed-field-order formula
-     * to verify the nonce embedded in the integrity token.
      *
      * @param challenge The 32-byte binding digest `D` of
      *   `09-security-model.md` §9.3.1. ADR-025 and ADR-027 require the caller

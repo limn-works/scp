@@ -9,7 +9,8 @@
 //!
 //! - [`key_custody`] — Android Keystore key management (TEE-backed Ed25519 on
 //!   API 33+, Bouncy Castle software fallback on API 26-32).
-//! - [`device_attestation`] — Play Integrity Standard API for device attestation.
+//! - [`device_attestation`] — Play Integrity device attestation (a Classic
+//!   request today; story SCP-111 tracks the Standard request ADR-027 requires).
 //! - [`push_provider`] — Firebase Cloud Messaging with opaque data-only payloads.
 //! - [`storage`] — SQLCipher encrypted storage with TEE-derived AES-256 key.
 //!
