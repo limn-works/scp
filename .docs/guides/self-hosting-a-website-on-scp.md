@@ -254,7 +254,7 @@ reusable diagnostic — see §6.)*
 ## 5. Build plan
 
 > Governed by the artifact flow (specs → ADRs → stories → code). Each code change
-> goes through a worktree + the full review roster per `CLAUDE.md`.
+> goes through a worktree + the full review roster per `AGENTS.md`.
 
 **Governance (verified):** **No new ADR.** §10.12.2 + §10.12.8 and ADR-032
 (Addressability/Deployment), ADR-035 (broadcast projection), ADR-042

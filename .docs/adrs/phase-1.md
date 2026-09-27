@@ -933,7 +933,7 @@ None. This is foundational. The traits it implements are defined in `scp-platfor
    - `public_key(key_handle) -> PublicKey`: Returns the public key for a handle (Ed25519 or X25519).
    - `destroy_key(key_handle) -> ()`: Removes the private key from the internal map. Subsequent operations with this handle fail.
    - `dh_agree(key_handle, peer_public) -> SharedSecret`: Performs X25519 ECDH. Returns error for Ed25519 handles.
-   - `derive_pseudonym(key_handle, context_id) -> PseudonymKeypair`: Computes `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`, derives an Ed25519 keypair from the first 32 bytes of the HMAC output (interpreted as an RFC-8032 seed). Returns error for X25519 handles. The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — using public key bytes would be a membership-enumeration oracle (§9.10.4.A). For software custody (InMemory, Apple software, Android software) `pseudonym_secret = HKDF-SHA256(ed25519_private_seed, salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic and pinned by §25.19 vectors. For hardware custody (Apple Secure Enclave, Android Keystore TEE API 33+) the private key is non-exportable, so `pseudonym_secret` is a device-local value computed inside the secure boundary (e.g. Android uses `SHA-256(TEE_sign("scp-pseudonym-secret-v1"))`); hardware pseudonyms are device-local by design. See `.docs/lessons/kotlin/android-tee-pseudonym-derivation.md`.
+   - `derive_pseudonym(key_handle, context_id) -> PseudonymKeypair`: Computes `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`, derives an Ed25519 keypair from the first 32 bytes of the HMAC output (interpreted as an RFC-8032 seed). Returns error for X25519 handles. The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — using public key bytes would be a membership-enumeration oracle (§9.10.4.A). For software custody (InMemory, Apple software, Android software) `pseudonym_secret = HKDF-SHA256(ed25519_private_seed, salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic and pinned by §25.19 vectors. For hardware custody (Apple Secure Enclave, Android Keystore TEE API 33+) the private key is non-exportable, so `pseudonym_secret` is a device-local value computed inside the secure boundary (e.g. Android uses `SHA-256(TEE_sign("scp-pseudonym-secret-v1"))`); hardware pseudonyms are device-local by design. See §9.10.4.A of `.docs/specs/09-security-model.md`.
    - `custody_type(key_handle) -> CustodyType::InMemory`.
    - Optionally accepts a seed for deterministic key generation in tests.
 
@@ -1004,7 +1004,7 @@ pub trait KeyCustody: Send + Sync {
     /// device-local value computed inside the secure boundary (e.g. Android uses
     /// SHA-256(TEE_sign("scp-pseudonym-secret-v1"))). Hardware pseudonyms are therefore
     /// device-local BY DESIGN, not cross-platform identical.
-    /// See .docs/lessons/kotlin/android-tee-pseudonym-derivation.md.
+    /// See §9.10.4.A of .docs/specs/09-security-model.md.
     ///
     /// The returned PseudonymKeypair is always software-managed (derived output).
     /// Returns an error if the key handle refers to an X25519 key.

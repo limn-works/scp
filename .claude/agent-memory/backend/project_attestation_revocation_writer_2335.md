@@ -24,4 +24,4 @@ step 1, compares `revoked_by` against `issuer` at step 4 (raising
 `AttestationRevocationInvalid` on mismatch), and consults an external checker
 only at step 5, so a step-5 hit against a list an earlier write produced cannot
 trigger another write. Anyone reordering those steps breaks that writer's
-soundness. Related: [[feedback-worktree-absolute-path]].
+soundness.

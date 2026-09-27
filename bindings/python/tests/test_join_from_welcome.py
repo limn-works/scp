@@ -18,7 +18,7 @@ Covers :meth:`scp_sdk.SCP.reserve_key_package` (step 1),
   context (the same trust model as ``context_create``).
 
 See ``.docs/adrs/ADR-049-actor-per-context.md`` §9 (Deferred Work 1) and
-``crates/scp-ffi/CLAUDE.md``.
+``crates/scp-ffi/AGENTS.md``.
 """
 
 from __future__ import annotations

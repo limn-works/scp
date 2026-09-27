@@ -1,20 +1,38 @@
 ---
 name: cross-sdk-shape-parity
-description: SCP's agent-first tenet requires identical API shape across all 4 SDK bindings; common parity defects to flag
+description: Recurring cross-SDK shape divergences to flag under the agent-first tenet, the direction to converge, and one divergence the binding substrate forces
 metadata:
   type: project
 ---
 
-SCP's "agent-first API design" tenet (CLAUDE.md) mandates **identical shape across all language bindings** (Python, TypeScript, Swift, Kotlin) so an LLM writing correct code in one SDK writes correct code in all. The measure: correct code from the type signature + one example, no compile-retry loop.
+When a change touches more than one SDK, build the operation × SDK matrix and check these
+divergences, which past reviews found repeatedly:
 
-**Why:** The SDK's primary author is an LLM; divergent shapes across bindings break that authorability and re-litigate the same operation per-language.
+- **Return type** — Python parses JSON into a `dict` while TypeScript hands back the raw
+  `string`. Converge on the parsed, typed shape.
+- **JSON string as a parameter** — `receipts_json: str` is the least discoverable parameter.
+  The SDK wrapper accepts a typed structure and serializes it before the bridge boundary; the
+  bridge may keep `str`. Precedent: `AggregationInput.consequenceRules` is typed
+  `ConsequenceRule[]` and the SDK serializes it.
+- **Calling convention** — one SDK exposes an operation as a module function over a
+  singleton while another takes the `SCP` instance. Pick one convention for the operation.
+- **Name collision in a flat namespace** — TypeScript `index.ts` is one flat namespace, while
+  Python separates names by module path. Two operations sharing a base name collide only in
+  TypeScript.
+- **Untyped custody or state** — `custody: string` where a `CustodyType` enum exists, or a
+  state accessor returning `String` beside an enum defined in the same file.
+- **Different defaults** — a default that differs between SDKs (a custody default was
+  `"in_memory"` in TypeScript and `FILE` in Python) breaks the "no silent security defaults"
+  tenet.
 
-**How to apply:** When reviewing a multi-SDK change (esp. PRs whose goal is "parity"), build the operation × SDK matrix and check these recurring divergences:
-- **Return type divergence** — e.g. Python parses JSON → `dict`, TS hands back raw `string`. Converge on the typed/parsed shape, not the raw blob.
-- **JSON-string-as-parameter** — `receipts_json: str` is the least discoverable param. SDK wrappers should accept typed structures (`list[dict]` / typed array) and serialize internally before the bridge boundary; the bridge can keep `str`. Precedent: `AggregationInput.consequenceRules` is typed `ConsequenceRule[]`, SDK serializes to wire JSON.
-- **Signature divergence** — same underlying bridge op exposed as module-fn-on-singleton in Python but instance-method-taking-`scp` in TS (e.g. `discover_contexts(query)` vs `discoverContexts(scp, query)`). Pick one calling convention, apply uniformly.
-- **Name collisions in flat namespaces** — TS `index.ts` is a flat namespace; Python disambiguates by module path. Two ops sharing a base name (`evaluateTrust` four-layer vs `evaluateTrust`/`bridgeEvaluateTrust` tier-integer) collide in TS even though Python (`trust.evaluate_trust` vs `bridge.evaluate_trust`) is clean. Prefer distinct top-level names or keep module-scoped.
+Converge upward: when one SDK has the typed shape and another the raw shape, move the raw one
+to the typed one.
 
-Convergence direction: when one SDK has the typed/structured shape and another the raw shape, drag the raw one UP to typed, not the typed one down.
+**Forced divergence, do not flag:** TypeScript `evaluateTrust` takes a `Context` handle and
+Python `evaluate_trust` takes a context-id string, because the NAPI `ucanValidate` and
+`eventLogQuery` calls need a handle while PyO3 resolves the context by id.
 
-Test-hook convention (TS): double-underscore prefix (`__setBridgeForTests`, `__extractCoreError`, `__classifyUcanError`, `__PASSED_BEFORE`) marks internal/test-only exports. `ForTests` suffix on seams. Guard production-shipped test seams with a runtime env check that throws outside test/dev.
+**TypeScript test hooks:** a double-underscore prefix (`__setBridgeForTests`,
+`__classifyUcanError`) marks an internal or test-only export, and a `ForTests` suffix marks a
+seam. A test seam that ships in production needs a runtime check that throws outside test and
+development.

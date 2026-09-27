@@ -305,5 +305,5 @@ deliberate test-time affordance, not a production pattern:
 
 - `.docs/adrs/phase-4.md` § ADR-022 — language bindings architecture
 - `.docs/adrs/phase-6.md` § ADR-034 — WASM constraint boundary
-- `crates/scp-ffi/CLAUDE.md`, `crates/scp-ffi/napi/CLAUDE.md` — bridge-specific design notes
+- `crates/scp-ffi/AGENTS.md` — bridge-specific design notes
 - `bindings/python/tests/bridge_parity/` — harness implementation

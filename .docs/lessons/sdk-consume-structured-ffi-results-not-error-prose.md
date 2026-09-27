@@ -1,78 +1,52 @@
-# SDK consumers consume structured FFI results — never reverse-engineer outcomes from error prose
+# SDKs Consume Structured FFI Results, Never Error Prose, and Validate Against a Real Capability URI
 
-**Source:** ADR-059 (`.docs/adrs/phase-2.md`), spec §7.2.4
-(`.docs/specs/07-trust-validation-and-capabilities.md`), the C3c trust/capability
-SDK rebuild (PRD SCP-302).
+Governing artifacts: ADR-059 (`.docs/adrs/phase-2.md`) and spec §7.2.4 of
+`07-trust-validation-and-capabilities.md`, which make the structured result normative. This
+lesson records the failure modes behind them.
 
-## The rule
+## Consuming results
 
-When a Rust core operation already returns a **structured** result across the FFI
-(a typed record of explicit fields), the SDK MUST consume that record directly. It
-MUST NOT discard the structured truth and then guess it back by string-matching the
-human-readable prose of an error message.
+- **Read the structured record, never guess it back from a message.** Capability validation
+  crosses the FFI as `CapabilityValidation`, six per-stage booleans. Matching
+  `[SCP-PERM-3001] permission error: …` prose to decide which stage failed couples every SDK
+  to Rust's wording, and its safe failure mode (all-false on an unrecognized message) turns a
+  reworded message into a silent regression.
+- **Prose-emitting mocks hide state bugs.** In the C3c rebuild, mocks that reported
+  `nonce_valid` unconditionally masked a multi-attestation nonce defect. A mock of a stateful
+  operation models the state the real one observes: `ucan_evaluate` probes the nonce
+  read-only, so re-evaluating keeps `nonce_valid: true`, while `ucan_validate` records it, so
+  a second call rejects.
+- **Classify a thrown error by its `[SCP-CAT-NNNN]` code, in one mapping function** (TypeScript
+  `mapBridgeError`) applied once per dispatch surface. That function passes an already-typed
+  error through untouched, since re-deriving a code from its message can only downgrade it,
+  and a test covers the pass-through.
 
-The canonical example: capability/trust validation crosses the FFI as
-`CapabilityValidation` — six explicit per-stage booleans (`tokens_valid`,
-`signatures_valid`, `within_ceiling`, `nonce_valid`, `not_revoked`,
-`time_bounds_valid`). A caller wanting the per-check breakdown reads those fields.
-Reconstructing *which* check failed by matching `[SCP-PERM-3001] permission error: …`
-prose is forbidden.
+## Validating a capability
 
-## Why prose-parsing is wrong on two independent grounds
+- **Never call `ucanValidate(handle, token, "*")`.** The enforcing path needs a full
+  `scp:ctx:{contextId}/{resource}:{action}` URI; the bridge rejects `"*"` at parse time, and
+  the caller receives an all-false verdict that reads as a result rather than an error.
+- **Pass the DID of the participant under assessment, and never let it default**, or the
+  audience check collapses into `aud == aud`.
+- **An intrinsic evaluation (`ucan_evaluate` with no challenge capability) is a diagnostic,
+  not an authorization.** It skips the grant match and does not consume the nonce, so the
+  token stays replayable against the enforcing path.
+- **Absorb by enumeration and propagate by default.** An absorbed error becomes a trust
+  verdict. `evaluate_trust` absorbs exactly one code, `SCP-CTX-2076` (no participation facts
+  for the subject), and re-throws the rest.
+- **Match the code to the failure class.** A context-state fault is `SCP-CTX-2023` so the SDK
+  re-throws it; `SCP-PERM-3001` is a real pipeline failure; `SCP-PERM-3030`, handle-affinity
+  misuse, re-throws. Collapsing a fault into the protocol-failure code launders it into a
+  verdict.
+- **Evaluate every declared capability, not `att[0]` alone**, and never infer which stages
+  passed from a hardcoded pipeline order.
 
-1. **Brittle by construction.** It couples the SDK to the exact wording of error
-   messages — a denylist of prose spellings that grows every time the core rephrases
-   a message, and silently mis-classifies the moment the wording drifts. A structured
-   truth flattened to a string and guessed back is a lossy projection.
-2. **It masks real defects (the mock-fidelity corollary).** Test mocks that emit
-   prose without modeling the state the real op observes will pass while the real op
-   is broken. In C3c this masked a multi-attestation **nonce** bug: the mocks emitted
-   a string that reported `nonce_valid` unconditionally, so the suite never exercised
-   the path where the nonce check actually consumes/observes state across attestations.
-   A typed result whose mocks must populate real per-stage outcomes — including nonce
-   state — would have surfaced it.
+## Where these rules are still broken
 
-## The mock-fidelity corollary
-
-**Typed mocks must model the state the real operation observes.** A mock for a
-read-only diagnostic (`ucan_evaluate`) must distinguish itself from the throwing
-gate (`ucan_validate`): the diagnostic probes the nonce read-only and records
-NOTHING, so re-evaluating the same token keeps `nonce_valid: true`; the gate records
-the nonce, so a second call would reject. A mock that returns the same canned record
-regardless of prior calls is a tautology that proves nothing about the state machine.
-
-## Error *typing* still derives from codes, through one chokepoint
-
-Where an SDK must classify a thrown gate error into a typed SDK error, it maps on the
-structured `[SCP-CAT-NNNN]` error **code** the bridge attaches, through a **single
-mapping function** (one chokepoint — e.g. TS `mapBridgeError`) applied at one site per
-dispatch surface (e.g. a `wrapBridgeErrors` Proxy over the bridge factories, plus the
-SDK-class methods that dispatch through the raw addon directly), not with a try/catch
-ladder of `message.contains(...)` at each call site. Scattered string classification is
-the same brittle denylist this lesson retires, in a second location. The mapping
-function must also pass already-typed errors through untouched — re-deriving a code from
-the message of an error that already carries a structured `.code` can only lose
-information (it downgrades a precise subclass to a generic error). That pass-through is
-security-load-bearing and must be covered by a test, or a future deletion silently
-re-opens the downgrade.
-
-## How to catch this when reviewing
-
-- Any SDK code path that `catch`es an error and branches on `.message`,
-  `.includes(...)`, `.startsWith(...)`, or `.match()` against message text to infer an
-  outcome: that is prose-parsing — replace it with the structured result.
-- Any FFI op with a structured return type whose SDK wrapper ignores the record and
-  re-parses an error: a finding.
-- Any test mock for a stateful op (nonce, replay, revocation) that returns a constant
-  record regardless of call history or arguments: it cannot catch state bugs.
-
-## Related
-
-- ADR-059 Rejected Alternatives (prose-parsing; overloading the throwing gate).
-- `.docs/lessons/per-sdk-idiom-not-cross-language-dogma.md` — the structured record
-  shape is identical across bindings (only field casing differs); the wrapper is
-  per-SDK idiomatic.
-- The `evaluate`/`evaluateTrust` wrappers landed in all four SDKs together
-  (Python, TypeScript, Kotlin, Swift), as ADR-059 §Decision-5 mandates: they consume
-  the existing `CapabilityValidationRecord` the UniFFI bridge already exports — they
-  must NOT re-introduce prose-parsing.
+`SCP.evaluateTrust` in `bindings/typescript/src/scp.ts`, `evaluate_trust` in
+`bindings/python/scp_sdk/trust.py`, and `evaluateTrust` in `bindings/swift/Sources/SCP/Trust.swift`
+call `ucanEvaluate` and read the six booleans. The module-level `evaluateTrust` that
+`bindings/typescript/src/index.ts` re-exports from `bindings/typescript/src/trust.ts` still runs
+the superseded path: `validateOneCapUri` classifies bridge errors by prefix-matching the
+`Display` message (with `REVOCATION_PREFIXES`), `__PASSED_BEFORE` hardcodes the stage order,
+and `evaluateLayer1` sends only the `att[0].with` that `__extractFirstCapabilityUri` returns.
