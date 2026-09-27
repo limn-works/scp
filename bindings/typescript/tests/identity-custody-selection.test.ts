@@ -18,6 +18,7 @@
 
 import { describe, expect, it } from "bun:test";
 import { GovernanceError, IdentityError, UnknownGovernanceOutcomeError } from "../src/errors";
+import type { CustodyType } from "../src/identity";
 import { GOVERNANCE_ACTION_RESULTS } from "../src/types";
 import { mountMockScp } from "./mock-bridge";
 
@@ -62,6 +63,14 @@ describe("custody selection is required", () => {
       }
       expect((err as IdentityError).message).toContain("SCP-IDENT-1059");
     }
+  });
+
+  it("types every custody name the napi bridge accepts", () => {
+    // Each element must be assignable to `CustodyType`, so dropping a name the
+    // bridge's `validate_custody_type` accepts from the union fails
+    // `tsc --noEmit -p tsconfig.test.json`.
+    const names: CustodyType[] = ["file", "platform", "software", "in_memory"];
+    expect(new Set(names).size).toBe(4);
   });
 
   it("rejects an empty custody string at runtime", async () => {

@@ -617,12 +617,7 @@ impl Scp {
                     }));
                 }
                 Err(ScpNapiError::Identity {
-                    message: format!(
-                        "custody type {custody:?} requires a wired platform \
-                         KeyCustodyProvider — use the KeyCustodyProvider callback \
-                         interface to inject Secure Enclave (iOS) or Android \
-                         Keystore (Android) backed custody"
-                    ),
+                    message: crate::identity::custody_provider_required_message(&custody),
                     code: codes::IDENT_1003.to_owned(),
                 }
                 .into())
@@ -802,12 +797,7 @@ impl Scp {
                 }
             }
             "platform" | "software" => Err(ScpNapiError::Identity {
-                message: format!(
-                    "custody type {custody:?} requires a wired platform \
-                     KeyCustodyProvider — use the KeyCustodyProvider callback \
-                     interface to inject Secure Enclave (iOS) or Android \
-                     Keystore (Android) backed custody"
-                ),
+                message: crate::identity::custody_provider_required_message(&custody),
                 code: codes::IDENT_1003.to_owned(),
             }
             .into()),

@@ -28,9 +28,10 @@ let scp = try SCP(storage: .inMemory)
 // `"in_memory"` keeps key material in this process's heap and loses it at
 // exit, and a build without the `testing` feature rejects it with
 // SCP-IDENT-1008 — it is what this quick start uses and what a shipped app
-// must not. A shipped iOS app names `"platform"` and wires a
-// KeyCustodyProvider through `identityCreateWithCustody`, so the Secure
-// Enclave holds the key material and it never enters this process.
+// must not. `identityCreateWithCustody` takes a KeyCustodyProvider that keeps
+// the key material in the Secure Enclave, and a published XCFramework
+// answers that call with SCP-IDENT-1059 too until a production pre-rotation
+// backend exists (see "What this quick start needs" below).
 let identity = try await scp.identityCreate(custody: "in_memory")
 print("DID: \(identity.did())")
 
@@ -84,9 +85,10 @@ test-only stand-in (`.docs/adrs/ADR-062-capability-injection.md` §Decision 6):
    the real backend.
 2. `"in_memory"` custody is a development affordance whose key material lives
    in this process's heap and dies with it. A build without `testing` answers
-   `[SCP-IDENT-1008] in_memory custody is not available in this build`. A
-   shipped app names `"platform"` and wires a `KeyCustodyProvider` through
-   `identityCreateWithCustody`, so the Secure Enclave holds the keys.
+   `[SCP-IDENT-1008] in_memory custody is not available in this build`.
+   Wiring a Secure Enclave `KeyCustodyProvider` through
+   `identityCreateWithCustody` does not avoid refusal 1: a published
+   XCFramework answers that call with `SCP-IDENT-1059` as well.
 
 `build-xcframework.sh --dev` builds a macOS-arm64 XCFramework with `testing`
 enabled, which runs the quick start today:

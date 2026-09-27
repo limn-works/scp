@@ -34,10 +34,11 @@ suspend fun main() {
     // SCP-CAPSEL-8000). `"in_memory"` keeps key material in this process's
     // heap and loses it at exit, and a build without the `testing` feature
     // rejects it with SCP-IDENT-1008 — it is what this quick start uses and
-    // what a shipped app must not. A shipped Android or iOS app names
-    // `"platform"` and wires a KeyCustodyProvider through
-    // `identityCreateWithCustody`, so the Android Keystore or the Secure
-    // Enclave holds the key material and it never enters this process.
+    // what a shipped app must not. `identityCreateWithCustody` takes a
+    // KeyCustodyProvider that keeps the key material in the Android Keystore
+    // or the Secure Enclave, and a published artifact answers that call with
+    // SCP-IDENT-1059 too until a production pre-rotation backend exists (see
+    // "What this quick start needs" below).
     val identity = scp.identityCreate(custody = "in_memory")
     println("DID: ${identity.did()}")
 
@@ -92,9 +93,10 @@ test-only stand-in (`.docs/adrs/ADR-062-capability-injection.md` §Decision 6):
    the real backend.
 2. `"in_memory"` custody is a development affordance whose key material lives
    in this process's heap and dies with it. A build without `testing` answers
-   `[SCP-IDENT-1008] in_memory custody is not available in this build`. A
-   shipped app names `"platform"` and wires a `KeyCustodyProvider` through
-   `identityCreateWithCustody`, so the Android Keystore holds the keys.
+   `[SCP-IDENT-1008] in_memory custody is not available in this build`.
+   Wiring an Android Keystore `KeyCustodyProvider` through
+   `identityCreateWithCustody` does not avoid refusal 1: a published artifact
+   answers that call with `SCP-IDENT-1059` as well.
 
 Build the native library with `testing` to run the quick start today:
 

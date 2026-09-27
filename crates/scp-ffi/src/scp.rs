@@ -548,12 +548,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// AC5: on a shipped build the production `identity_create` path fails closed
-    /// with [`IDENT_1059`](scp_ffi_common::error_codes::IDENT_1059) — it reaches
-    /// the pre-rotation commitment step (after real File custody + real Pkarr DHT
-    /// construction) and returns the typed error rather than minting the
-    /// `InMemoryPreRotationCustody` nullifier. File custody is used because
-    /// `in_memory` custody is itself severed on shipped builds; a temp `HOME` +
-    /// `SCP_KEY_PASSPHRASE` give the File backend a real, isolated key file.
+    /// with [`IDENT_1059`](scp_ffi_common::error_codes::IDENT_1059) rather than
+    /// minting the `InMemoryPreRotationCustody` nullifier. The `"file"` arm of
+    /// `parse_custody_inner` resolves `HOME` and `SCP_KEY_PASSPHRASE`, then
+    /// returns the typed error without opening a key file or constructing a DHT
+    /// client. File custody is used because `in_memory` custody is itself severed
+    /// on shipped builds; a temp `HOME` + `SCP_KEY_PASSPHRASE` let environment
+    /// resolution succeed, and the test then asserts that no key file exists.
     #[cfg(not(feature = "testing"))]
     #[test]
     fn identity_create_fails_closed_without_pre_rotation_backend() {

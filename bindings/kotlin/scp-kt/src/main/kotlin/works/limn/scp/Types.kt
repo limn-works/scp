@@ -85,7 +85,8 @@ object Capability {
 enum class CustodyType(val rawValue: String) {
     /**
      * Platform-native secure storage (Keychain on macOS/iOS, Keystore
-     * on Android, credential manager on Windows/Linux). Default.
+     * on Android, credential manager on Windows/Linux). No custody is a
+     * default: every identity creation names one (spec §17.17.1).
      */
     PLATFORM("platform"),
 

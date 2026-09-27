@@ -19,7 +19,8 @@ import Foundation
 /// - Spec section 3.2 (Key Custody)
 public nonisolated enum CustodyType: String, Sendable, CaseIterable {
     /// Platform-native secure storage (Keychain on macOS/iOS, Keystore
-    /// on Android, credential manager on Windows/Linux). Default.
+    /// on Android, credential manager on Windows/Linux). No custody is a
+    /// default: every identity creation names one (spec §17.17.1).
     case platform
     /// Ephemeral in-memory key store, suitable for testing or short-lived
     /// agents. Keys are lost on process exit.

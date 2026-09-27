@@ -676,13 +676,88 @@ mod tests {
         use crate::bridge::parse_custody_method;
 
         match parse_custody_method("in_memory") {
-            Err(ScpError::Identity { code, msg }) => assert_eq!(
-                code,
-                scp_ffi_common::error_codes::IDENT_1008,
-                "expected the custody-unavailable code SCP-IDENT-1008, got code \
-                 {code} with message: {msg}"
-            ),
+            Err(ScpError::Identity { code, msg }) => {
+                assert_eq!(
+                    code,
+                    scp_ffi_common::error_codes::IDENT_1008,
+                    "expected the custody-unavailable code SCP-IDENT-1008, got code \
+                     {code} with message: {msg}"
+                );
+                // The rejection names no remedy this build cannot serve: every
+                // custody, `identity_create_with_custody` included, meets
+                // SCP-IDENT-1059 here, and the `testing` feature carries the
+                // nullifiers a shipped build severs.
+                for remedy in ["\"platform\"", "\"file\"", "\"testing\""] {
+                    assert!(
+                        !msg.contains(remedy),
+                        "the rejection recommends {remedy}, which this build cannot \
+                         serve: {msg}"
+                    );
+                }
+                assert!(
+                    msg.contains(codes::IDENT_1059),
+                    "the rejection must state that every custody name meets {}: {msg}",
+                    codes::IDENT_1059
+                );
+            }
             other => panic!("a shipped build must reject \"in_memory\" custody, got: {other:?}"),
+        }
+    }
+
+    /// A shipped (no-`testing`) build answers `"platform"` and `"software"`
+    /// custody on both string-custody creators with `SCP-IDENT-1003`, and the
+    /// message names no entry point to retry through: the
+    /// `identity_create_with_custody` it would name fails closed with
+    /// `SCP-IDENT-1059` in this build
+    /// (`identity_create_with_custody_fails_closed_without_pre_rotation_backend`).
+    /// Job rust-build-uniffi-production names this test in its `-E` filter.
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn provider_custody_rejection_recommends_no_entry_point_this_build_cannot_serve() {
+        let rt = runtime();
+        let scp = scp_test();
+        for custody in ["platform", "software"] {
+            let results = [
+                (
+                    "identity_create",
+                    rt.block_on(scp.identity_create(custody.to_owned(), None)),
+                ),
+                (
+                    "identity_create_with_agent_key",
+                    rt.block_on(scp.identity_create_with_agent_key(custody.to_owned())),
+                ),
+            ];
+            for (entry_point, result) in results {
+                match result {
+                    Err(ScpError::Identity { code, msg }) => {
+                        assert_eq!(
+                            code,
+                            codes::IDENT_1003,
+                            "{entry_point}({custody:?}): expected SCP-IDENT-1003, got \
+                             {code} with message: {msg}"
+                        );
+                        assert!(
+                            !msg.contains("identity_create_with_custody"),
+                            "{entry_point}({custody:?}) recommends \
+                             identity_create_with_custody, which fails closed with \
+                             SCP-IDENT-1059 in this build: {msg}"
+                        );
+                        assert!(
+                            msg.contains(codes::IDENT_1059),
+                            "{entry_point}({custody:?}) must state that every custody \
+                             name meets {}: {msg}",
+                            codes::IDENT_1059
+                        );
+                    }
+                    Ok(_) => {
+                        panic!("{entry_point}({custody:?}) minted an identity on a shipped build")
+                    }
+                    Err(other) => panic!(
+                        "{entry_point}({custody:?}): expected ScpError::Identity with \
+                         SCP-IDENT-1003, got: {other:?}"
+                    ),
+                }
+            }
         }
     }
 

@@ -136,6 +136,35 @@ pub(crate) fn in_memory_unavailable_message() -> String {
     )
 }
 
+/// Message for the `SCP-IDENT-1003` rejection of `"platform"` or `"software"`
+/// custody named to a string-custody create entry point.
+///
+/// A `testing` build serves those custodies through the `KeyCustodyProvider`
+/// callback interface, so the message names that interface. A shipped build
+/// answers the callback entry point with `no_pre_rotation_backend` too, so
+/// there the message names no remedy and states that every custody name meets
+/// `SCP-IDENT-1059`. The `UniFFI` bridge's `custody_provider_required_message`
+/// splits its message the same way.
+pub(crate) fn custody_provider_required_message(custody: &str) -> String {
+    #[cfg(feature = "testing")]
+    {
+        format!(
+            "custody type {custody:?} requires a wired platform KeyCustodyProvider — \
+             use the KeyCustodyProvider callback interface to inject Secure Enclave \
+             (iOS) or Android Keystore (Android) backed custody"
+        )
+    }
+    #[cfg(not(feature = "testing"))]
+    {
+        format!(
+            "custody type {custody:?} requires a wired platform KeyCustodyProvider, and \
+             this build has no pre-rotation backend, so creating an identity fails \
+             closed with {} under every custody name (ADR-062 \u{a7}Decision 6)",
+            codes::IDENT_1059
+        )
+    }
+}
+
 /// Maps a shared [`FileCustodyError`] onto this bridge's error type.
 ///
 /// An unset environment variable is something the caller sets, so it surfaces
@@ -2318,13 +2347,12 @@ mod prod_fail_closed_tests {
     /// AC5 (napi `identity_create` string-custody surface): on a shipped build the
     /// `identity_create(kind)` string entry point mints no identity — every custody
     /// kind fails closed *before* any DID creation, so the pre-rotation nullifier is
-    /// unreachable via this surface. Unlike `PyO3` (which exposes a `"file"` custody
-    /// kind that reaches the shared `scp-identity::config::create_inner` lowering and
-    /// returns `SCP-IDENT-1059`), napi's real production key custody is the callback
-    /// `KeyCustodyProvider` (keychain/HSM) reached only via `identity_create_with_custody`,
-    /// not the string API. The string kinds fail closed earlier: `in_memory` is severed
-    /// (`SCP-IDENT-1008`) and `software`/`platform` require the callback provider
-    /// (`SCP-IDENT-1003`). This test pins that string-surface fail-closed on `"software"`.
+    /// unreachable via this surface. `"file"` resolves its environment and then
+    /// returns `SCP-IDENT-1059` without opening a key file, as the `PyO3` `"file"` arm
+    /// does. The other string kinds fail closed with their own codes: `in_memory` is
+    /// severed (`SCP-IDENT-1008`) and `software`/`platform` require the callback
+    /// provider (`SCP-IDENT-1003`). This test pins that string-surface fail-closed on
+    /// `"software"`.
     ///
     /// The *callback* path's own pre-rotation fail-closed (`SCP-IDENT-1059`) is NOT
     /// exercised here — it takes a napi `Env` + JS `Function`s that cannot be
@@ -2341,6 +2369,64 @@ mod prod_fail_closed_tests {
     ///
     /// `identity_create` is `async`; the crate tokio runtime drives it, mirroring the
     /// napi-rs worker's `block_on`.
+    /// The shipped `in_memory`, `platform` and `software` rejections on both
+    /// string-custody creators name no custody and no entry point as the remedy,
+    /// because this build answers every identity creation, the callback entry
+    /// point included, with `SCP-IDENT-1059`. Each message states that instead.
+    #[test]
+    fn custody_rejections_recommend_no_remedy_this_build_cannot_serve() {
+        use scp_ffi_common::error_codes::{IDENT_1003, IDENT_1008, IDENT_1059};
+
+        let scp = Scp::new_in_memory_for_test();
+        for (custody, code) in [
+            ("in_memory", IDENT_1008),
+            ("platform", IDENT_1003),
+            ("software", IDENT_1003),
+        ] {
+            let results = [
+                (
+                    "identity_create",
+                    crate::runtime().block_on(scp.identity_create(custody.to_owned(), None)),
+                ),
+                (
+                    "identity_create_with_agent_key",
+                    crate::runtime()
+                        .block_on(scp.identity_create_with_agent_key(custody.to_owned())),
+                ),
+            ];
+            for (entry_point, result) in results {
+                let msg = match result {
+                    Ok(_) => {
+                        panic!("{entry_point}({custody:?}) minted an identity on a shipped build")
+                    }
+                    Err(err) => err.to_string(),
+                };
+                assert!(
+                    msg.contains(code),
+                    "{entry_point}({custody:?}) must fail with {code}, got: {msg}"
+                );
+                // A `"platform"` rejection names its own custody, so only the
+                // other two rejections are checked for recommending it.
+                let platform_remedy = (custody != "platform").then_some("\"platform\"");
+                for remedy in ["\"file\"", "callback interface", "Secure Enclave"]
+                    .into_iter()
+                    .chain(platform_remedy)
+                {
+                    assert!(
+                        !msg.contains(remedy),
+                        "{entry_point}({custody:?}) recommends {remedy}, which this \
+                         build cannot serve: {msg}"
+                    );
+                }
+                assert!(
+                    msg.contains(IDENT_1059),
+                    "{entry_point}({custody:?}) must state that every custody name \
+                     meets {IDENT_1059}: {msg}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn identity_create_fails_closed_without_pre_rotation_backend() {
         let scp = Scp::new_in_memory_for_test();

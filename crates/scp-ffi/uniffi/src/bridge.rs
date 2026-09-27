@@ -299,6 +299,50 @@ fn no_pre_rotation_backend() -> ScpError {
     }
 }
 
+/// Message for the `SCP-IDENT-1008` rejection of `"in_memory"` custody in a
+/// shipped (no-`testing`) build.
+///
+/// The message names no other custody as the remedy, because this build
+/// answers every identity creation with [`no_pre_rotation_backend`] whichever
+/// custody the caller names, `identity_create_with_custody` included. It
+/// states that instead, so a caller who reads it does not retry with
+/// `"platform"` and meet `SCP-IDENT-1059` second. Mirrors the napi-rs
+/// bridge's `in_memory_unavailable_message` and the `PyO3` `"in_memory"` arm.
+#[cfg(not(feature = "testing"))]
+pub(crate) fn in_memory_unavailable_message() -> String {
+    format!(
+        "in_memory custody is not available in this build. This build also has no \
+         pre-rotation backend, so creating an identity fails closed with {} under \
+         every custody name (ADR-062 \u{a7}Decision 6)",
+        codes::IDENT_1059
+    )
+}
+
+/// Message for the `SCP-IDENT-1003` rejection of `"platform"` or `"software"`
+/// custody named to a string-custody create entry point.
+///
+/// A `testing` build serves those custodies through a `KeyCustodyProvider`
+/// callback, so the message names `remedy`, the entry point that accepts one.
+/// A shipped build answers that entry point with `no_pre_rotation_backend`
+/// too, so there the message names no remedy and states that every custody
+/// name meets `SCP-IDENT-1059`.
+pub(crate) fn custody_provider_required_message(custody: &str, remedy: &str) -> String {
+    #[cfg(feature = "testing")]
+    {
+        format!("custody type {custody:?} requires a KeyCustodyProvider — {remedy}")
+    }
+    #[cfg(not(feature = "testing"))]
+    {
+        let _ = remedy;
+        format!(
+            "custody type {custody:?} requires a KeyCustodyProvider, and this build has \
+             no pre-rotation backend, so creating an identity fails closed with {} under \
+             every custody name (ADR-062 \u{a7}Decision 6)",
+            codes::IDENT_1059
+        )
+    }
+}
+
 /// Selects the DHT client that key-rotation / agent-key / migration operations
 /// should publish their UPDATED DID document into, **failing closed**.
 ///
@@ -6744,10 +6788,7 @@ pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpEr
         "in_memory" => Ok(CustodyMethod::InMemory),
         #[cfg(not(feature = "testing"))]
         "in_memory" => Err(ScpError::Identity {
-            msg: "\"in_memory\" custody is not available in this build — enable the \
-                  \"testing\" feature for dev/desktop use. Production mobile builds must \
-                  use \"platform\" custody (Secure Enclave / Android Keystore)."
-                .to_owned(),
+            msg: in_memory_unavailable_message(),
             code: codes::IDENT_1008.to_owned(),
         }),
         "platform" => Ok(CustodyMethod::Platform),
@@ -9658,11 +9699,7 @@ impl Scp {
                                 });
                             }
                             Err(ScpError::Identity {
-                                msg: "\"in_memory\" custody is not available in this build \
-                                      — enable the \"testing\" feature for \
-                                      dev/desktop use. Production mobile builds must use \
-                                      \"platform\" custody (Secure Enclave / Android Keystore)."
-                                    .to_owned(),
+                                msg: in_memory_unavailable_message(),
                                 code: codes::IDENT_1008.to_owned(),
                             })
                         }
@@ -9776,11 +9813,11 @@ impl Scp {
                         // Use `identity_create_with_custody` to inject a
                         // platform-backed KeyCustodyProvider callback.
                         Err(ScpError::Identity {
-                            msg: format!(
-                                "custody type {custody:?} requires a KeyCustodyProvider — \
-                             use identity_create_with_custody() to inject a Secure \
-                             Enclave (iOS) or Android Keystore (Android) backed \
-                             custody provider"
+                            msg: custody_provider_required_message(
+                                &custody,
+                                "use identity_create_with_custody() to inject a Secure \
+                                 Enclave (iOS) or Android Keystore (Android) backed \
+                                 custody provider",
                             ),
                             code: codes::IDENT_1003.to_owned(),
                         })
@@ -17532,11 +17569,7 @@ impl Scp {
                         {
                             let _ = &bi;
                             Err(ScpError::Identity {
-                                msg: "\"in_memory\" custody is not available in this build \
-                                      — enable the \"testing\" feature for \
-                                      dev/desktop use. Production mobile builds must use \
-                                      \"platform\" custody (Secure Enclave / Android Keystore)."
-                                    .to_owned(),
+                                msg: in_memory_unavailable_message(),
                                 code: codes::IDENT_1008.to_owned(),
                             })
                         }
@@ -17610,10 +17643,10 @@ impl Scp {
                         }
                     }
                     CustodyMethod::Platform | CustodyMethod::Software => Err(ScpError::Identity {
-                        msg: format!(
-                            "custody type {custody:?} requires a KeyCustodyProvider — \
-                                 use identity_create_with_custody() + add_agent_key() to create \
-                                 an identity with an agent key using platform custody"
+                        msg: custody_provider_required_message(
+                            &custody,
+                            "use identity_create_with_custody() + add_agent_key() to create \
+                             an identity with an agent key using platform custody",
                         ),
                         code: codes::IDENT_1003.to_owned(),
                     }),

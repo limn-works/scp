@@ -67,7 +67,7 @@ export interface IdentityLinkAttestation {
 // ---------------------------------------------------------------------------
 
 /** Supported custody methods for identity key management. */
-export type CustodyType = "platform" | "in_memory" | "software";
+export type CustodyType = "file" | "platform" | "in_memory" | "software";
 
 // ---------------------------------------------------------------------------
 // Identity
