@@ -66,6 +66,26 @@
         case internalError(String)
     }
 
+    extension AttestationError {
+        /// The `ScpError` that carries this error across the UniFFI
+        /// `DeviceAttestationProvider` callback, with one `SCP-ATTEST-` code
+        /// per case, so Rust tells every case apart by its code.
+        /// `crates/scp-ffi/common/src/error_codes.rs` registers each code.
+        var scpError: ScpError {
+            switch self {
+            case let .serviceError(msg): .Identity(msg: msg, code: "SCP-ATTEST-9001")
+            case let .unsupported(msg): .Identity(msg: msg, code: "SCP-ATTEST-9019")
+            case .keyNotFound:
+                .Identity(msg: "no App Attest key ID is stored; call attest first", code: "SCP-ATTEST-9020")
+            case let .keyAlreadyAttested(msg): .Identity(msg: msg, code: "SCP-ATTEST-9021")
+            case let .keyNotAttested(msg): .Identity(msg: msg, code: "SCP-ATTEST-9022")
+            case let .keyRejected(msg): .Identity(msg: msg, code: "SCP-ATTEST-9023")
+            case let .serverUnavailable(msg): .Identity(msg: msg, code: "SCP-ATTEST-9024")
+            case let .internalError(msg): .Identity(msg: msg, code: "SCP-ATTEST-9025")
+            }
+        }
+    }
+
     // ---------------------------------------------------------------------------
     // Storage key constants
     // ---------------------------------------------------------------------------
@@ -106,7 +126,8 @@
     /// ## Unavailable service (simulator, or a device without App Attest)
     ///
     /// When `DCAppAttestService.isSupported` is `false`, `attest` and
-    /// `assertRequest` throw `AttestationError.unsupported`. The adapter mints
+    /// `assertRequest` throw `ScpError.Identity` with code `SCP-ATTEST-9019`,
+    /// which `AttestationError.unsupported` maps to. The adapter mints
     /// no substitute token, because a locally fabricated token would assert a
     /// hardware guarantee that no hardware produced. §9.3 of the security model
     /// spec, "Sybil resistance and identity uniqueness", states that the
@@ -177,6 +198,36 @@
 
         // MARK: - DeviceAttestationProvider
 
+        /// The `DeviceAttestationProvider` callback method Rust calls through
+        /// UniFFI to obtain an attestation.
+        ///
+        /// The UniFFI callback declares `ScpError` as its error type. The
+        /// generated glue lowers a thrown `ScpError` into an error value that
+        /// Rust receives, and hands any other thrown type to Rust as an
+        /// unexpected callback error, which panics on the Rust side. This
+        /// method therefore throws `ScpError` only: it translates each
+        /// `AttestationError` through `AttestationError.scpError`, and
+        /// `attestReportingAttestationError(challenge:deviceId:)` declares
+        /// `throws(AttestationError)`, so the compiler rejects any other type.
+        public func attest(challenge: Data, deviceId: Data) async throws(ScpError) -> Data {
+            do throws(AttestationError) {
+                return try await attestReportingAttestationError(challenge: challenge, deviceId: deviceId)
+            } catch {
+                throw error.scpError
+            }
+        }
+
+        /// The `DeviceAttestationProvider` callback method Rust calls through
+        /// UniFFI to obtain an assertion. It throws `ScpError` only, for the
+        /// reason `attest(challenge:deviceId:)` states.
+        public func assertRequest(requestHash: Data) async throws(ScpError) -> Data {
+            do throws(AttestationError) {
+                return try await assertRequestReportingAttestationError(requestHash: requestHash)
+            } catch {
+                throw error.scpError
+            }
+        }
+
         /// Generate an attestation token for the given challenge and device ID.
         ///
         /// On a real device with App Attest available:
@@ -207,7 +258,10 @@
         ///   `AttestationError.serviceError` for every other App Attest error.
         ///   `classify(_:keyId:operation:)` states which condition each
         ///   `DCError.invalidKey` maps to.
-        public func attest(challenge: Data, deviceId: Data) async throws -> Data {
+        func attestReportingAttestationError(
+            challenge: Data,
+            deviceId: Data
+        ) async throws(AttestationError) -> Data {
             guard service.isSupported else {
                 throw AttestationError.unsupported(
                     "DCAppAttestService.isSupported is false on this device, so App Attest cannot "
@@ -298,7 +352,9 @@
         ///   `AttestationError.keyRejected` when Apple's App Attest service
         ///   rejected an attested key; this method discards its key ID.
         ///   `AttestationError.serviceError` for every other App Attest error.
-        public func assertRequest(requestHash: Data) async throws -> Data {
+        func assertRequestReportingAttestationError(
+            requestHash: Data
+        ) async throws(AttestationError) -> Data {
             guard service.isSupported else {
                 throw AttestationError.unsupported(
                     "DCAppAttestService.isSupported is false on this device, so App Attest cannot "

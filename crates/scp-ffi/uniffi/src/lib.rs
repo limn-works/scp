@@ -941,4 +941,35 @@ mod tests {
     // NOTE: routing_id tests removed — SA-15 changed ContextHandle to accept
     // Identity (for KeyCustody signing), which removed the routing_id field.
     // Routing ID tests will be re-added when routing is wired through KeyCustody.
+
+    // -----------------------------------------------------------------------
+    // DeviceAttestationProvider callback errors (ADR-025)
+    // -----------------------------------------------------------------------
+
+    /// The Rust half of a `DeviceAttestationProvider` callback that throws.
+    ///
+    /// The Swift adapter `AppleDeviceAttestation` throws `ScpError` from
+    /// `attest` and `assert_request`, and the generated Swift glue lowers that
+    /// value with the `ScpError` converter. This test lifts such a buffer
+    /// through the lift `UniFFI` runs for `Result<Vec<u8>, ScpError>` callback
+    /// returns, and requires an `Err` carrying the unsupported code.
+    #[test]
+    fn device_attestation_callback_scp_error_lifts_to_an_error_value() {
+        use uniffi::{LiftReturn, LowerError};
+        for code in [codes::ATTEST_9019, codes::ATTEST_9025] {
+            let thrown = ScpError::Identity {
+                msg: "DCAppAttestService.isSupported is false".to_owned(),
+                code: code.to_owned(),
+            };
+            let buf = <ScpError as LowerError<crate::UniFfiTag>>::lower_error(thrown);
+            let lifted =
+                <Result<Vec<u8>, ScpError> as LiftReturn<crate::UniFfiTag>>::lift_error(buf);
+            match lifted {
+                Err(ScpError::Identity {
+                    code: lifted_code, ..
+                }) => assert_eq!(lifted_code, code),
+                other => panic!("expected ScpError::Identity with {code}, got {other:?}"),
+            }
+        }
+    }
 }
