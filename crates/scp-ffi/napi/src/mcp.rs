@@ -338,20 +338,18 @@ impl McpTransport for SseMcpTransport {
 
 /// FFI bridge provider for the MCP server.
 ///
-/// Implements `ContextProvider` by reading this bridge instance's per-context
-/// UCAN state (role assignments, outlet registry, Merkle event log) — the same
-/// state the `PyO3` reference bridge reads from `FfiBridgeState`. Before
-/// #1341's follow-up every query method here returned an empty stand-in
-/// (`Vec::new()` / `Array([])`), which the builder tenet forbids on a shipped
-/// path: once the resource-authorization gap was closed those placeholders
-/// would have become live, serving an empty roster and an empty event log as
-/// if they were the real thing.
+/// Implements `ContextProvider` for one bridge instance. With a supervisor
+/// attached, the provider reads each context's role state and event log from
+/// the actor ([`live_role_state`] and `context_events`). With no supervisor
+/// attached, it reads the bridge's own per-context copy of both. It reads the
+/// outlet registry from the bridge's per-context state in either case. A read
+/// that fails returns an error, never an empty roster, log or outlet list.
 struct McpNapiBridgeProvider {
     /// Weak reference to the bridge instance whose registries this provider
     /// reads.
     ///
     /// `Weak`, not `Arc`, for the same reason as the `PyO3` and `UniFFI`
-    /// providers (#1549 round-2): the MCP server task is spawned on the shared
+    /// providers: the MCP server task is spawned on the shared
     /// runtime and is not enrolled in the per-instance `JoinSet`, so an `Arc`
     /// would pin the whole `NapiBridgeInstance` alive for the process when a
     /// caller drops `Scp` without calling `mcpServerStop`.
@@ -509,14 +507,20 @@ impl ContextProvider for McpNapiBridgeProvider {
         .map_err(|e| format!("{e}"))
     }
 
-    fn validate_capability(&self, _context_id: &str, _outlet_name: &str) -> Result<(), String> {
+    fn validate_capability(
+        &self,
+        _context_id: &str,
+        _outlet_name: &str,
+    ) -> Result<(), scp_mcp::server::AccessRefusal> {
         // `McpServer` lists a tool exactly when this method returns `Ok`, and
         // every `tools/call` ends in `invoke_outlet`. This bridge's
         // `invoke_outlet` cannot execute an outlet, so granting here would
         // put tools in `tools/list` that every `tools/call` then fails. The
         // denial keeps `tools/list` empty and refuses `tools/call` before it
         // reaches `invoke_outlet`, so a client sees the capability as absent.
-        Err(OUTLET_INVOCATION_UNAVAILABLE.to_owned())
+        Err(scp_mcp::server::AccessRefusal::Denied(
+            OUTLET_INVOCATION_UNAVAILABLE.to_owned(),
+        ))
     }
 
     fn invoke_outlet(
@@ -532,10 +536,15 @@ impl ContextProvider for McpNapiBridgeProvider {
         &self,
         context_id: &str,
         resource: scp_mcp::server::ResourceKind,
-    ) -> Result<(), String> {
-        let bi = self.upgrade_bi()?;
-        let role_state = live_role_state(&bi, context_id)?;
-        resource.check_access(&role_state, &self.agent_did, context_id)
+    ) -> Result<(), scp_mcp::server::AccessRefusal> {
+        use scp_mcp::server::AccessRefusal;
+        // A dropped bridge instance or an unreadable role state is a failed
+        // read, which `resources/list` reports as an error instead of
+        // omitting the context's resources.
+        let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
+        let role_state = live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;
+        let access = resource.check_access(&role_state, &self.agent_did, context_id);
+        access.map_err(AccessRefusal::Denied)
     }
 
     fn context_members(
@@ -613,8 +622,8 @@ impl ContextProvider for McpNapiBridgeProvider {
 /// Both `shutdown_rx` (`mcp_server_stop`) AND the bridge instance's
 /// `cancel_token` (`emergency_cancel_tasks` from `Drop`) terminate this task, so
 /// a caller that drops `Scp` without calling `mcp_server_stop` still tears the
-/// server and its pump down (#1549 round-2) — matching the SSE path and the
-/// PyO3/UniFFI bridges.
+/// server and its pump down, as the SSE path and the `PyO3` and `UniFFI`
+/// bridges do.
 async fn run_mcp_stdio_server(
     server: McpServerForTransport<McpNapiBridgeProvider>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
@@ -707,7 +716,7 @@ pub(crate) async fn mcp_server_create_on(
 
     // The bridge instance's cancel token fires on `emergency_cancel_tasks()`
     // from `Drop`, so an instance dropped without an explicit `mcp_server_stop`
-    // still tears down both the stdio and the SSE server + pump (#1549 round-2).
+    // still tears down both the stdio and the SSE server + pump.
     let cancel_token = bi.core.cancel_token();
 
     let task_handle = crate::runtime().spawn(async move {
@@ -718,8 +727,8 @@ pub(crate) async fn mcp_server_create_on(
             "sse" => {
                 // `SseConfig::new` draws a fresh bearer token, and the transport rejects
                 // every request that does not present it. This bridge returns neither that
-                // token nor the bound port to its caller (issue #2311), so no client can
-                // reach this server until that issue lands.
+                // token nor the bound port to its caller, so no client can reach this
+                // server.
                 let sse_config =
                     scp_mcp::sse::SseConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
                 let sse_shutdown = scp_mcp::sse::ShutdownHandle::new();
@@ -728,9 +737,9 @@ pub(crate) async fn mcp_server_create_on(
                 // instance's `cancel_token` (emergency_cancel_tasks from Drop) so
                 // either signal tears down the SSE server + pump. Without the
                 // cancel_token arm, a caller that drops `Scp` without calling
-                // `mcp_server_stop` would leave this task running indefinitely
-                // (#1549 round-2), matching the stdio path and the PyO3/UniFFI
-                // bridges.
+                // `mcp_server_stop` would leave this task running indefinitely.
+                // The stdio path and the `PyO3` and `UniFFI` bridges wire both
+                // signals the same way.
                 tokio::spawn(async move {
                     tokio::select! {
                         _ = shutdown_rx => {}
@@ -1177,7 +1186,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Resource subscriptions (#1341)
+    // Resource subscriptions
     //
     // `McpNapiBridgeProvider::subscribe_resource` is gone: the capability is
     // no longer a provider concern. The transport owns it, and it is gated on
@@ -1273,7 +1282,7 @@ mod tests {
             .expect("resources.subscribe must be advertised as a bool")
     }
 
-    /// Negative half of #1341. With no event receiver wired — what
+    /// Negative half: with no event receiver wired — what
     /// `mcp_server_create_on` produces when `Supervisor::subscribe_events()`
     /// yields `None` — the server must advertise `resources.subscribe: false`
     /// AND reject `resources/subscribe`. The replaced bridge behaviour
@@ -1310,9 +1319,10 @@ mod tests {
         );
     }
 
-    /// Positive half of #1341. `McpServer::with_event_source` (public only
-    /// under `scp-mcp/testing`) builds the flag and the pump in one call, the
-    /// same pair `with_optional_event_source(Some(rx))` seals into its bundle. The server then advertises the capability, accepts the
+    /// Positive half: `McpServer::with_event_source` (public only under
+    /// `scp-mcp/testing`) builds the flag and the pump in one call, the same
+    /// pair `with_optional_event_source(Some(rx))` seals into its bundle. The
+    /// server then advertises the capability, accepts the
     /// subscription, and `notifications_for_event` — the function the pump
     /// drives for each received `ContextEvent` — emits a real
     /// `notifications/resources/updated` for the subscribed URI. The receiver
@@ -1473,7 +1483,10 @@ mod tests {
             .validate_resource_access(SUB_CTX, ResourceKind::Tools)
             .expect_err("a non-member must not be able to read the tool list");
         assert!(
-            tools_denial.contains("lacks membership") && !tools_denial.contains("messages:read"),
+            matches!(
+                &tools_denial,
+                scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("lacks membership") && !msg.contains("messages:read")
+            ),
             "the Tools denial must name membership, got: {tools_denial}"
         );
         for kind in [ResourceKind::Events, ResourceKind::Members] {
@@ -1481,7 +1494,7 @@ mod tests {
                 .validate_resource_access(SUB_CTX, kind)
                 .expect_err("a non-member must be denied");
             assert!(
-                denial.contains("lacks messages:read"),
+                matches!(&denial, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("lacks messages:read")),
                 "the {kind:?} denial must name messages:read, got: {denial}"
             );
         }
@@ -1540,7 +1553,10 @@ mod tests {
                 .validate_resource_access(SUB_CTX, kind)
                 .expect_err("the bridge copy must not grant what the actor does not");
             assert!(
-                denial.contains("not held by the supervisor"),
+                matches!(
+                    &denial,
+                    scp_mcp::server::AccessRefusal::Unreadable(msg) if msg.contains("not held by the supervisor")
+                ),
                 "the {kind:?} denial must come from the actor query, got: {denial}"
             );
         }
@@ -1643,7 +1659,10 @@ mod tests {
             let denial = provider(revoked)
                 .validate_resource_access(revoked, kind)
                 .expect_err("the copy's grant must not outlive the actor's revocation");
-            assert!(denial.contains(requirement), "{kind:?}: {denial}");
+            assert!(
+                matches!(&denial, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains(requirement)),
+                "{kind:?}: {denial}"
+            );
         }
         assert!(provider(revoked).agent_role(revoked).is_none());
         let members = provider(revoked).context_members(revoked).unwrap();
@@ -1713,7 +1732,7 @@ mod tests {
         );
     }
 
-    /// Wiring guard for #1341: `mcp_server_create_on` sources its receiver
+    /// Wiring guard: `mcp_server_create_on` sources its receiver
     /// from `Supervisor::subscribe_events()`. Every NAPI supervisor path
     /// enables the broadcast channel (`build_supervisor_arc`), so that call
     /// must yield `Some` — were it to regress to `None`, a fully-wired bridge

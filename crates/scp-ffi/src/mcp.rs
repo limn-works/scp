@@ -735,6 +735,143 @@ impl FfiBridgeProvider {
                 .block_on(query),
         }
     }
+
+    /// Decides whether the agent may invoke `outlet_name` in `context_id`,
+    /// given the context's current role state: the UCAN check, then the
+    /// role-state capability check.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the check that refused the invocation.
+    fn outlet_grant(
+        &self,
+        bi: &crate::runtime::PyBridgeInstance,
+        role_state: &scp_core::context::roles::ContextRoleState,
+        context_id: &str,
+        outlet_name: &str,
+    ) -> Result<(), String> {
+        // Primary check: UCAN token validation via the full 11-step ADR-016
+        // pipeline. Verifies the token grants the outlet's kind-appropriate stem
+        // — outlet_query:{outlet_name}/outlet_query:* for Query outlets,
+        // outlet_call:{outlet_name}/outlet_call:* for Action outlets
+        // (SCP-OUT-014, §5.4.2) — for this context.
+        // See spec §6.2, §8, ADR-016, and issue #319.
+        if let Some(ref token) = self.agent_ucan_token {
+            // Build proof resolver from optional proof tokens (supports delegated UCANs).
+            let proof_resolver =
+                crate::ucan::build_proof_resolver_from_tokens(self.agent_proof_tokens.as_deref())
+                    .map_err(|e| format!("failed to build proof resolver: {e}"))?;
+
+            crate::runtime::with_context(bi, context_id, |rt| {
+                // SCP-OUT-014: select the split capability stem from the
+                // outlet's registered kind — `outlet_query:{id}` for Query
+                // outlets, `outlet_call:{id}` for Action outlets.
+                let outlet_kind_for_ucan = rt
+                    .outlet_registry
+                    .get(outlet_name)
+                    .map(|r| r.kind)
+                    .ok_or_else(|| {
+                        ScpPyError::ucan(format!(
+                            "outlet '{outlet_name}' not registered in context '{context_id}'"
+                        ))
+                    })?;
+
+                let production_resolver = crate::runtime::did_resolver(bi);
+                let did_resolver = crate::bridge_adapters::DispatchDidResolver::new(
+                    production_resolver.map(std::convert::AsRef::as_ref),
+                );
+                let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
+                    revocation_list: &rt.revocation_list,
+                };
+                let mut nonce_adapter = crate::bridge_adapters::BridgeNonceTracker {
+                    inner: &mut rt.nonce_tracker,
+                };
+
+                let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+                    did_resolver: &did_resolver,
+                    nonce_tracker: &mut nonce_adapter,
+                    revocation_checker: &revocation_checker,
+                    proof_resolver: &proof_resolver,
+                    ceiling: &rt.ceiling_strings,
+                    context_creator_did: &rt.creator_did,
+                    presenting_agent_did: &self.agent_did,
+                    clock_skew_tolerance_secs:
+                        scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                    clock: &scp_clock::SystemClock,
+                    // §5.4.5 HIGH-3 — outlet-invocation site resolves effective
+                    // caveats from each token's `nb` field so §7.3.8 Step 7b
+                    // (per-edge narrow) and Step 11b (time-box) run over the
+                    // proof chain's VALIDATED-NARROWED caveat set. Generic
+                    // validate/evaluate sites (ucan.rs) stay on `NoCaveatResolver`.
+                    caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
+                };
+
+                scp_core::context::outlets::validate_outlet_invocation_ucan(
+                    token,
+                    context_id,
+                    outlet_name,
+                    outlet_kind_for_ucan,
+                    &mut ctx,
+                )
+                .map_err(|e| {
+                    tracing::warn!(
+                        agent = %self.agent_did,
+                        outlet = %outlet_name,
+                        context = %context_id,
+                        error = %e,
+                        "UCAN validation failed for outlet invocation"
+                    );
+                    ScpPyError::ucan(format!(
+                        "UCAN authorization failed for outlet '{outlet_name}': {e}"
+                    ))
+                })
+            })
+            .map_err(|e| format!("{e}"))?;
+        } else {
+            tracing::warn!(
+                agent = %self.agent_did,
+                outlet = %outlet_name,
+                context = %context_id,
+                "no UCAN token provided for outlet invocation — authorization bypass risk"
+            );
+            return Err("UCAN token required for outlet invocation — no token provided".to_owned());
+        }
+
+        // Defense-in-depth: check role-state capabilities in addition to the
+        // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
+        crate::runtime::with_context(bi, context_id, |rt| {
+            // SCP-OUT-014: select the kind-appropriate split stem from the
+            // outlet's registered kind — OutletQuery for Query outlets,
+            // OutletCall for Action outlets (§5.4.2). The two stems are
+            // independent, so a Query grant never authorizes an Action call and
+            // vice versa. An outlet absent from the registry defaults to the
+            // Action stem (the UCAN gate above already required registration).
+            let outlet_kind = rt
+                .outlet_registry
+                .get(outlet_name)
+                .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind);
+            if scp_core::context::outlets::invoke::has_outlet_invocation_capability(
+                role_state,
+                &self.agent_did,
+                outlet_name,
+                outlet_kind,
+            ) {
+                Ok(())
+            } else {
+                // Generic message for the wire — detailed info stays server-side.
+                tracing::warn!(
+                    agent = %self.agent_did,
+                    outlet = %outlet_name,
+                    context = %context_id,
+                    "capability check failed: agent lacks the required outlet invocation capability"
+                );
+                Err(ScpPyError::context(
+                    "insufficient permissions to invoke outlet",
+                ))
+            }
+        })
+        .map_err(|e| format!("{e}"))
+    }
 }
 
 impl ContextProvider for FfiBridgeProvider {
@@ -799,136 +936,21 @@ impl ContextProvider for FfiBridgeProvider {
         .map_err(|e| format!("{e}"))
     }
 
-    fn validate_capability(&self, context_id: &str, outlet_name: &str) -> Result<(), String> {
-        // Upgrade the bridge instance handle up-front so every check below
-        // sees a stable `&PyBridgeInstance`. If the instance has been
-        // dropped, fail fast with a deterministic error rather than
-        // silently accepting the capability.
-        let bi = self.upgrade_bi()?;
-        // The role-state check below reads the actor's role state, not the
+    fn validate_capability(
+        &self,
+        context_id: &str,
+        outlet_name: &str,
+    ) -> Result<(), scp_mcp::server::AccessRefusal> {
+        use scp_mcp::server::AccessRefusal;
+        // A dropped bridge instance or an unreadable role state is a failed
+        // read, which `tools/list` reports as an error instead of omitting
+        // the context's tools. The role state comes from the actor, not the
         // bridge copy.
-        let role_state = Self::live_role_state(&bi, context_id)?;
-        // Primary check: UCAN token validation via the full 11-step ADR-016
-        // pipeline. Verifies the token grants the outlet's kind-appropriate stem
-        // — outlet_query:{outlet_name}/outlet_query:* for Query outlets,
-        // outlet_call:{outlet_name}/outlet_call:* for Action outlets
-        // (SCP-OUT-014, §5.4.2) — for this context.
-        // See spec §6.2, §8, ADR-016, and issue #319.
-        if let Some(ref token) = self.agent_ucan_token {
-            // Build proof resolver from optional proof tokens (supports delegated UCANs).
-            let proof_resolver =
-                crate::ucan::build_proof_resolver_from_tokens(self.agent_proof_tokens.as_deref())
-                    .map_err(|e| format!("failed to build proof resolver: {e}"))?;
-
-            crate::runtime::with_context(&bi, context_id, |rt| {
-                // SCP-OUT-014: select the split capability stem from the
-                // outlet's registered kind — `outlet_query:{id}` for Query
-                // outlets, `outlet_call:{id}` for Action outlets.
-                let outlet_kind_for_ucan = rt
-                    .outlet_registry
-                    .get(outlet_name)
-                    .map(|r| r.kind)
-                    .ok_or_else(|| {
-                        ScpPyError::ucan(format!(
-                            "outlet '{outlet_name}' not registered in context '{context_id}'"
-                        ))
-                    })?;
-
-                let production_resolver = crate::runtime::did_resolver(&bi);
-                let did_resolver = crate::bridge_adapters::DispatchDidResolver::new(
-                    production_resolver.map(std::convert::AsRef::as_ref),
-                );
-                let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
-                    revocation_list: &rt.revocation_list,
-                };
-                let mut nonce_adapter = crate::bridge_adapters::BridgeNonceTracker {
-                    inner: &mut rt.nonce_tracker,
-                };
-
-                let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
-                    did_resolver: &did_resolver,
-                    nonce_tracker: &mut nonce_adapter,
-                    revocation_checker: &revocation_checker,
-                    proof_resolver: &proof_resolver,
-                    ceiling: &rt.ceiling_strings,
-                    context_creator_did: &rt.creator_did,
-                    presenting_agent_did: &self.agent_did,
-                    clock_skew_tolerance_secs:
-                        scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                    clock: &scp_clock::SystemClock,
-                    // §5.4.5 HIGH-3 — outlet-invocation site resolves effective
-                    // caveats from each token's `nb` field so §7.3.8 Step 7b
-                    // (per-edge narrow) and Step 11b (time-box) run over the
-                    // proof chain's VALIDATED-NARROWED caveat set. Generic
-                    // validate/evaluate sites (ucan.rs) stay on `NoCaveatResolver`.
-                    caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
-                };
-
-                scp_core::context::outlets::validate_outlet_invocation_ucan(
-                    token,
-                    context_id,
-                    outlet_name,
-                    outlet_kind_for_ucan,
-                    &mut ctx,
-                )
-                .map_err(|e| {
-                    tracing::warn!(
-                        agent = %self.agent_did,
-                        outlet = %outlet_name,
-                        context = %context_id,
-                        error = %e,
-                        "UCAN validation failed for outlet invocation"
-                    );
-                    ScpPyError::ucan(format!(
-                        "UCAN authorization failed for outlet '{outlet_name}': {e}"
-                    ))
-                })
-            })
-            .map_err(|e| format!("{e}"))?;
-        } else {
-            tracing::warn!(
-                agent = %self.agent_did,
-                outlet = %outlet_name,
-                context = %context_id,
-                "no UCAN token provided for outlet invocation — authorization bypass risk"
-            );
-            return Err("UCAN token required for outlet invocation — no token provided".to_owned());
-        }
-
-        // Defense-in-depth: check role-state capabilities in addition to the
-        // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
-        crate::runtime::with_context(&bi, context_id, |rt| {
-            // SCP-OUT-014: select the kind-appropriate split stem from the
-            // outlet's registered kind — OutletQuery for Query outlets,
-            // OutletCall for Action outlets (§5.4.2). The two stems are
-            // independent, so a Query grant never authorizes an Action call and
-            // vice versa. An outlet absent from the registry defaults to the
-            // Action stem (the UCAN gate above already required registration).
-            let outlet_kind = rt
-                .outlet_registry
-                .get(outlet_name)
-                .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind);
-            if scp_core::context::outlets::invoke::has_outlet_invocation_capability(
-                &role_state,
-                &self.agent_did,
-                outlet_name,
-                outlet_kind,
-            ) {
-                Ok(())
-            } else {
-                // Generic message for the wire — detailed info stays server-side.
-                tracing::warn!(
-                    agent = %self.agent_did,
-                    outlet = %outlet_name,
-                    context = %context_id,
-                    "capability check failed: agent lacks the required outlet invocation capability"
-                );
-                Err(ScpPyError::context(
-                    "insufficient permissions to invoke outlet",
-                ))
-            }
-        })
-        .map_err(|e| format!("{e}"))
+        let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
+        let role_state =
+            Self::live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;
+        self.outlet_grant(&bi, &role_state, context_id, outlet_name)
+            .map_err(AccessRefusal::Denied)
     }
 
     #[allow(clippy::too_many_lines)] // Three-phase dispatch: validate + execute + emit event.
@@ -1246,10 +1268,16 @@ impl ContextProvider for FfiBridgeProvider {
         &self,
         context_id: &str,
         resource: scp_mcp::server::ResourceKind,
-    ) -> Result<(), String> {
-        let bi = self.upgrade_bi()?;
-        let role_state = Self::live_role_state(&bi, context_id)?;
-        resource.check_access(&role_state, &self.agent_did, context_id)
+    ) -> Result<(), scp_mcp::server::AccessRefusal> {
+        use scp_mcp::server::AccessRefusal;
+        // A dropped bridge instance or an unreadable role state is a failed
+        // read, which `resources/list` reports as an error instead of
+        // omitting the context's resources.
+        let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
+        let role_state =
+            Self::live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;
+        let access = resource.check_access(&role_state, &self.agent_did, context_id);
+        access.map_err(AccessRefusal::Denied)
     }
 
     fn context_members(&self, context_id: &str) -> Result<Vec<MemberInfo>, String> {
@@ -1366,8 +1394,8 @@ fn generate_handle_id(prefix: &str) -> String {
 /// and context state from the scp-ffi runtime registry. For `"stdio"`
 /// transport, the server processes JSON-RPC messages via a tokio task. For
 /// `"sse"` transport, the server binds a loopback HTTP server on an ephemeral
-/// port behind a per-server bearer token; this function returns neither the
-/// port nor the token (issue #2311).
+/// port behind a per-server bearer token. This function returns neither the
+/// port nor the token, so no client can reach an SSE server it starts.
 ///
 /// # Arguments
 ///
@@ -1519,8 +1547,8 @@ impl crate::scp::PyScp {
                     // no mutex wrapper, since the SSE transport owns it.
                     // `SseConfig::new` draws a fresh bearer token, and the transport rejects
                     // every request that does not present it. This bridge returns neither that
-                    // token nor the bound port to its caller (issue #2311), so no client can
-                    // reach this server until that issue lands.
+                    // token nor the bound port to its caller, so no client can reach this
+                    // server.
                     let config = scp_mcp::sse::SseConfig::new(std::net::SocketAddr::from((
                         [127, 0, 0, 1],
                         0,
@@ -2804,7 +2832,7 @@ mod tests {
         );
         let err = result.unwrap_err();
         assert!(
-            err.contains("UCAN token required"),
+            matches!(&err, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("UCAN token required")),
             "error should mention UCAN requirement: {err}"
         );
 
@@ -2851,7 +2879,7 @@ mod tests {
         );
         let err = result.unwrap_err();
         assert!(
-            err.contains("UCAN token required"),
+            matches!(&err, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("UCAN token required")),
             "error should mention UCAN requirement: {err}"
         );
 
@@ -3848,7 +3876,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // FfiBridgeProvider::validate_resource_access — answered from real role
-    // state (#1341 parity with the NAPI and UniFFI providers)
+    // state, as the NAPI and UniFFI providers answer it
     // -----------------------------------------------------------------------
 
     /// Builds an [`FfiBridgeProvider`] over `bi` serving `context_id` on
@@ -3939,7 +3967,7 @@ mod tests {
                 ResourceKind::Events | ResourceKind::Members => "lacks messages:read",
             };
             assert!(
-                denial.contains(expected),
+                matches!(&denial, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains(expected)),
                 "the denial for scp://{ctx_id}/{} must say {expected:?}, got: {denial}",
                 kind.uri_suffix()
             );
@@ -3957,12 +3985,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Resource subscriptions (#1341): honest advertisement + delivery.
+    // Resource subscriptions: honest advertisement + delivery.
     // Mirrors the NAPI (`mcp_subscribe_*_napi`) and UniFFI test pairs — PyO3
     // is the reference bridge, so it carries the same pair.
     // -----------------------------------------------------------------------
 
-    /// Negative half of #1341. With no event receiver wired — what
+    /// Negative half: with no event receiver wired — what
     /// `py_mcp_serve` produces when `Supervisor::subscribe_events()` yields
     /// `None` — the server must advertise `resources.subscribe: false` AND
     /// reject `resources/subscribe` with a typed `METHOD_NOT_FOUND`, never
@@ -4006,7 +4034,7 @@ mod tests {
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
-    /// Positive half of #1341. Built with a `ContextEvent` receiver from a
+    /// Positive half: built with a `ContextEvent` receiver from a
     /// detached channel, not the supervisor's, the server advertises the
     /// capability, accepts the subscription, and `notifications_for_event`
     /// (the function the transport pump drives per received event) produces a
@@ -4150,8 +4178,11 @@ mod tests {
             "validate_capability must reject when bridge is dropped"
         );
         assert!(
-            vc.unwrap_err().contains("bridge instance has been dropped"),
-            "error must mention the dropped bridge"
+            matches!(
+                vc.unwrap_err(),
+                scp_mcp::server::AccessRefusal::Unreadable(msg) if msg.contains("bridge instance has been dropped")
+            ),
+            "a dropped bridge is a failed read that names the dropped bridge"
         );
 
         // validate_resource_access: fails closed for every resource kind —
@@ -4168,9 +4199,11 @@ mod tests {
                 "validate_resource_access must reject {kind:?} when bridge is dropped"
             );
             assert!(
-                vra.unwrap_err()
-                    .contains("bridge instance has been dropped"),
-                "error must mention the dropped bridge"
+                matches!(
+                    vra.unwrap_err(),
+                    scp_mcp::server::AccessRefusal::Unreadable(msg) if msg.contains("bridge instance has been dropped")
+                ),
+                "a dropped bridge is a failed read that names the dropped bridge"
             );
         }
 
@@ -4231,7 +4264,10 @@ mod tests {
                 .validate_resource_access(&ctx_id, kind)
                 .expect_err("the bridge copy must not grant what the actor does not");
             assert!(
-                denial.contains("not held by the supervisor"),
+                matches!(
+                    &denial,
+                    scp_mcp::server::AccessRefusal::Unreadable(msg) if msg.contains("not held by the supervisor")
+                ),
                 "the {kind:?} denial must come from the actor query, got: {denial}"
             );
         }
@@ -4332,7 +4368,10 @@ mod tests {
             let denial = provider
                 .validate_resource_access(&revoked, kind)
                 .expect_err("the copy's grant must not outlive the actor's revocation");
-            assert!(denial.contains(requirement), "{kind:?}: {denial}");
+            assert!(
+                matches!(&denial, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains(requirement)),
+                "{kind:?}: {denial}"
+            );
         }
         assert!(provider.agent_role(&revoked).is_none());
         let members = provider.context_members(&revoked).unwrap();
@@ -4418,7 +4457,7 @@ mod tests {
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
-    /// Wiring guard for #1341, mirroring the NAPI and `UniFFI` tests:
+    /// Wiring guard, mirroring the NAPI and `UniFFI` tests:
     /// `py_mcp_serve` sources its receiver from `Supervisor::subscribe_events()`,
     /// and `crate::runtime::build_supervisor` enables the broadcast channel, so
     /// that call must yield `Some`. Were it to regress to `None`, every `PyO3`

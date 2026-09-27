@@ -571,7 +571,11 @@ mod tests {
         fn context_tools(&self, _context_id: &str) -> Result<Vec<ContextOutletInfo>, String> {
             Ok(Vec::new())
         }
-        fn validate_capability(&self, _context_id: &str, _tool_name: &str) -> Result<(), String> {
+        fn validate_capability(
+            &self,
+            _context_id: &str,
+            _tool_name: &str,
+        ) -> Result<(), crate::server::AccessRefusal> {
             Ok(())
         }
         fn invoke_outlet(
@@ -586,7 +590,7 @@ mod tests {
             &self,
             _context_id: &str,
             _resource: crate::server::ResourceKind,
-        ) -> Result<(), String> {
+        ) -> Result<(), crate::server::AccessRefusal> {
             Ok(())
         }
         fn context_members(&self, _context_id: &str) -> Result<Vec<MemberInfo>, String> {

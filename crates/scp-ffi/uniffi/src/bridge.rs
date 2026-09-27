@@ -4932,17 +4932,25 @@ impl McpUniFfiBridgeProvider {
         bi: &crate::runtime::UniffiBridgeInstance,
         context_id: &str,
     ) -> Result<Option<scp_core::context::roles::ContextRoleState>, String> {
-        let sup = match bi.context_manager_expect() {
-            Ok(sup) => Arc::clone(sup),
-            // No supervisor is attached, so no actor holds this context, and
-            // this provider reads role state only from the actor.
-            Err(_) if !bi.core.is_suspended() && !bi.core.is_shutdown() => return Ok(None),
-            Err(e) => {
-                return Err(format!(
-                    "role state of context '{context_id}' could not be read: {e}"
-                ));
-            }
+        // The lifecycle checks come before the supervisor lookup, so a resume
+        // that lands between them cannot turn a suspended read into
+        // `Ok(None)`.
+        if bi.core.is_suspended() || bi.core.is_shutdown() {
+            let state = if bi.core.is_suspended() {
+                "suspended"
+            } else {
+                "shut down"
+            };
+            return Err(format!(
+                "role state of context '{context_id}' could not be read: bridge {state}"
+            ));
+        }
+        // No supervisor is attached, so no actor holds this context, and this
+        // provider reads role state only from the actor.
+        let Some(sup) = bi.core.try_supervisor() else {
+            return Ok(None);
         };
+        let sup = Arc::clone(sup);
         let id = context_id.to_owned();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
@@ -4950,95 +4958,21 @@ impl McpUniFfiBridgeProvider {
         })
         .map_err(|e| format!("role state of context '{context_id}' could not be read: {e}"))
     }
-}
 
-impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
-    fn active_context_ids(&self) -> Result<Vec<scp_mcp::namespace::ContextId>, String> {
-        // Configured ∩ live: a context the agent has left is no longer served,
-        // so its tools and resources drop out of `tools/list` and
-        // `resources/list` without restarting the server (ADR-015 AC7). A
-        // context no actor holds is not served; a failed read is an error, not
-        // a departure.
-        let bi = self.upgrade_bi()?;
-        let mut served = Vec::new();
-        for id in &self.context_ids {
-            if Self::role_state_of(&bi, id)?.is_some_and(|rs| rs.members.contains(&self.agent_did))
-            {
-                served.push(id.clone());
-            }
-        }
-        Ok(served)
-    }
-
-    fn validate_resource_access(
+    /// Decides whether the agent may invoke `outlet_name` in `context_id`,
+    /// given the context's current role state: the UCAN check, then the
+    /// role-state capability check.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the check that refused the invocation.
+    fn outlet_grant(
         &self,
+        bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+        role_state: &scp_core::context::roles::ContextRoleState,
         context_id: &str,
-        resource: scp_mcp::server::ResourceKind,
+        outlet_name: &str,
     ) -> Result<(), String> {
-        let bi = self.upgrade_bi()?;
-        let role_state = Self::role_state_of(&bi, context_id)?.ok_or_else(|| {
-            format!("context '{context_id}' has no role state on this bridge instance")
-        })?;
-        resource.check_access(&role_state, &self.agent_did, context_id)
-    }
-
-    fn agent_role(&self, context_id: &str) -> Option<String> {
-        // Read the agent's role assignment from this instance's Supervisor
-        // role state via the ADR-049 query shim
-        // ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)).
-        // Returns None if the bridge instance has been dropped (#1549 round-2).
-        let bi = self.upgrade_bi().ok()?;
-        Self::role_state_of(&bi, context_id)
-            .ok()??
-            .assignments
-            .get(&self.agent_did)
-            .map(|assignment| assignment.role_name.clone())
-    }
-
-    fn agent_did(&self) -> &str {
-        &self.agent_did
-    }
-
-    fn context_tools(
-        &self,
-        context_id: &str,
-    ) -> Result<Vec<scp_mcp::server::ContextOutletInfo>, String> {
-        // Look up the ContextHandle from this provider's instance registry
-        // and read its outlet_registry. A dropped bridge or a context with no
-        // handle is an error, never an empty outlet registry.
-        let bi = self.upgrade_bi()?;
-        let registry = context_handle_registry(&bi);
-        let handle = registry.get(context_id).ok_or_else(|| {
-            format!("context '{context_id}' could not be read — no context handle")
-        })?;
-        let outlet_registry = handle
-            .outlet_registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(outlet_registry
-            .registrations()
-            .map(|t| scp_mcp::server::ContextOutletInfo {
-                name: t.name.clone(),
-                description: Some(t.description.clone()),
-                input_schema: t.schema.input_schema.clone(),
-                output_schema: Some(t.schema.output_schema.clone()),
-                admin_only: false,
-                // Carry the registry's authoritative §5.4.2 kind so the
-                // translator surfaces the correct `query.` / `call.` MCP
-                // tool-name prefix. `ContextOutletInfo.kind` is the canonical
-                // `scp_core::context::outlets::OutletKind` (re-exported by
-                // scp-mcp), so this is a direct move — never hardcode Action.
-                kind: t.kind,
-            })
-            .collect())
-    }
-
-    fn validate_capability(&self, context_id: &str, outlet_name: &str) -> Result<(), String> {
-        // Upgrade the bridge instance handle up-front so every check below
-        // sees a stable `&UniffiBridgeInstance`. If the instance has been
-        // dropped, fail fast rather than silently accepting the capability
-        // (#1549 round-2).
-        let bi = self.upgrade_bi()?;
         // Primary check: UCAN token validation via the full 11-step ADR-016
         // pipeline. Verifies the token grants the outlet's kind-appropriate stem
         // — outlet_query:{outlet_name}/outlet_query:* for Query outlets,
@@ -5062,11 +4996,9 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             // split stem (SCP-OUT-014). Scope the DashMap Ref so the shard lock
             // is released before entering with_ucan_state (a different DashMap).
             let outlet_kind_for_ucan = {
-                let handle = context_handle_registry(&bi)
-                    .get(context_id)
-                    .ok_or_else(|| {
-                        format!("context '{context_id}' not found in handle registry")
-                    })?;
+                let handle = context_handle_registry(bi).get(context_id).ok_or_else(|| {
+                    format!("context '{context_id}' not found in handle registry")
+                })?;
                 bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
                 let registry = handle
                     .outlet_registry
@@ -5138,33 +5070,8 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         }
 
         // Defense-in-depth: check role-state capabilities in addition to the
-        // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
-        //
-        // Routed through the ADR-049 query shim
-        // ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)).
-        use scp_core::context::actor::commands::QueriesCommand;
-        let sup = bi
-            .context_manager_expect()
-            .map_err(|e| format!("Supervisor not initialized: {e}"))?
-            .clone();
-        let role_state = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let cmd = QueriesCommand::GetRoleState {
-                    context_id: context_id.to_owned(),
-                    reply: tx,
-                };
-                sup.dispatch_query(cmd)
-                    .await
-                    .map_err(|e| format!("supervisor dispatch_query failed: {e}"))?;
-                rx.await
-                    .map_err(|e| format!("query shim reply dropped: {e}"))?
-                    .map_err(|e| e.to_string())
-            })
-        })?
-        .ok_or_else(|| {
-            format!("context '{context_id}' not registered with Supervisor for capability check")
-        })?;
+        // UCAN layer. See §7.2 and ADR-010 for the dual-check design. The
+        // caller read `role_state` from the actor.
 
         // SCP-OUT-014: select the kind-appropriate split stem from the outlet's
         // registered kind — OutletQuery for Query outlets, OutletCall for Action
@@ -5173,7 +5080,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         // registry defaults to the Action stem (the UCAN gate above already
         // required registration).
         let outlet_kind = {
-            let handle = context_handle_registry(&bi)
+            let handle = context_handle_registry(bi)
                 .get(context_id)
                 .ok_or_else(|| format!("context '{context_id}' not found in handle registry"))?;
             let registry = handle
@@ -5186,7 +5093,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         };
 
         if scp_core::context::outlets::invoke::has_outlet_invocation_capability(
-            &role_state,
+            role_state,
             &self.agent_did,
             outlet_name,
             outlet_kind,
@@ -5201,6 +5108,115 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             );
             Err("insufficient permissions to invoke outlet".to_owned())
         }
+    }
+}
+
+impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
+    fn active_context_ids(&self) -> Result<Vec<scp_mcp::namespace::ContextId>, String> {
+        // Configured ∩ live: a context the agent has left is no longer served,
+        // so its tools and resources drop out of `tools/list` and
+        // `resources/list` without restarting the server (ADR-015 AC7). A
+        // context no actor holds is not served; a failed read is an error, not
+        // a departure.
+        let bi = self.upgrade_bi()?;
+        let mut served = Vec::new();
+        for id in &self.context_ids {
+            if Self::role_state_of(&bi, id)?.is_some_and(|rs| rs.members.contains(&self.agent_did))
+            {
+                served.push(id.clone());
+            }
+        }
+        Ok(served)
+    }
+
+    fn validate_resource_access(
+        &self,
+        context_id: &str,
+        resource: scp_mcp::server::ResourceKind,
+    ) -> Result<(), scp_mcp::server::AccessRefusal> {
+        use scp_mcp::server::AccessRefusal;
+        let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
+        let role_state = Self::role_state_of(&bi, context_id)
+            .map_err(AccessRefusal::Unreadable)?
+            .ok_or_else(|| {
+                AccessRefusal::Unreadable(format!(
+                    "context '{context_id}' has no role state on this bridge instance"
+                ))
+            })?;
+        let access = resource.check_access(&role_state, &self.agent_did, context_id);
+        access.map_err(AccessRefusal::Denied)
+    }
+
+    fn agent_role(&self, context_id: &str) -> Option<String> {
+        // Read the agent's role assignment from this instance's Supervisor
+        // role state via the ADR-049 query shim
+        // ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)).
+        // Returns None if the bridge instance has been dropped.
+        let bi = self.upgrade_bi().ok()?;
+        Self::role_state_of(&bi, context_id)
+            .ok()??
+            .assignments
+            .get(&self.agent_did)
+            .map(|assignment| assignment.role_name.clone())
+    }
+
+    fn agent_did(&self) -> &str {
+        &self.agent_did
+    }
+
+    fn context_tools(
+        &self,
+        context_id: &str,
+    ) -> Result<Vec<scp_mcp::server::ContextOutletInfo>, String> {
+        // Look up the ContextHandle from this provider's instance registry
+        // and read its outlet_registry. A dropped bridge or a context with no
+        // handle is an error, never an empty outlet registry.
+        let bi = self.upgrade_bi()?;
+        let registry = context_handle_registry(&bi);
+        let handle = registry.get(context_id).ok_or_else(|| {
+            format!("context '{context_id}' could not be read — no context handle")
+        })?;
+        let outlet_registry = handle
+            .outlet_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(outlet_registry
+            .registrations()
+            .map(|t| scp_mcp::server::ContextOutletInfo {
+                name: t.name.clone(),
+                description: Some(t.description.clone()),
+                input_schema: t.schema.input_schema.clone(),
+                output_schema: Some(t.schema.output_schema.clone()),
+                admin_only: false,
+                // Carry the registry's authoritative §5.4.2 kind so the
+                // translator surfaces the correct `query.` / `call.` MCP
+                // tool-name prefix. `ContextOutletInfo.kind` is the canonical
+                // `scp_core::context::outlets::OutletKind` (re-exported by
+                // scp-mcp), so this is a direct move — never hardcode Action.
+                kind: t.kind,
+            })
+            .collect())
+    }
+
+    fn validate_capability(
+        &self,
+        context_id: &str,
+        outlet_name: &str,
+    ) -> Result<(), scp_mcp::server::AccessRefusal> {
+        use scp_mcp::server::AccessRefusal;
+        // A dropped bridge instance or an unreadable role state is a failed
+        // read, which `tools/list` reports as an error instead of omitting
+        // the context's tools.
+        let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
+        let role_state = Self::role_state_of(&bi, context_id)
+            .map_err(AccessRefusal::Unreadable)?
+            .ok_or_else(|| {
+                AccessRefusal::Unreadable(format!(
+                    "context '{context_id}' has no role state on this bridge instance"
+                ))
+            })?;
+        self.outlet_grant(&bi, &role_state, context_id, outlet_name)
+            .map_err(AccessRefusal::Denied)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -5445,7 +5461,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 /// and pumps each event into `notifications/resources/updated`; when it is the
 /// unwired variant, the server advertises `resources.subscribe: false` and
 /// rejects `resources/subscribe` with a typed error — the capability is honestly
-/// absent rather than accepted-and-never-delivered (#1341). The advertisement
+/// absent rather than accepted-and-never-delivered. The advertisement
 /// and its pump are one value, so the loop cannot be handed one without the
 /// other.
 async fn run_mcp_stdio_server_uniffi(
@@ -16378,8 +16394,8 @@ impl Scp {
                     // `run_sse` takes ownership of the `McpServer` directly.
                     // `SseConfig::new` draws a fresh bearer token, and the transport rejects
                     // every request that does not present it. This bridge returns neither that
-                    // token nor the bound port to its caller (issue #2311), so no client can
-                    // reach this server until that issue lands.
+                    // token nor the bound port to its caller, so no client can reach this
+                    // server.
                     let sse_config = scp_mcp::sse::SseConfig::new(std::net::SocketAddr::from((
                         [127, 0, 0, 1],
                         0,
@@ -23477,7 +23493,10 @@ mod tests {
             .validate_resource_access("ctx-denial", ResourceKind::Tools)
             .expect_err("a non-member must not read the tool list");
         assert!(
-            tools_denial.contains("lacks membership") && !tools_denial.contains("messages:read"),
+            matches!(
+                &tools_denial,
+                scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("lacks membership") && !msg.contains("messages:read")
+            ),
             "the Tools denial must name membership, got: {tools_denial}"
         );
         for kind in [ResourceKind::Events, ResourceKind::Members] {
@@ -23485,7 +23504,7 @@ mod tests {
                 .validate_resource_access("ctx-denial", kind)
                 .expect_err("a non-member must be denied");
             assert!(
-                denial.contains("lacks messages:read"),
+                matches!(&denial, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("lacks messages:read")),
                 "the {kind:?} denial must name messages:read, got: {denial}"
             );
         }
@@ -23560,7 +23579,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // MCP resource subscriptions (#1341)
+    // MCP resource subscriptions
     //
     // `ContextProvider::subscribe_resource` used to be a bridge-local no-op
     // that returned `Ok(())` while the server advertised

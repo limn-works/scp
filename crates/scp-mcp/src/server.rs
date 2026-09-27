@@ -28,7 +28,7 @@
 //!
 //! See ADR-015 in `.docs/adrs/phase-3.md` for the full design.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use scp_core::context::membership::ContextEvent;
 use scp_core::context::outlets::validate_value_against_schema;
@@ -238,6 +238,28 @@ pub struct MemberInfo {
     pub role: String,
 }
 
+/// Why a [`ContextProvider`] gate refused access.
+///
+/// `tools/list` and `resources/list` leave a [`Self::Denied`] item out of a
+/// successful response, and answer an [`Self::Unreadable`] one with an error,
+/// so a failed read never reaches the client as a shorter list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessRefusal {
+    /// The agent lacks the grant. The message names what it lacks.
+    Denied(String),
+    /// The provider could not read the state that decides the grant, such as
+    /// the context's role state, so it cannot say whether the agent holds it.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for AccessRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Denied(msg) | Self::Unreadable(msg) => f.write_str(msg),
+        }
+    }
+}
+
 /// Trait abstracting the server's access to SCP contexts, tools, and
 /// capabilities.
 ///
@@ -284,12 +306,14 @@ pub trait ContextProvider: Send + Sync {
     /// no ceiling, no role catalogue and no UCAN stem — denying every client
     /// unconditionally on every bridge.
     ///
-    /// Returns `Ok(())` if permitted, or an error message if denied.
+    /// Returns `Ok(())` if permitted.
     ///
     /// # Errors
     ///
-    /// Returns an error message if the agent lacks the required capability.
-    fn validate_capability(&self, context_id: &str, tool_name: &str) -> Result<(), String>;
+    /// Returns [`AccessRefusal::Denied`] if the agent lacks the required
+    /// capability, and [`AccessRefusal::Unreadable`] if the provider cannot
+    /// read the state that decides it.
+    fn validate_capability(&self, context_id: &str, tool_name: &str) -> Result<(), AccessRefusal>;
 
     /// Validates whether the agent may read a context resource
     /// (`scp://{context_id}/{kind}`).
@@ -319,12 +343,14 @@ pub trait ContextProvider: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns an error message if the agent may not read the resource.
+    /// Returns [`AccessRefusal::Denied`] if the agent may not read the
+    /// resource, and [`AccessRefusal::Unreadable`] if the provider cannot read
+    /// the context's role state.
     fn validate_resource_access(
         &self,
         context_id: &str,
         resource: ResourceKind,
-    ) -> Result<(), String>;
+    ) -> Result<(), AccessRefusal>;
 
     /// Invokes a tool and returns its output as a JSON value.
     ///
@@ -387,6 +413,17 @@ pub struct McpServer<P: ContextProvider> {
     /// context this client never saw". A `Mutex` because the pump holds
     /// `&self`.
     served_contexts: std::sync::Mutex<HashSet<ContextId>>,
+    /// The [`ContextView`] of each served context as of the last list
+    /// response, subscribe, or notification that told the client about it.
+    ///
+    /// [`Self::notifications_for_event`] sends the `tools/list_changed` +
+    /// `resources/list_changed` pair and the `scp://{ctx}/tools` update only
+    /// when the context's current view differs from this record. Another
+    /// member's join, departure or revocation leaves this agent's view
+    /// unchanged, so a member denied `scp://{ctx}/members` does not learn
+    /// from those notifications when the roster changes. A `Mutex` because the
+    /// pump holds `&self`.
+    client_views: std::sync::Mutex<HashMap<ContextId, ContextView>>,
     /// Whether a real runtime event source is wired to this server.
     ///
     /// Set only by `McpServer::wired_pair`, which is the *only* constructor
@@ -411,8 +448,12 @@ pub struct McpServer<P: ContextProvider> {
 /// consumed atomically by a transport ([`run_stdio`](crate::stdio::run_stdio) /
 /// [`run_sse`](crate::sse::run_sse)): a wired server cannot be transported
 /// without its pump, and there is no seam at which a caller could pair one
-/// server's flag with another server's pump. Dropping the pump unspawned is
-/// additionally a bug the `#[must_use]` catches at compile time.
+/// server's flag with another server's pump. Only
+/// `McpServer::with_event_source` hands a caller a bare pump, and it compiles
+/// only under `cfg(test)` or the `testing` feature, so no production caller can
+/// drop a pump unspawned. The `#[must_use]` below warns only when a caller
+/// discards the pump as a statement; binding it to a name such as `_pump` and
+/// dropping it raises no warning.
 #[must_use = "hand this to a transport (run_stdio / run_sse) — dropping it leaves \
               resources.subscribe advertised with nothing delivering notifications"]
 pub struct ContextEventPump {
@@ -455,13 +496,13 @@ impl std::fmt::Debug for ContextEventPump {
 /// is the sole builder that ties the two together. The bundle is an opaque
 /// struct whose one field is `pub(crate)`, so a caller outside `scp-mcp` can
 /// neither assemble one by hand nor destructure one to take the wired server
-/// out; [`Self::into_parts`] is `pub(crate)` and the transports are its only
+/// out; `into_parts` is `pub(crate)` and the transports are its only
 /// consumers. (A public enum with `#[non_exhaustive]` variants would not do:
 /// another crate can still destructure such a variant with
 /// `Wired { 0: server, .. }`.) Within `scp-mcp`, the field⟺variant
 /// correspondence is established at that single construction site — not
 /// enforced by the type system — and cross-checked by a `debug_assert!` in
-/// [`Self::into_parts`]. The transports perform no runtime pairing check: on
+/// `into_parts`. The transports perform no runtime pairing check: on
 /// production paths the bundle is only ever built at the one site
 /// ([`McpServer::with_optional_event_source`]) that keeps field and variant in
 /// sync — the sole hand-constructions are `#[cfg(test)]`, which that
@@ -549,6 +590,7 @@ impl<P: ContextProvider> McpServer<P> {
             client_capabilities: None,
             subscriptions: HashSet::new(),
             served_contexts: std::sync::Mutex::new(HashSet::new()),
+            client_views: std::sync::Mutex::new(HashMap::new()),
             // Fail closed: no event source, no promises that need one.
             event_source_wired: false,
         }
@@ -591,6 +633,7 @@ impl<P: ContextProvider> McpServer<P> {
             client_capabilities: None,
             subscriptions: HashSet::new(),
             served_contexts: std::sync::Mutex::new(HashSet::new()),
+            client_views: std::sync::Mutex::new(HashMap::new()),
             event_source_wired: true,
         };
         (server, ContextEventPump { rx })
@@ -785,11 +828,7 @@ impl<P: ContextProvider> McpServer<P> {
 
         // Built-in tools -- available to participants that hold the capability.
         for builtin in BUILTIN_TOOLS {
-            if self
-                .provider
-                .validate_capability(context_id, builtin.tool_name())
-                .is_ok()
-            {
+            if self.capability_granted(context_id, builtin.tool_name())? {
                 tools.push(builtin.to_tool_definition(context_id));
             }
         }
@@ -806,11 +845,7 @@ impl<P: ContextProvider> McpServer<P> {
             // Validate capability against the outlet_id (SCP-internal name).
             // The kind prefix is an MCP-facing display concern, not part of
             // the authorization check.
-            if self
-                .provider
-                .validate_capability(context_id, &outlet_info.name)
-                .is_ok()
-            {
+            if self.capability_granted(context_id, &outlet_info.name)? {
                 let mcp_name = format_mcp_tool_name(outlet_info.kind, &outlet_info.name);
                 tools.push(context_tool_definition(
                     context_id,
@@ -822,6 +857,21 @@ impl<P: ContextProvider> McpServer<P> {
         }
 
         Ok(tools)
+    }
+
+    /// Whether the provider grants `tool_name` in `context_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider's message when it cannot read the state that
+    /// decides the grant, so a list built from the answer never omits a tool
+    /// because of a failed read.
+    fn capability_granted(&self, context_id: &str, tool_name: &str) -> Result<bool, String> {
+        match self.provider.validate_capability(context_id, tool_name) {
+            Ok(()) => Ok(true),
+            Err(AccessRefusal::Denied(_)) => Ok(false),
+            Err(AccessRefusal::Unreadable(msg)) => Err(msg),
+        }
     }
 
     /// Handles `tools/list` -- returns all tools the agent can access across
@@ -917,7 +967,13 @@ impl<P: ContextProvider> McpServer<P> {
         }
 
         // Validate UCAN capability.
-        if let Err(msg) = self.provider.validate_capability(&context_id, tool_name) {
+        if let Err(refusal) = self.provider.validate_capability(&context_id, tool_name) {
+            let msg = match refusal {
+                AccessRefusal::Denied(msg) => msg,
+                AccessRefusal::Unreadable(msg) => {
+                    return internal_error(request.id.clone(), &msg);
+                }
+            };
             return JsonRpcResponse::error(
                 request.id.clone(),
                 JsonRpcError {
@@ -1039,8 +1095,12 @@ impl<P: ContextProvider> McpServer<P> {
         };
         for context_id in &served {
             for kind in RESOURCE_KINDS {
-                if self.resource_access(&served, context_id, kind).is_err() {
-                    continue;
+                match self.resource_access(&served, context_id, kind) {
+                    Ok(()) => {}
+                    Err(ResourceDenial::Unreadable(msg)) => {
+                        return internal_error(request.id.clone(), &msg);
+                    }
+                    Err(ResourceDenial::NotParticipant | ResourceDenial::Denied(_)) => continue,
                 }
                 resources.push(ResourceDefinition {
                     uri: kind.uri(context_id),
@@ -1086,7 +1146,10 @@ impl<P: ContextProvider> McpServer<P> {
         }
         self.provider
             .validate_resource_access(context_id, kind)
-            .map_err(ResourceDenial::Denied)
+            .map_err(|refusal| match refusal {
+                AccessRefusal::Denied(msg) => ResourceDenial::Denied(msg),
+                AccessRefusal::Unreadable(msg) => ResourceDenial::Unreadable(msg),
+            })
     }
 
     /// Applies [`Self::resource_access`] to a `resources/read` or
@@ -1118,6 +1181,9 @@ impl<P: ContextProvider> McpServer<P> {
                         data: Some(serde_json::json!({ "uri": uri })),
                     },
                 )),
+                ResourceDenial::Unreadable(msg) => {
+                    Box::new(internal_error(request_id.clone(), &msg))
+                }
             })
     }
 
@@ -1205,6 +1271,12 @@ impl<P: ContextProvider> McpServer<P> {
         }
 
         self.subscriptions.insert(params.uri);
+        // Record the context's view, so a later event notifies this client
+        // only when that view changes. A failed read records nothing, which
+        // makes the next event notify.
+        if let Ok(served) = self.provider.active_context_ids() {
+            self.refresh_view(&served, &context_id);
+        }
 
         JsonRpcResponse::success(
             request.id.clone(),
@@ -1293,9 +1365,10 @@ impl<P: ContextProvider> McpServer<P> {
     /// that inherited a subscription registry would receive updates it never
     /// asked for.
     ///
-    /// `served_contexts` is cleared too: it records which contexts sit in
-    /// *this* client's cached lists, so a context the previous client listed
-    /// must not produce a removal notice for a client that never listed it.
+    /// `served_contexts` and `client_views` are cleared too: they record which
+    /// contexts sit in *this* client's cached lists, so a context the previous
+    /// client listed must not produce a removal notice for a client that never
+    /// listed it.
     ///
     /// `event_source_wired` is deliberately *not* reset: it describes the
     /// server's wiring, not the session.
@@ -1304,6 +1377,10 @@ impl<P: ContextProvider> McpServer<P> {
         self.initialized = false;
         self.client_capabilities = None;
         self.served_contexts
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.client_views
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
@@ -1338,10 +1415,22 @@ impl<P: ContextProvider> McpServer<P> {
     /// and `notifications/resources/list_changed` when the event changes the
     /// visible tool set / the served resource set.
     ///
+    /// # Only this agent's own view
+    ///
+    /// For a membership or lifecycle event, the server compares the context's
+    /// current view (the capability-filtered tools and the readable
+    /// resource kinds) with the view it recorded when it last told the client
+    /// about the context. It sends the list-changed pair and the
+    /// `scp://{ctx}/tools` update only when the two differ, or when the event
+    /// removed the context. Another member's join, departure or revocation
+    /// leaves the view unchanged and sends none of them, so a member denied
+    /// `scp://{ctx}/members` cannot time roster changes through the tools
+    /// resource, whose only requirement is membership.
+    ///
     /// # Re-authorization on every emission
     ///
     /// Each candidate URI is re-checked through the same
-    /// [`Self::resource_access`] predicate that admitted the subscription.
+    /// `resource_access` predicate that admitted the subscription.
     /// Capabilities are revocable mid-session — `CapabilitiesSuspended`,
     /// `ReadAccessRevoked` and `MemberLeft` are all in the classifier below —
     /// so a subscription registered while authorized must stop delivering the
@@ -1423,12 +1512,27 @@ impl<P: ContextProvider> McpServer<P> {
             return Vec::new();
         }
 
+        // A membership or lifecycle event changes this client's lists only
+        // when it changes this agent's view of the context, or removes the
+        // context. The events in the `tools` class include other members'
+        // joins, departures and revocations, which leave the view unchanged.
+        let view_changed = affected.tools
+            && if serves_context {
+                self.refresh_view(&served, context_id)
+            } else {
+                self.client_views
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(context_id);
+                true
+            };
+
         let mut out = Vec::new();
 
         for (changed, kind) in [
             (affected.events, ResourceKind::Events),
             (affected.members, ResourceKind::Members),
-            (affected.tools, ResourceKind::Tools),
+            (view_changed, ResourceKind::Tools),
         ] {
             // A context that is no longer served has no readable resources,
             // so only the list-changed pair below goes out for it.
@@ -1445,20 +1549,11 @@ impl<P: ContextProvider> McpServer<P> {
             out.push(Self::resource_updated_notification(&uri));
         }
 
-        if affected.tools {
-            // Deliberate asymmetry with the per-resource `resources/updated`
-            // re-authorization above, not an oversight: list-changed signals
-            // are content-free (no URI, no payload), and the re-read they
-            // prompt — `tools/list` / `resources/list` — is capability-
-            // filtered at request time, so they can name nothing the client
-            // may not see. A member's own revocation genuinely changes their
-            // filtered list, so notifying them is correct, not an activity
-            // oracle. Do NOT add per-event auth gating here.
+        if view_changed {
+            // The pair goes out only when this agent's own tool list, its
+            // readable resource kinds, or its served set changed, so it
+            // reveals only a change the client can read by re-listing.
             out.push(Self::tools_list_changed_notification());
-            // The resource *set* is derived from `active_context_ids()`, and
-            // the events classified as `tools` are exactly the membership and
-            // lifecycle transitions that add or remove a served context — so
-            // the client's cached `resources/list` is stale here too.
             out.push(Self::resources_list_changed_notification());
         }
 
@@ -1479,7 +1574,46 @@ impl<P: ContextProvider> McpServer<P> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extend(active.iter().cloned());
+        for context_id in &active {
+            self.refresh_view(&active, context_id);
+        }
         Ok(active)
+    }
+
+    /// Reads `context_id`'s current [`ContextView`], records it in
+    /// `client_views`, and returns whether it differs from the view recorded
+    /// before.
+    ///
+    /// Returns `true` when no view was recorded, and when the view cannot be
+    /// read. A failed read also forgets the recorded view, so the next event
+    /// compares against nothing and notifies again.
+    fn refresh_view(&self, served: &[ContextId], context_id: &str) -> bool {
+        let current = self.context_view(served, context_id);
+        let mut views = self
+            .client_views
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(view) = current {
+            views.insert(context_id.to_owned(), view.clone()) != Some(view)
+        } else {
+            views.remove(context_id);
+            true
+        }
+    }
+
+    /// Reads what `context_id` contributes to this client's `tools/list` and
+    /// `resources/list`, or `None` when the provider cannot read it.
+    fn context_view(&self, served: &[ContextId], context_id: &str) -> Option<ContextView> {
+        let tools = serde_json::to_value(self.visible_tools(context_id).ok()?).ok()?;
+        let mut readable = Vec::new();
+        for kind in RESOURCE_KINDS {
+            match self.resource_access(served, context_id, kind) {
+                Ok(()) => readable.push(kind),
+                Err(ResourceDenial::Unreadable(_)) => return None,
+                Err(ResourceDenial::NotParticipant | ResourceDenial::Denied(_)) => {}
+            }
+        }
+        Some(ContextView { tools, readable })
     }
 
     /// Builds the notifications a client needs after the pump's broadcast
@@ -1491,8 +1625,8 @@ impl<P: ContextProvider> McpServer<P> {
     /// one `notifications/resources/list_changed` (the served resource set may
     /// have changed) and one `notifications/tools/list_changed` (the
     /// capability-filtered tool list may have changed — the dropped events could
-    /// include the membership/lifecycle/capability transitions that
-    /// [`Self::notifications_for_event`] pairs a `tools/list_changed` with),
+    /// include a membership, lifecycle or capability transition that changed
+    /// this agent's view of a context),
     /// plus one `notifications/resources/updated` per still-authorized
     /// subscription. A lagged client then re-reads exactly the resources — and
     /// the tool list — it cares about. Emitting `tools/list_changed` here is
@@ -1500,7 +1634,7 @@ impl<P: ContextProvider> McpServer<P> {
     /// nothing the agent may not invoke.
     ///
     /// Each subscribed URI is re-authorized through the same
-    /// [`Self::resource_access`] predicate [`Self::notifications_for_event`]
+    /// `resource_access` predicate [`Self::notifications_for_event`]
     /// applies, so a subscription whose grant
     /// was revoked during the lag delivers nothing: the lag path cannot become
     /// the activity oracle the subscribe gate prevents. Delivery is best-effort
@@ -1515,19 +1649,15 @@ impl<P: ContextProvider> McpServer<P> {
             return Vec::new();
         }
 
-        // Over-notify on the two list-changed channels the pump advertises: a
-        // lag can hide the membership/lifecycle/capability events that would have
-        // invalidated both the served resource set AND the capability-filtered
-        // tool list, so signal both. `notifications_for_event` pairs
-        // `tools/list_changed` with `resources/list_changed` for exactly those
-        // events; the lag path, unable to tell which fired, must assume they did.
+        // Over-notify on the two list-changed channels the pump advertises: the
+        // dropped events may include one that changed this agent's view of a
+        // context, and the pump never evaluated them, so it signals both.
         //
         // Emitting them unconditionally — unlike the per-URI re-authorization
-        // below — is deliberate: list-changed signals are content-free, the
-        // re-read they prompt is capability-filtered at request time, and a
-        // member's own revocation genuinely changes their filtered list, so
-        // notifying them is correct, not an activity oracle. Do NOT add
-        // per-event auth gating here.
+        // below — is deliberate: list-changed signals are content-free, and the
+        // re-read they prompt is capability-filtered at request time. A lag
+        // tells the client that the pump fell behind, not which kind of event
+        // it dropped.
         let mut out = vec![
             Self::resources_list_changed_notification(),
             Self::tools_list_changed_notification(),
@@ -1663,6 +1793,21 @@ enum ResourceDenial {
     /// The provider's [`ContextProvider::validate_resource_access`] refused,
     /// with its message.
     Denied(String),
+    /// The provider could not read the state that decides access, with its
+    /// message.
+    Unreadable(String),
+}
+
+/// What one served context contributes to a client's `tools/list` and
+/// `resources/list`: the capability-filtered tool definitions, and the
+/// resource kinds the agent may read.
+#[derive(Debug, Clone, PartialEq)]
+struct ContextView {
+    /// The serialized [`McpServer::visible_tools`] answer.
+    tools: Value,
+    /// The kinds [`McpServer::resource_access`] admits, in [`RESOURCE_KINDS`]
+    /// order.
+    readable: Vec<ResourceKind>,
 }
 
 /// Creates an internal error response.
@@ -1926,13 +2071,20 @@ mod tests {
                 .collect())
         }
 
-        fn validate_capability(&self, context_id: &str, tool_name: &str) -> Result<(), String> {
+        fn validate_capability(
+            &self,
+            context_id: &str,
+            tool_name: &str,
+        ) -> Result<(), AccessRefusal> {
+            self.read(context_id).map_err(AccessRefusal::Unreadable)?;
             if self
                 .denied_capabilities
                 .iter()
                 .any(|(cid, tn)| cid == context_id && tn == tool_name)
             {
-                Err(format!("capability denied: {tool_name} in {context_id}"))
+                Err(AccessRefusal::Denied(format!(
+                    "capability denied: {tool_name} in {context_id}"
+                )))
             } else {
                 Ok(())
             }
@@ -1951,16 +2103,17 @@ mod tests {
             &self,
             context_id: &str,
             resource: ResourceKind,
-        ) -> Result<(), String> {
+        ) -> Result<(), AccessRefusal> {
+            self.read(context_id).map_err(AccessRefusal::Unreadable)?;
             if self
                 .denied_resources
                 .iter()
                 .any(|(cid, kind)| cid == context_id && *kind == resource)
             {
-                Err(format!(
+                Err(AccessRefusal::Denied(format!(
                     "resource access denied: {} in {context_id}",
                     resource.uri_suffix()
-                ))
+                )))
             } else {
                 Ok(())
             }
@@ -3223,15 +3376,23 @@ mod tests {
 
     #[test]
     fn capability_changing_event_emits_tools_list_changed() {
-        let server = subscribing_server(MockProvider::default());
-        // No resource subscription needed: tools/list_changed is gated on the
-        // advertised capability, not on a subscription.
+        let mut server = subscribing_server(MockProvider::default());
+        let list = make_request(protocol::METHOD_TOOLS_LIST, None);
+        assert!(server.handle_request(&list).unwrap().error.is_none());
+
+        // The agent loses a built-in tool. No resource subscription is
+        // needed: tools/list_changed is gated on the advertised capability,
+        // not on a subscription.
+        server
+            .provider
+            .denied_capabilities
+            .push(("ctx_a".to_owned(), BUILTIN_TOOLS[0].tool_name().to_owned()));
         let notifs = server.notifications_for_event("ctx_a", &members_and_tools_event());
         assert!(
             notifs
                 .iter()
                 .any(|n| n.method == protocol::METHOD_TOOLS_LIST_CHANGED),
-            "membership change must invalidate the capability-filtered tool list"
+            "a change to the agent's capability-filtered tool list must be announced"
         );
 
         // An events-only event, such as a message, does not change the tool
@@ -3241,6 +3402,50 @@ mod tests {
             !sent
                 .iter()
                 .any(|n| n.method == protocol::METHOD_TOOLS_LIST_CHANGED)
+        );
+    }
+
+    /// A member denied `messages:read` cannot read `scp://ctx_a/members`, so
+    /// the membership events of other members must not reach it through the
+    /// tools resource or the list-changed pair. Those events leave its tool
+    /// list and its readable resources unchanged.
+    #[test]
+    fn roster_change_that_leaves_the_view_unchanged_is_silent() {
+        let mut provider = MockProvider::default();
+        for kind in [ResourceKind::Events, ResourceKind::Members] {
+            provider.denied_resources.push(("ctx_a".to_owned(), kind));
+        }
+        let mut server = subscribing_server(provider);
+        subscribe(&mut server, "scp://ctx_a/tools");
+
+        assert!(
+            server
+                .notifications_for_event("ctx_a", &members_and_tools_event())
+                .is_empty(),
+            "another member's join changes nothing this agent can read"
+        );
+
+        // The agent's own messages:read is restored: its readable resources
+        // change, so it is told to re-list.
+        server.provider.denied_resources.clear();
+        let methods: Vec<String> = server
+            .notifications_for_event("ctx_a", &members_and_tools_event())
+            .into_iter()
+            .map(|n| n.method)
+            .collect();
+        assert!(
+            methods.contains(&protocol::METHOD_RESOURCES_LIST_CHANGED.to_owned())
+                && methods.contains(&protocol::METHOD_TOOLS_LIST_CHANGED.to_owned())
+                && methods.contains(&protocol::METHOD_RESOURCES_UPDATED.to_owned()),
+            "a change to the agent's own view must be announced, got: {methods:?}"
+        );
+
+        // The same view again: silent.
+        assert!(
+            server
+                .notifications_for_event("ctx_a", &members_and_tools_event())
+                .is_empty(),
+            "an unchanged view must not produce the list-changed pair or a tools update"
         );
     }
 
@@ -3394,6 +3599,52 @@ mod tests {
                 .code,
             protocol::INTERNAL_ERROR
         );
+
+        // `active_context_ids` read the context as served, so only the
+        // per-resource gate reads fail here.
+        let list = make_request(protocol::METHOD_RESOURCES_LIST, None);
+        let resp = server.handle_request(&list).unwrap();
+        assert_eq!(
+            resp.error
+                .expect("resources/list must not omit an unreadable context")
+                .code,
+            protocol::INTERNAL_ERROR
+        );
+
+        // A failed capability read is not a capability denial.
+        let call = make_request(
+            protocol::METHOD_TOOLS_CALL,
+            Some(serde_json::json!({ "name": "ctx_a/some_outlet", "arguments": {} })),
+        );
+        let resp = server.handle_request(&call).unwrap();
+        assert_eq!(
+            resp.error
+                .expect("tools/call must fail on an unreadable context")
+                .code,
+            protocol::INTERNAL_ERROR
+        );
+    }
+
+    /// `tools/list` and `resources/list` leave out a tool or a resource the
+    /// provider denies, and still answer with success.
+    #[test]
+    fn denied_items_are_left_out_of_a_successful_list() {
+        let mut provider = MockProvider::default();
+        provider
+            .denied_resources
+            .push(("ctx_a".to_owned(), ResourceKind::Members));
+        let mut server = initialized_server(provider);
+
+        let list = make_request(protocol::METHOD_RESOURCES_LIST, None);
+        let result = server.handle_request(&list).unwrap().result.unwrap();
+        let uris: Vec<&str> = result["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["uri"].as_str().unwrap())
+            .collect();
+        assert!(!uris.contains(&"scp://ctx_a/members"), "{uris:?}");
+        assert!(uris.contains(&"scp://ctx_a/events"), "{uris:?}");
     }
 
     #[test]

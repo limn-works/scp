@@ -21,9 +21,11 @@
 //!
 //! ## Reconnection
 //!
-//! Reconnection is a full resync, not a resume. Every admission resets the
-//! MCP session (see [`AppState::session_slot`] and [`sse_handler`]), so a
-//! reconnecting client re-initializes, re-subscribes, and re-reads state;
+//! Reconnection is a full resync, not a resume. When an SSE stream is
+//! dropped, the server clears that session's handshake, negotiated client
+//! capabilities and resource subscriptions, and admits the next `GET /sse`
+//! only after that reset. A reconnecting client therefore re-initializes,
+//! re-subscribes, and re-reads state;
 //! any event broadcast before that reset belongs to the prior logical
 //! session. Cross-session replay is therefore deliberately absent: the
 //! standard SSE `Last-Event-ID` header is ignored — honoring it would stream
@@ -474,7 +476,9 @@ async fn bearer_auth_middleware(
 /// # Sessions
 ///
 /// The endpoint serves one MCP session at a time; a new `GET /sse` evicts the
-/// live session and takes its place. See [`AppState::session_slot`].
+/// live session and takes its place. The server resets the evicted session's
+/// handshake and subscriptions before it admits the new stream, so the new
+/// client starts with neither.
 ///
 /// # Errors
 ///
@@ -1019,7 +1023,11 @@ mod tests {
         fn context_tools(&self, _context_id: &str) -> Result<Vec<ContextOutletInfo>, String> {
             Ok(Vec::new())
         }
-        fn validate_capability(&self, _context_id: &str, _tool_name: &str) -> Result<(), String> {
+        fn validate_capability(
+            &self,
+            _context_id: &str,
+            _tool_name: &str,
+        ) -> Result<(), crate::server::AccessRefusal> {
             Ok(())
         }
         fn invoke_outlet(
@@ -1034,7 +1042,7 @@ mod tests {
             &self,
             _context_id: &str,
             _resource: crate::server::ResourceKind,
-        ) -> Result<(), String> {
+        ) -> Result<(), crate::server::AccessRefusal> {
             Ok(())
         }
         fn context_members(&self, _context_id: &str) -> Result<Vec<MemberInfo>, String> {
@@ -1360,7 +1368,7 @@ mod tests {
     ///
     /// This is the test that would have failed against the old no-op
     /// implementation, which accepted the subscription and then delivered
-    /// nothing (issue #1341).
+    /// nothing.
     #[tokio::test]
     async fn subscribe_then_event_delivers_resources_updated() {
         let (event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);

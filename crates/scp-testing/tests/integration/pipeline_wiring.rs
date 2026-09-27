@@ -2938,7 +2938,7 @@ fn b3_webhook_dispatch_wired() {
 }
 
 // ===========================================================================
-// MCP resource subscriptions — advertised capability must be backed (#1341)
+// MCP resource subscriptions — advertised capability must be backed
 // ===========================================================================
 
 /// `resources/subscribe` MUST be backed by a real runtime event source on
