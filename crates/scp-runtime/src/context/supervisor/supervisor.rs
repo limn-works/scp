@@ -10828,7 +10828,9 @@ impl Supervisor {
 
     /// Reads the current lifecycle
     /// [`ContextState`](scp_protocol::context::ContextState) for
-    /// `context_id`, or `None` if no per-context actor exists.
+    /// `context_id`, or `None` when this call got no answer from an actor
+    /// for it: no actor serves the id, or the actor is busy, mid-respawn, or
+    /// past a failed respawn (see the collapse paragraph below).
     ///
     /// Unlike the other query passthroughs, this does NOT route through
     /// [`Self::dispatch_query`]: that method falls through to
@@ -10840,12 +10842,15 @@ impl Supervisor {
     /// (no mailbox, no reply), and a present actor's mailbox reply is
     /// surfaced as `Some(state)`.
     ///
-    /// Close / TTL does NOT despawn the per-context actor, so
+    /// Close does NOT despawn the per-context actor, so
     /// `lookup(id).is_some()` alone cannot tell a live context from a
     /// terminal one — this query is the read-only lifecycle probe that
     /// makes that distinction without a `per-context-state Mutex`. A
     /// dropped reply or mailbox-send failure (actor shutting down)
-    /// resolves to `None`, treated by callers as "no live context".
+    /// resolves to `None`, treated by callers as "no live context". A TTL
+    /// expiry is the exception to the close rule: the actor despawns itself
+    /// once the `Expired` state is durable, so an expired context reads
+    /// `None`, never `Some(Expired)`.
     ///
     /// This form collapses an unreachable actor into the same `None` a
     /// never-registered context reports, so a caller that reads `None` as
@@ -10893,7 +10898,9 @@ impl Supervisor {
     ///
     /// `Ok(None)` means the supervisor holds no actor for `context_id`, no
     /// sticky poison flag for it, and no crash-window record that it is
-    /// mid-respawn or that its last respawn failed. `Ok(Some(state))` is the
+    /// mid-respawn or that its last respawn failed. A context that expired by
+    /// TTL reads `Ok(None)`: its actor despawns itself once the `Expired`
+    /// state is durable. `Ok(Some(state))` is the
     /// actor's own answer,
     /// or [`ContextState::Poisoned`](scp_protocol::context::ContextState::Poisoned)
     /// for a context the crash watchdog poisoned and despawned (ADR-049 §10).

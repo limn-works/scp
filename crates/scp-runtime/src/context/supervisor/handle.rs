@@ -368,10 +368,13 @@ impl SupervisorHandle {
             .cloned()
     }
 
-    /// Read-only lifecycle-state probe for `context_id`. Close / TTL does
-    /// not despawn the actor, so `Some(state)` reflects the live lifecycle
-    /// state — `Active` / `Creating` vs a terminal state — and a context the
-    /// crash watchdog poisoned reads `Some(Poisoned)` (ADR-049 §10).
+    /// Read-only lifecycle-state probe for `context_id`. Close does not
+    /// despawn the actor, so `Some(state)` reflects the live lifecycle
+    /// state — `Active` / `Creating` vs a terminal state such as `Closed` —
+    /// and a context the crash watchdog poisoned reads `Some(Poisoned)`
+    /// (ADR-049 §10). A TTL expiry does despawn the actor once the `Expired`
+    /// state is durable, so an expired context reads `None`, never
+    /// `Some(Expired)`.
     ///
     /// `None` does not mean the context is absent. It covers an id no actor
     /// serves and also an actor this call could not reach: a busy or
