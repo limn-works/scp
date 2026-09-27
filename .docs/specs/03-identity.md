@@ -777,7 +777,7 @@ impl<S: Storage> Identity<S> {
 }
 ```
 
-**The write API is one method per consequential act on the identity handle, and every event that needs a root threshold goes through one collection flow**: `create`'s inception, `rotate_active` and `set_witnesses`, and the rollover, recovery and abandonment `Recovery::begin` composes. **Under `SignerPlan::ThisSdk` the composing method signs every group with the members this SDK's custody holds, publishes, and returns `EventOutcome::Published` in one call**, refusing with `IdentityError::SignatureSetIncomplete` where those members fall short of a group's threshold. **Under `SignerPlan::Groups` it returns `EventOutcome::AwaitingSignatures`** carrying the unsigned `PendingEvent`, whose preimage binds the signer index list and form list the plan names for each group the kind carries; a group the kind does not carry is empty, and an inception's one group is `installed_root`. **Each holder of a named member, the composer included, calls `Identity::cosign`**, which runs the display confirmation `09-security-model.md` §9.7.4.2 R10's device-boundary paragraph states and returns the `IndexedSignature` of the one member its custody holds. **`attach` verifies each signature against its group and index, refuses with `IdentityError::SignatureSetIncomplete` where a group falls short of the plan, publishes the signed event, and returns the cycle's `PublishOutcome`**; for a reveal-authorized event it runs R10's ceremony from the `Signed` write through the removal. The application carries a `PendingEvent` and each `IndexedSignature` between the holders' devices, and the protocol defines no transport for them. `Identity::create` composes the inception event and returns the handle beside the flow's outcome. `rotate_active` composes a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` composes a `KeyState` that names the witness set and its witnessing interval. `Recovery::begin` (R10) composes the reveal-authorized events, and a compromised root member leaves the root set under a `RootRecovery`, because a `KeyState` drops no root member (R3).
+**The write API is one method per consequential act on the identity handle, and every event that needs a root threshold goes through one collection flow**: `create`'s inception, `rotate_active` and `set_witnesses`, and the rollover, recovery and abandonment `Recovery::begin` composes. **Under `SignerPlan::ThisSdk` the composing method signs every group with the members this SDK's custody holds, publishes, and returns `EventOutcome::Published` in one call**, refusing with `IdentityError::SignatureSetIncomplete` where those members fall short of a group's threshold. **Under `SignerPlan::Groups` it returns `EventOutcome::AwaitingSignatures`** carrying the unsigned `PendingEvent`, whose preimage binds the signer index list and form list the plan names for each group the kind carries; a group the kind does not carry is empty, and an inception's one group is `installed_root`. **Each holder of a named member, the composer included, calls `Identity::cosign`**, which runs the display confirmation `09-security-model.md` §9.7.4.2 R10's device-boundary paragraph states and returns the `IndexedSignature` of the one member its custody holds. **`cosign` and `attach` each compute the event digest as SHA-256 of `PendingEvent::preimage` and refuse a `PendingEvent` whose `event_digest` differs with `IdentityError::PendingDigestMismatch`.** **`attach` verifies each signature against its group and index, refuses with `IdentityError::SignatureSetIncomplete` where a group falls short of the plan, publishes the signed event, and returns the cycle's `PublishOutcome`**; for a reveal-authorized event it runs R10's ceremony from the `Signed` write through the removal. The application carries a `PendingEvent` and each `IndexedSignature` between the holders' devices, and the protocol defines no transport for them. `Identity::create` composes the inception event and returns the handle beside the flow's outcome. `rotate_active` composes a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` composes a `KeyState` that names the witness set and its witnessing interval. `Recovery::begin` (R10) composes the reveal-authorized events, and a compromised root member leaves the root set under a `RootRecovery`, because a `KeyState` drops no root member (R3).
 
 ```rust
 impl<S: EncryptedStorage> Identity<S> {
@@ -913,7 +913,7 @@ pub trait IdentityBackend: Send + Sync {
 }
 
 /// The error half of this trait's six methods and of the three recovery entry
-/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries fourteen
+/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries fifteen
 /// variants and no others. A refusal the protocol mandates carries one of these
 /// variants, so four bindings mint one code rather than four and a caller tells
 /// a custody choice from a network condition. **The identity half's one refusal reaches a caller through
@@ -944,7 +944,8 @@ pub enum IdentityError {
     /// unpublished reveal-authorized event or a pending `RecoveryHandle` for
     /// this identity; or its adopted log already reveals the commitment the
     /// event would reveal; or its handle vanished or changed digest before it
-    /// signed or published (`09-security-model.md` §9.7.4.2 R10).
+    /// signed or published; or, as a cosigner, it recorded a commitment the
+    /// event reveals (`09-security-model.md` §9.7.4.2 R10).
     RevealAlreadyPending,
     /// SCP-IDENT-1104. The verifier could not persist a contested verdict, its
     /// retained suffixes, or the accepted-head baseline (§9.7.4.2 R14).
@@ -984,6 +985,9 @@ pub enum IdentityError {
     /// set's last-reveal marker names, and no entry of the publication set
     /// served it (`09-security-model.md` §9.7.4.2 R10).
     LastRevealUnadopted { sequence: u64, event_digest: [u8; 32] },
+    /// SCP-IDENT-1114. A `PendingEvent`'s `event_digest` differs from the
+    /// SHA-256 of its `preimage` (§3.10.10).
+    PendingDigestMismatch,
 }
 
 /// One relay entry's declared write policy, as that entry publishes it at
