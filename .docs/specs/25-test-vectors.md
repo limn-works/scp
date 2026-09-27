@@ -941,6 +941,9 @@ context_seed_v2 = HMAC-SHA256(pseudonym_secret, context_id || BE64(epoch) || "sc
 scalar_input = HKDF-Expand-SHA256(context_seed, "SCP-PSEUDONYM-P256-V1", 48)
 d            = (int(scalar_input) mod (n - 1)) + 1
 pseudonym_public_key = P256_keypair_from_scalar(d).public_key   (33-byte compressed)
+
+# routing id (every routing field carries this, never the point):
+pseudonym_routing_id = SHA-256("scp-pseudonym-routing-v1:" || pseudonym_public_key)
 ```
 
 The 32-byte `context_seed` is the HKDF-Expand input of the seed-to-scalar rule, never a scalar in its own right: §9.10.4 forbids reducing it directly, which biases the low-order scalars, and forbids reject-and-retry, which makes the derivation diverge across implementations that draw retries differently. The HMAC `data` is plain concatenation with NO length prefixes — these are fixed-format internal inputs, and the domain-separator suffix (`"scp-pseudonym"` vs `"scp-pseudonym-v2"`) plus the fixed 8-byte BE64 epoch make the encoding unambiguous.
@@ -967,11 +970,17 @@ Expected context_seed_v1:
 Expected v1 pseudonym public key (33-byte compressed):
   0x0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72
 
+Expected v1 pseudonym_routing_id:
+  0xb7faa05dea2cef1b7aff6a48fa5b7b9ffe217b25f3152d78d597bb9078e98307
+
 Expected context_seed_v2 (epoch = 1):
   0x6ab63aa150992ff032f6963c31dc9f5a8bd4e9518516f9fbd3bea7bc07f64b38
 
 Expected v2 pseudonym public key (epoch = 1, 33-byte compressed):
   0x0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479
+
+Expected v2 pseudonym_routing_id (epoch = 1):
+  0xb19754a5e88c993683f99e48646ba518cba80dec0693f920c5671263650b6ae9
 ```
 
 ### Vector 31: Pseudonym Derivation — identity seed 0x9d,0x01..0x1f
@@ -994,14 +1003,20 @@ Expected context_seed_v1:
 Expected v1 pseudonym public key (33-byte compressed):
   0x0239f7c3213f3567183fd2fcf7aec6c884bc70e0e694c42053284a4b5ebef4fe2d
 
+Expected v1 pseudonym_routing_id:
+  0xcab5ff45d21b6d0425fa7657e89fc68514965cbb4ca2b9549f4ccf430d581e7c
+
 Expected context_seed_v2 (epoch = 1):
   0x8133a9d716dcbe729b1f447ac0efccf3795e8bf28da2db4744090d0316ead730
 
 Expected v2 pseudonym public key (epoch = 1, 33-byte compressed):
   0x037967cfe8d3111cdd72288ea3f444c15b710300323162fec63ca9036af73754e3
+
+Expected v2 pseudonym_routing_id (epoch = 1):
+  0x3c0ac4dec86c0dafe38195a7b66cdfec6b0ae0d44834c6e8b6b6129e097b5e27
 ```
 
-`derive_pseudonym_keypair_known_answer_vectors` in `crates/scp-crypto/src/pseudonym.rs` (the wasm-safe home of the derivation, ADR-057 Option A) and `pseudonym_derivation_matches_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs` are two of the unported artifacts §25.18 names. The native/`wasm32` byte-parity obligation those two tests carry is unchanged, because only the curve and the key width changed.
+`spec_25_19_vectors_30_31` in `crates/scp-crypto/src/pseudonym.rs` (the wasm-safe home of the derivation, ADR-057 Option A) and `pseudonym_derivation_matches_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs` assert every value above, routing ids included, on native and on `wasm32`. `scripts/gen-test-vectors-p256.py` emits them.
 
 ### Vector 36: `PseudonymAnnouncement` wire format + classifier decisions (§9.10.4)
 
