@@ -1423,25 +1423,27 @@ mod tests {
     /// `resources/subscribe` — never a silent accept.
     #[test]
     fn missing_supervisor_degrades_subscriptions_not_the_whole_server_napi() {
-        let bi = NapiBridgeInstance::new_napi();
-
-        // No supervisor attached: the event source resolves to `None` rather
-        // than propagating an error out of MCP serve.
+        let bi = Arc::new(NapiBridgeInstance::new_napi());
         assert!(
             crate::runtime::supervisor(&bi).is_err(),
             "precondition: this instance has no supervisor attached"
         );
 
-        // The resolution `mcp_server_create_on` performs must yield `None`,
-        // NOT propagate the error — that is what keeps serving alive. The
-        // honest `subscribe: false` + typed rejection that follows from `None`
-        // is covered by `mcp_subscribe_rejected_when_no_event_source_wired_napi`.
-        let context_events = crate::runtime::supervisor(&bi)
-            .ok()
-            .and_then(|supervisor| supervisor.subscribe_events());
-        assert!(
-            context_events.is_none(),
-            "an unattached supervisor must degrade to no event source"
-        );
+        // Drive the production entry point. Were `mcp_server_create_on` to
+        // propagate the missing-supervisor error (`supervisor(bi)?`), this
+        // call would return `Err` and the test would fail.
+        let handle = crate::runtime()
+            .block_on(mcp_server_create_on(
+                &bi,
+                NapiMcpServerConfig {
+                    identity_did: AGENT_DID.to_owned(),
+                    context_ids: vec![SUB_CTX.to_owned()],
+                    transport: "sse".to_owned(),
+                },
+            ))
+            .expect("a missing supervisor must degrade subscriptions, not fail MCP serving");
+        crate::runtime()
+            .block_on(mcp_server_stop_on(&bi, &handle))
+            .expect("the server created without a supervisor must stop cleanly");
     }
 }

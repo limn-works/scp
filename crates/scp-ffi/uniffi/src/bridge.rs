@@ -22760,6 +22760,34 @@ mod tests {
         assert!(result.is_err(), "invalid transport mode should be rejected");
     }
 
+    /// A missing `Supervisor` degrades ONLY the subscription capability: the
+    /// production `mcp_server_create` must still return a server handle. Were
+    /// it to propagate the missing-supervisor error
+    /// (`context_manager_or_error()?`), this test would fail.
+    #[tokio::test]
+    async fn missing_supervisor_degrades_subscriptions_not_the_whole_server_uniffi() {
+        let scp = scp_test();
+        assert!(
+            scp.inner.context_manager_or_error().is_err(),
+            "precondition: this instance has no supervisor attached"
+        );
+        let config = McpServerConfig {
+            identity_did: "did:dht:z6MkTestUser".to_owned(),
+            context_ids: vec!["ctx-1".to_owned()],
+            transport: "sse".to_owned(),
+            ucan_token: None,
+            proof_tokens: None,
+        };
+
+        let handle = scp
+            .mcp_server_create(config)
+            .await
+            .expect("a missing supervisor must degrade subscriptions, not fail MCP serving");
+        scp.mcp_server_stop(handle)
+            .await
+            .expect("the server created without a supervisor must stop cleanly");
+    }
+
     /// `mcp_client_connect_stdio` must reject empty command list.
     #[tokio::test]
     async fn mcp_client_connect_stdio_rejects_empty_command() {
