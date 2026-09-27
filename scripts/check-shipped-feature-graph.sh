@@ -1107,13 +1107,14 @@ assert_every_pipeline_reader_consumes_its_input() {
 #   path equals TARGET_ALL_EXEMPT_FILE. A second definition of the function in that
 #   file cancels the exemption, and so does a body the range cannot close on a bare
 #   `}`: a line inside it that opens another function, or a line other than exactly
-#   `}` on which a closing `}` (at the line start or after `;` or `&`, the places
-#   bash accepts one) comes when the line has opened no brace group left of it
-#   that is still open (an opening `{` sits at the line start or after `;`, `&`,
-#   `|`, or `(`, followed by a space): an indented `  }`, `} >&2`, `} # ...`, an inline `  x; }`), because each of those
-#   can close the function early and let the first bare `}` belong to a later
-#   construct. A balanced one-line group such as `{ echo x; return 1; }` keeps the
-#   exemption, and a spelling this count misreads cancels it. The function
+#   `}` whose closing braces, read left to right, outnumber its opening braces at
+#   some point. A closing `}` is one at the line start or after `;` or `&`, the
+#   places bash accepts one; an opening `{` is one at the line start or after `;`,
+#   `&`, `|`, or `(`, followed by a space. That covers an indented `  }`, `} >&2`,
+#   `} # ...`, and an inline `  x; }`, each of which can close the function early
+#   and let the first bare `}` belong to a later construct. A balanced one-line
+#   group such as `{ echo x; return 1; }` keeps the exemption, and a spelling this
+#   count misreads cancels it. The function
 #   resolves the wheel entry `--print-wheel-entries` writes and takes only a triple
 #   from its caller, so every call of it is the wheel's presence proof. Every other
 #   line, including a line elsewhere in that file and a same-named function in
@@ -1124,9 +1125,9 @@ TARGET_ALL_EXEMPT_FUNCTION="wheel_triple_occurrences"
 # target_all_exempt_range <file>
 #   Emit "<start> <end>", the line numbers of TARGET_ALL_EXEMPT_FUNCTION's
 #   `name() {` line and its first following `}` line, when the file defines that
-#   function exactly once and no line between them opens a function or closes more
-#   command-position brace groups than it opens (read left to right); emit nothing
-#   otherwise, which leaves every line under the rule.
+#   function exactly once and no line between them opens a function or, read left
+#   to right, closes a brace group it did not open; emit nothing otherwise, which
+#   leaves every line under the rule.
 target_all_exempt_range() {
   local line n=0 defs=0 start="" end="" broken=0 rest depth
   local fn_def='^[[:space:]]*(function[[:space:]]+[A-Za-z_]|[A-Za-z_][A-Za-z0-9_:.-]*[[:space:]]*\(\))'
