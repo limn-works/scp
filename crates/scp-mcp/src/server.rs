@@ -30,7 +30,7 @@
 
 use std::collections::HashSet;
 
-use scp_core::context::membership::{ContextEvent, ContextEventEnvelope};
+use scp_core::context::membership::ContextEvent;
 use scp_core::context::outlets::validate_value_against_schema;
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -334,13 +334,13 @@ pub struct McpServer<P: ContextProvider> {
 #[must_use = "hand this to a transport (run_stdio / run_sse) — dropping it leaves \
               resources.subscribe advertised with nothing delivering notifications"]
 pub struct ContextEventPump {
-    rx: broadcast::Receiver<ContextEventEnvelope>,
+    rx: broadcast::Receiver<(String, ContextEvent)>,
 }
 
 impl ContextEventPump {
     /// Consumes the pump, yielding the underlying receiver for a transport's
     /// delivery loop.
-    pub(crate) fn into_receiver(self) -> broadcast::Receiver<ContextEventEnvelope> {
+    pub(crate) fn into_receiver(self) -> broadcast::Receiver<(String, ContextEvent)> {
         self.rx
     }
 }
@@ -470,7 +470,7 @@ impl<P: ContextProvider> McpServer<P> {
     #[doc(hidden)]
     pub fn with_event_source(
         provider: P,
-        rx: broadcast::Receiver<ContextEventEnvelope>,
+        rx: broadcast::Receiver<(String, ContextEvent)>,
     ) -> (Self, ContextEventPump) {
         let server = Self {
             provider,
@@ -486,7 +486,7 @@ impl<P: ContextProvider> McpServer<P> {
     /// transport-ready [`McpServerForTransport`] bundle.
     ///
     /// Convenience for bridge code holding
-    /// `Option<broadcast::Receiver<ContextEventEnvelope>>` from
+    /// `Option<broadcast::Receiver<(String, ContextEvent)>>` from
     /// `Supervisor::subscribe_events()`: `Some` routes to
     /// [`Self::with_event_source`] and yields [`McpServerForTransport::Wired`]
     /// (server-with-flag-true paired with its pump); `None` routes to
@@ -496,7 +496,7 @@ impl<P: ContextProvider> McpServer<P> {
     /// without the other.
     pub fn with_optional_event_source(
         provider: P,
-        rx: Option<broadcast::Receiver<ContextEventEnvelope>>,
+        rx: Option<broadcast::Receiver<(String, ContextEvent)>>,
     ) -> McpServerForTransport<P> {
         match rx {
             Some(rx) => {
@@ -1760,7 +1760,7 @@ mod tests {
     ///
     /// The sender is leaked so the channel stays open for the test's lifetime;
     /// these tests exercise `McpServer`, not delivery.
-    fn test_event_source() -> broadcast::Receiver<ContextEventEnvelope> {
+    fn test_event_source() -> broadcast::Receiver<(String, ContextEvent)> {
         let (tx, rx) = broadcast::channel(16);
         std::mem::forget(tx);
         rx

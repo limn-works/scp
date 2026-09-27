@@ -16415,6 +16415,10 @@ impl Scp {
                 }
                 "sse" => {
                     // `run_sse` takes ownership of the `McpServer` directly.
+                    // `SseConfig::new` draws a fresh bearer token, and the transport rejects
+                    // every request that does not present it. This bridge returns neither that
+                    // token nor the bound port to its caller (issue #2311), so no client can
+                    // reach this server until that issue lands.
                     let sse_config = scp_mcp::sse::SseConfig::new(std::net::SocketAddr::from((
                         [127, 0, 0, 1],
                         0,

@@ -1321,7 +1321,9 @@ fn generate_handle_id(prefix: &str) -> String {
 /// Creates an MCP server backed by a `FfiBridgeProvider` that reads outlets
 /// and context state from the scp-ffi runtime registry. For `"stdio"`
 /// transport, the server processes JSON-RPC messages via a tokio task. For
-/// `"sse"` transport, the server binds an HTTP server on a random port.
+/// `"sse"` transport, the server binds a loopback HTTP server on an ephemeral
+/// port behind a per-server bearer token; this function returns neither the
+/// port nor the token (issue #2311).
 ///
 /// # Arguments
 ///
@@ -1471,6 +1473,10 @@ impl crate::scp::PyScp {
                 "sse" => {
                     // `run_sse` takes ownership of the `McpServer` directly —
                     // no mutex wrapper, since the SSE transport owns it.
+                    // `SseConfig::new` draws a fresh bearer token, and the transport rejects
+                    // every request that does not present it. This bridge returns neither that
+                    // token nor the bound port to its caller (issue #2311), so no client can
+                    // reach this server until that issue lands.
                     let config = scp_mcp::sse::SseConfig::new(std::net::SocketAddr::from((
                         [127, 0, 0, 1],
                         0,

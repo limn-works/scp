@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use scp_core::context::membership::ContextEventEnvelope;
+use scp_core::context::membership::ContextEvent;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 
@@ -190,7 +190,7 @@ impl StdioNotifier {
 ///
 /// `server` is the single [`McpServerForTransport`] bundle
 /// [`McpServer::with_optional_event_source`](crate::server::McpServer::with_optional_event_source)
-/// produces: a wired server *and* its [`ContextEventPump`] as one value, or an
+/// produces: a wired server *and* its [`ContextEventPump`](crate::server::ContextEventPump) as one value, or an
 /// unwired server alone. A wired server advertises `resources.subscribe: true`;
 /// its pump turns each [`ContextEvent`] into `notifications/resources/updated`
 /// for the subscribed resources it invalidates. An unwired server
@@ -270,14 +270,14 @@ where
 /// Forwards runtime context events to the client as MCP notifications.
 async fn pump_events<P, C>(
     server: Arc<std::sync::Mutex<McpServer<P>>>,
-    mut events: broadcast::Receiver<ContextEventEnvelope>,
+    mut events: broadcast::Receiver<(String, ContextEvent)>,
     channel: C,
 ) where
     P: ContextProvider,
     C: ClientChannel,
 {
     loop {
-        let ContextEventEnvelope { context_id, event } = match events.recv().await {
+        let (context_id, event) = match events.recv().await {
             Ok(v) => v,
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 // The dropped events are gone; nothing can reconstruct which
@@ -864,7 +864,7 @@ mod tests {
     fn wired_subscribed_server(
         uri: &str,
     ) -> (
-        broadcast::Sender<ContextEventEnvelope>,
+        broadcast::Sender<(String, ContextEvent)>,
         McpServer<MockProvider>,
         ContextEventPump,
     ) {
@@ -928,7 +928,7 @@ mod tests {
 
         // Positive control: the live pump delivers a first event.
         event_tx
-            .send(ContextEventEnvelope::new(
+            .send((
                 "ctx_a".to_owned(),
                 ContextEvent::ContentKeysRotated { reason: None },
             ))
@@ -959,7 +959,7 @@ mod tests {
 
         // The pump must now be dead: a fresh event produces nothing more.
         let before = channel.notifications().await.len();
-        let _ = event_tx.send(ContextEventEnvelope::new(
+        let _ = event_tx.send((
             "ctx_a".to_owned(),
             ContextEvent::ContentKeysRotated { reason: None },
         ));

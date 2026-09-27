@@ -63,7 +63,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_util::sync::CancellationToken;
 
-use scp_core::context::membership::ContextEventEnvelope;
+use scp_core::context::membership::ContextEvent;
 
 use crate::protocol::{
     JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, PARSE_ERROR, RequestId,
@@ -642,10 +642,10 @@ async fn message_handler<P: ContextProvider + 'static>(
 /// Forwards runtime context events to connected clients as MCP notifications.
 async fn pump_events<P: ContextProvider + 'static>(
     state: Arc<AppState<P>>,
-    mut events: broadcast::Receiver<ContextEventEnvelope>,
+    mut events: broadcast::Receiver<(String, ContextEvent)>,
 ) {
     loop {
-        let ContextEventEnvelope { context_id, event } = match events.recv().await {
+        let (context_id, event) = match events.recv().await {
             Ok(v) => v,
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 // The dropped events are gone; nothing can reconstruct which
@@ -1085,7 +1085,7 @@ mod tests {
     /// `uri`.
     fn subscribed_server(
         uri: &str,
-        rx: broadcast::Receiver<ContextEventEnvelope>,
+        rx: broadcast::Receiver<(String, ContextEvent)>,
     ) -> (McpServer<MockProvider>, ContextEventPump) {
         let (mut server, pump) = McpServer::with_event_source(MockProvider::default(), rx);
 
@@ -1121,7 +1121,7 @@ mod tests {
     /// nothing (issue #1341).
     #[tokio::test]
     async fn subscribe_then_event_delivers_resources_updated() {
-        let (event_tx, event_rx) = broadcast::channel::<ContextEventEnvelope>(16);
+        let (event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
 
         // A client initializes and subscribes to the context's event stream.
         let (server, pump_source) = subscribed_server("scp://ctx_a/events", event_rx);
@@ -1140,7 +1140,7 @@ mod tests {
 
         // The runtime emits a context event.
         event_tx
-            .send(ContextEventEnvelope::new(
+            .send((
                 "ctx_a".to_owned(),
                 ContextEvent::ContentKeysRotated { reason: None },
             ))
@@ -1161,7 +1161,7 @@ mod tests {
     /// The same chain must stay silent for a resource nobody subscribed to.
     #[tokio::test]
     async fn event_without_subscription_delivers_nothing() {
-        let (event_tx, event_rx) = broadcast::channel::<ContextEventEnvelope>(16);
+        let (event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
 
         let (server, pump_source) = McpServer::with_event_source(MockProvider::default(), event_rx);
         let state = Arc::new(AppState {
@@ -1175,7 +1175,7 @@ mod tests {
         let pump = tokio::spawn(pump_events(Arc::clone(&state), pump_source.into_receiver()));
 
         event_tx
-            .send(ContextEventEnvelope::new(
+            .send((
                 "ctx_a".to_owned(),
                 ContextEvent::ContentKeysRotated { reason: None },
             ))
@@ -1619,7 +1619,7 @@ mod tests {
     /// only after `reset_session()` completes.
     #[tokio::test]
     async fn session_admitted_after_previous_drop_keeps_its_subscription() {
-        let (_event_tx, event_rx) = broadcast::channel::<ContextEventEnvelope>(16);
+        let (_event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
         // Wired server: `resources/subscribe` must be accepted for the second
         // session's registration to exist at all.
         let (server, _pump) = McpServer::with_event_source(MockProvider::default(), event_rx);
@@ -1940,7 +1940,7 @@ mod tests {
     /// to zero; a detached pump would hold that receiver forever.
     #[tokio::test]
     async fn aborting_run_sse_tears_down_the_pump() {
-        let (event_tx, event_rx) = broadcast::channel::<ContextEventEnvelope>(16);
+        let (event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
         let (server, pump) = McpServer::with_event_source(MockProvider::default(), event_rx);
         let bundle = McpServerForTransport::Wired(server, pump);
         let config = SseConfig::new("127.0.0.1:0".parse().unwrap());

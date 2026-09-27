@@ -39,7 +39,7 @@ use scp_clock::Clock;
 use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::governance::KeyResolver;
-use scp_protocol::context::membership::{ContextEvent, ContextEventEnvelope};
+use scp_protocol::context::membership::ContextEvent;
 
 use crate::context::actor::commands::{
     BroadcastCommand, ContextCommand, EconomyCommand, GovernanceCommand, LifecycleCommand,
@@ -1530,7 +1530,7 @@ pub struct Supervisor {
     /// Optional broadcast sender for fan-out of [`ContextEvent`]s to
     /// external consumers. Empty `OnceLock` means "no channel
     /// configured".
-    event_tx: OnceLock<tokio::sync::broadcast::Sender<ContextEventEnvelope>>,
+    event_tx: OnceLock<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
     /// OpenMLS storage adapter — the bridge's chosen Storage, erased once via
     /// `SpawnBlockingStorageAdapter`. Runtime NEVER defaults this. Lock-free
     /// read per ADR-049 §Decision 12.
@@ -2023,7 +2023,7 @@ impl Supervisor {
         key_resolver: KeyResolver,
         persistence: Option<Box<dyn ContextPersistence>>,
         payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
-        event_tx: Option<tokio::sync::broadcast::Sender<ContextEventEnvelope>>,
+        event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
         clock: Option<Arc<dyn Clock>>,
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
     ) -> Arc<Self> {
@@ -2086,7 +2086,7 @@ impl Supervisor {
         key_resolver: KeyResolver,
         persistence: Option<Box<dyn ContextPersistence>>,
         payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
-        event_tx: Option<tokio::sync::broadcast::Sender<ContextEventEnvelope>>,
+        event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
         clock: Option<Arc<dyn Clock>>,
         durable: DurableProviders,
     ) -> Arc<Self> {
@@ -2383,7 +2383,7 @@ impl Supervisor {
     #[must_use]
     pub(crate) fn event_tx_ref(
         &self,
-    ) -> Option<&tokio::sync::broadcast::Sender<ContextEventEnvelope>> {
+    ) -> Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>> {
         self.event_tx.get()
     }
 
@@ -2417,7 +2417,7 @@ impl Supervisor {
     #[must_use]
     pub fn subscribe_events(
         &self,
-    ) -> Option<tokio::sync::broadcast::Receiver<ContextEventEnvelope>> {
+    ) -> Option<tokio::sync::broadcast::Receiver<(String, ContextEvent)>> {
         self.event_tx
             .get()
             .map(tokio::sync::broadcast::Sender::subscribe)

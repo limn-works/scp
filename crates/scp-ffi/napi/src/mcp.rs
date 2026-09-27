@@ -1153,12 +1153,15 @@ mod tests {
     // together, and a wired bridge actually yields a receiver.
     // -----------------------------------------------------------------------
 
-    use scp_core::context::membership::{ContextEvent, ContextEventEnvelope};
+    use scp_core::context::membership::ContextEvent;
     use scp_mcp::protocol::{
         JSONRPC_VERSION, METHOD_INITIALIZE, METHOD_NOT_FOUND, METHOD_RESOURCES_SUBSCRIBE,
         METHOD_RESOURCES_UPDATED, RequestId,
     };
     use tokio::sync::broadcast;
+
+    /// The sender half of the supervisor's context-event channel.
+    type ContextEventSender = broadcast::Sender<(String, ContextEvent)>;
 
     const SUB_CTX: &str = "ctx-subscribe-napi";
     const SUB_URI: &str = "scp://ctx-subscribe-napi/events";
@@ -1192,7 +1195,7 @@ mod tests {
         Arc<NapiBridgeInstance>,
         scp_mcp::server::McpServer<McpNapiBridgeProvider>,
         scp_mcp::server::ContextEventPump,
-        broadcast::Sender<ContextEventEnvelope>,
+        ContextEventSender,
     ) {
         let bi = Arc::new(NapiBridgeInstance::new_napi());
         crate::runtime::register_ffi_state(&bi, SUB_CTX, AGENT_DID, &[])

@@ -840,9 +840,10 @@ impl RunningNode {
     #[must_use]
     pub fn wire_context_events(
         &self,
-        events: tokio::sync::broadcast::Receiver<
-            scp_core::context::membership::ContextEventEnvelope,
-        >,
+        events: tokio::sync::broadcast::Receiver<(
+            String,
+            scp_core::context::membership::ContextEvent,
+        )>,
     ) -> tokio::task::JoinHandle<()> {
         dispatch_running_node!(self, |n| n.wire_context_events(events))
     }

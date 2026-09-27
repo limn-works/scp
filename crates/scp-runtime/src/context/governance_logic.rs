@@ -119,7 +119,10 @@ pub struct EnforceConsequencesCtx<'a> {
     /// Optional broadcast channel for event propagation from free
     /// functions that lack `&self` access to `ContextManager`.
     pub event_tx: Option<
-        &'a tokio::sync::broadcast::Sender<scp_protocol::context::membership::ContextEventEnvelope>,
+        &'a tokio::sync::broadcast::Sender<(
+            String,
+            scp_protocol::context::membership::ContextEvent,
+        )>,
     >,
 }
 
@@ -973,9 +976,7 @@ mod convergence_tests {
         // A `ConsequenceTriggered` ContextEvent must always be surfaced,
         // regardless of durability.
         let mut saw_triggered = false;
-        while let Ok(scp_protocol::context::membership::ContextEventEnvelope { event, .. }) =
-            rx.try_recv()
-        {
+        while let Ok((_ctx, event)) = rx.try_recv() {
             if matches!(event, ContextEvent::ConsequenceTriggered { .. }) {
                 saw_triggered = true;
             }

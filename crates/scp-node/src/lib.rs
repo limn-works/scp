@@ -477,9 +477,10 @@ impl<S: Storage> ApplicationNode<S> {
     #[must_use]
     pub fn wire_context_events(
         &self,
-        events: tokio::sync::broadcast::Receiver<
-            scp_core::context::membership::ContextEventEnvelope,
-        >,
+        events: tokio::sync::broadcast::Receiver<(
+            String,
+            scp_core::context::membership::ContextEvent,
+        )>,
     ) -> tokio::task::JoinHandle<()> {
         crate::webhook::spawn_event_consumer(events, self.webhook_dispatcher())
     }
