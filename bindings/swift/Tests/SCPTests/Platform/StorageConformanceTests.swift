@@ -163,19 +163,7 @@
                     try AppleStorage.bindText(prefix, to: stmt, at: 1)
                 }
 
-                var keys: [String] = []
-                while sqlite3_step(stmt) == SQLITE_ROW {
-                    guard let text = sqlite3_column_text(stmt, 0) else { continue }
-                    let byteCount = Int(sqlite3_column_bytes(stmt, 0))
-                    let bytes = Data(UnsafeBufferPointer(start: text, count: byteCount))
-                    guard let key = String(bytes: bytes, encoding: .utf8) else {
-                        throw StorageError.databaseError(
-                            "a stored key of \(byteCount) bytes decodes as no UTF-8 string"
-                        )
-                    }
-                    keys.append(key)
-                }
-                return keys
+                return try AppleStorage.readKeys(from: stmt)
             }
         }
 

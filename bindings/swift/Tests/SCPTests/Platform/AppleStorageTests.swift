@@ -212,6 +212,74 @@
             #expect(sqlite3_step(stmt) == SQLITE_ROW)
             #expect(sqlite3_column_int(stmt, 0) == 9)
         }
+
+        /// `bindText` and `bindBlob` both reach this conversion, so a count
+        /// above `Int32.max` throws for either of them where `Int32(_:)` would
+        /// terminate the process. A case cannot allocate 2 GiB, so it hands
+        /// the conversion the count directly.
+        @Test("a byte count above Int32.max throws instead of trapping")
+        func byteCountAboveInt32MaxThrows() throws {
+            #expect(throws: StorageError.self) {
+                _ = try AppleStorage.sqliteByteCount(Int(Int32.max) + 1, binder: "bindBlob")
+            }
+            #expect(try AppleStorage.sqliteByteCount(Int(Int32.max), binder: "bindBlob") == Int32.max)
+        }
+    }
+
+    // MARK: - Key-scan tests
+
+    /// Cases that pin how `AppleStorage.readKeys(from:)`, the loop behind
+    /// `listKeys`, ends a scan.
+    struct AppleStorageKeyScanTests {
+        /// `abs` raises SQLite's "integer overflow" error for the smallest
+        /// 64-bit integer, so this statement answers `SQLITE_ROW` for `a` and
+        /// then an error for `b`. A loop that stops on any answer other than
+        /// `SQLITE_ROW` would return `["a"]` as a complete list.
+        @Test("readKeys throws when a step ends the scan with an error")
+        func readKeysThrowsOnStepError() throws {
+            let connection = try makeBareConnection()
+            defer { sqlite3_close_v2(connection) }
+
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let sql = """
+            SELECT CASE WHEN column1 = 'b' THEN abs(-9223372036854775807 - 1) ELSE column1 END
+            FROM (VALUES ('a'), ('b'))
+            """
+            #expect(sqlite3_prepare_v2(connection, sql, -1, &stmt, nil) == SQLITE_OK)
+
+            #expect(throws: StorageError.self) {
+                _ = try AppleStorage.readKeys(from: stmt)
+            }
+        }
+
+        @Test("readKeys throws when a key row reads NULL")
+        func readKeysThrowsOnNullKey() throws {
+            let connection = try makeBareConnection()
+            defer { sqlite3_close_v2(connection) }
+
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let sql = "SELECT column1 FROM (VALUES ('a'), (NULL))"
+            #expect(sqlite3_prepare_v2(connection, sql, -1, &stmt, nil) == SQLITE_OK)
+
+            #expect(throws: StorageError.self) {
+                _ = try AppleStorage.readKeys(from: stmt)
+            }
+        }
+
+        @Test("readKeys returns every key when the scan ends with SQLITE_DONE")
+        func readKeysReturnsEveryKey() throws {
+            let connection = try makeBareConnection()
+            defer { sqlite3_close_v2(connection) }
+
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let sql = "SELECT column1 FROM (VALUES ('a'), ('b'))"
+            #expect(sqlite3_prepare_v2(connection, sql, -1, &stmt, nil) == SQLITE_OK)
+
+            #expect(try AppleStorage.readKeys(from: stmt) == ["a", "b"])
+        }
     }
 
     // MARK: - Round-trip tests
