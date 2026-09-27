@@ -423,7 +423,7 @@ Phase 4 adds three required gates on every PR touching `bindings/**` or
 | `scripts/check-handle-affinity.sh`       | Handle-accepting FFI function without its bridge's affinity macro                 | Add the macro invocation in the function prologue.                                |
 
 All three gates are listed in the `NEVER modify enforcement files to
-bypass failures` block in repo-root `CLAUDE.md`. Adding NEW assertions is
+bypass failures` block in repo-root `AGENTS.md`. Adding NEW assertions is
 always welcome; weakening or exempting existing ones requires human
 approval.
 

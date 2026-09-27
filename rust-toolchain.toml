@@ -37,12 +37,12 @@
 # added `chunks_exact_to_as_chunks` and `unused_async_trait_impl`. The `Rust / clippy`
 # required check started failing on every branch the next morning, and a local run of the
 # identical command on 1.97.1 reported nothing, so nobody could reproduce the failure that
-# was blocking the merge queue. CLAUDE.md requires running CI locally before pushing; that
+# was blocking the merge queue. AGENTS.md requires a local check before pushing; that
 # requirement only means something when the local compiler and the CI compiler are the
 # same compiler. See `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`.
 #
 # HOW TO RAISE IT. Edit `channel` below and run the CI clippy command from the
-# "Orchestrator verification protocol" section of CLAUDE.md; rustup downloads the new
+# "Verification after every agent merge" rules of AGENTS.md; rustup downloads the new
 # toolchain the first time a cargo command runs here. Fix everything the new release
 # reports in that same pull request. Nothing else names a version, so nothing else has to
 # move. Never lower the pin to make a new lint disappear.

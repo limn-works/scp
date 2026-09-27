@@ -6,7 +6,7 @@
 #   `.claude/agents/README.md` requires two things of every agent definition: one sentence
 #   stating what the agent has to confirm before it reports a verdict, and one sentence
 #   labelling the rest of the file as the place to look rather than as the definition. The
-#   CLAUDE.md rule "Write every agent prompt as a contract, never as your recipe" states
+#   AGENTS.md rule "Write every agent prompt as a contract, never as your recipe" states
 #   the same requirement for the standing definitions. Before this check existed, that
 #   requirement bound only the author who happened to read the README: on the day the
 #   README added it, twenty of the twenty-nine definitions held neither the word "verdict"

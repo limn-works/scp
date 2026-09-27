@@ -53,7 +53,7 @@ inject test doubles:
   are `#[async_trait]`, `Send + Sync`, and dyn-compatible so one `Arc<dyn …>`
   is shared across every context actor. This is a hard requirement: actor
   futures are `tokio::spawn`'d, so the primitives they await must produce
-  `Send` futures. See this crate's `CLAUDE.md` for the full Send-discipline.
+  `Send` futures. See this crate's `AGENTS.md` for the full Send-discipline.
 
 ## Storage: `OpenMlsStorageAdapter` (`storage_adapter.rs`)
 
@@ -134,8 +134,8 @@ Commit bytes:
     `execute_rotate_content_keys`, `leave_context`, `recovery_advance_epoch` —
     fail-close this way; the two best-effort sites (`execute_add_member`,
     `execute_reset_member`) apply the *same* failure value **coalesced** via
-    `class_c_view()` (Class-C), not fail-closed — see the context layer +
-    `crates/scp-runtime/CLAUDE.md` for the authoritative site list.
+    `class_c_view()` (Class-C), not fail-closed — see the context layer for the authoritative
+    site list.
 - On budget exhaustion the context **fail-closes**: a `CommitFaultMarker` is
   set. While it is set, `check_commit_fault_marker` makes all governance and
   lifecycle mutations return `ContextError::CommitBroadcastFault`.
@@ -153,4 +153,4 @@ Merkle event log (§9.9.3).
 cloned into each `ContextActor`'s `ActorDeps` (`Arc<NodeMlsFactory>`), so
 handler bodies call `seal` / `open` / `advance_epoch` without reaching back
 through the supervisor. See `../../context/README.md` for the actor model and
-this crate's `CLAUDE.md` for the injection + Send-discipline rules.
+this crate's `AGENTS.md` for the injection + Send-discipline rules.

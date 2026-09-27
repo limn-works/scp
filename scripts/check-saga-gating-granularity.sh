@@ -91,7 +91,7 @@
 #   `reserved_saga_contexts` set, the `saga_participant_context_set` extractor,
 #   and the overlap-reject. Do NOT weaken this gate — fix the code.
 #
-# This script is in the CLAUDE.md NEVER-WEAKEN enforcement list. The only
+# This script is in the AGENTS.md NEVER-WEAKEN enforcement list. The only
 # legitimate edits are ADDITIVE (new assertions / wider coverage).
 #
 # ---------------------------------------------------------------------------

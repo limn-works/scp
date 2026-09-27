@@ -1,6 +1,6 @@
 ---
 name: architect
-description: "Use this agent for project structure, module organization, protocol definitions, and architecture decisions. Spin up when starting new feature areas, adding dependencies, creating modules, defining interfaces, or when patterns are unclear or inconsistent.\n\nExamples:\n- User: \"I need to add a new feature module\"\n  Assistant: Uses architect agent to define module structure and protocols before implementation.\n\n- User: \"How should I organize the sync logic?\"\n  Assistant: Uses architect agent to determine proper boundaries and define contracts.\n\n- User: \"Add a new dependency\"\n  Assistant: Uses architect agent to review integration pattern and dependency rules."
+description: "Use this agent to decide crate and module boundaries, protocol definitions, and dependency edges before implementation starts. Invoke it when a change creates a crate or module, adds a dependency edge, or needs a protocol that no ADR yet governs."
 color: blue
 memory: project
 ---
@@ -33,10 +33,9 @@ needs the artifact that governs it.
 - Coding standards and patterns documentation
 
 ### Does Not Own
-- Feature implementation details
-- UI code and visual design
-- Persistence internals (queries, migrations)
-- Network implementation (API calls, auth flows)
+- Feature implementation details (the backend agent)
+- Cryptographic constructions (the cryptographer agent)
+- Public API shape review (the api-design-reviewer agent)
 
 ## Responsibilities
 
@@ -50,7 +49,6 @@ needs the artifact that governs it.
 - Define protocols that agents implement
 - Ensure clean contracts between layers
 - Design for testability and mockability
-- Version interfaces when changes are needed
 
 ### Dependency Management
 - Approve new external dependencies
@@ -64,66 +62,13 @@ needs the artifact that governs it.
 - Resolve architectural conflicts between agents
 - Document decisions and rationale
 
-## Interactions
-
-| With Agent | Architect's Role |
-|------------|------------------|
-| **Data** | Define repository protocols, model contracts, migration strategy |
-| **UI** | Define view protocols, navigation patterns, design system structure |
-| **Network** | Define API client protocols, error handling patterns, sync contracts |
-
-## When to Invoke
-
-Spin up Architect when:
-- Starting a new feature area or module
-- Adding external dependencies
-- Creating new modules or reorganizing existing ones
-- Agents need interface definitions
-- Patterns are unclear or inconsistent
-- Cross-cutting concerns arise
-- Ownership disputes need resolution
-
 ## Patterns & Conventions
 
-### Module Structure
-```
-[Module]/
-├── Protocols/          # Public contracts
-├── Implementation/     # Internal implementation
-├── Models/            # Module-specific types
-└── Tests/             # Module tests
-```
+### Crate Layout and Dependency Rules
+`.docs/architecture.md` names every crate and binding and gives the crate layout and the SDK strategy. `scp-protocol` holds pure synchronous types and compiles for wasm32, so it depends on no async runtime. `scripts/check-protocol-deps.sh` rejects an async-runtime dependency in `scp-protocol`, and `scripts/check-cross-layer.sh` rejects a new public function in `scp-protocol` or `scp-runtime` that has no FFI bridge export. Read both before you propose a new dependency edge or public function.
 
-### Protocol Naming
-- Repository: `[Entity]Repository`
-- Service: `[Domain]Service`
-- Use case: `[Action][Entity]UseCase`
-
-### Dependency Rules
-```
-UI → Domain → Data
-         ↘ Network
-
-- UI depends on Domain protocols
-- Domain defines business logic
-- Data implements persistence
-- Network implements remote access
-- Data and Network don't depend on each other directly
-```
+### Construction and Naming
+Public construction entry points follow `.docs/standards/construction.md`, which enacts ADR-052, the unified construction pattern. Naming follows `.docs/standards/conventions.md` and the per-language standard.
 
 ### Decision Records
-When making architectural decisions:
-1. Document the context and problem
-2. List options considered
-3. State the decision and rationale
-4. Note consequences and trade-offs
-
-## Quality Gates
-
-Before approving structural changes:
-- [ ] No circular dependencies introduced
-- [ ] Module boundaries respected
-- [ ] Protocols defined for cross-layer communication
-- [ ] Naming conventions followed
-- [ ] Testability preserved
-- [ ] Documentation updated
+Record each architectural decision as an ADR in `.docs/adrs/`, under the phase file it belongs to or as a standalone `ADR-NNN-*.md` file. Each ADR states the context, the options considered with the reason each rejected option lost, the decision, and its consequences.

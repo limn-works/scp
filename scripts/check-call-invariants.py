@@ -1,7 +1,7 @@
 #!/usr/bin/env python3.12
 # ENFORCEMENT FILE: This script and its baseline
 # (.docs/standards/call-invariants-baseline.json) are enforcement files.
-# See CLAUDE.md "NEVER modify enforcement files" — will be added to that
+# See AGENTS.md "NEVER modify enforcement files" — will be added to that
 # list in the merge commit that lands this PR. Modifications that weaken
 # or remove existing assertions require human approval; adding NEW rules
 # (expanding coverage) is always fine.
@@ -33,7 +33,7 @@ Also enforces the **rule-id ratchet** in
 ``required_rule_ids`` must appear in the matrix's ``call_invariants[].rule_id``
 set. This prevents a PR from swapping a critical rule for a trivial one while
 keeping the rule count constant. Adding new rules beyond the baseline is
-always fine; retiring a rule requires explicit human approval per CLAUDE.md
+always fine; retiring a rule requires explicit human approval per AGENTS.md
 enforcement-file policy.
 
 Layer-B scope:
@@ -47,7 +47,7 @@ Layer-B scope:
 Rule-id renames:
 - Renaming a ``rule_id`` is equivalent to *retirement + new rule*, even if
   the new name is obviously similar (``foo-on-bar`` → ``foo-at-bar``). The PR
-  performing a rename MUST also update CLAUDE.md's enforcement-files list so
+  performing a rename MUST also update AGENTS.md's enforcement-files list so
   reviewers see the change. A rename that touches only the matrix and the
   baseline in the same commit is a RED FLAG — reviewers should block.
 - The baseline pins ``required_rule_ids_digest`` (SHA-256 over the sorted
@@ -956,7 +956,7 @@ def _run() -> int:
 
     # Rule-id ratchet: every baseline-required rule_id must appear in the
     # matrix. Adding new rules is fine; retiring one requires human
-    # approval (see baseline note + CLAUDE.md enforcement-files list).
+    # approval (see baseline note + AGENTS.md enforcement-files list).
     required_ids = baseline.get("required_rule_ids", [])
     if not isinstance(required_ids, list) or not all(
         isinstance(r, str) for r in required_ids
@@ -980,7 +980,7 @@ def _run() -> int:
     # (e.g. ``foo-on-bar`` → ``foo-at-bar`` changed in matrix+baseline in
     # the same PR) visible in any diff or CI log. A rename changes the
     # digest; reviewers who see the delta should treat it as a red flag
-    # and verify the rename was intentional and documented per CLAUDE.md.
+    # and verify the rename was intentional and documented per AGENTS.md.
     sorted_ids = sorted(required_ids)
     digest = hashlib.sha256("\n".join(sorted_ids).encode("utf-8")).hexdigest()[:16]
     computed_digest = f"sha256:{digest}"
@@ -995,7 +995,7 @@ def _run() -> int:
     # not just via reviewer eyeballs. ``required_rule_ids_digest`` is a
     # required field — missing or wrong values are hard failures. Updating
     # the digest in the same commit as a rename counts as a modification
-    # of an enforcement file per CLAUDE.md and must be reviewed accordingly.
+    # of an enforcement file per AGENTS.md and must be reviewed accordingly.
     expected_digest = baseline.get("required_rule_ids_digest")
     if not isinstance(expected_digest, str) or not expected_digest.strip():
         print(
@@ -1117,7 +1117,7 @@ def _run() -> int:
             "To retire an enforced invariant, human approval is required: "
             "remove the rule_id from call-invariants-baseline.json's "
             "required_rule_ids AND from sdk-capability-matrix.json's "
-            "call_invariants[] AND update CLAUDE.md's enforcement-files "
+            "call_invariants[] AND update AGENTS.md's enforcement-files "
             "list in the same PR.",
             file=sys.stderr,
         )

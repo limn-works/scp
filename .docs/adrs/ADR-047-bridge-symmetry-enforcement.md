@@ -99,6 +99,8 @@ The hook blocks only on **regressions** (an alias present before the edit that t
 
 A second `PreToolUse` hook in `.claude/settings.json` protects the enforcement files themselves: `.claude/settings.json`, `scripts/check-bridge-symmetry.sh`, `scripts/bridge-aliases.json`. Edits to these paths (including via symlink, which is why `python3 os.path.realpath` resolution is required) are blocked by the hook with a message directing the author to raise a separate PR. This mirrors the existing CLAUDE.md enforcement-files policy and prevents an agent from silently weakening enforcement in the same PR that introduces a symmetry violation.
 
+On 2026-09-26 Alec ruled "delete the hook then", and the enforcement-file hook was deleted: it anchored to the main checkout while agents work in worktrees, and it missed dozens of command shapes. CI, which runs the gates, and review of the PR diff catch a change to an enforcement file.
+
 ## Alternatives rejected
 
 1. **Keep hand-maintained match arms.** The prior state. Rejected because silent drift across five artifacts is exactly the failure mode this ADR eliminates; no hook surface exists; exemptions are undocumented.

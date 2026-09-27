@@ -320,8 +320,8 @@ cd fuzz && cargo check              # compile-check (no fuzzing)
 
 **Do NOT use `Arbitrary` for parser targets (T1/T2).** Raw bytes give libFuzzer direct
 mutation-coverage feedback. `Arbitrary` wrappers cause the fuzzer to mutate the Arbitrary
-encoding rather than the parser input, breaking coverage guidance. See
-`.docs/lessons/fuzz-raw-bytes-over-arbitrary-wrappers.md`.
+encoding rather than the parser input, breaking coverage guidance. See ADR-045, the
+fuzzing infrastructure decision (`.docs/adrs/phase-6.md`).
 
 **Do NOT replicate private production functions in fuzz targets.** Replicas drift silently.
 Prefer promoting the function to `#[doc(hidden)] pub` so the fuzz target calls the real
@@ -332,7 +332,7 @@ implementation. See `.docs/lessons/fuzz-replica-production-type-drift.md`.
 `rmp_serde::from_slice`. See `.docs/lessons/serde-flatten-rmpv-value-buffering.md`.
 
 See `fuzz/README.md` for the full target inventory, crash workflow, and corpus management.
-See `fuzz/.claude/CLAUDE.md` for agent-facing conventions.
+See `fuzz/AGENTS.md` for agent-facing conventions.
 
 ### Test naming
 
