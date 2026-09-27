@@ -417,6 +417,19 @@ pub(crate) enum NapiKeyCustody {
     /// two mutexes — 288 bytes against the 72 the next-largest variant needs,
     /// so an unboxed payload would grow every `NapiKeyCustody` value by that
     /// difference.
+    ///
+    /// A build without the `testing` feature never constructs this variant:
+    /// both `"file"` creation arms fail closed with `SCP-IDENT-1059` before
+    /// they open the key file, because no production pre-rotation backend
+    /// exists (ADR-062 §Decision 6). `expect` fails that build once a creation
+    /// path constructs it, so this attribute cannot outlive the reason for it.
+    #[cfg_attr(
+        not(feature = "testing"),
+        expect(
+            dead_code,
+            reason = "shipped \"file\" creation fails closed before opening the key file"
+        )
+    )]
     File(Box<FileKeyCustody>),
     /// Caller-provided custody backed by JS callbacks.
     Callback(NapiCallbackKeyCustody),
