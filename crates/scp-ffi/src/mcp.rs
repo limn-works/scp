@@ -1190,21 +1190,25 @@ impl ContextProvider for FfiBridgeProvider {
             // to `Capability::Custom("resource:tools")`, which appears in no
             // ceiling and no role catalogue, so gating on it denied every
             // client on every bridge unconditionally.
-            let permitted = match resource {
-                ResourceKind::Events | ResourceKind::Members => rt
+            //
+            // The denial names the requirement this kind actually checks, so a
+            // caller acting on the message grants what decides the outcome.
+            let missing = match resource {
+                ResourceKind::Events | ResourceKind::Members => (!rt
                     .role_state
-                    .member_has_capability(&self.agent_did, &Capability::MessagesRead),
-                ResourceKind::Tools => rt.role_state.members.contains(&self.agent_did),
+                    .member_has_capability(&self.agent_did, &Capability::MessagesRead))
+                .then_some("messages:read"),
+                ResourceKind::Tools => {
+                    (!rt.role_state.members.contains(&self.agent_did)).then_some("membership")
+                }
             };
-            if permitted {
-                Ok(())
-            } else {
+            missing.map_or(Ok(()), |requirement| {
                 Err(ScpPyError::context(format!(
-                    "agent lacks messages:read in context '{context_id}' — required to read \
+                    "agent lacks {requirement} in context '{context_id}' — required to read \
                      scp://{context_id}/{}",
                     resource.uri_suffix()
                 )))
-            }
+            })
         })
         .map_err(|e| format!("{e}"))
     }
@@ -3866,9 +3870,17 @@ mod tests {
             ResourceKind::Members,
             ResourceKind::Tools,
         ] {
+            let denial = outsider
+                .validate_resource_access(&ctx_id, kind)
+                .expect_err("a non-member must not be able to read the resource");
+            // The denial names the requirement this kind checks.
+            let expected = match kind {
+                ResourceKind::Tools => "lacks membership",
+                ResourceKind::Events | ResourceKind::Members => "lacks messages:read",
+            };
             assert!(
-                outsider.validate_resource_access(&ctx_id, kind).is_err(),
-                "a non-member must not be able to read scp://{ctx_id}/{}",
+                denial.contains(expected),
+                "the denial for scp://{ctx_id}/{} must say {expected:?}, got: {denial}",
                 kind.uri_suffix()
             );
         }

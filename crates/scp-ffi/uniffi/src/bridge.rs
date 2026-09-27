@@ -4980,21 +4980,24 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         // `Tools` carries no separate grant because its contents are the
         // capability-filtered tool list; an agent with no tool capabilities
         // reads `[]` rather than being denied.
-        let permitted = match resource {
-            ResourceKind::Events | ResourceKind::Members => {
-                role_state.member_has_capability(&self.agent_did, &Capability::MessagesRead)
+        //
+        // The denial names the requirement this kind actually checks, so a
+        // caller acting on the message grants what decides the outcome.
+        let missing = match resource {
+            ResourceKind::Events | ResourceKind::Members => (!role_state
+                .member_has_capability(&self.agent_did, &Capability::MessagesRead))
+            .then_some("messages:read"),
+            ResourceKind::Tools => {
+                (!role_state.members.contains(&self.agent_did)).then_some("membership")
             }
-            ResourceKind::Tools => role_state.members.contains(&self.agent_did),
         };
-        if permitted {
-            Ok(())
-        } else {
+        missing.map_or(Ok(()), |requirement| {
             Err(format!(
-                "agent lacks messages:read in context '{context_id}' — required to read \
+                "agent lacks {requirement} in context '{context_id}' — required to read \
                  scp://{context_id}/{}",
                 resource.uri_suffix()
             ))
-        }
+        })
     }
 
     fn agent_role(&self, context_id: &str) -> Option<String> {
@@ -23362,6 +23365,62 @@ mod tests {
     // server task cannot pin the instance alive past the caller's last
     // `Arc` drop.
     // -----------------------------------------------------------------------
+
+    /// A denied resource read names the requirement the gate checked for that
+    /// kind: membership for `Tools`, `messages:read` for `Events`/`Members`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uniffi_resource_denial_names_the_requirement_it_checks() {
+        use scp_mcp::server::{ContextProvider as _, ResourceKind};
+
+        let scp = scp_test();
+        let bi = Arc::clone(&scp.inner);
+        bi.init_context_manager_with_did("did:dht:z6MkDenialCreator");
+        bi.context_manager_or_error()
+            .expect("supervisor must be attached")
+            .clone()
+            .create_context(
+                "ctx-denial".to_owned(),
+                scp_core::context::ContextParams::default(),
+                scp_did::DID("did:dht:z6MkDenialCreator".to_owned()),
+                None,
+            )
+            .await
+            .expect("context creation must succeed");
+        let provider_for = |agent: &str| McpUniFfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: agent.to_owned(),
+            context_ids: vec!["ctx-denial".to_owned()],
+            outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: None,
+            agent_proof_tokens: None,
+        };
+
+        // Positive control: the gate reads real role state for this context.
+        assert!(
+            provider_for("did:dht:z6MkDenialCreator")
+                .validate_resource_access("ctx-denial", ResourceKind::Tools)
+                .is_ok(),
+            "the creator is a member and must read the tool list"
+        );
+
+        let outsider = provider_for("did:dht:z6MkNotAMember");
+        let tools_denial = outsider
+            .validate_resource_access("ctx-denial", ResourceKind::Tools)
+            .expect_err("a non-member must not read the tool list");
+        assert!(
+            tools_denial.contains("lacks membership") && !tools_denial.contains("messages:read"),
+            "the Tools denial must name membership, got: {tools_denial}"
+        );
+        for kind in [ResourceKind::Events, ResourceKind::Members] {
+            let denial = outsider
+                .validate_resource_access("ctx-denial", kind)
+                .expect_err("a non-member must be denied");
+            assert!(
+                denial.contains("lacks messages:read"),
+                "the {kind:?} denial must name messages:read, got: {denial}"
+            );
+        }
+    }
 
     /// Struct-level proof: `McpUniFfiBridgeProvider.bi` is `Weak`.
     /// If someone reverts the type to `Arc`, this test stops compiling.

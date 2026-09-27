@@ -540,24 +540,27 @@ fn resource_access_from_role_state(
     use scp_mcp::server::ResourceKind;
 
     crate::runtime::with_context(bi, context_id, |rt| {
-        let permitted = match resource {
-            ResourceKind::Events | ResourceKind::Members => rt
+        // The denial names the requirement this kind actually checks, so a
+        // caller acting on the message grants what decides the outcome.
+        let missing = match resource {
+            ResourceKind::Events | ResourceKind::Members => (!rt
                 .role_state
-                .member_has_capability(agent_did, &Capability::MessagesRead),
-            ResourceKind::Tools => rt.role_state.members.contains(agent_did),
+                .member_has_capability(agent_did, &Capability::MessagesRead))
+            .then_some("messages:read"),
+            ResourceKind::Tools => {
+                (!rt.role_state.members.contains(agent_did)).then_some("membership")
+            }
         };
-        if permitted {
-            Ok(())
-        } else {
+        missing.map_or(Ok(()), |requirement| {
             Err(ScpNapiError::Context {
                 message: format!(
-                    "agent lacks messages:read in context '{context_id}' — \
+                    "agent lacks {requirement} in context '{context_id}' — \
                      required to read scp://{context_id}/{}",
                     resource.uri_suffix()
                 ),
                 code: codes::TRANS_5012.to_owned(),
             })
-        }
+        })
     })
     .map_err(|e| e.to_string())
 }
@@ -1388,6 +1391,24 @@ mod tests {
                 .is_err(),
             "a non-member must not be able to read the roster"
         );
+        // The denial names the requirement each kind checks: membership for
+        // `Tools`, `messages:read` for `Events` and `Members`.
+        let tools_denial = outsider
+            .validate_resource_access(SUB_CTX, ResourceKind::Tools)
+            .expect_err("a non-member must not be able to read the tool list");
+        assert!(
+            tools_denial.contains("lacks membership") && !tools_denial.contains("messages:read"),
+            "the Tools denial must name membership, got: {tools_denial}"
+        );
+        for kind in [ResourceKind::Events, ResourceKind::Members] {
+            let denial = outsider
+                .validate_resource_access(SUB_CTX, kind)
+                .expect_err("a non-member must be denied");
+            assert!(
+                denial.contains("lacks messages:read"),
+                "the {kind:?} denial must name messages:read, got: {denial}"
+            );
+        }
         assert!(
             outsider.active_context_ids().is_empty(),
             "a non-member must not have the context in its served set"
