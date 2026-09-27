@@ -23149,13 +23149,15 @@ mod tests {
     /// [`Supervisor::read_context_state_checked`], not as an absent context.
     ///
     /// Both contexts have no registered actor, and both still exist: the
-    /// watchdog re-registers the first one when its respawn finishes, and
-    /// `lookup_miss_error` classifies both as crashed. `context_close` on the
-    /// three FFI bridges reads `Ok(None)` as proof that the close already
-    /// happened and skips the `CloseContext` dispatch, which carries the only
-    /// `ContextClose` capability check on that path, so a `None` here would
-    /// let a caller holding no `context:close` capability release a context
-    /// the supervisor is about to serve as `Active` again.
+    /// watchdog re-registers the first one when its respawn finishes, the
+    /// operator's `clear_poison` respawns the second one (as it does a
+    /// poisoned context), and `lookup_miss_error` classifies both as crashed.
+    /// `context_close` on the three FFI bridges reads `Ok(None)` as proof that
+    /// the close already happened and skips the `CloseContext` dispatch, which
+    /// carries the only `ContextClose` capability check on that path, so a
+    /// `None` here would let a caller holding no `context:close` capability
+    /// release a context the supervisor can serve as `Active` again. The
+    /// bridges refuse a `Poisoned` close for the same reason.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_crashed_context_with_no_actor_reads_as_actor_crashed_not_as_absent() {
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));

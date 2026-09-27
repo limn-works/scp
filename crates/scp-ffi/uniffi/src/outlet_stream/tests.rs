@@ -272,7 +272,7 @@ async fn seed_owner_document_into_resolver(
 fn streaming_context_params(ceiling: &[&str]) -> crate::bridge::ContextParams {
     crate::bridge::ContextParams {
         mode: crate::bridge::ContextMode::Encrypted,
-        ceiling: ceiling.iter().map(|s| (*s).to_owned()).collect(),
+        ceiling: Some(ceiling.iter().map(|s| (*s).to_owned()).collect()),
         ceiling_policy: crate::bridge::CeilingPolicy::Immutable,
         governance: crate::bridge::GovernanceModel::SingleAdmin,
         memory_scope: crate::bridge::MemoryScope::Ephemeral,
@@ -1180,14 +1180,17 @@ mod xctx_streaming_saga_tests {
     /// (CRYPTO defense-in-depth, SCP-OUT-047) The streaming-saga RECOVER derives
     /// the TARGET context's Active Signing Key from the `creator_did` it reads
     /// off that context's supervisor actor (`live_role_state`), whereas the
-    /// context handle carries its OWN `creator_did` recorded at creation. For a
-    /// context whose creator no `AdminTransferred` action has moved, these are
-    /// the SAME fact from two sources, and this pins that they agree at
-    /// creation, so a future refactor that seals under a different context's key
-    /// is caught here. The handle copy is the one that goes stale after an admin
-    /// transfer, which is why recover reads the actor and not the handle.
+    /// context handle carries its OWN `creator_did` recorded at creation.
+    ///
+    /// The test pins two facts. At creation the two sources agree, so the key
+    /// recover resolves is the creator's key. Once the supervisor despawns the
+    /// actor, `resolve_context_active_signing_key_by_id` refuses with the
+    /// absent-role-state error, while the handle still carries its copy: a
+    /// resolver that went back to reading the handle or the per-context UCAN
+    /// state would resolve a key for a context no actor serves, and this test
+    /// would go red.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn xctx_streaming_saga_live_creator_did_matches_handle() {
+    async fn xctx_streaming_saga_signing_key_resolves_from_the_live_actor() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
         let bi = Arc::clone(&scp.inner);
         let _resolver = install_seedable_resolver(&bi);
@@ -1214,6 +1217,21 @@ mod xctx_streaming_saga_tests {
             "the supervisor's creator_did (the recover signing-key source) must equal the \
              handle's creator_did at creation — a divergence would let streaming-saga recover \
              seal under a different context's Active Signing Key"
+        );
+        super::resolve_context_active_signing_key_by_id(&bi, &handle.context_id)
+            .await
+            .expect("a live actor whose creator this bridge hosts resolves the signing key");
+
+        bi.context_manager_or_error()
+            .expect("supervisor")
+            .despawn_actor(&handle.context_id)
+            .await;
+        let err = super::resolve_context_active_signing_key_by_id(&bi, &handle.context_id)
+            .await
+            .expect_err("a context no actor serves must not resolve a signing key");
+        assert!(
+            err.to_string().contains("no live supervisor role state"),
+            "the refusal must come from the live role-state read: {err}"
         );
     }
 }

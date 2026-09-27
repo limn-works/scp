@@ -1641,8 +1641,8 @@ pub(crate) fn ucan_registry(bi: &NapiBridgeInstance) -> &DashMap<String, UcanCon
 /// `ucan_evaluate`, `ucan_mint`, `ucan_delegate`, `ucan_revoke`, and the three
 /// outlet entry points read both from the per-context supervisor actor through
 /// [`live_role_state`] at the moment each decides, because a `ModifyCeiling`
-/// governance action and an `AdminTransferred` action move them after this
-/// registration runs.
+/// governance action moves the ceiling after this registration runs, and a
+/// context no actor serves must refuse rather than authorize against a copy.
 ///
 /// # Errors
 ///
@@ -1897,8 +1897,8 @@ pub async fn live_ceiling_strings(
 /// [`require_active_context`] is the gate form: it turns `None` into an error so
 /// a gate never admits an operation on an absent answer. `context_close` reads
 /// this form instead, because a close of a context whose actor the supervisor
-/// already despawned — a completed TTL expiry, an all-members-left teardown, a
-/// watchdog poisoning — is idempotent: the close already happened, and the
+/// already despawned — a completed TTL expiry or an all-members-left teardown —
+/// is idempotent: the close already happened, and the
 /// bridge still has to release the [`UcanContextState`] it holds for that id.
 ///
 /// An actor the supervisor still holds but this call could not reach — a

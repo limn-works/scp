@@ -31,10 +31,10 @@ pub(crate) async fn validate_ucan_for_outlet(
 ) -> Result<(), ScpNapiError> {
     // ADR-016 step 8 compares the token's grants against the context's
     // capability ceiling, and the chain check anchors on the context creator.
-    // Both come from the supervisor actor, read HERE — a bridge copy of either
-    // kept granting what a `ModifyCeiling` governance action had already
-    // narrowed, and it kept anchoring on a creator an `AdminTransferred` action
-    // had already replaced.
+    // Both come from the supervisor actor, read HERE — a bridge copy of the
+    // ceiling kept granting what a `ModifyCeiling` governance action had
+    // already narrowed, and a copy of either kept authorizing against a context
+    // no actor serves.
     let role_state = crate::runtime::live_role_state(bi, context_id).await?;
     let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
@@ -854,8 +854,8 @@ pub(crate) fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> S
 ///
 /// The creator DID comes from the supervisor actor rather than from the
 /// context handle, because this call chooses the authority a cross-context saga
-/// signs as. An `AdminTransferred` governance action moves that authority, and a
-/// handle minted before that action would keep signing as the previous holder.
+/// signs as, and a context no actor serves must refuse to sign rather than sign
+/// as the creator a handle recorded.
 pub(crate) async fn resolve_context_signing_key(
     bi: &crate::runtime::NapiBridgeInstance,
     context_id: &str,
@@ -1435,8 +1435,8 @@ pub(crate) async fn outlet_interface_expose_on(
 
     // `expose_outlet` decides whether the caller may offer this context's outlet
     // to another context, reading roles and the creator DID. Both come from the
-    // supervisor actor so an admin transfer or a role change lands before the
-    // offer is minted.
+    // supervisor actor so an admin transfer's role reassignment, or any other
+    // role change, lands before the offer is minted.
     let role_state = crate::runtime::live_role_state(bi, &context_id)
         .await
         .map_err(napi::Error::from)?;

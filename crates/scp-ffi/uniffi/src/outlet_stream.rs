@@ -1103,9 +1103,9 @@ fn no_active_saga_err(saga_id: &str) -> ScpError {
 /// (ADR-006) — it is resolved per-call here and passed to the seal.
 ///
 /// The creator DID comes from the actor rather than from the per-context UCAN
-/// state, because this call chooses the authority a streaming saga signs as. An
-/// `AdminTransferred` governance action moves that authority, and the UCAN
-/// state's copy would keep signing as the previous holder.
+/// state, because this call chooses the authority a streaming saga signs as, and
+/// a context no actor serves must refuse to sign rather than sign as the creator
+/// a bridge copy recorded.
 async fn resolve_context_active_signing_key_by_id(
     bi: &Arc<UniffiBridgeInstance>,
     context_id: &str,

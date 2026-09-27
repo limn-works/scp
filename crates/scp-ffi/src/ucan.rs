@@ -296,9 +296,10 @@ impl crate::scp::PyScp {
         // ADR-016 step 8 compares the token's grants against the context's
         // capability ceiling, and the chain check anchors on the context creator.
         // Both come from the supervisor actor, so a `ModifyCeiling` governance
-        // action or an admin transfer binds the very next validation. Read BEFORE
-        // the token parse: an unknown or actor-less context refuses on its own
-        // account rather than on the shape of a caller-supplied token.
+        // action binds the very next validation, and a context no actor serves
+        // refuses. Read BEFORE the token parse: an unknown or actor-less context
+        // refuses on its own account rather than on the shape of a
+        // caller-supplied token.
         let role_state = crate::runtime::live_role_state(bi, context_id)?;
         let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
@@ -541,8 +542,8 @@ impl crate::scp::PyScp {
             }
         }
         // The issuer is the context creator, and the ceiling bounds what may be
-        // minted (#339). Both come from the supervisor actor: an admin transfer
-        // moves the issuer, and a `ModifyCeiling` narrows what a mint may grant.
+        // minted (#339). Both come from the supervisor actor: a `ModifyCeiling`
+        // narrows what a mint may grant, and a context no actor serves refuses.
         let live_role_state = crate::runtime::live_role_state(bi, context_id)?;
         let creator_did = live_role_state.creator_did.clone();
         let live_ceiling_strings = live_role_state.ceiling().to_ucan_string_set();
@@ -751,10 +752,10 @@ impl crate::scp::PyScp {
         validate::validate_did(revoker_did)?;
 
         // The authorizer admits the token's issuer or the context creator. The
-        // creator DID comes from the supervisor actor, so an admin transfer moves
-        // who may revoke on the very next call. Read BEFORE the token parse: an
-        // unknown or actor-less context refuses on its own account rather than on
-        // the shape of a caller-supplied token.
+        // creator DID comes from the supervisor actor, so a context no actor
+        // serves refuses. Read BEFORE the token parse: an unknown or actor-less
+        // context refuses on its own account rather than on the shape of a
+        // caller-supplied token.
         let creator_did = crate::runtime::live_role_state(bi, context_id)?.creator_did;
 
         // Parse the token to extract the issuer DID for authorization.
@@ -1257,9 +1258,13 @@ mod tests {
     //
     // `register_context` receives an EMPTY ceiling argument below, and a
     // bridge-local copy built from that argument carried `default_ceiling()` and
-    // named the registering DID as creator. Giving the supervisor a NARROWER
-    // ceiling — or no role state at all — makes the two answers differ, so a
-    // call site that goes back to reading a copy fails the covering test.
+    // named the registering DID as creator. `FfiBridgeState` no longer holds
+    // either field, so the compiler, not these tests, blocks a revert to a copy.
+    // The tests below cover absence only: a context with no supervisor role
+    // state must refuse at the live read. They do not prove which ceiling value
+    // step 8 compares against; the e2e test
+    // `ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling`
+    // covers the supervisor's ceiling value for `ucan_mint` only.
     // -----------------------------------------------------------------------
 
     /// Builds a `PyScp` whose context has FFI state but NO supervisor role
@@ -1280,8 +1285,9 @@ mod tests {
         let creator = "did:dht:z6MkUcanValidateNoActor";
         let (scp, ctx_id) = scp_without_supervisor_context("ucan-validate-no-actor", creator);
 
-        // A structurally valid but unsigned token: the call must refuse at the
-        // live read, before any parse-level verdict.
+        // A token that passes the non-empty, no-control-character input check
+        // but does not parse: the call must refuse at the live read, before any
+        // parse-level verdict, so a parse error here means the parse ran first.
         let err = scp
             .ucan_validate(&ctx_id, "aaa.bbb.ccc", "messages:write", creator, None)
             .expect_err("no supervisor role state must refuse the validation");
@@ -1289,6 +1295,11 @@ mod tests {
         assert!(
             message.contains("no live supervisor role state"),
             "the refusal must name the absent supervisor role state: {message}"
+        );
+        // The same context-state fault code the NAPI and UniFFI bridges attach.
+        assert!(
+            message.contains("SCP-CTX-2023"),
+            "the refusal must carry SCP-CTX-2023: {message}"
         );
         crate::runtime::remove_context(&scp.inner, &ctx_id);
     }

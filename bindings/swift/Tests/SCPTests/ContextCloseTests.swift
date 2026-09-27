@@ -12,11 +12,12 @@ import XCTest
 /// `SCP-CTX-2012` under contention — or reports a string this SDK does not
 /// recognize, so the cached value reaches `.poisoned` without the crash
 /// watchdog poisoning anything. The bridge reads the supervisor actor and
-/// decides the close: it releases for an absent, poisoned, or terminal
-/// supervisor state, and it throws for the live non-terminal states
-/// `creating`, `closing`, and `migrating_out`. A `closing` context sits in
-/// the §5.9 cooperative window, and the supervisor dispatch a release would
-/// skip carries the only `context:close` capability check the close path has.
+/// decides the close: it releases when the supervisor holds no actor because
+/// the close already happened or reports a terminal state, and it throws for
+/// the non-terminal states `creating`, `closing`, `migrating_out`, and
+/// `poisoned`, and for an actor the crash watchdog is respawning. The
+/// supervisor dispatch a release would skip carries the only `context:close`
+/// capability check the close path has.
 final class ContextCloseTests: XCTestCase {
     // Implicitly unwrapped because XCTest `setUp` initializes it before any
     // test method runs — the XCTest lifecycle guarantees non-nil.

@@ -1645,39 +1645,38 @@ pub(crate) async fn context_close_on(
 
     // Read the supervisor, not the handle's cached string. A close is the one
     // lifecycle operation that stays valid after the supervisor took the
-    // context out of service for good: a TTL expiry despawns the actor, the
-    // crash watchdog poisons the context and despawns the actor, a peer's
-    // finalized close leaves `Closed`, and a migration leaves `Tombstoned`.
-    // In every one of those cases the context is past its cooperative window,
-    // and this bridge still holds a `UcanContextState` for the id that only
-    // this path releases. So an absent actor and a terminal state skip the
-    // dispatch and fall through to the release below; every live non-terminal
-    // state (`Creating`, `Closing`, `MigratingOut`) refuses the close.
+    // context out of service for good: a TTL expiry despawns the actor, a
+    // peer's finalized close leaves `Closed`, and a migration leaves
+    // `Tombstoned`. In every one of those cases the context is past its
+    // cooperative window, and this bridge still holds a `UcanContextState`
+    // for the id that only this path releases. So an absent actor and a
+    // terminal state skip the dispatch and fall through to the release below;
+    // every non-terminal state (`Creating`, `Closing`, `MigratingOut`,
+    // `Poisoned`) refuses the close.
     //
-    // `Closing` refuses rather than skipping, because skipping it released
-    // the `UcanContextState` with no capability check at all:
+    // A non-terminal state refuses rather than skipping, because a skip
+    // releases the `UcanContextState` with no capability check at all:
     // `ttl::close_context` is the only `ContextClose` check on this path, it
-    // runs inside the dispatch, and the skip is what removes the dispatch.
-    // `Closing` is not terminal — `ttl::close_context` drives `Active ->
-    // Closing` and the context stays there until a separate `FinalizeClose`
-    // command runs — so the §5.9 cooperative window is a live state in which
+    // runs inside the dispatch, and the skip is what removes the dispatch. A
+    // caller holding no `context:close` capability could otherwise release
     // the outlet registry, the outlet handlers, the session store, the event
-    // log, the nonce tracker, and the revocation list this bridge holds for
-    // the id are still in use. A caller holding no `context:close` capability
-    // could destroy all of them, for every identity sharing this bridge
-    // instance, by calling close during that window. The release path out of
-    // `Closing` is `contextFinalizeClose`, which transitions the context to
-    // `Closed`; a close then sees `Closed` and releases.
+    // log, the nonce tracker, and the revocation list for every identity
+    // sharing this bridge instance. `Closing` ends at `Closed` through
+    // `contextFinalizeClose`, and a close then sees `Closed` and releases.
+    // `Poisoned` (the crash watchdog despawned the actor and keeps the sticky
+    // poison flag, ADR-049 §10) is not terminal either:
+    // `SupervisorHandle::clear_poison` respawns the actor from its snapshot as
+    // `Active`, and a revocation list released before that recovery comes
+    // back empty, so a token revoked before the poison would validate again.
     let close_already_happened =
         match crate::runtime::read_live_context_state(bi, &handle.context_id)
             .await
             .map_err(NapiError::from)?
         {
             // The supervisor holds no actor for the id (a completed TTL
-            // expiry), reports `Poisoned` (the watchdog despawned the actor and
-            // keeps only the sticky poison flag, ADR-049 §10), or the actor
-            // reports a terminal state (a finalized close, an expiry, a
-            // migration tombstone): the close already happened.
+            // expiry), or the actor reports a terminal state (a finalized
+            // close, an expiry, a migration tombstone): the close already
+            // happened.
             // `read_live_context_state` reports an actor the supervisor still
             // holds but this bridge could not reach as `ActorBusy`, and a
             // context whose actor is mid-respawn or whose last respawn failed
@@ -1685,8 +1684,7 @@ pub(crate) async fn context_close_on(
             // or crashed context refuses the close instead of taking this arm.
             None
             | Some(
-                scp_core::context::ContextState::Poisoned
-                | scp_core::context::ContextState::Closed
+                scp_core::context::ContextState::Closed
                 | scp_core::context::ContextState::Expired
                 | scp_core::context::ContextState::Tombstoned,
             ) => true,
@@ -1698,7 +1696,19 @@ pub(crate) async fn context_close_on(
                 return Err(ScpNapiError::Context {
                     message: "cannot close context in 'closing' state -- the context is inside \
                               its cooperative closing window; call contextFinalizeClose to reach \
-                              'closed', then close to release this bridge's state for the context"
+                              'closed', then close to release any state this bridge still holds \
+                              for the context"
+                        .to_owned(),
+                    code: codes::CTX_2017.to_owned(),
+                }
+                .into());
+            }
+            Some(scp_core::context::ContextState::Poisoned) => {
+                return Err(ScpNapiError::Context {
+                    message: "cannot close context in 'poisoned' state -- the crash watchdog took \
+                              the context out of service and an operator's clear_poison returns \
+                              it to 'active'; this bridge keeps its revocation list and nonce \
+                              state for the context until a close runs against a live actor"
                         .to_owned(),
                     code: codes::CTX_2017.to_owned(),
                 }
@@ -5704,6 +5714,8 @@ mod tests {
                 pre_rotation_custody,
             },
         );
+        // Balances the decrement `NapiContextHandle`'s `Drop` runs.
+        crate::increment_handle_count();
         let handle = super::NapiContextHandle {
             context_id: format!("persona-test-{}", uuid::Uuid::new_v4()),
             state: std::sync::Mutex::new(super::ContextState::Active),
@@ -5865,6 +5877,8 @@ mod tests {
         let custody_b = Arc::new(crate::custody::NapiKeyCustody::InMemory(
             OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
         ));
+        // Balances the decrement `NapiContextHandle`'s `Drop` runs.
+        crate::increment_handle_count();
         let handle = super::NapiContextHandle {
             context_id: format!("persona-regress-{}", uuid::Uuid::new_v4()),
             state: std::sync::Mutex::new(super::ContextState::Active),
@@ -6447,6 +6461,8 @@ mod tests {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
         let instance_id = bi.instance_id();
 
+        // Balances the decrement `NapiContextHandle`'s `Drop` runs.
+        crate::increment_handle_count();
         let mut handle = NapiContextHandle {
             context_id: "test-ctx-econ".to_owned(),
             state: Mutex::new(ContextState::Active),
@@ -6538,30 +6554,16 @@ mod tests {
     /// Builds a handle whose cached string reads `"active"` for a context this
     /// bridge registered, so a test can exercise the gap between that string
     /// and whatever the supervisor reports.
+    ///
+    /// Builds through `test_active_on`, which increments the process-global
+    /// handle count that `NapiContextHandle`'s `Drop` decrements, so the
+    /// fixture leaves the count balanced.
     fn active_handle_for(
         bi: &Arc<crate::runtime::NapiBridgeInstance>,
         context_id: &str,
         creator_did: &str,
     ) -> super::NapiContextHandle {
-        super::NapiContextHandle {
-            context_id: context_id.to_owned(),
-            state: std::sync::Mutex::new(super::ContextState::Active),
-            creator_did: creator_did.to_owned(),
-            mode: "Encrypted".to_owned(),
-            ceiling: vec![],
-            ceiling_policy: "immutable".to_owned(),
-            ttl_seconds: None,
-            promotion_policy: None,
-            governance: "single_admin".to_owned(),
-            economic_policy: None,
-            in_memory_custody: None,
-            signing_key: None,
-            core_handle: None,
-            subscription_cancel: std::sync::Mutex::new(super::CancellationToken::new()),
-            subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            bi: Arc::clone(bi),
-            instance_id: bi.instance_id(),
-        }
+        super::NapiContextHandle::test_active_on(bi, context_id.to_owned(), creator_did.to_owned())
     }
 
     /// A context no supervisor actor serves fails every lifecycle gate closed.
@@ -6606,12 +6608,18 @@ mod tests {
         );
     }
 
-    /// Outlet registration, exposure, and acceptance authorize against the
-    /// supervisor actor, so a context no actor serves refuses all three.
+    /// Outlet registration, exposure, and acceptance each refuse a context no
+    /// supervisor actor serves, and the role-state read they authorize against
+    /// refuses it too.
     ///
     /// Before this test existed the bridge kept a `role_state` copy seeded with
     /// the creator as admin, so all three operations authorized off that copy
-    /// and never asked the supervisor.
+    /// and never asked the supervisor. Each entry point runs the lifecycle gate
+    /// before the role-state read, so after the despawn the three refusals come
+    /// from that gate; the direct `live_role_state` assertion covers the read
+    /// the gate shadows.
+    /// `outlet_register_follows_the_supervisor_ceiling_not_the_handle_ceiling`
+    /// covers the value the read returns for registration.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn outlet_authorization_fails_closed_without_a_supervisor_actor() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -6662,6 +6670,51 @@ mod tests {
             after.to_string().contains("no live supervisor role state"),
             "live role state reported: {after}"
         );
+
+        let register = crate::outlets::outlet_register_on(
+            &bi,
+            &handle,
+            crate::outlets::NapiOutletDefinition {
+                name: "napi-no-actor-register-probe".to_owned(),
+                description: "a despawned-actor fixture outlet".to_owned(),
+                kind: crate::outlets::NapiOutletKind::Action,
+                input_schema_json: r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
+                    .to_owned(),
+                output_schema_json: r#"{"type":"object"}"#.to_owned(),
+                test_vectors_json: None,
+                implementation_hash: None,
+                operator_did: creator.to_owned(),
+                cost: None,
+            },
+        )
+        .await
+        .expect_err("registration must refuse a context no actor serves");
+        assert!(
+            register.to_string().contains("no live supervisor state"),
+            "register reported: {register}"
+        );
+
+        let expose = crate::outlets::outlet_interface_expose_on(
+            &bi,
+            &handle,
+            "outlet-that-does-not-exist".to_owned(),
+            format!("napi-outlet-target-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .await
+        .expect_err("exposure must refuse a context no actor serves");
+        assert!(
+            expose.to_string().contains("no live supervisor state"),
+            "expose reported: {expose}"
+        );
+
+        let accept = crate::outlets::outlet_interface_accept_on(&bi, &handle, "{}".to_owned())
+            .await
+            .expect_err("acceptance must refuse a context no actor serves");
+        assert!(
+            accept.to_string().contains("no live supervisor state"),
+            "accept reported: {accept}"
+        );
     }
 
     /// A close of a context whose actor the supervisor despawned succeeds
@@ -6697,19 +6750,17 @@ mod tests {
     }
 
     /// A close refuses a context the supervisor holds in its §5.9 cooperative
-    /// closing window, releases none of that context's bridge state, and
-    /// refuses a caller that holds no `ContextClose` capability.
+    /// closing window and releases none of that context's bridge state.
     ///
     /// `ttl::close_context` drives `Active` -> `Closing` and the context stays
-    /// there until a separate `FinalizeClose` command runs, so `Closing` is a
-    /// live non-terminal state in which the `UcanContextState` — the outlet
-    /// registry, the outlet handlers, the session store, the event log, the
-    /// nonce tracker, the revocation list — is still in use. Treating
-    /// `Closing` as "the close already happened" skipped the supervisor
-    /// dispatch, and that dispatch carries the only `ContextClose` check on
-    /// this path: any handle holder, including an identity holding no
-    /// `context:close` capability, then released that state for every identity
-    /// sharing the bridge instance.
+    /// there until a separate `FinalizeClose` command runs, so `Closing` is not
+    /// terminal. Treating `Closing` as "the close already happened" skipped the
+    /// supervisor dispatch, and that dispatch carries the only `ContextClose`
+    /// check on this path, so any handle holder released the bridge state with no
+    /// capability check. The `Closing` arm refuses before any capability read,
+    /// so the refusal does not depend on who calls: the outsider this test
+    /// uses and the creator get the same answer, and this test proves the
+    /// state refusal, not a capability check.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_refuses_a_closing_context_and_keeps_its_bridge_state() {
@@ -6996,19 +7047,22 @@ mod tests {
         .expect("a supervisor ceiling carrying outlet:register must admit registration");
     }
 
-    /// A close of a poisoned context succeeds idempotently and releases the
-    /// bridge state for that id.
+    /// A close of a poisoned context refuses and keeps the bridge state for
+    /// that id.
     ///
     /// The crash watchdog poisons a context once its actor exhausts the
     /// respawn budget (ADR-049 §10) and despawns the actor, so the supervisor
     /// reports `Poisoned` from its sticky poison flag and no actor answers.
-    /// `clear_poison` is an operator action no bridge exports, so a close that
-    /// refused a poisoned context held the `UcanContextState` for the life of
-    /// the process. Before this test existed, the close gate refused with
-    /// "cannot close context in 'poisoned' state".
+    /// `Poisoned` is not terminal: the operator's `clear_poison` respawns the
+    /// actor as `Active`. A close that released the `UcanContextState` here
+    /// ran no `ContextClose` check, and the revocation list and nonce tracker
+    /// it dropped came back empty after the recovery, so a token revoked
+    /// before the poison validated again. The creator, who holds
+    /// `context:close`, gets the same refusal: no capability check can run
+    /// without an actor.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn close_of_a_poisoned_context_releases_bridge_state() {
+    async fn close_refuses_a_poisoned_context_and_keeps_its_bridge_state() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
         crate::runtime::init_supervisor_for_test_on(&bi);
         let ctx_id = format!("napi-close-poisoned-{}", uuid::Uuid::new_v4());
@@ -7030,19 +7084,23 @@ mod tests {
         );
 
         let handle = active_handle_for(&bi, &ctx_id, creator);
-        super::context_close_on(&bi, &handle, creator.to_owned())
+        let err = super::context_close_on(&bi, &handle, creator.to_owned())
             .await
-            .expect("close of a poisoned context must succeed idempotently");
+            .expect_err("close of a poisoned context must refuse");
         assert!(
-            !crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
-            "close must release the bridge state for a poisoned context"
+            err.to_string()
+                .contains("cannot close context in 'poisoned' state"),
+            "unexpected refusal: {err}"
         );
-        assert_eq!(handle.state().expect("state"), "closed");
-
-        // A second close stays idempotent: no state to release, no error.
-        super::context_close_on(&bi, &handle, creator.to_owned())
-            .await
-            .expect("a repeated close must stay idempotent");
+        assert!(
+            crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
+            "a refused close must keep the bridge state for a poisoned context"
+        );
+        assert_eq!(
+            handle.state().expect("state"),
+            "active",
+            "a refused close must not write the handle's cached string"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -8087,6 +8145,8 @@ mod tests {
         let core_handle = test_dispatch_create_context(&bi, &ctx_id, params, creator.clone()).await;
 
         // Build a handle with NO retained custody — the externally-loaded shape.
+        // Balances the decrement `NapiContextHandle`'s `Drop` runs.
+        crate::increment_handle_count();
         let handle = NapiContextHandle {
             context_id: ctx_id.clone(),
             state: std::sync::Mutex::new(ContextState::Active),

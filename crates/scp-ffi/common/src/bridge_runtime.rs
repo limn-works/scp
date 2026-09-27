@@ -370,9 +370,9 @@ impl ProtocolRepoVariant {
 /// This struct holds no capability ceiling and no context creator DID. Both
 /// belong to the per-context supervisor actor, and every bridge reads them
 /// from it at the moment it decides an authorization question: a `ModifyCeiling`
-/// governance action moves the ceiling and an `AdminTransferred` action moves
-/// the creator, so a copy recorded when a bridge registered the context grants
-/// what the supervisor already withdrew. The `PyO3` bridge reads
+/// governance action moves the ceiling, so a copy recorded when a bridge
+/// registered the context grants what the supervisor already withdrew, and a
+/// copy of either authorizes against a context no actor serves. The `PyO3` bridge reads
 /// `runtime::live_role_state`, NAPI reads `runtime::live_role_state`, and
 /// `UniFFI` reads `UniffiBridgeInstance::live_role_state`. Restoring either
 /// field here would give those reads a bridge-local rival that goes stale on

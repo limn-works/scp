@@ -781,7 +781,7 @@ mod tests {
 
         let params = bridge::ContextParams {
             mode: bridge::ContextMode::Encrypted,
-            ceiling: Vec::new(),
+            ceiling: Some(Vec::new()),
             ceiling_policy: bridge::CeilingPolicy::Immutable,
             governance: bridge::GovernanceModel::SingleAdmin,
             memory_scope: bridge::MemoryScope::Ephemeral,
@@ -844,7 +844,7 @@ mod tests {
 
         let params = bridge::ContextParams {
             mode: bridge::ContextMode::Encrypted,
-            ceiling: Vec::new(),
+            ceiling: Some(Vec::new()),
             ceiling_policy: bridge::CeilingPolicy::Immutable,
             governance: bridge::GovernanceModel::SingleAdmin,
             memory_scope: bridge::MemoryScope::Ephemeral,

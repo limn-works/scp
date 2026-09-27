@@ -1178,9 +1178,9 @@ pub(crate) fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> S
 /// be the one authorized to act for `target_context_id`).
 ///
 /// The creator DID comes from the supervisor rather than from a bridge copy
-/// because this call chooses the authority a cross-context saga signs as. An
-/// `AdminTransferred` governance action moves that authority, and a bridge copy
-/// would keep signing as the previous holder.
+/// because this call chooses the authority a cross-context saga signs as, and a
+/// context no actor serves must refuse to sign rather than sign as the creator
+/// a bridge copy recorded.
 pub(crate) fn resolve_context_signing_key(
     bi: &PyBridgeInstance,
     context_id: &str,
@@ -1783,8 +1783,8 @@ fn outlet_interface_expose_impl(
 
     // `expose_outlet` decides whether the caller may offer this context's outlet
     // to another context, reading roles and the creator DID. Both come from the
-    // supervisor actor so an admin transfer or a role change lands before the
-    // offer is minted.
+    // supervisor actor so an admin transfer's role reassignment, or any other
+    // role change, lands before the offer is minted.
     let role_state = crate::runtime::live_role_state(bi, context_id)?;
     let creator_did = role_state.creator_did.clone();
 

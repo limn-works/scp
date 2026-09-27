@@ -604,16 +604,22 @@ public actor Context {
     /// that value would strand the bridge's per-context UCAN state for the
     /// life of the process — `close()` is the only path that releases it, and
     /// no SDK method clears a poison. The bridge reads the supervisor actor
-    /// and decides: it releases that state for an absent, poisoned, or
-    /// terminal supervisor state, and it throws for the live non-terminal
-    /// states `creating`, `closing`, and `migrating_out`. A `closing` context
-    /// sits in the §5.9 cooperative window, and the supervisor dispatch a
-    /// release would skip carries the only `context:close` capability check
-    /// the close path has. The bridge also throws when the supervisor still
-    /// holds an actor for the context and that actor did not answer the state
-    /// read, because an unanswered read is not evidence that the close already
-    /// happened; a caller retries that close. `deinit` already gates on the
-    /// same flag.
+    /// and decides: it releases that state when the supervisor holds no actor
+    /// because the close already happened (a completed TTL expiry, an
+    /// all-members-left teardown) or reports a terminal state (`closed`,
+    /// `expired`, `tombstoned`), and it throws for the non-terminal states
+    /// `creating`, `closing`, `migrating_out`, and `poisoned`. A `closing`
+    /// context sits in the §5.9 cooperative window, a `poisoned` context
+    /// returns to `active` through the operator's poison recovery, and the
+    /// supervisor dispatch a release would skip carries the only
+    /// `context:close` capability check the close path has. The bridge throws
+    /// `SCP-CTX-2135` when the crash watchdog is respawning the context's
+    /// actor or its last respawn failed; that close succeeds once an actor
+    /// serves the context again. The bridge also throws when the supervisor
+    /// still holds an actor for the context and that actor did not answer the
+    /// state read, because an unanswered read is not evidence that the close
+    /// already happened; a caller retries that close. `deinit` already gates
+    /// on the same flag.
     ///
     /// - Throws: ``ScpError/Context(msg:code:)`` if the bridge close
     ///   operation fails.

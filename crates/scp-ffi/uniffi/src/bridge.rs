@@ -1863,8 +1863,12 @@ pub struct ContextParams {
     /// See spec §5.14.
     pub mode: ContextMode,
     /// Capability ceiling — maximum capabilities any participant can hold.
-    /// Empty list means no ceiling restriction.
-    pub ceiling: Vec<String>,
+    /// `None` declares no ceiling, and the context records `default_ceiling()`.
+    /// `Some(list)` records exactly `list`, so `Some([])` declares a ceiling
+    /// that grants nothing: every UCAN mint, delegation, validation, and outlet
+    /// check against the context refuses. The `PyO3` and NAPI bridges draw the
+    /// same line between an omitted ceiling and an empty one.
+    pub ceiling: Option<Vec<String>>,
     /// Ceiling mutability policy — `Immutable` (default) or `Governed`.
     /// See spec §5.3.
     pub ceiling_policy: CeilingPolicy,
@@ -4369,7 +4373,8 @@ pub(crate) async fn validate_outlet_ucan_uniffi(
     // ADR-016 step 8 compares the token's grants against the context's
     // capability ceiling, and the chain check anchors on the context creator.
     // Both come from the supervisor actor, so a `ModifyCeiling` governance
-    // action or an admin transfer binds the very next validation.
+    // action binds the very next validation, and a context no actor serves
+    // refuses.
     let role_state = bi.live_role_state(&handle.context_id).await?;
     let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
@@ -5524,11 +5529,10 @@ async fn ucan_mint_impl(
         .spawn(async move {
             // The issuer is the context creator, and the ceiling bounds what a
             // mint may grant (#339, the ceiling-enforcement issue). Both come
-            // from the supervisor actor: an `AdminTransferred` action moves the
-            // creator, and a `ModifyCeiling` governance action narrows the
-            // ceiling. The handle records the creator and the ceiling THIS
-            // bridge saw at registration, so a mint reading them granted what
-            // the supervisor had already withdrawn. The `PyO3` and NAPI bridges
+            // from the supervisor actor: a `ModifyCeiling` governance action
+            // narrows the ceiling, and a context no actor serves refuses. A
+            // ceiling this bridge recorded at registration granted what the
+            // supervisor had already withdrawn. The `PyO3` and NAPI bridges
             // read the actor at this decision for the same reason.
             let role_state = bi.live_role_state(&handle.context_id).await?;
             let creator_did = role_state.creator_did.clone();
@@ -5568,9 +5572,9 @@ async fn ucan_mint_impl(
                 key_scope: None,
                 signing_key_id: None,
                 // The supervisor's ceiling stands as the context declared it. A
-                // context created with `ceiling=[]` grants nothing, and the
-                // absent-versus-empty distinction is resolved once, at context
-                // creation, where an absent ceiling becomes `default_ceiling()`
+                // context created with `ceiling: Some([])` grants nothing, and
+                // the absent-versus-empty distinction is resolved once, at context
+                // creation, where `ceiling: None` becomes `default_ceiling()`
                 // (#1419, the empty-ceiling issue).
                 ceiling,
             };
@@ -6669,7 +6673,15 @@ fn bridge_params_to_core(
 
     let common = scp_ffi_common::context_params::CommonContextParams {
         mode: mode_str.to_owned(),
-        ceiling: params.ceiling.clone(),
+        // An absent ceiling records `default_ceiling()`, in the capability
+        // vocabulary a caller writes, so the shared parser reads it the way it
+        // reads a caller's list.
+        ceiling: params.ceiling.clone().unwrap_or_else(|| {
+            scp_core::context::roles::default_ceiling()
+                .iter()
+                .map(|cap| cap.name().into_owned())
+                .collect()
+        }),
         ceiling_policy: ceiling_policy_str.to_owned(),
         promotion_policy: promotion_policy_str.to_owned(),
         memory_scope: memory_scope_str.to_owned(),
@@ -11162,27 +11174,25 @@ impl Scp {
                 // and this bridge still holds per-context UCAN state for the
                 // id that only this path releases. So an absent actor and a
                 // terminal state skip the dispatch and fall through to the
-                // release below; every live non-terminal state (`Creating`,
-                // `Closing`, `MigratingOut`) refuses the close. A poisoned
-                // context (the crash watchdog despawned the actor and keeps only
-                // the sticky poison flag, ADR-049 §10) is a close that already
-                // happened, so it releases like an absent actor.
+                // release below; every non-terminal state (`Creating`,
+                // `Closing`, `MigratingOut`, `Poisoned`) refuses the close.
                 //
-                // `Closing` refuses rather than skipping, because skipping it
-                // released the per-context UCAN state with no capability check
-                // at all: `ttl::close_context` is the only `ContextClose` check
-                // on this path, it runs inside the dispatch, and the skip is
-                // what removes the dispatch. `Closing` is not terminal —
-                // `ttl::close_context` drives `Active -> Closing` and the
-                // context stays there until a separate `FinalizeClose` command
-                // runs — so the §5.9 cooperative window is a live state in
-                // which the event log, the nonce tracker, and the revocation
-                // list this bridge holds for the id are still in use. A caller
-                // holding no `context:close` capability could destroy all of
-                // them, for every identity sharing this bridge instance, by
-                // calling close during that window. The release path out of
-                // `Closing` is `context_finalize_close`, which transitions the
-                // context to `Closed`; a close then sees `Closed` and releases.
+                // A non-terminal state refuses rather than skipping, because a
+                // skip releases the per-context UCAN state with no capability
+                // check at all: `ttl::close_context` is the only `ContextClose`
+                // check on this path, it runs inside the dispatch, and the skip
+                // is what removes the dispatch. A caller holding no
+                // `context:close` capability could otherwise release the event
+                // log, the nonce tracker, and the revocation list for every
+                // identity sharing this bridge instance. `Closing` ends at
+                // `Closed` through `context_finalize_close`, and a close then
+                // sees `Closed` and releases. `Poisoned` (the crash watchdog
+                // despawned the actor and keeps the sticky poison flag,
+                // ADR-049 §10) is not terminal either:
+                // `SupervisorHandle::clear_poison` respawns the actor from its
+                // snapshot as `Active`, and a revocation list released before
+                // that recovery comes back empty, so a token revoked before
+                // the poison would validate again.
                 //
                 // `scp_core::context::ContextState` is the supervisor's own
                 // enum; the UniFFI-exported `ContextState` is a separate type,
@@ -11193,19 +11203,18 @@ impl Scp {
                     .await?
                 {
                     // The supervisor holds no actor for the id (a completed
-                    // TTL expiry), reports `Poisoned`, or the actor reports a
-                    // terminal state (a finalized close, an expiry, a migration
-                    // tombstone): the close already happened.
-                    // `read_live_context_state` reports an actor the supervisor
-                    // still holds but this bridge could not reach as
-                    // `ActorBusy`, and a context whose actor is mid-respawn or
-                    // whose last respawn failed as `ActorCrashed`, rather than
-                    // as `None`, so a saturated, wedged, or crashed context
-                    // refuses the close instead of taking this arm.
+                    // TTL expiry), or the actor reports a terminal state (a
+                    // finalized close, an expiry, a migration tombstone): the
+                    // close already happened. `read_live_context_state`
+                    // reports an actor the supervisor still holds but this
+                    // bridge could not reach as `ActorBusy`, and a context
+                    // whose actor is mid-respawn or whose last respawn failed
+                    // as `ActorCrashed`, rather than as `None`, so a
+                    // saturated, wedged, or crashed context refuses the close
+                    // instead of taking this arm.
                     None
                     | Some(
-                        CoreContextState::Poisoned
-                        | CoreContextState::Closed
+                        CoreContextState::Closed
                         | CoreContextState::Expired
                         | CoreContextState::Tombstoned,
                     ) => true,
@@ -11217,8 +11226,19 @@ impl Scp {
                         return Err(ScpError::Context {
                             msg: "cannot close context in Closing state — the context is inside \
                                   its cooperative closing window; call context_finalize_close to \
-                                  reach Closed, then close to release this bridge's state for the \
-                                  context"
+                                  reach Closed, then close to release any state this bridge \
+                                  still holds for the context"
+                                .to_owned(),
+                            code: codes::CTX_2017.to_owned(),
+                        });
+                    }
+                    Some(CoreContextState::Poisoned) => {
+                        return Err(ScpError::Context {
+                            msg: "cannot close context in Poisoned state — the crash watchdog \
+                                  took the context out of service and an operator's clear_poison \
+                                  returns it to Active; this bridge keeps its revocation list and \
+                                  nonce state for the context until a close runs against a live \
+                                  actor"
                                 .to_owned(),
                             code: codes::CTX_2017.to_owned(),
                         });
@@ -15638,12 +15658,12 @@ impl Scp {
                 // ADR-016 step 8 compares the token's grants against the
                 // context's capability ceiling, and the chain check anchors on
                 // the context creator. Both come from the supervisor actor, so
-                // a `ModifyCeiling` governance action or an `AdminTransferred`
-                // action binds the very next validation. The per-context UCAN
-                // state recorded a ceiling and a creator THIS bridge saw when it
-                // registered the context, and reading those two fields granted
-                // what the supervisor had already withdrawn, so both fields are
-                // deleted.
+                // a `ModifyCeiling` governance action binds the very next
+                // validation, and a context no actor serves refuses. The
+                // per-context UCAN state recorded a ceiling and a creator THIS
+                // bridge saw when it registered the context, and reading the
+                // ceiling granted what the supervisor had already withdrawn, so
+                // both fields are deleted.
                 let role_state = bi.live_role_state(&handle.context_id).await?;
                 let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
@@ -15807,12 +15827,12 @@ impl Scp {
                 // ADR-016 step 8 compares the token's grants against the
                 // context's capability ceiling, and the chain check anchors on
                 // the context creator. Both come from the supervisor actor, so
-                // a `ModifyCeiling` governance action or an `AdminTransferred`
-                // action binds the very next validation. The per-context UCAN
-                // state recorded a ceiling and a creator THIS bridge saw when it
-                // registered the context, and reading those two fields granted
-                // what the supervisor had already withdrawn, so both fields are
-                // deleted.
+                // a `ModifyCeiling` governance action binds the very next
+                // validation, and a context no actor serves refuses. The
+                // per-context UCAN state recorded a ceiling and a creator THIS
+                // bridge saw when it registered the context, and reading the
+                // ceiling granted what the supervisor had already withdrawn, so
+                // both fields are deleted.
                 let role_state = bi.live_role_state(&handle.context_id).await?;
                 let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
@@ -15940,10 +15960,9 @@ impl Scp {
 
                 // `revoke_ucan` admits a revoker who is either the token's
                 // issuer or the context creator, and that creator comes from the
-                // supervisor actor: an `AdminTransferred` action moves it. The
-                // per-context UCAN state records the creator THIS bridge saw at
-                // registration, so reading it left revocation authority with a
-                // principal the supervisor had already replaced.
+                // supervisor actor, so a context no actor serves refuses the
+                // revocation instead of authorizing it against a creator this
+                // bridge recorded at registration.
                 let creator_did = bi.live_role_state(&handle.context_id).await?.creator_did;
 
                 // Execute the full revocation pipeline within the UCAN state closure.
@@ -19620,7 +19639,7 @@ mod tests {
     fn encrypted_join_test_params() -> ContextParams {
         ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: Vec::new(),
+            ceiling: Some(Vec::new()),
             ceiling_policy: CeilingPolicy::Immutable,
             governance: GovernanceModel::SingleAdmin,
             memory_scope: MemoryScope::Ephemeral,
@@ -19991,6 +20010,14 @@ mod tests {
             "join reported: {join}"
         );
 
+        let leave = rt
+            .block_on(scp.context_leave(Arc::clone(&handle), Arc::clone(&identity)))
+            .expect_err("leave must refuse a context no actor serves");
+        assert!(
+            format!("{leave}").contains("no live supervisor state"),
+            "leave reported: {leave}"
+        );
+
         let send = rt
             .block_on(scp.context_send(
                 Arc::clone(&handle),
@@ -20018,19 +20045,71 @@ mod tests {
         ));
     }
 
+    /// `context_create` records `default_ceiling()` for `ceiling: None` and
+    /// exactly the declared list for `ceiling: Some(list)`, so `Some([])`
+    /// records a ceiling that grants nothing. The `PyO3` and NAPI bridges draw
+    /// the same line between an omitted ceiling and an empty one.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn context_create_records_default_ceiling_for_none_and_empty_for_some_empty() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+
+        let absent = rt
+            .block_on(scp.context_create(
+                Arc::clone(&identity),
+                ContextParams {
+                    ceiling: None,
+                    ..encrypted_join_test_params()
+                },
+            ))
+            .expect("context_create with no ceiling should succeed");
+        let absent_ceiling = rt
+            .block_on(scp.inner.live_role_state(&absent.context_id()))
+            .expect("role state")
+            .ceiling()
+            .to_ucan_string_set();
+        assert_eq!(
+            absent_ceiling,
+            scp_core::context::roles::default_ceiling().to_ucan_string_set(),
+            "an absent ceiling must record default_ceiling()"
+        );
+
+        let empty = rt
+            .block_on(scp.context_create(
+                Arc::clone(&identity),
+                ContextParams {
+                    ceiling: Some(Vec::new()),
+                    ..encrypted_join_test_params()
+                },
+            ))
+            .expect("context_create with an empty ceiling should succeed");
+        let empty_ceiling = rt
+            .block_on(scp.inner.live_role_state(&empty.context_id()))
+            .expect("role state")
+            .ceiling()
+            .to_ucan_string_set();
+        assert!(
+            empty_ceiling.is_empty(),
+            "an empty ceiling must record a ceiling that grants nothing: {empty_ceiling:?}"
+        );
+    }
+
     /// A close refuses a context the supervisor holds in its §5.9 cooperative
-    /// closing window, releases none of that context's UCAN state, and refuses
-    /// an identity that holds no `ContextClose` capability.
+    /// closing window and releases none of that context's UCAN state.
     ///
     /// `ttl::close_context` drives `Active` -> `Closing` and the context stays
-    /// there until a separate `FinalizeClose` command runs, so `Closing` is a
-    /// live non-terminal state in which the per-context UCAN state — the event
-    /// log, the nonce tracker, the revocation list — is still in use. Treating
-    /// `Closing` as "the close already happened" skipped the supervisor
-    /// dispatch, and that dispatch carries the only `ContextClose` check on
-    /// this path: any handle holder, including an identity holding no
-    /// `context:close` capability, then released that state for every identity
-    /// sharing the bridge instance.
+    /// there until a separate `FinalizeClose` command runs, so `Closing` is not
+    /// terminal. Treating `Closing` as "the close already happened" skipped the
+    /// supervisor dispatch, and that dispatch carries the only `ContextClose`
+    /// check on this path, so any handle holder released the UCAN state with no
+    /// capability check. The `Closing` arm refuses before any capability read,
+    /// so the refusal does not depend on who calls: the outsider this test
+    /// uses and the creator get the same answer, and this test proves the
+    /// state refusal, not a capability check.
     #[test]
     #[cfg(feature = "testing")]
     fn close_refuses_a_closing_context_and_keeps_its_bridge_state() {
@@ -20044,11 +20123,11 @@ mod tests {
             .expect("identity_create failed for the outsider");
 
         let params = ContextParams {
-            ceiling: vec![
+            ceiling: Some(vec![
                 "messages:read".to_owned(),
                 "messages:write".to_owned(),
                 "context:close".to_owned(),
-            ],
+            ]),
             ..encrypted_join_test_params()
         };
         let handle = rt
@@ -20188,19 +20267,21 @@ mod tests {
         }
     }
 
-    /// A close of a poisoned context succeeds idempotently and releases the
-    /// bridge's per-context UCAN state.
+    /// A close of a poisoned context refuses and keeps the bridge's
+    /// per-context UCAN state.
     ///
     /// The crash watchdog poisons a context once its actor exhausts the
     /// respawn budget (ADR-049 §10) and despawns the actor, so the supervisor
     /// reports `Poisoned` from its sticky poison flag and no actor answers.
-    /// `clear_poison` is an operator action no bridge exports, so a close that
-    /// refused a poisoned context held the UCAN state for the life of the
-    /// process. Before this test existed, the close gate refused with
-    /// "cannot close context in Poisoned state".
+    /// `Poisoned` is not terminal: the operator's `clear_poison` respawns the
+    /// actor as `Active`. A close that released the UCAN state here ran no
+    /// `ContextClose` check, and the revocation list and nonce tracker it
+    /// dropped came back empty after the recovery, so a token revoked before
+    /// the poison validated again. The creator, who holds `context:close`,
+    /// gets the same refusal: no capability check can run without an actor.
     #[test]
     #[cfg(feature = "testing")]
-    fn close_of_a_poisoned_context_releases_bridge_state() {
+    fn close_refuses_a_poisoned_context_and_keeps_its_bridge_state() {
         let rt = runtime();
         let scp = scp_test();
         let identity = rt
@@ -20226,20 +20307,22 @@ mod tests {
             "the fixture must leave the supervisor reporting Poisoned"
         );
 
-        rt.block_on(scp.context_close(Arc::clone(&handle), Arc::clone(&identity)))
-            .expect("close of a poisoned context must succeed idempotently");
+        let err = rt
+            .block_on(scp.context_close(Arc::clone(&handle), identity))
+            .expect_err("close of a poisoned context must refuse");
         assert!(
-            scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
-            "close must release the per-context UCAN state"
+            err.to_string()
+                .contains("cannot close context in Poisoned state"),
+            "unexpected refusal: {err}"
         );
-        assert!(matches!(
-            *rt.block_on(handle.state.lock()),
-            ContextState::Closed
-        ));
-
-        // A second close stays idempotent: no state to release, no error.
-        rt.block_on(scp.context_close(handle, identity))
-            .expect("a repeated close must stay idempotent");
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
+            "a refused close must keep the per-context UCAN state"
+        );
+        assert!(
+            matches!(*rt.block_on(handle.state.lock()), ContextState::Active),
+            "a refused close must not write the handle's cached state"
+        );
     }
 
     /// Both cross-context outlet entry points gate each axis on that context's
@@ -21379,8 +21462,10 @@ mod tests {
     }
 
     /// Registers `context_id` with `scp`'s supervisor under `creator_did` and
-    /// `ceiling`, so a live read answers for it. An empty `ceiling` records
-    /// `default_ceiling()`.
+    /// `ceiling`, so a live read answers for it. An empty `ceiling` slice asks
+    /// for `default_ceiling()`, the value `context_create` records for
+    /// `ContextParams { ceiling: None, .. }`; this fixture has no way to
+    /// request the deny-all ceiling `ceiling: Some(vec![])` records.
     ///
     /// Every authorization site reads the context creator and the ceiling off
     /// the per-context actor, so a synthetic `ContextHandle` alone no longer
@@ -23769,6 +23854,74 @@ mod tests {
         let _opt: Option<Arc<crate::runtime::UniffiBridgeInstance>> = provider.bi.upgrade();
     }
 
+    /// `McpUniFfiBridgeProvider::validate_capability` grades an agent's UCAN
+    /// against the ceiling and the context creator it reads off the supervisor
+    /// actor, so once no actor serves the context it refuses at that live read.
+    ///
+    /// The provider runs the read through `live_role_state_blocking`, which
+    /// calls `block_in_place`, and it takes the outlet registry with
+    /// `blocking_lock`, which panics on an async worker thread; the test calls
+    /// it from the shared runtime's blocking pool, where both are legal. A
+    /// provider that skipped the live read would fail later, on the unparseable
+    /// token, and this test would go red on the message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_uniffi_provider_validate_capability_reads_the_live_supervisor() {
+        use scp_mcp::server::ContextProvider;
+
+        let scp = scp_test();
+        let (handle, _key) = callback_context_handle(
+            &scp,
+            &["messages:write", "outlet:register", "outlet:call:*"],
+        )
+        .await;
+        let operator = handle.creator_did.clone();
+        let outlet_id = scp
+            .outlet_register(
+                Arc::clone(&handle),
+                OutletDefinition {
+                    name: "uniffi-mcp-live-probe".to_owned(),
+                    description: "an MCP live-read fixture outlet".to_owned(),
+                    kind: OutletKind::Action,
+                    input_schema_json: r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
+                        .to_owned(),
+                    output_schema_json: r#"{"type":"object"}"#.to_owned(),
+                    test_vectors_json: None,
+                    implementation_hash: None,
+                    operator_did: operator,
+                    cost: None,
+                },
+            )
+            .await
+            .expect("a supervisor ceiling carrying outlet:register must admit registration");
+        register_context_handle(&scp.inner, &handle);
+
+        scp.inner
+            .context_manager_or_error()
+            .expect("supervisor")
+            .despawn_actor(&handle.context_id)
+            .await;
+
+        let provider = McpUniFfiBridgeProvider {
+            bi: Arc::downgrade(&scp.inner),
+            agent_did: "did:dht:z6MkMcpLiveReadAgent".to_owned(),
+            context_ids: vec![handle.context_id.clone()],
+            outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: Some("aaa.bbb.ccc".to_owned()),
+            agent_proof_tokens: None,
+        };
+        let context_id = handle.context_id.clone();
+        let err = runtime()
+            .spawn_blocking(move || provider.validate_capability(&context_id, &outlet_id))
+            .await
+            .expect("the validation task must not panic")
+            .expect_err("a context no actor serves must refuse the capability");
+        assert!(
+            err.contains("no live supervisor role state"),
+            "the refusal must come from the live role-state read: {err}"
+        );
+        deregister_context_handle(&scp.inner, &handle.context_id);
+    }
+
     /// The `UniFFI` MCP provider's methods that degrade gracefully return
     /// safe defaults when the bridge instance has been dropped.
     #[test]
@@ -26086,7 +26239,7 @@ mod tests {
         fn saga_context_params(ceiling: &[&str]) -> ContextParams {
             ContextParams {
                 mode: ContextMode::Encrypted,
-                ceiling: ceiling.iter().map(|s| (*s).to_owned()).collect(),
+                ceiling: Some(ceiling.iter().map(|s| (*s).to_owned()).collect()),
                 ceiling_policy: CeilingPolicy::Immutable,
                 governance: GovernanceModel::SingleAdmin,
                 memory_scope: MemoryScope::Ephemeral,

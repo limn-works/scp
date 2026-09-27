@@ -1729,18 +1729,26 @@ pub fn live_role_state(
 ) -> Result<ContextRoleState, ScpPyError> {
     let sup = Arc::clone(supervisor(bi)?);
     let ctx = context_id.to_owned();
+    // `SCP-CTX-2023` is the context-state fault code the NAPI and `UniFFI`
+    // bridges attach to this same refusal, so every SDK branches on one code.
     block_on_supervisor_query(async move { sup.get_role_state(&ctx).await })?.ok_or_else(|| {
-        ScpPyError::context(format!(
-            "context '{context_id}' has no live supervisor role state — refusing to \
-             authorize against an absent membership record"
-        ))
+        ScpPyError::ContextError {
+            message: format!(
+                "context '{context_id}' has no live supervisor role state — refusing to \
+                 authorize against an absent membership record"
+            ),
+            code: scp_ffi_common::error_codes::CTX_2023.to_owned(),
+        }
     })
 }
 
 /// Reads a context's lifecycle state from that context's supervisor actor.
 ///
-/// Every `PyO3` entry point that gates on a lifecycle state reads through this
-/// function. [`PyContextHandle`](crate::context::PyContextHandle) carries a
+/// `require_active_context` reads through this function; the cross-context
+/// outlet gates in `outlets.rs` and `outlet_stream.rs` call
+/// `Supervisor::read_context_state` directly and fail closed on its `None` by
+/// requiring `Some(Active)`. Every one of those gates reads the supervisor,
+/// never the handle. [`PyContextHandle`](crate::context::PyContextHandle) carries a
 /// `state` string, and that string records the last transition THIS bridge
 /// observed: a TTL expiry the supervisor applied on its own timer, a close
 /// another member initiated, a migration that tombstoned the context, and an
@@ -1789,8 +1797,8 @@ pub fn live_context_state(
 /// [`live_context_state`] is the gate form: it turns `None` into an error so a
 /// gate never admits an operation on an absent answer. `context_close` calls
 /// this form instead, because a close of a context whose actor the supervisor
-/// already despawned — a completed TTL expiry, an all-members-left teardown, a
-/// watchdog poisoning — is idempotent: the close already happened, and the
+/// already despawned — a completed TTL expiry or an all-members-left teardown —
+/// is idempotent: the close already happened, and the
 /// bridge still has to release the [`FfiBridgeState`] it holds for that id.
 /// Refusing that close would leave the registry entry alive for the life of
 /// the process.

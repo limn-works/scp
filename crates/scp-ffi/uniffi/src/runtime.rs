@@ -980,9 +980,9 @@ impl UniffiBridgeInstance {
     /// a capability, or a capability ceiling reads through this function. The
     /// per-context UCAN state carried a `creator_did` and a `ceiling_strings`
     /// set recorded when THIS bridge registered the context, and a
-    /// `ModifyCeiling` governance action or an `AdminTransferred` action left
-    /// those two fields granting what the supervisor already withdrew, so both
-    /// fields are deleted. The `PyO3` and NAPI bridges read the actor at the
+    /// `ModifyCeiling` governance action left the ceiling granting what the
+    /// supervisor already withdrew, and both fields authorized against a
+    /// context no actor serves, so both fields are deleted. The `PyO3` and NAPI bridges read the actor at the
     /// same decisions.
     ///
     /// Fails closed. A context whose actor holds no role state yields
@@ -1042,8 +1042,7 @@ impl UniffiBridgeInstance {
     /// turns `None` into an error so a gate never admits an operation on an
     /// absent answer. `context_close` reads this form instead, because a close
     /// of a context whose actor the supervisor already despawned — a completed
-    /// TTL expiry, an all-members-left teardown, a watchdog poisoning — is
-    /// idempotent: the close already happened, and the bridge still has to
+    /// TTL expiry or an all-members-left teardown — is idempotent: the close already happened, and the bridge still has to
     /// release the per-context UCAN state it holds for that id.
     ///
     /// An actor the supervisor still holds but this call could not reach — a
@@ -1235,8 +1234,8 @@ impl UniffiBridgeInstance {
     /// `ucan_revoke`, and the three outlet entry points read both from the
     /// per-context supervisor actor through [`Self::live_role_state`] at the
     /// moment each decides, because a `ModifyCeiling` governance action moves
-    /// the ceiling and an `AdminTransferred` action moves the creator after
-    /// this registration runs.
+    /// the ceiling after this registration runs, and a context no actor serves
+    /// must refuse rather than authorize against a copy.
     fn build_ucan_context_state(context_id: &str) -> UcanContextState {
         UcanContextState {
             revocation_list: RevocationList::new(context_id.to_owned()),

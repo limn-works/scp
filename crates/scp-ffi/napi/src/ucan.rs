@@ -293,7 +293,8 @@ pub(crate) async fn ucan_validate_on(
     // ADR-016 step 8 compares the token's grants against the context's
     // capability ceiling, and the chain check anchors on the context creator.
     // Both come from the supervisor actor, so a `ModifyCeiling` governance
-    // action or an admin transfer binds the very next validation.
+    // action binds the very next validation, and a context no actor serves
+    // refuses.
     let role_state = crate::runtime::live_role_state(bi, &context_id)
         .await
         .map_err(napi::Error::from)?;
@@ -479,11 +480,10 @@ pub(crate) async fn ucan_mint_on(
 
     // The issuer is the context creator, and the ceiling bounds what may be
     // minted (#339, the ceiling-enforcement issue). Both come from the
-    // supervisor actor: an admin transfer moves the issuer, and a
-    // `ModifyCeiling` governance action narrows what a mint may grant. The
-    // handle's `creator_did` and `ceiling` record what THIS bridge saw at
-    // registration, so a mint reading them granted what the supervisor had
-    // already withdrawn.
+    // supervisor actor: a `ModifyCeiling` governance action narrows what a
+    // mint may grant, and a context no actor serves refuses. The handle's
+    // `ceiling` records what THIS bridge saw at registration, so a mint
+    // reading it granted what the supervisor had already withdrawn.
     let role_state = crate::runtime::live_role_state(bi, &context_id)
         .await
         .map_err(napi::Error::from)?;
@@ -708,10 +708,9 @@ pub(crate) async fn ucan_revoke_on(
     let context_id = handle.context_id();
 
     // `revoke_ucan` admits a revoker who is either the token's issuer or the
-    // context creator, and that creator comes from the supervisor actor: an
-    // `AdminTransferred` action moves it. `UcanContextState` records the creator
-    // THIS bridge saw at registration, so reading it left revocation authority
-    // with a principal the supervisor had already replaced. The `PyO3` bridge
+    // context creator, and that creator comes from the supervisor actor, so a
+    // context no actor serves refuses the revocation instead of authorizing it
+    // against a creator this bridge recorded at registration. The `PyO3` bridge
     // reads the actor at this decision for the same reason.
     let creator_did = crate::runtime::live_role_state(bi, &context_id)
         .await
