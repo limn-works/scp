@@ -32,6 +32,7 @@ use std::collections::HashSet;
 
 use scp_core::context::membership::ContextEvent;
 use scp_core::context::outlets::validate_value_against_schema;
+use scp_core::context::roles::{Capability, ContextRoleState};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
@@ -117,6 +118,46 @@ impl ResourceKind {
     #[must_use]
     pub fn uri(self, context_id: &str) -> String {
         format!("{RESOURCE_SCHEME}{context_id}/{}", self.uri_suffix())
+    }
+
+    /// Decides whether `agent` may read this resource of `context_id`, given
+    /// the context's current role state.
+    ///
+    /// Every bridge's [`ContextProvider::validate_resource_access`] calls this
+    /// function with the role state it read from the actor, so the rule has one
+    /// definition:
+    ///
+    /// - [`Self::Events`] and [`Self::Members`] require `messages:read`. Per
+    ///   spec §5.3.1's role table an `observer`, whose sole capability is
+    ///   `messages:read`, "can see all content and membership", so that grant
+    ///   is the authority to read the event stream and the roster.
+    /// - [`Self::Tools`] requires membership only. Its contents are the
+    ///   capability-filtered tool list, so a member with no tool capabilities
+    ///   reads `[]` instead of a denial.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the requirement the agent lacks, so a caller
+    /// acting on it grants the requirement that decides the outcome.
+    pub fn check_access(
+        self,
+        role_state: &ContextRoleState,
+        agent: &str,
+        context_id: &str,
+    ) -> Result<(), String> {
+        let missing = match self {
+            Self::Events | Self::Members => (!role_state
+                .member_has_capability(agent, &Capability::MessagesRead))
+            .then_some("messages:read"),
+            Self::Tools => (!role_state.members.contains(agent)).then_some("membership"),
+        };
+        missing.map_or(Ok(()), |requirement| {
+            Err(format!(
+                "agent lacks {requirement} in context '{context_id}' — required to read \
+                 scp://{context_id}/{}",
+                self.uri_suffix()
+            ))
+        })
     }
 
     /// Human-readable label used in `resources/list`.
@@ -259,7 +300,11 @@ pub trait ContextProvider: Send + Sync {
     ///   denied. Implementations should return `Ok(())` for it whenever the
     ///   agent participates in the context.
     ///
-    /// The same predicate gates `resources/list`, `resources/read`,
+    /// [`ResourceKind::check_access`] states that rule once; an implementation
+    /// reads the context's current role state and passes it to that function.
+    ///
+    /// The server calls this method only through its one resource-access
+    /// predicate, which gates `resources/list`, `resources/read`,
     /// `resources/subscribe` **and** notification delivery, so a client can
     /// never hold a subscription to a resource it cannot read (which would be
     /// an activity oracle over denied state).
@@ -977,17 +1022,14 @@ impl<P: ContextProvider> McpServer<P> {
     fn handle_resources_list(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
         let mut resources: Vec<ResourceDefinition> = Vec::new();
 
-        for context_id in self.record_served_contexts() {
+        let served = self.record_served_contexts();
+        for context_id in &served {
             for kind in RESOURCE_KINDS {
-                if self
-                    .provider
-                    .validate_resource_access(&context_id, kind)
-                    .is_err()
-                {
+                if self.resource_access(&served, context_id, kind).is_err() {
                     continue;
                 }
                 resources.push(ResourceDefinition {
-                    uri: kind.uri(&context_id),
+                    uri: kind.uri(context_id),
                     name: format!("{context_id} {}", kind.display_name()),
                     description: Some(format!("{} {context_id}", kind.description())),
                     mime_type: Some("application/json".to_owned()),
@@ -1008,14 +1050,34 @@ impl<P: ContextProvider> McpServer<P> {
 
     /// The single authorization predicate for every resource operation.
     ///
-    /// `resources/list`, `resources/read`, `resources/subscribe` and
-    /// notification delivery all funnel through this, so the set of resources
-    /// a client can subscribe to is exactly the set it can read. Any looser
-    /// subscribe gate would hand the client an activity/timing oracle over
-    /// state it is denied.
+    /// `resources/list` ([`Self::handle_resources_list`]), `resources/read`
+    /// and `resources/subscribe` (both through [`Self::authorize_resource`]),
+    /// and notification delivery ([`Self::notifications_for_event`] and
+    /// [`Self::lagged_resync_notifications`]) all call this function, so the
+    /// set of resources a client can subscribe to is exactly the set it can
+    /// read. Any looser subscribe gate would hand the client an
+    /// activity/timing oracle over state it is denied.
     ///
-    /// Checks participation first so a non-participant learns only "not
+    /// `served` is the caller's `active_context_ids()` answer. The function
+    /// checks participation first, so a non-participant learns only "not
     /// found", never whether a capability would have been granted.
+    fn resource_access(
+        &self,
+        served: &[ContextId],
+        context_id: &str,
+        kind: ResourceKind,
+    ) -> Result<(), ResourceDenial> {
+        if !served.iter().any(|c| c == context_id) {
+            return Err(ResourceDenial::NotParticipant);
+        }
+        self.provider
+            .validate_resource_access(context_id, kind)
+            .map_err(ResourceDenial::Denied)
+    }
+
+    /// Applies [`Self::resource_access`] to a `resources/read` or
+    /// `resources/subscribe` request and turns a denial into its JSON-RPC
+    /// error response.
     fn authorize_resource(
         &self,
         uri: &str,
@@ -1023,30 +1085,22 @@ impl<P: ContextProvider> McpServer<P> {
         kind: ResourceKind,
         request_id: &RequestId,
     ) -> Result<(), Box<JsonRpcResponse>> {
-        if !self
-            .provider
-            .active_context_ids()
-            .iter()
-            .any(|served| served == context_id)
-        {
-            return Err(Box::new(resource_not_found(
-                request_id.clone(),
-                uri,
-                format!("not a participant in context: {context_id}"),
-            )));
-        }
-
-        self.provider
-            .validate_resource_access(context_id, kind)
-            .map_err(|msg| {
-                Box::new(JsonRpcResponse::error(
+        let served = self.provider.active_context_ids();
+        self.resource_access(&served, context_id, kind)
+            .map_err(|denial| match denial {
+                ResourceDenial::NotParticipant => Box::new(resource_not_found(
+                    request_id.clone(),
+                    uri,
+                    format!("not a participant in context: {context_id}"),
+                )),
+                ResourceDenial::Denied(msg) => Box::new(JsonRpcResponse::error(
                     request_id.clone(),
                     JsonRpcError {
                         code: protocol::CAPABILITY_DENIED,
                         message: msg,
                         data: Some(serde_json::json!({ "uri": uri })),
                     },
-                ))
+                )),
             })
     }
 
@@ -1270,7 +1324,7 @@ impl<P: ContextProvider> McpServer<P> {
     /// # Re-authorization on every emission
     ///
     /// Each candidate URI is re-checked through the same
-    /// [`Self::authorize_resource`] predicate that admitted the subscription.
+    /// [`Self::resource_access`] predicate that admitted the subscription.
     /// Capabilities are revocable mid-session — `CapabilitiesSuspended`,
     /// `ReadAccessRevoked` and `MemberLeft` are all in the classifier below —
     /// so a subscription registered while authorized must stop delivering the
@@ -1305,11 +1359,8 @@ impl<P: ContextProvider> McpServer<P> {
         }
 
         let affected = affected_resources(event);
-        let serves_context = self
-            .provider
-            .active_context_ids()
-            .iter()
-            .any(|c| c == context_id);
+        let served = self.provider.active_context_ids();
+        let serves_context = served.iter().any(|c| c == context_id);
         let was_served = {
             let mut served = self
                 .served_contexts
@@ -1346,11 +1397,7 @@ impl<P: ContextProvider> McpServer<P> {
             if !self.subscriptions.contains(&uri) {
                 continue;
             }
-            if self
-                .provider
-                .validate_resource_access(context_id, kind)
-                .is_err()
-            {
+            if self.resource_access(&served, context_id, kind).is_err() {
                 continue;
             }
             out.push(Self::resource_updated_notification(&uri));
@@ -1405,9 +1452,9 @@ impl<P: ContextProvider> McpServer<P> {
     /// oracle-safe: `tools/list` is capability-filtered on re-read, so it names
     /// nothing the agent may not invoke.
     ///
-    /// Each subscribed URI is re-authorized through the same participation +
-    /// [`ContextProvider::validate_resource_access`] check
-    /// [`Self::notifications_for_event`] applies, so a subscription whose grant
+    /// Each subscribed URI is re-authorized through the same
+    /// [`Self::resource_access`] predicate [`Self::notifications_for_event`]
+    /// applies, so a subscription whose grant
     /// was revoked during the lag delivers nothing: the lag path cannot become
     /// the activity oracle the subscribe gate prevents. Delivery is best-effort
     /// but never silent.
@@ -1439,23 +1486,12 @@ impl<P: ContextProvider> McpServer<P> {
             Self::tools_list_changed_notification(),
         ];
 
+        let served = self.provider.active_context_ids();
         for uri in &self.subscriptions {
             let Ok((context_id, kind)) = parse_resource_uri(uri) else {
                 continue;
             };
-            let serves_context = self
-                .provider
-                .active_context_ids()
-                .iter()
-                .any(|c| c == &context_id);
-            if !serves_context {
-                continue;
-            }
-            if self
-                .provider
-                .validate_resource_access(&context_id, kind)
-                .is_err()
-            {
+            if self.resource_access(&served, &context_id, kind).is_err() {
                 continue;
             }
             out.push(Self::resource_updated_notification(uri));
@@ -1569,6 +1605,15 @@ fn resource_not_found(id: RequestId, uri: &str, message: String) -> JsonRpcRespo
     )
 }
 
+/// Why the server's resource-access predicate refused a resource.
+enum ResourceDenial {
+    /// The context is not in the provider's `active_context_ids()`.
+    NotParticipant,
+    /// The provider's [`ContextProvider::validate_resource_access`] refused,
+    /// with its message.
+    Denied(String),
+}
+
 /// Creates an internal error response.
 fn internal_error(id: RequestId, message: &str) -> JsonRpcResponse {
     JsonRpcResponse::error(
@@ -1606,8 +1651,11 @@ pub(crate) struct AffectedResources {
 /// the capability-filtered tool list is ambiguous, it is classified as
 /// affecting them.
 ///
-/// `events` is true for every variant: `scp://{ctx}/events` exposes the
-/// context event stream, which every event is by definition part of.
+/// `events` is true for every variant. `scp://{ctx}/events` reports the
+/// entry count and Merkle root of the actor's event log, and a `ContextEvent`
+/// does not say whether the transition behind it appended a log entry, so the
+/// classifier notifies on every variant. A variant that appended no entry costs
+/// the client one read that returns the same count and root.
 ///
 /// The match is exhaustive (no wildcard) so that adding a `ContextEvent`
 /// variant fails to compile until its resource impact is decided — the same

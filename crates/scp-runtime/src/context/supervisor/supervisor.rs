@@ -11966,6 +11966,39 @@ impl Supervisor {
         event_log.event_log_entries(context_id_bytes)
     }
 
+    /// Returns the entry count and Merkle root of `context_id`'s event log,
+    /// read from the same shared provider as [`Self::event_log_entries`].
+    ///
+    /// A context whose log has no entries reports a count of 0 and the
+    /// empty-tree root, `SHA-256("")` (spec §25.8 Vector 15). Synchronous for
+    /// the reason [`Self::event_log_entries`] gives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::NotInitialized`] if no event-log provider is
+    /// wired, and the provider's [`ContextError`] if it cannot read the log or
+    /// holds entries without a root.
+    pub fn event_log_summary(
+        &self,
+        context_id_bytes: &[u8; 32],
+    ) -> Result<(usize, [u8; 32]), ContextError> {
+        let event_log = self.event_log_ref().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::event_log_summary — event_log provider not configured".to_owned(),
+            )
+        })?;
+        let count = event_log
+            .event_log_entries(context_id_bytes)?
+            .map_or(0, |entries| entries.len());
+        if count == 0 {
+            return Ok((
+                0,
+                scp_event_log::tree::root(&scp_event_log::EventLog::new(String::new())),
+            ));
+        }
+        Ok((count, event_log.event_log_merkle_root(context_id_bytes)?))
+    }
+
     /// Computes the participation record (§7.3.2) for `subject_did` in
     /// `context_id` from the context's FULL event log.
     ///

@@ -4964,40 +4964,11 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         context_id: &str,
         resource: scp_mcp::server::ResourceKind,
     ) -> Result<(), String> {
-        use scp_core::context::roles::Capability;
-        use scp_mcp::server::ResourceKind;
-
         let bi = self.upgrade_bi()?;
         let role_state = Self::role_state_of(&bi, context_id).ok_or_else(|| {
             format!("context '{context_id}' has no role state on this bridge instance")
         })?;
-
-        // `Events` and `Members` require `messages:read`: per spec §5.3.1's
-        // role table an `observer` — whose sole capability is `messages:read` —
-        // "can see all content and membership", so that grant is exactly the
-        // authority to read the event stream and the roster.
-        //
-        // `Tools` carries no separate grant because its contents are the
-        // capability-filtered tool list; an agent with no tool capabilities
-        // reads `[]` rather than being denied.
-        //
-        // The denial names the requirement this kind actually checks, so a
-        // caller acting on the message grants what decides the outcome.
-        let missing = match resource {
-            ResourceKind::Events | ResourceKind::Members => (!role_state
-                .member_has_capability(&self.agent_did, &Capability::MessagesRead))
-            .then_some("messages:read"),
-            ResourceKind::Tools => {
-                (!role_state.members.contains(&self.agent_did)).then_some("membership")
-            }
-        };
-        missing.map_or(Ok(()), |requirement| {
-            Err(format!(
-                "agent lacks {requirement} in context '{context_id}' — required to read \
-                 scp://{context_id}/{}",
-                resource.uri_suffix()
-            ))
-        })
+        resource.check_access(&role_state, &self.agent_did, context_id)
     }
 
     fn agent_role(&self, context_id: &str) -> Option<String> {
@@ -5430,24 +5401,24 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     }
 
     fn context_events(&self, context_id: &str) -> Result<serde_json::Value, String> {
-        // The EventLog stores Merkle tree hashes, not event payloads.
-        // Return the event count and Merkle root as metadata (matching PyO3).
-        // A dropped bridge or a context with no event log is an error, never
-        // an empty log.
+        // The event log stores Merkle tree hashes, not event payloads, so the
+        // resource reports the entry count and the Merkle root, matching PyO3.
+        // It reads the actor's log: the pump's `resources/updated` notices come
+        // from the actor's events, and the bridge's UCAN-state tree is synced
+        // from the actor's log only by the event-log API, which the MCP path
+        // never calls. A dropped bridge, a missing supervisor or an unreadable
+        // log is an error, never an empty log.
         let bi = self.upgrade_bi()?;
-        if let Some(handle) = context_handle_registry(&bi).get(context_id) {
-            bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
-        }
-
-        bi.with_ucan_state(context_id, |ucan_state| {
-            let leaf_count = ucan_state.event_log.leaves().len();
-            let root = scp_event_log::tree::root(&ucan_state.event_log);
-            serde_json::json!({
-                "event_count": leaf_count,
-                "merkle_root": hex::encode(root),
-            })
-        })
-        .ok_or_else(|| format!("context '{context_id}' could not be read — no event log"))
+        let supervisor = bi
+            .context_manager_expect()
+            .map_err(|e| format!("cannot read the event log of context '{context_id}': {e}"))?;
+        let (event_count, root) = supervisor
+            .event_log_summary(&scp_core::context::state::context_id_to_bytes(context_id))
+            .map_err(|e| format!("cannot read the event log of context '{context_id}': {e}"))?;
+        Ok(serde_json::json!({
+            "event_count": event_count,
+            "merkle_root": hex::encode(root),
+        }))
     }
 }
 
@@ -16355,10 +16326,14 @@ impl Scp {
         // advertises `resources.subscribe: false` and rejects
         // `resources/subscribe` — the capability is honestly absent rather
         // than accepted-and-never-delivered.
-        // Absence degrades only this capability: the server still serves
-        // `tools/*` and `resources/list|read`, and honestly advertises
-        // `resources.subscribe: false`. Serving is NOT failed outright — that
-        // would deny working functionality over an optional feature.
+        // A supervisor built without the channel degrades only this
+        // capability: the server still serves `tools/*` and
+        // `resources/list|read`, and advertises `resources.subscribe: false`.
+        // With no supervisor attached at all, the provider has no role state to
+        // read, because it asks the actor on every read, so the server serves
+        // no context: `tools/list` and `resources/list` return empty lists and
+        // `resources/read` answers "not a participant". Serving still starts,
+        // so a supervisor attached later is read on the next request.
         let context_events = match self.inner.context_manager_or_error() {
             Ok(supervisor) => supervisor.subscribe_events(),
             Err(e) => {
@@ -22734,12 +22709,15 @@ mod tests {
         assert!(result.is_err(), "invalid transport mode should be rejected");
     }
 
-    /// A missing `Supervisor` degrades ONLY the subscription capability: the
-    /// production `mcp_server_create` must still return a server handle. Were
-    /// it to propagate the missing-supervisor error
-    /// (`context_manager_or_error()?`), this test would fail.
+    /// With no `Supervisor` attached, the production `mcp_server_create` still
+    /// returns a server handle, and that server serves no context: the
+    /// provider it builds reads role state from the actor, so `resources/list`
+    /// comes back empty and `resources/read` answers "not a participant". Were
+    /// `mcp_server_create` to propagate the missing-supervisor error
+    /// (`context_manager_or_error()?`), or the provider to read a bridge copy,
+    /// this test would fail.
     #[tokio::test]
-    async fn missing_supervisor_degrades_subscriptions_not_the_whole_server_uniffi() {
+    async fn missing_supervisor_serves_no_context_uniffi() {
         let scp = scp_test();
         assert!(
             scp.inner.context_manager_or_error().is_err(),
@@ -22756,10 +22734,118 @@ mod tests {
         let handle = scp
             .mcp_server_create(config)
             .await
-            .expect("a missing supervisor must degrade subscriptions, not fail MCP serving");
+            .expect("a missing supervisor must not fail MCP serving");
         scp.mcp_server_stop(handle)
             .await
             .expect("the server created without a supervisor must stop cleanly");
+
+        let mut server = scp_mcp::server::McpServer::new(McpUniFfiBridgeProvider {
+            bi: Arc::downgrade(&scp.inner),
+            agent_did: "did:dht:z6MkTestUser".to_owned(),
+            context_ids: vec!["ctx-1".to_owned()],
+            outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: None,
+            agent_proof_tokens: None,
+        });
+        let request = |method: &str, params: serde_json::Value| scp_mcp::protocol::JsonRpcRequest {
+            jsonrpc: scp_mcp::protocol::JSONRPC_VERSION.to_owned(),
+            method: method.to_owned(),
+            params: Some(params),
+            id: scp_mcp::protocol::RequestId::Number(1),
+        };
+        server
+            .handle_request(&request(
+                scp_mcp::protocol::METHOD_INITIALIZE,
+                serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": { "name": "uniffi-test" },
+                }),
+            ))
+            .expect("initialize must produce a response")
+            .result
+            .expect("initialize must succeed");
+        let listed = server
+            .handle_request(&request("resources/list", serde_json::json!({})))
+            .expect("resources/list must produce a response")
+            .result
+            .expect("resources/list must succeed");
+        assert_eq!(listed["resources"], serde_json::json!([]));
+        let read = server
+            .handle_request(&request(
+                "resources/read",
+                serde_json::json!({ "uri": "scp://ctx-1/events" }),
+            ))
+            .expect("resources/read must produce a response");
+        let error = read.error.expect("resources/read must be refused");
+        assert!(
+            error.message.contains("not a participant"),
+            "got: {}",
+            error.message
+        );
+    }
+
+    /// `scp://{ctx}/events` reports the actor's event log, the log whose
+    /// events drive the `resources/updated` notices, and not the bridge's
+    /// UCAN-state tree, which the MCP path never syncs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn events_resource_reports_the_actor_log_uniffi() {
+        use scp_mcp::server::ContextProvider as _;
+
+        let creator = "did:dht:z6MkEventsResourceCreator";
+        let scp = scp_test();
+        let bi = Arc::clone(&scp.inner);
+        bi.init_context_manager_with_did(creator);
+        let supervisor = bi
+            .context_manager_or_error()
+            .expect("supervisor must be attached")
+            .clone();
+        supervisor
+            .create_context(
+                "ctx-events-resource".to_owned(),
+                scp_core::context::ContextParams::default(),
+                scp_did::DID(creator.to_owned()),
+                None,
+            )
+            .await
+            .expect("context creation must succeed");
+        // Make the bridge's UCAN-state tree diverge from the actor's log.
+        bi.ensure_ucan_registered("ctx-events-resource", creator, &[]);
+        bi.with_ucan_state("ctx-events-resource", |state| {
+            state.event_log.push_leaf_raw([0x5A; 32]);
+            state.event_log.push_leaf_raw([0xA5; 32]);
+        })
+        .expect("the UCAN state must be registered");
+
+        let (count, root) = supervisor
+            .event_log_summary(&scp_core::context::state::context_id_to_bytes(
+                "ctx-events-resource",
+            ))
+            .expect("the actor's log must be readable");
+        let resource = McpUniFfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: creator.to_owned(),
+            context_ids: vec!["ctx-events-resource".to_owned()],
+            outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: None,
+            agent_proof_tokens: None,
+        }
+        .context_events("ctx-events-resource")
+        .expect("the events resource must be readable");
+        assert_eq!(
+            resource,
+            serde_json::json!({ "event_count": count, "merkle_root": hex::encode(root) })
+        );
+        let copy_root = bi
+            .with_ucan_state("ctx-events-resource", |state| {
+                scp_event_log::tree::root(&state.event_log)
+            })
+            .expect("the UCAN state must be registered");
+        assert_ne!(
+            resource["merkle_root"],
+            serde_json::json!(hex::encode(copy_root)),
+            "the resource must not report the bridge's UCAN-state tree"
+        );
     }
 
     /// `mcp_client_connect_stdio` must reject empty command list.

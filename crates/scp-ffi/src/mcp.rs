@@ -656,16 +656,21 @@ impl FfiBridgeProvider {
         })
     }
 
-    /// Replaces this bridge's copy of `context_id`'s role state
-    /// (`FfiBridgeState.role_state`) with the actor's before an MCP
-    /// authorization reads it.
+    /// Reads `context_id`'s current role state for an MCP authorization.
     ///
-    /// Only the bridge's own join, leave and governance calls resync that copy.
-    /// A change the actor applies from an inbound commit, such as another admin
-    /// revoking this agent's `messages:read` or removing it, never reaches the
-    /// copy by itself, so a gate reading the copy unrefreshed keeps authorizing
-    /// the agent after the revocation. The `UniFFI` provider asks the actor on
-    /// every read for the same reason.
+    /// With a supervisor attached, the answer is the actor's role state, never
+    /// this bridge's copy (`FfiBridgeState.role_state`). Only the bridge's own
+    /// join, leave and governance calls resync that copy. A change the actor
+    /// applies from an inbound commit, such as another admin revoking this
+    /// agent's `messages:read` or removing it, never reaches the copy by itself,
+    /// so a gate reading the copy keeps authorizing the agent after the
+    /// revocation. The `UniFFI` provider asks the actor on every read for the
+    /// same reason.
+    ///
+    /// The function writes nothing back to the copy. The MCP transport task
+    /// and the notification pump call it concurrently with the bridge's own
+    /// calls, so a write-back could replace a newer copy with the older
+    /// snapshot this call read.
     ///
     /// With no supervisor attached there is no actor and no inbound path, so
     /// the copy is the context's only role state and is read as it stands.
@@ -674,17 +679,18 @@ impl FfiBridgeProvider {
     ///
     /// Fails when the actor does not hold the context or cannot be asked; the
     /// caller then denies, because it cannot learn the current role state.
-    fn refresh_role_state(
+    fn live_role_state(
         bi: &crate::runtime::PyBridgeInstance,
         context_id: &str,
-    ) -> Result<(), String> {
+    ) -> Result<scp_core::context::roles::ContextRoleState, String> {
         let Some(supervisor) = bi.core.try_supervisor() else {
-            return Ok(());
+            return crate::runtime::with_context(bi, context_id, |rt| Ok(rt.role_state.clone()))
+                .map_err(|e| format!("{e}"));
         };
         let supervisor = Arc::clone(supervisor);
         let id = context_id.to_owned();
         let query = async move { supervisor.get_role_state(&id).await };
-        let live = match tokio::runtime::Handle::try_current() {
+        match tokio::runtime::Handle::try_current() {
             // Inside the MCP transport task: the actor runs on this runtime's
             // other workers while this one blocks.
             Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
@@ -702,12 +708,7 @@ impl FfiBridgeProvider {
                 .map_err(|e| format!("{e}"))?
                 .block_on(query),
         }
-        .ok_or_else(|| format!("context '{context_id}' is not held by the supervisor"))?;
-        crate::runtime::with_context(bi, context_id, |rt| {
-            rt.role_state = live;
-            Ok(())
-        })
-        .map_err(|e| format!("{e}"))
+        .ok_or_else(|| format!("context '{context_id}' is not held by the supervisor"))
     }
 }
 
@@ -722,11 +723,8 @@ impl ContextProvider for FfiBridgeProvider {
         self.context_ids
             .iter()
             .filter(|id| {
-                Self::refresh_role_state(&bi, id).is_ok()
-                    && crate::runtime::with_context(&bi, id, |rt| {
-                        Ok(rt.role_state.members.contains(&self.agent_did))
-                    })
-                    .unwrap_or(false)
+                Self::live_role_state(&bi, id)
+                    .is_ok_and(|role_state| role_state.members.contains(&self.agent_did))
             })
             .cloned()
             .collect()
@@ -737,17 +735,11 @@ impl ContextProvider for FfiBridgeProvider {
         // Silently returns None if the bridge has been dropped — matches the
         // "unknown context" fallback semantics of this trait method.
         let bi = self.upgrade_bi().ok()?;
-        Self::refresh_role_state(&bi, context_id).ok()?;
-        crate::runtime::with_context(&bi, context_id, |rt| {
-            let role = rt
-                .role_state
-                .assignments
-                .get(&self.agent_did)
-                .map(|assignment| assignment.role_name.clone());
-            Ok(role)
-        })
-        .ok()
-        .flatten()
+        Self::live_role_state(&bi, context_id)
+            .ok()?
+            .assignments
+            .get(&self.agent_did)
+            .map(|assignment| assignment.role_name.clone())
     }
 
     fn agent_did(&self) -> &str {
@@ -787,9 +779,9 @@ impl ContextProvider for FfiBridgeProvider {
         // dropped, fail fast with a deterministic error rather than
         // silently accepting the capability.
         let bi = self.upgrade_bi()?;
-        // Both checks below read the context's role state, so bring it up to
-        // the actor's first.
-        Self::refresh_role_state(&bi, context_id)?;
+        // The role-state check below reads the actor's role state, not the
+        // bridge copy.
+        let role_state = Self::live_role_state(&bi, context_id)?;
         // Primary check: UCAN token validation via the full 11-step ADR-016
         // pipeline. Verifies the token grants the outlet's kind-appropriate stem
         // — outlet_query:{outlet_name}/outlet_query:* for Query outlets,
@@ -891,7 +883,7 @@ impl ContextProvider for FfiBridgeProvider {
                 .get(outlet_name)
                 .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind);
             if scp_core::context::outlets::invoke::has_outlet_invocation_capability(
-                &rt.role_state,
+                &role_state,
                 &self.agent_did,
                 outlet_name,
                 outlet_kind,
@@ -1229,89 +1221,56 @@ impl ContextProvider for FfiBridgeProvider {
         context_id: &str,
         resource: scp_mcp::server::ResourceKind,
     ) -> Result<(), String> {
-        use scp_core::context::roles::Capability;
-        use scp_mcp::server::ResourceKind;
-
         let bi = self.upgrade_bi()?;
-        Self::refresh_role_state(&bi, context_id)?;
-        crate::runtime::with_context(&bi, context_id, |rt| {
-            // `Events` and `Members` require `messages:read`: per spec §5.3.1's
-            // role table an `observer` — whose sole capability is
-            // `messages:read` — "can see all content and membership", so that
-            // grant is exactly the authority to read the event stream and the
-            // roster.
-            //
-            // `Tools` carries no separate grant because its contents are the
-            // capability-filtered tool list; an agent with no tool capabilities
-            // reads `[]` rather than being denied. This is deliberately NOT a
-            // `validate_capability("resource:tools")` call — that name resolves
-            // to `Capability::Custom("resource:tools")`, which appears in no
-            // ceiling and no role catalogue, so gating on it denied every
-            // client on every bridge unconditionally.
-            //
-            // The denial names the requirement this kind actually checks, so a
-            // caller acting on the message grants what decides the outcome.
-            let missing = match resource {
-                ResourceKind::Events | ResourceKind::Members => (!rt
-                    .role_state
-                    .member_has_capability(&self.agent_did, &Capability::MessagesRead))
-                .then_some("messages:read"),
-                ResourceKind::Tools => {
-                    (!rt.role_state.members.contains(&self.agent_did)).then_some("membership")
-                }
-            };
-            missing.map_or(Ok(()), |requirement| {
-                Err(ScpPyError::context(format!(
-                    "agent lacks {requirement} in context '{context_id}' — required to read \
-                     scp://{context_id}/{}",
-                    resource.uri_suffix()
-                )))
-            })
-        })
-        .map_err(|e| format!("{e}"))
+        let role_state = Self::live_role_state(&bi, context_id)?;
+        resource.check_access(&role_state, &self.agent_did, context_id)
     }
 
     fn context_members(&self, context_id: &str) -> Result<Vec<MemberInfo>, String> {
         // A dropped bridge or an unreadable context is an error, never an
         // empty roster.
         let bi = self.upgrade_bi()?;
-        Self::refresh_role_state(&bi, context_id)?;
-        crate::runtime::with_context(&bi, context_id, |rt| {
-            let members = rt
-                .role_state
-                .members
-                .iter()
-                .map(|did| {
-                    let role = rt
-                        .role_state
-                        .assignments
-                        .get(did)
-                        .map_or_else(|| "member".to_owned(), |a| a.role_name.clone());
-                    MemberInfo {
-                        did: did.clone(),
-                        role,
-                    }
-                })
-                .collect();
-            Ok(members)
-        })
-        .map_err(|e| format!("{e}"))
+        let role_state = Self::live_role_state(&bi, context_id)?;
+        Ok(role_state
+            .members
+            .iter()
+            .map(|did| MemberInfo {
+                did: did.clone(),
+                role: role_state
+                    .assignments
+                    .get(did)
+                    .map_or_else(|| "member".to_owned(), |a| a.role_name.clone()),
+            })
+            .collect())
     }
 
     fn context_events(&self, context_id: &str) -> Result<serde_json::Value, String> {
-        // The EventLog stores Merkle tree hashes, not event payloads.
-        // Return the event count and Merkle root as metadata. A dropped
-        // bridge or an unreadable context is an error, never an empty log.
+        // The event log stores Merkle tree hashes, not event payloads, so the
+        // resource reports the entry count and the Merkle root. A dropped
+        // bridge or an unreadable log is an error, never an empty log.
         let bi = self.upgrade_bi()?;
-        crate::runtime::with_context(&bi, context_id, |rt| {
-            let leaf_count = rt.event_log.leaves().len();
-            let root = scp_event_log::tree::root(&rt.event_log);
-            Ok(serde_json::json!({
-                "event_count": leaf_count,
-                "merkle_root": crate::types::encode_hex(&root),
-            }))
-        })
-        .map_err(|e| format!("{e}"))
+        // With a supervisor attached, report the actor's log: the pump's
+        // `resources/updated` notices come from the actor's events, and the
+        // bridge's local tree is synced from the actor's log only by the
+        // event-log API, which the MCP path never calls.
+        let (event_count, root) = if let Some(supervisor) = bi.core.try_supervisor() {
+            supervisor
+                .event_log_summary(&scp_core::context::state::context_id_to_bytes(context_id))
+                .map_err(|e| format!("cannot read the event log of context '{context_id}': {e}"))?
+        } else {
+            // No actor: the bridge's tree is the context's only log.
+            crate::runtime::with_context(&bi, context_id, |rt| {
+                Ok((
+                    rt.event_log.leaves().len(),
+                    scp_event_log::tree::root(&rt.event_log),
+                ))
+            })
+            .map_err(|e| format!("{e}"))?
+        };
+        Ok(serde_json::json!({
+            "event_count": event_count,
+            "merkle_root": crate::types::encode_hex(&root),
+        }))
     }
 }
 
@@ -4267,6 +4226,143 @@ mod tests {
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
+    /// Registers `ctx_id` on the bridge with `copy_creator` as the copy's sole
+    /// member, and creates it on the actor with `actor_creator` as its creator,
+    /// so the bridge copy and the actor disagree about who is a member.
+    fn setup_diverged_context(
+        bi: &crate::runtime::PyBridgeInstance,
+        ctx_id: &str,
+        copy_creator: &str,
+        actor_creator: &str,
+    ) {
+        crate::runtime::register_context(bi, ctx_id, copy_creator, &[]).unwrap();
+        let supervisor = Arc::clone(crate::runtime::supervisor(bi).unwrap());
+        let params = scp_core::context::ContextParams {
+            ceiling: vec![
+                scp_core::context::params::Capability::new("messages:read")
+                    .expect("known capability"),
+            ],
+            ..scp_core::context::ContextParams::default()
+        };
+        crate::runtime()
+            .unwrap()
+            .block_on(supervisor.create_context(
+                ctx_id.to_owned(),
+                params,
+                scp_did::DID(actor_creator.to_owned()),
+                None,
+            ))
+            .unwrap();
+    }
+
+    /// Every MCP gate answers from the actor's role state while the actor holds
+    /// the context, and the gates write nothing back to the bridge copy.
+    ///
+    /// `revoked` is the state after an inbound commit removed the agent: the
+    /// actor holds the context without the agent while the bridge copy still
+    /// names the agent as its member. `granted` is the reverse. A gate that read
+    /// the copy, or that let the copy decide, fails one of the two halves; a
+    /// gate that wrote the actor's snapshot back into the copy fails the final
+    /// assertions.
+    #[test]
+    fn provider_gates_read_the_actor_role_state_without_writing_the_copy_pyo3() {
+        use scp_mcp::server::ResourceKind;
+
+        crate::init_runtime().ok();
+        let agent = "did:dht:z6MkLiveRoleAgent";
+        let other = "did:dht:z6MkLiveRoleOther";
+        let bi = __bi();
+        let revoked = crate::types::generate_random_id("test-mcp-revoked");
+        let granted = crate::types::generate_random_id("test-mcp-granted");
+        setup_diverged_context(&bi, &revoked, agent, other);
+        setup_diverged_context(&bi, &granted, other, agent);
+        let copy_has_agent = |ctx: &str| {
+            crate::runtime::with_context(&bi, ctx, |rt| Ok(rt.role_state.members.contains(agent)))
+                .unwrap()
+        };
+        assert!(copy_has_agent(&revoked) && !copy_has_agent(&granted));
+
+        let provider = pyo3_mcp_provider(&bi, &revoked, agent);
+        assert!(provider.active_context_ids().is_empty());
+        for (kind, requirement) in [
+            (ResourceKind::Events, "lacks messages:read"),
+            (ResourceKind::Members, "lacks messages:read"),
+            (ResourceKind::Tools, "lacks membership"),
+        ] {
+            let denial = provider
+                .validate_resource_access(&revoked, kind)
+                .expect_err("the copy's grant must not outlive the actor's revocation");
+            assert!(denial.contains(requirement), "{kind:?}: {denial}");
+        }
+        assert!(provider.agent_role(&revoked).is_none());
+        let members = provider.context_members(&revoked).unwrap();
+        assert!(members.iter().all(|m| m.did != agent));
+
+        let provider = pyo3_mcp_provider(&bi, &granted, agent);
+        assert_eq!(provider.active_context_ids(), vec![granted.clone()]);
+        for kind in [
+            ResourceKind::Events,
+            ResourceKind::Members,
+            ResourceKind::Tools,
+        ] {
+            provider
+                .validate_resource_access(&granted, kind)
+                .unwrap_or_else(|e| panic!("the actor grants {kind:?}: {e}"));
+        }
+        assert!(provider.agent_role(&granted).is_some());
+
+        // No write-back: each copy still holds what the bridge wrote into it.
+        assert!(copy_has_agent(&revoked) && !copy_has_agent(&granted));
+
+        crate::runtime::remove_context(&bi, &revoked);
+        crate::runtime::remove_context(&bi, &granted);
+    }
+
+    /// With a supervisor attached, `scp://{ctx}/events` reports the actor's
+    /// event log, the log whose events drive the `resources/updated` notices,
+    /// and not the bridge's local tree, which the MCP path never syncs.
+    #[test]
+    fn events_resource_reports_the_actor_log_pyo3() {
+        crate::init_runtime().ok();
+        let agent = "did:dht:z6MkEventsResourceAgent";
+        let bi = __bi();
+        let ctx_id = crate::types::generate_random_id("test-mcp-events");
+        setup_diverged_context(&bi, &ctx_id, agent, agent);
+        // Make the bridge's local tree diverge from the actor's log.
+        crate::runtime::with_context(&bi, &ctx_id, |rt| {
+            rt.event_log.push_leaf_raw([0x5A; 32]);
+            rt.event_log.push_leaf_raw([0xA5; 32]);
+            Ok(())
+        })
+        .unwrap();
+
+        let (count, root) = crate::runtime::supervisor(&bi)
+            .unwrap()
+            .event_log_summary(&scp_core::context::state::context_id_to_bytes(&ctx_id))
+            .unwrap();
+        let resource = pyo3_mcp_provider(&bi, &ctx_id, agent)
+            .context_events(&ctx_id)
+            .unwrap();
+        assert_eq!(
+            resource,
+            serde_json::json!({
+                "event_count": count,
+                "merkle_root": crate::types::encode_hex(&root),
+            })
+        );
+        let copy_root = crate::runtime::with_context(&bi, &ctx_id, |rt| {
+            Ok(scp_event_log::tree::root(&rt.event_log))
+        })
+        .unwrap();
+        assert_ne!(
+            resource["merkle_root"],
+            serde_json::json!(crate::types::encode_hex(&copy_root)),
+            "the resource must not report the bridge's local tree"
+        );
+
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
     /// Wiring guard for #1341, mirroring the NAPI and `UniFFI` tests:
     /// `py_mcp_serve` sources its receiver from `Supervisor::subscribe_events()`,
     /// and `crate::runtime::build_supervisor` enables the broadcast channel, so
@@ -4290,7 +4386,10 @@ mod tests {
     /// A missing `Supervisor` degrades ONLY the subscription capability — it
     /// must not fail MCP serving outright. Drives the production entry point:
     /// were `py_mcp_serve` to propagate the missing-supervisor error
-    /// (`supervisor(bi)?`), the serve call would return `Err`.
+    /// (`supervisor(bi)?`), the serve call would return `Err`. Then reads
+    /// `resources/list` through the provider type that entry point builds over
+    /// the same instance, so a provider that served nothing without a
+    /// supervisor fails here.
     #[test]
     fn missing_supervisor_degrades_subscriptions_not_the_whole_server_pyo3() {
         crate::init_runtime().ok();
@@ -4310,6 +4409,28 @@ mod tests {
             .expect("a missing supervisor must degrade subscriptions, not fail MCP serving");
         scp.py_mcp_server_stop(&handle)
             .expect("the server created without a supervisor must stop cleanly");
+
+        let mut server = McpServer::new(pyo3_mcp_provider(&bi, &ctx_id, agent));
+        assert!(!initialize_and_read_subscribe_flag(&mut server));
+        let listed = server
+            .handle_request(&mcp_request("resources/list", serde_json::json!({})))
+            .expect("resources/list must produce a response")
+            .result
+            .expect("resources/list must succeed without a supervisor");
+        let uris: Vec<&str> = listed["resources"]
+            .as_array()
+            .expect("resources must be an array")
+            .iter()
+            .filter_map(|r| r["uri"].as_str())
+            .collect();
+        let expected: Vec<String> = ["events", "members", "tools"]
+            .iter()
+            .map(|kind| format!("scp://{ctx_id}/{kind}"))
+            .collect();
+        assert_eq!(
+            uris, expected,
+            "a missing supervisor must leave resources/list serving the context"
+        );
 
         crate::runtime::remove_context(&bi, &ctx_id);
     }
