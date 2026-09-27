@@ -578,7 +578,7 @@ bindings/kotlin/
     build.gradle.kts                       # SDK core module (JVM + Android)
     src/
       main/kotlin/works/limn/scp/
-        Scp.kt                             # Scp class — top-level entry point, factory, context creation
+        SCP.kt                             # Scp class — top-level entry point, factory, context creation
         Identity.kt                        # Identity class, ResolutionOutcome data class
         Context.kt                         # Context class, Flow<Message>, AutoCloseable lifecycle
         Outlets.kt                           # OutletDefinition, TestVector data classes
@@ -650,7 +650,7 @@ tasks.test {
 }
 ```
 
-**`Scp.kt` — top-level entry point:**
+**`SCP.kt` — top-level entry point:**
 
 ```kotlin
 /**
@@ -1228,7 +1228,7 @@ dependencies {
 | File | Purpose |
 |------|---------|
 | `scp-kt/build.gradle.kts` | Gradle module build — dependencies, publishing, signing, ktlint, detekt |
-| `src/main/kotlin/works/limn/scp/Scp.kt` | `Scp` class — top-level entry point, `create()` factory, `createContext()`, `joinContext()` |
+| `src/main/kotlin/works/limn/scp/SCP.kt` | `Scp` class — top-level entry point, `create()` factory, `createContext()`, `joinContext()` |
 | `src/main/kotlin/works/limn/scp/Identity.kt` | `Identity` class — `identifier`, `custodyType`, `load()`, `resolve()`, `rotateKey()`; `ResolutionOutcome` data class |
 | `src/main/kotlin/works/limn/scp/Context.kt` | `Context` class — `send()`, `receiveFlow()`, `invokeOutlet()`, `registerOutlet()`, `leave()`, `closeContext()`, `AutoCloseable` |
 | `src/main/kotlin/works/limn/scp/Outlets.kt` | `OutletDefinition`, `TestVector`, `OutletVerificationResult` data classes |

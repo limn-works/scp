@@ -382,6 +382,12 @@ class ScopedHandle internal constructor(
  *
  * Construction validates [hostname], [deployRetentionCount], and [cspOverride].
  *
+ * This is intentionally NOT a data class: the auto-generated `copy()` method
+ * on data classes would allow callers to create a new instance that bypasses
+ * init validation (e.g., invalid hostname, out-of-range deployRetentionCount).
+ *
+ * Custom [equals], [hashCode], and [toString] are provided for testing ergonomics.
+ *
  * @property hostname Virtual host hostname (e.g., `"mysite.example.com"`). RFC 1123 validated.
  * @property indexPath Default path for directory requests (default: `"/index.html"`).
  * @property maxAssetsPerDeploy Maximum assets per deploy (default: 10,000).
@@ -389,12 +395,6 @@ class ScopedHandle internal constructor(
  * @property deployRetentionCount Number of deploys to retain (default: 2, max 8).
  * @property cspOverride Optional CSP override. Validated: no `unsafe-eval`, `unsafe-inline`,
  *   `unsafe-hashes`, bare `*`, `data:`, `blob:`.
- *
- * This is intentionally NOT a data class: the auto-generated `copy()` method
- * on data classes would allow callers to create a new instance that bypasses
- * init validation (e.g., invalid hostname, out-of-range deployRetentionCount).
- *
- * Custom [equals], [hashCode], and [toString] are provided for testing ergonomics.
  */
 class SiteConfig(
     val hostname: String,
