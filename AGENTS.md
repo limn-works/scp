@@ -63,9 +63,9 @@ SCP is an open, ecosystem-agnostic protocol for the agentic Internet: verifiable
 - Enter plan mode for any task of three or more steps and for any task that decides an architectural question.
 - Cite `.docs/` in your work and update it as you go. After anyone corrects you, write the lesson into `.docs/lessons/`.
 - Read the `.docs/standards/` file for the language before you write code.
-- Give each subagent exactly one task, so the orchestrator's context stays small.
+- Give each subagent exactly one task, and dispatch as many subagents as the work needs, so the orchestrator's context stays small.
 - The request, or the plan the human approved, sets the scope of a task. Implement every behavior it asks for, completely. When you find a bug, a performance problem, or missing behavior that the requested behavior does not need, file it as a GitHub issue and list it in your final report instead of fixing it in the change.
-- Run every gate, test, and build the change affects, and read their output, before you call the work done.
+- Run every gate, every test, and every build, and read their output, before you call the work done.
 
 **Change protocol (MANDATORY for all code changes):**
 - Make every change in a subagent with worktree isolation. Give a coder only worktree paths: a bare path under the main checkout edits the human's uncommitted work there.
@@ -161,7 +161,7 @@ Validate a contested design against external convention in primary sources befor
 The orchestrator writes no code. It plans, dispatches, keeps chunked work coherent with the plan, and triages review findings.
 
 1. **Plan first.** Send a Plan agent the paths to the plan sections, issues, and code it must read, and tell it to read code, not just grep. Authorize execution only after the plan is reviewed.
-2. **Execute in isolation.** Send coders with `isolation: "worktree"`. Run at most two or three coders at once, and run coders that touch the same files one after another. Never mix phases: plan fully, review the plans, then code. Watch the main worktree, and investigate any dirty change on it before you take a destructive action.
+2. **Execute in isolation.** Send coders with `isolation: "worktree"`. Coders that touch the same files conflict, so run them one after another. Never mix phases: plan fully, review the plans, then code. Watch the main worktree, and investigate any dirty change on it before you take a destructive action.
 3. **Review.** Give reviewers what was intended, what to look for, and what to read. Never discard a finding silently; escalate to the human when you cannot tell whether it is actionable.
 4. **Fix and re-review** until two consecutive passes return zero findings.
 
