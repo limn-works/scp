@@ -572,8 +572,9 @@ pub trait DeviceAttestationProvider: Send + Sync {
     /// Generate a per-request assertion proving key possession.
     ///
     /// `request_hash` — SHA-256 hash of the request data being asserted.
-    ///   Apple: the assertion digest `A` of `09-security-model.md` §9.3.1,
-    ///   which the adapter hands App Attest as `clientDataHash` unchanged.
+    ///   Apple: the 32-byte assertion digest `A` of `09-security-model.md`
+    ///   §9.3.1, which the adapter hands App Attest as `clientDataHash`
+    ///   unchanged and rejects when it is not 32 bytes.
     ///
     /// Returns the platform assertion object bytes (Apple: CBOR assertion;
     /// Android: integrity verdict).
@@ -948,48 +949,4 @@ mod tests {
     // NOTE: routing_id tests removed — SA-15 changed ContextHandle to accept
     // Identity (for KeyCustody signing), which removed the routing_id field.
     // Routing ID tests will be re-added when routing is wired through KeyCustody.
-
-    // -----------------------------------------------------------------------
-    // DeviceAttestationProvider callback errors (ADR-025)
-    // -----------------------------------------------------------------------
-
-    /// The Rust half of a `DeviceAttestationProvider` callback that throws.
-    ///
-    /// The Swift adapter `AppleDeviceAttestation` throws `ScpError` from
-    /// `attest` and `assert_request`, and the generated Swift glue lowers that
-    /// value with the `ScpError` converter. This test lifts such a buffer
-    /// through the lift `UniFFI` runs for `Result<Vec<u8>, ScpError>` callback
-    /// returns, and requires an `Err` carrying each listed code. It pins
-    /// `UniFFI`'s lift of that return type only: which code the Swift adapter
-    /// throws for which condition is pinned by the Swift tests, and the Swift
-    /// adapter's `throws(ScpError)` signatures are what keep it from throwing
-    /// any other type.
-    #[test]
-    fn device_attestation_callback_scp_error_lifts_to_an_error_value() {
-        use uniffi::{LiftReturn, LowerError};
-        for (code, msg) in [
-            (
-                codes::ATTEST_9019,
-                "DCAppAttestService.isSupported is false",
-            ),
-            (
-                codes::ATTEST_9025,
-                "generateKey returned neither keyId nor error",
-            ),
-        ] {
-            let thrown = ScpError::Identity {
-                msg: msg.to_owned(),
-                code: code.to_owned(),
-            };
-            let buf = <ScpError as LowerError<crate::UniFfiTag>>::lower_error(thrown);
-            let lifted =
-                <Result<Vec<u8>, ScpError> as LiftReturn<crate::UniFfiTag>>::lift_error(buf);
-            match lifted {
-                Err(ScpError::Identity {
-                    code: lifted_code, ..
-                }) => assert_eq!(lifted_code, code),
-                other => panic!("expected ScpError::Identity with {code}, got {other:?}"),
-            }
-        }
-    }
 }

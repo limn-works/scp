@@ -14509,8 +14509,9 @@ public protocol DeviceAttestationProvider: AnyObject, Sendable {
      * Generate a per-request assertion proving key possession.
      *
      * `request_hash` — SHA-256 hash of the request data being asserted.
-     * Apple: the assertion digest `A` of `09-security-model.md` §9.3.1,
-     * which the adapter hands App Attest as `clientDataHash` unchanged.
+     * Apple: the 32-byte assertion digest `A` of `09-security-model.md`
+     * §9.3.1, which the adapter hands App Attest as `clientDataHash`
+     * unchanged and rejects when it is not 32 bytes.
      *
      * Returns the platform assertion object bytes (Apple: CBOR assertion;
      * Android: integrity verdict).

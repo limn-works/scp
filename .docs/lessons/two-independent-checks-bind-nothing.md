@@ -51,8 +51,10 @@ built one genuinely anchored chain beside a second chain's key identifier and
 asserted `false`, which is the substitution the missing clause admitted. On
 2026-09-26 the maintainer ruled that the Swift `verify` method is deleted and
 that the identity workstream owns the reading-side verifier, so that test was
-deleted with `verify`. Clause 5 of acceptance criterion 3 in ADR-025, the Apple
-platform adapter, still states the comparison that verifier has to make.
+deleted with `verify`. App Attest check 6 of `09-security-model.md` §9.3.1,
+reading a device attestation, now states the comparison that verifier has to
+make: a credential ID unequal to `SHA-256` of the credential certificate's
+public key returns `Rejected{KeyIdMismatch}`.
 
 ## Related
 

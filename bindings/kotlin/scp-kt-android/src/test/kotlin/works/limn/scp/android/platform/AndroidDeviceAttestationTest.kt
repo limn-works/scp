@@ -232,16 +232,19 @@ class AndroidDeviceAttestationTest {
     }
 
     // -----------------------------------------------------------------------
-    // Cross-platform determinism (matches Apple adapter formula)
+    // Legacy clientDataJSON field order (Android adapter only)
     // -----------------------------------------------------------------------
 
     @Test
     fun `clientDataJSON fields appear in the fixed order challenge then deviceId then type`() {
         // Android formula: {"challenge":"<b64>","deviceId":"<b64>","type":"scp-device-attestation-v1"}
         //
-        // The Apple adapter no longer builds this JSON: it hands App Attest the
-        // 32-byte binding digest of 09-security-model.md section 9.3.1
-        // unchanged. OQ-33 of spec 27 keeps the Android binding open.
+        // This test pins the legacy clientDataJSON behaviour of the shipped
+        // adapter. ADR-027 acceptance criterion 7, as its 2026-09-27 amendment
+        // states it, replaced this JSON with requestHash = hex(D), where D is
+        // the binding digest of 09-security-model.md section 9.3.1; story
+        // SCP-111 carries that change. OQ-22 of spec 27 keeps only the choice
+        // of trait open. The Apple adapter builds no JSON.
         val attestation = createAttestationWithMockContext()
         val json = attestation.buildClientDataJSON(
             byteArrayOf(1, 2, 3),

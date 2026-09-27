@@ -14,7 +14,10 @@ App Attest key identifier the adapter stored. Roughly forty cases in
 naming one clause it broke. On 2026-09-26 the maintainer ruled that the Swift
 `verify` method is deleted and that the identity workstream owns the
 reading-side verifier, so those cases were deleted with `verify`; the hazard
-below applies to that verifier's tests when it is built.
+below applies to that verifier's tests when it is built. ADR-025, the Apple
+platform adapter, no longer carries clause 5: App Attest check 6 of
+`09-security-model.md` §9.3.1, reading a device attestation, now states the
+credential-ID comparison and returns `Rejected{KeyIdMismatch}`.
 
 Two hazards arrived with that clause, and both make a case pass while testing
 nothing:

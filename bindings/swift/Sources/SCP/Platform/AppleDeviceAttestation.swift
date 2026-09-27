@@ -454,8 +454,10 @@
         }
 
         /// The `clientDataHash` of the assertion that tells an already-attested
-        /// key from a rejected one. Apple signs it with the stored key, and this
-        /// adapter discards that assertion.
+        /// key from a rejected one: the key-probe input `K` of
+        /// `09-security-model.md` §9.3.1, whose separator §9.18.2 registers.
+        /// Apple signs it with the stored key, and this adapter discards that
+        /// assertion.
         private static let keyProbeClientDataHash = Data(SHA256.hash(data: Data("SCP-APP-ATTEST-KEY-PROBE-V1".utf8)))
 
         /// Translate an App Attest service error into a typed error, and update

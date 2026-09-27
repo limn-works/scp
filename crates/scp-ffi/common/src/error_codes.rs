@@ -1220,11 +1220,11 @@ pub const ATTEST_9024: &str = "SCP-ATTEST-9024";
 /// service answered a completion handler with neither a value nor an error, or
 /// the adapter was deallocated during a call.
 pub const ATTEST_9025: &str = "SCP-ATTEST-9025";
-/// The attestation challenge is not 32 bytes.
+/// The attestation challenge or the assertion request hash is not 32 bytes.
 ///
-/// ADR-025 acceptance criterion 3 has the Rust core pass the 32-byte binding digest of `09-security-model.md`
-/// §9.3.1 as `challenge`, and the Apple adapter hands it to App Attest as
-/// `clientDataHash` unchanged.
+/// ADR-025 acceptance criterion 3 has the Rust core pass the 32-byte binding digest `D` of `09-security-model.md`
+/// §9.3.1 as `challenge` and the 32-byte assertion digest `A` as `request_hash`,
+/// and the Apple adapter hands each to App Attest as `clientDataHash` unchanged.
 pub const ATTEST_9026: &str = "SCP-ATTEST-9026";
 
 // -------------------------------------------------------------------------

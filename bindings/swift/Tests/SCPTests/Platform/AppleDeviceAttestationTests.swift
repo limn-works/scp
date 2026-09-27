@@ -463,9 +463,7 @@
     struct AppleDeviceAttestationFailClosedTests {
         /// Require `ScpError.Identity` carrying `SCP-ATTEST-9019`, the value the
         /// UniFFI `DeviceAttestationProvider` callback lowers into an error
-        /// Rust receives. Rust's half of that path is
-        /// `device_attestation_callback_scp_error_lifts_to_an_error_value` in
-        /// `crates/scp-ffi/uniffi/src/lib.rs`.
+        /// Rust receives.
         private func expectUnsupported(_ error: ScpError, from method: String) {
             guard case let .Identity(msg, code) = error else {
                 Issue.record("\(method) threw \(error) instead of ScpError.Identity")
