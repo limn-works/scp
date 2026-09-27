@@ -5,8 +5,8 @@
 // the relay sends only `{"aps": {"content-available": 1}}`, and "the adapter
 // enforces opacity on receipt", rejecting "payloads containing any field other
 // than `aps.content-available`". §10.7 of the security-model spec is where that
-// requirement comes from: a payload carrying a context ID, a sender DID, or a
-// message count would hand Apple metadata the protocol keeps encrypted.
+// requirement comes from: a payload carrying a context ID, a sender identifier, or
+// a message count would hand Apple metadata the protocol keeps encrypted.
 //
 // Each case below names the field it added, the value it changed, or the shape
 // it broke, and asserts the thrown case.
@@ -110,6 +110,19 @@
             }
         }
 
+        @Test("handleNotification rejects a fractional content-available whose integer part is 1")
+        func handleNotificationRejectsFractionalContentAvailable() async throws {
+            // `NSNumber.intValue` truncates 1.5 to 1, so an implementation that
+            // checks the CFNumber type and `intValue` alone would accept this
+            // payload.
+            let provider = ApplePushProvider()
+            let bytes = Data(#"{"aps":{"content-available":1.5}}"#.utf8)
+
+            await #expect(throws: PushError.self) {
+                try await provider.handleNotification(payload: bytes)
+            }
+        }
+
         @Test("handleNotification rejects bytes that are not JSON")
         func handleNotificationRejectsNonJson() async throws {
             let provider = ApplePushProvider()
@@ -134,10 +147,15 @@
             // A payload this large reaches no device through APNs, and rejecting
             // it before `JSONSerialization` runs keeps a caller from spending
             // parse time on bytes APNs never sends.
+            //
+            // Trailing whitespace is legal JSON, so these bytes break no rule
+            // but the size rule: without the size guard they parse as the one
+            // payload §10.7 permits and the call returns them.
             let provider = ApplePushProvider()
-            let filler = String(repeating: "a", count: 5000)
-            let bytes = try payload(["aps": ["content-available": 1], "filler": filler])
+            let bytes = try opaquePayload() + Data(String(repeating: " ", count: 5000).utf8)
             #expect(bytes.count > 4096)
+            let parsed = try JSONSerialization.jsonObject(with: bytes) as? [String: [String: Int]]
+            #expect(parsed == ["aps": ["content-available": 1]])
 
             await #expect(throws: PushError.self) {
                 try await provider.handleNotification(payload: bytes)

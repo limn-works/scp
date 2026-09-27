@@ -328,13 +328,17 @@
             // __NSCFBoolean is a NSNumber subclass; NSNumber(boolValue: true).intValue == 1,
             // so intValue alone incorrectly accepts boolean true.
             // CFGetTypeID disambiguates: CFBooleanGetTypeID() ≠ CFNumberGetTypeID().
+            // A JSON fraction such as 1.5 is a floating-point CFNumber whose
+            // intValue truncates to 1, so CFNumberIsFloatType rejects it before
+            // intValue is read.
             guard
                 let number = contentAvailable as? NSNumber,
                 CFGetTypeID(number) == CFNumberGetTypeID(),
-                number.intValue == 1
+                !CFNumberIsFloatType(number),
+                number.int64Value == 1
             else {
                 throw PushError.opaquePayloadViolation(
-                    "\"content-available\" must be integer 1 (not boolean true or other value), got \(contentAvailable)"
+                    "\"content-available\" must be integer 1 (not boolean true, a fraction, or other value), got \(contentAvailable)"
                 )
             }
         }
