@@ -33,6 +33,7 @@ See ADR-046.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -55,6 +56,26 @@ SWIFT_RUNNER_DIR = HELPERS_DIR / "swift_bridge_runner"
 # -> python -> bindings -> repo root
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _TYPESCRIPT_DIR = _REPO_ROOT / "bindings" / "typescript"
+
+
+def _cargo_target_dir() -> Path:
+    """Return the directory cargo compiles this workspace into.
+
+    Cargo resolves it from `CARGO_TARGET_DIR`, then `build.target-dir` in any
+    `.cargo/config.toml` it reads, then `<workspace>/target`, so a machine whose
+    `~/.cargo/config.toml` points every worktree at one shared directory builds
+    the cdylib outside this checkout. `cargo metadata --no-deps` reads the
+    manifests and compiles nothing.
+    """
+    out = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+        cwd=_REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return Path(json.loads(out)["target_directory"])
+
 
 # Graceful-shutdown budget (how long we wait for a child after sending
 # a shutdown request before escalating to SIGTERM / SIGKILL).
@@ -315,10 +336,11 @@ def kotlin_runner() -> Iterator[RunnerClient]:
     # JNA needs a path to the UniFFI cdylib. On macOS, DYLD_* env vars
     # are stripped from child processes of non-entitled binaries (SIP),
     # so we also inject `-Djna.library.path` via JAVA_OPTS. The default
-    # points at the repo's `target/release` which is where
-    # `cargo build -p scp-ffi-uniffi` puts the dylib; any existing
+    # points at the `release` directory under the target directory cargo
+    # resolves (see `_cargo_target_dir`), which is where
+    # `cargo build --release -p scp-ffi-uniffi` puts the dylib; any existing
     # JAVA_OPTS in the caller's environment is preserved alongside.
-    target_dir = _REPO_ROOT / "target" / "release"
+    target_dir = _cargo_target_dir() / "release"
     jna_opt = f"-Djna.library.path={target_dir}"
     kotlin_env = _sanitized_env()
     existing_opts = kotlin_env.get("JAVA_OPTS", "")
