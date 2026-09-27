@@ -12,7 +12,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk.errors import ScpError, _coded_bridge_error
+from scp_sdk._extension import native_module
+from scp_sdk.errors import _coded_bridge_error
 
 if TYPE_CHECKING:
     pass
@@ -28,16 +29,7 @@ def _bridge() -> Any:
     take an explicit :class:`scp_sdk.SCP` and dispatch on its
     ``_native`` handle.
     """
-    try:
-        import _scp_core  # type: ignore[import-not-found]
-
-        return _scp_core
-    except ImportError as exc:
-        raise ScpError(
-            "The _scp_core extension module is not installed. "
-            "Install scp-python with: pip install scp-python",
-            code="SCP-UNKNOWN-0001",
-        ) from exc
+    return native_module()
 
 
 def parse_address(address: str) -> dict[str, Any]:

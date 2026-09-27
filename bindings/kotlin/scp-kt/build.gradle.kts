@@ -81,11 +81,12 @@ tasks.test {
     // both candidate paths so the tests run without the caller having
     // to set `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH` manually.
     //
-    // PersistenceTest and ScpClassTest skip themselves via
-    // `assumeTrue(nativeAvailable)` when the dylib is absent (browser
-    // runtime, fresh checkout without a cargo build yet). This just
-    // lets them run locally after `cargo build -p scp-ffi-uniffi` or
-    // `./scripts/generate-uniffi-kotlin.sh` (which builds the lib).
+    // The real-FFI test classes skip through `assumeTrue(nativeAvailable)`
+    // only when the generated `uniffi.scp` classes are absent. A dylib
+    // that is absent or fails to load throws `UnsatisfiedLinkError` from
+    // the first native call and fails the test, so run
+    // `cargo build -p scp-ffi-uniffi` or
+    // `./scripts/generate-uniffi-kotlin.sh` (which builds the lib) first.
     //
     // Matches CI (`.github/workflows/ci.yml`) which sets
     // `LD_LIBRARY_PATH` to `target/debug` before `./gradlew test`.

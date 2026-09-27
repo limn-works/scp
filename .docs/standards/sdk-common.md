@@ -270,6 +270,8 @@ constant).
 | `SCP-VALID-7029` | `scp-client-wasm` (browser participant) | Frame content type did not match its relay channel — §9.10.4 mis-routed frame, defense-in-depth (`ClientError::ChannelContentMismatch`) |
 | `SCP-VALID-7025` | `@limn-works/scp-ts-wasm` (browser SDK wrapper) | wasm module not initialized — `initScp()` (or `ScpBrowserClient.connect`) must be awaited before constructing/using a client |
 | `SCP-VALID-7026` | `@limn-works/scp-ts-wasm` (browser SDK wrapper) | `WebSocketRelaySocket` (the managed transport) passed to `create()` instead of `ScpBrowserClient.connect()` — it would be left unattached |
+| `SCP-VALID-7081` | Python SDK (`scp_sdk/_extension.py`) + ts-native SDK (`src/internal/native.ts`) (**shared meaning**, SDK-wrapper local guard, never minted by a bridge) | No native bridge is installed: no `_scp_core` extension file is present, or no napi addon package resolves for the platform. The only native-load failure a test skip guard may treat as absence |
+| `SCP-VALID-7082` | Python SDK (`scp_sdk/_extension.py`, `scp_sdk/scp.py`) + ts-native SDK (`src/internal/native.ts`, `src/scp.ts`) (**shared meaning**, SDK-wrapper local guard, never minted by a bridge) | A native bridge is installed and failed to load (`dlopen` error, ABI or architecture mismatch, missing shared library), or it loaded without an export the SDK calls. A test skip guard fails on it |
 
 The browser participant reuses **only** `SCP-CTX-2095` from the shared band —
 its condition is semantically identical on all five surfaces. Every other

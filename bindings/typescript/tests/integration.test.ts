@@ -56,6 +56,7 @@ import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
 import type { ConsequenceRule as ConsequenceRuleTypeAlias, OutletDefinition } from "../src/types";
 import { createMockNativeScp, mountMockScp } from "./mock-bridge";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 /**
  * Generates a raw X25519 keypair (32-byte secret + 32-byte public key) for
@@ -690,16 +691,15 @@ try {
   // those changes would miss the surface. Check before claiming the
   // bridge is usable.
   if (typeof (probe as unknown as Record<string, unknown>).relayStartInMemory !== "function") {
-    napiSkipReason = "SCP missing relayStartInMemory — rebuild with the Phase 4 changes";
-  } else {
-    napiAvailable = true;
+    throw new Error("SCP missing relayStartInMemory — rebuild with the Phase 4 changes");
   }
+  napiAvailable = true;
   // Always shut the probe down — it is disposable and never used by tests.
   // Fresh `new SCP({ storage: { type: "in_memory" } })` instances are minted per-test in the `beforeEach`
   // below, so there is no shared NAPI state between tests.
   probe.shutdown(1).catch(() => {});
 } catch (e: unknown) {
-  napiSkipReason = e instanceof Error ? e.message : String(e);
+  napiSkipReason = skipReasonIfAddonAbsent(e);
 }
 
 // Only stateful contexts — everything stateless (mock/harness) is unaffected.
@@ -2173,7 +2173,8 @@ function napiIsUsable(): boolean {
     const probe = new SCP({ storage: { type: "in_memory" } });
     probe.shutdown(1).catch(() => {});
     return true;
-  } catch {
+  } catch (e: unknown) {
+    skipReasonIfAddonAbsent(e);
     return false;
   }
 }

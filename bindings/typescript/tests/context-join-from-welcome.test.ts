@@ -43,6 +43,7 @@ import { ContextError, IdentityError } from "../src/errors";
 import { SCP } from "../src/scp";
 import type { SealedInvitation } from "../src/types";
 import { mountMockScp } from "./mock-bridge";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
 // Layer 1 — delegation / marshaling via the mock native handle
@@ -257,7 +258,7 @@ try {
   scpAvailable = true;
   probe.shutdown(1).catch(() => {});
 } catch (e: unknown) {
-  skipReason = `NAPI SCP class not available: ${e instanceof Error ? e.message : String(e)}`;
+  skipReason = skipReasonIfAddonAbsent(e);
 }
 
 if (!scpAvailable) {

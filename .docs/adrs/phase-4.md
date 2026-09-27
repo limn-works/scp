@@ -1348,7 +1348,8 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
 
 11. **napi bridge — Bun/Node-specific:**
     - The native addon is loaded via `require('@limn-works/scp-ts-napi-{platform}')`, resolved from `optionalDependencies`.
-    - If the platform-specific package is not installed, `getBridge()` throws `TransportError` with code `SCP-TRANS-5001` and an actionable message indicating the missing package.
+    - If no platform-specific package exists for the platform, or the package does not resolve, the loader throws `ValidationError` with code `SCP-VALID-7081` and an actionable message naming the missing package. This is the only load failure a caller may treat as absence.
+    - If the package resolves and requiring it fails (a `dlopen` error, an ABI or architecture mismatch, a missing shared library), or the loaded addon lacks an export the SDK calls, the SDK throws `ScpError` with code `SCP-VALID-7082`. A caller must not treat this code as absence. `.docs/standards/sdk-common.md` registers both codes, which the Python SDK raises for its `_scp_core` extension with the same meanings.
     - Async bridge functions run on a multi-threaded tokio runtime. The runtime is created once at addon load time via `OnceLock<Runtime>` and shared across all calls.
     - The tokio runtime is shut down cleanly when the Node.js process exits (via napi-rs cleanup hook).
 

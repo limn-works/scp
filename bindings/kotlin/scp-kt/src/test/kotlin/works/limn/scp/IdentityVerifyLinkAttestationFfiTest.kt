@@ -9,9 +9,10 @@
 // wrapper takes the per-instance route: an SCP-IDENT-1060 here would mean it
 // reverted to that free function.
 //
-// All tests require the compiled UniFFI cdylib; if the native library is not
-// loadable the suite skips via JUnit 5 assumptions, matching
-// TrustAggregateFfiTest.
+// All tests require the compiled UniFFI cdylib. The suite skips via JUnit 5
+// assumptions only when the generated `uniffi.scp` classes are absent; a cdylib
+// that is absent or fails to load throws `UnsatisfiedLinkError` from the first
+// native call and fails the test.
 
 package works.limn.scp
 
@@ -44,12 +45,6 @@ class IdentityVerifyLinkAttestationFfiTest {
                 nativeAvailable = true
             } catch (e: ClassNotFoundException) {
                 skipReason = "UniFFI bindings not available: ${e.message}"
-            } catch (e: UnsatisfiedLinkError) {
-                skipReason = "Native library link error: ${e.message}"
-            } catch (e: ExceptionInInitializerError) {
-                skipReason = "Native library init error: ${e.cause?.message ?: e.message}"
-            } catch (e: NoClassDefFoundError) {
-                skipReason = "Native library class not found: ${e.message}"
             }
         }
     }
