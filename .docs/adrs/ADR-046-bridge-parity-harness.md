@@ -140,7 +140,7 @@ Normalization order:
 
 ### Determinism and crypto outputs
 
-Crypto outputs (DIDs, verifying keys, signatures) are derived from
+Crypto outputs (identifiers, verifying keys, signatures) are derived from
 non-deterministic key generation across bridges. To compare byte-equality
 would require a `seed: Option<[u8; 32]>` parameter on identity creation in
 every bridge, routed to a deterministic RNG behind `#[cfg(feature =
@@ -148,9 +148,14 @@ every bridge, routed to a deterministic RNG behind `#[cfg(feature =
 
 **MVP decision**: use **shape-only comparators** (regex / ignore) for
 crypto-generated identifiers on `identity_create_deterministic` and
-`sign_message`. The DID must match `did:dht:z[1-9a-km-np-zA-HJ-NP-Z]+`,
-the verifying key must be 32-byte base64, the signature must be 64-byte
-base64 — but we do not require cross-bridge byte equality.
+`sign_message`. The identifier must be a non-empty string, the verifying
+key must be a 33-byte base64 SEC1 compressed P-256 point, the signature
+must be 64-byte base64 — but we do not require cross-bridge byte equality.
+**Amended 2026-09-10:** the comparator pinned a textual identifier
+pattern and a 32-byte key. `03-identity.md` §3.1 fixes the identifier's text form, which no shape
+assertion pins, and ADR-063, inception-derived self-certifying identity
+over a key-event log, sets the key width under its §The curve and the
+root's custody.
 
 This trades off a class of findings (bit-exact crypto divergence) for
 shipping the harness now. When a bridge-wide `seed` parameter lands, flip
@@ -168,8 +173,8 @@ MVP ships exactly five operations:
 
 | ID  | Op                           | What it exercises                        |
 |-----|------------------------------|------------------------------------------|
-| 1   | `identity_create_deterministic` | Identity creation, DID shape, key shape |
-| 2   | `context_create`             | Context ID shape, creator DID routing    |
+| 1   | `identity_create_deterministic` | Identity creation, identifier shape, key shape |
+| 2   | `context_create`             | Context ID shape, creator routing        |
 | 3   | `invalid_capability_rejected` | Error path parity (error code equality)  |
 | 4   | `event_log_append`           | Event sequence, payload, Merkle root     |
 | 5   | `sign_message`               | SCPID sign — signature shape, algorithm  |

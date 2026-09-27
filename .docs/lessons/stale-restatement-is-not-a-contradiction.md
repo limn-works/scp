@@ -26,7 +26,7 @@ platform, and whether it does is a question about which artifact governs.
 ## What governs
 
 §3.2.1 of the identity spec, the key custody migration protocol, governs both passages. It
-moves the operational signing capability between custody providers without changing the DID,
+moves the operational signing capability between custody providers without changing the identifier,
 names `#active` as the key that case 1 migrates, and enumerates the targets:
 `target_custody_type: enum { SecureEnclave, AndroidKeystore, HardwareKey, Passkey, Software }`
 (`.docs/specs/03-identity.md`). `#active` custody therefore varies per identity and over its

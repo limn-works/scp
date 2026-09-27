@@ -7,6 +7,15 @@
 
 ---
 
+> **Annotation, 2026-09-13.** Everything below is the record as its author wrote it on the
+> date this file carries, restored unedited. The identity model it reads — the DID document and its verification methods, Ed25519 and the identifier written as a `did:` string — was
+> replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity substrate,
+> whose rules `.docs/specs/09-security-model.md` §9.7.4.2 and `.docs/specs/03-identity.md`
+> §3.10 carry, and whose curve Alec settled on 2026-09-10 as ECDSA on NIST P-256
+> (`.docs/specs/09-security-model.md` §9.5). A record of what a named party read on a named
+> date states what that party read, so this annotation records what replaced the model and
+> no sentence below is edited to match.
+
 ## Executive Summary
 
 Spec 12 (Platform Bridge Connectors) is by far the most substantial of these four files and is the only one with meaningful protocol-level content requiring detailed implementation. It is partially well-specified (the cooperative mode HTTP binding in 12.10-12.11 is thorough) but has significant gaps in the bridge registration protocol, shadow identity lifecycle, security model for bridge operators, and integration with the rest of the protocol machinery. Specs 13, 14, and 15 are intentionally high-level vision documents rather than normative protocol specifications, but even at that level they omit details that will become blocking ambiguities when someone tries to implement against them.

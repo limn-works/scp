@@ -6,6 +6,15 @@
 
 ---
 
+> **Annotation, 2026-09-11.** Everything below is the record as it was written on the date
+> above, restored unedited. The identity model it names — did:dht, the DID document and its
+> verification methods, the shared `#agent` key, the identifier as a `did:` string — was
+> replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity substrate,
+> whose rules `.docs/specs/09-security-model.md` §9.7.4.2 and `.docs/specs/03-identity.md`
+> carry. A record of what a named party read on a named date states what that party read, so
+> this annotation records what replaced it and the text below is not edited to match.
+
+
 ## How This Session Started
 
 The opening question was: **how would SCP integrate data and context from existing services like X and Facebook, without needing their cooperation?**

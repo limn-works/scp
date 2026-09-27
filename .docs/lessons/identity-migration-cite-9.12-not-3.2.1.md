@@ -1,14 +1,13 @@
-# `identity_migrate` Cites §9.12 and ADR-003 §4b, Not §3.2.1
+# Two Migration Operations Cite Two Cases of the Key Custody Migration Protocol
 
-Two SDK operations share the verb "migrate" and do different things:
+Two SDK operations share the verb "migrate" and change different keys:
 
 | Operation | What it does | Cites |
 |---|---|---|
-| `identity_migrate` / `identityMigrate` | Creates a new DID by revealing the pre-rotation key and returns a `DidRotationEvent` | §9.12 of `09-security-model.md`, Compromise Recovery Protocol, and ADR-003 §4b |
-| `identity_execute_custody_migration` / `identityExecuteCustodyMigration` | Moves custody to another key-storage substrate and keeps the DID | §3.2.1 of `03-identity.md`, Key Custody Migration Protocol |
+| `identity_migrate` / `identityMigrate` | Changes the root set by revealing a standing pre-rotation key, and returns the key event | §3.2.1 of `03-identity.md`, Key Custody Migration Protocol, case 2; §9.7.4.2 of `09-security-model.md`, Root-Authority Recovery and Fork Precedence |
+| `identity_execute_custody_migration` / `identityExecuteCustodyMigration` | Moves the Active Signing Key to another key-storage substrate | §3.2.1 of `03-identity.md`, Key Custody Migration Protocol, case 1 |
 
-Citing §3.2.1 for the new-DID operation sends a reader to the DID-preserving swap and past the
-pre-rotation reveal. Decide a citation by asking whether the DID changes, not by the name, and
-keep the citation identical in every binding's doc comment. §9.7.4.1 of
-`09-security-model.md`, Pre-Rotation Key Custody, holds the custody requirements the reveal
-depends on.
+Citing the operational-key case for the root-change operation sends a reader past the
+pre-rotation reveal. Decide a citation by asking which key the operation changes, not by the
+name: the identifier changes in neither case (`09-security-model.md` §9.7.4.2 R2). Keep the
+citation identical in every binding's doc comment.

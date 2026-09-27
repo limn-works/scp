@@ -1,5 +1,7 @@
 # A Hash-Then-Reveal Commitment Needs Its Preimage From Commit Time Through Reveal Time
 
+> **Dating note (2026-09-02):** this lesson describes `migrate_identity` and the pre-rotation model as Pre-Rotation Key Custody, §9.7.4.1 of `09-security-model.md`, read before the key-event-log recovery amendment. Root-Authority Recovery and Fork Precedence, §9.7.4.2 of that spec, states the amended model. The lesson's principle stands; its spec citations are historical.
+
 ## Rule
 
 When a scheme publishes a commitment (a hash) at time T and requires the preimage at time
@@ -10,7 +12,7 @@ impossible.
 
 | Commitment | Preimage | Spec | Lifetime |
 |---|---|---|---|
-| `pre_rotation_commitment` | pre-rotation public key | §9.7.4.1, ADR-003 §4b | identity creation → next migration (possibly years) |
+| `pre_rotation_commitment` | pre-rotation public key | §9.7.4.1, §9.7.4.2 R1 | inception → the next reveal-authorized event (possibly years) |
 | KeyPackage | KeyPackage init key | RFC 9420 | publish → consumption |
 | sender key commitment | sender key | §9.16.2 | distribution → destruction |
 
@@ -33,8 +35,8 @@ migration generated a fresh key whose hash could not match. Three fixes were wei
    Rejected: an attacker who compromises operational custody also gets the recovery
    backstop, which §9.7.4.1 item 3 storage isolation forbids.
 3. **A separate `PreRotationCustody` trait with its own `PreRotationKeyHandle`.** Landed.
-   `ScpIdentity` carries only `pre_rotation_commitment`; `DidDht::create_identity` returns
-   `(ScpIdentity, DidDocument, PreRotationKeyHandle)`; `migrate_identity` takes the handle
+   `ScpIdentity` carries only `pre_rotation_commitment`; `create` returns
+   `(ScpIdentity, KeyEvent, PreRotationKeyHandle)`; `migrate_identity` takes the handle
    and a `&impl PreRotationCustody`. The only implementation, `InMemoryPreRotationCustody`,
    compiles under the `testing` feature alone, so a shipped build has no backend and
    `create_inner` in `crates/scp-identity/src/config.rs` fails closed with

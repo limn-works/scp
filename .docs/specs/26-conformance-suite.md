@@ -27,27 +27,27 @@ Each test specifies:
 
 ## 26.3 Identity Tests (§3, §4)
 
-### CONF-001: DID Creation with Required Verification Methods
+### CONF-001: Identity Inception under the Key-Event Log
 
 | Field | Value |
 |-------|-------|
 | **Layer** | Identity |
 | **Tier** | Core |
-| **Spec Sections** | §3.1, §3.2, ADR-039 |
+| **Spec Sections** | §3.1, §3.2, `09-security-model.md` §9.7.4.2 R2, R13, definitions |
 | **Preconditions** | None. |
-| **Steps** | 1. Generate Ed25519 keypair. 2. Create did:dht DID. 3. Build DID document with verification methods `#0` (root), `#active` (signing), `#agent` (agent signing). |
-| **Expected Outcome** | DID document contains exactly 3 verification methods with IDs `#0`, `#active`, `#agent`. All are Ed25519VerificationKey2020. The DID string is the z-base-32 encoding of the `#0` public key. |
+| **Steps** | 1. Generate the root set's P-256 keypairs and the pre-rotation keypairs. 2. Compose the inception event under the preimage field order `09-security-model.md` §9.7.4.2's definitions fix, carrying the root set and its threshold, the first commitment list and next threshold, and the initial key state. 3. Sign it with a root signature verifying against the set it installs. 4. Compute the identifier as `SHA-256("SCP-KEL-ID-V1:" \|\| inception_signed_preimage)`. 5. Publish the key-event record frame at `SHA-256("scp:did:" \|\| identifier_bytes)`. |
+| **Expected Outcome** | The identifier recomputes from the served inception event under R2. The derived key state names one operational role `#active` and names no agent key. The identity resolves the moment its inception event is published, with no witness cosignature. |
 
-### CONF-002: DID Resolution and Self-Certification
+### CONF-002: Key-State Resolution and Self-Certification
 
 | Field | Value |
 |-------|-------|
 | **Layer** | Identity |
 | **Tier** | Core |
-| **Spec Sections** | §3.1, §9.6.1 |
-| **Preconditions** | DID published to Mainline DHT (or test DHT). |
-| **Steps** | 1. Resolve DID via DHT lookup. 2. Verify BEP44 signature against the public key encoded in the DID string. 3. Parse DID document. |
-| **Expected Outcome** | BEP44 signature verification succeeds. DID document matches what was published. The public key embedded in the DID string matches `#0`. |
+| **Spec Sections** | §3.1, §9.6.1, `03-identity.md` §3.10.4, `09-security-model.md` §9.7.4.2 R2, R8, R11 |
+| **Preconditions** | A key-event log published to two community relays under distinct operator keys. The resolver holds no baseline. |
+| **Steps** | 1. Query both relays at the identifier's routing id with `proof_nonce` set. 2. Decode each frame and verify every event. 3. Recompute the identifier under R2. 4. Apply the relay proof's five checks. 5. Derive the key state under R8. |
+| **Expected Outcome** | The recomputed identifier equals the one queried, so the binding verifies from the served bytes alone. Both relay proofs verify, R11's floor is met, and the resolver returns the derived key state rather than `Inconclusive{SingleSource}`. |
 
 ### CONF-003: Key Rotation (Active Key Update)
 
@@ -55,32 +55,32 @@ Each test specifies:
 |-------|-------|
 | **Layer** | Identity |
 | **Tier** | Core |
-| **Spec Sections** | §3.3, §9.11 |
-| **Preconditions** | DID with established `#active` key. Existing messages signed with old key. |
-| **Steps** | 1. Generate new Ed25519 keypair for `#active`. 2. Update DID document with new `#active` key. 3. Publish updated document with incremented sequence number. 4. Resolve DID again. 5. Verify old `#active` key is no longer in document. 6. Verify key continuity fingerprint changed. |
-| **Expected Outcome** | New DID document has new `#active` key. Old `#active` key is absent. Key continuity fingerprint (§9.11) reflects the change. Messages signed with old key still verify against the old key (retained by recipients). |
+| **Spec Sections** | `03-identity.md` §3.2.1 case 1, §9.11, `09-security-model.md` §9.7.4.2 R3, R8 |
+| **Preconditions** | An identity with an established `#active` key. Existing messages signed with the old key. |
+| **Steps** | 1. Generate a new P-256 `#active` keypair. 2. Compose a `KeyState` carrying the new key `Current` in the `#active` role and the old key's `Superseded` drop entry. 3. Sign it with the standing root, publish the chain, and resolve the identity again. 4. Verify the old key reads `Superseded` and the fingerprint changed. |
+| **Expected Outcome** | The derived key state lists the new key `Current`, and a replay reads the old key `Superseded` from that event's drop entry: a condition retires a key, not an absence. The key continuity fingerprint (§9.11) reflects the change. Messages signed with the old key still verify, because a content signature verifies against a retired key (§9.7.1). |
 
-### CONF-004: Agent Binding (Human DID Attests Agent DID)
-
-| Field | Value |
-|-------|-------|
-| **Layer** | Identity |
-| **Tier** | Core |
-| **Spec Sections** | §4.2, ADR-039 |
-| **Preconditions** | Human DID and agent DID both created. |
-| **Steps** | 1. Create identity attestation binding agent DID to human DID. 2. Sign attestation with human's `#active` key. 3. Verify attestation signature. 4. Verify agent DID's `#agent` key matches the key in the attestation. |
-| **Expected Outcome** | Attestation is valid. Agent DID traces to human DID through the attestation chain. |
-
-### CONF-005: Multi-Device (Same DID, Different Device Keys)
+### CONF-004: A Chain Claiming Delegation Is Rejected
 
 | Field | Value |
 |-------|-------|
 | **Layer** | Identity |
 | **Tier** | Core |
-| **Spec Sections** | §3.4 |
-| **Preconditions** | DID exists on device A. |
-| **Steps** | 1. On device B, derive device-specific signing material from the same DID. 2. Both devices sign messages. 3. Both signatures verify against the DID document. |
-| **Expected Outcome** | Both devices can sign messages that verify against the same DID. The DID document is the single source of truth. |
+| **Spec Sections** | `09-security-model.md` §9.1 invariants 1 and 4, §9.7.4.2 R3, `00-open-questions.md` |
+| **Preconditions** | A human identity and a second identity whose inception event names the human as its delegator. |
+| **Steps** | 1. Publish both chains. 2. Resolve the second identity. |
+| **Expected Outcome** | R3 rejects every chain whose delegator field is nonzero, so the second identity does not resolve and signs no autonomous action. This test asserts the fail-closed rejection that stands until the delegation model lands (`00-open-questions.md`). |
+
+### CONF-005: Multi-Device (One Identity, Different Device Leaf Keys)
+
+| Field | Value |
+|-------|-------|
+| **Layer** | Identity |
+| **Tier** | Core |
+| **Spec Sections** | `10-infrastructure-and-self-hosting.md` §10.8.1, `09-security-model.md` §9.7.1 |
+| **Preconditions** | An identity established on device A. |
+| **Steps** | 1. On device B, generate an ephemeral context-scoped MLS leaf key for the same identity. 2. Sign a KeyPackage attestation over each device's leaf key with the identity's `#active` key. 3. Verify both attestations. |
+| **Expected Outcome** | Both attestations verify against the key the identity's key state lists `Current` in the `#active` role, so both devices act for one identity. An attestation and never a document binds a leaf key to an identity. |
 
 ## 26.4 Context Tests (§5, §6)
 
@@ -91,7 +91,7 @@ Each test specifies:
 | **Layer** | Context |
 | **Tier** | Core |
 | **Spec Sections** | §5.1, §9.7 |
-| **Preconditions** | Creator has a DID. Relay is available. |
+| **Preconditions** | Creator has an identity. Relay is available. |
 | **Steps** | 1. Create context with parameters (name, mode: encrypted, ceiling, governance model). 2. Initialize MLS group with creator as sole member. 3. Publish context metadata to relay. |
 | **Expected Outcome** | Context ID is derived from initial parameters. MLS group is established. Context metadata is retrievable from relay. Creator holds the only MLS leaf node. |
 
@@ -102,7 +102,7 @@ Each test specifies:
 | **Layer** | Context |
 | **Tier** | Core |
 | **Spec Sections** | §5.3, §9.7 |
-| **Preconditions** | Context exists with at least one member. Invitee has a DID. |
+| **Preconditions** | Context exists with at least one member. Invitee has an identity. |
 | **Steps** | 1. Existing member generates invitation (MLS KeyPackage fetch + Add proposal). 2. Invitee receives Welcome message. 3. Invitee processes Welcome and joins MLS group. 4. Invitee can decrypt messages sent after joining. |
 | **Expected Outcome** | Invitee is a member of the MLS group. Invitee can decrypt new messages. Invitee cannot decrypt messages sent before joining (forward secrecy). |
 
@@ -123,7 +123,7 @@ Each test specifies:
 |-------|-------|
 | **Layer** | Context |
 | **Tier** | Core |
-| **Spec Sections** | §6.4 |
+| **Spec Sections** | §6.4 [no such section] |
 | **Preconditions** | Context with 3 members. Governance model: majority vote. |
 | **Steps** | 1. Member A proposes role change for Member C. 2. Proposal ID is computed per §9.5.2 (domain: `"SCP-PROPOSAL-V1:"`). 3. Member A votes approve (signed per `"SCP-VOTE-V1:"`). 4. Member B votes approve. 5. Quorum reached (2/3). 6. Role change is applied. |
 | **Expected Outcome** | Proposal passes with 2/3 votes. Member C's role is updated. Governance event recorded in event log. All vote signatures are verifiable. |
@@ -134,7 +134,7 @@ Each test specifies:
 |-------|-------|
 | **Layer** | Context |
 | **Tier** | Core |
-| **Spec Sections** | §6.4 |
+| **Spec Sections** | §6.4 [no such section] |
 | **Preconditions** | Context with 5 members. Governance model: 3-of-5 threshold. |
 | **Steps** | 1. Propose parameter change. 2. Two members vote approve (below threshold). 3. Third member votes approve (meets threshold). 4. Verify proposal passes. 5. Verify a fourth vote does not double-apply. |
 | **Expected Outcome** | Proposal passes exactly when the 3rd approval is received. Parameter change is applied once. |
@@ -145,7 +145,7 @@ Each test specifies:
 |-------|-------|
 | **Layer** | Context |
 | **Tier** | Core |
-| **Spec Sections** | §5.6, §6.4 |
+| **Spec Sections** | §5.6, §6.4 [no such section] |
 | **Preconditions** | Context with mutable parameters. |
 | **Steps** | 1. Propose changing a context parameter (e.g., name). 2. Vote and pass the proposal. 3. Verify context metadata reflects the change. 4. Verify the change is recorded in the event log. |
 | **Expected Outcome** | Context metadata is updated. Event log contains the parameter change event. All members see the updated metadata. |
@@ -193,7 +193,7 @@ Each test specifies:
 | **Tier** | Core |
 | **Spec Sections** | §9.5.2, §9.8, §9.10 |
 | **Preconditions** | Recipient is member of context. Has sender's sender key. |
-| **Steps** | 1. Receive OuterEnvelope from relay. 2. Strip padding, recover original ciphertext. 3. Decrypt with sender key. 4. Verify InnerEnvelope signature against sender's DID document. 5. Verify epoch, sequence, timestamp. |
+| **Steps** | 1. Receive OuterEnvelope from relay. 2. Strip padding, recover original ciphertext. 3. Decrypt with sender key. 4. Verify the InnerEnvelope signature against the key the sender's key state names in the signing role (`03-identity.md` §3.10.4). 5. Verify epoch, sequence, timestamp. |
 | **Expected Outcome** | Decryption succeeds. Signature verification succeeds. Plaintext matches original. |
 
 ### CONF-016: Padding Roundtrip
@@ -284,8 +284,8 @@ Each test specifies:
 | **Layer** | Trust |
 | **Tier** | Core |
 | **Spec Sections** | §7, §9.5 |
-| **Preconditions** | Issuer has Ed25519 keypair. |
-| **Steps** | 1. Construct UCAN token with: issuer, audience, capabilities, nonce, expiry. 2. Sign with Ed25519. 3. Verify signature. 4. Verify nonce freshness (within 5 min tolerance, §9.18.7). 5. Verify expiry < 24h (§9.18.7). |
+| **Preconditions** | Issuer has P-256 keypair. |
+| **Steps** | 1. Construct UCAN token with: issuer, audience, capabilities, nonce, expiry. 2. Sign with ES256 — ECDSA on P-256 with SHA-256. 3. Verify signature. 4. Verify nonce freshness (within 5 min tolerance, §9.18.7). 5. Verify expiry < 24h (§9.18.7). |
 | **Expected Outcome** | Token verifies. Nonce and expiry constraints pass. |
 
 ### CONF-024: UCAN Delegation Chain (A -> B -> C)
@@ -295,7 +295,7 @@ Each test specifies:
 | **Layer** | Trust |
 | **Tier** | Full |
 | **Spec Sections** | §7 |
-| **Preconditions** | Three DIDs: A (root), B (delegate), C (sub-delegate). |
+| **Preconditions** | Three identities: A (root), B (delegate), C (sub-delegate). |
 | **Steps** | 1. A issues UCAN to B with capability X. 2. B issues UCAN to C with capability X (or subset). 3. C presents token. 4. Verifier validates full chain: C's token → B's token → A's authority. |
 | **Expected Outcome** | Chain validates. Each link's signature verifies. Capability attenuation is correct. |
 
@@ -317,7 +317,7 @@ Each test specifies:
 | **Layer** | Trust |
 | **Tier** | Full |
 | **Spec Sections** | §7 |
-| **Preconditions** | DID A has capabilities [read, write, admin]. |
+| **Preconditions** | Identity A has capabilities [read, write, admin]. |
 | **Steps** | 1. A delegates [read, write] to B (subset). 2. B attempts to delegate [read, write, admin] to C (superset — should fail). 3. B delegates [read] to C (further attenuation — should succeed). |
 | **Expected Outcome** | Step 2 fails — cannot delegate capabilities not held. Step 3 succeeds — attenuation is valid. |
 
@@ -366,8 +366,8 @@ Each test specifies:
 | **Tier** | Full |
 | **Spec Sections** | §22.3.1, §22.11 |
 | **Preconditions** | Context exists with handle support. |
-| **Steps** | 1. Register handle `alice` pointing to DID via `handle_register`. 2. Look up `alice` via `handle_lookup`. 3. Verify result contains the correct DID and metadata. 4. Attempt to register `alice` again from different DID — expect conflict. |
-| **Expected Outcome** | Registration succeeds. Lookup returns correct DID. Duplicate registration returns `conflict`. |
+| **Steps** | 1. Register handle `alice` pointing to an identifier via `handle_register`. 2. Look up `alice` via `handle_lookup`. 3. Verify the result carries that identifier and its metadata. 4. Register `alice` again from a second identifier — expect conflict. |
+| **Expected Outcome** | Registration succeeds. Lookup returns the registered identifier. Duplicate registration returns `conflict`. |
 
 ### CONF-031: Agent Capability Registration and Search
 
@@ -375,7 +375,7 @@ Each test specifies:
 |-------|-------|
 | **Layer** | Discovery |
 | **Tier** | Full |
-| **Spec Sections** | §6.2.2B, §22.11 |
+| **Spec Sections** | §6.2.2B [no such section], §22.11 |
 | **Preconditions** | Context exists. |
 | **Steps** | 1. Register agent with capabilities `["scp:capability:translate/v1"]` via `agent_register`. 2. Search with `capability_filter: ["scp:capability:translate/v1"]` via `agent_search`. 3. Verify result includes the registered agent. 4. Deregister via `agent_deregister`. 5. Search again — agent absent. |
 | **Expected Outcome** | Registration and search work. Deregistration removes agent from search results. |
@@ -481,7 +481,7 @@ Each test specifies:
 | **Layer** | Interop |
 | **Tier** | Core |
 | **Spec Sections** | §5.3, §9.7 |
-| **Preconditions** | Implementation A created context. Implementation B has a DID. |
+| **Preconditions** | Implementation A created context. Implementation B has an identity. |
 | **Steps** | 1. A generates MLS Welcome for B. 2. B processes Welcome (MLS KeyPackage, group info). 3. B joins MLS group. 4. B sends a message. 5. A decrypts B's message. |
 | **Expected Outcome** | Cross-implementation MLS interop works. Welcome processing succeeds. Group state converges. |
 
@@ -491,7 +491,7 @@ Each test specifies:
 |-------|-------|
 | **Layer** | Interop |
 | **Tier** | Full |
-| **Spec Sections** | §6.4 |
+| **Spec Sections** | §6.4 [no such section] |
 | **Preconditions** | Context with member A (Implementation 1) and member B (Implementation 2). |
 | **Steps** | 1. A proposes governance action. 2. B votes approve (signed per `"SCP-VOTE-V1:"`). 3. A verifies B's vote signature. 4. Proposal passes. |
 | **Expected Outcome** | Vote signature produced by Implementation 2 is verifiable by Implementation 1. Canonical hash construction is interoperable. |

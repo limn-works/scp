@@ -2,6 +2,15 @@
 
 # SCP Specification Gap Audit: Specs 01-03
 
+> **Annotation, 2026-09-11.** This file is the record as its author wrote it on the date it
+> carries, restored unedited. The identity model it reads — did:dht, the DID document and its
+> verification methods, the shared `#agent` key, the identifier as a `did:` string — was
+> replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity substrate,
+> whose rules `.docs/specs/09-security-model.md` §9.7.4.2 and `.docs/specs/03-identity.md`
+> carry. A record of what a named party read on a named date states what that party read, so
+> this annotation records what replaced the model and no sentence below is edited to match.
+
+
 ## Executive Summary
 
 Specs 01 (Thesis), 02 (System Design), and 03 (Identity) serve as the conceptual foundation for SCP. Spec 01 is pure strategy and positioning -- light on protocol-level claims and therefore has few specification gaps, though it makes several claims that downstream specs must substantiate. Spec 02 provides architectural framing through diagrams and narrative but deliberately defers detail, so its gaps are mostly about ensuring cross-reference consistency. Spec 03 (Identity) is where the real problems are. It introduces multiple security-critical subsystems -- key custody, recovery, attestations, identity private state, dual-layer resolution, block/mute -- and leaves several of them either underspecified or specified only at the narrative level without enough detail for a conformant implementation.

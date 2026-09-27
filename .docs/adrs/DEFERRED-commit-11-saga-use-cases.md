@@ -1,6 +1,6 @@
 # DEFERRED — ADR-049 commit 11.5: saga use-case wiring
 
-**Status:** RESOLVED (commit 11.5). Three of the four saga use cases were originally specced (§5.15.8, §6.2.4, §5.14.13); the fourth (Gap 4, migration custody handover) is RESOLVED-AS-WITHDRAWN — the operation does not exist. See "## Resolution (commit 11.5)" below. **Correction (2026-06-18):** of the three originally specced, §5.15.8 standing-pair creation was subsequently reclassified as **single-context async creation — not a saga** (a 2-member MLS group is one context; replica sync is MLS + the event-log consistency layer, not a saga journal). **Correction (2026-06-25):** Gap 3 broadcast hosting handshake is now **RESOLVED-AS-WITHDRAWN** — it is a category error (not a saga: no harmful partial commit; and a phantom topology assuming content flows through an intermediate context, forbidden by §5.11A.6). Its §5.14.13 spec section, `broadcast/hosting_handshake.rs`, the `SagaInput::BroadcastHostingHandshake` variant, and `SCP-SAGA-13100..13102` are deleted. The **sole live saga** is now cross-context outlet invocation (§6.2.4). See spec §5.15.8 and ADR-049 §3/§3a/§3b.
+**Status:** RESOLVED (commit 11.5). Three of the four saga use cases were originally specced (§5.15.8, §6.2.4, §5.14.13 [no such section]); the fourth (Gap 4, migration custody handover) is RESOLVED-AS-WITHDRAWN — the operation does not exist. See "## Resolution (commit 11.5)" below. **Correction (2026-06-18):** of the three originally specced, §5.15.8 standing-pair creation was subsequently reclassified as **single-context async creation — not a saga** (a 2-member MLS group is one context; replica sync is MLS + the event-log consistency layer, not a saga journal). **Correction (2026-06-25):** Gap 3 broadcast hosting handshake is now **RESOLVED-AS-WITHDRAWN** — it is a category error (not a saga: no harmful partial commit; and a phantom topology assuming content flows through an intermediate context, forbidden by §5.11A.6). Its §5.14.13 [no such section] spec section, `broadcast/hosting_handshake.rs`, the `SagaInput::BroadcastHostingHandshake` variant, and `SCP-SAGA-13100..13102` are deleted. The **sole live saga** is now cross-context outlet invocation (§6.2.4). See spec §5.15.8 and ADR-049 §3/§3a/§3b.
 
 **Context.** ADR-049 commit 11 migrates the non-saga standing-pair, outlet,
 and broadcast handlers to the actor shape. The 4 cross-context saga
@@ -115,7 +115,7 @@ context but not the cross-context forwarding path:
 
 **What needs specification.**
 - A new envelope type (e.g. `CrossContextOutletInvoke`) with fields:
-  caller context ID, caller DID, target outlet registration ID, input
+  caller context ID, caller identifier, target outlet registration ID, input
   JSON, optional UCAN proof reference.
 - The transport leg: does the caller serialize and send via
   `send_message` to the target context, or does a dedicated
@@ -135,14 +135,14 @@ supervisor-side (FFI bridges invoke it inline).
 
 ## Gap 3 — Broadcast hosting handshake protocol
 
-> **RESOLVED-AS-WITHDRAWN (2026-06-25) — see "Resolution (commit 11.5)" below. Broadcast hosting handshake is a category error, not a saga: there is no harmful partial commit (the host's forwarding registry is benign on loss; B's accepted-host snapshot is a unilateral B-side write satisfiable by sequencing), and it assumes a PHANTOM TOPOLOGY in which content flows through an intermediate host context to that host's members — forbidden by §5.11A.6 (decrypt-then-re-encrypt violates context-isolation and encryption-as-access-control). Broadcast scale-out is a transport/CDN concern (relays re-serving the already-public `BroadcastEnvelope`). The §5.14.13 spec section, `broadcast/hosting_handshake.rs`, `SagaInput::BroadcastHostingHandshake`, and `SCP-SAGA-13100..13102` are deleted in this PR; see ADR-049 §3b. The present-tense text below is the original problem statement, retained for historical provenance only.**
+> **RESOLVED-AS-WITHDRAWN (2026-06-25) — see "Resolution (commit 11.5)" below. Broadcast hosting handshake is a category error, not a saga: there is no harmful partial commit (the host's forwarding registry is benign on loss; B's accepted-host snapshot is a unilateral B-side write satisfiable by sequencing), and it assumes a PHANTOM TOPOLOGY in which content flows through an intermediate host context to that host's members — forbidden by §5.11A.6 (decrypt-then-re-encrypt violates context-isolation and encryption-as-access-control). Broadcast scale-out is a transport/CDN concern (relays re-serving the already-public `BroadcastEnvelope`). The §5.14.13 [no such section] spec section, `broadcast/hosting_handshake.rs`, `SagaInput::BroadcastHostingHandshake`, and `SCP-SAGA-13100..13102` are deleted in this PR; see ADR-049 §3b. The present-tense text below is the original problem statement, retained for historical provenance only.**
 
 **What's missing.** Spec §5.14.2 describes broadcast contexts but does
 not fully specify the "hosting handshake" — the flow where a
 subscriber requests that a host context relay broadcasts from a
 broadcast context:
-- Subscriber → host key-exchange frames (is it ECIES on host's
-  X25519 key, or an MLS handshake).
+- Subscriber → host key-exchange frames (HPKE to the host's key,
+  or an MLS handshake).
 - Host config negotiation (rate limits, max subscribers, forwarding
   policy).
 - The §5.14.2 step-4 transport: how the host signals its willingness
@@ -198,7 +198,7 @@ dispatch remains.
 
 ## Gap 5 — FFI SagaId wire format (block-until-terminal vs async)
 
-> **Superseded — see "Resolution (commit 11.5)" below: RESOLVED by ADR-049 §3a. The wait model is **block-until-terminal** for the sole live saga — §6.2.4 cross-context outlet invocation (supervisor-minted `SagaId`; **no** async/poll `saga_state` query — that option was contemplated only for the now-withdrawn Gap-4 custody handover). (Corrected 2026-06-18: standing-pair creation, §5.15.8, is **not** a saga — single-context async creation reached via the `standing_context` get-or-create path. Corrected 2026-06-25: broadcast hosting handshake, formerly §5.14.13, is **WITHDRAWN** as a category error — so the saga count is **one**.) The present-tense text below — including the "likely async" and `saga_state(id)` poll option — is the original problem statement, retained for historical provenance only.**
+> **Superseded — see "Resolution (commit 11.5)" below: RESOLVED by ADR-049 §3a. The wait model is **block-until-terminal** for the sole live saga — §6.2.4 cross-context outlet invocation (supervisor-minted `SagaId`; **no** async/poll `saga_state` query — that option was contemplated only for the now-withdrawn Gap-4 custody handover). (Corrected 2026-06-18: standing-pair creation, §5.15.8, is **not** a saga — single-context async creation reached via the `standing_context` get-or-create path. Corrected 2026-06-25: broadcast hosting handshake, formerly §5.14.13 [no such section], is **WITHDRAWN** as a category error — so the saga count is **one**.) The present-tense text below — including the "likely async" and `saga_state(id)` poll option — is the original problem statement, retained for historical provenance only.**
 
 **What's missing.** FFI bridges currently have no `SagaId` exports.
 The saga surface requires a decision on the caller's wait model:
@@ -288,7 +288,7 @@ async/poll wait model having been withdrawn with Gap 4 per ADR-049 §3a.)
 
 - ADR-049 — actor-per-context architecture
 - Spec §5.12.6 (the contact graph; §5.12.4 is actually *Context Creation as a Runtime Operation*, not the contact graph)
-- Spec §5.14.2 (broadcast contexts) — the §5.14.13 broadcast-hosting-handshake-saga section was **WITHDRAWN** (2026-06-25) and deleted; see ADR-049 §3b
+- Spec §5.14.2 (broadcast contexts) — the §5.14.13 [no such section] broadcast-hosting-handshake-saga section was **WITHDRAWN** (2026-06-25) and deleted; see ADR-049 §3b
 - Spec §5.12.6 (contact graph) and §5.15.8 (standing-pair creation — single-context async, not a saga)
 - Spec §6.2 (Context-to-Context Outlet Interfaces / single-context outlet invocation) and §6.2.4 (cross-context outlet invocation saga)
 - Spec §9.4.3 (saga journal secret handling)
@@ -343,14 +343,14 @@ downstream PR):
   is a transport/CDN concern: relays/CDNs re-serve the already-public
   encrypted `BroadcastEnvelope` (§5.14.5), granting no new access; only an
   entity that independently joins B as a §5.14.3 subscriber can read B's
-  content. The §5.14.13 spec section, `broadcast/hosting_handshake.rs`,
+  content. The §5.14.13 [no such section] spec section, `broadcast/hosting_handshake.rs`,
   `SagaInput::BroadcastHostingHandshake`, and `SCP-SAGA-13100..13102` are
   **deleted** — this gap is NOT specced. See ADR-049 §3/§3a/§3b.
 
 - **Gap 4 — Migration CustodyHandover envelope → RESOLVED-AS-WITHDRAWN.**
   The operation **does not exist.** Cross-identity custody handover
   (transferring a context's `mls_group_state` + `sender_key_material`
-  to a *different* DID) fails on three independent grounds: (1) no use
+  to a *different* identity) fails on three independent grounds: (1) no use
   case survives — every cross-identity custody scenario is an MLS
   Update, remove-and-re-add, Welcome (join), or the §7.3.2.1's
   "Seed custody and admin rotation" paragraph (HPKE seed re-wrap),

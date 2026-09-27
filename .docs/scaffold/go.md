@@ -60,7 +60,7 @@ Rust → cbindgen → C header → cgo → Go
 /// Returns an opaque handle. Caller must free with scp_identity_free().
 #[no_mangle]
 pub extern "C" fn scp_identity_create(
-    custody: *const c_char,
+    config: *const ScpIdentityConfig,
     out_handle: *mut *mut ScpIdentity,
     out_error: *mut *mut ScpError,
 ) -> i32 {
@@ -71,12 +71,11 @@ pub extern "C" fn scp_identity_create(
 #[no_mangle]
 pub extern "C" fn scp_identity_free(handle: *mut ScpIdentity) { }
 
-/// Get the DID string from an identity.
-/// Caller must free the returned string with scp_string_free().
+/// Copy an identity's 32-byte identifier into the caller's buffer.
 #[no_mangle]
-pub extern "C" fn scp_identity_did(
+pub extern "C" fn scp_identity_identifier(
     handle: *const ScpIdentity,
-    out_did: *mut *mut c_char,
+    out_identifier: *mut u8,
 ) -> i32 { }
 
 /// Free a string allocated by the FFI layer.
@@ -160,14 +159,18 @@ func Shutdown() {
     C.scp_runtime_shutdown()
 }
 
-func IdentityCreate(custody string) (*IdentityHandle, error) {
-    cCustody := C.CString(custody)
-    defer C.free(unsafe.Pointer(cCustody))
+// IdentityConfig is the three-slot config object
+// `.docs/standards/construction.md` states. Its Custody slot carries the
+// bridge's KeyCustodyConfig and carries no default, because that slot decides
+// where an identity's private key lives.
+func IdentityCreate(config IdentityConfig) (*IdentityHandle, error) {
+    cConfig := config.toC()
+    defer cConfig.free()
 
     var handle *C.ScpIdentity
     var errPtr *C.ScpError
 
-    rc := C.scp_identity_create(cCustody, &handle, &errPtr)
+    rc := C.scp_identity_create(cConfig, &handle, &errPtr)
     if rc != 0 {
         return nil, extractError(errPtr)
     }
@@ -189,16 +192,16 @@ type Identity struct {
     handle *ffi.IdentityHandle
 }
 
-func (i *Identity) DID() string { return ffi.IdentityDID(i.handle) }
-func (i *Identity) CustodyType() string { return ffi.IdentityCustodyType(i.handle) }
+func (i *Identity) Identifier() []byte { return ffi.IdentityIdentifier(i.handle) }
+func (i *Identity) CustodyType() CustodyType { return ffi.IdentityCustodyType(i.handle) }
 
 type Message struct {
-    SenderDID  string
-    Content    []byte
-    Timestamp  int64
-    Sequence   int64
-    ContextID  string
-    Provenance *Provenance
+    SenderIdentifier []byte
+    Content          []byte
+    Timestamp        int64
+    Sequence         int64
+    ContextID        string
+    Provenance       *Provenance
 }
 
 type ToolDefinition struct {
@@ -206,7 +209,7 @@ type ToolDefinition struct {
     Description        string
     InputSchema        map[string]any
     OutputSchema       map[string]any
-    Operator           string // DID
+    Operator           []byte // identifier
     TestVectors        []TestVector
     ImplementationHash []byte
 }
