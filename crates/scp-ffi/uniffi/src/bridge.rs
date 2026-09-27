@@ -5016,22 +5016,23 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         &self.agent_did
     }
 
-    fn context_tools(&self, context_id: &str) -> Vec<scp_mcp::server::ContextOutletInfo> {
+    fn context_tools(
+        &self,
+        context_id: &str,
+    ) -> Result<Vec<scp_mcp::server::ContextOutletInfo>, String> {
         // Look up the ContextHandle from this provider's instance registry
-        // and read its outlet_registry.
-        // Returns empty if the bridge instance has been dropped (#1549 round-2).
-        let Ok(bi) = self.upgrade_bi() else {
-            return Vec::new();
-        };
+        // and read its outlet_registry. A dropped bridge or a context with no
+        // handle is an error, never an empty outlet registry.
+        let bi = self.upgrade_bi()?;
         let registry = context_handle_registry(&bi);
-        let Some(handle) = registry.get(context_id) else {
-            return Vec::new();
-        };
+        let handle = registry.get(context_id).ok_or_else(|| {
+            format!("context '{context_id}' could not be read — no context handle")
+        })?;
         let outlet_registry = handle
             .outlet_registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        outlet_registry
+        Ok(outlet_registry
             .registrations()
             .map(|t| scp_mcp::server::ContextOutletInfo {
                 name: t.name.clone(),
@@ -5046,7 +5047,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                 // scp-mcp), so this is a direct move — never hardcode Action.
                 kind: t.kind,
             })
-            .collect()
+            .collect())
     }
 
     fn validate_capability(&self, context_id: &str, outlet_name: &str) -> Result<(), String> {
@@ -5404,66 +5405,36 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         Ok(output)
     }
 
-    fn context_members(&self, context_id: &str) -> Vec<scp_mcp::server::MemberInfo> {
-        // Read member list and role assignments via the ADR-049 query shim
-        // ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)).
-        // Returns empty if the bridge instance has been dropped (#1549 round-2).
-        use scp_core::context::actor::commands::QueriesCommand;
-        let Ok(bi) = self.upgrade_bi() else {
-            return Vec::new();
-        };
-        let Ok(sup) = bi.context_manager_expect().map(Arc::clone) else {
-            return Vec::new();
-        };
-
-        let (member_dids, role_state) = tokio::task::block_in_place(|| {
-            let handle = tokio::runtime::Handle::current();
-            handle.block_on(async move {
-                let (dids_tx, dids_rx) = tokio::sync::oneshot::channel();
-                let dids_cmd = QueriesCommand::MemberDids {
-                    context_id: context_id.to_owned(),
-                    reply: dids_tx,
-                };
-                let dids = if sup.dispatch_query(dids_cmd).await.is_ok() {
-                    dids_rx.await.ok().and_then(Result::ok).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-
-                let (roles_tx, roles_rx) = tokio::sync::oneshot::channel();
-                let roles_cmd = QueriesCommand::GetRoleState {
-                    context_id: context_id.to_owned(),
-                    reply: roles_tx,
-                };
-                let roles = if sup.dispatch_query(roles_cmd).await.is_ok() {
-                    roles_rx.await.ok().and_then(Result::ok).flatten()
-                } else {
-                    None
-                };
-                (dids, roles)
+    fn context_members(
+        &self,
+        context_id: &str,
+    ) -> Result<Vec<scp_mcp::server::MemberInfo>, String> {
+        // Read the roster and role assignments from the context's role state
+        // through the ADR-049 query shim, as the PyO3 and NAPI bridges read
+        // `role_state.members`. A dropped bridge, an unreachable actor or an
+        // unknown context is an error, never an empty roster.
+        let bi = self.upgrade_bi()?;
+        let role_state = Self::role_state_of(&bi, context_id)
+            .ok_or_else(|| format!("context '{context_id}' could not be read — no role state"))?;
+        Ok(role_state
+            .members
+            .iter()
+            .map(|did| scp_mcp::server::MemberInfo {
+                did: did.clone(),
+                role: role_state
+                    .assignments
+                    .get(did)
+                    .map_or_else(|| "member".to_owned(), |a| a.role_name.clone()),
             })
-        });
-
-        member_dids
-            .into_iter()
-            .map(|did| {
-                let role = role_state
-                    .as_ref()
-                    .and_then(|rs| rs.assignments.get(&did))
-                    .map_or_else(|| "member".to_owned(), |a| a.role_name.clone());
-                scp_mcp::server::MemberInfo { did, role }
-            })
-            .collect()
+            .collect())
     }
 
-    fn context_events(&self, context_id: &str) -> serde_json::Value {
+    fn context_events(&self, context_id: &str) -> Result<serde_json::Value, String> {
         // The EventLog stores Merkle tree hashes, not event payloads.
         // Return the event count and Merkle root as metadata (matching PyO3).
-        // Falls back to zero-count JSON if the bridge has been dropped
-        // (#1549 round-2).
-        let Ok(bi) = self.upgrade_bi() else {
-            return serde_json::json!({ "event_count": 0 });
-        };
+        // A dropped bridge or a context with no event log is an error, never
+        // an empty log.
+        let bi = self.upgrade_bi()?;
         if let Some(handle) = context_handle_registry(&bi).get(context_id) {
             bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
         }
@@ -5476,7 +5447,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                 "merkle_root": hex::encode(root),
             })
         })
-        .unwrap_or_else(|| serde_json::json!({ "event_count": 0 }))
+        .ok_or_else(|| format!("context '{context_id}' could not be read — no event log"))
     }
 }
 
@@ -23464,16 +23435,14 @@ mod tests {
             "upgrade_bi must fail when the bridge has been dropped"
         );
 
-        // context_tools: returns empty (no panic, no upgrade attempt leak).
-        assert!(provider.context_tools("ctx-dropped").is_empty());
-
-        // context_members: returns empty.
-        assert!(provider.context_members("ctx-dropped").is_empty());
-
-        // context_events: returns zero-count JSON fallback.
-        assert_eq!(
-            provider.context_events("ctx-dropped"),
-            serde_json::json!({ "event_count": 0 })
+        // context_tools / context_members / context_events: each fails (no
+        // panic), so no read of a dropped bridge reports an empty registry,
+        // roster or log.
+        assert!(provider.context_tools("ctx-dropped").is_err());
+        assert!(provider.context_members("ctx-dropped").is_err());
+        assert!(
+            provider.context_events("ctx-dropped").is_err(),
+            "context_events must fail, not report a zero-event log"
         );
 
         // validate_capability with no UCAN: returns the UCAN-required error
@@ -23791,7 +23760,9 @@ mod tests {
             // async context: `tools/list` calls it for every active context,
             // and this is the exact call that used to `blocking_lock`-panic.
             use scp_mcp::server::ContextProvider as _;
-            let outlets = provider.context_tools("ctx-test");
+            let outlets = provider
+                .context_tools("ctx-test")
+                .expect("context_tools must read a registered context");
             (response, outlets)
         });
         let (response, outlets) = serve.await.expect(

@@ -698,12 +698,10 @@ impl ContextProvider for FfiBridgeProvider {
         &self.agent_did
     }
 
-    fn context_tools(&self, context_id: &str) -> Vec<ContextOutletInfo> {
-        // Returns empty if the bridge has been dropped — matches the
-        // "unknown context" fallback semantics of this trait method.
-        let Ok(bi) = self.upgrade_bi() else {
-            return Vec::new();
-        };
+    fn context_tools(&self, context_id: &str) -> Result<Vec<ContextOutletInfo>, String> {
+        // A dropped bridge or an unreadable context is an error, never an
+        // empty outlet registry.
+        let bi = self.upgrade_bi()?;
         crate::runtime::with_context(&bi, context_id, |rt| {
             let outlets = rt
                 .outlet_registry
@@ -724,7 +722,7 @@ impl ContextProvider for FfiBridgeProvider {
                 .collect();
             Ok(outlets)
         })
-        .unwrap_or_default()
+        .map_err(|e| format!("{e}"))
     }
 
     fn validate_capability(&self, context_id: &str, outlet_name: &str) -> Result<(), String> {
@@ -1213,12 +1211,10 @@ impl ContextProvider for FfiBridgeProvider {
         .map_err(|e| format!("{e}"))
     }
 
-    fn context_members(&self, context_id: &str) -> Vec<MemberInfo> {
-        // Returns empty if the bridge has been dropped — matches the
-        // "unknown context" fallback semantics of this trait method.
-        let Ok(bi) = self.upgrade_bi() else {
-            return Vec::new();
-        };
+    fn context_members(&self, context_id: &str) -> Result<Vec<MemberInfo>, String> {
+        // A dropped bridge or an unreadable context is an error, never an
+        // empty roster.
+        let bi = self.upgrade_bi()?;
         crate::runtime::with_context(&bi, context_id, |rt| {
             let members = rt
                 .role_state
@@ -1238,16 +1234,14 @@ impl ContextProvider for FfiBridgeProvider {
                 .collect();
             Ok(members)
         })
-        .unwrap_or_default()
+        .map_err(|e| format!("{e}"))
     }
 
-    fn context_events(&self, context_id: &str) -> serde_json::Value {
+    fn context_events(&self, context_id: &str) -> Result<serde_json::Value, String> {
         // The EventLog stores Merkle tree hashes, not event payloads.
-        // Return the event count and Merkle root as metadata.
-        // Falls back to zero-count JSON if the bridge has been dropped.
-        let Ok(bi) = self.upgrade_bi() else {
-            return serde_json::json!({ "event_count": 0 });
-        };
+        // Return the event count and Merkle root as metadata. A dropped
+        // bridge or an unreadable context is an error, never an empty log.
+        let bi = self.upgrade_bi()?;
         crate::runtime::with_context(&bi, context_id, |rt| {
             let leaf_count = rt.event_log.leaves().len();
             let root = scp_event_log::tree::root(&rt.event_log);
@@ -1256,7 +1250,7 @@ impl ContextProvider for FfiBridgeProvider {
                 "merkle_root": crate::types::encode_hex(&root),
             }))
         })
-        .unwrap_or_else(|_| serde_json::json!({ "event_count": 0 }))
+        .map_err(|e| format!("{e}"))
     }
 }
 
@@ -2636,7 +2630,7 @@ mod tests {
     }
 
     #[test]
-    fn ffi_bridge_provider_context_outlets_empty_for_unknown_context() {
+    fn ffi_bridge_provider_context_outlets_error_for_unknown_context() {
         let bi = __bi();
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -2647,9 +2641,12 @@ mod tests {
 
             agent_proof_tokens: None,
         };
-        // Unknown context returns empty outlet list (no panic).
-        let outlets = provider.context_tools("nonexistent");
-        assert!(outlets.is_empty());
+        // An unknown context is an unreadable registry: an error, never an
+        // empty outlet list that reads as "no outlets registered".
+        assert!(
+            provider.context_tools("nonexistent").is_err(),
+            "context_tools must fail for a context the bridge cannot read"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4072,18 +4069,13 @@ mod tests {
         // agent_role: returns None.
         assert!(provider.agent_role("ctx-dropped").is_none());
 
-        // context_tools: returns empty.
-        assert!(provider.context_tools("ctx-dropped").is_empty());
-
-        // context_members: returns empty.
-        assert!(provider.context_members("ctx-dropped").is_empty());
-
-        // context_events: returns zero-count JSON fallback.
-        let events = provider.context_events("ctx-dropped");
-        assert_eq!(
-            events,
-            serde_json::json!({ "event_count": 0 }),
-            "context_events must emit the zero-count fallback"
+        // context_tools / context_members / context_events: each fails, so
+        // no read of a dropped bridge reports an empty registry, roster or log.
+        assert!(provider.context_tools("ctx-dropped").is_err());
+        assert!(provider.context_members("ctx-dropped").is_err());
+        assert!(
+            provider.context_events("ctx-dropped").is_err(),
+            "context_events must fail, not report a zero-event log"
         );
 
         // validate_capability: returns Err.

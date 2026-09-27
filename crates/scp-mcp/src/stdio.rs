@@ -540,8 +540,8 @@ mod tests {
         fn agent_did(&self) -> &str {
             &self.agent_did
         }
-        fn context_tools(&self, _context_id: &str) -> Vec<ContextOutletInfo> {
-            Vec::new()
+        fn context_tools(&self, _context_id: &str) -> Result<Vec<ContextOutletInfo>, String> {
+            Ok(Vec::new())
         }
         fn validate_capability(&self, _context_id: &str, _tool_name: &str) -> Result<(), String> {
             Ok(())
@@ -561,11 +561,11 @@ mod tests {
         ) -> Result<(), String> {
             Ok(())
         }
-        fn context_members(&self, _context_id: &str) -> Vec<MemberInfo> {
-            Vec::new()
+        fn context_members(&self, _context_id: &str) -> Result<Vec<MemberInfo>, String> {
+            Ok(Vec::new())
         }
-        fn context_events(&self, _context_id: &str) -> serde_json::Value {
-            serde_json::json!([])
+        fn context_events(&self, _context_id: &str) -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!([]))
         }
     }
 

@@ -406,10 +406,13 @@ impl ContextProvider for McpNapiBridgeProvider {
         &self.agent_did
     }
 
-    fn context_tools(&self, context_id: &str) -> Vec<scp_mcp::server::ContextOutletInfo> {
-        let Ok(bi) = self.upgrade_bi() else {
-            return Vec::new();
-        };
+    fn context_tools(
+        &self,
+        context_id: &str,
+    ) -> Result<Vec<scp_mcp::server::ContextOutletInfo>, String> {
+        // A dropped bridge or an unreadable context is an error, never an
+        // empty outlet registry.
+        let bi = self.upgrade_bi()?;
         crate::runtime::with_context(&bi, context_id, |rt| {
             Ok(rt
                 .outlet_registry
@@ -427,7 +430,7 @@ impl ContextProvider for McpNapiBridgeProvider {
                 })
                 .collect())
         })
-        .unwrap_or_default()
+        .map_err(|e| format!("{e}"))
     }
 
     fn validate_capability(&self, context_id: &str, outlet_name: &str) -> Result<(), String> {
@@ -479,10 +482,13 @@ impl ContextProvider for McpNapiBridgeProvider {
         resource_access_from_role_state(&bi, context_id, &self.agent_did, resource)
     }
 
-    fn context_members(&self, context_id: &str) -> Vec<scp_mcp::server::MemberInfo> {
-        let Ok(bi) = self.upgrade_bi() else {
-            return Vec::new();
-        };
+    fn context_members(
+        &self,
+        context_id: &str,
+    ) -> Result<Vec<scp_mcp::server::MemberInfo>, String> {
+        // A dropped bridge or an unreadable context is an error, never an
+        // empty roster.
+        let bi = self.upgrade_bi()?;
         crate::runtime::with_context(&bi, context_id, |rt| {
             Ok(rt
                 .role_state
@@ -498,15 +504,15 @@ impl ContextProvider for McpNapiBridgeProvider {
                 })
                 .collect())
         })
-        .unwrap_or_default()
+        .map_err(|e| format!("{e}"))
     }
 
-    fn context_events(&self, context_id: &str) -> serde_json::Value {
+    fn context_events(&self, context_id: &str) -> Result<serde_json::Value, String> {
         // The EventLog stores Merkle tree leaf hashes, not event payloads.
-        // Report count + root, matching the PyO3 and UniFFI bridges.
-        let Ok(bi) = self.upgrade_bi() else {
-            return serde_json::json!({ "event_count": 0 });
-        };
+        // Report count + root, matching the PyO3 and UniFFI bridges. A
+        // dropped bridge or an unreadable context is an error, never an
+        // empty log.
+        let bi = self.upgrade_bi()?;
         crate::runtime::with_context(&bi, context_id, |rt| {
             let leaf_count = rt.core.event_log.leaves().len();
             let root = scp_event_log::tree::root(&rt.core.event_log);
@@ -515,7 +521,7 @@ impl ContextProvider for McpNapiBridgeProvider {
                 "merkle_root": hex::encode(root),
             }))
         })
-        .unwrap_or_else(|_| serde_json::json!({ "event_count": 0 }))
+        .map_err(|e| format!("{e}"))
     }
 }
 
@@ -1346,7 +1352,9 @@ mod tests {
         };
 
         // The creator is a real member with a real role.
-        let members = provider.context_members(SUB_CTX);
+        let members = provider
+            .context_members(SUB_CTX)
+            .expect("context_members must read a live context");
         assert!(
             members.iter().any(|m| m.did == AGENT_DID),
             "context_members must report the real roster, got: {members:?}"
@@ -1359,11 +1367,19 @@ mod tests {
 
         // The event log is reported by count + Merkle root, matching PyO3 and
         // UniFFI — never a bare `[]`.
-        let events = provider.context_events(SUB_CTX);
+        let events = provider
+            .context_events(SUB_CTX)
+            .expect("context_events must read a live context");
         assert!(
             events.get("event_count").is_some() && events.get("merkle_root").is_some(),
             "context_events must report real Merkle event-log state, got: {events}"
         );
+
+        // A context the bridge cannot read is an error on every read, never
+        // an empty registry, an empty roster or a `{"event_count": 0}` log.
+        assert!(provider.context_tools("ctx-unknown").is_err());
+        assert!(provider.context_members("ctx-unknown").is_err());
+        assert!(provider.context_events("ctx-unknown").is_err());
 
         // The creator holds `messages:read`, so the resource gate admits it.
         for kind in [
