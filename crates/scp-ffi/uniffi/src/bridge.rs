@@ -5453,12 +5453,16 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 
     fn context_events(&self, context_id: &str) -> Result<serde_json::Value, String> {
         // The event log stores Merkle tree hashes, not event payloads, so the
-        // resource reports the entry count and the Merkle root, matching PyO3.
-        // It reads the actor's log: the pump's `resources/updated` notices come
-        // from the actor's events, and the bridge's UCAN-state tree is synced
-        // from the actor's log only by the event-log API, which the MCP path
-        // never calls. A dropped bridge, a missing supervisor or an unreadable
-        // log is an error, never an empty log.
+        // resource reports entry counts and Merkle roots, matching PyO3.
+        // `event_count` and `merkle_root` summarize the actor's log, whose
+        // events drive the pump's `resources/updated` notices.
+        // `bridge_event_log` summarizes the bridge's UCAN-state tree, to which
+        // `invoke_outlet` appends the OutletInvokedEvent of every MCP
+        // `tools/call`. The actor's log never receives that record, so without
+        // `bridge_event_log` a `tools/call` would leave this resource
+        // unchanged. `bridge_event_log` is `null` when the bridge holds no
+        // UCAN state for the context. A dropped bridge, a missing supervisor or
+        // an unreadable actor log is an error, never an empty log.
         let bi = self.upgrade_bi()?;
         let supervisor = bi
             .context_manager_expect()
@@ -5466,9 +5470,16 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         let (event_count, root) = supervisor
             .event_log_summary(&scp_core::context::state::context_id_to_bytes(context_id))
             .map_err(|e| format!("cannot read the event log of context '{context_id}': {e}"))?;
+        let bridge_event_log = bi.with_ucan_state(context_id, |ucan_state| {
+            serde_json::json!({
+                "event_count": ucan_state.event_log.leaves().len(),
+                "merkle_root": hex::encode(scp_event_log::tree::root(&ucan_state.event_log)),
+            })
+        });
         Ok(serde_json::json!({
             "event_count": event_count,
             "merkle_root": hex::encode(root),
+            "bridge_event_log": bridge_event_log,
         }))
     }
 }
@@ -22855,11 +22866,12 @@ mod tests {
         );
     }
 
-    /// `scp://{ctx}/events` reports the actor's event log, the log whose
-    /// events drive the `resources/updated` notices, and not the bridge's
-    /// UCAN-state tree, which the MCP path never syncs.
+    /// `scp://{ctx}/events` reports the actor's event log, whose events drive
+    /// the `resources/updated` notices, at the top level, and reports the
+    /// bridge's UCAN-state tree, where `invoke_outlet` appends each MCP
+    /// `tools/call` record, under `bridge_event_log`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn events_resource_reports_the_actor_log_uniffi() {
+    async fn events_resource_reports_the_actor_log_and_the_bridge_log_uniffi() {
         use scp_mcp::server::ContextProvider as _;
 
         let creator = "did:dht:z6MkEventsResourceCreator";
@@ -22902,19 +22914,25 @@ mod tests {
         }
         .context_events("ctx-events-resource")
         .expect("the events resource must be readable");
-        assert_eq!(
-            resource,
-            serde_json::json!({ "event_count": count, "merkle_root": hex::encode(root) })
-        );
-        let copy_root = bi
+        let (copy_count, copy_root) = bi
             .with_ucan_state("ctx-events-resource", |state| {
-                scp_event_log::tree::root(&state.event_log)
+                (
+                    state.event_log.leaves().len(),
+                    scp_event_log::tree::root(&state.event_log),
+                )
             })
             .expect("the UCAN state must be registered");
-        assert_ne!(
-            resource["merkle_root"],
-            serde_json::json!(hex::encode(copy_root)),
-            "the resource must not report the bridge's UCAN-state tree"
+        assert_ne!(root, copy_root, "the two logs must differ for this test");
+        assert_eq!(
+            resource,
+            serde_json::json!({
+                "event_count": count,
+                "merkle_root": hex::encode(root),
+                "bridge_event_log": {
+                    "event_count": copy_count,
+                    "merkle_root": hex::encode(copy_root),
+                },
+            })
         );
     }
 

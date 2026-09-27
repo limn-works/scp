@@ -1322,30 +1322,45 @@ impl ContextProvider for FfiBridgeProvider {
 
     fn context_events(&self, context_id: &str) -> Result<serde_json::Value, String> {
         // The event log stores Merkle tree hashes, not event payloads, so the
-        // resource reports the entry count and the Merkle root. A dropped
-        // bridge or an unreadable log is an error, never an empty log.
+        // resource reports entry counts and Merkle roots. A dropped bridge or
+        // an unreadable log is an error, never an empty log.
         let bi = self.upgrade_bi()?;
-        // With a supervisor attached, report the actor's log: the pump's
-        // `resources/updated` notices come from the actor's events, and the
-        // bridge's local tree is synced from the actor's log only by the
-        // event-log API, which the MCP path never calls.
-        let (event_count, root) = if let Some(supervisor) = bi.core.try_supervisor() {
-            supervisor
+        // `bridge_event_log` summarizes the bridge's local tree, to which
+        // `invoke_outlet` appends the OutletInvokedEvent of every MCP
+        // `tools/call`. The actor's log never receives that record, so without
+        // `bridge_event_log` a `tools/call` would leave this resource
+        // unchanged.
+        let bridge_log = crate::runtime::with_context(&bi, context_id, |rt| {
+            Ok((
+                rt.event_log.leaves().len(),
+                scp_event_log::tree::root(&rt.event_log),
+            ))
+        })
+        .map_err(|e| format!("{e}"));
+        // With a supervisor attached, the top level reports the actor's log,
+        // whose events drive the pump's `resources/updated` notices, and
+        // `bridge_event_log` is `null` when the bridge holds no local tree for
+        // the context. Without a supervisor the bridge's tree is the context's
+        // only log, so an unreadable tree is an error.
+        let ((event_count, root), bridge_log) = if let Some(supervisor) = bi.core.try_supervisor() {
+            let actor_log = supervisor
                 .event_log_summary(&scp_core::context::state::context_id_to_bytes(context_id))
-                .map_err(|e| format!("cannot read the event log of context '{context_id}': {e}"))?
+                .map_err(|e| format!("cannot read the event log of context '{context_id}': {e}"))?;
+            (actor_log, bridge_log.ok())
         } else {
-            // No actor: the bridge's tree is the context's only log.
-            crate::runtime::with_context(&bi, context_id, |rt| {
-                Ok((
-                    rt.event_log.leaves().len(),
-                    scp_event_log::tree::root(&rt.event_log),
-                ))
-            })
-            .map_err(|e| format!("{e}"))?
+            let bridge_log = bridge_log?;
+            (bridge_log, Some(bridge_log))
         };
+        let bridge_event_log = bridge_log.map(|(count, root)| {
+            serde_json::json!({
+                "event_count": count,
+                "merkle_root": crate::types::encode_hex(&root),
+            })
+        });
         Ok(serde_json::json!({
             "event_count": event_count,
             "merkle_root": crate::types::encode_hex(&root),
+            "bridge_event_log": bridge_event_log,
         }))
     }
 }
@@ -3229,7 +3244,6 @@ mod tests {
             after_count, 1,
             "event log should have 1 event after invocation"
         );
-
         // Invoke again to verify sequential appending.
         let result2 =
             provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 5, "b": 6}));
@@ -4550,10 +4564,11 @@ mod tests {
     }
 
     /// With a supervisor attached, `scp://{ctx}/events` reports the actor's
-    /// event log, the log whose events drive the `resources/updated` notices,
-    /// and not the bridge's local tree, which the MCP path never syncs.
+    /// event log, whose events drive the `resources/updated` notices, at the
+    /// top level, and reports the bridge's local tree, where `invoke_outlet`
+    /// appends each MCP `tools/call` record, under `bridge_event_log`.
     #[test]
-    fn events_resource_reports_the_actor_log_pyo3() {
+    fn events_resource_reports_the_actor_log_and_the_bridge_log_pyo3() {
         crate::init_runtime().ok();
         let agent = "did:dht:z6MkEventsResourceAgent";
         let bi = __bi();
@@ -4586,21 +4601,24 @@ mod tests {
         let resource = pyo3_mcp_provider(&bi, &ctx_id, agent)
             .context_events(&ctx_id)
             .unwrap();
+        let (copy_count, copy_root) = crate::runtime::with_context(&bi, &ctx_id, |rt| {
+            Ok((
+                rt.event_log.leaves().len(),
+                scp_event_log::tree::root(&rt.event_log),
+            ))
+        })
+        .unwrap();
+        assert_ne!(root, copy_root, "the two logs must differ for this test");
         assert_eq!(
             resource,
             serde_json::json!({
                 "event_count": count,
                 "merkle_root": crate::types::encode_hex(&root),
+                "bridge_event_log": {
+                    "event_count": copy_count,
+                    "merkle_root": crate::types::encode_hex(&copy_root),
+                },
             })
-        );
-        let copy_root = crate::runtime::with_context(&bi, &ctx_id, |rt| {
-            Ok(scp_event_log::tree::root(&rt.event_log))
-        })
-        .unwrap();
-        assert_ne!(
-            resource["merkle_root"],
-            serde_json::json!(crate::types::encode_hex(&copy_root)),
-            "the resource must not report the bridge's local tree"
         );
 
         crate::runtime::remove_context(&bi, &ctx_id);
