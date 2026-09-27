@@ -794,7 +794,8 @@ run_step format cargo fmt --all -- --check
 # THREE GATES STAY IN THE LIST ALTHOUGH THEY START CARGO. `scripts/check-shipped-feature-
 # graph.sh` runs three `cargo tree` resolutions per entry of its ARTIFACTS list plus its
 # default-members and fixture resolutions, `scripts/check-protocol-deps.sh` runs one, and
-# `scripts/check-vendored-openssl-scope.sh` runs one per wheel triple, one per other
+# `scripts/check-vendored-openssl-scope.sh` runs two per wheel triple on a passing run
+# (the second, `-i openssl-sys`, whenever the first finds openssl-src), one per other
 # shipped configuration and one per workspace root, and
 # `cargo tree` compiles nothing and takes no build lock: a 2026-09-13 run measured the
 # first two at 12.9 seconds and 391 ms while another worktree held that lock. A workspace
@@ -870,7 +871,7 @@ if ! "$PYTHON" -c 'import yaml' >/dev/null 2>&1; then
     printf 'fix-round-check: %s cannot import yaml, which scripts/check-workflow-compile-steps.py parses every workflow file with, so that gate fails below for the missing library. Install it with: pip install '"'"'pyyaml>=6,<7'"'"'\n' "$PYTHON" >&2
 fi
 if ! command -v python3.12 >/dev/null 2>&1; then
-    printf 'fix-round-check: python3.12 is not on PATH, and scripts/check-vendored-openssl-scope.sh runs it to read the python-wheels matrix of .github/workflows/build-matrix.yml, so that gate fails below for the missing interpreter. Install Python 3.12 (mise installs it for this repository).\n' >&2
+    printf 'fix-round-check: python3.12 is not on PATH. scripts/check-vendored-openssl-scope.sh runs it to read the python-wheels matrix of .github/workflows/build-matrix.yml, and scripts/check-shipped-feature-graph.sh runs its tomllib to read the [tool.maturin] table of each pyproject.toml, so both gates fail below for the missing interpreter. Install Python 3.12 (mise installs it for this repository).\n' >&2
 elif ! python3.12 -P -c 'import yaml' >/dev/null 2>&1; then
     printf 'fix-round-check: python3.12 cannot import yaml, which scripts/check-vendored-openssl-scope.sh reads the python-wheels matrix of .github/workflows/build-matrix.yml with, so that gate fails below for the missing library. Install it with: python3.12 -m pip install '"'"'pyyaml>=6,<7'"'"'\n' >&2
 fi

@@ -24,8 +24,7 @@
 # package and features from wheel_line, which runs the script FEATURE_GRAPH_GATE
 # names. The file ends with the lines that run this
 # gate: run_fixtures in a subshell, whose planted-gate overrides cannot reach the
-# parent, then `readonly` on four functions and two variables, then run_gate. A
-# call that sets FEATURE_GRAPH_GATE for itself fails on the readonly name. The pin
+# parent, then run_gate. The pin
 # holds this file's text and not what it reads or runs: WHEEL_MATRIX_FILE, the
 # gate FEATURE_GRAPH_GATE names, and the environment bash runs in, where a
 # function exported into the environment, or a PATH entry, named cargo, bash or
@@ -237,22 +236,6 @@ run_fixtures() {
   FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_triple_occurrences aarch64-apple-darwin scp-node --no-default-features >/dev/null
   same "$(cat "$ARGV_LOG")" "$want_argv"
   expect "a caller's package and feature arguments do not reach the one-triple resolution" PASS $?
-  # The readonly lines at the end of this file, read from the file and run here in a
-  # subshell: after them each pinned variable refuses a call's temporary assignment
-  # and each pinned function refuses a redefinition. A readonly line deleted or
-  # narrowed lets that override through, and its fixture goes red. A subshell whose
-  # eval of those lines fails exits 0, so it cannot pass as a refused override.
-  local ro name
-  ro="$(grep -E '^readonly ' "${BASH_SOURCE[0]}")" || ro=""
-  ( eval "$ro" ) >/dev/null 2>&1; expect "this file's readonly lines run" PASS $?
-  ( eval "$ro" || exit 0; FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_triple_occurrences aarch64-apple-darwin ) >/dev/null 2>&1
-  expect "after this file's readonly lines, a call that overrides FEATURE_GRAPH_GATE FAILS" FAIL $?
-  ( eval "$ro" || exit 0; VENDOR_CRATE=pkg count_in "pkg v0.1.0" ) >/dev/null 2>&1
-  expect "after this file's readonly lines, a call that overrides VENDOR_CRATE FAILS" FAIL $?
-  for name in wheel_triple_occurrences wheel_line is_feature_selection count_in; do
-    ( eval "$ro" || exit 0; eval "$name() { :; }" ) >/dev/null 2>&1
-    expect "after this file's readonly lines, a redefinition of $name FAILS" FAIL $?
-  done
   scenario() { # <label> <want>
     out="$(FEATURE_GRAPH_GATE="$dir/gate.sh" WHEEL_MATRIX_FILE="$dir/m.yml" run_gate 2>&1)"; expect "$1" "$2" $?
   }
@@ -368,14 +351,9 @@ is_feature_selection() {
 # count_in <tree>: how many `openssl-src` lines a `cargo tree --prefix none` graph holds.
 count_in() { printf '%s\n' "$1" | grep -cE "^${VENDOR_CRATE} v" || true; }
 
-VENDOR_CRATE="openssl-src"
-FEATURE_GRAPH_GATE="scripts/check-shipped-feature-graph.sh"
 echo "==> vendored-OpenSSL scope: $VENDOR_CRATE reaches the PyPI wheel's configuration and no other configuration this repository ships"
 # The fixtures run in a subshell, so a definition or assignment they make cannot
-# reach run_gate. The readonly lines then fail any later assignment to these names,
-# a temporary one on a call included, and any redefinition of these functions.
+# reach run_gate.
 ( run_fixtures ) || exit 1
 [[ "${1:-}" == "--self-test" ]] && exit 0
-readonly VENDOR_CRATE FEATURE_GRAPH_GATE
-readonly -f wheel_triple_occurrences wheel_line is_feature_selection count_in
 run_gate

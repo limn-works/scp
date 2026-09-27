@@ -700,8 +700,9 @@ jobs:
   # gates in the runner's list read: the tree-sitter grammars nine Python gates
   # parse with, the PyYAML check-workflow-compile-steps.py reads every workflow
   # file with and check-vendored-openssl-scope.sh reads the python-wheels matrix
-  # with, the ruff check-pyi-generated.sh runs, the jq check-bridge-symmetry.sh
-  # requires, a Rust toolchain for the `cargo tree` resolutions
+  # with, the Python 3.12 whose tomllib check-shipped-feature-graph.sh reads each
+  # pyproject.toml's [tool.maturin] table with, the ruff check-pyi-generated.sh
+  # runs, the jq check-bridge-symmetry.sh requires, a Rust toolchain for the `cargo tree` resolutions
   # check-shipped-feature-graph.sh, check-protocol-deps.sh and
   # check-vendored-openssl-scope.sh run, and the base ref check-cross-layer.sh diffs against. No step here
   # compiles a crate: the suite replaces `cargo check` and `cargo fmt` with
@@ -1844,8 +1845,9 @@ jobs:
           # available in this job — they run in dedicated parity jobs below.
           PYTHONPATH=. pytest tests/ -v -m "not parity"
 
-  # Compile the wheel with the cargo configuration a release compiles it with, so
-  # an `openssl-src` build failure fails a pull request instead of a tag push.
+  # Compile the wheel with the cargo configuration a release compiles it with, on
+  # the ubuntu-latest host, so an `openssl-src` build failure on that host fails a
+  # pull request instead of a tag push.
   # `.github/workflows/build-matrix.yml` triggers on a `scp-*@*` tag push and on
   # `workflow_call`, and job python-test above runs `maturin develop --release
   # --features testing`, which REPLACES the `[tool.maturin] features` array rather
@@ -1862,7 +1864,10 @@ jobs:
   # Windows, nor the aarch64 cross image. build-matrix.yml has no
   # `workflow_dispatch` of its own; run release.yml through `workflow_dispatch`
   # with `dry-run: true`, which calls build-matrix.yml, to exercise those before
-  # cutting a tag.
+  # cutting a tag. No check requires that run, so a failure that only those
+  # environments produce first fails the tag push. The readelf check below reads
+  # only this host's Linux extension; no job checks the macOS or Windows extension
+  # for a dynamic OpenSSL link.
   #
   # It builds for CPython 3.10, the floor `requires-python` names, and 3.12, then
   # installs each wheel into a fresh virtualenv and imports every module of the

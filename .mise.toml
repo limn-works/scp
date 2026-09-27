@@ -1,10 +1,13 @@
-# mise installs every tool this repository needs EXCEPT Rust and the four the next
+# mise installs every tool this repository needs EXCEPT Rust and the ones the next
 # sentences name, and it names no Rust version. rustup installs Rust, and README.md
 # lists rustup among the prerequisites. Neither installs the full perl, plus make on
 # Linux and macOS, that the Python binding's `maturin develop` needs to compile
 # OpenSSL; bindings/python/README.md §Requirements names them. Neither installs
-# PyYAML under python3.12, which scripts/check-vendored-openssl-scope.sh imports, or,
-# on macOS, coreutils' `timeout`, which scripts/fix-round-check.sh runs.
+# PyYAML under python3.12, which scripts/check-vendored-openssl-scope.sh imports; the
+# tree-sitter grammars and ruff under python3.12, which the Python gates that import
+# `tree_sitter` parse with and scripts/check-pyi-generated.sh formats with; jq, which
+# scripts/check-bridge-symmetry.sh requires; or, on macOS, coreutils' `timeout`, which
+# scripts/fix-round-check.sh runs. README.md gives the install command for each.
 #
 # WHY. mise exports one `RUSTUP_TOOLCHAIN` for every command it runs, and it computes that
 # value once from the directory the shell sat in. `RUSTUP_TOOLCHAIN` overrides a
