@@ -10,6 +10,9 @@ package works.limn.scp
 
 import java.text.Normalizer
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
@@ -852,5 +855,38 @@ enum class GovernanceActionResult(val rawValue: String) {
                             "bridge it calls.",
                     code = "SCP-GOV-11040",
                 )
+
+        /**
+         * Checks the `execution_result` of a bridge's `governancePropose`
+         * response and returns that response unchanged.
+         *
+         * A `SingleAdmin` proposal auto-executes, so its outcome arrives in
+         * this response rather than through `governanceExecute`. A non-null
+         * `execution_result` goes through [fromBridge], so an outcome this SDK
+         * version cannot name throws on this path as it does on the execute
+         * path.
+         *
+         * @throws uniffi.scp.ScpException.Context with `SCP-GOV-11040` when
+         *   `execution_result` names no entry, or when [raw] is not a JSON
+         *   object or its `execution_result` is neither a string nor `null`.
+         */
+        fun checkProposeResponse(raw: String): String {
+            val response =
+                runCatching { Json.parseToJsonElement(raw) }.getOrNull() as? JsonObject
+                    ?: throw uncheckableProposeResponse("is not a JSON object")
+            val executionResult = response["execution_result"]
+            if (executionResult == null || executionResult is JsonNull) return raw
+            if (executionResult !is JsonPrimitive || !executionResult.isString) {
+                throw uncheckableProposeResponse("carries an execution_result that is neither a string nor null")
+            }
+            fromBridge(executionResult.content)
+            return raw
+        }
+
+        private fun uncheckableProposeResponse(what: String): uniffi.scp.ScpException.Context =
+            uniffi.scp.ScpException.Context(
+                msg = "governance propose response $what, so this SDK cannot name its outcome",
+                code = "SCP-GOV-11040",
+            )
     }
 }

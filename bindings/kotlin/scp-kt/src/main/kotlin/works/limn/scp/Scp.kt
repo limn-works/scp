@@ -1151,16 +1151,26 @@ class SCP internal constructor(
     /** Forwards to [NativeScp.governanceListProposals] on [inner]. */
     suspend fun governanceListProposals(handle: ContextHandle): String = inner.governanceListProposals(handle = handle)
 
-    /** Forwards to [NativeScp.governancePropose] on [inner]. */
+    /**
+     * Forwards to [NativeScp.governancePropose] on [inner].
+     *
+     * @return JSON with `proposal_id`, `status`, and `execution_result`,
+     *   checked by [GovernanceActionResult.checkProposeResponse].
+     * @throws uniffi.scp.ScpException.Context with `SCP-GOV-11040` when a
+     *   `SingleAdmin` proposal auto-executed and its outcome has no name in
+     *   this SDK version, as [governanceExecute] throws for that outcome.
+     */
     suspend fun governancePropose(
         handle: ContextHandle,
         proposerDid: String,
         actionJson: String,
     ): String =
-        inner.governancePropose(
-            handle = handle,
-            proposerDid = proposerDid,
-            actionJson = actionJson,
+        GovernanceActionResult.checkProposeResponse(
+            inner.governancePropose(
+                handle = handle,
+                proposerDid = proposerDid,
+                actionJson = actionJson,
+            ),
         )
 
     /** Forwards to [NativeScp.governanceReject] on [inner]. */

@@ -2172,12 +2172,19 @@ class GovernanceBridgeOps internal constructor(
      *
      * @param contextHandle Handle from context create.
      * @param proposalIdHex Hex-encoded id of the approved, tracked proposal.
-     * @return A string describing the governance action result.
+     * @return The outcome name a bridge reported, checked by
+     *   [works.limn.scp.GovernanceActionResult.fromBridge].
+     * @throws uniffi.scp.ScpException.Context with `SCP-GOV-11040` when that
+     *   outcome has no name in this SDK version.
      */
     suspend fun execute(
         contextHandle: Long,
         proposalIdHex: String,
-    ): String = bridge.ffiCall { bindings.governanceExecute(contextHandle, proposalIdHex) }
+    ): String {
+        val raw = bridge.ffiCall { bindings.governanceExecute(contextHandle, proposalIdHex) }
+        works.limn.scp.GovernanceActionResult.fromBridge(raw)
+        return raw
+    }
 
     /**
      * Propose a governance action for voting (#621).
@@ -2193,15 +2200,20 @@ class GovernanceBridgeOps internal constructor(
      *   name [execute] returns (e.g., `"MemberAdded"`, `"RoleChanged"`) when a
      *   `SingleAdmin` proposal auto-executed, and is `null` while a
      *   multi-admin proposal awaits votes.
+     * @throws uniffi.scp.ScpException.Context with `SCP-GOV-11040` when
+     *   `execution_result` names an outcome this SDK version cannot name
+     *   ([works.limn.scp.GovernanceActionResult.checkProposeResponse]).
      */
     suspend fun propose(
         contextHandle: Long,
         proposerDid: String,
         actionJson: String,
     ): String =
-        bridge.ffiCall {
-            bindings.governancePropose(contextHandle, proposerDid, actionJson)
-        }
+        works.limn.scp.GovernanceActionResult.checkProposeResponse(
+            bridge.ffiCall {
+                bindings.governancePropose(contextHandle, proposerDid, actionJson)
+            },
+        )
 
     /**
      * Cast an approval vote on a pending governance proposal (#621).
