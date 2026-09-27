@@ -2306,8 +2306,10 @@ pub async fn import_context(
         {
             Ok(()) => {
                 // Prior actor ran the floor gate and claimed itself terminal;
-                // remove its dead handle so the respawn slot is vacant.
-                let _ = deps.supervisor.despawn_actor(&context_id).await;
+                // remove its dead handle so the respawn slot is vacant. The
+                // replace-gap marker makes a lifecycle-state read during the
+                // gap report `ActorCrashed`, not an absent context.
+                let _ = deps.supervisor.despawn_for_replace(&context_id).await;
             }
             // ONLY a stale/unreachable handle routes to recovery. The prior
             // actor exited (or dropped its reply) before we reached it. ALL

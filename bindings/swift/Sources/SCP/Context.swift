@@ -236,9 +236,12 @@ public actor Context {
             // fallback. The fallback is `.poisoned` (NOT `.active`): a handle
             // whose state cannot be read, or that reports an unrecognized
             // string, must never present as a live/usable context. Per ADR-049
-            // §10 the authoritative crash/poison signal is the error code on
-            // the next per-context operation; this cached getter is best-effort
-            // and fails safe to a non-active state.
+            // §10 this cached getter is best-effort and fails safe to a
+            // non-active state. While it reads anything but `.active`, `send`,
+            // `join`, `leave`, `messages`, the economic-policy calls, and the
+            // governance and outlet methods that check it throw without calling
+            // the bridge; `close()` and the streaming outlet `invoke` call the
+            // bridge, which reads the supervisor.
             state = Context.mapStateString((try? handle.state()) ?? "poisoned")
         }
     }
@@ -248,9 +251,19 @@ public actor Context {
     /// An unrecognized or unreadable state fails safe to ``ContextState/poisoned``
     /// rather than ``ContextState/active``: per ADR-049 §10 the cached
     /// ``state`` getter is best-effort, and an unknown context must never be
-    /// reported as live. The authoritative crash/poison signal is the
-    /// `SCP-CTX-2134`/`2135` error code surfaced on the next per-context
-    /// operation, not this getter.
+    /// reported as live. While the cached value is not ``ContextState/active``,
+    /// `send`, `join`, `leave`, `messages`, `setEconomicPolicy`,
+    /// `getEconomicPolicy`, and every method in `Governance.swift` and
+    /// `Outlets.swift` that checks this value throw a local context error
+    /// without calling the bridge. `close()` and the streaming outlet
+    /// `invoke` (`Outlets+Streaming.swift`) do not check it and reach the
+    /// bridge, which reads the supervisor. While it is
+    /// ``ContextState/active``, each operation reaches the bridge, which reads
+    /// the supervisor and refuses a crashed or poisoned context: an operation
+    /// the bridge gates on the lifecycle state refuses with its own error
+    /// code, and an operation the supervisor answers without that gate returns
+    /// `SCP-CTX-2134` (poisoned) or `SCP-CTX-2135` (crashed). This getter
+    /// reports neither.
     static func mapStateString(_ stateString: String) -> ContextState {
         switch stateString {
         case "creating": return .creating
@@ -596,11 +609,36 @@ public actor Context {
     /// Always call `close()` when done with a context. `deinit` provides a
     /// safety net but should not be relied upon for timely cleanup.
     ///
+    /// A second `close()`, and a `close()` after ``leave()``, returns without
+    /// calling the bridge. Every other cached ``state`` reaches the bridge,
+    /// including ``ContextState/poisoned``: the initializer writes
+    /// ``ContextState/poisoned`` whenever ``ContextHandle/state()`` throws or
+    /// reports a string this SDK does not recognize, so refusing the close on
+    /// that value would strand the bridge's per-context UCAN state for the
+    /// life of the process — `close()` is the only path that releases it, and
+    /// no SDK method clears a poison. The bridge reads the supervisor actor
+    /// and decides: it releases that state when the supervisor holds no actor
+    /// because the close already happened (a completed TTL expiry, an
+    /// all-members-left teardown) or reports a terminal state (`closed`,
+    /// `expired`, `tombstoned`), and it throws for the non-terminal states
+    /// `creating`, `closing`, `migrating_out`, and `poisoned`. A `closing`
+    /// context sits in the §5.9 cooperative window, a `poisoned` context
+    /// returns to `active` through the operator's poison recovery, and the
+    /// supervisor dispatch a release would skip carries the only
+    /// `context:close` capability check the close path has. The bridge throws
+    /// `SCP-CTX-2135` when the crash watchdog is respawning the context's
+    /// actor or its last respawn failed; that close succeeds once an actor
+    /// serves the context again. The bridge also throws when the supervisor
+    /// still holds an actor for the context and that actor did not answer the
+    /// state read, because an unanswered read is not evidence that the close
+    /// already happened; a caller retries that close. `deinit` already gates
+    /// on the same flag.
+    ///
     /// - Throws: ``ScpError/Context(msg:code:)`` if the bridge close
     ///   operation fails.
     public func close() async throws {
-        guard state == .active else {
-            // Closing an already-closed context is idempotent — no error.
+        guard !didClose else {
+            // This actor already closed or left the context — no error.
             return
         }
         try await scp.contextClose(handle: handle, identity: identity)

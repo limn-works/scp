@@ -458,6 +458,18 @@ pub(crate) async fn outlet_stream_open_impl(
             code: codes::OUTLET_6002.to_owned(),
         })?;
 
+    // The supervisor actor answers the lifecycle question before the UCAN
+    // pipeline reads the live role state, so a context no actor serves refuses
+    // with the same withheld text as every other non-`Active` state — see
+    // `UniffiBridgeInstance::require_active_context_before_authz`.
+    bi.require_active_context_before_authz(&context_id, "open outlet stream in context", |msg| {
+        ScpError::Outlet {
+            msg,
+            code: codes::OUTLET_6005.to_owned(),
+        }
+    })
+    .await?;
+
     // Snapshot the bridge-owned per-handle outlet registry once (cheap Vec of
     // registrations); every subsequent outlet field is read off this clone, so
     // the handle's `outlet_registry` mutex is released before the runtime call.
@@ -492,7 +504,8 @@ pub(crate) async fn outlet_stream_open_impl(
         &ucan_token,
         &caller_did,
         proof_tokens.as_ref(),
-    )?;
+    )
+    .await?;
 
     // §7.3.8 effective-caveat resolution from the VALIDATED invocation UCAN's
     // narrowed `nb` — mirrors `outlet_invoke`. `ucan_cid` keys the owned Class-S
@@ -1096,27 +1109,20 @@ fn no_active_saga_err(saga_id: &str) -> ScpError {
 /// Resolves the TARGET context's raw Ed25519 Active Signing Key from a
 /// context-id STRING (the streaming-saga RECOVER path has no `ContextHandle`,
 /// only the `target_context_id` pinned in the registry entry). Reads the
-/// context creator DID off the per-context UCAN state, then exports that
-/// identity's Active Signing Key from this instance's identity custody registry
+/// context creator DID off the supervisor actor, then exports that identity's
+/// Active Signing Key from this instance's identity custody registry
 /// (co-resident single-tenant). The key never enters the runtime autonomously
 /// (ADR-006) — it is resolved per-call here and passed to the seal.
+///
+/// The creator DID comes from the actor rather than from the per-context UCAN
+/// state, because this call chooses the authority a streaming saga signs as, and
+/// a context no actor serves must refuse to sign rather than sign as the creator
+/// a bridge copy recorded.
 async fn resolve_context_active_signing_key_by_id(
     bi: &Arc<UniffiBridgeInstance>,
     context_id: &str,
 ) -> Result<ed25519_dalek::SigningKey, ScpError> {
-    let creator_did = bi
-        .with_ucan_state(context_id, |state| state.creator_did.clone())
-        .ok_or_else(|| ScpError::Context {
-            msg: format!(
-                "context '{context_id}' not found in the UCAN registry — cannot resolve its \
-                 Active Signing Key for streaming-saga reconnect recovery"
-            ),
-            // Same "not hosted by this bridge instance" (channel-auth /
-            // co-resident single-tenant) class as the identity-custody miss
-            // below — a context whose per-context UCAN state is absent here is
-            // not hosted here. Aligned to CTX_2001 for cross-bridge consistency.
-            code: codes::CTX_2001.to_owned(),
-        })?;
+    let creator_did = bi.live_role_state(context_id).await?.creator_did;
     let (custody, key_handle) = {
         let registry = identity_custody_registry(bi);
         let entry = registry.get(&creator_did).ok_or_else(|| ScpError::Context {
@@ -1190,12 +1196,12 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
 
     // Both contexts MUST be Active before this money-moving open touches any
     // state. Read the AUTHORITATIVE lifecycle state from the per-context
-    // supervisor actor (`read_context_state`) — NOT the bridge-cached
+    // supervisor actor (`Supervisor::read_context_state_checked`) — NOT the bridge-cached
     // `ContextHandle::state`, which LAGS: on close the core handle flips to
     // `Closing` immediately, but the FFI cache stays `Active` until the async
     // finalize completes. A stale-cache read would let a `Closing` context (actor
     // alive, members intact) pass this gate and DEBIT ESCROW. Mirrors the PyO3
-    // reference's authoritative `read_context_state`. A missing actor (`None`) is
+    // reference, which gates through the same checked read. A missing actor is
     // treated as non-active (fail-closed). Codes match NAPI/PyO3: OUTLET_6010
     // (caller axis) / OUTLET_6011 (target axis). Checked BEFORE input validation,
     // the caller-principal binding, and the saga drive, so a non-active context is
@@ -1211,26 +1217,28 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
     // bridge's target-axis check (OUTLET_6011) is demoted to defense-in-depth.
     // The reserve does NOT run on the CALLER/source context, so this bridge's
     // caller-axis check (OUTLET_6010) remains the authoritative gate stopping a
-    // non-active source from initiating the saga.
-    let supervisor = Arc::clone(bi.context_manager_or_error()?);
-    let source_state = supervisor.read_context_state(&caller_context_id).await;
-    if !matches!(source_state, Some(scp_core::context::ContextState::Active)) {
-        return Err(ScpError::Outlet {
-            msg: format!(
-                "cannot start cross-context streaming saga: caller context in {source_state:?} state"
-            ),
+    // non-active source from initiating the saga. Both gates run before the
+    // caller-principal binding, so both withhold the lifecycle state (see
+    // `UniffiBridgeInstance::require_active_context_before_authz`).
+    bi.require_active_context_before_authz(
+        &caller_context_id,
+        "start cross-context streaming saga from caller context",
+        |msg| ScpError::Outlet {
+            msg,
             code: codes::OUTLET_6010.to_owned(),
-        });
-    }
-    let target_state = supervisor.read_context_state(&target_context_id).await;
-    if !matches!(target_state, Some(scp_core::context::ContextState::Active)) {
-        return Err(ScpError::Outlet {
-            msg: format!(
-                "cannot start cross-context streaming saga: target context in {target_state:?} state"
-            ),
+        },
+    )
+    .await?;
+    bi.require_active_context_before_authz(
+        &target_context_id,
+        "start cross-context streaming saga into target context",
+        |msg| ScpError::Outlet {
+            msg,
             code: codes::OUTLET_6011.to_owned(),
-        });
-    }
+        },
+    )
+    .await?;
+    let supervisor = Arc::clone(bi.context_manager_or_error()?);
 
     // ----- (a) validate inputs ------------------------------------------------
     validate_context_id(&caller_context_id)?;
@@ -1258,8 +1266,8 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
     //
     // Runs before ANY outlet read or state mutation, so an unauthenticated caller
     // is rejected before it can touch B's state (identical to the `PyO3`
-    // reference's ordering). `supervisor` was resolved above for the authoritative
-    // lifecycle gate; reuse it.
+    // reference's ordering). The binding reuses the `supervisor` resolved
+    // above.
     enforce_caller_principal_binding(bi, &supervisor, &caller_context_id, &caller_did).await?;
 
     // ----- (c) validate the invocation UCAN against the TARGET context --------
@@ -1295,7 +1303,8 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
         &ucan_token,
         &caller_did,
         proof_tokens.as_ref(),
-    )?;
+    )
+    .await?;
 
     // §7.3.8 effective-caveat resolution from the VALIDATED invocation UCAN's
     // narrowed `nb`. `ucan_cid` keys the owned Class-S counters and anchors the

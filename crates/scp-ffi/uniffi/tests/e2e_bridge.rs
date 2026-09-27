@@ -54,7 +54,7 @@ use scp_ffi_uniffi::{
 fn full_capability_params() -> ContextParams {
     ContextParams {
         mode: ContextMode::Encrypted,
-        ceiling: vec![
+        ceiling: Some(vec![
             "messages:read".to_owned(),
             "messages:write".to_owned(),
             "outlet:call:*".to_owned(),
@@ -62,7 +62,7 @@ fn full_capability_params() -> ContextParams {
             "member:invite".to_owned(),
             "member:remove".to_owned(),
             "role:assign".to_owned(),
-        ],
+        ]),
         ceiling_policy: CeilingPolicy::Immutable,
         governance: GovernanceModel::SingleAdmin,
         memory_scope: MemoryScope::Ephemeral,
@@ -81,11 +81,11 @@ fn full_capability_params() -> ContextParams {
 fn default_encrypted_params() -> ContextParams {
     ContextParams {
         mode: ContextMode::Encrypted,
-        ceiling: vec![
+        ceiling: Some(vec![
             "messages:read".to_owned(),
             "messages:write".to_owned(),
             "outlet:call:*".to_owned(),
-        ],
+        ]),
         ceiling_policy: CeilingPolicy::Immutable,
         governance: GovernanceModel::SingleAdmin,
         memory_scope: MemoryScope::Ephemeral,
@@ -556,8 +556,14 @@ async fn invite_member_seals_for_a_locally_minted_invitee() {
     // ceiling must carry it. This is the ceiling the Kotlin suite's
     // `makeInviteParams()` builds.
     let mut params = full_capability_params();
-    params.ceiling.push("governance:propose".to_owned());
-    params.ceiling.push("governance:vote".to_owned());
+    params
+        .ceiling
+        .get_or_insert_with(Vec::new)
+        .push("governance:propose".to_owned());
+    params
+        .ceiling
+        .get_or_insert_with(Vec::new)
+        .push("governance:vote".to_owned());
     let handle = scp
         .context_create(Arc::clone(&creator), params)
         .await
@@ -815,10 +821,16 @@ async fn outlet_register_and_verify() {
         .identity_create("in_memory".to_owned(), None)
         .await
         .unwrap();
-    let handle = scp
-        .context_create(alice.clone(), default_encrypted_params())
-        .await
-        .unwrap();
+    // `outlet_register` reads the ceiling off the context's supervisor actor,
+    // so the context has to declare `outlet:register` for Alice to register
+    // one. `default_encrypted_params` omits it, and every other test on that
+    // fixture registers no outlet.
+    let mut params = default_encrypted_params();
+    params
+        .ceiling
+        .get_or_insert_with(Vec::new)
+        .push("outlet:register".to_owned());
+    let handle = scp.context_create(alice.clone(), params).await.unwrap();
 
     let definition = OutletDefinition {
         name: "calculator".to_owned(),
@@ -1241,7 +1253,7 @@ async fn context_create_with_all_governance_models() {
     ] {
         let params = ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: vec!["messages:read".to_owned()],
+            ceiling: Some(vec!["messages:read".to_owned()]),
             ceiling_policy: CeilingPolicy::Immutable,
             governance: model,
             memory_scope: MemoryScope::Ephemeral,
@@ -1275,7 +1287,7 @@ async fn context_create_with_all_memory_scopes() {
     ] {
         let params = ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: vec!["messages:read".to_owned()],
+            ceiling: Some(vec!["messages:read".to_owned()]),
             ceiling_policy: CeilingPolicy::Immutable,
             governance: GovernanceModel::SingleAdmin,
             memory_scope: scope,

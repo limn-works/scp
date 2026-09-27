@@ -442,10 +442,14 @@ public extension ContextParams {
     /// strings — it removes the round-trip through hand-rolled JSON and gives
     /// callers compile-time checks against the discriminated unions.
     ///
+    /// `ceiling` is required and optional, as the generated field is: `nil`
+    /// declares no ceiling, and the context records `default_ceiling()`. A
+    /// list stands as written, so `[]` declares a ceiling that grants nothing.
+    ///
     /// - Throws: `EncodingError` if a typed value cannot be serialized.
     init(
         mode: ContextMode,
-        ceiling: [String],
+        ceiling: [String]?,
         ceilingPolicy: CeilingPolicy,
         governance: GovernanceModel,
         memoryScope: MemoryScope,

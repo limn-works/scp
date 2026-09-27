@@ -64,7 +64,7 @@ use scp_core::context::persistence::ContextPersistence;
 use scp_core::context::providers::{
     MerkleEventLogProvider, ProtocolRepositoryContextBridge, ProtocolRepositoryEventLogBridge,
 };
-use scp_core::context::roles::{ContextRoleState, default_ceiling};
+use scp_core::context::roles::ContextRoleState;
 use scp_core::crypto::mls::provider::NodeMlsFactory;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
@@ -1460,28 +1460,35 @@ pub(crate) fn ffi_state_registry(bi: &PyBridgeInstance) -> &DashMap<String, FfiB
 ///
 /// Contains subsystem state used by `outlets.rs`, `ucan.rs`, `event_log.rs`,
 /// and `mcp.rs`, plus FFI-specific message channel and outlet handler state.
+///
+/// # No authorization state lives here
+///
+/// This struct holds NO role state, NO membership set, NO capability ceiling,
+/// and NO creator DID. Every authorization, membership, role, and ceiling
+/// decision reads [`live_role_state`], which queries the context's supervisor
+/// actor. `media_initiate_session` breaks this rule: it checks the requested
+/// media capabilities against a ceiling list the caller passes, not against
+/// the context's live ceiling that ADR-024 requires. A bridge-local copy of any of those refreshes only when THIS bridge
+/// performs the mutation, so a change the supervisor applied by another route —
+/// a governance execution, a broadcast-subscriber removal, a TTL expiry, a
+/// trust-recovery transition — left the copy granting authority the supervisor
+/// had already withdrawn. Deleting the fields is what stops a caller from
+/// reading one; a scanner over source text would not.
 pub struct FfiBridgeState {
     /// Outlet registry for this context.
     pub outlet_registry: OutletRegistry,
     /// Event log (Merkle tree) for this context.
     pub event_log: EventLog,
-    /// Role state tracking member capabilities.
-    ///
-    /// Also maintained by `ContextManager` for lifecycle operations.
-    /// This copy is used by UCAN validation (`ucan.rs`) and outlet capability
-    /// checking (`outlets.rs`, `mcp.rs`) which access state via `with_ffi_state`.
-    /// Both copies are kept in sync: `register_ffi_state` initializes from
-    /// the same parameters, and `py_context_join` updates both.
-    pub role_state: ContextRoleState,
     /// UCAN revocation list for this context.
+    ///
+    /// The bridge OWNS this list: `PyScp::ucan_revoke` writes it and the
+    /// supervisor keeps no counterpart, so reading it here reads the record of
+    /// state, not a copy of someone else's.
     pub revocation_list: RevocationList,
     /// UCAN nonce tracker for replay prevention (ADR-016 step 9).
+    ///
+    /// Bridge-owned for the same reason as `revocation_list`.
     pub nonce_tracker: NonceTracker<SystemClock>,
-    /// Capability ceiling as a set of `{resource}:{action}` strings for
-    /// UCAN validation (ADR-016 step 8).
-    pub ceiling_strings: HashSet<String>,
-    /// The DID of the context creator.
-    pub creator_did: String,
     /// Registered outlet handlers keyed by outlet ID.
     ///
     /// Python callers register callable handlers via
@@ -1523,26 +1530,57 @@ pub const RECEIVE_BUFFER_CAPACITY: usize = 1000;
 
 /// Registers FFI-specific state for a new context.
 ///
-/// Creates a [`OutletRegistry`], [`EventLog`], [`ContextRoleState`], and
-/// [`RevocationList`] for the context. The creator DID is assigned admin
-/// capabilities (all capabilities in the ceiling).
+/// Creates an [`OutletRegistry`], an [`EventLog`], a [`RevocationList`], a
+/// [`NonceTracker`], and a session store for the context. Role state,
+/// membership, the capability ceiling, and the creator DID are NOT stored here:
+/// the supervisor actor owns them and [`live_role_state`] reads them.
 ///
 /// `user_ceiling` contains user-provided ceiling strings in colon format
-/// (e.g. `"outlet:call:*"`). These are converted to UCAN underscore format
-/// (e.g. `"outlet_call:*"`) via `Capability::new` + `ucan_capability_name`.
-/// Pass an empty slice to use the default ceiling.
+/// (e.g. `"outlet:call:*"`). This function VALIDATES each entry against the
+/// ceiling-entry grammar (spec §5.3.1.1) and then discards the parsed values —
+/// `Supervisor::create_context` stores the ceiling that authorization reads.
+/// Validating at the FFI boundary rejects a malformed entry with a bridge-native
+/// message before the supervisor sees it. The slice is the ceiling the caller
+/// declared: `context_create` passes an empty slice for a context whose
+/// declared ceiling grants nothing, and the default-ceiling case reaches this
+/// function as the resolved `default_ceiling()` entries, never as an empty
+/// slice.
 ///
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` if the context ID is already registered
-/// or if role state creation fails.
+/// or if a `user_ceiling` entry fails the ceiling-entry grammar.
 pub fn register_ffi_state(
     bi: &PyBridgeInstance,
     context_id: &str,
-    creator_did: &str,
     user_ceiling: &[String],
 ) -> Result<(), ScpPyError> {
     use dashmap::mapref::entry::Entry;
+
+    // Ceiling-entry grammar enforcement (spec §5.3.1.1) on each user entry.
+    // Validate the PARSED enum (`Capability::new(entry).validate_as_ceiling_entry()`)
+    // — NOT the raw string — so the validation checks EXACTLY the capability the
+    // supervisor will enforce. `Capability::new` strips a `custom:` prefix: the raw
+    // string `"custom:payments"` has one colon (would pass a raw-string check) but
+    // parses to `Custom("payments")`, whose enforced form (`ucan_capability_name` →
+    // `payments:payments`) corresponds to a no-colon custom that
+    // `validate_as_ceiling_entry` REJECTS. Routing through the parsed enum keeps the
+    // raw-string validation and the enforced parse in agreement on one canonical form
+    // (BLACK-003), and still rejects a no-colon `payments` that would otherwise be
+    // widened to `payments:*`.
+    for entry in user_ceiling {
+        // Fail-closed: a malformed capability string (deleted legacy
+        // outlet-invoke / pre-rename outlet-invoke stems, invalid §5.4.2.1
+        // outlet suffix) parses to `None` and is rejected at the FFI boundary
+        // rather than silently dropped.
+        let cap = scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
+            ScpPyError::context(format!(
+                "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+            ))
+        })?;
+        cap.validate_as_ceiling_entry()
+            .map_err(|e| ScpPyError::context(e.to_string()))?;
+    }
 
     let map = ffi_state_registry(bi);
 
@@ -1553,67 +1591,11 @@ pub fn register_ffi_state(
             )));
         }
         Entry::Vacant(vacant) => {
-            let outlet_registry = OutletRegistry::new();
-            let event_log = EventLog::new(context_id.to_owned());
-            let ceiling = default_ceiling();
-            let ceiling_strings = if user_ceiling.is_empty() {
-                ceiling
-                    .iter()
-                    .map(scp_core::context::roles::Capability::ucan_capability_name)
-                    .collect::<HashSet<String>>()
-            } else {
-                // Ceiling-entry grammar enforcement (spec §5.3.1.1) on each user
-                // entry BEFORE it is normalized into the UCAN ceiling string set.
-                // Validate the PARSED enum (`Capability::new(entry)
-                // .validate_as_ceiling_entry()`) — NOT the raw string — so the
-                // validation checks EXACTLY the capability that gets enforced.
-                // `Capability::new` strips a `custom:` prefix: the raw string
-                // `"custom:payments"` has one colon (would pass a raw-string check)
-                // but parses to `Custom("payments")`, whose enforced form
-                // (`ucan_capability_name` → `payments:payments`) corresponds to a
-                // no-colon custom that `validate_as_ceiling_entry` REJECTS. Routing
-                // through the parsed enum keeps the raw-string validation and the
-                // enforced parse in agreement on one canonical form (BLACK-003), and
-                // still rejects a no-colon `payments` that would otherwise be widened
-                // to `payments:*`.
-                for entry in user_ceiling {
-                    // Fail-closed: a malformed capability string (deleted
-                    // legacy outlet-invoke / pre-rename outlet-invoke stems,
-                    // invalid §5.4.2.1 outlet suffix) parses to `None` and is
-                    // rejected at the FFI boundary rather than silently dropped.
-                    let cap =
-                        scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
-                            ScpPyError::context(format!(
-                                "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
-                            ))
-                        })?;
-                    cap.validate_as_ceiling_entry()
-                        .map_err(|e| ScpPyError::context(e.to_string()))?;
-                }
-                user_ceiling
-                    .iter()
-                    .filter_map(|s| {
-                        scp_core::context::roles::Capability::new(s)
-                            .map(|c| c.ucan_capability_name())
-                    })
-                    .collect::<HashSet<String>>()
-            };
-            let role_state =
-                ContextRoleState::new(context_id, creator_did, ceiling, vec![], &SystemClock)
-                    .map_err(|e| {
-                        ScpPyError::context(format!("failed to create role state: {e}"))
-                    })?;
-            let revocation_list = RevocationList::new(context_id.to_owned());
-            let nonce_tracker = NonceTracker::new(context_id.to_owned(), SystemClock);
-
             let state = FfiBridgeState {
-                outlet_registry,
-                event_log,
-                role_state,
-                revocation_list,
-                nonce_tracker,
-                ceiling_strings,
-                creator_did: creator_did.to_owned(),
+                outlet_registry: OutletRegistry::new(),
+                event_log: EventLog::new(context_id.to_owned()),
+                revocation_list: RevocationList::new(context_id.to_owned()),
+                nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
                 outlet_handlers: HashMap::new(),
                 message_tx: None,
                 message_rx: None,
@@ -1653,17 +1635,296 @@ where
     f(entry.value_mut())
 }
 
-/// Returns the IDs of all registered contexts where the given DID is a member.
+// ---------------------------------------------------------------------------
+// Live supervisor role state — the single authorization source
+// ---------------------------------------------------------------------------
+
+/// Runs `fut` to completion under whichever tokio regime the calling thread
+/// sits in, and returns whatever `fut` produced.
+///
+/// A `PyO3` entry point reaches a supervisor query from three regimes:
+///
+/// 1. a Python call that carries no ambient tokio runtime (`PyO3` methods are
+///    synchronous, and the Python SDK dispatches them through
+///    `asyncio.to_thread`);
+/// 2. an MCP server task running on the shared multi-thread runtime, where
+///    `Runtime::block_on` panics but `block_in_place` is legal; and
+/// 3. an MCP server task running on a current-thread runtime, where
+///    `Runtime::block_on` and `block_in_place` both panic.
+///
+/// This function reads the ambient handle, then picks the bridge that regime
+/// permits: the shared runtime's `block_on`, `block_in_place` around the
+/// ambient handle, or a private current-thread runtime on a fresh thread. The
+/// supervisor query itself only awaits a mailbox channel, so a private runtime
+/// drives it to completion while the per-context actor keeps running on the
+/// shared runtime. `scripts/check-block-in-place.py` excludes
+/// `crates/scp-ffi/**` because every FFI bridge needs a synchronous-to-async
+/// seam of exactly this shape.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` when the shared tokio runtime is absent,
+/// when a private current-thread runtime fails to build, or when the fresh
+/// thread ends before it sends an answer.
+fn block_on_supervisor_query<T, F>(fut: F) -> Result<T, ScpPyError>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Err(_) => {
+            let rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
+            Ok(rt.block_on(fut))
+        }
+        Ok(handle)
+            if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) =>
+        {
+            Ok(tokio::task::block_in_place(|| handle.block_on(fut)))
+        }
+        Ok(_) => {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => drop(tx.send(rt.block_on(fut))),
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        "live supervisor query could not build a private runtime; \
+                         the caller fails closed"
+                    ),
+                }
+            });
+            rx.recv().map_err(|_| {
+                ScpPyError::context(
+                    "live supervisor query ended before the supervisor answered".to_owned(),
+                )
+            })
+        }
+    }
+}
+
+/// Reads a context's role state from that context's supervisor actor.
+///
+/// Every `PyO3` entry point that decides authorization, membership, a role, a
+/// capability, or a capability ceiling reads through this function, except
+/// `media_initiate_session`, which breaks the rule: it checks media
+/// capabilities against a ceiling list the caller passes, not against the
+/// context's live ceiling that ADR-024 requires.
+/// [`FfiBridgeState`] deliberately holds no role-state copy: a bridge-local
+/// copy only refreshes when THIS bridge performs the mutation, so a membership
+/// change another participant authored — an MLS commit that the per-context
+/// actor applies — leaves a copy that still grants authority the supervisor
+/// already withdrew. `outlet_stream_open` and the cross-context streaming saga
+/// already read the actor, so a bridge-local copy also made one bridge answer
+/// one authorization question two ways.
+///
+/// Fails closed. A context whose actor returns no role state yields
+/// [`ScpPyError::ContextError`]; no caller receives a permissive default.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` when the supervisor is unavailable, when
+/// the sync-to-async bridge to the supervisor fails (the shared tokio runtime
+/// is absent, or a private current-thread runtime fails to build or answer), or when the
+/// supervisor holds no role state for `context_id`. Returns the converted
+/// `ActorBusy`, `ActorCrashed`, or `ContextPoisoned` error when the context's
+/// actor is saturated, wedged, mid-respawn, or poisoned.
+pub fn live_role_state(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Result<ContextRoleState, ScpPyError> {
+    let sup = Arc::clone(supervisor(bi)?);
+    let ctx = context_id.to_owned();
+    // `SCP-CTX-2023` is the context-state fault code the NAPI and `UniFFI`
+    // bridges attach to this same refusal, so every SDK branches on one code.
+    // A busy, crashed, or poisoned actor surfaces as its own `ContextError`
+    // (`ActorBusy`, `ActorCrashed`, `ContextPoisoned`), never as an absent
+    // context, so a caller knows to retry.
+    block_on_supervisor_query(async move { sup.get_role_state_checked(&ctx).await })??.ok_or_else(
+        || ScpPyError::ContextError {
+            message: format!(
+                "context '{context_id}' has no live supervisor role state — refusing to \
+                 authorize against an absent membership record"
+            ),
+            code: scp_ffi_common::error_codes::CTX_2023.to_owned(),
+        },
+    )
+}
+
+/// Reads a context's lifecycle state from that context's supervisor actor.
+///
+/// `require_active_context` reads through this function, and every outlet and
+/// UCAN gate on this bridge reads through
+/// [`require_active_context_before_authz`]. Every one
+/// of those gates reads the supervisor, never the handle. [`PyContextHandle`](crate::context::PyContextHandle) carries a
+/// `state` string, and that string records the last transition THIS bridge
+/// observed: a TTL expiry the supervisor applied on its own timer, a close
+/// another member initiated, a migration that tombstoned the context, and an
+/// actor the watchdog poisoned all leave that string reading `"active"`. A gate
+/// reading that string therefore admits an operation into a context the
+/// supervisor had already stopped serving. The handle's `state` getter stays a
+/// cached snapshot, because its documented contract says so; a gate does not.
+///
+/// Fails closed. A context whose supervisor reports no state — an unknown
+/// context, or one whose mailbox does not answer — yields
+/// [`ScpPyError::ContextError`], so no caller passes a gate on an absent
+/// answer.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` when the supervisor is unavailable, when
+/// the sync-to-async bridge to the supervisor fails (the shared tokio runtime
+/// is absent, or a private current-thread runtime fails to build or answer), or when the
+/// supervisor reports no state for `context_id`.
+pub fn live_context_state(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Result<scp_core::context::ContextState, ScpPyError> {
+    read_live_context_state(bi, context_id)?.ok_or_else(|| {
+        ScpPyError::context(format!(
+            "context '{context_id}' has no live supervisor state — refusing to run a \
+             lifecycle-gated operation against a context no actor serves"
+        ))
+    })
+}
+
+/// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`, and
+/// withholds the lifecycle state from the refusal.
+///
+/// Every UCAN entry point, every outlet entry point that authorizes a caller
+/// against the context, and the MCP provider's `validate_capability` gate
+/// through this form, because each one runs the gate before it authorizes the
+/// caller. `outlet_stream_open` gates here before its UCAN pipeline reads
+/// [`live_role_state`], whose refusal for a context no actor serves names the
+/// context. The outlet entry points that authorize nothing against
+/// the context carry no gate: `outlet_session_close`, `outlet_interface_revoke`,
+/// and the calls that act on a stream `outlet_stream_open` already opened. The
+/// outlet PRD's SCP-OUT-031 PR-2a note records the rule this form keeps: the
+/// raw lifecycle state never reaches an FFI caller before authorization. The
+/// refusal therefore reads the same for every non-`Active` state, for a
+/// context no actor serves, and for a state read that failed: a context
+/// mid-respawn or past a failed respawn (`ActorCrashed`), and an actor that did
+/// not answer (`ActorBusy`), refuse with the same text and the caller's code.
+/// The NAPI and `UniFFI` bridges gate the same entry points through their own
+/// `require_active_context_before_authz`, so the three bridges answer one
+/// lifecycle question one way.
+///
+/// `mk_err` wraps the refusal message in the error variant and the error code
+/// the calling entry point reports.
+///
+/// # Errors
+///
+/// Returns whatever `mk_err` builds when the supervisor reports any state other
+/// than `Active`, when no actor serves `context_id`, and when the state read
+/// fails.
+pub fn require_active_context_before_authz<F>(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    verb: &str,
+    mk_err: F,
+) -> Result<(), ScpPyError>
+where
+    F: FnOnce(String) -> ScpPyError,
+{
+    match read_live_context_state(bi, context_id) {
+        Ok(Some(scp_core::context::ContextState::Active)) => Ok(()),
+        Ok(Some(_) | None) | Err(_) => Err(mk_err(format!(
+            "cannot {verb}: {}",
+            scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+        ))),
+    }
+}
+
+/// Reads a context's lifecycle state from that context's supervisor actor.
+///
+/// `Ok(None)` means the supervisor holds no actor for `context_id`. An absent
+/// actor the crash watchdog poisoned reads as `Some(Poisoned)`, because the
+/// supervisor keeps that flag outside the actor (ADR-049 §10).
+///
+/// An actor the supervisor still holds but this call could not reach — a
+/// mailbox send that timed out against a saturated mailbox, or a wedged actor
+/// that took longer than the reply timeout — reads as an error, never as
+/// `Ok(None)`. `Supervisor::read_context_state` folds that outcome into
+/// `None`; this function calls `Supervisor::read_context_state_checked`, which
+/// keeps the two apart, because [`crate::scp::PyScp::context_close`] reads
+/// `None` as proof that the close already happened and skips the supervisor
+/// dispatch that carries the only `ContextClose` capability check.
+///
+/// [`live_context_state`] is the gate form: it turns `None` into an error so a
+/// gate never admits an operation on an absent answer. `context_close` calls
+/// this form instead, because a close of a context whose actor the supervisor
+/// already despawned — a completed TTL expiry or an all-members-left teardown —
+/// is idempotent: the close already happened, and the
+/// bridge still has to release the [`FfiBridgeState`] it holds for that id.
+/// Refusing that close would leave the registry entry alive for the life of
+/// the process.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` when the supervisor is unavailable, when
+/// the sync-to-async bridge to the supervisor fails (the shared tokio runtime
+/// is absent, or a private current-thread runtime fails to build or answer), when an actor
+/// serves `context_id` but did not answer the state read, and when the crash
+/// watchdog despawned `context_id`'s actor for a respawn it has not finished or
+/// its last respawn failed (ADR-049 §10).
+pub fn read_live_context_state(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Result<Option<scp_core::context::ContextState>, ScpPyError> {
+    let sup = Arc::clone(supervisor(bi)?);
+    let ctx = context_id.to_owned();
+    block_on_supervisor_query(async move { sup.read_context_state_checked(&ctx).await })?
+        .map_err(ScpPyError::from)
+}
+
+/// Reads a context's capability ceiling from that context's supervisor actor,
+/// normalized to the `{resource}:{action}` UCAN capability names that ADR-016
+/// step 8 compares a token's grants against.
+///
+/// Callers that also need membership or roles call [`live_role_state`] once and
+/// derive the ceiling from it, so one authorization decision costs one mailbox
+/// round trip.
+///
+/// # Errors
+///
+/// Propagates every error [`live_role_state`] returns.
+pub fn live_ceiling_strings(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Result<HashSet<String>, ScpPyError> {
+    Ok(live_role_state(bi, context_id)?
+        .ceiling()
+        .to_ucan_string_set())
+}
+
+/// Returns the IDs of all registered contexts where the given DID is a member,
+/// reading each context's membership from its supervisor actor.
 ///
 /// Used by `py_mcp_load_contexts` to return locally known contexts when
 /// relay transport is not yet wired. Returns an empty Vec if no contexts
 /// match.
+///
+/// A context whose actor holds no role state is omitted rather than reported as
+/// a match: the bridge cannot confirm membership it cannot read, and claiming
+/// membership from a bridge-local copy is the staleness this function exists to
+/// avoid.
 #[must_use]
 pub fn context_ids_for_member(bi: &PyBridgeInstance, member_did: &str) -> Vec<String> {
-    ffi_state_registry(bi)
+    let context_ids: Vec<String> = ffi_state_registry(bi)
         .iter()
-        .filter(|entry| entry.value().role_state.members.contains(member_did))
         .map(|entry| entry.key().clone())
+        .collect();
+    context_ids
+        .into_iter()
+        .filter(|context_id| {
+            live_role_state(bi, context_id)
+                .is_ok_and(|role_state| role_state.members.contains(member_did))
+        })
         .collect()
 }
 
@@ -1714,94 +1975,120 @@ pub fn remove_ffi_state(bi: &PyBridgeInstance, context_id: &str) {
     bi.core.remove_economy_state(context_id);
 }
 
-/// Re-syncs the `FfiBridgeState.role_state` for a context from the shared
-/// `ContextManager`.
+// `sync_role_state_from_manager`, `sync_role_state_from_manager_async`, and
+// `sync_ceiling_from_params` are DELETED. Each one copied supervisor role state
+// or an authenticated ceiling into `FfiBridgeState` so a later authorization
+// check could read the copy. A copy refreshed on a local mutation still went
+// stale on every change the supervisor applied by another route, so
+// authorization now reads `live_role_state` at the moment it decides, and no
+// copy exists for a caller to read.
+
+/// Test-only: spawns the per-context supervisor actor that [`live_role_state`]
+/// reads, carrying `ceiling` as the context's capability ceiling.
 ///
-/// Must be called after any governance action that modifies role state
-/// (`ChangeRole`, `ModifyCeiling`, `AddMember`, `RemoveMember`, etc.) so that the
-/// FFI-side copy used by UCAN/outlet capability checks stays current.
+/// [`register_context`] alone registers FFI state and attaches a supervisor to
+/// the bridge instance; it does NOT create the context inside that supervisor,
+/// so a unit test that only calls it leaves every authorization read failing
+/// closed. Tests call this to give the context the role state a real
+/// `context_create` would have created.
 ///
-/// # Errors
+/// `ceiling` entries take the colon form the Python surface accepts
+/// (`"outlet:register"`, `"messages:write"`). An empty slice creates the context
+/// with `default_ceiling()`, matching what `build_core_context_params` sends
+/// when a caller supplies no ceiling.
 ///
-/// Returns `ScpPyError` if the context manager is not initialized, the
-/// context is not registered in either the manager or the FFI state registry,
-/// or the tokio runtime is unavailable.
-pub fn sync_role_state_from_manager(
+/// # Panics
+///
+/// Panics when a `ceiling` entry fails the §5.4.2.1 capability parser, when the
+/// tokio runtime is unavailable, or when `create_context` rejects the request —
+/// each one is a broken test fixture rather than a condition under test.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)] // A broken test fixture panics; production paths keep the deny.
+pub(crate) fn create_supervisor_context_for_test(
     bi: &PyBridgeInstance,
     context_id: &str,
-) -> Result<(), ScpPyError> {
-    let sup = supervisor(bi)?;
-    let rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
-    let new_role_state = rt.block_on(sup.get_role_state(context_id)).ok_or_else(|| {
-        ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
-    })?;
-
-    with_ffi_state(bi, context_id, |st| {
-        st.role_state = new_role_state;
-        Ok(())
-    })
+    creator_did: &str,
+    ceiling: &[&str],
+) {
+    let capabilities: Vec<scp_core::context::roles::Capability> = if ceiling.is_empty() {
+        scp_core::context::roles::default_ceiling()
+            .iter()
+            .cloned()
+            .collect()
+    } else {
+        ceiling
+            .iter()
+            .map(|entry| {
+                scp_core::context::roles::Capability::new(entry)
+                    .unwrap_or_else(|| panic!("test ceiling entry {entry:?} must parse"))
+            })
+            .collect()
+    };
+    let params = scp_core::context::ContextParams {
+        ceiling: capabilities,
+        ..scp_core::context::ContextParams::default()
+    };
+    let sup = Arc::clone(supervisor(bi).expect("test supervisor must be attached"));
+    let rt = super::runtime().expect("tokio runtime must be initialized");
+    rt.block_on(sup.create_context(
+        context_id.to_owned(),
+        params,
+        scp_did::DID(creator_did.to_owned()),
+        None,
+    ))
+    .expect("test supervisor context creation must succeed");
 }
 
-/// Async-native variant of [`sync_role_state_from_manager`].
+/// Test-only: builds a bridge instance whose supervisor role state DIFFERS from
+/// anything a bridge-local copy could have held, and returns it with the
+/// context id.
 ///
-/// Callers that are already executing inside `runtime().block_on(...)` (e.g.
-/// the governance proposal/approve/reject/withdraw flows in `context.rs`) MUST
-/// use this instead of the sync wrapper: the sync wrapper performs its own
-/// `block_on`, and a nested `block_on` on the multi-threaded runtime panics
-/// with "Cannot start a runtime from within a runtime". This helper awaits the
-/// supervisor role-state query directly so it composes inside an existing
-/// async context.
+/// `register_context` is called with an EMPTY ceiling. A bridge copy built from
+/// that argument carried `default_ceiling()` and named `creator_did` as the
+/// context creator, so passing a NARROWER `supervisor_ceiling` (or a different
+/// creator) makes the supervisor and any such copy disagree. A test that asserts
+/// the supervisor's answer therefore fails the moment a call site goes back to
+/// reading a copy.
 ///
-/// # Errors
+/// # Panics
 ///
-/// Returns `ScpPyError` if the supervisor is not initialized, the context is
-/// not registered in the supervisor, or the FFI state is missing.
-pub async fn sync_role_state_from_manager_async(
-    bi: &PyBridgeInstance,
-    context_id: &str,
-) -> Result<(), ScpPyError> {
-    let sup = supervisor(bi)?;
-    let new_role_state = sup.get_role_state(context_id).await.ok_or_else(|| {
-        ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
-    })?;
-
-    with_ffi_state(bi, context_id, |st| {
-        st.role_state = new_role_state;
-        Ok(())
-    })
+/// Panics when `register_context` or the supervisor context creation fails —
+/// each is a broken fixture rather than a condition under test.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)] // A broken test fixture panics; production paths keep the deny.
+pub(crate) fn live_state_fixture(
+    prefix: &str,
+    creator_did: &str,
+    supervisor_ceiling: &[&str],
+) -> (Arc<PyBridgeInstance>, String) {
+    crate::init_runtime().ok();
+    let bi = Arc::new(PyBridgeInstance::new_py());
+    let context_id = format!("{prefix}-{}", uuid::Uuid::new_v4());
+    register_context(&bi, &context_id, creator_did, &[]).expect("fixture registration");
+    create_supervisor_context_for_test(&bi, &context_id, creator_did, supervisor_ceiling);
+    (bi, context_id)
 }
 
-/// Re-syncs the `FfiBridgeState.ceiling_strings` for a context from the
-/// AUTHENTICATED context params carried by a joined
-/// [`ContextHandle`](scp_core::context::ContextHandle).
+/// Test-only: records `member` in the context's SUPERVISOR role state through
+/// the `testing`-gated actor seam, writing nothing bridge-side.
 ///
-/// Peer of [`sync_role_state_from_manager`] (which syncs role state); this syncs
-/// the UCAN/outlet capability-check ceiling string set. Used by
-/// `context_join_from_welcome`: the joiner no longer supplies a ceiling, so the
-/// FFI state is registered with the DEFAULT ceiling as a reversible precheck,
-/// then this overwrites it with the ceiling AUTHENTICATED by the joined MLS
-/// group's signed context binding. The ceiling entries are normalized to their
-/// enforced UCAN capability-name form (`{resource}:{action}`), matching the set
-/// [`register_ffi_state`] builds on the create path.
+/// A membership change this bridge did not author is the shape the stale-copy
+/// defect turned on, so the fixture reproduces it.
 ///
-/// # Errors
+/// # Panics
 ///
-/// Returns `ScpPyError::ContextError` if the context's FFI state is not
-/// registered (unreachable on the join success path — the state was just
-/// registered and not removed).
-pub fn sync_ceiling_from_params(
+/// Panics when the supervisor rejects the insert.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)] // A broken test fixture panics; production paths keep the deny.
+pub(crate) fn insert_supervisor_member_for_test(
     bi: &PyBridgeInstance,
     context_id: &str,
-    ceiling: &[scp_core::context::roles::Capability],
-) -> Result<(), ScpPyError> {
-    let ceiling_strings: HashSet<String> = ceiling
-        .iter()
-        .map(scp_core::context::roles::Capability::ucan_capability_name)
-        .collect();
-    with_ffi_state(bi, context_id, |st| {
-        st.ceiling_strings = ceiling_strings;
-        Ok(())
-    })
+    member: &str,
+) {
+    let sup = Arc::clone(supervisor(bi).expect("fixture supervisor"));
+    let rt = super::runtime().expect("tokio runtime");
+    rt.block_on(sup.test_insert_member(context_id, scp_did::DID(member.to_owned()), "member"))
+        .expect("supervisor must record the member");
 }
 
 /// Closes the receive channel for a context by dropping the sender (SCP-216).
@@ -2274,12 +2561,19 @@ pub fn register_context(
     // context is valid locally even without relay publication, #501).
     // Passes the creator DID to NodeMlsFactory for real MLS encryption (#1324).
     #[cfg(test)]
-    init_context_manager_for_test(bi);
+    {
+        // The test supervisor is built with a fixed MLS credential identity, so
+        // `creator_did` has no consumer on this branch.
+        let _ = creator_did;
+        init_context_manager_for_test(bi);
+    }
     #[cfg(not(test))]
     init_context_manager(bi, creator_did);
 
-    // Register FFI-specific state.
-    register_ffi_state(bi, context_id, creator_did, user_ceiling)
+    // Register FFI-specific state. `creator_did` reaches the MLS factory above;
+    // FFI state stores no creator DID, because authorization reads the
+    // supervisor's `creator_did` through `live_role_state`.
+    register_ffi_state(bi, context_id, user_ceiling)
 }
 
 /// Backward-compatible alias for [`with_ffi_state`].
@@ -2302,6 +2596,38 @@ where
 /// Backward-compatible alias for [`remove_ffi_state`].
 pub fn remove_context(bi: &PyBridgeInstance, context_id: &str) {
     remove_ffi_state(bi, context_id);
+}
+
+/// Re-reads the supervisor and removes `context_id`'s [`FfiBridgeState`] only
+/// when the re-read does not report `Active`.
+///
+/// `context_close` decides from a lifecycle read taken before it releases, so
+/// an import or restore can return the id to `Active` in between. On an
+/// `Active` re-read this removes nothing and returns `false`, so the live
+/// context keeps its revocation list, nonce tracker, outlets, and sessions.
+/// Any other answer, a failed read included, removes the state and returns
+/// `true`.
+///
+/// The re-read and the removal are two steps, and nothing stops a readmit
+/// from landing between them. That window fails closed on this bridge, so it
+/// carries no release mark of the kind the NAPI and `UniFFI` bridges use:
+/// - `context_import` and `restore_context` register no `FfiBridgeState`, so
+///   an id they return to `Active` after the re-read is left with none, the
+///   same state either call leaves on any id. Outlet dispatch and UCAN
+///   issue, revoke, and validate refuse it.
+/// - A Welcome join registers its state before it commits and checks the
+///   state is still present after it commits. A removal in between makes the
+///   join tear down its actor and return `SCP-CTX-2040`, so no context stays
+///   live without state.
+pub fn release_context_unless_readmitted(bi: &PyBridgeInstance, context_id: &str) -> bool {
+    if matches!(
+        read_live_context_state(bi, context_id),
+        Ok(Some(scp_core::context::ContextState::Active))
+    ) {
+        return false;
+    }
+    remove_context(bi, context_id);
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -2533,7 +2859,7 @@ mod tests {
 
         // remove_ffi_state clears both registries (FFI state + known contexts).
         // Register FFI state first so remove_ffi_state has something to remove.
-        let _ = register_ffi_state(bi, &ctx_id, "did:dht:z6MkStatsKnown", &[]);
+        let _ = register_ffi_state(bi, &ctx_id, &[]);
         remove_ffi_state(bi, &ctx_id);
         assert!(
             !bi.core.has_known_context(&ctx_id),
@@ -2622,8 +2948,11 @@ mod tests {
         let creator = "did:dht:z6MkFfiFind";
         register_context(bi, &ctx_id, creator, &[]).unwrap();
 
-        let creator_did = with_ffi_state(bi, &ctx_id, |st| Ok(st.creator_did.clone())).unwrap();
-        assert_eq!(creator_did, creator);
+        // `FfiBridgeState` carries no creator DID any more, so the lookup asserts
+        // that the registered entry exists by reading a bridge-owned field.
+        let context_id = with_ffi_state(bi, &ctx_id, |st| Ok(st.event_log.context_id().to_owned()))
+            .expect("registered context must be found in the FFI state registry");
+        assert_eq!(context_id, ctx_id);
 
         remove_context(bi, &ctx_id);
     }
@@ -2696,13 +3025,15 @@ mod tests {
     }
 
     /// User-provided ceiling strings in colon format (e.g. `"outlet:call:*"`)
-    /// must be converted to UCAN underscore format (e.g. `"outlet_call:*"`)
-    /// when stored in `FfiBridgeState.ceiling_strings`. Without this
-    /// conversion, `mint_ucan` ceiling checks fail because the minted
-    /// capability name (underscore format) doesn't match the stored
-    /// raw string.
+    /// must reach UCAN checks in underscore format (e.g. `"outlet_call:*"`).
+    /// Without this conversion, `mint_ucan` ceiling checks fail because the
+    /// minted capability name (underscore format) doesn't match the raw
+    /// string. `live_ceiling_strings` reads the set from the supervisor actor,
+    /// so this proves the normalization survives the round trip through the
+    /// supervisor.
     #[test]
     fn user_ceiling_strings_converted_to_ucan_format() {
+        crate::init_runtime().ok();
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
         init_context_manager_for_test(bi);
@@ -2717,8 +3048,19 @@ mod tests {
         ];
 
         register_context(bi, &ctx_id, creator, &user_ceiling).unwrap();
+        create_supervisor_context_for_test(
+            bi,
+            &ctx_id,
+            creator,
+            &[
+                "outlet:call:*",
+                "messages:write",
+                "context:child:create",
+                "outlet:call:calculator",
+            ],
+        );
 
-        let ceiling = with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
+        let ceiling = live_ceiling_strings(bi, &ctx_id).unwrap();
 
         // Compound resources must have underscores joining their segments.
         assert!(
@@ -2751,10 +3093,74 @@ mod tests {
         remove_context(bi, &ctx_id);
     }
 
-    /// When no user ceiling is provided (empty slice), the default ceiling
-    /// should be used with proper UCAN underscore format.
+    /// The pre-authorization gate refuses a crashed context and an actor that
+    /// did not answer with the withheld text and the caller's code, the same
+    /// refusal a context no actor serves gets.
+    ///
+    /// `read_live_context_state` reports a context mid-respawn or past a failed
+    /// respawn as `ActorCrashed` (`SCP-CTX-2135`) and an unreachable mailbox as
+    /// `ActorBusy`. A gate that passed those errors through told a caller it
+    /// had not yet authorized that the context exists and crashed, which the
+    /// outlet PRD's SCP-OUT-031 PR-2a note forbids.
     #[test]
-    fn empty_user_ceiling_uses_default_in_ucan_format() {
+    #[cfg(feature = "testing")]
+    fn pre_authz_gate_withholds_crashed_and_busy_states() {
+        crate::init_runtime().ok();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
+        let creator = "did:dht:z6MkGateCrashed";
+        let sup = Arc::clone(supervisor(bi).expect("supervisor"));
+        let rt = crate::runtime().expect("tokio runtime");
+
+        for fault in ["mid_respawn", "respawn_failed", "unreachable"] {
+            let ctx_id = unique_ctx_id(&format!("gate-{fault}"));
+            create_supervisor_context_for_test(bi, &ctx_id, creator, &[]);
+            match fault {
+                "mid_respawn" => rt.block_on(sup.test_hold_context_mid_respawn(&ctx_id)),
+                "respawn_failed" => rt.block_on(sup.test_fail_context_respawn(&ctx_id)),
+                _ => sup.test_make_actor_unreachable(&ctx_id),
+            }
+            assert!(
+                read_live_context_state(bi, &ctx_id).is_err(),
+                "the fixture must make the checked state read fail ({fault})"
+            );
+
+            let err = require_active_context_before_authz(
+                bi,
+                &ctx_id,
+                "validate a UCAN in context",
+                |message| ScpPyError::ContextError {
+                    message,
+                    code: scp_ffi_common::error_codes::CTX_2023.to_owned(),
+                },
+            )
+            .expect_err("the gate must refuse a context whose state read failed");
+            let text = err.to_string();
+            assert!(
+                text.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                    && text.contains(scp_ffi_common::error_codes::CTX_2023),
+                "the refusal must carry the withheld text and the caller's code ({fault}): {text}"
+            );
+            assert!(
+                !text.contains(scp_ffi_common::error_codes::CTX_2135) && !text.contains(&ctx_id),
+                "the refusal must not disclose the crash or echo the id ({fault}): {text}"
+            );
+        }
+    }
+
+    /// The supervisor reports `default_ceiling()` in UCAN underscore format.
+    ///
+    /// The fixture `create_supervisor_context_for_test` maps an empty slice to
+    /// `default_ceiling()` itself, so this test covers the format of the
+    /// ceiling the supervisor reports, not which ceiling production picks.
+    /// Production picks in `PyContextParams::from_py_dict`: an absent
+    /// `ceiling` key gets the default and `ceiling=[]` grants nothing, which
+    /// `absent_ceiling_gets_the_documented_default` and
+    /// `empty_ceiling_list_stays_empty` in `context.rs` cover.
+    #[test]
+    fn default_ceiling_reads_in_ucan_format() {
+        crate::init_runtime().ok();
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
         init_context_manager_for_test(bi);
@@ -2762,8 +3168,9 @@ mod tests {
         let creator = "did:dht:z6MkCeilingDefault";
 
         register_context(bi, &ctx_id, creator, &[]).unwrap();
+        create_supervisor_context_for_test(bi, &ctx_id, creator, &[]);
 
-        let ceiling = with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
+        let ceiling = live_ceiling_strings(bi, &ctx_id).unwrap();
 
         // Default ceiling must include outlet_call:* (not outlet:call:*).
         assert!(
@@ -3322,5 +3729,169 @@ mod tests {
             "durable_providers_from_bi MUST fail closed with STORAGE_8000 when no storage \
              provider is set (not attach a Noop/absent journal); observed {observed_code:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Live supervisor state is the only authorization source
+    // -----------------------------------------------------------------------
+
+    /// `live_role_state` fails closed when the context has no supervisor actor,
+    /// so no caller receives a permissive default in place of a membership
+    /// record it could not read.
+    #[test]
+    fn live_role_state_fails_closed_without_a_supervisor_actor() {
+        crate::init_runtime().ok();
+        let bi = Arc::new(PyBridgeInstance::new_py());
+        let ctx_id = unique_ctx_id("live-no-actor");
+        // FFI state exists; the supervisor never created the context.
+        register_context(&bi, &ctx_id, "did:dht:z6MkLiveNoActor", &[]).unwrap();
+
+        let err = live_role_state(&bi, &ctx_id)
+            .expect_err("a context with no supervisor role state must refuse to authorize");
+        assert!(
+            format!("{err:?}").contains("no live supervisor role state"),
+            "the refusal must name the absent supervisor role state: {err:?}"
+        );
+    }
+
+    /// `live_role_state` reports a context whose actor does not answer as
+    /// `ActorBusy` (`SCP-CTX-2130`), not as a context with no role state
+    /// (`SCP-CTX-2023`), so a caller retries a saturated context instead of
+    /// treating it as gone.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn live_role_state_reports_an_unreachable_actor_as_busy_not_absent() {
+        let (bi, ctx_id) = live_state_fixture("live-role-busy", "did:dht:z6MkLiveRoleBusy", &[]);
+        live_role_state(&bi, &ctx_id).expect("the fixture's actor answers");
+        supervisor(&bi)
+            .expect("supervisor")
+            .test_make_actor_unreachable(&ctx_id);
+
+        let err = format!(
+            "{:?}",
+            live_role_state(&bi, &ctx_id).expect_err("an unreachable actor must refuse")
+        );
+        assert!(
+            err.contains("SCP-CTX-2130") && !err.contains("no live supervisor role state"),
+            "an unreachable actor must read as busy, not absent: {err}"
+        );
+    }
+
+    /// `context_ids_for_member` reports a member the SUPERVISOR recorded and the
+    /// bridge never wrote down. Reading a bridge-local roster omitted that
+    /// member, so this test fails if the function goes back to one.
+    #[test]
+    fn context_ids_for_member_reads_supervisor_membership() {
+        let creator = "did:dht:z6MkIdsForMemberCreator";
+        let member = "did:dht:z6MkIdsForMemberJoiner";
+        let (bi, ctx_id) = live_state_fixture("ids-for-member", creator, &[]);
+
+        assert!(
+            !context_ids_for_member(&bi, member).contains(&ctx_id),
+            "precondition: the member is not in the context yet"
+        );
+
+        insert_supervisor_member_for_test(&bi, &ctx_id, member);
+
+        assert!(
+            context_ids_for_member(&bi, member).contains(&ctx_id),
+            "a member the supervisor recorded must be reported, with no bridge-side write"
+        );
+        remove_context(&bi, &ctx_id);
+    }
+
+    /// `live_ceiling_strings` returns the ceiling the SUPERVISOR holds, not the
+    /// `default_ceiling()` a bridge-local copy carried. The fixture registers FFI
+    /// state with an empty ceiling argument and gives the supervisor a narrower
+    /// one, so a copy-reading implementation reports the wider default and fails
+    /// the exclusion below.
+    #[test]
+    fn live_ceiling_strings_reads_the_supervisor_ceiling() {
+        let creator = "did:dht:z6MkLiveCeilingCreator";
+        let (bi, ctx_id) = live_state_fixture(
+            "live-ceiling",
+            creator,
+            &["messages:read", "messages:write"],
+        );
+
+        let ceiling = live_ceiling_strings(&bi, &ctx_id).unwrap();
+        assert!(
+            ceiling.contains("messages:write"),
+            "the supervisor ceiling entry must be present: {ceiling:?}"
+        );
+        assert!(
+            !ceiling.contains("outlet_register:*") && !ceiling.contains("outlet_call:*"),
+            "entries the supervisor ceiling omits must be absent — a default-ceiling copy \
+             would carry them: {ceiling:?}"
+        );
+        remove_context(&bi, &ctx_id);
+    }
+
+    /// `live_role_state` answers from inside `Runtime::block_on`, the regime a
+    /// bridge method enters when it drives an async supervisor call and then
+    /// needs an authorization read. A plain `Runtime::block_on` here would panic
+    /// with "Cannot start a runtime from within a runtime".
+    #[test]
+    fn live_role_state_answers_from_inside_block_on() {
+        let creator = "did:dht:z6MkRegimeBlockOnCreator";
+        let (bi, ctx_id) = live_state_fixture("regime-block-on", creator, &[]);
+
+        let rt = crate::runtime().unwrap();
+        let answer = rt.block_on(async { live_role_state(&bi, &ctx_id) });
+        assert_eq!(
+            answer
+                .expect("the read must answer from inside block_on")
+                .creator_did,
+            creator
+        );
+        remove_context(&bi, &ctx_id);
+    }
+
+    /// `live_role_state` answers from inside a spawned task, the regime the MCP
+    /// server's `ContextProvider` methods run in: a synchronous trait method on a
+    /// runtime worker thread, where `Runtime::block_on` panics and
+    /// `block_in_place` is the legal bridge.
+    #[test]
+    fn live_role_state_answers_from_inside_a_spawned_task() {
+        let creator = "did:dht:z6MkRegimeSpawnedCreator";
+        let (bi, ctx_id) = live_state_fixture("regime-spawned", creator, &[]);
+
+        let rt = crate::runtime().unwrap();
+        let bi_for_task = Arc::clone(&bi);
+        let ctx_for_task = ctx_id.clone();
+        let answer = rt.block_on(async move {
+            rt.spawn(async move { live_role_state(&bi_for_task, &ctx_for_task) })
+                .await
+                .expect("the spawned task must not panic")
+        });
+        assert_eq!(
+            answer
+                .expect("the read must answer from inside a spawned task")
+                .creator_did,
+            creator
+        );
+        remove_context(&bi, &ctx_id);
+    }
+    /// `live_role_state` answers from inside a current-thread runtime, the
+    /// regime an async host embedding the bridge on a single-threaded executor
+    /// enters. `block_in_place` panics there, so the read runs on a private
+    /// runtime on its own thread and hands the answer back.
+    #[test]
+    fn live_role_state_answers_from_inside_a_current_thread_runtime() {
+        let creator = "did:dht:z6MkRegimeCurrentThreadCreator";
+        let (bi, ctx_id) = live_state_fixture("regime-current-thread", creator, &[]);
+
+        let host = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let answer = host.block_on(async { live_role_state(&bi, &ctx_id) });
+        assert_eq!(
+            answer
+                .expect("the read must answer from inside a current-thread runtime")
+                .creator_did,
+            creator
+        );
+        remove_context(&bi, &ctx_id);
     }
 }

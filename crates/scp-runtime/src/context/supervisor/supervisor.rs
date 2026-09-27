@@ -887,8 +887,33 @@ pub struct CrashWindow {
     /// failed-respawn state), the lookup-miss surfaces the retryable
     /// [`ContextError::ActorCrashed`] class so the caller retries through the
     /// respawn rather than treating the context as unknown. Cleared on every
-    /// respawn exit (success, failure, or terminal-skip).
+    /// respawn exit (success, failure, or terminal-skip). The import path
+    /// sets the same marker for its replace gap
+    /// ([`Supervisor::despawn_for_replace`]) and clears it when the
+    /// `ImportContext` arm exits.
     respawning: bool,
+}
+
+/// The bootstrap scope [`Supervisor::begin_bootstrap_window`] returns. When
+/// it drops, an id an actor now serves keeps a fresh budget, and an id no
+/// actor serves gets its prior [`CrashWindow`] back.
+pub(in crate::context) struct BootstrapCrashWindow<'a> {
+    supervisor: &'a Supervisor,
+    context_id: String,
+    prior: Option<CrashWindow>,
+}
+
+impl Drop for BootstrapCrashWindow<'_> {
+    fn drop(&mut self) {
+        match self.prior.take() {
+            Some(prior) if self.supervisor.lookup(&self.context_id).is_none() => {
+                self.supervisor
+                    .crash_windows
+                    .insert(self.context_id.clone(), prior);
+            }
+            _ => self.supervisor.end_replace_window(&self.context_id),
+        }
+    }
 }
 
 impl CrashWindow {
@@ -3109,11 +3134,12 @@ impl Supervisor {
                 // this op's crypto-init and actor registration. See
                 // `bootstrap_spawn_lock`.
                 let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
-                // (Re)creating this id is a fresh start: drop ALL stale crash
-                // history (including a stale poison) so the fresh actor begins
+                // (Re)creating this id is a fresh start: the fresh actor begins
                 // with a clean budget and does not inherit a previous
-                // instance's crash count or sticky poison (ADR-049 §10).
-                self.reset_crash_window(&context_id);
+                // instance's crash count or sticky poison (ADR-049 §10). A
+                // create that registers no actor restores that history when
+                // `_crash_window` drops.
+                let _crash_window = self.begin_bootstrap_window(&context_id);
                 // ADR-049 Phase 2A finalization: bootstrap now builds the
                 // actor-shape `ActorDeps` (self-sourced from the
                 // supervisor's provider slots, scoped to the creator's
@@ -3309,10 +3335,11 @@ impl Supervisor {
                 // strictly inside this guard, never the reverse. See
                 // `bootstrap_spawn_lock`.
                 let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
-                // Importing (re-establishing) this id is a fresh start: drop
-                // ALL stale crash history (including a stale poison) so the
-                // imported actor begins with a clean budget (ADR-049 §10).
-                self.reset_crash_window(&context_id);
+                // Importing (re-establishing) this id is a fresh start: the
+                // imported actor begins with a clean budget, free of stale
+                // crash history and a stale poison (ADR-049 §10); a failed
+                // import restores that history.
+                let crash_window = self.begin_bootstrap_window(&context_id);
                 // Defense in depth: track whether `build_actor_deps` will
                 // newly spawn this identity's key-package store, so a
                 // post-verification import failure (e.g. epoch-floor
@@ -3346,9 +3373,14 @@ impl Supervisor {
                     &verifying_key,
                     local_pseudonym,
                 ));
-                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
-                    .await
-                {
+                let import_result = tokio::time::timeout(LIFECYCLE_TIMEOUT, fut).await;
+                // `import_context` marks the replace gap when it despawns a
+                // prior actor (`despawn_for_replace`). `crash_window` ends
+                // that gap when it drops, before the reply: the imported actor
+                // registers before the marker clears, which
+                // `read_context_state_checked` relies on, and a failed import
+                // gets the id's prior crash window back.
+                let (outcome, reply_result) = match import_result {
                     Ok(Ok(handle)) => (Outcome::ok_mutated(()), Ok(handle)),
                     Ok(Err(e)) => {
                         // Import failed after deps were built (e.g. epoch-floor
@@ -3372,6 +3404,7 @@ impl Supervisor {
                         (Outcome::err_mutated(sketch), Err(err))
                     }
                 };
+                drop(crash_window);
                 let _ = reply.send(reply_result);
                 outcome
             }
@@ -4859,8 +4892,21 @@ impl Supervisor {
         // identical to create/import); neither `despawn_actor`,
         // `build_actor_deps`, nor `restore_context` re-acquires
         // `bootstrap_spawn_lock`, so this is re-entrancy- and deadlock-free.
-        let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+        let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+        self.respawn_from_snapshot_locked(ctx_id, owning_did, &bootstrap_guard)
+            .await
+    }
 
+    /// Body of [`Self::respawn_from_snapshot`], run by a caller that already
+    /// holds `bootstrap_spawn_lock`; the guard parameter proves it.
+    /// [`Self::clear_poison`] takes the lock itself so that it clears the
+    /// poison flag and sets the respawn marker under the lock.
+    async fn respawn_from_snapshot_locked(
+        self: &Arc<Self>,
+        ctx_id: &str,
+        owning_did: &DID,
+        _bootstrap_guard: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<(), ContextError> {
         // Mark the transient respawn window BEFORE despawning the stale actor.
         // Between the despawn below and re-registration, a concurrent
         // per-context dispatch would `lookup`-miss a context that genuinely
@@ -5105,6 +5151,106 @@ impl Supervisor {
             .is_some_and(|w| w.is_poisoned())
     }
 
+    /// Test fixture: poisons `context_id` the way the crash watchdog does, so a
+    /// caller can observe a poisoned context without crashing an actor
+    /// [`CRASH_POISON_THRESHOLD`] times.
+    ///
+    /// The fixture records [`CRASH_POISON_THRESHOLD`] crashes at one instant
+    /// in the context's [`CrashWindow`], which sets the sticky `poisoned` flag,
+    /// and then despawns the actor, which is the state the watchdog leaves
+    /// behind once it stops respawning (ADR-049 §10). After this call
+    /// [`Self::read_context_state`] reports
+    /// [`ContextState::Poisoned`](scp_protocol::context::ContextState::Poisoned)
+    /// and [`Self::lookup`] finds no actor. A context with no actor poisons the
+    /// same way, because the watchdog's poison flag lives in `crash_windows`
+    /// and not on the actor.
+    ///
+    /// `testing`-gated: no production build compiles it, no FFI bridge exports
+    /// it, and only an in-process `Arc<Supervisor>` holder can call it.
+    #[cfg(feature = "testing")]
+    pub async fn test_poison_context(&self, context_id: &str) {
+        let now_ms = self.crash_now_ms("context_actor", context_id);
+        // Record every crash and drop the DashMap guard before the `.await`
+        // below (the workspace denies `await_holding_lock`).
+        {
+            let mut entry = self.crash_windows.entry(context_id.to_owned()).or_default();
+            for _ in 0..CRASH_POISON_THRESHOLD {
+                entry.record(now_ms);
+            }
+        }
+        self.despawn_actor(context_id).await;
+    }
+
+    /// Test fixture: leaves `context_id` in the respawn gap, the state
+    /// `respawn_from_snapshot` holds between despawning a crashed actor and
+    /// re-registering its replacement (ADR-049 §10).
+    ///
+    /// The fixture sets the transient respawn marker in the context's
+    /// [`CrashWindow`] and despawns the actor, and never re-registers one.
+    /// After this call [`Self::lookup`] finds no actor and
+    /// [`Self::read_context_state_checked`] reports
+    /// [`ContextError::ActorCrashed`].
+    ///
+    /// `testing`-gated: no production build compiles it, no FFI bridge exports
+    /// it, and only an in-process `Arc<Supervisor>` holder can call it.
+    #[cfg(feature = "testing")]
+    pub async fn test_hold_context_mid_respawn(&self, context_id: &str) {
+        // Drop the DashMap guard before the `.await` below (the workspace
+        // denies `await_holding_lock`).
+        self.crash_windows
+            .entry(context_id.to_owned())
+            .or_default()
+            .mark_respawning();
+        self.despawn_actor(context_id).await;
+    }
+
+    /// Test fixture: leaves `context_id` crashed with a failed last respawn
+    /// and below the poison threshold, the "silently dead" state
+    /// `record_respawn_failure` leaves behind (ADR-049 §10).
+    ///
+    /// The fixture sets the failed-respawn flag in the context's
+    /// [`CrashWindow`], records no crash against the respawn budget, and
+    /// despawns the actor. After this call [`Self::lookup`] finds no actor,
+    /// [`Self::is_context_poisoned`] reports `false`, and
+    /// [`Self::read_context_state_checked`] reports
+    /// [`ContextError::ActorCrashed`].
+    ///
+    /// `testing`-gated: no production build compiles it, no FFI bridge exports
+    /// it, and only an in-process `Arc<Supervisor>` holder can call it.
+    #[cfg(feature = "testing")]
+    pub async fn test_fail_context_respawn(&self, context_id: &str) {
+        self.crash_windows
+            .entry(context_id.to_owned())
+            .or_default()
+            .mark_respawn_failed();
+        self.despawn_actor(context_id).await;
+    }
+
+    /// Test fixture: registers an actor handle for `context_id` whose mailbox
+    /// no task drains, so a caller reaches the supervisor's registry and never
+    /// reaches an actor.
+    ///
+    /// The fixture builds a command channel, drops the receiving half, and
+    /// stores the sending half as `context_id`'s actor handle, replacing any
+    /// handle the id already had. Every later command send fails with
+    /// [`ContextError::ActorBusy`], which is the outcome a saturated mailbox
+    /// produces once
+    /// [`SEND_TIMEOUT`](crate::context::actor::SEND_TIMEOUT) elapses. After
+    /// this call [`Self::lookup`] finds an actor for the id,
+    /// [`Self::read_context_state_checked`] reports
+    /// [`ContextError::ActorBusy`], and [`Self::read_context_state`] reports
+    /// `None`.
+    ///
+    /// `testing`-gated: no production build compiles it, no FFI bridge exports
+    /// it, and only an in-process `Arc<Supervisor>` holder can call it.
+    #[cfg(feature = "testing")]
+    pub fn test_make_actor_unreachable(&self, context_id: &str) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        drop(rx);
+        self.actors
+            .insert(context_id.to_owned(), ContextActorHandle::from_sender(tx));
+    }
+
     /// Map a per-context `lookup` miss to the right typed error (ADR-049
     /// §10). Three cases, in precedence order:
     ///
@@ -5162,14 +5308,26 @@ impl Supervisor {
         ctx_id: &str,
         owning_did: &DID,
     ) -> Result<(), ContextError> {
-        // Clear the window first so the single retry starts from a clean
-        // budget. `entry().or_default()` then `clear()` resets both the
-        // deque and the sticky flag.
+        // Take `bootstrap_spawn_lock` BEFORE touching the window. While this
+        // call waits for the lock the sticky poison flag still stands, so
+        // `read_context_state_checked` reports the wait as `Poisoned`, never as
+        // `Ok(None)`, the answer on which the FFI bridges' `context_close`
+        // skips its `ContextClose` check and releases the context's bridge
+        // state. Every writer of the respawn marker holds this lock, so no
+        // create, import, or join bootstrap for the same id can clear the
+        // marker set below.
+        let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+        // Clear the window so the single retry starts from a clean budget.
+        // `entry().or_default()` then `clear()` resets both the deque and the
+        // sticky flag, and the same guard sets the respawn marker, so no read
+        // falls between the clear and the marker.
         {
             let mut entry = self.crash_windows.entry(ctx_id.to_owned()).or_default();
             entry.clear();
+            entry.mark_respawning();
         }
-        self.respawn_from_snapshot(ctx_id, owning_did).await
+        self.respawn_from_snapshot_locked(ctx_id, owning_did, &bootstrap_guard)
+            .await
     }
 
     /// Operator action (ADR-049 §10): clear a per-identity KeyPackage actor's
@@ -5245,6 +5403,49 @@ impl Supervisor {
     pub async fn despawn_actor(&self, context_id: &str) -> bool {
         let _guard = self.write_lock.lock().await;
         self.actors.remove(context_id).is_some()
+    }
+
+    /// Despawn the actor that `import_context` is replacing, and mark the
+    /// replace gap in the context's [`CrashWindow`] (ADR-049 §10).
+    ///
+    /// Between this despawn and the registration of the imported actor the
+    /// context exists but no actor serves it. Without the marker,
+    /// [`Self::read_context_state_checked`] reports that gap as `Ok(None)`,
+    /// and each FFI bridge's `context_close` reads `Ok(None)` as a close that
+    /// already happened: it skips the `CloseContext` dispatch, which carries
+    /// the only `ContextClose` capability check, and releases the bridge's
+    /// per-context state. With the marker the gap reads as
+    /// [`ContextError::ActorCrashed`], the same answer a crash-respawn gap
+    /// gives. The marker is set before the despawn so no read falls between
+    /// the two. The [`BootstrapCrashWindow`] the supervisor's
+    /// `ImportContext` arm holds clears it on every exit, after the imported
+    /// actor registers or the import fails.
+    pub(in crate::context) async fn despawn_for_replace(&self, context_id: &str) -> bool {
+        // Drop the DashMap guard before the `.await` below (the workspace
+        // denies `await_holding_lock`).
+        self.crash_windows
+            .entry(context_id.to_owned())
+            .or_default()
+            .mark_respawning();
+        self.despawn_actor(context_id).await
+    }
+
+    /// Clear the respawn marker a bootstrap set ([`Self::begin_bootstrap_window`]
+    /// or [`Self::despawn_for_replace`]), and drop the context's
+    /// [`CrashWindow`] entry when the marker was its only content. A no-op
+    /// when no entry exists (a bootstrap of an id with no crash history that
+    /// replaced no actor). Called by [`BootstrapCrashWindow`]'s drop under
+    /// `bootstrap_spawn_lock`. Every writer of the respawn marker holds that
+    /// lock (`respawn_from_snapshot` and `clear_poison` included), so no
+    /// respawn's marker is cleared here.
+    fn end_replace_window(&self, context_id: &str) {
+        if let Some(mut window) = self.crash_windows.get_mut(context_id) {
+            window.clear_respawning();
+        }
+        // The `get_mut` guard above is dropped before `remove_if` takes the
+        // same shard lock.
+        self.crash_windows
+            .remove_if(context_id, |_, window| window.is_empty_except_respawning());
     }
 
     /// COMPLETE compensating teardown of a just-joined context (BLACK-2JF-01).
@@ -5330,9 +5531,11 @@ impl Supervisor {
     /// the durable "dormant, needs operator recovery" signal that
     /// [`Self::lookup_miss_error`] / [`Self::is_context_poisoned`] /
     /// [`Self::read_context_state`] all read after the actor is despawned.
-    /// Only [`CrashWindow::clear`] (operator `clear_poison`),
-    /// [`Self::reset_crash_window`] (an explicit (re)create of the id), or a
-    /// process restart removes a poison.
+    /// Only [`CrashWindow::clear`] (operator `clear_poison`), a (re)create,
+    /// import, standing recreate, or Welcome join of the id whose bootstrap
+    /// registers an actor ([`Self::begin_bootstrap_window`]), or a process
+    /// restart removes a poison. A bootstrap that registers no actor puts
+    /// the poisoned window back.
     ///
     /// It is NOT called on the respawn path: a respawn's internal despawn
     /// must preserve the running crash count so the budget accumulates across
@@ -5346,21 +5549,47 @@ impl Supervisor {
             .remove_if(context_id, |_, window| !window.is_poisoned());
     }
 
-    /// Unconditionally drop a context's [`CrashWindow`] entry on an explicit
-    /// (re)create / import / standing-recreate of the id (ADR-049 §10).
+    /// Start a fresh crash budget for an explicit (re)create / import /
+    /// standing-recreate / Welcome-join bootstrap of the id (ADR-049 §10).
     ///
-    /// Unlike [`Self::reap_crash_window`], this removes the entry EVEN IF it
-    /// is poisoned: deliberately (re)creating or importing a context id is a
-    /// fresh start that resets the crash budget. Without this, a re-created
-    /// context with a deterministic id (e.g. a standing-pair id) would
-    /// inherit the prior instance's sticky `poisoned = true` and re-poison on
-    /// its very first panic, or inherit a partial crash count and poison
-    /// early. The fresh actor must begin with a clean budget.
+    /// Deliberately (re)creating or importing a context id is a fresh start
+    /// that resets the crash budget, poisoned or not. Without the reset, a
+    /// re-created context with a deterministic id (e.g. a standing-pair id)
+    /// would inherit the prior instance's sticky `poisoned = true` and
+    /// re-poison on its very first panic, or inherit a partial crash count and
+    /// poison early.
     ///
-    /// Called under `bootstrap_spawn_lock` at the create / import / standing
-    /// bootstrap sites, before the new actor is spawned.
-    pub(in crate::context) fn reset_crash_window(&self, context_id: &str) {
-        self.crash_windows.remove(context_id);
+    /// The reset swaps any existing window for one that holds only the
+    /// respawn marker, in one map operation, so from here until the bootstrap
+    /// ends [`Self::read_context_state_checked`] reports the id as
+    /// `ActorCrashed`, never as `Ok(None)`. The returned guard ends the
+    /// window when it drops: when an actor serves the id, it clears the
+    /// marker and reaps the now-empty window; when none does (the bootstrap
+    /// failed), it puts the prior window back, so a poisoned or
+    /// respawn-failed context that a failed import or create left without an
+    /// actor still reads as `Poisoned` or `ActorCrashed`.
+    ///
+    /// Called under `bootstrap_spawn_lock`, and the caller keeps the guard
+    /// inside that lock's scope. Every writer of the respawn marker holds the
+    /// same lock, so the guard never clears or restores over a marker another
+    /// respawn set.
+    pub(in crate::context) fn begin_bootstrap_window(
+        &self,
+        context_id: &str,
+    ) -> BootstrapCrashWindow<'_> {
+        let prior = match self.crash_windows.entry(context_id.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                let mut fresh = CrashWindow::default();
+                fresh.mark_respawning();
+                Some(std::mem::replace(occupied.get_mut(), fresh))
+            }
+            dashmap::mapref::entry::Entry::Vacant(_) => None,
+        };
+        BootstrapCrashWindow {
+            supervisor: self,
+            context_id: context_id.to_owned(),
+            prior,
+        }
     }
 
     /// Dispatch a [`StandingCommand`] — mailbox-first for variants that
@@ -10616,35 +10845,136 @@ impl Supervisor {
     /// makes that distinction without a `per-context-state Mutex`. A
     /// dropped reply or mailbox-send failure (actor shutting down)
     /// resolves to `None`, treated by callers as "no live context".
+    ///
+    /// This form collapses an unreachable actor into the same `None` a
+    /// never-registered context reports, so a caller that reads `None` as
+    /// "the context is gone" reads a saturated or wedged actor that way too.
+    /// A caller whose decision turns on that difference calls
+    /// [`Self::read_context_state_checked`], which reports an unreachable
+    /// actor as [`ContextError::ActorBusy`].
     #[must_use]
     pub async fn read_context_state(
         &self,
         context_id: &str,
     ) -> Option<scp_protocol::context::ContextState> {
-        let Some(actor) = self.lookup(context_id) else {
+        // An unreachable actor answers `Err` here. Every caller of this form
+        // reads `None` as "no live Active context": the standing
+        // get-or-create falls through to its create step, and the reconnect
+        // sweep skips the id. Neither skips an authorization check on `None`,
+        // so folding the error into it grants nothing. The FFI bridges call
+        // `read_context_state_checked` instead.
+        self.read_context_state_checked(context_id)
+            .await
+            .unwrap_or(None)
+    }
+
+    /// Reads the current lifecycle
+    /// [`ContextState`](scp_protocol::context::ContextState) for
+    /// `context_id` and reports an actor this call could not reach as an
+    /// error rather than as an absent actor.
+    ///
+    /// [`Self::read_context_state`] answers `None` for three different
+    /// outcomes: the supervisor holds no actor for the id, the mailbox send
+    /// failed or exceeded
+    /// [`SEND_TIMEOUT`](crate::context::actor::SEND_TIMEOUT), and the actor
+    /// accepted the command but did not answer within
+    /// [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT). A caller that
+    /// treats `None` as proof that the supervisor stopped serving the context
+    /// therefore draws that conclusion from a context whose actor is merely
+    /// saturated or wedged. `context_close` on the three FFI bridges draws
+    /// exactly that conclusion — it skips the `CloseContext` dispatch, which
+    /// carries the only `ContextClose` capability check on the path — so it
+    /// reads this form.
+    ///
+    /// `Ok(None)` means the supervisor holds no actor for `context_id`, no
+    /// sticky poison flag for it, and no crash-window record that it is
+    /// mid-respawn or that its last respawn failed. `Ok(Some(state))` is the actor's own answer,
+    /// or [`ContextState::Poisoned`](scp_protocol::context::ContextState::Poisoned)
+    /// for a context the crash watchdog poisoned and despawned (ADR-049 §10).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ActorBusy`] when an actor is registered for
+    ///   `context_id` and the mailbox send failed or timed out, or the actor
+    ///   did not answer within `REPLY_TIMEOUT`.
+    /// - [`ContextError::ActorCrashed`] when no actor is registered for
+    ///   `context_id` because the crash watchdog despawned it and has not yet
+    ///   re-registered the replacement, because an operator's `clear_poison`
+    ///   cleared its poison flag and has not yet respawned it, because an
+    ///   import despawned it and
+    ///   has not yet registered the imported actor, or because its last
+    ///   respawn failed and the context is not yet poisoned (ADR-049 §10).
+    /// - Whatever error the `ReadContextState` handler itself returned.
+    pub async fn read_context_state_checked(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<scp_protocol::context::ContextState>, ContextError> {
+        let actor = if let Some(actor) = self.lookup(context_id) {
+            actor
+        } else {
             // No live actor. A poisoned context (ADR-049 §10) has been
             // despawned by the watchdog, so its state is no longer readable
             // from a mailbox — it lives in the sticky `crash_windows` poison
-            // flag. Report `Poisoned` so callers (FFI `read_context_state`,
-            // the eviction sweep's `Poisoned` arm) can observe a poisoned
+            // flag. Report `Poisoned` so callers (the FFI bridges'
+            // `read_live_context_state`, the eviction sweep's `Poisoned` arm)
+            // can observe a poisoned
             // context as poisoned rather than as "unknown" (`None`).
-            // An un-poisoned absent context stays `None` (genuinely unknown).
-            if self.is_context_poisoned(context_id) {
-                return Some(scp_protocol::context::ContextState::Poisoned);
+            // A context whose actor the watchdog despawned for a respawn it
+            // has not finished, or whose last respawn failed below the poison
+            // threshold, still exists (ADR-049 §10); `lookup_miss_error`
+            // reports both as `ActorCrashed`, and so does this read, so that
+            // no caller mistakes a crashed context for one the supervisor
+            // stopped serving. Only an id with no actor and no crash-window
+            // signal reads as `None`.
+            //
+            // The poison flag and the respawn markers are read from ONE
+            // `crash_windows` guard. A failed bootstrap's
+            // `BootstrapCrashWindow::drop` swaps a marker-only window for the
+            // prior poisoned one in a single insert; two separate reads could
+            // see the fresh window's clear poison flag and then the restored
+            // window's clear markers, and report a poisoned context as absent.
+            let crash_signal = self.crash_windows.get(context_id).map(|window| {
+                (
+                    window.is_poisoned(),
+                    window.is_respawning() || window.last_respawn_failed(),
+                )
+            });
+            match crash_signal {
+                Some((true, _)) => {
+                    return Ok(Some(scp_protocol::context::ContextState::Poisoned));
+                }
+                Some((false, true)) => {
+                    return Err(ContextError::ActorCrashed(context_id.to_owned()));
+                }
+                Some((false, false)) | None => {}
             }
-            return None;
+            // The reads above hold no lock across them, so the miss can be
+            // stale: a respawn (`respawn_rebuild_and_restore`) or an
+            // import-replace (`import_context`) that was in its gap when
+            // `lookup` ran may have registered the replacement actor and then
+            // cleared the respawn marker before `crash_windows` was read. Both
+            // writers register the actor BEFORE they clear the marker, so a
+            // clean window read here means a second `lookup` sees any actor
+            // that closed the gap, and the read queries that actor instead of
+            // reporting an Active context as absent.
+            match self.lookup(context_id) {
+                Some(actor) => actor,
+                None => return Ok(None),
+            }
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = ContextCommand::Queries(QueriesCommand::ReadContextState {
             context_id: context_id.to_owned(),
             reply: tx,
         });
-        if Self::dispatch_via_mailbox(&actor, cmd).await.is_err() {
-            return None;
-        }
+        Self::dispatch_via_mailbox(&actor, cmd).await?;
         match bounded_reply_await(rx).await {
-            Ok(Ok(state)) => Some(state),
-            Ok(Err(_)) | Err(_) => None,
+            Ok(Ok(state)) => Ok(Some(state)),
+            Ok(Err(handler_error)) => Err(handler_error),
+            Err(reply_error) => Err(ContextError::ActorBusy(format!(
+                "context '{context_id}' has a live actor that did not answer a lifecycle-state \
+                 read ({reply_error:?}); the supervisor still serves this context"
+            ))),
         }
     }
 
@@ -10760,7 +11090,7 @@ impl Supervisor {
                 "poisoned standing context auto-revived on re-contact"
             );
         }
-        self.reset_crash_window(&context_id);
+        let _crash_window = self.begin_bootstrap_window(&context_id);
         let params = scp_protocol::context::templates::template_params(
             &scp_protocol::context::TemplateId::BilateralPersistent,
         );
@@ -11408,6 +11738,64 @@ impl Supervisor {
         match bounded_reply_await(rx).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) | Err(_) => None,
+        }
+    }
+
+    /// Reads the context's role state and reports an actor this call could not
+    /// reach as an error rather than as an absent context.
+    ///
+    /// [`Self::get_role_state`] answers `None` both when the supervisor serves
+    /// no context for the id and when a saturated or wedged actor misses
+    /// [`SEND_TIMEOUT`](crate::context::actor::SEND_TIMEOUT) or
+    /// [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT). The FFI
+    /// bridges authorize against role state and must tell a caller to retry a
+    /// busy context instead of telling it the context does not exist, so they
+    /// read this form.
+    ///
+    /// `Ok(None)` has the meaning [`Self::read_context_state_checked`] gives
+    /// it: no actor, no poison flag, and no crash-window record for the id.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ActorBusy`] when an actor is registered and the
+    ///   mailbox send failed or timed out, the actor did not answer within
+    ///   `REPLY_TIMEOUT`, or an actor registered for the id between this
+    ///   read's two lookups.
+    /// - [`ContextError::ContextPoisoned`] for a context the crash watchdog
+    ///   poisoned and despawned (ADR-049 §10).
+    /// - [`ContextError::ActorCrashed`] for a context that is mid-respawn or
+    ///   whose last respawn failed (ADR-049 §10).
+    /// - Whatever error the `GetRoleState` handler itself returned.
+    pub async fn get_role_state_checked(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<scp_protocol::context::roles::ContextRoleState>, ContextError> {
+        let Some(actor) = self.lookup(context_id) else {
+            // No actor: classify the miss the way the lifecycle read does, so
+            // a poisoned or crashed context never reads as absent.
+            return match self.read_context_state_checked(context_id).await? {
+                None => Ok(None),
+                Some(scp_protocol::context::ContextState::Poisoned) => {
+                    Err(ContextError::ContextPoisoned(context_id.to_owned()))
+                }
+                Some(_) => Err(ContextError::ActorBusy(format!(
+                    "context '{context_id}' registered its actor while its role state was \
+                     being read; retry"
+                ))),
+            };
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = ContextCommand::Queries(QueriesCommand::GetRoleState {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        });
+        Self::dispatch_via_mailbox(&actor, cmd).await?;
+        match bounded_reply_await(rx).await {
+            Ok(answer) => answer,
+            Err(reply_error) => Err(ContextError::ActorBusy(format!(
+                "context '{context_id}' has a live actor that did not answer a role-state \
+                 read: {reply_error:?}"
+            ))),
         }
     }
 
@@ -14046,12 +14434,12 @@ impl Supervisor {
                     //    register order (step 4 then step 5) is deliberate and durability-safe
                     //    under `bootstrap_spawn_lock` + Precheck A/D; it must NOT be reordered
                     //    (a persist-after-register would open a crash window that loses the
-                    //    context). Drop any stale crash-window state
-                    //    for this id FIRST (under `bootstrap_spawn_lock`, mirroring the
-                    //    create / import / standing bootstraps): a previously-poisoned+despawned
-                    //    same-id context must not leave the freshly-spawned joiner actor
-                    //    inheriting a sticky poison window.
-                    self.reset_crash_window(&context_id);
+                    //    context). Start a fresh crash window for this id FIRST (under
+                    //    `bootstrap_spawn_lock`, mirroring the create / import / standing
+                    //    bootstraps): a previously-poisoned+despawned same-id context must
+                    //    not leave the freshly-spawned joiner actor inheriting a sticky
+                    //    poison window. A failed spawn gets the prior window back.
+                    let _crash_window = self.begin_bootstrap_window(&context_id);
                     let owned_deps = deps.clone_for_spawn();
                     if let Err(e) = self.spawn_actor_with_state(state, owned_deps, None).await {
                         let _ = deps.persistence.delete_context(&context_id).await;
@@ -21272,6 +21660,139 @@ mod tests {
         );
     }
 
+    /// `clear_poison` touches the crash window only once it holds
+    /// `bootstrap_spawn_lock`, so while it waits for the lock the sticky
+    /// poison flag stands and the checked lifecycle read reports `Poisoned`,
+    /// never `Ok(None)`: the FFI bridges' `context_close` treats `Ok(None)` as
+    /// "already closed" and skips the `ContextClose` check. A bootstrap that
+    /// holds the lock meanwhile cannot clear a marker `clear_poison` has not
+    /// set yet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_poison_wait_for_the_spawn_lock_reads_as_poisoned_not_absent() {
+        let clock = Arc::new(TestClock::new(1_700_000_000));
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let ctx_key = hex::encode([0xDDu8; 32]);
+        let owning = DID(format!("did:scp:{ctx_key}"));
+        sup.crash_windows
+            .entry(ctx_key.clone())
+            .or_default()
+            .poisoned = true;
+
+        // Another lifecycle operation holds the global spawn lock.
+        let spawn_guard = sup.bootstrap_spawn_lock.lock().await;
+        let task = {
+            let sup = Arc::clone(&sup);
+            let ctx_key = ctx_key.clone();
+            tokio::spawn(async move { sup.clear_poison(&ctx_key, &owning).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "clear_poison must wait for the spawn lock"
+        );
+        let read = sup.read_context_state_checked(&ctx_key).await;
+        assert!(
+            matches!(
+                read,
+                Ok(Some(scp_protocol::context::ContextState::Poisoned))
+            ),
+            "the clear_poison wait must read as Poisoned, got {read:?}"
+        );
+
+        drop(spawn_guard);
+        let respawn = task.await.expect("clear_poison task must not panic");
+        assert!(
+            matches!(respawn, Err(ContextError::ActorCrashed(_))),
+            "the respawn with no snapshot fails, got {respawn:?}"
+        );
+    }
+
+    /// A bootstrap over a poisoned id reads as `ActorCrashed` while it runs,
+    /// and one that registers no actor (a failed import or create) puts the
+    /// poisoned window back, so the context never reads as `Ok(None)`. A
+    /// bootstrap over an id with no crash history leaves no window behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_bootstrap_restores_the_prior_crash_window() {
+        let clock = Arc::new(TestClock::new(1_700_000_000));
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let poisoned = hex::encode([0xDEu8; 32]);
+        sup.crash_windows
+            .entry(poisoned.clone())
+            .or_default()
+            .poisoned = true;
+
+        let window = sup.begin_bootstrap_window(&poisoned);
+        assert!(
+            !sup.is_context_poisoned(&poisoned),
+            "the bootstrap starts the new actor on a clean budget"
+        );
+        let during = sup.read_context_state_checked(&poisoned).await;
+        assert!(
+            matches!(during, Err(ContextError::ActorCrashed(_))),
+            "a bootstrap in progress must read as ActorCrashed, got {during:?}"
+        );
+        drop(window);
+        let after = sup.read_context_state_checked(&poisoned).await;
+        assert!(
+            matches!(
+                after,
+                Ok(Some(scp_protocol::context::ContextState::Poisoned))
+            ),
+            "a bootstrap that registered no actor must restore the poison, got {after:?}"
+        );
+
+        let clean = hex::encode([0xDFu8; 32]);
+        drop(sup.begin_bootstrap_window(&clean));
+        assert!(
+            !sup.crash_windows.contains_key(&clean),
+            "a bootstrap over an id with no crash history leaves no window"
+        );
+    }
+
+    /// A checked read racing bootstraps that fail over a poisoned id never
+    /// reads as `Ok(None)`. Each failed bootstrap swaps a marker-only window
+    /// in and then restores the poisoned one. A read that took the poison
+    /// flag and the respawn markers from two separate `crash_windows` reads
+    /// could see the fresh window's clear poison flag and then the restored
+    /// window's clear markers, and report the poisoned context as absent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_checked_read_racing_failed_bootstraps_never_reads_a_poisoned_id_as_absent() {
+        let clock = Arc::new(TestClock::new(1_700_000_000));
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let poisoned = hex::encode([0xD1u8; 32]);
+        sup.crash_windows
+            .entry(poisoned.clone())
+            .or_default()
+            .poisoned = true;
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flipper = {
+            let sup = Arc::clone(&sup);
+            let id = poisoned.clone();
+            let stop = Arc::clone(&stop);
+            tokio::task::spawn_blocking(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    drop(sup.begin_bootstrap_window(&id));
+                }
+            })
+        };
+        for _ in 0..20_000 {
+            let read = sup.read_context_state_checked(&poisoned).await;
+            assert!(
+                !matches!(read, Ok(None)),
+                "a poisoned id must never read as absent mid-bootstrap"
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        flipper.await.expect("the bootstrap loop must not panic");
+    }
+
     /// `clear_poison` on a context with NO persisted snapshot records a FRESH
     /// respawn failure (the single retry fails) and returns an error WITHOUT
     /// looping: the budget is reset to one fresh failure, not re-poisoned in a
@@ -22862,6 +23383,151 @@ mod tests {
         );
     }
 
+    /// A registered actor this call cannot reach reads as `ActorBusy` from
+    /// [`Supervisor::read_context_state_checked`] and as `None` from
+    /// [`Supervisor::read_context_state`].
+    ///
+    /// The `Option` form collapses "the supervisor holds no actor for this id"
+    /// and "the supervisor holds an actor that did not answer" into one value.
+    /// `context_close` on the three FFI bridges reads `None` as proof that the
+    /// close already happened and skips the `CloseContext` dispatch, which
+    /// carries the only `ContextClose` capability check on that path, so it
+    /// reads the checked form instead. The `Option` form keeps its collapse
+    /// because no caller of that form reads `None` as an authorization.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_actor_reads_as_actor_busy_not_as_an_absent_context() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+
+        let ctx_key = "ctx-unreachable-actor";
+        // A mailbox no task drains. `send_with_timeout` fails on it with
+        // `ActorBusy`, which is the error a saturated mailbox produces once
+        // `SEND_TIMEOUT` elapses and a wedged actor produces once
+        // `REPLY_TIMEOUT` elapses.
+        let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        drop(rx);
+        sup.actors
+            .insert(ctx_key.to_owned(), ContextActorHandle::from_sender(tx));
+
+        let checked = sup.read_context_state_checked(ctx_key).await;
+        assert!(
+            matches!(checked, Err(ContextError::ActorBusy(_))),
+            "an actor the supervisor still holds but this call cannot reach must read as \
+             ActorBusy, got {checked:?}"
+        );
+        assert_eq!(
+            sup.read_context_state(ctx_key).await,
+            None,
+            "the Option form keeps folding an unreachable actor into None, which no caller of \
+             that form reads as an authorization"
+        );
+
+        // An id the supervisor holds no actor for still reads as absent, so
+        // the checked form did not turn every miss into an error.
+        let absent = sup.read_context_state_checked("never-existed").await;
+        assert!(
+            matches!(absent, Ok(None)),
+            "an id with no actor and no poison flag must read as Ok(None), got {absent:?}"
+        );
+    }
+
+    /// A context in the respawn gap, and a context whose last respawn failed
+    /// below the poison threshold, read as `ActorCrashed` from
+    /// [`Supervisor::read_context_state_checked`], not as an absent context.
+    ///
+    /// Both contexts have no registered actor, and both still exist: the
+    /// watchdog re-registers the first one when its respawn finishes, the
+    /// operator's `clear_poison` respawns the second one (as it does a
+    /// poisoned context), and `lookup_miss_error` classifies both as crashed.
+    /// `context_close` on the three FFI bridges reads `Ok(None)` as proof that
+    /// the close already happened and skips the `CloseContext` dispatch, which
+    /// carries the only `ContextClose` capability check on that path, so a
+    /// `None` here would let a caller holding no `context:close` capability
+    /// release a context the supervisor can serve as `Active` again. The
+    /// bridges refuse a `Poisoned` close for the same reason.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_crashed_context_with_no_actor_reads_as_actor_crashed_not_as_absent() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+
+        sup.test_hold_context_mid_respawn("ctx-checked-mid-respawn")
+            .await;
+        let mid_respawn = sup
+            .read_context_state_checked("ctx-checked-mid-respawn")
+            .await;
+        assert!(
+            matches!(mid_respawn, Err(ContextError::ActorCrashed(_))),
+            "a context the watchdog is respawning must read as ActorCrashed, got {mid_respawn:?}"
+        );
+
+        sup.test_fail_context_respawn("ctx-checked-respawn-failed")
+            .await;
+        assert!(
+            !sup.is_context_poisoned("ctx-checked-respawn-failed"),
+            "the fixture must leave the context below the poison threshold"
+        );
+        let respawn_failed = sup
+            .read_context_state_checked("ctx-checked-respawn-failed")
+            .await;
+        assert!(
+            matches!(respawn_failed, Err(ContextError::ActorCrashed(_))),
+            "a context whose last respawn failed must read as ActorCrashed, got \
+             {respawn_failed:?}"
+        );
+
+        let absent = sup.read_context_state_checked("never-existed").await;
+        assert!(
+            matches!(absent, Ok(None)),
+            "an id with no actor and no crash-window record must read as Ok(None), got {absent:?}"
+        );
+    }
+
+    /// [`Supervisor::get_role_state_checked`] reports an unreachable actor as
+    /// `ActorBusy`, a crashed context as `ActorCrashed`, and a poisoned context
+    /// as `ContextPoisoned`, and answers `Ok(None)` only for an id the
+    /// supervisor never served. [`Supervisor::get_role_state`] folds all four
+    /// into `None`, so an FFI bridge authorizing against it told a caller that
+    /// a merely saturated context does not exist.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_checked_role_state_read_tells_a_busy_or_crashed_context_from_an_absent_one() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+
+        sup.test_make_actor_unreachable("ctx-role-unreachable");
+        assert!(sup.get_role_state("ctx-role-unreachable").await.is_none());
+        let busy = sup.get_role_state_checked("ctx-role-unreachable").await;
+        assert!(
+            matches!(busy, Err(ContextError::ActorBusy(_))),
+            "an unreachable actor must read as ActorBusy, got {busy:?}"
+        );
+
+        sup.test_hold_context_mid_respawn("ctx-role-mid-respawn")
+            .await;
+        let crashed = sup.get_role_state_checked("ctx-role-mid-respawn").await;
+        assert!(
+            matches!(crashed, Err(ContextError::ActorCrashed(_))),
+            "a context mid-respawn must read as ActorCrashed, got {crashed:?}"
+        );
+
+        sup.test_poison_context("ctx-role-poisoned").await;
+        let poisoned = sup.get_role_state_checked("ctx-role-poisoned").await;
+        assert!(
+            matches!(poisoned, Err(ContextError::ContextPoisoned(_))),
+            "a poisoned context must read as ContextPoisoned, got {poisoned:?}"
+        );
+
+        let absent = sup.get_role_state_checked("never-existed").await;
+        assert!(
+            matches!(absent, Ok(None)),
+            "an id the supervisor never served must read as Ok(None), got {absent:?}"
+        );
+    }
+
     /// ADR-049 §10 transient-respawn observability: while a context is
     /// mid-respawn (despawned, not yet re-registered), a concurrent
     /// per-context dispatch that `lookup`-misses must surface the retryable
@@ -22904,6 +23570,221 @@ mod tests {
             matches!(after, ContextError::ContextNotRegistered(_)),
             "after the respawn window closes, a lookup miss falls back to \
              ContextNotRegistered, got {after:?}"
+        );
+    }
+
+    /// A lifecycle-state read whose registry lookup misses, and whose
+    /// crash-window read runs after a respawn registered the replacement actor
+    /// and cleared its marker, reads the replacement's state and not `Ok(None)`.
+    /// `read_context_state_checked` holds no lock across the two reads, so
+    /// both come back clean in that interleaving; only the second `lookup`
+    /// after the window read finds the replacement. `context_close` on every
+    /// FFI bridge reads `Ok(None)` as a close that already happened and skips
+    /// the `ContextClose` capability check, so `Ok(None)` here is a fail-open.
+    ///
+    /// The test forces the interleaving. It holds the context's crash-window
+    /// shard lock, so the reader task's first `crash_windows` read blocks after
+    /// its `lookup` has missed. While the reader waits, the test re-registers
+    /// the actor and clears the marker, in the order the respawn success path
+    /// uses, and then releases the lock. If the reader has not reached its
+    /// `lookup` when the actor is re-registered, the lookup hits and the test
+    /// passes without exercising the gap, so the pause below only has to be
+    /// long enough for a spawned task to start.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn state_read_that_misses_a_respawning_actor_reads_the_replacement() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let (_handle, ctx_key) = spawn_active_with_snapshot(&sup, [0xC7u8; 32]).await;
+
+        // The respawn gap: marker set, actor out of the registry. The removed
+        // handle keeps the actor's mailbox open for re-registration.
+        sup.crash_windows
+            .entry(ctx_key.clone())
+            .or_default()
+            .mark_respawning();
+        let (_, actor) = sup
+            .actors
+            .remove(&ctx_key)
+            .expect("the spawned actor must be registered");
+
+        let mut window_guard = sup
+            .crash_windows
+            .get_mut(&ctx_key)
+            .expect("the marker created the window");
+        let reader = {
+            let sup = Arc::clone(&sup);
+            let ctx_key = ctx_key.clone();
+            tokio::spawn(async move { sup.read_context_state_checked(&ctx_key).await })
+        };
+        // Blocking pause on the test thread, which runs no runtime task, so the
+        // reader runs on a worker, misses the lookup, and blocks on the shard.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        sup.actors.insert(ctx_key.clone(), actor);
+        window_guard.clear_respawning();
+        drop(window_guard);
+
+        let read = reader.await.expect("reader task must not panic");
+        assert!(
+            matches!(read, Ok(Some(crate::context::ContextState::Active))),
+            "a read that missed a respawning actor must report the replacement's \
+             state, got {read:?}"
+        );
+    }
+
+    /// The import-replace gap reads as `ActorCrashed`, not as an absent
+    /// context. `import_context` despawns the actor it replaces through
+    /// `despawn_for_replace` and registers the imported actor later; a
+    /// `context_close` that read `Ok(None)` in that gap would skip the
+    /// `ContextClose` capability check and release the bridge's state. Once
+    /// the `ImportContext` arm ends the gap, the marker is gone and a window
+    /// the marker alone created is reaped, while a window holding real crash
+    /// history survives with the marker cleared.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn import_replace_gap_reads_as_actor_crashed_until_the_window_ends() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+
+        let ctx_key = spawn_live_context(&sup, [0xC8u8; 32]).await;
+        assert!(
+            sup.despawn_for_replace(&ctx_key).await,
+            "the live actor must be despawned"
+        );
+        assert!(sup.lookup(&ctx_key).is_none(), "no actor serves the gap");
+        let in_gap = sup.read_context_state_checked(&ctx_key).await;
+        assert!(
+            matches!(in_gap, Err(ContextError::ActorCrashed(_))),
+            "a context in the import-replace gap must read as ActorCrashed, got {in_gap:?}"
+        );
+        sup.end_replace_window(&ctx_key);
+        assert!(
+            !sup.crash_windows.contains_key(&ctx_key),
+            "a crash window the replace marker alone created must be reaped"
+        );
+
+        let with_history = spawn_live_context(&sup, [0xC9u8; 32]).await;
+        let now_ms = sup.crash_now_ms("context_actor", &with_history);
+        sup.crash_windows
+            .entry(with_history.clone())
+            .or_default()
+            .record(now_ms);
+        sup.despawn_for_replace(&with_history).await;
+        sup.end_replace_window(&with_history);
+        let window = sup
+            .crash_windows
+            .get(&with_history)
+            .expect("a window with crash history must survive the replace");
+        assert!(
+            !window.is_respawning(),
+            "the replace marker must be cleared"
+        );
+        assert_eq!(window.crash_count(), 1, "the crash history must be kept");
+    }
+
+    /// `Supervisor::import_context` over a replaceable actor marks the replace
+    /// gap on its own production path, and its `ImportContext` arm clears the
+    /// mark once the imported actor registers. The test above drives
+    /// `despawn_for_replace` and `end_replace_window` by hand, so it stays
+    /// green when `lifecycle_helpers::import_context` calls `despawn_actor`
+    /// instead or when the arm stops calling `end_replace_window`; this one
+    /// goes red in either case.
+    ///
+    /// The test holds `write_lock`, which `despawn_actor` takes after
+    /// `despawn_for_replace` sets the mark, so the import stops at the start
+    /// of the gap and the mark stays observable. The owning member's
+    /// key-package store is resolved first so `build_actor_deps` takes no
+    /// `write_lock` before that point.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn import_over_replaceable_actor_marks_and_ends_the_replace_gap() {
+        // `TestEventLog` refuses `import_event_log_data`; the import needs a
+        // provider that takes the export's event-log bytes.
+        let sup = supervisor_with_providers_and_event_log(Box::new(
+            crate::context::providers::event_log::MerkleEventLogProvider::new(),
+        ));
+        let ctx_id_bytes = [0xCAu8; 32];
+        let deps = test_actor_deps(&sup).await;
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:replace-admin".to_owned()),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .expect("drive the prior context to Active");
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Closing)
+            .expect("drive the prior context to Closing, which an import may replace");
+        sup.spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers the prior context");
+        let ctx_key = hex::encode(ctx_id_bytes);
+
+        let owning_member = "did:key:aaa-replace-gap-owning-member";
+        sup.key_package_store_for(&DID(owning_member.to_owned()))
+            .await
+            .expect("kp store resolves with providers");
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let export = signed_import_export_with_member(
+            &ctx_key,
+            "did:key:replace-gap-creator",
+            owning_member,
+            &signing_key,
+        )
+        .await;
+
+        let write_guard = sup.write_lock.lock().await;
+        let import = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move { sup.import_context(export, &verifying_key, None).await })
+        };
+        let marked = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if sup
+                    .crash_windows
+                    .get(&ctx_key)
+                    .is_some_and(|window| window.is_respawning())
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            marked.is_ok(),
+            "import_context must mark the replace gap before it despawns the prior actor"
+        );
+        // Stand in for the despawn the held `write_lock` is blocking, so the
+        // read below lands in the gap the production marker covers. The
+        // import's own `despawn_actor` then finds the slot empty.
+        sup.actors.remove(&ctx_key);
+        let in_gap = sup.read_context_state_checked(&ctx_key).await;
+        assert!(
+            matches!(in_gap, Err(ContextError::ActorCrashed(_))),
+            "a context in the import-replace gap must read as ActorCrashed, got {in_gap:?}"
+        );
+        drop(write_guard);
+
+        import
+            .await
+            .expect("import task must not panic")
+            .expect("an import over a Closing context succeeds");
+        assert!(
+            !sup.crash_windows.contains_key(&ctx_key),
+            "the ImportContext arm must end the replace gap and reap the window it created"
+        );
+        assert!(
+            sup.despawn_actor(&ctx_key).await,
+            "the imported actor must be registered"
+        );
+        let after = sup.read_context_state_checked(&ctx_key).await;
+        assert!(
+            matches!(after, Ok(None)),
+            "with the gap ended, a despawned context must read as absent, got {after:?}"
         );
     }
 

@@ -41,6 +41,53 @@ use scp_ffi_common::html_escape_event_string;
 use crate::validate;
 
 // ---------------------------------------------------------------------------
+// Lifecycle-state gate
+// ---------------------------------------------------------------------------
+
+/// Renders a lifecycle state as the string this bridge reports to Python.
+///
+/// Delegates to [`scp_ffi_common::context_state_str`], which the NAPI and
+/// `UniFFI` lifecycle gates also call, so an SDK reads one vocabulary whichever
+/// bridge it links.
+const fn context_state_str(state: &scp_core::context::ContextState) -> &'static str {
+    scp_ffi_common::context_state_str(state)
+}
+
+/// Rejects an operation unless a context's supervisor actor reports `Active`.
+///
+/// `verb` names the operation in the error a caller receives, so
+/// `require_active_context(bi, id, "join", codes::CTX_2013)` produces a
+/// `ContextError` carrying `SCP-CTX-2013` and "cannot join context in
+/// 'closed' state -- context must be 'active'". `code` is the operation's own
+/// code, the one the NAPI and `UniFFI` gates attach for the same operation.
+///
+/// The state comes from [`crate::runtime::live_context_state`], which queries
+/// the context's supervisor actor. Reading
+/// [`PyContextHandle`]'s `state` string instead would admit an operation into a
+/// context a TTL expiry, another member's close, a migration, or an actor
+/// poison had already taken out of service, because that string only records a
+/// transition this bridge itself observed.
+fn require_active_context(
+    bi: &crate::runtime::PyBridgeInstance,
+    context_id: &str,
+    verb: &str,
+    code: &str,
+) -> PyResult<()> {
+    let state = crate::runtime::live_context_state(bi, context_id)?;
+    if matches!(state, scp_core::context::ContextState::Active) {
+        return Ok(());
+    }
+    let state_name = context_state_str(&state);
+    Err(crate::error::ScpPyError::ContextError {
+        message: format!(
+            "cannot {verb} context in '{state_name}' state -- context must be 'active'"
+        ),
+        code: code.to_owned(),
+    }
+    .into())
+}
+
+// ---------------------------------------------------------------------------
 // PyContextHandle
 // ---------------------------------------------------------------------------
 
@@ -89,14 +136,21 @@ impl PyContextHandle {
     ///
     /// This is a **best-effort, cached** snapshot taken at the last observed
     /// transition — it is intentionally NOT a live supervisor read (that would
-    /// add a mailbox round-trip to every call). Per ADR-049 §10, an actor
-    /// crash or poison detected by the supervisor watchdog is surfaced
-    /// authoritatively via a typed **error code on the next per-context
-    /// operation** (`SCP-CTX-2134` `ContextPoisoned` once the respawn budget is
-    /// exceeded, `SCP-CTX-2135` `ActorCrashed` for the crashed/mid-respawn
-    /// window) — NOT by polling this getter, which may still report the
-    /// last-known non-terminal state. Operator recovery from a poisoned context
-    /// is `clear_poison` / process restart, not an SDK call.
+    /// add a mailbox round-trip to every call). Per ADR-049 §10, the next
+    /// per-context operation reads the supervisor and refuses a context whose
+    /// actor the watchdog poisoned or found crashed; polling this getter may
+    /// still report the last-known non-terminal state. Join, leave, send, and
+    /// receive refuse a poisoned context with the operation's own code
+    /// (`SCP-CTX-2013`, `SCP-CTX-2015`, `SCP-CTX-2019`, `SCP-CTX-2021`), not
+    /// `SCP-CTX-2134`, and surface a crashed or mid-respawn actor as
+    /// `SCP-CTX-2135` `ActorCrashed`. Every UCAN entry point and every outlet
+    /// entry point that decides authorization refuses a poisoned, crashed, or
+    /// busy context with one text that withholds the lifecycle state and the
+    /// entry point's own code, because those gates run before the caller is
+    /// authorized. An operation the supervisor answers without a bridge
+    /// lifecycle gate returns `SCP-CTX-2134` `ContextPoisoned`. Operator
+    /// recovery from a poisoned context is `clear_poison` / process restart,
+    /// not an SDK call.
     #[getter]
     fn state(&self) -> PyResult<String> {
         let guard = self
@@ -183,7 +237,10 @@ impl PyContextHandle {
 /// Context creation parameters, constructed from a Python dict.
 ///
 /// The dict may contain any of these keys (all optional):
-/// - `ceiling` -- list of capability strings
+/// - `ceiling` -- list of capability strings. Omitting this key, or passing
+///   `None`, declares no ceiling and gets `default_ceiling()`. Passing `[]`
+///   declares a ceiling that grants nothing, and this bridge builds that
+///   deny-all context rather than reading the empty list as an omission.
 /// - `roles` -- dict mapping role names to lists of capability strings
 /// - `outlets` -- list of outlet name strings
 /// - `ttl` -- float (seconds) or `None`
@@ -200,6 +257,11 @@ impl PyContextHandle {
 #[derive(Debug, Clone)]
 pub struct PyContextParams {
     /// Capability ceiling -- maximum capabilities any participant can hold.
+    ///
+    /// This field holds the ceiling the context runs under, so
+    /// `from_py_dict` has already resolved an absent declaration to
+    /// `default_ceiling()` and an empty list stands for a deny-all ceiling.
+    /// No later stage substitutes a default into it.
     ceiling: Vec<String>,
     /// Role definitions mapping role names to capability lists.
     roles: HashMap<String, Vec<String>>,
@@ -429,10 +491,17 @@ impl PyContextParams {
     /// implemented by a parallel subagent) and uses `PyO3` extraction directly.
     #[allow(clippy::too_many_lines)] // Flat field-by-field extraction with validation.
     fn from_py_dict(dict: &Bound<'_, PyDict>) -> PyResult<Self> {
-        // ceiling: list[str] (default: empty)
+        // ceiling: list[str] (default: `default_ceiling()`).
+        //
+        // An absent key and a `None` value both mean "this caller declared no
+        // ceiling", and `default_ceiling`'s own doc comment states that every
+        // FFI bridge applies it "when no explicit ceiling is provided". A
+        // supplied list stands as written, so an empty list declares a ceiling
+        // that grants nothing rather than reading as an absent key — a caller
+        // that writes `ceiling=[]` means a deny-all context and gets one.
         let ceiling: Vec<String> = match dict.get_item("ceiling")? {
-            Some(val) => val.extract()?,
-            None => Vec::new(),
+            Some(val) if !val.is_none() => val.extract()?,
+            Some(_) | None => default_ceiling_strings(),
         };
 
         // roles: dict[str, list[str]] (default: empty)
@@ -1463,7 +1532,27 @@ fn build_core_context_params(
         governance_voters: None,
     };
 
+    // `PyContextParams::from_py_dict` already resolved an absent ceiling to
+    // `default_ceiling()`, so `py_params.ceiling` holds the ceiling this
+    // context runs under and this function passes it through unchanged.
+    // Substituting a default HERE would read an explicitly empty list as an
+    // absent one, and a caller that wrote `ceiling=[]` to build a deny-all
+    // context would silently receive eleven capabilities.
     build_context_params(&common).map_err(PyRuntimeError::new_err)
+}
+
+/// `default_ceiling()` rendered as the `{resource}:{action}` capability strings
+/// a Python caller supplies.
+///
+/// `PyContextParams` carries a caller's vocabulary, and
+/// `build_core_context_params` hands that vocabulary to the shared parser, so a
+/// default this bridge substitutes has to arrive in the same form a caller
+/// would have written.
+fn default_ceiling_strings() -> Vec<String> {
+    scp_core::context::roles::default_ceiling()
+        .iter()
+        .map(|cap| cap.name().into_owned())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2326,9 +2415,10 @@ impl crate::scp::PyScp {
             parsed.clone(),
         );
 
-        // Register FFI-specific state (OutletRegistry, EventLog, RoleState, RevocationList)
-        // in the global FFI state registry so that outlets/UCAN/event_log bridge functions
-        // can look them up by context ID. Also initializes the shared ContextManager.
+        // Register FFI-specific state (OutletRegistry, EventLog, RevocationList,
+        // NonceTracker, session store) in this bridge instance's FFI state registry
+        // so that outlets/UCAN/event_log bridge functions can look it up by context
+        // ID. `register_context` also initializes the context manager.
         crate::runtime::register_context(bi, &context_id, identity_did, &parsed.ceiling).map_err(
             |e| PyRuntimeError::new_err(format!("failed to register context state: {e}")),
         )?;
@@ -2497,17 +2587,7 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(identity_did)?;
-        let state = handle
-            .state
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
-
-        if *state != "active" {
-            return Err(PyRuntimeError::new_err(format!(
-                "cannot join context in '{state}' state -- context must be 'active'"
-            )));
-        }
-        drop(state);
+        require_active_context(bi, &handle.context_id, "join", codes::CTX_2013)?;
 
         // Parse optional spending UCAN JWT for AND-composition (join cost).
         let spending_ucan = spending_ucan_jwt
@@ -2622,12 +2702,9 @@ impl crate::scp::PyScp {
                 });
             }
 
-            // Also update FFI bridge state's role_state for UCAN/outlet capability checks.
-            crate::runtime::with_ffi_state(bi, &context_id, |st| {
-                st.role_state.members.insert(member_did.clone());
-                Ok(())
-            })
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            // No bridge-side membership write follows the join: `Supervisor::join_context`
+            // recorded the new member, and every UCAN/outlet capability check reads
+            // that record through `crate::runtime::live_role_state`.
 
             // Bridge: drain events (MemberJoined) from ContextManager's receive
             // buffer and deliver to the FFI receive channel (#332).
@@ -2860,19 +2937,19 @@ impl crate::scp::PyScp {
         })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        // Register the bridge-side FFI state (OutletRegistry / EventLog / RoleState)
-        // as a REVERSIBLE precheck BEFORE the irreversible runtime join. Mirrors
-        // `context_create`, which registers FFI state first and rolls it back via
-        // `remove_context` if the runtime step fails. The creator is the
-        // role-state admin (bundle-derived); the joiner is added as a member
-        // below.
+        // Register the bridge-side FFI state (OutletRegistry / EventLog /
+        // RevocationList / NonceTracker / SessionStore) as a REVERSIBLE precheck
+        // BEFORE the irreversible runtime join. Mirrors `context_create`, which
+        // registers FFI state first and rolls it back via `remove_context` if the
+        // runtime step fails. The FFI state holds no role state and no
+        // membership; `spawn_actor_from_welcome` records both in the supervisor.
         //
-        // FLAG-1: the caller no longer supplies a ceiling, so register with the
-        // DEFAULT ceiling (`&[]`). The Occupied dedup is keyed on `context_id`,
-        // so the "detect a duplicate BEFORE consuming the single-use KeyPackage"
-        // crash-safety is preserved regardless of the ceiling. The AUTHENTICATED
-        // ceiling is re-synced from the joined handle's signed params AFTER a
-        // successful spawn (see `sync_ceiling_from_params` below).
+        // FLAG-1: the caller supplies no ceiling, and none is stored here. FFI
+        // state holds no ceiling at all; UCAN validation reads the ceiling that
+        // `spawn_actor_from_welcome` took from the creator-signed bundle, through
+        // `crate::runtime::live_ceiling_strings`. The Occupied dedup is keyed on
+        // `context_id`, so the "detect a duplicate BEFORE consuming the single-use
+        // KeyPackage" crash-safety is preserved.
         //
         // Ordering matters for two reasons:
         //   1. `register_ffi_state` hard-errors on an already-registered context
@@ -2883,20 +2960,12 @@ impl crate::scp::PyScp {
         //   2. If the runtime join later fails, we roll THIS state back, so there
         //      is no path where the join commits but bridge state errors, and no
         //      leaked FFI state when the join fails.
-        crate::runtime::register_ffi_state(bi, &sealed.context_id, &sealed.creator_did, &[])
-            .map_err(|e| {
-                PyRuntimeError::new_err(format!("failed to register context state: {e}"))
-            })?;
-        // Insert the joiner as a member of the freshly-registered role state. On
-        // the (practically unreachable) failure of this insert into state we just
-        // created, roll it back so a failed join leaves nothing behind.
-        if let Err(e) = crate::runtime::with_ffi_state(bi, &sealed.context_id, |st| {
-            st.role_state.members.insert(owning_did.clone());
-            Ok(())
-        }) {
-            crate::runtime::remove_context(bi, &sealed.context_id);
-            return Err(PyRuntimeError::new_err(e.to_string()));
-        }
+        crate::runtime::register_ffi_state(bi, &sealed.context_id, &[]).map_err(|e| {
+            PyRuntimeError::new_err(format!("failed to register context state: {e}"))
+        })?;
+        // No bridge-side membership write follows: `spawn_actor_from_welcome`
+        // records the joiner in the supervisor's role state, and every later
+        // capability check reads that record through `live_role_state`.
 
         let owning = scp_did::DID(owning_did.clone());
         let req = scp_core::context::supervisor::WelcomeJoinRequest {
@@ -2925,33 +2994,40 @@ impl crate::scp::PyScp {
                 }
             };
 
-        // FLAG-1: re-sync the AUTHENTICATED ceiling from the joined handle's
-        // signed params, overwriting the default ceiling used for the reversible
-        // precheck. The authoritative ceiling lives in the bundle the creator
-        // signed — never in caller input. This runs AFTER the irreversible
-        // commit; the FFI state was just registered (and not removed on this
-        // success path), so the sync targets a live entry.
+        // FLAG-1: no ceiling copy is written here. `spawn_actor_from_welcome`
+        // stored the ceiling the creator signed into the supervisor's role state,
+        // and UCAN validation reads it through `live_ceiling_strings`, so the
+        // authenticated ceiling reaches every check without a bridge-side copy
+        // that a later governance `ModifyCeiling` would leave stale.
         //
-        // BLACK-2JF-01 — post-irreversible-commit compensation: the sync fails
-        // ONLY if a concurrent close/leave removed the just-registered FFI state
-        // in the window since the spawn returned. A close/leave does NOT despawn
-        // the runtime actor, so returning `Err` here without tearing the actor
-        // down would strand a live, orphaned actor for a join that never fully
-        // materialized at the bridge. Compensate with the COMPLETE teardown
-        // (`discard_joined_context`): it removes the actor handle AND destroys
-        // the resident MLS group AND deletes the durable Class-S snapshot the
-        // join persisted — a bare `despawn_actor` would leave the crypto group
-        // and snapshot behind, resurrecting the context on restart and blocking
-        // a fresh re-join. Then purge residual bridge state and surface the
-        // error.
-        if let Err(e) = crate::runtime::sync_ceiling_from_params(
-            bi,
-            &sealed.context_id,
-            &joined.params().ceiling,
-        ) {
+        // BLACK-2JF-01, post-irreversible-commit compensation: the presence
+        // probe below misses only when a concurrent close or leave removed the
+        // FFI state this join registered while the spawn ran or after it
+        // returned. A close on an older handle for the same context id reads no
+        // actor while the spawn runs, so `context_close` skips the dispatch and
+        // releases that state. This join holds the GIL across the spawn, which
+        // keeps other Python threads out of the window; the probe does not rely
+        // on that, so the detection survives a later change that releases the
+        // GIL. A close or leave does not despawn the actor, so returning without
+        // a teardown would strand a live actor behind a handle with no FFI
+        // state. `discard_joined_context` removes the actor handle, destroys the
+        // resident MLS group, and deletes the durable snapshot the join
+        // persisted; a bare `despawn_actor` would leave the group and the
+        // snapshot behind, so a restart would restore the context and a fresh
+        // re-join would collide with it.
+        if !crate::runtime::ffi_state_registry(bi).contains_key(&sealed.context_id) {
             rt.block_on(sup.discard_joined_context(&sealed.context_id));
             crate::runtime::remove_context(bi, &sealed.context_id);
-            return Err(PyRuntimeError::new_err(e.to_string()));
+            return Err(crate::error::ScpPyError::ContextError {
+                message: format!(
+                    "FFI state for context '{}' vanished between the reversible registration \
+                     and the committed join; the just-committed actor was torn down so no \
+                     context stays live without FFI state",
+                    sealed.context_id
+                ),
+                code: scp_ffi_common::error_codes::CTX_2040.to_owned(),
+            }
+            .into());
         }
 
         // Runtime join committed. Register the context in the known-contexts
@@ -2962,8 +3038,9 @@ impl crate::scp::PyScp {
         // and needs no rollback. spawn-from-Welcome always stands up an ENCRYPTED
         // context, so the routing id is the joiner's derived §9.10.4 pseudonym
         // (`local_pseudonym` is `Copy`, still valid after the request move). The
-        // member is the JOINER (`owning_did`), matching the role-state member
-        // inserted above so `context_ids_for_member` / discovery agree.
+        // member is the JOINER (`owning_did`), the member `spawn_actor_from_welcome`
+        // recorded in the supervisor's role state, so `context_ids_for_member` /
+        // discovery agree.
         {
             let relay_url = match self.transport_status() {
                 Ok(status) => status.relay_url,
@@ -3150,17 +3227,7 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(identity_did)?;
-        let state = handle
-            .state
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
-
-        if *state != "active" {
-            return Err(PyRuntimeError::new_err(format!(
-                "cannot leave context in '{state}' state -- context must be 'active'"
-            )));
-        }
-        drop(state);
+        require_active_context(bi, &handle.context_id, "leave", codes::CTX_2015)?;
 
         // Delegate leave to the shared ContextManager for membership tracking.
         {
@@ -3184,11 +3251,9 @@ impl crate::scp::PyScp {
                 PyRuntimeError::new_err(format!("ContextManager leave_context failed: {e}"))
             })?;
 
-            // Also update FFI bridge state's role_state.
-            let _ = crate::runtime::with_ffi_state(bi, &context_id, |st| {
-                st.role_state.members.remove(identity_did);
-                Ok(())
-            });
+            // No bridge-side membership write follows the leave: `Supervisor::leave_context`
+            // dropped the member, and every UCAN/outlet capability check reads that
+            // record through `crate::runtime::live_role_state`.
 
             // Bridge: drain events (MemberLeft) from ContextManager's receive
             // buffer and deliver BEFORE closing the channel (#332).
@@ -3215,29 +3280,124 @@ impl crate::scp::PyScp {
     ///   hold the `ContextClose` capability (typically the context creator or
     ///   an admin).
     ///
+    /// The close is idempotent once the supervisor has taken the context out
+    /// of service for good: when no actor serves the context (a completed TTL
+    /// expiry, an all-members-left teardown) or the supervisor reports
+    /// `closed`, `expired`, or `tombstoned`, the call skips the supervisor
+    /// dispatch and only releases this bridge's state for the id. `closing`
+    /// and `poisoned` are not among those states — see the `Errors` section.
+    ///
     /// # Errors
     ///
-    /// Returns `RuntimeError` if the context is not in "active" state.
+    /// Returns `RuntimeError` if the supervisor reports the context in a
+    /// non-terminal, non-active state (`creating`, `closing`,
+    /// `migrating_out`, `poisoned`). A `closing` context sits in the §5.9
+    /// cooperative window, which `finalize_close` ends; only after that
+    /// transition to `closed` does a close release this bridge's state for
+    /// the id. A `poisoned` context returns to `active` through the
+    /// operator's `clear_poison`, so this bridge keeps its revocation list and
+    /// nonce state until a close runs against the respawned actor.
+    /// Returns `ContextError` with code `SCP-CTX-2135` (`ActorCrashed`) if the
+    /// supervisor holds no actor for the context because the actor is
+    /// mid-respawn or its last respawn failed; the close succeeds once the
+    /// respawn completes or the operator's `clear_poison` revives the context.
+    /// Returns `ContextError` whose message carries `SCP-CTX-2130` if the
+    /// supervisor still holds an actor for the context and that actor did not
+    /// answer the state read: an unanswered read is not evidence that the
+    /// close already happened, so the call refuses and the caller retries it.
     /// Returns `ContextError` if the caller lacks the `ContextClose` capability.
     #[pyo3(signature = (handle, identity_did))]
     pub fn context_close(&self, handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(identity_did)?;
-        let mut state = handle
-            .state
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
+        // Read the supervisor, not the handle's cached string. A close is the
+        // one lifecycle operation that stays valid after the supervisor took
+        // the context out of service for good: a TTL expiry despawns the
+        // actor, a peer's finalized close leaves `Closed`, and a migration
+        // leaves `Tombstoned`. In every one of those cases the context is
+        // past its cooperative window, and this bridge still holds an
+        // `FfiBridgeState` for the id that only this path releases. So an
+        // absent actor and a terminal state skip the dispatch and fall
+        // through to the release below; every non-terminal state
+        // (`Creating`, `Closing`, `MigratingOut`, `Poisoned`) refuses the
+        // close.
+        //
+        // The terminal skip runs no `ContextClose` check, because
+        // `ttl::close_context` runs inside the dispatch the skip removes. Any
+        // holder of the handle can therefore release this bridge's
+        // `FfiBridgeState` once the supervisor reports no actor, `Closed`,
+        // `Expired`, or `Tombstoned`, including a holder who first calls
+        // `finalize_close` to take a `Closing` context to `Closed`. This bridge
+        // never rebuilds a released `FfiBridgeState`: every UCAN and outlet
+        // call reads it through `runtime::with_context`, which fails on an
+        // absent entry. `import_context` can return the id to `Active`,
+        // because it replaces an actor in `Closing`, `Closed`, `Expired`, or
+        // `Tombstoned` and imports fresh when no actor serves the id, and
+        // `context_import` registers no `FfiBridgeState`, so UCAN and outlet
+        // calls against the re-imported id still fail on the missing state.
+        //
+        // The non-terminal states refuse whoever calls. `Poisoned` (the crash
+        // watchdog despawned the actor and keeps the sticky poison flag,
+        // ADR-049 §10) and `MigratingOut` can both return to `Active`
+        // without an import: `SupervisorHandle::clear_poison` respawns the
+        // actor from its snapshot, and a cancelled migration reopens the
+        // context. A release before either return would leave an `Active`
+        // context with no `FfiBridgeState`, so the revocations and nonces this
+        // bridge recorded would be gone and every outlet and UCAN call would
+        // fail against the context. `Closing` refuses so the release follows
+        // `finalize_close`, and the refusal tells the caller which call comes
+        // next.
+        let close_already_happened =
+            match crate::runtime::read_live_context_state(bi, &handle.context_id)? {
+                // The supervisor holds no actor for the id (a completed TTL
+                // expiry), or the actor reports a terminal state (a finalized
+                // close, an expiry, a migration tombstone): the close already
+                // happened.
+                // `read_live_context_state` reports an actor the supervisor
+                // still holds but this bridge could not reach as `ActorBusy`,
+                // and a context whose actor is mid-respawn or whose last
+                // respawn failed as `ActorCrashed`, rather than as `None`, so
+                // a saturated, wedged, or crashed context refuses the close
+                // instead of taking this arm.
+                None
+                | Some(
+                    scp_core::context::ContextState::Closed
+                    | scp_core::context::ContextState::Expired
+                    | scp_core::context::ContextState::Tombstoned,
+                ) => true,
+                Some(scp_core::context::ContextState::Active) => false,
+                // `Closing` names its own successor call, because
+                // "context must be 'active'" is unreachable from the closing
+                // window: the window ends at `Closed`, and only an import returns
+                // the id to `Active`.
+                Some(scp_core::context::ContextState::Closing) => {
+                    return Err(PyRuntimeError::new_err(
+                        "cannot close context in 'closing' state -- the context is inside its \
+                         cooperative closing window; call finalize_close to reach 'closed', then \
+                         close to release any state this bridge still holds for the context",
+                    ));
+                }
+                Some(scp_core::context::ContextState::Poisoned) => {
+                    return Err(PyRuntimeError::new_err(
+                        "cannot close context in 'poisoned' state -- the crash watchdog took the \
+                         context out of service and an operator's clear_poison returns it to \
+                         'active'; this bridge keeps its revocation list and nonce state for the \
+                         context until a close runs against a live actor",
+                    ));
+                }
+                Some(other) => {
+                    let state_name = context_state_str(&other);
+                    return Err(PyRuntimeError::new_err(format!(
+                        "cannot close context in '{state_name}' state -- context must be 'active'"
+                    )));
+                }
+            };
 
-        if *state != "active" {
-            return Err(PyRuntimeError::new_err(format!(
-                "cannot close context in '{state}' state -- context must be 'active'"
-            )));
-        }
-
-        // Authorization is enforced by the ContextManager (which delegates to
-        // ttl::close_context checking the ContextClose capability). No bridge-layer
-        // auth check — the ContextManager is authoritative.
+        // The bridge runs no capability check of its own. On the `Active` path
+        // the supervisor's `CloseContext` dispatch below runs
+        // `ttl::close_context`, which checks the `ContextClose` capability; the
+        // terminal skip runs no capability check (see above).
         let context_id = handle.context_id.clone();
 
         // ----------------------------------------------------------------
@@ -3248,7 +3408,7 @@ impl crate::scp::PyScp {
         // initiator's `ContextClose` capability and the governance model and
         // can reject with `PermissionDenied` (or other non-idempotent
         // errors). Close is NON-terminal for the supervisor actor — it
-        // transitions the context lifecycle to Closed but does NOT despawn
+        // transitions the context lifecycle to Closing and does NOT despawn
         // the actor (see `handle_close_context_actor`). Because the actor
         // stays alive, its per-context hard-rate-limit bucket remains live
         // and `try_consume_hard_rate_limit_from_any_context` stays
@@ -3279,8 +3439,11 @@ impl crate::scp::PyScp {
 
         // Delegate close to the shared supervisor FIRST so close
         // authorization (and any other precondition) is honored before the
-        // FFI bridge state is touched.
-        {
+        // FFI bridge state is touched. A close that already happened (see the
+        // supervisor read above) skips the dispatch: either no actor serves the
+        // context, or the resident actor reports `Closed`, `Expired`, or
+        // `Tombstoned`, so the bridge only has to release its own state.
+        if !close_already_happened {
             let initiator_did = scp_did::DID(identity_did.to_owned());
             let rt = crate::runtime()?;
             let sup = crate::runtime::supervisor(bi)
@@ -3332,13 +3495,27 @@ impl crate::scp::PyScp {
         }
 
         // Close succeeded (or was idempotently already closed). Remove the
-        // FFI bridge state → bridge outlet dispatch fails closed for this id.
-        crate::runtime::remove_context(bi, &handle.context_id);
+        // FFI bridge state → bridge outlet dispatch fails closed for this id,
+        // unless an import or restore returned the id to `Active` after the
+        // lifecycle read above.
+        if !crate::runtime::release_context_unless_readmitted(bi, &handle.context_id) {
+            return Err(PyRuntimeError::new_err(
+                "the context returned to Active through an import or restore while this close \
+                 ran; the imported context stays open and keeps its state on this bridge",
+            ));
+        }
 
         // Transition directly to "closed" (skipping "closing" for the bridge
         // layer -- the full runtime will implement the cooperative closing window).
-        "closed".clone_into(&mut state);
-        drop(state);
+        // This writes the handle's cached snapshot, which the `state` getter
+        // reports; the gate above read the supervisor rather than this string.
+        {
+            let mut cached_state = handle
+                .state
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
+            "closed".clone_into(&mut cached_state);
+        }
 
         // Bridge: drain the `SystemClose` event the close produced and
         // deliver it through the channel sender captured before FFI-state
@@ -3373,17 +3550,7 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(identity_did)?;
-        let state = handle
-            .state
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
-
-        if *state != "active" {
-            return Err(PyRuntimeError::new_err(format!(
-                "cannot send to context in '{state}' state -- context must be 'active'"
-            )));
-        }
-        drop(state);
+        require_active_context(bi, &handle.context_id, "send to", codes::CTX_2019)?;
 
         // Extract payload bytes: must be bytes or str.
         let payload_bytes: Vec<u8> = if payload.is_instance_of::<pyo3::types::PyBytes>() {
@@ -3477,17 +3644,7 @@ impl crate::scp::PyScp {
     pub fn context_receive(&self, handle: &PyContextHandle) -> PyResult<PyMessageReceiver> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let state = handle
-            .state
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
-
-        if *state != "active" {
-            return Err(PyRuntimeError::new_err(format!(
-                "cannot receive from context in '{state}' state -- context must be 'active'"
-            )));
-        }
-        drop(state);
+        require_active_context(bi, &handle.context_id, "receive from", codes::CTX_2021)?;
 
         let (tx, rx) = mpsc::channel::<PyMessage>(crate::runtime::RECEIVE_BUFFER_CAPACITY);
         let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
@@ -3845,11 +4002,10 @@ impl crate::scp::PyScp {
         let context_id = handle.context_id.clone();
         let handle_state = handle.state.clone();
         let proposal_id = parse_proposal_id(proposal_id_hex)?;
-        let proposal_id_log = hex::encode(proposal_id);
 
         rt.block_on(async move {
             use scp_core::context::actor::commands::{
-                ExecuteGovernanceActionPayload, GovernanceCommand, QueriesCommand,
+                ExecuteGovernanceActionPayload, GovernanceCommand,
             };
 
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3874,46 +4030,11 @@ impl crate::scp::PyScp {
                     PyRuntimeError::new_err(format!("governance execution failed: {e}"))
                 })?;
 
-            // Re-sync local role state cache from ContextManager after any
-            // governance action that may have modified roles/membership (#560).
-            //
-            // NOTE: Cannot call `sync_role_state_from_manager()` here because that
-            // function uses `rt.block_on()` and we are already inside `rt.block_on()`.
-            // Nested `block_on` panics with "Cannot start a runtime from within a
-            // runtime." Instead, dispatch the role-state query inline.
-            let (rs_tx, rs_rx) = tokio::sync::oneshot::channel();
-            let rs_cmd = QueriesCommand::GetRoleState {
-                context_id: context_id.clone(),
-                reply: rs_tx,
-            };
-            let role_state_lookup = match sup.dispatch_query(rs_cmd).await {
-                Ok(_) => rs_rx.await.ok().and_then(Result::ok).flatten(),
-                Err(_) => None,
-            };
-            match role_state_lookup {
-                Some(new_role_state) => {
-                    if let Err(e) = crate::runtime::with_ffi_state(bi, &context_id, |st| {
-                        st.role_state = new_role_state;
-                        Ok(())
-                    }) {
-                        tracing::warn!(
-                            context_id = %context_id,
-                            proposal_id = %proposal_id_log,
-                            error = %e,
-                            "failed to sync role state after governance action — \
-                             local capability checks may be stale"
-                        );
-                    }
-                }
-                None => {
-                    tracing::warn!(
-                        context_id = %context_id,
-                        proposal_id = %proposal_id_log,
-                        "failed to sync role state after governance action — \
-                         context not found in ContextManager"
-                    );
-                }
-            }
+            // No role-state copy follows a governance action (#560 closed by
+            // deletion). The action mutated the supervisor's role state, and the
+            // next capability check reads that role state through
+            // `crate::runtime::live_role_state`, so no window exists in which a
+            // bridge copy still grants what the action revoked.
 
             use scp_core::context::state::GovernanceActionResult;
             let result_str = match result {
@@ -4138,8 +4259,6 @@ impl crate::scp::PyScp {
             scp_ffi_common::validate::validate_governance_action_strings(&action)
                 .map_err(|e| PyValueError::new_err(format!("SCP-CTX-2040: {}", e.message)))?;
 
-            let action_name = action.variant_name();
-
             let outcome = sup
                 .propose_governance_action_checked(&context_id, &proposer_did, action, &signing_key)
                 .await
@@ -4149,19 +4268,8 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            // Re-sync local role state cache from ContextManager after any
-            // governance action that may have modified roles/membership (#560).
-            if let Err(e) =
-                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
-            {
-                tracing::warn!(
-                    context_id = %context_id,
-                    action = action_name,
-                    error = %e,
-                    "failed to sync role state after governance proposal — \
-                     local capability checks may be stale"
-                );
-            }
+            // No role-state copy follows a governance action: the supervisor
+            // holds the mutation and `crate::runtime::live_role_state` reads it.
 
             let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
 
@@ -4246,15 +4354,8 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            if let Err(e) =
-                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
-            {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to sync role state after governance approval"
-                );
-            }
+            // No role-state copy follows a governance action: the supervisor
+            // holds the mutation and `crate::runtime::live_role_state` reads it.
 
             Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
         })
@@ -4330,15 +4431,8 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            if let Err(e) =
-                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
-            {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to sync role state after governance rejection"
-                );
-            }
+            // No role-state copy follows a governance action: the supervisor
+            // holds the mutation and `crate::runtime::live_role_state` reads it.
 
             Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
         })
@@ -4390,15 +4484,8 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            if let Err(e) =
-                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
-            {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to sync role state after governance withdrawal"
-                );
-            }
+            // No role-state copy follows a governance action: the supervisor
+            // holds the mutation and `crate::runtime::live_role_state` reads it.
 
             Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
         })
@@ -6278,6 +6365,10 @@ mod tests {
     /// `PyContextParams` parse so the handle carries an authoritative
     /// `ContextMode` (the same axis `context_join` branches on at the mode
     /// gate). Used by the encrypted-join hard-fail coverage below.
+    ///
+    /// It also creates the context in the supervisor, because `context_join`
+    /// gates on the state that context's supervisor actor reports and a handle
+    /// no actor backs never reaches the mode gate.
     fn active_handle_for_mode(
         bi: &crate::runtime::PyBridgeInstance,
         creator_did: &str,
@@ -6288,7 +6379,10 @@ mod tests {
             dict.set_item("mode", mode).unwrap();
             PyContextParams::from_py_dict(&dict).unwrap()
         });
-        let handle = PyContextHandle::new(bi, "0".repeat(64), creator_did.to_owned(), params);
+        let context_id = "0".repeat(64);
+        crate::runtime::init_context_manager_for_test(bi);
+        crate::runtime::create_supervisor_context_for_test(bi, &context_id, creator_did, &[]);
+        let handle = PyContextHandle::new(bi, context_id, creator_did.to_owned(), params);
         *handle.state.lock().unwrap() = "active".to_owned();
         handle
     }
@@ -7559,14 +7653,13 @@ mod tests {
         let (bi, ctx_id) = setup_singleadmin_ctx(creator, "exec-forgery-state");
 
         // Snapshot membership before the forged execute.
-        crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert!(
-                !st.role_state.members.contains(victim),
-                "victim must not be a member before the forged execute"
-            );
-            Ok(())
-        })
-        .unwrap();
+        assert!(
+            !crate::runtime::live_role_state(&bi, &ctx_id)
+                .unwrap()
+                .members
+                .contains(victim),
+            "victim must not be a member before the forged execute"
+        );
 
         let fabricated = [0x11u8; 32];
         let result = test_dispatch_execute_by_id(&bi, &ctx_id, fabricated);
@@ -7576,15 +7669,13 @@ mod tests {
         );
 
         // Membership must be unchanged: no phantom AddMember took effect.
-        crate::runtime::sync_role_state_from_manager(&bi, &ctx_id).unwrap();
-        crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert!(
-                !st.role_state.members.contains(victim),
-                "rejected forgery must not have added the victim as a member"
-            );
-            Ok(())
-        })
-        .unwrap();
+        assert!(
+            !crate::runtime::live_role_state(&bi, &ctx_id)
+                .unwrap()
+                .members
+                .contains(victim),
+            "rejected forgery must not have added the victim as a member"
+        );
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
@@ -7642,7 +7733,8 @@ mod tests {
         // not torn down by the failed close.
         crate::runtime::with_context(&bi, &ctx_id, |st| {
             assert_eq!(
-                st.creator_did, creator,
+                st.event_log.context_id(),
+                ctx_id,
                 "FFI bridge state must survive a failed close"
             );
             Ok(())
@@ -7841,6 +7933,611 @@ mod tests {
         assert!(
             !core_params.consequence_rules.is_empty(),
             "consequence_rules should parse into non-empty vec"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Lifecycle gates read the supervisor actor, not the handle string (#2372)
+    // -------------------------------------------------------------------
+
+    /// Builds a bridge instance, a supervisor context, and a handle whose
+    /// cached `state` string reads `"active"`.
+    ///
+    /// A caller reaches every lifecycle-gated entry point through such a
+    /// handle, so each case below starts here and then makes the supervisor's
+    /// answer differ from that string.
+    fn lifecycle_fixture(prefix: &str, creator_did: &str) -> (crate::scp::PyScp, PyContextHandle) {
+        crate::init_runtime().ok();
+        let bi = __bi();
+        let context_id = format!("{prefix}{}", "0".repeat(56));
+        crate::runtime::init_context_manager_for_test(&bi);
+        crate::runtime::register_context(&bi, &context_id, creator_did, &[])
+            .expect("fixture registration");
+        crate::runtime::create_supervisor_context_for_test(&bi, &context_id, creator_did, &[]);
+
+        let handle = active_handle_for(&bi, &context_id, creator_did);
+        (
+            crate::scp::PyScp {
+                inner: std::sync::Arc::clone(&bi),
+            },
+            handle,
+        )
+    }
+
+    /// Builds a handle for `context_id` whose cached `state` string reads
+    /// `"active"`.
+    fn active_handle_for(
+        bi: &crate::runtime::PyBridgeInstance,
+        context_id: &str,
+        creator_did: &str,
+    ) -> PyContextHandle {
+        let params = Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            PyContextParams::from_py_dict(&dict).unwrap()
+        });
+        let handle =
+            PyContextHandle::new(bi, context_id.to_owned(), creator_did.to_owned(), params);
+        *handle.state.lock().unwrap() = "active".to_owned();
+        handle
+    }
+
+    /// Closes a context through a SECOND handle, leaving the first handle's
+    /// cached string reading `"active"`.
+    ///
+    /// Two handles on one context is what a caller holds in production — one
+    /// per `context_create` or `context_join_from_welcome` call — and a close
+    /// through either one writes only that handle's string. A TTL expiry a
+    /// supervisor applies on its own timer, a migration, and an actor poison
+    /// leave every handle's string stale the same way; this fixture reproduces
+    /// that divergence with the bridge's own entry point rather than by writing
+    /// supervisor state directly.
+    fn close_context_behind_the_handle(
+        scp: &crate::scp::PyScp,
+        handle: &PyContextHandle,
+        creator_did: &str,
+    ) {
+        let closer = active_handle_for(&scp.inner, &handle.context_id, creator_did);
+        scp.context_close(&closer, creator_did)
+            .expect("fixture close");
+        assert_eq!(
+            *handle.state.lock().unwrap(),
+            "active",
+            "the fixture depends on the first handle's string staying stale"
+        );
+    }
+
+    /// A close's release that lands while the supervisor serves the id as
+    /// `Active` (an import or restore returned it after the close's lifecycle
+    /// read) removes nothing, so the live context keeps its bridge state; a
+    /// release against an id no actor serves removes the state.
+    #[test]
+    fn close_release_keeps_the_state_of_a_context_the_supervisor_reports_active() {
+        let creator = "did:dht:z6MkPyReleaseActiveCreator";
+        let (scp, handle) = lifecycle_fixture("pyrelact", creator);
+        assert!(
+            !crate::runtime::release_context_unless_readmitted(&scp.inner, &handle.context_id),
+            "a release on an Active context must report the readmit"
+        );
+        assert!(
+            crate::runtime::with_context(&scp.inner, &handle.context_id, |_| Ok(())).is_ok(),
+            "the Active context must keep its bridge state"
+        );
+
+        let absent = format!("pyrelabs{}", "0".repeat(56));
+        crate::runtime::register_context(&scp.inner, &absent, creator, &[])
+            .expect("fixture registration");
+        assert!(crate::runtime::release_context_unless_readmitted(
+            &scp.inner, &absent
+        ));
+        assert!(
+            crate::runtime::with_context(&scp.inner, &absent, |_| Ok(())).is_err(),
+            "a release on an id no actor serves must remove the bridge state"
+        );
+    }
+
+    /// Every lifecycle-gated entry point refuses once the supervisor reports a
+    /// context in its closing window, even though the handle still reads
+    /// `"active"`.
+    ///
+    /// A gate reading `handle.state` passes all five of these calls, so
+    /// reverting any one of them to that string fails this case.
+    ///
+    /// The state each gate reports is `"closing"`, not `"closed"`: a close
+    /// enters the §5.9 cooperative closing window, and the bridge writes
+    /// `"closed"` into the closing handle's own cached string. Those two
+    /// vocabularies differing is what a live read surfaces and a cached read
+    /// hides.
+    #[test]
+    fn lifecycle_gates_refuse_a_context_the_supervisor_closed() {
+        let creator = "did:dht:z6MkLifecycleGateCreator";
+        let member = "did:dht:z6MkLifecycleGateMember";
+
+        let (scp, handle) = lifecycle_fixture("a1", creator);
+        close_context_behind_the_handle(&scp, &handle, creator);
+
+        let join = scp
+            .context_join(&handle, member, None)
+            .expect_err("join must refuse a closed context");
+        assert!(
+            join.to_string()
+                .contains("cannot join context in 'closing'")
+                && join.to_string().contains(codes::CTX_2013),
+            "join reported: {join}"
+        );
+
+        let leave = scp
+            .context_leave(&handle, member)
+            .expect_err("leave must refuse a closed context");
+        assert!(
+            leave
+                .to_string()
+                .contains("cannot leave context in 'closing'")
+                && leave.to_string().contains(codes::CTX_2015),
+            "leave reported: {leave}"
+        );
+
+        let send = Python::with_gil(|py| {
+            let payload = pyo3::types::PyBytes::new(py, b"hello");
+            scp.context_send(&handle, creator, payload.as_any(), None)
+                .expect_err("send must refuse a closed context")
+        });
+        assert!(
+            send.to_string()
+                .contains("cannot send to context in 'closing'")
+                && send.to_string().contains(codes::CTX_2019),
+            "send reported: {send}"
+        );
+
+        let receive = scp
+            .context_receive(&handle)
+            .err()
+            .expect("receive must refuse a closed context");
+        assert!(
+            receive
+                .to_string()
+                .contains("cannot receive from context in 'closing'")
+                && receive.to_string().contains(codes::CTX_2021),
+            "receive reported: {receive}"
+        );
+
+        // Close refuses the closing window too. `Closing` is live and
+        // non-terminal, and the supervisor dispatch a skip would remove
+        // carries the only `ContextClose` capability check this path has.
+        let close = scp
+            .context_close(&handle, creator)
+            .expect_err("close must refuse a context inside its closing window");
+        assert!(
+            close
+                .to_string()
+                .contains("cannot close context in 'closing'"),
+            "close reported: {close}"
+        );
+    }
+
+    /// A close refuses a context the supervisor holds in its §5.9 cooperative
+    /// closing window and releases none of that context's bridge state.
+    ///
+    /// `ttl::close_context` drives `Active` -> `Closing` and the context stays
+    /// there until a separate `FinalizeClose` command runs, so `Closing` is not
+    /// terminal. The `Closing` arm orders the release after `FinalizeClose` and
+    /// names that call in its refusal. The arm refuses before any capability
+    /// read, so the refusal does not depend on who calls: the outsider this
+    /// test uses and the creator get the same answer, and this test proves the
+    /// state refusal, not a capability check.
+    #[test]
+    fn close_refuses_a_closing_context_and_keeps_its_bridge_state() {
+        let creator = "did:dht:z6MkClosingWindowCreator";
+        let outsider = "did:dht:z6MkClosingWindowOutsider";
+
+        let (scp, handle) = lifecycle_fixture("a5", creator);
+        // A close through a second handle leaves the supervisor in `Closing`
+        // and releases the bridge state, so re-register the state: this case
+        // asks what a close does to a LIVE entry, not to an absent one.
+        close_context_behind_the_handle(&scp, &handle, creator);
+        crate::runtime::register_context(&scp.inner, handle.context_id(), creator, &[])
+            .expect("re-register the bridge state the fixture close released");
+        assert_eq!(
+            crate::runtime::read_live_context_state(&scp.inner, handle.context_id())
+                .expect("state read"),
+            Some(scp_core::context::ContextState::Closing),
+            "the fixture must leave the supervisor inside the cooperative closing window"
+        );
+
+        let err = scp
+            .context_close(&handle, outsider)
+            .expect_err("close must refuse a context inside its closing window");
+        assert!(
+            err.to_string()
+                .contains("cannot close context in 'closing'"),
+            "close reported: {err}"
+        );
+        assert!(
+            crate::runtime::ffi_state_registry(&scp.inner).contains_key(handle.context_id()),
+            "a refused close must leave the bridge state registered"
+        );
+        assert_eq!(
+            *handle.state.lock().unwrap(),
+            "active",
+            "a refused close must not write the handle's cached string"
+        );
+    }
+
+    /// A close of a context whose actor the supervisor despawned succeeds
+    /// idempotently and releases the bridge state for that id.
+    ///
+    /// A TTL expiry despawns the actor once the expiry is durable, and the
+    /// handle's cached string still reads `"active"`. The close already
+    /// happened, so `context_close` skips the supervisor dispatch and releases
+    /// the `FfiBridgeState` — the only path that releases it after creation.
+    /// Before this test existed, the close gate refused the despawned context
+    /// with "has no live supervisor state", and every short-TTL context leaked
+    /// its registry entry for the life of the process.
+    #[test]
+    fn close_after_the_supervisor_despawned_the_actor_releases_bridge_state() {
+        crate::init_runtime().ok();
+        let bi = __bi();
+        let creator = "did:dht:z6MkDespawnedCloseCreator";
+        let context_id = format!("a3{}", "0".repeat(56));
+        crate::runtime::init_context_manager_for_test(&bi);
+        crate::runtime::register_context(&bi, &context_id, creator, &[])
+            .expect("fixture registration");
+        // No `create_supervisor_context_for_test`: this context has no actor,
+        // which is the state a completed TTL expiry leaves behind.
+        assert!(crate::runtime::ffi_state_registry(&bi).contains_key(&context_id));
+
+        let handle = active_handle_for(&bi, &context_id, creator);
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi),
+        };
+
+        scp.context_close(&handle, creator)
+            .expect("close of a despawned context must succeed idempotently");
+        assert!(
+            !crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
+            "close must release the bridge state for a despawned context"
+        );
+        assert_eq!(handle.state().expect("state"), "closed");
+
+        // A second close stays idempotent: no state to release, no error.
+        scp.context_close(&handle, creator)
+            .expect("a repeated close must stay idempotent");
+    }
+
+    /// A close refuses a context whose actor the supervisor still holds but
+    /// this bridge could not reach, and releases none of that context's bridge
+    /// state.
+    ///
+    /// `Supervisor::read_context_state` answered `None` both for a context the
+    /// supervisor holds no actor for and for an actor whose mailbox send
+    /// failed or whose reply never arrived, so a close reading that form
+    /// treated a saturated or wedged actor as proof that the close already
+    /// happened. It then skipped the `CloseContext` dispatch, which carries
+    /// the only `ContextClose` capability check on this path, released the
+    /// `FfiBridgeState` — the outlet handlers, the receive-channel sender, the
+    /// event log, the nonce tracker, the revocation list — for every identity
+    /// sharing the bridge instance, and returned success while the supervisor
+    /// still served the context as `Active`.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_refuses_a_context_whose_actor_this_bridge_cannot_reach() {
+        crate::init_runtime().ok();
+        let bi = __bi();
+        let creator = "did:dht:z6MkUnreachableActorCreator";
+        let context_id = format!("a6{}", "0".repeat(56));
+        crate::runtime::init_context_manager_for_test(&bi);
+        crate::runtime::register_context(&bi, &context_id, creator, &[])
+            .expect("fixture registration");
+        crate::runtime::create_supervisor_context_for_test(&bi, &context_id, creator, &[]);
+
+        let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        sup.test_make_actor_unreachable(&context_id);
+
+        let handle = active_handle_for(&bi, &context_id, creator);
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi),
+        };
+
+        let err = scp
+            .context_close(&handle, creator)
+            .expect_err("a close must refuse a context whose actor did not answer");
+        assert!(
+            err.to_string().contains("SCP-CTX-2130"),
+            "the refusal must report the actor-busy code, got: {err}"
+        );
+        assert!(
+            crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
+            "a refused close must leave the bridge state registered"
+        );
+        assert_eq!(
+            *handle.state.lock().unwrap(),
+            "active",
+            "a refused close must not write the handle's cached string"
+        );
+    }
+
+    /// A close refuses a context whose actor the crash watchdog is respawning,
+    /// and a context whose last respawn failed below the poison threshold, and
+    /// releases none of either context's bridge state.
+    ///
+    /// Neither context has a registered actor, and both still exist: the
+    /// watchdog re-registers the first when its respawn finishes, and the
+    /// supervisor classifies both as crashed (ADR-049 §10). A close that read
+    /// the missing actor as proof that the close already happened skipped the
+    /// `CloseContext` dispatch, which carries the only `ContextClose`
+    /// capability check on this path, and released the bridge state for every
+    /// identity sharing the bridge instance.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_refuses_a_context_the_crash_watchdog_has_not_recovered() {
+        crate::init_runtime().ok();
+        let bi = __bi();
+        let creator = "did:dht:z6MkCrashedCloseCreator";
+        crate::runtime::init_context_manager_for_test(&bi);
+        let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi),
+        };
+
+        for (prefix, mid_respawn) in [("a7", true), ("a8", false)] {
+            let context_id = format!("{prefix}{}", "0".repeat(56));
+            crate::runtime::register_context(&bi, &context_id, creator, &[])
+                .expect("fixture registration");
+            crate::runtime::create_supervisor_context_for_test(&bi, &context_id, creator, &[]);
+            let tokio_rt = crate::runtime().expect("tokio runtime");
+            if mid_respawn {
+                tokio_rt.block_on(sup.test_hold_context_mid_respawn(&context_id));
+            } else {
+                tokio_rt.block_on(sup.test_fail_context_respawn(&context_id));
+            }
+
+            let handle = active_handle_for(&bi, &context_id, creator);
+            let err = scp
+                .context_close(&handle, creator)
+                .expect_err("a close must refuse a context the watchdog has not recovered");
+            assert!(
+                err.to_string().contains("SCP-CTX-2135"),
+                "the refusal must report the actor-crashed code (mid_respawn={mid_respawn}), \
+                 got: {err}"
+            );
+            assert!(
+                crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
+                "a refused close must leave the bridge state registered (mid_respawn={mid_respawn})"
+            );
+            assert_eq!(
+                *handle.state.lock().unwrap(),
+                "active",
+                "a refused close must not write the handle's cached string"
+            );
+        }
+    }
+
+    /// A close of a poisoned context refuses and keeps the bridge state for
+    /// that id.
+    ///
+    /// The crash watchdog poisons a context once its actor exhausts the
+    /// respawn budget (ADR-049 §10) and despawns the actor, so the supervisor
+    /// reports `Poisoned` from its sticky poison flag and no actor answers.
+    /// `Poisoned` is not terminal: the operator's `clear_poison` respawns the
+    /// actor as `Active`. A close that released the `FfiBridgeState` here ran
+    /// no `ContextClose` check, and after the recovery the context was
+    /// `Active` with no `FfiBridgeState`: the revocations and nonces this
+    /// bridge recorded were gone, and every outlet and UCAN call failed against
+    /// the context. The creator, who holds `context:close`, gets the same
+    /// refusal: no capability check can run without an actor.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_refuses_a_poisoned_context_and_keeps_its_bridge_state() {
+        crate::init_runtime().ok();
+        let bi = __bi();
+        let creator = "did:dht:z6MkPoisonedCloseCreator";
+        let context_id = format!("a4{}", "0".repeat(56));
+        crate::runtime::init_context_manager_for_test(&bi);
+        crate::runtime::register_context(&bi, &context_id, creator, &[])
+            .expect("fixture registration");
+        crate::runtime::create_supervisor_context_for_test(&bi, &context_id, creator, &[]);
+        assert!(crate::runtime::ffi_state_registry(&bi).contains_key(&context_id));
+
+        let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        crate::runtime()
+            .expect("tokio runtime")
+            .block_on(sup.test_poison_context(&context_id));
+        assert_eq!(
+            crate::runtime::read_live_context_state(&bi, &context_id).expect("state read"),
+            Some(scp_core::context::ContextState::Poisoned),
+            "the fixture must leave the supervisor reporting Poisoned"
+        );
+
+        let handle = active_handle_for(&bi, &context_id, creator);
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi),
+        };
+
+        let err = scp
+            .context_close(&handle, creator)
+            .expect_err("close of a poisoned context must refuse");
+        assert!(
+            err.to_string()
+                .contains("cannot close context in 'poisoned' state"),
+            "unexpected refusal: {err}"
+        );
+        assert!(
+            crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
+            "a refused close must keep the bridge state for a poisoned context"
+        );
+        assert_eq!(
+            handle.state().expect("state"),
+            "active",
+            "a refused close must not write the handle's cached string"
+        );
+    }
+
+    /// A context no supervisor actor serves fails every lifecycle gate closed.
+    ///
+    /// A handle can outlive its actor — a despawn after migration, a watchdog
+    /// that stopped respawning a crashing actor — and the handle's cached
+    /// string still reads `"active"`. No gate infers "active" from an absent
+    /// answer.
+    #[test]
+    fn lifecycle_gates_fail_closed_without_a_supervisor_actor() {
+        crate::init_runtime().ok();
+        let bi = __bi();
+        let creator = "did:dht:z6MkNoActorCreator";
+        let context_id = format!("a2{}", "0".repeat(56));
+        crate::runtime::init_context_manager_for_test(&bi);
+        crate::runtime::register_context(&bi, &context_id, creator, &[])
+            .expect("fixture registration");
+        // No `create_supervisor_context_for_test`: this context has no actor.
+
+        let handle = active_handle_for(&bi, &context_id, creator);
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi),
+        };
+
+        let err = scp
+            .context_receive(&handle)
+            .err()
+            .expect("receive must refuse a context no actor serves");
+        assert!(
+            err.to_string().contains("has no live supervisor state"),
+            "receive reported: {err}"
+        );
+    }
+
+    /// A gate admits an operation while the supervisor reports `Active`.
+    ///
+    /// Without this case the two above would also pass for a gate that refused
+    /// every call.
+    #[test]
+    fn lifecycle_gates_admit_an_active_context() {
+        let creator = "did:dht:z6MkActiveGateCreator";
+        let (scp, handle) = lifecycle_fixture("a3", creator);
+
+        scp.context_receive(&handle)
+            .expect("receive must pass the gate for an active context");
+    }
+
+    // -------------------------------------------------------------------
+    // Ceiling: an absent declaration and an empty one are different (#2372)
+    // -------------------------------------------------------------------
+
+    /// Build a `PyContextParams` from a Python dict, so a case exercises the
+    /// same extraction path `context_create` runs.
+    fn params_from_dict(entries: &[(&str, Bound<'_, PyAny>)]) -> PyResult<PyContextParams> {
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            for (key, value) in entries {
+                dict.set_item(key, value)?;
+            }
+            PyContextParams::from_py_dict(&dict)
+        })
+    }
+
+    /// A dict carrying no `ceiling` key declares no ceiling, and
+    /// `default_ceiling`'s doc comment states that every FFI bridge applies
+    /// that default "when no explicit ceiling is provided".
+    #[test]
+    fn absent_ceiling_gets_the_documented_default() {
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            let parsed = PyContextParams::from_py_dict(&dict).unwrap();
+
+            let expected: HashSet<String> = scp_core::context::roles::default_ceiling()
+                .iter()
+                .map(|cap| cap.name().into_owned())
+                .collect();
+            let actual: HashSet<String> = parsed.ceiling.iter().cloned().collect();
+            assert_eq!(actual, expected, "an absent ceiling gets default_ceiling()");
+
+            let core = super::build_core_context_params(&parsed).unwrap();
+            assert_eq!(
+                core.ceiling.len(),
+                expected.len(),
+                "the supervisor receives the same default, parsed back into capabilities"
+            );
+        });
+    }
+
+    /// A `ceiling` key holding Python `None` declares no ceiling, exactly as an
+    /// absent key does, because a Python caller spells "unset" that way.
+    #[test]
+    fn none_ceiling_gets_the_documented_default() {
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("ceiling", py.None()).unwrap();
+            let parsed = PyContextParams::from_py_dict(&dict).unwrap();
+
+            assert_eq!(
+                parsed.ceiling.len(),
+                scp_core::context::roles::default_ceiling().iter().count(),
+                "a None ceiling gets default_ceiling()"
+            );
+        });
+    }
+
+    /// An empty list declares a ceiling that grants nothing. Reading it as an
+    /// absent declaration would hand a caller who asked for a deny-all context
+    /// the eleven capabilities `default_ceiling()` carries.
+    #[test]
+    fn empty_ceiling_list_stays_empty() {
+        Python::with_gil(|py| {
+            let empty: Vec<String> = Vec::new();
+            let parsed =
+                params_from_dict(&[("ceiling", empty.into_pyobject(py).unwrap().into_any())])
+                    .unwrap();
+
+            assert!(
+                parsed.ceiling.is_empty(),
+                "an explicitly empty ceiling declares a deny-all context, got {:?}",
+                parsed.ceiling
+            );
+
+            let core = super::build_core_context_params(&parsed).unwrap();
+            assert!(
+                core.ceiling.is_empty(),
+                "the supervisor receives that deny-all ceiling, got {:?}",
+                core.ceiling
+            );
+        });
+    }
+
+    /// A supplied ceiling stands as written: no default is unioned into it.
+    #[test]
+    fn explicit_ceiling_list_is_not_widened() {
+        Python::with_gil(|py| {
+            let declared = vec!["messages:read".to_owned()];
+            let parsed =
+                params_from_dict(&[("ceiling", declared.into_pyobject(py).unwrap().into_any())])
+                    .unwrap();
+
+            assert_eq!(parsed.ceiling, vec!["messages:read".to_owned()]);
+
+            let core = super::build_core_context_params(&parsed).unwrap();
+            assert_eq!(
+                core.ceiling.len(),
+                1,
+                "a one-entry ceiling reaches the supervisor as one entry, got {:?}",
+                core.ceiling
+            );
+        });
+    }
+
+    /// `default_ceiling_strings` renders capabilities in the vocabulary the
+    /// shared parser accepts, so the default this bridge substitutes survives
+    /// the round trip into `ContextParams`.
+    #[test]
+    fn default_ceiling_strings_round_trip_through_the_parser() {
+        let strings = super::default_ceiling_strings();
+        assert_eq!(strings.len(), 11, "default_ceiling() carries 11 entries");
+
+        let p = PyContextParams {
+            ceiling: strings.clone(),
+            ..default_params()
+        };
+        let core = super::build_core_context_params(&p).unwrap();
+        assert_eq!(
+            core.ceiling.len(),
+            strings.len(),
+            "every rendered name parses back into a capability"
         );
     }
 
@@ -8161,7 +8858,6 @@ mod tests {
                 "member",
             ))
             .expect("test_insert_member must record the second member");
-            crate::runtime::sync_role_state_from_manager(&bi, &ctx_id).unwrap();
 
             // Sanity: the context really has multiple members.
             let members = rt.block_on(sup.member_dids(&ctx_id));

@@ -244,7 +244,6 @@ impl From<CapabilityValidation> for NapiCapabilityValidation {
 // ---------------------------------------------------------------------------
 
 /// Per-bridge-instance implementation of [`Scp::ucan_validate`](crate::scp::Scp::ucan_validate).
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Option<Vec>
 pub(crate) async fn ucan_validate_on(
     bi: &NapiBridgeInstance,
@@ -265,6 +264,23 @@ pub(crate) async fn ucan_validate_on(
     // `ucan_evaluate_on`. `validate_did` rejects an empty/whitespace value.
     let agent_did = presenting_agent_did.trim();
     validate_did(agent_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    // The supervisor must report `Active` before this bridge touches the
+    // context's revocation list or nonce tracker. `context_close_on` releases
+    // those, and `ensure_registered` below refuses to rebuild a released id,
+    // so a close that lands after this gate leaves the call no state to read
+    // and the call fails closed.
+    crate::runtime::require_active_context_before_authz(
+        bi,
+        &handle.context_id(),
+        "validate a UCAN in context",
+        |msg| ScpNapiError::Context {
+            message: msg,
+            code: codes::CTX_2023.to_owned(),
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
 
     // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
     // is registered. Uses the same registry as event_log and ucan_revoke.
@@ -290,6 +306,16 @@ pub(crate) async fn ucan_validate_on(
 
     let context_id = handle.context_id();
 
+    // ADR-016 step 8 compares the token's grants against the context's
+    // capability ceiling, and the chain check anchors on the context creator.
+    // Both come from the supervisor actor, so a `ModifyCeiling` governance
+    // action binds the very next validation, and a context no actor serves
+    // refuses.
+    let role_state = crate::runtime::live_role_state(bi, &context_id)
+        .await
+        .map_err(napi::Error::from)?;
+    let ceiling_strings = role_state.ceiling().to_ucan_string_set();
+
     // Run validation inside with_context to use persistent revocation list
     // and nonce tracker from the runtime registry. This ensures:
     // - Revoked tokens are rejected across calls (persistent RevocationList).
@@ -312,8 +338,8 @@ pub(crate) async fn ucan_validate_on(
             nonce_tracker: &mut nonce_adapter,
             revocation_checker: &revocation_checker,
             proof_resolver: &proof_resolver,
-            ceiling: &rt.core.ceiling_strings,
-            context_creator_did: &rt.core.creator_did,
+            ceiling: &ceiling_strings,
+            context_creator_did: &role_state.creator_did,
             presenting_agent_did: agent_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
@@ -351,7 +377,6 @@ pub(crate) async fn ucan_validate_on(
 /// addressed to someone else would report `signatures_valid` (trust inflation). An
 /// empty/whitespace value is rejected by `validate_did`. The SDK trust path always
 /// passes the subject; raw diagnostic callers must pass an explicit presenting agent.
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Option<Vec>
 pub(crate) async fn ucan_evaluate_on(
     bi: &NapiBridgeInstance,
@@ -378,6 +403,23 @@ pub(crate) async fn ucan_evaluate_on(
     let agent_did = presenting_agent_did.trim();
     validate_did(agent_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
+    // The supervisor must report `Active` before this bridge touches the
+    // context's revocation list or nonce tracker. `context_close_on` releases
+    // those, and `ensure_registered` below refuses to rebuild a released id,
+    // so a close that lands after this gate leaves the call no state to read
+    // and the call fails closed.
+    crate::runtime::require_active_context_before_authz(
+        bi,
+        &handle.context_id(),
+        "evaluate a UCAN in context",
+        |msg| ScpNapiError::Context {
+            message: msg,
+            code: codes::CTX_2023.to_owned(),
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
+
     // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
     // is registered. Uses the same registry as event_log and ucan_revoke.
     crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
@@ -403,6 +445,14 @@ pub(crate) async fn ucan_evaluate_on(
 
     let context_id = handle.context_id();
 
+    // The ceiling and the creator DID come from the supervisor actor for the
+    // same reason `ucan_validate_on` reads them there: a bridge copy kept
+    // reporting a permission a governance action had already withdrawn.
+    let role_state = crate::runtime::live_role_state(bi, &context_id)
+        .await
+        .map_err(napi::Error::from)?;
+    let ceiling_strings = role_state.ceiling().to_ucan_string_set();
+
     // evaluate_ucan takes `&ValidationContext` and is read-only — it probes the
     // nonce tracker via check_replay but never records, so the persistent
     // NonceTracker is not mutated.
@@ -422,8 +472,8 @@ pub(crate) async fn ucan_evaluate_on(
             nonce_tracker: &mut nonce_adapter,
             revocation_checker: &revocation_checker,
             proof_resolver: &proof_resolver,
-            ceiling: &rt.core.ceiling_strings,
-            context_creator_did: &rt.core.creator_did,
+            ceiling: &ceiling_strings,
+            context_creator_did: &role_state.creator_did,
             presenting_agent_did: agent_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
@@ -442,7 +492,6 @@ pub(crate) async fn ucan_evaluate_on(
 
 /// Per-bridge-instance implementation of [`Scp::ucan_mint`](crate::scp::Scp::ucan_mint).
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec/Option<Vec>
-#[allow(clippy::unused_async)] // napi requires async for Promise return type
 pub(crate) async fn ucan_mint_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -458,38 +507,57 @@ pub(crate) async fn ucan_mint_on(
         }
     }
 
-    // Extract key custody and signing key from the context handle. Available
-    // for any context whose creator identity retains custody — in-memory OR a
-    // production callback custody (`identityCreateWithCustody`).
-    let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
-        napi::Error::from(ScpNapiError::Identity {
-            message: "UCAN minting requires retained signing custody — the context creator \
-                  identity has no retained custody (it was externally loaded)"
-                .to_owned(),
-            code: codes::IDENT_1017.to_owned(),
-        })
-    })?;
-    let signing_key = handle.signing_key.ok_or_else(|| {
-        napi::Error::from(ScpNapiError::Identity {
-            message: "UCAN minting requires retained signing custody — the context creator \
-                  identity has no active signing key"
-                .to_owned(),
-            code: codes::IDENT_1017.to_owned(),
-        })
-    })?;
+    // The supervisor must report `Active` before this bridge issues a token for
+    // the context, because a context the supervisor stopped serving grants no
+    // new authority.
+    crate::runtime::require_active_context_before_authz(
+        bi,
+        &handle.context_id(),
+        "mint a UCAN in context",
+        |msg| ScpNapiError::Context {
+            message: msg,
+            code: codes::CTX_2023.to_owned(),
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
 
-    let creator_did = handle.creator_did();
     let context_id = handle.context_id();
 
-    // Get ceiling from the context handle for mint-time enforcement (#339).
-    // Empty ceiling means the user passed `[]` — apply the default ceiling
-    // instead of `None` (which would mean unlimited). See #1419.
-    let ceiling_strings: std::collections::HashSet<String> = handle.ceiling().into_iter().collect();
-    let ceiling = Some(if ceiling_strings.is_empty() {
-        scp_core::context::roles::default_ceiling().to_ucan_string_set()
-    } else {
-        ceiling_strings
-    });
+    // The issuer is the context creator, and the ceiling bounds what may be
+    // minted (#339, the ceiling-enforcement issue). Both come from the
+    // supervisor actor: a `ModifyCeiling` governance action narrows what a
+    // mint may grant, and a context no actor serves refuses. The handle's
+    // `ceiling` records what THIS bridge saw at registration, so a mint
+    // reading it granted what the supervisor had already withdrawn.
+    let role_state = crate::runtime::live_role_state(bi, &context_id)
+        .await
+        .map_err(napi::Error::from)?;
+    let creator_did = role_state.creator_did.clone();
+    let ceiling = Some(role_state.ceiling().to_ucan_string_set());
+
+    // Resolve the custody and the Active Signing Key from THIS instance's
+    // identity registry under the live creator DID, never off the handle. The
+    // handle carries the custody of whoever created the context, so signing
+    // with it while issuing as the live creator would mint a token whose `iss`
+    // names one principal and whose signature belongs to another. The `PyO3`
+    // bridge resolves both from the registry under the live creator for the
+    // same reason.
+    let (custody, signing_key) = crate::runtime::with_identity(bi, &creator_did, |entry| {
+        Ok((
+            std::sync::Arc::clone(&entry.custody),
+            entry.identity.active_signing_key,
+        ))
+    })
+    .map_err(|_| {
+        napi::Error::from(ScpNapiError::Identity {
+            message: format!(
+                "UCAN minting requires retained signing custody — this bridge instance hosts \
+                 no identity for context creator '{creator_did}'"
+            ),
+            code: codes::IDENT_1017.to_owned(),
+        })
+    })?;
 
     let params = MintParams {
         issuer_did: &creator_did,
@@ -537,7 +605,6 @@ pub(crate) async fn ucan_mint_on(
 
 /// Per-bridge-instance implementation of [`Scp::ucan_delegate`](crate::scp::Scp::ucan_delegate).
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub(crate) async fn ucan_delegate_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -562,6 +629,22 @@ pub(crate) async fn ucan_delegate_on(
     // custody — in-memory OR a production callback custody
     // (`identityCreateWithCustody`). The delegator's key is looked up from the
     // identity registry below (NOT the context creator's key).
+
+    // The supervisor must report `Active` before this bridge issues a token for
+    // the context, because a context the supervisor stopped serving grants no
+    // new authority.
+    crate::runtime::require_active_context_before_authz(
+        bi,
+        &handle.context_id(),
+        "delegate a UCAN in context",
+        |msg| ScpNapiError::Context {
+            message: msg,
+            code: codes::CTX_2023.to_owned(),
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
+
     let context_id = handle.context_id();
 
     // Parse the parent token.
@@ -607,15 +690,14 @@ pub(crate) async fn ucan_delegate_on(
         .collect::<Result<Vec<_>, ScpNapiError>>()
         .map_err(napi::Error::from)?;
 
-    // Get ceiling from the context handle for delegation-time enforcement (#339).
-    // Empty ceiling means the user passed `[]` — apply the default ceiling
-    // instead of `None` (which would mean unlimited). See #1419.
-    let ceiling_strings: std::collections::HashSet<String> = handle.ceiling().into_iter().collect();
-    let ceiling = Some(if ceiling_strings.is_empty() {
-        scp_core::context::roles::default_ceiling().to_ucan_string_set()
-    } else {
-        ceiling_strings
-    });
+    // The ceiling bounds what a delegation may carry (#339, the
+    // ceiling-enforcement issue); it comes from the supervisor actor so a
+    // narrowed ceiling binds the next delegation.
+    let ceiling = Some(
+        crate::runtime::live_ceiling_strings(bi, &handle.context_id())
+            .await
+            .map_err(napi::Error::from)?,
+    );
 
     // Look up the DELEGATOR's identity from the global identity registry.
     // This is critical: the delegation must be signed with the delegator's
@@ -668,7 +750,6 @@ pub(crate) async fn ucan_delegate_on(
 }
 
 /// Per-bridge-instance implementation of [`Scp::ucan_revoke`](crate::scp::Scp::ucan_revoke).
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub(crate) async fn ucan_revoke_on(
     bi: &NapiBridgeInstance,
@@ -680,18 +761,46 @@ pub(crate) async fn ucan_revoke_on(
     validate_ucan_token(&token).map_err(ScpNapiError::from)?;
     validate_did(&revoker_did).map_err(ScpNapiError::from)?;
 
+    // The supervisor must report `Active` before this bridge records a
+    // revocation. `context_close_on` releases the revocation list, and
+    // `ensure_registered` below refuses to rebuild a released id, so a
+    // revocation that a close overtakes after this gate fails and never lands
+    // in a list no validation reads.
+    crate::runtime::require_active_context_before_authz(
+        bi,
+        &handle.context_id(),
+        "revoke a UCAN in context",
+        |msg| ScpNapiError::Context {
+            message: msg,
+            code: codes::CTX_2023.to_owned(),
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
+
     crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
     // Parse the token to extract the issuer DID for authorization.
     let parsed = parse_ucan(&token).map_err(ScpNapiError::from)?;
 
     let context_id = handle.context_id();
+
+    // `revoke_ucan` admits a revoker who is either the token's issuer or the
+    // context creator, and that creator comes from the supervisor actor, so a
+    // context no actor serves refuses the revocation instead of authorizing it
+    // against a creator this bridge recorded at registration. The `PyO3` bridge
+    // reads the actor at this decision for the same reason.
+    let creator_did = crate::runtime::live_role_state(bi, &context_id)
+        .await
+        .map_err(napi::Error::from)?
+        .creator_did;
+
     crate::runtime::with_context(bi, &context_id, |rt| {
         use std::cell::RefCell;
 
         let authorizer = BridgeRevocationAuthorizer {
             issuer_did: parsed.payload.iss.clone(),
-            creator_did: rt.core.creator_did.clone(),
+            creator_did: creator_did.clone(),
         };
         let distributor = BridgeRevocationDistributor;
         let event_log_cell = RefCell::new(&mut rt.core.event_log);
@@ -1000,7 +1109,7 @@ mod tests {
         let context_id = format!("ctx-revoke-persist-{}", uuid::Uuid::new_v4());
 
         // Manually register a context in the runtime registry.
-        runtime::register_test_context(&bi, &context_id, "did:dht:zCreator");
+        runtime::register_test_context(&bi, &context_id);
 
         // First call: revoke a CID.
         runtime::with_context(&bi, &context_id, |rt| {
@@ -1042,7 +1151,7 @@ mod tests {
 
         let bi = runtime::NapiBridgeInstance::new_napi();
         let context_id = format!("ctx-nonce-persist-{}", uuid::Uuid::new_v4());
-        runtime::register_test_context(&bi, &context_id, "did:dht:zCreator");
+        runtime::register_test_context(&bi, &context_id);
 
         let now_millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1226,6 +1335,146 @@ mod tests {
                 "ucan_revoke_on must append a TokenRevoked event: the log held {events_before} \
                  leaves before the call and {events_after} after"
             );
+        }
+
+        /// A token revoked before a close stays refused after the close
+        /// released the context's revocation list.
+        ///
+        /// The creator's close takes the supervisor to `Closing` and releases
+        /// this bridge's `UcanContextState`; `contextFinalizeClose` then takes
+        /// it to `Closed`, and the actor stays resident and still answers the
+        /// role-state read. A rebuilt state would hold an empty revocation
+        /// list, so a validation that reached one would accept the revoked
+        /// token. The validation below must fail at
+        /// `require_active_context_before_authz`. An entry point that passed
+        /// that gate before the close released the state reaches
+        /// `ensure_registered` next, so the test also calls
+        /// `ensure_registered` directly after the close: it must refuse and
+        /// leave no rebuilt state in the registry. Only `readmit_context`,
+        /// which the import, restore, and Welcome-join paths call, lifts the
+        /// refusal.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn revoked_token_stays_refused_after_a_close_released_the_revocation_list() {
+            let scp = crate::scp::Scp::new_in_memory_for_test();
+            let bi = std::sync::Arc::clone(&scp.inner);
+            let owner = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+            let owner_did = owner.did();
+            let params = serde_json::json!({
+                "ceiling": ["messages:read", "messages:write", "context:close"],
+                "governance": "single_admin",
+                "memoryScope": "ephemeral",
+            })
+            .to_string();
+            let handle = crate::context::context_create_on(&bi, &owner, params)
+                .await
+                .expect("context_create should succeed");
+            let context_id = handle.context_id();
+
+            let minted = ucan_mint_on(
+                &bi,
+                &handle,
+                AUDIENCE_DID.to_owned(),
+                vec!["messages:write".to_owned()],
+                None,
+            )
+            .await
+            .expect("ucan_mint_on should succeed");
+            let token = minted.encoded.clone();
+            let capability = minted
+                .data
+                .capabilities
+                .first()
+                .expect("the minted token carries its capability")
+                .clone();
+
+            ucan_validate_on(
+                &bi,
+                &handle,
+                token.clone(),
+                capability.clone(),
+                AUDIENCE_DID.to_owned(),
+                None,
+            )
+            .await
+            .expect("an unrevoked token must validate while the context is active");
+
+            ucan_revoke_on(&bi, &handle, token.clone(), owner_did.clone())
+                .await
+                .expect("the creator may revoke a token the creator issued");
+
+            crate::context::context_close_on(&bi, &handle, owner_did)
+                .await
+                .expect("the creator's close should succeed");
+            crate::context::context_finalize_close_on(&bi, &handle)
+                .await
+                .expect("finalize should take the context from closing to closed");
+            assert_eq!(
+                runtime::read_live_context_state(&bi, &context_id)
+                    .await
+                    .expect("state read"),
+                Some(scp_core::context::ContextState::Closed),
+                "the actor must stay resident and report closed"
+            );
+            assert!(
+                runtime::live_role_state(&bi, &context_id).await.is_ok(),
+                "the closed actor still answers the role-state read, so the role-state \
+                 read cannot be what refuses the validation below"
+            );
+
+            let err = ucan_validate_on(
+                &bi,
+                &handle,
+                token,
+                capability,
+                AUDIENCE_DID.to_owned(),
+                None,
+            )
+            .await
+            .expect_err("a token revoked before the close must not validate after it");
+            let message = format!("{err}");
+            assert!(
+                message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+                "the validation must refuse at the lifecycle gate, got: {message}"
+            );
+            assert!(
+                !message.to_lowercase().contains("closed"),
+                "the refusal must withhold the lifecycle state, got: {message}"
+            );
+
+            // The step a validation takes after its gate passed: a close that
+            // released the state in between must leave it nothing to read.
+            let err = runtime::ensure_registered(&bi, &handle)
+                .expect_err("ensure_registered must not rebuild a released context's state");
+            assert!(
+                format!("{err}").contains("SCP-CTX-2023"),
+                "the refusal must carry SCP-CTX-2023, got: {err}"
+            );
+            assert!(
+                !runtime::ucan_registry(&bi).contains_key(&context_id),
+                "a refused rebuild must leave no state in the registry"
+            );
+
+            // The ungated session close finds no session and builds no state.
+            let err =
+                crate::outlets::outlet_session_close_on(&bi, &handle, "no-such-session".to_owned())
+                    .await
+                    .expect_err("a released context holds no session");
+            assert!(
+                err.to_string().contains(codes::OUTLET_6021),
+                "the session close must report session-not-found, got: {err}"
+            );
+            assert!(
+                !runtime::ucan_registry(&bi).contains_key(&context_id),
+                "a session close must not rebuild a released context's state"
+            );
+
+            runtime::readmit_context(&bi, &context_id);
+            runtime::ensure_registered(&bi, &handle)
+                .expect("a readmitted context builds fresh state again");
+            assert!(runtime::ucan_registry(&bi).contains_key(&context_id));
         }
 
         /// `ucan_revoke_on` rejects a revoker that is neither the token's issuer
@@ -1633,11 +1882,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ucan_mint_without_retained_custody_returns_ident_1017() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        let handle = crate::context::NapiContextHandle::test_active_on(
-            &bi,
-            "ctx-no-custody-mint".to_owned(),
-            "did:dht:z6MkCreatorNoCustody".to_owned(),
-        );
+        let ctx_id = format!("ctx-no-custody-mint-{}", uuid::Uuid::new_v4());
+        let creator_did = "did:dht:z6MkCreatorNoCustody";
+        // `ucan_mint_on` reads the ceiling and the creator off the actor before
+        // it resolves custody, so the actor has to answer for this context.
+        // Then the mint fails at the custody lookup, which is what this test
+        // pins, rather than at the live read.
+        crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator_did, &[]).await;
+        let handle =
+            crate::context::NapiContextHandle::test_active_on(&bi, ctx_id, creator_did.to_owned());
 
         let result = ucan_mint_on(
             &bi,
