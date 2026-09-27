@@ -1,10 +1,16 @@
-//! Play Integrity [`DeviceAttestation`] adapter for Android.
+//! Play Integrity device attestation adapter for Android.
 //!
-//! The Android device attestation adapter is implemented in Kotlin at
-//! `bindings/kotlin/scp-kt-android/.../AndroidDeviceAttestation.kt` and
-//! injected into the Rust engine via the UniFFI callback interface (ADR-021).
-//! This module documents the Rust-side contract and re-exports the trait types
-//! that the Kotlin adapter implements.
+//! The Kotlin class `AndroidDeviceAttestation` in
+//! `bindings/kotlin/scp-kt-android/.../AndroidDeviceAttestation.kt` implements
+//! the Kotlin `DeviceAttestationProvider` interface in `Types.kt`. That
+//! interface restates the `UniFFI` `DeviceAttestationProvider` callback
+//! interface in `crates/scp-ffi/uniffi/src/lib.rs`, and no Rust code calls
+//! that callback yet (story SCP-095 criterion 1). The Kotlin adapter does not
+//! implement [`DeviceAttestation`], whose `attest` takes no argument and which
+//! declares a `verify` method the Kotlin interface lacks. OQ-22 of
+//! `.docs/specs/27-attestations.md` keeps open which of the two traits is
+//! normative. This module re-exports [`DeviceAttestation`] and
+//! [`DeviceAttestationToken`] for Android builds.
 //!
 //! # Play Integrity request (ADR-027)
 //!

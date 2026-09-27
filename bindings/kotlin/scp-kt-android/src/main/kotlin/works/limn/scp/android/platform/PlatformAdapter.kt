@@ -14,8 +14,9 @@ import android.content.Context
  * Assembled Android platform adapter holding all four provider implementations.
  *
  * Created by [AndroidPlatformAdapter.make] and passed to the Rust engine via
- * UniFFI at SDK initialization time. Each provider implements the corresponding
- * UniFFI callback interface defined in `crates/scp-ffi/uniffi/src/bridge.rs`.
+ * UniFFI at SDK initialization time. Each provider implements a Kotlin interface in
+ * `Types.kt` that restates the corresponding UniFFI callback interface declared in
+ * `crates/scp-ffi/uniffi/src/lib.rs`.
  *
  * @property keyCustody Android Keystore key management (TEE-backed Ed25519 on API 33+).
  * @property deviceAttestation Play Integrity device attestation, which requests a Classic

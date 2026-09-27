@@ -243,8 +243,10 @@ class AndroidDeviceAttestationTest {
         // adapter. ADR-027 acceptance criterion 7, as its 2026-09-27 amendment
         // states it, replaced this JSON with requestHash = hex(D), where D is
         // the binding digest of 09-security-model.md section 9.3.1; story
-        // SCP-111 carries that change. OQ-22 of spec 27 keeps only the choice
-        // of trait open. The Apple adapter builds no JSON.
+        // SCP-111 carries that change. OQ-22 of spec 27 keeps two questions
+        // open: which of the two device-attestation traits is normative, and
+        // whether that trait's attest takes D or D's two inputs (a challenge
+        // and an identifier). The Apple adapter builds no JSON.
         val attestation = createAttestationWithMockContext()
         val json = attestation.buildClientDataJSON(
             byteArrayOf(1, 2, 3),

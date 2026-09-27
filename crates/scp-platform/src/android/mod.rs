@@ -1,9 +1,10 @@
 //! Android platform adapter modules for SCP.
 //!
-//! This module declares and re-exports the four Android platform adapters that
-//! implement the traits defined in [`crate::traits`]. The actual implementations
-//! are in Kotlin at `bindings/kotlin/scp-kt-android/` and are injected
-//! into the Rust engine via UniFFI callback interfaces (ADR-021, ADR-027).
+//! This module declares the four Android platform adapter modules. The
+//! adapters themselves are Kotlin classes in `bindings/kotlin/scp-kt-android/`.
+//! Each Kotlin class implements a Kotlin interface in `Types.kt`, not a trait
+//! in [`crate::traits`]. Those Kotlin interfaces restate the `UniFFI` callback
+//! interfaces in `crates/scp-ffi/uniffi/src/lib.rs` (ADR-021, ADR-027).
 //!
 //! # Adapter Modules
 //!

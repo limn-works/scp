@@ -1,7 +1,7 @@
 // Types.kt — Supporting types for Android platform adapters (ADR-027)
 //
 // These types mirror the Rust `scp-platform` trait signatures (crates/scp-platform/src/traits.rs)
-// and the UniFFI callback interface contract (crates/scp-ffi/uniffi/src/bridge.rs). They will
+// and the UniFFI callback interface contract (crates/scp-ffi/uniffi/src/lib.rs). They will
 // eventually be replaced by UniFFI-generated Kotlin types once the full FFI binding pipeline is
 // wired. Until then, they serve as the Kotlin-side contract.
 //
@@ -138,7 +138,10 @@ enum class WakeSignal {
  * The Android implementation requests a Classic Play Integrity token; ADR-027
  * requires a Standard request, and story SCP-111 tracks that change.
  *
- * This interface mirrors the Rust `DeviceAttestation` trait in `scp-platform/src/traits.rs`.
+ * This interface mirrors the UniFFI `DeviceAttestationProvider` callback interface in
+ * `crates/scp-ffi/uniffi/src/lib.rs`. It does not mirror the Rust `DeviceAttestation` trait in
+ * `crates/scp-platform/src/traits.rs`, whose `attest` takes no argument and which declares a
+ * `verify` method that this interface lacks.
  *
  * See ADR-006 for the platform abstraction design and ADR-027 for the Android adapter.
  */
@@ -206,7 +209,7 @@ interface PushProvider {
  * for software fallback on API 26-32.
  *
  * This interface mirrors the Rust `KeyCustody` trait in `scp-platform/src/traits.rs`
- * and the UniFFI `KeyCustodyProvider` callback interface in `scp-ffi/uniffi/src/bridge.rs`.
+ * and the UniFFI `KeyCustodyProvider` callback interface in `scp-ffi/uniffi/src/lib.rs`.
  *
  * See ADR-006 for the platform abstraction design and ADR-027 for the Android adapter.
  */
@@ -352,7 +355,7 @@ interface KeyCustodyProvider {
  * encryption key stored in Android Keystore.
  *
  * This interface mirrors the Rust `Storage` trait in `scp-platform/src/traits.rs`
- * and the UniFFI `StorageProvider` callback interface in `scp-ffi/uniffi/src/bridge.rs`.
+ * and the UniFFI `StorageProvider` callback interface in `scp-ffi/uniffi/src/lib.rs`.
  *
  * All keys are UTF-8 strings. Values are opaque byte arrays. Keys are unique — storing
  * a value with an existing key replaces the previous value.
