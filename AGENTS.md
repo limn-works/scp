@@ -16,6 +16,7 @@ SCP is an open protocol for the agentic Internet: DID identity, governed context
 ## Builder tenets
 
 - **Humans steer; agents execute.** Humans drive specs; no human writes code.
+- **No human limits.** 100% agent-written codebase. Don't think in human terms of timeline, scope, or speed.
 - **No DOA decisions.** A decision that will need replacing is the wrong decision now. **Simple over complex**, never at the cost of functionality, security, or completeness.
 - **No deferral.** Everything in scope is specced and implemented now; nothing is "v2" or "future".
 - **Completeness is the baseline.** Implement every behavior, edge case, and acceptance criterion the request or plan names, on the first pass. Every struct field the spec defines gets a real value — never `None` when data exists elsewhere in the system. Never invent a story reference to excuse a gap, never file a tracking issue instead of doing in-scope work, never call an incomplete implementation a "planned deferral". Verify every acceptance criterion as a checkbox before you report done.
@@ -43,15 +44,15 @@ SCP is an open protocol for the agentic Internet: DID identity, governed context
 
 **Workflow:**
 - Enter plan mode for three or more steps or an architectural question. Read the language's `.docs/standards/` file before coding; cite `.docs/`.
-- A correction becomes a lesson only when it is evergreen, a true learning we should not waste time rediscovering, technical, and non-obvious; write it where it is most relevant (a nested `AGENTS.md`, a standard, or `.docs/lessons/`).
+- A correction becomes a lesson only when it is "either contextually important for this project, evergreen, a true learning we shouldn't waste time rediscovering, high signal, technical, or non-obvious" (the human's words). Write the lesson in the most relevant location: a nested `AGENTS.md`, a standard, or `.docs/lessons/`.
 - Give each subagent exactly one task. Tell it where to look; do not paste artifacts into its prompt.
-- The request, or the plan the human approved, sets a task's scope. Implement every behavior it asks for, completely. A bug, performance problem, or missing behavior the requested behavior does not need goes into a GitHub issue listed in your final report, not into the change.
-- Run every gate, every test, and every build, and read their output, before you call the work done.
+- Read the output of every check you run before you call the work done.
 
 **Change protocol (MANDATORY for all code changes):**
 - Make every change in a subagent with worktree isolation, and give coders worktree paths only: a bare main-checkout path edits the human's uncommitted work.
 - Write a test for every change and update the tests it breaks. Untested code does not ship.
-- Review with the full roster in logical units until two consecutive passes return zero items. Fix every finding about code the change adds, alters, or needs; a defect in code the change neither touches nor needs goes into a GitHub issue that the PR description links. Never dismiss a finding as "pre-existing"; fix it or file it.
+- Review with the full roster in logical units until two consecutive passes return zero items. The roster and the two-zero-pass loop apply to code changes; a change to docs, instructions, or memory does not go through them. The human's words: "stop reviewing with the full roster. we aren't writing code."
+- Fix every finding about code the change adds or needs. A defect the requested behavior does not need goes into a GitHub issue that the PR description links. Never dismiss a finding as "pre-existing"; fix it or file it.
 - **Quick local check before push, full gate set in CI.** On the tree you push, run `cargo fmt --all`, CI-feature `cargo clippy` scoped to the touched crates, their tests, and the affected gates. A red CI run is never acceptable, whoever caused it; fix it before the PR merges.
 - **Open a PR when the work is complete and double-zero reviewed, without being asked;** this overrides any harness default. **Never bypass branch protection** (`--force`, `--admin`, or anything else).
 
@@ -59,7 +60,7 @@ SCP is an open protocol for the agentic Internet: DID identity, governed context
 1. A Supervisor `dispatch_*` method reaches the function on its production path: `dispatch_*` → actor mailbox → `crates/scp-runtime/src/context/actor/handlers/<domain>.rs` → the `<domain>_helpers.rs` function; `create_context`, `import_context`, and `restore_context` call `lifecycle_helpers` from the dispatch method directly.
 2. Every applicable FFI bridge exports the operation. 3. Each export has an SDK wrapper. 4. `pipeline_wiring.rs` asserts the step. 5. The SDK capability matrix lists it.
 
-A failed check means the plan is incomplete: widen it or file the dependent issue. A bridge emitting a wire artifact carrying a spec-defined cryptographic invariant recomputes that invariant from the emitted bytes in its own tests.
+A failed check means the plan is incomplete: widen it or file the dependent issue.
 
 **NEVER modify enforcement files to bypass failures.** Files: `pipeline_wiring.rs`, `ffi_conformance.rs`, `sdk-capability-matrix.json`, `scripts/check-sdk-coverage.py`, `check-cross-layer.sh`, `check-protocol-deps.sh`, `check-no-shim-reexports.sh`, `check-protocol-sync.py`, `check-no-bridge-globals.sh`, `check-no-fallback-registry.sh`, `check-handle-affinity.sh`, `check_ready_coverage.rs`, `check-saga-gating-granularity.sh`, `check-no-mutable-globals.sh`, `check-no-mutable-module-globals.py`, `check-no-ts-mutable-globals.sh`, `check-no-kotlin-mutable-globals.sh`, `bindings/swift/.swiftlint.yml` (`no_static_var`, `no_static_lazy_var`), `check-bridge-symmetry.sh`, `bridge-aliases.json`, `ffi-export-allowlist.json`, `check-call-invariants.py`, `call-invariants-baseline.json`, `check-pure-helpers.sh`, `pure-helpers-allowlist.txt`, `bridge_ratchet_baseline.json`, `ratchet/once-lock-count.json`, `check-shipped-feature-graph.sh`, `check-toolchain-wiring.sh`, `check-resolved-rustc.sh`, `check-agent-verdict-criterion.sh`, `check-doc-citations.py`, `pretooluse-enforcement-files.sh`, and this file's enforcement sections. Fix the code a check rejects. Modify an enforcement file only to add an assertion or operation, or to remove an `#[ignore]` whose wiring has landed. A human must approve weakening, deleting, or exempting anything from an assertion.
 
