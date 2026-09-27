@@ -35,9 +35,12 @@ cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs --bin scp-n
 
 Every test inside `postgres_blob.rs` and `s3_blob.rs` carries `#[ignore]` and
 connects to a live `PostgreSQL` server or S3-compatible endpoint, so the first
-two lines compile both modules and execute none of their 36 test bodies. Run
-those against a server you started yourself: see the `# Testing` section at the
-head of each module for the environment variables it reads.
+two lines compile both modules and execute none of those test bodies. The Linux
+leg of job rust-test-optional-features in `.github/workflows/ci.yml` starts both
+services and runs them. Locally, run them against a server you started yourself:
+see the `# Testing` section at the head of each module for the environment
+variables it reads, and pass `--test-threads=1` to the `PostgreSQL` tests,
+because each one empties the table the others write to.
 
 **Required environment variable** (macOS): scp-ffi links against libpython at test time.
 

@@ -361,12 +361,12 @@ fn optional_bytes_to_array32(bytes: Option<Vec<u8>>) -> Result<Option<[u8; 32]>,
 //   createdb scp_test_blobs
 //
 // Every test below is #[ignore]d, because each one connects to a running
-// `PostgreSQL` instance. No workflow in .github/workflows/ declares a
-// `services:` block, so CI runs none of them: job rust-test-optional-features
-// in .github/workflows/ci.yml compiles this module and its test bodies under
-// `--features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob` and passes
-// no `--ignored`. Run them against a server you started yourself, with the
-// command above.
+// `PostgreSQL` instance. On its Linux leg, job rust-test-optional-features in
+// .github/workflows/ci.yml starts a `PostgreSQL` container and runs every one
+// of them with `--run-ignored ignored-only --test-threads 1`: each test empties
+// the shared `blobs` table before it runs, so two running at once would delete
+// each other's rows. Locally, run them against a server you started yourself,
+// with the command above and `--test-threads=1`.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {

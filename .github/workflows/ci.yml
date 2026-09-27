@@ -1233,14 +1233,12 @@ jobs:
           # what it covers in those two modules is the compile: every test
           # `postgres_blob.rs` and `s3_blob.rs` define carries `#[ignore]` and
           # opens a connection to a live `PostgreSQL` server or S3-compatible
-          # endpoint, no workflow in this directory declares a `services:` block
-          # that starts either one, and this line passes no `--ignored`, so it
-          # builds all 36 of those test bodies and runs none of them. It does
-          # run every other test `scp-transport` defines, under the two cloud
-          # features. Running the 36 needs a job that provisions a `PostgreSQL`
-          # service container and a `MinIO` endpoint, which no pull request has
-          # written yet; until one does, a behavioural change inside either
-          # module reaches CI as a compile only.
+          # endpoint, and this line passes no `--ignored`, so it builds those
+          # test bodies and runs none of them. It does run every other test
+          # `scp-transport` defines, under the two cloud features. The step
+          # "Run the PostgreSQL and S3 blob backend tests against live
+          # services" below starts both services on the Linux leg and runs
+          # every one of the ignored tests.
           cargo nextest run -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob
           # cargo-nextest runs no doctests, so the line above never compiles the
           # `rust,no_run` snippet at the head of postgres_blob.rs, which calls
@@ -1299,6 +1297,38 @@ jobs:
           # its own.
           cargo check -p scp-testing --lib
           cargo check -p scp-testing --lib --features testing
+      # The tests in crates/scp-transport/src/native/postgres_blob.rs and
+      # s3_blob.rs are the only tests that execute `PostgresBlobStore` and
+      # `S3BlobStore`, and each carries `#[ignore]` because it opens a
+      # connection to a live server. This step starts `PostgreSQL` and `MinIO`
+      # and runs only those ignored tests. It runs on the Linux leg alone, because GitHub's macOS runners
+      # ship no Docker daemon. The `PostgreSQL` tests share one `blobs` table
+      # and each one empties it first, so `--test-threads 1` runs them one at a
+      # time; the S3 tests each write under a random prefix. `--no-tests=fail`
+      # fails the step when the filter matches no test, so a module rename
+      # cannot turn this step into a pass that ran nothing.
+      - name: Run the PostgreSQL and S3 blob backend tests against live services
+        if: runner.os == 'Linux'
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/scp_test_blobs
+          S3_TEST_ENDPOINT: http://localhost:9000
+          S3_TEST_BUCKET: scp-test
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_REGION: us-east-1
+        run: |
+          docker run -d --name scp-postgres -p 5432:5432 \
+            -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=scp_test_blobs postgres:16
+          docker run -d --name scp-minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          timeout 120 bash -c 'until docker exec scp-postgres pg_isready -U postgres -d scp_test_blobs; do sleep 2; done'
+          timeout 120 bash -c 'until curl -sf http://localhost:9000/minio/health/live; do sleep 2; done'
+          aws --endpoint-url "$S3_TEST_ENDPOINT" s3 mb "s3://$S3_TEST_BUCKET"
+          cargo nextest run --no-tests=fail -p scp-transport \
+            --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob \
+            --run-ignored ignored-only --test-threads 1 \
+            -E 'test(/^native::(postgres_blob|s3_blob)::tests::/)'
 
   # Exercises the napi bridge in its PRODUCTION configuration: default features
   # (`server` on) but WITHOUT `testing` / `scp-core/testing` /

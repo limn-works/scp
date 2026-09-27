@@ -41,9 +41,10 @@ run_rust() (
   # lines cover inside the two modules is the compile: every test both modules
   # define carries `#[ignore]` and opens a connection to a live `PostgreSQL`
   # server or S3-compatible endpoint, and neither line passes `--ignored`, so
-  # they build all 36 of those test bodies and run none of them. Start a server
-  # yourself and run them with `-- --ignored`; the `# Testing` section at the
-  # head of each module names the environment variables it reads.
+  # they build those test bodies and run none of them. The Linux leg of that CI
+  # job starts both services and runs them. Locally, start a server yourself and
+  # run them with `-- --ignored`; the `# Testing` section at the head of each
+  # module names the environment variables it reads.
   if command -v cargo-nextest &>/dev/null; then
     cargo nextest run -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob
   else
