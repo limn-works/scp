@@ -12,8 +12,13 @@
 //
 // ## Storage Backend
 //
-// Uses the system `sqlite3` C library (available on all Apple platforms) with
-// SQLCipher pragmas for encryption. The database is stored in Application
+// The `sqlite3_` symbols this file calls through `import SQLite3` must resolve
+// to the SQLCipher copy that `ScpFFI.xcframework` bundles, which receives the
+// encryption key through `PRAGMA key`. `open(at:encryptionKey:)` asks the
+// connection for `PRAGMA cipher_version` and throws when the answer is empty,
+// so a process whose symbols resolved to Apple's system SQLite, which ignores
+// `PRAGMA key` and would write every value in the clear, opens no storage.
+// The database is stored in Application
 // Support at `dev.limn.scp/scp.db`. The schema matches the Rust core's
 // `SqliteStorage`:
 //
@@ -206,21 +211,25 @@
             PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;
             PRAGMA journal_mode = WAL;
             """
+            // No `AppleStorage` owns `db` until the return below, so its
+            // `deinit` cannot close the connection: every statement that can
+            // throw between `sqlite3_open` and that return sits inside this
+            // `do`, whose `catch` closes it.
             do {
                 try execSQL(db: db, sql: pragmas)
                 _ = try sqlCipherVersion(db: db)
+
+                // Create the KV table.
+                try execSQL(db: db, sql: """
+                CREATE TABLE IF NOT EXISTS kv (
+                    key TEXT PRIMARY KEY,
+                    value BLOB NOT NULL
+                ) WITHOUT ROWID;
+                """)
             } catch {
                 sqlite3_close_v2(db)
                 throw error
             }
-
-            // Create the KV table.
-            try execSQL(db: db, sql: """
-            CREATE TABLE IF NOT EXISTS kv (
-                key TEXT PRIMARY KEY,
-                value BLOB NOT NULL
-            ) WITHOUT ROWID;
-            """)
 
             return AppleStorage(db: db, encryptionKey: encryptionKey)
         }

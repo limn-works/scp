@@ -3,9 +3,10 @@
 // These cases run against `AppleStorage` itself, opened at a database file this
 // process created under an encryption key this file holds, rather than against
 // the in-memory replica in `StorageConformanceTests.swift`. That replica shares
-// the schema, the query text, and the two parameter-binding helpers, and it
-// shares no line of the six `StorageProvider` method bodies, so a defect in one
-// of those six bodies reaches no assertion there.
+// the schema, the query text, the two parameter-binding helpers, and
+// `AppleStorage.readKeys(from:)`, the row loop behind `listKeys`, and it shares
+// no other line of the six `StorageProvider` method bodies, so a defect in the
+// rest of those six bodies reaches no assertion there.
 //
 // Four properties these cases pin:
 //
@@ -105,6 +106,24 @@
             throw StorageError.databaseError("could not create the kv table")
         }
         return connection
+    }
+
+    /// The paths of this process's open file descriptors whose path contains
+    /// `name`, read through `fcntl(F_GETPATH)`.
+    private func openDescriptors(naming name: String) -> [String] {
+        var paths: [String] = []
+        for descriptor in 0 ..< getdtablesize() {
+            var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+            let found = buffer.withUnsafeMutableBytes { raw in
+                fcntl(descriptor, F_GETPATH, raw.baseAddress) != -1
+            }
+            guard found else { continue }
+            let path = String(cString: buffer)
+            if path.contains(name) {
+                paths.append(path)
+            }
+        }
+        return paths
     }
 
     // MARK: - Bind-status tests
@@ -439,8 +458,44 @@
                 )
             }
             // A case that read no bytes would pass for a plaintext build, so
-            // it requires the files it searched to hold the stored row.
+            // it requires that it searched some bytes. The page `open` writes
+            // when it creates the `kv` table meets this check by itself, so the
+            // check does not prove the stored row reached any of these files;
+            // only the marker search above looks for that row.
             #expect(bytesRead > 0, "no database file held any bytes to search")
+        }
+
+        @Test("an open that fails after sqlite3_open leaves no descriptor on the file")
+        func failedOpenClosesTheConnection() throws {
+            // `AppleStorage` closes its connection in `deinit`, and no instance
+            // exists while `open(at:encryptionKey:)` still runs, so every
+            // statement that throws inside `open` must close the connection
+            // itself. A file written under one key and reopened under another
+            // makes `open` throw at the first statement SQLCipher runs against
+            // a page.
+            let fileURL: URL = try { () throws -> URL in
+                // The fixture's storage goes out of scope when this closure
+                // returns, and its `deinit` closes the first connection.
+                let fixture = try makeStorageFixture()
+                return fixture.fileURL
+            }()
+            defer {
+                for suffix in ["", "-wal", "-shm"] {
+                    try? FileManager.default.removeItem(atPath: fileURL.path + suffix)
+                }
+            }
+            #expect(openDescriptors(naming: fileURL.lastPathComponent).isEmpty)
+
+            #expect(throws: StorageError.self) {
+                _ = try AppleStorage.open(
+                    at: fileURL,
+                    encryptionKey: Data(repeating: 0x55, count: 32)
+                )
+            }
+            #expect(
+                openDescriptors(naming: fileURL.lastPathComponent).isEmpty,
+                "a failed open left a descriptor on the database file"
+            )
         }
 
         @Test("open runs on SQLCipher, which answers PRAGMA cipher_version")

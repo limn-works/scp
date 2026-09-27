@@ -9,9 +9,10 @@
 // The in-memory backend uses the identical SQL schema and query
 // patterns as ``AppleStorage``, and it binds every parameter through
 // ``AppleStorage/bindText(_:to:at:)`` and
-// ``AppleStorage/bindBlob(_:to:at:)`` rather than through a second copy
-// of that binding code. A copy would let one of the two spellings carry
-// a binding defect the other had fixed.
+// ``AppleStorage/bindBlob(_:to:at:)``, and its `listKeys` reads rows
+// through ``AppleStorage/readKeys(from:)``, rather than through a second
+// copy of that code. A copy would let one of the two spellings carry a
+// defect the other had fixed.
 // Three differences remain: this backend applies no SQLCipher encryption
 // pragma, opens `:memory:` instead of a file path, and serializes access
 // through a serial `DispatchQueue` where ``AppleStorage`` is an actor, so

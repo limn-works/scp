@@ -34,8 +34,9 @@
 //    `SCP-ATTEST-9025` result of an App Attest answer that carries neither a
 //    value nor an error.
 //
-// See ADR-025 (Apple Platform Adapter) in `.docs/adrs/phase-5.md` and
-// `crates/scp-platform/src/traits.rs` `DeviceAttestation`.
+// See ADR-025 (Apple Platform Adapter) in `.docs/adrs/phase-5.md` and the
+// UniFFI `DeviceAttestationProvider` callback interface in
+// `crates/scp-ffi/uniffi/src/lib.rs`, which the adapter conforms to.
 
 #if os(iOS) || os(macOS)
 

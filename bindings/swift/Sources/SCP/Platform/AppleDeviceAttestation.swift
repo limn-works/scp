@@ -181,7 +181,9 @@
     /// run their App Attest calls in one order, and neither reads an
     /// attestation record the other is still deciding what to write into.
     ///
-    /// See ADR-025 and `crates/scp-platform/src/traits.rs` `DeviceAttestation`.
+    /// See ADR-025 and the UniFFI `DeviceAttestationProvider` callback
+    /// interface in `crates/scp-ffi/uniffi/src/lib.rs`, which this class
+    /// conforms to.
     public final class AppleDeviceAttestation: DeviceAttestationProvider, @unchecked Sendable {
         // `@unchecked Sendable` is required because this class conforms to the
         // UniFFI `DeviceAttestationProvider` callback protocol, whose Rust trait
