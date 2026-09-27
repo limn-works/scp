@@ -20,6 +20,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { loadNativeAddon } from "../src/internal/native";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
 // Load the raw native addon — the fullstack methods live on `SCP` (gated
@@ -51,8 +52,7 @@ try {
     throw new Error("SCP.fullstackCreateNode not found — rebuild with testing feature");
   }
 } catch (e: unknown) {
-  const msg = e instanceof Error ? e.message : String(e);
-  skipReason = `Native NAPI bridge not available or missing fullstack methods: ${msg}`;
+  skipReason = skipReasonIfAddonAbsent(e);
 }
 
 if (addon === null) {

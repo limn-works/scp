@@ -21,6 +21,7 @@ import { describe, expect, test } from "bun:test";
 import { ValidationError } from "../src/errors";
 import { loadNativeAddon } from "../src/internal/native";
 import { __clampShutdownMillisForTests, __serializeStorageConfigForTests, SCP } from "../src/scp";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
 // Compile-time guard: storage selection is mandatory (spec §17.6).
@@ -103,8 +104,7 @@ try {
     throw new Error("SCP class not exported from native addon — rebuild with the Phase 4 changes");
   }
 } catch (e: unknown) {
-  skipReason =
-    e instanceof Error ? `native addon unavailable: ${e.message}` : "native addon unavailable";
+  skipReason = skipReasonIfAddonAbsent(e);
 }
 
 // ---------------------------------------------------------------------------

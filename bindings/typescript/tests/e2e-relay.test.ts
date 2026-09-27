@@ -37,6 +37,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
 // Guard: skip if native addon unavailable
@@ -58,13 +59,10 @@ try {
   scp = new SCP({ storage: { type: "in_memory" } });
   bridge = createNativeBridge(scp);
   if (typeof (scp as unknown as Record<string, unknown>).relayStartInMemory !== "function") {
-    skipReason = "SCP missing relayStartInMemory — rebuild with the Phase 4 changes";
-    bridge = null;
-    scp = null;
+    throw new Error("SCP missing relayStartInMemory — rebuild with the Phase 4 changes");
   }
 } catch (e: unknown) {
-  const msg = e instanceof Error ? e.message : String(e);
-  skipReason = `Native NAPI bridge not available: ${msg}`;
+  skipReason = skipReasonIfAddonAbsent(e);
 }
 
 if (bridge === null || scp === null) {

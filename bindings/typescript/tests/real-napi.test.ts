@@ -24,6 +24,7 @@ import { __getNativeScp, SCP } from "../src/scp";
 import type { Relay } from "../src/server";
 import type { BehavioralRecord, CapabilityRequirement, ParticipationProfile } from "../src/types";
 import { allValid } from "../src/types";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 /**
  * Generates a raw X25519 keypair (32-byte secret + 32-byte public key) for
@@ -78,11 +79,9 @@ try {
   createNativeBridge = nativeModule.createNativeBridge;
   const probe = new SCP({ storage: { type: "in_memory" } });
   if (typeof (probe as unknown as Record<string, unknown>).relayStartInMemory !== "function") {
-    skipReason = "SCP missing relayStartInMemory — rebuild with the Phase 4 changes";
-    createNativeBridge = null;
-  } else {
-    napiAvailable = true;
+    throw new Error("SCP missing relayStartInMemory — rebuild with the Phase 4 changes");
   }
+  napiAvailable = true;
   // Dispose of the probe so it never leaks state into the per-test
   // instances bootstrapped in `beforeEach` below.
   probe.shutdown(1).catch(() => {});
@@ -94,8 +93,7 @@ try {
   // would then skip over an addon the loader resolves.
   rawAddon = nativeModule.loadNativeAddon() as NativeAddon;
 } catch (e: unknown) {
-  const msg = e instanceof Error ? e.message : String(e);
-  skipReason = `Native NAPI bridge not available: ${msg}`;
+  skipReason = skipReasonIfAddonAbsent(e);
 }
 
 // When the bridge is unavailable, define a single test that reports the skip.

@@ -2079,6 +2079,7 @@ jobs:
         run: |
           bun -e '
             import { loadNativeAddon } from "./src/internal/native.ts";
+            import { SCP } from "./src/scp.ts";
             const addon = loadNativeAddon();
             const NativeScp = addon.SCP;
             if (typeof NativeScp !== "function") {
@@ -2093,7 +2094,11 @@ jobs:
                 );
               }
             }
-            console.log("NAPI addon loaded, constructed, and carries the gated methods");
+            // The skip guards under tests/ construct through the SDK class, so a
+            // failure only that path raises must fail here, not skip those suites.
+            const sdk = new SCP({ storage: { type: "in_memory" } });
+            await sdk.shutdown(1);
+            console.log("NAPI addon loaded, constructed through the SDK, and carries the gated methods");
             process.exit(0);
           '
       - name: Run checks
@@ -2597,6 +2602,7 @@ jobs:
         run: |
           bun -e '
             import { loadNativeAddon } from "./src/internal/native.ts";
+            import { SCP } from "./src/scp.ts";
             const addon = loadNativeAddon();
             const NativeScp = addon.SCP;
             if (typeof NativeScp !== "function") {
@@ -2611,7 +2617,11 @@ jobs:
                 );
               }
             }
-            console.log("NAPI addon loaded, constructed, and carries the gated methods");
+            // The skip guards under tests/ construct through the SDK class, so a
+            // failure only that path raises must fail here, not skip those suites.
+            const sdk = new SCP({ storage: { type: "in_memory" } });
+            await sdk.shutdown(1);
+            console.log("NAPI addon loaded, constructed through the SDK, and carries the gated methods");
             process.exit(0);
           '
       - name: Run parity tests (NAPI only)

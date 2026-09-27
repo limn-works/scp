@@ -1,0 +1,110 @@
+/**
+ * Tests for the absent-versus-load-failed separation in the native addon
+ * loader, the `SCP` wrapper's mapping of loader errors, and the skip rule
+ * every real-NAPI test file applies (`tests/napi-guard.ts`).
+ *
+ * None of these tests needs the real addon: the loader tests build a package
+ * in a temporary `node_modules`, and the guard tests pass a stand-in loader.
+ */
+
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ScpError, TransportError, ValidationError } from "../src/errors";
+import {
+  NATIVE_ADDON_ABSENT_CODE,
+  NATIVE_ADDON_LOAD_FAILED_CODE,
+  requireNativeAddon,
+} from "../src/internal/native";
+import { __addonLoadErrorForTests } from "../src/scp";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
+
+const BROKEN_PACKAGE = "scp-broken-native-addon";
+let root = "";
+
+beforeAll(() => {
+  root = mkdtempSync(join(tmpdir(), "scp-napi-guard-"));
+  const pkgDir = join(root, "node_modules", BROKEN_PACKAGE);
+  mkdirSync(pkgDir, { recursive: true });
+  writeFileSync(
+    join(pkgDir, "package.json"),
+    JSON.stringify({ name: BROKEN_PACKAGE, version: "0.0.0", main: "index.node" }),
+  );
+  // Not a shared library, so `dlopen` rejects it: the shape of an addon built
+  // for another platform or truncated in transit.
+  writeFileSync(join(pkgDir, "index.node"), "this is not a native addon");
+});
+
+afterAll(() => {
+  rmSync(root, { recursive: true, force: true });
+});
+
+describe("requireNativeAddon", () => {
+  test("a package that does not resolve is reported as absent", () => {
+    const req = createRequire(join(root, "entry.js"));
+    let caught: unknown;
+    try {
+      requireNativeAddon("scp-native-addon-that-is-not-installed", req);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(TransportError);
+    expect((caught as ScpError).code).toBe(NATIVE_ADDON_ABSENT_CODE);
+  });
+
+  test("a package that resolves and fails to load is reported as a load failure", () => {
+    const req = createRequire(join(root, "entry.js"));
+    let caught: unknown;
+    try {
+      requireNativeAddon(BROKEN_PACKAGE, req);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ScpError);
+    expect(caught).not.toBeInstanceOf(TransportError);
+    expect((caught as ScpError).code).toBe(NATIVE_ADDON_LOAD_FAILED_CODE);
+    expect((caught as ScpError).message).toContain(join(BROKEN_PACKAGE, "index.node"));
+    expect((caught as Error & { cause?: unknown }).cause).toBeInstanceOf(Error);
+  });
+});
+
+describe("SCP wrapper mapping of loader errors", () => {
+  test("a load failure keeps SCP-UNKNOWN-0002", () => {
+    const loadFailure = new ScpError("dlopen failed", NATIVE_ADDON_LOAD_FAILED_CODE);
+    expect(__addonLoadErrorForTests(loadFailure)).toBe(loadFailure);
+  });
+
+  test("absence becomes SCP-VALID-7005", () => {
+    const mapped = __addonLoadErrorForTests(
+      new TransportError("not installed", NATIVE_ADDON_ABSENT_CODE),
+    );
+    expect(mapped).toBeInstanceOf(ValidationError);
+    expect(mapped.code).toBe("SCP-VALID-7005");
+  });
+});
+
+describe("skipReasonIfAddonAbsent", () => {
+  const guardError = new Error("SCP wrapper constructor threw");
+
+  test("returns a skip reason when the loader reports absence", () => {
+    const reason = skipReasonIfAddonAbsent(guardError, () => {
+      throw new TransportError("no addon for this platform", NATIVE_ADDON_ABSENT_CODE);
+    });
+    expect(reason).toContain("no addon for this platform");
+  });
+
+  test("throws the loader's error when the addon is installed and failed to load", () => {
+    const loadFailure = new ScpError("dlopen failed", NATIVE_ADDON_LOAD_FAILED_CODE);
+    expect(() =>
+      skipReasonIfAddonAbsent(guardError, () => {
+        throw loadFailure;
+      }),
+    ).toThrow(loadFailure);
+  });
+
+  test("throws the guard's error when the addon loads", () => {
+    expect(() => skipReasonIfAddonAbsent(guardError, () => ({}))).toThrow(guardError);
+  });
+});

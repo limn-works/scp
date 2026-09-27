@@ -40,10 +40,14 @@
 import type { BridgeCredential } from "./bridge";
 import type { Context } from "./context";
 import type { PaymentReceiptVerificationResult } from "./economy";
-import { ContextError, mapBridgeError, mapSagaError, ValidationError } from "./errors";
+import { ContextError, mapBridgeError, mapSagaError, ScpError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
 import { type BridgeContextHandle, getBridge, toCapabilityValidation } from "./internal/bridge";
-import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
+import {
+  loadNativeAddon,
+  NATIVE_ADDON_LOAD_FAILED_CODE,
+  type NativeAddon as RawNativeAddon,
+} from "./internal/native";
 import { assertTestEnvironment } from "./internal/test-guard";
 import type { StreamingSagaNative, StreamingSagaOptions } from "./outlets";
 import { StreamingSagaHandle } from "./outlets";
@@ -159,11 +163,13 @@ interface NativeScpInstance {
  * Routes through the shared `loadNativeAddon` cache in
  * `internal/native.ts` so this module and the bridge factory share a
  * single frozen addon reference. The shared loader throws
- * `TransportError` (`SCP-TRANS-5001`) on platform-package missing or
- * load failure; this wrapper layers an additional runtime check
- * and a stale-addon (no `SCP` class) check, both surfaced as
- * `ValidationError` (`SCP-VALID-7005`) — the public-API code that
- * SDK consumers see when they call `new SCP(...)`.
+ * `TransportError` (`SCP-TRANS-5001`) when the platform package is
+ * missing, which this wrapper surfaces as `ValidationError`
+ * (`SCP-VALID-7005`) — the public-API code SDK consumers see when they
+ * call `new SCP(...)` — together with a runtime check and a stale-addon
+ * (no `SCP` class) check. An installed addon that failed to load passes
+ * through as the loader's `ScpError` (`SCP-UNKNOWN-0002`), so it is never
+ * reported as a missing package.
  */
 function loadAddon(): NativeAddon {
   if (typeof process === "undefined" || !process.versions?.node) {
@@ -179,13 +185,7 @@ function loadAddon(): NativeAddon {
   try {
     addon = loadNativeAddon() as NativeAddon;
   } catch (cause) {
-    const underlying = (cause as Error)?.message ?? String(cause);
-    throw new ValidationError(
-      `Native addon failed to load: ${underlying}. ` +
-        "Ensure the matching @limn-works/scp-ts-napi-* platform package is " +
-        "installed, then reinstall with `bun install`.",
-      "SCP-VALID-7005",
-    );
+    throw __addonLoadErrorForTests(cause);
   }
 
   if (typeof addon.SCP !== "function") {
@@ -218,8 +218,9 @@ function nativeScp(): NativeScpCtor {
  * ADR-048 §1; `SCP` class methods that wrap them route through this
  * accessor instead of `this.#native[name]`.
  *
- * Throws `SCP-VALID-7005` if the addon is unloadable or does not
- * export the named function (e.g., a stale prebuilt addon predating
+ * Throws `SCP-VALID-7005` if the addon is not installed or does not
+ * export the named function, and `SCP-UNKNOWN-0002` if the addon is
+ * installed and failed to load (e.g., a stale prebuilt addon predating
  * the §1 split).
  */
 function nativeFreeFn<T>(name: keyof NativeAddon): T {
@@ -239,6 +240,29 @@ function nativeFreeFn<T>(name: keyof NativeAddon): T {
 // ---------------------------------------------------------------------------
 // Internal helpers (exported for tests, not part of the public API)
 // ---------------------------------------------------------------------------
+
+/**
+ * Maps an error `loadNativeAddon` threw to the error `loadAddon` throws.
+ *
+ * An installed addon that failed to load keeps the loader's
+ * `SCP-UNKNOWN-0002`, so a caller can tell it apart from absence. Every
+ * other loader error — the platform package is missing — becomes
+ * `ValidationError` (`SCP-VALID-7005`).
+ *
+ * @internal
+ */
+export function __addonLoadErrorForTests(cause: unknown): ScpError {
+  if (cause instanceof ScpError && cause.code === NATIVE_ADDON_LOAD_FAILED_CODE) {
+    return cause;
+  }
+  const underlying = (cause as Error)?.message ?? String(cause);
+  return new ValidationError(
+    `Native addon is not installed: ${underlying}. ` +
+      "Ensure the matching @limn-works/scp-ts-napi-* platform package is " +
+      "installed, then reinstall with `bun install`.",
+    "SCP-VALID-7005",
+  );
+}
 
 /**
  * Clamps a float-seconds timeout into a millisecond count suitable for
@@ -594,7 +618,9 @@ export class SCP {
    * compile error. There is no default backend.
    *
    * @param options Constructor options; `options.storage` is required.
-   * @throws {ValidationError} If no NAPI addon is available — code `SCP-VALID-7005`.
+   * @throws {ValidationError} If no NAPI addon is installed — code `SCP-VALID-7005`.
+   * @throws {ScpError} If the NAPI addon is installed and failed to load —
+   *   code `SCP-UNKNOWN-0002`.
    */
   constructor(options: ScpOptions) {
     // Runtime fail-closed guard (spec §17.6): the TS type makes
