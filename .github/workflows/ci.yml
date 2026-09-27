@@ -2015,7 +2015,12 @@ jobs:
           echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > $ANDROID_HOME/licenses/mips-android-sysimage-license
       - run: sdkmanager "platforms;android-35"
       - uses: gradle/actions/setup-gradle@v4
-      - run: ./gradlew :scp-kt:runKtlintCheckOverMainSourceSet
+      # `ktlintCheck`, not `runKtlintCheckOverMainSourceSet`: the `runKtlint*`
+      # tasks only write the report and exit 0 whatever it lists; the
+      # ktlint-gradle plugin fails the build in the `ktlint*SourceSetCheck`
+      # tasks, and `ktlintCheck` runs them for the main, test and Kotlin-script
+      # source sets (#2379). `:scp-kt` is the only module that applies ktlint.
+      - run: ./gradlew :scp-kt:ktlintCheck
       - run: ./gradlew :scp-kt:detekt
       # `generateUniffiBindings` writes into `src/main/kotlin`, so Gradle fails
       # any task that reads that root and carries no ordering edge to it. Gradle

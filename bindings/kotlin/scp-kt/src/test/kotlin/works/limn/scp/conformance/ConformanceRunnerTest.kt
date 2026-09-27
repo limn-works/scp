@@ -267,56 +267,61 @@ class ConformanceRunnerTest {
 
     @Nested
     inner class FixtureRoundtrip {
-        private val ctx = mapOf(
-            "context_handle" to "10",
-            "identity_handle" to "1",
-        )
+        private val ctx =
+            mapOf(
+                "context_handle" to "10",
+                "identity_handle" to "1",
+            )
 
-        private val roundtripFixtures = listOf(
-            ConformanceFixture(
-                testId = "roundtrip-identity-001",
-                category = "identity",
-                description = "Create identity",
-                operation = "identity_create",
-                input = mapOf("custody" to "in_memory"),
-                expected = mapOf("custody_type" to "in_memory"),
-            ),
-            ConformanceFixture(
-                testId = "roundtrip-context-001",
-                category = "context",
-                description = "Leave context",
-                operation = "context_leave",
-                input = ctx,
-                expected = mapOf("status" to "left"),
-            ),
-            ConformanceFixture(
-                testId = "roundtrip-send-001",
-                category = "messaging",
-                description = "Send message",
-                operation = "context_send",
-                input = ctx + ("payload" to "hello"),
-                expected = mapOf("status" to "sent"),
-            ),
-            ConformanceFixture(
-                testId = "roundtrip-outlet-001",
-                category = "outlets",
-                description = "Register outlet",
-                operation = "outlet_register",
-                input = mapOf(
-                    "context_handle" to "10",
-                    "definition" to "{}",
+        private val roundtripFixtures =
+            listOf(
+                ConformanceFixture(
+                    testId = "roundtrip-identity-001",
+                    category = "identity",
+                    description = "Create identity",
+                    operation = "identity_create",
+                    input = mapOf("custody" to "in_memory"),
+                    expected = mapOf("custody_type" to "in_memory"),
                 ),
-                expected = mapOf("outlet_id" to "outlet-001"),
-            ),
-        )
+                ConformanceFixture(
+                    testId = "roundtrip-context-001",
+                    category = "context",
+                    description = "Leave context",
+                    operation = "context_leave",
+                    input = ctx,
+                    expected = mapOf("status" to "left"),
+                ),
+                ConformanceFixture(
+                    testId = "roundtrip-send-001",
+                    category = "messaging",
+                    description = "Send message",
+                    operation = "context_send",
+                    input = ctx + ("payload" to "hello"),
+                    expected = mapOf("status" to "sent"),
+                ),
+                ConformanceFixture(
+                    testId = "roundtrip-outlet-001",
+                    category = "outlets",
+                    description = "Register outlet",
+                    operation = "outlet_register",
+                    input =
+                        mapOf(
+                            "context_handle" to "10",
+                            "definition" to "{}",
+                        ),
+                    expected = mapOf("outlet_id" to "outlet-001"),
+                ),
+            )
 
         @Test
         fun `inline fixtures run through full pipeline`() =
             runTest(testDispatcher) {
                 for (fixture in roundtripFixtures) {
-                    val result = dispatcher.dispatch(
-                        fixture.operation, fixture.input,
-                    )
+                    val result =
+                        dispatcher.dispatch(
+                            fixture.operation,
+                            fixture.input,
+                        )
                     val mismatches =
                         compareResults(result, fixture.expected)
                     assertTrue(

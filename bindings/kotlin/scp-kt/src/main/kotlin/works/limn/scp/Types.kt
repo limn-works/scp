@@ -8,22 +8,14 @@
 
 package works.limn.scp
 
-import java.text.Normalizer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
-import works.limn.scp.bridge.BridgeException
 import uniffi.scp.OutletKind
+import works.limn.scp.bridge.BridgeException
+import java.text.Normalizer
 
-/**
- * Key custody method for identity key management (spec section 3.2).
- *
- * Determines where cryptographic keys are stored and managed. The
- * [rawValue] property returns the string expected by the FFI bridge.
- *
- * @property rawValue Wire-format string passed to the FFI bridge.
- */
 /**
  * Canonical protocol capability strings and parameterised constructors.
  *
@@ -79,6 +71,14 @@ object Capability {
     fun outletCall(outletId: String): String = "outlet:call:$outletId"
 }
 
+/**
+ * Key custody method for identity key management (spec section 3.2).
+ *
+ * Determines where cryptographic keys are stored and managed. The
+ * [rawValue] property returns the string expected by the FFI bridge.
+ *
+ * @property rawValue Wire-format string passed to the FFI bridge.
+ */
 enum class CustodyType(val rawValue: String) {
     /**
      * Platform-native secure storage (Keychain on macOS/iOS, Keystore
@@ -389,9 +389,6 @@ class ScopedHandle internal constructor(
  * @property deployRetentionCount Number of deploys to retain (default: 2, max 8).
  * @property cspOverride Optional CSP override. Validated: no `unsafe-eval`, `unsafe-inline`,
  *   `unsafe-hashes`, bare `*`, `data:`, `blob:`.
- */
-/**
- * Node-local site configuration for broadcast projection (spec section 18.11.12).
  *
  * This is intentionally NOT a data class: the auto-generated `copy()` method
  * on data classes would allow callers to create a new instance that bypasses
@@ -496,18 +493,19 @@ class SiteConfig(
      * Uses [buildJsonObject] from kotlinx.serialization to produce structurally
      * valid JSON, preventing injection via untrusted string fields.
      */
-    fun toJson(): String = Json.encodeToString(
-        buildJsonObject {
-            put("hostname", hostname)
-            put("index_path", indexPath)
-            put("max_assets_per_deploy", maxAssetsPerDeploy)
-            put("max_deploy_size_bytes", maxDeploySizeBytes)
-            put("deploy_retention_count", deployRetentionCount)
-            if (cspOverride != null) {
-                put("csp_override", cspOverride)
-            }
-        },
-    )
+    fun toJson(): String =
+        Json.encodeToString(
+            buildJsonObject {
+                put("hostname", hostname)
+                put("index_path", indexPath)
+                put("max_assets_per_deploy", maxAssetsPerDeploy)
+                put("max_deploy_size_bytes", maxDeploySizeBytes)
+                put("deploy_retention_count", deployRetentionCount)
+                if (cspOverride != null) {
+                    put("csp_override", cspOverride)
+                }
+            },
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -653,26 +651,28 @@ private val TCHAR_REGEX = Regex("^[a-zA-Z0-9!#\$&'*+\\-.^_`|~]+$")
  * Returns true for Unicode formatting and invisible characters that should
  * be rejected in content paths. Mirrors the Rust `is_unicode_formatting` helper.
  */
-private fun isUnicodeFormatting(cp: Int): Boolean = cp in 0x00A0..0x00A0 || // NBSP
-    cp in 0x1680..0x1680 || // Ogham space mark
-    cp in 0x2000..0x200F || // Typographic spaces (U+2000-U+200A) + ZWSP..RLM (U+200B-U+200F)
-    cp in 0x2028..0x2029 || // Line/paragraph separators
-    cp in 0x202A..0x202F || // Bidi embedding controls + narrow no-break space
-    cp == 0x205F || // Medium mathematical space
-    cp in 0x2060..0x206F || // Word joiner, invisible operators
-    cp == 0x3000 || // Ideographic space
-    cp == 0xFEFF || // BOM / ZWNBSP
-    cp in 0xFFFE..0xFFFF // Non-characters
+private fun isUnicodeFormatting(cp: Int): Boolean =
+    cp in 0x00A0..0x00A0 || // NBSP
+        cp in 0x1680..0x1680 || // Ogham space mark
+        cp in 0x2000..0x200F || // Typographic spaces (U+2000-U+200A) + ZWSP..RLM (U+200B-U+200F)
+        cp in 0x2028..0x2029 || // Line/paragraph separators
+        cp in 0x202A..0x202F || // Bidi embedding controls + narrow no-break space
+        cp == 0x205F || // Medium mathematical space
+        cp in 0x2060..0x206F || // Word joiner, invisible operators
+        cp == 0x3000 || // Ideographic space
+        cp == 0xFEFF || // BOM / ZWNBSP
+        cp in 0xFFFE..0xFFFF // Non-characters
 
 /** Forbidden substrings in content paths, paired with error messages. */
-private val CONTENT_PATH_FORBIDDEN = listOf(
-    "\\" to "ContentPath must not contain backslashes",
-    "%" to "ContentPath must not contain percent-encoded bytes",
-    "?" to "ContentPath must not contain query strings ('?')",
-    "#" to "ContentPath must not contain fragments ('#')",
-    "\u0000" to "ContentPath must not contain null bytes",
-    "//" to "ContentPath must not contain '//'",
-)
+private val CONTENT_PATH_FORBIDDEN =
+    listOf(
+        "\\" to "ContentPath must not contain backslashes",
+        "%" to "ContentPath must not contain percent-encoded bytes",
+        "?" to "ContentPath must not contain query strings ('?')",
+        "#" to "ContentPath must not contain fragments ('#')",
+        "\u0000" to "ContentPath must not contain null bytes",
+        "//" to "ContentPath must not contain '//'",
+    )
 
 /** Checks for forbidden substrings and control characters in a content path. */
 private fun contentPathCharError(path: String): String? {
@@ -691,19 +691,21 @@ private fun contentPathCharError(path: String): String? {
 }
 
 /** Checks structural rules (prefix, length, trailing slash, segments). */
-private fun contentPathStructureError(path: String): String? = when {
-    !path.startsWith("/") -> "ContentPath must start with '/'"
-    path.toByteArray(Charsets.UTF_8).size > MAX_CONTENT_PATH_BYTES ->
-        "ContentPath exceeds $MAX_CONTENT_PATH_BYTES bytes"
-    path.length > 1 && path.endsWith("/") -> "ContentPath must not have trailing slash (except root '/')"
-    else -> path.split("/").drop(1).firstNotNullOfOrNull { segment ->
-        when (segment) {
-            "." -> "ContentPath must not contain '.' segments"
-            ".." -> "ContentPath must not contain '..' segments (directory traversal)"
-            else -> null
-        }
+private fun contentPathStructureError(path: String): String? =
+    when {
+        !path.startsWith("/") -> "ContentPath must start with '/'"
+        path.toByteArray(Charsets.UTF_8).size > MAX_CONTENT_PATH_BYTES ->
+            "ContentPath exceeds $MAX_CONTENT_PATH_BYTES bytes"
+        path.length > 1 && path.endsWith("/") -> "ContentPath must not have trailing slash (except root '/')"
+        else ->
+            path.split("/").drop(1).firstNotNullOfOrNull { segment ->
+                when (segment) {
+                    "." -> "ContentPath must not contain '.' segments"
+                    ".." -> "ContentPath must not contain '..' segments (directory traversal)"
+                    else -> null
+                }
+            }
     }
-}
 
 /**
  * Validates a content path before FFI crossing (SCP-297).
@@ -732,23 +734,24 @@ private fun mimeTypeControlCharError(contentType: String): String? {
  * Checks MIME type structure (semicolon, slash count, non-empty parts)
  * and RFC 7230 tchar validation.
  */
-private fun mimeTypeStructureError(contentType: String): String? = when {
-    contentType.isEmpty() -> "MimeType must not be empty"
-    contentType.contains(";") -> "MimeType must not contain parameters (';' not allowed)"
-    contentType.count { it == '/' } != 1 -> "MimeType must be 'type/subtype' (exactly one '/')"
-    else -> {
-        val parts = contentType.split("/", limit = 2)
-        if (parts.size != 2 || parts[0].isEmpty() || parts[1].isEmpty()) {
-            "MimeType type and subtype must both be non-empty"
-        } else if (!TCHAR_REGEX.matches(parts[0])) {
-            "MimeType type part contains invalid characters"
-        } else if (!TCHAR_REGEX.matches(parts[1])) {
-            "MimeType subtype part contains invalid characters"
-        } else {
-            null
+private fun mimeTypeStructureError(contentType: String): String? =
+    when {
+        contentType.isEmpty() -> "MimeType must not be empty"
+        contentType.contains(";") -> "MimeType must not contain parameters (';' not allowed)"
+        contentType.count { it == '/' } != 1 -> "MimeType must be 'type/subtype' (exactly one '/')"
+        else -> {
+            val parts = contentType.split("/", limit = 2)
+            if (parts.size != 2 || parts[0].isEmpty() || parts[1].isEmpty()) {
+                "MimeType type and subtype must both be non-empty"
+            } else if (!TCHAR_REGEX.matches(parts[0])) {
+                "MimeType type part contains invalid characters"
+            } else if (!TCHAR_REGEX.matches(parts[1])) {
+                "MimeType subtype part contains invalid characters"
+            } else {
+                null
+            }
         }
     }
-}
 
 /**
  * Validates a MIME type before FFI crossing (SCP-297).
@@ -766,14 +769,15 @@ fun validateMimeType(contentType: String) {
 }
 
 /** Returns an error message if the deploy ID is invalid, null otherwise. */
-private fun deployIdError(deployId: String): String? = when {
-    deployId.isEmpty() -> "deploy_id must not be empty"
-    deployId.toByteArray(Charsets.UTF_8).size > MAX_DEPLOY_ID_BYTES ->
-        "deploy_id exceeds $MAX_DEPLOY_ID_BYTES bytes"
-    !DEPLOY_ID_REGEX.matches(deployId) ->
-        "deploy_id must be ASCII alphanumeric, '-', or '_'"
-    else -> null
-}
+private fun deployIdError(deployId: String): String? =
+    when {
+        deployId.isEmpty() -> "deploy_id must not be empty"
+        deployId.toByteArray(Charsets.UTF_8).size > MAX_DEPLOY_ID_BYTES ->
+            "deploy_id exceeds $MAX_DEPLOY_ID_BYTES bytes"
+        !DEPLOY_ID_REGEX.matches(deployId) ->
+            "deploy_id must be ASCII alphanumeric, '-', or '_'"
+        else -> null
+    }
 
 /**
  * Validates a deploy ID before FFI crossing (SCP-297).

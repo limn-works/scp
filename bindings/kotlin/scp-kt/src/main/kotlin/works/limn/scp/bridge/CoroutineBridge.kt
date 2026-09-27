@@ -7,7 +7,7 @@
 //   - Coroutine cancellation propagated to Rust via CancellationHandle
 //
 // This bridge is the single point of FFI dispatch for the Kotlin SDK. Every public
-// SDK method (Scp.kt, Context.kt, Identity.kt, etc.) delegates through this bridge
+// SDK method (SCP.kt, Context.kt, Identity.kt, etc.) delegates through this bridge
 // to exactly one UniFFI function — zero protocol logic lives in the Kotlin layer.
 //
 // UniFFI-generated NativeLib.kt does not exist yet — generation requires a compiled
@@ -1320,7 +1320,7 @@ data class ExtendedBindings(
  * ## Error handling
  *
  * FFI errors from the Rust engine are thrown as [BridgeException]. Callers
- * (the ergonomics layer in Scp.kt, Context.kt, etc.) map these to the
+ * (the ergonomics layer in SCP.kt, Context.kt, etc.) map these to the
  * SDK's public exception hierarchy.
  *
  * @param nativeBindings The UniFFI-generated native bindings (or a test stub).
@@ -1507,8 +1507,9 @@ class IdentityBridge internal constructor(
      * @param custody Key custody method.
      * @return Opaque identity handle for use in subsequent operations.
      */
-    suspend fun create(custody: works.limn.scp.CustodyType): Long =
-        bridge.ffiCall { bindings.identityCreate(custody.rawValue) }
+    suspend fun create(custody: works.limn.scp.CustodyType): Long {
+        return bridge.ffiCall { bindings.identityCreate(custody.rawValue) }
+    }
 
     /**
      * Create a new identity with the specified custody method.
@@ -1678,8 +1679,9 @@ class ContextBridge internal constructor(
      * @param contextHandle Handle from context create or join.
      * @return JSON-encoded economic policy, or null if none is set.
      */
-    suspend fun getEconomicPolicy(contextHandle: Long): String? =
-        bridge.ffiCall { bindings.contextGetEconomicPolicy(contextHandle) }
+    suspend fun getEconomicPolicy(contextHandle: Long): String? {
+        return bridge.ffiCall { bindings.contextGetEconomicPolicy(contextHandle) }
+    }
 
     /**
      * Subscribe to incoming messages on a context as a cold [Flow].
@@ -2136,8 +2138,9 @@ class MembershipBridgeOps internal constructor(
      * @param contextHandle Handle from context create or join.
      * @return List of DID strings.
      */
-    suspend fun memberDids(contextHandle: Long): List<String> =
-        bridge.ffiCall { bindings.contextMemberDids(contextHandle) }
+    suspend fun memberDids(contextHandle: Long): List<String> {
+        return bridge.ffiCall { bindings.contextMemberDids(contextHandle) }
+    }
 
     /**
      * Return the role of a member in a context.
@@ -2408,8 +2411,7 @@ class BroadcastBridgeOps internal constructor(
         contextHandle: Long,
         subscriberDid: String,
         messagesReadUcanJwt: String? = null,
-    ): Unit =
-        bridge.ffiCall { bindings.broadcastSubscribe(contextHandle, subscriberDid, messagesReadUcanJwt) }
+    ): Unit = bridge.ffiCall { bindings.broadcastSubscribe(contextHandle, subscriberDid, messagesReadUcanJwt) }
 
     /**
      * Unsubscribe a DID from a broadcast context.
@@ -2500,8 +2502,9 @@ class BroadcastBridgeOps internal constructor(
      * @param contextHandle Handle from context create or join.
      * @return The subscriber count, or null if not a broadcast context.
      */
-    suspend fun subscriberCount(contextHandle: Long): Long? =
-        bridge.ffiCall { bindings.broadcastSubscriberCount(contextHandle) }
+    suspend fun subscriberCount(contextHandle: Long): Long? {
+        return bridge.ffiCall { bindings.broadcastSubscriberCount(contextHandle) }
+    }
 
     /**
      * Check whether a DID is a broadcast subscriber.
@@ -2669,8 +2672,9 @@ private fun JsonObject.toPublishResult(context: String = "publish result"): Publ
  *
  * @throws BridgeException if the JSON is malformed or missing required fields.
  */
-internal fun parsePublishResult(json: String): PublishResult =
-    Json.parseToJsonElement(json).jsonObject.toPublishResult()
+internal fun parsePublishResult(json: String): PublishResult {
+    return Json.parseToJsonElement(json).jsonObject.toPublishResult()
+}
 
 /**
  * Parses a JSON batch publish result into a [BatchPublishResult].
