@@ -4918,45 +4918,48 @@ impl McpUniFfiBridgeProvider {
 
     /// Reads a context's role state through the ADR-049 query shim.
     ///
-    /// Shared by `active_context_ids`, `agent_role` and
-    /// `validate_resource_access` so all three answer from one source rather
-    /// than three near-identical `block_in_place` blocks.
+    /// Shared by `active_context_ids`, `agent_role`, `context_members` and
+    /// `validate_resource_access` so all four answer from one source rather
+    /// than near-identical `block_in_place` blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Ok(None)` when the actor holds no such context, and `Err` when
+    /// the read itself fails: the bridge is not ready or the query fails. A
+    /// caller must not treat the error as the context being absent.
     fn role_state_of(
         bi: &crate::runtime::UniffiBridgeInstance,
         context_id: &str,
-    ) -> Option<scp_core::context::roles::ContextRoleState> {
-        use scp_core::context::actor::commands::QueriesCommand;
-        let sup = bi.context_manager_expect().ok()?.clone();
-        let context_id = context_id.to_owned();
+    ) -> Result<Option<scp_core::context::roles::ContextRoleState>, String> {
+        let sup = bi
+            .context_manager_expect()
+            .map_err(|e| format!("role state of context '{context_id}' could not be read: {e}"))?
+            .clone();
+        let id = context_id.to_owned();
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let cmd = QueriesCommand::GetRoleState {
-                    context_id,
-                    reply: tx,
-                };
-                sup.dispatch_query(cmd).await.ok()?;
-                rx.await.ok()?.ok()?
-            })
+            tokio::runtime::Handle::current()
+                .block_on(async move { sup.try_get_role_state(&id).await })
         })
+        .map_err(|e| format!("role state of context '{context_id}' could not be read: {e}"))
     }
 }
 
 impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
-    fn active_context_ids(&self) -> Vec<scp_mcp::namespace::ContextId> {
+    fn active_context_ids(&self) -> Result<Vec<scp_mcp::namespace::ContextId>, String> {
         // Configured ∩ live: a context the agent has left is no longer served,
         // so its tools and resources drop out of `tools/list` and
-        // `resources/list` without restarting the server (ADR-015 AC7).
-        let Ok(bi) = self.upgrade_bi() else {
-            return Vec::new();
-        };
-        self.context_ids
-            .iter()
-            .filter(|id| {
-                Self::role_state_of(&bi, id).is_some_and(|rs| rs.members.contains(&self.agent_did))
-            })
-            .cloned()
-            .collect()
+        // `resources/list` without restarting the server (ADR-015 AC7). A
+        // context no actor holds is not served; a failed read is an error, not
+        // a departure.
+        let bi = self.upgrade_bi()?;
+        let mut served = Vec::new();
+        for id in &self.context_ids {
+            if Self::role_state_of(&bi, id)?.is_some_and(|rs| rs.members.contains(&self.agent_did))
+            {
+                served.push(id.clone());
+            }
+        }
+        Ok(served)
     }
 
     fn validate_resource_access(
@@ -4965,7 +4968,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         resource: scp_mcp::server::ResourceKind,
     ) -> Result<(), String> {
         let bi = self.upgrade_bi()?;
-        let role_state = Self::role_state_of(&bi, context_id).ok_or_else(|| {
+        let role_state = Self::role_state_of(&bi, context_id)?.ok_or_else(|| {
             format!("context '{context_id}' has no role state on this bridge instance")
         })?;
         resource.check_access(&role_state, &self.agent_did, context_id)
@@ -4977,7 +4980,8 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         // ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)).
         // Returns None if the bridge instance has been dropped (#1549 round-2).
         let bi = self.upgrade_bi().ok()?;
-        Self::role_state_of(&bi, context_id)?
+        Self::role_state_of(&bi, context_id)
+            .ok()??
             .assignments
             .get(&self.agent_did)
             .map(|assignment| assignment.role_name.clone())
@@ -5385,7 +5389,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         // `role_state.members`. A dropped bridge, an unreachable actor or an
         // unknown context is an error, never an empty roster.
         let bi = self.upgrade_bi()?;
-        let role_state = Self::role_state_of(&bi, context_id)
+        let role_state = Self::role_state_of(&bi, context_id)?
             .ok_or_else(|| format!("context '{context_id}' could not be read — no role state"))?;
         Ok(role_state
             .members
@@ -23535,13 +23539,12 @@ mod tests {
         // (it short-circuits before the bridge upgrade).
         assert!(provider.validate_capability("ctx-dropped", "t").is_err());
 
-        // active_context_ids: empty. It now resolves live participation through
-        // the bridge's Supervisor, so a dropped instance serves nothing — the
-        // fail-closed answer, since serving a context whose membership can no
-        // longer be checked is worse than serving none.
+        // active_context_ids: an error. It resolves live participation through
+        // the bridge's Supervisor, so a dropped instance cannot answer, and an
+        // empty list would report the agent as a participant in nothing.
         assert!(
-            provider.active_context_ids().is_empty(),
-            "a dropped bridge must serve no contexts"
+            provider.active_context_ids().is_err(),
+            "a dropped bridge must fail the participation read, not serve an empty list"
         );
 
         // agent_did is provider-local and does not touch the Weak at all.
@@ -23698,11 +23701,13 @@ mod tests {
         );
     }
 
-    /// Once the transport wires the supervisor's event receiver (what
-    /// `run_stdio` / `run_sse` do with the `Some` receiver), the subscription
-    /// is accepted AND runtime events produce real notifications.
+    /// A server built with a `ContextEvent` receiver accepts the subscription,
+    /// and `notifications_for_event`, the function the pump drives per
+    /// received event, produces real notifications. The receiver comes from a
+    /// detached channel and the pump does not run; the `pipeline_wiring`
+    /// event-source gate covers which receiver the `UniFFI` serve path passes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn uniffi_mcp_server_honours_subscribe_once_event_source_is_wired() {
+    async fn uniffi_mcp_server_produces_notifications_once_event_source_is_wired() {
         let bi = Arc::new(crate::runtime::UniffiBridgeInstance::new_uniffi());
         live_context(&bi, "ctx-sub").await;
 

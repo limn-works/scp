@@ -395,13 +395,38 @@ fn live_role_state(
     bi: &NapiBridgeInstance,
     context_id: &str,
 ) -> Result<scp_core::context::roles::ContextRoleState, String> {
+    held_role_state(bi, context_id)?
+        .ok_or_else(|| format!("context '{context_id}' is not held by the supervisor"))
+}
+
+/// Reads `context_id`'s current role state from the source [`live_role_state`]
+/// names, and separates the two outcomes that function merges: `Ok(None)` when
+/// the actor holds no such context (with no supervisor, when the bridge holds
+/// no copy), and `Err` when the read itself failed.
+///
+/// # Errors
+///
+/// Fails when the actor cannot be asked or does not answer: from a
+/// current-thread runtime, or when the query fails.
+fn held_role_state(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+) -> Result<Option<scp_core::context::roles::ContextRoleState>, String> {
     let Some(supervisor) = bi.core.try_supervisor() else {
-        return crate::runtime::with_context(bi, context_id, |rt| Ok(rt.role_state.clone()))
-            .map_err(|e| format!("{e}"));
+        // The closure cannot fail, so an error from `with_context` means the
+        // bridge holds no copy of the context.
+        return Ok(
+            crate::runtime::with_context(bi, context_id, |rt| Ok(rt.role_state.clone())).ok(),
+        );
     };
     let supervisor = Arc::clone(supervisor);
     let id = context_id.to_owned();
-    let query = async move { supervisor.get_role_state(&id).await };
+    let query = async move {
+        supervisor
+            .try_get_role_state(&id)
+            .await
+            .map_err(|e| format!("role state of context '{id}' could not be read: {e}"))
+    };
     match tokio::runtime::Handle::try_current() {
         // Inside the MCP transport task: the actor runs on this runtime's
         // other workers while this one blocks.
@@ -410,15 +435,12 @@ fn live_role_state(
         }
         // A current-thread runtime would have to run the actor on the thread
         // this call blocks.
-        Ok(_) => {
-            return Err(format!(
-                "cannot read the role state of context '{context_id}' from a \
-                 current-thread runtime"
-            ));
-        }
+        Ok(_) => Err(format!(
+            "cannot read the role state of context '{context_id}' from a \
+             current-thread runtime"
+        )),
         Err(_) => crate::runtime().block_on(query),
     }
-    .ok_or_else(|| format!("context '{context_id}' is not held by the supervisor"))
 }
 
 /// Why the NAPI MCP server lists no tools and refuses every `tools/call`: the
@@ -429,21 +451,22 @@ const OUTLET_INVOCATION_UNAVAILABLE: &str = "outlet invocation through the NAPI 
      cannot execute an outlet from an MCP tools/call";
 
 impl ContextProvider for McpNapiBridgeProvider {
-    fn active_context_ids(&self) -> Vec<scp_mcp::namespace::ContextId> {
+    fn active_context_ids(&self) -> Result<Vec<scp_mcp::namespace::ContextId>, String> {
         // Configured ∩ live: a context the agent has left is no longer served,
         // so its tools and resources disappear from `tools/list` and
-        // `resources/list` without restarting the server (ADR-015 AC7).
-        let Ok(bi) = self.upgrade_bi() else {
-            return Vec::new();
-        };
-        self.context_ids
-            .iter()
-            .filter(|id| {
-                live_role_state(&bi, id)
-                    .is_ok_and(|role_state| role_state.members.contains(&self.agent_did))
-            })
-            .cloned()
-            .collect()
+        // `resources/list` without restarting the server (ADR-015 AC7). A
+        // context no actor holds is not served; a failed read is an error, not
+        // a departure.
+        let bi = self.upgrade_bi()?;
+        let mut served = Vec::new();
+        for id in &self.context_ids {
+            if held_role_state(&bi, id)?
+                .is_some_and(|role_state| role_state.members.contains(&self.agent_did))
+            {
+                served.push(id.clone());
+            }
+        }
+        Ok(served)
     }
 
     fn agent_role(&self, context_id: &str) -> Option<String> {
@@ -1292,9 +1315,12 @@ mod tests {
     /// same pair `with_optional_event_source(Some(rx))` seals into its bundle. The server then advertises the capability, accepts the
     /// subscription, and `notifications_for_event` — the function the pump
     /// drives for each received `ContextEvent` — emits a real
-    /// `notifications/resources/updated` for the subscribed URI.
+    /// `notifications/resources/updated` for the subscribed URI. The receiver
+    /// comes from a detached channel and the pump does not run; the
+    /// `pipeline_wiring` event-source gate covers which receiver the NAPI
+    /// serve path passes.
     #[test]
-    fn mcp_subscribe_delivers_notifications_when_event_source_wired_napi() {
+    fn mcp_subscribe_produces_notifications_when_event_source_wired_napi() {
         let (_bi, mut server, _pump, _tx) = napi_mcp_fixture_wired();
         assert!(
             initialize_and_read_subscribe_flag(&mut server),
@@ -1460,7 +1486,7 @@ mod tests {
             );
         }
         assert!(
-            outsider.active_context_ids().is_empty(),
+            outsider.active_context_ids().unwrap().is_empty(),
             "a non-member must not have the context in its served set"
         );
     }
@@ -1484,7 +1510,10 @@ mod tests {
         };
 
         // No supervisor: the copy is the context's only role state.
-        assert_eq!(provider().active_context_ids(), vec![SUB_CTX.to_owned()]);
+        assert_eq!(
+            provider().active_context_ids().unwrap(),
+            vec![SUB_CTX.to_owned()]
+        );
         assert!(
             provider()
                 .validate_resource_access(SUB_CTX, ResourceKind::Events)
@@ -1499,7 +1528,7 @@ mod tests {
         assert!(crate::runtime::supervisor(&bi).is_ok());
 
         assert!(
-            provider().active_context_ids().is_empty(),
+            provider().active_context_ids().unwrap().is_empty(),
             "a context the actor does not hold must drop out of the served set"
         );
         for kind in [
@@ -1523,11 +1552,24 @@ mod tests {
         let spawned = provider();
         let rt = crate::runtime();
         let served = rt
-            .block_on(rt.spawn(async move { spawned.active_context_ids() }))
+            .block_on(rt.spawn(async move { spawned.active_context_ids().unwrap() }))
             .unwrap();
         assert!(
             served.is_empty(),
             "the transport task must see the actor's role state too"
+        );
+
+        // A read the provider cannot make is an error, never "not served": a
+        // current-thread runtime cannot run the actor while this call blocks
+        // its only thread.
+        let current_thread = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert!(
+            current_thread
+                .block_on(async { provider().active_context_ids() })
+                .is_err(),
+            "a failed participation read must not be reported as an empty served set"
         );
     }
 
@@ -1592,7 +1634,7 @@ mod tests {
             context_ids: vec![ctx.to_owned()],
         };
 
-        assert!(provider(revoked).active_context_ids().is_empty());
+        assert!(provider(revoked).active_context_ids().unwrap().is_empty());
         for (kind, requirement) in [
             (ResourceKind::Events, "lacks messages:read"),
             (ResourceKind::Members, "lacks messages:read"),
@@ -1608,7 +1650,7 @@ mod tests {
         assert!(members.iter().all(|m| m.did != agent));
 
         assert_eq!(
-            provider(granted).active_context_ids(),
+            provider(granted).active_context_ids().unwrap(),
             vec![granted.to_owned()]
         );
         for kind in [

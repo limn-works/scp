@@ -683,13 +683,41 @@ impl FfiBridgeProvider {
         bi: &crate::runtime::PyBridgeInstance,
         context_id: &str,
     ) -> Result<scp_core::context::roles::ContextRoleState, String> {
+        Self::held_role_state(bi, context_id)?
+            .ok_or_else(|| format!("context '{context_id}' is not held by the supervisor"))
+    }
+
+    /// Reads `context_id`'s current role state from the source
+    /// [`Self::live_role_state`] names, and separates the two outcomes that
+    /// function merges: `Ok(None)` when the actor holds no such context (with
+    /// no supervisor, when the bridge holds no copy), and `Err` when the read
+    /// itself failed.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the actor cannot be asked or does not answer: from a
+    /// current-thread runtime, when the bridge runtime cannot start, or when
+    /// the query fails.
+    fn held_role_state(
+        bi: &crate::runtime::PyBridgeInstance,
+        context_id: &str,
+    ) -> Result<Option<scp_core::context::roles::ContextRoleState>, String> {
         let Some(supervisor) = bi.core.try_supervisor() else {
-            return crate::runtime::with_context(bi, context_id, |rt| Ok(rt.role_state.clone()))
-                .map_err(|e| format!("{e}"));
+            // The closure cannot fail, so an error from `with_context` means
+            // the bridge holds no copy of the context.
+            return Ok(crate::runtime::with_context(bi, context_id, |rt| {
+                Ok(rt.role_state.clone())
+            })
+            .ok());
         };
         let supervisor = Arc::clone(supervisor);
         let id = context_id.to_owned();
-        let query = async move { supervisor.get_role_state(&id).await };
+        let query = async move {
+            supervisor
+                .try_get_role_state(&id)
+                .await
+                .map_err(|e| format!("role state of context '{id}' could not be read: {e}"))
+        };
         match tokio::runtime::Handle::try_current() {
             // Inside the MCP transport task: the actor runs on this runtime's
             // other workers while this one blocks.
@@ -698,36 +726,34 @@ impl FfiBridgeProvider {
             }
             // A current-thread runtime would have to run the actor on the
             // thread this call blocks.
-            Ok(_) => {
-                return Err(format!(
-                    "cannot read the role state of context '{context_id}' from a \
-                     current-thread runtime"
-                ));
-            }
+            Ok(_) => Err(format!(
+                "cannot read the role state of context '{context_id}' from a \
+                 current-thread runtime"
+            )),
             Err(_) => crate::runtime()
                 .map_err(|e| format!("{e}"))?
                 .block_on(query),
         }
-        .ok_or_else(|| format!("context '{context_id}' is not held by the supervisor"))
     }
 }
 
 impl ContextProvider for FfiBridgeProvider {
-    fn active_context_ids(&self) -> Vec<String> {
+    fn active_context_ids(&self) -> Result<Vec<String>, String> {
         // Configured ∩ live: a context the agent has left is no longer served,
         // so its tools and resources drop out of `tools/list` and
-        // `resources/list` without restarting the server (ADR-015 AC7).
-        let Ok(bi) = self.upgrade_bi() else {
-            return Vec::new();
-        };
-        self.context_ids
-            .iter()
-            .filter(|id| {
-                Self::live_role_state(&bi, id)
-                    .is_ok_and(|role_state| role_state.members.contains(&self.agent_did))
-            })
-            .cloned()
-            .collect()
+        // `resources/list` without restarting the server (ADR-015 AC7). A
+        // context no actor holds is not served; a failed read is an error, not
+        // a departure.
+        let bi = self.upgrade_bi()?;
+        let mut served = Vec::new();
+        for id in &self.context_ids {
+            if Self::held_role_state(&bi, id)?
+                .is_some_and(|role_state| role_state.members.contains(&self.agent_did))
+            {
+                served.push(id.clone());
+            }
+        }
+        Ok(served)
     }
 
     fn agent_role(&self, context_id: &str) -> Option<String> {
@@ -2631,7 +2657,7 @@ mod tests {
         // context the agent is not (or is no longer) a member of drops out
         // without restarting the server. A static snapshot of the configured
         // list could never satisfy that.
-        assert_eq!(provider.active_context_ids(), vec![live_a, live_b]);
+        assert_eq!(provider.active_context_ids().unwrap(), vec![live_a, live_b]);
     }
 
     #[test]
@@ -3980,14 +4006,16 @@ mod tests {
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
-    /// Positive half of #1341. Wired with the REAL
-    /// `Supervisor::subscribe_events()` receiver — the exact source
-    /// `py_mcp_serve` hands to `McpServer::with_optional_event_source` — the
-    /// server advertises the capability, accepts the subscription, and
-    /// `notifications_for_event` (the function the transport pump drives per
-    /// received event) emits a real `notifications/resources/updated`.
+    /// Positive half of #1341. Built with a `ContextEvent` receiver from a
+    /// detached channel, not the supervisor's, the server advertises the
+    /// capability, accepts the subscription, and `notifications_for_event`
+    /// (the function the transport pump drives per received event) produces a
+    /// real `notifications/resources/updated`. This test does not run the pump
+    /// and does not read the receiver `py_mcp_serve` passes;
+    /// `supervisor_yields_context_event_receiver_for_mcp_pyo3` and the
+    /// `pipeline_wiring` event-source gate cover that wiring.
     #[test]
-    fn mcp_subscribe_delivers_notifications_when_event_source_wired_pyo3() {
+    fn mcp_subscribe_produces_notifications_when_event_source_wired_pyo3() {
         let creator = "did:dht:z6MkSubWired";
         let bi = __bi();
         let ctx_id = setup_unsupervised_context(&bi, creator, false);
@@ -4146,13 +4174,12 @@ mod tests {
             );
         }
 
-        // active_context_ids: empty. It now resolves live participation
-        // through the bridge, so a dropped instance means nothing is served —
-        // which is the fail-closed answer: serving a context whose membership
-        // can no longer be checked would be worse than serving none.
+        // active_context_ids: an error. It resolves live participation
+        // through the bridge, so a dropped instance cannot answer, and an empty
+        // list would report the agent as a participant in nothing.
         assert!(
-            provider.active_context_ids().is_empty(),
-            "a dropped bridge must serve no contexts"
+            provider.active_context_ids().is_err(),
+            "a dropped bridge must fail the participation read, not serve an empty list"
         );
 
         // agent_did is provider-local and does not touch the weak at all.
@@ -4177,7 +4204,7 @@ mod tests {
         let provider = pyo3_mcp_provider(&bi, &ctx_id, agent);
 
         // No supervisor: the copy is the context's only role state.
-        assert_eq!(provider.active_context_ids(), vec![ctx_id.clone()]);
+        assert_eq!(provider.active_context_ids().unwrap(), vec![ctx_id.clone()]);
         assert!(provider.context_members(&ctx_id).is_ok());
         assert!(provider.agent_role(&ctx_id).is_some());
         assert!(
@@ -4192,7 +4219,7 @@ mod tests {
         assert!(crate::runtime::supervisor(&bi).is_ok());
 
         assert!(
-            provider.active_context_ids().is_empty(),
+            provider.active_context_ids().unwrap().is_empty(),
             "a context the actor does not hold must drop out of the served set"
         );
         for kind in [
@@ -4216,11 +4243,24 @@ mod tests {
         let spawned = pyo3_mcp_provider(&bi, &ctx_id, agent);
         let rt = crate::runtime().unwrap();
         let served = rt
-            .block_on(rt.spawn(async move { spawned.active_context_ids() }))
+            .block_on(rt.spawn(async move { spawned.active_context_ids().unwrap() }))
             .unwrap();
         assert!(
             served.is_empty(),
             "the transport task must see the actor's role state too"
+        );
+
+        // A read the provider cannot make is an error, never "not served": a
+        // current-thread runtime cannot run the actor while this call blocks
+        // its only thread.
+        let current_thread = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert!(
+            current_thread
+                .block_on(async { provider.active_context_ids() })
+                .is_err(),
+            "a failed participation read must not be reported as an empty served set"
         );
 
         crate::runtime::remove_context(&bi, &ctx_id);
@@ -4283,7 +4323,7 @@ mod tests {
         assert!(copy_has_agent(&revoked) && !copy_has_agent(&granted));
 
         let provider = pyo3_mcp_provider(&bi, &revoked, agent);
-        assert!(provider.active_context_ids().is_empty());
+        assert!(provider.active_context_ids().unwrap().is_empty());
         for (kind, requirement) in [
             (ResourceKind::Events, "lacks messages:read"),
             (ResourceKind::Members, "lacks messages:read"),
@@ -4299,7 +4339,10 @@ mod tests {
         assert!(members.iter().all(|m| m.did != agent));
 
         let provider = pyo3_mcp_provider(&bi, &granted, agent);
-        assert_eq!(provider.active_context_ids(), vec![granted.clone()]);
+        assert_eq!(
+            provider.active_context_ids().unwrap(),
+            vec![granted.clone()]
+        );
         for kind in [
             ResourceKind::Events,
             ResourceKind::Members,

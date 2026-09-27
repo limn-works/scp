@@ -3049,6 +3049,75 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
     let real = "fn check() -> bool {\n    rt.role_state\n        \
                 .member_has_capability(agent_did, &Capability::MessagesRead)\n}\n";
     assert!(checks_messages_read(&production_code(real)));
+
+    // The bridge half of the resource gate: `validate_resource_access` must
+    // read role state from the live source and pass THAT value to the shared
+    // predicate.
+    let bridge = "fn validate_resource_access(&self, context_id: &str, resource: ResourceKind) \
+                  -> Result<(), String> {\n    let bi = self.upgrade_bi()?;\n    \
+                  let role_state = Self::live_role_state(&bi, context_id)?;\n    \
+                  resource.check_access(&role_state, &self.agent_did, context_id)\n}\n\
+                  fn context_members(&self) {}\n";
+    assert!(answers_resource_access_from_live_role_state(
+        &production_code(bridge)
+    ));
+    // A stand-in role state reaches the predicate: the live read is gone.
+    let stand_in = bridge.replace(
+        "Self::live_role_state(&bi, context_id)?",
+        "ContextRoleState::default()",
+    );
+    assert!(!answers_resource_access_from_live_role_state(
+        &production_code(&stand_in)
+    ));
+    // The predicate call is deleted and the function answers `Ok(())`.
+    let unchecked = bridge.replace(
+        "resource.check_access(&role_state, &self.agent_did, context_id)",
+        "Ok(())",
+    );
+    assert!(!answers_resource_access_from_live_role_state(
+        &production_code(&unchecked)
+    ));
+    // The live read and the predicate call survive only in ANOTHER function.
+    let moved = "fn validate_resource_access(&self) -> Result<(), String> { Ok(()) }\n\
+                 fn other(&self) { let role_state = Self::live_role_state(&bi, context_id)?; \
+                 resource.check_access(&role_state, &self.agent_did, context_id) }\n";
+    assert!(!answers_resource_access_from_live_role_state(
+        &production_code(moved)
+    ));
+    // The predicate's `messages:read` arm is replaced by a membership check.
+    let predicate = "pub fn check_access(self, role_state: &ContextRoleState) -> bool {\n    \
+                     role_state.member_has_capability(agent, &Capability::MessagesRead)\n}\n\
+                     const fn display_name(self) {}\n";
+    assert!(fn_body(&production_code(predicate), "check_access").is_some_and(checks_messages_read));
+    let membership_only = predicate.replace(
+        "member_has_capability(agent, &Capability::MessagesRead)",
+        "members.contains(agent)",
+    );
+    assert!(
+        !fn_body(&production_code(&membership_only), "check_access")
+            .is_some_and(checks_messages_read)
+    );
+}
+
+/// Returns the text of the first `fn {name}(` in `code` (from
+/// [`production_code`]), from that signature up to the next ` fn `.
+fn fn_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
+    let start = code.find(&format!("fn {name}("))?;
+    let rest = &code[start..];
+    Some(rest[3..].find(" fn ").map_or(rest, |end| &rest[..end + 3]))
+}
+
+/// Whether the production `validate_resource_access` in `code` reads the
+/// context's role state from the live source (PyO3 and NAPI `live_role_state`,
+/// UniFFI `role_state_of`) and passes that value to
+/// `ResourceKind::check_access`.
+fn answers_resource_access_from_live_role_state(code: &str) -> bool {
+    fn_body(code, "validate_resource_access").is_some_and(|body| {
+        (body.contains("let role_state = Self::live_role_state(&bi, context_id)")
+            || body.contains("let role_state = live_role_state(&bi, context_id)")
+            || body.contains("let role_state = Self::role_state_of(&bi, context_id)"))
+            && body.contains("resource.check_access(&role_state, &self.agent_did, context_id)")
+    })
 }
 
 /// Returns the production code of a Rust source file as one whitespace-collapsed
@@ -3105,15 +3174,24 @@ fn production_source(src: &str) -> &str {
 /// `ContextProvider::validate_resource_access` is a required trait method with
 /// no default, so a bridge cannot forget to answer it, and it takes the typed
 /// `ResourceKind` rather than a string, so no `resource:`-prefixed name can be
-/// synthesized again. This test pins the part the types cannot see: that each
-/// bridge answers from context role state rather than a stand-in.
+/// synthesized again. The rule has one definition,
+/// `scp_mcp::server::ResourceKind::check_access`, and each bridge's
+/// `validate_resource_access` passes it the role state that bridge read. This
+/// test pins the two parts the types cannot see: that each bridge feeds the
+/// predicate role state read from the live source rather than a stand-in, and
+/// that the predicate authorizes the events and members resources against
+/// `Capability::MessagesRead`. `scp-mcp`'s unit tests exercise the predicate's
+/// decisions.
 #[test]
 fn mcp_resource_access_is_answered_from_real_role_state() {
     // `ContextProvider::validate_resource_access` takes a typed `ResourceKind`,
     // not a string, so no `resource:{kind}` capability name can be synthesized
-    // from it; this test carries no source-text check for that spelling. The
-    // pins below check what the types cannot see: that each bridge answers
-    // from the real capability catalogue.
+    // from it; this test carries no source-text check for that spelling.
+    //
+    // Search PRODUCTION code with comment-only lines removed, as the
+    // event-source gate above does: each bridge's test module and doc comments
+    // name the same symbols, so a whole-file `contains` stayed green after the
+    // real call was deleted.
     for (bridge, src) in [
         (
             "PyO3",
@@ -3128,20 +3206,23 @@ fn mcp_resource_access_is_answered_from_real_role_state() {
             include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs"),
         ),
     ] {
-        // Search PRODUCTION code with comment-only lines removed, as the
-        // event-source gate above does: PyO3's and UniFFI's test modules and
-        // NAPI's doc comments also name `Capability::MessagesRead`, so a
-        // whole-file `contains` stayed green after the real check was deleted.
-        // The search requires the
-        // `member_has_capability(.., &Capability::MessagesRead)` call itself.
         assert!(
-            checks_messages_read(&production_code(src)),
-            "{bridge} must authorize the events/members resources against the real \
-             capability catalogue (spec §5.3.1: `messages:read` is what lets an \
-             observer see content and membership) on its PRODUCTION path — a \
-             test-module occurrence does not count"
+            answers_resource_access_from_live_role_state(&production_code(src)),
+            "{bridge}'s production `validate_resource_access` must read the context's \
+             role state from the live source and pass that value to \
+             `ResourceKind::check_access`; a stand-in role state, a deleted predicate \
+             call, or a call in some other function does not count"
         );
     }
+
+    let server = production_code(include_str!("../../../../crates/scp-mcp/src/server.rs"));
+    assert!(
+        fn_body(&server, "check_access").is_some_and(checks_messages_read),
+        "`ResourceKind::check_access` must authorize the events/members resources \
+         against the real capability catalogue (spec §5.3.1: `messages:read` is what \
+         lets an observer see content and membership) on its PRODUCTION path; a \
+         test-module occurrence does not count"
+    );
 }
 
 // ===========================================================================

@@ -213,6 +213,9 @@ impl ContextEventLogProvider for ArcEventLogProvider {
     fn event_log_merkle_root(&self, id: &[u8; 32]) -> Result<[u8; 32], ContextError> {
         self.0.event_log_merkle_root(id)
     }
+    fn event_log_summary(&self, id: &[u8; 32]) -> Result<(usize, [u8; 32]), ContextError> {
+        self.0.event_log_summary(id)
+    }
     async fn restore_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.0.restore_event_log(id).await
     }

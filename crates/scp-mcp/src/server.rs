@@ -245,7 +245,15 @@ pub struct MemberInfo {
 /// the server to be tested with mock providers.
 pub trait ContextProvider: Send + Sync {
     /// Returns the IDs of all contexts the agent currently participates in.
-    fn active_context_ids(&self) -> Vec<ContextId>;
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the provider cannot read whether the agent
+    /// participates in a configured context. A failed read must never be
+    /// reported as non-participation: the server would then answer
+    /// `tools/list` and `resources/list` with an empty list and announce the
+    /// context as removed.
+    fn active_context_ids(&self) -> Result<Vec<ContextId>, String>;
 
     /// Returns the agent's role in the given context (e.g., `"admin"`,
     /// `"member"`).
@@ -819,8 +827,12 @@ impl<P: ContextProvider> McpServer<P> {
     /// Handles `tools/list` -- returns all tools the agent can access across
     /// all active contexts, filtered by capability.
     fn handle_tools_list(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
+        let served = match self.record_served_contexts() {
+            Ok(served) => served,
+            Err(msg) => return internal_error(request.id.clone(), &msg),
+        };
         let mut tools: Vec<ToolDefinition> = Vec::new();
-        for context_id in self.record_served_contexts() {
+        for context_id in served {
             match self.visible_tools(&context_id) {
                 Ok(visible) => tools.extend(visible),
                 Err(msg) => return internal_error(request.id.clone(), &msg),
@@ -887,12 +899,11 @@ impl<P: ContextProvider> McpServer<P> {
         let tool_name: &str = owned_outlet_id.as_str();
 
         // Verify caller is a member of the target context.
-        if !self
-            .provider
-            .active_context_ids()
-            .iter()
-            .any(|id| id == &context_id)
-        {
+        let served = match self.provider.active_context_ids() {
+            Ok(served) => served,
+            Err(msg) => return internal_error(request.id.clone(), &msg),
+        };
+        if !served.iter().any(|id| id == &context_id) {
             return JsonRpcResponse::error(
                 request.id.clone(),
                 JsonRpcError {
@@ -1022,7 +1033,10 @@ impl<P: ContextProvider> McpServer<P> {
     fn handle_resources_list(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
         let mut resources: Vec<ResourceDefinition> = Vec::new();
 
-        let served = self.record_served_contexts();
+        let served = match self.record_served_contexts() {
+            Ok(served) => served,
+            Err(msg) => return internal_error(request.id.clone(), &msg),
+        };
         for context_id in &served {
             for kind in RESOURCE_KINDS {
                 if self.resource_access(&served, context_id, kind).is_err() {
@@ -1085,7 +1099,10 @@ impl<P: ContextProvider> McpServer<P> {
         kind: ResourceKind,
         request_id: &RequestId,
     ) -> Result<(), Box<JsonRpcResponse>> {
-        let served = self.provider.active_context_ids();
+        let served = self
+            .provider
+            .active_context_ids()
+            .map_err(|msg| Box::new(internal_error(request_id.clone(), &msg)))?;
         self.resource_access(&served, context_id, kind)
             .map_err(|denial| match denial {
                 ResourceDenial::NotParticipant => Box::new(resource_not_found(
@@ -1344,6 +1361,10 @@ impl<P: ContextProvider> McpServer<P> {
     /// removed the context. The server then sends the
     /// `tools/list_changed` + `resources/list_changed` pair once, so the
     /// client drops the context from its cached lists.
+    ///
+    /// When `active_context_ids()` fails, the server forgets no context and
+    /// sends only that pair, and only for a context a list response found
+    /// served, so the client's re-list surfaces the failure.
     #[must_use]
     pub fn notifications_for_event(
         &self,
@@ -1359,7 +1380,28 @@ impl<P: ContextProvider> McpServer<P> {
         }
 
         let affected = affected_resources(event);
-        let served = self.provider.active_context_ids();
+        // When the provider cannot read whether the agent still takes part,
+        // the event is neither a change to a served context nor the one that
+        // removed it. `served_contexts` stays as it is. A client that was told
+        // about this context receives the list-changed pair, and its re-list
+        // reports the read failure instead of a stale list. No
+        // `resources/updated` goes out, because a subscription cannot be
+        // re-authorized without the served set.
+        let Ok(served) = self.provider.active_context_ids() else {
+            let listed = self
+                .served_contexts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(context_id);
+            return if listed {
+                vec![
+                    Self::tools_list_changed_notification(),
+                    Self::resources_list_changed_notification(),
+                ]
+            } else {
+                Vec::new()
+            };
+        };
         let serves_context = served.iter().any(|c| c == context_id);
         let was_served = {
             let mut served = self
@@ -1426,13 +1468,18 @@ impl<P: ContextProvider> McpServer<P> {
     /// Returns `active_context_ids()` and records each returned context in
     /// `served_contexts`, because the response built from it puts that
     /// context in the client's cached `tools/list` or `resources/list`.
-    fn record_served_contexts(&self) -> Vec<ContextId> {
-        let active = self.provider.active_context_ids();
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider's message when it cannot read participation; no
+    /// context is recorded then.
+    fn record_served_contexts(&self) -> Result<Vec<ContextId>, String> {
+        let active = self.provider.active_context_ids()?;
         self.served_contexts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extend(active.iter().cloned());
-        active
+        Ok(active)
     }
 
     /// Builds the notifications a client needs after the pump's broadcast
@@ -1486,7 +1533,11 @@ impl<P: ContextProvider> McpServer<P> {
             Self::tools_list_changed_notification(),
         ];
 
-        let served = self.provider.active_context_ids();
+        // Without the served set no subscription can be re-authorized, so a
+        // failed participation read sends only the list-changed pair above.
+        let Ok(served) = self.provider.active_context_ids() else {
+            return out;
+        };
         for uri in &self.subscriptions {
             let Ok((context_id, kind)) = parse_resource_uri(uri) else {
                 continue;
@@ -1796,6 +1847,9 @@ mod tests {
         events: Value,
         /// Contexts whose tools, members and events the provider cannot read.
         unreadable: Vec<String>,
+        /// Whether the provider fails to read which contexts the agent takes
+        /// part in.
+        participation_unreadable: bool,
     }
 
     impl MockProvider {
@@ -1838,13 +1892,17 @@ mod tests {
                 ],
                 events: serde_json::json!([]),
                 unreadable: Vec::new(),
+                participation_unreadable: false,
             }
         }
     }
 
     impl ContextProvider for MockProvider {
-        fn active_context_ids(&self) -> Vec<ContextId> {
-            self.contexts.clone()
+        fn active_context_ids(&self) -> Result<Vec<ContextId>, String> {
+            if self.participation_unreadable {
+                return Err("participation could not be read".to_owned());
+            }
+            Ok(self.contexts.clone())
         }
 
         fn agent_role(&self, context_id: &str) -> Option<String> {
@@ -1975,6 +2033,49 @@ mod tests {
         let (tx, rx) = broadcast::channel(16);
         std::mem::forget(tx);
         rx
+    }
+
+    // -----------------------------------------------------------------------
+    // ResourceKind::check_access — the one resource-authorization rule
+    // -----------------------------------------------------------------------
+
+    /// The events and members resources require `messages:read`, which a
+    /// suspension withdraws; the tools resource requires membership only.
+    #[test]
+    fn check_access_requires_messages_read_for_events_and_members_and_membership_for_tools() {
+        let reader = "reader";
+        let member = "member-without-messages-read";
+        let suspended = "suspended-reader";
+        let outsider = "outsider";
+        let mut role_state = ContextRoleState::empty_for_test();
+        for agent in [reader, member, suspended] {
+            role_state.members.insert(agent.to_owned());
+        }
+        for agent in [reader, suspended] {
+            role_state
+                .member_capabilities
+                .insert(agent.to_owned(), HashSet::from([Capability::MessagesRead]));
+        }
+        role_state.suspend_capabilities(suspended, [Capability::MessagesRead]);
+
+        for kind in [ResourceKind::Events, ResourceKind::Members] {
+            assert!(kind.check_access(&role_state, reader, "ctx").is_ok());
+            for denied in [member, suspended, outsider] {
+                let err = kind.check_access(&role_state, denied, "ctx").unwrap_err();
+                assert!(err.contains("messages:read"), "{denied}: {err}");
+            }
+        }
+        for agent in [reader, member, suspended] {
+            assert!(
+                ResourceKind::Tools
+                    .check_access(&role_state, agent, "ctx")
+                    .is_ok()
+            );
+        }
+        let err = ResourceKind::Tools
+            .check_access(&role_state, outsider, "ctx")
+            .unwrap_err();
+        assert!(err.contains("membership"), "{err}");
     }
 
     // -----------------------------------------------------------------------
@@ -2575,19 +2676,17 @@ mod tests {
         assert!(resp.error.is_none(), "subscribe to {uri} failed: {resp:?}");
     }
 
-    fn member_joined() -> ContextEvent {
-        ContextEvent::MemberJoined {
-            member_did: scp_did::DID("did:dht:z6MkNewMember".to_owned()),
-            role_name: "member".to_owned(),
-        }
+    /// An event `affected_resources` classifies as changing the event stream,
+    /// the member list and the tool set: the class of every membership and
+    /// lifecycle transition. Context expiry carries no fields.
+    fn members_and_tools_event() -> ContextEvent {
+        ContextEvent::Expired
     }
 
-    fn message_sent() -> ContextEvent {
-        ContextEvent::MessageSent {
-            sender_did: scp_did::DID("did:dht:z6MkSender".to_owned()),
-            sequence_number: 1,
-            payload: vec![],
-        }
+    /// An event `affected_resources` classifies as changing the event stream
+    /// only, as a message does.
+    fn events_only_event() -> ContextEvent {
+        ContextEvent::ContentKeysRotated { reason: None }
     }
 
     // -----------------------------------------------------------------------
@@ -2649,7 +2748,7 @@ mod tests {
         subscribe(&mut server, "scp://ctx_a/members");
         assert!(
             server
-                .notifications_for_event("ctx_a", &member_joined())
+                .notifications_for_event("ctx_a", &members_and_tools_event())
                 .iter()
                 .any(|n| n.method == protocol::METHOD_RESOURCES_UPDATED),
             "precondition: an authorized subscription delivers"
@@ -2668,7 +2767,7 @@ mod tests {
 
         assert!(
             server
-                .notifications_for_event("ctx_a", &member_joined())
+                .notifications_for_event("ctx_a", &members_and_tools_event())
                 .iter()
                 .all(|n| n.method != protocol::METHOD_RESOURCES_UPDATED),
             "a revoked subscription must stop delivering"
@@ -2837,7 +2936,7 @@ mod tests {
         // And an unwired server can indeed never emit one, whoever calls.
         assert!(
             server
-                .notifications_for_event("ctx_a", &member_joined())
+                .notifications_for_event("ctx_a", &members_and_tools_event())
                 .is_empty(),
             "an unwired server must emit no pump-backed notification at all"
         );
@@ -2983,7 +3082,7 @@ mod tests {
         // And no notification is produced for it any more.
         assert!(
             server
-                .notifications_for_event("ctx_a", &message_sent())
+                .notifications_for_event("ctx_a", &events_only_event())
                 .is_empty()
         );
     }
@@ -3029,7 +3128,7 @@ mod tests {
         );
         assert!(
             server
-                .notifications_for_event("ctx_a", &message_sent())
+                .notifications_for_event("ctx_a", &events_only_event())
                 .is_empty()
         );
     }
@@ -3043,7 +3142,7 @@ mod tests {
         let mut server = subscribing_server(MockProvider::default());
         subscribe(&mut server, "scp://ctx_a/events");
 
-        let notifs = server.notifications_for_event("ctx_a", &message_sent());
+        let notifs = server.notifications_for_event("ctx_a", &events_only_event());
 
         assert_eq!(notifs.len(), 1);
         assert_eq!(notifs[0].method, protocol::METHOD_RESOURCES_UPDATED);
@@ -3060,14 +3159,14 @@ mod tests {
         // With nothing subscribed, an events-only change is entirely silent.
         assert!(
             server
-                .notifications_for_event("ctx_a", &message_sent())
+                .notifications_for_event("ctx_a", &events_only_event())
                 .is_empty()
         );
 
         // A membership change still emits the list-changed notifications
         // (capability-gated, not subscription-gated) but no
         // `resources/updated`, because no resource is subscribed.
-        let notifs = server.notifications_for_event("ctx_a", &member_joined());
+        let notifs = server.notifications_for_event("ctx_a", &members_and_tools_event());
         assert!(
             notifs
                 .iter()
@@ -3084,13 +3183,13 @@ mod tests {
         // Same event, different context — the URI does not match.
         assert!(
             server
-                .notifications_for_event("ctx_b", &message_sent())
+                .notifications_for_event("ctx_b", &events_only_event())
                 .is_empty()
         );
     }
 
     #[test]
-    fn membership_event_updates_events_and_members_but_not_a_message() {
+    fn members_and_tools_event_updates_events_and_members_but_events_only_does_not() {
         let mut server = subscribing_server(MockProvider::default());
         subscribe(&mut server, "scp://ctx_a/events");
         subscribe(&mut server, "scp://ctx_a/members");
@@ -3108,15 +3207,17 @@ mod tests {
                 .collect()
         };
 
-        // MemberJoined invalidates both the event stream and the member list.
-        let joined = server.notifications_for_event("ctx_a", &member_joined());
+        // A membership or lifecycle transition invalidates both the event
+        // stream and the member list.
+        let joined = server.notifications_for_event("ctx_a", &members_and_tools_event());
         assert_eq!(
             uris(&joined),
             vec!["scp://ctx_a/events", "scp://ctx_a/members"]
         );
 
-        // A message only invalidates the event stream.
-        let sent = server.notifications_for_event("ctx_a", &message_sent());
+        // An events-only event, such as a message, invalidates the event
+        // stream alone.
+        let sent = server.notifications_for_event("ctx_a", &events_only_event());
         assert_eq!(uris(&sent), vec!["scp://ctx_a/events"]);
     }
 
@@ -3125,7 +3226,7 @@ mod tests {
         let server = subscribing_server(MockProvider::default());
         // No resource subscription needed: tools/list_changed is gated on the
         // advertised capability, not on a subscription.
-        let notifs = server.notifications_for_event("ctx_a", &member_joined());
+        let notifs = server.notifications_for_event("ctx_a", &members_and_tools_event());
         assert!(
             notifs
                 .iter()
@@ -3133,8 +3234,9 @@ mod tests {
             "membership change must invalidate the capability-filtered tool list"
         );
 
-        // A plain message does not change the tool set.
-        let sent = server.notifications_for_event("ctx_a", &message_sent());
+        // An events-only event, such as a message, does not change the tool
+        // set.
+        let sent = server.notifications_for_event("ctx_a", &events_only_event());
         assert!(
             !sent
                 .iter()
@@ -3145,7 +3247,7 @@ mod tests {
     #[test]
     fn tools_list_changed_not_emitted_for_unserved_context() {
         let server = subscribing_server(MockProvider::default());
-        let notifs = server.notifications_for_event("ctx_not_served", &member_joined());
+        let notifs = server.notifications_for_event("ctx_not_served", &members_and_tools_event());
         assert!(
             notifs.is_empty(),
             "an event for a context this server does not serve must be silent"
@@ -3190,7 +3292,7 @@ mod tests {
 
             assert!(
                 server
-                    .notifications_for_event("ctx_a", &member_joined())
+                    .notifications_for_event("ctx_a", &members_and_tools_event())
                     .is_empty(),
                 "after announcing the removal once, events on the removed context \
                  must stay silent"
@@ -3252,7 +3354,7 @@ mod tests {
 
         assert!(
             server
-                .notifications_for_event("ctx_a", &message_sent())
+                .notifications_for_event("ctx_a", &events_only_event())
                 .is_empty()
         );
     }
@@ -3297,16 +3399,89 @@ mod tests {
     #[test]
     fn affected_resources_classification() {
         // Every event is part of the event stream.
-        assert!(affected_resources(&message_sent()).events);
-        assert!(affected_resources(&member_joined()).events);
+        assert!(affected_resources(&events_only_event()).events);
+        assert!(affected_resources(&members_and_tools_event()).events);
 
-        // Membership changes hit members and the capability-filtered tools.
-        let joined = affected_resources(&member_joined());
+        // Membership and lifecycle transitions hit members and the
+        // capability-filtered tools.
+        let joined = affected_resources(&members_and_tools_event());
         assert!(joined.members && joined.tools);
 
-        // A message changes neither the member list nor the tool list.
-        let sent = affected_resources(&message_sent());
+        // An events-only event, such as a message, changes neither the member
+        // list nor the tool list.
+        let sent = affected_resources(&events_only_event());
         assert!(!sent.members && !sent.tools);
+    }
+
+    /// A failed participation read is an error on every request that needs
+    /// it, never an empty list or "not a participant", and an event that
+    /// arrives during the failure leaves the served set as it was.
+    #[test]
+    fn unreadable_participation_is_an_error_not_an_empty_list() {
+        let mut server = subscribing_server(MockProvider::default());
+        subscribe(&mut server, "scp://ctx_a/events");
+        let listed = make_request(protocol::METHOD_TOOLS_LIST, None);
+        assert!(server.handle_request(&listed).unwrap().error.is_none());
+
+        server.provider.participation_unreadable = true;
+        for (method, params) in [
+            (protocol::METHOD_TOOLS_LIST, None),
+            (protocol::METHOD_RESOURCES_LIST, None),
+            (
+                protocol::METHOD_RESOURCES_READ,
+                Some(serde_json::json!({"uri": "scp://ctx_a/events"})),
+            ),
+            (
+                protocol::METHOD_RESOURCES_SUBSCRIBE,
+                Some(serde_json::json!({"uri": "scp://ctx_a/members"})),
+            ),
+            (
+                protocol::METHOD_TOOLS_CALL,
+                Some(serde_json::json!({"name": "ctx_a/calc", "arguments": {}})),
+            ),
+        ] {
+            let req = make_request(method, params);
+            let err = server
+                .handle_request(&req)
+                .unwrap()
+                .error
+                .unwrap_or_else(|| panic!("{method} must fail when participation is unreadable"));
+            assert_eq!(err.code, protocol::INTERNAL_ERROR, "{method}: {err:?}");
+        }
+
+        // The event is neither a served-context update nor a removal: the
+        // client gets the list-changed pair and no `resources/updated`.
+        let methods = |notifs: Vec<JsonRpcNotification>| -> Vec<String> {
+            notifs.into_iter().map(|n| n.method).collect()
+        };
+        assert_eq!(
+            methods(server.notifications_for_event("ctx_a", &events_only_event())),
+            vec![
+                protocol::METHOD_TOOLS_LIST_CHANGED.to_owned(),
+                protocol::METHOD_RESOURCES_LIST_CHANGED.to_owned(),
+            ]
+        );
+        assert!(
+            server
+                .notifications_for_event("ctx_not_listed", &members_and_tools_event())
+                .is_empty()
+        );
+
+        // Once the read recovers, ctx_a is still served and still listed.
+        server.provider.participation_unreadable = false;
+        assert_eq!(
+            methods(server.notifications_for_event("ctx_a", &events_only_event())),
+            vec![protocol::METHOD_RESOURCES_UPDATED.to_owned()]
+        );
+        server.provider.contexts.retain(|c| c != "ctx_a");
+        assert_eq!(
+            methods(server.notifications_for_event("ctx_a", &members_and_tools_event())),
+            vec![
+                protocol::METHOD_TOOLS_LIST_CHANGED.to_owned(),
+                protocol::METHOD_RESOURCES_LIST_CHANGED.to_owned(),
+            ],
+            "the failed read must not have forgotten that the client listed ctx_a"
+        );
     }
 
     // -----------------------------------------------------------------------

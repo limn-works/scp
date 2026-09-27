@@ -1007,8 +1007,8 @@ mod tests {
     }
 
     impl ContextProvider for MockProvider {
-        fn active_context_ids(&self) -> Vec<String> {
-            self.contexts.clone()
+        fn active_context_ids(&self) -> Result<Vec<String>, String> {
+            Ok(self.contexts.clone())
         }
         fn agent_role(&self, _context_id: &str) -> Option<String> {
             Some("admin".to_owned())
