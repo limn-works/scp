@@ -38,12 +38,12 @@ cargo --version
 
 ### Python
 
-- Python >= 3.12 (use `python3.12`, not system `python3` which may be Xcode 3.9)
-- Rust toolchain (required for building the native extension via `maturin`)
-- Pre-built wheels are available for Linux, macOS, and Windows
+- Python >= 3.10 (macOS's system `python3` from Xcode may be 3.9)
+- Pre-built wheels cover CPython 3.10-3.13 on Linux (x86_64, aarch64), macOS, and Windows (x86_64)
+- A Rust toolchain only for a build from the source distribution, which pip falls back to when no wheel matches (see `bindings/python/README.md` §Requirements)
 
 ```bash
-python3.12 --version  # >= 3.12
+python3 --version  # >= 3.10
 ```
 
 ### TypeScript

@@ -86,7 +86,7 @@
 #
 #     Case 14 leaves one edit uncommitted and asserts that the summary names
 #     `scripts/check-cross-layer.sh` as the gate whose diff range holds no uncommitted edit.
-#     That gate reads `git diff <merge base>...HEAD` and the other 28 read the working tree,
+#     That gate reads `git diff <merge base>...HEAD` and the other 30 read the working tree,
 #     so its pass counts toward `gates N/N passed` over work it did not read.
 #
 #     Case 15 names one crate on the command line on a branch that changed another, and
@@ -784,7 +784,7 @@ fi
 # ── Case 14: the gate whose diff range holds no uncommitted edit ─────────────────────
 #
 # `scripts/check-cross-layer.sh` decides from `git diff <merge base with origin/main>…HEAD`
-# and the other 28 gates read the working tree, so on an uncommitted edit — one of the
+# and the other 30 gates read the working tree, so on an uncommitted edit — one of the
 # three input shapes the runner's own comment names as supported — that gate passes over
 # work it never read and its pass counts toward `gates N/N passed`.
 #

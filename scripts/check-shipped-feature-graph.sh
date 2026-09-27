@@ -348,14 +348,15 @@ SHIPPING_FILES=(
 # sat in this list while the maturin step still passed `--manifest-path
 # crates/scp-ffi/Cargo.toml`; the step no longer does, and
 # `assert_maturin_project_files_are_complete` fails on the stale entry rather than
-# leaving a reader to notice. Restoring that argument, or adding any other line a
-# shipping file runs maturin from, fails the same assertion until this list names
-# the pyproject.toml the new line reaches. That table's `features`,
-# `all-features`, and
-# `no-default-features` keys select the wheel's cargo features, and the maturin
-# step passes no `--features` of its own, so a `testing` entry added to either
-# table compiles `scp-platform/testing`, `scp-dht/testing`, and `scp-testing`
-# into a published wheel while every line of SHIPPING_FILES stays unchanged.
+# leaving a reader to notice. A shipping line that runs maturin fails the same
+# assertion when the pyproject.toml it reaches exists and this list omits it. A
+# line whose pyproject.toml does not exist, such as that `--manifest-path`
+# argument restored while `crates/scp-ffi/pyproject.toml` stays deleted, reaches
+# no `[tool.maturin]` table, adds no feature selection, and passes. The listed
+# table's `features`, `all-features`, and `no-default-features` keys select the
+# wheel's cargo features, and the maturin step passes no `--features` of its own,
+# so a `testing` entry added to that table compiles `scp-platform/testing`,
+# `scp-dht/testing`, and `scp-testing` into a published wheel while every line of SHIPPING_FILES stays unchanged.
 #
 # `assert_wheel_feature_selection_is_gated` derives the cargo configuration each
 # file selects and fails unless ARTIFACTS carries it verbatim, and

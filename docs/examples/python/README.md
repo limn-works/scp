@@ -10,7 +10,7 @@ context lifecycle, messaging, and tool invocation.
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    ```
 
-2. **Python 3.12+** (via mise):
+2. **Python 3.10+**; the repository's mise config installs 3.12:
    ```bash
    mise install python@3.12
    ```
