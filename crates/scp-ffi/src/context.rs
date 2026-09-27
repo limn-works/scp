@@ -1677,22 +1677,7 @@ fn derive_member_pseudonym(
                 codes::IDENT_1055,
             )
         })?;
-        let pseudonym = rt.block_on(async {
-            entry
-                .custody
-                .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
-                .await
-        });
-        // §9.10.4: the routing axis carries the 32-byte routing id of the
-        // 33-byte P-256 pseudonym. `PseudonymKeypair::new` already rejected a
-        // malformed host-returned point, which surfaces here as SCP-IDENT-1055.
-        let pseudonym = pseudonym.map_err(|e| {
-            crate::error::ScpPyError::identity_with_code(
-                format!("pseudonym derivation failed: {e}"),
-                codes::IDENT_1055,
-            )
-        })?;
-        Ok(*pseudonym.routing_id())
+        pseudonym_routing_id_on(rt, &entry.custody, entry.identity.identity_key, context_id)
     })
     .map_err(|e| {
         // A registry miss surfaces `with_identity`'s generic SCP-IDENT-1001;
@@ -1713,6 +1698,32 @@ fn derive_member_pseudonym(
         };
         PyErr::from(mapped)
     })
+}
+
+/// Derives the §9.10.4 routing id of `identity_key`'s pseudonym in
+/// `context_id` over `custody`: the derivation step every member-pseudonym
+/// path shares, with the SCP-IDENT-1055 failure contract.
+pub(crate) fn pseudonym_routing_id_on(
+    rt: &tokio::runtime::Runtime,
+    custody: &crate::custody::FfiKeyCustody,
+    identity_key: scp_platform::KeyHandle,
+    context_id: &str,
+) -> Result<[u8; 32], crate::error::ScpPyError> {
+    let pseudonym = rt.block_on(async {
+        custody
+            .derive_pseudonym(&identity_key, context_id.as_bytes())
+            .await
+    });
+    // §9.10.4: the routing axis carries the 32-byte routing id of the
+    // 33-byte P-256 pseudonym. `PseudonymKeypair::new` already rejected a
+    // malformed host-returned point, which surfaces here as SCP-IDENT-1055.
+    let pseudonym = pseudonym.map_err(|e| {
+        crate::error::ScpPyError::identity_with_code(
+            format!("pseudonym derivation failed: {e}"),
+            codes::IDENT_1055,
+        )
+    })?;
+    Ok(*pseudonym.routing_id())
 }
 
 /// Bridge-level local-custody gate for the bare-`DID` join-side bootstraps

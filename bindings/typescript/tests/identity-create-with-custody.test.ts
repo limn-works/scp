@@ -128,11 +128,28 @@ class CryptoKeychain implements KeyCustodyProvider {
     return seed;
   }
 
-  // Register the §9.10.4.A P-256 pseudonym of a context seed as a new key.
+  // The pseudonym key id for (identity, context, epoch): the provider contract
+  // requires the same inputs to name the same key. The top bit keeps it clear
+  // of the small sequential identity ids.
+  static #pseudonymKeyId(identity: string, contextId: Uint8Array, epoch?: bigint): string {
+    const h = crypto.createHash("sha256");
+    const identityBytes = Buffer.from(identity, "utf8");
+    const lengths = Buffer.alloc(8);
+    lengths.writeUInt32BE(identityBytes.length, 0);
+    lengths.writeUInt32BE(contextId.length, 4);
+    h.update("fake-keychain-pseudonym-id").update(lengths).update(identityBytes).update(contextId);
+    if (epoch !== undefined) {
+      const be = Buffer.alloc(8);
+      be.writeBigUInt64BE(epoch);
+      h.update(be);
+    }
+    return (h.digest().readBigUInt64BE(0) | (1n << 63n)).toString();
+  }
+
+  // Register the §9.10.4.A P-256 pseudonym of a context seed under `keyId`.
   // Native software custody keys the recipe on the Ed25519 identity seed.
-  #registerPseudonym(contextSeed: Uint8Array): PseudonymResult {
+  #registerPseudonym(contextSeed: Uint8Array, keyId: string): PseudonymResult {
     const d = pseudonymScalar(contextSeed);
-    const keyId = String(this.#next++);
     this.#pseudonyms.set(keyId, d);
     const point = p256Compressed(d);
     // A host still on the retired 32-byte Ed25519 pseudonym shape.
@@ -141,7 +158,10 @@ class CryptoKeychain implements KeyCustodyProvider {
   }
 
   derivePseudonym(keyId: string, contextId: Uint8Array): PseudonymResult {
-    return this.#registerPseudonym(pseudonymSeedV1(this.#identitySeed(keyId), contextId));
+    return this.#registerPseudonym(
+      pseudonymSeedV1(this.#identitySeed(keyId), contextId),
+      CryptoKeychain.#pseudonymKeyId(keyId, contextId),
+    );
   }
 
   deriveRotatablePseudonym(
@@ -151,6 +171,7 @@ class CryptoKeychain implements KeyCustodyProvider {
   ): PseudonymResult {
     return this.#registerPseudonym(
       pseudonymSeedV2(this.#identitySeed(keyId), contextId, pseudonymEpoch),
+      CryptoKeychain.#pseudonymKeyId(keyId, contextId, pseudonymEpoch),
     );
   }
 

@@ -28,7 +28,8 @@ use crate::error::PlatformError;
 /// X25519 keys are used for key agreement (HPKE wrapping keys).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum KeyType {
-    /// Ed25519 signing key (identity keys, active signing keys, pseudonym keys).
+    /// Ed25519 signing key (identity keys, active signing keys). Pseudonym keys
+    /// are P-256 (§9.10.4) and are never generated through this type.
     Ed25519,
     /// X25519 key agreement key (HPKE wrapping keys).
     X25519,

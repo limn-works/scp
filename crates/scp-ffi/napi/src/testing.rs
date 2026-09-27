@@ -451,3 +451,148 @@ pub(crate) fn fullstack_seed_peer_pseudonym_on(
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Pseudonym custody test hooks (§9.10.4)
+// ---------------------------------------------------------------------------
+
+/// Test-only: the §9.10.4 routing id the bridge derives for a software-custody
+/// identity whose Ed25519 seed is `seed`, in `context_id`.
+///
+/// Imports `seed` into an in-memory custody as the identity key and runs the
+/// bridge's own pseudonym derivation (`derive_pseudonym_bytes`, the path the
+/// create / join / import flows use), so a TypeScript KAT can compare the
+/// production bridge output against a §25.19 routing id.
+///
+/// # Errors
+///
+/// `SCP-VALID-7005` when `seed` is not 32 bytes; `SCP-IDENT-1055` when the
+/// derivation fails.
+#[napi(js_name = "testingPseudonymRoutingIdFromSeed")]
+pub async fn testing_pseudonym_routing_id_from_seed(
+    seed: Buffer,
+    context_id: String,
+) -> napi::Result<Buffer> {
+    let seed: zeroize::Zeroizing<[u8; 32]> =
+        zeroize::Zeroizing::new(seed.as_ref().try_into().map_err(|_| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("seed must be 32 bytes, got {}", seed.len()),
+                code: codes::VALID_7005.to_owned(),
+            })
+        })?);
+    let in_memory = scp_platform::testing::InMemoryKeyCustody::new();
+    let identity_key = in_memory.import_ed25519_key(&seed).await;
+    let custody = crate::custody::NapiKeyCustody::InMemory(
+        crate::identity::OpaqueInMemoryKeyCustody(in_memory),
+    );
+    let routing_id =
+        crate::context::derive_pseudonym_bytes(&custody, &identity_key, &context_id).await?;
+    Ok(Buffer::from(routing_id.to_vec()))
+}
+
+/// Test-only handle over one callback custody adapter built from a JS provider.
+///
+/// TypeScript tests reach the adapter's pseudonym checks through it:
+/// `get_public_key` binding, 32-byte digest input, strict low-`s` signature
+/// verification, and destroy-time unbinding.
+#[napi]
+pub struct TestingCallbackCustody {
+    inner: crate::custody::NapiCallbackKeyCustody,
+}
+
+fn custody_err(e: &scp_platform::PlatformError) -> napi::Error {
+    napi::Error::from(ScpNapiError::Identity {
+        message: e.to_string(),
+        code: codes::IDENT_1055.to_owned(),
+    })
+}
+
+fn testing_handle(key_id: &str) -> napi::Result<scp_platform::KeyHandle> {
+    scp_ffi_common::custody_parse::parse_handle("testing", key_id).map_err(|e| custody_err(&e))
+}
+
+#[napi]
+impl TestingCallbackCustody {
+    /// Wraps `provider` in a fresh callback custody adapter.
+    ///
+    /// # Errors
+    ///
+    /// A `napi::Error` if a callback cannot become a threadsafe function.
+    #[napi(constructor)]
+    pub fn new(provider: crate::custody::NapiKeyCustodyProvider) -> napi::Result<Self> {
+        Ok(Self {
+            inner: crate::custody::NapiCallbackKeyCustody::from_provider(provider)?,
+        })
+    }
+
+    /// Generates an Ed25519 identity key through the provider.
+    ///
+    /// # Errors
+    ///
+    /// `SCP-IDENT-1055` carrying the adapter's custody error.
+    #[napi(js_name = "generateKeypair")]
+    pub async fn generate_keypair(&self) -> napi::Result<String> {
+        use scp_platform::KeyCustody;
+        self.inner
+            .generate_keypair(scp_platform::KeyType::Ed25519)
+            .await
+            .map(|h| h.id().to_string())
+            .map_err(|e| custody_err(&e))
+    }
+
+    /// Derives and binds the v1 pseudonym of `identity_key_id` in `context_id`.
+    ///
+    /// # Errors
+    ///
+    /// `SCP-IDENT-1055` carrying the adapter's custody error.
+    #[napi(js_name = "derivePseudonym")]
+    pub async fn derive_pseudonym(
+        &self,
+        identity_key_id: String,
+        context_id: String,
+    ) -> napi::Result<crate::custody::NapiPseudonymResult> {
+        use scp_platform::KeyCustody;
+        let identity = testing_handle(&identity_key_id)?;
+        let pseudonym = self
+            .inner
+            .derive_pseudonym(&identity, context_id.as_bytes())
+            .await
+            .map_err(|e| custody_err(&e))?;
+        Ok(crate::custody::NapiPseudonymResult {
+            public_key: pseudonym.public_key().as_bytes().to_vec(),
+            key_id: pseudonym.key_handle().id().to_string(),
+        })
+    }
+
+    /// Signs `data` with `key_id` through the adapter's checked `sign`.
+    ///
+    /// # Errors
+    ///
+    /// `SCP-IDENT-1055` carrying the adapter's custody error.
+    #[napi]
+    pub async fn sign(&self, key_id: String, data: Buffer) -> napi::Result<Buffer> {
+        use scp_platform::KeyCustody;
+        let key = testing_handle(&key_id)?;
+        let signature = self
+            .inner
+            .sign(&key, data.as_ref())
+            .await
+            .map_err(|e| custody_err(&e))?;
+        Ok(Buffer::from(signature.as_bytes().to_vec()))
+    }
+
+    /// Destroys `key_id` through the adapter (which unbinds a pseudonym).
+    ///
+    /// # Errors
+    ///
+    /// `SCP-IDENT-1055` carrying the adapter's custody error.
+    #[napi(js_name = "destroyKey")]
+    pub async fn destroy_key(&self, key_id: String) -> napi::Result<()> {
+        use scp_platform::KeyCustody;
+        let key = testing_handle(&key_id)?;
+        self.inner
+            .destroy_key(&key)
+            .await
+            .map_err(|e| custody_err(&e))
+    }
+}

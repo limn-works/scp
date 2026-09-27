@@ -53,10 +53,13 @@ pub struct NapiKeyCustodyProvider {
     /// `(keyType: string) => string` — generate a keypair, return its id.
     #[napi(ts_type = "(keyType: string) => string")]
     pub generate_keypair: Function<'static, String, String>,
-    /// `(keyId: string, message: Uint8Array) => Uint8Array` — 64-byte sig.
+    /// `(keyId: string, message: Uint8Array) => Uint8Array` — 64-byte sig: an
+    /// Ed25519 signature, or for a pseudonym key id a 32-byte digest in and
+    /// the low-`s` P-256 `r || s` out (§9.5), which the bridge verifies.
     #[napi(ts_type = "(keyId: string, message: Uint8Array) => Uint8Array")]
     pub sign: Function<'static, (String, Vec<u8>), Vec<u8>>,
-    /// `(keyId: string) => Uint8Array` — 32 public-key bytes.
+    /// `(keyId: string) => Uint8Array` — 32 public-key bytes, or the 33-byte
+    /// compressed P-256 point for a pseudonym key id.
     #[napi(ts_type = "(keyId: string) => Uint8Array")]
     pub get_public_key: Function<'static, String, Vec<u8>>,
     /// `(keyId: string) => void` — destroy key material.
@@ -68,14 +71,17 @@ pub struct NapiKeyCustodyProvider {
     /// `(keyId: string, contextId: Uint8Array) => { publicKey, keyId }` —
     /// the §9.10.4 v1 pseudonym: `publicKey` is the 33-byte compressed P-256
     /// point and `keyId` the numeric handle of the pseudonym key. The bridge
-    /// requires `getPublicKey(keyId)` to return the same 33 bytes.
+    /// requires `getPublicKey(keyId)` to return the same 33 bytes. The same
+    /// (`keyId`, `contextId`) MUST return the same pseudonym `keyId` on every
+    /// call, so re-deriving names one key rather than minting another.
     #[napi(
         ts_type = "(keyId: string, contextId: Uint8Array) => { publicKey: Uint8Array; keyId: string }"
     )]
     pub derive_pseudonym: Function<'static, (String, Vec<u8>), NapiPseudonymResult>,
     /// `(keyId: string, contextId: Uint8Array, pseudonymEpoch: bigint) => { publicKey, keyId }`
     /// — the §9.10.4 rotatable v2 pseudonym, same return shape as
-    /// `derivePseudonym`. The provider performs the canonical derivation
+    /// `derivePseudonym`; the same (`keyId`, `contextId`, `pseudonymEpoch`)
+    /// MUST return the same pseudonym `keyId`. The provider performs the canonical derivation
     /// (HMAC key is the private-derived `pseudonym_secret`, domain
     /// `"scp-pseudonym-v2"`); the bridge does NOT synthesize the preimage.
     #[napi(
@@ -244,7 +250,7 @@ impl NapiCallbackKeyCustody {
         let host_public_key = self
             .tsfns
             .get_public_key
-            .call_async(result.key_id)
+            .call_async(pseudonym.key_handle().id().to_string())
             .await
             .map_err(|e| Self::map_call_err("get_public_key", &e))?;
         self.pseudonyms.bind(method, &pseudonym, &host_public_key)?;

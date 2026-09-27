@@ -28,16 +28,27 @@ use scp_platform::traits::{KeyHandle, PseudonymKeypair};
 /// Parses a numeric key-id string (as returned by a `KeyCustodyProvider`) into
 /// a [`KeyHandle`].
 ///
+/// Only the canonical decimal form is accepted (the form `u64::to_string`
+/// writes, which is what every bridge sends back to the host), so one host key
+/// has exactly one spelling: `"007"`, `"+7"` and `" 7"` are rejected rather
+/// than aliased to handle 7.
+///
 /// # Errors
 ///
 /// Returns [`PlatformError::CustodyError`] if `key_id` does not parse as a
-/// `u64`.
+/// `u64`, or parses but is not in canonical decimal form.
 pub fn parse_handle(method: &str, key_id: &str) -> Result<KeyHandle, PlatformError> {
-    key_id.parse::<u64>().map(KeyHandle::new).map_err(|_| {
+    let id = key_id.parse::<u64>().map_err(|_| {
         PlatformError::CustodyError(format!(
             "KeyCustodyProvider.{method} returned a non-numeric key_id: {key_id}"
         ))
-    })
+    })?;
+    if id.to_string() != key_id {
+        return Err(PlatformError::CustodyError(format!(
+            "KeyCustodyProvider.{method} returned a non-canonical key_id: {key_id:?}"
+        )));
+    }
+    Ok(KeyHandle::new(id))
 }
 
 /// Coerces a 32-byte custody return into a fixed array.
@@ -86,7 +97,7 @@ pub fn parse_pseudonym(
 /// `public_key(key_id)` reports the same point, and routes every `sign` through
 /// [`check_sign_input`](Self::check_sign_input) and
 /// [`check_signature`](Self::check_signature) so a pseudonym signature is a
-/// strict §9.5.1 signature under the bound point. A host that returns a high-`s`
+/// strict §9.5 signature under the bound point. A host that returns a high-`s`
 /// or otherwise invalid signature fails closed; the bridge never normalizes it.
 #[derive(Debug, Default)]
 pub struct PseudonymBindings {
@@ -96,6 +107,7 @@ pub struct PseudonymBindings {
 impl PseudonymBindings {
     /// Binds `pseudonym`'s handle to its point once the host's
     /// `public_key(key_id)` return (`host_public_key`) matches it byte for byte.
+    /// Re-binding the same point to the same handle is a no-op.
     ///
     /// # Errors
     ///
@@ -145,7 +157,7 @@ impl PseudonymBindings {
     /// # Errors
     ///
     /// Returns [`PlatformError::CustodyError`] if `key` is a pseudonym handle
-    /// and `data` is not a 32-byte digest (§9.5.1 prehash).
+    /// and `data` is not a 32-byte digest (§9.5 prehash).
     pub fn check_sign_input(
         &self,
         key: &KeyHandle,
@@ -460,5 +472,51 @@ mod tests {
                 .expect("unbound")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn parse_handle_rejects_non_canonical_ids() {
+        for id in ["007", "+7", "00"] {
+            let msg = custody_msg(
+                parse_handle("derive_pseudonym", id).expect_err("non-canonical id rejected"),
+            );
+            assert_eq!(
+                msg,
+                format!(
+                    "KeyCustodyProvider.derive_pseudonym returned a non-canonical key_id: {id:?}"
+                )
+            );
+        }
+        // `u64::from_str` already refuses surrounding whitespace.
+        for id in [" 7", "7 "] {
+            let msg = custody_msg(parse_handle("derive_pseudonym", id).expect_err("rejected"));
+            assert!(msg.contains("non-numeric key_id"), "{msg}");
+        }
+        assert_eq!(parse_handle("m", "0").expect("canonical zero").id(), 0);
+        assert_eq!(
+            parse_handle("m", "18446744073709551615")
+                .expect("u64::MAX")
+                .id(),
+            u64::MAX
+        );
+    }
+
+    /// B1: a host that returns the same key id for the same pseudonym (the
+    /// §9.10.4 determinism the provider interfaces require) re-binds cleanly.
+    #[test]
+    fn rebinding_the_same_point_under_the_same_id_is_ok() {
+        let bindings = PseudonymBindings::default();
+        let pseudo = parse_pseudonym("derive_pseudonym", &REFERENCE_POINT, "5").expect("valid");
+        bindings
+            .bind("derive_pseudonym", &pseudo, &REFERENCE_POINT)
+            .expect("first bind");
+        bindings
+            .bind("derive_pseudonym", &pseudo, &REFERENCE_POINT)
+            .expect("same point re-binds");
+        let (point, _) = bindings
+            .check_sign_input(pseudo.key_handle(), &[0u8; 32])
+            .expect("32-byte digest")
+            .expect("still bound");
+        assert_eq!(point.to_compressed(), REFERENCE_POINT);
     }
 }

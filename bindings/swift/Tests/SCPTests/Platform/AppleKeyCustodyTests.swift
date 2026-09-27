@@ -38,6 +38,29 @@
     @testable import SCP
     import Testing
 
+    // MARK: - Hex helper
+
+    /// Decodes an even-length lowercase hex string into raw bytes.
+    ///
+    /// Used to load the literal §25.19 known-answer vectors without any
+    /// self-derivation, so a regression in the derivation cannot mask itself.
+    private func hexToData(_ hex: String) throws -> Data {
+        guard hex.count % 2 == 0 else {
+            throw PlatformError.custodyError("hex string must have even length")
+        }
+        var data = Data(capacity: hex.count / 2)
+        var index = hex.startIndex
+        while index < hex.endIndex {
+            let next = hex.index(index, offsetBy: 2)
+            guard let byte = UInt8(hex[index ..< next], radix: 16) else {
+                throw PlatformError.custodyError("invalid hex byte in '\(hex)'")
+            }
+            data.append(byte)
+            index = next
+        }
+        return data
+    }
+
     // MARK: - AppleKeyCustody Tests
 
     struct AppleKeyCustodyTests {
@@ -297,12 +320,7 @@
             #expect(try await custody.publicKey(pseudonym.keyId) == pseudonym.publicKey)
 
             let publicKey = try P256.Signing.PublicKey(compressedRepresentation: pseudonym.publicKey)
-            // (n - 1) / 2, the largest low-s value (§9.5.1).
-            let halfOrderHex = Array("7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a8")
-            let halfOrder = Data(stride(from: 0, to: 64, by: 2).compactMap {
-                UInt8(String(halfOrderHex[$0 ..< $0 + 2]), radix: 16)
-            })
-            #expect(halfOrder.count == 32)
+            let halfOrder = try hexToData(Self.halfOrderHex)
             for index in 0 ..< 16 {
                 let digest = SHA256.hash(data: Data("pseudonym message \(index)".utf8))
                 let signature = try await custody.sign(pseudonym.keyId, data: Data(digest))
@@ -316,6 +334,12 @@
                 )
             }
 
+            // RFC 6979: the same digest signs to the same bytes (§9.5).
+            let digest = Data(SHA256.hash(data: Data("deterministic".utf8)))
+            let first = try await custody.sign(pseudonym.keyId, data: digest)
+            let second = try await custody.sign(pseudonym.keyId, data: digest)
+            #expect(first == second, "software pseudonym signatures must be deterministic")
+
             // A pseudonym key signs only a 32-byte digest.
             await #expect(throws: PlatformError.self) {
                 _ = try await custody.sign(pseudonym.keyId, data: Data("12 bytes....".utf8))
@@ -324,6 +348,33 @@
             // Cleanup
             try await custody.destroyKey(identityHandle)
             try await custody.destroyKey(pseudonym.keyId)
+        }
+
+        /// (n - 1) / 2 for P-256, the largest low-s value (§9.5.1).
+        static let halfOrderHex = "7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a8"
+
+        /// RFC 6979 A.2.5 (P-256, SHA-256, message "sample"): the pseudonym
+        /// signer reproduces the RFC's r, so its nonce is the RFC 6979 k, and
+        /// returns the low-s form of the RFC's (high) s. No Swift code
+        /// normalizes s; the Rust export does.
+        @Test("pseudonym signer reproduces RFC 6979 A.2.5 with low s")
+        func pseudonymSignerMatchesRfc6979() throws {
+            let scalar = try hexToData("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721")
+            let digest = Data(SHA256.hash(data: Data("sample".utf8)))
+            let signature = try P256Pseudonym.signPrehash(scalar: scalar, digest: digest)
+            #expect(
+                try signature.prefix(32)
+                    == hexToData("efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716")
+            )
+            #expect(try P256Pseudonym.signPrehash(scalar: scalar, digest: digest) == signature)
+            let halfOrder = try hexToData(Self.halfOrderHex)
+            #expect(
+                signature.suffix(32).lexicographicallyPrecedes(halfOrder)
+                    || signature.suffix(32) == halfOrder
+            )
+            let publicKey = try P256.Signing.PrivateKey(rawRepresentation: scalar).publicKey
+            let ecdsa = try P256.Signing.ECDSASignature(rawRepresentation: signature)
+            #expect(publicKey.isValidSignature(ecdsa, for: SHA256.hash(data: Data("sample".utf8))))
         }
 
         // MARK: - custodyType
@@ -478,7 +529,7 @@
                 let v1Expected = try hexToData(vector.staticPoint)
                 let v2Expected = try hexToData(vector.rotatedPoint)
                 #expect(
-                    P256Pseudonym.seedToScalar(label: "SCP-TEST-VECTOR-KEY-V1", seed: vector.seed)
+                    try p256SeedToScalar(label: Data("SCP-TEST-VECTOR-KEY-V1".utf8), seed: vector.seed)
                         == ikm,
                     "seed-to-scalar must reproduce the §25.19 identity scalar"
                 )
@@ -518,29 +569,6 @@
                 try await custody.destroyKey(staticPseudonym.keyId)
                 try await custody.destroyKey(rotatablePseudonym.keyId)
             }
-        }
-
-        // MARK: - Helpers
-
-        /// Decodes an even-length lowercase hex string into raw bytes.
-        ///
-        /// Used to load the literal §25.19 known-answer vectors without any
-        /// self-derivation, so a regression in the derivation cannot mask itself.
-        private func hexToData(_ hex: String) throws -> Data {
-            guard hex.count % 2 == 0 else {
-                throw PlatformError.custodyError("hex string must have even length")
-            }
-            var data = Data(capacity: hex.count / 2)
-            var index = hex.startIndex
-            while index < hex.endIndex {
-                let next = hex.index(index, offsetBy: 2)
-                guard let byte = UInt8(hex[index ..< next], radix: 16) else {
-                    throw PlatformError.custodyError("invalid hex byte in '\(hex)'")
-                }
-                data.append(byte)
-                index = next
-            }
-            return data
         }
     }
 

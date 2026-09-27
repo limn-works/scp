@@ -14776,10 +14776,10 @@ public func FfiConverterCallbackInterfaceDeviceAttestationProvider_lower(_ v: De
 /**
  * Callback for platform cryptographic key management.
  *
- * Swift SDK: Secure Enclave / Keychain.
- * Kotlin SDK: Android Keystore.
- *
- * Implemented by Swift/Kotlin code and injected into the Rust engine.
+ * Implemented by host code and injected into the Rust engine. No in-tree
+ * Swift or Kotlin host implements this protocol yet: `AppleKeyCustody` and
+ * `AndroidKeyCustody` implement their SDKs' own custody interfaces (UUID or
+ * hex key ids, no [`PseudonymResult`]), and S0 PR8 conforms them to it.
  *
  * # SAFETY: Thread execution context
  *
@@ -14800,8 +14800,10 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      *
      * For an Ed25519 key, returns the raw 64-byte Ed25519 signature. For a
      * pseudonym key id from `derive_pseudonym`, `message` is a 32-byte digest
-     * and the return is the 64-byte low-`s` P-256 `r || s` (§9.5.1); the
-     * bridge verifies it strictly and rejects anything else.
+     * and the return is the 64-byte low-`s` P-256 `r || s` (§9.5); the
+     * bridge verifies it strictly and rejects anything else. A software host
+     * signs with [`crate::p256_host::p256_sign_prehash_rfc6979`] rather than
+     * its own ECDSA.
      */
     func sign(keyId: String, message: Data) async throws  -> Data
     
@@ -14837,8 +14839,7 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
     /**
      * Derive a deterministic, context-scoped P-256 pseudonym keypair (§9.10.4).
      *
-     * The actual derivation runs inside the injected platform `KeyCustody`
-     * callback (Swift Keychain/Secure Enclave, Kotlin Keystore). Algorithm:
+     * The derivation runs inside the host's custody. Algorithm:
      * 1. `pseudonym_secret = HKDF-SHA256(ikm, salt="scp-pseudonym-secret-v1", info="", L=32)`
      * 2. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
      * 3. `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`; the public key
@@ -14855,6 +14856,13 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      * non-numeric key id, and a key id whose `get_public_key` does not return
      * the same 33 bytes. `sign` on that key id receives a 32-byte digest and
      * must return a 64-byte low-`s` `r || s` that verifies under the point.
+     * A host maps the seed with [`crate::p256_host::p256_seed_to_scalar`]
+     * rather than reducing it itself.
+     *
+     * The same (`key_id`, `context_id`) MUST return the same pseudonym key id
+     * on every call, so re-deriving names one key rather than minting another;
+     * the bridge's per-key-id point bindings grow with the distinct ids a
+     * host returns.
      */
     func derivePseudonym(keyId: String, contextId: Data) async throws  -> PseudonymResult
     
@@ -14868,6 +14876,9 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      * `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`. Returns a
      * [`PseudonymResult`], checked exactly as for `derive_pseudonym`.
      *
+     * The same (`key_id`, `context_id`, `pseudonym_epoch`) MUST return the
+     * same pseudonym key id on every call, as for `derive_pseudonym`.
+     *
      * The `pseudonym_epoch` is passed through to the provider so it performs
      * the canonical v2 derivation itself. Bridges MUST NOT synthesize a
      * `context_id || BE64(epoch) || "scp-pseudonym-v2"` preimage and feed it to
@@ -14877,9 +14888,9 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      * # Default
      *
      * Rust-side providers that do not rotate return `ScpError::Context`
-     * (SCP-CTX-2050) indicating the method is not implemented. Platform SDK
-     * adapters (Swift `AppleKeyCustody`, Kotlin `AndroidKeyCustody`) override
-     * this with real implementations.
+     * (SCP-CTX-2050) indicating the method is not implemented. A host that
+     * rotates overrides it; no in-tree Swift or Kotlin host implements this
+     * protocol yet (S0 PR8).
      *
      * **Note:** `UniFFI` callback interfaces require foreign implementations to
      * define all methods. The generated Swift protocol / Kotlin interface will
@@ -14902,8 +14913,8 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      * # Default
      *
      * Returns `ScpError::Context` (SCP-CTX-2050) indicating the method is not
-     * implemented. Platform SDKs (Swift `AppleKeyCustody`, Kotlin
-     * `AndroidKeyCustody`) override this with real implementations. Third-party
+     * implemented. A host that needs it overrides it (no in-tree Swift or
+     * Kotlin host implements this protocol yet, S0 PR8). Third-party
      * `KeyCustodyProvider` implementations that do not need governance vote
      * signing may rely on the default until they add support.
      *
@@ -17359,6 +17370,59 @@ public func metadataRecordToJson(contextId: String, sequence: UInt64, signerDid:
 })
 }
 /**
+ * The 33-byte SEC1 compressed public key `d·G` of a 32-byte scalar.
+ *
+ * # Errors
+ *
+ * `SCP-VALID-7005` when `scalar` is not 32 bytes; `SCP-CRYPTO-4001` when it
+ * is zero or not below `n`.
+ */
+public func p256PublicKey(scalar: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_p256_public_key(
+        FfiConverterData.lower(scalar),$0
+    )
+})
+}
+/**
+ * Maps a 32-byte seed to a P-256 private scalar in `[1, n − 1]` under `label`.
+ *
+ * FIPS 186-5 A.2.1, §9.10.4: `HKDF-Expand(seed, label, 48) mod (n − 1) + 1`.
+ * Returns the 32-byte big-endian scalar. For a pseudonym the label is
+ * `"SCP-PSEUDONYM-P256-V1"` and the seed the §9.10.4 `context_seed`.
+ *
+ * # Errors
+ *
+ * `SCP-VALID-7005` when `seed` is not 32 bytes; `SCP-CRYPTO-4001` if the
+ * reduction fails (unreachable for a 32-byte seed).
+ */
+public func p256SeedToScalar(label: Data, seed: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_p256_seed_to_scalar(
+        FfiConverterData.lower(label),
+        FfiConverterData.lower(seed),$0
+    )
+})
+}
+/**
+ * Signs a 32-byte digest with the scalar: RFC 6979 deterministic nonce
+ * (`h1 = digest`), low-`s` normalized, returned as the 64-byte `r || s`
+ * (§9.5).
+ *
+ * # Errors
+ *
+ * `SCP-VALID-7005` when `scalar` or `digest` is not 32 bytes;
+ * `SCP-CRYPTO-4001` when the scalar is out of range or signing fails.
+ */
+public func p256SignPrehashRfc6979(scalar: Data, digest: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_p256_sign_prehash_rfc6979(
+        FfiConverterData.lower(scalar),
+        FfiConverterData.lower(digest),$0
+    )
+})
+}
+/**
  * Checks whether the provenance chain depth is within the allowed limit.
  */
 public func provenanceCheckChainDepth(chainDepth: UInt8, maxDepth: UInt8?) -> Bool  {
@@ -17745,6 +17809,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_metadata_record_to_json() != 58960) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_p256_public_key() != 39495) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_p256_seed_to_scalar() != 31098) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_p256_sign_prehash_rfc6979() != 49215) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_provenance_check_chain_depth() != 15774) {
@@ -18431,7 +18504,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_assert_request() != 17302) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 6702) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 53456) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 51576) {
@@ -18446,13 +18519,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_dh_agree() != 52565) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 28985) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 30099) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 34766) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 42755) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 55617) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 44263) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_custody_type() != 30807) {

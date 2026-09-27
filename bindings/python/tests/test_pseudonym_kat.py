@@ -2,17 +2,18 @@
 
 Spec §9.10.4.A (algorithm) and §25.19 vectors 30 & 31 (pinned outputs).
 
-Software-custody pseudonym derivation is cross-platform deterministic: every
-SDK (Rust, Swift, Kotlin, TypeScript, Python) MUST reproduce the exact bytes
-the spec pins for a given identity key, ``context_id``, and epoch. This test
-runs the pure-Python canonical recipe in :mod:`tests.pseudonym_recipe` and
-asserts every intermediate and output equals the spec literal: the identity
-scalar, ``pseudonym_secret``, both context seeds, both 33-byte compressed P-256
-public keys, and both routing ids.
+Software-custody pseudonym derivation is cross-platform deterministic (§9.10.4.A).
+This file checks two things:
 
-The recipe is stdlib-only (HKDF/HMAC via :mod:`hashlib`/:mod:`hmac`, P-256 via a
-compact affine implementation), so this KAT runs under plain ``pytest`` with no
-native extension built.
+- The pure-Python recipe in :mod:`tests.pseudonym_recipe` (the fixture that
+  test custody providers derive with) reproduces every §25.19 intermediate and
+  output: the identity scalar, ``pseudonym_secret``, both context seeds, both
+  33-byte compressed P-256 public keys, and both routing ids. It is
+  stdlib-only and runs with no native extension built.
+- The production bridge path: the Vector 30 identity scalar, installed as the
+  native custody's Ed25519 seed (the §9.10.4.A native interim ikm), derives on
+  ``context-alpha`` to the spec's v1 routing id through the PyO3 bridge. That
+  test skips when the extension is not built with the ``testing`` feature.
 """
 
 from __future__ import annotations
@@ -101,7 +102,7 @@ def test_v2_rotatable_pseudonym_matches_spec(vector: dict) -> None:
 
 
 def test_prehash_signature_is_low_s_and_64_bytes() -> None:
-    """The fixture signer emits the §9.5.1 64-byte low-s form."""
+    """The fixture signer emits the §9.5 64-byte low-s form."""
     n = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
     ikm = _ikm(VECTORS[0])
     d = pseudonym_scalar(canonical_pseudonym_seed(ikm, CONTEXT_ALPHA))
@@ -109,3 +110,14 @@ def test_prehash_signature_is_low_s_and_64_bytes() -> None:
         sig = p256_sign_prehash(d, bytes([i]) * 32)
         assert len(sig) == 64
         assert int.from_bytes(sig[32:], "big") <= (n - 1) // 2
+
+
+def test_bridge_derives_vector_30_routing_id() -> None:
+    """§25.19 Vector 30 ``rid_v1`` through the PyO3 bridge's pseudonym derivation."""
+    core = pytest.importorskip("scp_sdk._scp_core")
+    hook = getattr(core, "testing_pseudonym_routing_id_from_seed", None)
+    if hook is None:
+        pytest.skip("extension built without the `testing` feature")
+    vector = VECTORS[0]
+    routing_id = hook(bytes.fromhex(vector["scalar"]), CONTEXT_ALPHA.decode())
+    assert bytes(routing_id).hex() == vector["rid_v1"]

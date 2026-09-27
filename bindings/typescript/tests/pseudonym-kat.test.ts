@@ -2,14 +2,16 @@
  * Byte-level Known-Answer Test (KAT) for per-context pseudonym derivation
  * (spec §9.10.4.A, §25.19 vectors 30 & 31).
  *
- * Every SDK MUST reproduce the bytes §25.19 pins. This test runs the shared
- * TypeScript recipe in `./pseudonym-recipe` and asserts every intermediate and
- * output equals the spec literal: the identity scalar, `pseudonym_secret`, both
+ * This file checks the shared TypeScript recipe in `./pseudonym-recipe` (the
+ * fixture test custody providers derive with): every intermediate and output
+ * equals the §25.19 literal: the identity scalar, `pseudonym_secret`, both
  * context seeds, both 33-byte compressed P-256 public keys, and both routing
  * ids. The §25.19 vectors map the identity seed to a scalar with the §25.2
  * label `"SCP-TEST-VECTOR-KEY-V1"`; that 32-byte scalar is the ikm.
  *
- * Pure JS (`node:crypto` plus BigInt), so it runs under plain `bun test`.
+ * Pure JS (`node:crypto` plus BigInt), so it runs under plain `bun test`. The
+ * production bridge path (Vector 30 through the napi pseudonym derivation) is
+ * checked in `custody-bridge-checks.test.ts`.
  */
 
 import { describe, expect, test } from "bun:test";

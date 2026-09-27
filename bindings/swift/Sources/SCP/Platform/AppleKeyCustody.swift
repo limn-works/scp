@@ -491,8 +491,9 @@ extension AppleKeyCustody {
             ))
             defer { contextSeed.resetBytes(in: 0 ..< contextSeed.count) }
 
-            let pseudonymKey = try P256Pseudonym.privateKey(contextSeed: contextSeed)
-            let publicKey = pseudonymKey.publicKey.compressedRepresentation
+            var scalar = try P256Pseudonym.scalar(contextSeed: contextSeed)
+            defer { scalar.resetBytes(in: 0 ..< scalar.count) }
+            let publicKey = try P256Pseudonym.publicKey(scalar: scalar)
 
             // Deterministic handle: HMAC-SHA256(identity_handle_utf8, handleMessage).
             // Same inputs -> same handle -> same Keychain slot. No accumulation.
@@ -501,7 +502,7 @@ extension AppleKeyCustody {
             )).map { String(format: "%02x", $0) }.joined()
 
             try storePrivateKeyBytes(
-                pseudonymKey.rawRepresentation,
+                scalar,
                 for: handle,
                 keyType: .p256Pseudonym,
                 publicKeyBytes: publicKey
@@ -592,7 +593,8 @@ public extension AppleKeyCustody {
     ///   unknown, ``PlatformError/biometricAuthenticationFailed(_:)`` if
     ///   biometric gating is active and authentication fails,
     ///   ``PlatformError/keychainError(_:)`` for Keychain failures,
-    ///   ``PlatformError/custodyError(_:)`` if CryptoKit rejects the key bytes.
+    ///   ``PlatformError/custodyError(_:)`` if CryptoKit or the Rust P-256
+    ///   signer rejects the key bytes.
     ///
     /// See ADR-025 Key custody and ADR-006 `sign`.
     @concurrent
@@ -609,8 +611,7 @@ public extension AppleKeyCustody {
 
         do {
             if storedType == .p256Pseudonym {
-                let pseudonymKey = try P256.Signing.PrivateKey(rawRepresentation: privateKeyBytes)
-                return try P256Pseudonym.signPrehash(key: pseudonymKey, digest: data)
+                return try P256Pseudonym.signPrehash(scalar: privateKeyBytes, digest: data)
             }
             let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: privateKeyBytes)
             return try signingKey.signature(for: data)
@@ -618,7 +619,8 @@ public extension AppleKeyCustody {
             throw platformErr
         } catch {
             throw PlatformError.custodyError(
-                "Ed25519 signing failed for handle '\(keyHandle)': \(error.localizedDescription)"
+                "\(storedType == .p256Pseudonym ? "P-256 pseudonym" : "Ed25519") signing failed for handle "
+                    + "'\(keyHandle)': \(error.localizedDescription)"
             )
         }
     }
@@ -675,8 +677,7 @@ public extension AppleKeyCustody {
                 )
                 return agreementKey.publicKey.rawRepresentation
             case .p256Pseudonym:
-                let pseudonymKey = try P256.Signing.PrivateKey(rawRepresentation: privateKeyBytes)
-                return pseudonymKey.publicKey.compressedRepresentation
+                return try P256Pseudonym.publicKey(scalar: privateKeyBytes)
             }
         } catch let platformErr as PlatformError {
             throw platformErr
@@ -859,7 +860,8 @@ public extension AppleKeyCustody {
     // MARK: deriveRotatablePseudonym
 
     /// Derives the deterministic, context-scoped, epoch-rotatable P-256
-    /// pseudonym of an Ed25519 identity key (spec §9.10.4.1).
+    /// pseudonym of an Ed25519 identity key (rotation per spec §9.10.4.1,
+    /// derivation per §9.10.4.A).
     ///
     /// Identical to ``derivePseudonym(_:contextId:)`` except step 3:
     /// `context_seed = HMAC-SHA256(pseudonym_secret,

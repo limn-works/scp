@@ -69,6 +69,7 @@ use std::time::Duration;
 
 pub mod bridge;
 pub mod outlet_stream;
+pub mod p256_host;
 pub mod runtime;
 pub mod scp;
 
@@ -327,10 +328,10 @@ pub struct PseudonymResult {
 
 /// Callback for platform cryptographic key management.
 ///
-/// Swift SDK: Secure Enclave / Keychain.
-/// Kotlin SDK: Android Keystore.
-///
-/// Implemented by Swift/Kotlin code and injected into the Rust engine.
+/// Implemented by host code and injected into the Rust engine. No in-tree
+/// Swift or Kotlin host implements this protocol yet: `AppleKeyCustody` and
+/// `AndroidKeyCustody` implement their SDKs' own custody interfaces (UUID or
+/// hex key ids, no [`PseudonymResult`]), and S0 PR8 conforms them to it.
 ///
 /// # SAFETY: Thread execution context
 ///
@@ -350,8 +351,10 @@ pub trait KeyCustodyProvider: Send + Sync {
     ///
     /// For an Ed25519 key, returns the raw 64-byte Ed25519 signature. For a
     /// pseudonym key id from `derive_pseudonym`, `message` is a 32-byte digest
-    /// and the return is the 64-byte low-`s` P-256 `r || s` (§9.5.1); the
-    /// bridge verifies it strictly and rejects anything else.
+    /// and the return is the 64-byte low-`s` P-256 `r || s` (§9.5); the
+    /// bridge verifies it strictly and rejects anything else. A software host
+    /// signs with [`crate::p256_host::p256_sign_prehash_rfc6979`] rather than
+    /// its own ECDSA.
     async fn sign(&self, key_id: String, message: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 
     /// Return the public key bytes for `key_id`: 32 bytes for an Ed25519 or
@@ -377,8 +380,7 @@ pub trait KeyCustodyProvider: Send + Sync {
 
     /// Derive a deterministic, context-scoped P-256 pseudonym keypair (§9.10.4).
     ///
-    /// The actual derivation runs inside the injected platform `KeyCustody`
-    /// callback (Swift Keychain/Secure Enclave, Kotlin Keystore). Algorithm:
+    /// The derivation runs inside the host's custody. Algorithm:
     ///   1. `pseudonym_secret = HKDF-SHA256(ikm, salt="scp-pseudonym-secret-v1", info="", L=32)`
     ///   2. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
     ///   3. `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`; the public key
@@ -395,6 +397,13 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// non-numeric key id, and a key id whose `get_public_key` does not return
     /// the same 33 bytes. `sign` on that key id receives a 32-byte digest and
     /// must return a 64-byte low-`s` `r || s` that verifies under the point.
+    /// A host maps the seed with [`crate::p256_host::p256_seed_to_scalar`]
+    /// rather than reducing it itself.
+    ///
+    /// The same (`key_id`, `context_id`) MUST return the same pseudonym key id
+    /// on every call, so re-deriving names one key rather than minting another;
+    /// the bridge's per-key-id point bindings grow with the distinct ids a
+    /// host returns.
     async fn derive_pseudonym(
         &self,
         key_id: String,
@@ -410,6 +419,9 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`. Returns a
     /// [`PseudonymResult`], checked exactly as for `derive_pseudonym`.
     ///
+    /// The same (`key_id`, `context_id`, `pseudonym_epoch`) MUST return the
+    /// same pseudonym key id on every call, as for `derive_pseudonym`.
+    ///
     /// The `pseudonym_epoch` is passed through to the provider so it performs
     /// the canonical v2 derivation itself. Bridges MUST NOT synthesize a
     /// `context_id || BE64(epoch) || "scp-pseudonym-v2"` preimage and feed it to
@@ -419,9 +431,9 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// # Default
     ///
     /// Rust-side providers that do not rotate return `ScpError::Context`
-    /// (SCP-CTX-2050) indicating the method is not implemented. Platform SDK
-    /// adapters (Swift `AppleKeyCustody`, Kotlin `AndroidKeyCustody`) override
-    /// this with real implementations.
+    /// (SCP-CTX-2050) indicating the method is not implemented. A host that
+    /// rotates overrides it; no in-tree Swift or Kotlin host implements this
+    /// protocol yet (S0 PR8).
     ///
     /// **Note:** `UniFFI` callback interfaces require foreign implementations to
     /// define all methods. The generated Swift protocol / Kotlin interface will
@@ -453,8 +465,8 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// # Default
     ///
     /// Returns `ScpError::Context` (SCP-CTX-2050) indicating the method is not
-    /// implemented. Platform SDKs (Swift `AppleKeyCustody`, Kotlin
-    /// `AndroidKeyCustody`) override this with real implementations. Third-party
+    /// implemented. A host that needs it overrides it (no in-tree Swift or
+    /// Kotlin host implements this protocol yet, S0 PR8). Third-party
     /// `KeyCustodyProvider` implementations that do not need governance vote
     /// signing may rely on the default until they add support.
     ///

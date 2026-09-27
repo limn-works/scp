@@ -92,10 +92,11 @@ dashmap = { workspace = true }
 rand = { workspace = true }
 zeroize = { workspace = true }
 z-base-32 = { workspace = true }
+# `p256_host` exports the §9.10.4 scalar reduction and the §9.5 RFC 6979
+# signer so no Swift or Kotlin host re-implements them (SCP-307).
+scp-crypto = { path = "../../scp-crypto" }
 
 [dev-dependencies]
-# The `ProdLikeCustody` test provider mints real §9.10.4 P-256 pseudonym points.
-scp-crypto = { path = "../../scp-crypto" }
 # Tests need InMemoryKeyCustody — enable the `testing` feature for dev-deps.
 scp-platform = { path = "../../scp-platform", features = ["testing"] }
 # Test seams (`install_seedable_resolver`) construct

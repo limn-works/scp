@@ -30,9 +30,14 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import uniffi.scp.p256SeedToScalar
 import java.math.BigInteger
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
+
+/** Decodes lowercase hex. */
+private fun hex(text: String): ByteArray =
+    ByteArray(text.length / 2) { text.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
 
 /**
  * In-memory [SharedPreferences] test double for [AndroidKeyCustody] persistence tests.
@@ -485,7 +490,7 @@ class AndroidKeyCustodyTest {
                 id = pseudonym.id,
                 custodyType = pseudonym.custodyType,
             )
-            // §9.5.1: the host signs a 32-byte digest as P-256 ECDSA, 64-byte r || s, low s.
+            // §9.5: the host signs a 32-byte digest as P-256 ECDSA, 64-byte r || s, low s.
             val curve = CustomNamedCurves.getByName("secp256r1")
             val domain = ECDomainParameters(curve.curve, curve.g, curve.n, curve.h)
             val pubKeyBytes = custody.publicKey(pseudonymKeyHandle)
@@ -498,9 +503,32 @@ class AndroidKeyCustodyTest {
                 assertEquals(64, signature.size)
                 val r = BigInteger(1, signature.copyOfRange(0, 32))
                 val sVal = BigInteger(1, signature.copyOfRange(32, 64))
-                assertTrue(sVal <= curve.n.shiftRight(1), "s must be low (§9.5.1)")
+                assertTrue(sVal <= curve.n.shiftRight(1), "s must be low (§9.5)")
                 assertTrue(verifier.verifySignature(digest, r, sVal))
+                // RFC 6979: the same digest signs to the same bytes.
+                assertArrayEquals(signature, custody.sign(pseudonymKeyHandle, digest))
             }
+        }
+
+        /**
+         * RFC 6979 A.2.5 (P-256, SHA-256, message "sample"): the pseudonym signer reproduces
+         * the RFC's r, so it draws the RFC 6979 nonce, and returns the low-s form of the
+         * RFC's (high) s, the two summing to n. No Kotlin code normalizes s; the Rust
+         * `p256SignPrehashRfc6979` export does.
+         */
+        @Test
+        fun `pseudonym signer reproduces RFC 6979 A_2_5 with low s`() {
+            val x = hex("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721")
+            val digest = MessageDigest.getInstance("SHA-256").digest("sample".toByteArray(Charsets.UTF_8))
+            val signature = P256Pseudonym.signPrehash(x, digest)
+            assertEquals(
+                "efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716",
+                signature.copyOfRange(0, 32).joinToString("") { "%02x".format(it) },
+            )
+            val n = CustomNamedCurves.getByName("secp256r1").n
+            val rfcS = BigInteger("f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8", 16)
+            assertEquals(n, BigInteger(1, signature.copyOfRange(32, 64)).add(rfcS))
+            assertArrayEquals(signature, P256Pseudonym.signPrehash(x, digest))
         }
 
         @Test
@@ -537,6 +565,9 @@ class AndroidKeyCustodyTest {
             val pubKey1 = custody.publicKey(pubKey1Handle)
             val pubKey2 = custody.publicKey(pubKey2Handle)
             assertArrayEquals(pubKey1, pubKey2)
+            // One handle per (identity, context): re-deriving reuses the id.
+            assertEquals(pseudonym1.id, pseudonym2.id)
+            assertEquals(1, custody.pseudonymKeys.size)
         }
 
         @Test
@@ -799,11 +830,10 @@ class AndroidKeyCustodyTest {
                 "test-ctx".toByteArray(Charsets.UTF_8),
             )
 
-            // Only the identity key should be persisted, not the pseudonym
-            val identityPrefsKey = "scp.ed25519.${identityHandle.id}"
-            val pseudonymPrefsKey = "scp.ed25519.${pseudonym.id}"
-            assertTrue(prefs.contains(identityPrefsKey))
-            assertTrue(!prefs.contains(pseudonymPrefsKey))
+            // Only the identity key is persisted; no prefs key names the pseudonym.
+            assertTrue(prefs.contains("scp.ed25519.${identityHandle.id}"))
+            val leaked = prefs.all.keys.filter { it.contains(pseudonym.id) }
+            assertTrue(leaked.isEmpty(), "pseudonym persisted under $leaked")
         }
     }
 
@@ -858,10 +888,7 @@ class AndroidKeyCustodyTest {
             expectedV1: String,
             expectedV2Epoch1: String,
         ) {
-            val scalar = P256Pseudonym.seedToScalar("SCP-TEST-VECTOR-KEY-V1", seed)
-            val ikm = scalar.toByteArray().let {
-                if (it.size > 32) it.copyOfRange(it.size - 32, it.size) else ByteArray(32 - it.size) + it
-            }
+            val ikm = p256SeedToScalar("SCP-TEST-VECTOR-KEY-V1".toByteArray(Charsets.UTF_8), seed)
             assertEquals(expectedScalar, ikm.toHexString())
             val identityHandle = injectSoftwareEd25519(ikm)
             val contextAlpha = "context-alpha".toByteArray(Charsets.UTF_8)

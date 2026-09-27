@@ -430,7 +430,7 @@ async fn derive_context_pseudonym_required(
 /// a handle or the registry). Centralizing here mirrors the `PyO3` reference
 /// bridge so the 1054/1055 contract cannot drift across create / join /
 /// import.
-async fn derive_pseudonym_bytes(
+pub(crate) async fn derive_pseudonym_bytes(
     custody: &crate::custody::NapiKeyCustody,
     identity_key: &scp_platform::KeyHandle,
     context_id: &str,

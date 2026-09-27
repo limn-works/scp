@@ -199,8 +199,10 @@ interface PushProvider {
  * uses Android Keystore for TEE-backed Ed25519 on API 33+ and Bouncy Castle
  * for software fallback on API 26-32.
  *
- * This interface mirrors the Rust `KeyCustody` trait in `scp-platform/src/traits.rs`
- * and the UniFFI `KeyCustodyProvider` callback interface in `scp-ffi/uniffi/src/bridge.rs`.
+ * This interface mirrors the Rust `KeyCustody` trait in `scp-platform/src/traits.rs`.
+ * It is NOT the `scp-ffi-uniffi` `KeyCustodyProvider` callback protocol (u64 key ids,
+ * `derivePseudonym` returning a `PseudonymResult`): no in-tree Kotlin host implements
+ * the bridge protocol yet; S0 PR8 conforms [AndroidKeyCustody] to it.
  *
  * See ADR-006 for the platform abstraction design and ADR-027 for the Android adapter.
  */
@@ -218,23 +220,28 @@ interface KeyCustodyProvider {
     fun generateKeypair(keyType: KeyType): KeyHandle
 
     /**
-     * Sign data with an Ed25519 key.
+     * Sign data with an Ed25519 identity key or a P-256 pseudonym key.
      *
-     * @param keyHandle Handle to an Ed25519 key.
-     * @param data The bytes to sign.
-     * @return 64-byte Ed25519 signature.
+     * @param keyHandle Handle to an Ed25519 key, or a pseudonym handle from
+     *   [derivePseudonym] / [deriveRotatablePseudonym].
+     * @param data For an Ed25519 key, the message. For a pseudonym key, a 32-byte digest,
+     *   signed without a second hash (§9.5).
+     * @return 64 bytes: an Ed25519 signature, or for a pseudonym key the P-256 ECDSA
+     *   `r || s` with low s (§9.5).
      * @throws ScpException with code `SCP-CRYPTO-4001` if key not found.
-     * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
+     * @throws ScpException with code `SCP-CRYPTO-4003` if key is X25519, or a pseudonym
+     *   key is given data that is not 32 bytes.
      */
     fun sign(keyHandle: KeyHandle, data: ByteArray): ByteArray
 
     /**
      * Return the raw public key bytes for a handle.
      *
-     * Works for both Ed25519 (32 bytes) and X25519 (32 bytes) key handles.
+     * Ed25519 and X25519 keys return 32 bytes; a P-256 pseudonym key returns its
+     * 33-byte SEC1 compressed point (§9.10.4).
      *
      * @param keyHandle Handle to any key type.
-     * @return Raw public key bytes (32 bytes).
+     * @return Raw public key bytes: 32, or 33 for a pseudonym key.
      * @throws ScpException with code `SCP-CRYPTO-4001` if key not found.
      */
     fun publicKey(keyHandle: KeyHandle): ByteArray
@@ -275,7 +282,7 @@ interface KeyCustodyProvider {
      *   2. `d = HKDF-Expand-SHA256(seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n - 1) + 1`;
      *      the pseudonym key is P-256 `d`, public key the 33-byte compressed `d * G`.
      *      [sign] on its handle takes a 32-byte digest and returns 64-byte low-s
-     *      `r || s` (§9.5.1).
+     *      `r || s` with an RFC 6979 nonce (§9.5).
      *
      * Software custody: `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
      * salt="scp-pseudonym-secret-v1")` — cross-platform deterministic. Hardware
@@ -302,7 +309,7 @@ interface KeyCustodyProvider {
      *   2. `d = HKDF-Expand-SHA256(seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n - 1) + 1`;
      *      the pseudonym key is P-256 `d`, public key the 33-byte compressed `d * G`.
      *      [sign] on its handle takes a 32-byte digest and returns 64-byte low-s
-     *      `r || s` (§9.5.1).
+     *      `r || s` with an RFC 6979 nonce (§9.5).
      *
      * The `"scp-pseudonym-v2"` domain separator differs from v1's `"scp-pseudonym"`,
      * so v2 at any epoch never collides with the v1 [derivePseudonym] output.

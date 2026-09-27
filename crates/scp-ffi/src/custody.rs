@@ -459,7 +459,9 @@ impl PyCallbackKeyCustody {
     ) -> Result<PseudonymKeypair, PlatformError> {
         let pseudonym =
             scp_ffi_common::custody_parse::parse_pseudonym(method, &public_key, &key_id)?;
-        let host_public_key: Vec<u8> = self.provider.call_str("get_public_key", &key_id)?;
+        let host_public_key: Vec<u8> = self
+            .provider
+            .call_str("get_public_key", &pseudonym.key_handle().id().to_string())?;
         self.pseudonyms.bind(method, &pseudonym, &host_public_key)?;
         Ok(pseudonym)
     }
@@ -684,8 +686,10 @@ pub(crate) mod test_fakes {
     /// bridge validates the point, binds it to `get_public_key(key_id)`, and
     /// verifies every pseudonym signature strictly, so the fake runs the
     /// §9.10.4 seed-to-scalar step over its context seed and signs digests with
-    /// a compact affine P-256. `fault` makes the pseudonym path misbehave in one
-    /// named way: `legacy32`, `wrong_public_key`, or `high_s`.
+    /// a compact affine P-256. Pseudonym key ids are deterministic per
+    /// (identity key id, context, epoch), as the provider contract requires.
+    /// `fault` makes the pseudonym path misbehave in one named way: `legacy32`,
+    /// `wrong_public_key`, `high_s`, or `fixed_id` (every pseudonym gets id 777).
     const FAKE_PROVIDER_PY: &std::ffi::CStr = c"
 import hashlib, hmac
 
@@ -771,17 +775,21 @@ class FakeCustody:
     def dh_agree(self, key_id, peer_public):
         return hmac.new(self._seeds[key_id], bytes(peer_public), hashlib.sha256).digest()
 
-    def _register(self, key_id, seed):
+    def _register(self, key_id, seed, context_id, epoch_tag):
         if self._fault == 'legacy32':
             return (hashlib.sha256(seed).digest(), key_id)
-        kid = str(self._next)
-        self._next += 1
+        if self._fault == 'fixed_id':
+            kid = '777'
+        else:
+            tag = hashlib.sha256(b'fake-pseudonym-key-id' + key_id.encode() + b'|'
+                                 + bytes(context_id) + epoch_tag).digest()
+            kid = str(int.from_bytes(tag[:8], 'big'))
         self._pseudonyms[kid] = seed_to_scalar(seed)
         return (compressed(self._pseudonyms[kid]), kid)
 
     def derive_pseudonym(self, key_id, context_id):
         seed = hmac.new(self._seeds[key_id], bytes(context_id), hashlib.sha256).digest()
-        return self._register(key_id, seed)
+        return self._register(key_id, seed, context_id, b'v1')
 
     def derive_rotatable_pseudonym(self, key_id, context_id, pseudonym_epoch):
         # Canonical v2 preimage: context_id || BE64(epoch) || 'scp-pseudonym-v2'.
@@ -789,7 +797,7 @@ class FakeCustody:
         # v1 'scp-pseudonym' separator, so this provider owns the full recipe.
         preimage = bytes(context_id) + pseudonym_epoch.to_bytes(8, 'big') + b'scp-pseudonym-v2'
         seed = hmac.new(self._seeds[key_id], preimage, hashlib.sha256).digest()
-        return self._register(key_id, seed)
+        return self._register(key_id, seed, context_id, b'v2' + pseudonym_epoch.to_bytes(8, 'big'))
 
     def export_signing_key_bytes(self, key_id):
         return self._seeds[key_id]
@@ -971,8 +979,69 @@ mod tests {
         );
         assert_eq!(
             msg,
-            "pseudonym key 2 signs only a 32-byte digest, got 12 bytes"
+            format!(
+                "pseudonym key {} signs only a 32-byte digest, got 12 bytes",
+                pseudo.key_handle().id()
+            )
         );
+    }
+
+    /// B1: deriving the same pseudonym twice returns the same key id, which
+    /// re-binds cleanly.
+    #[tokio::test]
+    async fn ffi_custody_callback_rederive_reuses_key_id() {
+        let custody = fake_callback_custody();
+        let handle = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("key");
+        let first = custody
+            .derive_pseudonym(&handle, b"ctx")
+            .await
+            .expect("first derive");
+        let second = custody
+            .derive_pseudonym(&handle, b"ctx")
+            .await
+            .expect("second derive re-binds");
+        assert_eq!(first.key_handle(), second.key_handle());
+        assert_eq!(first.routing_id(), second.routing_id());
+    }
+
+    /// B3: `destroy_key` unbinds the handle. A host that reuses key id 777
+    /// for a second point is refused while the first is bound, and accepted
+    /// once the first is destroyed.
+    #[tokio::test]
+    async fn ffi_custody_callback_destroy_unbinds_pseudonym() {
+        let custody = FfiKeyCustody::Callback(fake_py_custody(Some("fixed_id")));
+        let handle = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("key");
+        let first = custody
+            .derive_pseudonym(&handle, b"ctx-a")
+            .await
+            .expect("first derive");
+        assert_eq!(first.key_handle().id(), 777);
+        let msg = custody_msg(
+            custody
+                .derive_pseudonym(&handle, b"ctx-b")
+                .await
+                .expect_err("id 777 is bound to ctx-a's point"),
+        );
+        assert!(
+            msg.contains("already bound to a different pseudonym point"),
+            "{msg}"
+        );
+        custody
+            .destroy_key(first.key_handle())
+            .await
+            .expect("destroy");
+        let second = custody
+            .derive_pseudonym(&handle, b"ctx-b")
+            .await
+            .expect("re-derive under the freed id");
+        assert_eq!(second.key_handle().id(), 777);
+        assert_ne!(second.public_key(), first.public_key());
     }
 
     /// Each host misbehavior on the pseudonym path fails closed for its own
