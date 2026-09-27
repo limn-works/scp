@@ -374,14 +374,33 @@ cargo fmt --all -- --check
 # Lint
 cargo clippy --workspace --all-targets -- -D warnings
 
+# Lint the PostgreSQL and S3 blob backends. scp-node and scp-relay compile them
+# only under their off-by-default `cloud-blobs` feature, so the --workspace
+# command above compiles neither `crates/scp-transport/src/native/postgres_blob.rs`
+# nor `s3_blob.rs`. Each binary gets its own command because cargo unifies
+# scp-transport's features across every package one invocation builds.
+cargo clippy -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings
+cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings
+cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings
+
 # Build (all crates)
 cargo build --workspace
 
 # Test (all crates)
 cargo nextest run --workspace
 
-# Doc tests
-cargo test --workspace --doc
+# Test the backend selection of each binary's `cloud-blobs` build, and the
+# scp-transport startup tests with every blob backend compiled. The --workspace
+# command above compiles neither cloud backend.
+cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs --test storage_backend_selection
+cargo nextest run --no-tests=fail -p scp-relay --features cloud-blobs --test storage_backend
+cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib startup::tests
+
+# Doc tests. The `--features` list is the one job `rust-doc` passes; without
+# the two `cloud-blobs` features, the command compiles no doctest in
+# `postgres_blob.rs` or `s3_blob.rs`.
+cargo test --workspace --doc \
+  --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant,scp-node/cloud-blobs,scp-relay/cloud-blobs
 
 # Dependency audit
 cargo deny check
@@ -415,10 +434,10 @@ Every push to a PR branch. Target: < 3 minutes.
 | Job | Runs on | Command |
 |-----|---------|---------|
 | fmt | ubuntu-latest | `cargo fmt --all -- --check` |
-| clippy | ubuntu-latest | `cargo clippy --workspace --all-targets -- -D warnings` |
-| test | ubuntu-latest, macos-latest | `cargo nextest run --workspace` |
+| clippy | ubuntu-latest | `cargo clippy --workspace --all-targets -- -D warnings`, then the three `cloud-blobs` lint commands the CI Commands section above gives |
+| test | ubuntu-latest, macos-latest | `cargo nextest run --workspace`. Job `rust-test-optional-features` in `.github/workflows/ci.yml` runs the three `cloud-blobs` test commands the CI Commands section above gives. |
 | build-release | ubuntu-latest, macos-latest, windows-latest | `cargo build --workspace --release` |
-| doc | ubuntu-latest | `cargo test --workspace --doc`, then the `cargo doc` the CI Commands section above gives. A table cell holds no fenced block, and `scripts/tests/ci-gate/ci_gate_selftest.py` compares a documented `cargo doc` against job `rust-doc` in `.github/workflows/ci.yml` only where a shell block encloses it, so this row names that command rather than repeating its flags. |
+| doc | ubuntu-latest | The `cargo test --workspace --doc`, then the `cargo doc`, that the CI Commands section above gives. A table cell holds no fenced block, and `scripts/tests/ci-gate/ci_gate_selftest.py` compares a documented `cargo doc` against job `rust-doc` in `.github/workflows/ci.yml` only where a shell block encloses it, so this row names that command rather than repeating its flags. |
 | deny | ubuntu-latest | `cargo deny check` |
 
 Unit tests and conformance macro suites (`transport_conformance!()`, `storage_conformance!()`, etc.) run as part of `cargo nextest run --workspace` against in-memory implementations.
