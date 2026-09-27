@@ -1,6 +1,6 @@
 # Memory stores in SCP
 
-This file says where each kind of fact is written, and when an agent reads each store. Each fact goes to exactly one store. Write facts in your own words; Flex holds every message verbatim. A short exact phrase of Alec's is useful as an anchor, because a keyword search for it in Flex finds the source message. Vestige is the working recall layer and Flex the perfect-retrieval layer; they are used together. Claude Code's auto-memory is turned off and never written. SCP has its own Vestige store, which a local-scope `vestige` MCP entry opens for a session started in the main checkout; a session started inside a worktree gets the user-scope `global` store; `~/.claude/CLAUDE.md` gives the tool mechanics and holds the rules that apply to all projects.
+This file says where each kind of fact is written, and when an agent reads each store. Each fact goes to exactly one store. Write facts in your own words; Flex holds every message verbatim. A short exact phrase of Alec's is useful as an anchor, because a keyword search for it in Flex finds the source message. Vestige is the working recall layer and Flex the perfect-retrieval layer; they are used together. Claude Code's auto-memory is turned off and never written. SCP has its own Vestige store, which a local-scope `vestige` MCP entry opens for a session started in the main checkout; a session started inside a worktree has no Vestige server and uses Flex; `~/.claude/CLAUDE.md` gives the tool mechanics and holds the rules that apply to all projects.
 
 ## Where each fact goes
 
