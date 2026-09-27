@@ -17,8 +17,24 @@
 
 #![allow(clippy::expect_used)]
 
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::{Command, Output};
+
+/// The `SCP_RELAY_STORAGE_BACKEND` values every node mode must reject: the two
+/// cloud backends, and on Unix a value that is not valid UTF-8.
+///
+/// The non-UTF-8 value is a value the operator set, so it must be rejected as
+/// unknown rather than read as unset, which would select `sqlite`.
+fn rejected_backend_values() -> Vec<OsString> {
+    let mut values = vec![OsString::from("postgres"), OsString::from("s3")];
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        values.push(OsString::from_vec(b"sq\xfflite".to_vec()));
+    }
+    values
+}
 
 /// Returns the path to the compiled `scp-node` binary.
 ///
@@ -30,7 +46,7 @@ fn node_bin() -> std::path::PathBuf {
 
 /// Runs a persistent `scp-node` in `cwd` with `storage_dir` as its node
 /// storage and `blob_db` as its sqlite blob path, plus `extra` variables.
-fn run_node(cwd: &Path, storage_dir: &Path, blob_db: &Path, extra: &[(&str, &str)]) -> Output {
+fn run_node(cwd: &Path, storage_dir: &Path, blob_db: &Path, extra: &[(&str, &OsStr)]) -> Output {
     let mut command = Command::new(node_bin());
     command
         .current_dir(cwd)
@@ -52,12 +68,14 @@ fn run_node(cwd: &Path, storage_dir: &Path, blob_db: &Path, extra: &[(&str, &str
 
 /// `postgres` and `s3` fail on every build: a default build compiled neither
 /// arm and names the `cloud-blobs` feature, and a `cloud-blobs` build finds no
-/// `SCP_RELAY_DATABASE_URL` or `SCP_RELAY_S3_BUCKET`. In every case the node
-/// exits non-zero and the storage directory it was given does not exist
-/// afterwards, so it wrote no `.key` file and opened no database.
+/// `SCP_RELAY_DATABASE_URL` or `SCP_RELAY_S3_BUCKET`. A value that is not
+/// valid UTF-8 names no backend. In every case the node exits non-zero and the
+/// storage directory it was given does not exist afterwards, so it wrote no
+/// `.key` file and opened no database.
 #[test]
 fn a_rejected_blob_backend_writes_no_storage_before_exiting() {
-    for backend in ["postgres", "s3"] {
+    for value in rejected_backend_values() {
+        let backend = value.to_string_lossy();
         let tmp = tempfile::tempdir().expect("tempdir");
         let storage_dir = tmp.path().join("node-storage");
         let blob_db = tmp.path().join("blobs.db");
@@ -66,7 +84,7 @@ fn a_rejected_blob_backend_writes_no_storage_before_exiting() {
             tmp.path(),
             &storage_dir,
             &blob_db,
-            &[("SCP_RELAY_STORAGE_BACKEND", backend)],
+            &[("SCP_RELAY_STORAGE_BACKEND", value.as_os_str())],
         );
 
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -75,7 +93,7 @@ fn a_rejected_blob_backend_writes_no_storage_before_exiting() {
             "a rejected {backend} backend must exit non-zero; stderr: {stderr}"
         );
         assert!(
-            stderr.contains(backend),
+            stderr.contains(&*backend),
             "the rejection names the requested backend; stderr: {stderr}"
         );
         assert!(
@@ -101,7 +119,7 @@ fn a_rejected_dht_mode_writes_no_storage_before_exiting() {
             tmp.path(),
             &storage_dir,
             &blob_db,
-            &[("SCP_NODE_DHT_MODE", mode)],
+            &[("SCP_NODE_DHT_MODE", OsStr::new(mode))],
         );
 
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -153,22 +171,24 @@ fn an_unusable_storage_path_opens_no_blob_database() {
     );
 }
 
-/// `--self-host` opens only `SQLite`, so `SCP_RELAY_STORAGE_BACKEND=postgres`
-/// or `=s3` exits non-zero, names the value, and leaves no storage directory,
-/// instead of serving from a `SQLite` store the operator did not select.
+/// `--self-host` opens only `SQLite`, so `SCP_RELAY_STORAGE_BACKEND=postgres`,
+/// `=s3`, or a value that is not valid UTF-8 exits non-zero, names the value,
+/// and leaves no storage directory, instead of serving from a `SQLite` store
+/// the operator did not select.
 ///
 /// A regression would start a server that never exits, so the child is killed
 /// after 30 seconds and the test fails on the missing exit.
 #[test]
 fn self_host_rejects_a_cloud_backend_before_writing_storage() {
-    for backend in ["postgres", "s3"] {
+    for value in rejected_backend_values() {
+        let backend = value.to_string_lossy();
         let tmp = tempfile::tempdir().expect("tempdir");
         let storage_dir = tmp.path().join("node-storage");
         let mut child = Command::new(node_bin())
             .arg("--self-host")
             .current_dir(tmp.path())
             .env("SCP_STORAGE_PATH", &storage_dir)
-            .env("SCP_RELAY_STORAGE_BACKEND", backend)
+            .env("SCP_RELAY_STORAGE_BACKEND", &value)
             .env("SCP_NODE_DHT_MODE", "disabled")
             .env("SCP_NODE_SELF_HOST_NO_NAT", "1")
             .env("SCP_NODE_SELF_HOST_PORT", "0")
@@ -205,6 +225,42 @@ fn self_host_rejects_a_cloud_backend_before_writing_storage() {
             !storage_dir.exists(),
             "a rejected {backend} backend must create no storage directory; found {}",
             storage_dir.display()
+        );
+    }
+}
+
+/// A `--features cloud-blobs` build of this binary compiled both cloud arms,
+/// so `postgres` and `s3` fail on the variable each backend requires and never
+/// on "not compiled into this binary".
+///
+/// Every other test in this file chooses its expected outcome from the build,
+/// so without this test a `cloud-blobs` list that stopped enabling
+/// `scp-transport/postgres-blob` or `scp-transport/s3-blob` would leave the
+/// `cloud-blobs` lane green while the binary told operators to rebuild with the
+/// flag they had just passed.
+#[cfg(feature = "cloud-blobs")]
+#[test]
+fn the_cloud_blobs_feature_compiles_both_cloud_backends() {
+    for (backend, required) in [
+        ("postgres", "SCP_RELAY_DATABASE_URL"),
+        ("s3", "SCP_RELAY_S3_BUCKET"),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let output = run_node(
+            tmp.path(),
+            &tmp.path().join("node-storage"),
+            &tmp.path().join("blobs.db"),
+            &[("SCP_RELAY_STORAGE_BACKEND", OsStr::new(backend))],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("not compiled"),
+            "a cloud-blobs build must compile the {backend} arm; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains(required),
+            "a cloud-blobs build must reach the {backend} arm and name {required}; \
+             stderr: {stderr}"
         );
     }
 }

@@ -401,3 +401,74 @@ fn default_backend_is_sqlite() {
         "relay should have logged 'using sqlite blob storage'; output: {output}"
     );
 }
+
+/// A `--features cloud-blobs` build of this binary compiled both cloud arms,
+/// so `postgres` and `s3` fail on the variable each backend requires and never
+/// on "not compiled into this binary".
+///
+/// Every other test in this file chooses its expected outcome with
+/// [`backend_is_compiled`], so without this test a `cloud-blobs` list that
+/// stopped enabling `scp-transport/postgres-blob` or `scp-transport/s3-blob`
+/// would leave the `cloud-blobs` lane green while the relay told operators to
+/// rebuild with the flag they had just passed.
+#[cfg(feature = "cloud-blobs")]
+#[test]
+fn the_cloud_blobs_feature_compiles_both_cloud_backends() {
+    for (backend, required) in [
+        ("postgres", "SCP_RELAY_DATABASE_URL"),
+        ("s3", "SCP_RELAY_S3_BUCKET"),
+    ] {
+        let output = Command::new(relay_bin())
+            .env("SCP_RELAY_STORAGE_BACKEND", backend)
+            .env_remove(required)
+            .env_remove("RUST_LOG")
+            .output()
+            .expect("failed to execute scp-relay");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("not compiled"),
+            "a cloud-blobs build must compile the {backend} arm; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains(required),
+            "a cloud-blobs build must reach the {backend} arm and name {required}; \
+             stderr: {stderr}"
+        );
+    }
+}
+
+/// A `SCP_RELAY_STORAGE_BACKEND` value that is not valid UTF-8 is a value the
+/// operator set. The relay rejects it as unknown and exits non-zero, instead of
+/// reading it as unset and opening the default `sqlite` store.
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_backend_value_is_rejected_not_defaulted() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = tempfile::tempdir().expect("failed to create tempdir");
+    let db_path = tmp.path().join("must-not-exist.db");
+    let output = Command::new(relay_bin())
+        .env(
+            "SCP_RELAY_STORAGE_BACKEND",
+            std::ffi::OsStr::from_bytes(b"sq\xfflite"),
+        )
+        .env("SCP_RELAY_STORAGE_PATH", &db_path)
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("failed to execute scp-relay");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a non-UTF-8 backend value must exit non-zero; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("unknown storage backend"),
+        "a non-UTF-8 backend value must be rejected as unknown; stderr: {stderr}"
+    );
+    assert!(
+        !db_path.exists(),
+        "a rejected backend value must open no sqlite store at {}",
+        db_path.display()
+    );
+}

@@ -401,9 +401,34 @@ pub fn check_storage_selection_from_env() {
 
 /// The lowercased `SCP_RELAY_STORAGE_BACKEND` value, `sqlite` when unset.
 fn selected_backend() -> String {
-    env::var("SCP_RELAY_STORAGE_BACKEND")
-        .unwrap_or_else(|_| "sqlite".to_owned())
+    storage_backend_var()
+        .unwrap_or_else(|| "sqlite".to_owned())
         .to_lowercase()
+}
+
+/// The `SCP_RELAY_STORAGE_BACKEND` value the operator set, or `None` when the
+/// variable is unset.
+///
+/// Every caller that selects a blob backend reads the variable through this
+/// function, so an unset variable is the only case that selects the default.
+#[must_use]
+pub fn storage_backend_var() -> Option<String> {
+    storage_backend_value(env::var("SCP_RELAY_STORAGE_BACKEND"))
+}
+
+/// Maps the result of reading `SCP_RELAY_STORAGE_BACKEND` to the value the
+/// operator set.
+///
+/// A value that is not valid UTF-8 is still a value the operator set, so it
+/// returns that value decoded lossily rather than `None`. The decoded value
+/// carries a U+FFFD replacement character, so it names no backend, and every
+/// caller rejects it as unknown instead of opening the default store.
+fn storage_backend_value(read: Result<String, env::VarError>) -> Option<String> {
+    match read {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(raw)) => Some(raw.to_string_lossy().into_owned()),
+    }
 }
 
 /// The environment variable the constructor for `backend` cannot open the
@@ -544,7 +569,8 @@ pub async fn start_relay_from_env() -> (
 #[cfg(test)]
 mod tests {
     use super::{
-        BACKENDS, backend_is_compiled, reject_backend_message, required_var, valid_backends,
+        BACKENDS, backend_is_compiled, reject_backend_message, required_var, storage_backend_value,
+        valid_backends,
     };
 
     /// A value naming no backend reads as a typo, and the message lists what
@@ -743,5 +769,40 @@ mod tests {
                 backend.name
             );
         }
+    }
+
+    /// Only an unset `SCP_RELAY_STORAGE_BACKEND` selects the default. A value
+    /// that is not valid UTF-8 is a value the operator set: it reaches the
+    /// callers as a string that names no backend, so `storage_from_env` and
+    /// `check_storage_selection_from_env` reject it as unknown and `--self-host`
+    /// rejects it too, instead of all three opening `sqlite`.
+    #[cfg(unix)]
+    #[test]
+    fn only_an_unset_variable_selects_the_default_backend() {
+        use std::env::VarError;
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        assert_eq!(storage_backend_value(Err(VarError::NotPresent)), None);
+        assert_eq!(
+            storage_backend_value(Ok("Redb".to_owned())).as_deref(),
+            Some("Redb")
+        );
+
+        let raw = OsString::from_vec(b"sq\xfflite".to_vec());
+        let value = storage_backend_value(Err(VarError::NotUnicode(raw)));
+        let value = value.unwrap_or_default();
+        assert!(
+            !value.is_empty(),
+            "a non-UTF-8 value must not read as unset"
+        );
+        assert!(
+            !BACKENDS.iter().any(|b| b.name == value.to_lowercase()),
+            "a non-UTF-8 value must name no backend; got '{value}'"
+        );
+        assert!(
+            reject_backend_message(&value.to_lowercase()).contains("unknown storage backend"),
+            "a non-UTF-8 value must be rejected as unknown"
+        );
     }
 }

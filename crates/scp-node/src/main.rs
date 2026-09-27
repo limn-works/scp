@@ -804,9 +804,7 @@ fn self_host_backend_conflict(selected: Option<&str>) -> Option<String> {
 /// startup banner.
 async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf>) {
     // Checked before the banner, the sockets and the storage directory exist.
-    if let Some(message) =
-        self_host_backend_conflict(env::var("SCP_RELAY_STORAGE_BACKEND").ok().as_deref())
-    {
+    if let Some(message) = self_host_backend_conflict(startup::storage_backend_var().as_deref()) {
         eprintln!("{message}");
         std::process::exit(1);
     }
@@ -1318,13 +1316,6 @@ mod tests {
         );
     }
 
-    /// Regression guard (SCP-CAPINJECT-010): ephemeral mode MUST select the
-    /// in-memory blob backend — no persistence, env overrides ignored. This pins
-    /// the ephemeral caller's boundary selection so it cannot silently regress to
-    /// a durable / env-driven backend (`startup::storage_from_env`, which defaults
-    /// to `Sqlite`), which would break the all-in-memory contract documented on
-    /// `run_full_node_ephemeral` and re-persist blobs to disk. If someone swaps
-    /// `ephemeral_blob_backend()` to any non-in-memory backend, this fails.
     /// `--self-host` opens only `SQLite`, so it accepts an unset variable and
     /// `sqlite` in any case, and rejects every other value, `postgres` and `s3`
     /// included, with a message naming the value.
@@ -1344,6 +1335,13 @@ mod tests {
         }
     }
 
+    /// Regression guard (SCP-CAPINJECT-010): ephemeral mode MUST select the
+    /// in-memory blob backend — no persistence, env overrides ignored. This pins
+    /// the ephemeral caller's boundary selection so it cannot silently regress to
+    /// a durable / env-driven backend (`startup::storage_from_env`, which defaults
+    /// to `Sqlite`), which would break the all-in-memory contract documented on
+    /// `run_full_node_ephemeral` and re-persist blobs to disk. If someone swaps
+    /// `ephemeral_blob_backend()` to any non-in-memory backend, this fails.
     #[test]
     fn ephemeral_uses_in_memory_blob() {
         assert!(
