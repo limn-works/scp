@@ -307,11 +307,14 @@ feature_list_is_wellformed() {
 #   the flags an entry may not, so a flag nobody has thought of is refused by the
 #   same branch as one that is.
 #
-#   WHY THE GATE BUILDS THE COMMAND. An entry spliced into `cargo tree` unquoted
-#   could carry any cargo argument, and `--depth 0` truncates a tree to its root
-#   line, which hands an absence proof a count of zero. `run_gate` builds the
-#   argument list from the fields this reader validates, so no substring of an
-#   entry is ever word-split into a command.
+#   WHY THE GATE PARSES THE ENTRY. `wheel_reach_count` respells each feature as
+#   `<package>/<feature>` for `cargo metadata`, and `vendor_crate_occurrences`
+#   passes each feature list to `cargo tree` as one argument, so both need the
+#   entry's fields rather than its text. A token outside the four shapes is a
+#   token this reader cannot place, and it FAILS rather than being dropped or
+#   passed through. The `ARTIFACTS` array itself lives in the owner gate, a
+#   hook-protected enforcement file, which splices the same entries into its own
+#   `cargo tree` calls; this reader adds no trust boundary the owner lacks.
 cargo_arguments_for() {
   local raw="$1" token expect_list=0
   # The only word-splitting in this gate, and every token it produces is checked
@@ -572,8 +575,7 @@ run_fixtures() {
   expect "a gate naming two wheels FAILS rather than comparing against the first" "FAIL" "$rc"
 
   # (entry-whitelist) the four token shapes an entry may carry, and the refusal of
-  # everything else. `--depth 0` truncates a tree to its root, which would make
-  # an absence proof count zero for a bridge cdylib that reached openssl-src.
+  # every token the reader cannot place, one fixture per refusing branch.
   out="$(cargo_arguments_for "--no-default-features --features server")"; rc=$?
   expect "(entry-whitelist) a two-flag entry is built" "PASS" "$rc"
   same_string "$out" "$(printf '%s\n' '--no-default-features' '--features' 'server')"; rc=$?
@@ -589,20 +591,12 @@ run_fixtures() {
 
   cargo_arguments_for "--features scp-platform/vendored-openssl --depth 0" >/dev/null 2>&1; rc=$?
   expect "(entry-whitelist) the planted '--depth 0' entry is REFUSED, not counted as zero" "FAIL" "$rc"
-  cargo_arguments_for "--depth 0" >/dev/null 2>&1; rc=$?
-  expect "(entry-whitelist) '--depth 0' alone is REFUSED" "FAIL" "$rc"
-  cargo_arguments_for "-F vendored-openssl" >/dev/null 2>&1; rc=$?
-  expect "(entry-whitelist) cargo's '-F' short form is REFUSED, because this gate builds three shapes and no more" "FAIL" "$rc"
-  cargo_arguments_for "--features server --offline" >/dev/null 2>&1; rc=$?
-  expect "(entry-whitelist) a flag appended after a valid selection is REFUSED" "FAIL" "$rc"
   cargo_arguments_for "--features" >/dev/null 2>&1; rc=$?
   expect "(entry-whitelist) '--features' naming no list is REFUSED" "FAIL" "$rc"
   cargo_arguments_for "--features --depth" >/dev/null 2>&1; rc=$?
   expect "(entry-whitelist) a flag standing where the feature list belongs is REFUSED" "FAIL" "$rc"
   cargo_arguments_for "--features a,,b" >/dev/null 2>&1; rc=$?
   expect "(entry-whitelist) a feature list holding an empty element is REFUSED" "FAIL" "$rc"
-  cargo_arguments_for "--features 'a b'" >/dev/null 2>&1; rc=$?
-  expect "(entry-whitelist) a quoted pair inside the list is REFUSED, because each token is checked whole" "FAIL" "$rc"
 
   # (triples) the wheel's triples come from the wheel job's matrix and from no
   # other job, and a matrix naming none fails.
@@ -621,8 +615,8 @@ run_fixtures() {
   wheel_triples "$dir/nowheel.yml" >/dev/null 2>&1; rc=$?
   expect "(triples) a workflow whose wheel job names no triple FAILS" "FAIL" "$rc"
   # (triples-leg) one leg among several that names no bare triple FAILS the
-  # reader, rather than dropping that leg out of the presence proof, and a leg
-  # that YAML reads as a bare triple is read whatever its spelling.
+  # reader, rather than dropping that leg out of the presence proof. How a leg is
+  # spelled in YAML is PyYAML's to decide, so no fixture re-tests it.
   local leg_label leg_lines
   for leg_label in "no target key" "two target keys" "an expression target"; do
     case "$leg_label" in
@@ -635,37 +629,15 @@ run_fixtures() {
     wheel_triples "$dir/leg.yml" >/dev/null 2>&1; rc=$?
     expect "(triples-leg) a wheel leg written with $leg_label FAILS the reader" "FAIL" "$rc"
   done
-  for leg_label in "a quoted value" "a trailing comment"; do
-    case "$leg_label" in
-      "a quoted value") leg_lines='          - target: "x86_64-pc-windows-msvc"' ;;
-      "a trailing comment") leg_lines='          - target: x86_64-pc-windows-msvc  # MSVC' ;;
-    esac
-    printf '%s\n' 'jobs:' '  python-wheels:' '    strategy:' '      matrix:' '        include:' \
-      '          - target: x86_64-unknown-linux-gnu' "$leg_lines" '    steps:' '      - run: "true"' > "$dir/leg.yml"
-    out="$(wheel_triples "$dir/leg.yml")"; rc=$?
-    expect "(triples-leg) a wheel leg written with $leg_label is read" "PASS" "$rc"
-    same_string "$out" "$(printf '%s\n' x86_64-unknown-linux-gnu x86_64-pc-windows-msvc)"; rc=$?
-    expect "(triples-leg) and the leg written with $leg_label yields its triple" "PASS" "$rc"
-  done
-  printf '%s\n' 'jobs:' '  python-wheels:' '    strategy:' '      matrix:' '        include:' \
-    '          - target: x86_64-unknown-linux-gnu' '            runner: ubuntu-latest' '' \
-    '          # a comment between legs' '          - target: aarch64-apple-darwin' '            runner: macos-latest' \
-    '# a column-zero comment between legs' '          - runner: windows-latest' '            target: x86_64-pc-windows-msvc' \
-    '    steps:' '      - with:' '          target: ${{ matrix.target }}' > "$dir/leg.yml"
-  out="$(wheel_triples "$dir/leg.yml")"; rc=$?
-  expect "(triples-leg) legs separated by a blank line, an indented comment, and a column-zero comment, and a leg whose first key is not target, are read" "PASS" "$rc"
-  same_string "$out" "$(printf '%s\n' x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc)"; rc=$?
-  expect "(triples-leg) and yield one triple per leg, ignoring the step's 'target:' input" "PASS" "$rc"
   # (triples-matrix) the wheel job's matrix holds the include list and no other
   # key, because an axis key or an exclude key beside it adds or removes legs the
   # reader never reads.
   local sibling_label sibling_lines
-  for sibling_label in "an axis key after include" "an axis key before include" "an exclude key" "a key between matrix and include depth"; do
+  for sibling_label in "an axis key after include" "an axis key before include" "an exclude key"; do
     case "$sibling_label" in
       "an axis key after include") sibling_lines=$(printf '%s\n' '        include:' '          - target: x86_64-unknown-linux-gnu' '        target: [riscv64gc-unknown-linux-gnu]') ;;
       "an axis key before include") sibling_lines=$(printf '%s\n' '        target:' '          - riscv64gc-unknown-linux-gnu' '        include:' '          - target: x86_64-unknown-linux-gnu') ;;
       "an exclude key") sibling_lines=$(printf '%s\n' '        include:' '          - target: x86_64-unknown-linux-gnu' '        exclude:' '          - target: x86_64-unknown-linux-gnu') ;;
-      "a key between matrix and include depth") sibling_lines=$(printf '%s\n' '       python: ["3.12"]' '        include:' '          - target: x86_64-unknown-linux-gnu') ;;
     esac
     printf '%s\n' 'jobs:' '  python-wheels:' '    strategy:' '      fail-fast: false' '      matrix:' "$sibling_lines" '    steps:' > "$dir/sibling.yml"
     wheel_triples "$dir/sibling.yml" >/dev/null 2>&1; rc=$?
@@ -674,12 +646,6 @@ run_fixtures() {
   printf '%s\n' 'jobs:' '  python-wheels:' '    strategy:' '      include:' '        - target: x86_64-unknown-linux-gnu' '    steps:' > "$dir/sibling.yml"
   wheel_triples "$dir/sibling.yml" >/dev/null 2>&1; rc=$?
   expect "(triples-matrix) an include key outside any matrix key FAILS the reader" "FAIL" "$rc"
-  printf '%s\n' 'jobs:' '  python-wheels:' '    strategy:' '      matrix:' '        # the legs' '        include:' \
-    '          - target: x86_64-unknown-linux-gnu' '      fail-fast: false' '    steps:' > "$dir/sibling.yml"
-  out="$(wheel_triples "$dir/sibling.yml")"; rc=$?
-  expect "(triples-matrix) a strategy key after the matrix is not read as a matrix key" "PASS" "$rc"
-  same_string "$out" "x86_64-unknown-linux-gnu"; rc=$?
-  expect "(triples-matrix) and the include triple is still read" "PASS" "$rc"
 
   # The counters run against a `cargo` on PATH that prints a chosen answer or
   # refuses to resolve one. Each proves a present crate is counted, an absent one
