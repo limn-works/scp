@@ -587,21 +587,32 @@ def test_package_import_registers_no_bare_name_alias() -> None:
     assert output == "False"
 
 
-def test_package_import_calls_no_log_forwarding_export() -> None:
-    """``import scp_sdk`` calls no ``init_pyo3_log``, even on a build that exports one.
+def test_package_import_never_swallows_a_log_forwarding_failure() -> None:
+    """``import scp_sdk`` never calls a failing ``init_pyo3_log`` and then succeeds.
 
-    No crate defines that export, so a probe for it could never fire on a real
-    build and only let the SDK document log forwarding it does not perform.
+    The deleted probe called ``init_pyo3_log`` and discarded its exception, so a
+    build that failed to install log forwarding still imported cleanly. This test
+    accepts an import that leaves the export uncalled, and accepts an import that
+    raises the export's error. ADR-014, Python SDK Wrappers, requires Rust
+    ``tracing`` forwarding, so a later change that installs the log bridge on
+    import still passes when it lets the installer's error reach the caller.
     """
     output = _import_package_over(
         """
         calls = []
-        module.init_pyo3_log = lambda: calls.append("called")
-        import scp_sdk
-        print(calls)
+        def init_pyo3_log():
+            calls.append("called")
+            raise RuntimeError("log bridge install failed")
+        module.init_pyo3_log = init_pyo3_log
+        try:
+            import scp_sdk
+        except RuntimeError as error:
+            print("propagated" if calls else f"unrelated: {error}")
+        else:
+            print("swallowed" if calls else "not called")
         """
     )
-    assert output == "[]"
+    assert output in {"not called", "propagated"}
 
 
 @pytest.mark.parametrize(("module_name", "accessor"), BRIDGE_ACCESSORS)
