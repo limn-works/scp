@@ -26,7 +26,7 @@ Key properties:
 
 ### Prerequisites
 
-Install the SCP Python SDK from the repository root:
+Install the SCP Python SDK from source. It needs CPython 3.12 or 3.13, a Rust toolchain, and a full perl, plus make on Linux and macOS: the build compiles the native extension and the OpenSSL its SQLCipher links (`bindings/python/README.md` §Requirements).
 
 ```bash
 pip install -e ../../bindings/python

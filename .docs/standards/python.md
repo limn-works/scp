@@ -235,7 +235,7 @@ pytest bindings/python/tests/ -v --asyncio-mode=auto
 
 ## Platform Wheels
 
-maturin builds binary wheels with the Rust extension embedded. Users on a platform and CPython minor a wheel covers (CPython 3.10-3.13 on Linux x86_64 and aarch64 with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64) install with `pip install scp-python` — no Rust toolchain required. On any other platform with CPython 3.10-3.13, pip builds the sdist, which compiles OpenSSL and needs a Rust toolchain and a full perl, plus make on Linux and macOS. CPython 3.14 and newer cannot install: the locked PyO3 0.24 builds for CPython 3.13 at most, so the sdist build fails there.
+maturin builds binary wheels with the Rust extension embedded. Users on a platform and CPython minor a wheel covers (CPython 3.10-3.13 on Linux x86_64 and aarch64 with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64) install with `pip install scp-python` — no Rust toolchain required. On any other platform with CPython 3.10-3.13, pip builds the sdist, which compiles OpenSSL and needs a Rust toolchain and a full perl, plus make on Linux and macOS. CPython 3.14 and newer cannot install: the locked PyO3 0.24 builds for CPython 3.13 at most, so `requires-python` stops below 3.14 and pip finds no version to install.
 
 | Platform | Architecture | Wheel tag |
 |----------|-------------|-----------|

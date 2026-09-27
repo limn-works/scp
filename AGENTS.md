@@ -76,7 +76,7 @@ A failed check means the plan is incomplete: widen it or file the dependent issu
 
 ## Toolchain
 
-mise installs every tool except Rust and these: the full perl (plus make on Linux and macOS) that the Python binding's `maturin develop` needs to compile OpenSSL, PyYAML under python3.12, and, on macOS, coreutils' `timeout`, which `scripts/fix-round-check.sh` needs. **Never use npm or npx** (bun only). Use `python3.12`, never the system `python3`.
+mise installs every tool except Rust and these, which README.md's prerequisites name: the full perl (plus make on Linux and macOS) that the Python binding's `maturin develop` needs to compile OpenSSL; PyYAML, the tree-sitter grammars, and ruff under python3.12; jq; and, on macOS, coreutils' `timeout`, which `scripts/fix-round-check.sh` needs. **Never use npm or npx** (bun only). Use `python3.12`, never the system `python3`.
 
 `rust-toolchain.toml` alone names the Rust version (`fuzz/rust-toolchain.toml` the fuzz nightly). To raise it, edit `channel`, run the CI clippy command below, and fix every new lint in the same PR; never lower it. A `RUSTUP_TOOLCHAIN` in the environment overrides both files, so `unset RUSTUP_TOOLCHAIN` before any gate (`scripts/check-resolved-rustc.sh` checks). mise reads every ancestor `.mise.toml`, so a stale one in the main checkout reaches every worktree.
 

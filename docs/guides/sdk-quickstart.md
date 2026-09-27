@@ -38,7 +38,7 @@ cargo --version
 
 ### Python
 
-- CPython 3.10-3.13 (macOS's system `python3` from Xcode may be 3.9). CPython 3.14 and newer cannot install: the locked PyO3 0.24 builds for CPython 3.13 at most, so no wheel covers it and the source build fails
+- CPython 3.10-3.13 (macOS's system `python3` from Xcode may be 3.9). CPython 3.14 and newer cannot install: the locked PyO3 0.24 builds for CPython 3.13 at most, so `requires-python` stops below 3.14 and pip finds no version to install
 - Pre-built wheels cover CPython 3.10-3.13 on Linux x86_64 and aarch64 with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64
 - A build from source compiles OpenSSL, both when pip falls back to the source distribution because no wheel matches and when you run `maturin develop` for development against the local workspace: it needs a Rust toolchain and a full perl, plus make on Linux and macOS (see `bindings/python/README.md` §Requirements)
 

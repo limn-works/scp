@@ -4,7 +4,8 @@ Minimal Python agent using the SCP SDK. Creates a DID identity, opens an encrypt
 
 ## Prerequisites
 
-- Python 3.12+
+- CPython 3.12 or 3.13 (the SDK's locked PyO3 0.24 builds for CPython 3.13 at most)
+- For the source install: a Rust toolchain and a full perl, plus make on Linux and macOS, which compile the native extension and the OpenSSL its SQLCipher links (`bindings/python/README.md` §Requirements)
 - SCP Python SDK (`pip install scp-python`, or install from source: `pip install -e ../../bindings/python`)
 
 ## Build and Run

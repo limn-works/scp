@@ -6,7 +6,9 @@ build-backend = "maturin"
 name = "scp-python"
 version = "0.1.0b2"
 description = "SCP (Shared Context Protocol) Python SDK — cryptographic identity, governed contexts, and trust for AI agents"
-requires-python = ">=3.10"
+# The ceiling: the locked PyO3 0.24 builds for CPython 3.13 at most, so pip refuses
+# 3.14 and newer at resolution instead of failing in the sdist build.
+requires-python = ">=3.10,<3.14"
 license = { text = "MIT OR Apache-2.0" }
 readme = "README.md"
 keywords = ["scp", "protocol", "agents", "identity", "did", "ucan", "mls", "context"]
