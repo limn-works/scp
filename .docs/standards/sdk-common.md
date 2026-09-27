@@ -338,7 +338,7 @@ reusing `8001` would make one code string mean both "storage key not found" and
 | `SCP-ATTEST-9022` | Apple holds no attestation for the stored App Attest key |
 | `SCP-ATTEST-9023` | Apple's App Attest service rejected this device's key |
 | `SCP-ATTEST-9024` | Apple could not reach its App Attest service |
-| `SCP-ATTEST-9025` | The App Attest adapter violated one of its own invariants |
+| `SCP-ATTEST-9025` | The App Attest adapter reached a state no caller input produces: Apple's service answered a completion handler with neither a value nor an error, a key ID did not base64-decode to 32 bytes, or the adapter was deallocated during a call |
 
 ### SCP-IDENT-1017 and its cross-bridge contract
 

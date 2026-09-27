@@ -560,8 +560,10 @@ pub trait DeviceAttestationProvider: Send + Sync {
     ///   `device_id` before submission to the platform attestation service).
     /// `device_id` — stable identifier for this device instance.
     ///
-    /// Returns the platform attestation object bytes (Apple: CBOR-encoded
-    /// attestation; Android: Play Integrity token bytes).
+    /// Returns the platform attestation bytes. Apple: bytes 0–31 are the App
+    /// Attest key identifier, base64-decoded, and every later byte belongs to
+    /// the CBOR attestation object Apple signed (ADR-025 acceptance criterion
+    /// 3). Android: the Play Integrity token bytes.
     async fn attest(&self, challenge: Vec<u8>, device_id: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 
     /// Generate a per-request assertion proving key possession.
@@ -952,13 +954,20 @@ mod tests {
     /// `attest` and `assert_request`, and the generated Swift glue lowers that
     /// value with the `ScpError` converter. This test lifts such a buffer
     /// through the lift `UniFFI` runs for `Result<Vec<u8>, ScpError>` callback
-    /// returns, and requires an `Err` carrying the unsupported code.
+    /// returns, and requires an `Err` carrying each listed code. It pins
+    /// `UniFFI`'s lift of that return type only: which code the Swift adapter
+    /// throws for which condition is pinned by the Swift tests, and the Swift
+    /// adapter's `throws(ScpError)` signatures are what keep it from throwing
+    /// any other type.
     #[test]
     fn device_attestation_callback_scp_error_lifts_to_an_error_value() {
         use uniffi::{LiftReturn, LowerError};
-        for code in [codes::ATTEST_9019, codes::ATTEST_9025] {
+        for (code, msg) in [
+            (codes::ATTEST_9019, "DCAppAttestService.isSupported is false"),
+            (codes::ATTEST_9025, "generateKey returned neither keyId nor error"),
+        ] {
             let thrown = ScpError::Identity {
-                msg: "DCAppAttestService.isSupported is false".to_owned(),
+                msg: msg.to_owned(),
                 code: code.to_owned(),
             };
             let buf = <ScpError as LowerError<crate::UniFfiTag>>::lower_error(thrown);

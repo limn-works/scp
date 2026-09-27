@@ -10,8 +10,11 @@
 `verify(token:)` gained clause 5, which requires the credential ID in `authData`
 to equal `SHA-256` of the credential certificate's public key and to equal the
 App Attest key identifier the adapter stored. Roughly forty cases in
-`AppleDeviceAttestationTests.swift` assert `verify(token:) == false`, each naming
-one clause it breaks.
+`AppleDeviceAttestationTests.swift` asserted `verify(token:) == false`, each
+naming one clause it broke. On 2026-09-26 the maintainer ruled that the Swift
+`verify` method is deleted and that the identity workstream owns the
+reading-side verifier, so those cases were deleted with `verify`; the hazard
+below applies to that verifier's tests when it is built.
 
 Two hazards arrived with that clause, and both make a case pass while testing
 nothing:
@@ -44,5 +47,3 @@ the only one left to fail.
 
 - `.docs/lessons/two-independent-checks-bind-nothing.md` — the defect whose fix
   introduced this hazard.
-- `.docs/lessons/test-whitelist-masks-ci-red.md`
-- `.docs/lessons/conformance-kdoc-is-not-coverage.md`

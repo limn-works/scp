@@ -1216,7 +1216,10 @@ pub const ATTEST_9022: &str = "SCP-ATTEST-9022";
 pub const ATTEST_9023: &str = "SCP-ATTEST-9023";
 /// Apple could not reach its App Attest service.
 pub const ATTEST_9024: &str = "SCP-ATTEST-9024";
-/// The App Attest adapter violated one of its own invariants.
+/// The App Attest adapter reached a state no caller input produces: Apple's
+/// service answered a completion handler with neither a value nor an error, a
+/// key ID did not base64-decode to 32 bytes, or the adapter was deallocated
+/// during a call.
 pub const ATTEST_9025: &str = "SCP-ATTEST-9025";
 
 // -------------------------------------------------------------------------
