@@ -616,6 +616,12 @@ jobs:
       - run: bash scripts/check-toolchain-wiring.sh
       - name: Run toolchain-wiring cases
         run: bash scripts/tests/toolchain-wiring/run-tests.sh
+      # scripts/hooks/pre-commit runs the toolchain check above on every commit, and runs
+      # each language's format and lint steps only for files that differ from what the
+      # commit's parent — or, on a merge, each merged-in head — already carries. These
+      # cases commit through the real hook in throwaway repositories with `cargo` stubbed.
+      - name: Run pre-commit merge cases
+        run: bash scripts/tests/pre-commit-merge/run-tests.sh
       # The compile-steps check reads every workflow file with PyYAML, which
       # `actions/setup-python` does not ship, so the step before it installs the library.
       # The check holds every `Swatinem/rust-cache` step to the group shape the header
