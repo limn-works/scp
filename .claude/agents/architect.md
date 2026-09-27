@@ -1,6 +1,6 @@
 ---
 name: architect
-description: "Use this agent for project structure, module organization, protocol definitions, and architecture decisions. Spin up when starting new feature areas, adding dependencies, creating modules, defining interfaces, or when patterns are unclear or inconsistent.\n\nExamples:\n- User: \"I need to add a new feature module\"\n  Assistant: Uses architect agent to define module structure and protocols before implementation.\n\n- User: \"How should I organize the sync logic?\"\n  Assistant: Uses architect agent to determine proper boundaries and define contracts.\n\n- User: \"Add a new dependency\"\n  Assistant: Uses architect agent to review integration pattern and dependency rules."
+description: "Use this agent to decide crate and module boundaries, protocol definitions, and dependency edges before implementation starts. Invoke it when a change creates a crate or module, adds a dependency edge, or needs a protocol that no ADR yet governs."
 color: blue
 memory: project
 ---

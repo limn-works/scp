@@ -1,6 +1,6 @@
 ---
 name: architecture-reviewer
-description: "Use this agent to review code for architectural soundness \u2014 completeness, scalability, maintainability, ADR compliance, and decision quality. Verifies that the approach is correct, not just the implementation. Invoke on structural changes, new modules, protocol modifications, or any change that establishes a pattern.\n\nExamples:\n\n- After implementing a new module or pattern:\n  Assistant: \"Let me launch the architecture-reviewer agent to validate this approach against our ADRs and architecture patterns.\"\n\n- When a change modifies protocols or module boundaries:\n  Assistant: \"I'll use the architecture-reviewer agent to check whether this structural change maintains our architectural invariants.\"\n\n- When reviewing a significant refactor:\n  Assistant: \"Let me run the architecture-reviewer agent to verify the refactor improves maintainability without breaking architectural decisions.\""
+description: "Use this agent to review a change for architectural soundness: completeness across every file the change obliges, ADR compliance, scalability, maintainability, and the quality of the decision itself. Invoke it on structural changes, new modules, protocol modifications, and changes that set a pattern other code will copy."
 color: red
 memory: project
 ---
@@ -32,7 +32,6 @@ Verify that every structural change:
 ## Project Context
 
 Read these artifacts to understand architectural context:
-- **Architecture**: `CLAUDE.md` (layer diagram, module structure, coding standards)
 - **ADRs**: `.claude/decisions/` (architectural decisions that must be followed)
 - **Standards**: `.claude/standards/`
 
@@ -115,13 +114,3 @@ Is the approach itself correct?
 - **Evaluate the approach, not just the code.** Sometimes correct code implements the wrong approach. That's your finding.
 - **If no ADR applies**, evaluate against CLAUDE.md principles and the existing patterns in the codebase.
 - **Flag missing ADRs.** If a change establishes a new pattern that others must follow, it should be an ADR.
-
-## Mandate: no dev/test-only stand-in masking production (MANDATORY)
-
-Flag as a finding — with the same severity as a correctness bug — any dev/test-only construct reachable on a **shipped production path** that masks an unfinished real implementation or stubs for prod:
-
-- a security **nullifier** — in-memory/plaintext key custody, an always-succeeds attestation/certificate verifier, a non-resolving or in-memory DID/DHT resolver, an in-memory pre-rotation recovery custody;
-- a `#[cfg(test)]`- or `testing`-feature-gated type, an in-memory/no-op adapter, or a `*::testing::*` construct built on a production create/run path;
-- a placeholder value — hardcoded default, empty result, `None`/`null`/`""`, reconstructed-from-args — standing in for data a real implementation would produce.
-
-The correct behavior is **fail closed** (a typed error, or the honest protocol-supported absent state), never a silent fallback to the stand-in. A dev stand-in shipped in production emits a *false guarantee* — callers believe a security property holds when it does not — which is strictly worse than the capability being honestly absent (absence is detectable; a nullifier lies). Deferring the *real backend* to a tracked issue/RFC is legitimate; shipping a stand-in *for it* in the interim is not — the two are independent (sever the nullifier now and fail closed; build the backend on its own schedule). The prove-absence gate allowlists durability-only features and **zero nullifiers, no exceptions** — challenge any "documented," "tracked," or "legible" allowlisted nullifier edge as the exact anti-pattern this rule forbids. See CLAUDE.md builder tenets, `.docs/standards/sdk-common.md` §Stub and Placeholder Policy, and spec §17.17 (durability-only-vs-nullifier classification).

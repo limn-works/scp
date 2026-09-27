@@ -1,6 +1,6 @@
 ---
 name: sdk-coverage-verifier
-description: Verifies SDK capability matrix entries are public, callable, and semantically correct. Use when reviewing PRs that modify SDK code (bindings/) or the capability matrix (sdk-capability-matrix.json). NOT for routine use — invoke explicitly or via review roster when SDK surface changes.
+description: "Use this agent to verify that each SDK capability-matrix entry marked true names a public, callable SDK symbol that delegates to the bridge function the entry claims. Invoke it when a change edits `bindings/` or `.docs/standards/sdk-capability-matrix.json`, and not for other changes."
 tools: [Read, Grep, Glob]
 ---
 
