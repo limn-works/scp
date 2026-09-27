@@ -430,12 +430,11 @@
             // Acceptance criterion 5 of ADR-025 states that the 32-byte key
             // reaches SQLCipher through `PRAGMA key` before any other operation
             // on the connection. Plain SQLite ignores an unknown pragma without
-            // an error, so a build whose `sqlite3_` symbols resolved to the
-            // system library rather than to the SQLCipher copy inside
-            // `ScpFFI.xcframework` would open, write, and read exactly as this
-            // suite's other cases expect, while writing every value to disk in
-            // the clear. Reading the bytes back off disk is what separates those
-            // two builds.
+            // an error, and `open(at:encryptionKey:cipherVersion:)` rejects a
+            // plain-SQLite connection because that connection answers
+            // `PRAGMA cipher_version` with no row. This case checks the
+            // outcome that check exists for, independently of the check: the
+            // bytes a stored value leaves on disk do not contain that value.
             let fixture = try makeStorageFixture()
             defer { fixture.removeFiles() }
 
@@ -468,7 +467,7 @@
         @Test("an open that fails after sqlite3_open leaves no descriptor on the file")
         func failedOpenClosesTheConnection() throws {
             // `AppleStorage` closes its connection in `deinit`, and no instance
-            // exists while `open(at:encryptionKey:)` still runs, so every
+            // exists while `open(at:encryptionKey:cipherVersion:)` still runs, so every
             // statement that throws inside `open` must close the connection
             // itself. A file written under one key and reopened under another
             // makes `open` throw at the first statement SQLCipher runs against
@@ -498,11 +497,43 @@
             )
         }
 
-        @Test("open runs on SQLCipher, which answers PRAGMA cipher_version")
-        func openedConnectionReportsSQLCipherVersion() throws {
+        @Test("the SQLite library this test process linked answers PRAGMA cipher_version")
+        func linkedLibraryReportsSQLCipherVersion() throws {
             let connection = try makeBareConnection()
             defer { sqlite3_close_v2(connection) }
             #expect(try !AppleStorage.sqlCipherVersion(db: connection).isEmpty)
+        }
+
+        @Test("open throws and closes the file when the connection reports no SQLCipher version")
+        func openRejectsConnectionWithoutSQLCipherVersion() throws {
+            // The probe answers the way plain SQLite answers
+            // `PRAGMA cipher_version`: with no row. Deleting the version check
+            // from `open(at:encryptionKey:cipherVersion:)` makes `open` return
+            // storage here, and this case fails.
+            let fileURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("scp-storage-test-\(UUID().uuidString).db")
+            defer {
+                for suffix in ["", "-wal", "-shm"] {
+                    try? FileManager.default.removeItem(atPath: fileURL.path + suffix)
+                }
+            }
+
+            do {
+                _ = try AppleStorage.open(
+                    at: fileURL,
+                    encryptionKey: Data(repeating: 0x2A, count: 32),
+                    cipherVersion: { _ in try AppleStorage.requireSQLCipherVersion([]) }
+                )
+                Issue.record("open returned storage on a connection that reported no SQLCipher version")
+            } catch let StorageError.databaseError(message) {
+                #expect(message.contains("cipher_version"))
+            } catch {
+                Issue.record("caught \(error), which is not StorageError.databaseError")
+            }
+            #expect(
+                openDescriptors(naming: fileURL.lastPathComponent).isEmpty,
+                "a failed open left a descriptor on the database file"
+            )
         }
 
         @Test("a cipher_version answer with no version rejects the connection")

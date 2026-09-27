@@ -17,7 +17,7 @@
 //
 // The `sqlite3_` symbols this file calls through `import SQLite3` must resolve
 // to the SQLCipher copy that `ScpFFI.xcframework` bundles, which receives the
-// encryption key through `PRAGMA key`. `open(at:encryptionKey:)` asks the
+// encryption key through `PRAGMA key`. `open(at:encryptionKey:cipherVersion:)` asks the
 // connection for `PRAGMA cipher_version` and throws when the answer is empty,
 // so a process whose symbols resolved to Apple's system SQLite, which ignores
 // `PRAGMA key` and would write every value in the clear, opens no storage.
@@ -173,9 +173,18 @@
         ///     file. On iOS this method sets file protection on that path before
         ///     it opens the connection.
         ///   - encryptionKey: 32 bytes SQLCipher takes through `PRAGMA key`.
+        ///   - cipherVersion: Reads the SQLCipher version from the connection
+        ///     after the key pragmas run, and throws when the connection is not
+        ///     SQLCipher. Every production caller takes the default,
+        ///     ``sqlCipherVersion(db:)``; a test passes a probe that answers the
+        ///     way plain SQLite does, to prove this method runs the check.
         /// - Throws: ``StorageError/databaseError(_:)`` if the database cannot
-        ///   be opened or configured.
-        static func open(at fileURL: URL, encryptionKey: Data) throws -> AppleStorage {
+        ///   be opened or configured, or if `cipherVersion` throws.
+        static func open(
+            at fileURL: URL,
+            encryptionKey: Data,
+            cipherVersion: (OpaquePointer) throws -> String = AppleStorage.sqlCipherVersion(db:)
+        ) throws -> AppleStorage {
             #if os(iOS)
                 // Set file protection before opening the database.
                 // NSFileProtectionCompleteUntilFirstUserAuthentication allows background
@@ -223,7 +232,7 @@
             // `do`, whose `catch` closes it.
             do {
                 try execSQL(db: db, sql: pragmas)
-                _ = try sqlCipherVersion(db: db)
+                _ = try cipherVersion(db)
 
                 // Create the KV table.
                 try execSQL(db: db, sql: """
@@ -572,8 +581,9 @@
         /// process whose `sqlite3_` symbols resolved to the system library
         /// accepts `PRAGMA key` and then writes every value in the clear.
         /// SQLCipher answers `PRAGMA cipher_version` with one row, and plain
-        /// SQLite answers it with no row, so `open(at:encryptionKey:)` calls
-        /// this method and fails closed on that answer.
+        /// SQLite answers it with no row, so `open(at:encryptionKey:cipherVersion:)` calls
+        /// this method through its default `cipherVersion` argument and fails
+        /// closed on that answer.
         ///
         /// - Throws: `StorageError.databaseError` when the statement cannot be
         ///   prepared or stepped, and when ``requireSQLCipherVersion(_:)``
