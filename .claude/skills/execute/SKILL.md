@@ -145,11 +145,11 @@ Same as Phase 3.2: fix ACTIONs, save LEARNINGs. Review-fix cycles continue until
 
 ## Phase 5: Push and PR
 
-### 5.1 — Run CI Locally
+### 5.1 — Run the Quick Local Check
 
-Run the full CI pipeline locally before pushing. Identify the project's lint, format, and test commands from CLAUDE.md's toolchain table or the CI configuration. All checks must pass. Fix any failures before proceeding.
+Run the quick local check that the Change protocol of CLAUDE.md names before pushing: `cargo fmt --all`, `cargo clippy` with the CI feature set scoped to the crates the PRD's changes touch, the tests of those crates, and the gate scripts the changes affect. Fix every failure before proceeding. CI runs the full gate set on the pushed head.
 
-If CLAUDE.md defines language-specific commands (e.g., `cargo clippy`, `bun run lint`, `python3.12 -m ruff check`), run all of them — not just the primary language.
+When the changes touch a language binding, also run that language's lint, format, and test commands from CLAUDE.md's toolchain table.
 
 ### 5.2 — Push and Open PR
 
@@ -164,7 +164,7 @@ Push the branch and open a PR using `gh pr create`. The PR title should summariz
 5. **One story per agent.** No bundling. Each subagent implements exactly one story.
 6. **Sources are truth.** When a story's `sources` reference spec files or ADRs, those documents govern. If the story text conflicts with the source, follow the source.
 7. **Memory is continuous.** Instruct every subagent to read and write Vestige. Decisions, patterns, and gotchas discovered during execution must be persisted for future sessions.
-8. **CI must pass before push.** Running lint, format, and test failures is never acceptable. Fix locally first.
+8. **Quick local check before push, full gate set in CI.** The quick check must pass before the push. A red CI run is never acceptable: fix the code the failing job rejected before the PR merges.
 9. **Every finding gets addressed.** Review feedback is never dismissed. No finding is "out of scope", "a nit", "pre-existing", or "for later." If a reviewer flags it, it gets fixed or the code gets changed. See `references/review-protocol.md` §Forbidden Dismissals.
 10. **Review-fix cycles continue until clean.** If a fix introduces a new issue, review again and fix again — up to 3 cycles. Completeness means the final code is clean, not that one pass was attempted.
 

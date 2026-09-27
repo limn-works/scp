@@ -345,8 +345,12 @@ impl Identity {
 /// Every identity commits a pre-rotation commitment at creation (spec §9.7.4.1
 /// §3 — mandatory, not optional), which requires a
 /// [`PreRotationCustody`](scp_platform::PreRotationCustody) backend. The only
-/// implementation that exists today is [`InMemoryPreRotationCustody`], a
-/// §17.17.2 security nullifier now gated to the test harness (`testing`) only.
+/// implementation that exists today is `scp_platform::testing::InMemoryPreRotationCustody`,
+/// a §17.17.2 security nullifier now gated to the test harness (`testing`) only.
+/// That name is written here without an intra-doc link on purpose: this function
+/// compiles in every build and the import that brings the type into scope carries
+/// `#[cfg(feature = "testing")]`, so a link would resolve in a `testing` doc build
+/// and fail `rustdoc::broken_intra_doc_links` in a shipped one.
 ///
 /// - **`testing` build:** mints a fresh per-identity `InMemoryPreRotationCustody`
 ///   (as the Node builder and every FFI `identity_create*` path do). Per spec
