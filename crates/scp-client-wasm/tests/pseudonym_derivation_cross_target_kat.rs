@@ -1,26 +1,24 @@
-//! Cross-target byte-parity known-answer tests for the §9.10.4.A per-context
+//! Cross-target byte-parity known-answer tests for the §9.10.4 per-context
 //! pseudonym DERIVATION (ADR-057 Option A, planning-session-10).
 //!
 //! The software-custody pseudonym derivation — `derive_pseudonym_secret`
-//! (HKDF-SHA-256 over the private seed) and `derive_pseudonym_keypair`
-//! (HMAC-SHA-256 keying + Ed25519 keygen) — was factored into the wasm-safe
-//! `scp-crypto::pseudonym` module so the in-browser client can derive its own
-//! per-context pseudonym in Rust over the wasm-held signing key WITHOUT forking
-//! the native `scp-platform` copy. This file is the guard that the shared
-//! derivation produces **byte-identical** output on both native and `wasm32`,
-//! so the future browser call site inherits one non-forked implementation.
+//! (HKDF-SHA-256 over the 32-byte private key material) and
+//! `derive_pseudonym_keypair` (HMAC-SHA-256 context seed, then the FIPS 186-5
+//! A.2.1 seed-to-scalar step onto P-256) — lives in the wasm-safe
+//! `scp-crypto::pseudonym` module so the in-browser client derives its own
+//! per-context pseudonym in Rust over the wasm-held key WITHOUT forking the
+//! native `scp-platform` copy. This file is the guard that the shared
+//! derivation produces **byte-identical** output on both native and `wasm32`.
 //!
 //! Every assertion lives in a helper called from BOTH a native `#[test]` and a
-//! `#[wasm_bindgen_test]`, against the SAME committed §25.19 golden vectors
-//! (Vectors 30/31). Agreement is transitive: `native == golden` AND
-//! `wasm == golden` implies `native == wasm`. The `scp-crypto` module's own
-//! `derive_pseudonym_keypair_known_answer_vectors` unit test pins these same
-//! bytes natively; this test extends that guarantee across the wasm32 boundary.
+//! `#[wasm_bindgen_test]`, against the SAME §25.19 golden vectors (Vectors
+//! 30/31), copied from `.docs/specs/25-test-vectors.md`. Agreement is
+//! transitive: `native == golden` AND `wasm == golden` implies `native == wasm`.
 
 // KATs assert on fixed vectors; `expect`/`unwrap`/`panic` keep failures legible.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-use ed25519_dalek::SigningKey;
+use scp_crypto::p256::P256SigningKey;
 use scp_crypto::pseudonym::{derive_pseudonym_keypair, derive_pseudonym_secret};
 
 #[cfg(target_arch = "wasm32")]
@@ -34,58 +32,54 @@ use wasm_bindgen_test::wasm_bindgen_test;
 /// `context_id` used by both §25.19 derivation vectors.
 const KAT_CONTEXT_ID: &[u8] = b"context-alpha";
 
-/// One §25.19 derivation vector: identity seed → (`pseudonym_secret`, v1 pubkey,
-/// v2 pubkey at epoch 1).
+/// The §25.2 seed-to-scalar label that maps a vector's identity seed to its
+/// identity P-256 scalar (the derivation's ikm).
+const IDENTITY_LABEL: &[u8] = b"SCP-TEST-VECTOR-KEY-V1";
+
+/// One §25.19 derivation vector, as hex: identity seed → identity scalar →
+/// `pseudonym_secret` → v1 pubkey and v2 pubkey at epoch 1 (33-byte
+/// compressed points).
 struct DerivationVector {
-    seed: [u8; 32],
-    secret: [u8; 32],
-    v1_pub: [u8; 32],
-    v2_pub: [u8; 32],
+    seed: &'static str,
+    scalar: &'static str,
+    secret: &'static str,
+    v1_pub: &'static str,
+    v2_pub: &'static str,
 }
 
 /// §25.19 Vector 30 — identity seed `0x01 × 32`.
 const VECTOR_30: DerivationVector = DerivationVector {
-    seed: [0x01u8; 32],
-    secret: [
-        0x27, 0x45, 0x6a, 0x3d, 0xd2, 0x4e, 0xd5, 0x81, 0x3b, 0x26, 0x45, 0xf0, 0xee, 0x00, 0x1f,
-        0x57, 0x76, 0x0c, 0x49, 0xb9, 0x11, 0x7b, 0x93, 0xc8, 0xfa, 0x98, 0xe4, 0x12, 0x9d, 0x36,
-        0xa6, 0x43,
-    ],
-    v1_pub: [
-        0xfd, 0xdc, 0x04, 0x88, 0x2a, 0x48, 0xaa, 0x39, 0x88, 0x8f, 0x6d, 0xbe, 0xc6, 0x22, 0xf9,
-        0xc5, 0xaa, 0x6f, 0x06, 0xb2, 0xe4, 0x08, 0x20, 0xa6, 0x9a, 0x2e, 0x0e, 0x89, 0xb5, 0xf0,
-        0x9a, 0xc2,
-    ],
-    v2_pub: [
-        0x43, 0xe5, 0x0a, 0x94, 0x7c, 0x4b, 0x2b, 0xe4, 0x4f, 0x87, 0x1e, 0x30, 0x9c, 0x7e, 0xdc,
-        0x64, 0xaf, 0xaf, 0x42, 0x07, 0xb9, 0xa5, 0x89, 0xc9, 0xb0, 0x1f, 0x61, 0xc0, 0x11, 0x58,
-        0x09, 0x0f,
-    ],
+    seed: "0101010101010101010101010101010101010101010101010101010101010101",
+    scalar: "32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64",
+    secret: "b88e781bb954a6681abc9016f8f69939f0e624311aeaa7e8f1b145857f58de82",
+    v1_pub: "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72",
+    v2_pub: "0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479",
 };
 
 /// §25.19 Vector 31 — identity seed `0x9d, 0x01..0x1f`.
 const VECTOR_31: DerivationVector = DerivationVector {
-    seed: [
-        0x9d, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
-        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
-        0x1e, 0x1f,
-    ],
-    secret: [
-        0xa5, 0x86, 0x19, 0x1a, 0x1a, 0xb6, 0xcd, 0x3e, 0xfe, 0x45, 0x69, 0x7b, 0x35, 0x10, 0xee,
-        0x1e, 0xda, 0xc8, 0xc5, 0x4a, 0x7f, 0x27, 0x86, 0x35, 0x46, 0xb6, 0xe0, 0x33, 0x3e, 0x20,
-        0xd6, 0x90,
-    ],
-    v1_pub: [
-        0xff, 0x6e, 0x2e, 0x90, 0x9a, 0x00, 0x83, 0x18, 0xf9, 0x7b, 0xb2, 0xc2, 0x6c, 0x1d, 0x78,
-        0x7c, 0xeb, 0x9a, 0xa2, 0x99, 0x6f, 0x74, 0x67, 0x66, 0x33, 0x5e, 0x10, 0xba, 0x7e, 0x22,
-        0x13, 0xcc,
-    ],
-    v2_pub: [
-        0xed, 0xd4, 0x73, 0x19, 0x71, 0x9e, 0x23, 0x50, 0xd1, 0xdb, 0x94, 0x88, 0xe0, 0x18, 0x9f,
-        0x24, 0x05, 0x26, 0x7d, 0x7d, 0xc2, 0x43, 0x48, 0x9c, 0xfd, 0x9a, 0xa6, 0xf3, 0xac, 0x3f,
-        0xc6, 0x39,
-    ],
+    seed: "9d0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    scalar: "65d56a863d03d31ea15ade82f677058d5bbe53afedc6ff7d2b8846aa25a1bc2b",
+    secret: "17ef25ad3e5be8adad38c4c5a1c68d3daca80015e81bdcae2ae8940645774739",
+    v1_pub: "0239f7c3213f3567183fd2fcf7aec6c884bc70e0e694c42053284a4b5ebef4fe2d",
+    v2_pub: "037967cfe8d3111cdd72288ea3f444c15b710300323162fec63ca9036af73754e3",
 };
+
+fn to_hex(bytes: &[u8]) -> String {
+    use core::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
+fn seed32(hex: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
+    }
+    out
+}
 
 // ---------------------------------------------------------------------------
 // The golden-vector assertion body (called from BOTH targets)
@@ -93,38 +87,44 @@ const VECTOR_31: DerivationVector = DerivationVector {
 
 fn assert_pseudonym_derivation_cross_target_vectors() {
     for vector in [&VECTOR_30, &VECTOR_31] {
-        let sk = SigningKey::from_bytes(&vector.seed);
-
-        // (1) pseudonym_secret = HKDF-SHA256(private_seed) matches the golden.
-        let secret = derive_pseudonym_secret(&sk);
+        // (1) identity seed → identity scalar (FIPS 186-5 A.2.1, §25.2 label).
+        let identity = P256SigningKey::from_seed(IDENTITY_LABEL, &seed32(vector.seed)).unwrap();
+        let ikm = identity.to_scalar_bytes();
         assert_eq!(
-            secret.as_slice(),
-            &vector.secret,
+            to_hex(ikm.as_ref()),
+            vector.scalar,
+            "identity scalar diverged"
+        );
+
+        // (2) pseudonym_secret = HKDF-SHA256(ikm) matches the golden.
+        let secret = derive_pseudonym_secret(&ikm);
+        assert_eq!(
+            to_hex(secret.as_ref()),
+            vector.secret,
             "derive_pseudonym_secret diverged from the §25.19 golden vector \
              (cross-target HKDF divergence or a derivation change)"
         );
 
-        // (2) v1 (static) pseudonym public key matches the golden.
-        let v1 = derive_pseudonym_keypair(&sk, KAT_CONTEXT_ID, None);
+        // (3) v1 (static) pseudonym public key matches the golden.
+        let v1 = derive_pseudonym_keypair(&ikm, KAT_CONTEXT_ID, None)
+            .unwrap()
+            .public_key()
+            .to_compressed();
         assert_eq!(
-            v1.verifying_key().to_bytes(),
+            to_hex(&v1),
             vector.v1_pub,
             "v1 pseudonym public key diverged from the §25.19 golden vector"
         );
 
-        // (3) v2 (rotatable, epoch = 1) pseudonym public key matches the golden.
-        let v2 = derive_pseudonym_keypair(&sk, KAT_CONTEXT_ID, Some(1));
+        // (4) v2 (rotatable, epoch = 1) pseudonym public key matches the golden.
+        let v2 = derive_pseudonym_keypair(&ikm, KAT_CONTEXT_ID, Some(1))
+            .unwrap()
+            .public_key()
+            .to_compressed();
         assert_eq!(
-            v2.verifying_key().to_bytes(),
+            to_hex(&v2),
             vector.v2_pub,
             "v2 (epoch=1) pseudonym public key diverged from the §25.19 golden vector"
-        );
-
-        // (4) Domain separation: v1 and v2 must differ.
-        assert_ne!(
-            v1.verifying_key().to_bytes(),
-            v2.verifying_key().to_bytes(),
-            "v1 and v2 derivations must differ (domain separation)"
         );
     }
 }
@@ -147,7 +147,7 @@ fn pseudonym_derivation_matches_golden_vectors() {
 // C2 — the FULL `ScpMlsGroup::derive_pseudonym` serde-extraction path, driven on
 // BOTH native and wasm32. The KAT above pins the raw `derive_pseudonym_keypair`
 // recipe; this exercises the driver's actual reach into the openmls
-// `SignatureKeyPair` (recovering the 32-byte Ed25519 seed through the type's serde
+// `SignatureKeyPair` (recovering the 32-byte Ed25519 seed, the S0 ikm, through the type's serde
 // form — the step whose wasm32 32-bit-`usize` behavior the byte-parity claim
 // depends on). The MLS key is random, so this is not a fixed-byte golden; instead
 // it pins determinism + context-separation + restore-stability of the serde path
@@ -183,7 +183,7 @@ fn mls_group_derive_pseudonym_serde_path_is_stable_cross_target() {
         p1, p2,
         "derive_pseudonym is deterministic (serde seed-extraction stable) on this target"
     );
-    assert_ne!(p1, [0u8; 32], "a real pseudonym is non-zero");
+    assert_ne!(p1, [0u8; 32], "a real pseudonym routing id is non-zero");
 
     // Context separation.
     let other = group

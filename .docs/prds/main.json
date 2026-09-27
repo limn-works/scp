@@ -10757,7 +10757,7 @@
       "gate": "gate-kel",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "in-progress",
       "files": [
         "crates/scp-crypto/src/p256.rs",
         "crates/scp-crypto/src/lib.rs",

@@ -478,7 +478,8 @@ async fn publish_to_resolver_dht_for<C: KeyCustody + Send + Sync>(
 /// (only in `testing` builds) the retained in-memory custody.
 /// Failures carry the cross-bridge contract codes: missing key material →
 /// `IDENT_1054`, derivation failure → `IDENT_1055`, custody unavailable in
-/// this build → `IDENT_1056`, wrong public-key length → `IDENT_1057`.
+/// this build → `IDENT_1056`. A host-returned pseudonym key that is not a
+/// valid 33-byte P-256 point fails in `unpack_pseudonym` → `IDENT_1055`.
 ///
 /// Callers gate this themselves: `context_create`/`context_join` skip it for
 /// broadcast contexts (soft `None`, spec §5.14), while `context_import` calls
@@ -534,14 +535,10 @@ async fn derive_member_pseudonym_required(
             });
         }
     };
-    pseudonym
-        .public_key
-        .as_bytes()
-        .try_into()
-        .map_err(|_| ScpError::Identity {
-            msg: "pseudonym public key must be 32 bytes".to_owned(),
-            code: codes::IDENT_1057.to_owned(),
-        })
+    // §9.10.4: the routing axis carries the 32-byte routing id of the 33-byte
+    // P-256 pseudonym. `PseudonymKeypair::new` already rejected a malformed
+    // host-returned point, which surfaced above as IDENT_1055.
+    Ok(*pseudonym.routing_id())
 }
 
 /// Best-effort §9.10.4 pseudonym announcement (`UniFFI`).
@@ -777,7 +774,8 @@ impl KeyCustody for CallbackKeyCustody {
             .derive_pseudonym(key.id().to_string(), context_id.to_vec())
             .await
             .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
-        // The callback returns concatenated [public_key_bytes (32) || key_id_utf8].
+        // The callback returns concatenated [public_key_bytes (33) || key_id_utf8],
+        // the key a compressed P-256 point (§9.10.4).
         // Unpack via the shared helper (unifies error text with PyO3/napi).
         scp_ffi_common::custody_parse::unpack_pseudonym("derive_pseudonym", &result_bytes)
     }
@@ -790,8 +788,9 @@ impl KeyCustody for CallbackKeyCustody {
     ) -> Result<PseudonymKeypair, PlatformError> {
         // Canonical v2 recipe (spec §9.10.4.A / §9.10.4.1): the provider performs
         // the rotatable derivation itself — seed = HMAC-SHA256(pseudonym_secret,
-        // context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2"); keypair =
-        // Ed25519_keygen(seed[0..32]). The epoch is threaded through to the
+        // context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2"); d =
+        // seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed), returned as the 33-byte
+        // compressed P-256 point. The epoch is threaded through to the
         // provider rather than synthesized into the context_id bridge-side, so
         // the v1 platform adapter does not re-append its own "scp-pseudonym"
         // domain separator (which would corrupt the v2 domain).
@@ -10255,7 +10254,7 @@ impl Scp {
                 // produces a silently unusable context — the member cannot send
                 // app-data on a pseudonymous routing axis), carrying granular
                 // codes (missing material → 1054, derivation failure → 1055,
-                // wrong length → 1057, custody unavailable → 1056) that match the
+                // custody unavailable → 1056) that match the
                 // PyO3 reference. BROADCAST contexts soft-fail to `None` (no
                 // per-member pseudonym, spec §5.14 — the runtime ignores it).
                 let create_is_broadcast = matches!(
@@ -10987,7 +10986,7 @@ impl Scp {
                 // announce of a reserved value, so the joiner becomes
                 // permanently unaddressable with no error surfaced. Carry the
                 // granular codes (missing material → 1054, derivation failure →
-                // 1055, wrong length → 1057, custody unavailable → 1056) at
+                // 1055, custody unavailable → 1056) at
                 // create/import granularity. BROADCAST contexts soft-fail to
                 // `None` (no per-member pseudonym, spec §5.14 — the runtime
                 // ignores it). Branch on the joined context's mode.
@@ -19114,7 +19113,7 @@ impl Scp {
                 // derive it UNCONDITIONALLY, exactly like the PyO3 reference
                 // bridge. Custody / derivation failure is a hard error carrying
                 // granular codes (missing material → 1054, derivation failure →
-                // 1055, wrong length → 1057), never a silent zero-pseudonym
+                // 1055), never a silent zero-pseudonym
                 // fallback and never a `[0u8; 32]` sentinel for broadcast (which
                 // would make the member permanently unaddressable).
                 let local_pseudonym: [u8; 32] =
@@ -24029,14 +24028,24 @@ mod tests {
             key_id: String,
             context_id: Vec<u8>,
         ) -> Result<Vec<u8>, ScpError> {
-            // Mint a derived key, return `[pubkey(32) || derived_key_id_utf8]`.
+            // Mint a derived key, return `[pubkey(33) || derived_key_id_utf8]`:
+            // the bridge accepts only a valid compressed P-256 point (§9.10.4).
+            // The point comes from a real P-256 key over the derived seed; the
+            // stored handle keeps an Ed25519 key, because no test signs with a
+            // pseudonym handle through this provider.
             let sk = self.key_for(&key_id)?;
             let mut hasher = sha2::Sha256::new();
             hasher.update(sk.to_bytes());
             hasher.update(&context_id);
             let derived_seed: [u8; 32] = hasher.finalize().into();
             let derived = ed25519_dalek::SigningKey::from_bytes(&derived_seed);
-            let derived_pub = derived.verifying_key().to_bytes();
+            let derived_pub = scp_crypto::p256::P256SigningKey::from_seed(
+                b"PRODLIKE-TEST-PSEUDONYM",
+                &derived_seed,
+            )
+            .expect("seed_to_scalar is total")
+            .public_key()
+            .to_compressed();
             let id = self
                 .next
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)

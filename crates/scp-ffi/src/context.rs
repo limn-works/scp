@@ -1654,7 +1654,7 @@ fn resolve_creator_verifying_key(
 /// IMPORT path: in each case a real pseudonym is REQUIRED for a usable
 /// encrypted context. Custody / derivation failure is a hard error carrying the
 /// canonical pseudonym-derivation identity codes (1054 missing key material,
-/// 1055 derivation failed, 1057 wrong key length) — never a silent
+/// 1055 derivation failed or invalid P-256 point) — never a silent
 /// zero-pseudonym fallback, which would reintroduce the relay-correlation
 /// vector by leaving the routing axis degraded. On import the exporter's
 /// pseudonym is local-instance state with no meaning to the importer, so it is
@@ -1683,21 +1683,16 @@ fn derive_member_pseudonym(
                 .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
                 .await
         });
-        let pk = pseudonym
-            .map_err(|e| {
-                crate::error::ScpPyError::identity_with_code(
-                    format!("pseudonym derivation failed: {e}"),
-                    codes::IDENT_1055,
-                )
-            })?
-            .public_key;
-        let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
+        // §9.10.4: the routing axis carries the 32-byte routing id of the
+        // 33-byte P-256 pseudonym. `PseudonymKeypair::new` already rejected a
+        // malformed host-returned point, which surfaces here as SCP-IDENT-1055.
+        let pseudonym = pseudonym.map_err(|e| {
             crate::error::ScpPyError::identity_with_code(
-                "pseudonym public key must be 32 bytes",
-                codes::IDENT_1057,
+                format!("pseudonym derivation failed: {e}"),
+                codes::IDENT_1055,
             )
         })?;
-        Ok(bytes)
+        Ok(*pseudonym.routing_id())
     })
     .map_err(|e| {
         // A registry miss surfaces `with_identity`'s generic SCP-IDENT-1001;
@@ -2568,7 +2563,7 @@ impl crate::scp::PyScp {
             // reserved `[0u8; 32]` sentinel — peers reject any announce of a
             // reserved value, so the joiner becomes permanently unaddressable
             // with no error surfaced. Propagate the canonical identity codes
-            // (1054/1055/1057) at the same granularity as create/import.
+            // (1054/1055) at the same granularity as create/import.
             // BROADCAST contexts soft-fail to `None`: they carry no per-member
             // pseudonym (spec §5.14) and the runtime ignores the value.
             let local_pseudonym: Option<[u8; 32]> = if join_is_broadcast {

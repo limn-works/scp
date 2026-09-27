@@ -1,13 +1,13 @@
 [package]
 name = "scp-crypto"
 version = "0.1.0-beta.2"
-description = "Low-level cryptographic anchor (Ed25519 verification) for SCP (Shared Context Protocol)"
+description = "Low-level cryptographic anchor (Ed25519 verification, P-256 primitives) for SCP (Shared Context Protocol)"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
 homepage.workspace = true
 readme = "README.md"
-keywords = ["protocol", "cryptography", "ed25519"]
+keywords = ["protocol", "cryptography", "ed25519", "p256"]
 categories = ["cryptography"]
 
 [dependencies]
@@ -19,9 +19,16 @@ hkdf = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 zeroize = { workspace = true }
+# P-256 primitives (§9.5, §9.10.4): signing, strict/lenient verification, ECDH,
+# SEC1 point validation, and the FIPS 186-5 A.2.1 seed-to-scalar step.
+p256 = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
+hex = { workspace = true }
+proptest = "1"
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

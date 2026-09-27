@@ -144,9 +144,10 @@ impl PublicKey {
     }
 }
 
-/// An Ed25519 signature produced by [`KeyCustody::sign`].
+/// A signature produced by [`KeyCustody::sign`].
 ///
-/// Contains the raw 64-byte Ed25519 signature.
+/// Contains the raw 64-byte signature: Ed25519 `R ‖ S` for an Ed25519 key, or
+/// the low-`s` P-256 `r ‖ s` for a pseudonym key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signature(Vec<u8>);
 
@@ -195,23 +196,65 @@ impl SharedSecret {
     }
 }
 
-/// A deterministic pseudonym keypair derived from an identity key and a context
-/// ID via [`KeyCustody::derive_pseudonym`].
+/// A per-context pseudonym derived via [`KeyCustody::derive_pseudonym`] or
+/// [`KeyCustody::derive_rotatable_pseudonym`] (§9.10.4).
 ///
-/// The derivation algorithm is specified in ADR-006 and §9.10.4:
-///   1. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
-///   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`
-///
-/// The HMAC key is the 32-byte `pseudonym_secret` (NEVER the public key, §9.10.4.A).
-/// The returned keypair is always software-managed regardless of whether the
-/// source identity key is hardware-backed.
+/// The pseudonym is a P-256 key: `public_key` is its 33-byte SEC1 compressed
+/// point, and `routing_id` is
+/// `SHA-256("scp-pseudonym-routing-v1:" || public_key)`, the 32-byte value
+/// every routing field carries. The only constructor,
+/// [`PseudonymKeypair::new`], validates the point (§9.5) and computes the
+/// routing id, so a held value is always well-formed, whichever custody
+/// backend or host adapter produced it.
 #[derive(Debug, Clone)]
 pub struct PseudonymKeypair {
-    /// The public key of the derived pseudonym.
-    pub public_key: PublicKey,
-    /// A handle to the derived pseudonym's signing key, managed by the
-    /// [`KeyCustody`] implementation.
-    pub key_handle: KeyHandle,
+    public_key: PublicKey,
+    routing_id: [u8; 32],
+    key_handle: KeyHandle,
+}
+
+impl PseudonymKeypair {
+    /// Validates a pseudonym public key and binds it to its custody handle.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::CustodyError`] when `public_key` is not a 33-byte SEC1
+    /// compressed P-256 point on the curve.
+    pub fn new(public_key: &[u8], key_handle: KeyHandle) -> Result<Self, PlatformError> {
+        use scp_crypto::p256::{COMPRESSED_POINT_LEN, P256PublicKey};
+        let compressed: [u8; COMPRESSED_POINT_LEN] = public_key.try_into().map_err(|_| {
+            PlatformError::CustodyError(format!(
+                "pseudonym public key must be a {COMPRESSED_POINT_LEN}-byte compressed P-256 point, got {} bytes",
+                public_key.len()
+            ))
+        })?;
+        P256PublicKey::from_sec1(&compressed).map_err(|e| {
+            PlatformError::CustodyError(format!("invalid pseudonym public key: {e}"))
+        })?;
+        Ok(Self {
+            public_key: PublicKey::new(compressed.to_vec()),
+            routing_id: scp_crypto::pseudonym::pseudonym_routing_id(&compressed),
+            key_handle,
+        })
+    }
+
+    /// The 33-byte SEC1 compressed P-256 pseudonym public key.
+    #[must_use]
+    pub const fn public_key(&self) -> &PublicKey {
+        &self.public_key
+    }
+
+    /// The 32-byte pseudonym routing id (§9.10.4).
+    #[must_use]
+    pub const fn routing_id(&self) -> &[u8; 32] {
+        &self.routing_id
+    }
+
+    /// The custody handle of the pseudonym's private key.
+    #[must_use]
+    pub const fn key_handle(&self) -> &KeyHandle {
+        &self.key_handle
+    }
 }
 
 /// The custody type for a given key, indicating where the key material is
@@ -334,13 +377,19 @@ pub trait KeyCustody: Send + Sync {
         key_type: KeyType,
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send;
 
-    /// Sign data with an Ed25519 key.
+    /// Sign data with an Ed25519 key, or a 32-byte digest with a P-256
+    /// pseudonym key ([`PseudonymKeypair::key_handle`]).
+    ///
+    /// For a pseudonym key, `data` is the digest itself (prehash, §9.5.1) and
+    /// the result is the 64-byte low-`s` `r ‖ s`.
     ///
     /// # Errors
     ///
     /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
     /// Returns [`PlatformError::WrongKeyType`] if the handle refers to an
     /// X25519 key.
+    /// Returns [`PlatformError::CustodyError`] if a pseudonym key is given
+    /// `data` that is not 32 bytes.
     fn sign(
         &self,
         key: &KeyHandle,
@@ -349,7 +398,8 @@ pub trait KeyCustody: Send + Sync {
 
     /// Return the public key for a handle.
     ///
-    /// Works for both Ed25519 and X25519 key handles.
+    /// Works for Ed25519 and X25519 key handles (32 bytes) and P-256 pseudonym
+    /// handles (33-byte compressed point).
     ///
     /// # Errors
     ///
@@ -392,7 +442,8 @@ pub trait KeyCustody: Send + Sync {
     ///
     /// Algorithm:
     ///   1. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
-    ///   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])` — `seed` is an RFC-8032 Ed25519 seed
+    ///   2. `d = (int(HKDF-Expand-SHA256(seed, "SCP-PSEUDONYM-P256-V1", 48)) mod (n − 1)) + 1`
+    ///      (FIPS 186-5 A.2.1), and the pseudonym is the P-256 key `d`
     ///
     /// The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key (public
     /// key bytes would be a membership-enumeration oracle, §9.10.4.A). For SOFTWARE
@@ -405,7 +456,9 @@ pub trait KeyCustody: Send + Sync {
     /// [`scp_crypto::pseudonym::derive_pseudonym_keypair`].
     ///
     /// The returned [`PseudonymKeypair`] is always software-managed (derived
-    /// output).
+    /// output). Its handle signs only a 32-byte digest, returning a 64-byte
+    /// low-`s` P-256 `r ‖ s` signature ([`KeyCustody::sign`]); every other
+    /// operation on it fails with a typed [`PlatformError`].
     ///
     /// For contexts that support pseudonym rotation (BLACK-001 mitigation),
     /// use [`derive_rotatable_pseudonym`](KeyCustody::derive_rotatable_pseudonym) instead.
@@ -429,7 +482,7 @@ pub trait KeyCustody: Send + Sync {
     ///
     /// Algorithm:
     ///   1. `seed = HMAC-SHA256(pseudonym_secret, context_id || epoch_BE || "scp-pseudonym-v2")`
-    ///   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])` — `seed` is an RFC-8032 Ed25519 seed
+    ///   2. the P-256 key `d` from `seed` exactly as in v1
     ///
     /// where `epoch_BE` is the `pseudonym_epoch` as an 8-byte big-endian u64. As in
     /// v1, the HMAC key is the `pseudonym_secret` (NEVER the public key, §9.10.4.A):
@@ -990,6 +1043,29 @@ impl<T: Storage> Storage for std::sync::Arc<T> {
 // ---------------------------------------------------------------------------
 // X25519 key agreement helper (software_platform only)
 // ---------------------------------------------------------------------------
+
+/// Signs a 32-byte digest with a software P-256 pseudonym key: the shared
+/// [`KeyCustody::sign`] path of every software backend for pseudonym handles.
+///
+/// # Errors
+///
+/// [`PlatformError::CustodyError`] when `data` is not 32 bytes, or when
+/// signing fails.
+#[cfg(feature = "software_platform")]
+pub(crate) fn sign_pseudonym_digest(
+    key: &scp_crypto::p256::P256SigningKey,
+    data: &[u8],
+) -> Result<Signature, PlatformError> {
+    let digest: &[u8; 32] = data.try_into().map_err(|_| {
+        PlatformError::CustodyError(format!(
+            "a P-256 pseudonym key signs a 32-byte digest, got {} bytes",
+            data.len()
+        ))
+    })?;
+    scp_crypto::p256::sign_prehash_rfc6979(key, digest)
+        .map(|sig| Signature::new(sig.to_vec()))
+        .map_err(|e| PlatformError::CustodyError(format!("pseudonym signing: {e}")))
+}
 
 /// Performs X25519 key agreement using an Ed25519 signing key via birational conversion.
 ///

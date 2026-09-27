@@ -416,9 +416,9 @@ impl FfiKeyCustody {
 /// - `destroy_key(key_id: str) -> None`.
 /// - `dh_agree(key_id: str, peer_public: bytes) -> bytes` — 32 shared bytes.
 /// - `derive_pseudonym(key_id: str, context_id: bytes) -> bytes` —
-///   `[public_key (32) || key_id_utf8]`.
+///   `[public_key (33, compressed P-256) || key_id_utf8]`.
 /// - `derive_rotatable_pseudonym(key_id: str, context_id: bytes, pseudonym_epoch: int) -> bytes`
-///   — `[public_key (32) || key_id_utf8]`. The provider performs the canonical
+///   — `[public_key (33, compressed P-256) || key_id_utf8]`. The provider performs the canonical
 ///   v2 derivation (HMAC key is the private-derived `pseudonym_secret`, domain
 ///   `"scp-pseudonym-v2"`); the bridge does NOT synthesize the preimage.
 /// - `export_signing_key_bytes(key_id: str) -> bytes` — 32 private seed bytes.
@@ -535,11 +535,12 @@ impl KeyCustody for PyCallbackKeyCustody {
         pseudonym_epoch: u64,
     ) -> Result<PseudonymKeypair, PlatformError> {
         // Canonical v2 recipe (spec §9.10.4.A / §9.10.4.1): the HMAC key is the
-        // private-derived `pseudonym_secret` (HKDF over the Ed25519 private
+        // private-derived `pseudonym_secret` (HKDF over the identity private
         // seed), NEVER the public key. The provider performs the canonical
         // derivation itself — seed = HMAC-SHA256(pseudonym_secret, context_id ||
-        // BE64(pseudonym_epoch) || "scp-pseudonym-v2"); keypair =
-        // Ed25519_keygen(seed[0..32]). The epoch is passed through directly
+        // BE64(pseudonym_epoch) || "scp-pseudonym-v2"); d =
+        // seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed), returned as the 33-byte
+        // compressed P-256 point. The epoch is passed through directly
         // rather than synthesized into the context_id bridge-side, so the v1
         // platform adapter does not re-append its own "scp-pseudonym" domain
         // separator (which would corrupt the v2 domain). Mirrors the UniFFI /
@@ -644,15 +645,22 @@ mod tests {
 
     /// Python source for a fake `KeyCustodyProvider` that exercises the
     /// `Callback` enum delegation using ONLY the stdlib (`hashlib`/`hmac`) —
-    /// no `PyNaCl`/cryptography. The returned bytes are NOT a real Ed25519
-    /// keypair (`sign` returns a deterministic 64-byte HMAC, `get_public_key` a
-    /// 32-byte SHA-256), so this verifies the bridge WIRING — argument
+    /// no `PyNaCl`/cryptography. The returned bytes are NOT a real keypair
+    /// (`sign` returns a deterministic 64-byte HMAC, `get_public_key` a 32-byte
+    /// SHA-256 of the seed). The pseudonym methods return the SEC 2 P-256
+    /// generator `G` as their 33-byte compressed point, because the bridge
+    /// rejects any pseudonym key that is not a valid P-256 point; the derived
+    /// seed stays observable through `get_public_key` on the derived handle.
+    /// So this verifies the bridge WIRING — argument
     /// marshalling, return-shape unpacking, error mapping — independently of
     /// cryptographic validity (which the Python integration test covers
     /// end-to-end against `dht.create`). Mirrors the protocol contract
     /// documented on `PyCallbackKeyCustody`.
     const FAKE_PROVIDER_PY: &std::ffi::CStr = c"
 import hashlib, hmac
+
+# SEC 2 P-256 generator G, SEC1-compressed.
+G_COMPRESSED = bytes.fromhex('036b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296')
 
 class FakeCustody:
     def __init__(self):
@@ -682,7 +690,7 @@ class FakeCustody:
         kid = str(self._next)
         self._next += 1
         self._seeds[kid] = d
-        return d + kid.encode('utf-8')
+        return G_COMPRESSED + kid.encode('utf-8')
 
     def derive_rotatable_pseudonym(self, key_id, context_id, pseudonym_epoch):
         # Canonical v2 preimage: context_id || BE64(epoch) || 'scp-pseudonym-v2'.
@@ -693,7 +701,7 @@ class FakeCustody:
         kid = str(self._next)
         self._next += 1
         self._seeds[kid] = d
-        return d + kid.encode('utf-8')
+        return G_COMPRESSED + kid.encode('utf-8')
 
     def export_signing_key_bytes(self, key_id):
         return self._seeds[key_id]
@@ -760,14 +768,14 @@ class FakeCustody:
             .await
             .expect("callback derive_pseudonym");
         assert_eq!(
-            pseudo.public_key.as_bytes().len(),
-            32,
-            "pseudonym public key is 32 bytes"
+            pseudo.public_key().as_bytes().len(),
+            33,
+            "pseudonym public key is a 33-byte compressed P-256 point"
         );
         // The unpacked key handle must be usable for a follow-up sign — proves
-        // the `[pubkey(32) || key_id_utf8]` return is unpacked correctly.
+        // the `[pubkey(33) || key_id_utf8]` return is unpacked correctly.
         let sig = custody
-            .sign(&pseudo.key_handle, b"as pseudonym")
+            .sign(pseudo.key_handle(), b"as pseudonym")
             .await
             .expect("sign with derived pseudonym handle");
         assert_eq!(sig.as_bytes().len(), 64);
@@ -795,9 +803,9 @@ class FakeCustody:
             .await
             .expect("callback derive_rotatable_pseudonym");
         assert_eq!(
-            pseudo.public_key.as_bytes().len(),
-            32,
-            "rotatable pseudonym public key is 32 bytes"
+            pseudo.public_key().as_bytes().len(),
+            33,
+            "rotatable pseudonym public key is a 33-byte compressed P-256 point"
         );
 
         // Reproduce the fake provider's canonical v2 preimage. handle id 1 is the
@@ -811,9 +819,16 @@ class FakeCustody:
         let mut mac =
             <Hmac<Sha256> as Mac>::new_from_slice(&seed).expect("HMAC accepts any key length");
         mac.update(&preimage);
-        let expected_pubkey = mac.finalize().into_bytes();
+        let expected_seed = mac.finalize().into_bytes();
+        // The fake stores the derived seed under the derived handle and reports
+        // SHA-256(seed) as that handle's public key.
+        let expected_pubkey = Sha256::digest(expected_seed);
+        let derived_pub = custody
+            .public_key(pseudo.key_handle())
+            .await
+            .expect("public key of derived handle");
         assert_eq!(
-            pseudo.public_key.as_bytes(),
+            derived_pub.as_bytes(),
             expected_pubkey.as_slice(),
             "bridge must pass raw context_id + epoch (canonical v2), not a \
              double-domain-appended preimage"
@@ -821,7 +836,7 @@ class FakeCustody:
 
         // The unpacked handle must be usable for a follow-up sign.
         let sig = custody
-            .sign(&pseudo.key_handle, b"as rotatable pseudonym")
+            .sign(pseudo.key_handle(), b"as rotatable pseudonym")
             .await
             .expect("sign with derived rotatable pseudonym handle");
         assert_eq!(sig.as_bytes().len(), 64);

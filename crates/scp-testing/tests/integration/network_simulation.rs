@@ -419,7 +419,8 @@ async fn end_to_end_network_demo() {
     let pseudonym = derive_pseudonym(&alice_custody, &alice_identity_key, ctx_id.as_bytes())
         .await
         .unwrap();
-    let routing_arr: [u8; 32] = pseudonym.public_key.as_bytes().try_into().unwrap();
+    // §9.10.4: routing fields carry the routing id of the 33-byte P-256 point.
+    let routing_arr: [u8; 32] = *pseudonym.routing_id();
 
     println!("  Step 2: Pseudonym derived for routing");
     println!("    routing_id:  {}...", hex::encode(&routing_arr[..8]));

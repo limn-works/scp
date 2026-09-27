@@ -283,7 +283,7 @@ pub struct FileKeyCustody {
     /// Counter for allocating new handle IDs.
     next_id: AtomicU64,
     /// In-memory store for derived pseudonym keys (not persisted to disk).
-    pseudonym_keys: Mutex<HashMap<u64, SigningKey>>,
+    pseudonym_keys: Mutex<HashMap<u64, P256SigningKey>>,
     /// Serializes file read-modify-write operations to prevent data races
     /// when multiple tasks call `append_entry` concurrently.
     file_write_lock: StdMutex<()>,
@@ -565,6 +565,7 @@ impl FileKeyCustody {
     }
 }
 
+use scp_crypto::p256::P256SigningKey;
 use scp_crypto::pseudonym::derive_pseudonym_keypair;
 
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
@@ -612,9 +613,8 @@ impl KeyCustody for FileKeyCustody {
             // Check if this is a derived pseudonym key (stored in memory).
             {
                 let pseudonyms = self.pseudonym_keys.lock().await;
-                if let Some(signing_key) = pseudonyms.get(&key_id) {
-                    let signature = signing_key.sign(data);
-                    return Ok(Signature::new(signature.to_bytes().to_vec()));
+                if let Some(pseudonym_key) = pseudonyms.get(&key_id) {
+                    return crate::traits::sign_pseudonym_digest(pseudonym_key, data);
                 }
             }
 
@@ -635,9 +635,10 @@ impl KeyCustody for FileKeyCustody {
             // Check pseudonym keys first.
             {
                 let pseudonyms = self.pseudonym_keys.lock().await;
-                if let Some(signing_key) = pseudonyms.get(&key_id) {
-                    let vk = signing_key.verifying_key();
-                    return Ok(PublicKey::new(vk.to_bytes().to_vec()));
+                if let Some(pseudonym_key) = pseudonyms.get(&key_id) {
+                    return Ok(PublicKey::new(
+                        pseudonym_key.public_key().to_compressed().to_vec(),
+                    ));
                 }
             }
 
@@ -820,23 +821,21 @@ impl KeyCustody for FileKeyCustody {
             let handle = KeyHandle::new(key_id);
             let (_key_bytes, signing_key) = self.decrypt_ed25519_key(&handle).await?;
 
-            // Software custody: pseudonym keypair = Ed25519_keygen(HMAC-SHA256(
-            //   pseudonym_secret, context_id || "scp-pseudonym")), where the
-            // pseudonym_secret is derived from the private seed via HKDF (§9.10.4.A),
-            // NOT the public key, to prevent membership enumeration attacks.
-            let pseudonym_signing_key = derive_pseudonym_keypair(&signing_key, &context_id, None);
-            let pseudonym_verifying_key = pseudonym_signing_key.verifying_key();
+            // Software custody (§9.10.4.A): the ikm is the identity private
+            // seed, never the public key. Until S12 the identity key is
+            // Ed25519, so its 32-byte seed is the ikm.
+            let ikm = Zeroizing::new(signing_key.to_bytes());
+            let pseudonym_key = derive_pseudonym_keypair(&ikm, &context_id, None)
+                .map_err(|e| PlatformError::CustodyError(format!("pseudonym derivation: {e}")))?;
+            let public_key = pseudonym_key.public_key().to_compressed();
 
-            // Store derived key in memory (pseudonyms are software-managed).
+            // Pseudonym keys are software-managed and held in memory only.
             let pseudo_handle = self.next_handle();
             let mut pseudonyms = self.pseudonym_keys.lock().await;
-            pseudonyms.insert(pseudo_handle.id(), pseudonym_signing_key);
+            pseudonyms.insert(pseudo_handle.id(), pseudonym_key);
             drop(pseudonyms);
 
-            Ok(PseudonymKeypair {
-                public_key: PublicKey::new(pseudonym_verifying_key.to_bytes().to_vec()),
-                key_handle: pseudo_handle,
-            })
+            PseudonymKeypair::new(&public_key, pseudo_handle)
         }
     }
 
@@ -852,24 +851,21 @@ impl KeyCustody for FileKeyCustody {
             let handle = KeyHandle::new(key_id);
             let (_key_bytes, signing_key) = self.decrypt_ed25519_key(&handle).await?;
 
-            // Software custody: rotatable pseudonym keypair = Ed25519_keygen(
-            //   HMAC-SHA256(pseudonym_secret, context_id || epoch_BE
-            //   || "scp-pseudonym-v2")). The pseudonym_secret is derived from the
-            // private seed via HKDF (§9.10.4.A), NOT the public key, to prevent
-            // membership enumeration attacks. epoch_BE breaks long-term correlation.
-            let pseudonym_signing_key =
-                derive_pseudonym_keypair(&signing_key, &context_id, Some(pseudonym_epoch));
-            let pseudonym_verifying_key = pseudonym_signing_key.verifying_key();
+            // Software custody (§9.10.4.A): the ikm is the identity private
+            // seed, never the public key. Until S12 the identity key is
+            // Ed25519, so its 32-byte seed is the ikm.
+            let ikm = Zeroizing::new(signing_key.to_bytes());
+            let pseudonym_key = derive_pseudonym_keypair(&ikm, &context_id, Some(pseudonym_epoch))
+                .map_err(|e| PlatformError::CustodyError(format!("pseudonym derivation: {e}")))?;
+            let public_key = pseudonym_key.public_key().to_compressed();
 
+            // Pseudonym keys are software-managed and held in memory only.
             let pseudo_handle = self.next_handle();
             let mut pseudonyms = self.pseudonym_keys.lock().await;
-            pseudonyms.insert(pseudo_handle.id(), pseudonym_signing_key);
+            pseudonyms.insert(pseudo_handle.id(), pseudonym_key);
             drop(pseudonyms);
 
-            Ok(PseudonymKeypair {
-                public_key: PublicKey::new(pseudonym_verifying_key.to_bytes().to_vec()),
-                key_handle: pseudo_handle,
-            })
+            PseudonymKeypair::new(&public_key, pseudo_handle)
         }
     }
 
@@ -1261,7 +1257,10 @@ mod tests {
         let first = custody.derive_pseudonym(&handle, b"ctx").await.unwrap();
         let second = custody.derive_pseudonym(&handle, b"ctx").await.unwrap();
 
-        assert_eq!(first.public_key.as_bytes(), second.public_key.as_bytes());
+        assert_eq!(
+            first.public_key().as_bytes(),
+            second.public_key().as_bytes()
+        );
     }
 
     #[tokio::test]
@@ -1271,15 +1270,27 @@ mod tests {
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
         let pseudo = custody.derive_pseudonym(&handle, b"ctx").await.unwrap();
-        let sig = custody.sign(&pseudo.key_handle, b"msg").await.unwrap();
-        assert_eq!(sig.as_bytes().len(), 64);
+        let digest = [0x33u8; 32];
+        let sig = custody.sign(pseudo.key_handle(), &digest).await.unwrap();
 
-        // Verify.
-        let pk_bytes: [u8; 32] = pseudo.public_key.as_bytes().try_into().unwrap();
-        let vk = VerifyingKey::from_bytes(&pk_bytes).unwrap();
-        let sig_bytes: [u8; 64] = sig.as_bytes().try_into().unwrap();
-        let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-        assert!(ed25519_dalek::Verifier::verify(&vk, b"msg", &signature).is_ok());
+        // A low-s P-256 signature under the 33-byte pseudonym point.
+        let pk =
+            scp_crypto::p256::P256PublicKey::from_sec1(pseudo.public_key().as_bytes()).unwrap();
+        scp_crypto::p256::verify_prehash_strict(&pk, &digest, sig.as_bytes()).unwrap();
+        assert!(matches!(
+            custody.sign(pseudo.key_handle(), b"msg").await,
+            Err(PlatformError::CustodyError(_))
+        ));
+        assert_eq!(
+            custody
+                .public_key(pseudo.key_handle())
+                .await
+                .unwrap()
+                .as_bytes(),
+            pseudo.public_key().as_bytes()
+        );
+        custody.destroy_key(pseudo.key_handle()).await.unwrap();
+        assert!(custody.public_key(pseudo.key_handle()).await.is_err());
     }
 
     #[cfg(unix)]

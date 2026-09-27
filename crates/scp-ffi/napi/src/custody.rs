@@ -66,11 +66,11 @@ pub struct NapiKeyCustodyProvider {
     #[napi(ts_type = "(keyId: string, peerPublic: Uint8Array) => Uint8Array")]
     pub dh_agree: Function<'static, (String, Vec<u8>), Vec<u8>>,
     /// `(keyId: string, contextId: Uint8Array) => Uint8Array` —
-    /// `publicKey(32) || keyIdUtf8`.
+    /// `publicKey(33, compressed P-256) || keyIdUtf8`.
     #[napi(ts_type = "(keyId: string, contextId: Uint8Array) => Uint8Array")]
     pub derive_pseudonym: Function<'static, (String, Vec<u8>), Vec<u8>>,
     /// `(keyId: string, contextId: Uint8Array, pseudonymEpoch: bigint) => Uint8Array`
-    /// — canonical rotatable v2 pseudonym; returns `publicKey(32) || keyIdUtf8`.
+    /// — canonical rotatable v2 pseudonym; returns `publicKey(33) || keyIdUtf8`.
     /// The provider performs the canonical derivation (HMAC key is the
     /// private-derived `pseudonym_secret`, domain `"scp-pseudonym-v2"`); the
     /// bridge does NOT synthesize the preimage.
@@ -311,8 +311,9 @@ impl KeyCustody for NapiCallbackKeyCustody {
     ) -> Result<PseudonymKeypair, PlatformError> {
         // Canonical v2 recipe (spec §9.10.4.A / §9.10.4.1): the provider performs
         // the rotatable derivation itself — seed = HMAC-SHA256(pseudonym_secret,
-        // context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2"); keypair =
-        // Ed25519_keygen(seed[0..32]). The epoch is threaded through to the
+        // context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2"); d =
+        // seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed), returned as the 33-byte
+        // compressed P-256 point. The epoch is threaded through to the
         // provider rather than synthesized into the context_id bridge-side, so
         // the v1 platform adapter does not re-append its own "scp-pseudonym"
         // domain separator (which would corrupt the v2 domain). Mirrors the
@@ -403,6 +404,10 @@ impl KeyCustody for NapiCallbackKeyCustody {
 /// Enum dispatch wrapper for the [`KeyCustody`] implementations the napi-rs
 /// bridge uses. Since [`KeyCustody`] is not object-safe (RPITIT), this enum
 /// wraps the concrete types and delegates each method to the active variant.
+// The `InMemory` variant exists only in `testing` builds, and each identity
+// holds one custody value, so boxing it would buy nothing. Same allowance as
+// the PyO3 `FfiKeyCustody`.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum NapiKeyCustody {
     /// Test/dev in-memory custody (feature-gated), wrapped for redacted Debug.
     #[cfg(feature = "testing")]

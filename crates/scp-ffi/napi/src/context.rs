@@ -397,7 +397,7 @@ pub struct NapiMessage {
 /// derivation failure MUST be a typed error rather than a swallowed `None`.
 /// Codes match the `PyO3` reference bridge exactly so the same failure yields the
 /// same `.code` across bridges: missing key material → SCP-IDENT-1054,
-/// derivation failure → SCP-IDENT-1055, wrong key length → SCP-IDENT-1057.
+/// derivation failure (including an invalid P-256 point) → SCP-IDENT-1055.
 ///
 /// Un-gated for production: pseudonym derivation runs through retained
 /// callback custody (OS-keychain/HSM), exactly like the rest of the signing
@@ -424,11 +424,11 @@ async fn derive_context_pseudonym_required(
 /// Core pseudonym-derivation sequence shared by every NAPI entry point.
 ///
 /// Holds the single authoritative definition of the derivation-failure code
-/// contract (derivation failure → SCP-IDENT-1055, wrong key length →
-/// SCP-IDENT-1057). The missing-key-material code (SCP-IDENT-1054) is surfaced
+/// contract (derivation failure, including a host-returned pseudonym key that
+/// is not a valid 33-byte P-256 point → SCP-IDENT-1055). The missing-key-material code (SCP-IDENT-1054) is surfaced
 /// by the callers that resolve custody (which know whether the lookup came from
 /// a handle or the registry). Centralizing here mirrors the `PyO3` reference
-/// bridge so the 1054/1055/1057 contract cannot drift across create / join /
+/// bridge so the 1054/1055 contract cannot drift across create / join /
 /// import.
 async fn derive_pseudonym_bytes(
     custody: &crate::custody::NapiKeyCustody,
@@ -444,13 +444,10 @@ async fn derive_pseudonym_bytes(
                 code: codes::IDENT_1055.to_owned(),
             })
         })?;
-    let bytes: [u8; 32] = pseudonym.public_key.as_bytes().try_into().map_err(|_| {
-        NapiError::from(ScpNapiError::Identity {
-            message: "pseudonym public key must be 32 bytes".to_owned(),
-            code: codes::IDENT_1057.to_owned(),
-        })
-    })?;
-    Ok(bytes)
+    // §9.10.4: the routing axis carries the 32-byte routing id of the 33-byte
+    // P-256 pseudonym. `PseudonymKeypair::new` already rejected a malformed
+    // host-returned point, which surfaced above as SCP-IDENT-1055.
+    Ok(*pseudonym.routing_id())
 }
 
 /// Resolves a member's per-context pseudonym from the bridge identity registry,
@@ -459,7 +456,7 @@ async fn derive_pseudonym_bytes(
 /// Mirrors the `PyO3` reference bridge's `derive_member_pseudonym(bi, did,
 /// context_id)`: resolves the importer/joiner's custody + identity key from the
 /// registry (a miss is missing key material → SCP-IDENT-1054), then routes
-/// through [`derive_pseudonym_bytes`] for the 1055/1057 contract. Used by the
+/// through [`derive_pseudonym_bytes`] for the 1055 contract. Used by the
 /// (encrypted-only) IMPORT path and the encrypted JOIN path so the routing axis
 /// is never silently degraded to the reserved `[0u8; 32]` sentinel.
 async fn derive_member_pseudonym_required(
@@ -935,7 +932,7 @@ pub(crate) async fn context_join_on(
     // `[0u8; 32]` sentinel — peers reject any announce of a reserved value, so
     // the joiner becomes permanently unaddressable with no error surfaced.
     // Route through `derive_member_pseudonym_required` to propagate the
-    // canonical identity codes (1054/1055/1056/1057) at create/import
+    // canonical identity codes (1054/1055/1056) at create/import
     // granularity. BROADCAST contexts soft-fail to `None`: they carry no
     // per-member pseudonym (spec §5.14) and the runtime ignores the value.
     let context_id = handle.context_id.clone();
@@ -4976,8 +4973,8 @@ pub(crate) async fn context_import_on(
     // exports are rejected upstream with SCP-CTX-2092), so a real pseudonym is
     // ALWAYS required — derive it UNCONDITIONALLY, exactly like the PyO3
     // reference bridge. Custody / derivation failure is a hard error carrying
-    // granular codes (missing material → 1054, derivation failure → 1055, wrong
-    // length → 1057, custody unavailable → 1056), never a silent zero-pseudonym
+    // granular codes (missing material → 1054, derivation failure → 1055,
+    // custody unavailable → 1056), never a silent zero-pseudonym
     // fallback (which would reintroduce the relay-correlation vector) and never
     // a `[0u8; 32]` sentinel for broadcast (which would make the member
     // permanently unaddressable). Resolve the importer's custody+key from the
@@ -7494,7 +7491,7 @@ mod tests {
     ///
     /// This helper is the single deduped definition of the encrypted JOIN /
     /// IMPORT derivation contract for the NAPI bridge — the join and import
-    /// paths both route through it so the 1054/1055/1057 codes cannot drift
+    /// paths both route through it so the 1054/1055 codes cannot drift
     /// across entry points. A registry miss (no identity registered for the
     /// DID) resolves no custody, so the encrypted routing axis must hard-fail
     /// rather than silently degrade to the reserved `[0u8; 32]` sentinel.

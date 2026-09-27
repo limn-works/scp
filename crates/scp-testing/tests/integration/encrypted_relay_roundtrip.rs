@@ -378,8 +378,9 @@ async fn alice_bob_encrypted_message_via_relay() {
         .await
         .unwrap();
 
-    let routing_bytes = pseudonym.public_key.as_bytes();
-    let routing_arr: [u8; 32] = routing_bytes.try_into().unwrap();
+    // §9.10.4: routing fields carry the 32-byte routing id of the P-256
+    // pseudonym, never the 33-byte point itself.
+    let routing_arr: [u8; 32] = *pseudonym.routing_id();
 
     // 8c. Seal: serialize inner, encrypt with sender key, encrypt with MLS,
     //     wrap in outer envelope (ADR-001, ADR-002, ADR-007).

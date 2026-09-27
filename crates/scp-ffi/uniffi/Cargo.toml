@@ -94,6 +94,8 @@ zeroize = { workspace = true }
 z-base-32 = { workspace = true }
 
 [dev-dependencies]
+# The `ProdLikeCustody` test provider mints real §9.10.4 P-256 pseudonym points.
+scp-crypto = { path = "../../scp-crypto" }
 # Tests need InMemoryKeyCustody — enable the `testing` feature for dev-deps.
 scp-platform = { path = "../../scp-platform", features = ["testing"] }
 # Test seams (`install_seedable_resolver`) construct

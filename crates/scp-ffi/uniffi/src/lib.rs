@@ -360,23 +360,24 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// custody boundary.
     async fn dh_agree(&self, key_id: String, peer_public: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 
-    /// Derive a deterministic, context-scoped Ed25519 pseudonym keypair.
+    /// Derive a deterministic, context-scoped P-256 pseudonym keypair (§9.10.4).
     ///
     /// The actual derivation runs inside the injected platform `KeyCustody`
     /// callback (Swift Keychain/Secure Enclave, Kotlin Keystore). Algorithm:
-    ///   1. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
-    ///   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`  // seed is an RFC-8032 Ed25519 seed
+    ///   1. `pseudonym_secret = HKDF-SHA256(ikm, salt="scp-pseudonym-secret-v1", info="", L=32)`
+    ///   2. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
+    ///   3. `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`; the public key
+    ///      is the 33-byte SEC1 compressed point `d·G`.
     ///
     /// The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key —
-    /// public key bytes would be a membership-enumeration oracle (§9.10.4.A).
-    /// For software custody, `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
-    /// salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic
-    /// (§25.19 vectors). For hardware custody (Secure Enclave, Keystore TEE) the
-    /// private key is non-exportable, so `pseudonym_secret` is a device-local value
-    /// computed inside the secure boundary, and those pseudonyms are device-local
-    /// by design.
+    /// public key bytes would be a membership-enumeration oracle (§9.10.4).
+    /// Routing fields carry `SHA-256("scp-pseudonym-routing-v1:" || point)`,
+    /// which the Rust side computes from the returned point.
     ///
-    /// Returns a two-element list: `[pseudonym_public_key_bytes (32), key_id (string as UTF-8)]`.
+    /// Returns `[pseudonym_public_key_bytes (33) || key_id_utf8]`. A point that
+    /// is not a valid compressed P-256 point is rejected (fail closed). Host
+    /// adapters that still return 32-byte Ed25519 keys fail until they move
+    /// to P-256.
     /// The bridge unpacks this into a `PseudonymKeypair`.
     async fn derive_pseudonym(
         &self,
@@ -387,11 +388,11 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// Derive a rotatable (epoch-versioned) per-context pseudonym keypair.
     ///
     /// Canonical recipe (spec §9.10.4.A / §9.10.4.1): the HMAC key is the
-    /// private-derived `pseudonym_secret` (HKDF over the Ed25519 private seed),
+    /// private-derived `pseudonym_secret` (HKDF over the identity private seed),
     /// NEVER the public key.
     /// `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2")`;
-    /// `keypair = Ed25519_keygen(seed[0..32])` (RFC-8032 seed). Returns
-    /// `[pseudonym_public_key_bytes (32) || key_id_utf8]`.
+    /// `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`. Returns
+    /// `[pseudonym_public_key_bytes (33, compressed P-256) || key_id_utf8]`.
     ///
     /// The `pseudonym_epoch` is passed through to the provider so it performs
     /// the canonical v2 derivation itself. Bridges MUST NOT synthesize a
