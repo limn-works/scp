@@ -1791,8 +1791,8 @@ pub(crate) fn emit_event_into(
 
 /// Strips decrypted plaintext from event variants that carry message payloads.
 ///
-/// The broadcast channel is observable by any subscriber (e.g., SDK event
-/// listeners). Sending decrypted content on it would
+/// The broadcast channel is observable by any holder of a receiver taken from
+/// `Supervisor::subscribe_events`. Sending decrypted content on it would
 /// defeat MLS encryption-as-access-control. This function replaces payload
 /// bytes with an empty `Vec` for `MessageReceived` and `MessageSent`, and
 /// passes all other variants through unchanged.
