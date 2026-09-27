@@ -1201,8 +1201,10 @@ pub const ATTEST_9017: &str = "SCP-ATTEST-9017";
 pub const ATTEST_9018: &str = "SCP-ATTEST-9018";
 
 // Codes the Swift `AppleDeviceAttestation` adapter throws as `ScpError`
-// across the UniFFI `DeviceAttestationProvider` callback, one per
-// `AttestationError` case (`AttestationError.scpError`).
+// across the UniFFI `DeviceAttestationProvider` callback
+// (`AttestationError.scpError`). Each of these eight codes belongs to one of
+// the nine `AttestationError` cases; the ninth case, `serviceError`, reuses
+// `ATTEST_9001`.
 
 /// Apple App Attest is unsupported on this device (`isSupported == false`).
 pub const ATTEST_9019: &str = "SCP-ATTEST-9019";

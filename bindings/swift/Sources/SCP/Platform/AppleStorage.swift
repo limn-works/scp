@@ -206,7 +206,13 @@
             PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;
             PRAGMA journal_mode = WAL;
             """
-            try execSQL(db: db, sql: pragmas)
+            do {
+                try execSQL(db: db, sql: pragmas)
+                _ = try sqlCipherVersion(db: db)
+            } catch {
+                sqlite3_close_v2(db)
+                throw error
+            }
 
             // Create the KV table.
             try execSQL(db: db, sql: """
@@ -542,6 +548,43 @@
         /// Returns the last SQLite error message for the current connection.
         private func lastErrorMessage() -> String {
             String(cString: sqlite3_errmsg(db))
+        }
+
+        /// Read `PRAGMA cipher_version` on `db` and return the SQLCipher
+        /// version it reports.
+        ///
+        /// Plain SQLite ignores an unknown pragma without an error, so a
+        /// process whose `sqlite3_` symbols resolved to the system library
+        /// accepts `PRAGMA key` and then writes every value in the clear.
+        /// SQLCipher answers `PRAGMA cipher_version` with one row, and plain
+        /// SQLite answers it with no row, so `open(at:encryptionKey:)` calls
+        /// this method and fails closed on that answer.
+        ///
+        /// - Throws: `StorageError.databaseError` when the statement cannot be
+        ///   prepared or stepped, and when ``requireSQLCipherVersion(_:)``
+        ///   rejects the rows it returned.
+        static func sqlCipherVersion(db: OpaquePointer) throws -> String { // swiftlint:disable:this identifier_name
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, "PRAGMA cipher_version;", -1, &stmt, nil) == SQLITE_OK else {
+                throw StorageError.databaseError(String(cString: sqlite3_errmsg(db)))
+            }
+            return try requireSQLCipherVersion(readKeys(from: stmt))
+        }
+
+        /// Return the one non-empty version `PRAGMA cipher_version` answered.
+        ///
+        /// - Throws: `StorageError.databaseError` when `rows` is not exactly
+        ///   one non-empty string, which means SQLCipher is not the SQLite
+        ///   library this process linked, so no value would be encrypted.
+        static func requireSQLCipherVersion(_ rows: [String]) throws -> String {
+            guard rows.count == 1, let version = rows.first, !version.isEmpty else {
+                throw StorageError.databaseError(
+                    "PRAGMA cipher_version returned \(rows.count) rows and no SQLCipher version, "
+                        + "so this process linked a SQLite library that does not encrypt"
+                )
+            }
+            return version
         }
 
         /// Execute a batch SQL statement (no results expected).

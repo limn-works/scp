@@ -36,8 +36,11 @@
         /// `DCError.h` lists "you call `attestKey:clientDataHash:` for a key
         /// that's already been attested" as one cause of that code. This
         /// adapter reaches it only when an earlier attestation succeeded and
-        /// its record was lost. It keeps that key and records the attestation,
-        /// so a later `attest(challenge:deviceId:)` generates a replacement
+        /// its record was lost. For the stored key, the adapter keeps that key
+        /// and records the attestation, so a later
+        /// `attest(challenge:deviceId:)` generates a replacement key. For a
+        /// replacement key, the adapter discards the replacement key, writes
+        /// no record for it, and keeps generating assertions with the stored
         /// key.
         case keyAlreadyAttested(String)
         /// Apple answered `generateAssertion` with `DCError.invalidKey` for a
@@ -180,9 +183,11 @@
     ///
     /// See ADR-025 and `crates/scp-platform/src/traits.rs` `DeviceAttestation`.
     public final class AppleDeviceAttestation: DeviceAttestationProvider, @unchecked Sendable {
-        // `@unchecked Sendable` is required because this class is injected into the
-        // Rust engine via the UniFFI `DeviceAttestationProvider` callback interface,
-        // which requires `Send + Sync` (Rust) → `Sendable` (Swift). Internal mutable
+        // `@unchecked Sendable` is required because this class conforms to the
+        // UniFFI `DeviceAttestationProvider` callback protocol, whose Rust trait
+        // requires `Send + Sync`, which UniFFI generates as `Sendable` in Swift.
+        // No Rust code holds or calls a `DeviceAttestationProvider` yet (story
+        // SCP-095 criterion 1). Internal mutable
         // state (`UserDefaults`) is protected by `lock`; no reference
         // semantics escape across the FFI boundary. This is the same exception as
         // `MessageListenerAdapter`. See .docs/standards/swift.md §Sendable — UniFFI exception.

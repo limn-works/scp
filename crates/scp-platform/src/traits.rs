@@ -821,9 +821,13 @@ pub trait PreRotationCustody: Send + Sync {
 ///
 /// §9.3.1 of `.docs/specs/09-security-model.md` states how a reader verifies
 /// an Apple App Attest attestation object, and story SCP-316 implements that
-/// reader. The Swift `AppleDeviceAttestation` adapter implements no `verify`,
-/// because the identity workstream owns the reading-side verifier (ADR-025,
-/// the Apple platform adapter, in `.docs/adrs/phase-5.md`).
+/// reader. The Swift `AppleDeviceAttestation` adapter does not implement this
+/// trait: it conforms to the UniFFI `DeviceAttestationProvider` callback
+/// interface in `crates/scp-ffi/uniffi/src/lib.rs`, which declares no
+/// verifier, because the identity workstream owns the reading-side verifier
+/// (ADR-025, the Apple platform adapter, in `.docs/adrs/phase-5.md`). OQ-22 of
+/// `.docs/specs/27-attestations.md` keeps open which of the two traits is
+/// normative.
 pub trait DeviceAttestation: Send + Sync {
     /// Generate a device attestation token.
     ///

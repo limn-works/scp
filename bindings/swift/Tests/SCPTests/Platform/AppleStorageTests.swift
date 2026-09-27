@@ -427,14 +427,39 @@
             // Write-ahead logging puts a fresh row in `<name>-wal` before a
             // checkpoint moves it into the database file, so both files carry
             // the value at some point and this case reads all three paths.
+            var bytesRead = 0
             for suffix in ["", "-wal", "-shm"] {
                 let path = fixture.fileURL.path + suffix
-                let bytes = (try? Data(contentsOf: URL(fileURLWithPath: path))) ?? Data()
+                guard FileManager.default.fileExists(atPath: path) else { continue }
+                let bytes = try Data(contentsOf: URL(fileURLWithPath: path))
+                bytesRead += bytes.count
                 #expect(
                     bytes.range(of: marker) == nil,
                     "the file at \(path) carries a stored value in plaintext"
                 )
             }
+            // A case that read no bytes would pass for a plaintext build, so
+            // it requires the files it searched to hold the stored row.
+            #expect(bytesRead > 0, "no database file held any bytes to search")
+        }
+
+        @Test("open runs on SQLCipher, which answers PRAGMA cipher_version")
+        func openedConnectionReportsSQLCipherVersion() throws {
+            let connection = try makeBareConnection()
+            defer { sqlite3_close_v2(connection) }
+            #expect(try !AppleStorage.sqlCipherVersion(db: connection).isEmpty)
+        }
+
+        @Test("a cipher_version answer with no version rejects the connection")
+        func missingSQLCipherVersionThrows() throws {
+            // Plain SQLite answers the unknown pragma with no row.
+            #expect(throws: StorageError.self) {
+                try AppleStorage.requireSQLCipherVersion([])
+            }
+            #expect(throws: StorageError.self) {
+                try AppleStorage.requireSQLCipherVersion([""])
+            }
+            #expect(try AppleStorage.requireSQLCipherVersion(["4.6.1 community"]) == "4.6.1 community")
         }
 
         @Test("set overwrites the value an earlier set stored")
