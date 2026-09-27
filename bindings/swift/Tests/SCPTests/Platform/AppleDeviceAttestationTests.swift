@@ -1229,7 +1229,7 @@
                 assertScript: [.init(result: .success(Data([0xB1])), delay: 0)]
             )
             let first = AppleDeviceAttestation(service: service, defaults: defaults)
-            let second = AppleDeviceAttestation(service: service, defaults: defaults, sharingKeyStateWith: first)
+            let second = AppleDeviceAttestation(service: service, defaults: defaults)
 
             await withTaskGroup(of: Void.self) { group in
                 for adapter in [first, second] {
@@ -1243,6 +1243,7 @@
             }
 
             #expect(first.sharesKeyState(with: second))
+            #expect(!first.sharesKeyState(with: AppleDeviceAttestation(service: service, defaults: InMemoryUserDefaults())))
             #expect(service.peakConcurrency == 1)
             #expect(service.attestedKeyIds.count == 2)
             #expect(Set(service.attestedKeyIds).count == 2, "Apple was asked to attest one key twice")

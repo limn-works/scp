@@ -170,12 +170,13 @@
     /// Apple's answer as a `Result`; `generateKey` bridges through
     /// `withCheckedThrowingContinuation`.
     ///
-    /// `init()` reads `UserDefaults.standard` and `DCAppAttestService.shared`,
-    /// which every instance in the process shares, so `init()` also hands every
-    /// instance one lock and one serializer that the process shares. Two
-    /// instances built with `init()` therefore run their App Attest calls in
-    /// one order, and neither reads an attestation record the other is still
-    /// deciding what to write into.
+    /// The lock and the serializer belong to the `UserDefaults` object that
+    /// holds the key state, not to one instance: `AppAttestKeyStateGuard`
+    /// attaches one pair to that object, and every instance over that object
+    /// takes that pair. `init()` reads `UserDefaults.standard`, which every
+    /// instance in the process shares, so two instances built with `init()`
+    /// run their App Attest calls in one order, and neither reads an
+    /// attestation record the other is still deciding what to write into.
     ///
     /// See ADR-025 and `crates/scp-platform/src/traits.rs` `DeviceAttestation`.
     public final class AppleDeviceAttestation: DeviceAttestationProvider, @unchecked Sendable {
@@ -196,15 +197,6 @@
         /// finished writing it, and concurrent `attest` calls generate one key.
         private let callSerializer: AppAttestCallSerializer
 
-        /// The lock every instance built with `init()` shares, because every
-        /// such instance reads and writes `UserDefaults.standard`.
-        private static let standardDefaultsLock = NSLock()
-
-        /// The serializer every instance built with `init()` shares, because
-        /// every such instance keeps its key state in `UserDefaults.standard`
-        /// and calls `DCAppAttestService.shared`.
-        private static let standardDefaultsCallSerializer = AppAttestCallSerializer()
-
         /// Whether this instance is running in hardware-backed mode.
         ///
         /// `false` on simulator or devices where App Attest is unavailable.
@@ -223,28 +215,28 @@
         public init() {
             service = DCAppAttestService.shared
             defaults = UserDefaults.standard
-            lock = Self.standardDefaultsLock
-            callSerializer = Self.standardDefaultsCallSerializer
+            let keyStateGuard = AppAttestKeyStateGuard.guarding(defaults)
+            lock = keyStateGuard.lock
+            callSerializer = keyStateGuard.callSerializer
         }
 
         /// Testing initializer that accepts injected dependencies.
         ///
         /// Used in unit tests to supply a mock `DCAppAttestService` subclass and
-        /// an in-memory `UserDefaults` suite.
-        ///
-        /// - Parameter peer: An adapter over the same `defaults`, whose lock and
-        ///   serializer this adapter shares; `nil` gives this adapter its own,
-        ///   which is correct only while no other adapter reads `defaults`.
-        init(service: DCAppAttestService, defaults: UserDefaults, sharingKeyStateWith peer: AppleDeviceAttestation? = nil) {
-            precondition(peer.map { $0.defaults === defaults } ?? true, "a peer adapter must read the same defaults")
+        /// an in-memory `UserDefaults` suite. Every adapter built over one
+        /// `defaults` object shares one lock and one serializer, as every
+        /// adapter `init()` builds does.
+        init(service: DCAppAttestService, defaults: UserDefaults) {
             self.service = service
             self.defaults = defaults
-            lock = peer?.lock ?? NSLock()
-            callSerializer = peer?.callSerializer ?? AppAttestCallSerializer()
+            let keyStateGuard = AppAttestKeyStateGuard.guarding(defaults)
+            lock = keyStateGuard.lock
+            callSerializer = keyStateGuard.callSerializer
         }
 
         /// Report whether this adapter and `other` share one lock and one
-        /// serializer, which every two adapters over one `UserDefaults` must.
+        /// serializer, which every two adapters over one `UserDefaults` object
+        /// must.
         func sharesKeyState(with other: AppleDeviceAttestation) -> Bool {
             lock === other.lock && callSerializer === other.callSerializer
         }
@@ -317,9 +309,10 @@
         ///   the key this method named although this adapter held no record of
         ///   it. For the stored key, this method records that attestation, so a
         ///   later call generates a replacement key. For a replacement key,
-        ///   this method discards the replacement, because no caller received
-        ///   an attestation that names it, so `assertRequest` keeps the
-        ///   attested key and a later call generates another replacement.
+        ///   this method discards the replacement, because this adapter holds
+        ///   no record that any call returned an attestation naming it, so
+        ///   `assertRequest` keeps the attested key and a later call generates
+        ///   another replacement.
         ///   `AttestationError.keyRejected` when Apple's App Attest service
         ///   rejected the stored key; this method discards its key ID, so a
         ///   later call generates a replacement.
@@ -515,11 +508,11 @@
         /// `DCError.serverUnavailable` from either call keeps the key, because
         /// `DCError.h` asks a caller to retry with the same key.
         ///
-        /// A replacement key Apple already attested is discarded, because the
-        /// `attestKey` call Apple answered never returned its attestation
-        /// object to a caller, so no published attestation names that key, and
-        /// promoting it would move `assertRequest` off the key an earlier
-        /// published attestation names.
+        /// A replacement key Apple already attested is discarded, because this
+        /// adapter holds no record that the `attestKey` call Apple answered
+        /// returned its attestation object to a caller, and promoting that key
+        /// would move `assertRequest` off the key an earlier published
+        /// attestation names, onto a key no published attestation may name.
         ///
         /// **What makes an attestation record a sound input.** The record
         /// describes the key App Attest holds only while no other App Attest
@@ -567,8 +560,8 @@
             case .success:
                 if forgetReplacementKeyId(keyId) {
                     return .keyAlreadyAttested(
-                        "App Attest already attested this replacement key, and no caller received "
-                            + "its attestation, so this adapter discarded it and a later attest "
+                        "App Attest already attested this replacement key, and this adapter holds no "
+                            + "record that a caller received its attestation, so it discarded the key and a later attest "
                             + "generates another replacement: \(error.localizedDescription)"
                     )
                 }
@@ -727,8 +720,8 @@
         ///
         /// Thread-safe: protected by `lock`.
         ///
-        /// - Parameter keyId: A key ID Apple attested in a call that returned
-        ///   no attestation object to a caller.
+        /// - Parameter keyId: A key ID Apple attested although this adapter
+        ///   holds no record that a call returned its attestation object.
         private func forgetReplacementKeyId(_ keyId: String) -> Bool {
             lock.lock()
             defer { lock.unlock() }
@@ -770,6 +763,42 @@
             guard defaults.string(forKey: StorageKey.appAttestKeyId) == keyId else { return }
             defaults.removeObject(forKey: StorageKey.appAttestKeyId)
             defaults.removeObject(forKey: StorageKey.attestedAppAttestKeyId)
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // App Attest key-state guard
+    // ---------------------------------------------------------------------------
+
+    /// The lock and the call serializer that order every App Attest call over
+    /// one `UserDefaults` object.
+    ///
+    /// The stored key ID and the attestation record live in that object, so
+    /// two adapters over it race unless they share one order. `guarding(_:)`
+    /// keeps the pair as an Objective-C associated object of that
+    /// `UserDefaults` object, so the pair lives exactly as long as that object
+    /// and no Swift global holds it.
+    private final class AppAttestKeyStateGuard {
+        let lock = NSLock()
+        let callSerializer = AppAttestCallSerializer()
+
+        /// Return the pair attached to `defaults`, attaching a new pair first
+        /// when `defaults` carries none.
+        ///
+        /// `objc_sync_enter` on `defaults` makes the read and the attach one
+        /// step, so two adapters built at once over one object take one pair.
+        static func guarding(_ defaults: UserDefaults) -> AppAttestKeyStateGuard {
+            // The class metadata address is unique in the process and never
+            // moves, which makes it a stable association key.
+            let key = unsafeBitCast(AppAttestKeyStateGuard.self, to: UnsafeRawPointer.self)
+            objc_sync_enter(defaults)
+            defer { objc_sync_exit(defaults) }
+            if let existing = objc_getAssociatedObject(defaults, key) as? AppAttestKeyStateGuard {
+                return existing
+            }
+            let created = AppAttestKeyStateGuard()
+            objc_setAssociatedObject(defaults, key, created, .OBJC_ASSOCIATION_RETAIN)
+            return created
         }
     }
 
