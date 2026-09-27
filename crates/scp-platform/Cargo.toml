@@ -65,8 +65,10 @@ sqlite = ["dep:rusqlite", "dep:hex", "dep:argon2", "dep:rand", "dep:fs2"]
 # upgrading `libssl3` in the runtime layer, and `Dockerfile` and
 # `templates/personal-relay/README.md` both state that dynamic link as the reason
 # they install `libssl3`. `scripts/check-vendored-openssl-scope.sh` fails when
-# `openssl-src` enters the shipped dependency graph of either binary or of any of
-# the three FFI bridges in their shipped configurations.
+# `openssl-src` is missing from the wheel's configuration on any triple the wheel
+# ships for, or enters the graph of any other shipped configuration: either
+# binary, the other shipped configurations of the three FFI bridges, or any
+# separately-workspaced template.
 #
 # `rusqlite?/` rather than `rusqlite/`: this feature adds a build mode to a
 # SQLCipher that some other feature already asked for, and never pulls rusqlite

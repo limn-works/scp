@@ -46,17 +46,17 @@ markers = [
 ]
 
 [tool.ruff]
-target-version = "py312"
+# The floor `requires-python` names: ruff reports syntax newer than the target
+# (PEP 695 `type X` and `def f[T]` among it), so code the 3.10 and 3.11 wheels
+# cannot import fails lint.
+target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "RUF"]
-# UP040/UP047: PEP 695 `type` statement and type params require Python 3.12+; we support 3.10+.
-# The `X: TypeAlias = ...` annotation is the only type-alias form legal on 3.10/3.11.
-ignore = ["UP040", "UP047"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.10"
 strict = true
 warn_return_any = true
 warn_unused_configs = true

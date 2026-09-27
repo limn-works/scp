@@ -6,7 +6,7 @@ Python conventions, toolchain, and CI for the SCP Python SDK. References `sdk-co
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| Python | 3.12+ | Minimum supported version (for PEP 695 type parameter syntax, `type X` statements, `ParamSpec`). `match` (3.10), `X \| Y` union syntax (3.10) are available but 3.12 is the floor for type parameter syntax. |
+| Python | 3.10+ | Minimum supported version, as ADR phase-3 and `requires-python = ">=3.10"` in `bindings/python/pyproject.toml` set it; wheels ship for CPython 3.10-3.13. `match`, `X \| Y` union syntax and `ParamSpec` (3.10) are available. PEP 695 type parameter syntax and `type X` statements (3.12) are not: write a type alias as `X: TypeAlias = ...`. Ruff's `target-version = "py310"` rejects the newer syntax, and CI job `python-wheel-build` imports the extension under CPython 3.10. |
 | maturin | latest | Build tool for PyO3 Rust extension |
 | ruff | latest | Linter + formatter (replaces flake8, isort, black) |
 | mypy | latest | Static type checker (`--strict` mode) |
@@ -199,8 +199,8 @@ ruff check bindings/python/
 # Type check
 mypy bindings/python/scp_sdk/ --strict
 
-# Build extension (dev mode)
-maturin develop --release
+# Build extension (dev mode), from the directory whose pyproject.toml holds [tool.maturin]
+cd bindings/python && maturin develop --release
 
 # Run tests
 pytest bindings/python/tests/ -v
@@ -211,12 +211,12 @@ pytest bindings/python/tests/ -v --asyncio-mode=auto
 # Build wheel
 maturin build --release
 
-# Build wheels for all platforms (CI)
-maturin build --release --target x86_64-unknown-linux-gnu
-maturin build --release --target aarch64-unknown-linux-gnu
-maturin build --release --target x86_64-apple-darwin
-maturin build --release --target aarch64-apple-darwin
-maturin build --release --target x86_64-pc-windows-msvc
+# Build wheels for all platforms (CI: job python-wheels in .github/workflows/build-matrix.yml,
+# from bindings/python; Linux legs run in the manylinux_2_28 container)
+maturin build --release --target x86_64-unknown-linux-gnu -i python3.10 python3.11 python3.12 python3.13
+maturin build --release --target aarch64-unknown-linux-gnu -i python3.10 python3.11 python3.12 python3.13
+maturin build --release --target universal2-apple-darwin -i python3.10 python3.11 python3.12 python3.13
+maturin build --release --target x86_64-pc-windows-msvc -i python3.10 python3.11 python3.12 python3.13
 ```
 
 ## CI Matrix
@@ -228,13 +228,14 @@ maturin build --release --target x86_64-pc-windows-msvc
 | pyi-generated (`.pyi` ↔ PyO3 signature parity) | ubuntu-latest | 3.12 | Every PR |
 | pip-audit | ubuntu-latest | 3.12 | Every PR |
 | test | ubuntu-latest, macos-latest | 3.12, 3.13 | Every PR |
-| build-wheel | ubuntu-latest, macos-latest, windows-latest | 3.12+ | Every PR |
+| python-wheel-build (debug wheel, installed and imported) | ubuntu-latest | 3.10, 3.12 | Every PR |
+| python-wheels (release wheels) | ubuntu-latest, macos-latest, windows-latest | 3.10, 3.11, 3.12, 3.13 | Tagged release |
 | conformance | ubuntu-latest | 3.12 | Every PR |
 | publish (PyPI) | ubuntu-latest | 3.12 | Tagged release |
 
 ## Platform Wheels
 
-maturin builds binary wheels with the Rust extension embedded. Users install with `pip install scp-python` — no Rust toolchain required.
+maturin builds binary wheels with the Rust extension embedded. Users on a platform and CPython minor a wheel covers (CPython 3.10-3.13 on Linux with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64) install with `pip install scp-python` — no Rust toolchain required. Anywhere else pip builds the sdist, which compiles OpenSSL and needs a Rust toolchain and a full perl, plus make on Linux and macOS.
 
 | Platform | Architecture | Wheel tag |
 |----------|-------------|-----------|

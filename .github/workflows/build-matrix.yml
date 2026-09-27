@@ -142,14 +142,16 @@ jobs:
   #     no wheel falls back to the sdist. The sdist builds with the same
   #     `vendored-openssl` feature, so installing it compiles OpenSSL through
   #     openssl-src: it needs a Rust toolchain and a full perl on the
-  #     installing machine, plus make on Linux and macOS and NASM on Windows.
+  #     installing machine, plus make on Linux and macOS; NASM on Windows is
+  #     optional, since openssl-src configures `no-asm` when it finds none.
   #   - manylinux 2_28, not 2014: CentOS 7 (EOL) can build neither
   #     ring/aws-lc-sys (glibc >= 2.18, newer gcc) nor vendored OpenSSL.
   #   - x86_64 2_28 container ships a minimal perl that openssl-src's
   #     Configure rejects -> install the full perl distribution. The aarch64
   #     leg is an Ubuntu-based rust-cross image (complete perl, NO dnf) — a
   #     dnf attempt there exits 127, so it must get no container prep.
-  #   - Windows needs NASM for the vendored-OpenSSL MSVC assembly.
+  #   - Windows installs NASM so the vendored OpenSSL keeps its assembly
+  #     routines; without NASM openssl-src builds OpenSSL with `no-asm`.
   #   - No --manifest-path arg: bindings/python/pyproject.toml already carries
   #     [tool.maturin] manifest-path.
   # ---------------------------------------------------------------------------

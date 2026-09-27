@@ -52,7 +52,11 @@ env:
 #   workspace-debug   `target/debug` under build mode — rust-test (both matrix legs),
 #                     rust-test-napi-production, rust-build-pyo3-production,
 #                     rust-build-uniffi-production, rust-doc (its `cargo test --doc`),
-#                     kotlin-test, fail-closed-pre-rotation, shipped-feature-graph.
+#                     kotlin-test, fail-closed-pre-rotation, shipped-feature-graph,
+#                     vendored-openssl-scope, fix-round-check-selftest, and
+#                     python-wheel-build, which compiles scp-ffi as a cdylib with
+#                     `extension-module,vendored-openssl`, a resolution no other
+#                     member produces.
 #   workspace-check   `target/debug` under check mode — rust-clippy, whose two
 #                     `cargo clippy` commands compile every dependency to an `.rmeta`,
 #                     and rust-doc (its `cargo doc --no-deps`, whose dependency units
@@ -1796,6 +1800,12 @@ jobs:
   # `workflow_dispatch` of its own; run release.yml through `workflow_dispatch`
   # with `dry-run: true`, which calls build-matrix.yml, to exercise those before
   # cutting a tag.
+  #
+  # It builds for CPython 3.10, the floor `requires-python` names, and 3.12, then
+  # installs each wheel into a fresh virtualenv and imports the extension, which
+  # fails when the package uses an API or syntax 3.10 lacks. It also fails when the
+  # extension names libcrypto or libssl as a dynamic dependency, because the wheel
+  # exists to carry its own OpenSSL.
   python-wheel-build:
     needs: check-draft
     name: Python / wheel (vendored OpenSSL)
@@ -1803,9 +1813,12 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
+      # The last version listed is the one `python` and `python3` resolve to.
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: |
+            3.10
+            3.12
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -1822,7 +1835,20 @@ jobs:
       - name: Build the wheel from the project file the release builds from
         run: |
           cd bindings/python
-          maturin build --out dist -i python3.12 --locked
+          maturin build --out dist -i python3.10 python3.12 --locked
+      - name: Install each wheel and import the extension without a system OpenSSL
+        run: |
+          set -euo pipefail
+          for py in python3.10 python3.12; do
+            "$py" -m venv "/tmp/venv-$py"
+            "/tmp/venv-$py/bin/pip" install --no-index --find-links bindings/python/dist scp-python
+            so="$(cd /tmp && "/tmp/venv-$py/bin/python" -c 'import scp_sdk._scp_core as m; print(m.__file__)')"
+            echo "$py imported $so"
+            if readelf -d "$so" | grep -E 'NEEDED.*(libcrypto|libssl)'; then
+              echo "::error::$so links OpenSSL dynamically; the wheel must carry the vendored build"
+              exit 1
+            fi
+          done
 
   # ── TypeScript ──────────────────────────────────────────────────────
   # ORs on `rust` for a reason spelled out above python-test: a NAPI addon
