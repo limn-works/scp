@@ -184,7 +184,8 @@ ENVIRONMENT VARIABLES:
                                 s3, memory. Required whenever this node serves a relay —
                                 it has no default, and a node that reads it unset exits
                                 non-zero
-    SCP_RELAY_STORAGE_PATH      Path for sqlite/redb blob storage (default: ./scp-relay.db)
+    SCP_RELAY_STORAGE_PATH      Absolute file path for sqlite/redb blob storage (required
+                                when backend=sqlite or redb; a relative path is refused)
     SCP_RELAY_DATABASE_URL      PostgreSQL connection URL (required when backend=postgres)
     SCP_RELAY_S3_BUCKET         S3 bucket name (required when backend=s3)
     SCP_RELAY_S3_PREFIX         S3 key prefix (default: blobs/)

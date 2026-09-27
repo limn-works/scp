@@ -152,12 +152,12 @@ OPTIONS:
 
 ## 4. Blob Storage Backend Selection
 
-Both `scp-relay` and `scp-node` (in relay-only mode) select a blob storage backend via `SCP_RELAY_STORAGE_BACKEND`. An operator sets that variable on every run: it has no default, and a relay that reads it unset prints an error naming it and exits with code 1. Persistence spec §17.17.1 (`SCP-CAPSEL-8000`) requires that explicit selection and forbids a default. That value maps to a `BlobStorageBackend` enum variant:
+Both `scp-relay` and `scp-node` (in relay-only mode) select a blob storage backend via `SCP_RELAY_STORAGE_BACKEND`. An operator sets that variable on every run: it has no default, and a relay that reads it unset prints an error naming it and exits with code 1. Persistence spec §17.17.1 (`SCP-CAPSEL-8000`) requires that explicit selection and forbids a default. The `sqlite` and `redb` backends also require `SCP_RELAY_STORAGE_PATH` to name an absolute path, and refuse a relative one, because a relative path opens a different file for every working directory the relay starts in. That value maps to a `BlobStorageBackend` enum variant:
 
 | Value | Backend | Required env vars | Default path |
 |-------|---------|-------------------|-------------|
-| `sqlite` | SQLite | `SCP_RELAY_STORAGE_PATH` | `./scp-relay.db` |
-| `redb` | redb (embedded) | `SCP_RELAY_STORAGE_PATH` | `./scp-relay.redb` |
+| `sqlite` | SQLite | `SCP_RELAY_STORAGE_PATH` (required, absolute) | none |
+| `redb` | redb (embedded) | `SCP_RELAY_STORAGE_PATH` (required, absolute) | none |
 | `postgres` | PostgreSQL | `SCP_RELAY_DATABASE_URL` (required) | N/A |
 | `s3` | S3-compatible | `SCP_RELAY_S3_BUCKET` (required), `SCP_RELAY_S3_PREFIX` | prefix: `blobs/` |
 | `memory` | In-memory | none | N/A (data lost on restart) |

@@ -18,8 +18,8 @@
 //!
 //! | Value      | Backend    | Config env vars                              |
 //! |------------|------------|----------------------------------------------|
-//! | `sqlite`   | `SQLite`     | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.db`) |
-//! | `redb`     | redb       | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.redb`) |
+//! | `sqlite`   | `SQLite`     | `SCP_RELAY_STORAGE_PATH` (required, absolute) |
+//! | `redb`     | redb       | `SCP_RELAY_STORAGE_PATH` (required, absolute) |
 //! | `postgres` | `PostgreSQL` | `SCP_RELAY_DATABASE_URL` (required)           |
 //! | `s3`       | S3-compat  | `SCP_RELAY_S3_BUCKET` (required) + AWS env    |
 //! | `memory`   | In-memory  | —                                             |

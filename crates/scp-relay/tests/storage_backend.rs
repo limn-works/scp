@@ -83,6 +83,35 @@ fn postgres_without_url_exits_with_error() {
     );
 }
 
+/// Selecting `sqlite` without `SCP_RELAY_STORAGE_PATH`, or with a relative
+/// one, exits non-zero naming that variable. A relative path would open a
+/// different database for every working directory the relay starts in.
+#[test]
+fn sqlite_without_absolute_path_exits_with_error() {
+    for path in [None, Some("./scp-relay.db")] {
+        let mut command = Command::new(relay_bin());
+        command
+            .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
+            .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+            .env_remove("RUST_LOG");
+        match path {
+            Some(p) => command.env("SCP_RELAY_STORAGE_PATH", p),
+            None => command.env_remove("SCP_RELAY_STORAGE_PATH"),
+        };
+        let output = command.output().expect("failed to execute scp-relay");
+
+        assert!(
+            !output.status.success(),
+            "expected non-zero exit for SCP_RELAY_STORAGE_PATH={path:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("SCP_RELAY_STORAGE_PATH"),
+            "error should name the required env var; got: {stderr}"
+        );
+    }
+}
+
 /// AC 6: Selecting `s3` without `SCP_RELAY_S3_BUCKET` exits with a
 /// descriptive error.
 #[test]

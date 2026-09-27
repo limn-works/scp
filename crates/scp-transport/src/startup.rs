@@ -130,6 +130,32 @@ fn compiled_backends_list() -> String {
     compiled_backends().join(", ")
 }
 
+/// Reads the file path a `sqlite` or `redb` backend stores its blobs in.
+///
+/// The path is required and must be absolute. A relative path resolves
+/// against the working directory the process started in, so a relay started
+/// once from `/srv` and once from `/` opens two different files: the second
+/// start serves none of the blobs the first one stored, and reports success.
+#[cfg(any(feature = "sqlite-blob", feature = "redb-blob"))]
+fn storage_path(backend: &str, raw: Option<String>) -> Result<PathBuf, StorageError> {
+    let raw = raw.unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Err(StorageError::Configuration(format!(
+            "SCP_RELAY_STORAGE_BACKEND={backend} requires SCP_RELAY_STORAGE_PATH to name an \
+             absolute file path. There is no default path."
+        )));
+    }
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err(StorageError::Configuration(format!(
+            "SCP_RELAY_STORAGE_PATH='{}' is relative, and a relative path opens a different \
+             file for every working directory the relay starts in. Name an absolute path.",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
 /// Constructs whichever blob storage backend an operator names in
 /// `SCP_RELAY_STORAGE_BACKEND`.
 ///
@@ -144,8 +170,8 @@ fn compiled_backends_list() -> String {
 ///
 /// | Value | Backend | Config env vars |
 /// |---|---|---|
-/// | `sqlite` | `SQLite` | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.db`) |
-/// | `redb` | redb | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.redb`) |
+/// | `sqlite` | `SQLite` | `SCP_RELAY_STORAGE_PATH` (required, absolute) |
+/// | `redb` | redb | `SCP_RELAY_STORAGE_PATH` (required, absolute) |
 /// | `postgres` | `PostgreSQL` | `SCP_RELAY_DATABASE_URL` (required) |
 /// | `s3` | S3-compat | `SCP_RELAY_S3_BUCKET` (required) + AWS env |
 /// | `memory` | In-memory | — |
@@ -156,7 +182,8 @@ fn compiled_backends_list() -> String {
 /// unset or empty, when its value names no backend in that table, when this
 /// build carries no arm for a named backend (each arm compiles only under its
 /// own feature: `sqlite-blob`, `redb-blob`, `postgres-blob`, `s3-blob`), or
-/// when a named backend requires an env var that an operator left unset.
+/// when a named backend requires an env var that an operator left unset, or
+/// when `SCP_RELAY_STORAGE_PATH` names a relative path for `sqlite` or `redb`.
 /// Returns whatever [`StorageError`] a backend constructor reports when that
 /// constructor cannot open its resource.
 // Only a postgres arm and an s3 arm await, and each compiles under its own
@@ -180,17 +207,13 @@ pub async fn storage_from_env() -> Result<BlobStorageBackend, StorageError> {
     match backend.as_str() {
         #[cfg(feature = "sqlite-blob")]
         "sqlite" => {
-            let path =
-                env::var("SCP_RELAY_STORAGE_PATH").unwrap_or_else(|_| "./scp-relay.db".to_owned());
-            let path = PathBuf::from(path);
+            let path = storage_path("sqlite", env::var("SCP_RELAY_STORAGE_PATH").ok())?;
             tracing::info!(path = %path.display(), "using sqlite blob storage");
             BlobStorageBackend::sqlite(&path)
         }
         #[cfg(feature = "redb-blob")]
         "redb" => {
-            let path = env::var("SCP_RELAY_STORAGE_PATH")
-                .unwrap_or_else(|_| "./scp-relay.redb".to_owned());
-            let path = PathBuf::from(path);
+            let path = storage_path("redb", env::var("SCP_RELAY_STORAGE_PATH").ok())?;
             tracing::info!(path = %path.display(), "using redb blob storage");
             BlobStorageBackend::redb(&path)
         }
@@ -365,4 +388,45 @@ pub async fn start_relay_from_env() -> Result<
     tracing::info!(addr = %local_addr, "relay listening");
 
     Ok((handle, local_addr, storage))
+}
+
+#[cfg(all(test, any(feature = "sqlite-blob", feature = "redb-blob")))]
+#[allow(clippy::panic)]
+mod storage_path_tests {
+    use super::{StorageError, storage_path};
+
+    fn configuration_message(result: Result<std::path::PathBuf, StorageError>) -> String {
+        match result {
+            Err(StorageError::Configuration(message)) => message,
+            other => panic!("expected StorageError::Configuration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unset_or_blank_path_is_refused() {
+        for raw in [None, Some(String::new()), Some("  ".to_owned())] {
+            let message = configuration_message(storage_path("sqlite", raw));
+            assert!(message.contains("SCP_RELAY_STORAGE_PATH"), "{message}");
+            assert!(message.contains("sqlite"), "{message}");
+        }
+    }
+
+    #[test]
+    fn working_directory_relative_path_is_refused() {
+        for raw in ["./scp-relay.db", "scp-relay.redb", "data/relay.db"] {
+            let message = configuration_message(storage_path("redb", Some(raw.to_owned())));
+            assert!(message.contains("relative"), "{message}");
+        }
+    }
+
+    #[test]
+    fn absolute_path_is_accepted_unchanged() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let path = dir.path().join("relay.db");
+        let raw = path.to_string_lossy().into_owned();
+        match storage_path("sqlite", Some(raw)) {
+            Ok(resolved) => assert_eq!(resolved, path),
+            Err(e) => panic!("an absolute path must be accepted: {e:?}"),
+        }
+    }
 }
