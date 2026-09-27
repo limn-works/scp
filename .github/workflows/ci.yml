@@ -1965,28 +1965,23 @@ jobs:
           python -m venv .venv
           source .venv/bin/activate
           pip install pytest pytest-asyncio
-      # THE DEFECT THIS CLOSES: every real-FFI test module under
-      # bindings/python/tests opens with `pytest.skip("Native _scp_core extension not
-      # available — run maturin develop first", allow_module_level=True)` when
-      # `from scp_sdk import _scp_core` raises, and the `scp` fixture in
-      # bindings/python/tests/conftest.py skips every test that requests it when
-      # `scp_sdk` does not import or when `SCP(storage={"type": "in_memory"})` raises
-      # the not-installed error. A download that landed the module anywhere but beside
-      # the package would therefore leave pytest exiting 0 over zero executed
-      # assertions, which is the `zero-test` shape
-      # scripts/tests/ci-gate/ci_gate_selftest.py names. This step runs both statements
-      # those guards run — the import and the construction — so a module that imports
-      # but cannot construct fails the job here rather than skipping every test that
-      # requests the fixture. It then reads the two methods the `server` and `testing`
-      # feature lists compile onto the native class, because the import and the
-      # construction both succeed on a module built without `testing`:
-      # crates/scp-ffi/src/lib.rs gates `pub mod testing` alone, and
-      # bindings/python/tests/test_e2e_fullstack.py answers a missing
-      # `fullstack_create_node` with `pytest.skip(..., allow_module_level=True)`, which
-      # would delete the whole real-MLS full-stack suite from a green run. An extension
-      # that loads but carries a different feature resolution fails the job here instead
-      # of skipping every test that calls those methods. Every consumer of a PyO3
-      # artifact runs this step.
+      # THE DEFECT THIS CLOSES: every real-FFI test module under bindings/python/tests
+      # passes the error its import guard caught to `skip_reason_if_extension_absent`
+      # in bindings/python/tests/conftest.py, and the `scp` fixture there passes a
+      # construction error to `extension_is_absent`. Both skip when, and only when,
+      # the loader in bindings/python/scp_sdk/_extension.py reports SCP-VALID-7081,
+      # which means no extension file sits beside the package. An extension that is
+      # present and fails to load (SCP-VALID-7082), and an extension that loads
+      # without a class or `testing`-gated method a module calls, fail collection
+      # instead of skipping. The absent case still skips: a download that landed the
+      # module anywhere but bindings/python/scp_sdk would leave pytest exiting 0 over
+      # zero executed assertions, which is the `zero-test` shape
+      # scripts/tests/ci-gate/ci_gate_selftest.py names. This step runs the import and
+      # the construction those guards run, so an absent module fails the job here
+      # rather than skipping every real-FFI module. It then reads the two methods the
+      # `server` and `testing` feature lists compile onto the native class, so a build
+      # with a different feature resolution fails here, before pytest, with the name
+      # of the missing method. Every consumer of a PyO3 artifact runs this step.
       - name: Assert the downloaded extension imports, constructs, and carries the gated methods
         run: |
           source .venv/bin/activate
@@ -2064,20 +2059,21 @@ jobs:
           # Create a minimal package.json so require() resolves
           echo '{"name":"'"$NAPI_PKG"'","version":"0.1.0","main":"index.node"}' > "$PKG_DIR/package.json"
       # THE DEFECT THIS CLOSES: every real-NAPI test file under
-      # bindings/typescript/tests wraps its addon load and its first construction in
-      # one `try`, writes the caught error into a skip reason, and resolves its whole
-      # `describe` block to `describe.skip` or to a lone `test.skip` — see
-      # tests/real-napi.test.ts, tests/e2e-fullstack.test.ts, tests/persistence.test.ts
-      # and the nine files that copy that shape. A downloaded addon that does not load
-      # therefore leaves `bun test` exiting 0 over zero executed NAPI assertions, which
-      # is the `zero-test` shape scripts/tests/ci-gate/ci_gate_selftest.py names, and
-      # which the `[ ! -f ]` check above cannot see because that check reads whether the
-      # file is present and never loads it. This step runs the statements those guards
-      # run — the SDK loader and the native constructor — and reads the two methods the
-      # `server` and `testing` feature lists compile onto the native class, so an addon
-      # that loads but carries a different feature resolution fails the job here instead
-      # of skipping every test that calls those methods. Every consumer of a NAPI
-      # artifact runs this step.
+      # bindings/typescript/tests passes the error its guard caught to
+      # `skipReasonIfAddonAbsent` in tests/napi-guard.ts, which skips the file when,
+      # and only when, `loadNativeAddon()` throws NATIVE_ADDON_ABSENT_CODE, meaning the
+      # addon package does not resolve. An addon that resolves and fails to load, and
+      # an addon missing a method the file calls, fail the file instead of skipping it.
+      # The absent case still skips: an addon wired anywhere but the package directory
+      # `require()` resolves would leave `bun test` exiting 0 over zero executed NAPI
+      # assertions, which is the `zero-test` shape
+      # scripts/tests/ci-gate/ci_gate_selftest.py names. The `[ ! -f ]` check above
+      # reads whether target/release holds the cdylib and never resolves the package.
+      # This step runs the SDK loader and the native constructor the guards run, so an
+      # absent addon fails the job here, and it reads the two methods the `server` and
+      # `testing` feature lists compile onto the native class, so a build with a
+      # different feature resolution fails here, before `bun test`, with the name of
+      # the missing method. Every consumer of a NAPI artifact runs this step.
       - name: Assert the downloaded addon loads and constructs
         working-directory: bindings/typescript
         run: |
