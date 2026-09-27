@@ -10,9 +10,13 @@
 //    and is not penalizing, so a typed error is an honest result and a
 //    locally minted token would assert a hardware guarantee no hardware
 //    produced.
-// 2. Concurrent first calls to `attest` generate one App Attest key, because
-//    `resolveKeyId` reads a stored key ID and publishes its generation task
-//    inside one critical section.
+// 2. Concurrent first calls to `attest` generate one App Attest key.
+//    `AppAttestCallSerializer` runs each `attest` body after the previous body
+//    finished, so the first caller stores its key ID before a second caller
+//    reads one. These cases drive `attest` through that serializer and so pin
+//    that outcome. No case here runs two callers inside `resolveKeyId` at
+//    once, so no case here fails when `resolveKeyId` reads absence in one
+//    critical section and publishes its generation task in another.
 // 3. Concurrent calls reach Apple's App Attest service one at a time, and a
 //    second `attest` therefore keeps the key a first `attest` got attested
 //    rather than reading a stale attestation record and discarding that key.
@@ -530,12 +534,14 @@
 
         @Test("concurrent first attests generate one App Attest key, over 50 rounds")
         func concurrentAttestsGenerateOneKey() async {
-            // A caller that reads absence in one critical section and publishes
-            // its generation task in another lets a second caller read absence
-            // too, and a device ends up holding two Secure Enclave App Attest
-            // keys. Eight callers racing on one fresh adapter expose that split
-            // whenever it exists; 50 rounds keep a scheduler that happens to
-            // serialize one round from hiding it.
+            // Eight callers start `attest` together on one fresh adapter, and
+            // the device must end up holding one Secure Enclave App Attest key.
+            // This case fails when `attest` stops routing its body through
+            // `AppAttestCallSerializer` and `resolveKeyId` also lets a second
+            // caller read absence. It does not fail for a split inside
+            // `resolveKeyId` alone, because the serializer admits one caller
+            // to `resolveKeyId` at a time. 50 rounds guard against a scheduler
+            // that happens to order one round's callers one after another.
             for round in 0 ..< 50 {
                 let defaults = InMemoryUserDefaults()
                 let service = CountingAppAttestService()
