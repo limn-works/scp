@@ -911,7 +911,7 @@ impl Drop for BootstrapCrashWindow<'_> {
                     .crash_windows
                     .insert(self.context_id.clone(), prior);
             }
-            _ => self.supervisor.end_replace_window(&self.context_id),
+            _ => self.supervisor.end_bootstrap_window(&self.context_id),
         }
     }
 }
@@ -5438,7 +5438,7 @@ impl Supervisor {
     /// `bootstrap_spawn_lock`. Every writer of the respawn marker holds that
     /// lock (`respawn_from_snapshot` and `clear_poison` included), so no
     /// respawn's marker is cleared here.
-    fn end_replace_window(&self, context_id: &str) {
+    fn end_bootstrap_window(&self, context_id: &str) {
         if let Some(mut window) = self.crash_windows.get_mut(context_id) {
             window.clear_respawning();
         }
@@ -10867,13 +10867,13 @@ impl Supervisor {
         // A busy or crashed actor answers `Err` here. No caller of
         // this form treats `None` as an authorization: each reads it as "no
         // live Active context" and declines the Active-only work. The
-        // standing get-or-create falls through to its create step, the
         // reconnect sweep skips the id, and the outlet-stream saga gates on
         // all three bridges refuse the stream unless both states read
         // `Some(Active)`. Folding the error into `None` therefore grants
-        // nothing. A new caller must hold the same property; a caller that
-        // reads `None` as "the close already happened" calls
-        // `read_context_state_checked` instead.
+        // nothing. A new caller must hold the same property; a caller whose
+        // decision turns on absence, such as the standing get-or-create
+        // choosing to create or a close reading `None` as "the close already
+        // happened", calls `read_context_state_checked` instead.
         self.read_context_state_checked(context_id)
             .await
             .unwrap_or(None)
@@ -11006,14 +11006,18 @@ impl Supervisor {
     /// # Algorithm
     ///
     /// 1. Derive the deterministic standing context id from the DID pair.
-    /// 2. Liveness check via [`Self::read_context_state`]: if a
+    /// 2. Liveness check via [`Self::read_context_state_checked`]: if a
     ///    per-context actor exists AND its lifecycle state is
     ///    [`Active`](scp_protocol::context::ContextState::Active) or
     ///    [`Creating`](scp_protocol::context::ContextState::Creating),
     ///    track the peer and return the existing id. A terminal state
     ///    (`Closed` / `Expired` / `Closing` / `MigratingOut` /
-    ///    `Tombstoned`) or a missing actor (`None`) falls through to
-    ///    create — a dead standing context is never reused.
+    ///    `Tombstoned`), a poisoned context (`Poisoned`), or an absent
+    ///    context (`Ok(None)`) falls through to create — a dead standing
+    ///    context is never reused. An error means the context is present
+    ///    but unreachable (a busy actor, or a crashed context whose last
+    ///    respawn failed below the poison threshold), so it is returned and
+    ///    nothing is created over the context (ADR-049 §10).
     /// 3. Create a fresh bilateral-persistent context through the
     ///    actor-shape [`lifecycle_helpers::create_context`](crate::context::lifecycle_helpers::create_context)
     ///    (membership, roles, governance, owned-state actor spawn), with
@@ -11022,7 +11026,7 @@ impl Supervisor {
     ///    deps build in [`Self::dispatch_lifecycle_direct`].
     /// 4. TOCTOU: a concurrent caller may have created the context
     ///    between the step-2 check and the step-3 create. On create
-    ///    error, re-probe [`Self::read_context_state`]; if it is now
+    ///    error, re-probe [`Self::read_context_state_checked`]; if it is now
     ///    `Active` / `Creating`, treat the create as idempotently
     ///    successful. Otherwise propagate
     ///    [`ContextError::TransportFailed`].
@@ -11031,8 +11035,12 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::TransportFailed`] if context creation
-    /// fails and no concurrent creation resolved the id.
+    /// - Whatever error [`Self::read_context_state_checked`] returns at
+    ///   step 2: [`ContextError::ActorBusy`] for a registered actor that did
+    ///   not answer, [`ContextError::ActorCrashed`] for a context whose last
+    ///   respawn failed below the poison threshold.
+    /// - [`ContextError::TransportFailed`] if context creation fails and no
+    ///   concurrent creation resolved the id.
     pub(in crate::context) async fn standing_context(
         self: &Arc<Self>,
         local_did: &DID,
@@ -11065,13 +11073,21 @@ impl Supervisor {
         // `track_standing_peer` / `spawn_actor_with_state`).
         let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
 
-        // Step 1/2: existence + liveness probe. `read_context_state`
-        // returns `None` when no actor exists (create path) and
-        // `Some(state)` for a live actor. Only Active/Creating short-
-        // circuits to reuse; every terminal state falls through so a
-        // dead standing context is replaced rather than resurrected.
+        // Step 1/2: existence + liveness probe. The decision to create turns
+        // on absence, so this reads the checked form and treats every error
+        // as a present context (ADR-049 §10): `?` returns it rather than
+        // creating over the id. Under `bootstrap_spawn_lock` no respawn marker
+        // can be set (every marker writer holds the lock), so the errors that
+        // reach here are `ActorBusy` for a registered actor that did not
+        // answer and `ActorCrashed` for a context whose last respawn failed
+        // below the poison threshold; recreating over the latter would replace
+        // a context whose snapshot may still restore (`clear_poison` or a
+        // restart). `Ok(None)` (no actor, no crash signal) falls through to
+        // create. Only Active/Creating short-circuits to reuse; every terminal
+        // state and `Poisoned` fall through so a dead standing context is
+        // replaced rather than resurrected.
         if matches!(
-            self.read_context_state(&context_id).await,
+            self.read_context_state_checked(&context_id).await?,
             Some(ContextState::Active | ContextState::Creating)
         ) {
             self.track_standing_peer(peer_did).await;
@@ -11132,11 +11148,15 @@ impl Supervisor {
         // Step 4: TOCTOU re-check. A concurrent caller may have created
         // the context between our step-2 probe and the step-3 create. If
         // the context is now Active/Creating, treat the create as
-        // idempotently successful; otherwise surface the create error.
+        // idempotently successful; otherwise surface the create error. A
+        // checked-read error also surfaces the create error: `_crash_window`
+        // still holds the respawn marker here, so an id with a prior crash
+        // window reads `ActorCrashed` until the guard drops, and that answer
+        // describes this bootstrap rather than why the create failed.
         if let Err(create_err) = create_result
             && !matches!(
-                self.read_context_state(&context_id).await,
-                Some(ContextState::Active | ContextState::Creating)
+                self.read_context_state_checked(&context_id).await,
+                Ok(Some(ContextState::Active | ContextState::Creating))
             )
         {
             return Err(create_err);
@@ -23408,6 +23428,63 @@ mod tests {
         );
     }
 
+    /// A standing context whose last respawn failed below the poison
+    /// threshold, or whose registered actor does not answer, is present, so
+    /// `standing_context` returns the checked read's error and creates
+    /// nothing over the id (ADR-049 §10: a caller whose decision turns on
+    /// absence treats every error as present).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standing_context_returns_the_error_for_a_present_unreachable_context() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let local = DID("did:example:local".to_owned());
+        let peer = DID("did:example:peer".to_owned());
+        let ctx_key = crate::context::standing_helpers::generate_standing_context_id(&local, &peer);
+
+        // Empty persistence: the respawn fails, recording one crash and
+        // `last_respawn_failed` without poisoning (1 < threshold).
+        let respawn = sup.respawn_from_snapshot(&ctx_key, &local).await;
+        assert!(
+            matches!(respawn, Err(ContextError::ActorCrashed(_))),
+            "a failed respawn must surface ActorCrashed, got {respawn:?}"
+        );
+        assert!(!sup.is_context_poisoned(&ctx_key));
+
+        let crashed = sup.standing_context(&local, &peer).await;
+        assert!(
+            matches!(crashed, Err(ContextError::ActorCrashed(_))),
+            "a standing context past a failed respawn is present and must surface \
+             ActorCrashed, not be recreated, got {crashed:?}"
+        );
+        assert!(
+            sup.lookup(&ctx_key).is_none(),
+            "no actor may be created over a crashed standing context"
+        );
+        assert!(
+            sup.crash_windows
+                .get(&ctx_key)
+                .is_some_and(|w| w.last_respawn_failed()),
+            "the failed-respawn record must survive the refused get-or-create"
+        );
+        assert!(
+            !sup.standing_contexts.load().contains_key(&peer.to_string()),
+            "a refused get-or-create must not track the peer"
+        );
+
+        // A registered actor no task drains: the checked read answers
+        // `ActorBusy`, and the get-or-create returns it.
+        let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        drop(rx);
+        sup.actors
+            .insert(ctx_key.clone(), ContextActorHandle::from_sender(tx));
+        let busy = sup.standing_context(&local, &peer).await;
+        assert!(
+            matches!(busy, Err(ContextError::ActorBusy(_))),
+            "a standing context whose actor does not answer must surface ActorBusy, got {busy:?}"
+        );
+    }
+
     /// A registered actor this call cannot reach reads as `ActorBusy` from
     /// [`Supervisor::read_context_state_checked`] and as `None` from
     /// [`Supervisor::read_context_state`].
@@ -23742,7 +23819,7 @@ mod tests {
             matches!(in_gap, Err(ContextError::ActorCrashed(_))),
             "a context in the import-replace gap must read as ActorCrashed, got {in_gap:?}"
         );
-        sup.end_replace_window(&ctx_key);
+        sup.end_bootstrap_window(&ctx_key);
         assert!(
             !sup.crash_windows.contains_key(&ctx_key),
             "a crash window the replace marker alone created must be reaped"
@@ -23755,7 +23832,7 @@ mod tests {
             .or_default()
             .record(now_ms);
         sup.despawn_for_replace(&with_history).await;
-        sup.end_replace_window(&with_history);
+        sup.end_bootstrap_window(&with_history);
         let window = sup
             .crash_windows
             .get(&with_history)
@@ -23770,9 +23847,9 @@ mod tests {
     /// `Supervisor::import_context` over a replaceable actor marks the replace
     /// gap on its own production path, and its `ImportContext` arm clears the
     /// mark once the imported actor registers. The test above drives
-    /// `despawn_for_replace` and `end_replace_window` by hand, so it stays
+    /// `despawn_for_replace` and `end_bootstrap_window` by hand, so it stays
     /// green when `lifecycle_helpers::import_context` calls `despawn_actor`
-    /// instead or when the arm stops calling `end_replace_window`; this one
+    /// instead or when the arm stops ending its bootstrap window; this one
     /// goes red in either case.
     ///
     /// The test holds `write_lock`, which `despawn_actor` takes after
