@@ -1683,7 +1683,9 @@ jobs:
   # Each upload names `if-no-files-found: error`. An upload over an empty set succeeds
   # and publishes an empty artifact, which reaches a consumer as a missing file rather
   # than as a failed producer — the shape `.github/workflows/release.yml` hit when a
-  # signing job published an artifact named as signed that held nothing.
+  # signing job published an artifact named as signed that held nothing. The option
+  # fails a producer only when every listed path matches nothing, so the XCFramework
+  # upload, which lists a tracked file, is guarded by a verify step in its own job.
   #
   # Each upload names `retention-days: 30` because GitHub offers "Re-run failed jobs"
   # for 30 days after a run starts, and that re-run skips a producer that passed, so
@@ -1846,7 +1848,34 @@ jobs:
           shared-key: apple-uniffi
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build XCFramework (dev mode — macOS arm64 only)
-        run: bindings/swift/build-xcframework.sh --dev
+        run: |
+          touch "$RUNNER_TEMP/xcframework-build-start"
+          bindings/swift/build-xcframework.sh --dev
+      # The upload below cannot fail on its own: `if-no-files-found: error` fires only
+      # when all three paths together match nothing, and ScpBindings.swift is tracked,
+      # so the checkout always supplies one match. A script that exited 0 without
+      # writing the XCFramework, or without regenerating the bindings, would publish
+      # the checkout's copy under a green producer. This step fails the producer when
+      # any uploaded path is absent or holds nothing written after the build began.
+      # scripts/tests/ci-gate/ci_gate_selftest.py runs it against each path missing
+      # and each path stale.
+      - name: Verify the build wrote every uploaded output
+        run: |
+          set -euo pipefail
+          marker="$RUNNER_TEMP/xcframework-build-start"
+          for output in \
+            bindings/swift/ScpFFI.xcframework \
+            bindings/swift/Headers \
+            bindings/swift/Sources/SCP/Internal/ScpBindings.swift; do
+            if [ ! -e "$output" ]; then
+              echo "::error::build-xcframework.sh --dev exited 0 without writing $output"
+              exit 1
+            fi
+            if [ -z "$(find "$output" -newer "$marker" -print -quit)" ]; then
+              echo "::error::$output holds nothing written by this build"
+              exit 1
+            fi
+          done
       - name: Upload XCFramework and generated bindings
         uses: actions/upload-artifact@v4
         with:

@@ -148,7 +148,12 @@ nothing:
                "Re-run failed jobs" re-runs a failed consumer without its
                producer, so a consumer re-run a day after its run started
                failed its download while GitHub still offered the re-run.
-  lint-scope   One crate declared the lint the two rustdoc jobs exist to fire:
+  xcframework-outputs
+               The XCFramework upload named `if-no-files-found: error` over
+               three paths, one of them the tracked ScpBindings.swift, so the
+               checkout always supplied a match and the option could not fail
+               the producer when build-xcframework.sh wrote nothing.
+  lint-scope  One crate declared the lint the two rustdoc jobs exist to fire:
                crates/scp-runtime/src/lib.rs carried
                `#![deny(rustdoc::broken_intra_doc_links)]` and none of the other
                25 members did, so job rust-doc, run verbatim on the tree that
@@ -3447,21 +3452,22 @@ def pyo3_consumers_without_a_construction_assertion(
     `SCP(storage=...)` from it, and a step that reads every feature-gated method named
     in PYO3_ASSERTION_FRAGMENTS off the native class.
 
-    WHY: every real-FFI test module under bindings/python/tests skips itself when
-    `from scp_sdk import _scp_core` raises, and the `scp` fixture in
-    bindings/python/tests/conftest.py skips every test that requests it when the
-    extension is not installed. A downloaded module that imports but cannot be
-    constructed therefore leaves pytest exiting 0 over zero executed assertions in
+    WHY: every real-FFI test module under bindings/python/tests skips itself, and the
+    `scp` fixture in bindings/python/tests/conftest.py skips every test that requests
+    it, when `scp_sdk._extension.native_module` raises SCP-VALID-7081, the code for no
+    extension file present. A consumer whose downloaded module never reached the
+    import path therefore leaves pytest exiting 0 over zero executed assertions in
     every one of these jobs at once, which is the `zero-test` shape this file names.
-    The import alone does not close that: it leaves the construction path open, so the
-    criterion names both statements. Neither closes the third path: an extension built
-    without `--features testing` imports and constructs, and
-    bindings/python/tests/test_e2e_fullstack.py answers a missing
-    `fullstack_create_node` with `pytest.skip(..., allow_module_level=True)`, which
-    deletes the whole real-MLS full-stack suite from a green run. `crates/scp-ffi/`
-    compiles `fullstack_create_node` only under `testing` and `relay_start_in_memory`
-    only under `server`, so reading both off the constructed object decides whether the
-    downloaded binary carries the feature resolution its consumers need.
+    The guards no longer skip on any other failure: an extension that is present and
+    fails to load, and an extension built without `--features testing` —
+    bindings/python/tests/test_e2e_fullstack.py raises SCP-VALID-7082 when
+    `fullstack_create_node` is missing — both fail collection. This check still
+    decides the absent case, which only the job can see, and it reports a wrong
+    feature resolution before pytest runs, naming the missing method.
+    `crates/scp-ffi/` compiles `fullstack_create_node` only under `testing` and
+    `relay_start_in_memory` only under `server`, so reading both off the constructed
+    object decides whether the downloaded binary carries the feature resolution its
+    consumers need.
     """
     gaps: list[str] = []
     for job_id, job in sorted(doc["jobs"].items()):
@@ -3754,6 +3760,72 @@ def check_shared_uploads_outlive_the_rerun_window(doc: dict) -> None:
             )
 
 
+def check_xcframework_outputs_are_verified(doc: dict) -> None:
+    """Run the xcframework job's verify step against each uploaded path gone or stale.
+
+    CRITERION: for every path the `swift-xcframework-dev` upload lists, the step
+    before that upload exits non-zero when the path is absent or holds nothing
+    newer than the marker the build step touches, and exits 0 when every path is
+    fresh.
+
+    WHY: `if-no-files-found: error` fires only when all listed paths together match
+    nothing. The upload lists the tracked ScpBindings.swift, so the checkout always
+    supplies a match and the option alone cannot fail the producer.
+    """
+    steps = doc["jobs"]["xcframework"]["steps"]
+    upload = next(
+        i
+        for i, step in enumerate(steps)
+        if (step.get("with") or {}).get("name") == "swift-xcframework-dev"
+    )
+    script = steps[upload - 1].get("run") or ""
+    paths = (steps[upload]["with"]["path"]).split()
+    now = 1_000_000_000
+
+    def run_with(missing: str | None, stale: str | None) -> int:
+        with tempfile.TemporaryDirectory() as root:
+            runner_temp = Path(root, "runner-temp")
+            runner_temp.mkdir()
+            marker = runner_temp / "xcframework-build-start"
+            marker.touch()
+            os.utime(marker, (now, now))
+            for path in paths:
+                if path == missing:
+                    continue
+                target = Path(root, "tree", path)
+                file = target / "content" if target.suffix != ".swift" else target
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.touch()
+                stamp = now - 100 if path == stale else now + 100
+                for entry in {file, target}:
+                    os.utime(entry, (stamp, stamp))
+            env = {**os.environ, "RUNNER_TEMP": str(runner_temp)}
+            return subprocess.run(
+                ["bash", "-c", script],
+                cwd=Path(root, "tree"),
+                env=env,
+                capture_output=True,
+                check=False,
+            ).returncode
+
+    check(
+        "xcframework: the verify step passes when the build wrote every output",
+        run_with(None, None) == 0,
+        "the verify step rejects a build that wrote every uploaded path",
+    )
+    for path in paths:
+        check(
+            f"xcframework: a missing {path} fails the producer",
+            run_with(path, None) != 0,
+            f"the verify step before the upload passes without {path}",
+        )
+        check(
+            f"xcframework: a {path} older than the build fails the producer",
+            run_with(None, path) != 0,
+            f"the verify step before the upload passes over a stale {path}",
+        )
+
+
 def a_producer_and_an_unguarded_consumer(
     doc: dict, artifact: str, upload_path: str, test_command: str
 ) -> dict:
@@ -3948,6 +4020,9 @@ def main() -> int:
 
     print("retention — a downloaded artifact outlives the re-run window")
     check_shared_uploads_outlive_the_rerun_window(workflow)
+
+    print("xcframework-outputs — the XCFramework producer fails on a missing output")
+    check_xcframework_outputs_are_verified(workflow)
 
     print("needs-condition — a job's dependencies run wherever the job does")
     check_dependency_conditions(workflow)
