@@ -498,30 +498,45 @@ impl ContextProvider for McpNapiBridgeProvider {
         // A dropped bridge or an unreadable context is an error, never an
         // empty outlet registry.
         let bi = self.upgrade_bi()?;
-        crate::runtime::with_context(&bi, context_id, |rt| {
-            Ok(rt
-                .outlet_registry
-                .registrations()
-                .map(|t| scp_mcp::server::ContextOutletInfo {
-                    name: t.name.clone(),
-                    description: Some(t.description.clone()),
-                    input_schema: t.schema.input_schema.clone(),
-                    output_schema: Some(t.schema.output_schema.clone()),
-                    admin_only: false,
-                    // Carry the registry's authoritative §5.4.2 kind so the
-                    // translator surfaces the correct `query.` / `call.` MCP
-                    // tool-name prefix — never hardcode Action.
-                    kind: t.kind,
-                })
-                .collect())
-        })
-        .map_err(|e| format!("{e}"))
+        let Some(rt) = crate::runtime::ucan_registry(&bi).get(context_id) else {
+            // This bridge creates a context's UCAN state lazily: the first
+            // UCAN, event-log, outlet or outlet-stream call on the context runs
+            // `ensure_registered`, and `context_create_on` and
+            // `context_join_on` do not. Every outlet registration runs
+            // `ensure_registered` first, so a context the supervisor holds with
+            // no entry here has had no outlet registered through this bridge,
+            // and its registry is empty. With no supervisor the entry is the
+            // context's only state, so `held_role_state` finds no context.
+            return match held_role_state(&bi, context_id)? {
+                Some(_) => Ok(Vec::new()),
+                None => Err(format!(
+                    "context '{context_id}' is held neither by the supervisor nor by \
+                     this bridge"
+                )),
+            };
+        };
+        Ok(rt
+            .outlet_registry
+            .registrations()
+            .map(|t| scp_mcp::server::ContextOutletInfo {
+                name: t.name.clone(),
+                description: Some(t.description.clone()),
+                input_schema: t.schema.input_schema.clone(),
+                output_schema: Some(t.schema.output_schema.clone()),
+                admin_only: false,
+                // Carry the registry's authoritative §5.4.2 kind so the
+                // translator surfaces the correct `query.` / `call.` MCP
+                // tool-name prefix — never hardcode Action.
+                kind: t.kind,
+            })
+            .collect())
     }
 
     fn validate_capability(
         &self,
         _context_id: &str,
         _outlet_name: &str,
+        _check: scp_mcp::server::CapabilityCheck,
     ) -> Result<(), scp_mcp::server::AccessRefusal> {
         // Stub — see SCP-048
         // `McpServer` lists a tool exactly when this method returns `Ok`, and
@@ -1718,6 +1733,54 @@ mod tests {
 
         // No write-back: each copy still holds what the bridge wrote into it.
         assert!(copy_has_agent(revoked) && !copy_has_agent(granted));
+    }
+
+    /// A context the supervisor holds but no UCAN, event-log or outlet call has
+    /// touched has no UCAN state entry on this bridge (`context_create_on` and
+    /// `context_join_on` create none). Its outlet registry is empty, so
+    /// `tools/list` answers `[]`; it is not an unreadable context. A context
+    /// neither the supervisor nor the bridge holds stays an error.
+    #[test]
+    fn served_context_without_ucan_state_lists_no_tools_napi() {
+        use scp_mcp::server::ContextProvider as _;
+
+        let agent = "did:dht:z6MkNapiLazyUcanAgent";
+        let ctx = "ctx-napi-lazy-ucan-state";
+        let bi = Arc::new(NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let supervisor = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+        crate::runtime()
+            .block_on(supervisor.create_context(
+                ctx.to_owned(),
+                scp_core::context::ContextParams::default(),
+                scp_did::DID(agent.to_owned()),
+                None,
+            ))
+            .unwrap();
+        assert!(!crate::runtime::ucan_registry(&bi).contains_key(ctx));
+        let provider = McpNapiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: agent.to_owned(),
+            context_ids: vec![ctx.to_owned()],
+        };
+        assert_eq!(provider.active_context_ids().unwrap(), vec![ctx.to_owned()]);
+        assert!(provider.context_tools(ctx).unwrap().is_empty());
+        assert!(provider.context_tools("ctx-napi-held-by-no-one").is_err());
+
+        let mut server = scp_mcp::server::McpServer::new(provider);
+        initialize_and_read_subscribe_flag(&mut server);
+        let listed = server
+            .handle_request(&mcp_request(
+                scp_mcp::protocol::METHOD_TOOLS_LIST,
+                serde_json::json!({}),
+            ))
+            .expect("tools/list must produce a response");
+        assert!(
+            listed.error.is_none(),
+            "tools/list failed: {:?}",
+            listed.error
+        );
+        assert_eq!(listed.result.unwrap()["tools"], serde_json::json!([]));
     }
 
     /// With a supervisor attached, `scp://{ctx}/events` reports the actor's

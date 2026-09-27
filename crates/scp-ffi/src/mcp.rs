@@ -763,6 +763,7 @@ impl FfiBridgeProvider {
         role_state: &scp_core::context::roles::ContextRoleState,
         context_id: &str,
         outlet_name: &str,
+        check: scp_mcp::server::CapabilityCheck,
     ) -> Result<(), scp_mcp::server::AccessRefusal> {
         use scp_mcp::server::AccessRefusal;
         // Primary check: UCAN token validation via the full 11-step ADR-016
@@ -800,8 +801,11 @@ impl FfiBridgeProvider {
                 let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
                     revocation_list: &rt.revocation_list,
                 };
-                let mut nonce_adapter = crate::bridge_adapters::BridgeNonceTracker {
+                // Only a `tools/call` records the token's nonce; a probe
+                // records nothing, so listing cannot burn the token.
+                let mut nonce_adapter = crate::bridge_adapters::OutletGrantNonceTracker {
                     inner: &mut rt.nonce_tracker,
+                    record: check == scp_mcp::server::CapabilityCheck::Invoke,
                 };
 
                 let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
@@ -960,6 +964,7 @@ impl ContextProvider for FfiBridgeProvider {
         &self,
         context_id: &str,
         outlet_name: &str,
+        check: scp_mcp::server::CapabilityCheck,
     ) -> Result<(), scp_mcp::server::AccessRefusal> {
         use scp_mcp::server::AccessRefusal;
         // A dropped bridge instance, an unreadable role state, or a failed
@@ -969,7 +974,7 @@ impl ContextProvider for FfiBridgeProvider {
         let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
         let role_state =
             Self::live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;
-        self.outlet_grant(&bi, &role_state, context_id, outlet_name)
+        self.outlet_grant(&bi, &role_state, context_id, outlet_name, check)
     }
 
     #[allow(clippy::too_many_lines)] // Three-phase dispatch: validate + execute + emit event.
@@ -2851,7 +2856,11 @@ mod tests {
             agent_proof_tokens: None,
         };
         // Even the creator is rejected without a UCAN token.
-        let result = provider.validate_capability(&ctx_id, "calculator");
+        let result = provider.validate_capability(
+            &ctx_id,
+            "calculator",
+            scp_mcp::server::CapabilityCheck::Probe,
+        );
         assert!(
             result.is_err(),
             "should reject when no UCAN token is provided"
@@ -2883,7 +2892,11 @@ mod tests {
         };
 
         let err = provider(Some(vec!["not-a-ucan".to_owned()]))
-            .validate_capability(&ctx_id, "calculator")
+            .validate_capability(
+                &ctx_id,
+                "calculator",
+                scp_mcp::server::CapabilityCheck::Probe,
+            )
             .unwrap_err();
         assert!(
             matches!(&err, scp_mcp::server::AccessRefusal::Unreadable(msg) if msg.contains("proof resolver")),
@@ -2891,7 +2904,11 @@ mod tests {
         );
 
         let err = provider(None)
-            .validate_capability(&ctx_id, "calculator")
+            .validate_capability(
+                &ctx_id,
+                "calculator",
+                scp_mcp::server::CapabilityCheck::Probe,
+            )
             .unwrap_err();
         assert!(
             matches!(&err, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("UCAN authorization failed")),
@@ -2934,7 +2951,11 @@ mod tests {
 
             agent_proof_tokens: None,
         };
-        let result = provider.validate_capability(&ctx_id, "calculator");
+        let result = provider.validate_capability(
+            &ctx_id,
+            "calculator",
+            scp_mcp::server::CapabilityCheck::Probe,
+        );
         assert!(
             result.is_err(),
             "member without UCAN token should be rejected"
@@ -4236,7 +4257,11 @@ mod tests {
         );
 
         // validate_capability: returns Err.
-        let vc = provider.validate_capability("ctx-dropped", "anyoutlet");
+        let vc = provider.validate_capability(
+            "ctx-dropped",
+            "anyoutlet",
+            scp_mcp::server::CapabilityCheck::Probe,
+        );
         assert!(
             vc.is_err(),
             "validate_capability must reject when bridge is dropped"

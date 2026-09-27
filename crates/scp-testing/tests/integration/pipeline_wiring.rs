@@ -3081,7 +3081,8 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
 }
 
 /// The resource-access gate must go red when a comment names the capability
-/// check, a stand-in role state reaches the predicate, the predicate's verdict
+/// check, a stand-in role state reaches the predicate (in place of the live
+/// read or shadowing it), the predicate's verdict
 /// is discarded, or the checked pieces survive only in another function.
 #[test]
 fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
@@ -3111,6 +3112,14 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
     );
     assert!(!answers_resource_access_from_live_role_state(
         &production_code(&stand_in)
+    ));
+    // The live read survives, but a stand-in shadows it before the predicate.
+    let shadowed = bridge.replace(
+        "let access = resource",
+        "let role_state = ContextRoleState::default();\n    let access = resource",
+    );
+    assert!(!answers_resource_access_from_live_role_state(
+        &production_code(&shadowed)
     ));
     // The predicate call is deleted and the function answers `Ok(())`.
     let unchecked = bridge.replace(
@@ -3171,15 +3180,29 @@ fn fn_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
 /// context's role state from the live source (PyO3 and NAPI `live_role_state`,
 /// UniFFI `role_state_of`), passes that value to `ResourceKind::check_access`,
 /// and returns that call's verdict as the function's tail expression.
+///
+/// The live read must be the statement right before the predicate call: one
+/// `;` separates them, so no later statement can rebind `role_state` to a
+/// stand-in between the read and the check.
 fn answers_resource_access_from_live_role_state(code: &str) -> bool {
+    const TAIL: &str = "let access = resource.check_access(&role_state, &self.agent_did, \
+                        context_id); access.map_err(AccessRefusal::Denied) }";
     fn_body(code, "validate_resource_access").is_some_and(|body| {
-        (body.contains("let role_state = Self::live_role_state(&bi, context_id)")
-            || body.contains("let role_state = live_role_state(&bi, context_id)")
-            || body.contains("let role_state = Self::role_state_of(&bi, context_id)"))
-            && body.trim_end().ends_with(
-                "let access = resource.check_access(&role_state, &self.agent_did, context_id); \
-                 access.map_err(AccessRefusal::Denied) }",
-            )
+        let body = body.trim_end();
+        let Some(tail_at) = body.strip_suffix(TAIL).map(str::len) else {
+            return false;
+        };
+        [
+            "let role_state = Self::live_role_state(&bi, context_id)",
+            "let role_state = live_role_state(&bi, context_id)",
+            "let role_state = Self::role_state_of(&bi, context_id)",
+        ]
+        .iter()
+        .any(|read| {
+            body[..tail_at]
+                .rfind(read)
+                .is_some_and(|at| body[at..tail_at].matches(';').count() == 1)
+        })
     })
 }
 

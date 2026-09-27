@@ -4976,6 +4976,7 @@ impl McpUniFfiBridgeProvider {
         role_state: &scp_core::context::roles::ContextRoleState,
         context_id: &str,
         outlet_name: &str,
+        check: scp_mcp::server::CapabilityCheck,
     ) -> Result<(), scp_mcp::server::AccessRefusal> {
         use scp_mcp::server::AccessRefusal;
         // Primary check: UCAN token validation via the full 11-step ADR-016
@@ -5028,8 +5029,11 @@ impl McpUniFfiBridgeProvider {
                 let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                     revocation_list: &ucan_state.revocation_list,
                 };
-                let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
+                // Only a `tools/call` records the token's nonce; a probe
+                // records nothing, so listing cannot burn the token.
+                let mut nonce_adapter = scp_ffi_common::OutletGrantNonceTracker {
                     inner: &mut ucan_state.nonce_tracker,
+                    record: check == scp_mcp::server::CapabilityCheck::Invoke,
                 };
 
                 let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
@@ -5224,6 +5228,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         &self,
         context_id: &str,
         outlet_name: &str,
+        check: scp_mcp::server::CapabilityCheck,
     ) -> Result<(), scp_mcp::server::AccessRefusal> {
         use scp_mcp::server::AccessRefusal;
         // A dropped bridge instance, an unreadable role state, or a failed
@@ -5237,7 +5242,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                     "context '{context_id}' has no role state on this bridge instance"
                 ))
             })?;
-        self.outlet_grant(&bi, &role_state, context_id, outlet_name)
+        self.outlet_grant(&bi, &role_state, context_id, outlet_name, check)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -23603,7 +23608,7 @@ mod tests {
         // dropped bridge is a failed read, not the UCAN-required denial.
         assert!(
             matches!(
-                provider.validate_capability("ctx-dropped", "t"),
+                provider.validate_capability("ctx-dropped", "t", scp_mcp::server::CapabilityCheck::Probe),
                 Err(scp_mcp::server::AccessRefusal::Unreadable(msg))
                     if msg.contains("bridge instance has been dropped")
             ),
@@ -23942,7 +23947,11 @@ mod tests {
             let outlets = provider
                 .context_tools("ctx-test")
                 .expect("context_tools must read a registered context");
-            let grant = provider.validate_capability("ctx-test", &task_outlet_id);
+            let grant = provider.validate_capability(
+                "ctx-test",
+                &task_outlet_id,
+                scp_mcp::server::CapabilityCheck::Probe,
+            );
             (response, outlets, grant)
         });
         let (response, outlets, grant) = serve.await.expect(
@@ -23978,7 +23987,11 @@ mod tests {
         };
         let proofs_grant = {
             use scp_mcp::server::ContextProvider as _;
-            unreadable_proofs.validate_capability("ctx-test", &outlet_id)
+            unreadable_proofs.validate_capability(
+                "ctx-test",
+                &outlet_id,
+                scp_mcp::server::CapabilityCheck::Probe,
+            )
         };
         assert!(
             matches!(

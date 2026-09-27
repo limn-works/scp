@@ -751,6 +751,34 @@ impl<C: Clock> NonceTrackerTrait for BridgeNonceTracker<'_, C> {
     }
 }
 
+/// Nonce adapter for an MCP outlet grant: [`BridgeNonceTracker`] when `record`
+/// is true, and otherwise one that runs the same format, freshness and replay
+/// checks and leaves the tracker unchanged.
+///
+/// An MCP server holds one agent token for its lifetime. A `tools/list` or a
+/// view refresh that recorded that token's nonce would fail every later check
+/// of it, `tools/call` included, as a replay, so only the check that
+/// authorizes a `tools/call` records it
+/// (`scp_mcp::server::CapabilityCheck`).
+pub struct OutletGrantNonceTracker<'a, C: Clock> {
+    pub inner: &'a mut scp_core::crypto::ucan::nonce::NonceTracker<C>,
+    pub record: bool,
+}
+
+impl<C: Clock> NonceTrackerTrait for OutletGrantNonceTracker<'_, C> {
+    fn check_replay(&self, nonce: &str, token_expiry: u64) -> Result<(), CoreUcanError> {
+        self.inner.check_replay(nonce, token_expiry)
+    }
+
+    fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), CoreUcanError> {
+        if self.record {
+            self.inner.record(nonce, token_expiry)
+        } else {
+            self.inner.check_replay(nonce, token_expiry)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BridgeRevocationAuthorizer (issue #499)
 // ---------------------------------------------------------------------------
@@ -913,6 +941,31 @@ mod tests {
     use scp_identity::resolver::{ResolutionSource, ResolvedDidDocument};
     use scp_identity::{DidMethod, DualLayerResolver, NoOpRelayQuerier};
     use std::sync::Arc;
+
+    /// A probe runs the replay check and records nothing, so the same token
+    /// passes any number of probes and then one recording check; after that
+    /// check, a probe and a recording check both fail it as a replay.
+    #[test]
+    fn outlet_grant_nonce_probe_records_nothing() {
+        let clock = scp_clock::SystemClock;
+        let nonce = scp_core::crypto::ucan::nonce::generate_nonce(&clock);
+        let expiry = clock.now_secs() + 3600;
+        let mut tracker =
+            scp_core::crypto::ucan::nonce::NonceTracker::new("ctx-probe".to_owned(), clock);
+        let check = |tracker: &mut scp_core::crypto::ucan::nonce::NonceTracker<_>, record: bool| {
+            OutletGrantNonceTracker {
+                inner: tracker,
+                record,
+            }
+            .check_and_record(&nonce, expiry)
+        };
+        for _ in 0..3 {
+            check(&mut tracker, false).expect("a probe must not record the nonce");
+        }
+        check(&mut tracker, true).expect("the first recording check passes");
+        assert!(check(&mut tracker, false).is_err());
+        assert!(check(&mut tracker, true).is_err());
+    }
 
     /// Helper: create a `DualLayerResolver` with in-memory backends for testing.
     fn make_test_resolver() -> Arc<DualLayerResolver<NoOpRelayQuerier, InMemoryDhtClient>> {

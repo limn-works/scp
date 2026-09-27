@@ -1027,6 +1027,7 @@ mod tests {
             &self,
             _context_id: &str,
             _tool_name: &str,
+            _check: crate::server::CapabilityCheck,
         ) -> Result<(), crate::server::AccessRefusal> {
             Ok(())
         }

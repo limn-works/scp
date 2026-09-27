@@ -239,6 +239,23 @@ pub struct MemberInfo {
     pub role: String,
 }
 
+/// What a [`ContextProvider::validate_capability`] answer is for.
+///
+/// A UCAN check records the token's nonce (ADR-016 Step 9), and a recorded
+/// nonce fails every later check of the same token as a replay. The server
+/// holds one agent token for its lifetime, so only the check that authorizes a
+/// `tools/call` may record it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityCheck {
+    /// Decides what the agent sees: `tools/list`, `scp://{ctx}/tools` and the
+    /// notification pump's view. The provider checks the nonce and records
+    /// nothing.
+    Probe,
+    /// Authorizes a `tools/call` that runs next. The provider records the
+    /// nonce when the check passes.
+    Invoke,
+}
+
 /// Why a [`ContextProvider`] gate refused access.
 ///
 /// `tools/list` and `resources/list` leave a [`Self::Denied`] item out of a
@@ -307,6 +324,10 @@ pub trait ContextProvider: Send + Sync {
     /// no ceiling, no role catalogue and no UCAN stem — denying every client
     /// unconditionally on every bridge.
     ///
+    /// `check` says what the answer is for. A [`CapabilityCheck::Probe`]
+    /// changes no state, so `tools/list`, `scp://{ctx}/tools` and the
+    /// notification pump's view can ask as often as they need.
+    ///
     /// Returns `Ok(())` if permitted.
     ///
     /// # Errors
@@ -314,7 +335,12 @@ pub trait ContextProvider: Send + Sync {
     /// Returns [`AccessRefusal::Denied`] if the agent lacks the required
     /// capability, and [`AccessRefusal::Unreadable`] if the provider cannot
     /// read the state that decides it.
-    fn validate_capability(&self, context_id: &str, tool_name: &str) -> Result<(), AccessRefusal>;
+    fn validate_capability(
+        &self,
+        context_id: &str,
+        tool_name: &str,
+        check: CapabilityCheck,
+    ) -> Result<(), AccessRefusal>;
 
     /// Validates whether the agent may read a context resource
     /// (`scp://{context_id}/{kind}`).
@@ -871,7 +897,10 @@ impl<P: ContextProvider> McpServer<P> {
     /// decides the grant, so a list built from the answer never omits a tool
     /// because of a failed read.
     fn capability_granted(&self, context_id: &str, tool_name: &str) -> Result<bool, String> {
-        match self.provider.validate_capability(context_id, tool_name) {
+        match self
+            .provider
+            .validate_capability(context_id, tool_name, CapabilityCheck::Probe)
+        {
             Ok(()) => Ok(true),
             Err(AccessRefusal::Denied(_)) => Ok(false),
             Err(AccessRefusal::Unreadable(msg)) => Err(msg),
@@ -982,7 +1011,10 @@ impl<P: ContextProvider> McpServer<P> {
         }
 
         // Validate UCAN capability.
-        if let Err(refusal) = self.provider.validate_capability(&context_id, tool_name) {
+        if let Err(refusal) =
+            self.provider
+                .validate_capability(&context_id, tool_name, CapabilityCheck::Invoke)
+        {
             let msg = match refusal {
                 AccessRefusal::Denied(msg) => msg,
                 AccessRefusal::Unreadable(msg) => {
@@ -2064,6 +2096,8 @@ mod tests {
         /// Whether the provider fails to read which contexts the agent takes
         /// part in.
         participation_unreadable: bool,
+        /// Every `validate_capability` call's purpose, in call order.
+        checks: std::sync::Mutex<Vec<CapabilityCheck>>,
     }
 
     impl MockProvider {
@@ -2107,6 +2141,7 @@ mod tests {
                 events: serde_json::json!([]),
                 unreadable: Vec::new(),
                 participation_unreadable: false,
+                checks: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -2144,7 +2179,12 @@ mod tests {
             &self,
             context_id: &str,
             tool_name: &str,
+            check: CapabilityCheck,
         ) -> Result<(), AccessRefusal> {
+            self.checks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(check);
             self.read(context_id).map_err(AccessRefusal::Unreadable)?;
             if self
                 .denied_capabilities
@@ -2525,6 +2565,38 @@ mod tests {
         assert!(!names.contains(&"ctx_a/send_message"));
         // But still available in ctx_b.
         assert!(names.contains(&"ctx_b/send_message"));
+    }
+
+    /// Listing asks the provider only for probes, which record no UCAN nonce;
+    /// the one check that authorizes a `tools/call` is the only `Invoke`. A
+    /// listing that recorded the agent token's nonce would fail every later
+    /// check of that token as a replay.
+    #[test]
+    fn only_tools_call_asks_for_an_invoke_check() {
+        let mut server = initialized_server(MockProvider::default());
+        let list = make_request(protocol::METHOD_TOOLS_LIST, None);
+        assert!(server.handle_request(&list).unwrap().error.is_none());
+        let read = make_request(
+            protocol::METHOD_RESOURCES_READ,
+            Some(serde_json::json!({"uri": "scp://ctx_a/tools"})),
+        );
+        assert!(server.handle_request(&read).unwrap().error.is_none());
+        let checks = std::mem::take(&mut *server.provider.checks.lock().unwrap());
+        assert!(!checks.is_empty());
+        assert!(checks.iter().all(|c| *c == CapabilityCheck::Probe));
+
+        let call = make_request(
+            protocol::METHOD_TOOLS_CALL,
+            Some(serde_json::json!({
+                "name": "ctx_a/send_message",
+                "arguments": {"content": "hello"}
+            })),
+        );
+        assert!(server.handle_request(&call).unwrap().error.is_none());
+        assert_eq!(
+            *server.provider.checks.lock().unwrap(),
+            vec![CapabilityCheck::Invoke]
+        );
     }
 
     // -----------------------------------------------------------------------
