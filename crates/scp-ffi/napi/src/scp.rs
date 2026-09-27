@@ -5781,6 +5781,26 @@ mod file_custody_agent_key_tests {
             }
         }
 
+        // `identity_create` answers `"file"` with the same fail-closed error.
+        let message = match rt.block_on(scp.identity_create("file".to_owned(), None)) {
+            Ok(_) => panic!("a shipped build must fail closed on `identity_create(\"file\")`"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            message.contains(codes::IDENT_1059),
+            "`identity_create(\"file\")` must fail closed with SCP-IDENT-1059: {message}"
+        );
+
+        // Both creators can only fail on a shipped build, so neither may leave
+        // a key file sealed to whatever passphrase happened to be set.
+        let home = std::env::var_os("HOME").expect("the parent sets HOME on this child");
+        let key_file = std::path::Path::new(&home).join(".scp").join("keys.bin");
+        assert!(
+            !key_file.exists(),
+            "a creation that fails closed left a key file at {}",
+            key_file.display()
+        );
+
         // Read by the parent process, which cannot otherwise tell a passing
         // inner test from a filter that matched nothing.
         println!("{INNER_TEST_SENTINEL}");

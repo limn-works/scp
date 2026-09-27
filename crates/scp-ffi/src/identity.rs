@@ -59,7 +59,6 @@ use scp_identity::{DidCache, DidDht, DidMethod, DualLayerResolver, NoOpRelayQuer
 // value directly (production migration is unreachable — ADR-062 §Decision 6).
 #[cfg(feature = "testing")]
 use scp_identity::ScpIdentity;
-use scp_platform::file::FileKeyCustody;
 #[cfg(feature = "testing")]
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, Storage};
@@ -703,24 +702,32 @@ impl PyDIDDocument {
 ///
 /// - `"in_memory"` — Test-only in-memory custody. Keys are lost on process
 ///   exit. Only available when compiled with `cfg(feature = "testing")`.
-/// - `"file"` — Encrypted file-backed custody ([`FileKeyCustody`]) using
-///   Argon2id + AES-256-GCM. This is the production default for desktop/server
-///   platforms. Mobile platforms (iOS/Android) should use their native
-///   `KeyCustodyProvider` callback interface via `UniFFI` instead.
+/// - `"file"` — Encrypted file-backed custody ([`FileKeyCustody`](scp_platform::file::FileKeyCustody)) using
+///   Argon2id + AES-256-GCM, for desktop and server platforms. The caller
+///   names it; no custody is a default (spec §17.17.1). Mobile platforms
+///   (iOS/Android) use their native `KeyCustodyProvider` callback interface via
+///   `UniFFI` instead.
 /// - `"platform"` — Backward-compatible alias for `"file"` (SCP-294a).
 ///
-/// The `"file"` / `"platform"` path creates a [`FileKeyCustody`] at a default
-/// location (`$HOME/.scp/keys.bin`) with a passphrase from the
-/// `SCP_KEY_PASSPHRASE` environment variable. If the variable is not set, an
-/// error is returned.
+/// The `"file"` / `"platform"` path resolves `$HOME/.scp/keys.bin` and the
+/// `SCP_KEY_PASSPHRASE` passphrase through
+/// `scp_ffi_common::custody_file`, the resolver the napi-rs bridge also calls.
 ///
 /// # Errors
 ///
 /// Returns [`ScpPyError::ValidationError`] if:
 /// - The custody string is not recognized.
-/// - `"in_memory"` is requested but the `testing` feature is not enabled.
-/// - `"file"` / `"platform"` is requested but `SCP_KEY_PASSPHRASE` is not set.
-/// - [`FileKeyCustody`] initialization fails (I/O error, corrupt key file).
+/// - `"file"` / `"platform"` is requested and `SCP_KEY_PASSPHRASE` is unset or
+///   empty, or `$HOME` is unset, empty, or relative.
+///
+/// Returns [`ScpPyError::IdentityError`] if:
+/// - `"in_memory"` is requested but the `testing` feature is not enabled
+///   (`SCP-IDENT-1008`).
+/// - The key directory or the key file cannot be opened
+///   (`SCP-IDENT-1008`).
+/// - `"file"` / `"platform"` is requested on a build without the `testing`
+///   feature, where creation fails closed before any key file is opened
+///   (`SCP-IDENT-1059`).
 ///
 /// See issue #323, ADR-006, and SCP-294a.
 fn parse_custody(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
@@ -794,33 +801,31 @@ fn parse_custody_inner(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), Sc
         // "file" is the canonical name; "platform" is a backward-compat alias
         // (SCP-294a). Both resolve to FileKeyCustody.
         "file" | "platform" => {
-            let passphrase =
-                zeroize::Zeroizing::new(std::env::var("SCP_KEY_PASSPHRASE").map_err(|_| {
-                    ScpPyError::validation(
-                        "file custody requires the SCP_KEY_PASSPHRASE environment \
-                         variable to be set — this passphrase protects the encrypted key file",
-                    )
-                })?);
+            // Resolve the environment first, through the resolver the napi-rs
+            // bridge also calls, so a caller who set no `SCP_KEY_PASSPHRASE`,
+            // an empty one, or an empty or relative `$HOME` reads that rather
+            // than a pre-rotation message they cannot act on. Resolution
+            // touches no file.
+            let inputs = scp_ffi_common::custody_file::resolve_file_custody_inputs()
+                .map_err(|e| file_custody_error(&e))?;
 
-            let key_dir = dirs_home()?.join(".scp");
-            std::fs::create_dir_all(&key_dir).map_err(|e| {
-                ScpPyError::validation(format!(
-                    "failed to create key directory {}: {e}",
-                    key_dir.display()
-                ))
-            })?;
+            // Both callers (`identity_create`, `identity_create_with_agent_key`)
+            // fail closed on a shipped build (ADR-062 §Decision 6, IDENT_1059),
+            // so opening the key file there would leave a file sealed to
+            // whatever passphrase happened to be set, for a call that fails.
+            #[cfg(not(feature = "testing"))]
+            {
+                let _ = inputs;
+                Err(no_pre_rotation_backend())
+            }
 
-            let key_path = key_dir.join("keys.bin");
-            let file_kc = FileKeyCustody::new(&key_path, &passphrase).map_err(|e| {
-                ScpPyError::identity(format!(
-                    "failed to initialize file-backed key custody at {}: {e}",
-                    key_path.display()
-                ))
-            })?;
-
-            // Normalize: always store "file" as the canonical custody type,
-            // even when the caller passed the "platform" backward-compat alias.
-            Ok((Arc::new(FfiKeyCustody::File(file_kc)), "file".to_owned()))
+            #[cfg(feature = "testing")]
+            {
+                let file_kc = inputs.open().map_err(|e| file_custody_error(&e))?;
+                // Normalize: always store "file" as the canonical custody type,
+                // even when the caller passed the "platform" backward-compat alias.
+                Ok((Arc::new(FfiKeyCustody::File(file_kc)), "file".to_owned()))
+            }
         }
         // Align with NAPI + UniFFI: unknown custody strings return the
         // generic "unrecognised value" code `SCP-VALID-7005` rather than
@@ -835,24 +840,27 @@ fn parse_custody_inner(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), Sc
     }
 }
 
-/// Returns a home directory that `$HOME` names.
+/// Maps a shared [`FileCustodyError`] onto this bridge's error type, with the
+/// codes the napi-rs bridge's `file_custody_error` uses.
 ///
-/// # Errors
+/// An unset, empty, or relative environment variable is something the caller
+/// sets, so it surfaces as a validation error (`SCP-VALID-7001`) naming that
+/// variable. A key directory or key file this process cannot open is
+/// something the caller restores, so it surfaces as an identity error
+/// (`SCP-IDENT-1008`).
 ///
-/// Returns [`ScpPyError::ValidationError`] when `$HOME` is unset. An earlier
-/// version substituted a working directory, so a service started from two
-/// working directories wrote two key files and held two identities while
-/// reporting nothing unusual. `scp_node::self_host::resolve_storage_path`
-/// rejects an unset `$HOME` for that same reason.
-fn dirs_home() -> Result<std::path::PathBuf, ScpPyError> {
-    std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .map_err(|_| {
-            ScpPyError::validation(
-                "file custody requires a HOME environment variable naming a directory — \
-                 it holds an encrypted key file at $HOME/.scp/keys.bin",
-            )
-        })
+/// [`FileCustodyError`]: scp_ffi_common::custody_file::FileCustodyError
+fn file_custody_error(error: &scp_ffi_common::custody_file::FileCustodyError) -> ScpPyError {
+    use scp_ffi_common::custody_file::FileCustodyError as E;
+    match error {
+        E::HomeUnset | E::HomeNotAbsolute { .. } | E::PassphraseUnset => {
+            ScpPyError::validation(error.to_string())
+        }
+        E::DirectoryCreate { .. } | E::Open { .. } => ScpPyError::identity_with_code(
+            error.to_string(),
+            scp_ffi_common::error_codes::IDENT_1008,
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2879,6 +2887,43 @@ mod tests {
 
     fn default_scp() -> crate::scp::PyScp {
         crate::scp::PyScp::new_in_memory_for_test()
+    }
+
+    /// `"file"` custody errors carry the classes and codes the napi-rs
+    /// bridge's `file_custody_error` gives them, so one failure reads the same
+    /// from Python and from TypeScript.
+    #[test]
+    #[allow(clippy::panic)]
+    fn file_custody_error_matches_the_napi_codes() {
+        use scp_ffi_common::custody_file::FileCustodyError as E;
+        use scp_ffi_common::error_codes as codes;
+        for env_error in [
+            E::HomeUnset,
+            E::HomeNotAbsolute {
+                home: std::path::PathBuf::from("data"),
+            },
+            E::PassphraseUnset,
+        ] {
+            match file_custody_error(&env_error) {
+                ScpPyError::ValidationError { code, .. } => assert_eq!(code, codes::VALID_7001),
+                other => panic!("{env_error:?} must be a validation error, got {other:?}"),
+            }
+        }
+        for file_error in [
+            E::DirectoryCreate {
+                path: std::path::PathBuf::from("/ro/.scp"),
+                message: "read-only file system".to_owned(),
+            },
+            E::Open {
+                path: std::path::PathBuf::from("/home/op/.scp/keys.bin"),
+                message: "wrong passphrase".to_owned(),
+            },
+        ] {
+            match file_custody_error(&file_error) {
+                ScpPyError::IdentityError { code, .. } => assert_eq!(code, codes::IDENT_1008),
+                other => panic!("{file_error:?} must be an identity error, got {other:?}"),
+            }
+        }
     }
 
     /// Verifies that `PyScp::identity_migrate` succeeds end-to-end.

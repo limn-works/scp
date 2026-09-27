@@ -583,6 +583,14 @@ mod tests {
                 "shipped identity_create must fail closed with SCP-IDENT-1059, got: {msg}"
             );
         });
+        // A creation that can only fail must not leave a key file sealed to
+        // whatever passphrase happened to be set.
+        let key_file = tmp.path().join(".scp").join("keys.bin");
+        assert!(
+            !key_file.exists(),
+            "a creation that fails closed left a key file at {}",
+            key_file.display()
+        );
     }
 
     /// AC3: on a shipped build the device-attestation *verify* op fails closed
