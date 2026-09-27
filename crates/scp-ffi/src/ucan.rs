@@ -1087,6 +1087,14 @@ mod tests {
         let context_id = format!("ctx-revoke-{}", uuid::Uuid::new_v4());
         crate::runtime::register_context(&scp.inner, &context_id, REVOKE_CREATOR_DID, &[])
             .expect("register_context should succeed");
+        // `ucan_revoke` reads the context creator from the supervisor actor,
+        // so the fixture creates the context there as well.
+        crate::runtime::create_supervisor_context_for_test(
+            &scp.inner,
+            &context_id,
+            REVOKE_CREATOR_DID,
+            &[],
+        );
         (scp, context_id)
     }
 
