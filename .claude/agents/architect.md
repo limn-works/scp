@@ -84,13 +84,3 @@ Public construction entry points follow `.docs/standards/construction.md`, which
 
 ### Decision Records
 Record each architectural decision as an ADR in `.docs/adrs/`, under the phase file it belongs to or as a standalone `ADR-NNN-*.md` file. Each ADR states the context, the options considered with the reason each rejected option lost, the decision, and its consequences.
-
-## Quality Gates
-
-Before approving structural changes:
-- [ ] No circular dependencies introduced
-- [ ] Module boundaries respected
-- [ ] Protocols defined for cross-layer communication
-- [ ] Naming conventions followed
-- [ ] Testability preserved
-- [ ] Documentation updated

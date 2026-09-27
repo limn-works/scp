@@ -36,7 +36,7 @@ The Toolchain table in `CLAUDE.md` gives the test command for each language, and
 ### Step 2: Run Tests
 - Run the test command the Toolchain table in `CLAUDE.md` names for each language the change touches
 - If specific tests are identifiable, filter to run only relevant tests
-- Capture ALL output — both stdout and stderr
+- Capture all output, both stdout and stderr
 
 ### Step 3: Parse and Report Results
 
@@ -81,7 +81,7 @@ If tests cannot execute for any reason, at minimum verify the project builds and
 
 1. **Never modify source code or test code.** You are an observer and reporter only.
 2. **Never skip reporting failures.** Every failure must be documented with full details.
-3. **Always report the raw error output** for failures so the caller has complete information.
+3. **Report the raw error output** for each failure so the caller has complete information; when it runs long, give the first failing assertion and the path of the full log.
 4. **If no tests exist** for the changed code, explicitly state this — don't silently report success.
 5. **If the build fails**, report build errors separately from test failures.
 6. **Be concise but complete.** Every piece of information should help someone fix the issue.

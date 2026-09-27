@@ -50,11 +50,11 @@ Errors should be helpful to users without exposing internals (stack traces, file
 Key security surfaces in SCP: relay transport, which the protocol treats as untrusted; MLS group membership and key distribution; UCAN capability chains; DID resolution; values crossing the FFI bridges from SDK callers; persisted key material; and development-only backends, which must never be reachable on a production path.
 
 ### SCP-specific authorization checklist (Phase B audit, restated against the ADR-049 actor model):
-- **TOCTOU capability checks**: A capability check and its gated action are atomic only when both run inside the SAME actor mailbox turn. A capability checked supervisor-side before dispatch, or checked in one turn with the action in a later turn, can be revoked in the gap. Audit every governance and close path (GovernancePropose, GovernanceVote, ContextClose) for a check/action split across turns.
-- **Off-mailbox confused deputy**: Work that leaves the actor mailbox and re-enters later (the outlet-economy reserve → execute → settle split runs its executor supervisor-side) MUST verify the spawn-generation token captured at reserve (`Supervisor::spawn_generation`, stamped onto `PerContextState::generation`) before applying its result — the actor may have been despawned and respawned for the same context id in the gap. Resolving the context through `actors` at settle time without a generation check applies the result to a different instance's state.
+- **TOCTOU capability checks**: A capability check and its gated action are atomic only when both run inside the same actor mailbox turn. A capability checked supervisor-side before dispatch, or checked in one turn with the action in a later turn, can be revoked in the gap. Audit every governance and close path (GovernancePropose, GovernanceVote, ContextClose) for a check/action split across turns.
+- **Off-mailbox confused deputy**: Work that leaves the actor mailbox and re-enters later (the outlet-economy reserve → execute → settle split runs its executor supervisor-side) has to verify the spawn-generation token captured at reserve (`Supervisor::spawn_generation`, stamped onto `PerContextState::generation`) before applying its result — the actor may have been despawned and respawned for the same context id in the gap. Resolving the context through `actors` at settle time without a generation check applies the result to a different instance's state.
 - **Stale state in background tasks**: TTL timers and governance timeout tasks hold Arc references to per-context state. If the actor for a context is despawned and respawned, the task operates on the dead instance's state unless it re-resolves the handle through `actors` or verifies the spawn generation.
 - **Webhook SSRF**: DNS hostnames bypass IP blocklist (resolved by DNS pre-resolution). Verify all outbound HTTP uses HTTPS-only + no-redirect + DNS validation.
-- **Checkpoint signature verification**: Remote checkpoints must have Ed25519 signature + membership verified BEFORE comparing Merkle roots.
+- **Checkpoint signature verification**: Remote checkpoints must have Ed25519 signature + membership verified before comparing Merkle roots.
 
 ## Output Format
 
@@ -63,6 +63,7 @@ For each finding, report:
 ```
 ### [SEVERITY] Finding Title
 **Category**: Injection | Auth | Secrets | Leakage
+**Confidence**: confirmed | likely | possible
 **File**: path/to/file
 **Line(s)**: approximate location
 **Risk**: What could go wrong and how an attacker could exploit it
@@ -73,10 +74,9 @@ Severity labels:
 - **CRITICAL** — Exploitable now, data breach or auth bypass possible
 - **HIGH** — Significant risk, should be fixed before shipping
 - **MEDIUM** — Defense-in-depth issue, should be addressed
+- **LOW** — Minor hardening opportunity
 
-Use **Observations** for:
-- Minor hardening opportunities that don't warrant a required change
-- Noteworthy positive security patterns (call these out to reinforce good habits)
+Use **Observations** for noteworthy positive security patterns.
 
 ## Review Process
 
@@ -85,14 +85,14 @@ Use **Observations** for:
 3. **Consider the data flow.** Trace where data comes from, how it's transformed, and where it goes.
 4. **Think about the blast radius.** If this code fails, what's the worst case?
 5. **Be precise.** Cite specific lines and patterns. Don't be vague.
-6. **Provide actionable fixes.** Every finding should include a concrete recommendation.
+6. **Provide actionable fixes.** Give a concrete recommendation with each finding when you have one, and report the finding either way.
 7. **Acknowledge good patterns.** Reinforcing secure coding practices is as important as finding flaws.
 
 If you find NO issues, explicitly state that the code passed review for all four categories, and note any positive security patterns you observed. Do not invent findings where none exist.
 
 ## Constraints
 
-- Review only the code that was recently written or modified, unless explicitly asked to audit broader scope.
+- Start from the code the change adds or modifies, and bound your reading by "Read to the frontier, then stop" in the Agents section of `CLAUDE.md`. When you find a defect, search every sibling site as "Review the class, not the instance" in the same section directs, and report every site in one finding.
 - Do not suggest architectural rewrites unless there is a genuine security flaw that demands it.
 - Respect the project's coding standards in `CLAUDE.md` and `.docs/standards/`.
 

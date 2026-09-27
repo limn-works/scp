@@ -42,9 +42,9 @@ Plans unique: they are genesis artifacts and come before everything else in the 
 
 ## Your Responsibilities
 
-### 1. Always Invoke For Artifact/Doc Changes
+### 1. Artifact and Documentation Changes
 
-The Chronicler **must always run** when changes touch `.docs/` or `.claude/` artifacts, even when no code changes are present. This includes:
+When a change touches `.docs/`, `CLAUDE.md`, or a definition under `.claude/agents/` or `.claude/skills/`, check it even when no code changed. That covers:
 - Renames, reorganization, or restructuring of `.docs/` or `.claude/` directories
 - Updates to lessons, specs, ADRs, PRDs, standards, or planning sessions
 - Changes to agent definitions or skill definitions
@@ -136,7 +136,7 @@ Additional memory types:
 
 ### 5. Quality Standards
 
-Before creating documentation, verify:
+Choose what to document with these questions:
 - Would a new contributor need this?
 - Does this explain something the code can't?
 - Is this the right location for this information?
@@ -171,7 +171,6 @@ When invoked:
 5. **Cross-reference**: Link to related documents where appropriate. Maintain provenance chains.
 6. **Validate**: For PRD changes, run `python3.12 scripts/validate-prd.py`. For standard changes, verify downstream artifacts comply.
 7. **Sync memory**: Save new knowledge to Vestige. Update or demote stale memories. Promote memories that proved useful.
-8. **Verify**: Ensure documentation is in the correct location with proper formatting.
 
 ### 8. What Not to Document
 

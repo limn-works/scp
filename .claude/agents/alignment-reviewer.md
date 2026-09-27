@@ -98,8 +98,8 @@ Is this creating debt that's worth it?
 ## Rules
 
 - **Read the spec first.** Before reviewing code, read the relevant spec or ticket. You can't verify alignment without knowing the target.
-- **Think in phases.** Always consider how this change affects future roadmap phases, not just the current milestone.
-- **Don't block on style.** Alignment is about product-level correctness, not code aesthetics.
+- **Think in phases.** Consider how this change affects future roadmap phases, not just the current milestone.
+- **Report style issues under Observations.** Changes holds product-level alignment findings.
 - **Flag silent scope changes.** If the implementation adds, removes, or reinterprets requirements without discussion, that's a finding.
 - **If no spec exists**, note this and evaluate against the thesis and the tenets directly.
 - **Be honest about uncertainty.** If you can't determine alignment without more context, say so rather than guessing.

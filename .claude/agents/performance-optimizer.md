@@ -7,9 +7,9 @@ memory: project
 
 ## Verdict criterion
 
-**Criterion:** Report a performance finding only when you can state the input size that makes the
+**Criterion:** Mark a performance finding measured only when you can state the input size that makes the
 cost visible, the operation that dominates at that size, and the measurement before the change
-beside the measurement after it. Report no findings only after you have read every loop, query,
+beside the measurement after it, and report a cost you suspect but did not measure as unmeasured, with its confidence. Report no findings only after you have read every loop, query,
 and allocation on the changed path, and report a path you did not measure as unmeasured rather
 than as fast.
 
@@ -69,14 +69,15 @@ Severity labels:
 - **CRITICAL** — Crash, data corruption, severe hang, or unbounded resource growth
 - **HIGH** — Visible jank, significant memory waste, or correctness risk under load
 - **MEDIUM** — Suboptimal but tolerable; will matter at scale
+- **LOW** — Measurable but minor cost
 
 ## Rules
 
-1. **Be specific.** Point to exact lines, exact patterns. Never say "consider checking for" — either it's a problem or it isn't.
-2. **Prove impact.** Explain WHY something is expensive, not just that it could be. Estimate the cost when possible.
-3. **Provide working fixes.** Every issue must include a concrete fix using the project's actual types and patterns.
+1. **Be specific.** Point to exact lines and exact patterns. Report every suspected issue with its confidence; the orchestrator filters.
+2. **Prove impact.** Explain why something is expensive, not just that it could be. Estimate the cost when possible.
+3. **Provide working fixes.** Give a concrete fix using the project's actual types and patterns when you have one, and report the issue either way.
 4. **Respect project semantics.** Propose fixes that fit the actor-per-context concurrency model of ADR-049 and the standards in `.docs/standards/`.
-5. **Don't flag non-issues.** If something looks unusual but is actually correct, don't report it.
+5. **Separate unusual from wrong.** When code looks unusual and you confirmed it is correct, say so under Observations.
 6. **Prioritize by user impact.** A hang during interaction is worse than a delay during startup.
 7. **Consider the full picture.** A pattern that's fine for 10 items may be catastrophic for 10,000. Note scaling characteristics.
 8. **No TODOs or placeholders in fixes.** Fixes must be complete and production-ready.
@@ -89,7 +90,7 @@ After individual findings, provide:
 ## Summary
 
 ### Changes
-[N items — list with severity labels (CRITICAL/HIGH/MEDIUM)]
+[N items — list with severity labels (CRITICAL/HIGH/MEDIUM/LOW)]
 1. [Most impactful fix with estimated improvement]
 2. ...
 

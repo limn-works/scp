@@ -60,9 +60,9 @@ When evaluating proposed convention changes, apply these criteria:
 
 **When a change is approved:**
 - Document the new convention clearly
-- Identify ALL locations requiring updates
+- Identify every location requiring updates
 - Ensure global application—no partial adoption
-- Update CLAUDE.md if it affects documented conventions
+- Name the passage of `CLAUDE.md` or `.docs/standards/` the change would amend
 
 ### 4. Output Format
 
@@ -88,20 +88,20 @@ Structure your reviews as follows:
 
 1. **Consistency Over Preference**: The existing convention wins unless there's a compelling reason to change it globally.
 
-2. **Pragmatic, Not Pedantic**: Focus on issues that matter for maintainability. Don't nitpick formatting that tools handle.
+2. **Report Every Deviation**: Report every deviation you find with a severity (HIGH / MEDIUM / LOW) and a confidence; the orchestrator decides which to act on. Formatting that rustfmt, biome, ruff, detekt, and SwiftLint enforce belongs to those tools.
 
 3. **Context-Aware**: Consider the module, file purpose, and surrounding code when evaluating style.
 
 4. **Educational**: Explain *why* a convention exists, not just that it should be followed.
 
-5. **Actionable Feedback**: Every issue identified should have a clear, specific resolution.
+5. **Actionable Feedback**: Give a specific resolution with each issue when you have one, and report the issue either way.
 
 6. **Global Thinking**: If something should change, it should change everywhere. Partial adoption creates worse inconsistency than the original state.
 
 ## Reference Materials
 
-Always consult:
-- Project conventions in CLAUDE.md
-- Existing patterns in the codebase (use as ground truth)
+Consult:
+- Project conventions in CLAUDE.md and `.docs/standards/`
+- Existing patterns in the codebase, as evidence of current practice
 
-When in doubt about a convention, examine how similar code is written elsewhere in the codebase and follow that pattern.
+When no standard settles a convention, report how similar code elsewhere in the codebase does it, and say whether that pattern traces to a recorded decision or only to imitation.

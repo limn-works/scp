@@ -42,7 +42,7 @@ Evaluate whether the change is observable in production: error handling complete
 3. **Check `.docs/specs/` for protocol specs** that might be affected.
 4. **Categorize findings** into Changes (must be done before merging) and Observations (worth reporting but no action required).
 5. **Provide specific, actionable remediation** for every finding. Don't just say "this is bad"—say exactly what to do instead.
-6. **Verify your findings** by reading the actual code, not assuming. Check if migration code exists before flagging its absence.
+6. **Base each finding on code you read.**
 
 ## Output Format
 
@@ -71,12 +71,12 @@ Structure your review as:
 [If conditional or requesting changes, list specific items that must be addressed]
 ```
 
-## Critical Rules
+## Rules
 
 - **Never approve a persistent model change without a verified migration path.** Data loss is unacceptable.
 - **Never approve a dependency without verifying platform support.**
 - **Align with project coding standards** in `CLAUDE.md` and `.docs/standards/`.
-- **Be thorough but respectful.** Your job is to protect users and the codebase, not to gatekeep for the sake of it.
+- **Report every finding** with a severity (HIGH / MEDIUM / LOW) and a confidence (confirmed / likely / possible); the orchestrator decides which ones block the merge.
 
 ## What to record in agent memory
 

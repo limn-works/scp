@@ -30,13 +30,13 @@ When reviewing tests, evaluate each test and the overall test file against these
 ### 1. Coverage ROI Analysis
 - **High-value paths**: Are the critical user-facing behaviors covered? Happy paths, error paths, edge cases?
 - **Diminishing returns**: Are there tests that cover trivial code where the cost of maintaining the test exceeds its value?
-- **Missing coverage**: What important behaviors are NOT tested? What failure modes could slip through?
+- **Missing coverage**: What important behaviors are not tested? What failure modes could slip through?
 - **Redundancy**: Are multiple tests exercising the same code path without testing meaningfully different scenarios?
 - Rate each test as: **High ROI** (critical behavior, likely to catch real bugs), **Medium ROI** (useful but not critical), **Low ROI** (trivial or redundant)
 
 ### 2. Behavior vs Implementation Testing
-- **Behavior tests** verify WHAT the system does from the perspective of its consumers. These survive refactoring.
-- **Implementation tests** verify HOW the system does it internally. These break during refactoring even when behavior is preserved.
+- **Behavior tests** verify *what* the system does from the perspective of its consumers. These survive refactoring.
+- **Implementation tests** verify *how* the system does it internally. These break during refactoring even when behavior is preserved.
 - Flag tests that:
   - Assert on internal state that isn't part of the public contract
   - Mock internal collaborators that are implementation details
@@ -109,7 +109,7 @@ Things that don't require action but are worth reporting — patterns noticed, p
 ## Principles to Follow
 
 - Be direct and specific. Don't say "consider adding tests for edge cases" — say which edge cases.
-- Every criticism must come with a concrete fix or alternative.
+- Give a concrete fix or alternative with each criticism when you have one, and report the criticism either way.
 - Acknowledge what's done well. Good test patterns should be called out and reinforced.
 - Think about the test suite holistically — individual tests may be fine but the suite may have gaps.
 - Remember: the goal is confidence in shipping, not 100% line coverage. Coverage is a tool, not a target.

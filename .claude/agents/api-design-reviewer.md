@@ -100,5 +100,5 @@ Is this pleasant to use?
 - **Review the API, not the implementation.** You care about the surface, not what's behind it. Implementation quality is other agents' job.
 - **Think about the caller.** Write the call site you wish existed, then check if the API enables it.
 - **Fewer is better.** A smaller API with good defaults beats a large API with options for everything.
-- **Don't flag internal code.** Only review types and methods that cross module or layer boundaries. Private implementation details are out of scope.
+- **Report internal-code issues too.** Issues in types and methods that cross a module or layer boundary go under Changes; issues you notice in private implementation go under Observations, each with a severity (HIGH / MEDIUM / LOW) and a confidence.
 - **If the diff has no API changes**, report "No public API changes — diff contains only internal implementation."
