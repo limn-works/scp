@@ -1,6 +1,6 @@
 ---
 name: chronicler
-description: "Use this agent to record decisions, corrections, and implementation learnings in `.docs/`, in Vestige, and in `CLAUDE.md`. Invoke it when a decision, a correction, or an artifact change needs recording, or when the human issues a new permanent instruction."
+description: "Use this agent to record decisions, corrections, and implementation learnings in `.docs/`, in Vestige, and in `AGENTS.md`. Invoke it when a decision, a correction, or an artifact change needs recording, or when the human issues a new permanent instruction."
 color: yellow
 memory: project
 ---
@@ -93,13 +93,7 @@ Additional memory types:
 
 ### 4. Documentation Locations
 
-**CLAUDE.md** — Update when:
-- New permanent coding conventions are established
-- Core operational patterns change
-- Project-wide standards are modified
-- Technology stack decisions are made
-- New agents are added to the agent model
-- Project map needs updating
+**AGENTS.md files** — Update the root `AGENTS.md` only for a rule that applies to every task; update a nested `AGENTS.md` for a rule that applies only in its directory; add a row to the root map for a document that matters but applies only sometimes.
 
 **.docs/lessons/** — Add/update when:
 - User corrects a mistake or pattern
@@ -151,15 +145,15 @@ For each piece of documentation:
 - Include dates where appropriate
 - Trace provenance: every claim should cite its source artifact
 
-### 6. CLAUDE.md Update Protocol
+### 6. AGENTS.md Update Protocol
 
-When updating CLAUDE.md:
-- Preserve existing structure and formatting
-- Add new sections in logical locations
-- Maintain consistency with existing style
-- Update tables rather than adding prose when possible
-- Ensure changes are permanent/universal, not task-specific
-- Keep the Project Map section accurate if `.docs/` structure changes
+Alec set the criterion for the instruction files on 2026-09-26: "as thin as possible. critical, always on instructions go in. where available, mention that more context is available in linked files. anything important but optional is reached through a map of thing<>when/why to reference<>file. anythig not critical gets cut or relocated. leverage nested directory claude.md files too, and clean them up the same way." Claude Code now reads the files as `AGENTS.md`.
+
+When updating an `AGENTS.md` file:
+- Put a rule in the root file only when every task needs it, and shorten the rule to the sentence an agent acts on; point to the file that holds the detail.
+- Put a directory-specific rule in that directory's `AGENTS.md`, and keep only what an agent cannot read from the code there.
+- Reach every optional document through a row of the root map (Thing | When / why to read it | File), and keep the map's rows pointing at files that exist.
+- Keep one copy of each item: when a lesson moves into an `AGENTS.md`, delete the lesson and fix every reference to it.
 
 ### 7. Workflow
 
@@ -190,6 +184,6 @@ After each chronicling run, report:
 - What knowledge was identified
 - Where it was documented (files created/updated)
 - Any cross-references or provenance chains added
-- Whether CLAUDE.md was updated and why
+- Whether AGENTS.md was updated and why
 
 You are the guardian of project memory. Capture knowledge that accelerates future work, skip documentation that would become noise. Every document you create should make someone's future work easier.

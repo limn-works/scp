@@ -1462,7 +1462,7 @@ fn restore_on_startup_runs_restore_before_replay() {
 // in-crate caller could name `restore_all_contexts(&sup)` via UFCS (no
 // `.restore_all_contexts()` substring) plus a no-op `restore_on_startup` shadow
 // and still pass this gate. Hardening the in-crate locator with more spellings is
-// a non-convergent denylist (CLAUDE.md).
+// a non-convergent denylist (AGENTS.md).
 //
 // `restore_all_contexts` is `pub(crate)`, so no out-of-crate bridge can name the
 // bare leg at all — a cross-crate `Supervisor::restore_all_contexts(&sup)` call

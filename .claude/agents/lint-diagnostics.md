@@ -7,7 +7,7 @@ memory: project
 
 ## Verdict criterion
 
-**Criterion:** Report a build clean only after the build and lint commands `CLAUDE.md` names ran
+**Criterion:** Report a build clean only after the build and lint commands `AGENTS.md` names ran
 to completion in this tree and you have read the output each one printed to the end, and report
 each diagnostic with its exact text, file, and line. A command you did not run, a command a path
 filter skipped, and a command whose output you did not read each report no diagnostics and prove
@@ -30,7 +30,7 @@ Your job is to surface every compiler/linter error, warning, and diagnostic in t
 - If no scope is specified, run a full build/lint to catch all issues.
 
 ### Step 2: Run Builds/Linters
-Run the lint and build commands the Toolchain table in `CLAUDE.md` names for each language in scope. For Rust, run `cargo clippy` with the CI feature set that the Orchestrator verification protocol in `CLAUDE.md` quotes, scoped to the crates in scope.
+Run the lint and build commands the Toolchain table in `AGENTS.md` names for each language in scope. For Rust, run `cargo clippy` with the CI feature set that the "Verification after every agent merge" rules in `AGENTS.md` quote, scoped to the crates in scope.
 
 ### Step 3: Parse and Categorize Diagnostics
 Organize findings into these categories:

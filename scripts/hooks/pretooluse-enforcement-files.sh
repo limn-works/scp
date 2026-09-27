@@ -24,7 +24,7 @@
 # Fails CLOSED on any of:
 #   * `jq` not installed / unable to parse the payload
 #   * `python3.12` not available (system `python3` is the Xcode stub
-#     per project CLAUDE.md and cannot be trusted for realpath)
+#     per project AGENTS.md and cannot be trusted for realpath)
 #   * `git rev-parse --show-toplevel` fails (cannot anchor protected paths)
 #   * A direct OR symlink-resolved path matches a protected canonical path
 
@@ -169,7 +169,7 @@ paths=$(
 
 command -v python3.12 >/dev/null 2>&1 || {
     echo "ENFORCEMENT ERROR: python3.12 required for hook realpath resolution" \
-         "(symlink bypass protection) — per project CLAUDE.md, system" \
+         "(symlink bypass protection) — per project AGENTS.md, system" \
          "python3 is the Xcode stub and must not be used" >&2
     exit 2
 }

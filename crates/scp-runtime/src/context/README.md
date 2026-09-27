@@ -4,7 +4,7 @@ This module is the heart of `scp-runtime`: the actor-per-context concurrency
 model (ADR-049). One `tokio` task per live context owns its state by move; a
 `Supervisor` owns the registry of those tasks and every provider. If you are
 new here, read `.docs/adrs/ADR-049-actor-per-context.md` and this crate's
-`CLAUDE.md`, then use the map below.
+`AGENTS.md`, then use the map below.
 
 ## How a command flows
 
@@ -68,7 +68,7 @@ through `SupervisorHandle::start_saga` (see the saga coordinator).
 - `handle.rs` — `ContextActorHandle`, the caller-side bounded-mailbox wrapper
   (send-with-timeout).
 - `class_s.rs` — `ClassSCell`, the fail-closed-persist wrapper around
-  `PerContextState` (Class-S vs Class-C; see `CLAUDE.md`).
+  `PerContextState` (Class-S vs Class-C; see `AGENTS.md`).
 - `state.rs` — `PerContextState`, the owned per-context payload (identity,
   membership, roles/ceiling, event log, mode-specific state, governance,
   crypto state, …).

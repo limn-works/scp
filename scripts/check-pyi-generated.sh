@@ -38,7 +38,7 @@
 # extension (`maturin develop`), so it is fast and cheap in CI.
 #
 # ---------------------------------------------------------------------------
-# ENFORCEMENT FILE (see CLAUDE.md)
+# ENFORCEMENT FILE (see AGENTS.md)
 # ---------------------------------------------------------------------------
 # Do not weaken this gate to hide drift. The only legitimate change is to
 # regenerate the stub (`python3.12 scripts/generate-pyi.py`) after changing a

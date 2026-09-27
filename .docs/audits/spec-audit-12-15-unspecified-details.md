@@ -407,7 +407,7 @@ Spec 12 (Platform Bridge Connectors) is by far the most substantial of these fou
 - **Category**: Missing edge cases
 - **Location**: 13
 - **What's missing**: When a breaking change occurs (major version bump), how do existing contexts migrate? Do they? Or are they abandoned? The spec says the goal is that "existing contexts and agents continue to work" but provides no mechanism for how.
-- **Why it matters**: Major version bumps without migration paths fracture the network. This contradicts the principle stated in CLAUDE.md: "No migration paths. Don't ship into something you plan to abandon."
+- **Why it matters**: Major version bumps without migration paths fracture the network. This contradicts the principle stated in AGENTS.md: "No migration paths. Don't ship into something you plan to abandon."
 - **Severity**: MEDIUM
 
 ### [13-011] Extension Collision Resolution Not Addressed

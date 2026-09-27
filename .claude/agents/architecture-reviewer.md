@@ -113,5 +113,5 @@ Is the approach itself correct?
 - **Read the ADRs.** Before reviewing, search `.docs/adrs/` for relevant decisions. Non-compliance with an ADR is a finding.
 - **Check completeness.** The most common architectural bug is a change that's 90% done — an interface updated but not all implementations, a model changed but not its consumers.
 - **Evaluate the approach, not just the code.** Sometimes correct code implements the wrong approach. That's your finding.
-- **If no ADR applies**, evaluate against CLAUDE.md principles and the existing patterns in the codebase.
+- **If no ADR applies**, evaluate against AGENTS.md principles and the existing patterns in the codebase.
 - **Flag missing ADRs.** If a change establishes a new pattern that others must follow, it should be an ADR.

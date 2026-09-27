@@ -368,7 +368,7 @@ impl Identity {
 /// - **shipped (no-`testing`) build:** there is NO real pre-rotation backend, so
 ///   creation FAILS CLOSED with [`IdentityError::NoPreRotationBackend`] rather
 ///   than silently minting the nullifier. Masking a missing production backend
-///   with a dev stand-in would ship a false durability guarantee (CLAUDE.md
+///   with a dev stand-in would ship a false durability guarantee (AGENTS.md
 ///   builder tenet "No dev/test-only stand-ins in production"). A real backend is
 ///   tracked by #1729 / RFC #2130; non-committing create (Option A, #1553) is out
 ///   of scope and would violate spec §9.7.4.1.

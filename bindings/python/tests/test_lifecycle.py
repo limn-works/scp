@@ -10,7 +10,7 @@ against the PyO3 FFI layer.  Each test verifies:
 
 Phase 4 PR 4 (#1549) deleted the free-function ``suspend(scp)`` /
 ``resume(scp)`` delegates; the class methods are now the only entry
-point (one happy path — CLAUDE.md architecture tenet).
+point (one happy path — AGENTS.md architecture tenet).
 
 Requires the native _scp_core extension built via maturin.
 """

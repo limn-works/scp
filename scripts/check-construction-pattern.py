@@ -39,7 +39,7 @@ Enforcement surface
 This script is listed in scripts/hooks/pretooluse-enforcement-files.sh and
 wired into CI (.github/workflows/ci.yml, job "construction-pattern").  It must
 NOT be modified to weaken checks; only additive changes (new rule coverage,
-new allowlist entries) are permitted.  See CLAUDE.md §enforcement files.
+new allowlist entries) are permitted.  See AGENTS.md §enforcement files.
 
 ADR reference: ADR-052 in .docs/adrs/phase-2.md; standard:
 .docs/standards/construction.md (M1, M5).

@@ -97,7 +97,7 @@ The hook blocks only on **regressions** (an alias present before the edit that t
 
 ### 4. Enforcement-file hook
 
-A second `PreToolUse` hook in `.claude/settings.json` protects the enforcement files themselves: `.claude/settings.json`, `scripts/check-bridge-symmetry.sh`, `scripts/bridge-aliases.json`. Edits to these paths (including via symlink, which is why `python3 os.path.realpath` resolution is required) are blocked by the hook with a message directing the author to raise a separate PR. This mirrors the existing CLAUDE.md enforcement-files policy and prevents an agent from silently weakening enforcement in the same PR that introduces a symmetry violation.
+A second `PreToolUse` hook in `.claude/settings.json` protects the enforcement files themselves: `.claude/settings.json`, `scripts/check-bridge-symmetry.sh`, `scripts/bridge-aliases.json`. Edits to these paths (including via symlink, which is why `python3 os.path.realpath` resolution is required) are blocked by the hook with a message directing the author to raise a separate PR. This mirrors the existing AGENTS.md enforcement-files policy and prevents an agent from silently weakening enforcement in the same PR that introduces a symmetry violation.
 
 ## Alternatives rejected
 
@@ -130,7 +130,7 @@ A second `PreToolUse` hook in `.claude/settings.json` protects the enforcement f
 
 ## Enforcement invariants
 
-- `scripts/bridge-aliases.json`, `scripts/check-bridge-symmetry.sh`, `scripts/tests/bridge-symmetry/**`, and `crates/scp-testing/tests/integration/ffi_conformance.rs` are named in CLAUDE.md's enforcement-files list. Weakening, removing, or adding an exemption to any of them requires explicit human approval via a separate PR. The `.claude/settings.json` enforcement-file hook blocks in-band edits.
+- `scripts/bridge-aliases.json`, `scripts/check-bridge-symmetry.sh`, `scripts/tests/bridge-symmetry/**`, and `crates/scp-testing/tests/integration/ffi_conformance.rs` are named in AGENTS.md's enforcement-files list. Weakening, removing, or adding an exemption to any of them requires explicit human approval via a separate PR. The `.claude/settings.json` enforcement-file hook blocks in-band edits.
 - New canonical operations MUST be added to `scripts/bridge-aliases.json` in the same PR that adds them to any bridge. The CI `bridge-symmetry` job will fail otherwise.
 - An operation is exempt from a bridge only by adding a `{ canonical, reason }` entry to that bridge's array in the top-level `exemptions` object. The `reason` must cite a spec reference (a spec section or ADR). (Historically, WASM exclusions per ADR-034 were instead expressed via a per-operation `wasm_required: false` boolean; ADR-055 removed the WASM bridge and that field.)
 - Both scanners MUST produce identical verdicts on the same source. The fixture tests under `scripts/tests/bridge-symmetry/fixtures/` are the enforcement mechanism; new scanner edge cases require a new fixture.
@@ -152,4 +152,4 @@ A second `PreToolUse` hook in `.claude/settings.json` protects the enforcement f
 5. The CI workflow `.github/workflows/ci.yml` contains a `bridge-symmetry` job in the required-checks merge gate. Its comment cites ADR-047.
 6. `.claude/settings.json` wires the `PreToolUse` hook on `Edit|Write|MultiEdit` with the `crates/scp-ffi/` path filter.
 7. `.claude/settings.json` wires the enforcement-file protection hook against `.claude/settings.json`, `scripts/check-bridge-symmetry.sh`, and `scripts/bridge-aliases.json` (including via symlink, resolved with `os.path.realpath`).
-8. CLAUDE.md's enforcement-files list is updated in this PR to add `check-bridge-symmetry.sh`, `bridge-aliases.json`, `check-call-invariants.py`, and `call-invariants-baseline.json`. The `.claude/settings.json` PreToolUse hook provides write-time protection in addition to the governance rule.
+8. AGENTS.md's enforcement-files list is updated in this PR to add `check-bridge-symmetry.sh`, `bridge-aliases.json`, `check-call-invariants.py`, and `call-invariants-baseline.json`. The `.claude/settings.json` PreToolUse hook provides write-time protection in addition to the governance rule.

@@ -131,7 +131,7 @@ BAN_ENTRIES=(
     # `pipeline_wiring.rs::provider_steady_state_crypto_methods_are_deleted`
     # (definition-shaped `fn NAME(` + `name: Type` field-absence over PROVIDER_SRC)
     # PLUS the compiler (a call to a deleted method fails to compile). A second
-    # source-text scanner for the same deletion is negative value (root CLAUDE.md
+    # source-text scanner for the same deletion is negative value (root AGENTS.md
     # non-convergent-enforcement), and a `\.with_context\(` token additionally
     # false-positives on anyhow's ubiquitous `.with_context()` — a landmine. See
     # #2148 F5.

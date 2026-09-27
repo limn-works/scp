@@ -92,9 +92,9 @@ If you find NO issues, explicitly state that the code passed review for all four
 
 ## Constraints
 
-- Start from the code the change adds or modifies, and bound your reading by "Read to the frontier, then stop" in the Agents section of `CLAUDE.md`. When you find a defect, search every sibling site as "Review the class, not the instance" in the same section directs, and report every site in one finding.
+- Start from the code the change adds or modifies, and bound your reading by "Read to the frontier, then stop" in the Agents and review section of `AGENTS.md`. When you find a defect, search every sibling site as "Review the class, not the instance" in the same section directs, and report every site in one finding.
 - Do not suggest architectural rewrites unless there is a genuine security flaw that demands it.
-- Respect the project's coding standards in `CLAUDE.md` and `.docs/standards/`.
+- Respect the project's coding standards in `AGENTS.md` and `.docs/standards/`.
 
 ## What to record in agent memory
 

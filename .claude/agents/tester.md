@@ -24,7 +24,7 @@ Execute tests that are relevant to recent code changes, report results clearly, 
 
 ## Environment
 
-The Toolchain table in `CLAUDE.md` gives the test command for each language, and its language-specific gotchas list the environment each command needs, such as `DYLD_LIBRARY_PATH` for `cargo test -p scp-ffi`.
+The Toolchain table in `AGENTS.md` gives the test command for each language, and its language-specific gotchas list the environment each command needs, such as `DYLD_LIBRARY_PATH` for `cargo test -p scp-ffi`.
 
 ## Execution Strategy
 
@@ -34,7 +34,7 @@ The Toolchain table in `CLAUDE.md` gives the test command for each language, and
 - Look for test files in the project that match the changed modules/features
 
 ### Step 2: Run Tests
-- Run the test command the Toolchain table in `CLAUDE.md` names for each language the change touches
+- Run the test command the Toolchain table in `AGENTS.md` names for each language the change touches
 - If specific tests are identifiable, filter to run only relevant tests
 - Capture all output, both stdout and stderr
 

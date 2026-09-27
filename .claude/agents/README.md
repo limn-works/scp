@@ -16,7 +16,7 @@ Every definition in this directory carries both requirements in a `## Verdict cr
 
 Write every agent definition to `.docs/standards/concrete-prose.md`, the writing standard that governs all prose in this repository, and rewrite to it every sentence you edit in one.
 
-Every review agent also follows "Review the class, not the instance" in the Agents section of `CLAUDE.md`: it searches the sibling sites before it writes a finding and reports every site it found as one finding. That statement in `CLAUDE.md` is the authoritative one, so no agent definition repeats it.
+Every review agent also follows "Review the class, not the instance" in the Agents and review section of `AGENTS.md`: it searches the sibling sites before it writes a finding and reports every site it found as one finding. That statement in `AGENTS.md` is the authoritative one, so no agent definition repeats it.
 
 ## Agents
 
@@ -24,7 +24,7 @@ Every review agent also follows "Review the class, not the instance" in the Agen
 |-------|---------------|------|
 | **Architect** | Crate boundaries, protocol definitions, dependency graph, architecture decisions | `architect.md` |
 | **Backend** | Rust services, runtime, storage, and relay implementation | `backend.md` |
-| **Chronicler** | Documentation, knowledge capture, CLAUDE.md updates | `chronicler.md` |
+| **Chronicler** | Documentation, knowledge capture, AGENTS.md updates | `chronicler.md` |
 | **Review Agents** | | |
 | **Adversarial Expert** | Ship/no-ship judgement from a paid outside skeptic's stance | `adversarial-expert.md` |
 | **Black Hat** | Worst-case adversary modelling, abuse of legitimate features | `black-hat.md` |
@@ -49,13 +49,13 @@ Every review agent also follows "Review the class, not the instance" in the Agen
 
 ## When to use which agent
 
-The "Default review agents" paragraph in the Agents section of `CLAUDE.md` names the review roster that runs on every code change. The table below names the condition under which each agent applies.
+The "Default review roster" paragraph in the Agents and review section of `AGENTS.md` names the review roster that runs on every code change. The table below names the condition under which each agent applies.
 
 | Agent | Condition |
 |-------|----------|
 | **Architect** | A change creates a crate or module, adds a dependency edge, or defines a protocol that no ADR yet governs |
 | **Backend** | Implementation work in the Rust runtime, storage, relay, or node crates |
-| **Chronicler** | A decision, a correction, or an artifact change needs recording in `.docs/` or `CLAUDE.md` |
+| **Chronicler** | A decision, a correction, or an artifact change needs recording in `.docs/` or `AGENTS.md` |
 | **Black Hat** | Protocol changes, trust assumptions, any feature an attacker could turn against a participant |
 | **Red Hat** | Security-sensitive changes where you need the exploitation chain, not the vulnerability list |
 | **White Hat** | New defensive controls, hardening work, security-invariant definitions |

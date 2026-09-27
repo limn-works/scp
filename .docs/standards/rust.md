@@ -332,7 +332,7 @@ implementation. See `.docs/lessons/fuzz-replica-production-type-drift.md`.
 `rmp_serde::from_slice`. See `.docs/lessons/serde-flatten-rmpv-value-buffering.md`.
 
 See `fuzz/README.md` for the full target inventory, crash workflow, and corpus management.
-See `fuzz/.claude/CLAUDE.md` for agent-facing conventions.
+See `fuzz/AGENTS.md` for agent-facing conventions.
 
 ### Test naming
 

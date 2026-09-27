@@ -26,7 +26,7 @@ CRITERION
 
 WHAT THE CHECK READS
     The files that tell an agent how to write and how to work: `.docs/standards/`,
-    `.docs/lessons/`, `.claude/agents/`, `CLAUDE.md`, and the two build blueprints an
+    `.docs/lessons/`, `.claude/agents/`, `AGENTS.md`, and the two build blueprints an
     agent reads before it writes a crate — `.docs/scaffold/` and `.docs/architecture.md`.
     A citation counts when its leading number names a spec file — `§18.11.3` names
     `.docs/specs/18-addressability-and-deployment.md`. A number that names no spec file

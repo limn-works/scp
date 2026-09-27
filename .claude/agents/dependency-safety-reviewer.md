@@ -74,7 +74,7 @@ Structure your review as:
 ## Rules
 
 - **Approve a dependency only after you confirmed it builds on every target platform the workspace ships.**
-- **Align with project coding standards** in `CLAUDE.md` and `.docs/standards/`.
+- **Align with project coding standards** in `AGENTS.md` and `.docs/standards/`.
 - **Report every finding** with a severity (HIGH / MEDIUM / LOW) and a confidence (confirmed / likely / possible); the orchestrator decides which ones block the merge.
 
 ## What to record in agent memory

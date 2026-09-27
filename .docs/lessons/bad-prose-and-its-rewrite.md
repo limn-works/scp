@@ -65,7 +65,7 @@ document contradicts a MessagePack definition.
 
 `scripts/check-doc-citations.py` checks the property the passage broke, over the files that
 tell agents how to write: `.docs/standards/`, `.docs/lessons/`, `.claude/agents/`, and
-`CLAUDE.md`. It reads every `§N.M` citation in those files and fails when the citation
+`AGENTS.md`. It reads every `§N.M` citation in those files and fails when the citation
 names a section its spec file does not contain. A file that has to quote a citation no
 merged spec resolves — because the spec withdrew the section, or because the author copied
 the number out of a draft — writes the literal marker `[no such section]` after the

@@ -3580,7 +3580,7 @@ For parser and deserializer targets (T1/T2), the fuzzer receives a raw `&[u8]` s
 
 `Arbitrary` is reserved for T3/T4 where raw bytes cannot reach the code path (e.g., merkle proof verification requires a structurally consistent proof, or differential targets require two semantically distinct inputs).
 
-**Invariant catalog I1–I10 as governance artifact.** The security invariants are defined once in `fuzz/README.md` and `fuzz/.claude/CLAUDE.md`, and referenced by target. Any new target must map to at least one invariant. Adding, weakening, or removing an invariant requires human approval.
+**Invariant catalog I1–I10 as governance artifact.** The security invariants are defined once in `fuzz/README.md` and `fuzz/AGENTS.md`, and referenced by target. Any new target must map to at least one invariant. Adding, weakening, or removing an invariant requires human approval.
 
 **CI cadence:**
 - **Nightly** (`.github/workflows/fuzz.yml`, 03:00 UTC): T1 targets 15 min each, T2 targets 5 min each. All targets parallel. Corpus cached per-target with `actions/cache`; `cargo fuzz cmin` runs after each campaign.
@@ -3694,7 +3694,7 @@ fuzz/                        # Standalone cargo-fuzz crate (not workspace member
 4. `.github/workflows/fuzz.yml` runs T1 targets (15 min) and T2 targets (5 min) nightly, and T1 targets for 2 hours each weekly, both under AddressSanitizer.
 5. `.github/workflows/ci.yml` includes a `fuzz-build` job that compiles the fuzz crate on the channel `fuzz/rust-toolchain.toml` names, and the job repeats that channel nowhere.
 6. Security invariants I1–I10 are documented in `fuzz/README.md` with current coverage status.
-7. `fuzz/.claude/CLAUDE.md` exists with agent-facing conventions: standalone crate caution, nightly requirement, raw-bytes-vs-Arbitrary guidance, dictionary format, invariant catalog.
+7. `fuzz/AGENTS.md` exists with agent-facing conventions: standalone crate caution, nightly requirement, raw-bytes-vs-Arbitrary guidance, dictionary format, invariant catalog.
 8. All T1/T2 targets use raw bytes (`|data: &[u8]|`). All T3/T4 targets that require semantic structure use `Arbitrary`.
 9. `fuzz/Cargo.lock` is committed (separate from root `Cargo.lock`).
 10. Crash workflow documented: reproduce → minimize (`fuzz tmin`) → file issue → add regression `#[test]`.

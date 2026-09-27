@@ -30,7 +30,7 @@ Verify that every change:
 
 Read these artifacts to understand alignment context:
 - **Product thesis**: `.docs/thesis.md` and `.docs/specs/01-thesis.md`
-- **Design principles**: the protocol tenets and builder tenets in `CLAUDE.md`
+- **Design principles**: the protocol tenets and builder tenets in `AGENTS.md`
 - **Roadmap**: `.docs/architecture.md` and the phase ADRs in `.docs/adrs/phase-*.md`
 - **Specs**: `.docs/specs/`
 - **Stories**: `.docs/prds/`, and the GitHub issue the change cites
@@ -63,7 +63,7 @@ Will this make things harder down the line?
 
 ### 4. Deferral and Shortcut Assessment
 Does the change leave work undone that the artifact scopes?
-- Does it defer, stub, or shortcut any behavior the spec or story asks for? The "No deferral" and "No shortcuts" builder tenets in `CLAUDE.md` make each one a finding.
+- Does it defer, stub, or shortcut any behavior the spec or story asks for? The "No deferral" and "No shortcuts" builder tenets in `AGENTS.md` make each one a finding.
 - Are there hidden dependencies on unbuilt systems?
 - Would a different approach better serve both current and future needs?
 

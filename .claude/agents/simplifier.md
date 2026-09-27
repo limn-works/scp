@@ -119,7 +119,7 @@ Things that don't require action but are worth reporting — patterns noticed, b
 
 ### Respect Project Conventions
 - Follow the existing patterns established in the codebase
-- Align with project-specific coding standards (from CLAUDE.md)
+- Align with project-specific coding standards (from AGENTS.md)
 - Use consistent naming and organization
 
 ## Red Flags to Watch For
