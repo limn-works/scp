@@ -80,9 +80,11 @@
 #     line would take the Python half of a round to have been checked.
 #
 #     Case 13 changes a file under `crates/scp-transport/` and asserts that the run issues
-#     one `cargo check` for each feature set of that package the `rust-clippy` job lints
-#     and the workspace command never activates: the optional transports, the blob-backend
-#     features, and the PostgreSQL and S3 blob backends. Without them, an edit inside a
+#     one `cargo check` for each feature set of that package that a cargo command in
+#     `.github/workflows/ci.yml` names and the workspace command never activates. The
+#     `rust-clippy` job lints two of them, the optional transports and the PostgreSQL and
+#     S3 blob backends; the `rust-test-optional-features` job tests the third, the
+#     blob-backend features `combined,local-cache`. Without them, an edit inside a
 #     `#[cfg(feature = "quic")]` module compiles nothing and reports `compile ok`.
 #
 #     Case 13b changes a file under `crates/scp-relay/` and asserts that the run compiles
