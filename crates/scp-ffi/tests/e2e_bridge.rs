@@ -3422,9 +3422,11 @@ fn session_invoke_admits_a_supervisor_only_capability_holder() {
 /// The cross-context source-capability gate admits an invoker whose capability
 /// exists ONLY in the source context's supervisor role state.
 ///
-/// The call still fails afterwards — the two contexts share no approved outlet
-/// interface — so the assertion is that it does NOT fail at the capability gate,
-/// which is where a bridge-local copy rejects it.
+/// A gate reading a bridge-local copy finds no such member and rejects with
+/// "does not have invocation capability". Past the gate the call checks chain
+/// depth, validates the input against the target outlet's schema, and answers in
+/// echo mode because the fixture registers no handler. The test asserts that
+/// echo-mode output, so a refusal at the gate or at any earlier check turns it red.
 #[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
 #[test]
 fn cross_context_invoke_admits_a_supervisor_only_capability_holder() {
@@ -3455,13 +3457,21 @@ fn cross_context_invoke_admits_a_supervisor_only_capability_holder() {
             1,
             None,
         );
-        if let Err(err) = result {
-            let message = err.to_string();
-            assert!(
-                !message.contains("does not have invocation capability"),
-                "the source-capability gate must read the supervisor's role state: {message}"
-            );
-        }
+        let output = result.expect(
+            "the source context's supervisor grants the capability, so the cross-context invocation proceeds",
+        );
+        let output = output.bind(py);
+        let field = |key: &str| -> String {
+            output
+                .get_item(key)
+                .unwrap_or_else(|e| panic!("echo-mode output carries `{key}`: {e}"))
+                .extract()
+                .unwrap_or_else(|e| panic!("echo-mode `{key}` is a string: {e}"))
+        };
+        assert_eq!(field("status"), "validated");
+        assert_eq!(field("source_context"), source_ctx);
+        assert_eq!(field("target_context"), target_ctx);
+        assert_eq!(field("outlet"), target_outlet);
     });
 }
 
