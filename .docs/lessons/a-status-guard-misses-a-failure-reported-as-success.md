@@ -56,5 +56,4 @@ Two failures `sqlite3_bind_text` reports as `SQLITE_OK`:
 
 ## Related
 
-- `.docs/lessons/wrap-error-sibling-methods-together.md`
 - `.docs/lessons/two-independent-checks-bind-nothing.md`

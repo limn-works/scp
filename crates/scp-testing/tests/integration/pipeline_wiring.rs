@@ -1462,7 +1462,7 @@ fn restore_on_startup_runs_restore_before_replay() {
 // in-crate caller could name `restore_all_contexts(&sup)` via UFCS (no
 // `.restore_all_contexts()` substring) plus a no-op `restore_on_startup` shadow
 // and still pass this gate. Hardening the in-crate locator with more spellings is
-// a non-convergent denylist (CLAUDE.md).
+// a non-convergent denylist (`.claude/agents/README.md` §Review rules).
 //
 // `restore_all_contexts` is `pub(crate)`, so no out-of-crate bridge can name the
 // bare leg at all — a cross-crate `Supervisor::restore_all_contexts(&sup)` call
@@ -3563,7 +3563,7 @@ fn pipeline_active_assertions_never_decrease() {
         .filter(|line| line.trim() == "#[test]")
         .count();
     let ignored = source.matches("#[ignore = \"").count();
-    let meta_tests = 3; // this test + claude_md_enforcement_sections_present + no_stale_ignores
+    let meta_tests = 3; // this test + agents_md_enforcement_sections_present + no_stale_ignores
     let active = total_tests - ignored - meta_tests;
     assert!(
         active >= MIN_ACTIVE_PIPELINE_ASSERTIONS,
@@ -3746,18 +3746,18 @@ fn every_node_start_path_starts_the_self_did_republish_cycle() {
     );
 }
 
-/// Verifies that CLAUDE.md contains the required enforcement sections.
+/// Verifies that the root AGENTS.md contains the required enforcement sections.
 /// These sections instruct agents to check integration wiring before
 /// writing code and to never weaken enforcement files.
 #[test]
-fn claude_md_enforcement_sections_present() {
-    let claude_md = include_str!("../../../../CLAUDE.md");
+fn agents_md_enforcement_sections_present() {
+    let agents_md = include_str!("../../../../AGENTS.md");
     assert!(
-        claude_md.contains("Integration checklist (MANDATORY"),
-        "CLAUDE.md must contain the 'Integration checklist (MANDATORY' section"
+        agents_md.contains("Integration checklist (MANDATORY"),
+        "AGENTS.md must contain the 'Integration checklist (MANDATORY' section"
     );
     assert!(
-        claude_md.contains("NEVER modify enforcement files"),
-        "CLAUDE.md must contain the 'NEVER modify enforcement files' section"
+        agents_md.contains("NEVER modify enforcement files"),
+        "AGENTS.md must contain the 'NEVER modify enforcement files' section"
     );
 }

@@ -124,6 +124,12 @@ Use the source's own language — do not paraphrase unless the original is ambig
 - Include module declaration files (`mod.rs`, `__init__.py`, `mod.ts`) if new modules are added.
 - Files that don't exist yet are expected for implementation stories.
 
+## Before You Commit
+
+- When a story states a requirement that no spec section or ADR contains, write that artifact first; the story then cites it.
+- Run `python3.12 scripts/validate-prd.py` before committing a PRD change.
+- A subagent that writes a story validates the story against this standard before it returns. Two audits shipped defective stories because neither checked its own output.
+
 ## CI Enforcement
 
 The `prd-validate` CI job checks all `.docs/prds/*.json` files on every PR that touches them. It enforces:
