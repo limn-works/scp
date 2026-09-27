@@ -69,8 +69,8 @@ def test_a_top_level_scp_core_on_the_path_never_stands_in_for_the_package_module
 ) -> None:
     """With the package's extension absent, a stray top-level ``_scp_core`` is not loaded.
 
-    A bare ``import _scp_core`` searches all of ``sys.path`` once
-    ``scp_sdk/__init__.py`` has registered no alias, so an old build left in the
+    A bare ``import _scp_core`` searches all of ``sys.path``, because
+    ``scp_sdk/__init__.py`` registers no bare-name alias, so an old build left in the
     working directory or on ``PYTHONPATH`` would load in place of the package's
     module, which the probe never examined. The loader must instead report the
     absence the probe reports.
@@ -337,7 +337,7 @@ EXTENSION_LEAF = "_scp_core"
 
 #: Every file under ``scp_sdk`` permitted to import the extension, mapped to the
 #: number of import statements it is permitted to hold. ``_extension.py`` holds
-#: the one loader. ``__init__.py`` registers the extension under its bare name
+#: the one loader. ``__init__.py`` imports the extension while the package loads
 #: and hands the failure to ``reject_load_failure``, which tells a load failure
 #: apart from an absence. This mapping is the whole permission: a file it does
 #: not name, and a second import inside a file it does name, are both offenders.
@@ -476,13 +476,73 @@ def test_a_missing_export_raises_the_load_failure_code(stale_extension: Any) -> 
 def test_a_probe_for_an_optional_export_still_reads_absence(stale_extension: Any) -> None:
     """``hasattr`` and ``getattr(..., default)`` keep working on the returned object.
 
-    ``scp_sdk/event_log.py`` probes ``init_pyo3_log`` and ``scp_sdk/scp.py`` probes
-    ``identity_verify_device_attestation`` with ``hasattr``; each needs ``False``
-    for a name the build lacks, not an exception.
+    ``scp_sdk/scp.py`` probes ``identity_verify_device_attestation`` with
+    ``hasattr`` and raises ``SCP-IDENT-1016`` when the build lacks it; that
+    branch needs ``False`` for a missing name, not an exception.
     """
     native = _extension.native_module()
-    assert not hasattr(native, "init_pyo3_log")
+    assert not hasattr(native, "identity_verify_device_attestation")
     assert getattr(native, "SCP", None) is None
+
+
+def _import_package_over(extension_source: str) -> str:
+    """Import ``scp_sdk`` in a fresh interpreter over a stand-in extension module.
+
+    ``extension_source`` runs with ``module`` bound to the stand-in, which is
+    installed as ``scp_sdk._scp_core`` before the package loads. The child prints
+    what the caller's assertion reads. A fresh interpreter keeps the package
+    import from re-binding the classes this test process already holds.
+    """
+    import subprocess
+    import textwrap
+
+    program = textwrap.dedent(
+        """
+        import sys, types
+        module = types.ModuleType("scp_sdk._scp_core")
+        sys.modules["scp_sdk._scp_core"] = module
+        """
+    ) + textwrap.dedent(extension_source)
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return completed.stdout.strip()
+
+
+def test_package_import_registers_no_bare_name_alias() -> None:
+    """``import scp_sdk`` leaves ``_scp_core`` out of ``sys.modules``.
+
+    Every SDK accessor reaches the extension as ``scp_sdk._scp_core`` through
+    :func:`scp_sdk._extension.native_module`, and no code imports the bare name.
+    """
+    output = _import_package_over(
+        """
+        import scp_sdk
+        print("_scp_core" in sys.modules)
+        """
+    )
+    assert output == "False"
+
+
+def test_package_import_calls_no_log_forwarding_export() -> None:
+    """``import scp_sdk`` calls no ``init_pyo3_log``, even on a build that exports one.
+
+    No crate defines that export, so a probe for it could never fire on a real
+    build and only let the SDK document log forwarding it does not perform.
+    """
+    output = _import_package_over(
+        """
+        calls = []
+        module.init_pyo3_log = lambda: calls.append("called")
+        import scp_sdk
+        print(calls)
+        """
+    )
+    assert output == "[]"
 
 
 @pytest.mark.parametrize(("module_name", "accessor"), BRIDGE_ACCESSORS)

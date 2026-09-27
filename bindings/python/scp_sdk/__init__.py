@@ -28,16 +28,14 @@ handle.
 
 from __future__ import annotations
 
-import sys
-
 from scp_sdk._extension import reject_load_failure as _reject_load_failure
 
-# Register the native extension under its bare name ``_scp_core`` as well as
-# its package name. Maturin installs the extension as ``scp_sdk._scp_core``
-# (see pyproject.toml module-name), and every SDK accessor imports it by that
-# name through ``scp_sdk._extension.native_module``; the bare-name alias serves
-# callers outside the package, such as ``pytest.importorskip("_scp_core")`` in
-# the test suite. The alias is set only when the package's own module loaded.
+# Import the native extension while the package loads, so that a broken build
+# fails here. Maturin installs the extension as ``scp_sdk._scp_core`` (see
+# pyproject.toml module-name), and every SDK accessor reaches it by that name
+# through ``scp_sdk._extension.native_module``. The package registers no
+# bare-name ``_scp_core`` alias in ``sys.modules``, because no code in this
+# repository imports the bare name.
 #
 # An absent extension is swallowed, so a pure-Python or mocked environment
 # still imports the package. A present extension that failed to load raises
@@ -47,11 +45,9 @@ from scp_sdk._extension import reject_load_failure as _reject_load_failure
 # skip the whole real-FFI suite over a broken artifact. ``ScpError`` is not an
 # ``ImportError``, so no such guard catches it.
 try:
-    from scp_sdk import _scp_core
+    from scp_sdk import _scp_core  # noqa: F401
 except ImportError as _exc:
     _reject_load_failure(_exc)
-else:
-    sys.modules["_scp_core"] = _scp_core
 
 from scp_sdk.auth import (
     ScpIdAuthentication,

@@ -51,10 +51,11 @@ def _require_native_extension() -> None:
 
     The loader decides, through ``skip_reason_if_extension_absent``: an
     installed extension that fails to load, or lacks a function the test calls,
-    fails the test instead of skipping it. ``pytest.importorskip("_scp_core")``
-    named a top-level module that maturin never installs (the extension is
-    ``scp_sdk._scp_core``), so it skipped these tests even where the extension
-    was present.
+    fails the test instead of skipping it. ``pytest.importorskip("_scp_core")``,
+    which this guard replaces, skips on any ``ImportError`` before pytest 9.1,
+    and an installed extension that fails to ``dlopen`` raises ``ImportError``
+    just as an absent one does, so a broken build skipped these tests instead
+    of failing them.
     """
     try:
         native_module()
