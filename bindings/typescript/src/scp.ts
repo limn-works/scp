@@ -42,6 +42,7 @@ import type { Context } from "./context";
 import type { PaymentReceiptVerificationResult } from "./economy";
 import {
   ContextError,
+  GovernanceError,
   IdentityError,
   mapBridgeError,
   mapSagaError,
@@ -183,6 +184,47 @@ function parseGovernanceActionResult(raw: string): GovernanceActionResult {
       "@limn-works/scp-ts to match whichever bridge it calls.",
     trimmed,
   );
+}
+
+/**
+ * Checks the `execution_result` of a bridge's governance-propose response and
+ * returns that response unchanged.
+ *
+ * A `single_admin` proposal auto-executes, so its outcome arrives here rather
+ * than through `contextExecuteGovernanceAction`. A non-null
+ * `execution_result` goes through {@link parseGovernanceActionResult}, so an
+ * outcome this SDK version cannot name throws `UnknownGovernanceOutcomeError`
+ * (`SCP-GOV-11040`) on this path as it does on the execute path. A response
+ * that is not a JSON object, or whose `execution_result` is neither a string
+ * nor `null`, cannot be checked and throws `GovernanceError` (`SCP-GOV-11040`).
+ */
+function checkGovernanceProposeResponse(raw: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    parsed = undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new GovernanceError(
+      "governance propose response is not a JSON object, so this SDK cannot check its " +
+        "execution_result",
+      "SCP-GOV-11040",
+    );
+  }
+  const executionResult = (parsed as Record<string, unknown>).execution_result;
+  if (executionResult === null || executionResult === undefined) {
+    return raw;
+  }
+  if (typeof executionResult !== "string") {
+    throw new GovernanceError(
+      "governance propose response carries an execution_result that is neither a " +
+        "string nor null, so this SDK cannot name its outcome",
+      "SCP-GOV-11040",
+    );
+  }
+  parseGovernanceActionResult(executionResult);
+  return raw;
 }
 
 /**
@@ -2227,6 +2269,9 @@ export class SCP {
    *   {@link GOVERNANCE_ACTION_RESULTS} when a `single_admin` proposal
    *   auto-approved and auto-executed, and `null` while a multi-admin
    *   proposal awaits votes.
+   * @throws {UnknownGovernanceOutcomeError} `SCP-GOV-11040` when
+   *   `execution_result` names an outcome this SDK version cannot name, as
+   *   `contextExecuteGovernanceAction` does.
    */
   async contextGovernancePropose(
     handle: unknown,
@@ -2234,7 +2279,14 @@ export class SCP {
     proposerDid: string,
   ): Promise<string> {
     const bridge = await getBridge(this);
-    return bridge.contextGovernancePropose(handle as BridgeContextHandle, actionJson, proposerDid);
+    const raw = await bridge.contextGovernancePropose(
+      handle as BridgeContextHandle,
+      actionJson,
+      proposerDid,
+    );
+    // Checked after the bridge call, so a rejected outcome name never reads as
+    // a bridge error.
+    return checkGovernanceProposeResponse(raw);
   }
 
   async contextGovernanceApprove(

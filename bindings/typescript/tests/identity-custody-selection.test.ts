@@ -132,6 +132,56 @@ describe("governance outcome parsing fails closed", () => {
     expect((err as UnknownGovernanceOutcomeError).message).toContain("SomethingThisSdkDoesNotKnow");
   });
 
+  it("rejects an auto-executed propose outcome this SDK version cannot name", async () => {
+    // A `single_admin` proposal auto-executes, so its outcome arrives in the
+    // propose response's `execution_result`. Deleting the check from
+    // `contextGovernancePropose` makes this call resolve, so this assertion fails.
+    const { scp, native } = mountMockScp();
+    native.__stub("contextGovernancePropose", async () =>
+      JSON.stringify({
+        proposal_id: "ab".repeat(16),
+        status: "Executed",
+        execution_result: "SomethingThisSdkDoesNotKnow",
+      }),
+    );
+
+    const err = await scp.contextGovernancePropose({}, "{}", "did:dht:z6MkAlice").then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+    expect(err).toBeInstanceOf(UnknownGovernanceOutcomeError);
+    expect((err as UnknownGovernanceOutcomeError).code).toBe("SCP-GOV-11040");
+    expect((err as UnknownGovernanceOutcomeError).rawOutcome).toBe("SomethingThisSdkDoesNotKnow");
+  });
+
+  it("returns a propose response whose outcome it can name, or that awaits votes", async () => {
+    for (const executionResult of ["RoleChanged", null]) {
+      const { scp, native } = mountMockScp();
+      const raw = JSON.stringify({
+        proposal_id: "ab".repeat(16),
+        status: executionResult === null ? "Pending" : "Executed",
+        execution_result: executionResult,
+      });
+      native.__stub("contextGovernancePropose", async () => raw);
+
+      expect(await scp.contextGovernancePropose({}, "{}", "did:dht:z6MkAlice")).toBe(raw);
+    }
+  });
+
+  it("rejects a propose response it cannot check", async () => {
+    for (const raw of ["not json", "[]", JSON.stringify({ execution_result: 7 })]) {
+      const { scp, native } = mountMockScp();
+      native.__stub("contextGovernancePropose", async () => raw);
+
+      const err = await scp.contextGovernancePropose({}, "{}", "did:dht:z6MkAlice").then(
+        () => undefined,
+        (caught: unknown) => caught,
+      );
+      expect(err).toBeInstanceOf(GovernanceError);
+      expect((err as GovernanceError).code).toBe("SCP-GOV-11040");
+    }
+  });
+
   it("names every outcome that Rust enum defines", () => {
     // `scp_core::context::state::GovernanceActionResult` defines 29 variants,
     // and one shared bridge mapping reports each by its variant name.
