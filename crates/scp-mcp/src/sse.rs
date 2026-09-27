@@ -38,7 +38,10 @@
 //! ## Shutdown
 //!
 //! [`run_sse`] accepts a [`ShutdownHandle`] that signals the server to stop
-//! accepting new connections. Existing SSE streams drain naturally.
+//! accepting new connections and to end every open SSE stream. Graceful
+//! shutdown waits for in-flight responses, and an SSE response stays in flight
+//! until its stream ends, so a stream that ignored the signal would keep the
+//! server running.
 //!
 //! See ADR-015 in `.docs/adrs/phase-3.md` for the full design.
 
@@ -168,8 +171,9 @@ pub enum SseError {
 /// Handle for gracefully shutting down a running SSE server.
 ///
 /// Dropping the handle does **not** shut down the server. Call
-/// [`shutdown`](Self::shutdown) explicitly. Existing SSE streams drain
-/// naturally after shutdown is signaled.
+/// [`shutdown`](Self::shutdown) explicitly. Signaling shutdown stops the
+/// listener and ends every open SSE stream, so [`run_sse`] returns even while
+/// a client is attached.
 #[derive(Debug, Clone)]
 pub struct ShutdownHandle {
     token: CancellationToken,
@@ -184,7 +188,8 @@ impl ShutdownHandle {
         }
     }
 
-    /// Signals the SSE server to stop accepting new connections.
+    /// Signals the SSE server to stop accepting new connections and to end
+    /// every open SSE stream.
     pub fn shutdown(&self) {
         self.token.cancel();
     }
@@ -333,16 +338,12 @@ pub(crate) struct AppState<P: ContextProvider> {
     /// reconnect. Every request here has passed the bearer check, so the
     /// newest admission is the token holder reconnecting and takes the slot.
     session_evict: std::sync::Mutex<CancellationToken>,
-}
-
-/// Replaces the stored eviction token with a fresh one for a newly admitted
-/// session and returns it.
-fn install_evict_token(slot: &std::sync::Mutex<CancellationToken>) -> CancellationToken {
-    let mut current = slot
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *current = CancellationToken::new();
-    current.clone()
+    /// The server's shutdown signal. Every session's eviction token is a child
+    /// of it, so a shutdown ends every live stream. Axum's graceful shutdown
+    /// waits for in-flight responses, and an SSE response is in flight until
+    /// its stream ends: without this link one attached client would keep
+    /// [`run_sse`] from returning, and keep the pump and this state alive.
+    shutdown: CancellationToken,
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +365,7 @@ fn router_with_pump<P: ContextProvider + 'static>(
     server: McpServer<P>,
     config: &SseConfig,
     pump: Option<ContextEventPump>,
+    shutdown: CancellationToken,
 ) -> (Router, Option<tokio::task::JoinHandle<()>>) {
     let state = Arc::new(AppState {
         server: Mutex::new(server),
@@ -371,6 +373,7 @@ fn router_with_pump<P: ContextProvider + 'static>(
         retry_ms: config.retry_ms,
         session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         session_evict: std::sync::Mutex::new(CancellationToken::new()),
+        shutdown,
     });
 
     let pump = pump.map(|pump| tokio::spawn(pump_events(Arc::clone(&state), pump.into_receiver())));
@@ -454,7 +457,7 @@ pub async fn run_sse<P: ContextProvider + 'static>(
     // so no pairing check is needed here.
     let (server, pump) = server.into_parts();
 
-    let (router, pump) = router_with_pump(server, &config, pump);
+    let (router, pump) = router_with_pump(server, &config, pump, shutdown.token.clone());
     // Hold the pump under a guard that aborts it on EVERY exit from this future:
     // a bind error, graceful shutdown, *and* the cancellation-drop when a bridge
     // aborts the task running `run_sse`. A bare `JoinHandle` dropped without
@@ -511,39 +514,45 @@ async fn sse_handler<P: ContextProvider + 'static>(
     // (see `AppState::session_evict`). The new admission waits for the
     // evicted stream to drop, which frees the permit only after the reset and
     // after the old broadcast receiver is gone.
-    let free = {
+    //
+    // Last admission wins. Under one lock each admission cancels the stored
+    // token and stores its own, so the stored token always belongs to the
+    // newest claimant: the live session, or an admission still waiting for
+    // the permit. A newer admission therefore cancels a waiting one, which
+    // gives up, instead of cancelling a session that has already ended and
+    // then losing the permit to the older waiter.
+    let (free, evict) = {
         let mut current = state
             .session_evict
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Ok(permit) = Arc::clone(&state.session_slot).try_acquire_owned() {
-            // Install this session's token under the same lock, so a
-            // concurrent admission can only ever cancel the current session.
-            *current = CancellationToken::new();
-            Some((permit, current.clone()))
-        } else {
-            current.cancel();
-            None
-        }
+        current.cancel();
+        *current = state.shutdown.child_token();
+        (
+            Arc::clone(&state.session_slot).try_acquire_owned().ok(),
+            current.clone(),
+        )
     };
-    let (permit, evict) = if let Some(admitted) = free {
-        admitted
+    let permit = if let Some(permit) = free {
+        permit
     } else {
         tracing::info!("MCP SSE: evicting the live session for a new admission");
-        let Ok(Ok(permit)) = tokio::time::timeout(
-            EVICTION_WAIT,
-            Arc::clone(&state.session_slot).acquire_owned(),
-        )
-        .await
-        else {
-            tracing::warn!("MCP SSE: the evicted session did not release the slot");
+        let waited = tokio::time::timeout(EVICTION_WAIT, async {
+            tokio::select! {
+                permit = Arc::clone(&state.session_slot).acquire_owned() => permit.ok(),
+                () = evict.cancelled() => None,
+            }
+        })
+        .await;
+        let Ok(Some(permit)) = waited else {
+            tracing::warn!("MCP SSE: admission superseded or the evicted session kept the slot");
             return (
                 StatusCode::CONFLICT,
                 "an MCP session is already active on this endpoint",
             )
                 .into_response();
         };
-        (permit, install_evict_token(&state.session_evict))
+        permit
     };
 
     // Every session begins from a clean slate by sequencing, not scheduling
@@ -605,7 +614,7 @@ async fn sse_handler<P: ContextProvider + 'static>(
 
     // `None` ends the stream: the content side sends it after its last event
     // (a `Lagged` receiver ends early), the eviction side sends it when a
-    // newer admission cancels this session.
+    // newer admission cancels this session or the server shuts down.
     let initial = tokio_stream::once(Ok(endpoint_event));
     let content = initial
         .chain(message_stream)
@@ -979,6 +988,7 @@ mod tests {
             retry_ms: DEFAULT_RETRY_MS,
             session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             session_evict: std::sync::Mutex::new(CancellationToken::new()),
+            shutdown: CancellationToken::new(),
         });
         state
             .session_slot
@@ -1026,7 +1036,7 @@ mod tests {
     async fn router_builds_successfully() {
         let server = McpServer::new(MockProvider::default());
         let config = SseConfig::new("127.0.0.1:0".parse().unwrap());
-        let (_router, pump) = router_with_pump(server, &config, None);
+        let (_router, pump) = router_with_pump(server, &config, None, CancellationToken::new());
         assert!(pump.is_none(), "no event source means no pump");
     }
 
@@ -1250,6 +1260,7 @@ mod tests {
             retry_ms: DEFAULT_RETRY_MS,
             session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             session_evict: std::sync::Mutex::new(CancellationToken::new()),
+            shutdown: CancellationToken::new(),
         });
 
         // A client attaches to the SSE stream.
@@ -1289,6 +1300,7 @@ mod tests {
             retry_ms: DEFAULT_RETRY_MS,
             session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             session_evict: std::sync::Mutex::new(CancellationToken::new()),
+            shutdown: CancellationToken::new(),
         });
 
         let mut client = state.notifier.tx.subscribe();
@@ -1365,6 +1377,72 @@ mod tests {
         assert!(result.unwrap().unwrap().is_ok());
     }
 
+    /// Shutdown must end an attached session's stream. Axum's graceful
+    /// shutdown waits for in-flight responses, and an SSE response is in
+    /// flight until its stream ends, so a stream that ignored the signal would
+    /// keep `run_sse` from returning and keep the pump running against a
+    /// server its host believes has stopped.
+    #[tokio::test]
+    async fn run_sse_shuts_down_with_a_session_attached() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
+        let (server, pump) = McpServer::with_event_source(MockProvider::default(), event_rx);
+        let bundle = McpServerForTransport(TransportBundle::Wired(server, pump));
+        // Reserve a free port, then hand it to `run_sse`, which binds its own
+        // listener and does not report the port it bound.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut config = SseConfig::new(addr);
+        config.auth_token = "shutdown-secret".to_owned();
+        let handle = ShutdownHandle::new();
+        let task = tokio::spawn(run_sse(bundle, config, handle.clone()));
+
+        // Attach a session over a real connection and wait for its endpoint
+        // event, which proves the response stream is open.
+        let mut conn = None;
+        for _ in 0..100 {
+            if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
+                conn = Some(stream);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut conn = conn.expect("run_sse never started listening");
+        conn.write_all(
+            b"GET /sse HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer shutdown-secret\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 1024];
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !String::from_utf8_lossy(&seen).contains("event: endpoint") {
+                let n = conn.read(&mut buf).await.unwrap();
+                assert!(n > 0, "the SSE connection closed before its endpoint event");
+                seen.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await
+        .expect("the SSE session never received its endpoint event");
+        assert_eq!(event_tx.receiver_count(), 1, "the pump must be running");
+
+        handle.shutdown();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("run_sse must return while a session is attached");
+        assert!(result.unwrap().is_ok());
+        assert_eq!(
+            event_tx.receiver_count(),
+            0,
+            "the pump must stop when run_sse returns"
+        );
+        drop(conn);
+    }
+
     // -- Auth middleware -------------------------------------------------------
 
     #[tokio::test]
@@ -1372,7 +1450,7 @@ mod tests {
         let server = McpServer::new(MockProvider::default());
         let mut config = SseConfig::new("127.0.0.1:0".parse().unwrap());
         config.auth_token = "secret-token".to_owned();
-        let (_router, pump) = router_with_pump(server, &config, None);
+        let (_router, pump) = router_with_pump(server, &config, None, CancellationToken::new());
         assert!(pump.is_none(), "no event source means no pump");
     }
 
@@ -1383,7 +1461,7 @@ mod tests {
         let server = McpServer::new(MockProvider::default());
         let mut config = SseConfig::new("127.0.0.1:0".parse().unwrap());
         config.auth_token = "test-secret".to_owned();
-        router_with_pump(server, &config, None).0
+        router_with_pump(server, &config, None, CancellationToken::new()).0
     }
 
     /// Helper: a request builder that presents the token `auth_router`
@@ -1456,6 +1534,59 @@ mod tests {
             .unwrap();
         assert_eq!(post.status(), StatusCode::ACCEPTED);
         drop(second);
+    }
+
+    /// The newest admission wins when admissions queue behind a session that
+    /// has not yet released the slot. Admission B arrives first and waits;
+    /// admission C arrives while B is still waiting. C must supersede B, not
+    /// cancel the already-cancelled token of the live session and then time
+    /// out behind B.
+    #[tokio::test]
+    async fn newest_of_two_waiting_admissions_takes_the_slot() {
+        use tower::ServiceExt;
+
+        let router = auth_router();
+
+        // A holds the slot. Its body is never polled, so its stream cannot
+        // observe eviction and A keeps the permit until it is dropped.
+        let first = router
+            .clone()
+            .oneshot(authed().uri("/sse").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let admit = |router: Router| {
+            tokio::spawn(async move {
+                router
+                    .oneshot(authed().uri("/sse").body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+            })
+        };
+        let second = admit(router.clone());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let third = admit(router.clone());
+
+        // C's arrival supersedes B, which gives up without waiting for A.
+        let second = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("a superseded admission must give up at once")
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+
+        // A's stream ends; C takes the slot well inside EVICTION_WAIT.
+        drop(first);
+        let third = tokio::time::timeout(Duration::from_secs(2), third)
+            .await
+            .expect("the newest admission must take the freed slot")
+            .unwrap();
+        assert_eq!(
+            third.status(),
+            StatusCode::OK,
+            "the newest admission must win the slot"
+        );
+        drop(third);
     }
 
     /// Helper: send a request through the router and return the status code.
@@ -1618,7 +1749,7 @@ mod tests {
     async fn default_config_rejects_unauthenticated_sse() {
         let server = McpServer::new(MockProvider::default());
         let config = SseConfig::new("127.0.0.1:0".parse().unwrap());
-        let router = router_with_pump(server, &config, None).0;
+        let router = router_with_pump(server, &config, None, CancellationToken::new()).0;
         let req = Request::builder().uri("/sse").body(Body::empty()).unwrap();
 
         let status = request_status(router, req).await;
@@ -1629,7 +1760,7 @@ mod tests {
     async fn default_config_rejects_unauthenticated_post() {
         let server = McpServer::new(MockProvider::default());
         let config = SseConfig::new("127.0.0.1:0".parse().unwrap());
-        let router = router_with_pump(server, &config, None).0;
+        let router = router_with_pump(server, &config, None, CancellationToken::new()).0;
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": METHOD_PING,
@@ -1751,6 +1882,7 @@ mod tests {
             retry_ms: DEFAULT_RETRY_MS,
             session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             session_evict: std::sync::Mutex::new(CancellationToken::new()),
+            shutdown: CancellationToken::new(),
         });
 
         // First client attaches through the real handler, then disconnects,
@@ -2002,6 +2134,7 @@ mod tests {
             retry_ms: DEFAULT_RETRY_MS,
             session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             session_evict: std::sync::Mutex::new(CancellationToken::new()),
+            shutdown: CancellationToken::new(),
         });
 
         // A client attaches; the handler subscribes its broadcast receiver.
