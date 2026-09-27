@@ -748,9 +748,14 @@ pub trait AttestationRevocationChecker {
 /// every shipped artifact. A checker that answers "not revoked" without asking
 /// anything is an always-succeeds verifier, which CLAUDE.md's builder tenet
 /// names as a security nullifier — a shipped caller that reached for it would
-/// verify a revoked attestation and report it valid. A caller with no
-/// revocation source calls `verify_attestation`, which takes no checker, rather
-/// than passing a checker that answers for one it does not have.
+/// verify a revoked attestation and report it valid.
+///
+/// Removing this type does not make [`verify_attestation`] a revocation
+/// check. That function passes no checker, so it reads only the attestation's
+/// own `revocation_status` field and consults no revocation list; its `Ok`
+/// says nothing about a revocation the issuer published separately. A caller
+/// that must know an attestation is unrevoked passes a checker backed by a
+/// real revocation source to [`verify_attestation_with_revocation`].
 #[cfg(any(test, feature = "testing"))]
 pub struct NoOpRevocationChecker;
 
@@ -913,7 +918,7 @@ impl Default for AttestationVerificationCache {
 // verify_attestation
 // ---------------------------------------------------------------------------
 
-/// Verifies an attestation's signature, evidence, expiry, and revocation status.
+/// Verifies an attestation's signature, evidence, expiry, and own revocation field.
 ///
 /// # Verification steps
 ///
@@ -924,10 +929,10 @@ impl Default for AttestationVerificationCache {
 /// 3. **Expiry:** Rejects if `expires_at < now`.
 /// 4. **Revocation (field):** Rejects if the attestation's `revocation_status`
 ///    field is `Revoked`.
-/// 5. **Revocation (external):** If a [`AttestationRevocationChecker`] is
-///    provided, queries it for external revocation signals. This is belt-and-
-///    suspenders with step 4: the field may be stale while the checker queries
-///    a live revocation service.
+/// 5. **Revocation (external):** Not performed. This function passes no
+///    [`AttestationRevocationChecker`], so a revocation the issuer published
+///    outside the attestation's own field goes unseen, and `Ok` does not mean
+///    "not revoked". [`verify_attestation_with_revocation`] takes a checker.
 ///
 /// # Errors
 ///
@@ -936,7 +941,8 @@ impl Default for AttestationVerificationCache {
 /// - [`TrustError::AttestationExpired`] when past expiry
 /// - [`TrustError::AttestationRevocationInvalid`] when `revoked_by` does not
 ///   match the issuer (§7.4.1)
-/// - [`TrustError::AttestationRevoked`] when revoked by the issuer (field or external)
+/// - [`TrustError::AttestationRevoked`] when the attestation's own field says
+///   the issuer revoked it
 /// - [`TrustError::AttestationEvidenceInvalid`] when required evidence is
 ///   missing or invalid
 ///
