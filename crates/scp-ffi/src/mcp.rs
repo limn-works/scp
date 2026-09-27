@@ -4267,10 +4267,10 @@ mod tests {
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
-    /// Wiring guard for #1341, mirroring the NAPI and UniFFI tests:
+    /// Wiring guard for #1341, mirroring the NAPI and `UniFFI` tests:
     /// `py_mcp_serve` sources its receiver from `Supervisor::subscribe_events()`,
     /// and `crate::runtime::build_supervisor` enables the broadcast channel, so
-    /// that call must yield `Some`. Were it to regress to `None`, every PyO3
+    /// that call must yield `Some`. Were it to regress to `None`, every `PyO3`
     /// MCP server would silently advertise `resources.subscribe: false`.
     #[test]
     fn supervisor_yields_context_event_receiver_for_mcp_pyo3() {
