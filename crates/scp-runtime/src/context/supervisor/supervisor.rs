@@ -5135,6 +5135,51 @@ impl Supervisor {
         self.despawn_actor(context_id).await;
     }
 
+    /// Test fixture: leaves `context_id` in the respawn gap, the state
+    /// `respawn_from_snapshot` holds between despawning a crashed actor and
+    /// re-registering its replacement (ADR-049 §10).
+    ///
+    /// The fixture sets the transient respawn marker in the context's
+    /// [`CrashWindow`] and despawns the actor, and never re-registers one.
+    /// After this call [`Self::lookup`] finds no actor and
+    /// [`Self::read_context_state_checked`] reports
+    /// [`ContextError::ActorCrashed`].
+    ///
+    /// `testing`-gated: no production build compiles it, no FFI bridge exports
+    /// it, and only an in-process `Arc<Supervisor>` holder can call it.
+    #[cfg(feature = "testing")]
+    pub async fn test_hold_context_mid_respawn(&self, context_id: &str) {
+        // Drop the DashMap guard before the `.await` below (the workspace
+        // denies `await_holding_lock`).
+        self.crash_windows
+            .entry(context_id.to_owned())
+            .or_default()
+            .mark_respawning();
+        self.despawn_actor(context_id).await;
+    }
+
+    /// Test fixture: leaves `context_id` crashed with a failed last respawn
+    /// and below the poison threshold, the "silently dead" state
+    /// `record_respawn_failure` leaves behind (ADR-049 §10).
+    ///
+    /// The fixture sets the failed-respawn flag in the context's
+    /// [`CrashWindow`], records no crash against the respawn budget, and
+    /// despawns the actor. After this call [`Self::lookup`] finds no actor,
+    /// [`Self::is_context_poisoned`] reports `false`, and
+    /// [`Self::read_context_state_checked`] reports
+    /// [`ContextError::ActorCrashed`].
+    ///
+    /// `testing`-gated: no production build compiles it, no FFI bridge exports
+    /// it, and only an in-process `Arc<Supervisor>` holder can call it.
+    #[cfg(feature = "testing")]
+    pub async fn test_fail_context_respawn(&self, context_id: &str) {
+        self.crash_windows
+            .entry(context_id.to_owned())
+            .or_default()
+            .mark_respawn_failed();
+        self.despawn_actor(context_id).await;
+    }
+
     /// Test fixture: registers an actor handle for `context_id` whose mailbox
     /// no task drains, so a caller reaches the supervisor's registry and never
     /// reaches an actor.
@@ -10712,8 +10757,9 @@ impl Supervisor {
     /// carries the only `ContextClose` capability check on the path — so it
     /// reads this form.
     ///
-    /// `Ok(None)` means the supervisor holds no actor for `context_id` and no
-    /// sticky poison flag for it. `Ok(Some(state))` is the actor's own answer,
+    /// `Ok(None)` means the supervisor holds no actor for `context_id`, no
+    /// sticky poison flag for it, and no crash-window record that it is
+    /// mid-respawn or that its last respawn failed. `Ok(Some(state))` is the actor's own answer,
     /// or [`ContextState::Poisoned`](scp_protocol::context::ContextState::Poisoned)
     /// for a context the crash watchdog poisoned and despawned (ADR-049 §10).
     ///
@@ -10722,6 +10768,10 @@ impl Supervisor {
     /// - [`ContextError::ActorBusy`] when an actor is registered for
     ///   `context_id` and the mailbox send failed or timed out, or the actor
     ///   did not answer within `REPLY_TIMEOUT`.
+    /// - [`ContextError::ActorCrashed`] when no actor is registered for
+    ///   `context_id` because the crash watchdog despawned it and has not yet
+    ///   re-registered the replacement, or because its last respawn failed
+    ///   and the context is not yet poisoned (ADR-049 §10).
     /// - Whatever error the `ReadContextState` handler itself returned.
     pub async fn read_context_state_checked(
         &self,
@@ -10734,9 +10784,20 @@ impl Supervisor {
             // flag. Report `Poisoned` so callers (FFI `read_context_state`,
             // the eviction sweep's `Poisoned` arm) can observe a poisoned
             // context as poisoned rather than as "unknown" (`None`).
-            // An un-poisoned absent context stays `None` (genuinely unknown).
+            // A context whose actor the watchdog despawned for a respawn it
+            // has not finished, or whose last respawn failed below the poison
+            // threshold, still exists (ADR-049 §10); `lookup_miss_error`
+            // reports both as `ActorCrashed`, and so does this read, so that
+            // no caller mistakes a crashed context for one the supervisor
+            // stopped serving. Only an id with no actor and no crash-window
+            // signal reads as `None`.
             if self.is_context_poisoned(context_id) {
                 return Ok(Some(scp_protocol::context::ContextState::Poisoned));
+            }
+            if let Some(window) = self.crash_windows.get(context_id)
+                && (window.is_respawning() || window.last_respawn_failed())
+            {
+                return Err(ContextError::ActorCrashed(context_id.to_owned()));
             }
             return Ok(None);
         };
@@ -23016,6 +23077,56 @@ mod tests {
         assert!(
             matches!(absent, Ok(None)),
             "an id with no actor and no poison flag must read as Ok(None), got {absent:?}"
+        );
+    }
+
+    /// A context in the respawn gap, and a context whose last respawn failed
+    /// below the poison threshold, read as `ActorCrashed` from
+    /// [`Supervisor::read_context_state_checked`], not as an absent context.
+    ///
+    /// Both contexts have no registered actor, and both still exist: the
+    /// watchdog re-registers the first one when its respawn finishes, and
+    /// `lookup_miss_error` classifies both as crashed. `context_close` on the
+    /// three FFI bridges reads `Ok(None)` as proof that the close already
+    /// happened and skips the `CloseContext` dispatch, which carries the only
+    /// `ContextClose` capability check on that path, so a `None` here would
+    /// let a caller holding no `context:close` capability release a context
+    /// the supervisor is about to serve as `Active` again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_crashed_context_with_no_actor_reads_as_actor_crashed_not_as_absent() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+
+        sup.test_hold_context_mid_respawn("ctx-checked-mid-respawn")
+            .await;
+        let mid_respawn = sup
+            .read_context_state_checked("ctx-checked-mid-respawn")
+            .await;
+        assert!(
+            matches!(mid_respawn, Err(ContextError::ActorCrashed(_))),
+            "a context the watchdog is respawning must read as ActorCrashed, got {mid_respawn:?}"
+        );
+
+        sup.test_fail_context_respawn("ctx-checked-respawn-failed")
+            .await;
+        assert!(
+            !sup.is_context_poisoned("ctx-checked-respawn-failed"),
+            "the fixture must leave the context below the poison threshold"
+        );
+        let respawn_failed = sup
+            .read_context_state_checked("ctx-checked-respawn-failed")
+            .await;
+        assert!(
+            matches!(respawn_failed, Err(ContextError::ActorCrashed(_))),
+            "a context whose last respawn failed must read as ActorCrashed, got \
+             {respawn_failed:?}"
+        );
+
+        let absent = sup.read_context_state_checked("never-existed").await;
+        assert!(
+            matches!(absent, Ok(None)),
+            "an id with no actor and no crash-window record must read as Ok(None), got {absent:?}"
         );
     }
 

@@ -3309,9 +3309,11 @@ impl crate::scp::PyScp {
                 // or the actor reports a terminal state (a finalized close, an
                 // expiry, a migration tombstone): the close already happened.
                 // `read_live_context_state` reports an actor the supervisor
-                // still holds but this bridge could not reach as an error
-                // rather than as `None`, so a saturated or wedged actor
-                // refuses the close instead of taking this arm.
+                // still holds but this bridge could not reach as `ActorBusy`,
+                // and a context whose actor is mid-respawn or whose last
+                // respawn failed as `ActorCrashed`, rather than as `None`, so
+                // a saturated, wedged, or crashed context refuses the close
+                // instead of taking this arm.
                 None
                 | Some(
                     scp_core::context::ContextState::Poisoned
@@ -8158,6 +8160,62 @@ mod tests {
             "active",
             "a refused close must not write the handle's cached string"
         );
+    }
+
+    /// A close refuses a context whose actor the crash watchdog is respawning,
+    /// and a context whose last respawn failed below the poison threshold, and
+    /// releases none of either context's bridge state.
+    ///
+    /// Neither context has a registered actor, and both still exist: the
+    /// watchdog re-registers the first when its respawn finishes, and the
+    /// supervisor classifies both as crashed (ADR-049 §10). A close that read
+    /// the missing actor as proof that the close already happened skipped the
+    /// `CloseContext` dispatch, which carries the only `ContextClose`
+    /// capability check on this path, and released the bridge state for every
+    /// identity sharing the bridge instance.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_refuses_a_context_the_crash_watchdog_has_not_recovered() {
+        crate::init_runtime().ok();
+        let bi = __bi();
+        let creator = "did:dht:z6MkCrashedCloseCreator";
+        crate::runtime::init_context_manager_for_test(&bi);
+        let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi),
+        };
+
+        for (prefix, mid_respawn) in [("a7", true), ("a8", false)] {
+            let context_id = format!("{prefix}{}", "0".repeat(56));
+            crate::runtime::register_context(&bi, &context_id, creator, &[])
+                .expect("fixture registration");
+            crate::runtime::create_supervisor_context_for_test(&bi, &context_id, creator, &[]);
+            let tokio_rt = crate::runtime().expect("tokio runtime");
+            if mid_respawn {
+                tokio_rt.block_on(sup.test_hold_context_mid_respawn(&context_id));
+            } else {
+                tokio_rt.block_on(sup.test_fail_context_respawn(&context_id));
+            }
+
+            let handle = active_handle_for(&bi, &context_id, creator);
+            let err = scp
+                .context_close(&handle, creator)
+                .expect_err("a close must refuse a context the watchdog has not recovered");
+            assert!(
+                err.to_string().contains("SCP-CTX-2135"),
+                "the refusal must report the actor-crashed code (mid_respawn={mid_respawn}), \
+                 got: {err}"
+            );
+            assert!(
+                crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
+                "a refused close must leave the bridge state registered (mid_respawn={mid_respawn})"
+            );
+            assert_eq!(
+                *handle.state.lock().unwrap(),
+                "active",
+                "a refused close must not write the handle's cached string"
+            );
+        }
     }
 
     /// A close of a poisoned context succeeds idempotently and releases the

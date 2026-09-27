@@ -1798,8 +1798,10 @@ pub fn live_context_state(
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` when the supervisor is unavailable, when
-/// the tokio bridge fails (see [`block_on_supervisor_query`]), and when an
-/// actor serves `context_id` but did not answer the state read.
+/// the tokio bridge fails (see [`block_on_supervisor_query`]), when an actor
+/// serves `context_id` but did not answer the state read, and when the crash
+/// watchdog despawned `context_id`'s actor for a respawn it has not finished or
+/// its last respawn failed (ADR-049 §10).
 pub fn read_live_context_state(
     bi: &PyBridgeInstance,
     context_id: &str,

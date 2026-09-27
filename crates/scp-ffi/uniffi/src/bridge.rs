@@ -11223,8 +11223,10 @@ impl Scp {
                     // terminal state (a finalized close, an expiry, a migration
                     // tombstone): the close already happened.
                     // `read_live_context_state` reports an actor the supervisor
-                    // still holds but this bridge could not reach as an error
-                    // rather than as `None`, so a saturated or wedged actor
+                    // still holds but this bridge could not reach as
+                    // `ActorBusy`, and a context whose actor is mid-respawn or
+                    // whose last respawn failed as `ActorCrashed`, rather than
+                    // as `None`, so a saturated, wedged, or crashed context
                     // refuses the close instead of taking this arm.
                     None
                     | Some(
@@ -20153,6 +20155,62 @@ mod tests {
             matches!(*rt.block_on(handle.state.lock()), ContextState::Active),
             "a refused close must not write the handle's cached state"
         );
+    }
+
+    /// A close refuses a context whose actor the crash watchdog is respawning,
+    /// and a context whose last respawn failed below the poison threshold, and
+    /// releases none of either context's bridge state.
+    ///
+    /// Neither context has a registered actor, and both still exist: the
+    /// watchdog re-registers the first when its respawn finishes, and the
+    /// supervisor classifies both as crashed (ADR-049 §10). A close that read
+    /// the missing actor as proof that the close already happened skipped the
+    /// `CloseContext` dispatch, which carries the only `ContextClose`
+    /// capability check on this path, and released the bridge state for every
+    /// identity sharing the bridge instance.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_refuses_a_context_the_crash_watchdog_has_not_recovered() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let sup = Arc::clone(
+            scp.inner
+                .context_manager_or_error()
+                .expect("test supervisor must be attached"),
+        );
+
+        for mid_respawn in [true, false] {
+            let handle = rt
+                .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+                .expect("context_create should succeed");
+            let context_id = handle.context_id();
+            if mid_respawn {
+                rt.block_on(sup.test_hold_context_mid_respawn(&context_id));
+            } else {
+                rt.block_on(sup.test_fail_context_respawn(&context_id));
+            }
+
+            let err = rt
+                .block_on(scp.context_close(Arc::clone(&handle), Arc::clone(&identity)))
+                .expect_err("a close must refuse a context the watchdog has not recovered");
+            assert!(
+                err.to_string().contains("SCP-CTX-2135"),
+                "the refusal must report the actor-crashed code (mid_respawn={mid_respawn}), \
+                 got: {err}"
+            );
+            assert!(
+                scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
+                "a refused close must leave the per-context UCAN state registered \
+                 (mid_respawn={mid_respawn})"
+            );
+            assert!(
+                matches!(*rt.block_on(handle.state.lock()), ContextState::Active),
+                "a refused close must not write the handle's cached state"
+            );
+        }
     }
 
     /// A close of a poisoned context succeeds idempotently and releases the

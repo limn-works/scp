@@ -1691,9 +1691,10 @@ pub(crate) async fn context_close_on(
             // reports a terminal state (a finalized close, an expiry, a
             // migration tombstone): the close already happened.
             // `read_live_context_state` reports an actor the supervisor still
-            // holds but this bridge could not reach as an error rather than as
-            // `None`, so a saturated or wedged actor refuses the close instead
-            // of taking this arm.
+            // holds but this bridge could not reach as `ActorBusy`, and a
+            // context whose actor is mid-respawn or whose last respawn failed
+            // as `ActorCrashed`, rather than as `None`, so a saturated, wedged,
+            // or crashed context refuses the close instead of taking this arm.
             None
             | Some(
                 scp_core::context::ContextState::Poisoned
@@ -6817,6 +6818,57 @@ mod tests {
             "active",
             "a refused close must not write the handle's cached string"
         );
+    }
+
+    /// A close refuses a context whose actor the crash watchdog is respawning,
+    /// and a context whose last respawn failed below the poison threshold, and
+    /// releases none of either context's bridge state.
+    ///
+    /// Neither context has a registered actor, and both still exist: the
+    /// watchdog re-registers the first when its respawn finishes, and the
+    /// supervisor classifies both as crashed (ADR-049 §10). A close that read
+    /// the missing actor as proof that the close already happened skipped the
+    /// `CloseContext` dispatch, which carries the only `ContextClose`
+    /// capability check on this path, and released the bridge state for every
+    /// identity sharing the bridge instance.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_refuses_a_context_the_crash_watchdog_has_not_recovered() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let creator = "did:key:z6MkNapiCloseCrashed";
+
+        for mid_respawn in [true, false] {
+            let ctx_id = format!("napi-close-crashed-{}", uuid::Uuid::new_v4());
+            crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator, &[]).await;
+            crate::runtime::register_test_context(&bi, &ctx_id);
+
+            let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+            if mid_respawn {
+                sup.test_hold_context_mid_respawn(&ctx_id).await;
+            } else {
+                sup.test_fail_context_respawn(&ctx_id).await;
+            }
+
+            let handle = active_handle_for(&bi, &ctx_id, creator);
+            let err = super::context_close_on(&bi, &handle, creator.to_owned())
+                .await
+                .expect_err("a close must refuse a context the watchdog has not recovered");
+            assert!(
+                err.to_string().contains("SCP-CTX-2135"),
+                "the refusal must report the actor-crashed code (mid_respawn={mid_respawn}), \
+                 got: {err}"
+            );
+            assert!(
+                crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
+                "a refused close must leave the bridge state registered (mid_respawn={mid_respawn})"
+            );
+            assert_eq!(
+                handle.state().expect("state"),
+                "active",
+                "a refused close must not write the handle's cached string"
+            );
+        }
     }
 
     /// Builds a handle for `context_id` whose `ceiling` is the wide default,

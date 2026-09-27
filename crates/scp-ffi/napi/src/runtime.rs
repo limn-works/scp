@@ -1906,8 +1906,10 @@ pub async fn live_ceiling_strings(
 ///
 /// # Errors
 ///
-/// Returns [`ScpNapiError::Context`] when this instance holds no supervisor and
-/// when an actor serves `context_id` but did not answer the state read. The
+/// Returns [`ScpNapiError::Context`] when this instance holds no supervisor,
+/// when an actor serves `context_id` but did not answer the state read, and
+/// when the crash watchdog despawned `context_id`'s actor for a respawn it has
+/// not finished or its last respawn failed (ADR-049 §10). The
 /// state read reports an actor the supervisor never held as `Ok(None)`, so a
 /// caller distinguishes "no actor serves this context" from "this bridge could
 /// not get an answer".
