@@ -140,14 +140,18 @@ impl PyContextHandle {
     ///
     /// This is a **best-effort, cached** snapshot taken at the last observed
     /// transition — it is intentionally NOT a live supervisor read (that would
-    /// add a mailbox round-trip to every call). Per ADR-049 §10, an actor
-    /// crash or poison detected by the supervisor watchdog is surfaced
-    /// authoritatively via a typed **error code on the next per-context
-    /// operation** (`SCP-CTX-2134` `ContextPoisoned` once the respawn budget is
-    /// exceeded, `SCP-CTX-2135` `ActorCrashed` for the crashed/mid-respawn
-    /// window) — NOT by polling this getter, which may still report the
-    /// last-known non-terminal state. Operator recovery from a poisoned context
-    /// is `clear_poison` / process restart, not an SDK call.
+    /// add a mailbox round-trip to every call). Per ADR-049 §10, the next
+    /// per-context operation reads the supervisor and refuses a context whose
+    /// actor the watchdog poisoned or found crashed; polling this getter may
+    /// still report the last-known non-terminal state. An operation with a
+    /// bridge lifecycle gate (join, leave, send, receive, every outlet entry
+    /// point that decides authorization, and every UCAN entry point) refuses a
+    /// poisoned context with its own error code, not `SCP-CTX-2134`. An
+    /// operation the supervisor answers without a bridge lifecycle
+    /// gate returns `SCP-CTX-2134` `ContextPoisoned`, and any supervisor read
+    /// during the crashed or mid-respawn window returns `SCP-CTX-2135`
+    /// `ActorCrashed`. Operator recovery from a poisoned context is
+    /// `clear_poison` / process restart, not an SDK call.
     #[getter]
     fn state(&self) -> PyResult<String> {
         let guard = self
@@ -2996,10 +3000,35 @@ impl crate::scp::PyScp {
         // authenticated ceiling reaches every check without a bridge-side copy
         // that a later governance `ModifyCeiling` would leave stale.
         //
-        // Deleting the copy also retires BLACK-2JF-01's post-irreversible-commit
-        // compensation: the sync that could fail after the irreversible spawn no
-        // longer exists, so no path strands a live actor for a join that never
-        // materialized at the bridge.
+        // BLACK-2JF-01, post-irreversible-commit compensation: the presence
+        // probe below misses only when a concurrent close or leave removed the
+        // FFI state this join registered while the spawn ran or after it
+        // returned. A close on an older handle for the same context id reads no
+        // actor while the spawn runs, so `context_close` skips the dispatch and
+        // releases that state. This join holds the GIL across the spawn, which
+        // keeps other Python threads out of the window; the probe does not rely
+        // on that, so the detection survives a later change that releases the
+        // GIL. A close or leave does not despawn the actor, so returning without
+        // a teardown would strand a live actor behind a handle with no FFI
+        // state. `discard_joined_context` removes the actor handle, destroys the
+        // resident MLS group, and deletes the durable snapshot the join
+        // persisted; a bare `despawn_actor` would leave the group and the
+        // snapshot behind, so a restart would restore the context and a fresh
+        // re-join would collide with it.
+        if !crate::runtime::ffi_state_registry(bi).contains_key(&sealed.context_id) {
+            rt.block_on(sup.discard_joined_context(&sealed.context_id));
+            crate::runtime::remove_context(bi, &sealed.context_id);
+            return Err(crate::error::ScpPyError::ContextError {
+                message: format!(
+                    "FFI state for context '{}' vanished between the reversible registration \
+                     and the committed join; the just-committed actor was torn down so no \
+                     context stays live without FFI state",
+                    sealed.context_id
+                ),
+                code: scp_ffi_common::error_codes::CTX_2040.to_owned(),
+            }
+            .into());
+        }
 
         // Runtime join committed. Register the context in the known-contexts
         // discovery registry so a Welcome-joined context is surfaced by
@@ -3294,21 +3323,32 @@ impl crate::scp::PyScp {
         // (`Creating`, `Closing`, `MigratingOut`, `Poisoned`) refuses the
         // close.
         //
-        // A non-terminal state refuses rather than skipping, because a skip
-        // releases the `FfiBridgeState` with no capability check at all:
-        // `ttl::close_context` is the only `ContextClose` check on this path,
-        // it runs inside the dispatch, and the skip is what removes the
-        // dispatch. A caller holding no `context:close` capability could
-        // otherwise release the outlet handlers, the receive-channel sender,
-        // the event log, the nonce tracker, and the revocation list for every
-        // identity sharing this bridge instance. `Closing` ends at `Closed`
-        // through `finalize_close`, and a close then sees `Closed` and
-        // releases. `Poisoned` (the crash watchdog despawned the actor and
-        // keeps the sticky poison flag, ADR-049 §10) is not terminal either:
+        // The terminal skip runs no `ContextClose` check, because
+        // `ttl::close_context` runs inside the dispatch the skip removes. Any
+        // holder of the handle can therefore release this bridge's
+        // `FfiBridgeState` once the supervisor reports no actor, `Closed`,
+        // `Expired`, or `Tombstoned`, including a holder who first calls
+        // `finalize_close` to take a `Closing` context to `Closed`. That
+        // release admits nothing afterward: no terminal state returns to
+        // `Active`, and every UCAN and outlet entry point refuses a
+        // non-`Active` context. The UCAN entry points and every outlet entry
+        // point except `outlet_stream_open` refuse through
+        // `runtime::require_active_context_before_authz` before they read the
+        // released revocation list and nonce tracker; `outlet_stream_open`
+        // fails on the released `FfiBridgeState`, and the runtime refuses to
+        // open a stream in a non-`Active` context.
+        //
+        // The non-terminal states refuse whoever calls. `Poisoned` (the crash
+        // watchdog despawned the actor and keeps the sticky poison flag,
+        // ADR-049 §10) and `MigratingOut` can both return to `Active`:
         // `SupervisorHandle::clear_poison` respawns the actor from its
-        // snapshot as `Active`, and a revocation list released before that
-        // recovery comes back empty, so a token revoked before the poison
-        // would validate again.
+        // snapshot, and a cancelled migration reopens the context. A release
+        // before either return would leave an `Active` context with no
+        // `FfiBridgeState`, so the revocations and nonces this bridge recorded
+        // would be gone and every outlet and UCAN call would fail against the
+        // context. `Closing` never returns to `Active`; its refusal orders the
+        // release after `finalize_close` and tells the caller which call comes
+        // next.
         let close_already_happened =
             match crate::runtime::read_live_context_state(bi, &handle.context_id)? {
                 // The supervisor holds no actor for the id (a completed TTL
@@ -8037,12 +8077,10 @@ mod tests {
     ///
     /// `ttl::close_context` drives `Active` -> `Closing` and the context stays
     /// there until a separate `FinalizeClose` command runs, so `Closing` is not
-    /// terminal. Treating `Closing` as "the close already happened" skipped the
-    /// supervisor dispatch, and that dispatch carries the only `ContextClose`
-    /// check on this path, so any handle holder released the bridge state with no
-    /// capability check. The `Closing` arm refuses before any capability read,
-    /// so the refusal does not depend on who calls: the outsider this test
-    /// uses and the creator get the same answer, and this test proves the
+    /// terminal. The `Closing` arm orders the release after `FinalizeClose` and
+    /// names that call in its refusal. The arm refuses before any capability
+    /// read, so the refusal does not depend on who calls: the outsider this
+    /// test uses and the creator get the same answer, and this test proves the
     /// state refusal, not a capability check.
     #[test]
     fn close_refuses_a_closing_context_and_keeps_its_bridge_state() {
@@ -8239,10 +8277,11 @@ mod tests {
     /// reports `Poisoned` from its sticky poison flag and no actor answers.
     /// `Poisoned` is not terminal: the operator's `clear_poison` respawns the
     /// actor as `Active`. A close that released the `FfiBridgeState` here ran
-    /// no `ContextClose` check, and the revocation list and nonce tracker it
-    /// dropped came back empty after the recovery, so a token revoked before
-    /// the poison validated again. The creator, who holds `context:close`,
-    /// gets the same refusal: no capability check can run without an actor.
+    /// no `ContextClose` check, and after the recovery the context was
+    /// `Active` with no `FfiBridgeState`: the revocations and nonces this
+    /// bridge recorded were gone, and every outlet and UCAN call failed against
+    /// the context. The creator, who holds `context:close`, gets the same
+    /// refusal: no capability check can run without an actor.
     #[test]
     #[cfg(feature = "testing")]
     fn close_refuses_a_poisoned_context_and_keeps_its_bridge_state() {

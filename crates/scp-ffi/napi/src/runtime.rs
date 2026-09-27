@@ -1975,6 +1975,48 @@ where
     }
 }
 
+/// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`, and
+/// withholds the lifecycle state from the refusal.
+///
+/// Every UCAN entry point and every outlet entry point except
+/// `outlet_stream_open_on` gates through this form, because each one runs the
+/// gate before it authorizes the caller. The runtime refuses a non-`Active`
+/// context when `outlet_stream_open_on` opens the stream, with the state-free
+/// `SCP-OUTLET-6101`. The outlet PRD's SCP-OUT-031
+/// PR-2a note records the rule this form keeps: the raw lifecycle state never
+/// reaches an FFI caller before authorization. The refusal therefore reads the
+/// same for every non-`Active` state and for a context no actor serves.
+///
+/// A UCAN or outlet entry point that skipped this gate would authorize against
+/// a context the supervisor stopped serving. `context_close_on` releases this
+/// bridge's `UcanContextState` once the supervisor reports a terminal state or
+/// no actor, and `ensure_registered` rebuilds that state with an empty
+/// revocation list and a fresh nonce tracker, so an ungated validation would
+/// accept a token revoked before the close and a nonce seen before the close.
+///
+/// # Errors
+///
+/// Returns whatever `mk_err` builds when the supervisor reports any state other
+/// than `Active` and when no actor serves `context_id`, and
+/// [`ScpNapiError::Context`] when the supervisor query itself fails.
+pub async fn require_active_context_before_authz<F>(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+    verb: &str,
+    mk_err: F,
+) -> Result<(), ScpNapiError>
+where
+    F: FnOnce(String) -> ScpNapiError,
+{
+    match read_live_context_state(bi, context_id).await? {
+        Some(scp_core::context::ContextState::Active) => Ok(()),
+        Some(_) | None => Err(mk_err(format!(
+            "cannot {verb}: {}",
+            scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+        ))),
+    }
+}
+
 /// Renders a [`ContextState`](scp_core::context::ContextState) as the lowercase
 /// name a lifecycle-gate error reports.
 #[must_use]

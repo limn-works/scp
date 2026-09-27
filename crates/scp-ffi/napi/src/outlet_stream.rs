@@ -1152,12 +1152,12 @@ pub(crate) async fn outlet_streaming_saga_open_on(
 
     // Both contexts MUST be Active before this money-moving open touches any
     // state. Read the AUTHORITATIVE lifecycle state from the per-context
-    // supervisor actor (`read_context_state`) — NOT the bridge-cached
+    // supervisor actor (`Supervisor::read_context_state_checked`) — NOT the bridge-cached
     // `NapiContextHandle::state()`, which LAGS: on close the core handle flips to
     // `Closing` immediately, but the FFI cache stays `"active"` until the async
     // finalize completes. A stale-cache read would let a `Closing` context (actor
     // alive, members intact) pass this gate and DEBIT ESCROW. Mirrors the PyO3
-    // reference's authoritative `read_context_state`. A missing actor (`None`) is
+    // reference, which gates through the same checked read. A missing actor is
     // treated as non-active (fail-closed).
     //
     // TARGET axis: DEFENSE-IN-DEPTH (#2196). CALLER/source axis: still primary.
@@ -1173,30 +1173,31 @@ pub(crate) async fn outlet_streaming_saga_open_on(
     // non-active source from initiating the saga. Both checked BEFORE input
     // validation, the caller-principal binding, and the saga drive, so a
     // non-active context is rejected before any receiver is handed out.
-    // Codes: OUTLET_6010 (caller axis) / OUTLET_6011 (target axis).
-    let supervisor = crate::runtime::supervisor(bi)?;
-    let source_state = supervisor.read_context_state(&caller_context_id).await;
-    if !matches!(source_state, Some(scp_core::context::ContextState::Active)) {
-        return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot start cross-context streaming saga: caller context in \
-                 {source_state:?} state"
-            ),
+    // Codes: OUTLET_6010 (caller axis) / OUTLET_6011 (target axis). Both gates
+    // run before the caller-principal binding, so both withhold the lifecycle
+    // state (see `crate::runtime::require_active_context_before_authz`).
+    crate::runtime::require_active_context_before_authz(
+        bi,
+        &caller_context_id,
+        "start cross-context streaming saga from caller context",
+        |msg| ScpNapiError::Outlet {
+            message: msg,
             code: codes::OUTLET_6010.to_owned(),
-        }
-        .into());
-    }
-    let target_state = supervisor.read_context_state(&target_context_id).await;
-    if !matches!(target_state, Some(scp_core::context::ContextState::Active)) {
-        return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot start cross-context streaming saga: target context in \
-                 {target_state:?} state"
-            ),
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
+    crate::runtime::require_active_context_before_authz(
+        bi,
+        &target_context_id,
+        "start cross-context streaming saga into target context",
+        |msg| ScpNapiError::Outlet {
+            message: msg,
             code: codes::OUTLET_6011.to_owned(),
-        }
-        .into());
-    }
+        },
+    )
+    .await
+    .map_err(napi::Error::from)?;
 
     // ----- (a) validate inputs ------------------------------------------------
     validate_context_id(&caller_context_id)
@@ -1228,8 +1229,8 @@ pub(crate) async fn outlet_streaming_saga_open_on(
     //
     // Runs before ANY per-context state mutation or outlet read, so an
     // unauthenticated caller is rejected before it can touch B's state (identical
-    // to the `PyO3` reference's ordering). `supervisor` was resolved above for the
-    // authoritative lifecycle gate; reuse it.
+    // to the `PyO3` reference's ordering).
+    let supervisor = crate::runtime::supervisor(bi)?;
     crate::outlets::enforce_caller_principal_binding(
         bi,
         supervisor,

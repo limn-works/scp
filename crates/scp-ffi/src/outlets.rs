@@ -193,6 +193,30 @@ impl PySagaResult {
 // Bridge helpers — per-bridge implementations used by PyScp methods
 // ---------------------------------------------------------------------------
 
+/// Refuses a single-context outlet entry point unless `context_id`'s
+/// supervisor actor reports `Active`, with `code` as the entry point's own
+/// error code.
+///
+/// The NAPI and `UniFFI` twins of each entry point gate on the same live read
+/// with the same code, so the three bridges refuse a `Closing`, `Expired`,
+/// `MigratingOut`, `Tombstoned`, or `Poisoned` context, and a context no actor
+/// serves, one way. The refusal withholds the lifecycle state, because the
+/// gate runs before the caller is authorized.
+fn require_active_outlet_context(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    verb: &str,
+    code: &str,
+) -> PyResult<()> {
+    crate::runtime::require_active_context_before_authz(bi, context_id, verb, |message| {
+        ScpPyError::ContextError {
+            message,
+            code: code.to_owned(),
+        }
+    })
+    .map_err(Into::into)
+}
+
 /// Registers an outlet in an SCP context on the given bridge instance.
 ///
 /// See ADR-013 §4.
@@ -301,10 +325,24 @@ fn outlet_register_impl(
         signature: vec![],
     };
 
+    // The supervisor actor answers the lifecycle question, never a cached copy;
+    // see `crate::runtime::require_active_context_before_authz`. The gate runs
+    // after the pure input validation above, so a malformed registration
+    // reports its own validation code whatever state the context is in.
+    require_active_outlet_context(
+        bi,
+        context_id,
+        "register outlet in context",
+        codes::OUTLET_6003,
+    )?;
+
     // Read the registrant's authority from the supervisor actor BEFORE taking the
-    // FFI shard lock. `register_outlet` decides whether the registrant holds
-    // `outlet:register`, so it reads the role state the supervisor holds now, not
-    // a bridge copy that a governance action or a membership change could have
+    // FFI shard lock. `register_outlet` checks whether the registrant it
+    // receives holds `outlet:register`, and this entry point passes the context
+    // creator (`role_state.creator_did`) as that registrant: it receives no
+    // caller identity, so the check does not ask whether the caller holds the
+    // capability. The role state is the one the supervisor holds now, not a
+    // bridge copy that a governance action or a membership change could have
     // left permissive.
     let role_state = crate::runtime::live_role_state(bi, context_id)?;
     let creator_did = role_state.creator_did.clone();
@@ -502,6 +540,15 @@ fn outlet_invoke_impl(
     }
     let input_json = py_dict_to_json(input)?;
 
+    // The supervisor actor answers the lifecycle question, never a cached copy;
+    // see `crate::runtime::require_active_context_before_authz`.
+    require_active_outlet_context(
+        bi,
+        context_id,
+        "invoke outlet in context",
+        codes::OUTLET_6005,
+    )?;
+
     // Primary authorization: UCAN token validation via the full 11-step
     // ADR-016 pipeline. This stays at the bridge layer because it
     // depends on bridge-owned per-context UCAN state (revocation list,
@@ -675,6 +722,14 @@ fn outlet_verify_impl(
 ) -> PyResult<PyOutletVerificationResult> {
     validate::validate_context_id(context_id)?;
     validate::validate_outlet_id(outlet_id)?;
+    // The supervisor actor answers the lifecycle question, never a cached copy;
+    // see `crate::runtime::require_active_context_before_authz`.
+    require_active_outlet_context(
+        bi,
+        context_id,
+        "verify outlet in context",
+        codes::OUTLET_6007,
+    )?;
     // Look up the context and verify the outlet against its test vectors.
     // The executor returns the expected output (identity function) since the
     // bridge layer has no external outlet executor. This verifies the test
@@ -968,7 +1023,7 @@ fn outlet_invoke_cross_context_impl(
     let input_json = py_dict_to_json(input)?;
 
     // Lifecycle gate: both contexts MUST be Active, read from each context's
-    // supervisor actor via `read_context_state`. The saga sibling
+    // supervisor actor. The saga sibling
     // (`outlet_invoke_cross_context_saga_impl`) and the streaming sibling
     // (`outlet_streaming_saga_open_impl`) gate on these same two reads with the
     // same two codes, and both twin bridges gate this unary entry point too:
@@ -977,31 +1032,20 @@ fn outlet_invoke_cross_context_impl(
     // equivalent. This entry point carried no lifecycle gate at all, so a
     // Closing, Expired, or MigratingOut context refused every sibling call and
     // admitted this one. A missing actor (`None`) counts as non-active, so the
-    // gate fails closed.
-    {
-        let supervisor = crate::runtime::supervisor(bi)?;
-        let tokio_rt = crate::runtime()?;
-        let source_state = tokio_rt.block_on(supervisor.read_context_state(source_context_id));
-        if !matches!(source_state, Some(scp_core::context::ContextState::Active)) {
-            return Err(ScpPyError::ContextError {
-                message: format!(
-                    "cannot invoke cross-context outlet: source context in {source_state:?} state"
-                ),
-                code: codes::OUTLET_6010.to_owned(),
-            }
-            .into());
-        }
-        let target_state = tokio_rt.block_on(supervisor.read_context_state(target_context_id));
-        if !matches!(target_state, Some(scp_core::context::ContextState::Active)) {
-            return Err(ScpPyError::ContextError {
-                message: format!(
-                    "cannot invoke cross-context outlet: target context in {target_state:?} state"
-                ),
-                code: codes::OUTLET_6011.to_owned(),
-            }
-            .into());
-        }
-    }
+    // gate fails closed. Both gates run before the caller is authorized, so
+    // both withhold the lifecycle state.
+    require_active_outlet_context(
+        bi,
+        source_context_id,
+        "invoke cross-context outlet from source context",
+        codes::OUTLET_6010,
+    )?;
+    require_active_outlet_context(
+        bi,
+        target_context_id,
+        "invoke cross-context outlet in target context",
+        codes::OUTLET_6011,
+    )?;
 
     // Primary authorization: UCAN token validation via the full 11-step
     // ADR-016 pipeline against the TARGET context's ceiling.
@@ -1330,31 +1374,24 @@ fn outlet_invoke_cross_context_saga_impl(
     let tokio_rt = crate::runtime()?;
 
     // Lifecycle gate: both contexts MUST be Active, read from each context's
-    // supervisor actor via `read_context_state`. The streaming twin
-    // (`outlet_streaming_saga_open_impl`) already gated on the same two reads with
-    // the same two codes; this unary sibling did not, so a Closing / Expired /
-    // MigratingOut context refused a streaming saga and admitted a unary one. A
-    // missing actor (`None`) counts as non-active.
-    let caller_state = tokio_rt.block_on(supervisor.read_context_state(caller_context_id));
-    if !matches!(caller_state, Some(scp_core::context::ContextState::Active)) {
-        return Err(ScpPyError::ContextError {
-            message: format!(
-                "cannot start cross-context saga: caller context in {caller_state:?} state"
-            ),
-            code: codes::OUTLET_6010.to_owned(),
-        }
-        .into());
-    }
-    let target_state = tokio_rt.block_on(supervisor.read_context_state(target_context_id));
-    if !matches!(target_state, Some(scp_core::context::ContextState::Active)) {
-        return Err(ScpPyError::ContextError {
-            message: format!(
-                "cannot start cross-context saga: target context in {target_state:?} state"
-            ),
-            code: codes::OUTLET_6011.to_owned(),
-        }
-        .into());
-    }
+    // supervisor actor. The streaming twin (`outlet_streaming_saga_open_impl`)
+    // already gated on the same two reads with the same two codes; this unary
+    // sibling did not, so a Closing / Expired / MigratingOut context refused a
+    // streaming saga and admitted a unary one. A missing actor counts as
+    // non-active. Both gates run before the caller-principal binding, so both
+    // withhold the lifecycle state.
+    require_active_outlet_context(
+        bi,
+        caller_context_id,
+        "start cross-context saga from caller context",
+        codes::OUTLET_6010,
+    )?;
+    require_active_outlet_context(
+        bi,
+        target_context_id,
+        "start cross-context saga into target context",
+        codes::OUTLET_6011,
+    )?;
 
     // Caller-principal binding (§6.2.4 *Caller authentication*) — BEFORE the
     // saga runs, so the supervisor never observes an unauthenticated caller.
@@ -1492,6 +1529,15 @@ fn outlet_session_create_impl(
     validate::validate_outlet_id(outlet_id)?;
     validate::validate_context_id(source_context_id)?;
 
+    // The supervisor actor answers the lifecycle question, never a cached copy;
+    // see `crate::runtime::require_active_context_before_authz`.
+    require_active_outlet_context(
+        bi,
+        context_id,
+        "create session in context",
+        codes::OUTLET_6014,
+    )?;
+
     let session_id = crate::runtime::with_context(bi, context_id, |rt| {
         // Validate outlet exists.
         if !rt.outlet_registry.contains(outlet_id) {
@@ -1589,6 +1635,15 @@ fn outlet_session_invoke_impl(
         }
     }
     let input_json = py_dict_to_json(input)?;
+
+    // The supervisor actor answers the lifecycle question, never a cached copy;
+    // see `crate::runtime::require_active_context_before_authz`.
+    require_active_outlet_context(
+        bi,
+        context_id,
+        "invoke session in context",
+        codes::OUTLET_6017,
+    )?;
 
     // Look up the outlet_id from the session before UCAN validation so we can
     // validate against the correct outlet capability.
@@ -1769,6 +1824,15 @@ fn outlet_interface_expose_impl(
     validate::validate_outlet_id(outlet_id)?;
     validate::validate_context_id(target_context_id)?;
 
+    // The supervisor actor answers the lifecycle question, never a cached copy;
+    // see `crate::runtime::require_active_context_before_authz`.
+    require_active_outlet_context(
+        bi,
+        context_id,
+        "expose outlet interface in context",
+        codes::OUTLET_6030,
+    )?;
+
     let rate_limit = match rate_limit_json {
         Some(json) => {
             let parsed: scp_core::context::outlets::interface::RateLimit =
@@ -1781,10 +1845,12 @@ fn outlet_interface_expose_impl(
         None => None,
     };
 
-    // `expose_outlet` decides whether the caller may offer this context's outlet
-    // to another context, reading roles and the creator DID. Both come from the
-    // supervisor actor so an admin transfer's role reassignment, or any other
-    // role change, lands before the offer is minted.
+    // `expose_outlet` checks whether the admin it receives holds `RoleAssign`,
+    // and this entry point passes the context creator (`role_state.creator_did`)
+    // as that admin: it receives no caller identity, so the check does not ask
+    // whether the caller may offer this context's outlet. Roles and the creator
+    // come from the supervisor actor, so a role change that strips the
+    // creator's `RoleAssign` refuses the next offer.
     let role_state = crate::runtime::live_role_state(bi, context_id)?;
     let creator_did = role_state.creator_did.clone();
 
@@ -1842,15 +1908,27 @@ fn outlet_interface_accept_impl(
 ) -> PyResult<String> {
     validate::validate_context_id(context_id)?;
 
+    // The supervisor actor answers the lifecycle question, never a cached copy;
+    // see `crate::runtime::require_active_context_before_authz`.
+    require_active_outlet_context(
+        bi,
+        context_id,
+        "accept outlet interface in context",
+        codes::OUTLET_6032,
+    )?;
+
     let mut interface: scp_core::context::outlets::interface::OutletInterface =
         serde_json::from_str(interface_json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid interface_json: {e}"),
             code: codes::VALID_7041.to_owned(),
         })?;
 
-    // `accept_outlet_interface` decides whether the caller may bind another
-    // context's outlet offer into this context, reading roles and the creator
-    // DID from the supervisor actor.
+    // `accept_outlet_interface` checks whether the admin it receives holds
+    // `RoleAssign`, and this entry point passes the context creator
+    // (`role_state.creator_did`) as that admin: it receives no caller identity,
+    // so the check does not ask whether the caller may bind another context's
+    // outlet offer into this context. Roles and the creator come from the
+    // supervisor actor.
     let role_state = crate::runtime::live_role_state(bi, context_id)?;
 
     let context_handle = scp_core::context::ContextHandle::new(
@@ -3013,8 +3091,8 @@ mod tests {
         (scp, ctx_id)
     }
 
-    /// Builds a `PyScp` whose context has FFI state but NO supervisor role
-    /// state, so every live read fails closed.
+    /// Builds a `PyScp` whose context has FFI state but NO supervisor actor, so
+    /// every lifecycle gate and every live read fails closed.
     fn scp_without_supervisor_context(prefix: &str, creator: &str) -> (crate::scp::PyScp, String) {
         crate::init_runtime().ok();
         let scp = crate::scp::PyScp::new_in_memory_for_test();
@@ -3156,9 +3234,10 @@ mod tests {
         crate::runtime::remove_context(bi, &ctx_id);
     }
 
-    /// `outlet_interface_expose` reads roles and the creator from the supervisor,
-    /// so a context with no supervisor role state refuses with the live-read
-    /// error rather than the `SCP-OUTLET-6030` a copy-reading path produced.
+    /// `outlet_interface_expose` reads the lifecycle state, the roles, and the
+    /// creator from the supervisor, so a context no supervisor actor serves
+    /// refuses at the lifecycle gate with `SCP-OUTLET-6030`, the code its NAPI
+    /// and `UniFFI` twins report. A copy-reading path admitted it.
     #[test]
     fn interface_expose_refuses_without_supervisor_role_state() {
         let creator = "did:dht:z6MkExposeNoActor";
@@ -3166,18 +3245,20 @@ mod tests {
 
         let err = scp
             .outlet_interface_expose(&ctx_id, "some-outlet", "target-context", None)
-            .expect_err("no supervisor role state must refuse the expose");
+            .expect_err("no supervisor actor must refuse the expose");
         let message = format!("{err}");
         assert!(
-            message.contains("no live supervisor role state"),
-            "the refusal must name the absent supervisor role state: {message}"
+            message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                && message.contains("SCP-OUTLET-6030"),
+            "the refusal must come from the lifecycle gate: {message}"
         );
         crate::runtime::remove_context(&scp.inner, &ctx_id);
     }
 
-    /// `outlet_interface_accept` reads roles and the creator from the supervisor,
-    /// so a context with no supervisor role state refuses with the live-read
-    /// error rather than the `SCP-OUTLET-6032` a copy-reading path produced.
+    /// `outlet_interface_accept` reads the lifecycle state, the roles, and the
+    /// creator from the supervisor, so a context no supervisor actor serves
+    /// refuses at the lifecycle gate with `SCP-OUTLET-6032`, the code its NAPI
+    /// and `UniFFI` twins report. A copy-reading path admitted it.
     #[test]
     fn interface_accept_refuses_without_supervisor_role_state() {
         let creator = "did:dht:z6MkAcceptNoActor";
@@ -3199,13 +3280,117 @@ mod tests {
 
         let err = scp
             .outlet_interface_accept(&ctx_id, &interface_json)
-            .expect_err("no supervisor role state must refuse the accept");
+            .expect_err("no supervisor actor must refuse the accept");
         let message = format!("{err}");
         assert!(
-            message.contains("no live supervisor role state"),
-            "the refusal must name the absent supervisor role state: {message}"
+            message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                && message.contains("SCP-OUTLET-6032"),
+            "the refusal must come from the lifecycle gate: {message}"
         );
         crate::runtime::remove_context(&scp.inner, &ctx_id);
+    }
+
+    /// Every single-context outlet entry point that decides authorization
+    /// refuses a context whose supervisor actor is gone, with the entry point's
+    /// own code and a refusal that withholds the lifecycle state.
+    ///
+    /// None of the seven carried a lifecycle gate, while their NAPI and
+    /// `UniFFI` twins refused a `Closing`, `Expired`, or `MigratingOut` context and a
+    /// context no actor serves. A TTL expiry despawns the actor, and the
+    /// bridge's FFI state for the context stays registered until a close
+    /// releases it, so `with_context` alone admitted each call. Each assertion
+    /// pins the entry point's code, so dropping any one gate turns this test
+    /// red.
+    #[test]
+    fn single_context_outlet_entry_points_refuse_once_the_actor_is_despawned() {
+        let creator = "did:dht:z6MkOutletGatesDespawned";
+        let (scp, ctx_id) = live_scp(
+            "outlet-gates-despawned",
+            creator,
+            &["messages:write", "outlet:register", "outlet:call:*"],
+        );
+        let bi = &*scp.inner;
+        let supervisor = std::sync::Arc::clone(crate::runtime::supervisor(bi).unwrap());
+        crate::runtime()
+            .unwrap()
+            .block_on(supervisor.despawn_actor(&ctx_id));
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let input = PyDict::new(py);
+            let refusals: Vec<(&str, &str, PyResult<()>)> = vec![
+                (
+                    "register",
+                    "SCP-OUTLET-6003",
+                    scp.outlet_register(
+                        &ctx_id,
+                        &registration_dict(py, "despawned-probe", creator),
+                    )
+                    .map(drop),
+                ),
+                (
+                    "invoke",
+                    "SCP-OUTLET-6005",
+                    scp.outlet_invoke(
+                        py,
+                        &ctx_id,
+                        "probe-outlet",
+                        &input,
+                        creator,
+                        "not-a-real-token",
+                        None,
+                        None,
+                    )
+                    .map(drop),
+                ),
+                (
+                    "verify",
+                    "SCP-OUTLET-6007",
+                    scp.outlet_verify(&ctx_id, "probe-outlet").map(drop),
+                ),
+                (
+                    "session_create",
+                    "SCP-OUTLET-6014",
+                    scp.outlet_session_create(&ctx_id, "probe-outlet", &ctx_id, None)
+                        .map(drop),
+                ),
+                (
+                    "session_invoke",
+                    "SCP-OUTLET-6017",
+                    scp.outlet_session_invoke(
+                        py,
+                        &ctx_id,
+                        "probe-session",
+                        &input,
+                        creator,
+                        "not-a-real-token",
+                        None,
+                    )
+                    .map(drop),
+                ),
+                (
+                    "interface_expose",
+                    "SCP-OUTLET-6030",
+                    scp.outlet_interface_expose(&ctx_id, "probe-outlet", "target-context", None)
+                        .map(drop),
+                ),
+                (
+                    "interface_accept",
+                    "SCP-OUTLET-6032",
+                    scp.outlet_interface_accept(&ctx_id, "{}").map(drop),
+                ),
+            ];
+            for (entry_point, code, result) in refusals {
+                let err = result.expect_err("a context no actor serves must refuse");
+                let message = format!("{err}");
+                assert!(
+                    message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                        && message.contains(code),
+                    "{entry_point} must refuse at the lifecycle gate with {code}: {message}"
+                );
+            }
+        });
+        crate::runtime::remove_context(bi, &ctx_id);
     }
 
     /// Registers FFI state for a second context on `scp` and creates NO

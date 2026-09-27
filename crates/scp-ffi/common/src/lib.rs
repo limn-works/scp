@@ -21,6 +21,16 @@ pub mod outlet_id;
 pub mod ucan_errors;
 pub mod validate;
 
+/// The refusal text every bridge's pre-authorization lifecycle gate reports
+/// after `cannot {verb}: `.
+///
+/// The outlet and UCAN entry points on all three bridges run their lifecycle
+/// gate before they authorize the caller, and the outlet PRD's SCP-OUT-031
+/// PR-2a note records that the raw lifecycle state never reaches an FFI caller
+/// before authorization. The gates therefore report this one text for every
+/// non-`Active` state and for a context no actor serves.
+pub const CONTEXT_NOT_ACTIVE_WITHHELD: &str = "context is not active";
+
 mod bridge_id;
 pub use bridge_id::generate_bridge_id;
 

@@ -601,8 +601,15 @@ public protocol ContextHandleProtocol: AnyObject, Sendable {
      * `"poisoned"` (ADR-049 §10) is surfaced here only when a snapshot/restore
      * path wrote `Poisoned` into this cached state; the watchdog poison path
      * does NOT push into this cache (it is a best-effort cached getter, not a
-     * live supervisor read). The authoritative poison signal is the
-     * `SCP-CTX-2134` error code on the next per-context operation.
+     * live supervisor read). The next per-context operation reads the
+     * supervisor and refuses a poisoned context. An operation with a bridge
+     * lifecycle gate (join, leave, send, subscribe, every outlet entry point
+     * that decides authorization, and every UCAN entry point) refuses with
+     * its own error code, not `SCP-CTX-2134`, before the supervisor runs it.
+     * An operation the supervisor answers without a bridge
+     * lifecycle gate returns `SCP-CTX-2134`, and `context_close` refuses a
+     * poisoned context with `SCP-CTX-2017` and a message that names the
+     * `Poisoned` state.
      *
      * # Errors
      *
@@ -703,8 +710,15 @@ open func creatorDid() -> String  {
      * `"poisoned"` (ADR-049 §10) is surfaced here only when a snapshot/restore
      * path wrote `Poisoned` into this cached state; the watchdog poison path
      * does NOT push into this cache (it is a best-effort cached getter, not a
-     * live supervisor read). The authoritative poison signal is the
-     * `SCP-CTX-2134` error code on the next per-context operation.
+     * live supervisor read). The next per-context operation reads the
+     * supervisor and refuses a poisoned context. An operation with a bridge
+     * lifecycle gate (join, leave, send, subscribe, every outlet entry point
+     * that decides authorization, and every UCAN entry point) refuses with
+     * its own error code, not `SCP-CTX-2134`, before the supervisor runs it.
+     * An operation the supervisor answers without a bridge
+     * lifecycle gate returns `SCP-CTX-2134`, and `context_close` refuses a
+     * poisoned context with `SCP-CTX-2017` and a message that names the
+     * `Poisoned` state.
      *
      * # Errors
      *
@@ -1360,6 +1374,9 @@ public protocol NodeHandleProtocol: AnyObject, Sendable {
     /**
      * Returns the WebSocket URL clients should connect to for this node's
      * relay (e.g., `ws://127.0.0.1:12345/scp/v1`).
+     *
+     * Read live per call from the node's relay-URL slot, so it reflects a NAT
+     * tier change that re-pointed the node's endpoint.
      */
     func relayUrl()  -> String
     
@@ -1580,6 +1597,9 @@ open func relayPort() -> UInt16  {
     /**
      * Returns the WebSocket URL clients should connect to for this node's
      * relay (e.g., `ws://127.0.0.1:12345/scp/v1`).
+     *
+     * Read live per call from the node's relay-URL slot, so it reflects a NAT
+     * tier change that re-pointed the node's endpoint.
      */
 open func relayUrl() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -1969,6 +1989,11 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function `address_resolve`.
+     *
+     * Returns a JSON object with two keys: `resolutions` holds the
+     * `AddressResolution` objects sorted by trust level, and
+     * `unavailable_layers` names each layer this build could not query,
+     * with the reason.
      */
     func addressResolve(ownerDid: String, address: String, knownContextsJson: String?) throws  -> String
     
@@ -2440,7 +2465,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Per-instance equivalent of the free-function `economy_verify_payment_receipts`.
      *
      * Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
-     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the
+     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`](scp_core::context::actor::commands::EconomyCommand::VerifyPaymentReceipts) to the
      * supervisor, returning a JSON `{"all_valid": <bool>, "results": [...]}`
      * document with one entry per receipt. Mirrors the `PyO3` reference bridge
      * exactly. Maximum 10,000 receipts per call.
@@ -3005,6 +3030,14 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Carries no lifecycle gate, unlike the nine outlet entry points that
+     * decide an authorization question: this one reads no context state and
+     * grants nothing. It builds an `InterfaceRevoked` event from the interface
+     * id and the clock and hands it back for the caller to distribute, so
+     * gating it would deny a member the record of a revocation without
+     * withholding any capability. The NAPI twin,
+     * `outlet_interface_revoke_on`, carries no gate for the same reason.
      */
     func outletInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String) async throws  -> String
     
@@ -3125,6 +3158,13 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Carries no lifecycle gate, unlike the nine outlet entry points that
+     * decide an authorization question: this one releases one session entry
+     * the handle itself owns, and refusing that release in a `Closing` or
+     * `Expired` context would strand the entry until the handle drops. The
+     * NAPI twin, `outlet_session_close_on`, carries no gate for the same
+     * reason.
      */
     func outletSessionClose(handle: ContextHandle, sessionId: String) async throws 
     
@@ -3631,13 +3671,17 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Signs each delegation with `delegator_did`'s own key, read from this
+     * instance's identity custody registry. A `delegator_did` that this
+     * instance has not registered returns `SCP-IDENT-1001`.
      */
     func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid: String, parentToken: String, capabilities: [String]) async throws  -> UcanToken
     
     /**
      * Diagnostic, read-only evaluation of a UCAN token.
      *
-     * Counterpart to [`SCP::ucan_validate`]: runs the same 11-step ADR-016
+     * Counterpart to [`Scp::ucan_validate`](crate::scp::Scp::ucan_validate): runs the same 11-step ADR-016
      * pipeline via `evaluate_ucan` but returns a structured
      * [`CapabilityValidationRecord`] (six booleans) instead of failing at the
      * first error, and never records the token's nonce (read-only probe).
@@ -3897,6 +3941,11 @@ open func addCheckpointCosignature(handle: ContextHandle, checkpointJson: String
     
     /**
      * Per-instance equivalent of the free-function `address_resolve`.
+     *
+     * Returns a JSON object with two keys: `resolutions` holds the
+     * `AddressResolution` objects sorted by trust level, and
+     * `unavailable_layers` names each layer this build could not query,
+     * with the reason.
      */
 open func addressResolve(ownerDid: String, address: String, knownContextsJson: String?)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
@@ -4995,7 +5044,7 @@ open func economyBudgetRemaining(contextId: String, did: String)throws  -> UInt6
      * Per-instance equivalent of the free-function `economy_verify_payment_receipts`.
      *
      * Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
-     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the
+     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`](scp_core::context::actor::commands::EconomyCommand::VerifyPaymentReceipts) to the
      * supervisor, returning a JSON `{"all_valid": <bool>, "results": [...]}`
      * document with one entry per receipt. Mirrors the `PyO3` reference bridge
      * exactly. Maximum 10,000 receipts per call.
@@ -6205,6 +6254,14 @@ open func outletInterfaceExpose(handle: ContextHandle, outletId: String, targetC
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Carries no lifecycle gate, unlike the nine outlet entry points that
+     * decide an authorization question: this one reads no context state and
+     * grants nothing. It builds an `InterfaceRevoked` event from the interface
+     * id and the clock and hands it back for the caller to distribute, so
+     * gating it would deny a member the record of a revocation without
+     * withholding any capability. The NAPI twin,
+     * `outlet_interface_revoke_on`, carries no gate for the same reason.
      */
 open func outletInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String)async throws  -> String  {
     return
@@ -6400,6 +6457,13 @@ open func outletRegister(handle: ContextHandle, definition: OutletDefinition)asy
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Carries no lifecycle gate, unlike the nine outlet entry points that
+     * decide an authorization question: this one releases one session entry
+     * the handle itself owns, and refusing that release in a `Closing` or
+     * `Expired` context would strand the entry until the handle drops. The
+     * NAPI twin, `outlet_session_close_on`, carries no gate for the same
+     * reason.
      */
 open func outletSessionClose(handle: ContextHandle, sessionId: String)async throws   {
     return
@@ -7469,6 +7533,10 @@ open func trustVerifyResponse(challengeJson: String, responseJson: String)throws
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Signs each delegation with `delegator_did`'s own key, read from this
+     * instance's identity custody registry. A `delegator_did` that this
+     * instance has not registered returns `SCP-IDENT-1001`.
      */
 open func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid: String, parentToken: String, capabilities: [String])async throws  -> UcanToken  {
     return
@@ -7490,7 +7558,7 @@ open func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid
     /**
      * Diagnostic, read-only evaluation of a UCAN token.
      *
-     * Counterpart to [`SCP::ucan_validate`]: runs the same 11-step ADR-016
+     * Counterpart to [`Scp::ucan_validate`](crate::scp::Scp::ucan_validate): runs the same 11-step ADR-016
      * pipeline via `evaluate_ucan` but returns a structured
      * [`CapabilityValidationRecord`] (six booleans) instead of failing at the
      * first error, and never records the token's nonce (read-only probe).
@@ -9172,9 +9240,13 @@ public struct ContextParams {
     public var mode: ContextMode
     /**
      * Capability ceiling — maximum capabilities any participant can hold.
-     * Empty list means no ceiling restriction.
+     * `None` declares no ceiling, and the context records `default_ceiling()`.
+     * `Some(list)` records exactly `list`, so `Some([])` declares a ceiling
+     * that grants nothing: every UCAN mint, delegation, validation, and outlet
+     * check against the context refuses. The `PyO3` and NAPI bridges draw the
+     * same line between an omitted ceiling and an empty one.
      */
-    public var ceiling: [String]
+    public var ceiling: [String]?
     /**
      * Ceiling mutability policy — `Immutable` (default) or `Governed`.
      * See spec §5.3.
@@ -9249,8 +9321,12 @@ public struct ContextParams {
          */mode: ContextMode, 
         /**
          * Capability ceiling — maximum capabilities any participant can hold.
-         * Empty list means no ceiling restriction.
-         */ceiling: [String], 
+         * `None` declares no ceiling, and the context records `default_ceiling()`.
+         * `Some(list)` records exactly `list`, so `Some([])` declares a ceiling
+         * that grants nothing: every UCAN mint, delegation, validation, and outlet
+         * check against the context refuses. The `PyO3` and NAPI bridges draw the
+         * same line between an omitted ceiling and an empty one.
+         */ceiling: [String]?, 
         /**
          * Ceiling mutability policy — `Immutable` (default) or `Governed`.
          * See spec §5.3.
@@ -9400,7 +9476,7 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
         return
             try ContextParams(
                 mode: FfiConverterTypeContextMode.read(from: &buf), 
-                ceiling: FfiConverterSequenceString.read(from: &buf), 
+                ceiling: FfiConverterOptionSequenceString.read(from: &buf), 
                 ceilingPolicy: FfiConverterTypeCeilingPolicy.read(from: &buf), 
                 governance: FfiConverterTypeGovernanceModel.read(from: &buf), 
                 memoryScope: FfiConverterTypeMemoryScope.read(from: &buf), 
@@ -9418,7 +9494,7 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
 
     public static func write(_ value: ContextParams, into buf: inout [UInt8]) {
         FfiConverterTypeContextMode.write(value.mode, into: &buf)
-        FfiConverterSequenceString.write(value.ceiling, into: &buf)
+        FfiConverterOptionSequenceString.write(value.ceiling, into: &buf)
         FfiConverterTypeCeilingPolicy.write(value.ceilingPolicy, into: &buf)
         FfiConverterTypeGovernanceModel.write(value.governance, into: &buf)
         FfiConverterTypeMemoryScope.write(value.memoryScope, into: &buf)
@@ -14229,10 +14305,10 @@ extension SourceType: Equatable, Hashable {}
  * an invalid state, so there is exactly one happy path per variant. This
  * mirrors the `PyO3` bridge's `SqliteKeyMaterial`.
  *
- * - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`] directly (raw-key
+ * - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`](scp_platform::sqlite::SqliteStorage::new) directly (raw-key
  * mode; the existing, unchanged path).
  * - [`SqliteKeyMaterial::Passphrase`] feeds
- * [`SqliteStorage::with_passphrase`], which derives the `SQLCipher` PRAGMA
+ * [`SqliteStorage::with_passphrase`](scp_platform::sqlite::SqliteStorage::with_passphrase), which derives the `SQLCipher` PRAGMA
  * key from the passphrase via the shared Argon2id parameterization with a
  * persisted per-database salt sidecar.
  *
@@ -17690,7 +17766,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_creator_did() != 33786) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_state() != 4611) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_state() != 41516) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_add_agent_key() != 23309) {
@@ -17744,7 +17820,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_relay_port() != 32247) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_relay_url() != 19628) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_relay_url() != 35261) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_rollback_deploy() != 34442) {
@@ -17780,7 +17856,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_add_checkpoint_cosignature() != 48565) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_address_resolve() != 64098) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_address_resolve() != 23956) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_aggregate_trust_input() != 37504) {
@@ -17930,7 +18006,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_budget_remaining() != 32105) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_verify_payment_receipts() != 16710) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_verify_payment_receipts() != 40702) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_evaluate_invitation() != 11385) {
@@ -18089,7 +18165,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_interface_expose() != 3812) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_interface_revoke() != 20193) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_interface_revoke() != 57369) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_invoke() != 47804) {
@@ -18104,7 +18180,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_register() != 48642) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_session_close() != 2713) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_session_close() != 47487) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_session_create() != 284) {
@@ -18251,10 +18327,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_response() != 16753) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 51192) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 59265) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_evaluate() != 33478) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_evaluate() != 17617) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_mint() != 2465) {

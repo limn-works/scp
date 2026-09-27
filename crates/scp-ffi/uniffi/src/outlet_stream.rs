@@ -1184,12 +1184,12 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
 
     // Both contexts MUST be Active before this money-moving open touches any
     // state. Read the AUTHORITATIVE lifecycle state from the per-context
-    // supervisor actor (`read_context_state`) — NOT the bridge-cached
+    // supervisor actor (`Supervisor::read_context_state_checked`) — NOT the bridge-cached
     // `ContextHandle::state`, which LAGS: on close the core handle flips to
     // `Closing` immediately, but the FFI cache stays `Active` until the async
     // finalize completes. A stale-cache read would let a `Closing` context (actor
     // alive, members intact) pass this gate and DEBIT ESCROW. Mirrors the PyO3
-    // reference's authoritative `read_context_state`. A missing actor (`None`) is
+    // reference, which gates through the same checked read. A missing actor is
     // treated as non-active (fail-closed). Codes match NAPI/PyO3: OUTLET_6010
     // (caller axis) / OUTLET_6011 (target axis). Checked BEFORE input validation,
     // the caller-principal binding, and the saga drive, so a non-active context is
@@ -1205,26 +1205,28 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
     // bridge's target-axis check (OUTLET_6011) is demoted to defense-in-depth.
     // The reserve does NOT run on the CALLER/source context, so this bridge's
     // caller-axis check (OUTLET_6010) remains the authoritative gate stopping a
-    // non-active source from initiating the saga.
-    let supervisor = Arc::clone(bi.context_manager_or_error()?);
-    let source_state = supervisor.read_context_state(&caller_context_id).await;
-    if !matches!(source_state, Some(scp_core::context::ContextState::Active)) {
-        return Err(ScpError::Outlet {
-            msg: format!(
-                "cannot start cross-context streaming saga: caller context in {source_state:?} state"
-            ),
+    // non-active source from initiating the saga. Both gates run before the
+    // caller-principal binding, so both withhold the lifecycle state (see
+    // `UniffiBridgeInstance::require_active_context_before_authz`).
+    bi.require_active_context_before_authz(
+        &caller_context_id,
+        "start cross-context streaming saga from caller context",
+        |msg| ScpError::Outlet {
+            msg,
             code: codes::OUTLET_6010.to_owned(),
-        });
-    }
-    let target_state = supervisor.read_context_state(&target_context_id).await;
-    if !matches!(target_state, Some(scp_core::context::ContextState::Active)) {
-        return Err(ScpError::Outlet {
-            msg: format!(
-                "cannot start cross-context streaming saga: target context in {target_state:?} state"
-            ),
+        },
+    )
+    .await?;
+    bi.require_active_context_before_authz(
+        &target_context_id,
+        "start cross-context streaming saga into target context",
+        |msg| ScpError::Outlet {
+            msg,
             code: codes::OUTLET_6011.to_owned(),
-        });
-    }
+        },
+    )
+    .await?;
+    let supervisor = Arc::clone(bi.context_manager_or_error()?);
 
     // ----- (a) validate inputs ------------------------------------------------
     validate_context_id(&caller_context_id)?;
@@ -1252,8 +1254,8 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
     //
     // Runs before ANY outlet read or state mutation, so an unauthenticated caller
     // is rejected before it can touch B's state (identical to the `PyO3`
-    // reference's ordering). `supervisor` was resolved above for the authoritative
-    // lifecycle gate; reuse it.
+    // reference's ordering). The binding reuses the `supervisor` resolved
+    // above.
     enforce_caller_principal_binding(bi, &supervisor, &caller_context_id, &caller_did).await?;
 
     // ----- (c) validate the invocation UCAN against the TARGET context --------

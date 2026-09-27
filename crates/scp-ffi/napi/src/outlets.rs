@@ -264,8 +264,8 @@ pub(crate) async fn outlet_register_on(
     validate_outlet_name(&definition.name).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     // The supervisor actor answers the lifecycle question, never the
-    // handle's cached string — see `crate::runtime::require_active_context`.
-    crate::runtime::require_active_context(
+    // handle's cached string — see `crate::runtime::require_active_context_before_authz`.
+    crate::runtime::require_active_context_before_authz(
         bi,
         &handle.context_id(),
         "register outlet in context",
@@ -334,10 +334,13 @@ pub(crate) async fn outlet_register_on(
     };
 
     // Read the registrant's authority from the supervisor actor BEFORE taking
-    // the FFI shard lock. `register_outlet` decides whether the registrant holds
-    // `outlet:register`, so it reads the role state the supervisor holds now,
-    // not a bridge copy that a governance action or a membership change could
-    // have left permissive.
+    // the FFI shard lock. `register_outlet` checks whether the registrant it
+    // receives holds `outlet:register`, and this entry point passes the context
+    // creator (`role_state.creator_did`) as that registrant: it receives no
+    // caller identity, so the check does not ask whether the caller holds the
+    // capability. The role state is the one the supervisor holds now, not a
+    // bridge copy that a governance action or a membership change could have
+    // left permissive.
     let role_state = crate::runtime::live_role_state(bi, &context_id)
         .await
         .map_err(napi::Error::from)?;
@@ -383,8 +386,8 @@ pub(crate) async fn outlet_invoke_on(
     }
 
     // The supervisor actor answers the lifecycle question, never the
-    // handle's cached string — see `crate::runtime::require_active_context`.
-    crate::runtime::require_active_context(
+    // handle's cached string — see `crate::runtime::require_active_context_before_authz`.
+    crate::runtime::require_active_context_before_authz(
         bi,
         &handle.context_id(),
         "invoke outlet in context",
@@ -558,8 +561,8 @@ pub(crate) async fn outlet_verify_on(
 ) -> napi::Result<NapiOutletVerificationResult> {
     crate::napi_check_handle!(&bi.core, handle);
     // The supervisor actor answers the lifecycle question, never the
-    // handle's cached string — see `crate::runtime::require_active_context`.
-    crate::runtime::require_active_context(
+    // handle's cached string — see `crate::runtime::require_active_context_before_authz`.
+    crate::runtime::require_active_context_before_authz(
         bi,
         &handle.context_id(),
         "verify outlet in context",
@@ -635,7 +638,7 @@ pub(crate) async fn outlet_invoke_cross_context_on(
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, source_handle, target_handle);
     // Validate both contexts are active.
-    crate::runtime::require_active_context(
+    crate::runtime::require_active_context_before_authz(
         bi,
         &source_handle.context_id(),
         "use source context",
@@ -647,7 +650,7 @@ pub(crate) async fn outlet_invoke_cross_context_on(
     .await
     .map_err(napi::Error::from)?;
 
-    crate::runtime::require_active_context(
+    crate::runtime::require_active_context_before_authz(
         bi,
         &target_handle.context_id(),
         "use target context",
@@ -1005,7 +1008,7 @@ pub(crate) async fn outlet_invoke_cross_context_saga_on(
 
     crate::napi_check_handle!(&bi.core, source_handle, target_handle);
 
-    crate::runtime::require_active_context(
+    crate::runtime::require_active_context_before_authz(
         bi,
         &source_handle.context_id(),
         "use caller context",
@@ -1016,7 +1019,7 @@ pub(crate) async fn outlet_invoke_cross_context_saga_on(
     )
     .await
     .map_err(napi::Error::from)?;
-    crate::runtime::require_active_context(
+    crate::runtime::require_active_context_before_authz(
         bi,
         &target_handle.context_id(),
         "use target context",
@@ -1157,8 +1160,8 @@ pub(crate) async fn outlet_session_create_on(
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
     // The supervisor actor answers the lifecycle question, never the
-    // handle's cached string — see `crate::runtime::require_active_context`.
-    crate::runtime::require_active_context(
+    // handle's cached string — see `crate::runtime::require_active_context_before_authz`.
+    crate::runtime::require_active_context_before_authz(
         bi,
         &handle.context_id(),
         "create session in context",
@@ -1226,8 +1229,8 @@ pub(crate) async fn outlet_session_invoke_on(
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
     // The supervisor actor answers the lifecycle question, never the
-    // handle's cached string — see `crate::runtime::require_active_context`.
-    crate::runtime::require_active_context(
+    // handle's cached string — see `crate::runtime::require_active_context_before_authz`.
+    crate::runtime::require_active_context_before_authz(
         bi,
         &handle.context_id(),
         "invoke session in context",
@@ -1403,8 +1406,8 @@ pub(crate) async fn outlet_interface_expose_on(
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     // The supervisor actor answers the lifecycle question, never the
-    // handle's cached string — see `crate::runtime::require_active_context`.
-    crate::runtime::require_active_context(
+    // handle's cached string — see `crate::runtime::require_active_context_before_authz`.
+    crate::runtime::require_active_context_before_authz(
         bi,
         &handle.context_id(),
         "expose outlet interface in context",
@@ -1433,10 +1436,12 @@ pub(crate) async fn outlet_interface_expose_on(
         None => None,
     };
 
-    // `expose_outlet` decides whether the caller may offer this context's outlet
-    // to another context, reading roles and the creator DID. Both come from the
-    // supervisor actor so an admin transfer's role reassignment, or any other
-    // role change, lands before the offer is minted.
+    // `expose_outlet` checks whether the admin it receives holds `RoleAssign`,
+    // and this entry point passes the context creator (`role_state.creator_did`)
+    // as that admin: it receives no caller identity, so the check does not ask
+    // whether the caller may offer this context's outlet. Roles and the creator
+    // come from the supervisor actor, so a role change that strips the
+    // creator's `RoleAssign` refuses the next offer.
     let role_state = crate::runtime::live_role_state(bi, &context_id)
         .await
         .map_err(napi::Error::from)?;
@@ -1480,8 +1485,8 @@ pub(crate) async fn outlet_interface_accept_on(
     crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id();
     // The supervisor actor answers the lifecycle question, never the handle's
-    // cached string — see `crate::runtime::require_active_context`.
-    crate::runtime::require_active_context(
+    // cached string — see `crate::runtime::require_active_context_before_authz`.
+    crate::runtime::require_active_context_before_authz(
         bi,
         &context_id,
         "accept outlet interface in context",
@@ -1502,9 +1507,12 @@ pub(crate) async fn outlet_interface_accept_on(
             })
         })?;
 
-    // `accept_outlet_interface` decides whether the caller may bind another
-    // context's outlet offer into this context, reading roles and the creator
-    // DID from the supervisor actor.
+    // `accept_outlet_interface` checks whether the admin it receives holds
+    // `RoleAssign`, and this entry point passes the context creator
+    // (`role_state.creator_did`) as that admin: it receives no caller identity,
+    // so the check does not ask whether the caller may bind another context's
+    // outlet offer into this context. Roles and the creator come from the
+    // supervisor actor.
     let role_state = crate::runtime::live_role_state(bi, &context_id)
         .await
         .map_err(napi::Error::from)?;

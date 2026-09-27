@@ -1744,11 +1744,10 @@ pub fn live_role_state(
 
 /// Reads a context's lifecycle state from that context's supervisor actor.
 ///
-/// `require_active_context` reads through this function; the cross-context
-/// outlet gates in `outlets.rs` and `outlet_stream.rs` call
-/// `Supervisor::read_context_state` directly and fail closed on its `None` by
-/// requiring `Some(Active)`. Every one of those gates reads the supervisor,
-/// never the handle. [`PyContextHandle`](crate::context::PyContextHandle) carries a
+/// `require_active_context` reads through this function, and every outlet and
+/// UCAN gate on this bridge reads through
+/// [`require_active_context_before_authz`]. Every one
+/// of those gates reads the supervisor, never the handle. [`PyContextHandle`](crate::context::PyContextHandle) carries a
 /// `state` string, and that string records the last transition THIS bridge
 /// observed: a TTL expiry the supervisor applied on its own timer, a close
 /// another member initiated, a migration that tombstoned the context, and an
@@ -1777,6 +1776,48 @@ pub fn live_context_state(
              lifecycle-gated operation against a context no actor serves"
         ))
     })
+}
+
+/// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`, and
+/// withholds the lifecycle state from the refusal.
+///
+/// Every UCAN entry point, every outlet entry point except
+/// `outlet_stream_open`, and the MCP provider's `validate_capability` gate
+/// through this form (the runtime refuses a non-`Active` context when
+/// `outlet_stream_open` opens the stream, with the state-free
+/// `SCP-OUTLET-6101`), because each one runs the
+/// gate before it authorizes the caller. The outlet PRD's SCP-OUT-031 PR-2a
+/// note records the rule this form keeps: the raw lifecycle state never
+/// reaches an FFI caller before authorization. The refusal therefore reads the
+/// same for every non-`Active` state and for a context no actor serves. The
+/// NAPI and `UniFFI` bridges gate the same entry points through their own
+/// `require_active_context_before_authz`, so the three bridges answer one
+/// lifecycle question one way.
+///
+/// `mk_err` wraps the refusal message in the error variant and the error code
+/// the calling entry point reports.
+///
+/// # Errors
+///
+/// Returns whatever `mk_err` builds when the supervisor reports any state other
+/// than `Active` and when no actor serves `context_id`, and every error
+/// [`read_live_context_state`] returns when the supervisor query itself fails.
+pub fn require_active_context_before_authz<F>(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    verb: &str,
+    mk_err: F,
+) -> Result<(), ScpPyError>
+where
+    F: FnOnce(String) -> ScpPyError,
+{
+    match read_live_context_state(bi, context_id)? {
+        Some(scp_core::context::ContextState::Active) => Ok(()),
+        Some(_) | None => Err(mk_err(format!(
+            "cannot {verb}: {}",
+            scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+        ))),
+    }
 }
 
 /// Reads a context's lifecycle state from that context's supervisor actor.
