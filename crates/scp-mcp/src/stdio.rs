@@ -167,24 +167,14 @@ impl StdioNotifier {
 
     /// Pushes a JSON-RPC notification to the client.
     ///
-    /// Returns `false` if the notification could not be serialized or written
-    /// (e.g. the client closed stdout). Named `_raw` for the same reason as
-    /// [`Self::write_line_raw`].
-    async fn notify_raw(&self, notification: &JsonRpcNotification) -> bool {
-        let json = match serde_json::to_string(notification) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::error!("failed to serialize MCP notification: {e}");
-                return false;
-            }
-        };
-        match self.write_line_raw(&json).await {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!("MCP stdio notification write failed: {e}");
-                false
-            }
-        }
+    /// Returns the I/O error if the notification could not be written (e.g.
+    /// the client closed stdout), or an [`std::io::ErrorKind::InvalidData`]
+    /// error if it could not be serialized. Named `_raw` for the same reason
+    /// as [`Self::write_line_raw`].
+    async fn notify_raw(&self, notification: &JsonRpcNotification) -> std::io::Result<()> {
+        let json = serde_json::to_string(notification)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.write_line_raw(&json).await
     }
 }
 
@@ -318,8 +308,9 @@ async fn pump_events<P, C>(
                 // Held across the writes: see `serve_stdio`.
                 let srv = server.lock().await;
                 for notification in &srv.lagged_resync_notifications() {
-                    if !channel.notify(notification).await {
+                    if let Err(e) = channel.notify(notification).await {
                         // stdout is gone; the session is over.
+                        tracing::warn!("MCP stdio notification write failed: {e}");
                         return;
                     }
                 }
@@ -335,8 +326,9 @@ async fn pump_events<P, C>(
         // between this read of the registry and the delivery it authorized.
         let srv = server.lock().await;
         for notification in &srv.notifications_for_event(&context_id, &event) {
-            if !channel.notify(notification).await {
+            if let Err(e) = channel.notify(notification).await {
                 // stdout is gone; the session is over.
+                tracing::warn!("MCP stdio notification write failed: {e}");
                 return;
             }
         }
@@ -359,12 +351,12 @@ trait ClientChannel: Clone + Send + Sync + 'static {
         json: &str,
     ) -> impl std::future::Future<Output = std::io::Result<()>> + Send;
 
-    /// Pushes a JSON-RPC notification, returning `false` if it could not be
-    /// written (e.g. the client closed stdout).
+    /// Pushes a JSON-RPC notification, returning the error if it could not be
+    /// serialized or written (e.g. the client closed stdout).
     fn notify(
         &self,
         notification: &JsonRpcNotification,
-    ) -> impl std::future::Future<Output = bool> + Send;
+    ) -> impl std::future::Future<Output = std::io::Result<()>> + Send;
 }
 
 impl ClientChannel for StdioNotifier {
@@ -375,7 +367,7 @@ impl ClientChannel for StdioNotifier {
         self.write_line_raw(json).await
     }
 
-    async fn notify(&self, notification: &JsonRpcNotification) -> bool {
+    async fn notify(&self, notification: &JsonRpcNotification) -> std::io::Result<()> {
         self.notify_raw(notification).await
     }
 }
@@ -457,12 +449,11 @@ where
             }
         }
         // A `tools/call` queues the notifications its outlet run causes. They
-        // go out after its response, under the same lock.
+        // go out after its response, under the same lock. A failed write is a
+        // stdout failure like a failed response write, so it returns
+        // `StdioError::Io` rather than the `Ok(())` that means stdin EOF.
         for notification in &srv.take_pending_notifications() {
-            if !channel.notify(notification).await {
-                // stdout is gone; the session is over.
-                return Ok(());
-            }
+            channel.notify(notification).await?;
         }
         // Released only after the response is on the wire: see `serve_stdio`.
         drop(srv);
@@ -906,11 +897,11 @@ mod tests {
             Ok(())
         }
 
-        async fn notify(&self, notification: &JsonRpcNotification) -> bool {
-            if let Ok(json) = serde_json::to_string(notification) {
-                self.notifications.lock().await.push(json);
-            }
-            true
+        async fn notify(&self, notification: &JsonRpcNotification) -> std::io::Result<()> {
+            let json = serde_json::to_string(notification)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            self.notifications.lock().await.push(json);
+            Ok(())
         }
     }
 
@@ -998,6 +989,60 @@ mod tests {
             "{notifications:?}"
         );
         assert!(server.lock().await.take_pending_notifications().is_empty());
+    }
+
+    /// A channel whose response writes succeed and whose notification writes
+    /// fail with `BrokenPipe`, as when the client closes stdout after the
+    /// response reached the pipe buffer.
+    #[derive(Clone, Default)]
+    struct NotifyFailsSink {
+        lines: Arc<tokio::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl ClientChannel for NotifyFailsSink {
+        async fn write_line(&self, json: &str) -> std::io::Result<()> {
+            {
+                let mut buf = self.lines.lock().await;
+                buf.extend_from_slice(json.as_bytes());
+                buf.push(b'\n');
+            }
+            Ok(())
+        }
+
+        async fn notify(&self, _notification: &JsonRpcNotification) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    /// A failed write of a notification a `tools/call` queued is a stdout
+    /// failure: the read loop returns `StdioError::Io`, as it does for a failed
+    /// response write, and never the `Ok(())` that means stdin reached EOF.
+    #[tokio::test]
+    async fn read_loop_reports_a_failed_notification_write_as_io() {
+        let (_event_tx, server, _pump) = wired_subscribed_server("scp://ctx_a/events");
+        let server = Arc::new(tokio::sync::Mutex::new(server));
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "ctx_a/send_message", "arguments": {"content": "hi"}},
+            "id": 3
+        });
+        let channel = NotifyFailsSink::default();
+        let result = read_loop_from(
+            &server,
+            BufReader::new(format!("{call}\n").as_bytes()),
+            &channel,
+        )
+        .await;
+
+        assert!(
+            !channel.lines.lock().await.is_empty(),
+            "the response write must succeed before the notification write fails"
+        );
+        match result {
+            Err(StdioError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe),
+            other => panic!("expected StdioError::Io(BrokenPipe), got {other:?}"),
+        }
     }
 
     /// The HIGH-severity fix: stopping the server while stdin is still open must
@@ -1095,15 +1140,16 @@ mod tests {
             Ok(())
         }
 
-        async fn notify(&self, notification: &JsonRpcNotification) -> bool {
+        async fn notify(&self, notification: &JsonRpcNotification) -> std::io::Result<()> {
             self.entered.notify_one();
-            let Ok(permit) = self.release.acquire().await else {
-                return false;
-            };
-            permit.forget();
+            self.release
+                .acquire()
+                .await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?
+                .forget();
             let json = serde_json::to_string(notification).expect("serialize");
             self.log.lock().await.push(json);
-            true
+            Ok(())
         }
     }
 

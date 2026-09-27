@@ -1541,7 +1541,7 @@ mod tests {
         // Attach a session over a real connection; its endpoint event proves
         // the response stream is open.
         let conn = attach_session(addr, "shutdown-secret").await;
-        assert_eq!(event_tx.receiver_count(), 1, "the pump must be running");
+        assert_pump_consumes(&event_tx).await;
 
         handle.shutdown();
 
@@ -1561,6 +1561,28 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         drop(conn);
+    }
+
+    /// Proves a spawned pump is draining `event_tx`: sends one event and waits
+    /// until no receiver still holds it queued. The pump's receiver exists from
+    /// `McpServer::with_event_source` whether or not anything spawns the pump,
+    /// so `receiver_count()` cannot tell a running pump from an unspawned one;
+    /// an unspawned receiver leaves the event queued and fails this check.
+    async fn assert_pump_consumes(event_tx: &broadcast::Sender<(String, ContextEvent)>) {
+        event_tx
+            .send((
+                "ctx_a".to_owned(),
+                ContextEvent::ContentKeysRotated { reason: None },
+            ))
+            .expect("the pump's receiver must exist");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !event_tx.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pump must be running: its event stayed queued"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Connects to the `run_sse` server at `addr`, opens `GET /sse` with
@@ -2471,7 +2493,7 @@ mod tests {
         // `Connection: close`, so the connection closes once the stream ends.
         let mut conn = attach_session(addr, "abort-secret").await;
         assert!(!task.is_finished(), "run_sse exited before it was aborted");
-        assert_eq!(event_tx.receiver_count(), 1);
+        assert_pump_consumes(&event_tx).await;
 
         // Abort the server task — the cancellation-drop path. Awaiting the
         // aborted task guarantees the `run_sse` future was dropped, so its

@@ -758,8 +758,8 @@ impl FfiBridgeProvider {
     /// Returns [`AccessRefusal::Denied`](scp_mcp::server::AccessRefusal::Denied)
     /// naming the check that refused the invocation, and
     /// [`AccessRefusal::Unreadable`](scp_mcp::server::AccessRefusal::Unreadable)
-    /// when the agent's proof tokens or the bridge's copy of the context
-    /// cannot be read, so a failed read never reaches the client as a denial.
+    /// when the agent's proof tokens cannot be read, so a failed read never
+    /// reaches the client as a denial.
     fn outlet_grant(
         &self,
         bi: &crate::runtime::PyBridgeInstance,
@@ -781,22 +781,25 @@ impl FfiBridgeProvider {
             ));
         };
         // Defense-in-depth: check role-state capabilities in addition to the
-        // UCAN layer. See §7.2 and ADR-010 for the dual-check design. The
-        // closure cannot fail, so an `Err` from `with_context` means the
-        // bridge's context copy could not be read.
+        // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
+        //
+        // SCP-OUT-014: select the kind-appropriate split stem from the
+        // outlet's registered kind — OutletQuery for Query outlets,
+        // OutletCall for Action outlets (§5.4.2). The two stems are
+        // independent, so a Query grant never authorizes an Action call and
+        // vice versa. An outlet absent from the registry defaults to the
+        // Action stem (the UCAN step below requires registration). The closure
+        // cannot fail, so an `Err` from `with_context` means the bridge holds
+        // no copy of a context the actor holds: only this bridge's create and
+        // join paths register a copy, so a context the actor holds by any
+        // other path has none. The bridge then holds no registration of the
+        // outlet, and the same default applies, as it does in `context_tools`.
         let outlet_kind = crate::runtime::with_context(bi, context_id, |rt| {
-            // SCP-OUT-014: select the kind-appropriate split stem from the
-            // outlet's registered kind — OutletQuery for Query outlets,
-            // OutletCall for Action outlets (§5.4.2). The two stems are
-            // independent, so a Query grant never authorizes an Action call and
-            // vice versa. An outlet absent from the registry defaults to the
-            // Action stem (the UCAN step below requires registration).
-            Ok(rt
-                .outlet_registry
-                .get(outlet_name)
-                .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind))
+            Ok(rt.outlet_registry.get(outlet_name).map(|r| r.kind))
         })
-        .map_err(|e| AccessRefusal::Unreadable(format!("{e}")))?;
+        .ok()
+        .flatten()
+        .unwrap_or(scp_core::context::outlets::OutletKind::Action);
         if !scp_core::context::outlets::invoke::has_outlet_invocation_capability(
             role_state,
             &self.agent_did,
@@ -935,6 +938,20 @@ impl ContextProvider for FfiBridgeProvider {
         // A dropped bridge or an unreadable context is an error, never an
         // empty outlet registry.
         let bi = self.upgrade_bi()?;
+        // Outlets register only on the bridge copy, and only this bridge's
+        // create and join paths register a copy, so a context the actor holds
+        // by any other path has no copy here and no outlet registered through
+        // this bridge: its registry is empty. With no supervisor the copy is
+        // the context's only state, so `held_role_state` finds no context.
+        if !crate::runtime::ffi_state_registry(&bi).contains_key(context_id) {
+            return match Self::held_role_state(&bi, context_id)? {
+                Some(_) => Ok(Vec::new()),
+                None => Err(format!(
+                    "context '{context_id}' is held neither by the supervisor nor by \
+                     this bridge"
+                )),
+            };
+        }
         crate::runtime::with_context(&bi, context_id, |rt| {
             let outlets = rt
                 .outlet_registry
@@ -1073,10 +1090,12 @@ impl FfiBridgeProvider {
     /// Runs `outlet_name` for [`ContextProvider::invoke_outlet`], which
     /// passes the Invoke check as `authorize`. `authorize` runs after every
     /// refusal that runs no outlet (the supervisor lookup, the hard rate
-    /// limit, the registry lookup and the input schema) and just before the
-    /// handler dispatch, because a passing Invoke check spends the agent
-    /// token. A refused `authorize` refunds the rate-limit token and runs no
-    /// outlet.
+    /// limit, the registry lookup, the input schema and the handler lookup)
+    /// and just before the handler dispatch, because a passing Invoke check
+    /// spends the agent token. A refused `authorize` refunds the rate-limit
+    /// token and runs no outlet. An outlet with no registered handler is
+    /// refused: nothing would run, so a success result for it would report
+    /// work that was not done.
     #[allow(clippy::too_many_lines)] // Three-phase dispatch: validate + execute + emit event.
     fn run_outlet(
         &self,
@@ -1085,9 +1104,8 @@ impl FfiBridgeProvider {
         arguments: serde_json::Value,
         authorize: impl FnOnce() -> Result<(), scp_mcp::server::AccessRefusal>,
     ) -> Result<serde_json::Value, scp_mcp::server::OutletInvokeError> {
-        // Validates outlet existence and input schema, then dispatches to a
-        // registered handler if one exists. If no handler is registered, falls
-        // back to echoing the validated input with metadata (schema-only mode).
+        // Validates outlet existence, input schema and handler registration,
+        // then dispatches to the registered handler.
         //
         // After successful invocation, appends a OutletInvokedEvent to the
         // context's event log per ADR-010 acceptance criterion 3.
@@ -1209,12 +1227,17 @@ impl FfiBridgeProvider {
             // Compute input hash before dispatch (arguments may be consumed).
             let input_hash = scp_core::context::outlets::sha256_json(&arguments);
 
-            Ok((
-                rt.outlet_handlers
-                    .get(outlet_name)
-                    .map(|handler| (handler.clone(), registration.schema.output_schema.clone())),
-                input_hash,
-            ))
+            let dispatch = rt
+                .outlet_handlers
+                .get(outlet_name)
+                .map(|handler| (handler.clone(), registration.schema.output_schema.clone()))
+                .ok_or_else(|| {
+                    ScpPyError::context(format!(
+                        "outlet '{outlet_name}' in context '{context_id}' has no registered handler"
+                    ))
+                })?;
+
+            Ok((dispatch, input_hash))
         })
         .map_err(|e| refund(format!("{e}")))?;
 
@@ -1229,53 +1252,41 @@ impl FfiBridgeProvider {
         // concurrent same-context operations are not blocked during Python
         // GIL acquisition and handler execution. Handler execution is
         // bounded by `outlet_timeout_ms` (issue #123).
-        let output = match dispatch {
-            Some((handler, output_schema)) => {
-                // Run the handler on a dedicated thread with a timeout to
-                // prevent indefinite blocking. The handler is Send + Sync
-                // (Arc<dyn Fn>), so it is safe to move across threads.
-                let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
-                    let result = handler(arguments);
-                    // If the receiver has been dropped (timeout elapsed), the
-                    // send will fail silently -- that is intentional.
-                    let _ = tx.send(result);
-                });
+        let output = {
+            let (handler, output_schema) = dispatch;
+            // Run the handler on a dedicated thread with a timeout to
+            // prevent indefinite blocking. The handler is Send + Sync
+            // (Arc<dyn Fn>), so it is safe to move across threads.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = handler(arguments);
+                // If the receiver has been dropped (timeout elapsed), the
+                // send will fail silently -- that is intentional.
+                let _ = tx.send(result);
+            });
 
-                let handler_result = rx.recv_timeout(timeout).map_err(|_| {
-                    refund(format!(
-                        "outlet handler for '{outlet_name}' timed out after {}ms",
-                        timeout.as_millis()
-                    ))
-                })?;
+            let handler_result = rx.recv_timeout(timeout).map_err(|_| {
+                refund(format!(
+                    "outlet handler for '{outlet_name}' timed out after {}ms",
+                    timeout.as_millis()
+                ))
+            })?;
 
-                let output = handler_result.map_err(|e| {
-                    refund(format!("outlet handler for '{outlet_name}' failed: {e}"))
-                })?;
+            let output = handler_result
+                .map_err(|e| refund(format!("outlet handler for '{outlet_name}' failed: {e}")))?;
 
-                // Validate output against the outlet's output schema (defense-in-depth).
-                scp_core::context::outlets::schema::validate_value_against_schema(
-                    &output,
-                    &output_schema,
-                )
-                .map_err(|msg| {
-                    refund(format!(
-                        "output validation failed for outlet '{outlet_name}': {msg}"
-                    ))
-                })?;
+            // Validate output against the outlet's output schema (defense-in-depth).
+            scp_core::context::outlets::schema::validate_value_against_schema(
+                &output,
+                &output_schema,
+            )
+            .map_err(|msg| {
+                refund(format!(
+                    "output validation failed for outlet '{outlet_name}': {msg}"
+                ))
+            })?;
 
-                output
-            }
-            None => {
-                // No handler registered -- fall back to echo mode.
-                serde_json::json!({
-                    "outlet": outlet_name,
-                    "context": context_id,
-                    "status": "validated",
-                    "input_valid": true,
-                    "validated_input": arguments,
-                })
-            }
+            output
         };
 
         // Phase 3: Append OutletInvokedEvent to the event log (ADR-010
@@ -3199,11 +3210,25 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FfiBridgeProvider::invoke_outlet — echo fallback when no handler
+    // FfiBridgeProvider::invoke_outlet — refuses an outlet with no handler
     // -----------------------------------------------------------------------
 
+    /// Registers a `calculator` handler that sums `a` and `b`.
+    fn register_sum_handler(bi: &crate::runtime::PyBridgeInstance, ctx_id: &str) {
+        let handler: crate::runtime::OutletHandler =
+            std::sync::Arc::new(|input: serde_json::Value| {
+                let a = input["a"].as_f64().unwrap_or(0.0);
+                let b = input["b"].as_f64().unwrap_or(0.0);
+                Ok(serde_json::json!({"result": a + b}))
+            });
+        crate::runtime::register_outlet_handler(bi, ctx_id, "calculator", handler).unwrap();
+    }
+
+    /// A registered outlet with no handler runs nothing, so the call is
+    /// refused before the Invoke check and appends no event: a success result
+    /// would report work that was not done.
     #[test]
-    fn ffi_bridge_provider_invoke_outlet_echo_fallback_without_handler() {
+    fn ffi_bridge_provider_invoke_outlet_refuses_an_outlet_without_handler() {
         let creator = "did:dht:z6MkCreatorInvokeOutlet";
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, true);
@@ -3218,19 +3243,23 @@ mod tests {
             agent_proof_tokens: None,
         };
 
-        let input = serde_json::json!({"a": 3, "b": 4});
-        let result = invoke_granted(&provider, &ctx_id, "calculator", input.clone());
-        assert!(result.is_ok(), "invoke_outlet should succeed: {result:?}");
-
-        let output = result.unwrap();
-        assert_eq!(
-            output["status"], "validated",
-            "without handler, status should be 'validated' (echo mode)"
+        let asked = std::cell::Cell::new(0_u32);
+        let result = provider.run_outlet(
+            &ctx_id,
+            "calculator",
+            serde_json::json!({"a": 3, "b": 4}),
+            || {
+                asked.set(asked.get() + 1);
+                Ok(())
+            },
         );
-        assert_eq!(output["outlet"], "calculator");
-        assert_eq!(output["context"], ctx_id);
-        assert_eq!(output["input_valid"], true);
-        assert_eq!(output["validated_input"], input);
+        let err = result.expect_err("an outlet without a handler must be refused");
+        assert!(
+            err.to_string().contains("has no registered handler"),
+            "the refusal must name the missing handler: {err}"
+        );
+        assert_eq!(asked.get(), 0, "the refusal must not spend the token");
+        assert_eq!(event_count(&bi, &ctx_id), 0, "no outlet may have run");
 
         crate::runtime::remove_context(&bi, &ctx_id);
     }
@@ -3241,10 +3270,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn invoke_outlet_echo_mode_appends_outlet_invoked_event() {
+    fn invoke_outlet_appends_one_outlet_invoked_event_per_call() {
         let creator = "did:dht:z6MkCreatorEventLog";
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, true);
+        register_sum_handler(&bi, &ctx_id);
 
         // Verify the event log is initially empty.
         let initial_count = crate::runtime::with_context(&bi, &ctx_id, |rt| {
@@ -3263,7 +3293,6 @@ mod tests {
             agent_proof_tokens: None,
         };
 
-        // Invoke in echo mode (no handler registered).
         let result = invoke_granted(
             &provider,
             &ctx_id,
@@ -3378,8 +3407,8 @@ mod tests {
 
     /// `run_outlet` asks for the Invoke check, which spends the agent token,
     /// only after every refusal that runs no outlet: a missing supervisor, an
-    /// unknown outlet, and an input the schema rejects each refuse the call
-    /// without asking.
+    /// unknown outlet, an input the schema rejects, and an outlet with no
+    /// registered handler each refuse the call without asking.
     #[test]
     fn run_outlet_authorizes_after_every_refusal_that_runs_no_outlet() {
         let creator = "did:dht:z6MkCreatorAuthorizeLast";
@@ -3421,8 +3450,15 @@ mod tests {
                 .run_outlet(&ctx_id, "calculator", serde_json::json!("bad"), authorize)
                 .is_err()
         );
+        assert!(
+            provider
+                .run_outlet(&ctx_id, "calculator", args.clone(), authorize)
+                .is_err(),
+            "no handler is registered yet"
+        );
         assert_eq!(asked.get(), 0, "a refused call must not spend the token");
 
+        register_sum_handler(&bi, &ctx_id);
         assert!(
             provider
                 .run_outlet(&ctx_id, "calculator", args, authorize)
@@ -3440,6 +3476,7 @@ mod tests {
         let creator = "did:dht:z6MkCreatorRefusedInvoke";
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, true);
+        register_sum_handler(&bi, &ctx_id);
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
@@ -3511,6 +3548,7 @@ mod tests {
         let creator = "did:dht:z6MkCreatorSchemaVal";
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, true);
+        register_sum_handler(&bi, &ctx_id);
 
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -4747,6 +4785,42 @@ mod tests {
 
         crate::runtime::remove_context(&bi, &revoked);
         crate::runtime::remove_context(&bi, &granted);
+    }
+
+    /// A context the actor holds while the bridge holds no copy of it has no
+    /// outlet registered through this bridge: `context_tools` reports an empty
+    /// registry and `validate_capability` reaches its UCAN step, as the NAPI
+    /// bridge does, instead of failing the read and, through it, `tools/list`
+    /// for every served context.
+    #[test]
+    fn actor_held_context_without_a_bridge_copy_has_no_outlets_pyo3() {
+        crate::init_runtime().ok();
+        let agent = "did:dht:z6MkNoCopyAgent";
+        let bi = __bi();
+        let ctx_id = crate::types::generate_random_id("test-mcp-no-copy");
+        setup_diverged_context(&bi, &ctx_id, agent, agent);
+        crate::runtime::remove_context(&bi, &ctx_id);
+        assert!(crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_err());
+
+        let mut provider = pyo3_mcp_provider(&bi, &ctx_id, agent);
+        assert_eq!(provider.active_context_ids().unwrap(), vec![ctx_id.clone()]);
+        assert!(provider.context_tools(&ctx_id).unwrap().is_empty());
+
+        provider.agent_ucan_token = Some("not-a-ucan".to_owned());
+        let refusal = provider
+            .validate_capability(
+                &ctx_id,
+                "calculator",
+                scp_mcp::server::CapabilityCheck::Probe,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(refusal, scp_mcp::server::AccessRefusal::Denied(_)),
+            "a missing bridge copy is no registration, not a failed read: {refusal}"
+        );
+
+        // A context held by neither is still an error.
+        assert!(provider.context_tools("ctx-held-by-no-one").is_err());
     }
 
     /// With a supervisor attached, `scp://{ctx}/events` reports the actor's

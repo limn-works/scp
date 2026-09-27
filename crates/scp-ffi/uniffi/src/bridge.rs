@@ -5318,9 +5318,11 @@ impl McpUniFfiBridgeProvider {
     /// Runs `outlet_name` for
     /// [`scp_mcp::server::ContextProvider::invoke_outlet`], which passes the
     /// Invoke check as `authorize`. `authorize` runs after every refusal that
-    /// runs no outlet (the handle lookup, the registry lookup and the input
-    /// schema) and just before the handler dispatch, because a passing
-    /// Invoke check spends the agent token.
+    /// runs no outlet (the handle lookup, the registry lookup, the input
+    /// schema and the handler lookup) and just before the handler dispatch,
+    /// because a passing Invoke check spends the agent token. An outlet with
+    /// no registered handler is refused: nothing would run, so a success
+    /// result for it would report work that was not done.
     #[allow(clippy::too_many_lines)]
     fn run_outlet(
         &self,
@@ -5372,6 +5374,11 @@ impl McpUniFfiBridgeProvider {
                 outlet_handlers
                     .get(outlet_name)
                     .map(|handler| (handler.clone(), registration.schema.output_schema.clone()))
+                    .ok_or_else(|| {
+                        format!(
+                            "outlet '{outlet_name}' in context '{context_id}' has no registered handler"
+                        )
+                    })?
             };
 
             (handler_dispatch, input_hash)
@@ -5384,45 +5391,32 @@ impl McpUniFfiBridgeProvider {
         // Phase 2: Execute handler OUTSIDE the locks so that concurrent
         // same-context operations are not blocked. Handler execution is
         // bounded by `outlet_timeout_ms` (matching PyO3 pattern, issue #123).
-        let output = match dispatch {
-            Some((handler, output_schema)) => {
-                let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
-                    let result = handler(arguments);
-                    let _ = tx.send(result);
-                });
+        let output = {
+            let (handler, output_schema) = dispatch;
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = handler(arguments);
+                let _ = tx.send(result);
+            });
 
-                let handler_result = rx.recv_timeout(timeout).map_err(|_| {
-                    format!(
-                        "outlet handler for '{outlet_name}' timed out after {}ms",
-                        timeout.as_millis()
-                    )
-                })?;
-
-                let output = handler_result
-                    .map_err(|e| format!("outlet handler for '{outlet_name}' failed: {e}"))?;
-
-                // Validate output against the outlet's output schema (defense-in-depth).
-                scp_core::context::outlets::schema::validate_value_against_schema(
-                    &output,
-                    &output_schema,
+            let handler_result = rx.recv_timeout(timeout).map_err(|_| {
+                format!(
+                    "outlet handler for '{outlet_name}' timed out after {}ms",
+                    timeout.as_millis()
                 )
-                .map_err(|msg| {
-                    format!("output validation failed for outlet '{outlet_name}': {msg}")
-                })?;
+            })?;
 
-                output
-            }
-            None => {
-                // No handler registered — fall back to echo mode.
-                serde_json::json!({
-                    "outlet": outlet_name,
-                    "context": context_id,
-                    "status": "validated",
-                    "input_valid": true,
-                    "validated_input": arguments,
-                })
-            }
+            let output = handler_result
+                .map_err(|e| format!("outlet handler for '{outlet_name}' failed: {e}"))?;
+
+            // Validate output against the outlet's output schema (defense-in-depth).
+            scp_core::context::outlets::schema::validate_value_against_schema(
+                &output,
+                &output_schema,
+            )
+            .map_err(|msg| format!("output validation failed for outlet '{outlet_name}': {msg}"))?;
+
+            output
         };
 
         // Phase 3: Append OutletInvokedEvent to the event log (ADR-010
@@ -23600,8 +23594,9 @@ mod tests {
 
     /// `run_outlet` asks for the Invoke check, which spends the agent token,
     /// only after every refusal that runs no outlet: an unknown context, an
-    /// unknown outlet, and an input the schema rejects each refuse the call
-    /// without asking. A refused check runs no outlet.
+    /// unknown outlet, an input the schema rejects, and an outlet with no
+    /// registered handler each refuse the call without asking. A refused
+    /// check runs no outlet, and a passing one runs the handler.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn uniffi_run_outlet_authorizes_after_every_refusal_that_runs_no_outlet() {
         let scp = scp_test();
@@ -23652,6 +23647,8 @@ mod tests {
             ("ctx-unknown", "calculator", args.clone()),
             ("ctx-test", "nonexistent", args.clone()),
             ("ctx-test", "calculator", serde_json::json!("bad")),
+            // Registered, but no handler: nothing would run.
+            ("ctx-test", "calculator", args.clone()),
         ] {
             assert!(
                 provider
@@ -23661,6 +23658,18 @@ mod tests {
         }
         assert_eq!(asked.get(), 0, "a refused call must not spend the token");
 
+        let ran = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ran_in_handler = Arc::clone(&ran);
+        handle.outlet_handlers.lock().expect("handler lock").insert(
+            "calculator".to_owned(),
+            Arc::new(
+                move |input: serde_json::Value| -> Result<serde_json::Value, String> {
+                    ran_in_handler.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(serde_json::json!({"sum": input["a"]}))
+                },
+            ),
+        );
+
         let refused = provider.run_outlet("ctx-test", "calculator", args.clone(), || {
             Err(scp_mcp::server::AccessRefusal::Denied("replay".to_owned()))
         });
@@ -23668,13 +23677,22 @@ mod tests {
             refused,
             Err(scp_mcp::server::OutletInvokeError::Refused(_))
         ));
-
-        assert!(
-            provider
-                .run_outlet("ctx-test", "calculator", args, authorize)
-                .is_ok()
+        assert_eq!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused check runs no outlet"
         );
+
+        let output = provider
+            .run_outlet("ctx-test", "calculator", args, authorize)
+            .expect("the dispatched call succeeds");
+        assert_eq!(output, serde_json::json!({"sum": 1}));
         assert_eq!(asked.get(), 1, "the dispatched call asks once");
+        assert_eq!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the dispatched call runs the handler once"
+        );
     }
 
     /// Struct-level proof: `McpUniFfiBridgeProvider.bi` is `Weak`.
