@@ -301,7 +301,8 @@
         "SCP-313",
         "SCP-314",
         "SCP-315",
-        "SCP-316"
+        "SCP-316",
+        "SCP-317"
       ]
     }
   ],
@@ -11192,23 +11193,25 @@
         "crates/scp-protocol/src/trust/mod.rs",
         "crates/scp-protocol/src/trust/sybil.rs"
       ],
-      "description": "Implement the reader `09-security-model.md` §9.3.1 defines: given an identifier and a context's `ContextSybilPolicy`, read the identifier's service record, select its `ScpDeviceAttestation` entries, and return `DeviceAttestationVerdict`. No code verifies a device attestation today: `evaluate_sybil_resistance` tests `require_device_attestation` against the presence of a caller-supplied map key (`27-attestations.md` §27.4.3). This story adds the policy fields (`device_attestation_challenge`, `device_attestation_max_age_secs`, `accepted_app_ids`, `accepted_validation_categories`, `play_integrity_verifier`), the binding digest `D` over the identifier, the context id and the challenge, the assertion digest `A`, the App Attest offline checks against a pinned Apple App Attestation Root CA, the Play Integrity verdict checks, the caching rule, and the fail-closed signal `evaluate_sybil_resistance` reads. A `Verified` proves an accepted app on genuine platform hardware minted the entry for this identifier and context; it proves no distinct device, and a Play Integrity `Verified` is trust in the named verifier. Minting over `D` and `A` stays with SCP-095 (App Attest) and SCP-111 (Play Integrity). The service-record read comes from `IdentityBackend::read_service_record` (SCP-006) and the verifier's key-state resolution from SCP-310.",
+      "description": "Implement the reader `09-security-model.md` §9.3.1 defines: given an identifier and a context's `ContextSybilPolicy`, read the identifier's service record, select its `ScpDeviceAttestation` entries, and return `DeviceAttestationVerdict`. No code verifies a device attestation today: `evaluate_sybil_resistance` tests `require_device_attestation` against the presence of a caller-supplied map key (`27-attestations.md` §27.4.3). This story adds the policy fields (`device_attestation_challenge`, `device_attestation_max_age_secs`, `accepted_app_ids`, `accepted_validation_categories`, `require_validation_category`, `accepted_android_packages`, `play_integrity_verifier`), the per-subject tag `T`, the binding digest `D` over the identifier, the context id and the challenge, the assertion digest `A`, the App Attest offline checks against a pinned Apple App Attestation Root CA, the Play Integrity verdict checks, the caching rule, and the fail-closed signal `evaluate_sybil_resistance` reads. A `Verified` proves an accepted app on genuine platform hardware minted the entry for this identifier and context; it proves no distinct device, and a Play Integrity `Verified` is trust in the named verifier. Minting over `D` and `A` stays with SCP-095 (App Attest) and SCP-111 (Play Integrity), and the owner-side producer that publishes, renews and deletes entries is SCP-317. The service-record read comes from `IdentityBackend::read_service_record` (SCP-006) and the verifier's key-state resolution from SCP-310.",
       "acceptanceCriteria": [
         "`device_attestation_binding_digest(identifier, context_id, challenge)` returns SHA-256 over the 26 bytes `SCP-DEVICE-ATTESTATION-V1:`, `BE32(56)`, the 56-byte `scp:` text form, `BE32(n)`, the n UTF-8 bytes of the context id, and the 32-byte challenge, and a unit test pins the `122 + n`-byte preimage for one context id",
+        "`device_attestation_tag(identifier, challenge)` returns SHA-256 over the 30 bytes `SCP-DEVICE-ATTESTATION-TAG-V1:`, `BE32(56)`, the 56-byte `scp:` text form and the 32-byte challenge, and a unit test pins the 122-byte preimage",
         "`device_assertion_digest(m)` returns SHA-256 over the 24 bytes `SCP-DEVICE-ASSERTION-V1:`, `BE32(len(m))` and `m`, and a test shows it differs from `device_attestation_binding_digest` for inputs whose concatenated bytes are equal",
-        "`ContextSybilPolicy` carries `device_attestation_challenge: [u8; 32]`, `device_attestation_max_age_secs: u64`, `accepted_app_ids: Vec<AcceptedAppId>` (each with `app_id`, `platform: ApplePlatform` and `accepted_bundle_versions`), `accepted_validation_categories: Vec<u32>` and `play_integrity_verifier: Option<[u8; 32]>`",
-        "`ContextSybilPolicy::casual()`, `standard()` and `high_trust()` each draw `device_attestation_challenge` from a CSPRNG, and no constructor or `Default` sets it to a fixed value: a test builds each preset twice and shows the two challenges differ",
+        "`ContextSybilPolicy` carries `device_attestation_challenge: [u8; 32]`, `device_attestation_max_age_secs: u64`, `accepted_app_ids: Vec<AcceptedAppId>` (each with `app_id`, `platform: ApplePlatform` and `accepted_bundle_versions`), `accepted_validation_categories: Vec<u32>`, `require_validation_category: bool`, `accepted_android_packages: Vec<AcceptedAndroidPackage>` (each with `package_name` and `signing_cert_sha256: [u8; 32]`) and `play_integrity_verifier: Option<[u8; 32]>`",
+        "`ContextSybilPolicy::casual()`, `standard()` and `high_trust()` each set `require_device_attestation` to false, add no `DeviceAttestation` `RequiredSignal`, and set the challenge to 32 zero bytes, `device_attestation_max_age_secs` to 2,592,000, the three accepted lists to empty, `require_validation_category` to false and `play_integrity_verifier` to `None`, and a test asserts each value for each preset",
+        "Policy validation rejects a `device_attestation_max_age_secs` above 31,536,000 and a `DeviceAttestation` `RequiredSignal` whose `min_strength` is not 1, and every sum with the maximum age saturates: a test with a `notBefore` near `u64::MAX` shows no overflow",
         "A policy whose challenge is 32 zero bytes returns `Rejected { cause: ContextChallengeUnset }` before the service record is read",
         "A service-record verdict of `Absent` returns `DeviceAttestationVerdict::Absent`",
         "A service-record verdict of `Rejected` or `Inconclusive` returns `Unverifiable { cause: ServiceRecordUnavailable }`",
-        "A record with no `ScpDeviceAttestation` entry whose challenge equals the policy's challenge returns `Absent`",
-        "An entry whose first field is a platform tag other than `app-attest` and `play-integrity` is skipped, and a record holding only such entries returns `Absent`",
-        "An entry with the wrong field count for its tag, a field that is not unpadded base64url, or a challenge that does not decode to 32 bytes returns `Rejected { cause: MalformedEntry }`",
-        "More than `MAX_DEVICE_ATTESTATIONS_PER_CHALLENGE` (4) matching entries return `Rejected { cause: TooManyEntries }` before any certificate is parsed",
+        "A record with no `ScpDeviceAttestation` entry whose second field is the unpadded base64url of the tag `T` the reader computes returns `Absent`, and a test shows an entry carrying the raw challenge in place of `T` is skipped",
+        "An entry whose first field is not `app-attest` or `play-integrity`, or whose tag is another context's, is skipped whatever its field count, and a test shows a malformed entry for another context leaves the verdict for this context unchanged",
+        "An entry whose tag matches with the wrong field count for its platform tag, or a field that is not unpadded base64url, returns `Rejected { cause: MalformedEntry }`",
+        "More than `MAX_DEVICE_ATTESTATIONS_PER_CHALLENGE` (1) entries with a matching tag return `Rejected { cause: TooManyEntries }` before any certificate is parsed",
         "An App Attest object that is not a CBOR map with `fmt` `apple-appattest`, a two-certificate `x5c`, and a byte-string `authData` returns `Rejected { cause: MalformedToken }`, and an `attStmt` without `receipt` passes this check",
         "`authData` shorter than 55 bytes, or shorter than `55 + L`, returns `Rejected { cause: AuthDataTruncated }`, and a credential ID length `L` other than 32 returns `Rejected { cause: CredentialIdLengthInvalid }`",
         "A COSE key or extensions map after the credential ID that does not decode returns `Rejected { cause: MalformedToken }`, and the reader locates the extensions without reading the flags byte's extension-data bit",
-        "A chain that does not verify to the pinned Apple App Attestation Root CA with validity checked at the credential certificate's `notBefore`, or a `notBefore` later than the reader's time, returns `Rejected { cause: CertificateChainInvalid }`, and a test shows a recorded attestation still passes after its credential certificate's `notAfter`",
+        "A chain that does not verify to the pinned Apple App Attestation Root CA with validity checked at the credential certificate's `notBefore`, or a `notBefore` later than the reader's time plus 300 seconds, returns `Rejected { cause: CertificateChainInvalid }`; a `notBefore` 299 seconds ahead passes; and a test shows a recorded attestation still passes after its credential certificate's `notAfter`",
         "An App Attest entry whose credential certificate `notBefore` plus `device_attestation_max_age_secs` precedes the reader's time returns `Rejected { cause: Expired }`",
         "A credential certificate without extension `1.2.840.113635.100.8.2` returns `Rejected { cause: MalformedToken }`",
         "An extension nonce unequal to `SHA-256(authData || D)` returns `Rejected { cause: NonceMismatch }`, and tests show an attestation minted for one identifier fails for another and one minted for one context id fails for another",
@@ -11216,32 +11219,86 @@
         "An `rpIdHash` matching no `app_id` of `accepted_app_ids`, including an empty list, returns `Rejected { cause: AppIdNotAccepted }`",
         "A nonzero counter at `authData` bytes 33 to 36 returns `Rejected { cause: CounterNotZero }`",
         "An AAGUID of `appattestdevelop` returns `Rejected { cause: DevelopmentEnvironment }`, and an AAGUID other than it and `appattest` followed by seven zero bytes returns `Rejected { cause: MalformedToken }`",
-        "For an App ID whose platform is `MacOs`, a credential certificate without extension `1.2.840.113635.100.8.6`, or whose octet string is not the 66 bytes base64 `MEAMAjExMDowCQwCb2uhAwEB/zAJDAJvYaEDAQH/MAsMBG9kZWyhAwEB/zAVDARvc2duoAYMBHJzZWMwBaYDAgEB` encodes, returns `Rejected { cause: AclBlobMismatch }`; for an `Ios` App ID the extension is not read",
-        "An `apple_validation_category_01` value that is not a 4-byte byte string returns `Rejected { cause: MalformedToken }`; a value of 0, 7, 8 or 9, or one absent from `accepted_validation_categories`, returns `Rejected { cause: ValidationCategoryNotAccepted }`; an absent key passes",
+        "A credential certificate without extension `1.2.840.113635.100.8.7`, or whose `[1026]` element is absent or names a system other than `macosx` or `iphoneos`, returns `Rejected { cause: PlatformUnreported }`, and an App ID whose `platform` differs from the reported system returns `Rejected { cause: PlatformMismatch }`",
+        "When the certificate reports `macosx`, a credential certificate without extension `1.2.840.113635.100.8.6`, or whose `SEQUENCE { [3] EXPLICIT OCTET STRING }` does not hold the 66 bytes base64 `MEAMAjExMDowCQwCb2uhAwEB/zAJDAJvYaEDAQH/MAsMBG9kZWyhAwEB/zAVDARvc2duoAYMBHJzZWMwBaYDAgEB` encodes, returns `Rejected { cause: AclBlobMismatch }`; when it reports `iphoneos` the extension is not read; and a test shows a Mac attestation matched against an App ID labelled `Ios` returns `PlatformMismatch` and never skips the `aclBlob` check",
+        "An `apple_validation_category_01` value that is not a 4-byte byte string returns `Rejected { cause: MalformedToken }`; a value of 0, 7, 8 or 9, or one the context does not accept, returns `Rejected { cause: ValidationCategoryNotAccepted }`, and an empty `accepted_validation_categories` accepts 4 alone; an absent key returns `ValidationCategoryNotAccepted` on macOS and on iOS when `require_validation_category` is true, and passes on iOS when it is false",
         "An `apple_bundle_version_01` value that is not a text string returns `Rejected { cause: MalformedToken }`; when the App ID's `accepted_bundle_versions` is not empty, a value outside it or an absent key returns `Rejected { cause: BundleVersionNotAccepted }`",
         "A Play Integrity entry under a policy with no `play_integrity_verifier` returns `Unverifiable { cause: NoVerifierNamed }`",
-        "A Play Integrity verdict field of 112 zero bytes returns `Unverifiable { cause: VerdictAbsent }`, and a verdict field of any length other than 112 bytes, or with `checked_at` before `token_issued_at`, returns `Rejected { cause: MalformedEntry }`",
+        "A Play Integrity verdict field of 176 zero bytes returns `Unverifiable { cause: VerdictAbsent }`, and a verdict field of any length other than 176 bytes, or with `token_issued_at` later than `checked_at`, returns `Rejected { cause: MalformedEntry }`",
         "A verdict whose `verifier` differs from `play_integrity_verifier` returns `Unverifiable { cause: VerdictFromUnnamedVerifier }`",
-        "A verdict whose `token_issued_at` or `checked_at` plus `device_attestation_max_age_secs` precedes the reader's time returns `Rejected { cause: Expired }`",
+        "A verdict whose `checked_at` exceeds the reader's time plus 300 seconds returns `Rejected { cause: NotYetValid }`, and one whose `token_issued_at` plus `device_attestation_max_age_secs` precedes the reader's time returns `Rejected { cause: Expired }`",
+        "A verdict whose `package_hash` and `cert_digest` match no `AcceptedAndroidPackage` (SHA-256 of `package_name`, and `signing_cert_sha256`), including under an empty list, returns `Rejected { cause: PackageNotAccepted }`",
         "A verifier whose key-state verdict is neither `Confirmed` nor `Adopted` returns `Unverifiable { cause: VerifierKeyStateUnresolved }`",
         "The verdict preimage's `subject` is the identifier being read: a test in which the reader's own identifier differs from the subject shows a valid verdict passes",
-        "A verdict signature that fails against the verifier's Current `Active` key over the `SCP-PLAY-INTEGRITY-VERDICT-V1:` preimage returns `Rejected { cause: VerdictSignatureInvalid }`, and a test shows a verdict signed by the verifier's previous `#active` key fails after rotation",
-        "When at least one kept entry passes, the reader returns `Verified { attestations }` with one `VerifiedDeviceAttestation { platform, entry_id, credential, minted_at }` per passing entry, where `credential` is the App Attest key ID or `SHA-256(token)` and `minted_at` is the credential certificate's `notBefore` or `token_issued_at`; when none passes, it returns the outcome of the first kept entry",
-        "The reader caches a `Rejected` outcome, keyed on the entry bytes and `D`, only for `MalformedEntry`, `MalformedToken`, `AuthDataTruncated`, `CredentialIdLengthInvalid`, `NonceMismatch`, `KeyIdMismatch`, `CounterNotZero`, `DevelopmentEnvironment` and `AclBlobMismatch`, and a test shows an `Expired`, a `VerdictSignatureInvalid` and an `Unverifiable` outcome are each re-evaluated on the next read",
-        "The `DeviceAttestation` signal value `evaluate_sybil_resistance` reads is the number of distinct `credential` values among the `Verified` attestations; a `RequiredSignal` for that category counts only attestations whose `minted_at` lies within its `max_age_secs` and passes when the count is at least its `min_strength`",
+        "A verdict signature that fails against the verifier's Current `Active` key over the 238-byte `SCP-PLAY-INTEGRITY-VERDICT-V1:` preimage, which carries `package_hash` and `cert_digest`, returns `Rejected { cause: VerdictSignatureInvalid }`, and a test shows a verdict signed by the verifier's previous `#active` key fails after rotation",
+        "When the one matching entry passes, the reader returns `Verified { attestation }` with `VerifiedDeviceAttestation { platform, entry_id, credential, minted_at }`, where `credential` is the App Attest key ID or `SHA-256(token)` and `minted_at` is the credential certificate's `notBefore` or `token_issued_at`",
+        "The reader keys a cached outcome on the service record's `sequence`, the SHA-256 over the canonical encoding of the policy's device-attestation fields, and for Play Integrity the verifier's key-state head, and drops it when any changes; a cached `Verified` lapses at `minted_at` plus the maximum age; `NotYetValid`, `CertificateChainInvalid` and every `Unverifiable` outcome are never cached; tests show a challenge change, a new record sequence and a verifier rotation each force a fresh read",
+        "The `DeviceAttestation` signal `evaluate_sybil_resistance` reads has strength 1 on `Verified` and 0 otherwise, with `TrustSignal.verified_at` set to the verified `minted_at`; a `RequiredSignal` for that category passes when the strength is 1 and the reader's time minus `verified_at` is at most its `max_age_secs`",
         "`evaluate_sybil_resistance` admits a context with `require_device_attestation` only on `Verified`, and a test shows `Absent`, `Rejected` and `Unverifiable` each fail the gate",
         "No reader path contacts Apple, Google or the named verifier: the module has no network dependency, which `cargo tree -p scp-protocol` shows"
       ],
       "actionItems": [
-        "Add `device_attestation.rs` with `DeviceAttestationVerdict`, `VerifiedDeviceAttestation`, `DeviceAttestationPlatform`, `DeviceAttestationRejection` (seventeen values) and `DeviceAttestationUnverifiable` (five values), and declare it in `trust/mod.rs`.",
-        "Add the five `ContextSybilPolicy` fields, `AcceptedAppId`, `ApplePlatform`, and the `MAX_DEVICE_ATTESTATIONS_PER_CHALLENGE` constant, and make every preset draw the challenge from a CSPRNG.",
-        "Implement the binding and assertion digests, the entry parser, the App Attest checks with the pinned root certificate, and the Play Integrity verdict checks.",
-        "Replace the map-key test in `evaluate_sybil_resistance` with the count of distinct verified credentials within `max_age_secs`.",
+        "Add `device_attestation.rs` with `DeviceAttestationVerdict`, `VerifiedDeviceAttestation`, `DeviceAttestationPlatform`, `DeviceAttestationRejection` (twenty-one values) and `DeviceAttestationUnverifiable` (five values), and declare it in `trust/mod.rs`.",
+        "Add the seven `ContextSybilPolicy` fields, `AcceptedAppId`, `ApplePlatform`, `AcceptedAndroidPackage`, and the `MAX_DEVICE_ATTESTATIONS_PER_CHALLENGE` constant (1), with the defaults and bounds of §9.3.1 and the preset values it states.",
+        "Implement the tag, binding and assertion digests, the tag-matching entry parser, the App Attest checks with the pinned root certificate and the reported-OS gate, and the Play Integrity verdict checks.",
+        "Replace the map-key test in `evaluate_sybil_resistance` with the 0-or-1 signal whose `verified_at` is the verified `minted_at`.",
         "Write one test per outcome, using a recorded production App Attest object and a signed test verdict."
       ],
       "blockedBy": [
         "SCP-006",
         "SCP-310"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.3.1 Reading a device attestation"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "## ADR-025: Apple Platform Adapter"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-027: Android Platform Adapter"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-317",
+      "title": "Implement the owner-side device-attestation producer that publishes, renews and deletes ScpDeviceAttestation entries",
+      "gate": "gate-kel",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-identity/src/device_attestation.rs",
+        "crates/scp-identity/src/lib.rs",
+        "crates/scp-ffi/uniffi/src/lib.rs",
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/napi/src/identity.rs"
+      ],
+      "description": "Implement the producer `09-security-model.md` §9.3.1 \"What the owner's SDK does\" defines, in the Rust core's `scp-identity` crate, beside `DhtDidMethod::attach_device_attestation`, and exposed through every bridge. For each context whose `ContextSybilPolicy` weights the device-attestation signal, the producer computes `D` and the tag `T`, calls the platform adapter's `attest` with `D` as `challenge` (the adapter hashes no identifier), strips `receipt` from an App Attest object, requests a Play Integrity verdict by invoking the named verifier's `play-integrity-verdict` outlet under the owner's own identity, and publishes the context's one entry in a service-record write that replaces any earlier entry for that context. It re-attests before `minted_at` plus `device_attestation_max_age_secs` and when its own Play Integrity entry reads `Rejected{VerdictSignatureInvalid}`, deletes the entry when the owner leaves the context, publishes nothing when a new entry would exceed `MAX_SERVICE_RECORD_ENTRIES` or the service-record frame's 262,111-byte value limit, and refuses a context whose challenge equals another held context's challenge with `SCP-ATTEST-9019`. The verifier service itself is out of scope; tests use a test verifier that registers the outlet. The platform-side mint stays with SCP-095 and SCP-111, and the reader with SCP-316.",
+      "acceptanceCriteria": [
+        "The producer computes `D` and `A` in Rust and passes them to `DeviceAttestationProvider.attest` as `challenge` and to `assert_request` as `request_hash`, and a test with a recording adapter shows the adapter receives `D` byte for byte",
+        "An App Attest entry is `app-attest.<T>.<attestation object>` with `attStmt.receipt` removed, and a Play Integrity entry is `play-integrity.<T>.<token>.<verdict>` with the 176-byte verdict",
+        "The producer invokes the verifier's `play-integrity-verdict` outlet under the owner's own identity with the subject identifier, context id, challenge and token, and assembles the verdict from the outlet's output; a test verifier that refuses a subject other than the authenticated caller shows the producer never requests a verdict for another identity",
+        "Publishing a new entry for a context replaces its earlier entry in one service-record write, and a test shows no published record carries two entries with one `T`",
+        "The producer re-attests before `minted_at` plus `device_attestation_max_age_secs`, using saturating addition, and requests a new token and verdict when its own Play Integrity entry reads `Rejected{VerdictSignatureInvalid}`",
+        "Leaving a context deletes that context's entry in the next service-record write",
+        "When a new entry would exceed `MAX_SERVICE_RECORD_ENTRIES` or a 262,111-byte service-record frame value, the producer publishes nothing, removes no other entry, and the context's reader returns `Absent`",
+        "Attesting for a context whose challenge equals another held context's challenge returns `ScpError::Validation` with code `SCP-ATTEST-9019` and publishes nothing",
+        "An adapter failure publishes no entry, and a test shows the context's reader returns `Absent`",
+        "The UniFFI, PyO3 and NAPI bridges each expose the producer, and a bridge test drives it end to end with the test verifier"
+      ],
+      "actionItems": [
+        "Add the producer to the Rust core with the tag, binding and assertion digests shared with SCP-316.",
+        "Wire the outlet invocation to the verifier, the service-record write, and the leave-context hook.",
+        "Expose the producer through the three bridges and register `SCP-ATTEST-9019`.",
+        "Write the tests above against a recording adapter and a test verifier."
+      ],
+      "blockedBy": [
+        "SCP-316"
       ],
       "sources": [
         {
