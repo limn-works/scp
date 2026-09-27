@@ -777,19 +777,55 @@ impl<S: Storage> Identity<S> {
 }
 ```
 
-**The write API is one method per consequential act on the identity handle, and each returns the `PublishOutcome` of the publish cycle that carries the event it signed.** `Identity::create` signs and publishes the inception event and returns the handle beside that outcome. `rotate_active` signs a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` signs a `KeyState` that names the witness set and its witnessing interval. A compromised root member leaves the root set under `recovery().begin(RecoveryKind::RootRecovery(..), ..)`, because a `KeyState` drops no root member (`09-security-model.md` §9.7.4.2 R3). `09-security-model.md` §9.7.4.2 R10 declares the reveal-authorized acts: `Recovery::begin` composes a `PendingEvent`, each root or next-set holder returns its `IndexedSignature` through `Recovery::cosign`, and `Recovery::attach` completes the ceremony.
+**The write API is one method per consequential act on the identity handle, and every event that needs a root threshold is composed as a `PendingEvent` and completed by `attach`.** The composing method returns the unsigned event, whose preimage binds the signer index list and form list its `SignerPlan` names for each group the kind carries; a group the kind does not carry is empty, and an inception's one group is `installed_root`. **Each holder of a named member, the composer included, calls `Identity::cosign`**, which runs the display confirmation `09-security-model.md` §9.7.4.2 R10's device-boundary paragraph states and returns the `IndexedSignature` of the one member its custody holds. **`attach` verifies each signature against its group and index, refuses with `IdentityError::SignatureSetIncomplete` where a group falls short of the plan, publishes the signed event, and returns the cycle's `PublishOutcome`**; for a reveal-authorized event it runs R10's ceremony from the `Signed` write through the removal. The application carries a `PendingEvent` and each `IndexedSignature` between the holders' devices, and the protocol defines no transport for them. `Identity::create` composes the inception event and returns the handle beside it. `rotate_active` composes a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` composes a `KeyState` that names the witness set and its witnessing interval. `Recovery::begin` (R10) composes the reveal-authorized events, and a compromised root member leaves the root set under a `RootRecovery`, because a `KeyState` drops no root member (R3).
 
 ```rust
 impl<S: EncryptedStorage> Identity<S> {
-    pub fn create(config: IdentityConfig<S>)
-        -> impl Future<Output = Result<(Identity<S>, PublishOutcome), IdentityError>> + Send;
+    pub fn create(config: IdentityConfig<S>, signers: SignerPlan)
+        -> impl Future<Output = Result<(Identity<S>, PendingEvent), IdentityError>> + Send;
 
-    pub fn rotate_active(&self, reason: RotationReason)
-        -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
+    pub fn rotate_active(&self, reason: RotationReason, signers: SignerPlan)
+        -> impl Future<Output = Result<PendingEvent, IdentityError>> + Send;
 
-    pub fn set_witnesses(&self, witnesses: Vec<WitnessDesignation>, witnessing_interval: u32)
+    pub fn set_witnesses(
+        &self,
+        witnesses: Vec<WitnessDesignation>,
+        witnessing_interval: u32,
+        signers: SignerPlan,
+    ) -> impl Future<Output = Result<PendingEvent, IdentityError>> + Send;
+
+    /// Called by any holder of a named member, with that holder's own
+    /// custody, whether or not it holds this identity's handle.
+    pub fn cosign(custody: &KeyCustodySlot, pending: &PendingEvent)
+        -> Result<IndexedSignature, IdentityError>;
+
+    pub fn attach(&self, pending: PendingEvent, signatures: Vec<IndexedSignature>)
         -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
 }
+
+/// The members that sign one group, each by root-set or next-set index and
+/// by signature form (`09-security-model.md` §9.7.4.2 definitions).
+pub struct GroupSigners { pub members: Vec<(u8, SignatureForm)> }
+
+/// The signer index list and form list of each group the preimage binds.
+pub struct SignerPlan {
+    pub reveal: GroupSigners,
+    pub installed_root: GroupSigners,
+    pub standing_root: GroupSigners,
+}
+
+pub enum SignatureGroup { Reveal, InstalledRoot, StandingRoot }
+
+/// A composed event awaiting its signatures.
+pub struct PendingEvent {
+    pub identifier: [u8; 32],
+    pub preimage: Vec<u8>,
+    pub event_digest: [u8; 32],
+}
+
+/// One member's indexed signature over a pending event, in the layout its
+/// form fixes.
+pub struct IndexedSignature { pub group: SignatureGroup, pub index: u8, pub signature: Vec<u8> }
 
 /// One designated witness: the operator identifier its community-relay-list
 /// entry declares (`09-security-model.md` §9.7.4.2 definitions).
@@ -930,8 +966,8 @@ pub enum IdentityError {
     /// SCP-IDENT-1111. The custody backend returned an error while the SDK
     /// signed a key event (`09-security-model.md` §9.7.4.2 R10).
     CustodySigningFailed,
-    /// SCP-IDENT-1112. `Recovery::attach` received signatures that fall short
-    /// of a group its `SignerPlan` names (`09-security-model.md` §9.7.4.2 R10).
+    /// SCP-IDENT-1112. `Identity::attach` received signatures that fall short
+    /// of a group the event's `SignerPlan` names (§3.10.10).
     SignatureSetIncomplete,
 }
 
