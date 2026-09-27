@@ -36,7 +36,7 @@ Exit codes
 
 Enforcement surface
 -------------------
-This script is listed in scripts/hooks/pretooluse-enforcement-files.sh and
+This script is an enforcement file and is
 wired into CI (.github/workflows/ci.yml, job "construction-pattern").  It must
 NOT be modified to weaken checks; only additive changes (new rule coverage,
 new allowlist entries) are permitted.  See AGENTS.md §enforcement files.

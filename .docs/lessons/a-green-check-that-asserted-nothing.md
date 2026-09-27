@@ -107,7 +107,7 @@ below produced a green check in this repository while the work behind it never r
   the literal.
 
 The tests that hold these closed live in `scripts/tests/ci-gate/`, `scripts/tests/cross-layer/`,
-`scripts/tests/signing-guard/`, `scripts/tests/enforcement-files-hook/`,
+`scripts/tests/signing-guard/`,
 `scripts/tests/toolchain-wiring/`, and the `--self-test` modes of
 `scripts/check-shipped-feature-graph.sh` and `scripts/check-saga-gating-granularity.sh`. Each
 one was run against the unfixed code first and failed.

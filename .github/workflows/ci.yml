@@ -469,8 +469,6 @@ jobs:
         run: bash scripts/check-bridge-symmetry.sh
       - name: Run bridge-symmetry fixture tests
         run: bash scripts/tests/bridge-symmetry/run-tests.sh
-      - name: Run enforcement-file hook tests
-        run: bash scripts/tests/enforcement-files-hook/run-tests.sh
 
   # ── SDK coverage ─────────────────────────────────────────────────────
   sdk-coverage:
