@@ -601,6 +601,9 @@ Implement the MCP adapter as the `scp-mcp` crate (Rust) with a Python interface 
    - POST endpoint accepts client-to-server JSON-RPC requests.
    - Handles connection lifecycle, reconnection, keep-alive.
    - Suitable for web-based MCP clients and remote integrations.
+   - Every request to the SSE and POST endpoints presents a bearer token in an `Authorization: Bearer <token>` header, and the server answers any other request with HTTP 401. The transport has no unauthenticated mode, because any process that reaches the bound address could otherwise read `scp://{ctx}/members` and call tools as the served agent. `SseConfig::new` fills the token with 256 bits from the operating system's random number generator.
+   - One SSE server serves one MCP session at a time, because one MCP server holds one handshake, one set of negotiated client capabilities, and one subscription registry. A new `GET /sse` that passes the bearer check ends the live session's stream and takes its place, because a peer that vanished without closing its connection would otherwise hold the session until the TCP retransmission timeout. The SSE endpoint names the session in the POST URL (`/message?sessionId=<id>`), and the server answers a POST that names any other session with HTTP 409.
+   - Reconnection starts a new session. When a stream ends, the server clears that session's handshake, client capabilities, and subscriptions before it admits the next client, and it ignores the `Last-Event-ID` header, because replaying buffered events would send one session's decrypted responses to the next client. A reconnecting client initializes, subscribes, and reads state again.
 
 6. **MCP client — consuming external tools:**
 
