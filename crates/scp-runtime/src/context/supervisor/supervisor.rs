@@ -10778,11 +10778,11 @@ impl Supervisor {
         context_id: &str,
     ) -> Option<scp_protocol::context::ContextState> {
         // An unreachable actor answers `Err` here. Every caller of this form
-        // reads `None` as "no live Active context": the FFI lifecycle gates
-        // refuse the operation, the standing get-or-create falls through to
-        // its create step, and the reconnect sweep skips the id. None of them
-        // skips an authorization check on `None`, so folding the error into
-        // it grants nothing.
+        // reads `None` as "no live Active context": the standing
+        // get-or-create falls through to its create step, and the reconnect
+        // sweep skips the id. Neither skips an authorization check on `None`,
+        // so folding the error into it grants nothing. The FFI bridges call
+        // `read_context_state_checked` instead.
         self.read_context_state_checked(context_id)
             .await
             .unwrap_or(None)
@@ -10833,8 +10833,9 @@ impl Supervisor {
             // No live actor. A poisoned context (ADR-049 §10) has been
             // despawned by the watchdog, so its state is no longer readable
             // from a mailbox — it lives in the sticky `crash_windows` poison
-            // flag. Report `Poisoned` so callers (FFI `read_context_state`,
-            // the eviction sweep's `Poisoned` arm) can observe a poisoned
+            // flag. Report `Poisoned` so callers (the FFI bridges'
+            // `read_live_context_state`, the eviction sweep's `Poisoned` arm)
+            // can observe a poisoned
             // context as poisoned rather than as "unknown" (`None`).
             // A context whose actor the watchdog despawned for a respawn it
             // has not finished, or whose last respawn failed below the poison

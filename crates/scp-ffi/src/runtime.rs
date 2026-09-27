@@ -1538,8 +1538,11 @@ pub const RECEIVE_BUFFER_CAPACITY: usize = 1000;
 /// ceiling-entry grammar (spec §5.3.1.1) and then discards the parsed values —
 /// `Supervisor::create_context` stores the ceiling that authorization reads.
 /// Validating at the FFI boundary rejects a malformed entry with a bridge-native
-/// message before the supervisor sees it. Pass an empty slice when the context
-/// takes the default ceiling.
+/// message before the supervisor sees it. The slice is the ceiling the caller
+/// declared: `context_create` passes an empty slice for a context whose
+/// declared ceiling grants nothing, and the default-ceiling case reaches this
+/// function as the resolved `default_ceiling()` entries, never as an empty
+/// slice.
 ///
 /// # Errors
 ///
@@ -1781,16 +1784,21 @@ pub fn live_context_state(
 /// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`, and
 /// withholds the lifecycle state from the refusal.
 ///
-/// Every UCAN entry point, every outlet entry point except
-/// `outlet_stream_open`, and the MCP provider's `validate_capability` gate
-/// through this form (the runtime refuses a non-`Active` context when
-/// `outlet_stream_open` opens the stream, with the state-free
-/// `SCP-OUTLET-6101`), because each one runs the
-/// gate before it authorizes the caller. The outlet PRD's SCP-OUT-031 PR-2a
-/// note records the rule this form keeps: the raw lifecycle state never
-/// reaches an FFI caller before authorization. The refusal therefore reads the
-/// same for every non-`Active` state and for a context no actor serves. The
-/// NAPI and `UniFFI` bridges gate the same entry points through their own
+/// Every UCAN entry point, every outlet entry point that authorizes a caller
+/// against the context except `outlet_stream_open`, and the MCP provider's
+/// `validate_capability` gate through this form, because each one runs the
+/// gate before it authorizes the caller. The runtime refuses a non-`Active`
+/// context when `outlet_stream_open` opens the stream, with the state-free
+/// `SCP-OUTLET-6101`. The outlet entry points that authorize nothing against
+/// the context carry no gate: `outlet_session_close`, `outlet_interface_revoke`,
+/// and the calls that act on a stream `outlet_stream_open` already opened. The
+/// outlet PRD's SCP-OUT-031 PR-2a note records the rule this form keeps: the
+/// raw lifecycle state never reaches an FFI caller before authorization. The
+/// refusal therefore reads the same for every non-`Active` state, for a
+/// context no actor serves, and for a state read that failed: a context
+/// mid-respawn or past a failed respawn (`ActorCrashed`), and an actor that did
+/// not answer (`ActorBusy`), refuse with the same text and the caller's code.
+/// The NAPI and `UniFFI` bridges gate the same entry points through their own
 /// `require_active_context_before_authz`, so the three bridges answer one
 /// lifecycle question one way.
 ///
@@ -1800,8 +1808,8 @@ pub fn live_context_state(
 /// # Errors
 ///
 /// Returns whatever `mk_err` builds when the supervisor reports any state other
-/// than `Active` and when no actor serves `context_id`, and every error
-/// [`read_live_context_state`] returns when the supervisor query itself fails.
+/// than `Active`, when no actor serves `context_id`, and when the state read
+/// fails.
 pub fn require_active_context_before_authz<F>(
     bi: &PyBridgeInstance,
     context_id: &str,
@@ -1811,9 +1819,9 @@ pub fn require_active_context_before_authz<F>(
 where
     F: FnOnce(String) -> ScpPyError,
 {
-    match read_live_context_state(bi, context_id)? {
-        Some(scp_core::context::ContextState::Active) => Ok(()),
-        Some(_) | None => Err(mk_err(format!(
+    match read_live_context_state(bi, context_id) {
+        Ok(Some(scp_core::context::ContextState::Active)) => Ok(()),
+        Ok(Some(_) | None) | Err(_) => Err(mk_err(format!(
             "cannot {verb}: {}",
             scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
         ))),
@@ -3040,10 +3048,73 @@ mod tests {
         remove_context(bi, &ctx_id);
     }
 
-    /// When no user ceiling is provided (empty slice), the default ceiling
-    /// should be used with proper UCAN underscore format.
+    /// The pre-authorization gate refuses a crashed context and an actor that
+    /// did not answer with the withheld text and the caller's code, the same
+    /// refusal a context no actor serves gets.
+    ///
+    /// `read_live_context_state` reports a context mid-respawn or past a failed
+    /// respawn as `ActorCrashed` (`SCP-CTX-2135`) and an unreachable mailbox as
+    /// `ActorBusy`. A gate that passed those errors through told a caller it
+    /// had not yet authorized that the context exists and crashed, which the
+    /// outlet PRD's SCP-OUT-031 PR-2a note forbids.
     #[test]
-    fn empty_user_ceiling_uses_default_in_ucan_format() {
+    #[cfg(feature = "testing")]
+    fn pre_authz_gate_withholds_crashed_and_busy_states() {
+        crate::init_runtime().ok();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
+        let creator = "did:dht:z6MkGateCrashed";
+        let sup = Arc::clone(supervisor(bi).expect("supervisor"));
+        let rt = crate::runtime().expect("tokio runtime");
+
+        for fault in ["mid_respawn", "respawn_failed", "unreachable"] {
+            let ctx_id = unique_ctx_id(&format!("gate-{fault}"));
+            create_supervisor_context_for_test(bi, &ctx_id, creator, &[]);
+            match fault {
+                "mid_respawn" => rt.block_on(sup.test_hold_context_mid_respawn(&ctx_id)),
+                "respawn_failed" => rt.block_on(sup.test_fail_context_respawn(&ctx_id)),
+                _ => sup.test_make_actor_unreachable(&ctx_id),
+            }
+            assert!(
+                read_live_context_state(bi, &ctx_id).is_err(),
+                "the fixture must make the checked state read fail ({fault})"
+            );
+
+            let err = require_active_context_before_authz(
+                bi,
+                &ctx_id,
+                "validate a UCAN in context",
+                |message| ScpPyError::ContextError {
+                    message,
+                    code: scp_ffi_common::error_codes::CTX_2023.to_owned(),
+                },
+            )
+            .expect_err("the gate must refuse a context whose state read failed");
+            let text = err.to_string();
+            assert!(
+                text.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                    && text.contains(scp_ffi_common::error_codes::CTX_2023),
+                "the refusal must carry the withheld text and the caller's code ({fault}): {text}"
+            );
+            assert!(
+                !text.contains(scp_ffi_common::error_codes::CTX_2135) && !text.contains(&ctx_id),
+                "the refusal must not disclose the crash or echo the id ({fault}): {text}"
+            );
+        }
+    }
+
+    /// The supervisor reports `default_ceiling()` in UCAN underscore format.
+    ///
+    /// The fixture `create_supervisor_context_for_test` maps an empty slice to
+    /// `default_ceiling()` itself, so this test covers the format of the
+    /// ceiling the supervisor reports, not which ceiling production picks.
+    /// Production picks in `PyContextParams::from_py_dict`: an absent
+    /// `ceiling` key gets the default and `ceiling=[]` grants nothing, which
+    /// `absent_ceiling_gets_the_documented_default` and
+    /// `empty_ceiling_list_stays_empty` in `context.rs` cover.
+    #[test]
+    fn default_ceiling_reads_in_ucan_format() {
         crate::init_runtime().ok();
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;

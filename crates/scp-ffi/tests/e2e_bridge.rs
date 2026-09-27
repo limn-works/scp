@@ -3636,5 +3636,10 @@ fn ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling() {
             message.contains("ceiling"),
             "the refusal must be the ceiling check: {message}"
         );
+
+        // The capability the supervisor's ceiling holds still mints, so the
+        // refusal above is the ceiling check and not a broken fixture.
+        scp.ucan_mint(&ctx_id, &audience, vec!["messages:read".to_owned()], None)
+            .expect("a mint inside the supervisor's ceiling must succeed");
     });
 }

@@ -230,13 +230,13 @@ impl PyCapabilityValidation {
 /// `Active`.
 ///
 /// `PyScp::context_close` releases the context's `FfiBridgeState`, and with it
-/// the revocation list and the nonce tracker, once the supervisor reports a
-/// terminal state or no actor. The NAPI and `UniFFI` twins rebuild that state
-/// empty on their next UCAN call, so their gates are what keep a revoked token
-/// refused; this bridge gates the same five entry points with the same code so
-/// the three bridges answer one lifecycle question one way. The refusal
-/// withholds the lifecycle state, because the gate runs before the caller is
-/// authorized.
+/// the revocation list and the nonce tracker. No bridge rebuilds a released
+/// state: this bridge reads it through `runtime::with_context`, which fails on
+/// an absent entry, and the NAPI and `UniFFI` twins refuse to rebuild an id
+/// their close released. This bridge gates the same five entry points with the
+/// same code as the twins, so the three bridges answer one lifecycle question
+/// one way. The refusal withholds the lifecycle state, because the gate runs
+/// before the caller is authorized.
 fn require_active_ucan_context(
     bi: &crate::runtime::PyBridgeInstance,
     context_id: &str,

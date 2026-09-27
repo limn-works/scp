@@ -267,9 +267,9 @@ pub(crate) async fn ucan_validate_on(
 
     // The supervisor must report `Active` before this bridge touches the
     // context's revocation list or nonce tracker. `context_close_on` releases
-    // those once the supervisor reports a terminal state or no actor, and
-    // `ensure_registered` rebuilds them empty, so a validation this gate
-    // admitted after a close would accept a revoked token or a replayed nonce.
+    // those, and `ensure_registered` below refuses to rebuild a released id,
+    // so a close that lands after this gate leaves the call no state to read
+    // and the call fails closed.
     crate::runtime::require_active_context_before_authz(
         bi,
         &handle.context_id(),
@@ -405,9 +405,9 @@ pub(crate) async fn ucan_evaluate_on(
 
     // The supervisor must report `Active` before this bridge touches the
     // context's revocation list or nonce tracker. `context_close_on` releases
-    // those once the supervisor reports a terminal state or no actor, and
-    // `ensure_registered` rebuilds them empty, so a validation this gate
-    // admitted after a close would accept a revoked token or a replayed nonce.
+    // those, and `ensure_registered` below refuses to rebuild a released id,
+    // so a close that lands after this gate leaves the call no state to read
+    // and the call fails closed.
     crate::runtime::require_active_context_before_authz(
         bi,
         &handle.context_id(),
@@ -762,10 +762,10 @@ pub(crate) async fn ucan_revoke_on(
     validate_did(&revoker_did).map_err(ScpNapiError::from)?;
 
     // The supervisor must report `Active` before this bridge records a
-    // revocation. `context_close_on` releases the revocation list once the
-    // supervisor reports a terminal state or no actor, and `ensure_registered`
-    // rebuilds it empty, so a revocation this gate admitted after a close would
-    // land in a list no validation reads and still report success.
+    // revocation. `context_close_on` releases the revocation list, and
+    // `ensure_registered` below refuses to rebuild a released id, so a
+    // revocation that a close overtakes after this gate fails and never lands
+    // in a list no validation reads.
     crate::runtime::require_active_context_before_authz(
         bi,
         &handle.context_id(),
@@ -1343,11 +1343,16 @@ mod tests {
         /// The creator's close takes the supervisor to `Closing` and releases
         /// this bridge's `UcanContextState`; `contextFinalizeClose` then takes
         /// it to `Closed`, and the actor stays resident and still answers the
-        /// role-state read. `ensure_registered` rebuilds a released state with
-        /// an empty revocation list, so a validation that reached it would
-        /// accept the revoked token. Every UCAN entry point refuses at
-        /// `require_active_context_before_authz` first, so the validation below
-        /// must fail at that gate and never report the token valid.
+        /// role-state read. A rebuilt state would hold an empty revocation
+        /// list, so a validation that reached one would accept the revoked
+        /// token. The validation below must fail at
+        /// `require_active_context_before_authz`. An entry point that passed
+        /// that gate before the close released the state reaches
+        /// `ensure_registered` next, so the test also calls
+        /// `ensure_registered` directly after the close: it must refuse and
+        /// leave no rebuilt state in the registry. Only `readmit_context`,
+        /// which the import, restore, and Welcome-join paths call, lifts the
+        /// refusal.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn revoked_token_stays_refused_after_a_close_released_the_revocation_list() {
             let scp = crate::scp::Scp::new_in_memory_for_test();
@@ -1415,8 +1420,8 @@ mod tests {
             );
             assert!(
                 runtime::live_role_state(&bi, &context_id).await.is_ok(),
-                "the closed actor still answers the role-state read, so only the \
-                 lifecycle gate stands between the validation and the rebuilt state"
+                "the closed actor still answers the role-state read, so the role-state \
+                 read cannot be what refuses the validation below"
             );
 
             let err = ucan_validate_on(
@@ -1438,6 +1443,38 @@ mod tests {
                 !message.to_lowercase().contains("closed"),
                 "the refusal must withhold the lifecycle state, got: {message}"
             );
+
+            // The step a validation takes after its gate passed: a close that
+            // released the state in between must leave it nothing to read.
+            let err = runtime::ensure_registered(&bi, &handle)
+                .expect_err("ensure_registered must not rebuild a released context's state");
+            assert!(
+                format!("{err}").contains("SCP-CTX-2023"),
+                "the refusal must carry SCP-CTX-2023, got: {err}"
+            );
+            assert!(
+                !runtime::ucan_registry(&bi).contains_key(&context_id),
+                "a refused rebuild must leave no state in the registry"
+            );
+
+            // The ungated session close finds no session and builds no state.
+            let err =
+                crate::outlets::outlet_session_close_on(&bi, &handle, "no-such-session".to_owned())
+                    .await
+                    .expect_err("a released context holds no session");
+            assert!(
+                err.to_string().contains(codes::OUTLET_6021),
+                "the session close must report session-not-found, got: {err}"
+            );
+            assert!(
+                !runtime::ucan_registry(&bi).contains_key(&context_id),
+                "a session close must not rebuild a released context's state"
+            );
+
+            runtime::readmit_context(&bi, &context_id);
+            runtime::ensure_registered(&bi, &handle)
+                .expect("a readmitted context builds fresh state again");
+            assert!(runtime::ucan_registry(&bi).contains_key(&context_id));
         }
 
         /// `ucan_revoke_on` rejects a revoker that is neither the token's issuer

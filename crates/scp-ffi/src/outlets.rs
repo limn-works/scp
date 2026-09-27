@@ -199,9 +199,10 @@ impl PySagaResult {
 ///
 /// The NAPI and `UniFFI` twins of each entry point gate on the same live read
 /// with the same code, so the three bridges refuse a `Closing`, `Expired`,
-/// `MigratingOut`, `Tombstoned`, or `Poisoned` context, and a context no actor
-/// serves, one way. The refusal withholds the lifecycle state, because the
-/// gate runs before the caller is authorized.
+/// `MigratingOut`, `Tombstoned`, or `Poisoned` context, a context no actor
+/// serves, and a context whose state read failed, one way. The refusal
+/// withholds the lifecycle state, because the gate runs before the caller is
+/// authorized.
 fn require_active_outlet_context(
     bi: &PyBridgeInstance,
     context_id: &str,
@@ -1027,9 +1028,10 @@ fn outlet_invoke_cross_context_impl(
     // (`outlet_invoke_cross_context_saga_impl`) and the streaming sibling
     // (`outlet_streaming_saga_open_impl`) gate on these same two reads with the
     // same two codes, and both twin bridges gate this unary entry point too:
-    // NAPI's `outlet_invoke_cross_context_on` calls `require_active_context` on
-    // each axis, and UniFFI's `outlet_invoke_cross_context` calls the UniFFI
-    // equivalent. This entry point carried no lifecycle gate at all, so a
+    // NAPI's `outlet_invoke_cross_context_on` calls
+    // `require_active_context_before_authz` on each axis, and UniFFI's
+    // `outlet_invoke_cross_context` calls
+    // `UniffiBridgeInstance::require_active_context_before_authz`. This entry point carried no lifecycle gate at all, so a
     // Closing, Expired, or MigratingOut context refused every sibling call and
     // admitted this one. A missing actor (`None`) counts as non-active, so the
     // gate fails closed. Both gates run before the caller is authorized, so

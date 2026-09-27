@@ -1681,9 +1681,10 @@ pub(crate) async fn context_close_on(
     identity_did: String,
 ) -> napi::Result<()> {
     crate::napi_check_handle!(&bi.core, handle);
-    // Authorization is enforced by the ContextManager (which delegates to
-    // ttl::close_context checking the ContextClose capability). No bridge-layer
-    // auth check — the ContextManager is authoritative.
+    // The bridge runs no capability check of its own. On the `Active` path the
+    // supervisor's `CloseContext` dispatch below runs `ttl::close_context`,
+    // which checks the `ContextClose` capability; the terminal skip runs no
+    // capability check (see below).
 
     // Read the supervisor, not the handle's cached string. A close is the one
     // lifecycle operation that stays valid after the supervisor took the
@@ -1701,25 +1702,27 @@ pub(crate) async fn context_close_on(
     // of the handle can therefore release this bridge's `UcanContextState`
     // once the supervisor reports no actor, `Closed`, `Expired`, or
     // `Tombstoned`, including a holder who first calls `contextFinalizeClose`
-    // to take a `Closing` context to `Closed`. That release admits nothing
-    // afterward: no terminal state returns to `Active`, and every UCAN and
-    // outlet entry point refuses a non-`Active` context. The UCAN entry points
-    // and every outlet entry point except `outlet_stream_open_on` refuse
-    // through `crate::runtime::require_active_context_before_authz` before
-    // `ensure_registered` can rebuild the released revocation list and nonce
-    // tracker empty; `outlet_stream_open_on` validates its UCAN first and the
-    // runtime then refuses to open the stream.
+    // to take a `Closing` context to `Closed`. The release marks the id, and
+    // `crate::runtime::ensure_registered` refuses to rebuild a marked id's
+    // revocation list and nonce tracker, so no entry point runs against an
+    // empty rebuild while the supervisor keeps the context out of service.
+    // `import_context` can return the id to `Active`: it replaces an actor in
+    // `Closing`, `Closed`, `Expired`, or `Tombstoned`, and it imports fresh
+    // when no actor serves the id. The import clears the mark, and this bridge
+    // then builds an empty revocation list and a fresh nonce tracker for the
+    // id. This bridge keeps revocations in process memory, so a revocation
+    // recorded before the close does not survive that re-import, just as it
+    // does not survive a process restart.
     //
     // The non-terminal states refuse whoever calls. `Poisoned` (the crash
     // watchdog despawned the actor and keeps the sticky poison flag, ADR-049
-    // §10) and `MigratingOut` can both return to `Active`:
+    // §10) and `MigratingOut` can both return to `Active` without an import:
     // `SupervisorHandle::clear_poison` respawns the actor from its snapshot,
-    // and a cancelled migration reopens the context. A revocation list
-    // released before either return would come back empty through
-    // `ensure_registered`, so a token revoked before the poison or the
-    // migration would validate again. `Closing` never returns to `Active`; its
-    // refusal orders the release after `contextFinalizeClose` and tells the
-    // caller which call comes next.
+    // and a cancelled migration reopens the context. A release before either
+    // return would leave the recovered `Active` context with no revocation
+    // list on this bridge. `Closing` refuses so the release follows
+    // `contextFinalizeClose`, and the refusal tells the caller which call
+    // comes next.
     let close_already_happened =
         match crate::runtime::read_live_context_state(bi, &handle.context_id)
             .await
@@ -1743,7 +1746,7 @@ pub(crate) async fn context_close_on(
             Some(scp_core::context::ContextState::Active) => false,
             // `Closing` names its own successor call, because "context must be
             // active" is unreachable from the closing window: the window ends
-            // at `Closed`, never back at `Active`.
+            // at `Closed`, and only an import returns the id to `Active`.
             Some(scp_core::context::ContextState::Closing) => {
                 return Err(ScpNapiError::Context {
                     message: "cannot close context in 'closing' state -- the context is inside \
@@ -1790,8 +1793,9 @@ pub(crate) async fn context_close_on(
     // mailbox wraps the delegated call in the 30s transport-timeout budget
     // and preserves byte-identical close semantics.
     // A close that already happened (see the supervisor read above) skips the
-    // dispatch: no actor serves the context, so the bridge only has to release
-    // its own state. `require_core_handle` sits inside the branch for the same
+    // dispatch: either no actor serves the context, or the resident actor
+    // reports `Closed`, `Expired`, or `Tombstoned`, so the bridge only has to
+    // release its own state. `require_core_handle` sits inside the branch for the same
     // reason — a despawned context needs no core handle to release bridge state,
     // and demanding one would restore the leak this branch exists to close.
     if !close_already_happened {
@@ -1823,8 +1827,9 @@ pub(crate) async fn context_close_on(
 
     handle.set_closed().map_err(NapiError::from)?;
 
-    // Clean up UCAN state for this context.
-    crate::runtime::remove_context(bi, &handle.context_id);
+    // Release UCAN state for this context, and mark the id so no later call
+    // rebuilds it empty.
+    crate::runtime::release_context(bi, &handle.context_id);
 
     // Clean up per-context bridge connector state and economy state via the
     // same NapiBridgeInstance's core (not the process-global bridge).
@@ -4624,7 +4629,7 @@ pub(crate) async fn context_restore_on(
     let (tx, rx) = tokio::sync::oneshot::channel();
     let cmd = LifecycleCommand::RestoreContext {
         payload: Box::new(RestoreContextPayload {
-            context_id,
+            context_id: context_id.clone(),
             params: scp_core::context::ContextParams::default(),
         }),
         reply: tx,
@@ -4647,7 +4652,9 @@ pub(crate) async fn context_restore_on(
                 message: format!("restore_context failed: {e}"),
                 code: codes::CTX_2064.to_owned(),
             })
-        })
+        })?;
+    crate::runtime::readmit_context(bi, &context_id);
+    Ok(())
 }
 
 /// Per-bridge-instance implementation of [`Scp::context_restore_all`](crate::scp::Scp::context_restore_all).
@@ -4667,6 +4674,9 @@ pub(crate) async fn context_restore_all_on(bi: &NapiBridgeInstance) -> napi::Res
             code: codes::CTX_2065.to_owned(),
         })
     })?;
+    for context_id in &restored {
+        crate::runtime::readmit_context(bi, context_id);
+    }
 
     serde_json::to_string(&restored).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
@@ -5078,6 +5088,9 @@ pub(crate) async fn context_import_on(
     sup.import_context(export, &verifying_key, Some(local_pseudonym))
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    // The supervisor serves the id again, so a release mark an earlier close
+    // left on this bridge instance no longer applies.
+    crate::runtime::readmit_context(bi, &context_id);
 
     // §9.10.4: emit a PseudonymAnnouncement so existing members learn this
     // importer's per-context routing ID. Encrypted contexts only — broadcast
@@ -6915,6 +6928,62 @@ mod tests {
             "active",
             "a refused close must not write the handle's cached string"
         );
+    }
+
+    /// The pre-authorization gate refuses a crashed context and an actor that
+    /// did not answer with the withheld text and the caller's code, the same
+    /// refusal a `Closed` context gets.
+    ///
+    /// `read_live_context_state` reports a context mid-respawn or past a failed
+    /// respawn as `ActorCrashed` (`SCP-CTX-2135`) and an unreachable mailbox as
+    /// `ActorBusy`. A gate that passed those errors through told a caller it
+    /// had not yet authorized that the context exists and crashed, which the
+    /// outlet PRD's SCP-OUT-031 PR-2a note forbids.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pre_authz_gate_withholds_crashed_and_busy_states() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let creator = "did:key:z6MkNapiGateCrashed";
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+
+        for fault in ["mid_respawn", "respawn_failed", "unreachable"] {
+            let ctx_id = format!("napi-gate-{fault}-{}", uuid::Uuid::new_v4());
+            crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator, &[]).await;
+            match fault {
+                "mid_respawn" => sup.test_hold_context_mid_respawn(&ctx_id).await,
+                "respawn_failed" => sup.test_fail_context_respawn(&ctx_id).await,
+                _ => sup.test_make_actor_unreachable(&ctx_id),
+            }
+            assert!(
+                crate::runtime::read_live_context_state(&bi, &ctx_id)
+                    .await
+                    .is_err(),
+                "the fixture must make the checked state read fail ({fault})"
+            );
+
+            let err = crate::runtime::require_active_context_before_authz(
+                &bi,
+                &ctx_id,
+                "invoke outlet in context",
+                |message| crate::error::ScpNapiError::Outlet {
+                    message,
+                    code: codes::OUTLET_6005.to_owned(),
+                },
+            )
+            .await
+            .expect_err("the gate must refuse a context whose state read failed");
+            let text = err.to_string();
+            assert!(
+                text.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                    && text.contains(codes::OUTLET_6005),
+                "the refusal must carry the withheld text and the caller's code ({fault}): {text}"
+            );
+            assert!(
+                !text.contains(codes::CTX_2135) && !text.contains(&ctx_id),
+                "the refusal must not disclose the crash or echo the id ({fault}): {text}"
+            );
+        }
     }
 
     /// A close refuses a context whose actor the crash watchdog is respawning,

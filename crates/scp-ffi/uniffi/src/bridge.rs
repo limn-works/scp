@@ -4950,10 +4950,9 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         let bi = self.upgrade_bi()?;
         // The supervisor must report `Active` before this provider touches the
         // context's revocation list or nonce tracker. `Scp::context_close`
-        // releases those once the supervisor reports a terminal state or no
-        // actor, and `ensure_ucan_registered` rebuilds them empty, so a
-        // validation this gate admitted after a close would accept a revoked
-        // token or a replayed nonce. The trait method is synchronous, so the
+        // releases those, and `ensure_ucan_registered` below builds nothing
+        // for a released id, so a close that lands after this gate leaves the
+        // validation no state to read and it fails closed. The trait method is synchronous, so the
         // gate runs through `block_in_place`, as `live_role_state_blocking`
         // does.
         tokio::task::block_in_place(|| {
@@ -11213,9 +11212,11 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                // Authorization is enforced by the ContextManager (which delegates
-                // to ttl::close_context checking the ContextClose capability). No
-                // bridge-layer auth check — the ContextManager is authoritative.
+                // The bridge runs no capability check of its own. On the
+                // `Active` path the supervisor's `CloseContext` dispatch below
+                // runs `ttl::close_context`, which checks the `ContextClose`
+                // capability; the terminal skip runs no capability check (see
+                // below).
                 let identity_did = identity.did.clone();
 
                 // Read the supervisor, not the handle's cached state. A close
@@ -11236,28 +11237,30 @@ impl Scp {
                 // bridge's per-context UCAN state once the supervisor reports
                 // no actor, `Closed`, `Expired`, or `Tombstoned`, including a
                 // holder who first calls `finalize_close` to take a `Closing`
-                // context to `Closed`. That release admits nothing afterward:
-                // no terminal state returns to `Active`, and every UCAN and
-                // outlet entry point refuses a non-`Active` context. The UCAN
-                // entry points and every outlet entry point except
-                // `outlet_stream_open` refuse through
-                // `UniffiBridgeInstance::require_active_context_before_authz`
-                // before `ensure_ucan_registered` can rebuild the released
-                // revocation list and nonce tracker empty; `outlet_stream_open`
-                // validates its UCAN first and the runtime then refuses to open
-                // the stream.
+                // context to `Closed`. The release marks the id, and
+                // `UniffiBridgeInstance::ensure_ucan_registered` refuses to
+                // rebuild a marked id's revocation list and nonce tracker, so
+                // no entry point runs against an empty rebuild while the
+                // supervisor keeps the context out of service.
+                // `import_context` can return the id to `Active`: it replaces
+                // an actor in `Closing`, `Closed`, `Expired`, or `Tombstoned`,
+                // and it imports fresh when no actor serves the id. The import
+                // clears the mark, and this bridge then builds an empty
+                // revocation list and a fresh nonce tracker for the id. This
+                // bridge keeps revocations in process memory, so a revocation
+                // recorded before the close does not survive that re-import,
+                // just as it does not survive a process restart.
                 //
                 // The non-terminal states refuse whoever calls. `Poisoned`
                 // (the crash watchdog despawned the actor and keeps the sticky
                 // poison flag, ADR-049 §10) and `MigratingOut` can both return
-                // to `Active`: `SupervisorHandle::clear_poison` respawns the
-                // actor from its snapshot, and a cancelled migration reopens
-                // the context. A revocation list released before either return
-                // would come back empty through `ensure_ucan_registered`, so a
-                // token revoked before the poison or the migration would
-                // validate again. `Closing` never returns to `Active`; its
-                // refusal orders the release after `finalize_close` and tells
-                // the caller which call comes next.
+                // to `Active` without an import:
+                // `SupervisorHandle::clear_poison` respawns the actor from its
+                // snapshot, and a cancelled migration reopens the context. A
+                // release before either return would leave the recovered
+                // `Active` context with no revocation list on this bridge.
+                // `Closing` refuses so the release follows `finalize_close`,
+                // and the refusal tells the caller which call comes next.
                 //
                 // `scp_core::context::ContextState` is the supervisor's own
                 // enum; the UniFFI-exported `ContextState` is a separate type,
@@ -11286,32 +11289,34 @@ impl Scp {
                     Some(CoreContextState::Active) => false,
                     // `Closing` names its own successor call, because "context
                     // must be active" is unreachable from the closing window:
-                    // the window ends at `Closed`, never back at `Active`.
+                    // the window ends at `Closed`, and only an import returns
+                    // the id to `Active`.
                     Some(CoreContextState::Closing) => {
                         return Err(ScpError::Context {
-                            msg: "cannot close context in Closing state — the context is inside \
-                                  its cooperative closing window; call finalize_close to \
-                                  reach Closed, then close to release any state this bridge \
-                                  still holds for the context"
+                            msg: "cannot close context in 'closing' state -- the context is \
+                                  inside its cooperative closing window; call finalize_close \
+                                  to reach Closed, then close to release any state this \
+                                  bridge still holds for the context"
                                 .to_owned(),
                             code: codes::CTX_2017.to_owned(),
                         });
                     }
                     Some(CoreContextState::Poisoned) => {
                         return Err(ScpError::Context {
-                            msg: "cannot close context in Poisoned state — the crash watchdog \
-                                  took the context out of service and an operator's clear_poison \
-                                  returns it to Active; this bridge keeps its revocation list and \
-                                  nonce state for the context until a close runs against a live \
-                                  actor"
+                            msg: "cannot close context in 'poisoned' state -- the crash \
+                                  watchdog took the context out of service and an operator's \
+                                  clear_poison returns it to Active; this bridge keeps its \
+                                  revocation list and nonce state for the context until a \
+                                  close runs against a live actor"
                                 .to_owned(),
                             code: codes::CTX_2017.to_owned(),
                         });
                     }
                     Some(other) => {
+                        let name = scp_ffi_common::context_state_str(&other);
                         return Err(ScpError::Context {
                             msg: format!(
-                                "cannot close context in {other:?} state — context must be active"
+                                "cannot close context in '{name}' state -- context must be active"
                             ),
                             code: codes::CTX_2017.to_owned(),
                         });
@@ -11323,9 +11328,10 @@ impl Scp {
                 // actor mailbox preserves byte-identical close semantics; the
                 // Supervisor is the authoritative auth layer (ttl::close_context
                 // ContextClose capability check). A close that already happened
-                // (see the supervisor read above) skips the dispatch: no actor
-                // serves the context, so the bridge only has to release its own
-                // state.
+                // (see the supervisor read above) skips the dispatch: either no
+                // actor serves the context, or the resident actor reports
+                // `Closed`, `Expired`, or `Tombstoned`, so the bridge only has
+                // to release its own state.
                 if !close_already_happened {
                     let sup = bi.context_manager_or_error()?;
                     let core_handle = scp_core::context::ContextHandle::new(
@@ -11373,8 +11379,9 @@ impl Scp {
                 // issued from here either (relay_urls / blob_ids were always empty),
                 // so nothing observable is lost by removing this block.
 
-                // Clean up per-context UCAN state on this instance.
-                bi.remove_ucan_state(&handle.context_id);
+                // Release per-context UCAN state on this instance, and mark the
+                // id so no later call rebuilds it empty.
+                bi.release_ucan_state(&handle.context_id);
 
                 // Clean up per-context bridge connector state and economy state.
                 bi.core.remove_bridge_state(&handle.context_id);
@@ -12304,7 +12311,9 @@ impl Scp {
                         msg: format!("restore_context shim reply dropped: {e}"),
                         code: codes::CTX_2064.to_owned(),
                     })?
-                    .map_err(ScpError::from)
+                    .map_err(ScpError::from)?;
+                bi.readmit_context(&ctx_id);
+                Ok(())
             })
             .await
             .map_err(|e| ScpError::Context {
@@ -12325,6 +12334,9 @@ impl Scp {
             .spawn(async move {
                 let sup = bi.context_manager_or_error()?;
                 let restored = sup.restore_on_startup().await.map_err(ScpError::from)?;
+                for context_id in &restored {
+                    bi.readmit_context(context_id);
+                }
 
                 serde_json::to_string(&restored).map_err(|e| ScpError::Context {
                     msg: format!("serialization failed: {e}"),
@@ -14274,8 +14286,8 @@ impl Scp {
             .spawn(async move {
                 // Lifecycle gate on both axes, read from each context's
                 // supervisor actor through
-                // `UniffiBridgeInstance::require_active_context`, BEFORE the
-                // caller-principal binding and the saga drive, so a non-active
+                // `UniffiBridgeInstance::require_active_context_before_authz`,
+                // BEFORE the caller-principal binding and the saga drive, so a non-active
                 // context is refused before the supervisor reserves anything.
                 // The `PyO3` sibling (`outlet_invoke_cross_context_saga_impl`)
                 // and the NAPI sibling (`outlet_invoke_cross_context_saga_on`)
@@ -15741,9 +15753,9 @@ impl Scp {
 
                 // The supervisor must report `Active` before this bridge touches the
                 // context's revocation list or nonce tracker. `context_close` releases
-                // those once the supervisor reports a terminal state or no actor, and
-                // `ensure_ucan_registered` rebuilds them empty, so a validation this gate
-                // admitted after a close would accept a revoked token or a replayed nonce.
+                // those, and `ensure_ucan_registered` below builds nothing for a released
+                // id, so a close that lands after this gate leaves the call no state to
+                // read and the call fails closed.
                 bi.require_active_context_before_authz(
                     &handle.context_id,
                     "validate a UCAN in context",
@@ -15925,9 +15937,9 @@ impl Scp {
 
                 // The supervisor must report `Active` before this bridge touches the
                 // context's revocation list or nonce tracker. `context_close` releases
-                // those once the supervisor reports a terminal state or no actor, and
-                // `ensure_ucan_registered` rebuilds them empty, so a validation this gate
-                // admitted after a close would accept a revoked token or a replayed nonce.
+                // those, and `ensure_ucan_registered` below builds nothing for a released
+                // id, so a close that lands after this gate leaves the call no state to
+                // read and the call fails closed.
                 bi.require_active_context_before_authz(
                     &handle.context_id,
                     "evaluate a UCAN in context",
@@ -16073,11 +16085,10 @@ impl Scp {
                 let parsed = parse_ucan(&token).map_err(ScpError::from)?;
 
                 // The supervisor must report `Active` before this bridge records a
-                // revocation. `context_close` releases the revocation list once the
-                // supervisor reports a terminal state or no actor, and
-                // `ensure_ucan_registered` rebuilds it empty, so a revocation this gate
-                // admitted after a close would land in a list no validation reads and
-                // still report success.
+                // revocation. `context_close` releases the revocation list, and
+                // `ensure_ucan_registered` below builds nothing for a released id, so a
+                // revocation that a close overtakes after this gate fails and never
+                // lands in a list no validation reads.
                 bi.require_active_context_before_authz(
                     &handle.context_id,
                     "revoke a UCAN in context",
@@ -16473,7 +16484,6 @@ impl Scp {
     /// Routes through `&*self.inner`. The MCP server registry is
     /// module-level (not per-instance) so the returned opaque handle
     /// string is globally unique; this method preserves that behaviour.
-    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_server_create(&self, config: McpServerConfig) -> Result<String, ScpError> {
         validate_did(&config.identity_did)?;
         validate_transport_mode(&config.transport)?;
@@ -16487,6 +16497,34 @@ impl Scp {
                 code: codes::TRANS_5011.to_owned(),
             });
         }
+
+        // Serving requires that the supervisor reports every served context
+        // `Active`, as `PyO3`'s `py_mcp_serve` requires. The gate withholds the
+        // lifecycle state, because it runs before the server authorizes any
+        // request.
+        let gate_bi = Arc::clone(&self.inner);
+        let gate_ids = config.context_ids.clone();
+        runtime()
+            .spawn(async move {
+                for ctx_id in &gate_ids {
+                    gate_bi
+                        .require_active_context_before_authz(
+                            ctx_id,
+                            &format!("serve context '{ctx_id}'"),
+                            |msg| ScpError::Transport {
+                                msg,
+                                code: codes::TRANS_5001.to_owned(),
+                            },
+                        )
+                        .await?;
+                }
+                Ok::<(), ScpError>(())
+            })
+            .await
+            .map_err(|e| ScpError::Transport {
+                msg: format!("tokio task join error during mcp_server_create: {e}"),
+                code: codes::TRANS_5001.to_owned(),
+            })??;
 
         // #1549 round-2: hold the bridge instance as a `Weak`, not an
         // `Arc`. The MCP server task is spawned on the shared tokio
@@ -19346,6 +19384,9 @@ impl Scp {
                 sup.import_context(export, &verifying_key, Some(local_pseudonym))
                     .await
                     .map_err(ScpError::from)?;
+                // The supervisor serves the id again, so a release mark an
+                // earlier close left on this bridge instance no longer applies.
+                bi.readmit_context(&context_id);
 
                 // §9.10.4: emit a PseudonymAnnouncement so existing members
                 // learn this importer's per-context routing ID. Encrypted
@@ -19769,6 +19810,19 @@ mod tests {
 
     /// Minimal ENCRYPTED single-admin params for the 2J join-side tests.
     #[cfg(feature = "testing")]
+    /// `encrypted_join_test_params` with a ceiling that holds `context:close`,
+    /// so the creator can close the context.
+    fn closable_test_params() -> ContextParams {
+        ContextParams {
+            ceiling: Some(vec![
+                "messages:read".to_owned(),
+                "messages:write".to_owned(),
+                "context:close".to_owned(),
+            ]),
+            ..encrypted_join_test_params()
+        }
+    }
+
     fn encrypted_join_test_params() -> ContextParams {
         ContextParams {
             mode: ContextMode::Encrypted,
@@ -20282,10 +20336,12 @@ mod tests {
         let context_id = handle.context_id();
 
         // The creator's authorized close drives the supervisor into the
-        // cooperative window and releases the UCAN state, so re-register it:
-        // this case asks what a close does to a LIVE entry, not an absent one.
+        // cooperative window, releases the UCAN state, and marks the id, so
+        // clear the mark and re-register the state: this case asks what a
+        // close does to a LIVE entry, not an absent one.
         rt.block_on(scp.context_close(Arc::clone(&handle), Arc::clone(&creator)))
             .expect("the creator's close should succeed");
+        scp.inner.readmit_context(&context_id);
         scp.inner.ensure_ucan_registered(&context_id);
         assert_eq!(
             rt.block_on(scp.inner.read_live_context_state(&context_id))
@@ -20297,7 +20353,10 @@ mod tests {
         let err = rt
             .block_on(scp.context_close(Arc::clone(&handle), outsider))
             .expect_err("close must refuse a context inside its closing window");
-        assert!(err.to_string().contains("Closing"), "close reported: {err}");
+        assert!(
+            err.to_string().contains("'closing'"),
+            "close reported: {err}"
+        );
         assert!(
             scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
             "a refused close must leave the per-context UCAN state registered"
@@ -20419,11 +20478,14 @@ mod tests {
     /// The creator's close takes the supervisor to `Closing` and releases this
     /// bridge's per-context UCAN state; `finalize_close` then takes it to
     /// `Closed`, and the actor stays resident and still answers the role-state
-    /// read. `ensure_ucan_registered` rebuilds a released state with an empty
-    /// revocation list, so a validation that reached it would accept the
-    /// revoked token. Every UCAN entry point refuses at
-    /// `require_active_context_before_authz` first, so the validation below
-    /// must fail at that gate and never report the token valid.
+    /// read. A rebuilt state would hold an empty revocation list, so a
+    /// validation that reached one would accept the revoked token. The
+    /// validation below must fail at `require_active_context_before_authz`. An
+    /// entry point that passed that gate before the close released the state
+    /// reaches `ensure_ucan_registered` next, so the test also calls it
+    /// directly after the close: it must build nothing. Only
+    /// `readmit_context`, which the import, restore, and Welcome-join paths
+    /// call, lifts that refusal.
     #[test]
     #[cfg(feature = "testing")]
     fn revoked_token_stays_refused_after_a_close_released_the_revocation_list() {
@@ -20485,8 +20547,8 @@ mod tests {
         );
         assert!(
             rt.block_on(scp.inner.live_role_state(&context_id)).is_ok(),
-            "the closed actor still answers the role-state read, so only the lifecycle \
-             gate stands between the validation and the rebuilt state"
+            "the closed actor still answers the role-state read, so the role-state read \
+             cannot be what refuses the validation below"
         );
 
         let err = rt
@@ -20498,6 +20560,103 @@ mod tests {
                     && msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
                     && !msg.contains("Closed")),
             "the validation must refuse at the lifecycle gate and withhold the state: {err:?}"
+        );
+
+        // The step a validation takes after its gate passed: a close that
+        // released the state in between must leave it nothing to read.
+        scp.inner.ensure_ucan_registered(&context_id);
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
+            "ensure_ucan_registered must not rebuild a released context's state"
+        );
+        scp.inner.readmit_context(&context_id);
+        scp.inner.ensure_ucan_registered(&context_id);
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
+            "a readmitted context builds fresh state again"
+        );
+    }
+
+    /// The pre-authorization gate refuses a crashed context and an actor that
+    /// did not answer with the withheld text and the caller's code, and the
+    /// state-naming gate spells a state the way the `PyO3` and NAPI gates do.
+    ///
+    /// `read_live_context_state` reports a context mid-respawn or past a failed
+    /// respawn as `ActorCrashed` (`SCP-CTX-2135`) and an unreachable mailbox as
+    /// `ActorBusy`. A gate that passed those errors through told a caller it
+    /// had not yet authorized that the context exists and crashed, which the
+    /// outlet PRD's SCP-OUT-031 PR-2a note forbids.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn pre_authz_gate_withholds_crashed_and_busy_states() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+
+        for fault in ["mid_respawn", "respawn_failed", "unreachable"] {
+            let handle = rt
+                .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+                .expect("context_create should succeed");
+            let context_id = handle.context_id();
+            let sup = Arc::clone(
+                scp.inner
+                    .context_manager_or_error()
+                    .expect("test supervisor must be attached"),
+            );
+            match fault {
+                "mid_respawn" => rt.block_on(sup.test_hold_context_mid_respawn(&context_id)),
+                "respawn_failed" => rt.block_on(sup.test_fail_context_respawn(&context_id)),
+                _ => sup.test_make_actor_unreachable(&context_id),
+            }
+            assert!(
+                rt.block_on(scp.inner.read_live_context_state(&context_id))
+                    .is_err(),
+                "the fixture must make the checked state read fail ({fault})"
+            );
+
+            let err = rt
+                .block_on(scp.inner.require_active_context_before_authz(
+                    &context_id,
+                    "invoke outlet in context",
+                    |msg| ScpError::Outlet {
+                        msg,
+                        code: codes::OUTLET_6005.to_owned(),
+                    },
+                ))
+                .expect_err("the gate must refuse a context whose state read failed");
+            assert!(
+                matches!(&err, ScpError::Outlet { code, msg }
+                    if code == codes::OUTLET_6005
+                        && msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                        && !msg.contains(&context_id)),
+                "the refusal must carry the withheld text and the caller's code ({fault}): \
+                 {err:?}"
+            );
+        }
+
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), closable_test_params()))
+            .expect("context_create should succeed");
+        // The creator's close takes the supervisor to `Closing`.
+        rt.block_on(scp.context_close(Arc::clone(&handle), Arc::clone(&identity)))
+            .expect("the creator's close should succeed");
+        let err = rt
+            .block_on(
+                scp.inner
+                    .require_active_context(&handle.context_id(), "send", |msg| {
+                        ScpError::Context {
+                            msg,
+                            code: codes::CTX_2023.to_owned(),
+                        }
+                    }),
+            )
+            .expect_err("a closing context must refuse");
+        assert!(
+            err.to_string()
+                .contains("cannot send in 'closing' state -- context must be active"),
+            "the refusal must spell the state the way the PyO3 and NAPI gates do: {err}"
         );
     }
 
@@ -20546,7 +20705,7 @@ mod tests {
             .expect_err("close of a poisoned context must refuse");
         assert!(
             err.to_string()
-                .contains("cannot close context in Poisoned state"),
+                .contains("cannot close context in 'poisoned' state"),
             "unexpected refusal: {err}"
         );
         assert!(
@@ -23629,6 +23788,40 @@ mod tests {
 
         let result = scp_test().mcp_server_create(config).await;
         assert!(result.is_err(), "invalid transport mode should be rejected");
+    }
+
+    /// `mcp_server_create` refuses a context the supervisor does not report
+    /// `Active`, with the withheld lifecycle text, before it starts a server.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn mcp_server_create_refuses_a_context_that_is_not_active() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), closable_test_params()))
+            .expect("context_create should succeed");
+        rt.block_on(scp.context_close(Arc::clone(&handle), Arc::clone(&identity)))
+            .expect("the creator's close should succeed");
+
+        let config = McpServerConfig {
+            identity_did: identity.did(),
+            context_ids: vec![handle.context_id()],
+            transport: "stdio".to_owned(),
+            ucan_token: None,
+            proof_tokens: None,
+        };
+        let err = rt
+            .block_on(scp.mcp_server_create(config))
+            .expect_err("serving a closing context must refuse");
+        assert!(
+            matches!(&err, ScpError::Transport { code, msg }
+                if code == codes::TRANS_5001
+                    && msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)),
+            "the refusal must come from the lifecycle gate: {err:?}"
+        );
     }
 
     /// `mcp_client_connect_stdio` must reject empty command list.

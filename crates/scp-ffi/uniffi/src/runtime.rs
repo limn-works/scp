@@ -237,6 +237,14 @@ pub struct UniffiBridgeInstance {
     /// [`BridgeInstanceCore::bridge_specific_shutdown`].
     pub(crate) ucan_registry: Arc<DashMap<String, UcanContextState>>,
 
+    /// Context ids whose `ucan_registry` entry `Scp::context_close` released.
+    ///
+    /// [`Self::ensure_ucan_registered`] builds no entry for an id in this set,
+    /// so no entry point rebuilds a revocation list and a nonce tracker empty
+    /// after a close released them. An import, a restore, or a Welcome-join of
+    /// the id removes it from the set.
+    pub(crate) released_contexts: Arc<DashMap<String, ()>>,
+
     /// Retained identity custody for the production identity ops, keyed by DID.
     ///
     /// Previously stored type-erased in `CoreFields::identity_registry` AND
@@ -419,6 +427,7 @@ impl UniffiBridgeInstance {
         Self {
             core: CoreFields::new(),
             ucan_registry: Arc::new(DashMap::new()),
+            released_contexts: Arc::new(DashMap::new()),
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             identity_link_attestation_registry: Arc::new(DashMap::new()),
@@ -454,6 +463,7 @@ impl UniffiBridgeInstance {
         Self {
             core: CoreFields::with_persistence(persistence),
             ucan_registry: Arc::new(DashMap::new()),
+            released_contexts: Arc::new(DashMap::new()),
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             identity_link_attestation_registry: Arc::new(DashMap::new()),
@@ -602,6 +612,7 @@ impl UniffiBridgeInstance {
         Self {
             core: CoreFields::with_persistence_arc(persistence),
             ucan_registry: Arc::new(DashMap::new()),
+            released_contexts: Arc::new(DashMap::new()),
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository,
             identity_link_attestation_registry: Arc::new(DashMap::new()),
@@ -1010,8 +1021,8 @@ impl UniffiBridgeInstance {
             })
     }
 
-    /// Synchronous form of [`UniffiBridgeInstance::live_role_state`] for the two
-    /// callers the `scp_mcp::server::ContextProvider` trait forces to be
+    /// Synchronous form of [`UniffiBridgeInstance::live_role_state`] for the
+    /// `scp_mcp::server::ContextProvider` methods that trait forces to be
     /// synchronous.
     ///
     /// Runs the mailbox round trip through `block_in_place`, matching the shape
@@ -1090,13 +1101,15 @@ impl UniffiBridgeInstance {
     /// Fails closed: a context no actor serves refuses the operation. `mk_err`
     /// wraps the refusal message in the error variant and the error code the
     /// calling operation reports, so a lifecycle refusal keeps whichever
-    /// `ScpError` variant that operation already returned.
+    /// `ScpError` variant that operation already returned. The refusal names
+    /// the state through [`scp_ffi_common::context_state_str`], the lowercase
+    /// spelling the `PyO3` and NAPI gates report.
     ///
     /// # Errors
     ///
-    /// Returns `ScpError::Context` when the supervisor reports any state other
-    /// than `Active`, when no actor serves `context_id`, or when the supervisor
-    /// query fails.
+    /// Returns whatever `mk_err` builds when the supervisor reports any state
+    /// other than `Active` and when no actor serves `context_id`, and
+    /// `ScpError::Context` when the supervisor query itself fails.
     pub async fn require_active_context<F>(
         &self,
         context_id: &str,
@@ -1110,7 +1123,8 @@ impl UniffiBridgeInstance {
         match state {
             Some(scp_core::context::ContextState::Active) => Ok(()),
             Some(other) => Err(mk_err(format!(
-                "cannot {verb} in {other:?} state — context must be active"
+                "cannot {verb} in '{}' state -- context must be active",
+                scp_ffi_common::context_state_str(&other)
             ))),
             None => Err(mk_err(format!(
                 "context '{context_id}' has no live supervisor state — refusing to run a \
@@ -1122,32 +1136,34 @@ impl UniffiBridgeInstance {
     /// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`,
     /// and withholds the lifecycle state from the refusal.
     ///
-    /// Every UCAN entry point, every outlet entry point except
-    /// `outlet_stream_open`, and the MCP provider's `validate_capability` gate
-    /// through this form (the runtime refuses a non-`Active` context when
-    /// `outlet_stream_open` opens the stream, with the state-free
-    /// `SCP-OUTLET-6101`), because each one runs
-    /// the gate before it authorizes the caller. The outlet PRD's SCP-OUT-031
-    /// PR-2a note records the rule this form keeps: the raw lifecycle state
-    /// never reaches an FFI caller before authorization. The refusal therefore
-    /// reads the same for every non-`Active` state and for a context no actor
-    /// serves. The `PyO3` and NAPI bridges gate the same entry points through
-    /// their own `require_active_context_before_authz`.
+    /// Every UCAN entry point, every outlet entry point that authorizes a
+    /// caller against the context except `outlet_stream_open`, and the MCP
+    /// provider's `validate_capability` gate through this form, because each
+    /// one runs the gate before it authorizes the caller. The runtime refuses
+    /// a non-`Active` context when `outlet_stream_open` opens the stream, with
+    /// the state-free `SCP-OUTLET-6101`. The outlet entry points that
+    /// authorize nothing against the context carry no gate:
+    /// `outlet_session_close`, `outlet_interface_revoke`, and the calls that
+    /// act on a stream `outlet_stream_open` already opened. The outlet PRD's
+    /// SCP-OUT-031 PR-2a note records the rule this form keeps: the raw
+    /// lifecycle state never reaches an FFI caller before authorization. The
+    /// refusal therefore reads the same for every non-`Active` state, for a
+    /// context no actor serves, and for a state read that failed: a context
+    /// mid-respawn or past a failed respawn (`ActorCrashed`), and an actor
+    /// that did not answer (`ActorBusy`), refuse with the same text and the
+    /// caller's code. The `PyO3` and NAPI bridges gate the same entry points
+    /// through their own `require_active_context_before_authz`.
     ///
-    /// A UCAN or outlet entry point that skipped this gate would authorize
-    /// against a context the supervisor stopped serving. `context_close`
-    /// releases this bridge's per-context UCAN state once the supervisor
-    /// reports a terminal state or no actor, and
-    /// [`UniffiBridgeInstance::ensure_ucan_registered`] rebuilds that state
-    /// with an empty revocation list and a fresh nonce tracker, so an ungated
-    /// validation would accept a token revoked before the close and a nonce
-    /// seen before the close.
+    /// `context_close` releases this bridge's per-context UCAN state, and
+    /// [`UniffiBridgeInstance::ensure_ucan_registered`] refuses to rebuild
+    /// it, so an entry point that passed this gate before a concurrent close
+    /// released the state finds no state and fails closed.
     ///
     /// # Errors
     ///
     /// Returns whatever `mk_err` builds when the supervisor reports any state
-    /// other than `Active` and when no actor serves `context_id`, and
-    /// `ScpError::Context` when the supervisor query itself fails.
+    /// other than `Active`, when no actor serves `context_id`, and when the
+    /// state read fails.
     pub async fn require_active_context_before_authz<F>(
         &self,
         context_id: &str,
@@ -1157,9 +1173,9 @@ impl UniffiBridgeInstance {
     where
         F: FnOnce(String) -> crate::ScpError,
     {
-        match self.read_live_context_state(context_id).await? {
-            Some(scp_core::context::ContextState::Active) => Ok(()),
-            Some(_) | None => Err(mk_err(format!(
+        match self.read_live_context_state(context_id).await {
+            Ok(Some(scp_core::context::ContextState::Active)) => Ok(()),
+            Ok(Some(_) | None) | Err(_) => Err(mk_err(format!(
                 "cannot {verb}: {}",
                 scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
             ))),
@@ -1213,17 +1229,50 @@ impl UniffiBridgeInstance {
     /// free function.
     ///
     /// Ensures UCAN validation state is registered for `context_id` in this
-    /// instance's UCAN registry. No-op if the context is already registered.
+    /// instance's UCAN registry. No-op if the context is already registered,
+    /// and no-op if [`Self::release_ucan_state`] released the id: the caller's
+    /// next [`Self::with_ucan_state`] then returns `None`, which every caller
+    /// turns into an error.
+    ///
+    /// The released-id check and the insert run under the registry entry's
+    /// shard lock, and [`Self::release_ucan_state`] marks the id before it
+    /// removes the entry, so a close that releases the state while a
+    /// lifecycle-gated entry point sits between its gate and this call leaves
+    /// that entry point with no state. No entry point validates against a
+    /// revocation list rebuilt empty.
     #[allow(dead_code)]
     pub fn ensure_ucan_registered(&self, context_id: &str) {
-        if self.ucan_registry.contains_key(context_id) {
-            return;
-        }
+        use dashmap::mapref::entry::Entry;
 
-        self.ucan_registry.insert(
-            context_id.to_owned(),
-            Self::build_ucan_context_state(context_id),
-        );
+        if let Entry::Vacant(vacant) = self.ucan_registry.entry(context_id.to_owned())
+            && !self.released_contexts.contains_key(context_id)
+        {
+            vacant.insert(Self::build_ucan_context_state(context_id));
+        }
+    }
+
+    /// Releases a closed context's per-context UCAN state and marks the id so
+    /// [`Self::ensure_ucan_registered`] does not rebuild it.
+    ///
+    /// `Scp::context_close` is the only caller. The mark goes in before the
+    /// entry comes out, and [`Self::ensure_ucan_registered`] reads the mark
+    /// while it holds the entry's shard lock, so no rebuild lands after this
+    /// call returns.
+    pub fn release_ucan_state(&self, context_id: &str) {
+        self.released_contexts.insert(context_id.to_owned(), ());
+        self.remove_ucan_state(context_id);
+    }
+
+    /// Clears the release mark [`Self::release_ucan_state`] left for
+    /// `context_id`, so the next call builds fresh state for it.
+    ///
+    /// The import, restore, and Welcome-join paths call this after the
+    /// supervisor serves the id again. The fresh state holds an empty
+    /// revocation list and a fresh nonce tracker: this bridge keeps
+    /// revocations in process memory, so they survive neither a close
+    /// followed by a re-import nor a process restart.
+    pub fn readmit_context(&self, context_id: &str) {
+        self.released_contexts.remove(context_id);
     }
 
     /// Atomically registers per-context UCAN validation state for a
@@ -1263,6 +1312,7 @@ impl UniffiBridgeInstance {
                 // building it while holding this shard's `Entry` write guard
                 // cannot deadlock (mirrors the napi reference's Vacant arm).
                 vacant.insert(Self::build_ucan_context_state(context_id));
+                self.readmit_context(context_id);
                 Ok(())
             }
         }
@@ -1278,7 +1328,7 @@ impl UniffiBridgeInstance {
     ///
     /// The state carries no capability ceiling and no context creator DID.
     /// `ucan_validate`, `ucan_evaluate`, `ucan_mint`, `ucan_delegate`,
-    /// `ucan_revoke`, and the three outlet entry points read both from the
+    /// `ucan_revoke`, and the outlet entry points read both from the
     /// per-context supervisor actor through [`Self::live_role_state`] at the
     /// moment each decides, because a `ModifyCeiling` governance action moves
     /// the ceiling after this registration runs, and a context no actor serves
@@ -1340,6 +1390,7 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         // zeroizes any key material they hold via the custody provider's
         // `Drop` impl.
         self.ucan_registry.clear();
+        self.released_contexts.clear();
         self.identity_custody_registry.clear();
         // Release the SQLite advisory lock on `{dir}/scp.db.lock` for the
         // `Sqlite` variant. Other `Arc<SqliteStorage>` holders

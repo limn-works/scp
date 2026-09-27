@@ -46,22 +46,11 @@ use crate::validate;
 
 /// Renders a lifecycle state as the string this bridge reports to Python.
 ///
-/// The `NAPI` bridge spells these eight strings the same way in its own
-/// `state_str`, and the `UniFFI` bridge spells them the same way in
-/// `ContextHandle::state`, so an SDK reads one vocabulary whichever bridge it
-/// links.
+/// Delegates to [`scp_ffi_common::context_state_str`], which the NAPI and
+/// `UniFFI` lifecycle gates also call, so an SDK reads one vocabulary whichever
+/// bridge it links.
 const fn context_state_str(state: &scp_core::context::ContextState) -> &'static str {
-    use scp_core::context::ContextState;
-    match state {
-        ContextState::Creating => "creating",
-        ContextState::Active => "active",
-        ContextState::Closing => "closing",
-        ContextState::Closed => "closed",
-        ContextState::Expired => "expired",
-        ContextState::MigratingOut => "migrating_out",
-        ContextState::Tombstoned => "tombstoned",
-        ContextState::Poisoned => "poisoned",
-    }
+    scp_ffi_common::context_state_str(state)
 }
 
 /// Rejects an operation unless a context's supervisor actor reports `Active`.
@@ -2416,9 +2405,10 @@ impl crate::scp::PyScp {
             parsed.clone(),
         );
 
-        // Register FFI-specific state (OutletRegistry, EventLog, RoleState, RevocationList)
-        // in the global FFI state registry so that outlets/UCAN/event_log bridge functions
-        // can look them up by context ID. Also initializes the shared ContextManager.
+        // Register FFI-specific state (OutletRegistry, EventLog, RevocationList,
+        // NonceTracker, session store) in this bridge instance's FFI state registry
+        // so that outlets/UCAN/event_log bridge functions can look it up by context
+        // ID. `register_context` also initializes the context manager.
         crate::runtime::register_context(bi, &context_id, identity_did, &parsed.ceiling).map_err(
             |e| PyRuntimeError::new_err(format!("failed to register context state: {e}")),
         )?;
@@ -3328,26 +3318,25 @@ impl crate::scp::PyScp {
         // holder of the handle can therefore release this bridge's
         // `FfiBridgeState` once the supervisor reports no actor, `Closed`,
         // `Expired`, or `Tombstoned`, including a holder who first calls
-        // `finalize_close` to take a `Closing` context to `Closed`. That
-        // release admits nothing afterward: no terminal state returns to
-        // `Active`, and every UCAN and outlet entry point refuses a
-        // non-`Active` context. The UCAN entry points and every outlet entry
-        // point except `outlet_stream_open` refuse through
-        // `runtime::require_active_context_before_authz` before they read the
-        // released revocation list and nonce tracker; `outlet_stream_open`
-        // fails on the released `FfiBridgeState`, and the runtime refuses to
-        // open a stream in a non-`Active` context.
+        // `finalize_close` to take a `Closing` context to `Closed`. This bridge
+        // never rebuilds a released `FfiBridgeState`: every UCAN and outlet
+        // call reads it through `runtime::with_context`, which fails on an
+        // absent entry. `import_context` can return the id to `Active`,
+        // because it replaces an actor in `Closing`, `Closed`, `Expired`, or
+        // `Tombstoned` and imports fresh when no actor serves the id, and
+        // `context_import` registers no `FfiBridgeState`, so UCAN and outlet
+        // calls against the re-imported id still fail on the missing state.
         //
         // The non-terminal states refuse whoever calls. `Poisoned` (the crash
         // watchdog despawned the actor and keeps the sticky poison flag,
-        // ADR-049 §10) and `MigratingOut` can both return to `Active`:
-        // `SupervisorHandle::clear_poison` respawns the actor from its
-        // snapshot, and a cancelled migration reopens the context. A release
-        // before either return would leave an `Active` context with no
-        // `FfiBridgeState`, so the revocations and nonces this bridge recorded
-        // would be gone and every outlet and UCAN call would fail against the
-        // context. `Closing` never returns to `Active`; its refusal orders the
-        // release after `finalize_close` and tells the caller which call comes
+        // ADR-049 §10) and `MigratingOut` can both return to `Active`
+        // without an import: `SupervisorHandle::clear_poison` respawns the
+        // actor from its snapshot, and a cancelled migration reopens the
+        // context. A release before either return would leave an `Active`
+        // context with no `FfiBridgeState`, so the revocations and nonces this
+        // bridge recorded would be gone and every outlet and UCAN call would
+        // fail against the context. `Closing` refuses so the release follows
+        // `finalize_close`, and the refusal tells the caller which call comes
         // next.
         let close_already_happened =
             match crate::runtime::read_live_context_state(bi, &handle.context_id)? {
@@ -3370,7 +3359,8 @@ impl crate::scp::PyScp {
                 Some(scp_core::context::ContextState::Active) => false,
                 // `Closing` names its own successor call, because
                 // "context must be 'active'" is unreachable from the closing
-                // window: the window ends at `Closed`, never back at `Active`.
+                // window: the window ends at `Closed`, and only an import returns
+                // the id to `Active`.
                 Some(scp_core::context::ContextState::Closing) => {
                     return Err(PyRuntimeError::new_err(
                         "cannot close context in 'closing' state -- the context is inside its \
@@ -3394,9 +3384,10 @@ impl crate::scp::PyScp {
                 }
             };
 
-        // Authorization is enforced by the ContextManager (which delegates to
-        // ttl::close_context checking the ContextClose capability). No bridge-layer
-        // auth check — the ContextManager is authoritative.
+        // The bridge runs no capability check of its own. On the `Active` path
+        // the supervisor's `CloseContext` dispatch below runs
+        // `ttl::close_context`, which checks the `ContextClose` capability; the
+        // terminal skip runs no capability check (see above).
         let context_id = handle.context_id.clone();
 
         // ----------------------------------------------------------------
@@ -3439,8 +3430,9 @@ impl crate::scp::PyScp {
         // Delegate close to the shared supervisor FIRST so close
         // authorization (and any other precondition) is honored before the
         // FFI bridge state is touched. A close that already happened (see the
-        // supervisor read above) skips the dispatch: no actor serves the
-        // context, so the bridge only has to release its own state.
+        // supervisor read above) skips the dispatch: either no actor serves the
+        // context, or the resident actor reports `Closed`, `Expired`, or
+        // `Tombstoned`, so the bridge only has to release its own state.
         if !close_already_happened {
             let initiator_did = scp_did::DID(identity_did.to_owned());
             let rt = crate::runtime()?;

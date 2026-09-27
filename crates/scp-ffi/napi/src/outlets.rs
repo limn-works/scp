@@ -1360,11 +1360,16 @@ pub(crate) async fn outlet_session_invoke_on(
 
 /// Per-bridge-instance implementation of [`Scp::outlet_session_close`](crate::scp::Scp::outlet_session_close).
 ///
-/// Carries no lifecycle gate, unlike the nine outlet entry points that decide
-/// an authorization question: this one releases one session entry the bridge
-/// itself owns, and refusing that release in a `Closing` or `Expired` context
-/// would strand the entry until `context_close_on` drops the whole
+/// Carries no lifecycle gate, unlike the outlet entry points that decide an
+/// authorization question: this one authorizes nothing and removes one session
+/// entry the bridge itself owns, so refusing it in a `Closing` or `Expired`
+/// context would keep the entry until `context_close_on` releases the whole
 /// `UcanContextState`.
+///
+/// It never builds registry state. A context with no `UcanContextState` on
+/// this bridge instance holds no session, so the call reports
+/// `SCP-OUTLET-6021`, and a call after `context_close_on` released the state
+/// does not rebuild it.
 #[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn outlet_session_close_on(
     bi: &crate::runtime::NapiBridgeInstance,
@@ -1373,18 +1378,19 @@ pub(crate) async fn outlet_session_close_on(
 ) -> napi::Result<()> {
     crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id();
-    crate::runtime::ensure_registered(bi, handle)?;
 
-    crate::runtime::with_context(bi, &context_id, |rt| {
-        if rt.session_store.remove(&session_id).is_none() {
-            return Err(ScpNapiError::Outlet {
-                message: format!("session '{session_id}' not found"),
-                code: codes::OUTLET_6021.to_owned(),
-            });
-        }
+    let removed = crate::runtime::ucan_registry(bi)
+        .get_mut(&context_id)
+        .is_some_and(|mut rt| rt.session_store.remove(&session_id).is_some());
+    if removed {
         Ok(())
-    })
-    .map_err(napi::Error::from)
+    } else {
+        Err(ScpNapiError::Outlet {
+            message: format!("session '{session_id}' not found"),
+            code: codes::OUTLET_6021.to_owned(),
+        }
+        .into())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1545,8 +1551,8 @@ pub(crate) async fn outlet_interface_accept_on(
 
 /// Per-bridge-instance implementation of [`Scp::outlet_interface_revoke`](crate::scp::Scp::outlet_interface_revoke).
 ///
-/// Carries no lifecycle gate, unlike the nine outlet entry points that decide
-/// an authorization question: this one reads no context state and grants
+/// Carries no lifecycle gate, unlike the outlet entry points that decide an
+/// authorization question: this one reads no context state and grants
 /// nothing. It builds an `InterfaceRevoked` event from the interface id and the
 /// clock and hands it back for the caller to distribute, so gating it would
 /// deny a member the record of a revocation without withholding any capability.

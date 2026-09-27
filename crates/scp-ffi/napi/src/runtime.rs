@@ -193,6 +193,14 @@ pub struct NapiBridgeInstance {
     /// [`BridgeInstanceCore::bridge_specific_shutdown`].
     pub(crate) ucan_registry: Arc<DashMap<String, UcanContextState>>,
 
+    /// Context ids whose `ucan_registry` entry `context_close_on` released.
+    ///
+    /// [`ensure_registered`] refuses to rebuild an entry for an id in this
+    /// set, so no entry point rebuilds a revocation list and a nonce tracker
+    /// empty after a close released them. An import, a restore, or a
+    /// Welcome-join of the id removes it from the set.
+    pub(crate) released_contexts: Arc<DashMap<String, ()>>,
+
     /// Retained identity state for registered DIDs.
     ///
     /// Previously stored type-erased in `CoreFields::identity_registry`.
@@ -388,6 +396,7 @@ impl NapiBridgeInstance {
         Self {
             core: CoreFields::new(),
             ucan_registry: Arc::new(DashMap::new()),
+            released_contexts: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             durable_providers: Some(durable_providers),
@@ -421,6 +430,7 @@ impl NapiBridgeInstance {
         Self {
             core: CoreFields::with_persistence(persistence),
             ucan_registry: Arc::new(DashMap::new()),
+            released_contexts: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             durable_providers: Some(durable_providers),
@@ -552,6 +562,7 @@ impl NapiBridgeInstance {
         Self {
             core: CoreFields::with_persistence_arc(persistence),
             ucan_registry: Arc::new(DashMap::new()),
+            released_contexts: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository,
             durable_providers: Some(durable_providers),
@@ -670,6 +681,7 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         // the custody provider's `Drop` impl (matching the behavior of the
         // previous `clear_fn` closures).
         self.ucan_registry.clear();
+        self.released_contexts.clear();
         self.identity_registry.clear();
         // Release the SQLite advisory lock on `{dir}/scp.db.lock` for the
         // `Sqlite` variant. Other `Arc<SqliteStorage>` holders
@@ -1736,6 +1748,7 @@ pub fn register_ffi_state(
         Entry::Vacant(vacant) => {
             let state = build_ucan_context_state(context_id, user_ceiling)?;
             vacant.insert(state);
+            readmit_context(bi, context_id);
             Ok(())
         }
     }
@@ -1746,25 +1759,66 @@ pub fn register_ffi_state(
 ///
 /// If the context is already registered, this is a no-op. Otherwise, creates
 /// UCAN state from the `NapiContextHandle` metadata via
-/// [`build_ucan_context_state`].
+/// [`build_ucan_context_state`], unless [`release_context`] released the id.
+///
+/// The released-id check and the insert run under the registry entry's shard
+/// lock, and [`release_context`] marks the id before it removes the entry, so
+/// a close that releases the state while a lifecycle-gated entry point sits
+/// between its gate and this call leaves that entry point with no state: this
+/// call refuses, or [`with_context`] finds no entry. Neither path validates
+/// against a revocation list rebuilt empty.
 ///
 /// # Errors
 ///
-/// Returns `ScpNapiError::Context` if the context state cannot be determined.
+/// Returns `ScpNapiError::Context` (`SCP-CTX-2023`) when `context_close_on`
+/// released the context's state on this bridge instance, and the errors of
+/// [`build_ucan_context_state`].
 pub fn ensure_registered(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
 ) -> Result<(), ScpNapiError> {
+    use dashmap::mapref::entry::Entry;
+
     let context_id = handle.context_id();
-    let map = ucan_registry(bi);
-
-    if map.contains_key(&context_id) {
-        return Ok(());
+    if let Entry::Vacant(vacant) = ucan_registry(bi).entry(context_id) {
+        if bi.released_contexts.contains_key(vacant.key()) {
+            // The withheld text: an ungated caller such as
+            // `outlet_stream_open_on` reaches this refusal before it authorizes
+            // anyone, so the refusal names no lifecycle state.
+            return Err(ScpNapiError::Context {
+                message: format!(
+                    "cannot use context: {}",
+                    scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+                ),
+                code: codes::CTX_2023.to_owned(),
+            });
+        }
+        let state = build_ucan_context_state(vacant.key(), &handle.ceiling())?;
+        vacant.insert(state);
     }
-
-    let state = build_ucan_context_state(&context_id, &handle.ceiling())?;
-    map.entry(context_id).or_insert(state);
     Ok(())
+}
+
+/// Releases a closed context's [`UcanContextState`] and marks the id so
+/// [`ensure_registered`] does not rebuild it.
+///
+/// `context_close_on` is the only caller. The mark goes in before the entry
+/// comes out; [`ensure_registered`] reads the mark while it holds the entry's
+/// shard lock, so no rebuild lands after this call returns.
+pub fn release_context(bi: &NapiBridgeInstance, context_id: &str) {
+    bi.released_contexts.insert(context_id.to_owned(), ());
+    remove_context(bi, context_id);
+}
+
+/// Clears the release mark [`release_context`] left for `context_id`, so the
+/// next UCAN, outlet, or event-log call builds fresh state for it.
+///
+/// The import, restore, and Welcome-join paths call this after the supervisor
+/// serves the id again. The fresh state holds an empty revocation list and a
+/// fresh nonce tracker: this bridge keeps revocations in process memory, so
+/// they survive neither a close followed by a re-import nor a process restart.
+pub fn readmit_context(bi: &NapiBridgeInstance, context_id: &str) {
+    bi.released_contexts.remove(context_id);
 }
 
 /// Executes a closure with mutable access to a context's UCAN state on the
@@ -1978,27 +2032,31 @@ where
 /// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`, and
 /// withholds the lifecycle state from the refusal.
 ///
-/// Every UCAN entry point and every outlet entry point except
-/// `outlet_stream_open_on` gates through this form, because each one runs the
-/// gate before it authorizes the caller. The runtime refuses a non-`Active`
-/// context when `outlet_stream_open_on` opens the stream, with the state-free
-/// `SCP-OUTLET-6101`. The outlet PRD's SCP-OUT-031
-/// PR-2a note records the rule this form keeps: the raw lifecycle state never
-/// reaches an FFI caller before authorization. The refusal therefore reads the
-/// same for every non-`Active` state and for a context no actor serves.
+/// Every UCAN entry point, and every outlet entry point that authorizes a
+/// caller against the context except `outlet_stream_open_on`, gates through
+/// this form, because each one runs the gate before it authorizes the caller.
+/// The runtime refuses a non-`Active` context when `outlet_stream_open_on`
+/// opens the stream, with the state-free `SCP-OUTLET-6101`. The outlet entry
+/// points that authorize nothing against the context carry no gate:
+/// `outlet_session_close_on`, `outlet_interface_revoke_on`, and the calls that
+/// act on a stream `outlet_stream_open_on` already opened. The outlet
+/// PRD's SCP-OUT-031 PR-2a note records the rule this form keeps: the raw
+/// lifecycle state never reaches an FFI caller before authorization. The
+/// refusal therefore reads the same for every non-`Active` state, for a
+/// context no actor serves, and for a state read that failed: a context
+/// mid-respawn or past a failed respawn (`ActorCrashed`), and an actor that did
+/// not answer (`ActorBusy`), refuse with the same text and the caller's code.
 ///
-/// A UCAN or outlet entry point that skipped this gate would authorize against
-/// a context the supervisor stopped serving. `context_close_on` releases this
-/// bridge's `UcanContextState` once the supervisor reports a terminal state or
-/// no actor, and `ensure_registered` rebuilds that state with an empty
-/// revocation list and a fresh nonce tracker, so an ungated validation would
-/// accept a token revoked before the close and a nonce seen before the close.
+/// `context_close_on` releases this bridge's `UcanContextState`, and
+/// [`ensure_registered`] refuses to rebuild it, so an entry point that passed
+/// this gate before a concurrent close released the state finds no state and
+/// fails closed.
 ///
 /// # Errors
 ///
 /// Returns whatever `mk_err` builds when the supervisor reports any state other
-/// than `Active` and when no actor serves `context_id`, and
-/// [`ScpNapiError::Context`] when the supervisor query itself fails.
+/// than `Active`, when no actor serves `context_id`, and when the state read
+/// fails.
 pub async fn require_active_context_before_authz<F>(
     bi: &NapiBridgeInstance,
     context_id: &str,
@@ -2008,9 +2066,9 @@ pub async fn require_active_context_before_authz<F>(
 where
     F: FnOnce(String) -> ScpNapiError,
 {
-    match read_live_context_state(bi, context_id).await? {
-        Some(scp_core::context::ContextState::Active) => Ok(()),
-        Some(_) | None => Err(mk_err(format!(
+    match read_live_context_state(bi, context_id).await {
+        Ok(Some(scp_core::context::ContextState::Active)) => Ok(()),
+        Ok(Some(_) | None) | Err(_) => Err(mk_err(format!(
             "cannot {verb}: {}",
             scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
         ))),
@@ -2021,17 +2079,7 @@ where
 /// name a lifecycle-gate error reports.
 #[must_use]
 pub const fn context_state_str(state: &scp_core::context::ContextState) -> &'static str {
-    use scp_core::context::ContextState as S;
-    match state {
-        S::Creating => "creating",
-        S::Active => "active",
-        S::Closing => "closing",
-        S::Closed => "closed",
-        S::Expired => "expired",
-        S::MigratingOut => "migrating_out",
-        S::Tombstoned => "tombstoned",
-        S::Poisoned => "poisoned",
-    }
+    scp_ffi_common::context_state_str(state)
 }
 
 /// Registers an outlet handler for an outlet in a context.
