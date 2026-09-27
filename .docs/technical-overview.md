@@ -26,7 +26,7 @@ Every establishment event commits to the digests of the next root keys before an
 
 **One ciphersuite, ECDSA on NIST P-256 with SHA-256**, no negotiation and no fallback (§9.5). Root custody defaults to a passkey, whose private key no code path exports, so the person manages no key material (§9.7.4.1 item 4).
 
-**Relays carry the log.** A resolver queries the identity's own relays and a fallback set from the community relay list the SDK ships, and every relay a first contact reads proves control of its declared operator identity (`.docs/specs/03-identity.md` §3.10.1, §3.10.4). Transport and service metadata live in a separately signed service record, so a relay-endpoint change appends no key event (§3.10.13).
+**Relays carry the log.** A resolver queries the identity's own relays and a fallback set from the community relay list, which the SDK fetches from a relay-list context its shipped pointer names, and every relay a first contact reads proves control of its declared operator identity (`.docs/specs/03-identity.md` §3.10.1, §3.10.4). Transport and service metadata live in a separately signed service record, so a relay-endpoint change appends no key event (§3.10.13).
 
 Identity private state (block lists, graph visibility policies, petnames, preferences) is encrypted to the owner's keys and replicated across relays as an append-only event log — the same
 infrastructure as context state, but membership of one.

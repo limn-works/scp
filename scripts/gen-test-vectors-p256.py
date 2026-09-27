@@ -1930,7 +1930,7 @@ SERVED_VALUE_DIGEST = sha256(
 
 
 def emit_witness_and_relay_objects() -> None:
-    section("§25.27 Witness objects, relay proof, community relay list")
+    section("§25.27 Witness objects, relay proof, relay-list record")
 
     subject = INCEPTION_IDENTIFIER
     designating_digest = INCEPTION_DIGEST
@@ -2060,14 +2060,20 @@ def emit_witness_and_relay_objects() -> None:
     emit_community_relay_list()
 
 
-# --- §25.27 Vector 49: the shipped community relay list ---
+# --- §25.27 Vector 49: the relay-list record ---
 
-# `18-addressability-and-deployment.md` §18.5.1 fixes the artifact: one JSON
-# document named `community-relays.json`, holding a JSON array of entries, each
-# an object with four members — `operator`, `key`, `url` and `free`. The two
-# entries below are a fixture: the operators are digests of stated ASCII labels
-# and the keys are §25.2's reference and secondary keys.
-RELAY_LIST_FILE_NAME = "community-relays.json"
+# `18-addressability-and-deployment.md` §18.5.1: the SDK ships a pointer to a
+# relay-list context, and that context's `relay_list` outlet returns a record
+# whose `entries` member is one JSON array of entries, each an object with four
+# members — `operator`, `key`, `url` and `free`. The governor's `#active` key
+# signs the record over
+# SHA-256("SCP-RELAY-LIST-V1:" || context_id || sequence || governor || SHA-256(entries)).
+# The two entries below are a fixture: the operators are digests of stated ASCII
+# labels and the keys are §25.2's reference and secondary keys. The governor is
+# Vector 41's identity, whose `#active` key is §25.2's secondary key.
+RELAY_LIST_SEPARATOR = "SCP-RELAY-LIST-V1:"
+RELAY_LIST_CONTEXT_ID = sha256(b"scp-25-relay-list-context")
+RELAY_LIST_SEQUENCE = 1
 RELAY_LIST_ENTRIES = [
     (
         sha256(b"scp-25-relay-operator"),
@@ -2085,11 +2091,11 @@ RELAY_LIST_ENTRIES = [
 
 
 def community_relay_list_bytes() -> bytes:
-    """The document's bytes: one JSON array, no insignificant whitespace.
+    """The entries document's bytes: one JSON array, no insignificant whitespace.
 
     Member order is the order §18.5.1 lists: `operator`, `key`, `url`, `free`.
     A 32-byte identifier and a 33-byte SEC1 compressed point each print as
-    lowercase hexadecimal, which §18.5.1 fixes for `key`.
+    lowercase hexadecimal, which §18.5.1 fixes for both.
     """
     entries = ",".join(
         '{{"operator":"{}","key":"{}","url":"{}","free":{}}}'.format(
@@ -2102,21 +2108,39 @@ def community_relay_list_bytes() -> bytes:
 
 def emit_community_relay_list() -> None:
     document = community_relay_list_bytes()
-    emit("vector_49.file_name", RELAY_LIST_FILE_NAME)
     emit("vector_49.entry_count", len(RELAY_LIST_ENTRIES))
     for index, (operator, key, url, free) in enumerate(RELAY_LIST_ENTRIES):
         emit_hex(f"vector_49.entry_{index}.operator", operator)
         emit_hex(f"vector_49.entry_{index}.key", key)
         emit(f"vector_49.entry_{index}.url", url)
         emit(f"vector_49.entry_{index}.free", "true" if free else "false")
-    assert any(free for *_, free in RELAY_LIST_ENTRIES), "§18.5.1: one free entry"
     assert len({key for _, key, *_ in RELAY_LIST_ENTRIES}) == len(RELAY_LIST_ENTRIES), (
         "§18.5.1: two entries whose `key` bytes are equal are one operator"
     )
     emit("vector_49.document_len", len(document))
     emit("vector_49.document", document.decode())
     emit_hex("vector_49.document_bytes", document)
-    emit_hex("vector_49.document_sha256", sha256(document))
+    entries_digest = sha256(document)
+    emit_hex("vector_49.document_sha256", entries_digest)
+
+    governor = INCEPTION_IDENTIFIER
+    assert len(governor) == 32, "the governor is Vector 41's 32-byte identifier"
+    record_fields = (
+        fixed_field(RELAY_LIST_CONTEXT_ID)
+        + u64(RELAY_LIST_SEQUENCE)
+        + fixed_field(governor)
+        + fixed_field(entries_digest)
+    )
+    assert len(record_fields) == 104, len(record_fields)
+    emit_hex("vector_49.context_id", RELAY_LIST_CONTEXT_ID)
+    emit("vector_49.sequence", RELAY_LIST_SEQUENCE)
+    emit_hex("vector_49.governor", governor)
+    emit("vector_49.field_bytes", len(record_fields))
+    sign_and_emit(
+        "vector_49",
+        canonical_preimage(RELAY_LIST_SEPARATOR, record_fields),
+        REF_KEY_2,
+    )
 
 
 # ---------------------------------------------------------------------------
