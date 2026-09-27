@@ -83,7 +83,7 @@ use crate::context::state::{self, CHECKPOINT_PAYLOAD_TAG, CheckpointMessage, emi
 use crate::context::supervisor::MessageSigner;
 
 /// Alias for the broadcast channel used to fan out [`ContextEvent`]s to
-/// external subscribers (webhook dispatcher, SDK event streams).
+/// external subscribers (SDK event streams).
 pub type ContextEventSender = tokio::sync::broadcast::Sender<(String, ContextEvent)>;
 
 /// Default TTL (in seconds) for sealed message blobs sent through the

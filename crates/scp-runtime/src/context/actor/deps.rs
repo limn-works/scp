@@ -25,8 +25,7 @@
 //!
 //! - `clock` — wall-clock source. Formerly `ContextManager::clock`.
 //! - `event_tx` — optional fan-out channel for external `ContextEvent`
-//!   subscribers (webhook dispatcher in `scp-node`). Formerly
-//!   `ContextManager::event_tx`. `Option` because not every embedder
+//!   subscribers. Formerly `ContextManager::event_tx`. `Option` because not every embedder
 //!   wires a subscriber; the legacy handler treated `None` as "drop silently."
 //! - `key_resolver` — DID → Ed25519 verifying-key map used by UCAN /
 //!   governance vote verification. Formerly `ContextManager::key_resolver`.
@@ -175,8 +174,7 @@ pub struct ActorDeps {
     /// callsite re-derived it from the supervisor.
     pub clock: Arc<dyn Clock>,
     /// Optional fan-out channel for `(context_id, ContextEvent)` pairs
-    /// sent to external subscribers (the webhook dispatcher in
-    /// `scp-node`, SDK event streams). Formerly
+    /// sent to external subscribers (SDK event streams). Formerly
     /// `ContextManager::event_tx`. `None` in embedders that do not
     /// subscribe to context events — handlers check `Option::is_some`
     /// before sending and drop silently otherwise, matching the legacy behavior.

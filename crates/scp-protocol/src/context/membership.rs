@@ -827,7 +827,7 @@ pub enum ContextEvent {
 impl ContextEvent {
     /// Returns the variant name as a static string slice.
     ///
-    /// Useful for serialization, logging, and webhook payloads where the
+    /// Useful for serialization and logging where the
     /// variant identity is needed without parsing `Debug` output.
     #[must_use]
     pub const fn variant_name(&self) -> &'static str {

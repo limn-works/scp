@@ -66,8 +66,8 @@
 // `clippy.toml` bans `std::sync::Mutex` on runtime paths. This module runs
 // OFF the actor mailbox (the pump runs supervisor-side), so it legitimately
 // owns its own shared per-stream state — but it uses `std::sync::RwLock`
-// (NOT banned; the sanctioned off-mailbox pattern also used by
-// `bridge::credentials`), always acquired via `.write()` for exclusive
+// (NOT banned; the sanctioned off-mailbox pattern), always acquired via
+// `.write()` for exclusive
 // access (semantically identical to a `Mutex`). The guard is NEVER held
 // across an `.await`, so `await_holding_lock` does not fire — the signer
 // call in `apply_outlet_cancel_signed` runs entirely off-lock.

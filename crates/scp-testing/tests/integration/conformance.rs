@@ -25,11 +25,6 @@
 use ed25519_dalek::{Signer, Verifier};
 use sha2::{Digest, Sha256};
 
-use scp_core::bridge::provenance::{
-    BridgeTrustLevel, evaluate_bridge_trust_level, mark_bridge_provenance,
-};
-use scp_core::bridge::shadow::{CreateShadowParams, ShadowRegistry, create_shadow, find_shadow};
-use scp_core::bridge::{BridgeConnector, BridgeMode, BridgeStatus, ShadowIdentity};
 use scp_core::context::governance::{GovernanceAction, VoteType, sign_vote, verify_vote};
 use scp_core::context::params::{ContextMode, ContextParams, TemplateId};
 use scp_core::context::roles::Capability;
@@ -41,7 +36,7 @@ use scp_core::crypto::key_continuity::{
     KeyContinuityParty, compute_key_continuity_fingerprint, fingerprint_to_decimal,
 };
 use scp_core::crypto::sender_keys::{
-    SenderKeyStore, decrypt_sender_layer, encrypt_sender_layer, generate_sender_key,
+    decrypt_sender_layer, encrypt_sender_layer, generate_sender_key,
 };
 use scp_core::discovery::HandleTarget;
 use scp_core::discovery::handles::{
@@ -52,7 +47,6 @@ use scp_core::economy::{
     PricingFormula, PricingMetric, PricingVariable, evaluate_formula, lookup_cost,
 };
 use scp_core::envelope::padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
-use scp_core::provenance::DataProvenance;
 use scp_core::sync::{
     OfflineTier, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS, classify_offline_duration,
 };
@@ -1588,161 +1582,6 @@ fn conf_035_dynamic_pricing() {
     assert!(capped.value() <= 10000, "cost must not exceed cap of 10000");
 
     println!("  PASS: Dynamic pricing formula verified");
-}
-
-// ===========================================================================
-// §26.11 Bridge Tests
-// ===========================================================================
-
-/// CONF-036: Bridge Registration and Approval
-/// Layer: Bridge | Tier: Full | Spec: §12.2.1, §12.12
-#[test]
-fn conf_036_bridge_registration() {
-    println!("=== CONF-036: Bridge Registration and Approval ===");
-
-    print_step(1, "Create bridge connector");
-    let connector = BridgeConnector {
-        bridge_id: "bridge-discord-001".to_owned(),
-        operator_did: DID::from("did:dht:z6MkOperator"),
-        platform: "discord".to_owned(),
-        mode: BridgeMode::Relay,
-        status: BridgeStatus::Active,
-        registration_context: "gov-context".to_owned(),
-        registered_at: 1_700_000_000,
-    };
-
-    print_step(2, "Verify bridge status is Active");
-    assert_eq!(connector.status, BridgeStatus::Active);
-
-    print_step(3, "Verify bridge serialization roundtrip");
-    let json = serde_json::to_string(&connector).unwrap();
-    let deserialized: BridgeConnector = serde_json::from_str(&json).unwrap();
-    assert_eq!(deserialized.bridge_id, "bridge-discord-001");
-    assert_eq!(deserialized.platform, "discord");
-
-    print_step(4, "All 4 BridgeMode variants serialize");
-    for mode in [
-        BridgeMode::Relay,
-        BridgeMode::Puppet,
-        BridgeMode::Api,
-        BridgeMode::Cooperative,
-    ] {
-        let json = serde_json::to_string(&mode).unwrap();
-        let _: BridgeMode = serde_json::from_str(&json).unwrap();
-    }
-
-    println!("  PASS: Bridge registration verified");
-}
-
-/// CONF-037: Shadow Identity Creation and Claiming
-/// Layer: Bridge | Tier: Full | Spec: §12.3, §12.12.3, §12.12.4
-#[test]
-fn conf_037_shadow_identity() {
-    println!("=== CONF-037: Shadow Identity Creation and Claiming ===");
-
-    let mut registry = ShadowRegistry::new("bridge-ctx".to_owned());
-    let mut sender_key_store = SenderKeyStore::new();
-
-    print_step(1, "Create shadow identity");
-    let params = CreateShadowParams {
-        shadow_id: "shadow-alice-discord",
-        bridge_id: "bridge-discord-001",
-        bridge_mode: BridgeMode::Relay,
-        platform_handle: "@alice#1234",
-        context_member_dids: &[],
-        timestamp: 1_700_000_000,
-    };
-    let (shadow, _event) =
-        create_shadow(&mut registry, &mut sender_key_store, &params).expect("create shadow");
-
-    print_step(2, "Shadow identity created");
-    println!("    Shadow ID: {}", shadow.shadow_id);
-    println!("    Platform handle: {}", shadow.platform_handle);
-
-    print_step(3, "Find in shadow registry");
-    let found = find_shadow(&registry, "shadow-alice-discord");
-    assert!(found.is_ok(), "shadow must be findable");
-
-    print_step(4, "Verify claim hash domain separator");
-    let claim_bytes = canonical_hash_bytes(
-        b"SCP-CLAIM-V1:",
-        &[
-            CanonicalField::VarBytes(b"shadow-alice-discord"),
-            CanonicalField::VarBytes(b"did:dht:z6MkClaimer"),
-            CanonicalField::VarBytes(b"bridge-ctx"),
-            CanonicalField::U64(1_700_000_000),
-        ],
-    )
-    .unwrap();
-    let claim_hash: [u8; 32] = Sha256::digest(&claim_bytes).into();
-    println!("    Claim hash: 0x{}", hex(&claim_hash));
-
-    println!("  PASS: Shadow identity creation verified");
-}
-
-/// CONF-038: Bridged Message Provenance Marking
-/// Layer: Bridge | Tier: Full | Spec: §12.5, §12.12.5
-#[test]
-fn conf_038_bridged_provenance() {
-    println!("=== CONF-038: Bridged Message Provenance ===");
-
-    let connector = BridgeConnector {
-        bridge_id: "bridge-slack-001".to_owned(),
-        operator_did: DID::from("did:dht:z6MkOp"),
-        platform: "slack".to_owned(),
-        mode: BridgeMode::Relay,
-        status: BridgeStatus::Active,
-        registration_context: "reg-ctx".to_owned(),
-        registered_at: 1_700_000_000,
-    };
-
-    use scp_core::bridge::ShadowProvenanceStatus;
-    use scp_core::context::params::MemoryScope;
-    use scp_core::provenance::{DiscoveryMethod, SourceType};
-
-    let shadow = ShadowIdentity {
-        shadow_id: "shadow-user-slack".to_owned(),
-        platform_handle: "@user".to_owned(),
-        bridge_id: "bridge-slack-001".to_owned(),
-        attributed_role: "observer".to_owned(),
-        provenance_status: ShadowProvenanceStatus::Shadow,
-        created_at: 1_700_000_000,
-    };
-
-    let base_provenance = DataProvenance {
-        source_context: "source-ctx".to_owned(),
-        source_type: SourceType::Persistent,
-        counterparties: vec![DID::from("did:dht:z6MkSource")],
-        purpose: None,
-        discovery_method: DiscoveryMethod::OutOfBand,
-        age: std::time::Duration::from_secs(0),
-        memory_scope: MemoryScope::Ephemeral,
-        chain_depth: 0,
-        chain_path: None,
-        payment_amount: None,
-        payment_adapter: None,
-        payment_receipt_id: None,
-    };
-
-    print_step(1, "Mark bridge provenance on message");
-    let provenance = mark_bridge_provenance(base_provenance, &connector, &shadow);
-
-    print_step(2, "Evaluate trust level");
-    let trust = evaluate_bridge_trust_level(&provenance);
-    assert_eq!(
-        trust,
-        BridgeTrustLevel::ShadowBridged,
-        "shadow + relay = ShadowBridged"
-    );
-
-    print_step(3, "Trust level distinguishable from native");
-    assert_ne!(trust, BridgeTrustLevel::NativeNative);
-    println!("    Trust level: {trust:?}");
-
-    print_step(4, "Ordering: ShadowBridged < NativeNative");
-    assert!(BridgeTrustLevel::ShadowBridged < BridgeTrustLevel::NativeNative);
-
-    println!("  PASS: Bridged provenance marking verified");
 }
 
 // ===========================================================================
