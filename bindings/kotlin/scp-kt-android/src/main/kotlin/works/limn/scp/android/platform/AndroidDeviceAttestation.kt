@@ -55,13 +55,18 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      *
      * Constructs a deterministic `clientDataJSON` with fixed field order:
      * `{"challenge":"<b64>","deviceId":"<b64>","type":"scp-device-attestation-v1"}`.
-     * The nonce is `Base64(SHA-256(clientDataJSON))`. A Play Integrity Standard
-     * token is requested with this nonce and returned as UTF-8 encoded JWT bytes.
+     * The nonce is `Base64(SHA-256(clientDataJSON))`. The adapter requests a
+     * Classic Play Integrity token with this nonce and returns it as UTF-8
+     * encoded JWT bytes. ADR-027 acceptance criterion 7 requires a Standard
+     * token whose `requestHash` is the lowercase hexadecimal form of the
+     * binding digest `D`; story SCP-111 tracks that change.
      *
      * The relay reconstructs this JSON with the same fixed-field-order formula
      * to verify the nonce embedded in the integrity token.
      *
-     * @param challenge Server-issued random challenge bytes.
+     * @param challenge The 32-byte binding digest `D` of
+     *   `09-security-model.md` §9.3.1. ADR-025 and ADR-027 require the caller
+     *   to pass `D`. No Rust code calls this method yet.
      * @param deviceId Stable device/identity identifier bytes.
      * @return Play Integrity token bytes (JWT, UTF-8 encoded).
      * @throws ScpException if the Play Integrity API call fails.
@@ -115,20 +120,25 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      * Generate a per-request assertion using a fresh integrity token.
      *
      * Play Integrity does not have a per-request assertion flow equivalent to
-     * Apple App Attest assertions. For assertion-equivalent use cases, a fresh
-     * Standard integrity token is requested with the request hash as the
-     * challenge and an empty device ID.
+     * Apple App Attest assertions. This method passes the request hash to
+     * [attest] as the challenge with an empty device ID, so it returns a
+     * Classic integrity token whose nonce is `Base64(SHA-256(clientDataJSON))`.
+     * ADR-027 acceptance criterion 8 requires a Standard integrity token whose
+     * `requestHash` is the lowercase hexadecimal form of `A`, requested
+     * without routing through [attest]; story SCP-111 tracks that change.
      *
      * @param requestHash The 32-byte assertion digest `A` of
-     *   `09-security-model.md` §9.3.1 over the request bytes, which the Rust
-     *   caller passes, never the request bytes or their plain SHA-256.
+     *   `09-security-model.md` §9.3.1 over the request bytes. ADR-025 and
+     *   ADR-027 require the caller to pass `A`, never the request bytes or
+     *   their plain SHA-256. No Rust code calls this method yet.
      * @return Play Integrity token bytes (JWT, UTF-8 encoded).
      * @throws ScpException if the Play Integrity API call fails.
      */
     override suspend fun assertRequest(requestHash: ByteArray): ByteArray {
         // Play Integrity does not have a per-request assertion flow equivalent
-        // to App Attest assertions. For assertion-equivalent use cases, a fresh
-        // Standard integrity token is requested.
+        // to App Attest assertions. This call requests a fresh Classic
+        // integrity token through `attest` (story SCP-111 tracks the Standard
+        // request ADR-027 acceptance criterion 8 requires).
         return attest(challenge = requestHash, deviceId = ByteArray(0))
     }
 

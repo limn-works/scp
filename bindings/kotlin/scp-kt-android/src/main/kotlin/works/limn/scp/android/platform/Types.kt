@@ -145,7 +145,9 @@ interface DeviceAttestationProvider {
     /**
      * Generate an attestation token for the given challenge and device ID.
      *
-     * @param challenge Server-issued random challenge bytes.
+     * @param challenge The 32-byte binding digest `D` of
+     *   `09-security-model.md` §9.3.1. ADR-025 and ADR-027 require the caller
+     *   to pass `D`. No Rust code calls this method yet.
      * @param deviceId Stable device/identity identifier bytes.
      * @return Platform-specific attestation token bytes.
      * @throws ScpException if attestation fails.
@@ -156,8 +158,9 @@ interface DeviceAttestationProvider {
      * Generate a per-request assertion.
      *
      * @param requestHash The 32-byte assertion digest `A` of
-     *   `09-security-model.md` §9.3.1 over the request bytes, which the Rust
-     *   caller passes, never the request bytes or their plain SHA-256.
+     *   `09-security-model.md` §9.3.1 over the request bytes. ADR-025 and
+     *   ADR-027 require the caller to pass `A`, never the request bytes or
+     *   their plain SHA-256. No Rust code calls this method yet.
      * @return Platform-specific assertion token bytes.
      * @throws ScpException if assertion fails.
      */

@@ -573,16 +573,21 @@ pub trait DeviceAttestationProvider: Send + Sync {
     ///
     /// `request_hash` — the 32-byte assertion digest
     ///   `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" || BE32(len(m)) || m)` of
-    ///   `09-security-model.md` §9.3.1 over the request bytes `m`, which the
-    ///   Rust caller passes on every platform, never `m` or `SHA-256(m)`.
-    ///   Apple: the adapter hands `A` to App Attest as `clientDataHash`
-    ///   unchanged and rejects it when it is not 32 bytes (ADR-025 acceptance
-    ///   criterion 3). Android: a Standard integrity token's `requestHash`
-    ///   carries the lowercase hexadecimal form of `A` (ADR-027 acceptance
-    ///   criterion 8).
+    ///   `09-security-model.md` §9.3.1 over the request bytes `m`. ADR-025
+    ///   and ADR-027 require the caller to pass `A` on every platform, never
+    ///   `m` or `SHA-256(m)`. No Rust code calls this trait yet (story
+    ///   SCP-095 criterion 1). Apple: the adapter hands `A` to App Attest as
+    ///   `clientDataHash` unchanged and rejects it when it is not 32 bytes
+    ///   (ADR-025 acceptance criterion 3). Android: ADR-027, the Android
+    ///   platform adapter, acceptance criterion 8 requires a Standard
+    ///   integrity token whose `requestHash` is the lowercase hexadecimal
+    ///   form of `A`. The shipped Android adapter does not meet it yet: it
+    ///   passes `A` to `attest` with an empty device ID and requests a
+    ///   Classic token whose nonce is `Base64(SHA-256(clientDataJSON))`
+    ///   (story SCP-111).
     ///
     /// Returns the platform assertion object bytes (Apple: CBOR assertion;
-    /// Android: Standard integrity token bytes).
+    /// Android: Play Integrity token bytes).
     async fn assert_request(&self, request_hash: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 }
 
