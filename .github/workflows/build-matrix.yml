@@ -135,8 +135,11 @@ jobs:
   # Every quirk below was learned the hard way on the 0.1.0b3 publish (the
   # first CI wheel build — this job previously carried latent bugs because no
   # run had ever reached it):
-  #   - maturin in CI finds no python by itself; each leg pins an explicit
-  #     interpreter (`-i`).
+  #   - maturin in CI finds no python by itself, so every leg names its
+  #     interpreters (`-i`). Without abi3 a wheel serves one CPython minor, so
+  #     each leg builds one wheel per minor that bindings/python/pyproject.toml
+  #     declares (requires-python >= 3.10, classifiers 3.10-3.13); a minor with
+  #     no wheel falls back to the sdist, which needs a Rust toolchain.
   #   - manylinux 2_28, not 2014: CentOS 7 (EOL) can build neither
   #     ring/aws-lc-sys (glibc >= 2.18, newer gcc) nor vendored OpenSSL.
   #   - x86_64 2_28 container ships a minimal perl that openssl-src's
@@ -158,12 +161,10 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             manylinux: 2_28
-            interpreter: python3.12
             before-script: dnf install -y perl
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             manylinux: 2_28
-            interpreter: python3.12
             before-script: "true"
           # One universal2 wheel, as ADR phase-3 and `.docs/standards/python.md`
           # name it: maturin compiles x86_64-apple-darwin and
@@ -171,19 +172,24 @@ jobs:
           - target: universal2-apple-darwin
             runner: macos-latest
             manylinux: auto
-            interpreter: python
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             manylinux: auto
-            interpreter: python
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Setup Python 3.12
+      # The macOS and Windows legs build on the runner, so each interpreter `-i`
+      # names below must exist there; the Linux legs build inside the manylinux
+      # container, which carries its own python3.10-python3.13.
+      - name: Setup Python 3.10-3.13
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: |
+            3.10
+            3.11
+            3.12
+            3.13
 
       - name: Setup NASM (Windows)
         if: runner.os == 'Windows'
@@ -204,7 +210,7 @@ jobs:
           args: >-
             --release
             --out dist
-            -i ${{ matrix.interpreter }}
+            -i python3.10 python3.11 python3.12 python3.13
           working-directory: bindings/python
 
       - name: Upload Python wheel
