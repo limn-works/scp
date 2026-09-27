@@ -399,6 +399,65 @@ def test_the_loader_is_the_only_sdk_module_that_imports_the_extension() -> None:
     assert importers == PERMITTED_EXTENSION_IMPORTS
 
 
+def _count_bare_name_imports(source: str) -> int:
+    """Count the statements in ``source`` that import the extension by its bare
+    top-level name, ``_scp_core``, rather than as ``scp_sdk._scp_core``.
+
+    The package registers no ``sys.modules["_scp_core"]`` alias, and CI places
+    the extension inside ``scp_sdk/``, so a bare-name import raises
+    ``ModuleNotFoundError`` wherever it runs.
+    """
+    total = 0
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0:
+            modules = [node.module or ""]
+        else:
+            continue
+        if any(m == EXTENSION_LEAF or m.startswith(f"{EXTENSION_LEAF}.") for m in modules):
+            total += 1
+    return total
+
+
+def test_no_sdk_or_test_file_imports_the_extension_by_its_bare_name() -> None:
+    """CRITERION: no file under ``scp_sdk/`` or ``tests/`` imports ``_scp_core``
+    by its bare name.
+
+    The scan above reads ``scp_sdk/`` only. A test that writes
+    ``import _scp_core`` inside its body passes collection and then raises
+    ``ModuleNotFoundError`` on a runner that has the extension, so this scan
+    reads the test directory as well.
+    """
+    python_root = Path(_extension.__file__).parent.parent
+    offenders = {
+        path.relative_to(python_root).as_posix(): count
+        for directory in ("scp_sdk", "tests")
+        for path in (python_root / directory).rglob("*.py")
+        if (count := _count_bare_name_imports(path.read_text()))
+    }
+    assert offenders == {}
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("import _scp_core\n", 1),
+        ("from _scp_core import SCP\n", 1),
+        ("def f():\n    import _scp_core\n", 1),
+        ("from scp_sdk import _scp_core\n", 0),
+        ("from . import _scp_core\n", 0),
+        ("import scp_sdk._scp_core\n", 0),
+        ("import _scp_core_helper\n", 0),
+    ],
+)
+def test_the_bare_name_detector_separates_bare_from_qualified_imports(
+    source: str, expected: int
+) -> None:
+    """NEGATIVE CONTROL: the bare-name scan finds the bare spellings and only those."""
+    assert _count_bare_name_imports(source) == expected
+
+
 @pytest.mark.parametrize(
     "source",
     [

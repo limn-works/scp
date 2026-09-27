@@ -932,8 +932,6 @@ class TestProvenance:
 
     async def test_evaluate_quality(self, scp: SCP):
         # ADR-048 §1: pure helper now exposed as a module-level free fn.
-        import _scp_core  # type: ignore[import-not-found]
-
         result = _scp_core.evaluate_provenance_quality(None, "persistent", "active", None)
         assert isinstance(result, int)
         assert 0 <= result <= 3
@@ -964,8 +962,6 @@ class TestProvenance:
 
     async def test_chain_depth(self, scp: SCP):
         # ADR-048 §1: pure helper now exposed as a module-level free fn.
-        import _scp_core  # type: ignore[import-not-found]
-
         assert _scp_core.provenance_check_chain_depth(3, 5)
         assert not _scp_core.provenance_check_chain_depth(6, 5)
 
