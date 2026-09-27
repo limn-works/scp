@@ -132,7 +132,7 @@
       "actionItems": [
         "Define RegistryEntry struct",
         "Build PROTOCOL_REGISTRY as a static/const map (phf or lazy_static HashMap) with all 27 entries",
-        "Build SYSTEM_REGISTRY with all 5 entries",
+        "Build SYSTEM_REGISTRY with all 4 entries",
         "Implement lookup_protocol_capability and is_known_protocol_capability",
         "Implement validate_capability_uri that enforces scp:capability:* reservation",
         "Add parameter schemas for parameterized capabilities",

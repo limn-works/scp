@@ -269,7 +269,7 @@ via `host_site_until`, plus **PRD stories** (validate with
 self-host is **opt-in only** (`--self-host` flag / `SCP_NODE_SELF_HOST=1`, never a
 default; `upnp` stays a non-default cargo feature); a **loud, legible startup log**
 ("opening TCP <port> to the public internet; home IP <x> now publicly bound to DID
-<y>"); **clean teardown** releases the mapping on shutdown; dev/bridge endpoints
+<y>"); **clean teardown** releases the mapping on shutdown; dev endpoints
 stay **loopback-only** (verify, don't assume); IP-doxing and the self-signed-cert
 (no-CA) posture stated explicitly (the self-host surface serves self-signed HTTPS
 by default per §10.12.11, with plaintext available only as an explicit
