@@ -135,79 +135,47 @@ FEATURE_GRAPH_GATE="scripts/check-shipped-feature-graph.sh"
 WHEEL_MATRIX_FILE=".github/workflows/build-matrix.yml"
 WHEEL_JOB="python-wheels"
 
-# The program behind wheel_triples: it prints the `target:` value of every item of
-# the one `include:` list inside the job named on argv[2] in the workflow file on
-# argv[1]. A job begins at a two-space-indented key and ends at the next one or at
-# a column-zero key. A comment line ends no job, at whatever column it starts,
-# because YAML reads it as no key at all. The criterion is that every include item yields one bare
-# triple. An item naming no `target:` key, naming two, or naming one whose value
-# is quoted, commented, or an expression FAILS, and so does a job holding zero
-# `include:` keys or two. The job's `matrix:` mapping may hold the `include:` key
-# and no other key, because an axis key such as `target: [...]` or an `exclude:`
-# key beside `include:` changes the legs GitHub builds, and this reader reads only
-# the include items. A matrix leg this reader cannot read therefore stops the gate
-# instead of dropping out of the per-triple presence proof.
+# The program behind wheel_triples: it loads the workflow file on argv[1] with
+# PyYAML and prints the `target:` value of every item of the matrix `include:`
+# list of the job named on argv[2]. A YAML parser reads every spelling of that
+# list that GitHub reads, so the criterion is stated on the parsed document: the
+# job's `strategy.matrix` is a mapping whose only key is `include:`, and every item
+# of that non-empty list is a mapping whose `target` value is one bare triple. An
+# axis key or an `exclude:` key beside `include:` changes the legs GitHub builds,
+# and an item whose target is an expression names no triple this gate can resolve,
+# so either one FAILS rather than dropping a leg out of the per-triple presence
+# proof. A duplicated key FAILS too, because PyYAML keeps the last value where
+# GitHub rejects the file.
 read -r -d '' WHEEL_TRIPLES_PROGRAM <<'PYTHON' || true
 import re
 import sys
+import yaml
+
+class Loader(yaml.SafeLoader):
+    pass
+def unique_mapping(loader, node):
+    keys = [loader.construct_object(k) for k, _ in node.value]
+    for key in keys:
+        if keys.count(key) > 1:
+            sys.exit(f"{path}: key '{key}' appears twice in one mapping")
+    return loader.construct_mapping(node)
+Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)
 
 path, job = sys.argv[1], sys.argv[2]
 with open(path, encoding="utf-8") as workflow:
-    lines = workflow.read().splitlines()
-body, inside = [], False
-for line in lines:
-    if line.lstrip().startswith("#"):
-        continue
-    header = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
-    if header or re.match(r"^\S", line):
-        inside = bool(header) and header.group(1) == job
-        continue
-    if inside:
-        body.append(line)
-starts = [i for i, line in enumerate(body) if re.match(r"^\s*include:\s*$", line)]
-if len(starts) != 1:
-    sys.exit(f"{path} job '{job}' holds {len(starts)} 'include:' keys; this gate reads exactly one matrix include list")
-base = len(body[starts[0]]) - len(body[starts[0]].lstrip())
-def depth(line):
-    return len(line) - len(line.lstrip())
-def content(lines):
-    return [(i, line) for i, line in lines if line.strip() and not line.lstrip().startswith("#")]
-parents = [(i, line) for i, line in content(enumerate(body[:starts[0]])) if depth(line) < base]
-if not parents or not re.match(r"^\s*matrix:\s*$", parents[-1][1]):
-    sys.exit(f"{path} job '{job}': the 'include:' key does not sit directly under a 'matrix:' key")
-matrix_at, matrix_indent = parents[-1][0], depth(parents[-1][1])
-for i, line in content(enumerate(body[matrix_at + 1:], matrix_at + 1)):
-    if depth(line) <= matrix_indent:
-        break
-    if depth(line) < base or (depth(line) == base and i != starts[0]):
-        sys.exit(f"{path} job '{job}': '{line.strip()}' sits in the matrix beside 'include:'; this gate reads a matrix whose only key is 'include:'")
-items, item_indent = [], None
-for line in body[starts[0] + 1:]:
-    if not line.strip() or line.lstrip().startswith("#"):
-        continue
-    indent = len(line) - len(line.lstrip())
-    if indent <= base:
-        break
-    if item_indent is None:
-        item_indent = indent
-    if indent == item_indent:
-        if not line.lstrip().startswith("- "):
-            sys.exit(f"{path} job '{job}': '{line.strip()}' sits at list-item depth without '- '")
-        items.append([])
-    elif indent < item_indent:
-        sys.exit(f"{path} job '{job}': '{line.strip()}' is indented between the include key and its items")
-    items[-1].append(line)
-if not items:
-    sys.exit(f"{path} job '{job}' has an empty matrix include list")
+    document = yaml.load(workflow, Loader=Loader)
+matrix = ((((document or {}).get("jobs") or {}).get(job) or {}).get("strategy") or {}).get("matrix")
+if not isinstance(matrix, dict) or list(matrix) != ["include"]:
+    sys.exit(f"{path} job '{job}': strategy.matrix is not a mapping whose only key is 'include'")
+items = matrix["include"]
+if not isinstance(items, list) or not items:
+    sys.exit(f"{path} job '{job}' has an empty or non-list matrix include")
 triples = []
 for item in items:
-    keys = [line for line in item if re.match(r"^\s*(- )?['\"]?target['\"]?\s*:", line)]
-    if len(keys) != 1:
-        sys.exit(f"{path} job '{job}': the include item starting '{item[0].strip()}' names {len(keys)} 'target:' keys, not one")
-    value = re.match(r"^\s*(- )?target:\s*([A-Za-z0-9_.-]+)\s*$", keys[0])
-    if not value:
-        sys.exit(f"{path} job '{job}': '{keys[0].strip()}' is not 'target: <bare triple>'")
-    triples.append(value.group(2))
+    target = item.get("target") if isinstance(item, dict) else None
+    if not isinstance(target, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", target):
+        sys.exit(f"{path} job '{job}': include item {item!r} names no bare 'target' triple")
+    triples.append(target)
 print("\n".join(triples))
 PYTHON
 
@@ -240,7 +208,8 @@ while stack:
 print(sum(1 for i in seen if names.get(i) == crate))
 PYTHON
 
-# The first interpreter on PATH. Both programs use only the standard library.
+# The first interpreter on PATH. The metadata walk uses only the standard library;
+# wheel_triples also imports PyYAML and FAILS when that interpreter lacks it.
 SCOPE_JSON_READER=""
 for scope_json_candidate in python3.12 python3 python; do
   if command -v "$scope_json_candidate" >/dev/null 2>&1; then
@@ -439,8 +408,9 @@ workspace_occurrences() {
 
 # wheel_triples <workflow-file>
 #   Emit one target triple per line: the triples the wheel job's matrix builds.
-#   FAILS when no interpreter is on PATH, or when any item of the job's matrix
-#   `include:` list yields no single bare triple.
+#   FAILS when no interpreter is on PATH, when that interpreter cannot import
+#   PyYAML, or when any item of the job's matrix `include:` list yields no single
+#   bare triple.
 wheel_triples() {
   if [[ -z "$SCOPE_JSON_READER" ]]; then
     echo "no python3.12, python3, or python on PATH, so this gate cannot read the wheel's target triples" >&2
@@ -646,20 +616,32 @@ run_fixtures() {
     '          - target: aarch64-apple-ios' > "$dir/nowheel.yml"
   wheel_triples "$dir/nowheel.yml" >/dev/null 2>&1; rc=$?
   expect "(triples) a workflow whose wheel job names no triple FAILS" "FAIL" "$rc"
-  # (triples-leg) one leg among several that the reader cannot read FAILS the
-  # reader, rather than dropping that triple out of the presence proof.
+  # (triples-leg) one leg among several that names no bare triple FAILS the
+  # reader, rather than dropping that leg out of the presence proof, and a leg
+  # that YAML reads as a bare triple is read whatever its spelling.
   local leg_label leg_lines
-  for leg_label in "a quoted value" "a trailing comment" "no target key" "two target keys"; do
+  for leg_label in "no target key" "two target keys" "an expression target"; do
+    case "$leg_label" in
+      "no target key") leg_lines='          - runner: windows-latest' ;;
+      "two target keys") leg_lines=$(printf '%s\n' '          - target: x86_64-pc-windows-msvc' '            target: aarch64-pc-windows-msvc') ;;
+      "an expression target") leg_lines='          - target: ${{ inputs.triple }}' ;;
+    esac
+    printf '%s\n' 'jobs:' '  python-wheels:' '    strategy:' '      matrix:' '        include:' \
+      '          - target: x86_64-unknown-linux-gnu' "$leg_lines" '    steps:' '      - run: "true"' > "$dir/leg.yml"
+    wheel_triples "$dir/leg.yml" >/dev/null 2>&1; rc=$?
+    expect "(triples-leg) a wheel leg written with $leg_label FAILS the reader" "FAIL" "$rc"
+  done
+  for leg_label in "a quoted value" "a trailing comment"; do
     case "$leg_label" in
       "a quoted value") leg_lines='          - target: "x86_64-pc-windows-msvc"' ;;
       "a trailing comment") leg_lines='          - target: x86_64-pc-windows-msvc  # MSVC' ;;
-      "no target key") leg_lines='          - runner: windows-latest' ;;
-      "two target keys") leg_lines=$(printf '%s\n' '          - target: x86_64-pc-windows-msvc' '            target: aarch64-pc-windows-msvc') ;;
     esac
     printf '%s\n' 'jobs:' '  python-wheels:' '    strategy:' '      matrix:' '        include:' \
-      '          - target: x86_64-unknown-linux-gnu' "$leg_lines" '    steps:' > "$dir/leg.yml"
-    wheel_triples "$dir/leg.yml" >/dev/null 2>&1; rc=$?
-    expect "(triples-leg) a wheel leg written with $leg_label FAILS the reader" "FAIL" "$rc"
+      '          - target: x86_64-unknown-linux-gnu' "$leg_lines" '    steps:' '      - run: "true"' > "$dir/leg.yml"
+    out="$(wheel_triples "$dir/leg.yml")"; rc=$?
+    expect "(triples-leg) a wheel leg written with $leg_label is read" "PASS" "$rc"
+    same_string "$out" "$(printf '%s\n' x86_64-unknown-linux-gnu x86_64-pc-windows-msvc)"; rc=$?
+    expect "(triples-leg) and the leg written with $leg_label yields its triple" "PASS" "$rc"
   done
   printf '%s\n' 'jobs:' '  python-wheels:' '    strategy:' '      matrix:' '        include:' \
     '          - target: x86_64-unknown-linux-gnu' '            runner: ubuntu-latest' '' \
