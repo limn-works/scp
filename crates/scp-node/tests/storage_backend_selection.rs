@@ -37,12 +37,17 @@ fn output_within_deadline(command: &mut Command) -> Output {
     child.wait_with_output().expect("collect scp-node output")
 }
 
-/// A persistent full node exits non-zero on `postgres` without
-/// `SCP_RELAY_DATABASE_URL` and on `s3` without `SCP_RELAY_S3_BUCKET`, in
-/// either case, and opens no `SQLite` blob store in their place. A build that
-/// compiled the arm names the missing variable; a build without `cloud-blobs`
-/// names the feature, and exits before it creates the node's storage
-/// directory, its storage key, or its root and custody stores.
+/// A persistent full node and a `--relay-only` node each exit non-zero on
+/// `postgres` without `SCP_RELAY_DATABASE_URL` and on `s3` without
+/// `SCP_RELAY_S3_BUCKET`, in either case, and open no `SQLite` blob store in
+/// their place. A build that compiled the arm names the missing variable; a
+/// build without `cloud-blobs` names the feature, and the full node exits
+/// before it creates its storage directory, its storage key, or its root and
+/// custody stores.
+///
+/// `--relay-only` reads the backend in `scp-node`'s own `run_relay_only`, not
+/// through `scp_transport::startup::start_relay_from_env`, so the `scp-relay`
+/// binary's test does not cover that path.
 ///
 /// Which of the two errors to expect is read from the `scp-transport` this test
 /// links, and not from this package's own `cloud-blobs` feature: cargo unifies
@@ -51,48 +56,54 @@ fn output_within_deadline(command: &mut Command) -> Output {
 #[test]
 fn a_cloud_backend_fails_closed() {
     let compiled = scp_transport::startup::valid_backends();
-    for (backend, value, required_var) in [
+    let cases = [
         ("postgres", "postgres", "SCP_RELAY_DATABASE_URL"),
         ("postgres", "POSTGRES", "SCP_RELAY_DATABASE_URL"),
         ("s3", "s3", "SCP_RELAY_S3_BUCKET"),
         ("s3", "S3", "SCP_RELAY_S3_BUCKET"),
-    ] {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let blob_db = tmp.path().join("blobs.db");
-        let node_storage = tmp.path().join("node-storage");
-        let output = output_within_deadline(
-            Command::new(node_bin())
-                .current_dir(tmp.path())
-                .env("SCP_NODE_DOMAIN", "example.com")
-                .env("SCP_NODE_BIND_ADDR", "127.0.0.1:0")
-                .env("SCP_STORAGE_PATH", &node_storage)
-                .env("SCP_RELAY_STORAGE_PATH", &blob_db)
-                .env("SCP_RELAY_STORAGE_BACKEND", value)
-                .env_remove(required_var)
-                .env_remove("SCP_NODE_DHT_MODE")
-                .env_remove("SCP_STORAGE_KEY")
-                .env_remove("RUST_LOG"),
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(!output.status.success(), "{value}: {stderr}");
-        if compiled.split(", ").any(|name| name == backend) {
-            assert!(stderr.contains(required_var), "{value}: {stderr}");
-        } else {
-            assert!(
-                stderr.contains(&format!("'{backend}' is not compiled into this binary")),
-                "{value}: {stderr}"
+    ];
+    for mode in [&[][..], &["--relay-only"][..]] {
+        for (backend, value, required_var) in cases {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let blob_db = tmp.path().join("blobs.db");
+            let node_storage = tmp.path().join("node-storage");
+            let output = output_within_deadline(
+                Command::new(node_bin())
+                    .args(mode)
+                    .current_dir(tmp.path())
+                    .env("SCP_NODE_DOMAIN", "example.com")
+                    .env("SCP_NODE_BIND_ADDR", "127.0.0.1:0")
+                    .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+                    .env("SCP_STORAGE_PATH", &node_storage)
+                    .env("SCP_RELAY_STORAGE_PATH", &blob_db)
+                    .env("SCP_RELAY_STORAGE_BACKEND", value)
+                    .env_remove(required_var)
+                    .env_remove("SCP_NODE_DHT_MODE")
+                    .env_remove("SCP_STORAGE_KEY")
+                    .env_remove("RUST_LOG"),
             );
-            assert!(
-                stderr.contains("--features cloud-blobs"),
-                "{value}: {stderr}"
-            );
-            assert!(
-                !node_storage.exists(),
-                "{value} created {} before rejecting the backend",
-                node_storage.display()
-            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let case = format!("{value} {mode:?}");
+            assert!(!output.status.success(), "{case}: {stderr}");
+            if compiled.split(", ").any(|name| name == backend) {
+                assert!(stderr.contains(required_var), "{case}: {stderr}");
+            } else {
+                assert!(
+                    stderr.contains(&format!("'{backend}' is not compiled into this binary")),
+                    "{case}: {stderr}"
+                );
+                assert!(
+                    stderr.contains("--features cloud-blobs"),
+                    "{case}: {stderr}"
+                );
+                assert!(
+                    !node_storage.exists(),
+                    "{case} created {} before rejecting the backend",
+                    node_storage.display()
+                );
+            }
+            assert!(!blob_db.exists(), "{case} opened {}", blob_db.display());
         }
-        assert!(!blob_db.exists(), "{value} opened {}", blob_db.display());
     }
 }
 
