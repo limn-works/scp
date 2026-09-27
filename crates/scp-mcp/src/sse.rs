@@ -78,7 +78,11 @@ use crate::server::{ContextEventPump, ContextProvider, McpServer, McpServerForTr
 const DEFAULT_RETRY_MS: u64 = 3000;
 
 /// Configuration for the SSE transport server.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented by hand so that formatting a config with `{:?}`
+/// prints `auth_token` as `<redacted>`: the token is a live credential, and a
+/// log line that carried it would let any reader of the log claim the session.
+#[derive(Clone)]
 pub struct SseConfig {
     /// The address to bind the HTTP server to (e.g., `127.0.0.1:3000`).
     pub bind_addr: SocketAddr,
@@ -103,6 +107,17 @@ pub struct SseConfig {
     /// `scp://{ctx}/members` and drive `tools/call` as the agent identity the
     /// server was started for.
     pub auth_token: String,
+}
+
+impl std::fmt::Debug for SseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SseConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("channel_capacity", &self.channel_capacity)
+            .field("retry_ms", &self.retry_ms)
+            .field("auth_token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl SseConfig {
@@ -1070,6 +1085,18 @@ mod tests {
             SseConfig::new(addr).auth_token,
             "two servers must never share a bearer token"
         );
+    }
+
+    #[test]
+    fn sse_config_debug_redacts_the_bearer_token() {
+        let config = SseConfig::new("127.0.0.1:3000".parse().unwrap());
+        let printed = format!("{config:?}");
+        assert!(
+            !printed.contains(&config.auth_token),
+            "Debug output carried the bearer token: {printed}"
+        );
+        assert!(printed.contains("auth_token: \"<redacted>\""), "{printed}");
+        assert!(printed.contains("127.0.0.1:3000"), "{printed}");
     }
 
     #[tokio::test]
