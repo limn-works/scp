@@ -14,8 +14,9 @@
 # wheel triple, keeping build edges because `openssl-src` is a build-dependency of
 # `openssl-sys`, and a second one, `-i openssl-sys --depth 1`, that has to list
 # libsqlite3-sys among openssl-sys's direct dependents, because only that edge makes
-# SQLCipher compile against the vendored OpenSSL. `scripts/check-shipped-feature-graph.sh` exempts that one function
-# from its rule that every `cargo tree` under scripts/ names `--target all` while
+# SQLCipher compile against the vendored OpenSSL.
+# `scripts/check-shipped-feature-graph.sh` exempts that one function from its rule
+# that every `cargo tree` under scripts/ names `--target all` while
 # this whole file hashes to the value it pins, so an edit anywhere in this file
 # cancels the exemption, an edit to WHEEL_TRIPLES_PROGRAM, which lists the wheel
 # triples, or to the `some` verdict run_gate wants from each per-triple count
@@ -302,8 +303,8 @@ run_fixtures() {
   echo "   FIXTURES: $fixture_failures failed."; return 1
 }
 
-# The owner gate pins this whole file (see the header). The function below is the
-# one per-triple `cargo tree` its `--target all` rule exempts.
+# The owner gate pins this whole file (see the header). The function below holds the
+# two per-triple `cargo tree` calls its `--target all` rule exempts.
 #
 # wheel_triple_occurrences <triple>: how many `openssl-src` the wheel's graph on one
 # triple holds, or 0 when libsqlite3-sys does not depend on openssl-sys there. The
@@ -325,7 +326,7 @@ wheel_triple_occurrences() {
   if [[ "$(count_in "$tree")" -gt 0 ]]; then
     dependents="$(cargo tree -p "${entry%%|*}" ${args[@]+"${args[@]}"} --target "$triple" -e no-dev -i openssl-sys --depth 1 --prefix none --format '{p}')" ||
       { echo "cargo tree -i openssl-sys failed for ${entry%%|*} on $triple" >&2; return 1; }
-    if ! printf '%s\n' "$dependents" | grep -qE '^libsqlite3-sys v'; then
+    if ! printf '%s\n' "$dependents" | grep -E '^libsqlite3-sys v' >/dev/null; then
       echo "$triple: $VENDOR_CRATE is in the wheel's graph, but libsqlite3-sys does not depend on openssl-sys, so SQLCipher links the build host's OpenSSL" >&2
       tree=""
     fi
