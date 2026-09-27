@@ -3,7 +3,8 @@
 #
 # CRITERION: `openssl-src`, the crate whose build script compiles OpenSSL so that
 # `openssl-sys` links it statically, is in the dependency graph of the PyPI wheel's
-# configuration on every target triple the `python-wheels` job of
+# configuration, with libsqlite3-sys depending on that `openssl-sys`, on every
+# target triple the `python-wheels` job of
 # `.github/workflows/build-matrix.yml` builds, and in the graph of no other
 # configuration this repository ships. `pip install` runs no linker, so the wheel
 # has to carry SQLCipher's crypto; the scp-node, scp-relay and scp-personal-relay
@@ -11,7 +12,9 @@
 #
 # Presence: `wheel_triple_occurrences` runs one `cargo tree --target <triple>` per
 # wheel triple, keeping build edges because `openssl-src` is a build-dependency of
-# `openssl-sys`. `scripts/check-shipped-feature-graph.sh` exempts that one function
+# `openssl-sys`, and a second one, `-i openssl-sys --depth 1`, that has to list
+# libsqlite3-sys among openssl-sys's direct dependents, because only that edge makes
+# SQLCipher compile against the vendored OpenSSL. `scripts/check-shipped-feature-graph.sh` exempts that one function
 # from its rule that every `cargo tree` under scripts/ names `--target all` while
 # this whole file hashes to the value it pins, so an edit anywhere in this file
 # cancels the exemption, an edit to WHEEL_TRIPLES_PROGRAM, which lists the wheel
@@ -113,9 +116,16 @@ all_target_occurrences() {
   count_in "$tree"
 }
 
-# manifest_paths: every Cargo.toml git tracks, plus every one in the working tree
-# that git does not ignore, so an uncommitted new workspace root is resolved too.
-manifest_paths() { git ls-files --cached --others --exclude-standard -- 'Cargo.toml' '*/Cargo.toml'; }
+# manifest_paths: every Cargo.toml git tracks that the working tree still holds, plus
+# every one in the working tree that git does not ignore, so an uncommitted new
+# workspace root is resolved too and an uncommitted deletion leaves no path that
+# WORKSPACE_ROOTS_PROGRAM fails to open. `--cached` lists index entries whether or
+# not the file exists, so the loop drops each path that is not a regular file.
+manifest_paths() {
+  local path
+  git ls-files --cached --others --exclude-standard -- 'Cargo.toml' '*/Cargo.toml' |
+    while IFS= read -r path; do if [[ -f "$path" ]]; then printf '%s\n' "$path"; fi; done
+}
 
 # report <label> <count or empty on failure> <want: some|none>: one verdict line.
 report() {
@@ -198,11 +208,14 @@ run_fixtures() {
 
   # A fake cargo that records its arguments and prints openssl-src for a graph naming
   # vendored-openssl on a triple other than $FAKE_DROPPED or naming a $FAKE_VENDORS word.
-  printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$*" >> "$ARGV_LOG"' '[ -n "$FAKE_BROKEN" ] && exit 101' 'echo "pkg v0.1.0"' \
+  # It answers `-i openssl-sys` with libsqlite3-sys as a dependent unless $FAKE_NO_EDGE.
+  printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$*" >> "$ARGV_LOG"' '[ -n "$FAKE_BROKEN" ] && exit 101' \
+    'case " $* " in *" -i openssl-sys "*) echo "openssl-sys v0.9.111"; [ -n "$FAKE_NO_EDGE" ] || echo "libsqlite3-sys v0.30.1"; exit 0;; esac' \
+    'echo "pkg v0.1.0"' \
     'for w in $FAKE_VENDORS; do case " $* " in *" $w "*) echo "openssl-src v300.5.1";; esac; done' \
     'case " $* " in *" --target all "*|*" --target $FAKE_DROPPED "*) ;; *vendored-openssl*) echo "openssl-src v300.5.1";; esac' > "$dir/bin/cargo"
   chmod +x "$dir/bin/cargo"
-  export ARGV_LOG="$dir/argv" FAKE_DROPPED=none FAKE_VENDORS="" FAKE_BROKEN=""
+  export ARGV_LOG="$dir/argv" FAKE_DROPPED=none FAKE_VENDORS="" FAKE_BROKEN="" FAKE_NO_EDGE=""
   PATH="$dir/bin:$saved_path"
   FAKE_BROKEN=1 all_target_occurrences --workspace >/dev/null 2>&1; expect "a cargo that exits non-zero FAILS rather than counting zero" FAIL $?
 
@@ -212,13 +225,16 @@ run_fixtures() {
     "  --print-wheel-entries) printf '%s\n' $(printf '%q' "$wheel") ;;" \
     "  --print-artifacts) if [ -n \"\${FAKE_ARTIFACTS+x}\" ]; then printf '%s\n' \"\$FAKE_ARTIFACTS\"; else printf '%s\n' 'scp-node|' 'scp-ffi|--no-default-features --features server' $(printf '%q' "${wheel#*$'\t'}"); fi ;;" \
     'esac' > "$dir/gate.sh"
+  local want_argv
+  want_argv="$(printf '%s\n' "tree -p scp-ffi --features extension-module,vendored-openssl --target aarch64-apple-darwin -e no-dev --prefix none --format {p}" \
+    "tree -p scp-ffi --features extension-module,vendored-openssl --target aarch64-apple-darwin -e no-dev -i openssl-sys --depth 1 --prefix none --format {p}")"
   : > "$ARGV_LOG"
   FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_triple_occurrences aarch64-apple-darwin >/dev/null
-  same "$(cat "$ARGV_LOG")" "tree -p scp-ffi --features extension-module,vendored-openssl --target aarch64-apple-darwin -e no-dev --prefix none --format {p}"
-  expect "the presence call resolves the wheel entry on the one triple with build edges" PASS $?
+  same "$(cat "$ARGV_LOG")" "$want_argv"
+  expect "the presence calls resolve the wheel entry on the one triple, with build edges and then openssl-sys's direct dependents" PASS $?
   : > "$ARGV_LOG"
   FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_triple_occurrences aarch64-apple-darwin scp-node --no-default-features >/dev/null
-  same "$(cat "$ARGV_LOG")" "tree -p scp-ffi --features extension-module,vendored-openssl --target aarch64-apple-darwin -e no-dev --prefix none --format {p}"
+  same "$(cat "$ARGV_LOG")" "$want_argv"
   expect "a caller's package and feature arguments do not reach the one-triple resolution" PASS $?
   # The readonly lines at the end of this file, read from the file and run here in a
   # subshell: after them each pinned variable refuses a call's temporary assignment
@@ -242,6 +258,8 @@ run_fixtures() {
   scenario "run_gate PASSES when only the wheel vendors" PASS
   FAKE_DROPPED=x86_64-pc-windows-msvc scenario "(presence) run_gate FAILS when one wheel triple reaches no $VENDOR_CRATE" FAIL
   printf '%s\n' "$out" | grep -F "FAIL — x86_64-pc-windows-msvc reaches 0" >/dev/null; expect "(presence) it names that triple" PASS $?
+  FAKE_NO_EDGE=1 scenario "(presence) run_gate FAILS when $VENDOR_CRATE reaches the wheel but libsqlite3-sys does not depend on openssl-sys" FAIL
+  printf '%s\n' "$out" | grep -F "libsqlite3-sys does not depend on openssl-sys" >/dev/null; expect "(presence) it names the missing SQLCipher edge" PASS $?
   FAKE_VENDORS=scp-node scenario "(absence) run_gate FAILS when another shipped configuration reaches $VENDOR_CRATE" FAIL
   printf '%s\n' "$out" | grep -F "FAIL — scp-node| reaches 1" >/dev/null; expect "(absence) it names scp-node" PASS $?
   # The absence loop skips the wheel entry by exact match. Vendoring the scp-ffi
@@ -270,10 +288,13 @@ run_fixtures() {
     py -c "$WORKSPACE_ROOTS_PROGRAM" | paste -sd' ' -)"
   same "$out" "$dir/w/Cargo.toml $dir/w/out/Cargo.toml $dir/solo/Cargo.toml"
   expect "a quoted [ \"workspace\" ] header, an excluded package, and an unenclosed package count as roots; a member, a package.workspace pointer, and a package below that pointer do not" PASS $?
-  mkdir -p "$dir/g/new" "$dir/g/skip"; printf '%s\n' skip/ > "$dir/g/.gitignore"
+  mkdir -p "$dir/g/new" "$dir/g/skip" "$dir/g/gone"; printf '%s\n' skip/ > "$dir/g/.gitignore"
   cp "$dir/w/member/Cargo.toml" "$dir/g/new/Cargo.toml"; cp "$dir/w/member/Cargo.toml" "$dir/g/skip/Cargo.toml"
-  out="$(cd "$dir/g" && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE && git init -q && manifest_paths | paste -sd' ' -)"
-  same "$out" "new/Cargo.toml"; expect "an untracked manifest is listed and an ignored one is not" PASS $?
+  cp "$dir/w/member/Cargo.toml" "$dir/g/gone/Cargo.toml"
+  out="$(cd "$dir/g" && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE && git init -q && git add gone/Cargo.toml &&
+    rm gone/Cargo.toml && manifest_paths | paste -sd' ' -)"
+  same "$out" "new/Cargo.toml"
+  expect "an untracked manifest is listed; an ignored one, and a tracked one the working tree deleted, are not" PASS $?
   printf '%s\n' '[workspace' > "$dir/c.toml"
   echo "$dir/c.toml" | py -c "$WORKSPACE_ROOTS_PROGRAM" >/dev/null 2>&1; expect "an unparseable manifest FAILS" FAIL $?
   PATH="$saved_path"; rm -rf "$dir"
@@ -284,17 +305,31 @@ run_fixtures() {
 # The owner gate pins this whole file (see the header). The function below is the
 # one per-triple `cargo tree` its `--target all` rule exempts.
 #
-# wheel_triple_occurrences <triple>: the wheel's graph on one triple. The package
-# and features come from wheel_line, never from the caller's arguments. A cargo
-# failure fails the count.
+# wheel_triple_occurrences <triple>: how many `openssl-src` the wheel's graph on one
+# triple holds, or 0 when libsqlite3-sys does not depend on openssl-sys there. The
+# package and features come from wheel_line, never from the caller's arguments. A
+# cargo failure fails the count. libsqlite3-sys 0.30 declares openssl-sys as an
+# optional dependency that only its `bundled-sqlcipher-vendored-openssl` feature
+# enables, and only that feature makes its build script compile SQLCipher against
+# openssl-sys; under plain `bundled-sqlcipher` it links the build host's OpenSSL. So
+# an `openssl-src` that another crate pulls in, with no libsqlite3-sys -> openssl-sys
+# edge, counts 0, because it proves nothing about the crypto SQLCipher links.
 wheel_triple_occurrences() {
-  local triple="$1" entry tree
+  local triple="$1" entry tree dependents
   local -a args=()
   entry="$(wheel_line)" || return 1
   entry="${entry#*$'\t'}"
   read -r -a args <<<"${entry#*|}"
   tree="$(cargo tree -p "${entry%%|*}" ${args[@]+"${args[@]}"} --target "$triple" -e no-dev --prefix none --format '{p}')" ||
     { echo "cargo tree failed for ${entry%%|*} on $triple" >&2; return 1; }
+  if [[ "$(count_in "$tree")" -gt 0 ]]; then
+    dependents="$(cargo tree -p "${entry%%|*}" ${args[@]+"${args[@]}"} --target "$triple" -e no-dev -i openssl-sys --depth 1 --prefix none --format '{p}')" ||
+      { echo "cargo tree -i openssl-sys failed for ${entry%%|*} on $triple" >&2; return 1; }
+    if ! printf '%s\n' "$dependents" | grep -qE '^libsqlite3-sys v'; then
+      echo "$triple: $VENDOR_CRATE is in the wheel's graph, but libsqlite3-sys does not depend on openssl-sys, so SQLCipher links the build host's OpenSSL" >&2
+      tree=""
+    fi
+  fi
   count_in "$tree"
 }
 

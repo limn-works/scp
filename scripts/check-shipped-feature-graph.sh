@@ -1143,7 +1143,7 @@ assert_every_pipeline_reader_consumes_its_input() {
 #   name `--target all`.
 TARGET_ALL_EXEMPT_FILE="scripts/check-vendored-openssl-scope.sh"
 TARGET_ALL_EXEMPT_FUNCTION="wheel_triple_occurrences"
-TARGET_ALL_EXEMPT_BLOB="384e7b101e2649ebaadd66caa5612915b988698d"
+TARGET_ALL_EXEMPT_BLOB="850fafba1f72e9777ec41fe8fd76065edd7e2089"
 
 # target_all_exempt_range <file>
 #   Emit "<start> <end>", the line numbers of TARGET_ALL_EXEMPT_FUNCTION's one
