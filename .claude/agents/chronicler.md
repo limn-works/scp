@@ -44,11 +44,11 @@ Plans unique: they are genesis artifacts and come before everything else in the 
 
 ### 1. Artifact and Documentation Changes
 
-When a change touches `.docs/`, `CLAUDE.md`, or a definition under `.claude/agents/` or `.claude/skills/`, check it even when no code changed. That covers:
+When a change touches `.docs/`, an `AGENTS.md` file, or a definition under `.claude/agents/`, check it even when no code changed. That covers:
 - Renames, reorganization, or restructuring of `.docs/` or `.claude/` directories
 - Updates to lessons, specs, ADRs, PRDs, standards, or planning sessions
-- Changes to agent definitions or skill definitions
-- Changes to `CLAUDE.md` or any project documentation
+- Changes to agent definitions
+- Changes to an `AGENTS.md` file or any project documentation
 
 **Purpose**: Verify cross-references remain valid, artifact flow is respected, and no stale paths or broken links were introduced.
 
