@@ -1690,8 +1690,11 @@ jobs:
     # `python || rust`, bridge-parity reads `python || typescript || rust`, and
     # bridge-parity-kotlin reads `python || kotlin || rust`. GitHub skips a job whose
     # `needs` holds a skipped job, so a producer selected by anything narrower than
-    # that union would turn a consumer that was supposed to run into a skip, and the
-    # `ci` aggregator counts a skip as a pass.
+    # that union would turn a consumer that was supposed to run into a skip. The `ci`
+    # aggregator evaluates that consumer's own `if:`, finds it true, and fails the run
+    # on the skip; the needs-condition check in
+    # scripts/tests/ci-gate/ci_gate_selftest.py reports the narrowed union before any
+    # pull request reaches that failure.
     if: >-
       needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.typescript == 'true' ||
@@ -1762,8 +1765,9 @@ jobs:
     needs: changes
     # The union of typescript-check (`typescript || rust`) and bridge-parity
     # (`python || typescript || rust`). Dropping the `python` clause would skip this
-    # job on a change confined to bindings/python, skip bridge-parity with it, and
-    # leave the NAPI half of the parity harness unrun under a green `ci`.
+    # job on a change confined to bindings/python and skip bridge-parity with it, so
+    # the `ci` aggregator, which reads bridge-parity's own `if:` as true, would fail
+    # every such pull request.
     if: >-
       needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.typescript == 'true' ||

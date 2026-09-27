@@ -133,9 +133,11 @@ nothing:
                Four jobs build one bridge artifact each and upload it, and six
                jobs download what they build instead of compiling their own.
                GitHub skips a job when any job in its `needs` list is skipped,
-               and both the aggregate below and branch protection read a skipped
-               job as a pass, so a producer whose `if:` is narrower than one
-               consumer's deletes that consumer from the run under a green `ci`.
+               so a producer whose `if:` is narrower than one consumer's skips
+               that consumer wherever the gap opens. The aggregate evaluates the
+               consumer's own `if:` and fails that run, but only on a pull
+               request whose changed files open the gap, which is usually not
+               the pull request that narrowed the producer.
                Job napi-addon is the case: bridge-parity reads
                `python || typescript || rust`, so a producer reading
                `typescript || rust` — the condition typescript-check alone
@@ -3199,16 +3201,20 @@ def dependency_condition_gaps(doc: dict) -> list[str]:
     CRITERION: wherever a job's own `if:` selects it, the `if:` of every job in its
     `needs` list must select that job too.
 
-    WHY: GitHub skips a job when any job in its `needs` list is skipped, and both
-    scripts/ci-aggregate-result.py and GitHub's own branch protection read a skipped
-    job as a pass. A dependency selected by a narrower condition than its dependant
-    therefore deletes the dependant from the run under a green `ci`. The shape this
+    WHY: GitHub skips a job when any job in its `needs` list is skipped, so a
+    dependency selected by a narrower condition than its dependant skips the
+    dependant. scripts/ci-aggregate-result.py evaluates the dependant's own `if:`,
+    finds it true, and fails that run, but it judges only the filter outputs of the
+    run in front of it: the pull request that narrowed the dependency passes when
+    its own changed files do not open the gap, and a later, unrelated pull request
+    goes red. This check evaluates every filter assignment, so it reports the gap
+    on the pull request that introduces it. The shape this
     check exists for is a producer job that builds an artifact for several consumers:
     its condition has to be the union of theirs, and an edit that narrows it, or that
     widens one consumer's, is invisible in a diff of either job alone.
 
     SCOPE: ci.yml, the workflow this file's aggregate judges, because that aggregate
-    is what reads a skipped job as a pass and it is a required status check. A
+    is the required status check that fails on the skip. A
     condition inside it that this grammar cannot read is reported rather than
     stepped over, so the check cannot pass by failing to parse.
     """
@@ -3255,7 +3261,7 @@ def dependency_condition_gaps(doc: dict) -> list[str]:
                 gaps.append(
                     f"{job_id} runs and {dependency} skips on event {event} with "
                     f"filters {selected or ['none']} true, which skips {job_id} "
-                    f"under a green `ci`"
+                    f"and fails the `ci` aggregate on every such pull request"
                 )
     return gaps
 
@@ -3335,9 +3341,9 @@ def check_dependency_conditions_read_a_status_guarded_consumer(doc: dict) -> Non
 
     A consumer that writes `success()`, `failure()` or `cancelled()` still skips when
     a job in its `needs` list skips, because each of those three evaluates false over
-    a skipped dependency. Exempting such a consumer would delete it from the run under
-    a green `ci` exactly as an unexempted gap would, and would delete it silently,
-    since the exemption runs before the branch that reports an expression this grammar
+    a skipped dependency. Exempting such a consumer would let the gap through to a
+    later pull request's red aggregate exactly as an unexempted gap would, and would
+    let it through silently, since the exemption runs before the branch that reports an expression this grammar
     cannot read. Job `error-codes` carries `needs: [check-draft]` and no `if:`; adding
     a producer selected by one filter output gives each mutant a pair to compare.
     """
@@ -4057,6 +4063,20 @@ def main() -> int:
     needs["rust-test"]["result"] = "skipped"
     code, out = run_aggregate(needs, rust_merge.event)
     check("merge_group event, a workspace test job skipped -> exit 1", code == 1, out)
+
+    # A producer that skips takes every consumer in its `needs` list down with it.
+    # The comments on the producer jobs in ci.yml and the needs-condition check above
+    # rest on this aggregate failing that run, because it evaluates the consumer's
+    # own `if:`, not its dependency's.
+    needs = build_needs(jobs, rust_pr)
+    needs["napi-addon"]["result"] = "skipped"
+    needs["bridge-parity"]["result"] = "skipped"
+    code, out = run_aggregate(needs, rust_pr.event)
+    check(
+        "a producer skip that skips a selected consumer -> exit 1",
+        code == 1 and "bridge-parity: skipped" in out,
+        f"exit {code}: {out}",
+    )
 
     needs = build_needs(jobs, docs_pr)
     needs["cross-layer"]["result"] = "skipped"
