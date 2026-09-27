@@ -114,8 +114,12 @@ impl PostgresBlobStore {
             .await
             .map_err(|e| StorageError::Internal(format!("postgres connect: {e}")))?;
 
-        // Create schema (idempotent).
-        sqlx::query(SCHEMA_SQL)
+        // Create schema (idempotent). `SCHEMA_SQL` holds three statements, and
+        // `sqlx::query` sends its text as one prepared statement, which
+        // PostgreSQL rejects with "cannot insert multiple commands into a
+        // prepared statement". `sqlx::raw_sql` sends the text over the simple
+        // query protocol, which accepts several statements in one string.
+        sqlx::raw_sql(SCHEMA_SQL)
             .execute(&pool)
             .await
             .map_err(|e| StorageError::Internal(format!("postgres schema: {e}")))?;

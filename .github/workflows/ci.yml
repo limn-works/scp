@@ -1330,7 +1330,7 @@ jobs:
           aws --endpoint-url "$S3_TEST_ENDPOINT" s3 mb "s3://$S3_TEST_BUCKET"
           cargo nextest run --no-tests=fail -p scp-transport \
             --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob \
-            --run-ignored ignored-only --test-threads 1 \
+            --run-ignored ignored-only --test-threads 1 --no-fail-fast \
             -E 'test(/^native::(postgres_blob|s3_blob)::tests::/)'
 
   # Exercises the napi bridge in its PRODUCTION configuration: default features
