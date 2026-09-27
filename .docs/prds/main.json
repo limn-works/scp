@@ -803,6 +803,7 @@
         "A `largeBlob` store joins the store set only after a write lands at the credential's designation, and a write that does not land removes that member alone: a test fails the write and asserts that the next compose reads the platform-account member and not the `largeBlob` member (`09-security-model.md` §9.7.4.2 R10).",
         "The ceremony's first step runs a self-observation pass and adopts what the extending arm adopts: a test completes a `CommitmentRollover` on one device, then calls `begin` on a second device whose retained log lacks it, and asserts that the second device adopts the rollover and reveals the next commitment rather than the one the rollover consumed (`09-security-model.md` §9.7.4.2 R10)",
         "The consumed-commitment rule holds with reserve members: a test builds a 2-of-4 next set whose rollover reveals two members and re-commits the other two, then calls `begin` on a device whose adopted log carries that rollover, composing at the rollover's predecessor, and asserts `IdentityError::RevealAlreadyPending` and no signature (`09-security-model.md` §9.7.4.2 R10)",
+        "Where the adopted log already carries a reveal-authorized event whose predecessor is a withheld `{Lost}` event's predecessor, the extending arm composes nothing and alerts: a test asserts no composition and one alert (`09-security-model.md` §9.7.4.2 R10)",
         "No unwrap() or expect() in library code."
       ],
       "actionItems": [
@@ -10681,6 +10682,9 @@
         "Before the handle moves to `PublishSent`, the signed event is written to the SDK's own store and to the platform-account member, and never to the `largeBlob` member: a test asserts each store's contents at `Signed` (`09-security-model.md` §9.7.4.2 R10)",
         "A second device that reads a handle past `Signed` and finds the signed event in the platform-account member resumes with `resume_recovery` and publishes it, and its `abort_recovery` refuses: a test loses the composing device at `Signed` and asserts the publish from the second device (`09-security-model.md` §9.7.4.2 R10)",
         "Completion writes a `LastRevealMarker` of `LAST_REVEAL_MARKER_BYTES` to every member and the handle's removal leaves it; before composing a reveal, a device whose adopted log lacks the marked event fetches until it adopts it, and where no entry serves it refuses with `IdentityError::LastRevealUnadopted` carrying the marker: a test per case (`09-security-model.md` §9.7.4.2 R10, `09-security-model.md` §9.18.17)",
+        "`abort_recovery(identifier, ComposingDevice::Destroyed)` clears a handle at `Signed` on a device that reaches no copy of the signed event, and `ComposingDevice::Available` refuses there with `SignedRevealUnpublished`: a test per variant (`09-security-model.md` §9.7.4.2 R10)",
+        "A cosigner writes the `Composed` handle into its own store set before it signs, records the commitment of every key the event reveals, and refuses a second event revealing a recorded commitment with `RevealAlreadyPending`: a test has two officers compose competing rollovers and a third co-sign the first, and asserts its refusal of the second (`09-security-model.md` §9.7.4.2 R10)",
+        "A device whose adopted log lacks the marked event adopts it from its own platform-account member when no relay serves it, and re-publishes it: a test asserts the adoption and the PUBLISH (`09-security-model.md` §9.7.4.2 R10)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
@@ -11007,6 +11011,8 @@
         "`set_witnesses` composes a `KeyState` naming the given witness set and witnessing interval and changes no commitment: a test asserts the snapshot fields and the unchanged commitment (`09-security-model.md` §9.7.4.2 R1)",
         "`cosign` returns the `IndexedSignature` of the one named member its custody holds; a cancelled or failed passkey gesture returns `IdentityError::UserVerificationDeclined` (SCP-IDENT-1109), and a custody backend error returns `IdentityError::CustodySigningFailed` (SCP-IDENT-1111): a test per case (`03-identity.md` §3.10.10)",
         "`attach` publishes through `IdentityBackend::publish` and returns its `PublishOutcome`: a test asserts the per-entry list (`03-identity.md` §3.10.10)",
+        "`cosign` and `attach` each refuse a `PendingEvent` whose `event_digest` differs from SHA-256 of its `preimage` with `IdentityError::PendingDigestMismatch` (SCP-IDENT-1114): a test per operation (`03-identity.md` §3.10.10)",
+        "`cosign`'s confirmation shows every field the event's kind carries: a test composes a `set_witnesses` event and asserts that the display lists the identifier, the sequence, the predecessor digest, each `Current` key with its role, each dropped key with its condition, the witness set and the seals (`09-security-model.md` §9.7.4.2 R10)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
@@ -11093,7 +11099,7 @@
       "acceptanceCriteria": [
         "PyO3, UniFFI and napi each export `identity_create`, `identity_resolve`, `identity_publish`, `identity_read_service_record`, `identity_publish_service_record`, `identity_read_policy`, `identity_fallback_set`, `identity_observe_self`, `identity_rotate_active`, `identity_set_witnesses`, `identity_cosign`, `identity_attach` and the `recovery_*` functions, `recovery_begin` included: `ffi_conformance.rs` asserts each export on each bridge",
         "Each SDK wraps each export under the name the shared scaffold's naming table gives: a test per SDK calls each wrapper",
-        "`EntryReach`, `ChainRelation`, `ExtendingAct`, `EntryResult`, `NotSentReason`, `RecoveryPhase`, `RecoveryKind`, `SignatureGroup`, `SignerPlan`, `EventOutcome`, `RotationReason` and `ResolutionVerdict` carry their spec variant names verbatim in every SDK: a conformance test compares the variant names across the five languages (`03-identity.md` §3.10.10)",
+        "`EntryReach`, `ChainRelation`, `ExtendingAct`, `EntryResult`, `NotSentReason`, `RecoveryPhase`, `RecoveryKind`, `ComposingDevice`, `SignatureGroup`, `SignerPlan`, `EventOutcome`, `RotationReason` and `ResolutionVerdict` carry their spec variant names verbatim in every SDK: a conformance test compares the variant names across the five languages (`03-identity.md` §3.10.10)",
         "One conformance fixture of identity operations replays in Rust, Python, TypeScript, Swift and Kotlin with identical results",
         "The SDK capability matrix lists every operation above for every SDK",
         "The agent-key exports, `identity_migrate`, the DID-document classes and the FFI DHT client are absent from all three bridges: a grep per name prints nothing"
