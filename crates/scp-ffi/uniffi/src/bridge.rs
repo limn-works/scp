@@ -4965,14 +4965,19 @@ impl McpUniFfiBridgeProvider {
     ///
     /// # Errors
     ///
-    /// Returns a message naming the check that refused the invocation.
+    /// Returns [`AccessRefusal::Denied`](scp_mcp::server::AccessRefusal::Denied)
+    /// naming the check that refused the invocation, and
+    /// [`AccessRefusal::Unreadable`](scp_mcp::server::AccessRefusal::Unreadable)
+    /// when the agent's proof tokens, the context's handle, or its UCAN state
+    /// cannot be read, so a failed read never reaches the client as a denial.
     fn outlet_grant(
         &self,
         bi: &Arc<crate::runtime::UniffiBridgeInstance>,
         role_state: &scp_core::context::roles::ContextRoleState,
         context_id: &str,
         outlet_name: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), scp_mcp::server::AccessRefusal> {
+        use scp_mcp::server::AccessRefusal;
         // Primary check: UCAN token validation via the full 11-step ADR-016
         // pipeline. Verifies the token grants the outlet's kind-appropriate stem
         // — outlet_query:{outlet_name}/outlet_query:* for Query outlets,
@@ -4984,7 +4989,9 @@ impl McpUniFfiBridgeProvider {
             if let Some(ref tokens) = self.agent_proof_tokens {
                 for encoded in tokens {
                     let proof_token = scp_core::crypto::ucan::validate::parse_ucan(encoded)
-                        .map_err(|e| format!("malformed proof token: {e}"))?;
+                        .map_err(|e| {
+                            AccessRefusal::Unreadable(format!("malformed proof token: {e}"))
+                        })?;
                     let cid = scp_core::crypto::ucan::mint::compute_cid(&proof_token);
                     proofs.insert(cid, proof_token);
                 }
@@ -4997,7 +5004,9 @@ impl McpUniFfiBridgeProvider {
             // is released before entering with_ucan_state (a different DashMap).
             let outlet_kind_for_ucan = {
                 let handle = context_handle_registry(bi).get(context_id).ok_or_else(|| {
-                    format!("context '{context_id}' not found in handle registry")
+                    AccessRefusal::Unreadable(format!(
+                        "context '{context_id}' not found in handle registry"
+                    ))
                 })?;
                 bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
                 let registry = handle
@@ -5005,7 +5014,9 @@ impl McpUniFfiBridgeProvider {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 registry.get(outlet_name).map(|r| r.kind).ok_or_else(|| {
-                    format!("outlet '{outlet_name}' not registered in context '{context_id}'")
+                    AccessRefusal::Denied(format!(
+                        "outlet '{outlet_name}' not registered in context '{context_id}'"
+                    ))
                 })?
             };
 
@@ -5058,7 +5069,12 @@ impl McpUniFfiBridgeProvider {
                     format!("UCAN authorization failed for outlet '{outlet_name}': {e}")
                 })
             })
-            .ok_or_else(|| format!("UCAN state not found for context '{context_id}'"))??;
+            .ok_or_else(|| {
+                AccessRefusal::Unreadable(format!(
+                    "UCAN state not found for context '{context_id}'"
+                ))
+            })?
+            .map_err(AccessRefusal::Denied)?;
         } else {
             tracing::warn!(
                 agent = %self.agent_did,
@@ -5066,7 +5082,9 @@ impl McpUniFfiBridgeProvider {
                 context = %context_id,
                 "no UCAN token provided for outlet invocation — authorization bypass risk"
             );
-            return Err("UCAN token required for outlet invocation — no token provided".to_owned());
+            return Err(AccessRefusal::Denied(
+                "UCAN token required for outlet invocation — no token provided".to_owned(),
+            ));
         }
 
         // Defense-in-depth: check role-state capabilities in addition to the
@@ -5080,9 +5098,11 @@ impl McpUniFfiBridgeProvider {
         // registry defaults to the Action stem (the UCAN gate above already
         // required registration).
         let outlet_kind = {
-            let handle = context_handle_registry(bi)
-                .get(context_id)
-                .ok_or_else(|| format!("context '{context_id}' not found in handle registry"))?;
+            let handle = context_handle_registry(bi).get(context_id).ok_or_else(|| {
+                AccessRefusal::Unreadable(format!(
+                    "context '{context_id}' not found in handle registry"
+                ))
+            })?;
             let registry = handle
                 .outlet_registry
                 .lock()
@@ -5106,7 +5126,9 @@ impl McpUniFfiBridgeProvider {
                 context = %context_id,
                 "capability check failed: agent lacks the required outlet invocation capability"
             );
-            Err("insufficient permissions to invoke outlet".to_owned())
+            Err(AccessRefusal::Denied(
+                "insufficient permissions to invoke outlet".to_owned(),
+            ))
         }
     }
 }
@@ -5204,9 +5226,9 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         outlet_name: &str,
     ) -> Result<(), scp_mcp::server::AccessRefusal> {
         use scp_mcp::server::AccessRefusal;
-        // A dropped bridge instance or an unreadable role state is a failed
-        // read, which `tools/list` reports as an error instead of omitting
-        // the context's tools.
+        // A dropped bridge instance, an unreadable role state, or a failed
+        // read inside `outlet_grant` is a failed read, which `tools/list`
+        // reports as an error instead of omitting the context's tools.
         let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
         let role_state = Self::role_state_of(&bi, context_id)
             .map_err(AccessRefusal::Unreadable)?
@@ -5216,7 +5238,6 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                 ))
             })?;
         self.outlet_grant(&bi, &role_state, context_id, outlet_name)
-            .map_err(AccessRefusal::Denied)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -23526,10 +23547,11 @@ mod tests {
         let _opt: Option<Arc<crate::runtime::UniffiBridgeInstance>> = provider.bi.upgrade();
     }
 
-    /// The `UniFFI` MCP provider's methods that degrade gracefully return
-    /// safe defaults when the bridge instance has been dropped.
+    /// Every `UniFFI` MCP provider read fails when the bridge instance has
+    /// been dropped, so no read reports an empty result for state it could
+    /// not see. `agent_did` is provider-local and still answers.
     #[test]
-    fn mcp_uniffi_provider_returns_safe_defaults_when_bridge_dropped() {
+    fn mcp_uniffi_provider_reads_fail_when_bridge_dropped() {
         use scp_mcp::server::ContextProvider;
 
         let provider = {
@@ -23562,9 +23584,16 @@ mod tests {
             "context_events must fail, not report a zero-event log"
         );
 
-        // validate_capability with no UCAN: returns the UCAN-required error
-        // (it short-circuits before the bridge upgrade).
-        assert!(provider.validate_capability("ctx-dropped", "t").is_err());
+        // validate_capability upgrades the bridge before its UCAN check, so a
+        // dropped bridge is a failed read, not the UCAN-required denial.
+        assert!(
+            matches!(
+                provider.validate_capability("ctx-dropped", "t"),
+                Err(scp_mcp::server::AccessRefusal::Unreadable(msg))
+                    if msg.contains("bridge instance has been dropped")
+            ),
+            "a dropped bridge is a failed read that names the dropped bridge"
+        );
 
         // active_context_ids: an error. It resolves live participation through
         // the bridge's Supervisor, so a dropped instance cannot answer, and an
@@ -23807,11 +23836,13 @@ mod tests {
         let bi = Arc::clone(&scp.inner);
 
         // A live supervisor-backed context whose creator is the DID the MCP
-        // provider serves, with a ceiling wide enough that the creator-admin
-        // holds `outlet_call:*` — so `tools/list` both reads the outlet
-        // registry (`context_tools`) AND passes the role-state capability
-        // filter (`validate_capability`), the two provider paths that read
-        // the handle's outlet mutexes during listing.
+        // provider serves. `tools/list` reads the outlet registry through
+        // `context_tools`. The server's provider holds no agent UCAN, so its
+        // capability filter returns before `outlet_grant` locks the registry;
+        // the task below therefore calls `validate_capability` itself with an
+        // unparseable UCAN, which locks the registry in the UCAN branch and
+        // then fails validation. The role-state branch's registry lock runs
+        // only after a UCAN validates, and this test does not reach it.
         bi.init_context_manager_with_did("did:dht:z6MkSubscriber");
         bi.context_manager_or_error()
             .expect("supervisor must be attached")
@@ -23850,7 +23881,8 @@ mod tests {
             operator_did: "did:dht:z6MkTestUser".to_owned(),
             cost: None,
         };
-        scp.outlet_register(Arc::clone(&handle), def)
+        let outlet_id = scp
+            .outlet_register(Arc::clone(&handle), def)
             .await
             .expect("outlet_register must succeed");
 
@@ -23860,12 +23892,13 @@ mod tests {
             agent_did: "did:dht:z6MkSubscriber".to_owned(),
             context_ids: vec!["ctx-test".to_owned()],
             outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
-            agent_ucan_token: None,
+            agent_ucan_token: Some("not-a-ucan".to_owned()),
             agent_proof_tokens: None,
         };
 
         // Drive the MCP exchange from a spawned async task — the same
         // execution context as the shipped serve loop's dispatch.
+        let task_outlet_id = outlet_id.clone();
         let serve = tokio::spawn(async move {
             let _ = advertised_subscribe(&mut server);
             let response = server
@@ -23881,9 +23914,10 @@ mod tests {
             let outlets = provider
                 .context_tools("ctx-test")
                 .expect("context_tools must read a registered context");
-            (response, outlets)
+            let grant = provider.validate_capability("ctx-test", &task_outlet_id);
+            (response, outlets, grant)
         });
-        let (response, outlets) = serve.await.expect(
+        let (response, outlets, grant) = serve.await.expect(
             "the MCP dispatch task must not panic — a panic here is the shipped \
              serve loop dying on its first registry-backed tools/list",
         );
@@ -23893,8 +23927,41 @@ mod tests {
             "tools/list must succeed, got: {:?}",
             response.error
         );
-        // With no agent UCAN the capability filter fails closed, so the
-        // MCP-visible tool list is empty — but the registry-backed read
+        // The UCAN branch read the registered outlet's kind under the
+        // registry lock, and only then refused the unparseable token.
+        assert!(
+            matches!(
+                &grant,
+                Err(scp_mcp::server::AccessRefusal::Denied(msg))
+                    if msg.contains("UCAN authorization failed")
+            ),
+            "validate_capability must reach UCAN validation, got: {grant:?}"
+        );
+        // An unparseable proof token is a failed read of the agent's
+        // credentials, so tools/list reports it as an error instead of
+        // omitting the tool as a denial.
+        let unreadable_proofs = McpUniFfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: "did:dht:z6MkSubscriber".to_owned(),
+            context_ids: vec!["ctx-test".to_owned()],
+            outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: Some("not-a-ucan".to_owned()),
+            agent_proof_tokens: Some(vec!["not-a-ucan".to_owned()]),
+        };
+        let proofs_grant = {
+            use scp_mcp::server::ContextProvider as _;
+            unreadable_proofs.validate_capability("ctx-test", &outlet_id)
+        };
+        assert!(
+            matches!(
+                &proofs_grant,
+                Err(scp_mcp::server::AccessRefusal::Unreadable(msg))
+                    if msg.contains("malformed proof token")
+            ),
+            "an unparseable proof token must be a failed read, got: {proofs_grant:?}"
+        );
+        // With no agent UCAN the server's capability filter fails closed, so
+        // the MCP-visible tool list is empty — but the registry-backed read
         // itself must have served the real registration.
         assert!(
             outlets.iter().any(|o| o.name == "async-probe"),

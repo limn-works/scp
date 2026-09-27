@@ -742,14 +742,19 @@ impl FfiBridgeProvider {
     ///
     /// # Errors
     ///
-    /// Returns a message naming the check that refused the invocation.
+    /// Returns [`AccessRefusal::Denied`](scp_mcp::server::AccessRefusal::Denied)
+    /// naming the check that refused the invocation, and
+    /// [`AccessRefusal::Unreadable`](scp_mcp::server::AccessRefusal::Unreadable)
+    /// when the agent's proof tokens or the bridge's copy of the context
+    /// cannot be read, so a failed read never reaches the client as a denial.
     fn outlet_grant(
         &self,
         bi: &crate::runtime::PyBridgeInstance,
         role_state: &scp_core::context::roles::ContextRoleState,
         context_id: &str,
         outlet_name: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), scp_mcp::server::AccessRefusal> {
+        use scp_mcp::server::AccessRefusal;
         // Primary check: UCAN token validation via the full 11-step ADR-016
         // pipeline. Verifies the token grants the outlet's kind-appropriate stem
         // — outlet_query:{outlet_name}/outlet_query:* for Query outlets,
@@ -760,21 +765,23 @@ impl FfiBridgeProvider {
             // Build proof resolver from optional proof tokens (supports delegated UCANs).
             let proof_resolver =
                 crate::ucan::build_proof_resolver_from_tokens(self.agent_proof_tokens.as_deref())
-                    .map_err(|e| format!("failed to build proof resolver: {e}"))?;
+                    .map_err(|e| {
+                    AccessRefusal::Unreadable(format!("failed to build proof resolver: {e}"))
+                })?;
 
-            crate::runtime::with_context(bi, context_id, |rt| {
+            // The closure's `Ok` carries the UCAN decision, so an `Err` from
+            // `with_context` is a failed read of the bridge's context copy.
+            let decision = crate::runtime::with_context(bi, context_id, |rt| {
                 // SCP-OUT-014: select the split capability stem from the
                 // outlet's registered kind — `outlet_query:{id}` for Query
                 // outlets, `outlet_call:{id}` for Action outlets.
-                let outlet_kind_for_ucan = rt
-                    .outlet_registry
-                    .get(outlet_name)
-                    .map(|r| r.kind)
-                    .ok_or_else(|| {
-                        ScpPyError::ucan(format!(
-                            "outlet '{outlet_name}' not registered in context '{context_id}'"
-                        ))
-                    })?;
+                let Some(outlet_kind_for_ucan) =
+                    rt.outlet_registry.get(outlet_name).map(|r| r.kind)
+                else {
+                    return Ok(Err(format!(
+                        "outlet '{outlet_name}' not registered in context '{context_id}'"
+                    )));
+                };
 
                 let production_resolver = crate::runtime::did_resolver(bi);
                 let did_resolver = crate::bridge_adapters::DispatchDidResolver::new(
@@ -806,7 +813,7 @@ impl FfiBridgeProvider {
                     caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
                 };
 
-                scp_core::context::outlets::validate_outlet_invocation_ucan(
+                Ok(scp_core::context::outlets::validate_outlet_invocation_ucan(
                     token,
                     context_id,
                     outlet_name,
@@ -821,12 +828,11 @@ impl FfiBridgeProvider {
                         error = %e,
                         "UCAN validation failed for outlet invocation"
                     );
-                    ScpPyError::ucan(format!(
-                        "UCAN authorization failed for outlet '{outlet_name}': {e}"
-                    ))
-                })
+                    format!("UCAN authorization failed for outlet '{outlet_name}': {e}")
+                }))
             })
-            .map_err(|e| format!("{e}"))?;
+            .map_err(|e| AccessRefusal::Unreadable(format!("{e}")))?;
+            decision.map_err(AccessRefusal::Denied)?;
         } else {
             tracing::warn!(
                 agent = %self.agent_did,
@@ -834,43 +840,47 @@ impl FfiBridgeProvider {
                 context = %context_id,
                 "no UCAN token provided for outlet invocation — authorization bypass risk"
             );
-            return Err("UCAN token required for outlet invocation — no token provided".to_owned());
+            return Err(AccessRefusal::Denied(
+                "UCAN token required for outlet invocation — no token provided".to_owned(),
+            ));
         }
 
         // Defense-in-depth: check role-state capabilities in addition to the
-        // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
-        crate::runtime::with_context(bi, context_id, |rt| {
+        // UCAN layer. See §7.2 and ADR-010 for the dual-check design. The
+        // closure cannot fail, so an `Err` from `with_context` means the
+        // bridge's context copy could not be read.
+        let outlet_kind = crate::runtime::with_context(bi, context_id, |rt| {
             // SCP-OUT-014: select the kind-appropriate split stem from the
             // outlet's registered kind — OutletQuery for Query outlets,
             // OutletCall for Action outlets (§5.4.2). The two stems are
             // independent, so a Query grant never authorizes an Action call and
             // vice versa. An outlet absent from the registry defaults to the
             // Action stem (the UCAN gate above already required registration).
-            let outlet_kind = rt
+            Ok(rt
                 .outlet_registry
                 .get(outlet_name)
-                .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind);
-            if scp_core::context::outlets::invoke::has_outlet_invocation_capability(
-                role_state,
-                &self.agent_did,
-                outlet_name,
-                outlet_kind,
-            ) {
-                Ok(())
-            } else {
-                // Generic message for the wire — detailed info stays server-side.
-                tracing::warn!(
-                    agent = %self.agent_did,
-                    outlet = %outlet_name,
-                    context = %context_id,
-                    "capability check failed: agent lacks the required outlet invocation capability"
-                );
-                Err(ScpPyError::context(
-                    "insufficient permissions to invoke outlet",
-                ))
-            }
+                .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind))
         })
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| AccessRefusal::Unreadable(format!("{e}")))?;
+        if scp_core::context::outlets::invoke::has_outlet_invocation_capability(
+            role_state,
+            &self.agent_did,
+            outlet_name,
+            outlet_kind,
+        ) {
+            Ok(())
+        } else {
+            // Generic message for the wire — detailed info stays server-side.
+            tracing::warn!(
+                agent = %self.agent_did,
+                outlet = %outlet_name,
+                context = %context_id,
+                "capability check failed: agent lacks the required outlet invocation capability"
+            );
+            Err(AccessRefusal::Denied(
+                "insufficient permissions to invoke outlet".to_owned(),
+            ))
+        }
     }
 }
 
@@ -942,15 +952,14 @@ impl ContextProvider for FfiBridgeProvider {
         outlet_name: &str,
     ) -> Result<(), scp_mcp::server::AccessRefusal> {
         use scp_mcp::server::AccessRefusal;
-        // A dropped bridge instance or an unreadable role state is a failed
-        // read, which `tools/list` reports as an error instead of omitting
-        // the context's tools. The role state comes from the actor, not the
-        // bridge copy.
+        // A dropped bridge instance, an unreadable role state, or a failed
+        // read inside `outlet_grant` is a failed read, which `tools/list`
+        // reports as an error instead of omitting the context's tools. The
+        // role state comes from the actor, not the bridge copy.
         let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
         let role_state =
             Self::live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;
         self.outlet_grant(&bi, &role_state, context_id, outlet_name)
-            .map_err(AccessRefusal::Denied)
     }
 
     #[allow(clippy::too_many_lines)] // Three-phase dispatch: validate + execute + emit event.
@@ -2839,6 +2848,42 @@ mod tests {
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
+    /// A proof token `outlet_grant` cannot parse is a failed read, so
+    /// `tools/list` reports it as an error. A token that parses and fails
+    /// validation is a denial, so `tools/list` omits the tool.
+    #[test]
+    fn ffi_bridge_provider_outlet_grant_read_failure_is_unreadable_not_denied() {
+        let creator = "did:dht:z6MkCreatorGrantRead";
+        let bi = __bi();
+        let ctx_id = setup_unsupervised_context(&bi, creator, true);
+        let provider = |proofs: Option<Vec<String>>| FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+            outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: Some("not-a-ucan".to_owned()),
+            agent_proof_tokens: proofs,
+        };
+
+        let err = provider(Some(vec!["not-a-ucan".to_owned()]))
+            .validate_capability(&ctx_id, "calculator")
+            .unwrap_err();
+        assert!(
+            matches!(&err, scp_mcp::server::AccessRefusal::Unreadable(msg) if msg.contains("proof resolver")),
+            "an unparseable proof token must be a failed read: {err}"
+        );
+
+        let err = provider(None)
+            .validate_capability(&ctx_id, "calculator")
+            .unwrap_err();
+        assert!(
+            matches!(&err, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("UCAN authorization failed")),
+            "a UCAN that fails validation must be a denial: {err}"
+        );
+
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
     // -----------------------------------------------------------------------
     // FfiBridgeProvider::validate_capability — rejects unauthorized member
     // without UCAN token (#319)
@@ -4133,10 +4178,12 @@ mod tests {
         let _opt: Option<Arc<crate::runtime::PyBridgeInstance>> = provider.bi.upgrade();
     }
 
-    /// Provider methods that degrade gracefully return safe defaults
-    /// when the bridge instance has been dropped.
+    /// Every provider read fails when the bridge instance has been dropped,
+    /// so no read reports an empty result for state it could not see.
+    /// `agent_role` answers `None`, which the trait defines as "unknown", and
+    /// `agent_did` is provider-local.
     #[test]
-    fn ffi_bridge_provider_returns_safe_defaults_when_bridge_dropped() {
+    fn ffi_bridge_provider_reads_fail_when_bridge_dropped() {
         let provider = {
             // Construct the provider against a short-lived Arc, then drop
             // the Arc so the provider's `Weak` can no longer upgrade.
