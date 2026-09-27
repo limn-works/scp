@@ -29,9 +29,11 @@ Phase 1-5 ADRs
 
 ## ADR-027: Android Platform Adapter
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling) — see the amendment below.
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling) and 2026-09-27 (the device-attestation binding and the named verifier) — see the amendments below.
 
 **Amendment (2026-09-10 — every SCP key is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. This ADR's Rationale called hardware-backed Ed25519 at API 33 and above "a direct win over Apple, where Secure Enclave's P-256 limitation forces software key storage". **That paragraph is withdrawn.** The gap it named came from SCP's own curve choice and not from either vendor's hardware: Apple's Secure Enclave performs P-256 operations, Android Keystore has held P-256 keys in the Trusted Execution Environment since API 23, and SCP signed with a curve only one of the two implemented. Under the ruling both adapters hold every SCP signing key in hardware, and ADR-025, the Apple platform adapter, carries the matching amendment. Two further consequences follow for this ADR. The Bouncy Castle software fallback for API levels 26 through 32 has nothing left to fall back from, because Keystore holds a P-256 signing key at every API level this SDK supports; it survives only for key agreement below API 31, which is the first level at which Keystore performs ECDH. And the root member is held by a passkey through the platform's credential provider (`09-security-model.md` §9.7.4.1 item 4), so `AndroidKeyCustody` neither generates nor stores it.
+
+**Amendment (2026-09-27 — the Play Integrity request binds the identifier and the context challenge, and a named verifier vouches for the token).** `09-security-model.md` §9.3.1, reading a device attestation, owns the construction and the reader's procedure, and this ADR carries them into the Android adapter. First, the adapter issues a Standard integrity request whose `requestHash` is the lowercase hexadecimal form of the binding digest `D = SHA-256("SCP-DEVICE-ATTESTATION-V1:" ‖ BE32(56) ‖ identifier_text ‖ challenge)`, where `identifier_text` is the identifier's `scp:` text form and `challenge` is the context's 32-byte `device_attestation_challenge`. That replaces the `Base64(SHA-256(clientDataJSON))` nonce of acceptance criterion 7, which named no identifier. The code block this ADR carried also contradicted its own text: the text names the Standard API, and the code called the Classic API's `IntegrityTokenRequest.builder().setNonce(nonce)`. The code block below now calls the Standard API. Second, no peer can decode a Standard token, because Google decodes one only for the Cloud project linked to the requesting app. A context that weights Play Integrity names that app's operator in its `ContextSybilPolicy.play_integrity_verifier`. The named verifier decodes the token, checks `requestHash`, `PLAY_RECOGNIZED`, and `MEETS_DEVICE_INTEGRITY`, and signs a verdict under `"SCP-PLAY-INTEGRITY-VERDICT-V1:"`. The SDK publishes the token and the verdict together in one `ScpDeviceAttestation` service-record entry, and a reader that cannot verify the verdict returns `Unverifiable` and counts no signal. Third, `assert` no longer routes through `attest` with an empty device ID. The shipped `AndroidDeviceAttestation` still builds the JSON document; story SCP-111 of `.docs/prds/main.json` stands in progress until it changes, and story SCP-316 implements the reader.
 
 ### Context
 
@@ -214,29 +216,35 @@ class AndroidKeyCustody : KeyCustodyProvider {
 ```kotlin
 class AndroidDeviceAttestation(private val context: Context) : DeviceAttestationProvider {
 
-    override suspend fun attest(challenge: ByteArray, deviceId: ByteArray): ByteArray {
-        val clientDataJSON = "{\"challenge\":\"${Base64.encodeToString(challenge, Base64.NO_WRAP)}\",\"deviceId\":\"${Base64.encodeToString(deviceId, Base64.NO_WRAP)}\",\"type\":\"scp-device-attestation-v1\"}"
-        val nonce = Base64.encodeToString(
-            MessageDigest.getInstance("SHA-256").digest(clientDataJSON.toByteArray(Charsets.UTF_8)),
-            Base64.NO_WRAP
-        )
-        val integrityTokenResponse = withContext(Dispatchers.IO) {
-            IntegrityManagerFactory.create(context)
-                .requestIntegrityToken(
-                    IntegrityTokenRequest.builder()
-                        .setNonce(nonce)
+    override suspend fun attest(challenge: ByteArray, identifierText: String): ByteArray {
+        // D per 09-security-model.md §9.3.1: separator, BE32 length, identifier text, challenge
+        val sha = MessageDigest.getInstance("SHA-256")
+        sha.update("SCP-DEVICE-ATTESTATION-V1:".toByteArray(Charsets.US_ASCII))
+        sha.update(byteArrayOf(0, 0, 0, 0x38))                      // BE32(56)
+        sha.update(identifierText.toByteArray(Charsets.US_ASCII))   // 56 bytes, "scp:..."
+        sha.update(challenge)                                       // 32 bytes
+        return requestStandardToken(sha.digest())
+    }
+
+    override suspend fun assert(requestHash: ByteArray): ByteArray = requestStandardToken(requestHash)
+
+    private suspend fun requestStandardToken(hash: ByteArray): ByteArray {
+        val hex = hash.joinToString("") { "%02x".format(it) }
+        val provider = withContext(Dispatchers.IO) {
+            IntegrityManagerFactory.createStandard(context)
+                .prepareIntegrityToken(
+                    PrepareIntegrityTokenRequest.builder()
+                        .setCloudProjectNumber(cloudProjectNumber)
                         .build()
                 )
                 .await()
         }
-        // Return the integrity token (JWT) for server-side verification
-        return integrityTokenResponse.token().toByteArray(Charsets.UTF_8)
-    }
-
-    override suspend fun assert(requestHash: ByteArray): ByteArray {
-        // Play Integrity does not have a per-request assertion flow equivalent to App Attest assertions.
-        // For assertion-equivalent use cases, a fresh Standard integrity token is requested.
-        return attest(challenge = requestHash, deviceId = ByteArray(0))
+        val response = provider.request(
+            StandardIntegrityTokenRequest.builder().setRequestHash(hex).build()
+        ).await()
+        // The SDK sends this token to the context's play_integrity_verifier for a verdict,
+        // then publishes token and verdict in one ScpDeviceAttestation entry (§9.3.1).
+        return response.token().toByteArray(Charsets.UTF_8)
     }
 }
 ```
@@ -439,13 +447,14 @@ dependencies {
    - Returns `PseudonymKeyHandle` with `custodyType = CustodyType.SOFTWARE` (the derived pseudonym keypair is always software-managed, even for a hardware identity key).
    - **pseudonym_secret definition (IMPORTANT):** The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — public key bytes are public and would be a membership-enumeration oracle (§9.10.4.A). For a **software** key (Bouncy Castle), `pseudonym_secret = HKDF-SHA256(p256_private_scalar, salt="scp-pseudonym-secret-v1", info="", len=32)`, byte-identical to Rust `derive_pseudonym_secret()`, so software pseudonyms are cross-platform deterministic (pinned by §25.19 vectors). For **hardware** keys (Keystore TEE), private key bytes are non-exportable, so `pseudonym_secret` is an associated 32-byte symmetric key generated inside the TEE at `generate_keypair` — a device-local secret, never `SHA-256` over a signature, because an ECDSA hardware signer draws its own nonce and would yield a different secret on every call (§9.5 of the security-model spec). **Hardware pseudonyms are device-local by design** and are intentionally NOT identical across devices or to the software vectors; cross-device pseudonym identity is not a protocol requirement, since the TEE key never leaves the device. This matches ADR-006 acceptance criterion 6 (§9.10.4.A).
 
-7. **`AndroidDeviceAttestation.attest(challenge, deviceId)`:**
-   - Calls Play Integrity Standard API via `IntegrityManagerFactory.create(context).requestIntegrityToken(...)`.
-   - Nonce is `Base64(SHA-256(clientDataJSON))` where `clientDataJSON = '{"challenge":"<base64(challenge)>","deviceId":"<base64(deviceId)>","type":"scp-device-attestation-v1"}'` (fields in this exact order, RFC 4648 base64 NO_WRAP).
-   - Returns raw integrity token bytes (JWT for server-side verification).
+7. **`AndroidDeviceAttestation.attest(challenge, identifierText)`:**
+   - Calls the Play Integrity Standard API through `IntegrityManagerFactory.createStandard(context)`, `prepareIntegrityToken`, and `StandardIntegrityTokenProvider.request`.
+   - `requestHash` is the lowercase hexadecimal form of the binding digest `D` of `09-security-model.md` §9.3.1, computed over `identifierText` and `challenge`. (Amended 2026-09-27; this criterion previously set a Classic `nonce` of `Base64(SHA-256(clientDataJSON))` that named no identifier.)
+   - Returns the raw integrity token bytes. The SDK obtains a verdict for the token from the context's `play_integrity_verifier` and publishes both in a `play-integrity` entry in the §9.3.1 format. No peer decodes the token; each reader verifies the verdict and returns `DeviceAttestationVerdict`.
+   - On a device without Google Play services, `attest` throws and the SDK publishes no entry, so a reader returns `Absent`.
 
 8. **`AndroidDeviceAttestation.assert(requestHash)`:**
-   - Issues a fresh Standard integrity token using `requestHash` as the challenge.
+   - Issues a fresh Standard integrity token whose `requestHash` is the lowercase hexadecimal form of the caller's `requestHash`. It does not route through `attest` and passes no empty identifier. (Amended 2026-09-27.)
    - Returns integrity token bytes.
 
 9. **`AndroidPushProvider.register()`:**

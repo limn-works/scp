@@ -300,7 +300,8 @@
         "SCP-312",
         "SCP-313",
         "SCP-314",
-        "SCP-315"
+        "SCP-315",
+        "SCP-316"
       ]
     }
   ],
@@ -5396,11 +5397,11 @@
       "gate": "gate-5",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift"
       ],
-      "description": "Implement Apple App Attest device attestation adapter in `scp-platform/apple/app_attest.rs`. Implements the `DeviceAttestation` trait for Apple platforms.\n\nApp Attest integration: attestation flow, server-side verification, fraud metric handling. App Attest provides hardware-backed device attestation that can be verified server-side.\n\nPer §9.15 key destruction verification: hardware-attested is the strongest trust level. App Attest provides the attestation primitive for this.\n\nThis is a stub ADR (ADR-025) — implementation details will be refined when the full ADR is written.",
+      "description": "Implement Apple App Attest device attestation adapter in `scp-platform/apple/app_attest.rs`. Implements the `DeviceAttestation` trait for Apple platforms.\n\nApp Attest integration: attestation flow, server-side verification, fraud metric handling. App Attest provides hardware-backed device attestation that can be verified server-side.\n\nPer §9.15 key destruction verification: hardware-attested is the strongest trust level. App Attest provides the attestation primitive for this.\n\nThis is a stub ADR (ADR-025) — implementation details will be refined when the full ADR is written.\n\nStatus reopened 2026-09-27: ADR-025's amendment of that date replaces the `clientDataJSON` binding with the binding digest `D` of `09-security-model.md` §9.3.1 and withdraws the synthetic software-only token. The shipped adapter mints the JSON binding, returns the synthetic token when App Attest is unsupported, and no code verifies an attestation against Apple's root, so the criterion \"Server-side verification validates attestation against Apple's attestation root\" is unmet. SCP-316 implements the reader; this story keeps the minting side.",
       "acceptanceCriteria": [
         "Implements DeviceAttestation trait for Apple platforms",
         "Attestation request generates App Attest attestation object",
@@ -5425,6 +5426,10 @@
         {
           "file": ".docs/adrs/phase-5.md",
           "section": "### What This ADR Will Decide"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.3.1 Reading a device attestation"
         }
       ],
       "details": {
@@ -6309,11 +6314,11 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidDeviceAttestation.kt"
       ],
-      "description": "Implement the DeviceAttestation platform trait for Android using Play Integrity API. Must decide integration level: standard requests vs classic attestation. Mirrors the Apple adapter structure from ADR-025. Play Integrity API integration pattern must be determined (standard vs classic).",
+      "description": "Implement the DeviceAttestation platform trait for Android using Play Integrity API. Must decide integration level: standard requests vs classic attestation. Mirrors the Apple adapter structure from ADR-025. Play Integrity API integration pattern must be determined (standard vs classic).\n\nStatus reopened 2026-09-27: ADR-027's amendment of that date sets the Standard request's `requestHash` to the hexadecimal binding digest `D` of `09-security-model.md` §9.3.1 and names a verifier whose signed verdict a reader checks. The shipped adapter calls the Classic API's `setNonce` with a `clientDataJSON` digest, and no component validates a token, so the criterion \"Attestation tokens validated server-side\" is unmet. SCP-316 implements the reader; this story keeps the minting side.",
       "acceptanceCriteria": [
         "DeviceAttestation trait implemented for Android using Play Integrity API matching ADR-025 trait signatures",
         "Standard Play Integrity request flow implemented",
@@ -6338,6 +6343,10 @@
         {
           "file": ".docs/adrs/phase-6.md",
           "section": "## ADR-027: Android Platform Adapter"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.3.1 Reading a device attestation"
         }
       ],
       "details": {
@@ -11167,6 +11176,72 @@
         {
           "file": ".docs/adrs/ADR-063-inception-derived-identity-key-event-log.md",
           "section": "### Implementation constraints"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-316",
+      "title": "Implement the device-attestation reader that verifies an ScpDeviceAttestation service-record entry",
+      "gate": "gate-kel",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/trust/device_attestation.rs",
+        "crates/scp-protocol/src/trust/mod.rs",
+        "crates/scp-protocol/src/trust/sybil.rs"
+      ],
+      "description": "Implement the reader `09-security-model.md` §9.3.1 defines: given an identifier and a context's `ContextSybilPolicy`, read the identifier's service record, select its `ScpDeviceAttestation` entries, and return `DeviceAttestationVerdict`. No code verifies a device attestation today: `evaluate_sybil_resistance` tests `require_device_attestation` against the presence of a caller-supplied map key (`27-attestations.md` §27.4.3). This story adds the three policy fields (`device_attestation_challenge`, `accepted_app_ids`, `play_integrity_verifier`), the binding digest `D`, the App Attest offline checks against a pinned Apple App Attestation Root CA, the Play Integrity verdict checks, and the fail-closed gate in `evaluate_sybil_resistance`. Minting over `D` stays with SCP-095 (App Attest) and SCP-111 (Play Integrity). The service-record read comes from `IdentityBackend::read_service_record` (SCP-006) and the verifier's key-state resolution from SCP-310.",
+      "acceptanceCriteria": [
+        "`device_attestation_binding_digest(identifier, challenge)` returns SHA-256 over the 26 bytes `SCP-DEVICE-ATTESTATION-V1:`, `BE32(56)`, the 56-byte `scp:` text form, and the 32-byte challenge, and a unit test pins the 118-byte preimage",
+        "`ContextSybilPolicy` carries `device_attestation_challenge: [u8; 32]`, `accepted_app_ids: Vec<String>` and `play_integrity_verifier: Option<[u8; 32]>`",
+        "A service-record verdict of `Absent` returns `DeviceAttestationVerdict::Absent`",
+        "A service-record verdict of `Rejected` or `Inconclusive` returns `Unverifiable { cause: ServiceRecordUnavailable }`",
+        "A record with no `ScpDeviceAttestation` entry whose challenge equals the policy's challenge returns `Absent`",
+        "An entry whose first field is a platform tag other than `app-attest` and `play-integrity` is skipped, and a record holding only such entries returns `Absent`",
+        "An entry with the wrong field count for its tag, a field that is not unpadded base64url, or a challenge that does not decode to 32 bytes returns `Rejected { cause: MalformedEntry }`",
+        "More than `MAX_DEVICE_ATTESTATIONS_PER_CHALLENGE` (4) matching entries return `Rejected { cause: TooManyEntries }` before any certificate is parsed",
+        "An App Attest object that is not a CBOR map with `fmt` `apple-appattest`, a two-certificate `x5c`, and `authData` of at least 55 bytes returns `Rejected { cause: MalformedToken }`",
+        "A chain that does not verify to the pinned Apple App Attestation Root CA, or a certificate outside its validity period, returns `Rejected { cause: CertificateChainInvalid }`",
+        "A credential certificate without extension `1.2.840.113635.100.8.2` returns `Rejected { cause: MalformedToken }`",
+        "An extension nonce unequal to `SHA-256(authData || D)` returns `Rejected { cause: NonceMismatch }`, and a test shows an attestation minted for one identifier fails for another",
+        "A credential ID unequal to SHA-256 of the 65-byte uncompressed credential public key returns `Rejected { cause: KeyIdMismatch }`",
+        "An `rpIdHash` matching no entry of `accepted_app_ids`, including an empty list, returns `Rejected { cause: AppIdNotAccepted }`",
+        "A nonzero counter at `authData` bytes 33 to 36 returns `Rejected { cause: CounterNotZero }`",
+        "An AAGUID of `appattestdevelop` returns `Rejected { cause: DevelopmentEnvironment }`, and an AAGUID other than it and `appattest` followed by seven zero bytes returns `Rejected { cause: MalformedToken }`",
+        "A Play Integrity entry under a policy with no `play_integrity_verifier` returns `Unverifiable { cause: NoVerifierNamed }`",
+        "A Play Integrity verdict field of 112 zero bytes returns `Unverifiable { cause: VerdictAbsent }`, and a verdict field of any other length than 112 bytes returns `Rejected { cause: MalformedEntry }`",
+        "A verdict whose `verifier` differs from `play_integrity_verifier` returns `Unverifiable { cause: VerdictFromUnnamedVerifier }`",
+        "A verifier whose key-state verdict is neither `Confirmed` nor `Adopted` returns `Unverifiable { cause: VerifierKeyStateUnresolved }`",
+        "A verdict signature that fails against the verifier's Current `Active` key over the `SCP-PLAY-INTEGRITY-VERDICT-V1:` preimage returns `Rejected { cause: VerdictSignatureInvalid }`",
+        "The first entry that passes every check returns `Verified { platform, entry_id }`; when none passes, the reader returns the outcome of the first kept entry",
+        "`evaluate_sybil_resistance` admits a context with `require_device_attestation` only on `Verified`, and a test shows `Absent`, `Rejected` and `Unverifiable` each fail the gate",
+        "No reader path contacts Apple, Google or the named verifier: the module has no network dependency, which `cargo tree -p scp-protocol` shows"
+      ],
+      "actionItems": [
+        "Add `device_attestation.rs` with `DeviceAttestationVerdict`, `DeviceAttestationPlatform`, `DeviceAttestationRejection` (ten values) and `DeviceAttestationUnverifiable` (five values), and declare it in `trust/mod.rs`.",
+        "Add the three `ContextSybilPolicy` fields and the `MAX_DEVICE_ATTESTATIONS_PER_CHALLENGE` constant.",
+        "Implement the binding digest, the entry parser, the App Attest checks with the pinned root certificate, and the Play Integrity verdict checks.",
+        "Replace the map-key test in `evaluate_sybil_resistance` with the reader's `Verified` outcome.",
+        "Write one test per outcome, using a recorded production App Attest object and a signed test verdict."
+      ],
+      "blockedBy": [
+        "SCP-006",
+        "SCP-310"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.3.1 Reading a device attestation"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "## ADR-025: Apple Platform Adapter"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-027: Android Platform Adapter"
         }
       ],
       "details": {}

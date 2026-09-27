@@ -172,7 +172,7 @@ A sybil attacker creates many shallow identities. A real human accumulates deep,
 | Signal | What it proves | Where it lives | Self-asserted? | Platform |
 |--------|---------------|---------------|---------------|----------|
 | Social attestation (§3.5) | Controls real platform accounts | Attestation surface (§3.5) | Yes (cryptographic proof) | All |
-| Device attestation | Real hardware + signed app | Attestation surface (§3.5) | Yes (platform-signed proof) | Mobile only |
+| Device attestation | Real hardware + signed app | Service record, `ScpDeviceAttestation` entry (§9.3.1) | Yes (platform-signed proof) | Mobile only |
 | Participation history | Active for N days across M contexts | Context state (computed) | No | All |
 | Participation record | No penalties, positive interactions | Context state (computed) | No | All |
 | Economic activity (§19) | Has spent real money | Context state / payment receipts | No | All |
@@ -181,10 +181,10 @@ A sybil attacker creates many shallow identities. A real human accumulates deep,
 **Key insight: multiple attestations on one identity is a strength signal.** An identity with App Attest from an iPhone, Play Integrity from a tablet, social attestations from X/GitHub/LinkedIn, 8 months of history, and clean participation records is highly trustworthy. This depth cannot be faked cheaply. Sybil accounts are broad (many identities) but shallow (no depth on any single one).
 
 **Storage split:**
-- Self-asserted signals (device attestation, social attestation, endorsements) are their own signed attestation objects the identity references (§3.5), and an identity's self-asserted capability URIs ride in its service record (`03-identity.md` §3.10.13). The owner publishes them; peers verify the cryptographic proofs.
+- Social attestations and endorsements are self-asserted signals, and each is its own signed attestation object the identity references (§3.5). A device attestation is a self-asserted signal carried as an entry of the identity's service record (§9.3.1). An identity's self-asserted capability URIs ride in that service record too (`03-identity.md` §3.10.13). The owner publishes each of these, and peers verify the proofs.
 - Protocol-derived signals (participation history, participation records, economic activity) live in context state. They are computed, not self-asserted. You publish your credentials; the network records your behavior.
 
-**Device attestation repositioned.** Device attestation (Apple App Attest, Google Play Integrity) is an optional SDK-level trust signal, not a protocol-level uniqueness gate. Contexts MAY weight it. Its absence is expected — desktop users, non-native clients, protocol-only implementations — and is not penalizing. Other signals compensate. The protocol cannot distinguish hardware at the network level; the protocol sees bytes, not devices. Device wipe produces fresh attestation keys with no collision detectable. App Attest is per-bundle-ID, but SCP is a protocol, not an app — different SCP apps on one device get different attestation keys. Play Integrity requires Google's servers, introducing an operator dependency the protocol otherwise avoids.
+**Device attestation repositioned.** Device attestation (Apple App Attest, Google Play Integrity) is an optional SDK-level trust signal, not a protocol-level uniqueness gate. Contexts MAY weight it. Its absence is expected — desktop users, non-native clients, protocol-only implementations — and is not penalizing. Other signals compensate. The protocol cannot distinguish hardware at the network level; the protocol sees bytes, not devices. Device wipe produces fresh attestation keys with no collision detectable. App Attest is per-bundle-ID, but SCP is a protocol, not an app — different SCP apps on one device get different attestation keys. Play Integrity requires Google's servers, introducing an operator dependency the protocol otherwise avoids. §9.3.1 states where a context names the party that decodes a Play Integrity token through Google, and what a reader returns when the context names none.
 
 **Desktop gap acknowledged.** macOS, Linux, and Windows have no App Attest or Play Integrity equivalent. The laptop/workstation deployment tier — a keystone use case (§10.2) — has zero hardware attestation path. Desktop identities rely on earned capacity, participation records, social verification, and economic cost for sybil resistance. This is acceptable: depth of investment discriminates sybil identities regardless of platform.
 
@@ -229,6 +229,95 @@ Age alone is necessary but not sufficient — the identity MUST also have at lea
 **Enforcement:** Earned capacity is enforced at the SDK level. The SDK tracks the identity's creation timestamp (from the identity's inception event), participation record count (from context state), and inactivity duration. Rate limit violations produce `ErrorCode::RATE_LIMITED` (error code 4001) with a `Retry-After` hint. Context governance MAY impose stricter thresholds than the protocol defaults (§9.3 layer 3), but MUST NOT relax them below the protocol floor for identities at tier 0-2.
 
 Sybil resistance is a **deterrent**, not an enforcement guarantee. The defense is structural: expensive to mount, expensive to sustain, costly when detected.
+
+### 9.3.1 Reading a device attestation
+
+This section owns the device-attestation signal's publication format, its binding construction, and the procedure a reader runs on it. `27-attestations.md` §27.3.3 and §27.4.3 record the shipped code against this section and state nothing normative of their own.
+
+**Where the signal lives.** An identity publishes each device attestation as one `ScpDeviceAttestation` entry of its service record (`03-identity.md` §3.10.13). The Current key of the service-key role signs that record, and the key state registers `Active` as that role's one value, so the entry is signed by `#active`. The entry carries no signature of its own. A reader takes an entry only from a record that `read_service_record` returned as `Adopted` (`03-identity.md` §3.10.10). The entry counts against `MAX_SERVICE_RECORD_ENTRIES` (§9.18.17).
+
+**The context's inputs.** A context that weights the signal states three fields in its `ContextSybilPolicy` (§9.3 layer 3):
+
+- `device_attestation_challenge: [u8; 32]`, which the context's creator draws from a cryptographically secure random source. A governance change that replaces the value leaves every entry minted over the old value unmatched, so each member re-attests.
+- `accepted_app_ids: Vec<String>`, each an Apple App ID in the form `<Team ID>.<bundle ID>`. A context that weights App Attest names at least one, because a reader rejects every App Attest entry when the list is empty.
+- `play_integrity_verifier: Option<[u8; 32]>`, the identifier of the one party whose verdict this context accepts for a Play Integrity token. The Play Integrity checks below state why a reader needs that party.
+
+An entry publishes its challenge in the clear. A party that knows a context's challenge can therefore list every identity that attested for that context. A context whose membership list is confidential keeps its challenge inside its encrypted state and accepts that disclosure to every party that reads the challenge there.
+
+**The binding digest.** Both platforms carry one 32-byte value, the binding digest `D`, into the platform's own request:
+
+```
+D = SHA-256(
+  "SCP-DEVICE-ATTESTATION-V1:"          (26 bytes, no length prefix)
+  || BE32(56) || identifier_text        (4 + 56 bytes)
+  || challenge                          (32 bytes, no length prefix)
+)
+```
+
+`identifier_text` is the 56 ASCII bytes of the identifier's `scp:` text form (`03-identity.md` §3.1), encoded under §9.5.1's variable-length rule. `challenge` is the context's `device_attestation_challenge`, encoded under §9.5.1's fixed-length rule. The preimage is 118 bytes. §9.18.2 registers the separator. For App Attest, `D` is the `clientDataHash` passed to `DCAppAttestService.attestKey`. For Play Integrity, the lowercase hexadecimal form of `D` is the `requestHash` of a Standard integrity request. `D` names the identifier and the challenge, so a token minted for one identifier or one context fails at a reader that recomputes `D` for another.
+
+**The entry's three strings.**
+
+- `id`: `<identifier text form>#device-attestation-<index>`, where `<index>` is a zero-based decimal integer that disambiguates several entries in one record.
+- `type`: `ScpDeviceAttestation`.
+- `serviceEndpoint`: fields joined by `.`, each binary field in RFC 4648 §5 base64url without padding. An App Attest entry is `app-attest.<challenge>.<attestation object>`. A Play Integrity entry is `play-integrity.<challenge>.<token>.<verdict>`, where `<token>` is the UTF-8 bytes of the integrity token string and `<verdict>` is the 112-byte verdict the Play Integrity procedure below defines.
+
+**What a reader returns.** The reader returns `DeviceAttestationVerdict` for one identifier and one context. Its four variants:
+
+| Variant | Meaning |
+|---|---|
+| `Verified { platform: DeviceAttestationPlatform, entry_id: String }` | One entry passed every check below. `DeviceAttestationPlatform` is `AppAttest` or `PlayIntegrity`. |
+| `Absent` | The service record verdict was `Absent`, or the record holds no `ScpDeviceAttestation` entry whose challenge equals the context's challenge. |
+| `Rejected { cause: DeviceAttestationRejection }` | An entry failed a check that the reader ran to completion. |
+| `Unverifiable { cause: DeviceAttestationUnverifiable }` | The reader could not run a check to completion. |
+
+`DeviceAttestationRejection` carries ten values: `MalformedEntry`, `MalformedToken`, `CertificateChainInvalid`, `NonceMismatch`, `KeyIdMismatch`, `AppIdNotAccepted`, `CounterNotZero`, `DevelopmentEnvironment`, `VerdictSignatureInvalid`, and `TooManyEntries`. `DeviceAttestationUnverifiable` carries five values: `ServiceRecordUnavailable`, `NoVerifierNamed`, `VerdictAbsent`, `VerdictFromUnnamedVerifier`, and `VerifierKeyStateUnresolved`.
+
+**The procedure.**
+
+1. Call `read_service_record` for the identifier. On `Absent`, return `Absent`. On `Rejected` or `Inconclusive`, return `Unverifiable{ServiceRecordUnavailable}`.
+2. Select the record's entries of type `ScpDeviceAttestation`. Split each `serviceEndpoint` on `.`, and skip an entry whose first field is a platform tag other than `app-attest` and `play-integrity`, so a platform a later version registers does not break a reader of this version. Return `Rejected{MalformedEntry}` for an entry whose field count does not match its platform tag, whose fields do not decode as base64url, or whose challenge does not decode to 32 bytes.
+3. Keep the entries whose challenge equals the context's `device_attestation_challenge`. When none remains, return `Absent`. When more than `MAX_DEVICE_ATTESTATIONS_PER_CHALLENGE` remain (§9.18.17), return `Rejected{TooManyEntries}`, so one record cannot make a reader run an unbounded number of certificate-chain verifications.
+4. Compute `D` from the identifier and the context's challenge, and run each kept entry through its platform's checks below, in record order. Return `Verified` for the first entry that passes. When none passes, return the outcome of the first kept entry.
+
+**App Attest checks.** A peer runs every check offline, because Apple's App Attestation Root CA certificate is the only external input and every reader ships that certificate as a pinned constant.
+
+1. CBOR-decode the attestation object. It MUST be a map whose `fmt` is `"apple-appattest"`, whose `attStmt` carries an `x5c` array of exactly two certificates, the credential certificate and then the intermediate, and whose `authData` is a byte string of at least 55 bytes. Otherwise return `Rejected{MalformedToken}`.
+2. Verify that the intermediate signed the credential certificate, that Apple's App Attestation Root CA signed the intermediate, and that each certificate is valid at the reader's current time. Otherwise return `Rejected{CertificateChainInvalid}`.
+3. Compute `nonce = SHA-256(authData ‖ D)`, which is the construction ADR-025, the Apple platform adapter, carries in its amendment of 2026-09-27. Read the credential certificate's extension `1.2.840.113635.100.8.2`, a DER `SEQUENCE` holding one `[1] EXPLICIT OCTET STRING` of 32 bytes. A certificate without that extension returns `Rejected{MalformedToken}`. An octet string unequal to `nonce` returns `Rejected{NonceMismatch}`.
+4. Compute `key_id = SHA-256(credential public key)` over the 65-byte uncompressed X9.62 point. Read `authData`'s credential ID, whose length is the big-endian `u16` at bytes 53 and 54 and whose bytes start at byte 55. A credential ID unequal to `key_id` returns `Rejected{KeyIdMismatch}`.
+5. Compare `authData` bytes 0 through 31, the `rpIdHash`, against `SHA-256` of each App ID in `accepted_app_ids`. No match returns `Rejected{AppIdNotAccepted}`.
+6. Read the big-endian `u32` counter at bytes 33 through 36. A nonzero counter returns `Rejected{CounterNotZero}`.
+7. Read the 16-byte AAGUID at bytes 37 through 52. `"appattest"` followed by seven `0x00` bytes names Apple's production environment and passes. `"appattestdevelop"` names Apple's development environment and returns `Rejected{DevelopmentEnvironment}`. Any other value returns `Rejected{MalformedToken}`.
+
+The reader does not read `attStmt.receipt`, because Apple's fraud-metric service is the only party that evaluates a receipt.
+
+**Play Integrity checks.** No peer can decode a Play Integrity Standard token, because Google's `decodeIntegrityToken` endpoint decodes a token only for the Google Cloud project linked to the app that requested it. A context that weights Play Integrity therefore names that app's operator in `play_integrity_verifier`. The named verifier decodes the token through Google, confirms that `requestDetails.requestHash` equals the lowercase hexadecimal form of `D`, that `appIntegrity.appRecognitionVerdict` is `PLAY_RECOGNIZED`, and that `deviceIntegrity.deviceRecognitionVerdict` contains `MEETS_DEVICE_INTEGRITY`, and then signs a verdict. The verifier signs no verdict for a token that fails any of the three, so a verdict states a pass. The owner obtains the verdict from the named verifier when it mints the token and publishes both in one entry, so a reader contacts neither Google nor the verifier.
+
+The verdict is `verifier (32 bytes) ‖ token_issued_at (u64, BE) ‖ checked_at (u64, BE) ‖ signature (64 bytes)`, 112 bytes. `token_issued_at` is `requestDetails.timestampMillis` divided by 1,000, and `checked_at` is the Unix second at which the verifier decoded the token. The verifier's `#active` key signs:
+
+```
+SHA-256(
+  "SCP-PLAY-INTEGRITY-VERDICT-V1:"      (30 bytes, no length prefix)
+  || verifier                           (32 bytes, the verifier's identifier)
+  || subject                            (32 bytes, the attesting identifier)
+  || D                                  (32 bytes)
+  || SHA-256(token)                     (32 bytes)
+  || BE64(token_issued_at)              (8 bytes)
+  || BE64(checked_at)                   (8 bytes)
+)
+```
+
+The signature is the 64-byte raw `r ‖ s` form of §9.5, and §9.7.1 classes the separator as an attestation-class separator. A reader runs four checks:
+
+1. When the context names no verifier, return `Unverifiable{NoVerifierNamed}`. When the verdict field is 112 bytes of `0x00`, which an owner publishes while it holds no verdict, return `Unverifiable{VerdictAbsent}`. A verdict field of any length other than 112 bytes returns `Rejected{MalformedEntry}`.
+2. When the verdict's `verifier` differs from `play_integrity_verifier`, return `Unverifiable{VerdictFromUnnamedVerifier}`.
+3. Resolve the verifier's key state (§9.6.1). On any verdict other than `Confirmed` or `Adopted`, return `Unverifiable{VerifierKeyStateUnresolved}`.
+4. Recompute the preimage from the reader's own identifier and `D`, and verify the signature against the key the verifier's key state lists `Current` in the `Active` role. A failure returns `Rejected{VerdictSignatureInvalid}`.
+
+**The reader fails closed.** `Verified` is the only outcome that yields a signal. A reader MUST NOT count `Absent`, `Rejected`, or `Unverifiable` toward `evaluate_sybil_resistance`'s `DeviceAttestation` signal, and a context whose `require_device_attestation` is true admits an identifier only on `Verified`. `Unverifiable` is distinct from `Rejected` in the same way `03-identity.md` §3.5.4 separates an unverified Class 2 attestation from a rejected one: a reader MUST NOT cache `Unverifiable` as a rejection, because the named verifier or the service record can become reachable on the next read.
+
+**A device without a platform attestation service publishes no entry.** An unsupported device, a simulator, and a desktop client publish no `ScpDeviceAttestation` entry, and a reader returns `Absent` for them. An adapter that writes a placeholder token instead produces an entry that returns `Rejected{MalformedToken}` at every reader.
 
 ## 9.4 Systemic Defense Philosophy
 
@@ -727,7 +816,7 @@ A key the state does not list `Current` is not a live signing capability, and th
 
 | Class | Rule | Separators |
 |---|---|---|
-| **Attestation** — current key only | verifies against the identity's current key for that role (check 1 above); a retired key's signature never verifies | `SCP-KEYPACKAGE-ATTESTATION-V1:`, `SCP-ATTESTATION-V1:`, `SCP-PARTICIPATION-V1:`, `SCP-PARTICIPATION-PROFILE-V1:`, `SCP-KEY-REQUEST-V1:`, `SCP-ACCESS-KEY-REQUEST-V1:`, `SCP-EPOCH-ADVANCE-V1:`, `SCP-BLOCK-NOTIFICATION-V1:`, `SCP-CHALLENGE-REQ-V1:`, `SCP-CHALLENGE-RESP-V1:`, `SCP-CHALLENGE-VERIFY-V1:`, `SCP-BRIDGE-REGISTER-V1:`, `SCP-PUSH-REGISTER-V1:`, `SCP-PUSH-DEREGISTER-V1:`, `SCP-INVITATION-BUNDLE-V1:`, `SCP-JOIN-RESPONSE-V1:`, `SCP-SERVICE-RECORD-V1:` (the role is the service-key designation, `03-identity.md` §3.10.13), `SCP-RELAY-LIST-V1:` (the role is the relay-list context governor's `#active`, `18-addressability-and-deployment.md` §18.5.1), UCAN tokens, and every separator this table does not list |
+| **Attestation** — current key only | verifies against the identity's current key for that role (check 1 above); a retired key's signature never verifies | `SCP-KEYPACKAGE-ATTESTATION-V1:`, `SCP-ATTESTATION-V1:`, `SCP-PARTICIPATION-V1:`, `SCP-PARTICIPATION-PROFILE-V1:`, `SCP-KEY-REQUEST-V1:`, `SCP-ACCESS-KEY-REQUEST-V1:`, `SCP-EPOCH-ADVANCE-V1:`, `SCP-BLOCK-NOTIFICATION-V1:`, `SCP-CHALLENGE-REQ-V1:`, `SCP-CHALLENGE-RESP-V1:`, `SCP-CHALLENGE-VERIFY-V1:`, `SCP-BRIDGE-REGISTER-V1:`, `SCP-PUSH-REGISTER-V1:`, `SCP-PUSH-DEREGISTER-V1:`, `SCP-INVITATION-BUNDLE-V1:`, `SCP-JOIN-RESPONSE-V1:`, `SCP-SERVICE-RECORD-V1:` (the role is the service-key designation, `03-identity.md` §3.10.13), `SCP-RELAY-LIST-V1:` (the role is the relay-list context governor's `#active`, `18-addressability-and-deployment.md` §18.5.1), `SCP-PLAY-INTEGRITY-VERDICT-V1:` (the role is the named verifier's `#active`, §9.3.1), UCAN tokens, and every separator this table does not list |
 | **Content** — accepted before the boundary | the relying-party obligation above: verifies under a current key, and under a retired key only for content that reached the party under an epoch before that context's boundary for that key | `SCP-INNER-ENVELOPE-V1:`, `SCP-BROADCAST-ENVELOPE-V1:`, `SCP-VOTE-V1:`, `SCP-PROPOSAL-V1:`, `SCP-RECEIPT-V1:`, `SCP-XCTX-RECEIPT-V1:`, `SCP-XCTX-STREAM-RECEIPT-V1:`, `SCP-XCTX-DIVERGENCE-V1:`, `SCP-OUTLET-CHUNK-SIG-V1:`, `SCP-OUTLET-CREDIT-V1:`, `SCP-OUTLET-CANCEL-V1:`, `SCP-RESET-REQUEST-V1:`, `SCP-COMMIT-RANGE-REQ-V1:`, `SCP-COMMIT-RANGE-RESP-V1:`, `SCP-CHECKPOINT-V1:` |
 | **Log-anchored evidence** — anchored to a key-state position | the artifact carries `key_state_head` inside the signed preimage (§9.5.2). **`key_state_head` is the §9.5.1 preimage digest of the latest state-carrying event at or before the moment the signer signed** — the digest R13 takes over that event's signed preimage, naming the position at which this row's `Current` test is read. The signature verifies **iff** the signing key was `Current` at that position, and, where the entry is `Compromised{from: N}`, only under the further test the paragraph below states. A key the state lists `Superseded` or `Retired` keeps its signature valid for this class, because the artifact names when it was made | `SCP-KEY-DESTRUCTION-V1:`, `SCP-CONTEXT-SNAPSHOT-V3:`, `SCP-CONTEXT-EXPORT-V3:` |
 | **Community-relay-list operator key** — the entry's declared key | the signature verifies against the P-256 public key the signing operator's community-relay-list entry declares (§9.7.4.2 definitions). That key is non-transferable, so it names no position and belongs to no key state, and neither the log-anchored rule nor the attestation rule can execute on these three separators. §9.7.4.3, `18-addressability-and-deployment.md` §18.5.1 and `03-identity.md` §3.10.2 state the same verification | `SCP-COSIGNED-HEAD-V1:`, `SCP-WITNESS-CONFLICT-V1:`, `SCP-RELAY-PROOF-V1:` |
@@ -2526,6 +2615,8 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash, sign
 | `"SCP-KEL-ID-V1:"` | Inception-derived identifier — `SHA-256("SCP-KEL-ID-V1:" \|\| inception_signed_preimage)`, with the inception's identifier and predecessor-digest fields set to the all-zero placeholder; an identifier-construction prefix, NOT a §9.5.1 signature-preimage separator | §9.7.4.2 R13 |
 | `"SCP-RELAY-PROOF-V1:"` | Relay proof of control — one community-relay-list operator's signed statement that the relay serving a QUERY is the one its entry names, over the requester's nonce, the routing id served, and the digest of the bytes served; §9.7.4.2's definitions state the field set and the five checks a resolver applies, and §9.7.4.2 R11 states the floor it feeds | §9.7.4.2 definitions, R11 |
 | `"SCP-SERVICE-RECORD-V1:"` | Signature preimage of the service record — `SHA-256("SCP-SERVICE-RECORD-V1:" \|\| identifier \|\| sequence \|\| entries)`, signed by the operational key the key state designates for the service record | `03-identity.md` §3.10.13 |
+| `"SCP-DEVICE-ATTESTATION-V1:"` | Device-attestation binding digest — `SHA-256("SCP-DEVICE-ATTESTATION-V1:" \|\| BE32(56) \|\| identifier_text \|\| challenge)`, passed as App Attest's `clientDataHash` and, in lowercase hexadecimal, as a Play Integrity Standard request's `requestHash`; a platform-request binding domain, NOT a §9.5.1 signature-preimage separator | §9.3.1 |
+| `"SCP-PLAY-INTEGRITY-VERDICT-V1:"` | Play Integrity verdict signing — the named verifier's statement that a token decoded through Google passed, over the verifier, the subject, the binding digest, the token's digest and two timestamps; signed by the verifier's `#active` key | §9.3.1 |
 | `"SCP-RELAY-LIST-V1:"` | Signature preimage of the relay-list record — `SHA-256("SCP-RELAY-LIST-V1:" \|\| context_id \|\| sequence \|\| governor \|\| SHA-256(entries))`, signed by the `#active` key of the relay-list context's governor, under the attestation class (§9.7.1) | `18-addressability-and-deployment.md` §18.5.1 |
 | `"scp:did:"` | Key-event record routing derivation — `SHA-256("scp:did:" \|\| identifier_bytes)`; an id-derivation domain, NOT a §9.5.1 signature-preimage separator | §9.7.4.2 R13 |
 | `"scp:svc:"` | Service-record routing derivation — `SHA-256("scp:svc:" \|\| identifier_bytes)`; an id-derivation domain, NOT a §9.5.1 signature-preimage separator | `03-identity.md` §3.10.13 |
@@ -2790,6 +2881,7 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | `MAX_EVENT_BYTES` | 65,536 (64 KiB) | The ceiling on one key event's encoded length. The largest event the registered set sizes admit is a `RootRecovery{CoSigns}`, whose three indexed signature groups carry at most 16 signatures each at the assertion form's own ceiling of 4 + `MAX_AUTHENTICATOR_DATA_BYTES` + 4 + `MAX_CLIENT_DATA_JSON_BYTES` + 64 = 840 bytes, which is 40,320 bytes of signatures, with its snapshot and lists under 49 KiB. 64 KiB leaves margin above that and stays under one frame's `value` bound of 262,111 bytes, so one frame carries at least three such events | §9.7.4.2 R3's defect list; the derivation of `MAX_RETAINED_BYTES` |
 | `MAX_EVENTS_PER_SUFFIX_RETAINED` | 1,024 | **The events-per-suffix factor of `MAX_RETAINED_BYTES`'s derivation.** It sizes one suffix an honest identity could not produce, because a suffix records key changes and no identity makes a thousand of them. **R9 states its retention rule in the count bound and the byte bound, and compares a suffix's event count against nothing**, so an implementer writes no per-suffix event check | The derivation of `MAX_RETAINED_BYTES` |
 | `MAX_SERVICE_RECORD_ENTRIES` | 64 | The ceiling on the entries one service record carries, and the ceiling on the concurrent queries a resolver opens against an identity's own relays. `18-addressability-and-deployment.md` §18.2.3 asks an identity for at least three relay entries, and 64 covers every honest configuration of relays, private-state relays, broadcast advertisements, capability URIs and the two pointers with margin, while a 262,111-byte frame would otherwise admit about five thousand entries pointing at one host | **The service-record verifier of `03-identity.md` §3.10.13**, which rejects a record carrying more entries than the cap, whatever its signature, and returns `ServiceRecordVerdict::Rejected` carrying the cause `TooManyEntries`. §9.7.4.2 R3 carries no service-record clause, because R3 rejects a chain at a key event and no key event carries a service record |
+| `MAX_DEVICE_ATTESTATIONS_PER_CHALLENGE` | 4 | An owner attesting for one context from an iPhone, an iPad, and two Android devices fits, and each App Attest entry costs a reader one certificate-chain verification | §9.3.1 step 3 |
 | `MAX_WITNESS_SET_SIZE` | 32 | The witness set is a repeated field of the preimage the key entries sit in, so an unbounded set puts an event past one frame's `value` bound | §9.7.4.2 R3's defect list and R9's retained-object bound; the SDK's default witness set in §9.7.4.3 |
 | `MIN_AUTHENTICATOR_DATA_BYTES` | 37 | Web Authentication Level 2, section 6.1, fixes an assertion's `authenticatorData` at a 32-byte `rpIdHash`, a flags byte, and a 4-byte counter, and the flags byte the user-presence and user-verification checks read sits at byte 32 | The assertion-form layout of §9.7.4.2 definitions; the frame decoder of §9.10.12 |
 | `MAX_AUTHENTICATOR_DATA_BYTES` | 256 | WebAuthn adds only CBOR extension outputs past 37 bytes | The assertion-form layout; the frame decoder of §9.10.12; §9.7.4.2 R3's copy-level-defect rule |
