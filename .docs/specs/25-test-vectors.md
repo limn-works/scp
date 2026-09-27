@@ -1590,7 +1590,7 @@ The witness objects below name Vector 41's identity as their subject and Vector 
 
 ### Vector 43: a witness's first cosigned head after a seed
 
-`previous_cosigned_digest` names the event the witness seeded at, which is Vector 41's inception event, the latest event whose key state names this witness. **It is never the all-zero placeholder** (§9.7.4.3). **`seed` carries `0x01`**, because this is the first head the witness cosigned for this subject after its designation; a head carrying `0x01` makes no fault proof.
+`previous_cosigned_digest` names the event the witness seeded at, which is Vector 41's inception event, the latest event whose key state names this witness. **It is never the all-zero placeholder** (§9.7.4.3). **`seed_event` names that same event**, because the witness seeded there. **`seed` carries `0x01`**, because this is the first head the witness cosigned for this subject after its designation; a head carrying `0x01` makes no fault proof.
 
 ```
 witness:                    9d94df95bc0a13f1963f484414c320354c73c75bb86e96559e97765f5bc2d313
@@ -1598,21 +1598,23 @@ subject:                    2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c5
 sequence:                   0
 event_digest:               d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7
 previous_cosigned_digest:   d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7
+seed_event:                 d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7
 seed:                       0x01
 observed_at:                1700000000
 
-Preimage (166 bytes = 21-byte separator + 145 field bytes):
+Preimage (198 bytes = 21-byte separator + 177 field bytes):
   5343502d434f5349474e45442d484541442d56313a9d94df95bc0a13f1963f48
   4414c320354c73c75bb86e96559e97765f5bc2d3132c0f7f4478be94db007831
   1ef51ba3cc9934362b0f154dcbf9c597572e46cf320000000000000000d8ba4e
   bad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7d8ba4e
+  bad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7d8ba4e
   bad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7010000
   00006553f100
 Canonical hash:
-  b83c123f20135cc5c691d4a4eb0a5f71959b15771452a92ceaa94a80a8cbea5d
-Signature, secondary key (209 bytes on the wire):
-  f9093276a1f268910dc69103e6c9609d282c47e30c613f94be03aa7678a7eaa8
-  5fbda73bc17d627a9c54631a47b4d3e9f2e3117f301d8969f43014cc8b78d0f6
+  8bf3e84165aa158d55614a32b09ab7edd7f60191434d5c99d02ef94e076441ec
+Signature, secondary key (241 bytes on the wire):
+  c4e3d868466051b075f9d15a87240b1150affb7994889116e09847b360744f3d
+  2f774336f0e642ab913f2fd5799f7ed77e40b35439519126ae4c9059ef03c6b4
 ```
 
 ### Vector 44: a relay proof of control over a served QUERY response
@@ -1667,41 +1669,45 @@ Signature, secondary key (216 bytes on the wire):
 
 ### Vector 46: the two-heads fault proof
 
-Two cosigned heads of one witness, over one subject, carrying one shared `previous_cosigned_digest`, two different `event_digest` values, and `seed` clear on both. The shared digest is where the two heads' chains meet, before any head that sets `seed`, so the sixth condition holds too. **Those six conditions are the fault proof §9.7.4.3 defines**, and a relay keys its cosigned-head store on (subject, witness, `event_digest`) so that both survive at one address (`03-identity.md` §3.10.2). A conforming implementation assembles the pair, verifies both signatures against the P-256 key the witness operator's community-relay-list entry declares, and reports a valid fault proof. **Substituting Vector 43, whose `seed` carries `0x01`, for either head yields no proof**, which is how a declared re-seed stays outside the predicate.
+Two cosigned heads of one witness, over one subject, carrying one shared `previous_cosigned_digest`, two different `event_digest` values, and `seed` clear on both. Both heads carry one `seed_event`, so the sixth condition holds too. **Those six conditions are the fault proof §9.7.4.3 defines**, and a relay keys its cosigned-head store on (subject, witness, `event_digest`) so that both survive at one address (`03-identity.md` §3.10.2). A conforming implementation assembles the pair, verifies both signatures against the P-256 key the witness operator's community-relay-list entry declares, and reports a valid fault proof. **Substituting Vector 43, whose `seed` carries `0x01`, for either head yields no proof**, which is how a declared re-seed stays outside the predicate.
 
 ```
 Shared previous_cosigned_digest:
   5ec440e45bc301ca80bda9c235036ef19f3fbf833eb5f09960cfac1f1098af54
+Shared seed_event:
+  d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7
 
 46a — event_digest: 3dacf98cadc7a299e6f0b25f83aec640c34d5c16a2ba2252d1efcf246aebf0a0
       sequence: 21, seed: 0x00, observed_at: 1700000000
-      preimage (166 bytes):
+      preimage (198 bytes):
       5343502d434f5349474e45442d484541442d56313a9d94df95bc0a13f1963f48
       4414c320354c73c75bb86e96559e97765f5bc2d3132c0f7f4478be94db007831
       1ef51ba3cc9934362b0f154dcbf9c597572e46cf3200000000000000153dacf9
       8cadc7a299e6f0b25f83aec640c34d5c16a2ba2252d1efcf246aebf0a05ec440
-      e45bc301ca80bda9c235036ef19f3fbf833eb5f09960cfac1f1098af54000000
+      e45bc301ca80bda9c235036ef19f3fbf833eb5f09960cfac1f1098af54d8ba4e
+      bad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7000000
       00006553f100
       canonical hash:
-  70c45b6e43fe7922a92d59b82bfc3dc2cc58c57beb5d109d0531d4e462254176
+  9d88b2149dd3250ca2a1731d40d981eb809861f2147e16e2f83d80cea1de65fe
       signature:
-  ef8f2c3364495498d82e1fba47c5cc5f945a95c52545e1ba027f2df46a02a86e
-  551a0badcb11405ececba6fc007e5443e5d9364151494977564c1cd7726f5adc
+  6edab5b133c2beb333884fa756467da0e92bb0a9586e21d75ab7b1127abc94e3
+  674fb5b08c4c30c84d9b2fff176db0d464cb242652a0982122cc6f2bca209f01
 
 46b — event_digest: 53adb5551ff17eb6349a13afc7155a42b0496a7b9889e268eabe6d0c5f60f8a6
       sequence: 21, seed: 0x00, observed_at: 1700000001
-      preimage (166 bytes):
+      preimage (198 bytes):
       5343502d434f5349474e45442d484541442d56313a9d94df95bc0a13f1963f48
       4414c320354c73c75bb86e96559e97765f5bc2d3132c0f7f4478be94db007831
       1ef51ba3cc9934362b0f154dcbf9c597572e46cf32000000000000001553adb5
       551ff17eb6349a13afc7155a42b0496a7b9889e268eabe6d0c5f60f8a65ec440
-      e45bc301ca80bda9c235036ef19f3fbf833eb5f09960cfac1f1098af54000000
+      e45bc301ca80bda9c235036ef19f3fbf833eb5f09960cfac1f1098af54d8ba4e
+      bad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7000000
       00006553f101
       canonical hash:
-  7dd96da1e28f420cb727caa34b29b54d1ab8fb09f97921188a8157020719d1d4
+  5b325d31323742c237668aa043025f44ad9be63f5ca75481e6cd319755f74c0e
       signature:
-  4f3b9eb1add56bd34f3914f7addbc37026ed8ba8ef20247e065f766fdb6a7d14
-  2f6f219050c1525bf6fe2d71e3b0056e6db05a1b9ec6b059ecd39e3c1e25d0ea
+  0b3eba5dafe1e26c94a855201ae21fe38cc07709b6dfa8a0ef63bb75d2c936b8
+  3cdb4fbb304d7ae1e34603d57191d08a465b063f4415368427cbd40aaf651ec2
 ```
 
 ### Vector 49: the community relay list's encoding
