@@ -152,7 +152,7 @@ OPTIONS:
 
 ## 4. Blob Storage Backend Selection
 
-`scp-relay` selects a blob storage backend via `SCP_RELAY_STORAGE_BACKEND`, and so does `scp-node` in `--relay-only` mode and in its default persistent full-node mode. `scp-node --self-host` always stores blobs in SQLite under its storage directory, and exits when the variable names `postgres` or `s3`. The value maps to a `BlobStorageBackend` enum variant. A default build, including the container image the repository's `Dockerfile` builds, compiles neither `postgres` nor `s3`: build the binary with `--features cloud-blobs` to use them. A binary built without that feature exits on either value with `storage backend '<value>' is not compiled into this binary`.
+`scp-relay` selects a blob storage backend via `SCP_RELAY_STORAGE_BACKEND`, and so does `scp-node` in `--relay-only` mode and in its default persistent full-node mode. `scp-node --self-host` always stores blobs in SQLite under its storage directory, and exits when the variable names `postgres` or `s3`. The value maps to a `BlobStorageBackend` enum variant. A default build, including the container image the repository's `Dockerfile` builds, compiles neither `postgres` nor `s3`: build the binary with `--features cloud-blobs` to use them. A binary built without that feature exits on either value, in any letter case, with `storage backend 'postgres' is not compiled into this binary` or `storage backend 's3' is not compiled into this binary`: the message names the backend in lowercase, not the value as the operator typed it.
 
 | Value | Backend | Required env vars | Default path |
 |-------|---------|-------------------|-------------|

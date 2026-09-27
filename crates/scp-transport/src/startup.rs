@@ -103,7 +103,8 @@ pub enum BackendSelectionError {
     /// backend. [`BackendChoice::parse`] returns this variant for those two
     /// names only.
     NotCompiled {
-        /// The backend the operator selected.
+        /// The lowercase name of the backend the operator selected,
+        /// `postgres` or `s3`, whatever letter case the operator set.
         backend: &'static str,
         /// The `scp-transport` cargo feature that compiles `backend`:
         /// `postgres-blob` or `s3-blob`. The binary's own feature that
@@ -114,7 +115,7 @@ pub enum BackendSelectionError {
     /// The value names no backend this build compiled, and is neither
     /// `postgres` nor `s3`.
     Unknown {
-        /// The value the operator set.
+        /// The value the operator set, with its case as set.
         value: String,
     },
 }
@@ -194,8 +195,8 @@ impl BackendChoice {
                 feature: "s3-blob",
             }),
             "memory" => Ok(Self::Memory),
-            other => Err(BackendSelectionError::Unknown {
-                value: other.to_owned(),
+            _ => Err(BackendSelectionError::Unknown {
+                value: value.to_owned(),
             }),
         }
     }
@@ -524,6 +525,14 @@ mod tests {
                 value: "banana".to_owned()
             })
         );
+        // An unknown value keeps the case the operator set, so the exit
+        // message echoes the operator's own value.
+        let mixed_case = BackendSelectionError::Unknown {
+            value: "Banana".to_owned(),
+        };
+        assert_eq!(BackendChoice::parse("Banana"), Err(mixed_case.clone()));
+        let display = mixed_case.to_string();
+        assert!(display.contains("'Banana'"), "{display}");
     }
 
     /// The options list names a backend exactly when this build compiled it.
