@@ -1200,8 +1200,12 @@ jobs:
           # feature, which --workspace leaves off. Run the two binaries' backend
           # selection tests with it on, so a cloud-blobs build that stops
           # exiting on a missing SCP_RELAY_DATABASE_URL or SCP_RELAY_S3_BUCKET
-          # fails here.
+          # fails here. The scp-transport command runs the `BackendChoice`
+          # unit tests with both arms compiled, the only build in which they
+          # assert that `postgres` and `s3` parse in either case and are cloud
+          # backends.
           cargo nextest run --no-tests=fail -p scp-node -p scp-relay --features scp-node/cloud-blobs,scp-relay/cloud-blobs --test storage_backend_selection --test storage_backend
+          cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib startup::tests
           # The saga-journal durable crash-recovery round-trip is gated behind
           # scp-testing/sqlite (it opens a real on-disk SqliteStorage across two
           # processes). --workspace does NOT activate this optional feature, so
