@@ -1614,11 +1614,12 @@ print(f"{name}|{' '.join(args)}")
 PYTHON
 
 # python3.12, the one interpreter AGENTS.md §Toolchain names, and only when it
-# imports `tomllib`. `maturin_artifact_entry` fails when it does not, rather than
+# imports `tomllib`, run under `-P` so no tomllib.py in the working directory replaces
+# the parser. `maturin_artifact_entry` fails when it does not, rather than
 # deriving an entry some other way, and `--print-artifacts` needs no interpreter
 # at all, so a machine without Python still answers that mode.
 MATURIN_TOML_READER=""
-if command -v python3.12 >/dev/null 2>&1 && python3.12 -c 'import tomllib' >/dev/null 2>&1; then
+if command -v python3.12 >/dev/null 2>&1 && python3.12 -P -c 'import tomllib' >/dev/null 2>&1; then
   MATURIN_TOML_READER=python3.12
 fi
 
@@ -1636,7 +1637,7 @@ maturin_artifact_entry() {
     echo "no python3.12 on PATH imports tomllib, so this gate cannot read $file. Install Python 3.12, which .mise.toml already names." >&2
     return 1
   fi
-  "$MATURIN_TOML_READER" -c "$MATURIN_ENTRY_PROGRAM" "$file" || return 1
+  "$MATURIN_TOML_READER" -P -c "$MATURIN_ENTRY_PROGRAM" "$file" || return 1
 }
 
 # assert_wheel_feature_selection_is_gated <pyproject.toml>...
@@ -2144,6 +2145,11 @@ TREE
   expect "(wheel-drift) a table that adds 'testing' still derives an entry" "PASS" "$rc"
   same_string "$wheel_entry" "scp-ffi|--features extension-module,testing"; rc=$?
   expect "(wheel-drift) that entry names both features in cargo's comma spelling" "PASS" "$rc"
+  printf '%s\n' 'def load(f): return {"tool": {"maturin": {"features": ["extension-module", "vendored-openssl"], "manifest-path": "'"$wheel_manifest"'"}}}' > "$wheel_dir/tomllib.py"
+  wheel_entry="$(cd "$wheel_dir" && maturin_artifact_entry "$wheel_file" 2>/dev/null)"
+  rm -f "$wheel_dir/tomllib.py"
+  same_string "$wheel_entry" "scp-ffi|--features extension-module,testing"; rc=$?
+  expect "(wheel-drift) a tomllib.py in the working directory does not replace the parser" "PASS" "$rc"
   printf '%s\n' "${ARTIFACTS[@]}" | grep -xF -- "$wheel_entry" >/dev/null; rc=$?
   expect "(wheel-drift) ARTIFACTS gates no configuration carrying 'testing'" "FAIL" "$rc"
   ( fixture_failures=0; assert_wheel_feature_selection_is_gated "$wheel_file" >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?

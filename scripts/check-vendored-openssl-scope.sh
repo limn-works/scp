@@ -39,13 +39,17 @@ WHEEL_MATRIX_FILE=".github/workflows/build-matrix.yml"
 # `fuzz/Cargo.toml` builds libFuzzer harnesses that no release or template ships,
 # and it resolves only under the nightly `fuzz/rust-toolchain.toml` pins.
 NOT_SHIPPED_ROOTS="fuzz/Cargo.toml"
+# py runs every Python program below. `-P` keeps the working directory off sys.path,
+# so no tomllib.py or yaml.py there replaces the parser the gate reads with.
+py() { python3.12 -P "$@"; }
 
 # Prints each manifest path, one per stdin line, that cargo treats as a workspace root:
 # its TOML document holds a `workspace` table, or it holds a `package` table without
-# `package.workspace` and no manifest above it in the input holds a `workspace` table
-# whose `exclude` list leaves it out, which is cargo's ancestor search. tomllib decides,
-# so `[workspace]`, `[ "workspace" ]` and `workspace = {}` all count, and an
-# unparseable manifest fails the run.
+# `package.workspace` and cargo's ancestor search over the input finds no root for it.
+# That search walks up and stops at the first manifest holding a `workspace` table whose
+# `exclude` list does not leave the package out, or holding a `package.workspace`
+# pointer. tomllib decides, so `[workspace]`, `[ "workspace" ]` and `workspace = {}`
+# all count, and an unparseable manifest fails the run.
 read -r -d '' WORKSPACE_ROOTS_PROGRAM <<'PYTHON' || true
 import os, sys, tomllib
 docs = {}
@@ -58,11 +62,14 @@ def claimed(path):
     here = d = os.path.dirname(path)
     while d != os.path.dirname(d) or d == "":
         d = os.path.dirname(d)
-        ws = docs.get(os.path.join(d, "Cargo.toml"), {}).get("workspace")
+        anc = docs.get(os.path.join(d, "Cargo.toml"), {})
+        ws = anc.get("workspace")
         if isinstance(ws, dict):
             rel = os.path.relpath(here, d or ".").split(os.sep)
             if not any(rel[:len(e)] == e for e in (os.path.normpath(x).split(os.sep) for x in ws.get("exclude", []))):
                 return True
+        elif isinstance(anc.get("package"), dict) and "workspace" in anc["package"]:
+            return True
         if d == "":
             return False
     return False
@@ -72,18 +79,13 @@ for path, doc in docs.items():
 PYTHON
 
 # Prints the wheel triples of job argv[2] in workflow argv[1], reading maturin's
-# `universal2-apple-darwin` as both darwin triples. It fails on a duplicated key, on
-# a matrix holding any key beside `include:`, and on an item whose `target` is not
-# one bare triple, so no leg drops out of the presence proof.
+# `universal2-apple-darwin` as both darwin triples. It fails on a matrix holding any
+# key beside `include:` and on an item whose `target` is not one bare triple, so no leg
+# drops out of the presence proof. A duplicated key needs no check here: GitHub Actions
+# refuses to load such a workflow, so it runs no leg.
 read -r -d '' WHEEL_TRIPLES_PROGRAM <<'PYTHON' || true
 import re, sys, yaml
-class Loader(yaml.SafeLoader): pass
-def unique(loader, node):
-    keys = [loader.construct_object(k) for k, _ in node.value]
-    if len(keys) != len(set(map(str, keys))): sys.exit(f"{sys.argv[1]}: a mapping repeats a key")
-    return loader.construct_mapping(node)
-Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique)
-doc = yaml.load(open(sys.argv[1], encoding="utf-8"), Loader=Loader) or {}
+doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
 matrix = ((doc.get("jobs") or {}).get(sys.argv[2]) or {}).get("strategy", {}).get("matrix")
 if not isinstance(matrix, dict) or list(matrix) != ["include"] or not matrix["include"]:
     sys.exit(f"{sys.argv[1]} job {sys.argv[2]}: strategy.matrix is not a non-empty include list alone")
@@ -167,7 +169,7 @@ run_gate() {
   local -a args=()
   line="$(wheel_line)" || return 1
   wheel_file="${line%%$'\t'*}"; wheel_entry="${line#*$'\t'}"
-  line="$(python3.12 -c "$WHEEL_TRIPLES_PROGRAM" "$WHEEL_MATRIX_FILE" python-wheels)" || return 1
+  line="$(py -c "$WHEEL_TRIPLES_PROGRAM" "$WHEEL_MATRIX_FILE" python-wheels)" || return 1
   echo "--> the wheel, $wheel_entry from $wheel_file, on each triple it ships for"
   while IFS= read -r triple; do
     n="$(wheel_triple_occurrences "$triple")" || n=""
@@ -185,7 +187,7 @@ run_gate() {
     fi
     report "$entry" "$n" none || failures=$((failures + 1))
   done <<<"$line"
-  line="$(git ls-files -- 'Cargo.toml' '*/Cargo.toml' | python3.12 -c "$WORKSPACE_ROOTS_PROGRAM")" || return 1
+  line="$(git ls-files -- 'Cargo.toml' '*/Cargo.toml' | py -c "$WORKSPACE_ROOTS_PROGRAM")" || return 1
   [[ -n "$line" ]] || { echo "FAIL — no tracked Cargo.toml declares a workspace"; return 1; }
   while IFS= read -r entry; do
     [[ " $NOT_SHIPPED_ROOTS " == *" $entry "* ]] && continue
@@ -212,10 +214,20 @@ run_fixtures() {
   is_feature_selection '--features --prune=openssl-src' 2>/dev/null; expect "a resolver flag in the feature-list slot FAILS" FAIL $?
   is_feature_selection '--no-default-features --features extension-module,scp-platform/vendored-openssl' 2>/dev/null; expect "a feature selection PASSES" PASS $?
   printf '%s\n' 'jobs: {python-wheels: {strategy: {matrix: {include: [{target: universal2-apple-darwin}, {target: x86_64-pc-windows-msvc}]}}}}' > "$dir/m.yml"
-  out="$(python3.12 -c "$WHEEL_TRIPLES_PROGRAM" "$dir/m.yml" python-wheels | paste -sd' ' -)"
+  out="$(py -c "$WHEEL_TRIPLES_PROGRAM" "$dir/m.yml" python-wheels | paste -sd' ' -)"
   same "$out" "x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc"; expect "universal2 reads as both darwin triples" PASS $?
   printf '%s\n' 'jobs: {python-wheels: {strategy: {matrix: {os: [a], include: [{target: x}]}}}}' > "$dir/bad.yml"
-  python3.12 -c "$WHEEL_TRIPLES_PROGRAM" "$dir/bad.yml" python-wheels >/dev/null 2>&1; expect "a matrix axis beside include FAILS" FAIL $?
+  py -c "$WHEEL_TRIPLES_PROGRAM" "$dir/bad.yml" python-wheels >/dev/null 2>&1; expect "a matrix axis beside include FAILS" FAIL $?
+  printf '%s\n' 'jobs: {python-wheels: {strategy: {matrix: {include: [{target: x}, {runner: r}]}}}}' > "$dir/bad.yml"
+  py -c "$WHEEL_TRIPLES_PROGRAM" "$dir/bad.yml" python-wheels >/dev/null 2>&1; expect "an include item with no target FAILS" FAIL $?
+  printf '%s\n' 'jobs: {python-wheels: {strategy: {matrix: {include: [{target: "${{ inputs.t }}"}]}}}}' > "$dir/bad.yml"
+  py -c "$WHEEL_TRIPLES_PROGRAM" "$dir/bad.yml" python-wheels >/dev/null 2>&1; expect "an expression target FAILS" FAIL $?
+  printf '%s\n' 'import sys; sys.exit(0)' > "$dir/yaml.py"; printf '%s\n' 'def load(f): return {"workspace": {}}' > "$dir/tomllib.py"
+  out="$(cd "$dir" && py -c "$WHEEL_TRIPLES_PROGRAM" m.yml python-wheels | paste -sd' ' -)"
+  same "$out" "x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc"; expect "a yaml.py in the working directory does not replace PyYAML" PASS $?
+  out="$(cd "$dir" && printf '%s\n' "$dir/m.yml" | py -c "$WORKSPACE_ROOTS_PROGRAM" 2>/dev/null)"
+  same "$out" ""; expect "a tomllib.py in the working directory does not replace tomllib" PASS $?
+  rm -f "$dir/yaml.py" "$dir/tomllib.py"
 
   # A fake cargo that records its arguments and prints openssl-src for a graph naming
   # vendored-openssl on a triple other than $FAKE_DROPPED or naming a $FAKE_VENDORS word.
@@ -266,11 +278,11 @@ run_fixtures() {
   cp "$dir/w/member/Cargo.toml" "$dir/solo/Cargo.toml"
   printf '%s\n' '[package]' 'name = "y"' 'workspace = ".."' > "$dir/w/sub/Cargo.toml"
   out="$(printf '%s\n' "$dir/w/Cargo.toml" "$dir/w/member/Cargo.toml" "$dir/w/out/Cargo.toml" "$dir/w/sub/in/Cargo.toml" "$dir/w/sub/Cargo.toml" "$dir/solo/Cargo.toml" |
-    python3.12 -c "$WORKSPACE_ROOTS_PROGRAM" | paste -sd' ' -)"
-  same "$out" "$dir/w/Cargo.toml $dir/w/out/Cargo.toml $dir/w/sub/in/Cargo.toml $dir/solo/Cargo.toml"
-  expect "a quoted [ \"workspace\" ] header, an excluded package, and an unenclosed package count as roots; a member and a package.workspace pointer do not" PASS $?
+    py -c "$WORKSPACE_ROOTS_PROGRAM" | paste -sd' ' -)"
+  same "$out" "$dir/w/Cargo.toml $dir/w/out/Cargo.toml $dir/solo/Cargo.toml"
+  expect "a quoted [ \"workspace\" ] header, an excluded package, and an unenclosed package count as roots; a member, a package.workspace pointer, and a package below that pointer do not" PASS $?
   printf '%s\n' '[workspace' > "$dir/c.toml"
-  echo "$dir/c.toml" | python3.12 -c "$WORKSPACE_ROOTS_PROGRAM" >/dev/null 2>&1; expect "an unparseable manifest FAILS" FAIL $?
+  echo "$dir/c.toml" | py -c "$WORKSPACE_ROOTS_PROGRAM" >/dev/null 2>&1; expect "an unparseable manifest FAILS" FAIL $?
   PATH="$saved_path"; rm -rf "$dir"
   [[ "$fixture_failures" -eq 0 ]] && echo "   FIXTURES: all passed." && return 0
   echo "   FIXTURES: $fixture_failures failed."; return 1
