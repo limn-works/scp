@@ -6,6 +6,15 @@
 
 ---
 
+> **Annotation, 2026-09-13.** Everything below is the record as its author wrote it on the
+> date this file carries, restored unedited. The identity model it reads — did:dht, did:web and the identifier written as a `did:` string — was
+> replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity substrate,
+> whose rules `.docs/specs/09-security-model.md` §9.7.4.2 and `.docs/specs/03-identity.md`
+> §3.10 carry, and whose curve Alec settled on 2026-09-10 as ECDSA on NIST P-256
+> (`.docs/specs/09-security-model.md` §9.5). A record of what a named party read on a named
+> date states what that party read, so this annotation records what replaced the model and
+> no sentence below is edited to match.
+
 ## How This Session Started
 
 Full review of PR #1 ("Arch thought process") which added architecture.md, planning sessions 03–05, and major updates to .docs/specs/ and sketch.md. The review identified several architectural corrections needed, elevated provenance to a core principle, and surfaced 10 open questions requiring decisions before implementation can begin.

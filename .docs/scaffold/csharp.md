@@ -12,7 +12,7 @@ bindings/csharp/
   src/
     Limn.Scp/
       Limn.Scp.csproj
-      Identity.cs                # Identity class, DIDDocument
+      Identity.cs                # Identity class
       Context.cs                 # Context class, Membership, IAsyncDisposable
       Tools.cs                   # ToolDefinition, TestVector records
       Trust.cs                   # EvaluateTrustAsync(), TrustEvaluation
@@ -65,17 +65,17 @@ internal static partial class NativeLib
 
     [LibraryImport(LibName, EntryPoint = "scp_identity_create", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial int IdentityCreate(
-        string custody,
+        IdentityConfig config,
         out nint handle,
         out nint error);
 
     [LibraryImport(LibName, EntryPoint = "scp_identity_free")]
     internal static partial void IdentityFree(nint handle);
 
-    [LibraryImport(LibName, EntryPoint = "scp_identity_did", StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial int IdentityDid(
+    [LibraryImport(LibName, EntryPoint = "scp_identity_identifier")]
+    internal static partial int IdentityIdentifier(
         nint handle,
-        out nint didString);
+        Span<byte> identifier);
 
     [LibraryImport(LibName, EntryPoint = "scp_string_free")]
     internal static partial void StringFree(nint s);
@@ -161,16 +161,20 @@ public sealed class Identity : IAsyncDisposable
 {
     private readonly IdentityHandle _handle;
 
-    public string Did => NativeLib.GetDid(_handle);
-    public string CustodyType => NativeLib.GetCustodyType(_handle);
+    public byte[] Identifier => NativeLib.GetIdentifier(_handle);
+    public CustodyType CustodyType => NativeLib.GetCustodyType(_handle);
 
-    public static async Task<Identity> CreateAsync(string custody = "platform")
+    // IdentityConfig is the three-slot config object
+    // `.docs/standards/construction.md` states. `Custody` carries the bridge's
+    // KeyCustodyConfig and carries no default, because that slot decides where
+    // an identity's private key lives.
+    public static async Task<Identity> CreateAsync(IdentityConfig config)
     {
         // Task.Run offloads blocking FFI to thread pool. If FFI throughput becomes
         // a bottleneck, consider a dedicated thread or async FFI callbacks.
         return await Task.Run(() =>
         {
-            var rc = NativeLib.IdentityCreate(custody, out var handle, out var error);
+            var rc = NativeLib.IdentityCreate(config, out var handle, out var error);
             if (rc != 0) throw ExtractException(error);
             return new Identity(new IdentityHandle { handle = handle });
         });
@@ -219,7 +223,7 @@ public sealed class Context : IAsyncDisposable
 
 ```csharp
 public record Message(
-    string SenderDid,
+    byte[] SenderIdentifier,
     byte[] Content,
     long Timestamp,
     long Sequence,
@@ -232,7 +236,7 @@ public record ToolDefinition(
     string Description,
     Dictionary<string, object> InputSchema,
     Dictionary<string, object> OutputSchema,
-    string Operator,
+    byte[] Operator,
     IReadOnlyList<TestVector>? TestVectors = null,
     byte[]? ImplementationHash = null
 );

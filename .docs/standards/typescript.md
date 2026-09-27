@@ -75,6 +75,20 @@ async send(message: string | Uint8Array): Promise<void>;
 async *receive(): AsyncIterable<Message>;
 ```
 
+### Enum members of a name-bound enumeration
+
+A name-bound enumeration is one `09-security-model.md` §9.7.4.2's definitions state the criterion for: its type name and every variant name are identical in every SDK binding. `.docs/standards/conventions.md`'s naming table carries the one mapping that decides the spelling, and this section shows what a TypeScript author writes under it: **an enum member whose name and whose string value are both the specification's own spelling**, and neither `camelCase`, nor `SCREAMING_SNAKE_CASE`, nor a bare string-literal union:
+
+```ts
+export enum HeadProvenance {
+  WitnessRead = "WitnessRead",
+  TwoOperatorRead = "TwoOperatorRead",
+  SingleRelay = "SingleRelay",
+}
+```
+
+TypeScript fixes no single convention for enum members, so a rule naming none would leave `WitnessRead`, `witnessRead`, `WITNESS_READ` and the string-literal union `'WitnessRead'` all defensible for one variant, and a conformance fixture comparing a variant across languages would compare two strings. Writing the member's name and its value as one spelling makes the value a TypeScript author serializes identical to the name a Rust author matches on.
+
 ### Naming
 
 - Types/interfaces/classes: `PascalCase`
@@ -93,9 +107,10 @@ import { describe, expect, it } from "bun:test";
 import { Identity } from "../src/index.js";
 
 describe("Identity", () => {
-  it("creates identity with valid DID", async () => {
+  it("creates an identity with a 32-byte identifier", async () => {
     const identity = await Identity.create({ custody: "in_memory" });
-    expect(identity.did).toMatch(/^did:dht:/);
+    // 09-security-model.md §9.7.4.2 R13
+    expect(identity.identifier).toHaveLength(32);
   });
 
   it("rejects invalid custody type", async () => {

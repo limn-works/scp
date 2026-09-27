@@ -1,6 +1,6 @@
 {
   "project": "scp",
-  "description": "Content access control: identity-level DID-to-DID blocking (§3.6), per-member access key wrapping layer (§9.17, ADR-038), governance-gated content access actions (ADR-031), and unblocking with forward-only restoration. Three enforcement layers: key distribution denial (existing), SDK-mandated state destruction (new), access key wrapping (new). Three tiers: per-relationship in-context, identity-level cross-context, governance-gated per-context.",
+  "description": "Content access control: identity-level identity-to-identity blocking (§3.6), per-member access key wrapping layer (§9.17, ADR-038), governance-gated content access actions (ADR-031), and unblocking with forward-only restoration. Three enforcement layers: key distribution denial (existing), SDK-mandated state destruction (new), access key wrapping (new). Three tiers: per-relationship in-context, identity-level cross-context, governance-gated per-context.",
   "gates": [
     {
       "id": "gate-identity-blocking",
@@ -61,9 +61,9 @@
       "description": "Implement block list storage in identity private state per §3.7.1. Two granularities: global block list (Tier 2, cross-context) and per-context block list (Tier 1, single context). Block lists are append-only event logs with commutative operations (BlockDID/UnblockDID for global, BlockDIDInContext/UnblockDIDInContext for per-context). Current state is derived by replaying the event log.\n\nAdd ProtocolRepository methods: get_global_block_list(), is_globally_blocked(), get_context_block_list(), is_blocked_in_context(). Implementations MAY maintain materialized views for query performance.\n\nMulti-device sync is conflict-free because all operations are commutative — two devices can independently add blocks and the union is correct.",
       "acceptanceCriteria": [
         "BlockListEvent enum has four variants: BlockDID { target_did, timestamp }, UnblockDID { target_did, timestamp }, BlockDIDInContext { target_did, context_id, timestamp }, UnblockDIDInContext { target_did, context_id, timestamp }",
-        "get_global_block_list(did) returns Vec<DID> of all globally blocked DIDs",
+        "get_global_block_list(did) returns Vec<DID> of every globally blocked identifier",
         "is_globally_blocked(blocker, target) returns bool",
-        "get_context_block_list(did, context_id) returns Vec<DID> of DIDs blocked in that context",
+        "get_context_block_list(did, context_id) returns Vec<DID> of the identifiers blocked in that context",
         "is_blocked_in_context(blocker, target, context_id) returns bool",
         "Block list state is derived from append-only event log replay",
         "BlockDID followed by UnblockDID for the same target results in unblocked state",
@@ -97,7 +97,7 @@
     },
     {
       "id": "SCP-CAC-002",
-      "title": "Implement DID-to-DID blocking orchestration with cross-context propagation",
+      "title": "Implement identity-to-identity blocking orchestration with cross-context propagation",
       "gate": "gate-identity-blocking",
       "priority": "P1",
       "severity": "critical",
@@ -107,7 +107,7 @@
         "crates/scp-core/src/identity/mod.rs",
         "crates/scp-core/src/context/manager.rs"
       ],
-      "description": "Implement the blocking orchestration for Tiers 1 and 2 per §3.6. Tier 1 (in-context): block a DID in a single context — rotate sender key excluding the target (Layer 1, existing §9.16.3), trigger SDK-mandated destruction (Layer 2, §9.16.7), delete target's access key (Layer 3, §9.17). Tier 2 (global): block a DID across all shared contexts — store in identity private state (SCP-CAC-001), enumerate shared contexts, execute Tier 1 protocol in each.\n\nPropagation is best-effort and idempotent — if the SDK is offline for some contexts, the block executes on next connection. The identity private state event log is authoritative; per-context enforcement is the mechanism.\n\nBlocking is bidirectional: when Alice blocks Dave, both sides rotate their sender keys excluding each other (§9.16.3). The block notification is signed to prevent forgery.",
+      "description": "Implement the blocking orchestration for Tiers 1 and 2 per §3.6. Tier 1 (in-context): block an identifier in a single context — rotate sender key excluding the target (Layer 1, existing §9.16.3), trigger SDK-mandated destruction (Layer 2, §9.16.7), delete target's access key (Layer 3, §9.17). Tier 2 (global): block an identifier across all shared contexts — store in identity private state (SCP-CAC-001), enumerate shared contexts, execute Tier 1 protocol in each.\n\nPropagation is best-effort and idempotent — if the SDK is offline for some contexts, the block executes on next connection. The identity private state event log is authoritative; per-context enforcement is the mechanism.\n\nBlocking is bidirectional: when Alice blocks Dave, both sides rotate their sender keys excluding each other (§9.16.3). The block notification is signed to prevent forgery.",
       "acceptanceCriteria": [
         "block_did_in_context(blocker, target, context_id) executes the three-layer block protocol for a single context",
         "Layer 1: sender key rotation excluding target via existing rotate_sender_key() (§9.16.3)",
@@ -117,8 +117,8 @@
         "Propagation enumerates all contexts where both blocker and target are members",
         "Propagation is idempotent — re-executing against an already-blocked context is a no-op",
         "Propagation is best-effort — offline contexts are queued for execution on reconnection",
-        "Block notification is signed with blocker's Active Signing Key (#active) or Agent Signing Key (#agent) per §9.16.3 and ADR-039",
-        "Block notification JSON includes signing_key_id field identifying which DID document verification method was used (§9.16.3)",
+        "Block notification is signed with the blocker's Active Signing Key (#active) per §9.16.3 and ADR-039",
+        "Block notification JSON includes a signing_key_id field naming the role that signed (§9.16.3)",
         "Block notification canonical hash includes signing_key_id as field 4 per §9.5.2 BlockNotification definition",
         "Bidirectional: both blocker and target rotate sender keys excluding each other",
         "Tests verify Tier 1 block protocol execution in a single context",
@@ -165,7 +165,7 @@
     },
     {
       "id": "SCP-CAC-003",
-      "title": "Implement DID-to-DID unblocking with forward-only restoration",
+      "title": "Implement identity-to-identity unblocking with forward-only restoration",
       "gate": "gate-identity-blocking",
       "priority": "P1",
       "severity": "critical",
@@ -224,11 +224,11 @@
         "crates/scp-core/src/crypto/mod.rs",
         "crates/scp-core/src/store/mod.rs"
       ],
-      "description": "Implement per-member access key generation, distribution, and storage per ADR-038 §2. Each context member holds an AES-256 access key generated at join time. Access keys are distributed via the pull-based protocol (same pattern as sender keys, §9.16.2): AccessKeyRequest/AccessKeyResponse wire types using HPKE with ephemeral X25519 keypairs.\n\nAccessKey struct: 32-byte AES-256 key, context_id, member_did, epoch counter. Key material uses Zeroize/ZeroizeOnDrop for secure cleanup. Persisted to ProtocolRepository under context/{context_id}/access_key/{did_hex}.\n\nAccess key generation is triggered by AddMember governance action execution. The executor generates the key and distributes it to the new member.",
+      "description": "Implement per-member access key generation, distribution, and storage per ADR-038 §2. Each context member holds an AES-256 access key generated at join time. Access keys are distributed via the pull-based protocol (same pattern as sender keys, §9.16.2): AccessKeyRequest/AccessKeyResponse wire types using HPKE with ephemeral keypairs.\n\nAccessKey struct: 32-byte AES-256 key, context_id, member_did, epoch counter. Key material uses Zeroize/ZeroizeOnDrop for secure cleanup. Persisted to ProtocolRepository under context/{context_id}/access_key/{did_hex}.\n\nAccess key generation is triggered by AddMember governance action execution. The executor generates the key and distributes it to the new member.",
       "acceptanceCriteria": [
         "AccessKey struct with 32-byte key, context_id, member_did, epoch fields; derives Zeroize and ZeroizeOnDrop",
         "generate_access_key(context_id, member_did) returns a cryptographically random AccessKey with epoch 0",
-        "AccessKeyRequest wire type with requester_did, context_id, wrapping_pubkey (ephemeral X25519), signature",
+        "AccessKeyRequest wire type with requester_did, context_id, wrapping_pubkey (ephemeral), signature",
         "AccessKeyResponse wire type with context_id, member_did, epoch, hpke_sealed_key, ephemeral_pubkey",
         "Distribution uses HPKE: ECDH between ephemeral secret and requester wrapping pubkey, HKDF derive, AES-128-GCM encrypt the access key",
         "Access key persisted to ProtocolRepository under context/{context_id}/access_key/{did_hex}",
@@ -278,7 +278,7 @@
         "crates/scp-core/src/crypto/access_keys/wrapping.rs",
         "crates/scp-core/src/crypto/access_keys/mod.rs"
       ],
-      "description": "Implement CEK generation, AES-256-KW wrapping/unwrapping, and the WrappedContent wire format per ADR-038 §§2,4. Each message gets a fresh 32-byte CEK. Content is encrypted with AES-256-GCM using the CEK. The CEK is wrapped with each recipient's access key using AES-256-KW (RFC 3394), producing a 40-byte wrapped key (32-byte CEK + 8-byte integrity check).\n\nWrappedContent struct: ciphertext, nonce (12 bytes), wrapped_ceks (Vec<WrappedCek>). Integrity is verified by AES-256-GCM's authentication tag — no separate content hash field (storing SHA-256(plaintext) alongside ciphertext would create a plaintext confirmation oracle). wrapped_ceks uses truncated DID hashes (first 8 bytes of SHA-256(member_did)) as lookup keys to avoid publishing full DIDs. AES-256-GCM MUST bind context_id || sender_did || sequence_number as additional authenticated data (AAD) to prevent cross-context ciphertext relocation.\n\nLayer ordering: access key wrapping occurs BEFORE sender key encryption (encrypted contexts) or broadcast key encryption (broadcast contexts).",
+      "description": "Implement CEK generation, AES-256-KW wrapping/unwrapping, and the WrappedContent wire format per ADR-038 §§2,4. Each message gets a fresh 32-byte CEK. Content is encrypted with AES-256-GCM using the CEK. The CEK is wrapped with each recipient's access key using AES-256-KW (RFC 3394), producing a 40-byte wrapped key (32-byte CEK + 8-byte integrity check).\n\nWrappedContent struct: ciphertext, nonce (12 bytes), wrapped_ceks (Vec<WrappedCek>). Integrity is verified by AES-256-GCM's authentication tag — no separate content hash field (storing SHA-256(plaintext) alongside ciphertext would create a plaintext confirmation oracle). wrapped_ceks uses truncated identifier hashes (first 8 bytes of SHA-256(member_did)) as lookup keys, so it publishes no full identifier. AES-256-GCM MUST bind context_id || sender_did || sequence_number as additional authenticated data (AAD) to prevent cross-context ciphertext relocation.\n\nLayer ordering: access key wrapping occurs BEFORE sender key encryption (encrypted contexts) or broadcast key encryption (broadcast contexts).",
       "acceptanceCriteria": [
         "ContentEncryptionKey::generate() produces a fresh 32-byte random key with Zeroize/ZeroizeOnDrop",
         "wrap_cek(cek, access_key) uses AES-256-KW (RFC 3394) and produces 40-byte output",
@@ -301,7 +301,7 @@
         "Implement ContentEncryptionKey struct with generate()",
         "Implement AES-256-KW wrap_cek and unwrap_cek",
         "Define WrappedCek and WrappedContent structs",
-        "Implement member_id computation (truncated SHA-256 of DID)",
+        "Implement member_id computation (truncated SHA-256 of the identifier)",
         "Implement wrap_content (CEK generation + AES-GCM encrypt + per-recipient KW wrap)",
         "Implement unwrap_content (lookup + KW unwrap + AES-GCM decrypt with AAD verification)",
         "Add MessagePack serialization for WrappedContent",
@@ -345,10 +345,10 @@
         "On verified block notification, blocked party's SDK deletes the blocker's access key from local store",
         "Destruction occurs synchronously before processing subsequent messages (not in a background task)",
         "On block initiation, blocker's SDK deletes the target's access key from local store",
-        "Block notification signature is verified by resolving the public key identified by signing_key_id (#active or #agent) from the blocker's DID document per §9.16.3 and ADR-039",
-        "Verification succeeds for both #active (Active Signing Key) and #agent (Agent Signing Key) paths",
+        "Block notification signature is verified by resolving the key signing_key_id names (#active) in the blocker's current key state per §9.16.3 and ADR-039",
+        "Verification succeeds for the #active (Active Signing Key) path",
         "Invalid block notification signature causes discard + anomaly log (no destruction)",
-        "Tests verify sender key deletion on verified block notification (all epochs for blocker DID purged from ProtocolRepository)",
+        "Tests verify sender key deletion on verified block notification (every epoch for the blocker's identifier purged from ProtocolRepository)",
         "Tests verify access key deletion on both sides (blocker and blocked) via ProtocolRepository get returning None",
         "Tests verify invalid signature causes discard without destruction (sender keys and access keys unchanged)",
         "ContentAccessState enum with Full, ReadOnly, PresenceOnly, NonMember variants; derives Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize",
@@ -360,9 +360,9 @@
       ],
       "actionItems": [
         "Add block notification handler in sender key module",
-        "Implement sender key epoch purge for specific DID",
-        "Implement plaintext cache purge for specific DID",
-        "Implement access key deletion for specific DID",
+        "Implement sender key epoch purge for one identifier",
+        "Implement plaintext cache purge for one identifier",
+        "Implement access key deletion for one identifier",
         "Wire block handler synchronously in message processing pipeline",
         "Wire blocker-side access key deletion on block initiation",
         "Add signature verification before destruction",
@@ -554,6 +554,10 @@
         {
           "file": ".docs/specs/09-security-model.md",
           "section": "## 9.17 Content Access Key Layer"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4 Key Lifecycle"
         }
       ],
       "details": {}

@@ -72,10 +72,10 @@ Full 11-step UCAN validation (ADR-016 criterion 2) runs at **token presentation 
 The 11 validation steps are:
 
 1. Parse the JWT-format UCAN token
-2. Verify Ed25519 signature (resolving `kid` from DID document per ADR-039)
+2. Verify the P-256 signature, resolving `kid` against the key state derived from the issuer's key-event log (`03-identity.md` §3.10.4)
 3. Verify delegation chain integrity (`prf` chain, each parent's `aud` matches child's `iss`)
-4. Verify root issuer is the context creator's DID
-5. Verify audience matches the presenting agent's DID (self-delegation valid with `fct.scp_key_scope`)
+4. Verify root issuer is the context creator's identifier
+5. Verify audience matches the presenting agent's identifier (self-delegation valid with `fct.scp_key_scope`)
 6. Verify capability match against required capability (with wildcard support)
 7. Verify attenuation (each delegation narrows or preserves, never widens)
 8. Verify every capability the token grants is within the context's immutable capability ceiling — not only the invoked capability. The token's entire attestation set (`att`) is checked; a token carrying any out-of-ceiling attestation is rejected even if the invoked capability is itself within the ceiling.
@@ -104,7 +104,7 @@ Operations that check the cache include:
 
 ### 7.2.3 Security Properties
 
-No action proceeds on reputation or identity alone. A trusted DID whose cached capabilities do not include the required permission is denied. An unknown DID whose role assignment granted the required capability (via validated UCAN) is permitted.
+No action proceeds on reputation or identity alone. A trusted identity whose cached capabilities do not include the required permission is denied. An unknown identity whose role assignment granted the required capability (via validated UCAN) is permitted.
 
 - For paid actions: spending UCAN is present and covers the cost (§19.5). Action UCAN + spending UCAN are AND-composed — both required.
 - Tier 1 provides cryptographic proof of authorization at trust boundaries.
@@ -112,7 +112,7 @@ No action proceeds on reputation or identity alone. A trusted DID whose cached c
 
 This two-tier design is not a relaxation of security. Tier 2 checks are derived from Tier 1 validation — they are a performance optimization that preserves the security invariant. Every capability in the cache traces back to a cryptographically authorized source: externally-presented tokens (cross-context outlet invocation, broadcast admission) are validated through the full Tier-1 UCAN chain, and role-derived capabilities trace to the signed governance authorization that granted the role (context creation for the creator; the signed `AddMember`/`AssignRole` governance action thereafter). The role-derived `member_capabilities` entries are local materializations of that signed authorization, not independently-presented bearer tokens.
 
-**Capability tokens** are fine-grained, per-context, per-capability. Build on UCAN (User Controlled Authorization Networks). Under the shared-DID model (ADR-039), intra-DID delegation uses self-delegation UCANs where `iss == aud` (same DID), the issuing key is `#active`, and `fct.scp_key_scope: "#agent"` scopes the delegation to the agent verification method. Tokens are independently revocable — you can revoke one capability from one agent in one context without affecting anything else. The UCAN chain provides verifiable delegation: the protocol can trace any token back to the root authority that granted it.
+**Capability tokens** are fine-grained, per-context, per-capability. Build on UCAN (User Controlled Authorization Networks). A human delegates to its agent by issuing a UCAN under the human identity's `#active` key whose audience is the agent identity, which exercises it under its own `#active` key (`09-security-model.md` §9.1 invariant 1). Tokens are independently revocable — you can revoke one capability from one agent in one context without affecting anything else. The UCAN chain provides verifiable delegation: the protocol can trace any token back to the root authority that granted it.
 
 **`Custom(String)` capabilities** extend the built-in capability set. Custom capabilities use the `{resource}:{action}` format and are subject to the same ceiling enforcement — a custom capability must be in the context's capability ceiling to be exercised. To be a valid ceiling entry, a custom capability MUST be well-formed per the ceiling-entry grammar (§5.3.1.1), which is the authoritative definition of the permitted charset: `{resource}` and `{action}` are non-empty kebab-case tokens (`[a-z0-9-]+`, no `:`, no `*`, no whitespace) separated by **exactly one** colon, with the asterisk permitted **only** as the whole action segment of an explicit `{resource}:*` wildcard (never in the resource position, never as a substring). A bare single-token custom with no action (e.g. `payments`) is **not** a valid ceiling entry — there is no implicit wildcard — and is rejected at context creation with `InvalidCeilingCategory` (§5.3.1). A custom entry is additionally valid only if it does not name a built-in capability under any spelling — enforced by canonical resolution: resolving the entry's string through the protocol's canonical capability parser must not yield a built-in (§5.3.1.1). A custom `{resource}:*` wildcard is **further** rejected when `{resource}` is the resource token of any built-in capability (e.g. `member:*`, `messages:*`, `governance:*`): canonical resolution does not catch this (no `member:*` built-in exists) but ceiling wildcard coverage would let such an entry silently grant the privileged built-in actions in that family (e.g. `member:ban`) — closed by construction over the built-in resource-token set (§5.3.1.1 "No built-in-resource wildcard shadow"); a non-wildcard custom action under a built-in resource (e.g. `member:promote`) and a wildcard over a non-built-in resource (e.g. `payments:*`) both remain valid. Ceiling-entry strings are subject to the same string sanitization (§9.1A) and 256-byte length cap as other context string fields (§9.1A "String field validation" table in §5.9). Delegation and attenuation of custom capabilities follow the standard UCAN URI structure (`scp:ctx:{context_id}/{resource}:{action}`), so custom capabilities compose with the delegation chain exactly like built-in capabilities.
 
@@ -155,15 +155,15 @@ This is the layer that replaces trust with evidence. It grows as the network acc
 
 ### 7.3.1 Verifiable Event Logs
 
-Every context maintains a verifiable event log — a Merkle tree (or equivalent authenticated data structure) of the context's convergent protocol events: membership changes, role assignments, governance actions, lifecycle, access, and provenance (the MLS-commit-ordered stream; ADR-011). Attestations are NOT context-log events: they are credential-layer artifacts (DID-document entries, relay-published blobs, the `TrustProtocolRepository` cache; §7.4), each verified by its own envelope signature and revocation status rather than by inclusion in the context Merkle tree. Application events — messages and outlet invocations — are per-author and enter this convergent log under the causal-DAG ordering of ADR-051; until then they are local `ContextEvent`s, not canonical leaves (see the ADR-011 amendment, exclusion taxonomy). Events are signed by the acting agent.
+Every context maintains a verifiable event log — a Merkle tree (or equivalent authenticated data structure) of the context's convergent protocol events: membership changes, role assignments, governance actions, lifecycle, access, and provenance (the MLS-commit-ordered stream; ADR-011). Attestations are NOT context-log events: they are credential-layer artifacts (service-record entries, relay-published blobs, the `TrustProtocolRepository` cache; §7.4), each verified by its own envelope signature and revocation status rather than by inclusion in the context Merkle tree. Application events — messages and outlet invocations — are per-author and enter this convergent log under the causal-DAG ordering of ADR-051; until then they are local `ContextEvent`s, not canonical leaves (see the ADR-011 amendment, exclusion taxonomy). Events are signed by the acting agent.
 
-**Event sequencing mechanism.** Events in the Merkle tree are sequenced using a per-context monotonic counter maintained by the context's governance authority (admin in SingleAdmin; the committing member in other models). Sequence numbers are 64-bit unsigned integers starting at 0, incremented by 1 for each event. The counter is stored at `context/{context_id}/event_meta/count` (§17.3). Concurrent events from different members are serialized through the MLS commit mechanism — only one Commit can succeed per epoch, and the committing member assigns the sequence number. In broadcast contexts, each author maintains their own sequence counter (independent per-author sequencing). The canonical Merkle leaf is `leaf_hash = SHA-256(0x00 ‖ rmp_serde(Event))` over the typed `Event` (ADR-011 / §25), whose serialized fields include the event type, actor DID, timestamp, and payload; commit-ordered events also carry the committer-assigned sequence, while DAG-ordered application events carry causal head-references in its place (ADR-051). The leaf `timestamp` is assigned the same way as the sequence: for a commit-ordered event the committing member sets it to the `created_at` of the signed SCP envelope carrying the commit (§9.8.2), and every member copies that one committer-assigned value into its own leaf — it is not each member's local wall-clock reading. All honest members therefore hold byte-identical leaf preimages for the same event, so the timestamp is a value *assigned-and-propagated*, not a current time each member reads independently; it is tamper-evident (covered by the committer's envelope signature and by the leaf hash) and bounded to real time within the clock-skew tolerance of §9.8.2 (the ±5-minute future bound). For events triggered by a local timer rather than a commit — TTL expiry/close, governance-freeze expiry, and deferred economic-policy application — the convergent timestamp is the pre-computed deadline already held in convergent context state (the TTL deadline, the freeze-expiry instant, the policy-application time), never local `now()`. Convergence of the leaf depends on this rule: leaves stamped with per-member-local times would diverge and break the equal-event-count ⇒ equal-Merkle-root property the Relay Consistency Protocol relies on (§9.9.3).
+**Event sequencing mechanism.** Events in the Merkle tree are sequenced using a per-context monotonic counter maintained by the context's governance authority (admin in SingleAdmin; the committing member in other models). Sequence numbers are 64-bit unsigned integers starting at 0, incremented by 1 for each event. The counter is stored at `context/{context_id}/event_meta/count` (§17.3). Concurrent events from different members are serialized through the MLS commit mechanism — only one Commit can succeed per epoch, and the committing member assigns the sequence number. In broadcast contexts, each author maintains their own sequence counter (independent per-author sequencing). The canonical Merkle leaf is `leaf_hash = SHA-256(0x00 ‖ rmp_serde(Event))` over the typed `Event` (ADR-011 / §25), whose serialized fields include the event type, the actor's identifier, the timestamp, and the payload; commit-ordered events also carry the committer-assigned sequence, while DAG-ordered application events carry causal head-references in its place (ADR-051). The leaf `timestamp` is assigned the same way as the sequence: for a commit-ordered event the committing member sets it to the `created_at` of the signed SCP envelope carrying the commit (§9.8.2), and every member copies that one committer-assigned value into its own leaf — it is not each member's local wall-clock reading. All honest members therefore hold byte-identical leaf preimages for the same event, so the timestamp is a value *assigned-and-propagated*, not a current time each member reads independently; it is tamper-evident (covered by the committer's envelope signature and by the leaf hash) and bounded to real time within the clock-skew tolerance of §9.8.2 (the ±5-minute future bound). For events triggered by a local timer rather than a commit — TTL expiry/close, governance-freeze expiry, and deferred economic-policy application — the convergent timestamp is the pre-computed deadline already held in convergent context state (the TTL deadline, the freeze-expiry instant, the policy-application time), never local `now()`. Convergence of the leaf depends on this rule: leaves stamped with per-member-local times would diverge and break the equal-event-count ⇒ equal-Merkle-root property the Relay Consistency Protocol relies on (§9.9.3).
 
 Any participant can verify claims about context history against the Merkle root:
 
-- "This outlet was registered on date X by DID Y" — verifiable via proof-of-inclusion.
+- "This outlet was registered on date X by identity Y" — verifiable via proof-of-inclusion.
 - "The context's capability ceiling has not changed since creation" — verifiable via the log's mutation history.
-- "Carol has never had a governance action taken against her in Context A" — verifiable by querying the log for governance actions with `subject == Carol's DID` and receiving an empty result set. Note: this is an exhaustive query against the log, not a cryptographic proof-of-absence. Standard append-only Merkle trees support proof-of-inclusion (a leaf exists) but do NOT support proof-of-absence (a leaf does not exist). A negative claim ("no governance action exists") is verified by the querier scanning the log and confirming no matching events are found. The Merkle root ensures the log has not been tampered with — if an event was recorded, it cannot be removed — but the protocol does not provide a single compact proof that a specific event type was never recorded. Consumers who require cryptographic proof-of-absence (rather than query-and-verify) SHOULD use a sparse Merkle tree or sorted Merkle tree with boundary proofs; the protocol does not mandate a specific authenticated data structure beyond the general requirement of Merkle-based integrity (§7.3.1 header: "Merkle tree (or equivalent authenticated data structure)").
+- "Carol has never had a governance action taken against her in Context A" — verifiable by querying the log for governance actions with `subject == Carol's identifier` and receiving an empty result set. Note: this is an exhaustive query against the log, not a cryptographic proof-of-absence. Standard append-only Merkle trees support proof-of-inclusion (a leaf exists) but do NOT support proof-of-absence (a leaf does not exist). A negative claim ("no governance action exists") is verified by the querier scanning the log and confirming no matching events are found. The Merkle root ensures the log has not been tampered with — if an event was recorded, it cannot be removed — but the protocol does not provide a single compact proof that a specific event type was never recorded. Consumers who require cryptographic proof-of-absence (rather than query-and-verify) SHOULD use a sparse Merkle tree or sorted Merkle tree with boundary proofs; the protocol does not mandate a specific authenticated data structure beyond the general requirement of Merkle-based integrity (§7.3.1 header: "Merkle tree (or equivalent authenticated data structure)").
 
 This transforms claims about the past from trust-dependent to validation-dependent. You don't need to trust a context admin's account of what happened — you verify it against a cryptographic data structure.
 
@@ -181,18 +181,18 @@ The protocol defines a standard participation record format whose facts are deri
 
 Facts derived from convergent events — participation duration (`MemberJoined`/`MemberLeft`), governance actions (`GovernanceActionExecuted`), role progression (`RoleAssigned`), and context-creation (`ChildContextCreated`) — are convergent-by-construction: each becomes Merkle-verifiable against the relevant context's Merkle root once receive-side replication lands (ADR-051). Today the runtime emits these leaves committer-side only (receive-side replication is dormant), so a non-committer's locally-derived record is committer-local rather than independently Merkle-verifiable until ADR-051. **`attestation_count` is the explicit exception: it is NOT a context-event fact and NOT Merkle-anchored.** Attestations are credential-layer artifacts (§7.4), not context-log leaves; `attestation_count` is computed on-demand from the attestations the verifying agent can access, and each contributing attestation is verified by its own envelope signature and revocation status (§7.4.4), not by inclusion in any context Merkle tree (see the per-context-extraction step for `attestation_count` below). The `outlet_invocation_count` fact derives from `OutletInvoked`, per-author application activity that becomes Merkle-anchored under the causal-DAG ordering of ADR-051 (computed locally until then; see the ADR-011 amendment, exclusion taxonomy). The participation record is not stored centrally — it is computed by any agent from the set of context logs and accessible attestations.
 
-**Participation record computation algorithm.** An agent computing a participation record for a target DID across N accessible context logs follows this deterministic procedure:
+**Participation record computation algorithm.** An agent computing a participation record for a target identity across N accessible context logs follows this deterministic procedure:
 
-1. **Enumerate contexts.** List all context logs the computing agent can access that contain membership events for the target DID.
-2. **Per-context extraction.** For each context log, scan events matching the target DID and extract:
-   - `participation_duration_secs`: `(latest_event_timestamp - MemberJoined_timestamp)` for the target DID. If the member has left and rejoined, sum all intervals. The `MemberJoined`/`MemberLeft` leaves carry the affected member's DID in their payload (the membership-change payload, ADR-011), so for admin-driven joins/removals the interval is attributed to the affected member rather than to the admin who executed the action; on self-join and broadcast-author paths the leaf `actor_did` is already the member itself. For the context creator (founder), the seeding `MemberJoined` leaf timestamp is the creator-assigned context-creation timestamp — so the founder's duration is creator-timestamp-trusting, and like every membership-derived fact it is committer-local until ADR-051 receive-side membership replication lands (no independent receiver corroborates the creator's clock before then).
-   - `governance_actions_against`: Count of events with type `GovernanceActionExecuted` whose leaf **`target_did`** equals the target DID. `target_did` is the *targeted* member, carried in `GovernanceActionExecutedPayload` (and `AccessRevokedPayload` for access-revocation events) and surfaced by the projection's `target_did` field (ADR-011) — a field distinct from the role/membership `subject_did` field below: governance/access facts key on `target_did`, role/membership facts key on `subject_did`.
-   - `governance_actions_by`: Count of events with type `GovernanceActionExecuted` whose leaf `actor_did` equals the target DID.
-   - `outlet_invocation_count`: Count of events with type `OutletInvoked` whose leaf `actor_did` equals the target DID. (Per-author application activity: computed from local `ContextEvent`s, not the Merkle log, until ADR-051 makes `OutletInvoked` a convergent leaf; it needs the convergent DAG *count* — no clock.)
-   - `context_creation_count`: Count of events with type `ChildContextCreated` whose leaf `actor_did` equals the target DID. This is per-context (counts child contexts created within this context only, not globally).
-   - `role_progression_count`: Count of events with type `RoleAssigned` whose leaf **`subject_did`** equals the target DID. `subject_did` is carried in the `RoleAssigned` leaf payload (`RoleAssignedPayload`, ADR-011) and surfaced by the projection's separate `subject_did` field, so the affected member — not the assigning governance actor — is the subject this fact is attributed to.
-   - `attestation_count`: counted from the **credential layer**, NOT from the context event log. There is no `AttestationPublished` event type — attestations are never context-log leaves (§7.4). The count is the number of endorsements issued/received for the target DID that the computing agent can access from the credential layer — DID-document attestation entries, relay-published attestation blobs, and the `TrustProtocolRepository` cache — filtered to currently-valid (non-revoked) attestations per §7.4.4. It is computed **on-demand** and is **verifier-relative**: two agents may compute different counts because they can access different subsets of the subject's attestations. It is **NOT Merkle-anchored** to any context event-log root; each contributing attestation is verified by its own envelope signature and revocation status (§7.4.1, §7.4.4), not by inclusion in a context Merkle tree.
-3. **Deduplication.** The same DID in multiple roles in the same context counts as one context participation. Role changes within a context do not create duplicate entries.
+1. **Enumerate contexts.** List all context logs the computing agent can access that contain membership events for the target identity.
+2. **Per-context extraction.** For each context log, scan events matching the target identity and extract:
+   - `participation_duration_secs`: `(latest_event_timestamp - MemberJoined_timestamp)` for the target identity. If the member has left and rejoined, sum all intervals. The `MemberJoined`/`MemberLeft` leaves carry the affected member's identifier in their payload (the membership-change payload, ADR-011), so for admin-driven joins/removals the interval is attributed to the affected member rather than to the admin who executed the action; on self-join and broadcast-author paths the leaf `actor_did` is already the member itself. For the context creator (founder), the seeding `MemberJoined` leaf timestamp is the creator-assigned context-creation timestamp — so the founder's duration is creator-timestamp-trusting, and like every membership-derived fact it is committer-local until ADR-051 receive-side membership replication lands (no independent receiver corroborates the creator's clock before then).
+   - `governance_actions_against`: Count of events with type `GovernanceActionExecuted` whose leaf **`target_did`** equals the target identity. `target_did` is the *targeted* member, carried in `GovernanceActionExecutedPayload` (and `AccessRevokedPayload` for access-revocation events) and surfaced by the projection's `target_did` field (ADR-011) — a field distinct from the role/membership `subject_did` field below: governance/access facts key on `target_did`, role/membership facts key on `subject_did`.
+   - `governance_actions_by`: Count of events with type `GovernanceActionExecuted` whose leaf `actor_did` equals the target identity.
+   - `outlet_invocation_count`: Count of events with type `OutletInvoked` whose leaf `actor_did` equals the target identity. (Per-author application activity: computed from local `ContextEvent`s, not the Merkle log, until ADR-051 makes `OutletInvoked` a convergent leaf; it needs the convergent DAG *count* — no clock.)
+   - `context_creation_count`: Count of events with type `ChildContextCreated` whose leaf `actor_did` equals the target identity. This is per-context (counts child contexts created within this context only, not globally).
+   - `role_progression_count`: Count of events with type `RoleAssigned` whose leaf **`subject_did`** equals the target identity. `subject_did` is carried in the `RoleAssigned` leaf payload (`RoleAssignedPayload`, ADR-011) and surfaced by the projection's separate `subject_did` field, so the affected member — not the assigning governance actor — is the subject this fact is attributed to.
+   - `attestation_count`: counted from the **credential layer**, NOT from the context event log. There is no `AttestationPublished` event type — attestations are never context-log leaves (§7.4). The count is the number of endorsements issued/received for the target identity that the computing agent can access from the credential layer — relay-published attestation blobs and the `TrustProtocolRepository` cache — filtered to currently-valid (non-revoked) attestations per §7.4.4. It is computed **on-demand** and is **verifier-relative**: two agents may compute different counts because they can access different subsets of the subject's attestations. It is **NOT Merkle-anchored** to any context event-log root; each contributing attestation is verified by its own envelope signature and revocation status (§7.4.1, §7.4.4), not by inclusion in a context Merkle tree.
+3. **Deduplication.** One identity in multiple roles in the same context counts as one context participation. Role changes within a context do not create duplicate entries.
 4. **Aggregation.** Sum each fact across all contexts to produce the aggregate participation record. The aggregate is NOT signed — it is a local computation. Only per-context `ParticipationProfile` attestations (§7.3.2.1) are signed.
 5. **Freshness.** Each fact carries the `updated_at` timestamp from its source context. Stale facts (older than the consumer's `max_age_secs` requirement) are excluded from the aggregate. Facts whose `updated_at` is implausibly far in the future — beyond the verifier's clock plus the §9.14 clock-skew tolerance (5 minutes) — are likewise excluded, so a future-dated timestamp cannot read as maximally fresh and evade the `max_age_secs` window.
 
@@ -241,7 +241,7 @@ Each `ParticipationProfile` contains all 7 participation fact categories:
 
 ```
 ParticipationProfile {
-    subject_did: DID,                  // who this is about
+    subject_did: Identifier,           // who this is about
     participation_duration_secs: u64,  // total seconds of context participation
     governance_actions_against: u64,   // governance actions taken against this identity
     governance_actions_by: u64,        // governance actions initiated by this identity
@@ -253,8 +253,8 @@ ParticipationProfile {
     updated_at: u64,                   // timestamp of last update
     event_log_root: [u8; 32],         // Merkle root; convergent-derived facts verifiable against it (outlet_invocation_count is context-signed-only until ADR-051; attestation_count is a credential-layer fact and is NOT covered by this root)
     // NOTE: no context_id — this is the privacy guarantee
-    signer_public_key: [u8; 32],      // context-specific signing key
-    signature: Ed25519Signature,       // over all signed fields above
+    signer_public_key: [u8; 33],      // context-specific signing key, SEC1 compressed P-256 (09 §9.5)
+    signature: P256Signature,       // over all signed fields above
 }
 ```
 
@@ -269,25 +269,28 @@ participation_signing_seed = CSPRNG(32)          // generated once at context cr
 salt = SHA-256("SCP-PARTICIPATION-SIGNER-V1")    // fixed salt, 32 bytes
 info = "scp-participation-signer:" || context_id // context_id as UTF-8 bytes
 prk = HKDF-Extract(salt, participation_signing_seed)  // 32 bytes
-okm = HKDF-Expand(prk, info, 32)                // 32 bytes — Ed25519 seed
-signer_keypair = Ed25519::from_seed(okm)
+okm = HKDF-Expand(prk, info, 48)                // 48 bytes — seed-to-scalar input
+d = (int_from_be_bytes(okm) mod (n - 1)) + 1     // private scalar in [1, n - 1]
+signer_keypair = P256_keypair_from_scalar(d)     // ECDSA on P-256, §9.5 of the security spec
 ```
+
+The last two steps are the extra-random-bits seed-to-scalar method of FIPS 186-5 Appendix A.2.1, which §9.10.4 of the security-model spec (per-context pseudonyms) states in full and this spec follows without restating its reasoning. `n` is the order of the P-256 group. An implementation MUST NOT reduce a 32-byte expansion directly, because that biases the low-order scalars, and MUST NOT reject-and-retry, because two implementations that draw retries differently then derive different keys from one seed.
 
 The `signer_public_key` in the `ParticipationProfile` is the public half of this derived keypair. Each context produces a unique signing key deterministically from its seed, so verification is possible by anyone who receives the statement — but the verifier cannot reverse-derive the context ID from the public key (one-way derivation).
 
-**Seed custody and admin rotation.** The `participation_signing_seed` is stored encrypted in the context's governance state, wrapped to the current admin's `#0` identity key using HPKE (X25519-HKDF-SHA256, HKDF-SHA256, ChaCha20Poly1305) with info string `"scp-participation-seed-wrap:" || context_id`. During admin rotation, the outgoing admin MUST re-wrap the seed to the incoming admin's `#0` key and include the re-wrapped seed in the `AdminRotation` governance event. The incoming admin unwraps the seed and can then produce and sign participation statements. If the outgoing admin is unavailable (e.g., key compromise), the seed is lost and a new seed MUST be generated — this invalidates all prior statements from this context, which is the correct security behavior when admin continuity is broken.
+**Seed custody and admin rotation.** The `participation_signing_seed` is stored encrypted in the context's governance state, wrapped to the current admin's `scp_wrapping_key` (`0xFF01`) MLS leaf key using HPKE (DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM) with info string `"scp-participation-seed-wrap:" || context_id`. The wrap names that leaf key and never the root: §9.7.4.1 item 4 of the security-model spec holds the root in a substrate that signs and performs no Diffie-Hellman agreement, so no party can wrap anything to a root member. **The re-wrap obligation is stated over the trigger and not over the actor**, because `09-security-model.md` §9.16.1 gives the wrapping keypair two rotation triggers of its own — an identity-key rotation, and suspected compromise of the wrapping key — and neither is an admin rotation. **Whenever the key holding this wrap rotates for any reason, the admin that holds the seed MUST re-wrap it to the new key before the old private half is destroyed, in the same governance event that publishes the new key.** Three triggers therefore fire the re-wrap: an `AdminRotation`, in which the outgoing admin re-wraps to the incoming admin's `scp_wrapping_key` and includes the re-wrapped seed in the `AdminRotation` event; and the two of `09-security-model.md` §9.16.1, in which the same admin re-wraps to its own new key (`09-security-model.md` §9.12 step 4 states the ordering). **The outgoing admin MUST destroy its copy of the plaintext seed once the incoming admin's wrap is published**, under §9.15 of the security-model spec at software-only confidence. **That destruction is the outgoing admin's own act, which a context cannot check, so an `AdminRotation` that removes an admin for cause MUST also run `RotateParticipationKey` below in the same governance flow.** Rotating the seed is what removes a hostile outgoing admin's signing authority without that party's cooperation: it derives a fresh signing keypair the outgoing admin never held, so every statement the outgoing admin signs after the rotation verifies against no key the context publishes. Without that step a removed admin keeps signing participation statements for the context indefinitely, and `RequireParticipation` reads those statements as admission evidence at other contexts under `min_contexts`, so the retained authority reaches past the context it came from. The 30-day overlap below is what keeps the honest statements valid across the rotation. If the admin holding the wrap is unavailable (a lost device, an unrecoverable key compromise), the seed is lost and a new seed MUST be generated — this invalidates all prior statements from this context, which is the correct security behavior when admin continuity is broken. **An admin performing a routine key rotation has not broken continuity**, so the re-wrap above is what keeps that case out of this one.
 
-**Participation signing key rotation.** The `participation_signing_seed` itself can be rotated independently of admin rotation via the `RotateParticipationKey` governance action. This generates a new random seed, derives a new signing keypair, re-signs all outstanding participation statements with the new key, and publishes a `ParticipationKeyRotated` event containing the new `signer_public_key`. Verifiers who cached the old public key MUST accept both old and new keys for a 30-day overlap period (matching the statement `max_age_secs` default). After the overlap period, only the new key is valid for newly-signed statements. Historical statements signed with the old key remain valid if their `updated_at` predates the rotation event.
+**Participation signing key rotation.** The `participation_signing_seed` itself is rotated by the `RotateParticipationKey` governance action, independently of admin rotation and, per the paragraph above, together with any `AdminRotation` that removes an admin for cause. This generates a new random seed, derives a new signing keypair, re-signs all outstanding participation statements with the new key, and publishes a `ParticipationKeyRotated` event containing the new `signer_public_key`. Verifiers who cached the old public key MUST accept both old and new keys for a 30-day overlap period (matching the statement `max_age_secs` default). After the overlap period, only the new key is valid for newly-signed statements. Historical statements signed with the old key remain valid if their `updated_at` predates the rotation event.
 
 **Context-hosted storage model:**
 
 Statements are stored on source context relays. The context controls the storage. The agent cannot write, modify, or delete statements — this is the critical integrity guarantee. When a member's participation facts change, the context re-computes and re-signs the statement, replacing the prior version in place.
 
-**DID document service endpoint:**
+**Service-record entry:**
 
-Each agent's DID document lists a `ParticipationStatements` service endpoint that points to a relay or aggregation endpoint where their statements can be fetched by verifiers. This is the discovery mechanism — admitting contexts resolve the agent's DID, find the service endpoint, and fetch statements from it. The endpoint type MUST be listed in the DID document service endpoint cross-reference table (§18.2.2).
+Each agent's service record carries a `ParticipationStatements` entry pointing to a relay or aggregation endpoint where a verifier fetches their statements (`03-identity.md` §3.10.13). This is the discovery mechanism: an admitting context resolves the agent's service record, reads the entry, and fetches statements from it. The entry type MUST be listed in the cross-reference table of `18-addressability-and-deployment.md` §18.2.2.
 
-**ParticipationStatements service endpoint format.** The DID document entry:
+**`ParticipationStatements` entry format.**
 
 ```json
 {
@@ -307,7 +310,7 @@ Response 200 OK:
 {
   "statements": [
     {
-      "subject_did":                "<DID>",
+      "subject_did":                "<scp-identifier:subject>",
       "participation_duration_secs": 86400,
       "governance_actions_against":  0,
       "governance_actions_by":       2,
@@ -317,26 +320,26 @@ Response 200 OK:
       "attestation_count":           5,
       "updated_at":                  1709654400,
       "event_log_root":             "<32 bytes, hex-encoded>",
-      "signer_public_key":          "<32 bytes, hex-encoded>",
+      "signer_public_key":          "<33 bytes, hex-encoded>",
       "signature":                  "<64 bytes, hex-encoded>"
     }
   ],
   "total": 7,
-  "did": "<DID>"
+  "did": "<scp-identifier:subject>"
 }
 ```
 
 **Filtering.** The endpoint supports optional query parameters: `?min_updated_at={unix_timestamp}` (only statements updated after this time), `?limit={n}` (max statements to return, default 100, max 1000), `?offset={n}` (for pagination). Statements are returned sorted by `updated_at` descending (most recent first).
 
-**Caching.** The endpoint SHOULD set `Cache-Control: public, max-age=300` (5 minutes). Verifiers SHOULD cache responses per DID to avoid repeated fetches during admission evaluation.
+**Caching.** The endpoint SHOULD set `Cache-Control: public, max-age=300` (5 minutes). Verifiers SHOULD cache responses per identity to avoid repeated fetches during admission evaluation.
 
-**Colluding contexts participation forgery mitigation.** A single operator running N contexts can produce N distinct `signer_public_key` values and generate `ParticipationProfile` statements for their own DID, trivially satisfying `min_contexts` requirements. The protocol addresses this through layered defenses:
+**Colluding contexts participation forgery mitigation.** A single operator running N contexts can produce N distinct `signer_public_key` values and generate `ParticipationProfile` statements for their own identity, trivially satisfying `min_contexts` requirements. The protocol addresses this through layered defenses:
 
 1. **DeviceAttestation binding (primary).** Contexts requiring strong Sybil resistance SHOULD require `DeviceAttestation` (§9.3) from attestors. Since each hardware device produces at most one attestation, a single operator cannot fabricate N hardware-attested contexts from one machine.
 2. **Statement age depth.** Admission requirements include `max_age_secs` and consumers can additionally require `participation_duration_secs >= T` (e.g., 30 days). Manufacturing fake participation over extended durations requires sustained resource expenditure (contexts must remain operational and active for the full duration).
 3. **Cross-statement correlation analysis (RECOMMENDED).** Consumers SHOULD analyze statement timing: N statements all with identical `updated_at` values (or timestamps within seconds of each other) suggest automated batch generation. Consumers MAY discount or reject statement sets with suspiciously correlated timing.
-4. **Transparency logging.** Each statement includes an `event_log_root` that commits to the context's full event log. A verifier who discovers that the event log behind a root contains only synthetic events (e.g., only the subject DID's activity, no other participants) can flag the statement as potentially fabricated.
-5. **Cost of attack.** Each fake context requires relay storage, DID publication, and ongoing maintenance. The economic cost scales linearly with N. Combined with context-level economic policy (§19), maintaining fake contexts has ongoing financial costs.
+4. **Transparency logging.** Each statement includes an `event_log_root` that commits to the context's full event log. A verifier who discovers that the event log behind a root contains only synthetic events (the subject's own activity and no other participant's, for one) can flag the statement as potentially fabricated.
+5. **Cost of attack.** Each fake context requires relay storage, key-event publication, and ongoing maintenance. The economic cost scales linearly with N. Combined with context-level economic policy (§19), maintaining fake contexts has ongoing financial costs.
 
 These defenses do not eliminate Sybil attacks — they raise the cost until the attack becomes economically irrational for the value of the admission being sought. Contexts requiring absolute Sybil resistance should use additional admission mechanisms (endorsements from known parties, identity link attestations to established external accounts).
 
@@ -348,9 +351,9 @@ Agents opt into per-context attestations by allowing the context to publish part
 
 1. Context declares one or more `RequireParticipation` entries in `ContextParams` admission requirements.
 2. Joining agent sees the requirements in context metadata before opting in (legibility tenet — visible before join decision).
-3. Admitting context resolves the agent's DID document and finds the `ParticipationStatements` service endpoint.
+3. The admitting context resolves the agent's service record and reads its `ParticipationStatements` entry (`03-identity.md` §3.10.13).
 4. Admitting context fetches statements from the service endpoint.
-5. Admitting context verifies: (a) each statement's signed `subject_did` equals the DID of the agent being admitted — statements for any other subject are discarded before they can contribute to any threshold, freshness, or distinct-signer count (closing cross-subject participation-profile replay, where a victim's genuine high-standing profiles are presented to admit a different agent), (b) each statement's Ed25519 signature is valid over its fields, (c) signers are distinct (N different `signer_public_key` values — proving N independent contexts), (d) each required fact meets the required threshold, (e) each statement's `updated_at` is within `max_age_secs` of the current time, (f) statements span at least `min_contexts` distinct signers for each requirement.
+5. Admitting context verifies: (a) each statement's signed `subject_did` equals the identifier of the agent being admitted — statements for any other subject are discarded before they can contribute to any threshold, freshness, or distinct-signer count (closing cross-subject participation-profile replay, where a victim's genuine high-standing profiles are presented to admit a different agent), (b) each statement's P-256 signature is valid over its fields, (c) signers are distinct (N different `signer_public_key` values — proving N independent contexts), (d) each required fact meets the required threshold, (e) each statement's `updated_at` is within `max_age_secs` of the current time, (f) statements span at least `min_contexts` distinct signers for each requirement.
 6. If any requirement is not met, admission is denied.
 
 All checks are mechanical — no judgment, no discretion, no governance vote. The admitting context verifies signed claims from distinct signers without ever learning which contexts produced them.
@@ -365,14 +368,14 @@ All checks are mechanical — no judgment, no discretion, no governance vote. Th
 **Tamper resistance:**
 
 - Agents CANNOT write, modify, or delete participation statements — contexts control the storage on their relays. The agent has no write access to the statement store.
-- Statements are signed by context-specific Ed25519 keys — the agent cannot forge them.
+- Statements are signed by context-specific P-256 keys — the agent cannot forge them.
 - Context-specific keys are derived with domain separation so they cannot be correlated across contexts by the verifier.
 
 **DDoS resistance:**
 
 - The admitting context fetches from the agent's service endpoint — bounded by one fetch per admission attempt. No amplification vector.
 - Source contexts only produce statements for opted-in members. No unauthenticated statement generation.
-- Statement size is bounded: ~150 bytes per statement per context. 100 contexts = ~15KB (acceptable). 1000 contexts = ~150KB (served via the service endpoint, not inline in the DID document).
+- Statement size is bounded: ~150 bytes per statement per context. 100 contexts = ~15KB (acceptable). 1000 contexts = ~150KB (served from the endpoint the entry names, not carried inline in the service record).
 
 **Example admission policy:**
 
@@ -406,7 +409,7 @@ When an outlet is registered with a context, the registration includes:
 - Schema (input and output types, MCP-compatible JSON Schema)
 - Implementation hash (content-addressable reference to the implementation)
 - Test vectors (known input-output pairs that define correct behavior)
-- Operator DID (who registered the outlet and is accountable for it)
+- Operator identifier (who registered the outlet and is accountable for it)
 
 Any agent can verify an outlet's integrity at any time by:
 
@@ -439,8 +442,8 @@ Not all capabilities are testable. "Good judgment" is not challengeable. But man
 ```
 ChallengeVerification {
   verification_id:  [u8; 32],          // SHA-256(verifier_did || subject_did || capability_uri || timestamp)
-  verifier_did:     DID,               // who administered the challenge
-  subject_did:      DID,               // who was tested
+  verifier_did:     Identifier,        // who administered the challenge
+  subject_did:      Identifier,        // who was tested
   capability_uri:   String,            // scp:capability:*/v1 or did:*:capability:*/v1
   suite_version:    String,            // version of the challenge suite used (e.g., "2026.1")
   passed:           bool,              // true = passed, false = failed
@@ -450,11 +453,11 @@ ChallengeVerification {
   timestamp:        u64,               // Unix timestamp of verification
   expires_at:       u64,               // verification validity period (MUST NOT exceed 90 days from timestamp)
   context_id:       Option<ContextId>, // context where challenge was administered (if applicable)
-  verifier_signature: Ed25519Signature // verifier signs all fields above
+  verifier_signature: P256Signature // verifier signs all fields above
 }
 ```
 
-**Storage and discovery.** `ChallengeVerification` records are stored in the subject's DID document as entries in the `SCPCapabilities` service endpoint, alongside self-attested capabilities. The record is also stored in the context's event log if the challenge was administered within a context. Verifiers fetch records from the subject's `SCPCapabilities` endpoint during admission checks (§7.3.4.4). Records are identified by `verification_id` for deduplication and revocation.
+**Storage and discovery.** A `ChallengeVerification` record is its own signed object the subject references, and not a field of any document the subject publishes; the service record carries only the self-asserted capability URIs (`03-identity.md` §3.10.13). The record is also stored in the context's event log if the challenge was administered within a context. Verifiers fetch records from the endpoint the subject's service record names during admission checks (§7.3.4.4). Records are identified by `verification_id` for deduplication and revocation.
 
 **Expiry.** Challenge verifications expire after the `expires_at` timestamp. The maximum validity period is 90 days — capabilities can degrade over time (model updates, configuration changes), so re-verification is necessary. Contexts MAY require shorter validity periods in their admission requirements.
 
@@ -468,7 +471,7 @@ ChallengeVerification {
      suite_version:   String,          // which version of the test suite
      test_cases:      Vec<TestCase>,   // the actual test cases
      timeout_secs:    u32,             // maximum time to complete all tests (default: 300)
-     verifier_did:    DID,             // who is administering
+     verifier_did:    Identifier,      // who is administering
    }
 
    TestCase {
@@ -493,7 +496,7 @@ ChallengeVerification {
      challenge_id:    [u8; 32],        // matches the request
      results:         Vec<TestResult>,
      completed_at:    u64,             // Unix timestamp
-     subject_signature: Ed25519Signature // subject signs the response
+     subject_signature: P256Signature // subject signs the response
    }
 
    TestResult {
@@ -528,13 +531,7 @@ scp:capability:{kebab-case-name}/v{integer}
 
 SDKs MUST reject any `scp:capability:*` URI not present in the signed protocol registry. The prefix is reserved — no agent, context, or outlet may define new URIs under this prefix. Capabilities are atomic: exact string equality for matching. No deeper nesting is permitted.
 
-**DID-scoped custom capabilities** use the definer's DID as the authority:
-
-```
-did:{method}:{id}:capability:{kebab-case-name}/v{integer}
-```
-
-Anyone can define capabilities under their own DID. Authority derives from the definer's identity — trust in the capability is trust in the definer. Custom capabilities follow the same versioning and kebab-case naming rules as protocol capabilities.
+**Identifier-scoped custom capabilities** take the definer's identifier as the authority, written in the text form `03-identity.md` §3.1 fixes. Trust in such a capability is trust in its definer. They follow the same versioning and kebab-case naming rules as protocol capabilities.
 
 **System capabilities** describe protocol-level node roles (not challenge-testable):
 
@@ -548,7 +545,7 @@ System capabilities declare what a node does (e.g., relay operation, bridge oper
 
 Capability URIs have two verification levels:
 
-- **Self-attested.** Declaring a URI in a DID document's `SCPCapabilities` service entry. Anyone can do this. The claim carries the weight of the claimant's identity and participation history.
+- **Self-attested.** Declaring a URI among the self-asserted capability URIs of the identity's service record (`03-identity.md` §3.10.13). Anyone can do this. The claim carries the weight of the claimant's identity and participation history.
 - **Challenge-verified.** A signed `ChallengeVerification` record (§7.3.4) demonstrates that a specific verifier tested the capability and the agent passed. The verifier's signature prevents forgery.
 
 The `scp:capability:*` prefix reservation provides an additional layer: SDKs reject unknown protocol-scoped URIs at parse time, preventing agents from fabricating protocol capability claims that don't correspond to real challenge suites.
@@ -676,18 +673,18 @@ The signed protocol registry is a JSON document listing all valid `scp:capabilit
       "added_in_registry_version": "2026.1"
     }
   ],
-  "signature": "<Ed25519 signature over canonical JSON of all fields above>",
-  "signing_key_id": "did:dht:z6MkSCPRegistryAuthority...#registry-signing"
+  "signature": "<P-256 signature over canonical JSON of all fields above>",
+  "signing_key_id": "<scp-identifier:registry-authority>#registry-signing"
 }
 ```
 
-**Signing authority.** The registry is signed by the SCP protocol authority key — a dedicated Ed25519 key whose public key is hardcoded in every SDK build. The signing key is distinct from any identity key. The key is published in the protocol governance DID document (§14) and in the SDK source code. The signing key MUST be rotatable via the protocol governance process (§14). On rotation, the new key is published with a 90-day grace period during which both old and new signatures are accepted. The old key MUST be accepted for verification of registry versions published before the rotation event. After the 90-day grace period, the old key is no longer accepted for newly-fetched registry documents (but historical verification of previously-cached versions remains valid).
+**Signing authority.** The registry is signed by the SCP protocol authority key — a dedicated P-256 key whose public key is hardcoded in every SDK build. The signing key is distinct from any identity key. The key is published in the protocol governance identity's service record (§14) and in the SDK source code. The signing key MUST be rotatable via the protocol governance process (§14). On rotation, the new key is published with a 90-day grace period during which both old and new signatures are accepted. The old key MUST be accepted for verification of registry versions published before the rotation event. After the 90-day grace period, the old key is no longer accepted for newly-fetched registry documents (but historical verification of previously-cached versions remains valid).
 
 **Distribution.** The registry is distributed through four channels:
 1. **Bundled in SDK (REQUIRED).** Each SDK release MUST include the registry version current at release time. This is the cold-start source and the fallback when all network sources are unavailable. SDKs MUST operate correctly using only the bundled snapshot — network fetch is an update mechanism, not a boot dependency.
 2. **Fetched from protocol relay (primary network source).** SDKs periodically fetch the latest registry from a well-known protocol relay URL: `https://registry.scp.dev/v1/capability-registry.json`. Fetch interval: once per 24 hours. The response includes `ETag` and `Last-Modified` headers for conditional requests.
 3. **Fetched from alternative URL (fallback network source).** SDKs MUST support at least one alternative fetch URL as a fallback when the primary URL is unreachable. The default alternative is `https://raw.githubusercontent.works/limn-scp/protocol-registry/main/v1/capability-registry.json`. Implementations MAY add additional fallback URLs (e.g., IPFS CID-addressed copies). Fallback URLs serve the same signed document — the signature verification is the trust anchor, not the transport URL.
-4. **Embedded in DID document.** The protocol governance DID document includes a `ProtocolRegistry` service endpoint pointing to the current registry URL.
+4. **Named by the governance service record.** The protocol governance identity's service record carries a `ProtocolRegistry` entry pointing to the current registry URL (`03-identity.md` §3.10.13).
 
 **Managed centralization tradeoff.** The registry model is a managed centralization tradeoff analogous to browser CA root stores or system time zone databases: a curated, signed list distributed with the software and periodically updated from a canonical source. The signing key — not the distribution URL — is the trust anchor. Implementations MAY override the default registry with a custom registry by providing an alternative signing key and fetch URL via SDK configuration. This enables private deployments, forks, and testing without protocol changes. Custom registries MUST use the same format and verification rules; only the signing key and fetch URLs differ.
 
@@ -704,19 +701,19 @@ Contexts can require specific capabilities for admission. Admission requirements
 
 - `(scp:capability:prompt-injection-resistance/v1, ChallengeVerified)` — agent must have a valid `ChallengeVerification` record for this capability.
 - `(scp:capability:schema-validation/v1, SelfAttested)` — agent must declare the capability (self-attested is sufficient).
-- `(did:dht:z6Mk...:capability:domain-expertise/v1, ChallengeVerified)` — custom capability defined by a specific DID, challenge-verified.
+- `(<scp-identifier:definer>:capability:domain-expertise/v1, ChallengeVerified)` — custom capability defined by a specific identity, challenge-verified.
 
-Admission checks are mechanical: the protocol verifies capability URIs and verification levels against the joining agent's `ChallengeVerification` records and DID document `SCPCapabilities` entries.
+Admission checks are mechanical: the protocol verifies capability URIs and verification levels against the joining agent's `ChallengeVerification` records and the self-asserted capability URIs of its service record.
 
 **Verification flow:**
 
 1. Context declares one or more `CapabilityRequirement` entries in `ContextParams` admission requirements — each pairs a capability URI with a required `VerificationLevel` (`SelfAttested` or `ChallengeVerified`).
 2. Joining agent sees the requirements in context metadata before opting in (legibility tenet — visible before join decision).
 3. Admitting context fetches the joining agent's self-attested capability URIs (`SCPCapabilities` entries) and `ChallengeVerification` records (from the subject's `SCPCapabilities` endpoint, §7.3.4).
-4. Admitting context verifies, for each requirement: (a) every candidate `ChallengeVerification`'s signed `subject_did` equals the DID of the agent being admitted AND its signed `context_id` equals the context being admitted to — a result minted for another subject or another context (or a context-agnostic result) is discarded before it can satisfy any requirement (closing cross-subject and cross-context challenge-result replay, where a genuine result issued for a different agent or context is presented to admit this one), (b) every candidate record's verifier Ed25519 signature is valid over its canonical bytes and the record is unexpired relative to the current clock (verify-on-use — an unauthentic or expired record is not considered), (c) a `SelfAttested` requirement is met when the capability URI appears among the agent's self-attested capabilities OR a valid `ChallengeVerification` with `passed == true` exists for it (challenge-verified implies self-attested), (d) a `ChallengeVerified` requirement is met only by a valid `ChallengeVerification` with `passed == true` for that capability.
+4. Admitting context verifies, for each requirement: (a) every candidate `ChallengeVerification`'s signed `subject_did` equals the identifier of the agent being admitted AND its signed `context_id` equals the context being admitted to — a result minted for another subject or another context (or a context-agnostic result) is discarded before it can satisfy any requirement (closing cross-subject and cross-context challenge-result replay, where a genuine result issued for a different agent or context is presented to admit this one), (b) every candidate record's verifier P-256 signature is valid over its canonical bytes and the record is unexpired relative to the current clock (verify-on-use — an unauthentic or expired record is not considered), (c) a `SelfAttested` requirement is met when the capability URI appears among the agent's self-attested capabilities OR a valid `ChallengeVerification` with `passed == true` exists for it (challenge-verified implies self-attested), (d) a `ChallengeVerified` requirement is met only by a valid `ChallengeVerification` with `passed == true` for that capability.
 5. If any requirement is not met, admission is denied (`MissingCapability` for an absent self-attested capability, `VerificationRequired` for a challenge-verified capability lacking a valid record).
 
-Subject binding and context binding are enforced by the protocol (steps 4a–4b), mirroring the participation-admission sibling (§7.3.2.1): the admission primitive takes the DID of the agent being admitted (`subject_did`) and the context being admitted to (`context_id`), and discards any challenge result whose signed subject or context does not match. All checks are mechanical — no judgment, no discretion, no governance vote.
+Subject binding and context binding are enforced by the protocol (steps 4a–4b), mirroring the participation-admission sibling (§7.3.2.1): the admission primitive takes the identifier of the agent being admitted (`subject_did`) and the context being admitted to (`context_id`), and discards any challenge result whose signed subject or context does not match. All checks are mechanical — no judgment, no discretion, no governance vote.
 
 **Authenticity is not verifier authorization.** As with participation profiles (§7.3.2.1) and the symmetric caveat in §7.4, verify-on-use establishes that each `ChallengeVerification` was genuinely *signed* by its stated `verifier_did` and is bound to this subject, context, and expiry — it does NOT establish that the verifier is *authorized or trusted*. A `verifier_did` is self-certifying, so a subject can present a genuinely-signed result from a verifier it controls. A consumer that needs verifier legitimacy MUST establish it separately (a trusted-verifier set, a context-membership proof, or the threshold/independence path of §7.3.5) and MUST NOT treat a passing signature check as an authorization decision.
 
@@ -728,13 +725,13 @@ The protocol supports threshold requirements: "this claim is considered validate
 
 **Independence criteria.** Independence is defined by the following rules, verified by the consuming agent (not enforced by the protocol):
 
-1. **Distinct DIDs (REQUIRED).** Attestors MUST have distinct DIDs. Multiple attestations from the same DID count as one attestation regardless of quantity.
+1. **Distinct identities (REQUIRED).** Attestors MUST be distinct identities. Multiple attestations from one identity count as one attestation regardless of quantity.
 2. **Relay diversity (RECOMMENDED).** Attestors SHOULD NOT share the same relay endpoint. Shared relay infrastructure increases the risk of coordinated manipulation. Consumers MAY require attestors to use at least N distinct relays.
 3. **No mutual endorsement cycles (RECOMMENDED).** Attestors that have mutual endorsement relationships (A endorsed B AND B endorsed A) have reduced independence. Consumers MAY discount or reject attestations from mutually-endorsing pairs.
 
-**Verification model.** Independence is verified by the consumer, not enforced by the protocol. The protocol provides the attestation chain — issuer DIDs, relay endpoints, endorsement graphs — and consumers decide their own trust policy for what constitutes sufficient independence. This is a Layer 4 (trust evaluation) decision informed by Layer 2 (participation validation) data.
+**Verification model.** Independence is verified by the consumer, not enforced by the protocol. The protocol provides the attestation chain — issuer identifiers, relay endpoints, endorsement graphs — and consumers decide their own trust policy for what constitutes sufficient independence. This is a Layer 4 (trust evaluation) decision informed by Layer 2 (participation validation) data.
 
-**Sybil resistance.** Threshold attestations are vulnerable to Sybil attacks where a single entity creates multiple DIDs to meet the threshold. The primary Sybil resistance mechanism is the DeviceAttestation (§9.3), which binds DIDs to hardware-attested devices. Consumers requiring strong Sybil resistance SHOULD require attestors to have valid DeviceAttestations. Additional Sybil signals include: participation history depth (new DIDs with no history are suspect), attestation timing correlation (multiple attestations arriving simultaneously suggest coordination), and shared behavioral patterns detectable via participation records (§7.3.2).
+**Sybil resistance.** Threshold attestations are vulnerable to Sybil attacks where a single entity creates multiple identities to meet the threshold. The primary Sybil resistance mechanism is the DeviceAttestation (§9.3), which binds identities to hardware-attested devices. Consumers requiring strong Sybil resistance SHOULD require attestors to have valid DeviceAttestations. Additional Sybil signals include: participation history depth (a new identity with no history is suspect), attestation timing correlation (multiple attestations arriving simultaneously suggest coordination), and shared behavioral patterns detectable via participation records (§7.3.2).
 
 Threshold attestations are useful for:
 
@@ -801,7 +798,7 @@ InvocationCaveats {
   input_schema:            Option<JSONSchema>,       // partial schema narrowing the parent's
                                                      // input_schema; see narrowing rules below
   allowed_adapters:        Option<Vec<PaymentAdapterId>>,  // restrict adapters; (§19.2)
-  allowed_target_dids:     Option<Vec<DID>>,         // restrict which peer DIDs may be
+  allowed_target_dids:     Option<Vec<Identifier>>,  // restrict which peers may be
                                                      // invoked via cross-context outlets (§6.2)
   origin_kind:             Option<OutletKind>,       // Query/Action amplification pin (§5.4.2,
                                                      // §6.2) — MUST equal the parent's
@@ -944,15 +941,15 @@ Attestation {
   type:              identity_link | capability_delegation | outlet_integrity |
                      endorsement | role_assignment | agent_capability |
                      context_endorsement | participation_witness
-  issuer:            DID of the entity making the claim
-  subject:           what the claim is about (DID, outlet_id, context_id, etc.)
+  issuer:            the identifier of the entity making the claim
+  subject:           what the claim is about (an identifier, outlet_id, context_id, etc.)
   claim:             structured content (type-specific)
   evidence:          supporting proof (type-specific, optional)
   issued_at:         u64 (Unix timestamp seconds)
   expires:           u64? (optional Unix timestamp seconds)
   renewed_at:        u64? (timestamp of last renewal, if renewable)
   revocation_status: RevocationStatus
-  signature:         Ed25519Signature (issuer's cryptographic signature over all fields except itself)
+  signature:         P256Signature (issuer's cryptographic signature over all fields except itself)
 }
 ```
 
@@ -963,21 +960,21 @@ RevocationStatus = Active
                  | Revoked {
                      reason:     String,    // human-readable revocation reason
                      revoked_at: u64,       // Unix timestamp seconds when revocation occurred
-                     revoked_by: DID        // DID that performed the revocation (must be the issuer)
+                     revoked_by: Identifier // who performed the revocation (must be the issuer)
                    }
 ```
 
 - All attestations are created with `revocation_status: Active`.
-- Revocation is performed by the issuer by publishing an updated attestation with `revocation_status: Revoked { ... }` to the same location as the original attestation (DID document entry, relay-published attestation blob, or revocation endpoint). Note: an attestation location is never the context event log — attestations are credential-layer artifacts (§7.4), not context-log leaves.
+- Revocation is performed by the issuer by publishing an updated attestation with `revocation_status: Revoked { ... }` to the same location as the original attestation (the endpoint the subject's service record names, a relay-published attestation blob, or a revocation endpoint). Note: an attestation location is never the context event log — attestations are credential-layer artifacts (§7.4), not context-log leaves.
 - Validators MUST reject any attestation with `revocation_status: Revoked`. A revoked attestation provides no trust signal — it is treated as if it does not exist for validation purposes.
 - Serialization: MessagePack, matching the SCP standard serialization format. The `RevocationStatus` enum is serialized as a tagged variant: `Active` as `{"Active": {}}`, `Revoked` as `{"Revoked": {"reason": "...", "revoked_at": ..., "revoked_by": "did:..."}}`.
 - The `revoked_by` field MUST equal the attestation's `issuer`. Only the issuer can revoke their own attestation. Context governance can request revocation but cannot unilaterally revoke another issuer's attestation — the governance mechanism is to remove the attestation from the context's accepted set, not to modify the attestation itself.
 
 The envelope is the same regardless of attestation type. Verification of the envelope (signature, expiry, revocation status) is automated and mechanical. Interpretation of the claim content depends on the type.
 
-**Authenticity is not Sybil resistance.** The envelope check proves an attestation was really issued by its stated issuer; it does NOT bound how many distinct real-world principals stand behind a set of attestations. A single operator can self-issue (or mutually co-issue across DIDs it controls) arbitrarily many *authentic* attestations. A raw count of authentic attestations — notably `attestation_count` (§7.3.2) — is therefore a credential-layer **claim count**, NOT a standalone trust score, and MUST NOT be treated as one. Sybil resistance comes from the threshold/independence path (§7.3.5) and DeviceAttestation binding (§9.3), which constrain *who* may contribute and bind contributors to distinct hardware — not from the count itself. Concretely, an admission gate that needs Sybil resistance MUST express it through the independence-scored threshold path (§7.3.5; the per-context `sybil_policy`), NOT through an `AttestationCount` participation requirement (§7.3.2.1): the latter gates on the raw, self-issuable count and a subject can clear it by minting endorsements from DIDs it controls.
+**Authenticity is not Sybil resistance.** The envelope check proves an attestation was really issued by its stated issuer; it does NOT bound how many distinct real-world principals stand behind a set of attestations. A single operator can self-issue (or mutually co-issue across identities it controls) arbitrarily many *authentic* attestations. A raw count of authentic attestations — notably `attestation_count` (§7.3.2) — is therefore a credential-layer **claim count**, NOT a standalone trust score, and MUST NOT be treated as one. Sybil resistance comes from the threshold/independence path (§7.3.5) and DeviceAttestation binding (§9.3), which constrain *who* may contribute and bind contributors to distinct hardware — not from the count itself. Concretely, an admission gate that needs Sybil resistance MUST express it through the independence-scored threshold path (§7.3.5; the per-context `sybil_policy`), NOT through an `AttestationCount` participation requirement (§7.3.2.1): the latter gates on the raw, self-issuable count and a subject can clear it by minting endorsements from identities it controls.
 
-**Authenticity is not authorization (verifiers and signers).** The same caveat applies, symmetrically, to challenge verifications (§7.3.4) and participation profiles (§7.3.2.1). Verify-on-ingest (`verify_challenge_verification`) proves the verifier *signed* the result and binds it to the target context and expiry; it does NOT prove the verifier is *authorized or trusted*. Because a `verifier_did` is self-certifying, a subject can self-issue a genuinely-signed challenge result from a DID it controls — so a valid signature is a necessary, not sufficient, condition. Likewise, `verify_participation_requirements`/`check_capability_requirements` verify signature authenticity over caller-supplied participation profiles, but the `signer_public_key` is self-certifying: a subject can mint genuinely-signed profiles from signers it controls (the colluding-contexts forgery of §7.3.2.1). **Subject binding IS enforced by the protocol, not delegated to the consumer:** both siblings take the DID of the agent being admitted (`expected_subject` / `subject_did`) and discard any profile or challenge result whose signed subject does not match, so a victim's genuine high-standing profiles cannot be replayed to admit a different agent (cross-subject participation-profile replay). What remains the consumer's responsibility is *signer/verifier legitimacy*: a consumer MUST establish it SEPARATELY — e.g. a context-membership proof, a trusted-signer set, or the threshold/independence path (§7.3.5) — and MUST NOT treat a passing signature check as an authorization decision.
+**Authenticity is not authorization (verifiers and signers).** The same caveat applies, symmetrically, to challenge verifications (§7.3.4) and participation profiles (§7.3.2.1). Verify-on-ingest (`verify_challenge_verification`) proves the verifier *signed* the result and binds it to the target context and expiry; it does NOT prove the verifier is *authorized or trusted*. Because a `verifier_did` is self-certifying, a subject can self-issue a genuinely-signed challenge result from an identity it controls — so a valid signature is a necessary, not sufficient, condition. Likewise, `verify_participation_requirements`/`check_capability_requirements` verify signature authenticity over caller-supplied participation profiles, but the `signer_public_key` is self-certifying: a subject can mint genuinely-signed profiles from signers it controls (the colluding-contexts forgery of §7.3.2.1). **Subject binding IS enforced by the protocol, not delegated to the consumer:** both siblings take the identifier of the agent being admitted (`expected_subject` / `subject_did`) and discard any profile or challenge result whose signed subject does not match, so a victim's genuine high-standing profiles cannot be replayed to admit a different agent (cross-subject participation-profile replay). What remains the consumer's responsibility is *signer/verifier legitimacy*: a consumer MUST establish it SEPARATELY — e.g. a context-membership proof, a trusted-signer set, or the threshold/independence path (§7.3.5) — and MUST NOT treat a passing signature check as an authorization decision.
 
 ### 7.4.2 Attestation Types
 
@@ -991,7 +988,7 @@ The envelope is the same regardless of attestation type. Verification of the env
 
 **Endorsement.** One identity vouches for another's competence in a specific capability. No objective evidence — the value comes from the issuer's own participation record and the attestation's accuracy history. This is the attestation type that lives primarily in Layer 4 (trust), but endorsement accuracy tracking (did the endorsed identity subsequently misbehave?) pushes it toward Layer 2 over time.
 
-**Role assignment.** Context governance assigns a role to an agent. Evidence: governance action signed by authorized DIDs. Verification: validate against governance model and UCAN chain.
+**Role assignment.** Context governance assigns a role to an agent. Evidence: governance action signed by authorized identities. Verification: validate against governance model and UCAN chain.
 
 **Context endorsement.** Any identity vouches for a context's legitimacy. Subjective, but endorser's participation record provides validation context.
 
@@ -1007,7 +1004,7 @@ Attestations are solicited and presented through several patterns:
 
 ### 7.4.4 Revocation
 
-All attestations are independently revocable by their issuer. The issuer revokes an attestation by updating its `revocation_status` field from `Active` to `Revoked { reason, revoked_at, revoked_by }` (§7.4.1) and publishing the updated attestation to the same location as the original (DID document entry, relay-published attestation blob, or revocation endpoint — never the context event log, since attestations are credential-layer artifacts per §7.4, not context-log leaves). Only the issuer (`revoked_by == issuer`) can revoke an attestation. Revocation is immediate for new verifications — validators MUST check `revocation_status` on every attestation evaluation. Agents that cached a previous verification SHOULD re-check on a defined interval (RECOMMENDED: at least once per hour for security-critical attestations, once per day for others). A revoked attestation MUST NOT be accepted by validators for any purpose.
+All attestations are independently revocable by their issuer. The issuer revokes an attestation by updating its `revocation_status` field from `Active` to `Revoked { reason, revoked_at, revoked_by }` (§7.4.1) and publishing the updated attestation to the same location as the original (the endpoint the subject's service record names, a relay-published attestation blob, or a revocation endpoint — never the context event log, since attestations are credential-layer artifacts per §7.4, not context-log leaves). Only the issuer (`revoked_by == issuer`) can revoke an attestation. Revocation is immediate for new verifications — validators MUST check `revocation_status` on every attestation evaluation. Agents that cached a previous verification SHOULD re-check on a defined interval (RECOMMENDED: at least once per hour for security-critical attestations, once per day for others). A revoked attestation MUST NOT be accepted by validators for any purpose.
 
 ## 7.5 Layer 4: Trust Evaluation
 
@@ -1015,7 +1012,7 @@ After all validation layers have run, some evaluation remains that requires judg
 
 Trust evaluation is needed for:
 
-- **New identities with no participation history.** A brand-new DID has no participation records, no outlet verification history, no challenge-response results. Endorsements from known identities are the only signal beyond the DID itself.
+- **New identities with no participation history.** A brand-new identity has no participation records, no outlet verification history, no challenge-response results. Endorsements from known identities are the only signal beyond the identifier itself.
 - **Non-testable capabilities.** "Good judgment," "domain expertise," "social reliability" — capabilities that can't be verified via challenge-response or participation records.
 - **Novel situations.** First interactions with unfamiliar contexts, outlets, or agents where no prior data exists.
 
@@ -1029,7 +1026,7 @@ Trust evaluation is agent-level. The protocol provides inputs (verified attestat
 
 Attestation is not a feature of any single section of SCP — it is a primitive used by every layer:
 
-- **Identity (§3):** Identity links are attestations binding external handles to DIDs.
+- **Identity (§3):** Identity links are attestations binding external handles to identifiers.
 - **Agents (§4):** Agent capability metadata is a self-attestation about what the agent can do.
 - **Contexts (§5):** Role assignments are attestations by governance about an agent's permissions. Outlet registrations include integrity attestations.
 - **Trust (§7):** Capability tokens (UCAN) are delegation attestations. Endorsements are trust attestations. Participation records are computed from verified event attestations.
@@ -1040,7 +1037,7 @@ The common envelope format (§7.4.1) unifies these under a single verifiable str
 
 ## 7.7 Data Provenance
 
-Provenance is a core principle of SCP (§1): all non-private data carries verifiable origin metadata. This section specifies how provenance is implemented for data that crosses context boundaries. Provenance applies protocol-wide — messages carry sender provenance (DID + context + timestamp), attestations carry issuer provenance (DID + evidence + expiry), outlet outputs carry invocation provenance (outlet + invoking agent + context), and cross-context data carries origin provenance (source context + counterparties + discovery method). The absence of provenance on any data is itself a signal that the data has no verified origin.
+Provenance is a core principle of SCP (§1): all non-private data carries verifiable origin metadata. This section specifies how provenance is implemented for data that crosses context boundaries. Provenance applies protocol-wide — messages carry sender provenance (identifier + context + timestamp), attestations carry issuer provenance (identifier + evidence + expiry), outlet outputs carry invocation provenance (outlet + invoking agent + context), and cross-context data carries origin provenance (source context + counterparties + discovery method). The absence of provenance on any data is itself a signal that the data has no verified origin.
 
 ### 7.7.1 Provenance Format
 
@@ -1050,7 +1047,7 @@ Data provenance is a structured record attached to data at the protocol level:
 DataProvenance {
   sourceContext:       contextID               // where the data originated
   sourceType:          .persistent | .ephemeral | .summary   // source data availability
-  counterparties:      [DID]                   // who was in the source interaction (subject to counterparty_policy)
+  counterparties:      [Identifier]            // who was in the source interaction (subject to counterparty_policy)
   purpose:             String                  // declared purpose of source context
   discoveryMethod:     .sharedContext(contextID)
                      | .registry(registryContextID)
@@ -1065,11 +1062,11 @@ DataProvenance {
 }
 ```
 
-**Counterparty privacy controls.** The `counterparties` field lists DIDs of participants in the source interaction. Because this reveals context membership, the field is subject to privacy controls when provenance crosses context boundaries:
+**Counterparty privacy controls.** The `counterparties` field lists the identifiers of participants in the source interaction. Because this reveals context membership, the field is subject to privacy controls when provenance crosses context boundaries:
 
 1. **`counterparty_policy` context parameter.** Each context declares a `counterparty_policy` in `ContextParams` that governs how counterparty information is handled in outbound provenance:
-   - `full` — Include real DIDs. Appropriate for intra-context provenance or contexts where membership is public. This is the default for intra-context use.
-   - `pseudonymized` — Replace real DIDs with context-scoped pseudonyms (per §9.10.4) before exporting. Receiving contexts see stable pseudonyms but cannot correlate them to real DIDs without the source context's pseudonym derivation key.
+   - `full` — Include real identifiers. Appropriate for intra-context provenance or contexts where membership is public. This is the default for intra-context use.
+   - `pseudonymized` — Replace real identifiers with context-scoped pseudonyms (per §9.10.4) before exporting. Receiving contexts see stable pseudonyms and cannot correlate them to real identifiers without the source context's pseudonym derivation key.
    - `redacted` — Always empty. No counterparty information is exported. This is the most privacy-preserving option.
 2. **SDK enforcement.** The sending SDK MUST apply the source context's `counterparty_policy` before attaching provenance to outbound data. When data crosses a context boundary, the SDK checks the source context's policy and strips, pseudonymizes, or passes through the counterparties accordingly. This is not optional — the SDK enforces it mechanically.
 3. **Default for cross-context export.** When provenance crosses a context boundary and no explicit `counterparty_policy` is set, the default is `redacted`. This is a privacy-safe default — contexts that want to share counterparty information must opt in explicitly.

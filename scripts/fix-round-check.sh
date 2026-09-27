@@ -210,12 +210,12 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 1
 fi
 
-# `timeout` bounds the `cargo metadata` call below and each of the 29 gates, so 30 call
+# `timeout` bounds the `cargo metadata` call below and each of the 30 gates, so 31 call
 # sites depend on it. macOS ships neither `timeout` nor `gtimeout`, Homebrew's coreutils
 # supplies both names, and `.mise.toml` provisions neither, so a checkout that installed
 # only the prerequisites README.md lists has no such program. Without this guard every gate
-# would exit 127, and the run would print 29 blocks reading "timeout: command not found"
-# and report 29 enforcement violations that do not exist.
+# would exit 127, and the run would print 30 blocks reading "timeout: command not found"
+# and report 30 enforcement violations that do not exist.
 TIMEOUT=timeout
 command -v "$TIMEOUT" >/dev/null 2>&1 || TIMEOUT=gtimeout
 if ! command -v "$TIMEOUT" >/dev/null 2>&1; then
@@ -223,7 +223,7 @@ if ! command -v "$TIMEOUT" >/dev/null 2>&1; then
     exit 1
 fi
 
-# The interpreter ten of the gates below run under, and the one that reads the dependency
+# The interpreter eleven of the gates below run under, and the one that reads the dependency
 # declarations out of `cargo metadata`'s JSON for the compile step's feature set. It is
 # resolved here rather than beside the gate list because the compile step runs first.
 PYTHON=python3.12
@@ -766,8 +766,8 @@ run_step format cargo fmt --all -- --check
 # cost is reading repository files and, for one gate, resolving a dependency graph. Every
 # gate that compiles or links belongs to CI, which runs it on the pushed head.
 #
-# WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 30 files named
-# `check-*`. This list names 29 of them, and GATES_NOT_RUN below names the other one with
+# WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 31 files named
+# `check-*`. This list names 30 of them, and GATES_NOT_RUN below names the other one with
 # the reason it is absent. Neither count is load-bearing: the loop below globs
 # `scripts/check-*` off the disk and fails the run on any file neither array names, so a
 # gate this repository gains and this list does not reports itself instead of going
@@ -784,6 +784,8 @@ run_step format cargo fmt --all -- --check
 # `scripts/check-toolchain-wiring.sh`, which this list already held, and it reads every
 # workflow file with PyYAML while starting no subprocess. It rejected this script's own CI
 # job once, for a `Swatinem/rust-cache` step that named no cache group.
+# `scripts/check-doc-includes.py` joined after that: the `doc-includes` job of
+# `.github/workflows/ci.yml` runs it, and it reads only `.docs/` with the standard library.
 GATES=(
     scripts/check-agent-verdict-criterion.sh
     scripts/check-block-in-place.py
@@ -794,6 +796,7 @@ GATES=(
     scripts/check-cross-layer.sh
     scripts/check-deleted-primitives.sh
     scripts/check-doc-citations.py
+    scripts/check-doc-includes.py
     scripts/check-error-codes.sh
     scripts/check-handle-affinity.sh
     scripts/check-handler-no-panic.sh
