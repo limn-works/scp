@@ -6,7 +6,7 @@ Python conventions, toolchain, and CI for the SCP Python SDK. References `sdk-co
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| Python | 3.10+ | Minimum supported version, as ADR phase-3 and `requires-python = ">=3.10"` in `bindings/python/pyproject.toml` set it; wheels ship for CPython 3.10-3.13. `match`, `X \| Y` union syntax and `ParamSpec` (3.10) are available. PEP 695 type parameter syntax and `type X` statements (3.12) are not: write a type alias as `X: TypeAlias = ...`. Ruff's `target-version = "py310"` rejects the newer syntax, and CI job `python-wheel-build` imports the extension under CPython 3.10. |
+| Python | 3.10+ | Minimum supported version, as ADR phase-3 and `requires-python = ">=3.10"` in `bindings/python/pyproject.toml` set it; wheels ship for CPython 3.10-3.13. `match`, `X \| Y` union syntax and `ParamSpec` (3.10) are available. PEP 695 type parameter syntax and `type X` statements (3.12) are not: write a type alias as `X: TypeAlias = ...`. Ruff's `target-version = "py310"` rejects the newer syntax, and CI job `python-wheel-build` imports every `scp_sdk` module under CPython 3.10, which rejects such syntax in any module. |
 | maturin | latest | Build tool for PyO3 Rust extension |
 | ruff | latest | Linter + formatter (replaces flake8, isort, black) |
 | mypy | latest | Static type checker (`--strict` mode) |

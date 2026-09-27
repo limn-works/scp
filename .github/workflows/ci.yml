@@ -1805,8 +1805,10 @@ jobs:
   # cutting a tag.
   #
   # It builds for CPython 3.10, the floor `requires-python` names, and 3.12, then
-  # installs each wheel into a fresh virtualenv and imports the extension, which
-  # fails when the package uses an API or syntax 3.10 lacks. It also fails when the
+  # installs each wheel into a fresh virtualenv and imports every module of the
+  # scp_sdk package, the extension among them. That fails when a module holds syntax
+  # 3.10 lacks, or runs at import time an API 3.10 lacks; an API a function body
+  # calls is not reached, because the import calls no function. It also fails when the
   # extension names libcrypto or libssl as a dynamic dependency, because the wheel
   # exists to carry its own OpenSSL.
   python-wheel-build:
@@ -1839,13 +1841,15 @@ jobs:
         run: |
           cd bindings/python
           maturin build --out dist -i python3.10 python3.12 --locked
-      - name: Install each wheel, import the extension, and check it names no dynamic libssl or libcrypto
+      - name: Install each wheel, import every scp_sdk module, and check the extension names no dynamic libssl or libcrypto
         run: |
           set -euo pipefail
           for py in python3.10 python3.12; do
             "$py" -m venv "/tmp/venv-$py"
             "/tmp/venv-$py/bin/pip" install --no-index --find-links bindings/python/dist scp-python
-            so="$(cd /tmp && "/tmp/venv-$py/bin/python" -c 'import scp_sdk._scp_core as m; print(m.__file__)')"
+            # walk_packages lists every module the installed package holds, so a
+            # module no other module imports (scp_sdk/provenance.py) is parsed too.
+            so="$(cd /tmp && "/tmp/venv-$py/bin/python" -c 'import importlib, pkgutil, scp_sdk, scp_sdk._scp_core as m; [importlib.import_module(i.name) for i in pkgutil.walk_packages(scp_sdk.__path__, "scp_sdk.")]; print(m.__file__)')"
             echo "$py imported $so"
             # Captured first: a readelf failure then aborts under `set -e`,
             # where inside the `if` pipeline it would read as "no OpenSSL".
