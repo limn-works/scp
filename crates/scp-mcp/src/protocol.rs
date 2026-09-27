@@ -12,7 +12,7 @@
 //! - **MCP resource messages:** [`ResourcesListParams`],
 //!   [`ResourcesListResult`], [`ResourcesReadParams`],
 //!   [`ResourcesReadResult`], [`ResourcesSubscribeParams`],
-//!   [`ResourcesUnsubscribeParams`], [`ResourcesUpdatedParams`].
+//!   [`ResourcesUnsubscribeParams`].
 //! - **Standard error codes** for JSON-RPC and MCP-specific errors.
 //!
 //! All types derive `Serialize` and `Deserialize` via `serde_json`.
@@ -567,13 +567,6 @@ pub struct ResourcesSubscribeParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourcesUnsubscribeParams {
     /// The URI of the resource to stop receiving updates for.
-    pub uri: String,
-}
-
-/// Parameters for the `notifications/resources/updated` notification.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourcesUpdatedParams {
-    /// The URI of the resource that changed.
     pub uri: String,
 }
 

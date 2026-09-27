@@ -677,14 +677,24 @@ impl FfiBridgeProvider {
     ///
     /// # Errors
     ///
-    /// Fails when the actor does not hold the context or cannot be asked; the
-    /// caller then denies, because it cannot learn the current role state.
+    /// Fails when the actor does not hold the context or cannot be asked, and,
+    /// with no supervisor attached, when the bridge holds no copy of the
+    /// context; the caller then denies, because it cannot learn the current
+    /// role state. The message names whichever of the two held nothing.
     fn live_role_state(
         bi: &crate::runtime::PyBridgeInstance,
         context_id: &str,
     ) -> Result<scp_core::context::roles::ContextRoleState, String> {
-        Self::held_role_state(bi, context_id)?
-            .ok_or_else(|| format!("context '{context_id}' is not held by the supervisor"))
+        Self::held_role_state(bi, context_id)?.ok_or_else(|| {
+            if bi.core.try_supervisor().is_some() {
+                format!("context '{context_id}' is not held by the supervisor")
+            } else {
+                format!(
+                    "context '{context_id}' is not held by this bridge, and no supervisor \
+                     is attached"
+                )
+            }
+        })
     }
 
     /// Reads `context_id`'s current role state from the source
@@ -4283,8 +4293,21 @@ mod tests {
         let ctx_id = setup_unsupervised_context(&bi, agent, false);
         let provider = pyo3_mcp_provider(&bi, &ctx_id, agent);
 
-        // No supervisor: the copy is the context's only role state.
+        // No supervisor: the copy is the context's only role state, and a
+        // context the bridge holds no copy of is reported as such, not as one
+        // a supervisor lacks.
         assert_eq!(provider.active_context_ids().unwrap(), vec![ctx_id.clone()]);
+        let denial = provider
+            .validate_resource_access("ctx-the-bridge-never-held", ResourceKind::Events)
+            .expect_err("a context the bridge holds no copy of must not be readable");
+        assert!(
+            matches!(
+                &denial,
+                scp_mcp::server::AccessRefusal::Unreadable(msg)
+                    if msg.contains("not held by this bridge, and no supervisor is attached")
+            ),
+            "with no supervisor the denial must name the bridge, got: {denial}"
+        );
         assert!(provider.context_members(&ctx_id).is_ok());
         assert!(provider.agent_role(&ctx_id).is_some());
         assert!(
