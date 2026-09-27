@@ -18,7 +18,7 @@ SCP is an open, ecosystem-agnostic infrastructure protocol — open infrastructu
 
 ### Builder tenets
 
-- **No human limits.** 100% agent-written codebase. Don't think in human terms of timeline, scope, or speed. Consider code to be free and time to be infinite.
+- **No human limits.** 100% agent-written codebase. Don't think in human terms of timeline, scope, or speed.
 - **No DOA decisions.** Design decisions are permanent commitments. If it needs replacing later, it's the wrong choice now.
 - **Simple over complex.** Never at the expense of functionality, security, or completeness.
 - **No deferral.** Everything gets specced and implemented now. Nothing is "v2" or "future."
@@ -31,7 +31,6 @@ SCP is an open, ecosystem-agnostic infrastructure protocol — open infrastructu
   - **Gaming enforcement tests with dead references.** `let _ = function_name;` passes a string search but calls nothing. This is fraud. Call the function with real arguments or leave the assertion `#[ignore]`.
   - **Counting acceptance criteria and stopping early.** "4 of 10 met" is not progress — it's failure. You will feel done at 4. You are not. Do the other 6.
   - **Rationalizing gaps as "separate scope."** If the plan says to do it, it is in scope. Period. "Follow-up," "tracked separately," "not blocking," "can be deferred" — these are all lies you tell yourself to stop working. The plan already scoped the work. Execute it.
-  - **Treating agent dispatches as expensive.** They are free. Time is infinite. Code is free. Dispatch as many agents as needed. Never trim scope to reduce iterations.
   - **Trusting subagent self-reports.** Subagents are liars. They report success while leaving work incomplete. ALWAYS verify against the actual acceptance criteria by reading the code yourself. grep for the function call. Read the test. Check the checkbox.
 - **SDK first.** Rust core + bindings before any app.
 - **Enforce mechanically.** Linters, structural tests, and the type system — not documentation.
@@ -46,11 +45,11 @@ SCP is an open, ecosystem-agnostic infrastructure protocol — open infrastructu
 
 ### Context+ MCP — Semantic codebase mapping ([instructions](./.claude/CONTEXTPLUS_MCP.md))
 
-`get_context_tree` → `get_file_skeleton` → `semantic_identifier_search` → `get_blast_radius` before modifying symbols → `run_static_analysis` to validate. **Use every time you search code.** Always skeleton before full read. `semantic_code_search` is broken on this codebase (context length) — use `semantic_identifier_search` or Grep instead.
+`get_context_tree` → `get_file_skeleton` → `semantic_identifier_search` → `get_blast_radius` before modifying symbols → `run_static_analysis` to validate. Use it to map a module before you read it and to check blast radius before you modify a symbol. Always skeleton before full read. `semantic_code_search` is broken on this codebase (context length) — use `semantic_identifier_search` or Grep instead.
 
 ### Vestige MCP — Long-term cognitive memory (instructions in user-scope CLAUDE.md)
 
-`session_context` at start → `search` before decisions → `smart_ingest` to save (auto-deduplicates) → `codebase` for project patterns/decisions → `intention` for reminders → `memory` for promote/demote. **Use every time you receive or recall information.**
+`session_context` at start → `search` before decisions → `smart_ingest` to save (auto-deduplicates) → `codebase` for project patterns/decisions → `intention` for reminders → `memory` for promote/demote. Search it before a decision or when a task touches earlier work, and save rulings, fixes, and decisions to it.
 
 **Remember with connotation** — tag memories so future sessions know how to act:
 - `"always"` — do this every time, no exceptions.
@@ -66,10 +65,17 @@ Artifacts (`.docs/`) are durable and versioned — the system of record. Vestige
 
 **Operating model:**
 - Humans steer. Agents execute. No human-written code; only human-driven specs.
-- An agent's context window is small, so tell an agent where to look and let it read the artifact itself. Do not paste the artifact into the prompt.
+- An agent's context is finite, and every token it loads competes for its attention, so tell an agent where to look and let it read the artifact itself. Do not paste the artifact into the prompt.
 - Maintain provenance and trace every claim back to its source. Read the source artifacts themselves — specs, ADRs, PRDs, standards — before you change anything. Skimming an artifact does not count as reading it.
-- Be autonomous: infer from context, code, artifacts. Escalate only for genuine judgment calls.
 - Follow every reference. When a spec cites a section, read that section. When code references a story, read the story. When an ADR lists a rejected alternative, find out why its author rejected it. An agent who skims the sources writes code that matches the sources only on the surface.
+
+**Asking the human a question, and ending a turn:**
+- Ask when the answer changes what you do next and nothing you can read settles it: two readings of the request lead to materially different work, the next action is destructive or visible outside the repository, or the plan leaves the decision to the human. Make every other judgment call yourself and say which call you made.
+- Before you ask, search the shipped code, the human's earlier words in this conversation, the persistent memory, and the plan of record, in that order. A question those sources answer costs the human a reply and stops the work until the reply arrives.
+- Do everything that does not depend on the answer first, and put the question at the end of a turn that delivers that progress. When a wrong guess is cheap to undo, proceed on it and state the assumption instead of asking.
+- Ask one decision per question. Give the options, what each one changes, and your recommendation, so one reply settles it. Use AskUserQuestion when the options are discrete.
+- When the human describes a problem, asks a question, or thinks out loud, your assessment is the deliverable. Report it and stop; apply a fix only when the human asks for one.
+- A turn that ends without a tool call stops the work until the human replies. End a turn only when the task is done, when nothing can move without the human's answer, or when the next step needs an approval this file reserves for the human. Four endings stop work the human already asked for: a summary that announces the next step instead of taking it; an offer ("Want me to…?", "Shall I…?") to do work the request already covers; a list of decisions none of which blocks the remaining work; and stopping because the turn ran long or a milestone finished. Put status notes and recommendations in the same message as your next tool call.
 
 **Never resolve an open question yourself (MANDATORY):**
 - When you ask the human a question, wait for the human to answer it. Do not answer it yourself, and do not proceed on the answer you expected.
@@ -99,7 +105,7 @@ Artifacts (`.docs/`) are durable and versioned — the system of record. Vestige
 - Cite `.docs/` in your work and update it as you go. After anyone corrects you, write the lesson into `.docs/lessons/`
 - Check `.docs/standards/` before writing code — read and follow them
 - Give each subagent exactly one task, and dispatch as many subagents as the work needs, so the orchestrator's context stays small
-- Subagents: ALWAYS instruct them to read CLAUDE.md
+- The request, or the plan the human approved, sets the scope of a task. Implement every behavior it asks for, completely. When you find a bug, a performance problem, or missing behavior that the requested behavior does not need, file it as a GitHub issue and list it in your final report instead of fixing it in the change.
 - Run every gate, every test, and every build, and read their output, before you call the work done
 
 **Change protocol (MANDATORY for all code changes):**
@@ -108,7 +114,7 @@ Artifacts (`.docs/`) are durable and versioned — the system of record. Vestige
 - Review locally using the full review roster, in logical units
   - Validate and address every item, then re-run the full review
   - Repeat the loop until a review pass returns zero items twice in a row
-  - Do NOT ignore or dismiss review items as "out of scope" or "preexisting." Prefer to fix them inline. At minimum, file GitHub issues — but fixing is always preferred over filing.
+  - Fix every review finding about code the change adds, alters, or needs. A defect the review surfaces in code the change neither touches nor needs goes into a GitHub issue, and the PR description links it. Never dismiss a finding as "pre-existing"; either fix it or file it.
 - **Quick local check before push, full gate set in CI.**
   - The quick check runs `cargo fmt --all`, `cargo clippy` with the CI feature set scoped to the crates the change touches, the tests of those crates, and the gate scripts the change affects. Run it on the tree you are about to push.
   - CI runs the full gate set on the pushed head. A red CI run is never acceptable, whether your change or an earlier one turned it red: fix the code the failing job rejected before the pull request merges.
@@ -177,7 +183,7 @@ A human must approve before you weaken an existing assertion, delete one, or exe
 - **Before creating, editing, or updating any story in `.docs/prds/`**, read `.docs/standards/prd.md` in full. No exceptions.
 - Fill every field the standard defines. Write every acceptance criterion so a machine can verify it. Point every source at a heading that exists in a file that exists. Point every dependency forward, never backward.
 - The artifact flow applies to stories: stories reference specs and ADRs, never the reverse. If a story can't cite a spec section or ADR, it needs one written first.
-- Run `python3 scripts/validate-prd.py` before committing PRD changes. CI enforces this.
+- Run `python3.12 scripts/validate-prd.py` before committing PRD changes. CI enforces this.
 - A subagent that writes a story validates the story against the standard before it returns. Two audits shipped defective stories because neither audit checked its own output, and that failure is why this standard exists.
 
 **Stubs:**
@@ -246,7 +252,9 @@ All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm 
 
 ## Agents
 
-Use eagerly for focus, expertise, and parallelization. See `.claude/agents/README.md` for the full roster.
+Use agents for focus, expertise, and parallel work. See `.claude/agents/README.md` for the full roster.
+
+**Delegation.** Delegate a task to a subagent when the task is large and independent of the other work in flight: a wide multi-file investigation, a separate implementation track, a review pass. Do work you can finish in a handful of tool calls yourself, because a subagent adds a spawn, a context load, and a handoff to every task it takes. Do not spawn a subagent to check your own work. When one subagent can do a task, send one.
 
 Default review agents: @"black-hat (agent)", @"red-hat (agent)", @"white-hat (agent)", @"security-reviewer (agent)", @"cryptographer (agent)", @"bug-catcher (agent)", @"chronicler (agent)", @"alignment-reviewer (agent)", @"completionist (agent)", @"inquisitor (agent)", @"api-design-reviewer (agent)", @"simplifier (agent)". Use discretion to add or remove based on review contents.
 
@@ -256,7 +264,7 @@ Default review agents: @"black-hat (agent)", @"red-hat (agent)", @"white-hat (ag
 
 **Review the class, not the instance.** Alec stated this rule on 2026-08-30: "when you find an issue in one section that's liable to exist in another, immediately check for it in every possible area. don't wait and allow churn. use findings to be a proactive reviewer; don't rely on checks and be purely reactive." Derived from the first sentence: a reviewer that finds a defect searches every other place the same defect can occur before writing the finding, and reports every site it found in one finding. The other two bridges, the other SDK wrappers, the other call sites, and the twin function one module over are where siblings usually sit; that list names where to look and does not bound what counts as a sibling site. A reviewer that reports one site gets one site fixed, and the next review round rediscovers the siblings after a full verification cycle has run. Alec's word for that cost is churn. A reviewer knows what the defect is the moment it reads the first site, and searching for the twins costs less then than in any later round. Derived from the second sentence: a check that passes says nothing about the sites the check does not read, so a reviewer looks for what no check covers instead of restating what the checks already caught. `.docs/lessons/review-the-class-not-the-instance.md` records two classes from pull request #2415, the custody-vocabulary branch: one changed error code left a stale assertion at three test sites and took three commits across three rounds to fix, and two production CI lanes ran no test code and took two commits three hours apart to fix.
 
-**Read to the frontier, then stop.** Alec's instruction quoted under "Review the class, not the instance" above directs a reviewer to expand its search and states no reading bound; this paragraph adds the bound because review rounds died at the 200k-token context limit before writing a verdict, and a bounded round finishes and reports. The criterion: a reviewer reads the diff, expands along the edges the change perturbs, and stops at every node whose observable contract the change leaves unchanged. The edge list names where to look and does not define the frontier: callers, when the change alters what a caller can observe; consumers of a changed value, because a wire format or a signed preimage is read wherever the bytes are consumed, not where the function is called; implementors of a changed trait; twin sites, only when a held finding points there. A held finding lifts the bound for the defect it names: "Review the class, not the instance" directs the reviewer to check every site where a found defect can occur, and the frontier bounds only the reading that no finding directs. A frontier that does not close within the reading budget is itself a finding — report "unbounded blast radius" — not a reading failure.
+**Read to the frontier, then stop.** Alec's instruction quoted under "Review the class, not the instance" above directs a reviewer to expand its search and states no reading bound; this paragraph adds the bound because review rounds died at the 200k-token context limit of the models then in use before writing a verdict, and a bounded round finishes and reports. The criterion: a reviewer reads the diff, expands along the edges the change perturbs, and stops at every node whose observable contract the change leaves unchanged. The edge list names where to look and does not define the frontier: callers, when the change alters what a caller can observe; consumers of a changed value, because a wire format or a signed preimage is read wherever the bytes are consumed, not where the function is called; implementors of a changed trait; twin sites, only when a held finding points there. A held finding lifts the bound for the defect it names: "Review the class, not the instance" directs the reviewer to check every site where a found defect can occur, and the frontier bounds only the reading that no finding directs. A frontier that does not close within the reading budget is itself a finding — report "unbounded blast radius" — not a reading failure.
 
 **Guard against over-engineering and non-convergent enforcement.** Mechanical checks (gates, validators, linters) are defense-in-depth, not the primary guarantee. Before adding or growing one, confirm: (a) it is *sound and bounded* — closed by construction (a positive whitelist of permitted shapes), not an ever-expanding denylist chasing "one more spelling"; (b) it does not redundantly re-check, in weaker source-text/AST/runtime form, a property the type system or another compile-time/cryptographic mechanism already enforces soundly — such redundancy is negative value, not defense-in-depth; (c) its cost (lines, complexity, review cycles) is proportionate to its marginal benefit. **Review-pass count is a convergence signal:** if more than ~3 review passes on one artifact keep surfacing "a new spelling of the same bypass," the *approach* is non-convergent — stop and reframe, do not grind. The @"simplifier (agent)" is charged with flagging this class as a BLOCKER; take it as seriously as a correctness finding. See `.docs/lessons/ast-gate-checks-definition-not-name-resolution.md`.
 
@@ -275,7 +283,7 @@ The orchestrator never writes code. It manages execution, maintains plan alignme
 
 **For every work item:**
 
-1. **Plan first.** Send a Plan agent with full context: master plan excerpts, file references, issue numbers, code to read. Instruct agents to READ CODE — not just grep. Use Explore agents too if needed. Use Vestige memory. Do not authorize execution until the plan is reviewed and signed off.
+1. **Plan first.** Send a Plan agent with full context: paths to the master plan sections, file references, issue numbers, code to read. Instruct agents to READ CODE — not just grep. Use Explore agents too if needed. Use Vestige memory. Do not authorize execution until the plan is reviewed and signed off.
 2. **Execute with isolation.** Send coder agents with worktree isolation (`isolation: "worktree"`). Provide all context from the approved plan. Monitor the main worktree — if dirty changes appear on main, investigate before any destructive action.
 3. **Review thoroughly.** After coder completes, review changes with subagents. Give reviewers full context: what was intended, what to look for, what to read. When triaging feedback: real issues are real regardless of "pre-existing" or "out of scope" — but stay focused. If unsure whether a finding is actionable, escalate to the human. Never silently discard findings.
 4. **Fix and re-review.** Actionable findings go back to coder agents. After fixes, re-review. Repeat until zero findings twice in a row (double-zero rule).
