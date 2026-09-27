@@ -18,7 +18,7 @@ import {
   NATIVE_ADDON_LOAD_FAILED_CODE,
   requireNativeAddon,
 } from "../src/internal/native";
-import { __addonExportForTests, __addonLoadErrorForTests } from "../src/scp";
+import { addonLoadError, requireAddonExport } from "../src/scp";
 import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 const BROKEN_PACKAGE = "scp-broken-native-addon";
@@ -73,13 +73,11 @@ describe("requireNativeAddon", () => {
 describe("SCP wrapper mapping of loader errors", () => {
   test("a load failure keeps SCP-UNKNOWN-0002", () => {
     const loadFailure = new ScpError("dlopen failed", NATIVE_ADDON_LOAD_FAILED_CODE);
-    expect(__addonLoadErrorForTests(loadFailure)).toBe(loadFailure);
+    expect(addonLoadError(loadFailure)).toBe(loadFailure);
   });
 
   test("absence becomes SCP-VALID-7005", () => {
-    const mapped = __addonLoadErrorForTests(
-      new TransportError("not installed", NATIVE_ADDON_ABSENT_CODE),
-    );
+    const mapped = addonLoadError(new TransportError("not installed", NATIVE_ADDON_ABSENT_CODE));
     expect(mapped).toBeInstanceOf(ValidationError);
     expect(mapped.code).toBe("SCP-VALID-7005");
   });
@@ -95,7 +93,7 @@ describe("SCP wrapper check of a loaded addon's exports", () => {
     test(`an addon that loaded without ${label} is a load failure, not absence`, () => {
       let caught: unknown;
       try {
-        __addonExportForTests({}, name);
+        requireAddonExport({}, name);
       } catch (e) {
         caught = e;
       }
@@ -108,7 +106,7 @@ describe("SCP wrapper check of a loaded addon's exports", () => {
 
   test("an addon that exports the name returns it", () => {
     const fn = () => "ok";
-    expect(__addonExportForTests<typeof fn>({ SCP: fn }, "SCP")).toBe(fn);
+    expect(requireAddonExport<typeof fn>({ SCP: fn }, "SCP")).toBe(fn);
   });
 });
 

@@ -20,7 +20,7 @@ import { describe, expect, test } from "bun:test";
 
 import { ValidationError } from "../src/errors";
 import { loadNativeAddon } from "../src/internal/native";
-import { __clampShutdownMillisForTests, __serializeStorageConfigForTests, SCP } from "../src/scp";
+import { __serializeStorageConfigForTests, clampShutdownMillis, SCP } from "../src/scp";
 import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
@@ -288,7 +288,7 @@ describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
 //
 // These tests exercise the float-seconds → millis clamp on the SDK
 // wrapper's `shutdown(timeoutSecs)` via the internal
-// `__clampShutdownMillisForTests` helper. Pure logic, no native addon
+// `clampShutdownMillis` helper. Pure logic, no native addon
 // required — runs on every platform. The clamp ceiling widened from
 // `u32::MAX` to `Number.MAX_SAFE_INTEGER` when the NAPI bridge moved to
 // `u64` (#1692).
@@ -299,42 +299,42 @@ describe("SCP.shutdown timeout clamp (round 5 RED-2001, #1692)", () => {
     // Regression for round 5 RED-2001: the previous clamp ordering
     // (`if !isFinite(t) || t <= 0: millis = 0`) caught Infinity in the
     // first branch and aborted the shutdown instead of waiting forever.
-    expect(__clampShutdownMillisForTests(Number.POSITIVE_INFINITY)).toBe(MAX_MILLIS);
+    expect(clampShutdownMillis(Number.POSITIVE_INFINITY)).toBe(MAX_MILLIS);
   });
 
   test("-Infinity maps to abort (0), not wait-forever", () => {
     // The Infinity-is-wait-forever exemption is deliberately asymmetric.
-    expect(__clampShutdownMillisForTests(Number.NEGATIVE_INFINITY)).toBe(0);
+    expect(clampShutdownMillis(Number.NEGATIVE_INFINITY)).toBe(0);
   });
 
   test("NaN maps to abort (0)", () => {
-    expect(__clampShutdownMillisForTests(Number.NaN)).toBe(0);
+    expect(clampShutdownMillis(Number.NaN)).toBe(0);
   });
 
   test("negative values map to abort (0)", () => {
-    expect(__clampShutdownMillisForTests(-1.5)).toBe(0);
+    expect(clampShutdownMillis(-1.5)).toBe(0);
   });
 
   test("zero maps to abort (0)", () => {
-    expect(__clampShutdownMillisForTests(0)).toBe(0);
+    expect(clampShutdownMillis(0)).toBe(0);
   });
 
   test("MAX_SAFE_INTEGER-overflowing values clamp to MAX_MILLIS (#1692)", () => {
     // 1e20 s * 1000 = 1e23 ms, far beyond MAX_SAFE_INTEGER (~9.007e15).
     // Previously clamped at u32::MAX; after the NAPI u64 widening the
     // ceiling is the JS `number` safe-integer boundary.
-    expect(__clampShutdownMillisForTests(1e20)).toBe(MAX_MILLIS);
+    expect(clampShutdownMillis(1e20)).toBe(MAX_MILLIS);
   });
 
   test("finite fractional seconds round to nearest ms", () => {
     // 0.25051 s → 250.51 ms → Math.round → 251.
-    expect(__clampShutdownMillisForTests(0.25051)).toBe(251);
+    expect(clampShutdownMillis(0.25051)).toBe(251);
     // 0.2504 s → 250.4 ms → 250.
-    expect(__clampShutdownMillisForTests(0.2504)).toBe(250);
+    expect(clampShutdownMillis(0.2504)).toBe(250);
   });
 
   test("default 5-second timeout resolves to 5000 ms", () => {
-    expect(__clampShutdownMillisForTests(5)).toBe(5000);
+    expect(clampShutdownMillis(5)).toBe(5000);
   });
 });
 

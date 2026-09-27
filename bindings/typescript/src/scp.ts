@@ -185,10 +185,10 @@ function loadAddon(): NativeAddon {
   try {
     addon = loadNativeAddon() as NativeAddon;
   } catch (cause) {
-    throw __addonLoadErrorForTests(cause);
+    throw addonLoadError(cause);
   }
 
-  __addonExportForTests(addon, "SCP");
+  requireAddonExport(addon, "SCP");
   return addon;
 }
 
@@ -215,7 +215,7 @@ function nativeScp(): NativeScpCtor {
  * addon predating the §1 split).
  */
 function nativeFreeFn<T>(name: keyof NativeAddon): T {
-  return __addonExportForTests<T>(loadAddon(), String(name));
+  return requireAddonExport<T>(loadAddon(), String(name));
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +232,7 @@ function nativeFreeFn<T>(name: keyof NativeAddon): T {
  *
  * @internal
  */
-export function __addonLoadErrorForTests(cause: unknown): ScpError {
+export function addonLoadError(cause: unknown): ScpError {
   if (cause instanceof ScpError && cause.code === NATIVE_ADDON_LOAD_FAILED_CODE) {
     return cause;
   }
@@ -258,7 +258,7 @@ export function __addonLoadErrorForTests(cause: unknown): ScpError {
  * @throws {ScpError} `SCP-UNKNOWN-0002` when `addon[name]` is not a function.
  * @internal
  */
-export function __addonExportForTests<T>(addon: NativeAddon, name: string): T {
+export function requireAddonExport<T>(addon: NativeAddon, name: string): T {
   const value = addon[name];
   if (typeof value !== "function") {
     throw new ScpError(
@@ -277,7 +277,7 @@ export function __addonExportForTests<T>(addon: NativeAddon, name: string): T {
  *
  * @internal
  */
-export function __clampShutdownMillisForTests(timeoutSecs: number): number {
+export function clampShutdownMillis(timeoutSecs: number): number {
   const MAX_MILLIS = Number.MAX_SAFE_INTEGER;
   if (timeoutSecs === Number.POSITIVE_INFINITY) {
     return MAX_MILLIS;
@@ -721,7 +721,7 @@ export class SCP {
    */
   async shutdown(timeoutSecs: number = 5): Promise<void> {
     try {
-      const millis = __clampShutdownMillisForTests(timeoutSecs);
+      const millis = clampShutdownMillis(timeoutSecs);
       await this.#native.shutdown(BigInt(millis));
     } catch (err) {
       throw mapBridgeError(err);
