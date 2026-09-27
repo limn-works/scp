@@ -10683,7 +10683,8 @@
         "A second device that reads a handle past `Signed` and finds the signed event in the platform-account member resumes with `resume_recovery` and publishes it, and its `abort_recovery` refuses: a test loses the composing device at `Signed` and asserts the publish from the second device (`09-security-model.md` §9.7.4.2 R10)",
         "Completion writes a `LastRevealMarker` of `LAST_REVEAL_MARKER_BYTES` to every member and the handle's removal leaves it; before composing a reveal, a device whose adopted log lacks the marked event fetches until it adopts it, and where no entry serves it refuses with `IdentityError::LastRevealUnadopted` carrying the marker: a test per case (`09-security-model.md` §9.7.4.2 R10, `09-security-model.md` §9.18.17)",
         "`abort_recovery(identifier, ComposingDevice::Destroyed)` clears a handle at `Signed` on a device that reaches no copy of the signed event, and `ComposingDevice::Available` refuses there with `SignedRevealUnpublished`: a test per variant (`09-security-model.md` §9.7.4.2 R10)",
-        "A cosigner writes the `Composed` handle into its own store set before it signs, records the commitment of every key the event reveals, and refuses a second event revealing a recorded commitment with `RevealAlreadyPending`: a test has two officers compose competing rollovers and a third co-sign the first, and asserts its refusal of the second (`09-security-model.md` §9.7.4.2 R10)",
+        "A cosigner writes the `Composed` handle into its own store set before it signs, records the event's digest with each revealed commitment, and refuses a different event revealing a commitment a standing record names with `RevealAlreadyPending`; `abort_recovery` at `Composed` on the cosigner's device clears its record for that digest, after which it co-signs a corrected event: a test per case (`09-security-model.md` §9.7.4.2 R10)",
+        "A composer confirming its own event on a second device that shares its store set confirms it, and refuses only where the pending handle's digest differs from the event it confirms: a test per case (`09-security-model.md` §9.7.4.2 R10)",
         "A device whose adopted log lacks the marked event adopts it from its own platform-account member when no relay serves it, and re-publishes it: a test asserts the adoption and the PUBLISH (`09-security-model.md` §9.7.4.2 R10)",
         "No unwrap() or expect() in library code"
       ],
@@ -11013,6 +11014,7 @@
         "`attach` publishes through `IdentityBackend::publish` and returns its `PublishOutcome`: a test asserts the per-entry list (`03-identity.md` §3.10.10)",
         "`cosign` and `attach` each refuse a `PendingEvent` whose `event_digest` differs from SHA-256 of its `preimage` with `IdentityError::PendingDigestMismatch` (SCP-IDENT-1114): a test per operation (`03-identity.md` §3.10.10)",
         "`cosign`'s confirmation shows every field the event's kind carries: a test composes a `set_witnesses` event and asserts that the display lists the identifier, the sequence, the predecessor digest, each `Current` key with its role, each dropped key with its condition, the witness set and the seals (`09-security-model.md` §9.7.4.2 R10)",
+        "`create` and every composing method refuse a root set or next set of more than one member whose threshold is at or below half its size with `IdentityError::ThresholdAdmitsDisjointQuorums` (SCP-IDENT-1115), and accept a 3-of-4 set: a test per case (`09-security-model.md` §9.7.4.1)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
