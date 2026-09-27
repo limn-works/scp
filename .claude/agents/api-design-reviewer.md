@@ -47,7 +47,7 @@ Can a developer understand this API without reading the implementation?
 Does the type system prevent mistakes?
 - Can invalid states be constructed? (Should mutual exclusions use enums?)
 - Are required preconditions enforced by the API, not documented as warnings?
-- Is there an implicit call ordering that should be made explicit? (builder pattern, state machine)
+- Is there an implicit call ordering? Encode each required choice as a required field of one flat named-field config object, per `.docs/standards/construction.md` and ADR-052, the unified construction pattern. A builder, a method chain, or typestate ordering a model cannot track is a defect.
 - Are there string or untyped parameters that should be typed?
 - Can required steps be accidentally skipped?
 
@@ -71,7 +71,7 @@ Does this API expose exactly what's needed?
 Is this pleasant to use?
 - Are common operations concise?
 - Do defaults make sense for the majority case?
-- Is the API chainable or composable where it would help?
+- Does each construction entry point take one flat named-field config object and one entry function, with no builder or method chain?
 - Does it work well with the language's idioms?
 
 ## Output Format

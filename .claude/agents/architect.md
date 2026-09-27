@@ -49,7 +49,6 @@ needs the artifact that governs it.
 - Define protocols that agents implement
 - Ensure clean contracts between layers
 - Design for testability and mockability
-- Version interfaces when changes are needed
 
 ### Dependency Management
 - Approve new external dependencies

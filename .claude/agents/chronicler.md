@@ -89,7 +89,7 @@ Additional memory types:
 - A memory proved useful in the current session
 - User confirms a recalled fact was helpful
 
-**Principle**: Artifacts (`.docs/`) are durable and versioned — the system of record. Vestige is fluid cognitive recall across sessions. They complement each other: decisions and outcomes belong in artifacts *and* in Vestige (for fast retrieval without file reads). Keep memories small and tagged. `smart_ingest` deduplicates automatically — just save, don't pre-search.
+**Principle**: Artifacts (`.docs/`) are durable and versioned — the system of record. Vestige is fluid cognitive recall across sessions. They complement each other: decisions and outcomes belong in artifacts *and* in Vestige (for fast retrieval without file reads). Keep memories small and tagged. Search Vestige before you save, per "Search first, save second" in the user-level CLAUDE.md; `smart_ingest` then merges what remains close to an existing memory.
 
 ### 4. Documentation Locations
 

@@ -46,7 +46,7 @@ Is everything that needs to change actually changed?
 - Are all consumers updated when a model they depend on changes?
 - Are tests updated or added for new behavior?
 - Are error cases handled, not deferred?
-- Are migrations present for data model changes?
+- Does every data-model or wire-format change reach its end state directly, with every reader and writer updated and no migration shim? SCP writes no migration code before release.
 
 ### 2. Scalability
 Will this work at scale?
