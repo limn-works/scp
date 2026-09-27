@@ -476,15 +476,35 @@ export interface KeyPackageReservation {
  * runs the full protocol in-tab and does not use this native custody callback.
  */
 export interface KeyCustodyProvider {
-  /** Generate a keypair (`"ed25519"` or `"x25519"`); return its opaque id. */
+  /**
+   * Generate a keypair and return its opaque id. `keyType` is `"ed25519"`,
+   * `"x25519"`, `"p256"` (ECDSA P-256 signing) or `"hpke-p256"` (P-256 ECDH
+   * for HPKE).
+   */
   generateKeypair(keyType: string): string;
-  /** Return the 64-byte Ed25519 signature of `message` under `keyId`. */
+  /**
+   * Sign `message` under `keyId`. An Ed25519 key returns the 64-byte
+   * signature. A `"p256"` key receives a 32-byte digest and returns raw
+   * `r || s` (64 bytes) or DER; the bridge normalises it to low-s and
+   * verifies it strictly against the key's public key, and any mismatch is
+   * an error. A software implementation MUST derive the ECDSA nonce by
+   * RFC 6979 with SHA-256; a hardware keystore may use a random nonce.
+   */
   sign(keyId: string, message: Uint8Array): Uint8Array;
-  /** Return the 32 public-key bytes for `keyId`. */
+  /**
+   * Return the public key of `keyId`: 32 bytes for Ed25519 and X25519, the
+   * 33-byte compressed SEC1 point for `"p256"`, the 65-byte uncompressed SEC1
+   * point for `"hpke-p256"`. Any other length is an error.
+   */
   getPublicKey(keyId: string): Uint8Array;
   /** Destroy key material for `keyId`; subsequent operations must fail. */
   destroyKey(keyId: string): void;
-  /** Return the 32-byte X25519 shared secret with `peerPublic`. */
+  /**
+   * Return the 32-byte shared secret with `peerPublic`. An X25519 key
+   * receives a 32-byte peer key; an `"hpke-p256"` key receives the 65-byte
+   * uncompressed SEC1 peer point, already validated on the curve, and
+   * returns the ECDH x-coordinate.
+   */
   dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array;
   /**
    * Derive a context-scoped pseudonym keypair. Returns

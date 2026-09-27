@@ -113,15 +113,32 @@ class KeyCustodyProvider(Protocol):
     """
 
     def generate_keypair(self, key_type: str) -> str:
-        """Generate a keypair (``"ed25519"`` or ``"x25519"``); return its id."""
+        """Generate a keypair and return its id.
+
+        ``key_type`` is ``"ed25519"``, ``"x25519"``, ``"p256"`` (ECDSA P-256
+        signing) or ``"hpke-p256"`` (P-256 ECDH for HPKE).
+        """
         ...
 
     def sign(self, key_id: str, message: bytes) -> bytes:
-        """Return the 64-byte Ed25519 signature of ``message`` under ``key_id``."""
+        """Sign ``message`` under ``key_id``.
+
+        An Ed25519 key returns the 64-byte signature. A ``"p256"`` key
+        receives a 32-byte digest and returns raw ``r || s`` (64 bytes) or
+        DER; the bridge normalises it to low-s and verifies it strictly
+        against the key's public key, and any mismatch is an error. A
+        software implementation MUST derive the ECDSA nonce by RFC 6979 with
+        SHA-256; a hardware keystore may use a random nonce.
+        """
         ...
 
     def get_public_key(self, key_id: str) -> bytes:
-        """Return the 32 public-key bytes for ``key_id``."""
+        """Return the public key of ``key_id``.
+
+        32 bytes for Ed25519 and X25519, the 33-byte compressed SEC1 point
+        for ``"p256"``, the 65-byte uncompressed SEC1 point for
+        ``"hpke-p256"``. Any other length is an error.
+        """
         ...
 
     def destroy_key(self, key_id: str) -> None:
@@ -129,7 +146,12 @@ class KeyCustodyProvider(Protocol):
         ...
 
     def dh_agree(self, key_id: str, peer_public: bytes) -> bytes:
-        """Return the 32-byte X25519 shared secret with ``peer_public``."""
+        """Return the 32-byte shared secret with ``peer_public``.
+
+        An X25519 key receives a 32-byte peer key. An ``"hpke-p256"`` key
+        receives the 65-byte uncompressed SEC1 peer point, already validated
+        on the curve, and returns the ECDH x-coordinate.
+        """
         ...
 
     def derive_pseudonym(self, key_id: str, context_id: bytes) -> bytes:

@@ -1360,6 +1360,9 @@ public protocol NodeHandleProtocol: AnyObject, Sendable {
     /**
      * Returns the WebSocket URL clients should connect to for this node's
      * relay (e.g., `ws://127.0.0.1:12345/scp/v1`).
+     *
+     * Read live per call from the node's relay-URL slot, so it reflects a NAT
+     * tier change that re-pointed the node's endpoint.
      */
     func relayUrl()  -> String
     
@@ -1580,6 +1583,9 @@ open func relayPort() -> UInt16  {
     /**
      * Returns the WebSocket URL clients should connect to for this node's
      * relay (e.g., `ws://127.0.0.1:12345/scp/v1`).
+     *
+     * Read live per call from the node's relay-URL slot, so it reflects a NAT
+     * tier change that re-pointed the node's endpoint.
      */
 open func relayUrl() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -1969,6 +1975,11 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function `address_resolve`.
+     *
+     * Returns a JSON object with two keys: `resolutions` holds the
+     * `AddressResolution` objects sorted by trust level, and
+     * `unavailable_layers` names each layer this build could not query,
+     * with the reason.
      */
     func addressResolve(ownerDid: String, address: String, knownContextsJson: String?) throws  -> String
     
@@ -2440,7 +2451,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Per-instance equivalent of the free-function `economy_verify_payment_receipts`.
      *
      * Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
-     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the
+     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`](scp_core::context::actor::commands::EconomyCommand::VerifyPaymentReceipts) to the
      * supervisor, returning a JSON `{"all_valid": <bool>, "results": [...]}`
      * document with one entry per receipt. Mirrors the `PyO3` reference bridge
      * exactly. Maximum 10,000 receipts per call.
@@ -3631,13 +3642,17 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Signs each delegation with `delegator_did`'s own key, read from this
+     * instance's identity custody registry. A `delegator_did` that this
+     * instance has not registered returns `SCP-IDENT-1001`.
      */
     func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid: String, parentToken: String, capabilities: [String]) async throws  -> UcanToken
     
     /**
      * Diagnostic, read-only evaluation of a UCAN token.
      *
-     * Counterpart to [`SCP::ucan_validate`]: runs the same 11-step ADR-016
+     * Counterpart to [`Scp::ucan_validate`](crate::scp::Scp::ucan_validate): runs the same 11-step ADR-016
      * pipeline via `evaluate_ucan` but returns a structured
      * [`CapabilityValidationRecord`] (six booleans) instead of failing at the
      * first error, and never records the token's nonce (read-only probe).
@@ -3897,6 +3912,11 @@ open func addCheckpointCosignature(handle: ContextHandle, checkpointJson: String
     
     /**
      * Per-instance equivalent of the free-function `address_resolve`.
+     *
+     * Returns a JSON object with two keys: `resolutions` holds the
+     * `AddressResolution` objects sorted by trust level, and
+     * `unavailable_layers` names each layer this build could not query,
+     * with the reason.
      */
 open func addressResolve(ownerDid: String, address: String, knownContextsJson: String?)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
@@ -4995,7 +5015,7 @@ open func economyBudgetRemaining(contextId: String, did: String)throws  -> UInt6
      * Per-instance equivalent of the free-function `economy_verify_payment_receipts`.
      *
      * Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
-     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the
+     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`](scp_core::context::actor::commands::EconomyCommand::VerifyPaymentReceipts) to the
      * supervisor, returning a JSON `{"all_valid": <bool>, "results": [...]}`
      * document with one entry per receipt. Mirrors the `PyO3` reference bridge
      * exactly. Maximum 10,000 receipts per call.
@@ -7469,6 +7489,10 @@ open func trustVerifyResponse(challengeJson: String, responseJson: String)throws
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Signs each delegation with `delegator_did`'s own key, read from this
+     * instance's identity custody registry. A `delegator_did` that this
+     * instance has not registered returns `SCP-IDENT-1001`.
      */
 open func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid: String, parentToken: String, capabilities: [String])async throws  -> UcanToken  {
     return
@@ -7490,7 +7514,7 @@ open func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid
     /**
      * Diagnostic, read-only evaluation of a UCAN token.
      *
-     * Counterpart to [`SCP::ucan_validate`]: runs the same 11-step ADR-016
+     * Counterpart to [`Scp::ucan_validate`](crate::scp::Scp::ucan_validate): runs the same 11-step ADR-016
      * pipeline via `evaluate_ucan` but returns a structured
      * [`CapabilityValidationRecord`] (six booleans) instead of failing at the
      * first error, and never records the token's nonce (read-only probe).
@@ -14229,10 +14253,10 @@ extension SourceType: Equatable, Hashable {}
  * an invalid state, so there is exactly one happy path per variant. This
  * mirrors the `PyO3` bridge's `SqliteKeyMaterial`.
  *
- * - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`] directly (raw-key
+ * - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`](scp_platform::sqlite::SqliteStorage::new) directly (raw-key
  * mode; the existing, unchanged path).
  * - [`SqliteKeyMaterial::Passphrase`] feeds
- * [`SqliteStorage::with_passphrase`], which derives the `SQLCipher` PRAGMA
+ * [`SqliteStorage::with_passphrase`](scp_platform::sqlite::SqliteStorage::with_passphrase), which derives the `SQLCipher` PRAGMA
  * key from the passphrase via the shared Argon2id parameterization with a
  * persisted per-database salt sidecar.
  *
@@ -14685,14 +14709,22 @@ public func FfiConverterCallbackInterfaceDeviceAttestationProvider_lower(_ v: De
 public protocol KeyCustodyProvider: AnyObject, Sendable {
     
     /**
-     * Sign `message` bytes with the Ed25519 key identified by `key_id`.
+     * Sign `message` bytes with the key identified by `key_id`.
      *
-     * Returns the raw 64-byte Ed25519 signature.
+     * For an Ed25519 key, returns the raw 64-byte signature. For a `"p256"`
+     * key, `message` is a 32-byte prehash and the result is raw `r || s`
+     * (64 bytes) or DER (`SecKeyCreateSignature` / `java.security.Signature`
+     * output); the bridge normalises it to low-s and verifies it strictly
+     * against the key's public key, and any mismatch is an error. A software
+     * host MUST derive the ECDSA nonce by RFC 6979 with SHA-256; a hardware
+     * host (Secure Enclave, `StrongBox`/TEE) may use a random nonce.
      */
     func sign(keyId: String, message: Data) async throws  -> Data
     
     /**
-     * Return the Ed25519 public key bytes (32 bytes) for `key_id`.
+     * Return the public key bytes for `key_id`: 32 bytes (Ed25519, X25519),
+     * the 33-byte compressed SEC1 point (`"p256"`), or the 65-byte
+     * uncompressed SEC1 point (`"hpke-p256"`). Any other length is an error.
      */
     func getPublicKey(keyId: String) async throws  -> Data
     
@@ -14702,17 +14734,20 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
     func destroyKey(keyId: String) async throws 
     
     /**
-     * Generate a new keypair. `key_type` is `"ed25519"` or `"x25519"`.
+     * Generate a new keypair. `key_type` is `"ed25519"`, `"x25519"`,
+     * `"p256"` (ECDSA P-256 signing) or `"hpke-p256"` (P-256 ECDH for HPKE).
      *
      * Returns an opaque key identifier string.
      */
     func generateKeypair(keyType: String) async throws  -> String
     
     /**
-     * Perform X25519 Diffie-Hellman key agreement.
+     * Perform Diffie-Hellman key agreement.
      *
-     * `key_id` — the X25519 key handle.
-     * `peer_public` — 32-byte peer X25519 public key.
+     * `key_id` — the X25519 or `"hpke-p256"` key handle.
+     * `peer_public` — the 32-byte peer X25519 public key, or for
+     * `"hpke-p256"` the 65-byte uncompressed SEC1 peer point (validated
+     * on-curve by the bridge before this call).
      *
      * Returns the 32-byte shared secret. The private key never leaves the
      * custody boundary.
@@ -14720,23 +14755,24 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
     func dhAgree(keyId: String, peerPublic: Data) async throws  -> Data
     
     /**
-     * Derive a deterministic, context-scoped Ed25519 pseudonym keypair.
+     * Derive a deterministic, context-scoped P-256 pseudonym keypair (§9.10.4).
      *
      * The actual derivation runs inside the injected platform `KeyCustody`
      * callback (Swift Keychain/Secure Enclave, Kotlin Keystore). Algorithm:
-     * 1. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
-     * 2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`  // seed is an RFC-8032 Ed25519 seed
+     * 1. `pseudonym_secret = HKDF-SHA256(ikm, salt="scp-pseudonym-secret-v1", info="", L=32)`
+     * 2. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
+     * 3. `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`; the public key
+     * is the 33-byte SEC1 compressed point `d·G`.
      *
      * The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key —
-     * public key bytes would be a membership-enumeration oracle (§9.10.4.A).
-     * For software custody, `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
-     * salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic
-     * (§25.19 vectors). For hardware custody (Secure Enclave, Keystore TEE) the
-     * private key is non-exportable, so `pseudonym_secret` is a device-local value
-     * computed inside the secure boundary, and those pseudonyms are device-local
-     * by design.
+     * public key bytes would be a membership-enumeration oracle (§9.10.4).
+     * Routing fields carry `SHA-256("scp-pseudonym-routing-v1:" || point)`,
+     * which the Rust side computes from the returned point.
      *
-     * Returns a two-element list: `[pseudonym_public_key_bytes (32), key_id (string as UTF-8)]`.
+     * Returns `[pseudonym_public_key_bytes (33) || key_id_utf8]`. A point that
+     * is not a valid compressed P-256 point is rejected (fail closed). Host
+     * adapters that still return 32-byte Ed25519 keys fail until they move
+     * to P-256.
      * The bridge unpacks this into a `PseudonymKeypair`.
      */
     func derivePseudonym(keyId: String, contextId: Data) async throws  -> Data
@@ -14745,11 +14781,11 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      * Derive a rotatable (epoch-versioned) per-context pseudonym keypair.
      *
      * Canonical recipe (spec §9.10.4.A / §9.10.4.1): the HMAC key is the
-     * private-derived `pseudonym_secret` (HKDF over the Ed25519 private seed),
+     * private-derived `pseudonym_secret` (HKDF over the identity private seed),
      * NEVER the public key.
      * `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2")`;
-     * `keypair = Ed25519_keygen(seed[0..32])` (RFC-8032 seed). Returns
-     * `[pseudonym_public_key_bytes (32) || key_id_utf8]`.
+     * `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`. Returns
+     * `[pseudonym_public_key_bytes (33, compressed P-256) || key_id_utf8]`.
      *
      * The `pseudonym_epoch` is passed through to the provider so it performs
      * the canonical v2 derivation itself. Bridges MUST NOT synthesize a
@@ -17744,7 +17780,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_relay_port() != 32247) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_relay_url() != 19628) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_relay_url() != 35261) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_rollback_deploy() != 34442) {
@@ -17780,7 +17816,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_add_checkpoint_cosignature() != 48565) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_address_resolve() != 64098) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_address_resolve() != 23956) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_aggregate_trust_input() != 37504) {
@@ -17930,7 +17966,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_budget_remaining() != 32105) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_verify_payment_receipts() != 16710) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_verify_payment_receipts() != 40702) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_evaluate_invitation() != 11385) {
@@ -18251,10 +18287,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_response() != 16753) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 51192) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 59265) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_evaluate() != 33478) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_evaluate() != 17617) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_mint() != 2465) {
@@ -18314,25 +18350,25 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_assert_request() != 17302) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 52852) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 4960) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 604) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 12268) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_destroy_key() != 15699) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_generate_keypair() != 22511) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_generate_keypair() != 32558) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_dh_agree() != 52565) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_dh_agree() != 46704) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 38646) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 53428) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 25367) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 34774) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 55617) {
