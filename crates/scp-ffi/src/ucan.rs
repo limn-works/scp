@@ -1362,7 +1362,11 @@ mod tests {
     /// the `CloseContext` dispatch the bridges' `context_close` sends. The actor
     /// stays resident and keeps its role state.
     #[allow(clippy::expect_used)] // A broken test fixture panics.
-    fn close_supervisor_context(bi: &crate::runtime::PyBridgeInstance, context_id: &str, creator: &str) {
+    fn close_supervisor_context(
+        bi: &crate::runtime::PyBridgeInstance,
+        context_id: &str,
+        creator: &str,
+    ) {
         use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
         let sup = std::sync::Arc::clone(crate::runtime::supervisor(bi).expect("supervisor"));
         let rt = crate::runtime().expect("tokio runtime");
@@ -1422,7 +1426,10 @@ mod tests {
         let (absent, absent_ctx) =
             scp_without_supervisor_context("ucan-gate-absent", "did:dht:z6MkUcanGateAbsent");
 
-        for (fixture, scp, ctx) in [("closing", &closing, &ctx_id), ("absent", &absent, &absent_ctx)] {
+        for (fixture, scp, ctx) in [
+            ("closing", &closing, &ctx_id),
+            ("absent", &absent, &absent_ctx),
+        ] {
             let refusals: [(&str, PyResult<()>); 5] = [
                 (
                     "validate",

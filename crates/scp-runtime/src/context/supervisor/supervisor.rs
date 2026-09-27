@@ -21528,7 +21528,10 @@ mod tests {
             supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
         let ctx_key = hex::encode([0xDDu8; 32]);
         let owning = DID(format!("did:scp:{ctx_key}"));
-        sup.crash_windows.entry(ctx_key.clone()).or_default().poisoned = true;
+        sup.crash_windows
+            .entry(ctx_key.clone())
+            .or_default()
+            .poisoned = true;
         assert!(
             matches!(
                 sup.read_context_state_checked(&ctx_key).await,

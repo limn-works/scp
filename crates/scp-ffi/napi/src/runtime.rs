@@ -1746,9 +1746,11 @@ pub fn register_ffi_state(
             code: codes::CTX_2023.to_owned(),
         }),
         Entry::Vacant(vacant) => {
+            // The release mark stays until the spawn commits: the caller
+            // readmits the id only then, so a failed join leaves a closed
+            // context's mark in place.
             let state = build_ucan_context_state(context_id, user_ceiling)?;
             vacant.insert(state);
-            readmit_context(bi, context_id);
             Ok(())
         }
     }
@@ -1819,6 +1821,27 @@ pub fn release_context(bi: &NapiBridgeInstance, context_id: &str) {
 /// they survive neither a close followed by a re-import nor a process restart.
 pub fn readmit_context(bi: &NapiBridgeInstance, context_id: &str) {
     bi.released_contexts.remove(context_id);
+}
+
+/// Runs [`release_context`], then re-reads the supervisor.
+///
+/// A close decides from a lifecycle read taken before it releases, so an
+/// import or restore can return the id to `Active`, and readmit it, in
+/// between. The import readmits only after the actor reports `Active`, so a
+/// re-read after the mark went in that reports `Active` means the release
+/// landed on the readmitted context: this clears the mark again and returns
+/// `false`. Any other answer, a failed read included, keeps the mark and
+/// returns `true`.
+pub async fn release_context_unless_readmitted(bi: &NapiBridgeInstance, context_id: &str) -> bool {
+    release_context(bi, context_id);
+    if matches!(
+        read_live_context_state(bi, context_id).await,
+        Ok(Some(scp_core::context::ContextState::Active))
+    ) {
+        readmit_context(bi, context_id);
+        return false;
+    }
+    true
 }
 
 /// Executes a closure with mutable access to a context's UCAN state on the

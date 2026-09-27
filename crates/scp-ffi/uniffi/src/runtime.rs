@@ -1278,6 +1278,27 @@ impl UniffiBridgeInstance {
         self.released_contexts.remove(context_id);
     }
 
+    /// Runs [`Self::release_ucan_state`], then re-reads the supervisor.
+    ///
+    /// A close decides from a lifecycle read taken before it releases, so an
+    /// import or restore can return the id to `Active`, and readmit it, in
+    /// between. The import readmits only after the actor reports `Active`, so a
+    /// re-read after the mark went in that reports `Active` means the release
+    /// landed on the readmitted context: this clears the mark again and returns
+    /// `false`. Any other answer, a failed read included, keeps the mark and
+    /// returns `true`.
+    pub async fn release_ucan_state_unless_readmitted(&self, context_id: &str) -> bool {
+        self.release_ucan_state(context_id);
+        if matches!(
+            self.read_live_context_state(context_id).await,
+            Ok(Some(scp_core::context::ContextState::Active))
+        ) {
+            self.readmit_context(context_id);
+            return false;
+        }
+        true
+    }
+
     /// Atomically registers per-context UCAN validation state for a
     /// Welcome-join, failing CLOSED on a pre-existing entry.
     ///
@@ -1314,8 +1335,10 @@ impl UniffiBridgeInstance {
                 // `build_ucan_context_state` never touches `ucan_registry`, so
                 // building it while holding this shard's `Entry` write guard
                 // cannot deadlock (mirrors the napi reference's Vacant arm).
+                // The release mark stays until the spawn commits: the caller
+                // readmits the id only then, so a failed join leaves a closed
+                // context's mark in place.
                 vacant.insert(Self::build_ucan_context_state(context_id));
-                self.readmit_context(context_id);
                 Ok(())
             }
         }

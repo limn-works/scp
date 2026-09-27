@@ -3808,4 +3808,26 @@ mod tests {
         );
         remove_context(&bi, &ctx_id);
     }
+    /// `live_role_state` answers from inside a current-thread runtime, the
+    /// regime an async host embedding the bridge on a single-threaded executor
+    /// enters. `block_in_place` panics there, so the read runs on a private
+    /// runtime on its own thread and hands the answer back.
+    #[test]
+    fn live_role_state_answers_from_inside_a_current_thread_runtime() {
+        let creator = "did:dht:z6MkRegimeCurrentThreadCreator";
+        let (bi, ctx_id) = live_state_fixture("regime-current-thread", creator, &[]);
+
+        let host = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let answer = host.block_on(async { live_role_state(&bi, &ctx_id) });
+        assert_eq!(
+            answer
+                .expect("the read must answer from inside a current-thread runtime")
+                .creator_did,
+            creator
+        );
+        remove_context(&bi, &ctx_id);
+    }
 }

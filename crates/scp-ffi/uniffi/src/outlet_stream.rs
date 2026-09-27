@@ -462,14 +462,12 @@ pub(crate) async fn outlet_stream_open_impl(
     // pipeline reads the live role state, so a context no actor serves refuses
     // with the same withheld text as every other non-`Active` state — see
     // `UniffiBridgeInstance::require_active_context_before_authz`.
-    bi.require_active_context_before_authz(
-        &context_id,
-        "open outlet stream in context",
-        |msg| ScpError::Outlet {
+    bi.require_active_context_before_authz(&context_id, "open outlet stream in context", |msg| {
+        ScpError::Outlet {
             msg,
             code: codes::OUTLET_6005.to_owned(),
-        },
-    )
+        }
+    })
     .await?;
 
     // Snapshot the bridge-owned per-handle outlet registry once (cheap Vec of

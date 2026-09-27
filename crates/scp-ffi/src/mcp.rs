@@ -2750,10 +2750,22 @@ mod tests {
         // Authorization reads the supervisor actor, so the fixture creates the
         // context there too rather than leaning on bridge-local state.
         crate::runtime::create_supervisor_context_for_test(bi, &ctx_id, creator_did, &[]);
-        let role_state = crate::runtime::live_role_state(bi, &ctx_id).unwrap();
-
         if with_outlet {
-            crate::runtime::with_context(bi, &ctx_id, |rt| {
+            register_calculator_outlet(bi, &ctx_id, creator_did);
+        }
+        ctx_id
+    }
+
+    /// Registers the Action outlet `calculator` in `ctx_id`, operated by
+    /// `creator_did`.
+    fn register_calculator_outlet(
+        bi: &crate::runtime::PyBridgeInstance,
+        ctx_id: &str,
+        creator_did: &str,
+    ) {
+        let role_state = crate::runtime::live_role_state(bi, ctx_id).unwrap();
+        {
+            crate::runtime::with_context(bi, ctx_id, |rt| {
                 let registration = scp_core::context::outlets::OutletRegistration {
                     outlet_id: "calculator".to_owned(),
                     kind: scp_core::context::outlets::OutletKind::default(),
@@ -2795,8 +2807,6 @@ mod tests {
             })
             .unwrap();
         }
-
-        ctx_id
     }
 
     // -----------------------------------------------------------------------
@@ -2841,8 +2851,8 @@ mod tests {
     // the built-in `member` role grants this member `OutletCallAll`: the role
     // layer would admit the member. The refusal therefore comes from the
     // missing token alone, before any role check runs.
-    // `ffi_bridge_provider_validate_capability_query_kind_selects_query_stem`
-    // covers the role-layer denial.
+    // `ffi_bridge_provider_validate_capability_role_layer_reads_live_membership`
+    // drives a valid UCAN through to the role-layer denial.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2877,6 +2887,67 @@ mod tests {
         );
 
         crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // FfiBridgeProvider::validate_capability — the role layer behind a valid
+    // UCAN reads live supervisor membership (§7.2, ADR-010 dual check).
+    //
+    // The agent holds a creator-minted `outlet_call:*` token, so the UCAN
+    // layer passes. While the supervisor does not count the agent as a member,
+    // the role layer refuses; once the supervisor records the member, the
+    // same call with a fresh token succeeds, with nothing written bridge-side.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ffi_bridge_provider_validate_capability_role_layer_reads_live_membership() {
+        Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let owner = scp.identity_create(py, "in_memory", None).unwrap();
+            let owner = owner.did().to_owned();
+            let agent = scp.identity_create(py, "in_memory", None).unwrap();
+            let agent = agent.did().to_owned();
+            let bi = Arc::clone(&scp.inner);
+            let ctx_id = crate::types::generate_random_id("test-mcp-role");
+            crate::runtime::register_context(&bi, &ctx_id, &owner, &[]).unwrap();
+            crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, &owner, &[]);
+            let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+            crate::runtime()
+                .unwrap()
+                .block_on(sup.register_local_did(scp_did::DID(owner.clone())))
+                .unwrap();
+            register_calculator_outlet(&bi, &ctx_id, &owner);
+
+            // Each validation consumes its token's nonce, so each call mints.
+            let provider = || FfiBridgeProvider {
+                bi: Arc::downgrade(&bi),
+                agent_did: agent.clone(),
+                context_ids: vec![ctx_id.clone()],
+                outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
+                agent_ucan_token: Some(
+                    scp.ucan_mint(&ctx_id, &agent, vec!["outlet_call:*".to_owned()], None)
+                        .expect("the creator mints the agent an outlet_call token")
+                        .encoded,
+                ),
+                agent_proof_tokens: None,
+            };
+
+            let err = provider()
+                .validate_capability(&ctx_id, "calculator")
+                .expect_err("a non-member must be refused by the role layer");
+            assert!(
+                err.contains("insufficient permissions to invoke outlet"),
+                "the refusal must come from the role layer, after the UCAN layer passed: {err}"
+            );
+
+            insert_supervisor_member(&bi, &ctx_id, &agent);
+            provider()
+                .validate_capability(&ctx_id, "calculator")
+                .expect("a member the supervisor records must pass the role layer");
+
+            crate::runtime::remove_context(&bi, &ctx_id);
+        });
     }
 
     // -----------------------------------------------------------------------

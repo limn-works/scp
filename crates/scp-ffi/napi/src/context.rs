@@ -1447,6 +1447,10 @@ pub(crate) async fn context_join_from_welcome_on(
             }));
         }
     };
+    // The supervisor serves the id again, so a release mark a prior close left
+    // no longer applies. A close landing after this line re-marks the id, and
+    // the presence probe below catches it.
+    crate::runtime::readmit_context(bi, &sealed.context_id);
 
     // FLAG-1: no ceiling copy is written here. `spawn_actor_from_welcome`
     // stored the ceiling the creator signed into the supervisor's role state,
@@ -1828,8 +1832,14 @@ pub(crate) async fn context_close_on(
     handle.set_closed().map_err(NapiError::from)?;
 
     // Release UCAN state for this context, and mark the id so no later call
-    // rebuilds it empty.
-    crate::runtime::release_context(bi, &handle.context_id);
+    // rebuilds it empty, unless an import or restore returned the id to
+    // `Active` after the lifecycle read above.
+    if !crate::runtime::release_context_unless_readmitted(bi, &handle.context_id).await {
+        return Err(NapiError::from(ScpNapiError::Context {
+            message: "the context returned to Active through an import or restore while this close ran; the imported context stays open and keeps its state on this bridge".to_owned(),
+            code: codes::CTX_2017.to_owned(),
+        }));
+    }
 
     // Clean up per-context bridge connector state and economy state via the
     // same NapiBridgeInstance's core (not the process-global bridge).
@@ -6113,6 +6123,9 @@ mod tests {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
         let joiner_did = register_in_memory_joiner(&bi).await;
         let ctx_id = "a".repeat(64);
+        // A close released this id before the join, so the release mark must
+        // survive the failed join: only a committed spawn readmits the id.
+        crate::runtime::release_context(&bi, &ctx_id);
 
         // A well-formed 32-byte `enc` passes the bridge enc-length check, so the
         // failure is the runtime join itself (bogus reservation + ciphertext) —
@@ -6149,6 +6162,40 @@ mod tests {
         assert!(
             !bi.core.has_known_context(&ctx_id),
             "no known-context discovery entry may leak after a failed join"
+        );
+        assert!(
+            bi.released_contexts.contains_key(&ctx_id),
+            "a failed join must not clear the release mark a close left"
+        );
+    }
+
+    /// A close's release that lands after an import returned the id to
+    /// `Active` clears its own mark, so the imported context keeps UCAN state;
+    /// a release against an id no actor serves keeps the mark.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_release_clears_its_mark_when_the_supervisor_reports_active() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let active = format!("napi-release-active-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiReleaseActiveCreator";
+        crate::runtime::create_supervisor_context_for_test(&bi, &active, creator, &[]).await;
+        crate::runtime::register_test_context(&bi, &active);
+
+        assert!(
+            !crate::runtime::release_context_unless_readmitted(&bi, &active).await,
+            "a release on an Active context must report the readmit"
+        );
+        assert!(!bi.released_contexts.contains_key(&active));
+        let handle = active_handle_for(&bi, &active, creator);
+        crate::runtime::ensure_registered(&bi, &handle)
+            .expect("the Active context must get its UCAN state back");
+
+        let absent = format!("napi-release-absent-{}", uuid::Uuid::new_v4());
+        assert!(crate::runtime::release_context_unless_readmitted(&bi, &absent).await);
+        assert!(
+            bi.released_contexts.contains_key(&absent),
+            "a release on an id no actor serves must keep the mark"
         );
     }
 
@@ -7203,12 +7250,17 @@ mod tests {
         .expect("a mint inside the wide ceiling must succeed")
         .encoded();
 
+        // Evaluate and validate take a full capability URI. The token's grant is
+        // scoped to the wide context, and every call names that grant, so the
+        // narrow context refuses at its ceiling rather than at a scope mismatch.
+        let cap = format!("scp:ctx:{}/messages:write", wide.context_id());
+
         for (handle, inside) in [(wide, true), (narrow, false)] {
             let evaluation = crate::ucan::ucan_evaluate_on(
                 &bi,
                 handle,
                 token.clone(),
-                Some("messages:write".to_owned()),
+                Some(cap.clone()),
                 holder_did.clone(),
                 None,
             )
@@ -7225,14 +7277,14 @@ mod tests {
                 holder_did.clone(),
                 delegatee.clone(),
                 token.clone(),
-                vec!["messages:write".to_owned()],
+                vec![cap.clone()],
             )
             .await;
             let validation = crate::ucan::ucan_validate_on(
                 &bi,
                 handle,
                 token.clone(),
-                "messages:write".to_owned(),
+                cap.clone(),
                 holder_did.clone(),
                 None,
             )

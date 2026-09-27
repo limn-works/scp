@@ -3617,16 +3617,12 @@ fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() 
                     .collect(),
                 ..scp_core::context::ContextParams::default()
             };
-            let (sup, id, creator) = (
-                supervisor.clone(),
-                ctx.clone(),
-                scp_did::DID(owner.clone()),
-            );
+            let (sup, id, creator) = (supervisor.clone(), ctx.clone(), scp_did::DID(owner.clone()));
             rt.block_on(async move { sup.create_context(id, params, creator, None).await })
                 .unwrap();
         }
-        let creator = scp_did::DID(owner.clone());
-        let sup = supervisor.clone();
+        let creator = scp_did::DID(owner);
+        let sup = supervisor;
         rt.block_on(async move { sup.register_local_did(creator).await })
             .unwrap();
 
@@ -3635,34 +3631,30 @@ fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() 
             .expect("a mint inside the wide ceiling must succeed")
             .encoded;
 
+        // Evaluate and validate take a full capability URI. The token's grant is
+        // scoped to the wide context, and every call names that grant, so the
+        // narrow context refuses at its ceiling rather than at a scope mismatch.
+        let cap = format!("scp:ctx:{wide}/messages:write");
+
         let in_wide = scp
-            .ucan_evaluate(&wide, &token, Some("messages:write"), &holder, None)
+            .ucan_evaluate(&wide, &token, Some(cap.as_str()), &holder, None)
             .unwrap();
         let in_narrow = scp
-            .ucan_evaluate(&narrow, &token, Some("messages:write"), &holder, None)
+            .ucan_evaluate(&narrow, &token, Some(cap.as_str()), &holder, None)
             .unwrap();
-        assert!(in_wide.within_ceiling, "evaluate must pass the wide ceiling");
+        assert!(
+            in_wide.within_ceiling,
+            "evaluate must pass the wide ceiling"
+        );
         assert!(
             !in_narrow.within_ceiling,
             "evaluate must report the narrow supervisor ceiling"
         );
 
-        scp.ucan_delegate(
-            &wide,
-            &holder,
-            &delegatee,
-            &token,
-            vec!["messages:write".to_owned()],
-        )
-        .expect("a delegation inside the wide ceiling must succeed");
+        scp.ucan_delegate(&wide, &holder, &delegatee, &token, vec![cap.clone()])
+            .expect("a delegation inside the wide ceiling must succeed");
         let delegate_err = scp
-            .ucan_delegate(
-                &narrow,
-                &holder,
-                &delegatee,
-                &token,
-                vec!["messages:write".to_owned()],
-            )
+            .ucan_delegate(&narrow, &holder, &delegatee, &token, vec![cap.clone()])
             .expect_err("the narrow supervisor ceiling must refuse the delegation")
             .to_string()
             .to_lowercase();
@@ -3672,7 +3664,7 @@ fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() 
         );
 
         let validate_err = scp
-            .ucan_validate(&narrow, &token, "messages:write", &holder, None)
+            .ucan_validate(&narrow, &token, &cap, &holder, None)
             .expect_err("the narrow supervisor ceiling must refuse the validation")
             .to_string()
             .to_lowercase();
@@ -3680,7 +3672,7 @@ fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() 
             validate_err.contains("ceiling"),
             "the validation refusal must be the ceiling check: {validate_err}"
         );
-        scp.ucan_validate(&wide, &token, "messages:write", &holder, None)
+        scp.ucan_validate(&wide, &token, &cap, &holder, None)
             .expect("a validation inside the wide ceiling must succeed");
     });
 }

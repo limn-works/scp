@@ -10738,6 +10738,10 @@ impl Scp {
                         return Err(ScpError::from(e));
                     }
                 };
+                // The supervisor serves the id again, so a release mark a
+                // prior close left no longer applies. A close landing after
+                // this line re-marks the id, and the probe below catches it.
+                bi.readmit_context(&context_id);
 
                 // FLAG-1: this block once re-synced the AUTHENTICATED ceiling
                 // from the joined handle's signed params over the DEFAULT
@@ -11380,8 +11384,17 @@ impl Scp {
                 // so nothing observable is lost by removing this block.
 
                 // Release per-context UCAN state on this instance, and mark the
-                // id so no later call rebuilds it empty.
-                bi.release_ucan_state(&handle.context_id);
+                // id so no later call rebuilds it empty, unless an import or
+                // restore returned the id to `Active` after the read above.
+                if !bi
+                    .release_ucan_state_unless_readmitted(&handle.context_id)
+                    .await
+                {
+                    return Err(ScpError::Context {
+                        msg: "the context returned to Active through an import or restore while this close ran; the imported context stays open and keeps its state on this bridge".to_owned(),
+                        code: codes::CTX_2017.to_owned(),
+                    });
+                }
 
                 // Clean up per-context bridge connector state and economy state.
                 bi.core.remove_bridge_state(&handle.context_id);
@@ -16520,12 +16533,14 @@ impl Scp {
                             },
                         )
                         .await?;
-                    let role_state = gate_bi.live_role_state(ctx_id).await.map_err(|e| {
-                        ScpError::Transport {
-                            msg: format!("cannot serve context '{ctx_id}': {e}"),
-                            code: codes::TRANS_5001.to_owned(),
-                        }
-                    })?;
+                    let role_state =
+                        gate_bi
+                            .live_role_state(ctx_id)
+                            .await
+                            .map_err(|e| ScpError::Transport {
+                                msg: format!("cannot serve context '{ctx_id}': {e}"),
+                                code: codes::TRANS_5001.to_owned(),
+                            })?;
                     if !role_state.members.contains(gate_identity.as_str()) {
                         return Err(ScpError::Transport {
                             msg: format!(
@@ -20141,6 +20156,9 @@ mod tests {
             .expect("identity_create failed");
         let creator_did = identity.did();
         let context_id = scp_ffi_common::generate_context_id();
+        // A close released this id before the join, so the release mark must
+        // survive the failed join: only a committed spawn readmits the id.
+        scp.inner.release_ucan_state(&context_id);
 
         // Custodied joiner + well-formed 32-byte `enc` clears the pseudonym gate
         // AND the enc-length check, so the join reaches the irreversible spawn —
@@ -20167,6 +20185,50 @@ mod tests {
         assert!(
             scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
             "UCAN state must be rolled back after a failed spawn"
+        );
+        assert!(
+            scp.inner.released_contexts.contains_key(&context_id),
+            "a failed join must not clear the release mark a close left"
+        );
+        scp.inner.ensure_ucan_registered(&context_id);
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
+            "a released id must not get an empty revocation list rebuilt after a failed join"
+        );
+    }
+
+    /// A close's release that lands after an import returned the id to
+    /// `Active` clears its own mark, so the imported context keeps UCAN state;
+    /// a release against an id no actor serves keeps the mark.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_release_clears_its_mark_when_the_supervisor_reports_active() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let active = handle.context_id();
+
+        assert!(
+            !rt.block_on(scp.inner.release_ucan_state_unless_readmitted(&active)),
+            "a release on an Active context must report the readmit"
+        );
+        assert!(!scp.inner.released_contexts.contains_key(&active));
+        scp.inner.ensure_ucan_registered(&active);
+        assert!(
+            scp.inner.with_ucan_state(&active, |_| ()).is_some(),
+            "the Active context must get its UCAN state back"
+        );
+
+        let absent = scp_ffi_common::generate_context_id();
+        assert!(rt.block_on(scp.inner.release_ucan_state_unless_readmitted(&absent)));
+        assert!(
+            scp.inner.released_contexts.contains_key(&absent),
+            "a release on an id no actor serves must keep the mark"
         );
     }
 
@@ -23938,12 +24000,17 @@ mod tests {
             .expect("a mint inside the wide ceiling must succeed")
             .encoded();
 
+        // Evaluate and validate take a full capability URI. The token's grant is
+        // scoped to the wide context, and every call names that grant, so the
+        // narrow context refuses at its ceiling rather than at a scope mismatch.
+        let cap = format!("scp:ctx:{}/messages:write", wide.context_id());
+
         for (handle, inside) in [(&wide, true), (&narrow, false)] {
             let evaluation = rt
                 .block_on(scp.ucan_evaluate(
                     Arc::clone(handle),
                     token.clone(),
-                    Some("messages:write".to_owned()),
+                    Some(cap.clone()),
                     holder.did(),
                     None,
                 ))
@@ -23958,13 +24025,13 @@ mod tests {
                     holder.did(),
                     "did:dht:z6MkUniffiLiveCeilingDelegatee".to_owned(),
                     token.clone(),
-                    vec!["messages:write".to_owned()],
+                    vec![cap.clone()],
                 ))
                 .map(drop);
             let validation = rt.block_on(scp.ucan_validate(
                 Arc::clone(handle),
                 token.clone(),
-                "messages:write".to_owned(),
+                cap.clone(),
                 holder.did(),
                 None,
             ));
