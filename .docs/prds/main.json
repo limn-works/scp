@@ -2881,7 +2881,7 @@
         "bindings/python/scp_sdk/py.typed",
         "bindings/python/pyproject.toml"
       ],
-      "description": "Implement the package root `__init__.py` with top-level re-exports, version declaration, and module-level convenience. Configure `pyproject.toml` with package metadata, build config, Python version constraints (3.10+), and optional dependencies. Add PEP 561 `py.typed` marker for type checking support.",
+      "description": "Implement the package root `__init__.py` with top-level re-exports, version declaration, and module-level convenience. Configure `pyproject.toml` with package metadata, build config, Python `>=3.10,<3.14` constraint, and optional dependencies. Add PEP 561 `py.typed` marker for type checking support.",
       "acceptanceCriteria": [
         "Top-level imports: `import scp_sdk` or `from scp_sdk import Identity, Context` work.",
         "The `scp` namespace alias: `import scp_sdk as scp` enables the 20-line agent from architecture.md section 3.1.",
