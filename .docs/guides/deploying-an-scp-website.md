@@ -21,6 +21,15 @@ The three knobs that matter:
 
 ---
 
+> **Annotation, 2026-09-13.** Everything below is the record as its author wrote it on the
+> date this file carries, restored unedited. The identity model it reads — the Mainline distributed hash table and the identifier written as a `did:` string — was
+> replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity substrate,
+> whose rules `.docs/specs/09-security-model.md` §9.7.4.2 and `.docs/specs/03-identity.md`
+> §3.10 carry, and whose curve Alec settled on 2026-09-10 as ECDSA on NIST P-256
+> (`.docs/specs/09-security-model.md` §9.5). A record of what a named party read on a named
+> date states what that party read, so this annotation records what replaced the model and
+> no sentence below is edited to match.
+
 ## Recipe 1 — Direct (raw public IP, no operator)
 
 The pure-SCP path: your machine is the public endpoint, with no third party in the data path.

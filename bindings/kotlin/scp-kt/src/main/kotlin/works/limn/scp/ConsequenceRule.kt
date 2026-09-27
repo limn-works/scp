@@ -66,12 +66,13 @@ sealed class ConsequenceTrigger {
  * Frozen list of [ConsequenceTrigger] variant short names. Used by tests to
  * pin the discriminated-union surface — renaming a variant trips the test.
  */
-val CONSEQUENCE_TRIGGER_VARIANT_NAMES: List<String> = listOf(
-    "MessageVelocity",
-    "OutletRateExceeded",
-    "WarningCount",
-    "Custom",
-)
+val CONSEQUENCE_TRIGGER_VARIANT_NAMES: List<String> =
+    listOf(
+        "MessageVelocity",
+        "OutletRateExceeded",
+        "WarningCount",
+        "Custom",
+    )
 
 // ---------------------------------------------------------------------------
 // AccessScope
@@ -118,7 +119,9 @@ sealed class ConsequenceCapability {
      * `{"OutletCall": "<id>"}` to match the Rust newtype.
      */
     data class OutletCall(val outletId: String) : ConsequenceCapability() {
-        init { require(outletId.isNotEmpty()) { "OutletCall outlet id must not be empty" } }
+        init {
+            require(outletId.isNotEmpty()) { "OutletCall outlet id must not be empty" }
+        }
     }
 
     /**
@@ -127,7 +130,9 @@ sealed class ConsequenceCapability {
      * Serializes as `{"Custom": "<name>"}` to match the Rust newtype.
      */
     data class Custom(val name: String) : ConsequenceCapability() {
-        init { require(name.isNotEmpty()) { "Custom capability name must not be empty" } }
+        init {
+            require(name.isNotEmpty()) { "Custom capability name must not be empty" }
+        }
     }
 }
 
@@ -174,7 +179,9 @@ sealed class EnforcementSeverity {
      * sets [ConsequenceConfig.allowAutomaticAccessRevocation] to `true`.
      */
     data class RevokeAccess(val did: String, val access: AccessScope) : EnforcementSeverity() {
-        init { require(did.isNotEmpty()) { "RevokeAccess.did must not be empty" } }
+        init {
+            require(did.isNotEmpty()) { "RevokeAccess.did must not be empty" }
+        }
     }
 
     /**
@@ -183,7 +190,9 @@ sealed class EnforcementSeverity {
      * action helpers in the future.
      */
     data class RemoveMember(val did: String, val reason: String? = null) : EnforcementSeverity() {
-        init { require(did.isNotEmpty()) { "RemoveMember.did must not be empty" } }
+        init {
+            require(did.isNotEmpty()) { "RemoveMember.did must not be empty" }
+        }
     }
 
     companion object {
@@ -193,12 +202,13 @@ sealed class EnforcementSeverity {
 }
 
 /** Frozen list of [EnforcementSeverity] variant short names. */
-val ENFORCEMENT_SEVERITY_VARIANT_NAMES: List<String> = listOf(
-    "SuspendCapability",
-    "SuspendAccess",
-    "RevokeAccess",
-    "RemoveMember",
-)
+val ENFORCEMENT_SEVERITY_VARIANT_NAMES: List<String> =
+    listOf(
+        "SuspendCapability",
+        "SuspendAccess",
+        "RevokeAccess",
+        "RemoveMember",
+    )
 
 // ---------------------------------------------------------------------------
 // ConsequenceAction
@@ -328,47 +338,56 @@ private fun encodeConsequenceRuleElement(rule: ConsequenceRule): JsonObject =
         }
     }
 
-private fun encodeTriggerElement(trigger: ConsequenceTrigger): JsonElement = when (trigger) {
-    ConsequenceTrigger.MessageVelocity -> JsonPrimitive("MessageVelocity")
-    ConsequenceTrigger.OutletRateExceeded -> JsonPrimitive("OutletRateExceeded")
-    ConsequenceTrigger.WarningCount -> JsonPrimitive("WarningCount")
-    is ConsequenceTrigger.Custom -> buildJsonObject { put("Custom", trigger.key) }
-}
-
-private fun encodeActionElement(action: ConsequenceAction): JsonElement = when (action) {
-    is ConsequenceAction.Enforcement -> buildJsonObject {
-        put("Enforcement", encodeSeverityElement(action.severity))
+private fun encodeTriggerElement(trigger: ConsequenceTrigger): JsonElement =
+    when (trigger) {
+        ConsequenceTrigger.MessageVelocity -> JsonPrimitive("MessageVelocity")
+        ConsequenceTrigger.OutletRateExceeded -> JsonPrimitive("OutletRateExceeded")
+        ConsequenceTrigger.WarningCount -> JsonPrimitive("WarningCount")
+        is ConsequenceTrigger.Custom -> buildJsonObject { put("Custom", trigger.key) }
     }
-    is ConsequenceAction.AssignRole -> buildJsonObject {
-        putJsonObject("AssignRole") { put("to_role", action.toRole) }
-    }
-}
 
-private fun encodeSeverityElement(severity: EnforcementSeverity): JsonElement = when (severity) {
-    EnforcementSeverity.SuspendAccess -> JsonPrimitive("SuspendAccess")
-    is EnforcementSeverity.SuspendCapability -> buildJsonObject {
-        putJsonObject("SuspendCapability") {
-            putJsonArray("capabilities") {
-                severity.capabilities.forEach { add(encodeCapabilityElement(it)) }
+private fun encodeActionElement(action: ConsequenceAction): JsonElement =
+    when (action) {
+        is ConsequenceAction.Enforcement ->
+            buildJsonObject {
+                put("Enforcement", encodeSeverityElement(action.severity))
             }
-        }
+        is ConsequenceAction.AssignRole ->
+            buildJsonObject {
+                putJsonObject("AssignRole") { put("to_role", action.toRole) }
+            }
     }
-    is EnforcementSeverity.RevokeAccess -> buildJsonObject {
-        putJsonObject("RevokeAccess") {
-            put("did", severity.did)
-            put("access", severity.access.rawValue)
-        }
-    }
-    is EnforcementSeverity.RemoveMember -> buildJsonObject {
-        putJsonObject("RemoveMember") {
-            put("did", severity.did)
-            put("reason", severity.reason?.let { JsonPrimitive(it) } ?: JsonNull)
-        }
-    }
-}
 
-private fun encodeCapabilityElement(capability: ConsequenceCapability): JsonElement = when (capability) {
-    is ConsequenceCapability.Unit -> JsonPrimitive(capability.name)
-    is ConsequenceCapability.OutletCall -> buildJsonObject { put("OutletCall", capability.outletId) }
-    is ConsequenceCapability.Custom -> buildJsonObject { put("Custom", capability.name) }
-}
+private fun encodeSeverityElement(severity: EnforcementSeverity): JsonElement =
+    when (severity) {
+        EnforcementSeverity.SuspendAccess -> JsonPrimitive("SuspendAccess")
+        is EnforcementSeverity.SuspendCapability ->
+            buildJsonObject {
+                putJsonObject("SuspendCapability") {
+                    putJsonArray("capabilities") {
+                        severity.capabilities.forEach { add(encodeCapabilityElement(it)) }
+                    }
+                }
+            }
+        is EnforcementSeverity.RevokeAccess ->
+            buildJsonObject {
+                putJsonObject("RevokeAccess") {
+                    put("did", severity.did)
+                    put("access", severity.access.rawValue)
+                }
+            }
+        is EnforcementSeverity.RemoveMember ->
+            buildJsonObject {
+                putJsonObject("RemoveMember") {
+                    put("did", severity.did)
+                    put("reason", severity.reason?.let { JsonPrimitive(it) } ?: JsonNull)
+                }
+            }
+    }
+
+private fun encodeCapabilityElement(capability: ConsequenceCapability): JsonElement =
+    when (capability) {
+        is ConsequenceCapability.Unit -> JsonPrimitive(capability.name)
+        is ConsequenceCapability.OutletCall -> buildJsonObject { put("OutletCall", capability.outletId) }
+        is ConsequenceCapability.Custom -> buildJsonObject { put("Custom", capability.name) }
+    }

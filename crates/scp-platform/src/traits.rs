@@ -819,10 +819,11 @@ pub trait PreRotationCustody: Send + Sync {
 /// that module, `verify_foreign_token_returns_false` and
 /// `verify_empty_token_returns_false`, pin the rejecting branch.
 ///
-/// ADR-025, the Apple platform adapter, in `.docs/adrs/phase-5.md` states in
-/// acceptance criterion 3 how a reader verifies an Apple App Attest token. The
-/// Swift `AppleDeviceAttestation` adapter implements no `verify`, because the
-/// identity workstream owns the reading-side verifier.
+/// §9.3.1 of `.docs/specs/09-security-model.md` states how a reader verifies
+/// an Apple App Attest attestation object, and story SCP-316 implements that
+/// reader. The Swift `AppleDeviceAttestation` adapter implements no `verify`,
+/// because the identity workstream owns the reading-side verifier (ADR-025,
+/// the Apple platform adapter, in `.docs/adrs/phase-5.md`).
 pub trait DeviceAttestation: Send + Sync {
     /// Generate a device attestation token.
     ///

@@ -14,7 +14,7 @@ bindings/kotlin/
     build.gradle.kts             # SDK module build
     src/
       main/kotlin/works/limn/scp/
-        Identity.kt              # Identity class, DIDDocument
+        Identity.kt              # Identity class
         Context.kt               # Context class, Membership
         Tools.kt                 # ToolDefinition, TestVector data classes
         Trust.kt                 # evaluateTrust(), TrustEvaluation
@@ -53,18 +53,18 @@ Located at `crates/scp-ffi/uniffi/src/scp.udl`:
 ```
 namespace scp {
   [Throws=ScpError]
-  Identity identity_create(string custody);
+  Identity identity_create(IdentityConfig config);
 
   [Throws=ScpError]
-  Identity identity_load(string did);
+  Identity identity_load(bytes identifier);
 
   [Throws=ScpError]
-  DIDDocument identity_resolve(string did);
+  ResolutionOutcome identity_resolve(bytes identifier);
 };
 
 interface Identity {
-  string did();
-  string custody_type();
+  bytes identifier();
+  CustodyType custody_type();
 
   [Throws=ScpError]
   Identity rotate_key();
@@ -158,7 +158,7 @@ detekt {
 
 ```kotlin
 data class Message(
-    val senderDid: String,
+    val senderIdentifier: ByteArray,
     val content: ByteArray,
     val timestamp: Long,
     val sequence: Long,
@@ -171,7 +171,7 @@ data class ToolDefinition(
     val description: String,
     val inputSchema: Map<String, Any>,
     val outputSchema: Map<String, Any>,
-    val operator: String,  // DID
+    val operator: ByteArray,  // identifier
     val testVectors: List<TestVector>? = null,
     val implementationHash: ByteArray? = null,
 )
@@ -198,18 +198,22 @@ class ValidationException(message: String, code: String) : ScpException(message,
 
 ```kotlin
 class Identity private constructor(private val handle: IdentityHandle) {
-    val did: String get() = handle.did()
-    val custodyType: String get() = handle.custodyType()
+    val identifier: ByteArray get() = handle.identifier()
+    val custodyType: CustodyType get() = handle.custodyType()
 
     companion object {
-        suspend fun create(custody: String = "platform"): Identity =
+        // IdentityConfig is the three-slot config object
+        // `.docs/standards/construction.md` states. Its `custody` slot carries
+        // the bridge's KeyCustodyConfig and carries no default, because that
+        // slot decides where an identity's private key lives.
+        suspend fun create(config: IdentityConfig): Identity =
             withContext(Dispatchers.IO) {
-                Identity(NativeLib.identityCreate(custody))
+                Identity(NativeLib.identityCreate(config))
             }
 
-        suspend fun load(did: String): Identity =
+        suspend fun load(identifier: ByteArray): Identity =
             withContext(Dispatchers.IO) {
-                Identity(NativeLib.identityLoad(did))
+                Identity(NativeLib.identityLoad(identifier))
             }
     }
 

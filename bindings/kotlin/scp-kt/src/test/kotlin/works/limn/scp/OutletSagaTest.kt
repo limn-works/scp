@@ -37,11 +37,11 @@ import uniffi.scp.ContextMode
 import uniffi.scp.ContextParams
 import uniffi.scp.GovernanceModel
 import uniffi.scp.MemoryScope
+import uniffi.scp.OutletDefinition
 import uniffi.scp.OutletKind
 import uniffi.scp.SagaResult
 import uniffi.scp.ScpException
 import uniffi.scp.StorageConfig
-import uniffi.scp.OutletDefinition
 import works.limn.scp.bridge.BridgeException
 import works.limn.scp.bridge.CoroutineBridge
 import works.limn.scp.conformance.ConformanceStubBindings

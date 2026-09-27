@@ -34,16 +34,23 @@ for arg in "$@"; do
 done
 
 UNIFFI_CRATE_DIR="$REPO_ROOT/crates/scp-ffi/uniffi"
-UDL_FILE="$UNIFFI_CRATE_DIR/src/scp.udl"
 OUTPUT_DIR="$REPO_ROOT/bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal"
 
-# Step 1: Build the Rust cdylib (skip if --skip-build and library exists).
-if [[ "$PROFILE" == "release" ]]; then
-    LIB_DIR="$REPO_ROOT/target/release"
-else
-    LIB_DIR="$REPO_ROOT/target/debug"
+# Cargo writes into the target directory it resolves from `CARGO_TARGET_DIR`, then
+# `build.target-dir` in any `.cargo/config.toml` it reads, then `<workspace>/target`.
+# A machine whose `~/.cargo/config.toml` points every worktree at one shared directory
+# therefore builds the library outside this checkout, so this script asks cargo for the
+# directory instead of assuming `$REPO_ROOT/target`. `cargo metadata --no-deps` reads
+# the manifests and compiles nothing.
+TARGET_DIR=$(cargo metadata --manifest-path "$UNIFFI_CRATE_DIR/Cargo.toml" --format-version 1 --no-deps \
+    | sed -nE 's/.*"target_directory":"([^"]*)".*/\1/p')
+if [[ -z "$TARGET_DIR" ]]; then
+    echo "ERROR: cargo metadata named no target directory for $UNIFFI_CRATE_DIR" >&2
+    exit 1
 fi
+LIB_DIR="$TARGET_DIR/$PROFILE"
 
+# Step 1: Build the Rust cdylib (skip if --skip-build and library exists).
 if [[ "$SKIP_BUILD" == "false" ]]; then
     CARGO_ARGS=(build --manifest-path "$UNIFFI_CRATE_DIR/Cargo.toml")
     if [[ "$PROFILE" == "release" ]]; then
@@ -75,7 +82,7 @@ if [[ ! -f "$LIB_FILE" ]]; then
 fi
 
 # Step 2: Build the uniffi-bindgen binary from the crate, under the profile step 1
-# used. Cargo shares no artifact between target/debug and target/release, so a
+# used. Cargo shares no artifact between the debug and release directories, so a
 # `--release` step 1 followed by a dev-profile bindgen build compiles the crate graph
 # a second time; passing the same profile here compiles the bindgen binary alone.
 echo "==> Building uniffi-bindgen tool ($PROFILE)..."

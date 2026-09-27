@@ -37,9 +37,10 @@ All I/O operations are `suspend` functions. Streaming uses `Flow<T>`. Blocking F
 ```kotlin
 class IdentityTest {
     @Test
-    fun `create identity returns valid DID`() = runTest {
+    fun `create identity returns a 32-byte identifier`() = runTest {
         val identity = Identity.create(custody = "in_memory")
-        assertTrue(identity.did.startsWith("did:dht:"))
+        // 09-security-model.md §9.7.4.2 R13
+        assertEquals(32, identity.identifier.size)
     }
 
     @Test

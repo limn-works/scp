@@ -1217,10 +1217,15 @@ pub const ATTEST_9023: &str = "SCP-ATTEST-9023";
 /// Apple could not reach its App Attest service.
 pub const ATTEST_9024: &str = "SCP-ATTEST-9024";
 /// The App Attest adapter reached a state no caller input produces: Apple's
-/// service answered a completion handler with neither a value nor an error, a
-/// key ID did not base64-decode to 32 bytes, or the adapter was deallocated
-/// during a call.
+/// service answered a completion handler with neither a value nor an error, or
+/// the adapter was deallocated during a call.
 pub const ATTEST_9025: &str = "SCP-ATTEST-9025";
+/// The attestation challenge is not 32 bytes.
+///
+/// ADR-025 acceptance criterion 3 has the Rust core pass the 32-byte binding digest of `09-security-model.md`
+/// §9.3.1 as `challenge`, and the Apple adapter hands it to App Attest as
+/// `clientDataHash` unchanged.
+pub const ATTEST_9026: &str = "SCP-ATTEST-9026";
 
 // -------------------------------------------------------------------------
 // Economy (SCP-ECON- 12000--12999)

@@ -556,19 +556,24 @@ pub trait PushProvider: Send + Sync {
 pub trait DeviceAttestationProvider: Send + Sync {
     /// Generate a cryptographic attestation for this device.
     ///
-    /// `challenge` — server-provided challenge bytes (SHA-256 digested with
-    ///   `device_id` before submission to the platform attestation service).
-    /// `device_id` — stable identifier for this device instance.
+    /// `challenge` — Apple: the 32-byte binding digest `D` of
+    ///   `09-security-model.md` §9.3.1, which the adapter hands App Attest as
+    ///   `clientDataHash` unchanged and rejects when it is not 32 bytes
+    ///   (ADR-025 acceptance criterion 3). Android: ADR-027, the Android
+    ///   platform adapter, states what it binds.
+    /// `device_id` — stable identifier for this device instance. The Apple
+    ///   adapter does not read it.
     ///
-    /// Returns the platform attestation bytes. Apple: bytes 0–31 are the App
-    /// Attest key identifier, base64-decoded, and every later byte belongs to
-    /// the CBOR attestation object Apple signed (ADR-025 acceptance criterion
-    /// 3). Android: the Play Integrity token bytes.
+    /// Returns the platform attestation bytes. Apple: the raw CBOR attestation
+    /// object Apple signed (ADR-025 acceptance criterion 3). Android: the Play
+    /// Integrity token bytes.
     async fn attest(&self, challenge: Vec<u8>, device_id: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 
     /// Generate a per-request assertion proving key possession.
     ///
     /// `request_hash` — SHA-256 hash of the request data being asserted.
+    ///   Apple: the assertion digest `A` of `09-security-model.md` §9.3.1,
+    ///   which the adapter hands App Attest as `clientDataHash` unchanged.
     ///
     /// Returns the platform assertion object bytes (Apple: CBOR assertion;
     /// Android: integrity verdict).

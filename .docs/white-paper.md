@@ -11,7 +11,7 @@ March 2026 — Preprint v0.1
 
 Frontier language models now produce functional applications from brief specifications, and agent frameworks compose sophisticated workflows from modular tools. The cost of building software is collapsing, but the cost of connecting it is not. Shared identity, trust, and relationships still depend on platform accounts, OAuth integrations, and API-level federation, all of which assume long-lived applications and manual integration effort. These mechanisms work when software is durable and carefully maintained. They break down when software is ephemeral, agent-generated, and disposable.
 
-This paper presents the Shared Context Protocol (SCP), an open protocol providing cryptographic identity (DID [10]), governed interaction spaces (contexts), end-to-end encryption as access control (MLS [2]), capability-based authorization (UCAN [12]), and verifiable provenance. All interaction occurs within contexts — bounded, encrypted, governed spaces where membership is enforced by cryptography. The protocol is designed for a world where autonomous agents are the primary actors: every agent traces to a human identity through cryptographic binding, agents are isolated per context at the protocol level, and behavioral records replace reputation scores as the primary trust input.
+This paper presents the Shared Context Protocol (SCP), an open protocol providing self-certifying cryptographic identity, governed interaction spaces (contexts), end-to-end encryption as access control (MLS [2]), capability-based authorization (UCAN [11]), and verifiable provenance. All interaction occurs within contexts — bounded, encrypted, governed spaces where membership is enforced by cryptography. The protocol is designed for a world where autonomous agents are the primary actors: every agent traces to a human identity through cryptographic binding, agents are isolated per context at the protocol level, and behavioral records replace reputation scores as the primary trust input.
 
 Key properties: no operator dependency (the protocol functions if its creators disappear), transport independence (17 adapter specifications across 3 tiers), human accountability for all autonomous agents, and context isolation as the security boundary. The protocol is designed to be complementary to existing platforms and tool-level protocols — bridge connectors, transport adapters, and identity attestations enable harmonious interoperation with established distribution networks. The reference implementation is in Rust with bindings for Python, Swift, Kotlin, TypeScript, and WebAssembly. The specification is published under CC-BY 4.0; the SDK is published under Apache 2.0.
 
@@ -33,7 +33,7 @@ If the protocol provides what every connected application needs — identity, en
 
 ### 1.2 Agents as Primary Actors
 
-The agent ecosystem is developing rapidly at the tool level. The Model Context Protocol (MCP) [20] defines how language models connect to local tools via JSON-RPC. Emerging protocols like WebMCP extend this to browser-accessible tools, and the Universal Commerce Protocol (UCP) addresses agent-to-commerce interactions. These protocols solve important problems: how agents *use* things.
+The agent ecosystem is developing rapidly at the tool level. The Model Context Protocol (MCP) [19] defines how language models connect to local tools via JSON-RPC. Emerging protocols like WebMCP extend this to browser-accessible tools, and the Universal Commerce Protocol (UCP) addresses agent-to-commerce interactions. These protocols solve important problems: how agents *use* things.
 
 What is missing is the social layer — how agents *relate to each other*. No existing protocol addresses the questions that arise when autonomous agents interact: How does an agent prove its identity? How is trust established between agents that have never met? How are interactions governed when both participants are software? Who is accountable when an autonomous agent misbehaves? How does an agent in one context safely share information with an agent in another?
 
@@ -49,15 +49,15 @@ SCP is governed by nine design principles. Each has a load-bearing consequence f
 
 1. **Provenance everywhere.** All non-private data carries verifiable origin metadata. The absence of provenance is itself a signal. *Consequence:* the protocol attaches provenance automatically at context boundary crossings (Section 8).
 
-2. **Human accountability.** Every agent traces to a human DID through cryptographic binding. *Consequence:* there are no anonymous autonomous actors; misbehavior is always attributable (Section 4.4).
+2. **Human accountability.** Every agent traces to a human identity through cryptographic binding. *Consequence:* there are no anonymous autonomous actors; misbehavior is always attributable (Section 4.4).
 
 3. **Context isolation.** All interaction occurs within bounded contexts. Cross-context data flow is explicit and governed. *Consequence:* agents in different contexts are separate instances at the protocol level, even when operated by the same human (Section 5).
 
-4. **Encryption-as-access-control.** MLS group keys enforce membership. No relay or intermediary enforces access — the cryptography does. *Consequence:* relays are untrusted; a compromised relay cannot breach confidentiality (Section 6). The untrust is what is load-bearing, not literal content-blindness: a relay MAY validate *public, self-certifying* records it stores (e.g. verify a DID document's BEP44 signature and keep the highest-sequence copy) as an availability and anti-suppression measure. This is never a trust dependency — clients verify every record independently, so a relay that skips, botches, or lies about such validation degrades availability only, never integrity — and it never applies to encrypted content, which relays can neither read nor validate.
+4. **Encryption-as-access-control.** MLS group keys enforce membership. No relay or intermediary enforces access — the cryptography does. *Consequence:* relays are untrusted; a compromised relay cannot breach confidentiality (Section 6). The untrust is what is load-bearing, not literal content-blindness: a relay MAY validate *public, self-certifying* records it stores (e.g. verify a key-event frame's own chain and refuse a later write that does not extend it) as an availability and anti-suppression measure. This is never a trust dependency — clients verify every record independently, so a relay that skips, botches, or lies about such validation degrades availability only, never integrity — and it never applies to encrypted content, which relays can neither read nor validate.
 
 5. **Legibility before opt-in.** Every context's parameters are visible before joining. *Consequence:* informed consent is mechanical, not social.
 
-6. **No operator dependency.** The protocol must function if its creators disappear. *Consequence:* identity is self-sovereign, relays are substitutable, and all cryptographic operations are local.
+6. **No operator dependency.** The protocol must function if its creators disappear. *Consequence:* identity is self-sovereign, every cryptographic operation is local, and relays are substitutable for every act except a first contact, which reads two entries of the community relay list under distinct operator keys; the SDK fetches that list from a relay-list context Limn governs.
 
 7. **Transport independence.** No structural coupling to any single transport. *Consequence:* the protocol defines a transport adapter trait with 17 adapter specifications (Section 9).
 
@@ -69,7 +69,7 @@ SCP is governed by nine design principles. Each has a load-bearing consequence f
 
 SCP provides a complete protocol specification, a reference SDK (Rust core with language bindings), and conformance infrastructure. It does not provide content moderation policy, specific transport implementations beyond the reference relay, or application-level logic. The protocol is the infrastructure; applications are built on top.
 
-The primary contributions are architectural, not cryptographic — SCP composes established primitives (MLS, DIDs, UCANs, Merkle trees) into a system designed specifically for autonomous agent interaction. Three contributions are novel to SCP: (1) the shared-DID model for human-agent accountability, where human and agent share one identity with distinct signing keys and structural action provenance on every message; (2) context isolation as the primary security boundary, with all cross-context data flow mediated by governed protocol mechanisms; and (3) the sender-side key layer that decouples content access from MLS group membership, enabling per-sender blocking without group disruption. The remaining design choices — the multi-key identity architecture (extending KERI's [25] pre-rotation approach), the provenance model (applying W3C PROV [26] concepts to cross-context agent communication), dual-layer DID resolution, and encryption-as-access-control — are novel applications of known techniques to the agent-native case, not claimed as independent contributions.
+The primary contributions are architectural, not cryptographic — SCP composes established primitives (MLS, key-event logs, UCANs, Merkle trees) into a system designed specifically for autonomous agent interaction. Three contributions are novel to SCP: (1) context isolation as the primary security boundary, with all cross-context data flow mediated by governed protocol mechanisms; (2) the sender-side key layer that decouples content access from MLS group membership, enabling per-sender blocking without group disruption; and (3) the agent-accountability model, in which an agent holds its own identity and a human's key-event log anchors that identity's establishment events, so a verifier reads the responsible human from the agent's own chain rather than from a self-reported claim. The remaining design choices — the identity substrate itself (a key-event log in KERI's [24] shape, encoded in SCP's own format), the provenance model (applying W3C PROV [25] concepts to cross-context agent communication), and encryption-as-access-control — are novel applications of known techniques to the agent-native case, not claimed as independent contributions.
 
 The remainder of this paper is organized as follows: Section 2 analyzes the problem space. Section 3 presents the architecture overview. Sections 4–8 detail the core protocol components: identity, contexts, encryption, capabilities, and provenance. Section 9 covers transport. Section 10 addresses discovery. Section 11 provides the security analysis. Section 12 compares with related work. Section 13 discusses implementation status, Section 14 discusses open questions and future work, and Section 15 concludes.
 
@@ -97,7 +97,7 @@ The tool-level protocols that exist today — MCP, WebMCP, UCP — define how ag
 
 ### 2.3 Why Not Existing Protocols?
 
-Existing protocols address pieces of this problem. Matrix [15] provides federated messaging with room-based grouping but ties identity to homeservers (`@user:server`), uses custom group encryption (Megolm) rather than a standardized construction, and has no agent accountability model. AT Protocol [16] provides self-sovereign identity (`did:plc`) with portable data stores but offers no end-to-end encryption and no governance model. Nostr [17] provides censorship-resistant relaying with keypair identity but lacks group encryption, capability-based authorization, and any mechanism for agent accountability. Signal [13] provides strong pairwise encryption (Double Ratchet) but is centralized, phone-number-bound, and has no programmable governance or provenance. Holepunch/Hypercore [18][19] provides zero-server P2P with authenticated append-only logs but lacks encryption at the log level, governance, and multi-writer is an application-layer concern. MCP [20] defines agent-tool integration but provides no identity, trust, or social infrastructure.
+Existing protocols address pieces of this problem. Matrix [14] provides federated messaging with room-based grouping but ties identity to homeservers (`@user:server`), uses custom group encryption (Megolm) rather than a standardized construction, and has no agent accountability model. AT Protocol [15] provides self-sovereign identity (`did:plc`) with portable data stores but offers no end-to-end encryption and no governance model. Nostr [16] provides censorship-resistant relaying with keypair identity but lacks group encryption, capability-based authorization, and any mechanism for agent accountability. Signal [12] provides strong pairwise encryption (Double Ratchet) but is centralized, phone-number-bound, and has no programmable governance or provenance. Holepunch/Hypercore [17][18] provides zero-server P2P with authenticated append-only logs but lacks encryption at the log level, governance, and multi-writer is an application-layer concern. MCP [19] defines agent-tool integration but provides no identity, trust, or social infrastructure.
 
 None addresses the agent-native case comprehensively: no existing protocol provides cryptographic context isolation, human accountability chains for autonomous agents, capability-based authorization with delegation, and verifiable provenance as a unified architecture. Section 12 provides a detailed structured comparison.
 
@@ -153,7 +153,7 @@ The protocol is organized in five layers:
 
 **Social Context Layer.** Contexts, agents, outlets, roles, governance, trust semantics. Agent-native social infrastructure.
 
-**Identity and Capabilities.** DID-based identity with multi-key verification methods. UCAN-based capability tokens with verifiable delegation chains. Invisible key custody.
+**Identity and Capabilities.** Self-certifying identity over an append-only key-event log, with a cold root authority and one operational key. UCAN-based capability tokens with verifiable delegation chains. Invisible key custody.
 
 **Crypto and Transport.** MLS group encryption, sender-side keys, Merkle event logs. Relay-based store-and-forward delivery with transport abstraction.
 
@@ -172,9 +172,9 @@ Context creation is a runtime operation — estimated at 5–15 ms of local comp
 
 Messages in SCP pass through a layered security pipeline:
 
-1. **Construction.** The sender constructs an inner envelope containing: context ID, sender DID, signing key identifier (`#active` or `#agent`), MLS epoch, generation, sequence number, timestamp, payload hash (SHA-256 of the original plaintext, before padding), padded payload, and provenance metadata. The signature commits to the payload hash, not the padded payload, preventing padding manipulation.
+1. **Construction.** The sender constructs an inner envelope containing: context ID, sender identifier, signing key identifier (`#active`), MLS epoch, generation, sequence number, timestamp, payload hash (SHA-256 of the original plaintext, before padding), padded payload, and provenance metadata. The signature commits to the payload hash, not the padded payload, preventing padding manipulation.
 
-2. **Signing.** The inner envelope is signed with the sender's verification method key. The signature preimage includes the signing key identifier, binding the message to a specific key.
+2. **Signing.** The sender signs the inner envelope with its Active Signing Key. The signature preimage includes the signing key identifier, binding the message to a specific key.
 
 3. **Sender-side encryption.** The signed inner envelope is encrypted with the sender's AES-256-GCM sender key.
 
@@ -191,7 +191,7 @@ flowchart LR
     end
 
     subgraph signing["2. Signing"]
-        SIG["Ed25519 Signature\n(commits to payload hash\n+ signing_key_id)"]
+        SIG["ECDSA P-256 Signature\n(commits to payload hash\n+ signing_key_id)"]
     end
 
     subgraph sender["3. Sender-Side Encryption"]
@@ -220,7 +220,7 @@ flowchart LR
     style transport fill:#1a1a1a,stroke:#444,color:#999
 ```
 
-*Figure 2: Message lifecycle. Each layer enforces distinct security properties: signatures provide non-repudiation and key attribution; sender-side keys enable per-sender blocking; MLS provides forward secrecy and post-compromise security; outer envelopes provide metadata privacy via pseudonymous routing IDs and bucket padding.*
+*Figure 2: Message lifecycle. Each layer enforces distinct security properties: signatures provide non-repudiation and attribution to the signing identity; sender-side keys enable per-sender blocking; MLS provides forward secrecy and post-compromise security; outer envelopes provide metadata privacy via pseudonymous routing IDs and bucket padding.*
 
 ### 3.5 Trust Model
 
@@ -238,7 +238,7 @@ The design goal: **the trust surface shrinks over time.** New identities are tru
 
 ### 3.6 Verifiable Event Logs
 
-Every context maintains an append-only Merkle tree recording all protocol events: messages, outlet invocations, membership changes, role assignments, governance proposals and votes, economic transactions, and media session lifecycle. The tree uses SHA-256 hashing following the Certificate Transparency structure (RFC 6962 [24]) with domain separation prefixes for leaf and internal nodes.
+Every context maintains an append-only Merkle tree recording all protocol events: messages, outlet invocations, membership changes, role assignments, governance proposals and votes, economic transactions, and media session lifecycle. The tree uses SHA-256 hashing following the Certificate Transparency structure (RFC 6962 [23]) with domain separation prefixes for leaf and internal nodes.
 
 Events are signed by the acting participant and sequenced. The Merkle root after each append constitutes a commitment to the entire event history — any tampering with a historical event changes the root, detectable by any member who has observed a prior root. Proof-of-inclusion (a specific event occurred) and proof-of-consistency (the log has not been retroactively modified) are both efficiently verifiable with O(log n) hash computations.
 
@@ -252,108 +252,78 @@ Relay consistency is enforced through two mechanisms. First, per-sender sequence
 
 ## 4. Identity
 
-### 4.1 DID-Based Identity
+### 4.1 Inception-Derived Identifiers
 
-Every identity in SCP is rooted in a cryptographic keypair expressed as a Decentralized Identifier (DID). The DID is the canonical identifier at the protocol level.
+An SCP identity is an append-only key-event log, and its identifier is the SHA-256 digest of that log's first event. The identifier therefore authenticates the log, rather than a registry authenticating the identifier. A verifier recomputes the digest from the inception event it was served and rejects a chain whose recomputed identifier differs from the one it asked for. Every later event binds its predecessor's digest, so one verifier checks the whole chain with no trusted intermediary.
 
-SCP uses `did:dht` as the primary DID method. did:dht stores DID documents as BEP44 [11] signed mutable items on BitTorrent's Mainline DHT — a network of millions of nodes with over 20 years of operational history. The DID string (`did:dht:<z-base-32-encoded-Ed25519-public-key>`) encodes the public key directly, making it self-certifying: DID documents are verifiable against the DID without trusting any intermediary. MITM on resolution is cryptographically impossible given the correct DID.
+KERI [24] introduced this construction as the autonomic identifier. SCP takes that shape, encodes it in its own format, and adopts none of KERI's wire encodings, discovery protocol, or witness pools. `09-security-model.md` §9.7.4.2 states the derivation and every rule a verifier applies, and ADR-063 records why SCP chose a key-event log over a method that resolved a mutable record.
 
-Key custody is invisible to users. Keys are stored in platform-specific secure storage — iOS Keychain (Secure Enclave supports only P-256, not the Ed25519 required by SCP), Android Keystore, passkey infrastructure — without the user managing keys directly. Recovery uses social and device mechanisms rather than seed phrases: trusted device recovery, social recovery via trusted contacts, and platform-backed recovery as the practical safety net for new users.
+Key custody stays invisible. The root credential defaults to a passkey no code path exports, and a root changes only through a `RootRecovery` revealing the standing commitment. Trusted-device, social and platform-backed mechanisms help a controller reach its credentials and authorize no root change (`03-identity.md` §3.3).
 
-### 4.2 Multi-Key Verification Method Architecture
+### 4.2 Root Authority, Operational Key, and Pre-Rotation
 
-Standard DID methods use a single keypair for everything — signing, authenticating, operating. This conflates distinct security concerns. SCP defines multiple verification methods per DID document, each serving a specific purpose:
+The log separates the authority that establishes keys from the key that uses them day to day.
 
-**Identity Key (`#0`).** The Ed25519 key encoded in the DID string. Hardware-backed. The long-lived root of trust. Used exclusively for BEP44 signing and DID document modifications. Never used for day-to-day protocol operations.
+**The root** is an ordered list of at most 16 P-256 public keys with a signing threshold. A personal identity runs the 1-of-1 case, and an organization runs a threshold several officers jointly satisfy from the identity's first event onward, because the inception event fixes the root set's shape. The root signs establishment events and nothing else, so it stays cold: no content signature, no MLS operation, and no capability token needs it.
 
-**Human Signing Key (`#active`).** The human's operational key for protocol actions — signing inner envelopes, MLS operations, capability delegation. Hardware-backed. Rotatable without changing the DID. Published in the DID document, authorized by the Identity Key.
+**The Active Signing Key** (`#active`) is the one operational key. It signs inner envelopes, MLS credentials, UCAN issuance, attestations, and the service record. An establishment event the root signs lists a replacement `Current` and the old key `Superseded`, and the identifier does not change, so no rename propagates to anyone holding it.
 
-**Pre-Rotation Key.** A commitment to the next Human Signing Key. The hash of the pre-rotation key is published in the DID document before it is needed. This enables safe key rotation even under compromise: the pre-rotation commitment was made before the compromise occurred, so an attacker who steals the current signing key cannot forge a valid rotation — they would need the pre-rotation private key, which was generated separately.
+**Pre-rotation** stops a thief holding today's root from installing a new root set. Every establishment event commits to the digests of the next root keys before anyone uses them, and publishes only the digests, so each public key first appears in the event that consumes its commitment. Installing a new root set therefore takes the pre-rotation private key, which resides in a substrate the daily operational path cannot reach, and the controller holding that key installs one and wins the fork under the root rule. **A thief holding the root installs its own operational keys, and pre-rotation does not stop that**: the event it signs carries a root signature alone, produces no divergence, and every verifier that resolves the identity reads the thief's key as the identity's operational key (`09-security-model.md` §9.7.4.2 R8). Where no independent substrate is available the SDK fails closed with a typed error rather than falling back to co-located storage (`09-security-model.md` §9.7.4.1).
 
-**Agent Signing Key (`#agent`).** Optional. A software-held Ed25519 key for the human's autonomous agent. Published in the DID document, authorized by the human via a self-delegation UCAN (`iss == aud`, same DID, with `fct.scp_key_scope: "#agent"`). Independently rotatable and revocable without affecting the human's keys.
+A key's standing is a root-asserted condition rather than an absence: `Current`, `Superseded`, `Retired`, or `Compromised` from a named position. A content signature verifies against a retired key for content accepted before that key's boundary, and an attestation verifies against the current key alone (`09-security-model.md` §9.7.1).
 
-All protocol messages carry a `signing_key_id` field identifying which verification method produced the signature. This provides structural action provenance: verifiers can determine whether a human or agent performed any action by inspecting the signing key identifier, without trusting self-reported claims.
-
-The pre-rotation mechanism draws on KERI's [25] key pre-commitment approach, applied here within the multi-key DID architecture.
-
-This separation provides three security improvements over single-key DID methods: (a) recovery from key compromise without changing the DID, via the pre-rotation commitment; (b) custody separation between human and agent operations; (c) graduated permission categories based on signing key type.
+**The root decides a fork.** Where a verifier holds two valid chains for one identifier, it ranks them by the root authority behind each, and the order in which it received the two decides nothing. An equal rank leaves the identity contested rather than resolved in either claimant's favour (`09-security-model.md` §9.7.4.2 R6 and R7).
 
 ```mermaid
-flowchart TB
-    subgraph did["DID Document (did:dht:z6Mk...)"]
-        direction TB
-        id["#0 Identity Key\n(Ed25519, hardware-backed)\nCategory A: DID doc modifications only"]
-        active["#active Human Signing Key\n(Ed25519, hardware-backed)\nCategory B: protocol operations"]
-        prerot["Pre-Rotation Key\n(hash commitment to next #active)"]
-        agent["#agent Agent Signing Key\n(Ed25519, software-held)\nCategory B: delegated via UCAN"]
-    end
+flowchart LR
+    inc["Inception (seq 0)\nroot signature\ninstalls the first root set\nidentifier = SHA-256 of this event"]
+    ks["KeyState (seq 1)\nroot signature\nretires #active"]
+    cr["CommitmentRollover (seq 2)\nreveal + root signature"]
+    rr["RootRecovery (seq 3)\nreveal + new root's signature\ninstalls a new root"]
 
-    id -- "authorizes" --> active
-    id -- "authorizes" --> prerot
-    active -- "self-delegation UCAN\n(iss == aud, fct.scp_key_scope: #agent)" --> agent
+    inc --> ks --> cr --> rr
 
-    subgraph catA["Category A"]
-        a_ops["DID doc modifications\nKey rotation"]
-    end
-    subgraph catB["Category B"]
-        b_ops["Messaging, outlet invocation\nGovernance votes, MLS ops"]
-    end
-    subgraph catC["Category C"]
-        c_ops["Context-configurable\nrestrictions per key type"]
-    end
-
-    id --> catA
-    active --> catB
-    agent -.-> catB
-    catB --> catC
-
-    style did fill:#1a1a1a,stroke:#555,color:#ccc
-    style id fill:#2a2a2a,stroke:#888,color:#eee
-    style active fill:#1a1a1a,stroke:#555,color:#ccc
-    style prerot fill:#1a1a1a,stroke:#444,color:#999
-    style agent fill:#1a1a1a,stroke:#555,color:#ccc
-    style catA fill:#2a2a2a,stroke:#666,color:#ddd
-    style catB fill:#1a1a1a,stroke:#555,color:#ccc
-    style catC fill:#1a1a1a,stroke:#444,color:#999
+    style inc fill:#2a2a2a,stroke:#888,color:#eee
+    style ks fill:#1a1a1a,stroke:#555,color:#ccc
+    style cr fill:#1a1a1a,stroke:#555,color:#ccc
+    style rr fill:#2a2a2a,stroke:#666,color:#ddd
 ```
 
-*Figure 3: Multi-key identity architecture. The identity key (`#0`) is the root of trust, used only for DID document modifications. The human signing key (`#active`) handles day-to-day operations. The agent signing key (`#agent`) is authorized via self-delegation UCAN and independently revocable. Pre-rotation provides safe key recovery under compromise. Permission categories (A/B/C) govern which keys can perform which actions.*
+*Figure 3: A key-event log. The identifier is the digest of the inception event, and each later event binds its predecessor's digest. The root signs establishment events and nothing else, and each event fixes the digests of the next root keys, so a rollover or a recovery reveals a key committed before the event that spends it.*
 
-### 4.3 Dual-Layer Resolution
+### 4.3 Resolution
 
-did:dht specifies a single resolution path: Mainline DHT. SCP adds a second: SCP relays. DID documents are published to SCP relays as standard blobs, addressed by a deterministic routing ID: `SHA-256("scp:did:" || did_string)`. Both layers are queried in parallel; the first valid response wins. BEP44 sequence numbers resolve conflicts when both layers return valid documents.
+A resolver queries two disjoint relay sets in parallel: the relays the identity's service record names, and a fallback set from the community relay list, which the SDK fetches from a relay-list context its shipped pointer names. Each response carries a key-event frame, which the resolver decodes, recomputing the identifier, verifying every event, and settling the surviving chains by shared prefix and then by fork precedence (`03-identity.md` §3.10.4).
 
-The dual-layer architecture provides:
+On a first contact, where the resolver holds no earlier chain for the identifier, each relay must also return a proof of control: a signature over the resolver's nonce, the routing id queried, and a digest of the bytes served, verifiable against the P-256 key that operator's community-relay-list entry declares. A relay serving no proof counts as one unattributed source and can never be the second of two, so a first contact that cannot reach two proven operators returns an inconclusive verdict rather than a key state (`03-identity.md` §3.10.1 and §3.10.8).
 
-- **Anti-segmentation.** Publishing to both layers is mandatory (MUST, not SHOULD). The SDK enforces this by default to prevent the network from fragmenting into two resolution namespaces.
-- **Protocol-level self-healing.** When layers return documents with different sequence numbers, the resolver accepts the fresher one and may re-publish it to the stale layer. The network converges on the freshest document without central coordination.
-- **Suppression resistance.** An attacker must suppress a DID document on all of an identity's relays *and* all reachable DHT nodes to prevent resolution — a strictly harder attack than suppressing on either layer alone.
+Publishing to the fallback set is a MUST, which stops the network fragmenting into separate resolution namespaces, and a publish cycle that no fallback relay accepted is reported as a failed publication, because a relay at its declared budget answers the publisher and stores nothing (`03-identity.md` §3.10.6). Freshness rests on the log's own highest-sequence event: a relay re-serves an event the controller already signed and signs none itself, and a resolver rejects a lower sequence on the chain it accepted, so a relay that withholds the newest event denies service and cannot roll a reader back onto a superseded key state (`09-security-model.md` §9.7.4.2 R12).
 
-The dual-cycle republishing schedule accommodates the layers' different characteristics: 2-hour cycles for DHT (matching BEP44 expiry), 6-day cycles for relays (within the 7-day blob TTL with a 1-day safety margin).
+An identity may designate relays as **witnesses** that cosign its log head. A witness runs one check — the offered chain carries the head it last cosigned for that identity — then signs or refuses, emitting a signed conflict statement where the chain carries a different event. A witness adjudicates nothing: its cosigned heads and conflict statements are portable evidence of a fork, which a relying party decides under Section 4.2 (`09-security-model.md` §9.7.4.3).
 
-### 4.4 The Human-Agent Pair
+### 4.4 The Human-Agent Relationship
 
-The fundamental unit of participation in SCP is the human-agent pair. Human and agent share a single DID. Neither is a separate identity — they are one participant with two signing keys.
+The unit of participation is a human and the agent acting for them, and every agent action must trace to a human identity.
 
-This binding is the foundation of the entire trust model, and the reasoning behind it is worth tracing. The alternative — giving agents their own identities, separate from humans — was considered and rejected because it severs the accountability chain. An agent with its own DID can be created trivially, operated anonymously, and discarded without consequence. The cost of manufacturing agent identities is computational, not social. Without human binding, nothing distinguishes a legitimate agent from a manufactured sybil except behavioral history that is itself cheap to fabricate. The shared-DID model makes agent creation socially expensive: every agent identity is a human identity, and human identities carry the accumulated weight of attestations, participation history, and social relationships.
+The alternative — an agent identity connected to no human — was considered and rejected because it severs the accountability chain. Such an identity is created trivially, operated anonymously, and discarded without consequence, so manufacturing agents costs computation rather than social standing, and nothing separates a legitimate agent from a sybil except behavioral history that is itself cheap to fabricate.
 
-The design process that led to this model went further. The original architecture included a second class of actors — unbound "anonymous agents" that could exist within contexts without human binding. Through iterative analysis, these were constrained: first to be context-scoped (no protocol existence outside their context), then to be non-initiating (they could respond but not act), then to be stateless (no persistent memory). At each step, the constraints removed attack surface — emergence within contexts, internal swarms, resource exhaustion through feedback loops. The final realization was that a stateless, non-initiating, context-scoped entity with no identity is not an agent at all. It is a function. The "anonymous agent" concept was eliminated entirely and replaced with outlets — stateless functions that agents invoke. This simplification reduced the actor model to two clean concepts: agents (always accountable, always human-bound) and outlets (stateless, non-agentic functions).
+SCP binds the two by cooperative delegation: the agent holds its own key-event log, and the human's log anchors that log's establishment events by a key-event seal. The anchor is structural rather than inferential, because a human cannot disown an agent whose establishment its own log records, and it makes agent creation socially expensive, because every agent resolves to a human identity carrying its attestations, participation history, and relationships. A human identity's key state names one operational role, `#active`, and names no agent key, so a verifier tells a human-direct action from an agent-autonomous one by the identity that signed it. **How a controller produces that anchor and how a verifier checks it is unspecified as of 2026-09-10** (`00-open-questions.md`), and until it is, a verifier rejects every chain claiming a delegator, so no delegated agent identity resolves today (`09-security-model.md` §9.1 invariants 1 and 4, §9.7.4.2 R3).
 
-**One agent per human per context.** This is structurally enforced — a DID document contains exactly one `#agent` verification method; verifiers reject documents with multiples. The constraint is on presence, not capability: the agent can be arbitrarily capable internally, but there is one seat per person per table.
+The same analysis eliminated the unbound "anonymous agents" the original architecture admitted: a stateless, non-initiating, context-scoped entity with no identity is a function rather than an agent, so outlets replaced the concept (Section 5.3). Two actor concepts remain, agents and outlets.
 
-The one-per-context constraint emerged from analysis of what happens without it. Even moderate-sized agent fleets create problems that compound with scale: force multiplication (one operator's agents outnumbering other participants), agent slot rental (a trusted identity lending its agent seats to untrusted operators), coordination risks (multiple agents from one identity amplifying each other), and ambiguity in trust evaluation (which of a person's agents do you evaluate?). One-per-context is the simplest constraint that eliminates all of these while preserving the human's power — their single agent can be arbitrarily capable, and they can participate in as many contexts as they have earned capacity for.
+**One agent per person per context.** A context admits at most one delegated agent identity per human identity (`09-security-model.md` §9.1 invariant 4). The constraint is on presence rather than capability: an agent may be arbitrarily capable, and there is one seat per person per table. Without it, agent fleets compound into force multiplication, seat rental, and ambiguity about which of a person's agents a counterparty evaluates.
 
-Three permission categories govern what each key can do:
+Three permission categories govern what each authority may do:
 
-- **Category A** (`#0` only): DID document modifications, key rotation. Human-exclusive, never delegable to the agent key. Structurally impossible for agents because the identity key is hardware-backed.
-- **Category B** (user-configurable): Operational actions — messaging, outlet invocation, governance votes. SDK defaults to human-only; the human can delegate subsets to the agent via UCAN.
-- **Category C** (context-configurable): Context governance can further restrict which key types are accepted for specific actions.
+- **Category A** (root only): establishment events — installing a root set, retiring an operational key, fixing a commitment. Never delegable.
+- **Category B** (user-configurable): messaging, outlet invocation, governance votes. The SDK defaults to human-only, and the human delegates subsets by UCAN.
+- **Category C** (context-configurable): further restrictions a context places on what it accepts from a delegated identity.
 
-The enforcement stack has five layers: custody separation (hardware vs. software keys) → SDK defaults (conservative) → verifier validation (signing key checks) → custody attestation (a DID document service entry declaring a key custody model, which a reader treats as software custody unless the entry carries a platform attestation proof and a verification of that proof returns a pass) → behavioral signals (participation history by key type).
+The enforcement stack runs five layers: custody separation, conservative SDK defaults, verifier validation against the key state, a separately signed custody attestation (the key state's own custody type is advisory, and a consumer reads it as software until a platform proof verifies), and behavioral signals by signing identity.
 
 ### 4.5 Identity Attestations
 
-Users can publish cryptographic attestations binding external platform identities to their DID. An attestation says: "The human behind `did:dht:z6Mk...` is the same human behind `@alice` on X." The attestation is non-transferable (bound to a specific DID and external identity), user-initiated, independently verifiable, revocable, and discoverable.
+Users can publish cryptographic attestations binding external platform identities to their own. An attestation says: "The human behind `<scp-identifier:alice>` is the same human behind `@alice` on X." The attestation is non-transferable (bound to one identifier and one external identity), user-initiated, independently verifiable, revocable, and discoverable.
 
 Attestations enable social graph import (resolving existing contacts who have joined SCP), shadow identity claiming (merging bridge-created representations with native identities), and cross-platform reputation continuity.
 
@@ -380,11 +350,11 @@ Governance models are pluggable. SCP defines a governance interface that accommo
 
 ### 5.3 Roles, Outlets, and Membership
 
-Contexts define roles with specific permission sets within the ceiling, visible before opt-in. Outlets are stateless functions registered with schemas, implementation hashes, test vectors, and operator DIDs. Membership is transparent — the roster is protocol state.
+Contexts define roles with specific permission sets within the ceiling, visible before opt-in. Outlets are stateless functions registered with schemas, implementation hashes, test vectors, and operator identifiers. Membership is transparent — the roster is protocol state.
 
 The protocol defines nine well-known context templates — bilateral-ephemeral, bilateral-persistent, coordination, group-discussion, public-broadcast, gated-broadcast, outlet-interface, paid-service, and paid-broadcast — each specifying default parameters for common interaction patterns. Templates are protocol-level identifiers, not SDK convenience: a joining agent can evaluate a context's template to make informed accept/reject decisions without parsing the full parameter set. This is architecturally significant for autonomous agents, which create and destroy contexts at high frequency — template-based creation reduces both the computational cost of context evaluation and the risk of misconfiguration.
 
-Broadcast contexts support two-tier membership: bounded MLS-group members (writers) and unbounded DID-authenticated subscribers (readers). This enables feed and broadcast patterns at scale without MLS group size limitations.
+Broadcast contexts support two-tier membership: bounded MLS-group members (writers) and unbounded `#active`-authenticated subscribers (readers). This enables feed and broadcast patterns at scale without MLS group size limitations.
 
 ### 5.4 Cross-Context Communication
 
@@ -424,15 +394,15 @@ The sender-side key layer provides selective confidentiality but intentionally d
 
 Content access operates at three tiers:
 
-- **Tier 1: DID-to-DID in-context.** Alice blocks Dave in a specific context. Dave loses access to Alice's content in that context only. Other members' content remains accessible.
-- **Tier 2: DID-to-DID global.** Alice blocks Dave across all shared contexts. Stored in identity private state, propagated to every shared context.
+- **Tier 1: identity-to-identity in-context.** Alice blocks Dave in a specific context. Dave loses access to Alice's content in that context only. Other members' content remains accessible.
+- **Tier 2: identity-to-identity global.** Alice blocks Dave across all shared contexts. Stored in identity private state, propagated to every shared context.
 - **Tier 3: Governance-gated.** Context governance revokes a member's access to all content in the context. Requires governance approval per the context's model.
 
 Each tier is enforced through three layers: sender key distribution denial (cryptographic exclusion), SDK-mandated state destruction (cached keys and plaintext destroyed on block), and access key wrapping (per-member AES-256 keys with AES-256-KW wrapping [4]). Restoration is forward-only — unblocking grants future access; historical content from the blocked period remains inaccessible.
 
 ### 6.4 Broadcast Mode Encryption
 
-Broadcast contexts use per-author AES-256-GCM keys without MLS. Subscribers register via DID-authenticated requests and receive the current epoch key through a request-response protocol. Blocking a subscriber rotates the author's key, excluding the blocked subscriber via the same pull model. Broadcast mode provides neither forward secrecy nor post-compromise security — key rotation occurs only on block events, not through automatic ratcheting. An attacker who compromises an author's broadcast key can decrypt all content encrypted under that key epoch. This is an explicit trade-off: broadcast mode prioritizes scalability and simplicity over the stronger security properties that MLS provides for encrypted contexts.
+Broadcast contexts use per-author AES-256-GCM keys without MLS. Subscribers register with `#active`-signed requests and receive the current epoch key through a request-response protocol. Blocking a subscriber rotates the author's key, excluding the blocked subscriber via the same pull model. Broadcast mode provides neither forward secrecy nor post-compromise security — key rotation occurs only on block events, not through automatic ratcheting. An attacker who compromises an author's broadcast key can decrypt all content encrypted under that key epoch. This is an explicit trade-off: broadcast mode prioritizes scalability and simplicity over the stronger security properties that MLS provides for encrypted contexts.
 
 ### 6.5 Metadata Privacy
 
@@ -444,11 +414,11 @@ SCP provides layered metadata protections: per-context pseudonymous routing IDs,
 
 ### 7.1 UCAN-Based Capability Tokens
 
-SCP uses UCAN (User Controlled Authorization Networks) [12] for capability-based authorization. Capability tokens are fine-grained, per-agent, per-context, per-capability. Every protocol action requires a valid token; no action proceeds on identity or reputation alone.
+SCP uses UCAN (User Controlled Authorization Networks) [11] for capability-based authorization. Capability tokens are fine-grained, per-agent, per-context, per-capability. Every protocol action requires a valid token; no action proceeds on identity or reputation alone.
 
 UCANs provide verifiable delegation chains — any token can be traced back to the root authority that granted it. Tokens are independently revocable: a human can revoke one capability from one agent in one context without affecting anything else.
 
-Under the shared-DID model, intra-DID delegation uses self-delegation UCANs where `iss == aud` (same DID) with `fct.scp_key_scope: "#agent"` — the mechanism by which a human authorizes their agent key to perform specific actions.
+A human authorizes its agent by issuing a UCAN to the agent's own identity, attenuated to the actions it may take. The identity binding is separate and structural: the human's key-event log anchors the agent identity's establishment events (Section 4.4). How a controller produces that anchor and how a verifier checks it is unspecified, and until it is specified a verifier rejects every chain claiming a delegator, so no delegated agent identity resolves today.
 
 ### 7.2 Capability Categories
 
@@ -472,7 +442,7 @@ Economic policy can be locked via governance action, making it immutable once th
 
 ### 8.1 Automatic Provenance Attachment
 
-Provenance is a foundational property of every protocol action. The protocol attaches provenance records automatically when data crosses context boundaries through protocol mechanisms. No manual tagging is required. The provenance data model is designed for the cross-context agent communication case specifically, complementing general-purpose provenance frameworks such as W3C PROV [26] and media-focused provenance systems such as C2PA [27].
+Provenance is a foundational property of every protocol action. The protocol attaches provenance records automatically when data crosses context boundaries through protocol mechanisms. No manual tagging is required. The provenance data model is designed for the cross-context agent communication case specifically, complementing general-purpose provenance frameworks such as W3C PROV [25] and media-focused provenance systems such as C2PA [26].
 
 A provenance record contains: source context, source type (persistent, ephemeral, or summary — reflecting current verifiability), counterparties present in the source interaction, purpose, discovery method, age, memory scope, chain depth (number of context boundaries crossed), chain path (ordered list of intermediary contexts), and optional economic provenance (what the data cost to produce).
 
@@ -511,12 +481,12 @@ Devices that are not always online need relays for message delivery. Relays hold
 SCP relays are:
 
 - **Protocol-unaware.** Relays store and forward encrypted blobs. They do not interpret protocol semantics. This keeps relay implementation simple and prevents relay operators from gaining protocol-level influence.
-- **Substitutable.** Switching relays requires no identity change, no context migration, no social disruption. Identity is DID-based, not relay-based. This is the key structural difference from Matrix homeservers, where the homeserver owns the identity (`@user:server`).
+- **Substitutable.** Switching relays requires no identity change, no context migration, no social disruption. Identity rests on the key-event log, not on a relay. This is the key structural difference from Matrix homeservers, where the homeserver owns the identity (`@user:server`).
 - **Untrusted for content.** Relays see encrypted payloads. They cannot read content, inspect membership, or understand context semantics. A compromised relay can delay or drop messages; it cannot compromise confidentiality or integrity.
 
 ### 9.2 Native Relay Protocol
 
-The SCP native relay protocol defines nine operations over WebSocket with MessagePack binary frames, organized in three groups: data operations (PUBLISH, SUBSCRIBE, UNSUBSCRIBE, QUERY, DELETE, ACK), keepalive (PING), and bridge operations (BRIDGE_REGISTER, BRIDGE_DATA for relay-to-relay proxying).
+The SCP native relay protocol defines nine operations over WebSocket with MessagePack binary frames, organized in three groups: six client operations (PUBLISH, SUBSCRIBE, UNSUBSCRIBE, QUERY, DELETE, ACK), keepalive (PING), and bridge operations (BRIDGE_REGISTER, BRIDGE_DATA for relay-to-relay proxying).
 
 ### 9.3 Transport Abstraction
 
@@ -532,7 +502,7 @@ The protocol functions correctly on any transport that implements the adapter tr
 
 ### 9.4 Deployment Spectrum
 
-SCP is online-first — designed for always-connected agents — but deployable from anywhere. In the tradition of local-first software [14], a user's device is a full protocol participant, not a client that talks to a server. The infrastructure overhead of running the protocol is negligible compared to the agent runtime itself.
+SCP is online-first — designed for always-connected agents — but deployable from anywhere. In the tradition of local-first software [13], a user's device is a full protocol participant, not a client that talks to a server. The infrastructure overhead of running the protocol is negligible compared to the agent runtime itself.
 
 The deployment spectrum ranges from phones (full participants when online, relays for offline delivery), through laptops (persistent daemons, potential personal relays), agent workstations (dedicated always-on hardware — natural SCP nodes), personal servers (power users), to managed infrastructure (convenience and high availability). All points on the spectrum are simultaneously valid; a user can operate at multiple points at once.
 
@@ -556,7 +526,7 @@ The reconnection protocol proceeds in six phases: relay catch-up, MLS epoch reco
 
 ### 10.1 Protocol-Level Discovery
 
-Contexts with discovery tools are standard SCP contexts with open join policies and standardized tool schemas (`agent_search`, `agent_register`, `agent_deregister`). They use a two-tier membership model: MLS members (bounded writers who process registrations and maintain governance) and DID-authenticated readers (unbounded, query via tool endpoints without MLS membership).
+Contexts with discovery tools are standard SCP contexts with open join policies and standardized tool schemas (`agent_search`, `agent_register`, `agent_deregister`). They use a two-tier membership model: MLS members (bounded writers who process registrations and maintain governance) and `#active`-authenticated readers (unbounded, query via tool endpoints without MLS membership).
 
 The SDK ships with default bootstrap context IDs, analogous to DNS root servers. These are starting points, not privileged authorities — anyone can create and operate a context with discovery tools.
 
@@ -566,7 +536,7 @@ SCP provides five resolution mechanisms with graceful degradation:
 
 1. **Petnames.** User-assigned local names stored in identity private state. Zero infrastructure, always functional.
 2. **Context handles.** SCP-native, DNS-free, community-governed. `alice@cooking-community` resolves through the cooking-community context.
-3. **Attestation-backed handles.** External platform identity → DID reverse lookup via attestation indices in contexts with discovery tools.
+3. **Attestation-backed handles.** External platform identity → identifier reverse lookup via attestation indices in contexts with discovery tools.
 4. **Domain handles.** `.well-known/scp` extension for web compatibility.
 5. **Unscoped resolution.** Try all layers, return merged results with trust levels.
 
@@ -586,9 +556,9 @@ The protocol distinguishes between what it defends against (confidentiality brea
 
 **Confidentiality.** MLS provides group encryption with forward secrecy and post-compromise security. Sender-side keys provide per-sender encryption. Relays see only encrypted blobs (Section 9.1).
 
-**Integrity.** Merkle event logs provide tamper-evident history. BEP44 signatures verify DID documents. UCAN chain validation ensures authorization. Inner envelope signatures provide non-repudiation.
+**Integrity.** Merkle event logs provide tamper-evident history. A key-event log verifies against the identifier derived from its own first event. UCAN chain validation ensures authorization. Inner envelope signatures provide non-repudiation.
 
-**Accountability.** Every action traces to a human DID via the shared-DID model. The `signing_key_id` field provides unforgeable human-vs-agent attribution on every signed message.
+**Accountability.** Every action traces to a human identity, directly or through the delegation anchor of Section 4.4. The signing identity provides unforgeable human-versus-agent attribution on every signed message.
 
 **Forward secrecy and post-compromise security.** MLS epoch ratcheting. The SDK issues MLS Update proposals after reconnection to restore post-compromise security.
 
@@ -600,7 +570,7 @@ Provably guaranteeing one identity per human in a decentralized system without i
 
 Trust signals include social attestations (cryptographic proof of external platform accounts), device attestations (platform-signed hardware proofs), participation history (duration and breadth across contexts), behavioral records (governance actions, outlet invocations), economic activity (real spending recorded in payment receipts), and endorsements from established identities.
 
-The key insight: multiple attestations on one DID is a strength signal. A DID with device attestation from an iPhone, social attestations from multiple platforms, months of participation history, and clean behavioral records is highly expensive to forge. Sybil accounts are broad but shallow — they cannot sustain depth across many identities.
+The key insight: multiple attestations on one identity is a strength signal. An identity with device attestation from an iPhone, social attestations from multiple platforms, months of participation history, and clean behavioral records is highly expensive to forge. Sybil accounts are broad but shallow — they cannot sustain depth across many identities.
 
 Three layers compose: earned capacity (new identities start limited, earning through participation), social and economic cost (real accounts, real money, real endorsements compound the cost of sybil maintenance), and context-level thresholds (contexts set their own admission requirements from available signals).
 
@@ -613,10 +583,10 @@ Traffic analysis by a sophisticated adversary with visibility into relay traffic
 ### 11.5 Key Security Invariants
 
 1. Agents are context-bound — no protocol-level cross-context awareness.
-2. One agent per person per context (DID document cardinality enforcement).
+2. One agent per person per context — a context admits at most one delegated agent identity per human identity (`09-security-model.md` §9.1 invariant 4).
 3. Outlets are stateless and non-agentic.
-4. Category A actions (`#0` only) are structurally impossible for agents (hardware custody separation).
-5. `signing_key_id` provides unforgeable human-vs-agent attribution on every signed message.
+4. Category A actions are the root's alone, and no delegation reaches them.
+5. The signing identity provides unforgeable human-versus-agent attribution on every signed message.
 6. Context metadata is transparent before opt-in.
 7. Role assignment is non-negotiable — agents cannot request elevated permissions.
 
@@ -628,11 +598,11 @@ Traffic analysis by a sophisticated adversary with visibility into relay traffic
 
 | Property | SCP | Matrix | AT Protocol | Nostr | Signal | Holepunch | MCP |
 |----------|-----|--------|-------------|-------|--------|-----------|-----|
-| **Identity** | Self-sovereign DID, multi-key, shared human-agent | Server-bound (`@user:server`) | `did:plc` (PLC directory) | Keypair | Phone number | Keypair (per-feed) | N/A |
-| **Resolution** | Dual-layer (relay + DHT), self-healing | Homeserver | PLC directory | Relay + NIP-05 | Phone registry | DHT | N/A |
-| **Encryption** | MLS + sender keys | Megolm | None | NIP-44 (pairwise) | Double Ratchet [13] | Noise XX (transport) | N/A |
+| **Identity** | Self-certifying, inception-derived, key-event log | Server-bound (`@user:server`) | `did:plc` (PLC directory) | Keypair | Phone number | Keypair (per-feed) | N/A |
+| **Resolution** | Log replay over SCP relays | Homeserver | PLC directory | Relay + NIP-05 | Phone registry | DHT | N/A |
+| **Encryption** | MLS + sender keys | Megolm | None | NIP-44 (pairwise) | Double Ratchet [12] | Noise XX (transport) | N/A |
 | **Group encryption** | MLS [2] | Megolm (custom) | None | None | Signal Groups | Undocumented | N/A |
-| **Agent accountability** | Protocol-level (shared DID) | None | None | None | None | None | None |
+| **Agent accountability** | Protocol-level (delegation anchored in the human's log) | None | None | None | None | None | None |
 | **Context isolation** | Cryptographic | Room-based (application-level) | None | None | N/A | None | N/A |
 | **Capabilities** | UCAN (fine-grained delegation) | Power levels | None | None | None | None | Tool permissions |
 | **Provenance** | Protocol-level, automatic | Server signatures | Repo signatures | Event signatures | None | Signature-level | None |
@@ -646,12 +616,11 @@ Traffic analysis by a sophisticated adversary with visibility into relay traffic
 SCP builds on established standards rather than inventing from scratch where good solutions exist:
 
 - **MLS** [2] from IETF: group key management with formal security analysis.
-- **DID** [10] from W3C: the identity abstraction, with did:dht's self-certification property.
-- **UCAN** [12] from the community working group: capability-based authorization with delegation chains.
+- **KERI** [24]: the inception-derived self-certifying identifier and the pre-rotation commitment, re-encoded in SCP's own format.
+- **UCAN** [11] from the community working group: capability-based authorization with delegation chains.
 - **Merkle trees** from distributed systems: tamper-evident history.
-- **BEP44** [11] from BitTorrent: signed mutable items on Mainline DHT.
 
-The relay model is informed by Nostr's simplicity [17]. Federation lessons are informed by Matrix's experience [15]. The append-only log primitive draws from the same well-understood lineage as Hypercore [19]. DHT-integrated hole punching is validated by Hyperswarm [18]. Keet [23] provides existence proof that zero-server encrypted group messaging works at production scale.
+The relay model is informed by Nostr's simplicity [16]. Federation lessons are informed by Matrix's experience [14]. The append-only log primitive draws from the same well-understood lineage as Hypercore [18]. DHT-integrated hole punching is validated by Hyperswarm [17]. Keet [22] provides existence proof that zero-server encrypted group messaging works at production scale.
 
 ### 12.3 Contributions
 
@@ -659,15 +628,14 @@ SCP's contributions are architectural — the composition of established primiti
 
 **Novel to SCP:**
 
-- **The shared-DID model for human-agent accountability.** Human and agent share one DID with distinct signing keys (`#active`, `#agent`). The `signing_key_id` field on every signed message provides structural action provenance — verifiers distinguish human from agent authorship cryptographically, not by self-report. No existing protocol binds agents to human accountability chains through shared identity with per-key attribution.
+- **Agent accountability anchored in a human's key-event log.** An agent holds its own identity, and the human's log anchors that identity's establishment events, so a verifier reads the responsible human from the agent's own chain rather than from a self-reported claim and the human cannot disown the agent. No existing protocol binds agents to human accountability chains this way.
 - **Context isolation as the primary security boundary** for multi-agent interaction. While group key isolation exists in other protocols (Matrix rooms use separate Megolm sessions, for example), SCP makes isolation the *organizing principle*: all cross-context data flow is mediated by governed protocol mechanisms with provenance, chain depth limits, and bilateral governance consent. The contribution is the design philosophy and its systematic enforcement, not the underlying group key separation.
 - **The sender-side key layer** enabling per-sender blocking without MLS group disruption. Double encryption (sender key then MLS group key) with a pull-based key distribution model decouples content access from group membership. Signal Groups v2 uses a structurally similar per-sender symmetric key layer, but for performance rather than access control. SCP's contribution is applying per-sender keys to selective blocking — denying key distribution to specific members without MLS group disruption — which is not present in Signal, MLS, or Megolm.
 
 **Novel applications of known techniques:**
 
-- **Multi-key identity architecture** extending KERI's [25] pre-rotation approach with agent signing keys and graduated permission categories (A/B/C) within a DID document.
-- **Cross-context provenance model** applying W3C PROV [26] concepts to the agent communication case: automatic attachment at context boundaries, ordered quality tiers, and chain depth enforcement.
-- **Dual-layer DID resolution** providing multi-homed resolution across SCP relays and Mainline DHT with protocol-level self-healing (re-publishing fresher documents to stale backends).
+- **Cross-context provenance model** applying W3C PROV [25] concepts to the agent communication case: automatic attachment at context boundaries, ordered quality tiers, and chain depth enforcement.
+- **A key-event log in KERI's [24] shape**, encoded in SCP's own format, resolved by replay across the identity's own relays and a shipped fallback set, with a proof-of-control obligation on every relay a first contact reads.
 - **Encryption-as-access-control** where MLS group keys constitute the membership boundary and relays are structurally untrusted.
 
 ### 12.4 Hypercore Comparison
@@ -678,29 +646,28 @@ Hypercore is the closest structural parallel to SCP's event logs — both are ap
 |-----------|-----------|----------------|
 | Structure | Append-only log, Merkle tree | Append-only log, Merkle tree |
 | Hash function | BLAKE2b-256 | SHA-256 |
-| Signing | Ed25519, single writer per log | Ed25519, multi-writer per context (MLS-authenticated) |
+| Signing | Ed25519, single writer per log | ECDSA on P-256, multi-writer per context (MLS-authenticated) |
 | Multi-writer | Autobase (app-layer DAG linearization) | Native via MLS group membership |
 | Encryption | None at log level; transport-level only | MLS + sender-side AES-256-GCM at log level |
 | Governance | None | Full: 30 action types, pluggable engines |
 
 Hypercore is a data structure; SCP event logs are a data structure embedded in a governance and encryption context. Autobase composes multi-writer from single-writer feeds; SCP starts multi-writer (MLS groups) and single-writer is the degenerate one-member group.
 
-### 12.5 did:dht Comparison
+### 12.5 Mutable-Record Identity Methods
 
-SCP builds on did:dht's self-certification property but extends it significantly. The comparison illuminates what SCP's identity layer adds:
+SCP's identity layer resolved a mutable record until August 2026 and replays a log now. The comparison records what the log gives that the record did not:
 
-| Property | did:dht | SCP Identity Layer |
+| Property | A mutable-record method | SCP Identity Layer |
 |----------|---------|-------------------|
-| Self-certification | Yes (BEP44) | Yes (same BEP44) |
-| Resolution backends | Mainline DHT only | Dual-layer: SCP relays + Mainline DHT |
-| Key architecture | Single Ed25519 keypair | Multi-key: identity (`#0`) / human signing (`#active`) / pre-rotation / agent signing (`#agent`) |
-| Rotation safety | No pre-rotation commitment | Pre-rotation key hash published in advance |
-| Self-healing | None | Protocol-level: fresher document re-published to stale layer |
-| TTL management | ~2 hour republish | Dual-cycle: 2h (DHT) + 6d (relay, 7d TTL) |
-| Payload limit | 1000 bytes (BEP44) | 1000 bytes (DHT fallback), 256KB (relay layer) |
-| Governance risk | Original maintainer shut down Nov 2024; stewardship transferred to DIF | Insulated — depends only on BEP44 + Ed25519, not on did:dht software |
+| Self-certification | The identifier encodes the current public key | The identifier is the digest of the log's first event, so it survives every key change |
+| Resolution | Read the highest-sequence record from a distributed hash table | Replay the log from the identity's own relays and a shipped fallback set |
+| Key architecture | One signing keypair | A threshold root set, one operational key, and a committed next set, all P-256 |
+| Rotation safety | No pre-rotation commitment | Every establishment event commits to the digests of the next root keys |
+| Fork handling | The highest sequence number wins | The root authority behind each chain decides, and an equal rank leaves the identity contested |
+| Freshness | Periodic republish against the record's expiry | The log's own highest-sequence event, which no relay signs |
+| Payload limit | 1000 bytes per record | 256 KB per relay frame |
 
-SCP identities are simultaneously did:dht-compatible (resolvable by standard did:dht resolvers via the DHT layer) and more resilient (dual-layer with self-healing). The multi-key architecture provides key compromise recovery without changing the DID — extending KERI's [25] pre-rotation approach with custody separation between human and agent operations and graduated permission categories.
+Reliability of the distributed hash table is not what decided it. A method whose resolution reads a mutable record lets the newest record a reader can reach define the current key state, so an adversary who suppresses one record pins that reader to a superseded key. A log the reader replays removes that lever, because the reader verifies every event itself.
 
 ---
 
@@ -711,13 +678,13 @@ SCP identities are simultaneously did:dht-compatible (resolvable by standard did
 The reference implementation is in Rust, organized as a cargo workspace:
 
 - **scp-core:** Protocol logic — contexts, agents, trust, capabilities, governance, encryption, provenance, event logs, sync.
-- **scp-identity:** DID management, DHT resolution, key rotation, document lifecycle.
+- **scp-identity:** key-event log construction and verification, identity resolution, key rotation, service records.
 - **scp-transport:** Transport abstraction, adapter implementations, relay protocol.
 - **scp-platform:** Platform-specific integrations — key custody, push notifications, device attestation.
 - **scp-ffi:** FFI bridge layer — PyO3 (Python), UniFFI (Swift, Kotlin), napi-rs (TypeScript).
 - **scp-node:** Full protocol node combining core, transport, and platform.
 
-The workspace includes eleven additional crates: scp-event-log (Merkle log), scp-media (media key derivation), scp-relay (standalone relay binary), scp-testing (conformance macros), scp-mcp (MCP integration), scp-clock (wall-clock port), scp-crypto (Ed25519 verification), scp-did (DID data model), scp-mls (synchronous MLS state machine), scp-client (in-browser participant driver), and scp-client-wasm (wasm-bindgen browser surface).
+The workspace includes eleven additional crates: scp-event-log (Merkle log), scp-media (media key derivation), scp-relay (standalone relay binary), scp-testing (conformance macros), scp-mcp (MCP integration), scp-clock (wall-clock port), scp-crypto (P-256 signature verification), scp-did (identity data model), scp-mls (synchronous MLS state machine), scp-client (in-browser participant driver), and scp-client-wasm (wasm-bindgen browser surface).
 
 Language bindings: Python (PyO3), Swift (UniFFI), Kotlin (UniFFI), TypeScript (napi-rs).
 
@@ -765,7 +732,7 @@ The security analysis (Section 11) addresses specific residual attack surfaces �
 
 ### 14.3 Standardization Path
 
-The current specification is self-published under CC-BY 4.0. The near-term path includes extraction of a standalone protocol specification document (implementation-agnostic, suitable for independent implementation), language-neutral test vectors, and a protocol evolution mechanism. The long-term trajectory follows AT Protocol's [16] model: IETF submission for core cryptographic subsystems once they have sufficient independent review and implementation experience.
+The current specification is self-published under CC-BY 4.0. The near-term path includes extraction of a standalone protocol specification document (implementation-agnostic, suitable for independent implementation), language-neutral test vectors, and a protocol evolution mechanism. The long-term trajectory follows AT Protocol's [15] model: IETF submission for core cryptographic subsystems once they have sufficient independent review and implementation experience.
 
 ---
 
@@ -773,7 +740,7 @@ The current specification is self-published under CC-BY 4.0. The near-term path 
 
 SCP provides the durable connective tissue for a world of ephemeral, generated software. When building software is trivial but connecting it is not, the bottleneck shifts from code to social infrastructure.
 
-The protocol's contribution is a coherent architecture that composes established cryptographic primitives — MLS for group encryption, DIDs for identity, UCANs for authorization, Merkle trees for integrity — into a system designed from the ground up for autonomous agents. Context isolation provides the security boundary. Encryption constitutes access control. Provenance is automatic and structural. Every agent traces to a human through cryptographic binding. The trust surface shrinks as behavioral evidence accumulates.
+The protocol's contribution is a coherent architecture that composes established cryptographic primitives — MLS for group encryption, key-event logs for identity, UCANs for authorization, Merkle trees for integrity — into a system designed from the ground up for autonomous agents. Context isolation provides the security boundary. Encryption constitutes access control. Provenance is automatic and structural. Every agent traces to a human through cryptographic binding. The trust surface shrinks as behavioral evidence accumulates.
 
 Three observations emerged from the design process and shaped the protocol's architecture. First, that the human must remain the root of trust and accountability even as agents become the primary actors — not because agents are untrustworthy, but because accountability requires a locus that cannot be manufactured computationally. Second, that isolation is a stronger security primitive than governance — a protocol that prevents cross-context infection by construction is fundamentally more secure than one that tries to govern it after the fact. Third, that the protocol that agents reach for first when building connected software will, over time, become the substrate for most connected software — and that this protocol must be open, interoperable with existing platforms, and independent of any single operator.
 
@@ -783,7 +750,7 @@ The specification is published under CC-BY 4.0 and covers the full protocol surf
 
 ## Appendix A: Notation and Cryptographic Primitives
 
-**Notation.** `#0`, `#active`, and `#agent` refer to DID document verification method identifiers. `iss == aud` denotes a UCAN self-delegation where the issuer and audience are the same DID. `fct.scp_key_scope` is a UCAN facts field constraining delegation to a specific key. Category A/B/C refers to the permission categories defined in Section 4.4.
+**Notation.** `#active` names the one operational role an identity's key state carries; the root is a set of keys with a threshold rather than a named method. Category A/B/C refers to the permission categories defined in Section 4.4.
 
 | Primitive | Standard | Usage in SCP |
 |-----------|----------|-------------|
@@ -793,12 +760,12 @@ The specification is published under CC-BY 4.0 and covers the full protocol surf
 | AES-256-KW | RFC 3394 [4] | Content access key wrapping |
 | HPKE (Base mode) | RFC 9180 [3] | Key distribution (sender keys, access keys, broadcast keys, MLS Welcome messages) |
 | HKDF | RFC 5869 [5] | Key derivation (pseudonym secrets, routing IDs, within HPKE) |
-| HMAC-SHA256 | RFC 2104 [21] | Key derivation within HKDF, pseudonym derivation |
-| Ed25519 | RFC 8032 [6] | Signatures (DID documents, inner envelopes, BEP44) |
-| X25519 | RFC 7748 [7] | Diffie-Hellman key agreement (HPKE KEM, MLS tree) |
+| HMAC-SHA256 | RFC 2104 [20] | Key derivation within HKDF, pseudonym derivation |
+| ECDSA on P-256 | FIPS 186-5 [6] | Signatures (key events, inner envelopes, attestations, service records) |
+| ECDH on P-256 | NIST SP 800-56A Rev. 3 [7] | Diffie-Hellman key agreement (HPKE KEM, MLS tree) |
 | SHA-256 | FIPS 180-4 [8] | Hashes (Merkle trees, content addressing, routing ID derivation) |
 
-**Serialization:** MessagePack [22] with a canonical encoding profile (most compact representation for each type) is used for deterministic binary serialization of protocol messages. It is not a cryptographic primitive but is security-relevant: deterministic encoding is required for reproducible signature verification.
+**Serialization:** MessagePack [21] with a canonical encoding profile (most compact representation for each type) is used for deterministic binary serialization of protocol messages. It is not a cryptographic primitive but is security-relevant: deterministic encoding is required for reproducible signature verification.
 
 **Security level note:** The MLS ciphersuite's AES-128-GCM AEAD provides 128-bit security for the group encryption layer. The sender-side and content access layers use AES-256-GCM (256-bit). The effective security level of the composed system is bounded by the weakest layer — 128 bits — which is considered sufficient for current and near-term threat models.
 
@@ -810,10 +777,9 @@ Constants are organized into three tiers per ADR-043.
 
 | Constant | Value | Purpose |
 |----------|-------|---------|
-| MLS ciphersuite | MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 | Single non-negotiable ciphersuite |
+| MLS ciphersuite | MLS_128_DHKEMP256_AES128GCM_SHA256_P256 | Single non-negotiable ciphersuite |
 | Bucket padding sizes | 256, 1024, 4096, 16384, 65536, 262144 bytes | Fixed-size outer envelopes (all implementations must agree) |
 | Sender key grace period | 30 seconds | Key transition overlap (ADR-001 criterion 6: bounds forward secrecy window) |
-| DHT republish interval | 7200 seconds (2 hours) | BEP44 expiry (external constraint) |
 
 ### Tier 2: Configurable Parameters (protocol defines mechanism, deployers/contexts set value)
 
@@ -823,7 +789,7 @@ Constants are organized into three tiers per ADR-043.
 | Chain depth limit | 8 | [1, 255] (u8) | Cross-context data flow hops. No protocol hard max. |
 | Session cap per caller | 1000 | [1, u32 max] | Outlet session resource bound per context. |
 | Relay blob TTL | 604800 seconds (7 days) | [1, ∞] | Relay operator configuration. |
-| Relay republish interval | Derived: max(TTL - 86400, TTL / 2, 60) | Derived | Identity-layer DID document re-publication. |
+| Relay republish interval | Derived: max(TTL - 86400, TTL / 2, 60) | Derived | Key-event-log and service-record re-publication. |
 
 ### Tier 3: Implementation Recommendations (SDK defaults, not protocol constants)
 
@@ -838,7 +804,9 @@ Constants are organized into three tiers per ADR-043.
 
 **Context.** A bounded, governed, encrypted interaction space. The fundamental unit of interaction in SCP. All communication occurs within contexts.
 
-**DID (Decentralized Identifier).** A W3C standard [10] for self-sovereign cryptographic identity. SCP uses `did:dht` as the primary method.
+**DID (Decentralized Identifier).** A W3C standard [10] for self-sovereign cryptographic identity. SCP publishes no document under that standard and derives its identifier from its own inception event instead. A `did:scp` string stays a deferred, unbuilt facade (ADR-063).
+
+**Key-Event Log.** An identity's append-only chain of establishment events. The digest of its first event is the identifier, and replaying it yields the current key state.
 
 **UCAN (User Controlled Authorization Network).** Capability tokens with verifiable delegation chains. The authorization mechanism for all protocol actions.
 
@@ -866,7 +834,7 @@ Constants are organized into three tiers per ADR-043.
 
 **Shadow Identity.** A protocol-level representation of an entity from an external platform, created by a bridge connector. Claimable by the real user via identity attestation.
 
-**Signing Key ID.** A field on every signed message identifying which verification method (`#active` or `#agent`) produced the signature. Provides structural action provenance.
+**Signing Key ID.** A field on every signed message naming the operational role that produced the signature, `#active`. The signing identity, not this field, separates a human-direct action from an agent-autonomous one.
 
 ---
 
@@ -882,9 +850,9 @@ Constants are organized into three tiers per ADR-043.
 
 [5] H. Krawczyk and P. Eronen, "HMAC-based Extract-and-Expand Key Derivation Function (HKDF)," RFC 5869, IETF, May 2010.
 
-[6] S. Josefsson and I. Liusvaara, "Edwards-Curve Digital Signature Algorithm (EdDSA)," RFC 8032, IETF, January 2017.
+[6] National Institute of Standards and Technology, "Digital Signature Standard (DSS)," FIPS 186-5, February 2023.
 
-[7] A. Langley, M. Hamburg, and S. Turner, "Elliptic Curves for Security," RFC 7748, IETF, January 2016.
+[7] E. Barker, L. Chen, A. Roginsky, A. Vassilev, and R. Davis, "Recommendation for Pair-Wise Key-Establishment Schemes Using Discrete Logarithm Cryptography," NIST SP 800-56A Rev. 3, April 2018.
 
 [8] National Institute of Standards and Technology, "Secure Hash Standard (SHS)," FIPS 180-4, August 2015.
 
@@ -892,36 +860,34 @@ Constants are organized into three tiers per ADR-043.
 
 [10] W3C, "Decentralized Identifiers (DIDs) v1.0," W3C Recommendation, July 2022.
 
-[11] S. Siloti, "BEP44: Storing Arbitrary Data in the DHT," BitTorrent Enhancement Proposal 44, 2014.
+[11] B. Zelenka and P. Krüger, "UCAN Specification v1.0," UCAN Working Group, 2024.
 
-[12] B. Zelenka and P. Krüger, "UCAN Specification v1.0," UCAN Working Group, 2024.
+[12] M. Marlinspike and T. Perrin, "The Double Ratchet Algorithm," Signal Foundation, November 2016.
 
-[13] M. Marlinspike and T. Perrin, "The Double Ratchet Algorithm," Signal Foundation, November 2016.
+[13] M. Kleppmann, A. Wiggins, P. van Hardenberg, and M. McGranaghan, "Local-first software: You own your data, in spite of the cloud," in *Proceedings of the ACM SIGPLAN International Symposium on New Ideas, New Paradigms, and Reflections on Programming and Software (Onward!)*, 2019.
 
-[14] M. Kleppmann, A. Wiggins, P. van Hardenberg, and M. McGranaghan, "Local-first software: You own your data, in spite of the cloud," in *Proceedings of the ACM SIGPLAN International Symposium on New Ideas, New Paradigms, and Reflections on Programming and Software (Onward!)*, 2019.
+[14] The Matrix.org Foundation, "Matrix Specification," matrix.org/docs/spec, 2024.
 
-[15] The Matrix.org Foundation, "Matrix Specification," matrix.org/docs/spec, 2024.
+[15] J. Graber, "AT Protocol Specification," atproto.com/specs, 2024.
 
-[16] J. Graber, "AT Protocol Specification," atproto.com/specs, 2024.
+[16] Nostr Protocol, "Nostr Implementation Possibilities," github.com/nostr-protocol/nips, 2024.
 
-[17] Nostr Protocol, "Nostr Implementation Possibilities," github.com/nostr-protocol/nips, 2024.
+[17] M. Buus, "Hyperswarm," Holepunch, github.com/holepunchto/hyperswarm, 2023.
 
-[18] M. Buus, "Hyperswarm," Holepunch, github.com/holepunchto/hyperswarm, 2023.
+[18] M. Buus and Holepunch, "Hypercore Protocol," github.com/holepunchto/hypercore, 2023.
 
-[19] M. Buus and Holepunch, "Hypercore Protocol," github.com/holepunchto/hypercore, 2023.
+[19] Anthropic, "Model Context Protocol Specification," modelcontextprotocol.io, 2024.
 
-[20] Anthropic, "Model Context Protocol Specification," modelcontextprotocol.io, 2024.
+[20] H. Krawczyk, M. Bellare, and R. Canetti, "HMAC: Keyed-Hashing for Message Authentication," RFC 2104, IETF, February 1997.
 
-[21] H. Krawczyk, M. Bellare, and R. Canetti, "HMAC: Keyed-Hashing for Message Authentication," RFC 2104, IETF, February 1997.
+[21] S. Furuhashi, "MessagePack Specification," msgpack.org, 2013.
 
-[22] S. Furuhashi, "MessagePack Specification," msgpack.org, 2013.
+[22] Holepunch (Pear Runtime), "Keet: Peer-to-peer encrypted group messaging," keet.io, 2024.
 
-[23] Holepunch (Pear Runtime), "Keet: Peer-to-peer encrypted group messaging," keet.io, 2024.
+[23] B. Laurie, A. Langley, and E. Kasper, "Certificate Transparency," RFC 6962, IETF, June 2013.
 
-[24] B. Laurie, A. Langley, and E. Kasper, "Certificate Transparency," RFC 6962, IETF, June 2013.
+[24] S. Smith, "Key Event Receipt Infrastructure (KERI)," arXiv:1907.02143, 2019. Pre-rotation key commitment mechanism.
 
-[25] S. Smith, "Key Event Receipt Infrastructure (KERI)," arXiv:1907.02143, 2019. Pre-rotation key commitment mechanism.
+[25] L. Moreau and P. Missier, Eds., "PROV-DM: The PROV Data Model," W3C Recommendation, April 2013.
 
-[26] L. Moreau and P. Missier, Eds., "PROV-DM: The PROV Data Model," W3C Recommendation, April 2013.
-
-[27] Coalition for Content Provenance and Authenticity (C2PA), "C2PA Technical Specification," c2pa.org, 2024.
+[26] Coalition for Content Provenance and Authenticity (C2PA), "C2PA Technical Specification," c2pa.org, 2024.
