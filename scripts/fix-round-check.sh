@@ -638,12 +638,17 @@ PYEOF
 # entry of each crate's `[features]` table, which the helper above does not read, so no
 # dependency declaration requests them and the third entry below names them. It copies the
 # `--features` string of the `rust-clippy` job's scp-transport cloud-backend command.
-# `cloud-blobs` itself gates no code in scp-node or scp-relay, so this list carries no
-# entry for either crate.
+# `cloud-blobs` itself gates one test in each of scp-node and scp-relay
+# (`the_cloud_blobs_feature_compiles_both_cloud_backends`), so the fourth and fifth
+# entries compile each crate with it. The scp-node entry adds `testing`, because this
+# loop checks `--all-targets` and the crate's other integration tests and its example
+# need that feature.
 EXTRA_FEATURE_CHECKS=(
     "scp-transport|quic,http3,udp,coap"
     "scp-transport|combined,local-cache"
     "scp-transport|postgres-blob,s3-blob,startup,sqlite-blob,redb-blob"
+    "scp-relay|cloud-blobs"
+    "scp-node|cloud-blobs,testing"
     "scp-testing|sqlite"
 )
 

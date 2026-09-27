@@ -1023,6 +1023,16 @@ jobs:
           # module is read by the Rust half of the stub policy. The feature list
           # is the one an operator ships with `--features cloud-blobs`.
           cargo clippy -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob --all-targets -- -D warnings
+          # scp-relay and scp-node each compile a test only under their own
+          # `cloud-blobs` feature (`the_cloud_blobs_feature_compiles_both_cloud_backends`
+          # in each crate's backend-selection integration test), and no command
+          # above resolves either crate with that feature, so without these two
+          # lines no clippy command reads that code. The scp-node line names the
+          # targets job rust-test-optional-features runs under the same feature,
+          # because the crate's other integration tests and its example need
+          # `testing`; `--profile test` makes clippy read the binary's unit tests.
+          cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings
+          cargo clippy -p scp-node --features cloud-blobs --bin scp-node --test storage_backend_selection --profile test -- -D warnings
 
   # This job runs `cargo nextest run --workspace`, so a merge gate rests on it.
   # It gates on `rust` at job level, never at step level. It carried seven

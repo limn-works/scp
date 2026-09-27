@@ -97,6 +97,12 @@ if $HAS_RUST; then
     # policy. Job rust-clippy in .github/workflows/ci.yml carries the same line.
     cargo clippy -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob --all-targets \
       -- -D warnings 2>&1 || { echo "  ✗ clippy (cloud blob backends) failed"; exit 1; }
+    # The test each binary compiles only under its own `cloud-blobs` feature.
+    # Job rust-clippy in .github/workflows/ci.yml carries the same two lines.
+    cargo clippy -p scp-relay --features cloud-blobs --all-targets \
+      -- -D warnings 2>&1 || { echo "  ✗ clippy (scp-relay cloud-blobs) failed"; exit 1; }
+    cargo clippy -p scp-node --features cloud-blobs --bin scp-node --test storage_backend_selection --profile test \
+      -- -D warnings 2>&1 || { echo "  ✗ clippy (scp-node cloud-blobs) failed"; exit 1; }
     python3.12 scripts/check-protocol-sync.py 2>&1 || { echo "  ✗ async code in scp-protocol"; exit 1; }
     bash scripts/check-protocol-deps.sh 2>&1 || { echo "  ✗ banned deps in scp-protocol"; exit 1; }
   ) > "$TMPDIR/rust.log" 2>&1 && touch "$TMPDIR/rust.ok" &

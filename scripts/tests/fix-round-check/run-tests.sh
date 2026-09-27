@@ -339,9 +339,10 @@ gate_paths() {
 # answer from `scp-ffi`. It also holds one file under no crate directory, which case 9
 # changes.
 #
-# It holds a fourth manifest, `crates/scp-transport`, because three of the four entries in
+# It holds a fourth manifest, `crates/scp-transport`, because three of the six entries in
 # the runner's EXTRA_FEATURE_CHECKS array name that package, and case 13 reads all three
-# `cargo check` commands they produce. It holds `bindings/python/scp_sdk/context.py` for
+# `cargo check` commands they produce. It holds `crates/scp-node` and `crates/scp-relay`,
+# which the other two entries name, for case 13b. It holds `bindings/python/scp_sdk/context.py` for
 # case 12, `Cargo.toml` for case 11 and `.github/workflows/ci.yml` for case 17, and the
 # fixture's base commit holds all three, so each case decides for itself whether its own
 # edit to them is committed.
@@ -354,6 +355,7 @@ build_fixture() {
     local root=$1 g
     mkdir -p "$root/scripts" "$root/crates/scp-clock/src" "$root/crates/scp-ffi/src" \
         "$root/crates/scp-ffi/napi/src" "$root/crates/scp-transport/src" \
+        "$root/crates/scp-node/src" "$root/crates/scp-relay/src" \
         "$root/bindings/python/scp_sdk" "$root/.github/workflows" "$root/notes"
     cp "$SCRIPT" "$root/scripts/fix-round-check.sh"
     cp "$REPO_ROOT/scripts/check-resolved-rustc.sh" "$root/scripts/check-resolved-rustc.sh"
@@ -370,6 +372,10 @@ build_fixture() {
     printf '[package]\nname = "scp-ffi-napi"\nversion = "0.0.0"\n' > "$root/crates/scp-ffi/napi/Cargo.toml"
     printf '[package]\nname = "scp-transport"\nversion = "0.0.0"\n' > "$root/crates/scp-transport/Cargo.toml"
     printf '// fixture source\n' > "$root/crates/scp-transport/src/lib.rs"
+    printf '[package]\nname = "scp-node"\nversion = "0.0.0"\n' > "$root/crates/scp-node/Cargo.toml"
+    printf '[package]\nname = "scp-relay"\nversion = "0.0.0"\n' > "$root/crates/scp-relay/Cargo.toml"
+    printf '// fixture source\n' > "$root/crates/scp-node/src/lib.rs"
+    printf '// fixture source\n' > "$root/crates/scp-relay/src/lib.rs"
     printf '# fixture binding source\n' > "$root/bindings/python/scp_sdk/context.py"
     printf 'name: fixture\n' > "$root/.github/workflows/ci.yml"
     printf '[workspace]\nmembers = ["crates/*"]\n' > "$root/Cargo.toml"
@@ -779,6 +785,24 @@ if grep -qF 'check -p scp-transport --all-targets --features postgres-blob,s3-bl
 else
     report "case 13 compiles the two cloud blob backends that only the cloud-blobs feature tables request" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13.harness/cargo.log")"
 fi
+
+# Case 13b: an edit to scp-node and scp-relay compiles each crate with its `cloud-blobs`
+# feature, which gates one integration test in each crate and which no workspace command
+# resolves. The mutation it kills: dropping either crate's EXTRA_FEATURE_CHECKS entry
+# leaves that test compiled by no local check while the run reports `compile ok`.
+FIXTURE13B="$WORK/cloud-blobs-binaries"
+build_fixture "$FIXTURE13B"
+fixture_commit "$FIXTURE13B" crates/scp-node/src/lib.rs
+fixture_commit "$FIXTURE13B" crates/scp-relay/src/lib.rs
+run_fixture "$FIXTURE13B"
+for expected in 'check -p scp-relay --all-targets --features cloud-blobs' \
+    'check -p scp-node --all-targets --features cloud-blobs,testing'; do
+    if grep -qF -- "$expected" "$FIXTURE13B.harness/cargo.log"; then
+        report "case 13b runs \`$expected\`" 0 ""
+    else
+        report "case 13b runs \`$expected\`" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13B.harness/cargo.log")"
+    fi
+done
 
 # ── Case 14: the gate whose diff range holds no uncommitted edit ─────────────────────
 #
