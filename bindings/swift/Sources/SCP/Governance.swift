@@ -38,6 +38,27 @@ public enum GovernanceActionResult: String, Sendable {
     case migrationProposed = "MigrationProposed"
     case migrationCancelled = "MigrationCancelled"
     case contextTombstoned = "ContextTombstoned"
+
+    /// Parses the outcome name a bridge's `governanceExecute` returns.
+    ///
+    /// Fails closed on a name this SDK version cannot name. Returning the bare
+    /// string, or resolving it to ``executed``, would let a caller read an
+    /// outcome this SDK cannot name as a success, and governance decides
+    /// authorization. The message states both facts a caller acts on: an
+    /// action DID execute, and this SDK is older than its bridge.
+    ///
+    /// - Throws: ``ScpError/Context(msg:code:)`` with `SCP-GOV-11040`.
+    static func fromBridge(_ raw: String) throws -> GovernanceActionResult {
+        guard let result = GovernanceActionResult(rawValue: raw) else {
+            throw ScpError.Context(
+                msg: "governance action executed, and its outcome '\(raw)' has no name in "
+                    + "this SDK version. Upgrade an SCP Swift package to match whichever "
+                    + "bridge it calls.",
+                code: "SCP-GOV-11040"
+            )
+        }
+        return result
+    }
 }
 
 // MARK: - MemberRole
@@ -322,24 +343,12 @@ public extension Context {
             )
         }
 
-        let raw = try await scp.governanceExecute(
+        // `SCP.governanceExecute` parses the outcome and fails closed with
+        // `SCP-GOV-11040` on one this SDK version cannot name.
+        return try await scp.governanceExecute(
             handle: handle,
             proposalIdHex: proposalIdHex
         )
-        // Fail closed on an outcome this SDK version cannot name. Resolving it
-        // to `.executed` would tell a caller that a governance action succeeded
-        // while this SDK cannot say which action ran, and governance decides
-        // authorization. A message states both facts a caller acts on: an
-        // action DID execute, and this SDK is older than its bridge.
-        guard let result = GovernanceActionResult(rawValue: raw) else {
-            throw ScpError.Context(
-                msg: "governance action executed, and its outcome '\(raw)' has no name in "
-                    + "this SDK version. Upgrade an SCP Swift package to match whichever "
-                    + "bridge it calls.",
-                code: "SCP-GOV-11040"
-            )
-        }
-        return result
     }
 }
 

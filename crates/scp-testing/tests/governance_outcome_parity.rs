@@ -1,19 +1,21 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! Four lists name governance outcomes, and this test holds them equal.
+//! Five lists name governance outcomes, and this test holds them equal.
 //!
 //! `scp_ffi_common::governance_result::governance_action_result_name` matches
 //! every variant of `scp_core::context::state::GovernanceActionResult` with no
 //! wildcard arm, so a new variant stops that crate from compiling until someone
-//! names it. No compiler sees three SDK lists that mirror those names:
+//! names it. No compiler sees four SDK lists that mirror those names:
 //!
 //! - `bindings/python/scp_sdk/governance.py` — `GovernanceActionResult` values,
 //! - `bindings/swift/Sources/SCP/Governance.swift` — enum raw values,
-//! - `bindings/typescript/src/types.ts` — `GOVERNANCE_ACTION_RESULTS` entries.
+//! - `bindings/typescript/src/types.ts` — `GOVERNANCE_ACTION_RESULTS` entries,
+//! - `bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Types.kt` —
+//!   `GovernanceActionResult` raw values.
 //!
 //! Each SDK rejects a name its list lacks (`SCP-GOV-11040`), which is right for
 //! a caller running an SDK older than its bridge and wrong for a maintainer who
 //! added a variant and stopped at Rust. This test tells those two apart by
-//! reading all four lists and comparing them.
+//! reading all five lists and comparing them.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -120,8 +122,22 @@ fn typescript_names() -> BTreeSet<String> {
     quoted_names(&source[array_start..array_end], |line| line.contains('"'))
 }
 
+/// Names Kotlin's `GovernanceActionResult` enum carries, spelled
+/// `MEMBER_ADDED("MemberAdded"),`.
+fn kotlin_names() -> BTreeSet<String> {
+    let source = read("bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Types.kt");
+    let enum_start = source
+        .find("enum class GovernanceActionResult(val rawValue: String) {")
+        .expect("Kotlin must declare GovernanceActionResult");
+    let enum_end = source[enum_start..]
+        .find("\n    ;\n")
+        .map(|offset| enum_start + offset)
+        .expect("that enum's entry list must end");
+    quoted_names(&source[enum_start..enum_end], |line| line.contains("(\""))
+}
+
 /// Adding a variant to `GovernanceActionResult` and naming it in one shared
-/// bridge mapping leaves three SDKs unable to name it, and each then rejects a
+/// bridge mapping leaves four SDKs unable to name it, and each then rejects a
 /// legitimate outcome with `SCP-GOV-11040`. This comparison catches that
 /// omission where a maintainer can still fix it.
 #[test]
@@ -137,6 +153,7 @@ fn every_sdk_names_every_governance_outcome() {
         ("Python", python_names()),
         ("Swift", swift_names()),
         ("TypeScript", typescript_names()),
+        ("Kotlin", kotlin_names()),
     ] {
         let missing: Vec<_> = rust.difference(&names).collect();
         assert!(

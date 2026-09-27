@@ -56,6 +56,23 @@ final class TypesTests: XCTestCase {
         XCTAssertNil(GovernanceActionResult(rawValue: "SomethingThisSdkDoesNotKnow"))
     }
 
+    /// `SCP.governanceExecute` and `Context.executeGovernanceAction` both parse
+    /// through `GovernanceActionResult.fromBridge`, which throws
+    /// `SCP-GOV-11040` on a name no case carries and returns the case for a
+    /// name one does. Making it return `.executed` for an unknown name fails
+    /// this test.
+    func testFromBridgeFailsClosedOnAnUnknownOutcome() throws {
+        XCTAssertEqual(try GovernanceActionResult.fromBridge("MemberAdded"), .memberAdded)
+        XCTAssertThrowsError(
+            try GovernanceActionResult.fromBridge("SomethingThisSdkDoesNotKnow")
+        ) { error in
+            guard case let ScpError.Context(_, code) = error else {
+                return XCTFail("expected ScpError.Context, got \(error)")
+            }
+            XCTAssertEqual(code, "SCP-GOV-11040")
+        }
+    }
+
     /// Each of the six names `RESERVED_ROLE_NAMES` reserves
     /// (`crates/scp-protocol/src/context/roles.rs`) parses to the case of that
     /// name. A bridge reports `RoleAssignment.role_name` in the lowercase form

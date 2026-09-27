@@ -680,8 +680,17 @@ public extension SCP {
     /// quorum-validated governance engine; the caller supplies no proposal,
     /// action, status, or identity. The executor and consequence subject are
     /// resolved from the tracked proposal's proposer.
-    func governanceExecute(handle: ContextHandle, proposalIdHex: String) async throws -> String {
-        try await inner.governanceExecute(handle: handle, proposalIdHex: proposalIdHex)
+    ///
+    /// - Returns: A ``GovernanceActionResult`` naming which action ran.
+    /// - Throws: ``ScpError/Context(msg:code:)`` with `SCP-GOV-11040` when the
+    ///   bridge reports an outcome this SDK version cannot name, and whatever
+    ///   the bridge throws when execution fails.
+    func governanceExecute(
+        handle: ContextHandle,
+        proposalIdHex: String
+    ) async throws -> GovernanceActionResult {
+        let raw = try await inner.governanceExecute(handle: handle, proposalIdHex: proposalIdHex)
+        return try GovernanceActionResult.fromBridge(raw)
     }
 
     /// Forwards to ``Scp/governanceGetProposal`` on ``inner``.

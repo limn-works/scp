@@ -8,6 +8,7 @@
 package works.limn.scp
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.Test
 
 class TypesTest {
@@ -51,5 +52,25 @@ class TypesTest {
         )
         assertEquals(true, handle.hasCapability("outlet:query:calculator"))
         assertEquals(false, handle.hasCapability("outlet:call:calculator"))
+    }
+
+    /**
+     * `Scp.governanceExecute` parses through [GovernanceActionResult.fromBridge],
+     * which returns the entry for a name one carries and throws
+     * `SCP-GOV-11040` for a name none carries. Making it return
+     * [GovernanceActionResult.EXECUTED] for an unknown name fails this test.
+     */
+    @Test
+    fun `governance outcome parse fails closed on an unknown name`() {
+        assertEquals(29, GovernanceActionResult.entries.size)
+        assertEquals(
+            GovernanceActionResult.MEMBER_ADDED,
+            GovernanceActionResult.fromBridge("MemberAdded"),
+        )
+        val error =
+            assertThrows<uniffi.scp.ScpException.Context> {
+                GovernanceActionResult.fromBridge("SomethingThisSdkDoesNotKnow")
+            }
+        assertEquals("SCP-GOV-11040", error.code)
     }
 }

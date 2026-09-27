@@ -1121,14 +1121,21 @@ class SCP internal constructor(
      * quorum-validated governance engine; the caller supplies no proposal,
      * action, status, or identity. The executor and consequence subject are
      * resolved from the tracked proposal's proposer.
+     *
+     * @return The [GovernanceActionResult] naming which action ran.
+     * @throws uniffi.scp.ScpException.Context with `SCP-GOV-11040` when the
+     *   bridge reports an outcome this SDK version cannot name, and whatever
+     *   the bridge throws when execution fails.
      */
     suspend fun governanceExecute(
         handle: ContextHandle,
         proposalIdHex: String,
-    ): String =
-        inner.governanceExecute(
-            handle = handle,
-            proposalIdHex = proposalIdHex,
+    ): GovernanceActionResult =
+        GovernanceActionResult.fromBridge(
+            inner.governanceExecute(
+                handle = handle,
+                proposalIdHex = proposalIdHex,
+            ),
         )
 
     /** Forwards to [NativeScp.governanceGetProposal] on [inner]. */
