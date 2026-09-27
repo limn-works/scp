@@ -935,15 +935,30 @@ pub const VALID_7047: &str = "SCP-VALID-7047";
 pub const VALID_7048: &str = "SCP-VALID-7048";
 /// Transport proof validation error.
 pub const VALID_7049: &str = "SCP-VALID-7049";
-/// DID validation error.
+/// General input validation error with no single subject.
+///
+/// The bridges emit it from unrelated checks, for example an unparseable
+/// provenance JSON string and the NAPI economy input validator.
 pub const VALID_7050: &str = "SCP-VALID-7050";
-/// Context ID validation error.
+/// General validation error with no single subject.
+///
+/// The bridges emit it from unrelated checks, for example a provenance
+/// record that fails to serialize.
 pub const VALID_7051: &str = "SCP-VALID-7051";
-/// Payload validation error.
+/// General validation error with no single subject.
+///
+/// The bridges emit it from unrelated checks, for example a failed trust
+/// aggregation.
 pub const VALID_7052: &str = "SCP-VALID-7052";
-/// Admission validation error.
+/// General validation error with no single subject.
+///
+/// The bridges emit it from unrelated checks, for example a provenance
+/// record that fails to serialize for hashing.
 pub const VALID_7053: &str = "SCP-VALID-7053";
-/// Key validation error.
+/// General validation error with no single subject.
+///
+/// No Rust bridge emits it; the Kotlin server wrapper emits it for a
+/// missing field in node-info JSON.
 pub const VALID_7054: &str = "SCP-VALID-7054";
 /// Participation record validation error (§7.3.2).
 pub const VALID_7059: &str = "SCP-VALID-7059";

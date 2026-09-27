@@ -283,7 +283,7 @@ Verification procedure depends on the attestation class (§3.5.0).
 3. Check `revocation_status` is `Active`. If `Revoked`, reject.
 4. Check `expires_at` (if present). If expired, reject.
 5. Check freshness: if `evidence.verified_at` is older than the renewal interval for the verification method (§3.5.1), the attestation is stale. Stale attestations are degraded (reduced trust weight), not rejected outright.
-6. **Trust the self-attestation.** Because issuer == subject, the DID key signature is sufficient. The attestation asserts "I performed OAuth verification at `verified_at` and the OIDC `sub` was `subject_id`." There is no cryptographic proof that the OAuth flow actually occurred — this is a self-attestation. It is acceptable for identity links because: (a) the claim is minimal, (b) the only use case is linking identities the user actually controls, (c) falsifying a link provides no protocol benefit (shadow claiming verifies independently, social graph import only surfaces genuine contacts).
+6. **Trust the self-attestation.** Because issuer == subject, the DID key signature is sufficient. The attestation asserts "I performed OAuth verification at `verified_at` and the OIDC `sub` was `subject_id`." There is no cryptographic proof that the OAuth flow actually occurred — this is a self-attestation. It is acceptable for identity links because: (a) the claim is minimal, (b) the only use case is linking identities the user actually controls, (c) falsifying a link provides no protocol benefit (social graph import only surfaces genuine contacts).
 
 **Class 2 (Reference) verification:**
 

@@ -17,7 +17,7 @@
 //! covers all fields except the `signature` field itself, serialized with
 //! sorted-key encoding per §17.1.
 //!
-//! See spec §3.5.1 (wire format) and §3.5.2 (verification protocol).
+//! See spec §3.5.2 (wire format) and §3.5.4 (verification protocol).
 
 use std::borrow::Cow;
 
