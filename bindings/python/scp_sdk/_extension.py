@@ -20,7 +20,7 @@ and answers for such a file.
 
 :func:`reject_load_failure` applies the separation. ``scp_sdk/__init__.py``
 swallows an absent extension, which lets a pure-Python environment import the
-package, and raises :class:`~scp_sdk.errors.ScpError` carrying
+package, and raises :class:`~scp_sdk.errors.ValidationError` carrying
 :data:`EXTENSION_LOAD_FAILED_CODE` for a load failure. That error is not an ``ImportError``,
 so every ``except ImportError: pytest.skip(...)`` guard in
 ``bindings/python/tests`` lets it through and the job fails instead of exiting
@@ -33,7 +33,7 @@ import importlib.util
 import os
 from typing import Any
 
-from scp_sdk.errors import ScpError, ValidationError
+from scp_sdk.errors import ValidationError
 
 #: Import path maturin installs the compiled extension at (see pyproject.toml
 #: ``module-name``).
@@ -110,13 +110,13 @@ def reject_load_failure(exc: ImportError) -> None:
         exc: The ``ImportError`` that importing the extension raised.
 
     Raises:
-        ScpError: :data:`EXTENSION_LOAD_FAILED_CODE` when :func:`extension_is_installed`
+        ValidationError: :data:`EXTENSION_LOAD_FAILED_CODE` when :func:`extension_is_installed`
             reports the extension file is present, which makes ``exc`` a load
             failure rather than an absence.
     """
     if not extension_is_installed():
         return
-    raise ScpError(
+    raise ValidationError(
         f"The {EXTENSION_MODULE} extension module is installed but failed to "
         f"load: {exc}. Rebuild it for this interpreter with "
         f"`maturin develop --release` from bindings/python.",
@@ -124,7 +124,7 @@ def reject_load_failure(exc: ImportError) -> None:
     ) from exc
 
 
-class MissingExportError(ScpError, AttributeError):
+class MissingExportError(ValidationError, AttributeError):
     """A loaded extension lacks an export the SDK asked for.
 
     Carries :data:`EXTENSION_LOAD_FAILED_CODE`, because a module that loaded
@@ -178,7 +178,7 @@ def native_module() -> Any:
     Raises:
         ValidationError: :data:`EXTENSION_ABSENT_CODE` when the extension is
             not installed.
-        ScpError: :data:`EXTENSION_LOAD_FAILED_CODE` when the extension is
+        ValidationError: :data:`EXTENSION_LOAD_FAILED_CODE` when the extension is
             installed and failed to load. The two codes differ because the ``scp`` fixture in
             ``bindings/python/tests/conftest.py`` skips on the first and fails
             on the second.

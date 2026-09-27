@@ -168,7 +168,7 @@ interface NativeScpInstance {
  * missing, which this wrapper rethrows under the same code with the
  * reinstall instruction SDK consumers see when they call `new SCP(...)`.
  * An installed addon that failed to load passes through as the loader's
- * `ScpError` (`SCP-VALID-7082`), and an addon that loaded without the `SCP`
+ * `ValidationError` (`SCP-VALID-7082`), and an addon that loaded without the `SCP`
  * class throws the same code, so neither is reported as a missing package.
  */
 function loadAddon(): NativeAddon {
@@ -232,7 +232,7 @@ function nativeFreeFn<T>(name: keyof NativeAddon): T {
  * condition. Every other `ScpError`, the loader's `SCP-VALID-7082` among
  * them, is returned unchanged. Any other thrown value is a failure the
  * loader did not classify, raised while an addon package may well be
- * installed, so it becomes an `ScpError` with the load-failure code
+ * installed, so it becomes a `ValidationError` with the load-failure code
  * `SCP-VALID-7082` and never counts as absence.
  *
  * @internal
@@ -250,7 +250,7 @@ export function addonLoadError(cause: unknown): ScpError {
   if (cause instanceof ScpError) {
     return cause;
   }
-  const error = new ScpError(
+  const error = new ValidationError(
     `Native addon failed to load: ${underlying}.`,
     NATIVE_ADDON_LOAD_FAILED_CODE,
   );
@@ -268,13 +268,13 @@ export function addonLoadError(cause: unknown): ScpError {
  * `_scp_core` loads without the `SCP` class, so no caller mistakes the
  * stale addon for the absence code `SCP-VALID-7081`.
  *
- * @throws {ScpError} `SCP-VALID-7082` when `addon[name]` is not a function.
+ * @throws {ValidationError} `SCP-VALID-7082` when `addon[name]` is not a function.
  * @internal
  */
 export function requireAddonExport<T>(addon: NativeAddon, name: string): T {
   const value = addon[name];
   if (typeof value !== "function") {
-    throw new ScpError(
+    throw new ValidationError(
       `Native addon loaded but does not export "${name}" — the installed ` +
         "platform addon is stale or partially built. Rebuild it with " +
         "`cargo build -p scp-ffi-napi` or upgrade the platform package.",

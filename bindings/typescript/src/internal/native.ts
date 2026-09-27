@@ -23,7 +23,7 @@
 import { createRequire } from "node:module";
 
 import type { BridgeMode, ShadowStatus } from "../bridge";
-import { ScpError, TransportError, ValidationError } from "../errors";
+import { TransportError, ValidationError } from "../errors";
 import { __getNativeScp, requireAddonExport, type SCP } from "../scp";
 import type {
   BroadcastAdmissionPolicy,
@@ -142,7 +142,7 @@ let _nativeAddon: NativeAddon | null = null;
  *
  * @throws {ValidationError} `NATIVE_ADDON_ABSENT_CODE` when `packageName` does
  *   not resolve.
- * @throws {ScpError} `NATIVE_ADDON_LOAD_FAILED_CODE` when `packageName`
+ * @throws {ValidationError} `NATIVE_ADDON_LOAD_FAILED_CODE` when `packageName`
  *   resolves and requiring it throws; the message carries the underlying
  *   error's message and `cause` carries the error.
  */
@@ -163,7 +163,7 @@ export function requireNativeAddon(
     return req(packageName) as NativeAddon;
   } catch (cause) {
     const underlying = cause instanceof Error ? cause.message : String(cause);
-    const error = new ScpError(
+    const error = new ValidationError(
       `Native addon ${packageName} is installed at ${resolved} but failed to load: ` +
         `${underlying}. Rebuild or reinstall it for this platform.`,
       NATIVE_ADDON_LOAD_FAILED_CODE,
@@ -186,7 +186,7 @@ export function requireNativeAddon(
  *
  * @throws {ValidationError} `NATIVE_ADDON_ABSENT_CODE` when no addon is
  *   installed for this platform.
- * @throws {ScpError} `NATIVE_ADDON_LOAD_FAILED_CODE` when the addon is
+ * @throws {ValidationError} `NATIVE_ADDON_LOAD_FAILED_CODE` when the addon is
  *   installed and failed to load.
  */
 export function loadNativeAddon(): NativeAddon {
@@ -217,7 +217,7 @@ export function loadNativeAddon(): NativeAddon {
  * `createNativeBridge` reads module-level free functions as `addon.X`. On a
  * stale addon that loaded without `X`, a plain read returns `undefined` and
  * the call throws a bare `TypeError`. Through this view the read throws
- * `ScpError` `SCP-VALID-7082`, the code the Python SDK raises for the same
+ * `ValidationError` `SCP-VALID-7082`, the code the Python SDK raises for the same
  * condition.
  *
  * @internal

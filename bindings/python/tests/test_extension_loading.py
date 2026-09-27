@@ -26,7 +26,7 @@ from typing import Any
 import pytest
 
 from scp_sdk import _extension
-from scp_sdk.errors import ScpError
+from scp_sdk.errors import CODE_PREFIX_MAP, ScpError, ValidationError
 
 #: A filename no interpreter running this suite imports: ``_scp_core`` plus an
 #: interpreter tag naming CPython 0.0, plus the POSIX dynamic-library suffix.
@@ -101,6 +101,7 @@ def test_present_extension_that_fails_to_load_raises_the_load_failure_code(
     with pytest.raises(ScpError) as caught:
         _extension.native_module()
     assert caught.value.code == _extension.EXTENSION_LOAD_FAILED_CODE
+    assert isinstance(caught.value, ValidationError)
 
 
 def test_load_failure_is_not_an_import_error(
@@ -144,6 +145,7 @@ def test_package_import_raises_the_load_failure_code_for_a_present_extension(
     with pytest.raises(ScpError) as caught:
         package_reimport()
     assert caught.value.code == _extension.EXTENSION_LOAD_FAILED_CODE
+    assert isinstance(caught.value, ValidationError)
     assert not isinstance(caught.value, ImportError)
 
 
@@ -169,6 +171,7 @@ def test_every_bridge_accessor_reports_a_load_failure_as_a_load_failure(
     with pytest.raises(ScpError) as caught:
         getattr(module, accessor)()
     assert caught.value.code == _extension.EXTENSION_LOAD_FAILED_CODE
+    assert isinstance(caught.value, ValidationError)
 
 
 @pytest.mark.parametrize(("module_name", "accessor"), BRIDGE_ACCESSORS)
@@ -325,6 +328,7 @@ def test_a_module_built_for_another_interpreter_raises_the_load_failure_code(
     with pytest.raises(ScpError) as caught:
         _extension.native_module()
     assert caught.value.code == _extension.EXTENSION_LOAD_FAILED_CODE
+    assert isinstance(caught.value, ValidationError)
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +539,7 @@ def test_a_missing_export_raises_the_load_failure_code(stale_extension: Any) -> 
     with pytest.raises(ScpError) as caught:
         native.scpid_challenge
     assert caught.value.code == _extension.EXTENSION_LOAD_FAILED_CODE
+    assert isinstance(caught.value, ValidationError)
     assert "scpid_challenge" in caught.value.message
 
 
@@ -630,6 +635,7 @@ def test_every_bridge_accessor_reports_a_missing_export_with_the_load_failure_co
     with pytest.raises(ScpError) as caught:
         bridge.evaluate_provenance_quality
     assert caught.value.code == _extension.EXTENSION_LOAD_FAILED_CODE
+    assert isinstance(caught.value, ValidationError)
 
 
 async def test_a_wrapper_call_on_a_stale_build_raises_the_load_failure_code(
@@ -641,3 +647,15 @@ async def test_a_wrapper_call_on_a_stale_build_raises_the_load_failure_code(
     with pytest.raises(ScpError) as caught:
         await SCP.scpid_challenge(object.__new__(SCP), "https://example.test")
     assert caught.value.code == _extension.EXTENSION_LOAD_FAILED_CODE
+    assert isinstance(caught.value, ValidationError)
+
+
+def test_the_load_failure_class_is_the_class_its_code_band_names() -> None:
+    """CRITERION: both native-load codes raise the class ``CODE_PREFIX_MAP``
+    assigns their ``SCP-VALID`` prefix, the class
+    ``.docs/standards/sdk-common.md`` "Error code format" ties to that band, so
+    a prefix-based mapper never reclassifies either code. The two codes, not
+    two classes, separate absence from load failure."""
+    for code in (_extension.EXTENSION_ABSENT_CODE, _extension.EXTENSION_LOAD_FAILED_CODE):
+        assert CODE_PREFIX_MAP[code.rsplit("-", 1)[0]] is ValidationError
+    assert issubclass(_extension.MissingExportError, ValidationError)

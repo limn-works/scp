@@ -56,7 +56,7 @@ from typing import (
 )
 
 from scp_sdk._extension import EXTENSION_LOAD_FAILED_CODE, native_module
-from scp_sdk.errors import ScpError, _coded_bridge_error
+from scp_sdk.errors import ValidationError, _coded_bridge_error
 from scp_sdk.types import CustodyType
 
 if TYPE_CHECKING:
@@ -326,7 +326,7 @@ def _native_mod() -> Any:
     Raised at call time (not import time) so that pure-Python environments
     — where the native extension isn't available — can still ``import
     scp_sdk`` without an ImportError. The caller sees a meaningful
-    :class:`ScpError` the first time they actually use the bridge.
+    :class:`~scp_sdk.errors.ValidationError` the first time they actually use the bridge.
 
     Used by SDK wrappers that route to module-level free functions per
     ADR-048 §1 (pure helpers exposed as ``_scp_core.<name>``).
@@ -340,7 +340,7 @@ def _native_cls() -> Any:
     Raised at call time (not import time) so that pure-Python environments
     — where the native extension isn't available — can still ``import
     scp_sdk`` without an ImportError. The caller sees a meaningful
-    :class:`ScpError` the first time they actually construct an instance.
+    :class:`~scp_sdk.errors.ValidationError` the first time they actually construct an instance.
     """
     mod = _native_mod()
     cls = getattr(mod, "SCP", None)
@@ -350,7 +350,7 @@ def _native_cls() -> Any:
         # ``scp`` fixture in bindings/python/tests/conftest.py fails on that
         # code instead of skipping, which ``EXTENSION_ABSENT_CODE`` would have
         # done.
-        raise ScpError(
+        raise ValidationError(
             "_scp_core loaded but does not export the SCP class — rebuild the "
             "native extension with `maturin develop --release` from "
             "bindings/python.",

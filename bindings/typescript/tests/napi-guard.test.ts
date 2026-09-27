@@ -12,7 +12,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ScpError, ValidationError } from "../src/errors";
+import { mapBridgeError, ScpError, ValidationError } from "../src/errors";
 import {
   checkedAddon,
   NATIVE_ADDON_ABSENT_CODE,
@@ -64,7 +64,7 @@ describe("requireNativeAddon", () => {
       caught = e;
     }
     expect(caught).toBeInstanceOf(ScpError);
-    expect(caught).not.toBeInstanceOf(ValidationError);
+    expect(caught).toBeInstanceOf(ValidationError);
     expect((caught as ScpError).code).toBe(NATIVE_ADDON_LOAD_FAILED_CODE);
     expect((caught as ScpError).message).toContain(join(BROKEN_PACKAGE, "index.node"));
     expect((caught as Error & { cause?: unknown }).cause).toBeInstanceOf(Error);
@@ -88,7 +88,7 @@ describe("SCP wrapper mapping of loader errors", () => {
     const cause = new Error("libc probe failed");
     const mapped = addonLoadError(cause);
     expect(mapped).toBeInstanceOf(ScpError);
-    expect(mapped).not.toBeInstanceOf(ValidationError);
+    expect(mapped).toBeInstanceOf(ValidationError);
     expect(mapped.code).toBe(NATIVE_ADDON_LOAD_FAILED_CODE);
     expect((mapped as Error & { cause?: unknown }).cause).toBe(cause);
   });
@@ -113,6 +113,16 @@ describe("native-load codes", () => {
     expect(NATIVE_ADDON_ABSENT_CODE).toBe("SCP-VALID-7081");
     expect(NATIVE_ADDON_LOAD_FAILED_CODE).toBe("SCP-VALID-7082");
   });
+
+  // .docs/standards/sdk-common.md "Error code format": a code's category
+  // names its class. The codes, not two classes, separate absence from a load
+  // failure, so the class the loader throws is the one mapBridgeError assigns
+  // the same code.
+  test("each code's class is the class mapBridgeError assigns its band", () => {
+    for (const code of [NATIVE_ADDON_ABSENT_CODE, NATIVE_ADDON_LOAD_FAILED_CODE]) {
+      expect(mapBridgeError(new Error(`[${code}] probe`))).toBeInstanceOf(ValidationError);
+    }
+  });
 });
 
 describe("SCP wrapper check of a loaded addon's exports", () => {
@@ -130,7 +140,7 @@ describe("SCP wrapper check of a loaded addon's exports", () => {
         caught = e;
       }
       expect(caught).toBeInstanceOf(ScpError);
-      expect(caught).not.toBeInstanceOf(ValidationError);
+      expect(caught).toBeInstanceOf(ValidationError);
       expect((caught as ScpError).code).toBe(NATIVE_ADDON_LOAD_FAILED_CODE);
       expect((caught as ScpError).message).toContain(name);
     });
@@ -152,7 +162,7 @@ describe("checkedAddon, the view createNativeBridge reads free functions through
       caught = e;
     }
     expect(caught).toBeInstanceOf(ScpError);
-    expect(caught).not.toBeInstanceOf(ValidationError);
+    expect(caught).toBeInstanceOf(ValidationError);
     expect((caught as ScpError).code).toBe(NATIVE_ADDON_LOAD_FAILED_CODE);
     expect((caught as ScpError).message).toContain("broadcastOpenKey");
   });

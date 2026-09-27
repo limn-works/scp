@@ -45,8 +45,8 @@ from scp_sdk._extension import reject_load_failure as _reject_load_failure
 # ``SCP-VALID-7082`` from here, because ``ImportError`` carries both causes
 # and reporting a load failure as absence lets every
 # ``except ImportError: pytest.skip(...)`` guard under ``bindings/python/tests``
-# skip the whole real-FFI suite over a broken artifact. ``ScpError`` is not an
-# ``ImportError``, so no such guard catches it.
+# skip the whole real-FFI suite over a broken artifact. The error raised is a
+# ``ValidationError``, not an ``ImportError``, so no such guard catches it.
 try:
     from scp_sdk import _scp_core  # noqa: F401
 except ImportError as _exc:
