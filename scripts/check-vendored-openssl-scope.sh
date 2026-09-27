@@ -129,7 +129,8 @@ WHEEL_JOB="python-wheels"
 # The program behind wheel_triples: it prints the `target:` value of every item of
 # the one `include:` list inside the job named on argv[2] in the workflow file on
 # argv[1]. A job begins at a two-space-indented key and ends at the next one or at
-# a column-zero key. The criterion is that every include item yields one bare
+# a column-zero key. A comment line ends no job, at whatever column it starts,
+# because YAML reads it as no key at all. The criterion is that every include item yields one bare
 # triple. An item naming no `target:` key, naming two, or naming one whose value
 # is quoted, commented, or an expression FAILS, and so does a job holding zero
 # `include:` keys or two. The job's `matrix:` mapping may hold the `include:` key
@@ -146,6 +147,8 @@ with open(path, encoding="utf-8") as workflow:
     lines = workflow.read().splitlines()
 body, inside = [], False
 for line in lines:
+    if line.lstrip().startswith("#"):
+        continue
     header = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
     if header or re.match(r"^\S", line):
         inside = bool(header) and header.group(1) == job
@@ -652,10 +655,10 @@ run_fixtures() {
   printf '%s\n' 'jobs:' '  python-wheels:' '    strategy:' '      matrix:' '        include:' \
     '          - target: x86_64-unknown-linux-gnu' '            runner: ubuntu-latest' '' \
     '          # a comment between legs' '          - target: aarch64-apple-darwin' '            runner: macos-latest' \
-    '          - runner: windows-latest' '            target: x86_64-pc-windows-msvc' \
+    '# a column-zero comment between legs' '          - runner: windows-latest' '            target: x86_64-pc-windows-msvc' \
     '    steps:' '      - with:' '          target: ${{ matrix.target }}' > "$dir/leg.yml"
   out="$(wheel_triples "$dir/leg.yml")"; rc=$?
-  expect "(triples-leg) legs separated by a blank line and a comment, and a leg whose first key is not target, are read" "PASS" "$rc"
+  expect "(triples-leg) legs separated by a blank line, an indented comment, and a column-zero comment, and a leg whose first key is not target, are read" "PASS" "$rc"
   same_string "$out" "$(printf '%s\n' x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc)"; rc=$?
   expect "(triples-leg) and yield one triple per leg, ignoring the step's 'target:' input" "PASS" "$rc"
   # (triples-matrix) the wheel job's matrix holds the include list and no other
