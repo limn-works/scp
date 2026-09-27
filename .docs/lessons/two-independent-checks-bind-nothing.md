@@ -47,8 +47,12 @@ Write the cross-part comparison as its own named step, and give it a test that
 builds the hybrid the check exists to reject.
 `AppAttestCredentialBindingTests` in
 `bindings/swift/Tests/SCPTests/Platform/AppleDeviceAttestationTests.swift`
-builds one genuinely anchored chain beside a second chain's key identifier and
-asserts `false`, which is the substitution the missing clause admitted.
+built one genuinely anchored chain beside a second chain's key identifier and
+asserted `false`, which is the substitution the missing clause admitted. On
+2026-09-26 the maintainer ruled that the Swift `verify` method is deleted and
+that the identity workstream owns the reading-side verifier, so that test was
+deleted with `verify`. Clause 5 of acceptance criterion 3 in ADR-025, the Apple
+platform adapter, still states the comparison that verifier has to make.
 
 ## Related
 
