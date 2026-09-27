@@ -66,7 +66,8 @@
 #   * The wheel's triples are the `target:` values of the items of the
 #     `python-wheels` job's matrix `include:` list in
 #     `.github/workflows/build-matrix.yml`, the job that builds the wheel. An item
-#     that yields no bare triple fails the gate.
+#     that yields no bare triple fails the gate, and so does a `matrix:` mapping
+#     holding any key beside `include:`.
 #
 # This gate asks the owner gate to print its lists rather than parsing that file's
 # source text, because bash expands every spelling of an array assignment and a
@@ -131,7 +132,10 @@ WHEEL_JOB="python-wheels"
 # a column-zero key. The criterion is that every include item yields one bare
 # triple. An item naming no `target:` key, naming two, or naming one whose value
 # is quoted, commented, or an expression FAILS, and so does a job holding zero
-# `include:` keys or two, so a matrix leg this reader cannot read stops the gate
+# `include:` keys or two. The job's `matrix:` mapping may hold the `include:` key
+# and no other key, because an axis key such as `target: [...]` or an `exclude:`
+# key beside `include:` changes the legs GitHub builds, and this reader reads only
+# the include items. A matrix leg this reader cannot read therefore stops the gate
 # instead of dropping out of the per-triple presence proof.
 read -r -d '' WHEEL_TRIPLES_PROGRAM <<'PYTHON' || true
 import re
@@ -152,6 +156,19 @@ starts = [i for i, line in enumerate(body) if re.match(r"^\s*include:\s*$", line
 if len(starts) != 1:
     sys.exit(f"{path} job '{job}' holds {len(starts)} 'include:' keys; this gate reads exactly one matrix include list")
 base = len(body[starts[0]]) - len(body[starts[0]].lstrip())
+def depth(line):
+    return len(line) - len(line.lstrip())
+def content(lines):
+    return [(i, line) for i, line in lines if line.strip() and not line.lstrip().startswith("#")]
+parents = [(i, line) for i, line in content(enumerate(body[:starts[0]])) if depth(line) < base]
+if not parents or not re.match(r"^\s*matrix:\s*$", parents[-1][1]):
+    sys.exit(f"{path} job '{job}': the 'include:' key does not sit directly under a 'matrix:' key")
+matrix_at, matrix_indent = parents[-1][0], depth(parents[-1][1])
+for i, line in content(enumerate(body[matrix_at + 1:], matrix_at + 1)):
+    if depth(line) <= matrix_indent:
+        break
+    if depth(line) < base or (depth(line) == base and i != starts[0]):
+        sys.exit(f"{path} job '{job}': '{line.strip()}' sits in the matrix beside 'include:'; this gate reads a matrix whose only key is 'include:'")
 items, item_indent = [], None
 for line in body[starts[0] + 1:]:
     if not line.strip() or line.lstrip().startswith("#"):
@@ -641,6 +658,30 @@ run_fixtures() {
   expect "(triples-leg) legs separated by a blank line and a comment, and a leg whose first key is not target, are read" "PASS" "$rc"
   same_string "$out" "$(printf '%s\n' x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc)"; rc=$?
   expect "(triples-leg) and yield one triple per leg, ignoring the step's 'target:' input" "PASS" "$rc"
+  # (triples-matrix) the wheel job's matrix holds the include list and no other
+  # key, because an axis key or an exclude key beside it adds or removes legs the
+  # reader never reads.
+  local sibling_label sibling_lines
+  for sibling_label in "an axis key after include" "an axis key before include" "an exclude key" "a key between matrix and include depth"; do
+    case "$sibling_label" in
+      "an axis key after include") sibling_lines=$(printf '%s\n' '        include:' '          - target: x86_64-unknown-linux-gnu' '        target: [riscv64gc-unknown-linux-gnu]') ;;
+      "an axis key before include") sibling_lines=$(printf '%s\n' '        target:' '          - riscv64gc-unknown-linux-gnu' '        include:' '          - target: x86_64-unknown-linux-gnu') ;;
+      "an exclude key") sibling_lines=$(printf '%s\n' '        include:' '          - target: x86_64-unknown-linux-gnu' '        exclude:' '          - target: x86_64-unknown-linux-gnu') ;;
+      "a key between matrix and include depth") sibling_lines=$(printf '%s\n' '       python: ["3.12"]' '        include:' '          - target: x86_64-unknown-linux-gnu') ;;
+    esac
+    printf '%s\n' 'jobs:' '  python-wheels:' '    strategy:' '      fail-fast: false' '      matrix:' "$sibling_lines" '    steps:' > "$dir/sibling.yml"
+    wheel_triples "$dir/sibling.yml" >/dev/null 2>&1; rc=$?
+    expect "(triples-matrix) a wheel matrix holding $sibling_label FAILS the reader" "FAIL" "$rc"
+  done
+  printf '%s\n' 'jobs:' '  python-wheels:' '    strategy:' '      include:' '        - target: x86_64-unknown-linux-gnu' '    steps:' > "$dir/sibling.yml"
+  wheel_triples "$dir/sibling.yml" >/dev/null 2>&1; rc=$?
+  expect "(triples-matrix) an include key outside any matrix key FAILS the reader" "FAIL" "$rc"
+  printf '%s\n' 'jobs:' '  python-wheels:' '    strategy:' '      matrix:' '        # the legs' '        include:' \
+    '          - target: x86_64-unknown-linux-gnu' '      fail-fast: false' '    steps:' > "$dir/sibling.yml"
+  out="$(wheel_triples "$dir/sibling.yml")"; rc=$?
+  expect "(triples-matrix) a strategy key after the matrix is not read as a matrix key" "PASS" "$rc"
+  same_string "$out" "x86_64-unknown-linux-gnu"; rc=$?
+  expect "(triples-matrix) and the include triple is still read" "PASS" "$rc"
 
   # The counters run against a `cargo` on PATH that prints a chosen answer or
   # refuses to resolve one. Each proves a present crate is counted, an absent one
