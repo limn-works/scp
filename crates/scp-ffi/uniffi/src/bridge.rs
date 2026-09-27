@@ -3309,8 +3309,6 @@ pub struct ContextHandle {
     /// Points into the custody provider. Used by `ucan_mint`.
     #[allow(dead_code)]
     pub(crate) signing_key: Option<KeyHandle>,
-    /// Capability ceiling strings for UCAN mint-time enforcement (#339).
-    pub(crate) ceiling_strings: Vec<String>,
     /// Outlet registry for this context.
     pub(crate) outlet_registry: tokio::sync::Mutex<scp_core::context::outlets::OutletRegistry>,
     /// Registered outlet handlers keyed by outlet ID.
@@ -3335,7 +3333,6 @@ impl std::fmt::Debug for ContextHandle {
         f.debug_struct("ContextHandle")
             .field("context_id", &self.context_id)
             .field("creator_did", &self.creator_did)
-            .field("ceiling_strings", &self.ceiling_strings)
             .finish_non_exhaustive()
     }
 }
@@ -10327,14 +10324,6 @@ impl Scp {
                     in_memory_custody,
                     callback_custody,
                     signing_key,
-                    ceiling_strings: params
-                        .ceiling
-                        .iter()
-                        .filter_map(|s| {
-                            scp_core::context::roles::Capability::new(s)
-                                .map(|c| c.ucan_capability_name())
-                        })
-                        .collect(),
                     outlet_registry: tokio::sync::Mutex::new(
                         scp_core::context::outlets::OutletRegistry::new(),
                     ),
@@ -10709,16 +10698,6 @@ impl Scp {
                 // behind, resurrecting the context on restart and blocking a
                 // fresh re-join. Then purge residual UCAN state and surface the
                 // error.
-                //
-                // The AUTHENTICATED ceiling still reaches the `ContextHandle`
-                // below, where it is the snapshot this bridge saw at
-                // registration and no authorization site reads it.
-                let authed_ceiling: std::collections::HashSet<String> = joined
-                    .params()
-                    .ceiling
-                    .iter()
-                    .map(scp_core::context::roles::Capability::ucan_capability_name)
-                    .collect();
                 if bi.with_ucan_state(&context_id, |_| ()).is_none() {
                     sup.discard_joined_context(&context_id).await;
                     bi.remove_ucan_state(&context_id);
@@ -10750,11 +10729,6 @@ impl Scp {
                     in_memory_custody,
                     callback_custody,
                     signing_key,
-                    // AUTHENTICATED ceiling from the joined MLS group's signed
-                    // context binding — NOT caller input (there is none). This is
-                    // the handle's registration snapshot; every authorization
-                    // site reads the actor's ceiling instead.
-                    ceiling_strings: authed_ceiling.into_iter().collect(),
                     outlet_registry: tokio::sync::Mutex::new(
                         scp_core::context::outlets::OutletRegistry::new(),
                     ),
@@ -21380,7 +21354,6 @@ mod tests {
             in_memory_custody: None,
             callback_custody: None,
             signing_key: None,
-            ceiling_strings: Vec::new(),
             outlet_registry: tokio::sync::Mutex::new(
                 scp_core::context::outlets::OutletRegistry::new(),
             ),
@@ -21576,7 +21549,6 @@ mod tests {
             in_memory_custody: Some(Arc::clone(&opaque)),
             callback_custody: None,
             signing_key: Some(active_handle),
-            ceiling_strings: Vec::new(),
             outlet_registry: tokio::sync::Mutex::new(
                 scp_core::context::outlets::OutletRegistry::new(),
             ),
@@ -21738,7 +21710,6 @@ mod tests {
             in_memory_custody: Some(Arc::clone(&opaque_b)),
             callback_custody: None,
             signing_key: Some(active_handle),
-            ceiling_strings: Vec::new(),
             outlet_registry: tokio::sync::Mutex::new(
                 scp_core::context::outlets::OutletRegistry::new(),
             ),
@@ -21930,7 +21901,6 @@ mod tests {
             in_memory_custody: None,
             callback_custody: Some(callback_custody),
             signing_key: Some(key_handle),
-            ceiling_strings: Vec::new(),
             outlet_registry: tokio::sync::Mutex::new(
                 scp_core::context::outlets::OutletRegistry::new(),
             ),
@@ -25222,13 +25192,6 @@ mod tests {
             in_memory_custody: None,
             callback_custody: Some(callback_custody),
             signing_key: Some(signing_key),
-            // The handle records the ceiling THIS bridge saw at registration.
-            // It stays the wide default here, so a test passing a narrower
-            // `supervisor_ceiling` fails the moment a call site reads the copy.
-            ceiling_strings: scp_core::context::roles::default_ceiling()
-                .to_ucan_string_set()
-                .into_iter()
-                .collect(),
             outlet_registry: tokio::sync::Mutex::new(
                 scp_core::context::outlets::OutletRegistry::new(),
             ),
@@ -25620,22 +25583,29 @@ mod tests {
         );
     }
 
-    /// A mint grants no more than the ceiling the supervisor actor holds, even
-    /// when the handle's registration-time copy is wider.
+    /// A mint grants no more than the ceiling the supervisor actor holds.
     ///
-    /// `ContextHandle::ceiling_strings` records what THIS bridge saw when it
-    /// registered the context, so a `ModifyCeiling` governance action that the
-    /// per-context actor applied leaves that copy granting a capability the
-    /// supervisor already withdrew. The fixture gives the actor
-    /// `messages:read` and the handle the wide default ceiling, so a mint of
-    /// `messages:write` succeeds against the copy and fails against the actor.
+    /// `ContextHandle` keeps no ceiling of its own, because a copy taken at
+    /// registration would go stale on the first `ModifyCeiling` the per-context
+    /// actor applies and would then grant a capability the supervisor already
+    /// withdrew. The fixture gives the actor `messages:read` and nothing else,
+    /// and a mint of `messages:write` must fail against that ceiling.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling() {
         let scp = scp_test();
         let (handle, _creator_key) = callback_context_handle(&scp, &["messages:read"]).await;
+        let actor_ceiling = scp
+            .inner
+            .live_role_state(&handle.context_id)
+            .await
+            .expect("the fixture registers a supervisor actor for the context")
+            .ceiling()
+            .to_ucan_string_set();
         assert!(
-            handle.ceiling_strings.iter().any(|c| c == "messages:write"),
-            "the fixture's handle copy must carry the capability the actor withholds"
+            !actor_ceiling.iter().any(|c| c == "messages:write")
+                && actor_ceiling.iter().any(|c| c == "messages:read"),
+            "the actor's ceiling must hold messages:read and withhold messages:write, got \
+             {actor_ceiling:?}"
         );
 
         let err = ucan_mint_impl(
