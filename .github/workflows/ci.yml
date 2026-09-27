@@ -1277,11 +1277,15 @@ jobs:
           # `cargo check`, because two of them read `help_text()` and assert
           # which `SCP_RELAY_*` lines it prints, and both assertions name the
           # opposite text in a `cloud-blobs` build from the one every other
-          # command in this workflow reaches. `--bin scp-node` keeps the seven
-          # integration-test binaries in `crates/scp-node/tests/` out of this
-          # lane: each one is covered by job rust-test at default features, and
-          # none of them reads a cloud backend.
-          cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs --bin scp-node
+          # command in this workflow reaches. `--test storage_backend_selection`
+          # runs the one integration test in `crates/scp-node/tests/` that
+          # selects a cloud backend: at default features it reaches the
+          # not-compiled half of its `postgres` and `s3` cases, and here it
+          # reaches the missing-variable half. `--bin` and `--test` together
+          # keep the other seven integration-test binaries out of this lane:
+          # job rust-test covers each at default features, and none of them
+          # selects a cloud backend.
+          cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs --bin scp-node --test storage_backend_selection
           # crates/scp-testing/src/lib.rs compiles `pub mod helpers` only under
           # this crate's `testing` feature, and that feature's list must name
           # every feature helpers.rs needs, because the one build that turns it

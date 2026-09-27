@@ -293,9 +293,7 @@ fn reject_backend_message(requested: &str) -> String {
     )
 )]
 pub async fn storage_from_env() -> BlobStorageBackend {
-    let backend = env::var("SCP_RELAY_STORAGE_BACKEND")
-        .unwrap_or_else(|_| "sqlite".to_owned())
-        .to_lowercase();
+    let backend = selected_backend();
 
     match backend.as_str() {
         #[cfg(feature = "sqlite-blob")]
@@ -322,12 +320,7 @@ pub async fn storage_from_env() -> BlobStorageBackend {
         }
         #[cfg(feature = "postgres-blob")]
         "postgres" => {
-            let Ok(url) = env::var("SCP_RELAY_DATABASE_URL") else {
-                eprintln!(
-                    "error: SCP_RELAY_STORAGE_BACKEND=postgres requires SCP_RELAY_DATABASE_URL to be set"
-                );
-                std::process::exit(1);
-            };
+            let url = required_var_or_exit("postgres", "SCP_RELAY_DATABASE_URL");
             tracing::info!("using postgres blob storage");
             let store = crate::native::postgres_blob::PostgresBlobStore::open(&url)
                 .await
@@ -339,12 +332,7 @@ pub async fn storage_from_env() -> BlobStorageBackend {
         }
         #[cfg(feature = "s3-blob")]
         "s3" => {
-            let Ok(bucket) = env::var("SCP_RELAY_S3_BUCKET") else {
-                eprintln!(
-                    "error: SCP_RELAY_STORAGE_BACKEND=s3 requires SCP_RELAY_S3_BUCKET to be set"
-                );
-                std::process::exit(1);
-            };
+            let bucket = required_var_or_exit("s3", "SCP_RELAY_S3_BUCKET");
             let prefix = env::var("SCP_RELAY_S3_PREFIX").unwrap_or_else(|_| "blobs/".to_owned());
             tracing::info!(bucket = %bucket, prefix = %prefix, "using s3 blob storage");
             let store = crate::native::s3_blob::S3BlobStore::open(&bucket, &prefix)
@@ -364,6 +352,55 @@ pub async fn storage_from_env() -> BlobStorageBackend {
             std::process::exit(1);
         }
     }
+}
+
+/// Exits 1 on every `SCP_RELAY_STORAGE_BACKEND` configuration error that
+/// [`storage_from_env`] exits on, and returns without opening, connecting to,
+/// or creating anything.
+///
+/// The configuration errors are a value this build did not compile, a value
+/// that names no backend, and a missing variable the selected backend requires.
+/// Each prints the message [`storage_from_env`] prints for the same error. A
+/// caller that writes state of its own before it opens the blob store calls
+/// this first, so a configuration error exits before that state exists.
+/// Failures of the open itself, such as an unreachable database or an
+/// unwritable file, are not configuration errors and surface only from
+/// [`storage_from_env`].
+pub fn check_storage_selection_from_env() {
+    let backend = selected_backend();
+    if !backend_is_compiled(&backend) {
+        eprintln!("{}", reject_backend_message(&backend));
+        std::process::exit(1);
+    }
+    if let Some(var) = required_var(&backend) {
+        let _ = required_var_or_exit(&backend, var);
+    }
+}
+
+/// The lowercased `SCP_RELAY_STORAGE_BACKEND` value, `sqlite` when unset.
+fn selected_backend() -> String {
+    env::var("SCP_RELAY_STORAGE_BACKEND")
+        .unwrap_or_else(|_| "sqlite".to_owned())
+        .to_lowercase()
+}
+
+/// The environment variable that [`storage_from_env`]'s arm for `backend`
+/// cannot construct the backend without, if any.
+fn required_var(backend: &str) -> Option<&'static str> {
+    match backend {
+        "postgres" => Some("SCP_RELAY_DATABASE_URL"),
+        "s3" => Some("SCP_RELAY_S3_BUCKET"),
+        _ => None,
+    }
+}
+
+/// Reads `var`, and exits 1 with a message naming `backend` and `var` when it
+/// is unset.
+fn required_var_or_exit(backend: &str, var: &str) -> String {
+    env::var(var).unwrap_or_else(|_| {
+        eprintln!("error: SCP_RELAY_STORAGE_BACKEND={backend} requires {var} to be set");
+        std::process::exit(1);
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -485,7 +522,9 @@ pub async fn start_relay_from_env() -> (
 
 #[cfg(test)]
 mod tests {
-    use super::{BACKENDS, backend_is_compiled, reject_backend_message, valid_backends};
+    use super::{
+        BACKENDS, backend_is_compiled, reject_backend_message, required_var, valid_backends,
+    };
 
     /// A value naming no backend reads as a typo, and the message lists what
     /// this build accepts instead of naming a rebuild.
@@ -747,6 +786,46 @@ mod tests {
             "each row's `compiled` column must read the same feature the row \
              names in `transport_feature`; a row reading a sibling's feature \
              reports a compiled backend as absent"
+        );
+    }
+
+    /// [`check_storage_selection_from_env`] rejects a missing variable for
+    /// exactly the backends, and exactly the variables, that the arms of
+    /// [`storage_from_env`] read.
+    ///
+    /// `scp-node` calls the check before it writes its storage key and opens
+    /// the blob store after, so an arm that required a variable
+    /// [`required_var`] did not name would exit only after the key file
+    /// exists. The scan reads the arms out of this file's text, so it sees the
+    /// `postgres` and `s3` arms in a build that compiled neither.
+    #[test]
+    fn the_selection_check_requires_what_each_arm_reads() {
+        let mut arm_vars: Vec<(&str, &str)> = dispatch_body()
+            .lines()
+            .filter_map(|line| {
+                line.split_once("required_var_or_exit(\"")
+                    .map(|(_, rest)| rest)
+            })
+            .filter_map(|rest| rest.split_once("\", \""))
+            .filter_map(|(backend, rest)| rest.split_once('"').map(|(var, _)| (backend, var)))
+            .collect();
+        arm_vars.sort_unstable();
+        assert_eq!(
+            arm_vars,
+            [
+                ("postgres", "SCP_RELAY_DATABASE_URL"),
+                ("s3", "SCP_RELAY_S3_BUCKET")
+            ],
+            "the arms of storage_from_env changed which variables they require"
+        );
+        let mut checked: Vec<(&str, &str)> = BACKENDS
+            .iter()
+            .filter_map(|b| required_var(b.name).map(|var| (b.name, var)))
+            .collect();
+        checked.sort_unstable();
+        assert_eq!(
+            checked, arm_vars,
+            "required_var must name every variable an arm of storage_from_env requires"
         );
     }
 

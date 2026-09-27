@@ -74,14 +74,16 @@ run_rust() (
   # than stopping at `cargo check`, because two of them read `help_text()` and
   # assert which `SCP_RELAY_*` lines it prints, and both assertions name the
   # opposite text in a `cloud-blobs` build from the one every other command in
-  # this script reaches. `--bin scp-node` keeps the seven integration-test
-  # binaries in `crates/scp-node/tests/` out of this run: the `--workspace`
-  # commands above already run each one at default features, and none of them
-  # reads a cloud backend.
+  # this script reaches. `--test storage_backend_selection` runs the one
+  # integration test in `crates/scp-node/tests/` that selects a cloud backend,
+  # which here reaches the missing-variable half of its `postgres` and `s3`
+  # cases. `--bin` and `--test` together keep the other seven integration-test
+  # binaries out of this run: the `--workspace` commands above already run each
+  # one at default features, and none of them selects a cloud backend.
   if command -v cargo-nextest &>/dev/null; then
-    cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs --bin scp-node
+    cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs --bin scp-node --test storage_backend_selection
   else
-    cargo test -p scp-node --features cloud-blobs --bin scp-node
+    cargo test -p scp-node --features cloud-blobs --bin scp-node --test storage_backend_selection
   fi
 )
 

@@ -510,15 +510,25 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     let domain = require_domain();
     let http_addr = node_http_addr();
 
-    // Persistent mode: operator-configured durable blob backend (default
-    // SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` / `SCP_RELAY_STORAGE_PATH`
-    // — the same explicit selection relay-only mode makes (SCP-CAPINJECT-010).
-    // It is resolved before the storage directory, the root key file, and the
-    // two SQLCipher databases are created: `storage_from_env` exits on a
-    // backend this build did not compile, an unknown value, or a missing
-    // required variable, and a configuration error must leave no key material
-    // on disk. `tests/storage_backend_selection.rs` pins that ordering.
-    let blob_storage = startup::storage_from_env().await;
+    // Every environment value this function rejects is read here, before the
+    // storage directory, the root key file, the two SQLCipher databases, or
+    // the blob store exist, so a rejected value exits with nothing written.
+    // Explicit parse: a typo (e.g. "memroy") must NOT silently fall through to
+    // the production DHT, which would publish the host's address to the
+    // network. `disabled` is a `--self-host` value: a full relay node must
+    // publish its DID to be discoverable.
+    let dht_mode = parse_dht_mode_or_exit();
+    if matches!(dht_mode, scp_node::DhtMode::Disabled) {
+        tracing::error!(
+            "DhtMode::Disabled is not a full-relay-node mode — the node must publish its DID. \
+             Use --self-host for a non-publishing hosted site."
+        );
+        std::process::exit(1);
+    }
+    // `SCP_RELAY_STORAGE_BACKEND`: a backend this build did not compile, an
+    // unknown value, or a missing required variable.
+    startup::check_storage_selection_from_env();
+    // `tests/storage_backend_selection.rs` pins both checks to this position.
 
     // Validate the storage path upfront before attempting to open databases.
     let resolved_path = resolve_storage_path_or_exit(storage_path);
@@ -531,6 +541,16 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // is alive would fail with an advisory-lock conflict (os error 35).
     let (storage_dir, _storage_key, node_storage_arc, custody) =
         init_persistent_storage(storage_path).await;
+
+    // Persistent mode: operator-configured durable blob backend (default
+    // SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` / `SCP_RELAY_STORAGE_PATH`
+    // — the same explicit selection relay-only mode makes (SCP-CAPINJECT-010).
+    // The selection was checked above; this call opens the store. It runs after
+    // the node storage exists, so a failure of the open itself (an unreachable
+    // database, an unwritable blob path) leaves the node's key file, which the
+    // next start reads back, and a failure of the node storage leaves no blob
+    // database.
+    let blob_storage = startup::storage_from_env().await;
 
     tracing::info!(
         domain = %domain,
@@ -547,19 +567,10 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
         scp_node::self_host::StorageSequenceStore::new(Arc::clone(&node_storage_arc)),
     );
 
-    // Explicit parse: a typo (e.g. "memroy") must NOT silently fall through to
-    // the production DHT, which would publish the host's address to the network.
-    match parse_dht_mode_or_exit() {
-        // `parse_dht_mode_or_exit` never returns `Disabled` for the full relay
-        // node (it exits with guidance to use `--self-host`); this arm exists
-        // only to keep the match exhaustive and fails closed if ever reached.
-        scp_node::DhtMode::Disabled => {
-            tracing::error!(
-                "DhtMode::Disabled is not a full-relay-node mode — the node must publish its DID. \
-                 Use --self-host for a non-publishing hosted site."
-            );
-            std::process::exit(1);
-        }
+    match dht_mode {
+        // Rejected before any storage was written, above; this arm keeps the
+        // match exhaustive and fails closed if ever reached.
+        scp_node::DhtMode::Disabled => std::process::exit(1),
         #[cfg(feature = "testing")]
         scp_node::DhtMode::Memory => {
             tracing::warn!(

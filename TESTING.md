@@ -30,7 +30,7 @@ cargo test --workspace --doc
 cargo nextest run -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob
 cargo test -p scp-transport --features postgres-blob,s3-blob,startup,sqlite-blob,redb-blob --doc
 cargo nextest run --no-tests=fail -p scp-relay --features cloud-blobs
-cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs --bin scp-node
+cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs --bin scp-node --test storage_backend_selection
 ```
 
 Every test inside `postgres_blob.rs` and `s3_blob.rs` carries `#[ignore]` and
