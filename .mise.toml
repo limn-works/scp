@@ -1,8 +1,9 @@
-# mise installs every tool this repository needs EXCEPT Rust and the ones the next
-# sentences name, and it names no Rust version. rustup installs Rust, and README.md
-# lists rustup among the prerequisites. Neither installs the full perl, plus make on
+# mise installs the tools listed under [tools] below, and it names no Rust version.
+# rustup installs Rust, and README.md lists rustup among the prerequisites.
+# scripts/setup-toolchain.sh installs the Android SDK and the NDK that [env] points
+# ANDROID_NDK_HOME at. None of the three installs the full perl, plus make on
 # Linux and macOS, that the Python binding's `maturin develop` needs to compile
-# OpenSSL; bindings/python/README.md §Requirements names them. Neither installs
+# OpenSSL; bindings/python/README.md §Requirements names them. None installs
 # PyYAML under python3.12, which scripts/check-vendored-openssl-scope.sh imports; the
 # tree-sitter grammars and ruff under python3.12, which the Python gates that import
 # `tree_sitter` parse with and scripts/check-pyi-generated.sh formats with; jq, which
