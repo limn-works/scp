@@ -51,18 +51,26 @@ use crate::identity::OpaqueInMemoryKeyCustody;
 #[napi(object, object_to_js = false)]
 pub struct NapiKeyCustodyProvider {
     /// `(keyType: string) => string` — generate a keypair, return its id.
+    /// `keyType` is `"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`.
     #[napi(ts_type = "(keyType: string) => string")]
     pub generate_keypair: Function<'static, String, String>,
     /// `(keyId: string, message: Uint8Array) => Uint8Array` — 64-byte sig.
+    /// For a `"p256"` key `message` is a 32-byte prehash and the result is
+    /// raw `r || s` (64 bytes) or DER; Rust normalises to low-s and verifies
+    /// it strictly against the key's public key, rejecting any mismatch.
     #[napi(ts_type = "(keyId: string, message: Uint8Array) => Uint8Array")]
     pub sign: Function<'static, (String, Vec<u8>), Vec<u8>>,
-    /// `(keyId: string) => Uint8Array` — 32 public-key bytes.
+    /// `(keyId: string) => Uint8Array` — 32 public-key bytes (Ed25519 /
+    /// X25519), 33-byte compressed SEC1 (`"p256"`) or 65-byte uncompressed
+    /// SEC1 (`"hpke-p256"`).
     #[napi(ts_type = "(keyId: string) => Uint8Array")]
     pub get_public_key: Function<'static, String, Vec<u8>>,
     /// `(keyId: string) => void` — destroy key material.
     #[napi(ts_type = "(keyId: string) => void")]
     pub destroy_key: Function<'static, String, ()>,
-    /// `(keyId: string, peerPublic: Uint8Array) => Uint8Array` — 32 shared bytes.
+    /// `(keyId: string, peerPublic: Uint8Array) => Uint8Array` — 32 shared
+    /// bytes; an `"hpke-p256"` key receives the 65-byte uncompressed peer
+    /// point.
     #[napi(ts_type = "(keyId: string, peerPublic: Uint8Array) => Uint8Array")]
     pub dh_agree: Function<'static, (String, Vec<u8>), Vec<u8>>,
     /// `(keyId: string, contextId: Uint8Array) => Uint8Array` —
@@ -124,6 +132,9 @@ struct CallbackTsfns {
 /// [`ThreadsafeFunction`]); the bridge awaits each via `call_async`.
 pub(crate) struct NapiCallbackKeyCustody {
     tsfns: CallbackTsfns,
+    /// Key types of the handles this adapter minted (the callback protocol
+    /// cannot report them).
+    registry: scp_ffi_common::callback_custody::CallbackKeyRegistry,
 }
 
 impl fmt::Debug for NapiCallbackKeyCustody {
@@ -146,6 +157,7 @@ impl NapiCallbackKeyCustody {
     /// threadsafe function.
     pub fn from_provider(provider: NapiKeyCustodyProvider) -> napi::Result<Self> {
         Ok(Self {
+            registry: scp_ffi_common::callback_custody::CallbackKeyRegistry::new(),
             tsfns: CallbackTsfns {
                 generate_keypair: provider
                     .generate_keypair
@@ -211,6 +223,7 @@ impl NapiCallbackKeyCustody {
         &self,
         handle: &KeyHandle,
     ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
+        scp_ffi_common::callback_custody::require_ed25519(&self.registry, handle)?;
         let bytes = zeroize::Zeroizing::new(
             self.tsfns
                 .export_signing_key_bytes
@@ -227,66 +240,92 @@ impl NapiCallbackKeyCustody {
 }
 
 impl KeyCustody for NapiCallbackKeyCustody {
+    // The shared flows in `scp_ffi_common::callback_custody` hold every
+    // key-type, length and P-256 validation rule; each closure is one
+    // `call_async` on the JS callback.
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
-        let type_str = match key_type {
-            KeyType::Ed25519 => "ed25519".to_owned(),
-            KeyType::X25519 => "x25519".to_owned(),
-        };
-        let key_id = self
-            .tsfns
-            .generate_keypair
-            .call_async(type_str)
-            .await
-            .map_err(|e| Self::map_call_err("generate_keypair", &e))?;
-        scp_ffi_common::custody_parse::parse_handle("generate_keypair", &key_id)
+        let t = &self.tsfns;
+        scp_ffi_common::callback_custody::generate_keypair(
+            &self.registry,
+            key_type,
+            |type_str| async move {
+                t.generate_keypair
+                    .call_async(type_str.to_owned())
+                    .await
+                    .map_err(|e| Self::map_call_err("generate_keypair", &e))
+            },
+            |key_id| async move {
+                t.get_public_key
+                    .call_async(key_id)
+                    .await
+                    .map_err(|e| Self::map_call_err("get_public_key", &e))
+            },
+            |key_id| async move {
+                t.destroy_key
+                    .call_async(key_id)
+                    .await
+                    .map_err(|e| Self::map_call_err("destroy_key", &e))
+            },
+        )
+        .await
     }
 
     async fn sign(&self, key: &KeyHandle, data: &[u8]) -> Result<Signature, PlatformError> {
-        let sig = self
-            .tsfns
-            .sign
-            .call_async((key.id().to_string(), data.to_vec()))
-            .await
-            .map_err(|e| Self::map_call_err("sign", &e))?;
-        Ok(Signature::new(sig))
+        let t = &self.tsfns;
+        scp_ffi_common::callback_custody::sign(
+            &self.registry,
+            key,
+            data,
+            |key_id, data| async move {
+                t.sign
+                    .call_async((key_id, data))
+                    .await
+                    .map_err(|e| Self::map_call_err("sign", &e))
+            },
+        )
+        .await
     }
 
     async fn public_key(&self, key: &KeyHandle) -> Result<PublicKey, PlatformError> {
-        let pk = self
-            .tsfns
-            .get_public_key
-            .call_async(key.id().to_string())
-            .await
-            .map_err(|e| Self::map_call_err("get_public_key", &e))?;
-        Ok(PublicKey::new(pk))
+        let t = &self.tsfns;
+        scp_ffi_common::callback_custody::public_key(&self.registry, key, |key_id| async move {
+            t.get_public_key
+                .call_async(key_id)
+                .await
+                .map_err(|e| Self::map_call_err("get_public_key", &e))
+        })
+        .await
     }
 
     async fn destroy_key(&self, key: &KeyHandle) -> Result<(), PlatformError> {
-        self.tsfns
-            .destroy_key
-            .call_async(key.id().to_string())
-            .await
-            .map_err(|e| Self::map_call_err("destroy_key", &e))
+        let t = &self.tsfns;
+        scp_ffi_common::callback_custody::destroy_key(&self.registry, key, |key_id| async move {
+            t.destroy_key
+                .call_async(key_id)
+                .await
+                .map_err(|e| Self::map_call_err("destroy_key", &e))
+        })
+        .await
     }
 
     async fn dh_agree(
         &self,
         key: &KeyHandle,
-        peer_public: &[u8; 32],
+        peer_public: &[u8],
     ) -> Result<SharedSecret, PlatformError> {
-        // Wrap the raw shared secret in `Zeroizing` so the intermediate heap
-        // buffer is wiped on drop once it has been copied into `SharedSecret`
-        // (defense-in-depth, matching `export_ed25519_signing_key`; ADR-006).
-        let shared = zeroize::Zeroizing::new(
-            self.tsfns
-                .dh_agree
-                .call_async((key.id().to_string(), peer_public.to_vec()))
-                .await
-                .map_err(|e| Self::map_call_err("dh_agree", &e))?,
-        );
-        Ok(SharedSecret::new(scp_ffi_common::custody_parse::expect_32(
-            "dh_agree", &shared,
-        )?))
+        let t = &self.tsfns;
+        scp_ffi_common::callback_custody::dh_agree(
+            &self.registry,
+            key,
+            peer_public,
+            |key_id, peer| async move {
+                t.dh_agree
+                    .call_async((key_id, peer))
+                    .await
+                    .map_err(|e| Self::map_call_err("dh_agree", &e))
+            },
+        )
+        .await
     }
 
     async fn derive_pseudonym(
@@ -335,6 +374,7 @@ impl KeyCustody for NapiCallbackKeyCustody {
         // The JS callback protocol does not expose a distinct birational
         // conversion; the provider manages key types internally, so delegate
         // to dh_agree (matches the UniFFI/PyO3 contract).
+        scp_ffi_common::callback_custody::require_ed25519(&self.registry, ed25519_handle)?;
         // Wrap the raw shared secret in `Zeroizing` so the intermediate heap
         // buffer is wiped on drop once it has been copied into `SharedSecret`
         // (defense-in-depth, matching `export_ed25519_signing_key`; ADR-006).
@@ -500,7 +540,7 @@ impl KeyCustody for NapiKeyCustody {
     async fn dh_agree(
         &self,
         key: &KeyHandle,
-        peer_public: &[u8; 32],
+        peer_public: &[u8],
     ) -> Result<SharedSecret, PlatformError> {
         match self {
             #[cfg(feature = "testing")]

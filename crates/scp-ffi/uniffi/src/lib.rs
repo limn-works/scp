@@ -335,26 +335,35 @@ pub trait MessageListener: Send + Sync {
 #[uniffi::export(callback_interface)]
 #[async_trait::async_trait]
 pub trait KeyCustodyProvider: Send + Sync {
-    /// Sign `message` bytes with the Ed25519 key identified by `key_id`.
+    /// Sign `message` bytes with the key identified by `key_id`.
     ///
-    /// Returns the raw 64-byte Ed25519 signature.
+    /// For an Ed25519 key, returns the raw 64-byte signature. For a `"p256"`
+    /// key, `message` is a 32-byte prehash and the result is raw `r || s`
+    /// (64 bytes) or DER (`SecKeyCreateSignature` / `java.security.Signature`
+    /// output); the bridge normalises it to low-s and verifies it strictly
+    /// against the key's public key, and any mismatch is an error.
     async fn sign(&self, key_id: String, message: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 
-    /// Return the Ed25519 public key bytes (32 bytes) for `key_id`.
+    /// Return the public key bytes for `key_id`: 32 bytes (Ed25519, X25519),
+    /// the 33-byte compressed SEC1 point (`"p256"`), or the 65-byte
+    /// uncompressed SEC1 point (`"hpke-p256"`). Any other length is an error.
     async fn get_public_key(&self, key_id: String) -> Result<Vec<u8>, ScpError>;
 
     /// Destroy key material for `key_id`. Subsequent operations must fail.
     async fn destroy_key(&self, key_id: String) -> Result<(), ScpError>;
 
-    /// Generate a new keypair. `key_type` is `"ed25519"` or `"x25519"`.
+    /// Generate a new keypair. `key_type` is `"ed25519"`, `"x25519"`,
+    /// `"p256"` (ECDSA P-256 signing) or `"hpke-p256"` (P-256 ECDH for HPKE).
     ///
     /// Returns an opaque key identifier string.
     async fn generate_keypair(&self, key_type: String) -> Result<String, ScpError>;
 
-    /// Perform X25519 Diffie-Hellman key agreement.
+    /// Perform Diffie-Hellman key agreement.
     ///
-    /// `key_id` — the X25519 key handle.
-    /// `peer_public` — 32-byte peer X25519 public key.
+    /// `key_id` — the X25519 or `"hpke-p256"` key handle.
+    /// `peer_public` — the 32-byte peer X25519 public key, or for
+    /// `"hpke-p256"` the 65-byte uncompressed SEC1 peer point (validated
+    /// on-curve by the bridge before this call).
     ///
     /// Returns the 32-byte shared secret. The private key never leaves the
     /// custody boundary.

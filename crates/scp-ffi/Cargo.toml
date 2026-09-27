@@ -102,6 +102,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 scp-ffi-common = { path = "common", features = ["testing", "custody"] }
 # Tests need InMemoryKeyCustody.
 scp-platform = { path = "../scp-platform", features = ["testing"] }
+# The P-256 callback-custody tests verify host signatures strictly.
+scp-crypto = { path = "../scp-crypto" }
 # Tests construct `InMemoryDhtClient` directly (the §17.17.3 DHT nullifier) via
 # the `FfiDhtClient::InMemory` test seam. `features = ["testing"]` (no
 # slash-string in a feature list) is fine per the ADR-062 §Decision 1 invariant.

@@ -37,7 +37,7 @@ testing = [
 # PseudonymKeypair, PublicKey, PlatformError). Deliberately NOT folded into
 # `resolvers`: these are pure byte/string ops far lighter than the resolver
 # stack.
-custody = ["dep:scp-platform"]
+custody = ["dep:scp-platform", "dep:scp-crypto"]
 # Shared relay/node startup code for FFI bridges that need to spawn servers.
 # Requires scp-transport (relay), scp-node (application node), scp-platform, and
 # tokio. `start_node_local` opens no protocol store: it receives a caller's
@@ -72,6 +72,7 @@ scp-mcp = { path = "../../scp-mcp", optional = true }
 scp-protocol = { path = "../../scp-protocol" }
 scp-clock = { path = "../../scp-clock" }
 scp-did = { path = "../../scp-did" }
+scp-crypto = { path = "../../scp-crypto", optional = true }
 scp-event-log = { path = "../../scp-event-log", optional = true }
 scp-identity = { path = "../../scp-identity", optional = true }
 # Non-optional: the shared `FfiDhtClient` (src/dht.rs) always ships the real

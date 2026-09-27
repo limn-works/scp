@@ -187,7 +187,7 @@ impl KeyCustody for OpaqueInMemoryKeyCustody {
     async fn dh_agree(
         &self,
         key: &KeyHandle,
-        peer_public: &[u8; 32],
+        peer_public: &[u8],
     ) -> Result<SharedSecret, PlatformError> {
         self.0.dh_agree(key, peer_public).await
     }
@@ -689,13 +689,24 @@ fn resolve_context_custody(handle: &ContextHandle) -> Option<Arc<UniffiKeyCustod
 /// is `dyn`-dispatched via `Box<dyn KeyCustodyProvider>`).
 pub(crate) struct CallbackKeyCustody {
     provider: Box<dyn crate::KeyCustodyProvider>,
+    /// Key types of the handles this adapter minted (the callback protocol
+    /// cannot report them).
+    registry: scp_ffi_common::callback_custody::CallbackKeyRegistry,
 }
 
 impl CallbackKeyCustody {
     /// Creates a new adapter wrapping the given callback provider.
     pub(crate) fn new(provider: Box<dyn crate::KeyCustodyProvider>) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            registry: scp_ffi_common::callback_custody::CallbackKeyRegistry::new(),
+        }
     }
+}
+
+/// Maps a `UniFFI` callback error to the platform custody error.
+fn host_err(e: impl fmt::Display) -> PlatformError {
+    PlatformError::CustodyError(e.to_string())
 }
 
 impl fmt::Debug for CallbackKeyCustody {
@@ -709,59 +720,65 @@ unsafe impl Send for CallbackKeyCustody {}
 unsafe impl Sync for CallbackKeyCustody {}
 
 impl KeyCustody for CallbackKeyCustody {
+    // The shared flows in `scp_ffi_common::callback_custody` hold every
+    // key-type, length and P-256 validation rule, so the three bridges
+    // cannot drift; each closure is one provider call.
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
-        let type_str = match key_type {
-            KeyType::Ed25519 => "ed25519".to_owned(),
-            KeyType::X25519 => "x25519".to_owned(),
-        };
-        let key_id = self
-            .provider
-            .generate_keypair(type_str)
-            .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
-        // Parse the returned key_id string as a u64 handle identifier via the
-        // shared helper (unifies the error text with the PyO3/napi bridges).
-        scp_ffi_common::custody_parse::parse_handle("generate_keypair", &key_id)
+        let p = &self.provider;
+        scp_ffi_common::callback_custody::generate_keypair(
+            &self.registry,
+            key_type,
+            |type_str| async move {
+                p.generate_keypair(type_str.to_owned())
+                    .await
+                    .map_err(host_err)
+            },
+            |key_id| async move { p.get_public_key(key_id).await.map_err(host_err) },
+            |key_id| async move { p.destroy_key(key_id).await.map_err(host_err) },
+        )
+        .await
     }
 
     async fn sign(&self, key: &KeyHandle, data: &[u8]) -> Result<Signature, PlatformError> {
-        let sig_bytes = self
-            .provider
-            .sign(key.id().to_string(), data.to_vec())
-            .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
-        Ok(Signature::new(sig_bytes))
+        let p = &self.provider;
+        scp_ffi_common::callback_custody::sign(
+            &self.registry,
+            key,
+            data,
+            |key_id, data| async move { p.sign(key_id, data).await.map_err(host_err) },
+        )
+        .await
     }
 
     async fn public_key(&self, key: &KeyHandle) -> Result<PublicKey, PlatformError> {
-        let pk_bytes = self
-            .provider
-            .get_public_key(key.id().to_string())
-            .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
-        Ok(PublicKey::new(pk_bytes))
+        let p = &self.provider;
+        scp_ffi_common::callback_custody::public_key(&self.registry, key, |key_id| async move {
+            p.get_public_key(key_id).await.map_err(host_err)
+        })
+        .await
     }
 
     async fn destroy_key(&self, key: &KeyHandle) -> Result<(), PlatformError> {
-        self.provider
-            .destroy_key(key.id().to_string())
-            .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))
+        let p = &self.provider;
+        scp_ffi_common::callback_custody::destroy_key(&self.registry, key, |key_id| async move {
+            p.destroy_key(key_id).await.map_err(host_err)
+        })
+        .await
     }
 
     async fn dh_agree(
         &self,
         key: &KeyHandle,
-        peer_public: &[u8; 32],
+        peer_public: &[u8],
     ) -> Result<SharedSecret, PlatformError> {
-        let shared = self
-            .provider
-            .dh_agree(key.id().to_string(), peer_public.to_vec())
-            .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
-        Ok(SharedSecret::new(scp_ffi_common::custody_parse::expect_32(
-            "dh_agree", &shared,
-        )?))
+        let p = &self.provider;
+        scp_ffi_common::callback_custody::dh_agree(
+            &self.registry,
+            key,
+            peer_public,
+            |key_id, peer| async move { p.dh_agree(key_id, peer).await.map_err(host_err) },
+        )
+        .await
     }
 
     async fn derive_pseudonym(
@@ -811,6 +828,7 @@ impl KeyCustody for CallbackKeyCustody {
     ) -> Result<SharedSecret, PlatformError> {
         // The callback protocol does not expose ed25519→x25519 conversion.
         // Delegates to dh_agree since the callback provider manages key types internally.
+        scp_ffi_common::callback_custody::require_ed25519(&self.registry, ed25519_handle)?;
         let shared = self
             .provider
             .dh_agree(ed25519_handle.id().to_string(), peer_x25519_public.to_vec())
@@ -916,6 +934,7 @@ impl CallbackKeyCustody {
         &self,
         handle: &KeyHandle,
     ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
+        scp_ffi_common::callback_custody::require_ed25519(&self.registry, handle)?;
         let key_bytes = self
             .provider
             .export_signing_key_bytes(handle.id().to_string())
@@ -1045,7 +1064,7 @@ impl KeyCustody for UniffiKeyCustody {
     async fn dh_agree(
         &self,
         key: &KeyHandle,
-        peer_public: &[u8; 32],
+        peer_public: &[u8],
     ) -> Result<SharedSecret, PlatformError> {
         match self {
             #[cfg(feature = "testing")]

@@ -113,7 +113,7 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
     fn dh_agree(
         &self,
         _key: &KeyHandle,
-        _peer_public: &[u8; 32],
+        _peer_public: &[u8],
     ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }

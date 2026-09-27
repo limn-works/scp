@@ -3765,7 +3765,7 @@ impl KeyCustody for NoOpCustody {
     fn dh_agree(
         &self,
         _handle: &scp_platform::KeyHandle,
-        _peer_public: &[u8; 32],
+        _peer_public: &[u8],
     ) -> impl std::future::Future<
         Output = Result<scp_platform::SharedSecret, scp_platform::PlatformError>,
     > + Send {

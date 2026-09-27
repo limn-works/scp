@@ -55,6 +55,7 @@ scp-platform = { path = "../scp-platform", features = ["testing"] }
 scp-dht = { path = "../scp-dht", optional = true }
 scp-clock = { path = "../scp-clock" }
 scp-did = { path = "../scp-did" }
+scp-crypto = { path = "../scp-crypto" }
 # Optional, default features. `helpers.rs` is the only module here that names `scp_node`,
 # so this crate's `testing` feature turns the edge on. `scp-node/allow_unencrypted_storage`
 # gates `Node::start_for_testing` and `SelfSignedTlsProvider`, which no module in this

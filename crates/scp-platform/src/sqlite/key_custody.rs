@@ -9,7 +9,7 @@
 //!
 //! See spec section 17.6 (`SQLite` storage) and ADR-006 (platform adapters).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
@@ -37,28 +37,24 @@ const KEY_TYPE_ED25519: u8 = 0;
 /// Key type discriminant for X25519 keys.
 const KEY_TYPE_X25519: u8 = 1;
 
-/// Key type discriminant for a P-256 pseudonym key (§9.10.4). In-memory only:
-/// pseudonyms are re-derivable from the identity key, so this value is never
-/// persisted and never read back from storage.
-const KEY_TYPE_P256_PSEUDONYM: u8 = 0xF0;
+/// Key type discriminant for P-256 signing keys ([`KeyType::P256Signing`]).
+const KEY_TYPE_P256_SIGNING: u8 = 2;
 
-/// The error for using a key of discriminant `kt` where `expected` is
-/// required. A pseudonym key has no public `KeyType` yet, so its misuse is
-/// `Unsupported`.
-const fn wrong_type(kt: u8, expected: KeyType) -> PlatformError {
-    match kt {
-        KEY_TYPE_ED25519 => PlatformError::WrongKeyType {
-            expected,
-            actual: KeyType::Ed25519,
-        },
-        KEY_TYPE_X25519 => PlatformError::WrongKeyType {
-            expected,
-            actual: KeyType::X25519,
-        },
-        _ => PlatformError::Unsupported(
-            "a P-256 pseudonym key handle supports only sign (32-byte digest), public_key and destroy_key",
-        ),
+/// Key type discriminant for P-256 HPKE keys ([`KeyType::HpkeP256`]).
+const KEY_TYPE_P256_HPKE: u8 = 3;
+
+const fn type_byte(key_type: KeyType) -> u8 {
+    match key_type {
+        KeyType::Ed25519 => KEY_TYPE_ED25519,
+        KeyType::X25519 => KEY_TYPE_X25519,
+        KeyType::P256Signing => KEY_TYPE_P256_SIGNING,
+        KeyType::HpkeP256 => KEY_TYPE_P256_HPKE,
     }
+}
+
+/// The error for using a key of type `actual` where `expected` is required.
+const fn wrong_type(actual: KeyType, expected: KeyType) -> PlatformError {
+    PlatformError::WrongKeyType { expected, actual }
 }
 
 /// Consolidated in-memory key store protected by a single mutex.
@@ -67,13 +63,25 @@ const fn wrong_type(kt: u8, expected: KeyType) -> PlatformError {
 /// three independent mutexes (`key_types`, `ed25519_keys`, `x25519_keys`).
 struct SqliteKeyStore {
     /// Key type lookup, indexed by handle ID.
-    key_types: HashMap<u64, u8>,
+    key_types: HashMap<u64, KeyType>,
     /// In-memory cache of Ed25519 signing keys, indexed by handle ID.
     ed25519_keys: HashMap<u64, SigningKey>,
     /// In-memory cache of X25519 static secrets, indexed by handle ID.
     x25519_keys: HashMap<u64, StaticSecret>,
-    /// Derived P-256 pseudonym keys, indexed by handle ID (never persisted).
-    p256_pseudonym_keys: HashMap<u64, P256SigningKey>,
+    /// P-256 signing and HPKE keys, indexed by handle ID; `key_types` says
+    /// which.
+    p256_keys: HashMap<u64, P256SigningKey>,
+    /// Handles of derived pseudonym keys: cached in `p256_keys` but never
+    /// persisted, because they are re-derivable from the identity key.
+    pseudonym_ids: HashSet<u64>,
+}
+
+impl SqliteKeyStore {
+    fn p256_key(&self, key_id: u64) -> Result<&P256SigningKey, PlatformError> {
+        self.p256_keys
+            .get(&key_id)
+            .ok_or(PlatformError::KeyNotFound)
+    }
 }
 
 /// Persistent [`KeyCustody`] backed by [`SqliteStorage`] with `SQLCipher` encryption.
@@ -86,7 +94,9 @@ struct SqliteKeyStore {
 /// # Key Storage Format
 ///
 /// Each key is stored under `custody/keys/{handle_id}` as a 33-byte blob:
-/// `[key_type_byte || 32_bytes_private_key]`. The handle counter is persisted
+/// `[key_type_byte || 32_bytes_private_key]`, where the type byte is 0
+/// (Ed25519), 1 (X25519), 2 (P-256 signing) or 3 (P-256 HPKE); a P-256
+/// scalar that is zero or not below `n` fails the load. The handle counter is persisted
 /// at `custody/next_id` as an 8-byte little-endian u64 to ensure handle
 /// uniqueness across restarts.
 ///
@@ -119,6 +129,7 @@ impl SqliteKeyCustody {
     pub async fn new(storage: SqliteStorage) -> Result<Self, PlatformError> {
         let mut ed25519_keys = HashMap::new();
         let mut x25519_keys = HashMap::new();
+        let mut p256_keys = HashMap::new();
         let mut key_types = HashMap::new();
         let mut max_id: u64 = 0;
 
@@ -166,12 +177,23 @@ impl SqliteKeyCustody {
                 KEY_TYPE_ED25519 => {
                     let signing_key = SigningKey::from_bytes(&key_bytes);
                     ed25519_keys.insert(id, signing_key);
-                    key_types.insert(id, KEY_TYPE_ED25519);
+                    key_types.insert(id, KeyType::Ed25519);
                 }
                 KEY_TYPE_X25519 => {
                     let secret = StaticSecret::from(*key_bytes);
                     x25519_keys.insert(id, secret);
-                    key_types.insert(id, KEY_TYPE_X25519);
+                    key_types.insert(id, KeyType::X25519);
+                }
+                KEY_TYPE_P256_SIGNING | KEY_TYPE_P256_HPKE => {
+                    let key = crate::traits::p256_key_from_stored(&key_bytes)
+                        .map_err(|e| PlatformError::StorageError(format!("key {id}: {e}")))?;
+                    p256_keys.insert(id, key);
+                    let key_type = if key_type_byte == KEY_TYPE_P256_SIGNING {
+                        KeyType::P256Signing
+                    } else {
+                        KeyType::HpkeP256
+                    };
+                    key_types.insert(id, key_type);
                 }
                 other => {
                     // key_bytes is Zeroizing — automatically zeroed on drop
@@ -192,7 +214,8 @@ impl SqliteKeyCustody {
                 key_types,
                 ed25519_keys,
                 x25519_keys,
-                p256_pseudonym_keys: HashMap::new(),
+                p256_keys,
+                pseudonym_ids: HashSet::new(),
             }),
             next_id: AtomicU64::new(next_id),
         })
@@ -228,7 +251,7 @@ impl SqliteKeyCustody {
     }
 
     /// Returns the stored key type for a handle, or an error if not found.
-    fn lookup_type(store: &SqliteKeyStore, handle: KeyHandle) -> Result<u8, PlatformError> {
+    fn lookup_type(store: &SqliteKeyStore, handle: KeyHandle) -> Result<KeyType, PlatformError> {
         store
             .key_types
             .get(&handle.id())
@@ -246,31 +269,46 @@ impl KeyCustody for SqliteKeyCustody {
         key_type: KeyType,
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
         async move {
-            let handle = self.next_handle().await?;
-            let mut key_bytes = Zeroizing::new([0u8; 32]);
-            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, key_bytes.as_mut());
-
-            let type_byte = match key_type {
-                KeyType::Ed25519 => KEY_TYPE_ED25519,
-                KeyType::X25519 => KEY_TYPE_X25519,
+            let p256_key = match key_type {
+                KeyType::P256Signing | KeyType::HpkeP256 => {
+                    Some(crate::traits::generate_p256_os_rng()?)
+                }
+                KeyType::Ed25519 | KeyType::X25519 => None,
             };
+            let key_bytes = p256_key.as_ref().map_or_else(
+                || {
+                    let mut key_bytes = Zeroizing::new([0u8; 32]);
+                    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, key_bytes.as_mut());
+                    key_bytes
+                },
+                P256SigningKey::to_scalar_bytes,
+            );
+            let handle = self.next_handle().await?;
 
             // Persist to storage before adding to cache.
-            self.persist_key(handle.id(), &key_bytes, type_byte).await?;
+            self.persist_key(handle.id(), &key_bytes, type_byte(key_type))
+                .await?;
 
             let mut store = self.store.lock().await;
-            match key_type {
-                KeyType::Ed25519 => {
+            match (key_type, p256_key) {
+                (KeyType::Ed25519, _) => {
                     let signing_key = SigningKey::from_bytes(&key_bytes);
                     store.ed25519_keys.insert(handle.id(), signing_key);
-                    store.key_types.insert(handle.id(), KEY_TYPE_ED25519);
                 }
-                KeyType::X25519 => {
+                (KeyType::X25519, _) => {
                     let secret = StaticSecret::from(*key_bytes);
                     store.x25519_keys.insert(handle.id(), secret);
-                    store.key_types.insert(handle.id(), KEY_TYPE_X25519);
+                }
+                (KeyType::P256Signing | KeyType::HpkeP256, Some(key)) => {
+                    store.p256_keys.insert(handle.id(), key);
+                }
+                (KeyType::P256Signing | KeyType::HpkeP256, None) => {
+                    return Err(PlatformError::CustodyError(
+                        "P-256 key generation produced no key".into(),
+                    ));
                 }
             }
+            store.key_types.insert(handle.id(), key_type);
 
             Ok(handle)
         }
@@ -286,15 +324,13 @@ impl KeyCustody for SqliteKeyCustody {
             let store = self.store.lock().await;
             let kt = Self::lookup_type(&store, KeyHandle::new(key_id))?;
 
-            if kt == KEY_TYPE_P256_PSEUDONYM {
-                let key = store
-                    .p256_pseudonym_keys
-                    .get(&key_id)
-                    .ok_or(PlatformError::KeyNotFound)?;
-                return crate::traits::sign_pseudonym_digest(key, data);
-            }
-            if kt != KEY_TYPE_ED25519 {
-                return Err(wrong_type(kt, KeyType::Ed25519));
+            match kt {
+                KeyType::Ed25519 => {}
+                KeyType::P256Signing => {
+                    return crate::traits::sign_p256_digest(store.p256_key(key_id)?, data);
+                }
+                KeyType::X25519 => return Err(wrong_type(kt, KeyType::Ed25519)),
+                KeyType::HpkeP256 => return Err(wrong_type(kt, KeyType::P256Signing)),
             }
 
             let signing_key = store
@@ -317,7 +353,7 @@ impl KeyCustody for SqliteKeyCustody {
             let kt = Self::lookup_type(&store, KeyHandle::new(key_id))?;
 
             match kt {
-                KEY_TYPE_ED25519 => {
+                KeyType::Ed25519 => {
                     let signing_key = store
                         .ed25519_keys
                         .get(&key_id)
@@ -325,7 +361,7 @@ impl KeyCustody for SqliteKeyCustody {
                     let verifying_key: VerifyingKey = signing_key.verifying_key();
                     Ok(PublicKey::new(verifying_key.to_bytes().to_vec()))
                 }
-                KEY_TYPE_X25519 => {
+                KeyType::X25519 => {
                     let secret = store
                         .x25519_keys
                         .get(&key_id)
@@ -333,14 +369,20 @@ impl KeyCustody for SqliteKeyCustody {
                     let public = X25519PublicKey::from(secret);
                     Ok(PublicKey::new(public.to_bytes().to_vec()))
                 }
-                KEY_TYPE_P256_PSEUDONYM => {
-                    let key = store
-                        .p256_pseudonym_keys
-                        .get(&key_id)
-                        .ok_or(PlatformError::KeyNotFound)?;
-                    Ok(PublicKey::new(key.public_key().to_compressed().to_vec()))
-                }
-                _ => Err(PlatformError::KeyNotFound),
+                KeyType::P256Signing => Ok(PublicKey::new(
+                    store
+                        .p256_key(key_id)?
+                        .public_key()
+                        .to_compressed()
+                        .to_vec(),
+                )),
+                KeyType::HpkeP256 => Ok(PublicKey::new(
+                    store
+                        .p256_key(key_id)?
+                        .public_key()
+                        .to_uncompressed()
+                        .to_vec(),
+                )),
             }
         }
     }
@@ -355,19 +397,20 @@ impl KeyCustody for SqliteKeyCustody {
             let kt = Self::lookup_type(&store, KeyHandle::new(key_id))?;
 
             match kt {
-                KEY_TYPE_ED25519 => {
+                KeyType::Ed25519 => {
                     store.ed25519_keys.remove(&key_id);
                 }
-                KEY_TYPE_X25519 => {
+                KeyType::X25519 => {
                     store.x25519_keys.remove(&key_id);
                 }
-                KEY_TYPE_P256_PSEUDONYM => {
-                    // Never persisted, so there is no stored row to remove.
-                    store.p256_pseudonym_keys.remove(&key_id);
-                    store.key_types.remove(&key_id);
-                    return Ok(());
+                KeyType::P256Signing | KeyType::HpkeP256 => {
+                    store.p256_keys.remove(&key_id);
+                    if store.pseudonym_ids.remove(&key_id) {
+                        // Never persisted, so there is no stored row to remove.
+                        store.key_types.remove(&key_id);
+                        return Ok(());
+                    }
                 }
-                _ => {}
             }
             store.key_types.remove(&key_id);
             drop(store);
@@ -382,17 +425,23 @@ impl KeyCustody for SqliteKeyCustody {
     fn dh_agree(
         &self,
         key: &KeyHandle,
-        peer_public: &[u8; 32],
+        peer_public: &[u8],
     ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
         let key_id = key.id();
-        let peer = *peer_public;
+        let peer_public = peer_public.to_vec();
         async move {
             let store = self.store.lock().await;
             let kt = Self::lookup_type(&store, KeyHandle::new(key_id))?;
 
-            if kt != KEY_TYPE_X25519 {
-                return Err(wrong_type(kt, KeyType::X25519));
+            match kt {
+                KeyType::X25519 => {}
+                KeyType::HpkeP256 => {
+                    return crate::traits::p256_dh_agree(store.p256_key(key_id)?, &peer_public);
+                }
+                KeyType::Ed25519 => return Err(wrong_type(kt, KeyType::X25519)),
+                KeyType::P256Signing => return Err(wrong_type(kt, KeyType::HpkeP256)),
             }
+            let peer = crate::traits::x25519_peer(&peer_public)?;
 
             let secret = store
                 .x25519_keys
@@ -417,7 +466,7 @@ impl KeyCustody for SqliteKeyCustody {
             let mut store = self.store.lock().await;
             let kt = Self::lookup_type(&store, KeyHandle::new(key_id))?;
 
-            if kt != KEY_TYPE_ED25519 {
+            if kt != KeyType::Ed25519 {
                 return Err(wrong_type(kt, KeyType::Ed25519));
             }
 
@@ -439,8 +488,9 @@ impl KeyCustody for SqliteKeyCustody {
             // Cached only, never persisted: pseudonyms are deterministically
             // re-derivable from the identity key.
             let handle = KeyHandle::new(self.next_id.fetch_add(1, Ordering::Relaxed));
-            store.p256_pseudonym_keys.insert(handle.id(), pseudonym_key);
-            store.key_types.insert(handle.id(), KEY_TYPE_P256_PSEUDONYM);
+            store.p256_keys.insert(handle.id(), pseudonym_key);
+            store.pseudonym_ids.insert(handle.id());
+            store.key_types.insert(handle.id(), KeyType::P256Signing);
             drop(store);
 
             PseudonymKeypair::new(&public_key, handle)
@@ -459,7 +509,7 @@ impl KeyCustody for SqliteKeyCustody {
             let mut store = self.store.lock().await;
             let kt = Self::lookup_type(&store, KeyHandle::new(key_id))?;
 
-            if kt != KEY_TYPE_ED25519 {
+            if kt != KeyType::Ed25519 {
                 return Err(wrong_type(kt, KeyType::Ed25519));
             }
 
@@ -483,8 +533,9 @@ impl KeyCustody for SqliteKeyCustody {
             // Cached only, never persisted: pseudonyms are deterministically
             // re-derivable from the identity key.
             let handle = KeyHandle::new(self.next_id.fetch_add(1, Ordering::Relaxed));
-            store.p256_pseudonym_keys.insert(handle.id(), pseudonym_key);
-            store.key_types.insert(handle.id(), KEY_TYPE_P256_PSEUDONYM);
+            store.p256_keys.insert(handle.id(), pseudonym_key);
+            store.pseudonym_ids.insert(handle.id());
+            store.key_types.insert(handle.id(), KeyType::P256Signing);
             drop(store);
 
             PseudonymKeypair::new(&public_key, handle)
@@ -502,7 +553,7 @@ impl KeyCustody for SqliteKeyCustody {
             let store = self.store.lock().await;
             let kt = Self::lookup_type(&store, KeyHandle::new(key_id))?;
 
-            if kt != KEY_TYPE_ED25519 {
+            if kt != KeyType::Ed25519 {
                 return Err(wrong_type(kt, KeyType::Ed25519));
             }
 
@@ -547,7 +598,7 @@ impl KeyCustody for SqliteKeyCustody {
             let mut store = self.store.lock().await;
             let signing_key = SigningKey::from_bytes(&key_bytes);
             store.ed25519_keys.insert(handle.id(), signing_key);
-            store.key_types.insert(handle.id(), KEY_TYPE_ED25519);
+            store.key_types.insert(handle.id(), KeyType::Ed25519);
 
             Ok(handle)
         }
@@ -676,7 +727,10 @@ mod tests {
             ));
             assert!(matches!(
                 custody.dh_agree(pseudo.key_handle(), &[1u8; 32]).await,
-                Err(PlatformError::Unsupported(_))
+                Err(PlatformError::WrongKeyType {
+                    expected: KeyType::HpkeP256,
+                    actual: KeyType::P256Signing
+                })
             ));
             custody.destroy_key(pseudo.key_handle()).await.unwrap();
             assert!(matches!(
@@ -754,5 +808,88 @@ mod tests {
         let custody = temp_custody(dir.path()).await;
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         assert_eq!(custody.custody_type(&handle), CustodyType::Software);
+    }
+
+    /// The P-256 group order `n`, big-endian: the smallest invalid scalar.
+    const P256_ORDER: [u8; 32] = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63,
+        0x25, 0x51,
+    ];
+
+    #[tokio::test]
+    async fn p256_keys_survive_reload_with_type_bytes_2_and_3() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [0x42u8; 32];
+        let (sign_handle, hpke_handle, sign_pub, hpke_pub);
+        {
+            let storage = SqliteStorage::new(dir.path(), &key).unwrap();
+            let custody = SqliteKeyCustody::new(storage).await.unwrap();
+            sign_handle = custody
+                .generate_keypair(KeyType::P256Signing)
+                .await
+                .unwrap();
+            hpke_handle = custody.generate_keypair(KeyType::HpkeP256).await.unwrap();
+            sign_pub = custody.public_key(&sign_handle).await.unwrap();
+            hpke_pub = custody.public_key(&hpke_handle).await.unwrap();
+            assert_eq!(sign_pub.as_bytes().len(), 33);
+            assert_eq!(hpke_pub.as_bytes().len(), 65);
+        }
+        {
+            let storage = SqliteStorage::new(dir.path(), &key).unwrap();
+            let sign_row = storage
+                .retrieve(&format!("{KEY_PREFIX}{}", sign_handle.id()))
+                .await
+                .unwrap()
+                .unwrap();
+            let hpke_row = storage
+                .retrieve(&format!("{KEY_PREFIX}{}", hpke_handle.id()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(sign_row[0], 2);
+            assert_eq!(hpke_row[0], 3);
+
+            let custody = SqliteKeyCustody::new(storage).await.unwrap();
+            assert_eq!(custody.public_key(&sign_handle).await.unwrap(), sign_pub);
+            assert_eq!(custody.public_key(&hpke_handle).await.unwrap(), hpke_pub);
+
+            let pk = scp_crypto::p256::P256PublicKey::from_sec1(sign_pub.as_bytes()).unwrap();
+            let digest = [0x11u8; 32];
+            let sig = custody.sign(&sign_handle, &digest).await.unwrap();
+            scp_crypto::p256::verify_prehash_strict(&pk, &digest, sig.as_bytes()).unwrap();
+
+            let peer = P256SigningKey::from_scalar_bytes(&[5u8; 32]).unwrap();
+            let own = scp_crypto::p256::P256PublicKey::from_sec1(hpke_pub.as_bytes()).unwrap();
+            let shared = custody
+                .dh_agree(&hpke_handle, &peer.public_key().to_uncompressed())
+                .await
+                .unwrap();
+            assert_eq!(
+                shared.as_bytes(),
+                &*scp_crypto::p256::ecdh_p256(&peer, &own)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn load_rejects_zero_or_out_of_range_p256_scalar() {
+        for type_byte in [KEY_TYPE_P256_SIGNING, KEY_TYPE_P256_HPKE] {
+            for scalar in [[0u8; 32], P256_ORDER, [0xFFu8; 32]] {
+                let dir = tempfile::tempdir().unwrap();
+                let key = [0x42u8; 32];
+                let storage = SqliteStorage::new(dir.path(), &key).unwrap();
+                let mut blob = vec![type_byte];
+                blob.extend_from_slice(&scalar);
+                storage
+                    .store(&format!("{KEY_PREFIX}7"), &blob)
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    SqliteKeyCustody::new(storage).await,
+                    Err(PlatformError::StorageError(_))
+                ));
+            }
+        }
     }
 }
