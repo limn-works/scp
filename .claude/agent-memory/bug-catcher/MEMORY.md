@@ -1,7 +1,5 @@
 # Bug Catcher Memory
 
-- [UniFFI Swift checksum staleness](uniffi_checksum_staleness.md) — hand-edited Swift signatures with stale checksum constants crash the Swift SDK at init; detect by regenerating and diffing.
-
 ## Recurring bug patterns in this codebase (most frequent first)
 1. **Check-then-act across a lock release or an `.await`.** A read lock for the check, then a separate write lock for the mutation, lets concurrent callers pass the limit or race the insert (subscription limits, connection limits, standing-channel creation, a `ConcurrentHashMap` get-then-put across a suspension point). Fix: one write lock around check and mutate, or the `entry()` API.
 2. **A lock guard held across an `.await` or a blocking call.** A read guard held through a 10-second DTLS receive or a jitter sleep starves writers and cleanup tasks.

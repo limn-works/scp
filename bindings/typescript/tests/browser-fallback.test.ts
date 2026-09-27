@@ -12,7 +12,7 @@
  * {@link __extractFirstCapabilityUri} (the only exported caller of the decoder),
  * and restore the global in a `finally`.
  *
- * See `.docs/lessons/typescript-node-only-globals-break-browser.md`.
+ * See "Code that also runs in a browser" in `bindings/typescript/AGENTS.md`.
  */
 
 import { describe, expect, it } from "bun:test";

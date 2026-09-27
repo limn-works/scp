@@ -7,8 +7,8 @@ provider (`crates/scp-runtime/src/context/providers/event_log.rs`) appends every
 way because it holds no per-event signing key.
 
 **Why the MCP path is unsigned**: `KeyCustody::sign` is async, the call site is synchronous
-code already running on the tokio runtime, and `block_on` there panics (see
-`.docs/lessons/tokio-mutex-blocking-lock-in-runtime.md`). The ways out are an async entry
+code already running on the tokio runtime, and `block_on` there panics (see the tokio-lock
+table in `crates/scp-ffi/AGENTS.md`). The ways out are an async entry
 point, a dedicated signing thread reached through a channel, or skipping the signature.
 
 **What still holds**: each unsigned event is chain-validated (its `sequence` must be the next

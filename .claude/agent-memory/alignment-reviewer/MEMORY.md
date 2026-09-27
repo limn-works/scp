@@ -12,4 +12,3 @@
 - **A Python wrapper that calls a bridge function that does not exist still imports cleanly** (attribute lookup happens at call time). Check each wrapper call against the bridge's module registration.
 - **A mock-based "integration" test validates SDK logic only.** Check what the mock replaces before crediting a story whose acceptance criterion is end-to-end.
 - **ADR pseudocode drifts from implementation** in method names, dependency versions, and artifact IDs; verify the code, then decide which side is wrong under the one-way artifact flow.
-- **Kotlin: raising a deprecation from `WARNING` to `ERROR` requires changing test `@Suppress("DEPRECATION")` to `@Suppress("DEPRECATION_ERROR")`;** the plain form covers only the warning level, and the tests then fail to compile.
