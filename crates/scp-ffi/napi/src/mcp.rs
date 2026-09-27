@@ -369,6 +369,14 @@ impl McpNapiBridgeProvider {
     }
 }
 
+/// Why the NAPI MCP server lists no tools and refuses every `tools/call`: the
+/// bridge has no synchronous path from `ContextProvider::invoke_outlet` to an
+/// outlet handler, so it reports the capability as absent rather than
+/// advertising tools it cannot run.
+const OUTLET_INVOCATION_UNAVAILABLE: &str =
+    "outlet invocation through the NAPI MCP server is unavailable: the bridge \
+     cannot execute an outlet from an MCP tools/call";
+
 impl ContextProvider for McpNapiBridgeProvider {
     fn active_context_ids(&self) -> Vec<scp_mcp::namespace::ContextId> {
         // Configured ∩ live: a context the agent has left is no longer served,
@@ -433,32 +441,14 @@ impl ContextProvider for McpNapiBridgeProvider {
         .map_err(|e| format!("{e}"))
     }
 
-    fn validate_capability(&self, context_id: &str, outlet_name: &str) -> Result<(), String> {
-        let bi = self.upgrade_bi()?;
-        crate::runtime::with_context(&bi, context_id, |rt| {
-            // SCP-OUT-014 §5.4.2: the split stem is selected from the outlet's
-            // registered kind — a Query grant never authorizes an Action call.
-            // An outlet absent from the registry defaults to the Action stem
-            // (the stricter of the two), so an unknown name fails closed.
-            let kind = rt
-                .outlet_registry
-                .get(outlet_name)
-                .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind);
-            if scp_core::context::outlets::invoke::has_outlet_invocation_capability(
-                &rt.role_state,
-                &self.agent_did,
-                outlet_name,
-                kind,
-            ) {
-                Ok(())
-            } else {
-                Err(ScpNapiError::Context {
-                    message: "insufficient permissions to invoke outlet".to_owned(),
-                    code: codes::TRANS_5012.to_owned(),
-                })
-            }
-        })
-        .map_err(|e| e.to_string())
+    fn validate_capability(&self, _context_id: &str, _outlet_name: &str) -> Result<(), String> {
+        // `McpServer` lists a tool exactly when this method returns `Ok`, and
+        // every `tools/call` ends in `invoke_outlet`. This bridge's
+        // `invoke_outlet` cannot execute an outlet, so granting here would
+        // put tools in `tools/list` that every `tools/call` then fails. The
+        // denial keeps `tools/list` empty and refuses `tools/call` before it
+        // reaches `invoke_outlet`, so a client sees the capability as absent.
+        Err(OUTLET_INVOCATION_UNAVAILABLE.to_owned())
     }
 
     fn invoke_outlet(
@@ -467,10 +457,7 @@ impl ContextProvider for McpNapiBridgeProvider {
         _outlet_name: &str,
         _arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        Err(
-            "outlet invocation through MCP server requires Supervisor outlet registry integration"
-                .to_owned(),
-        )
+        Err(OUTLET_INVOCATION_UNAVAILABLE.to_owned())
     }
 
     fn validate_resource_access(
@@ -1333,13 +1320,50 @@ mod tests {
         );
     }
 
+    /// `tools/list` must not name a tool that `tools/call` cannot run. The
+    /// NAPI `invoke_outlet` cannot execute an outlet, so the context creator,
+    /// who holds the admin role, sees an empty tool list and a `tools/call`
+    /// refused at the capability check.
+    #[test]
+    fn napi_mcp_lists_no_tool_it_cannot_invoke() {
+        let (_bi, mut server) = napi_mcp_fixture();
+        let _ = initialize_and_read_subscribe_flag(&mut server);
+
+        let listed = server
+            .handle_request(&mcp_request(
+                scp_mcp::protocol::METHOD_TOOLS_LIST,
+                serde_json::json!({}),
+            ))
+            .expect("tools/list must produce a response");
+        let tools = listed.result.expect("tools/list must succeed")["tools"].clone();
+        assert_eq!(
+            tools,
+            serde_json::json!([]),
+            "the NAPI server listed tools its invoke_outlet cannot execute"
+        );
+
+        let called = server
+            .handle_request(&mcp_request(
+                scp_mcp::protocol::METHOD_TOOLS_CALL,
+                serde_json::json!({
+                    "name": format!("{SUB_CTX}/send_message"),
+                    "arguments": {},
+                }),
+            ))
+            .expect("tools/call must produce a response");
+        let error = called.error.expect("tools/call must be refused");
+        assert_eq!(error.code, scp_mcp::protocol::CAPABILITY_DENIED);
+        assert_eq!(error.message, OUTLET_INVOCATION_UNAVAILABLE);
+    }
+
     /// The NAPI provider must serve REAL context state, not empty stand-ins.
     ///
     /// Before this fix `context_members` returned `Vec::new()`,
     /// `context_events` returned `[]` and `context_tools` returned
-    /// `Vec::new()`, while `validate_capability` returned `Err` unconditionally
-    /// — dead placeholders on a shipped path that would have gone live the
-    /// moment resource authorization started admitting anyone.
+    /// `Vec::new()` — empty stand-ins on a shipped path that would have gone
+    /// live the moment resource authorization started admitting anyone.
+    /// (`validate_capability` denies every tool on purpose; see
+    /// `napi_mcp_lists_no_tool_it_cannot_invoke`.)
     #[test]
     fn napi_provider_serves_real_context_state() {
         use scp_mcp::server::{ContextProvider as _, ResourceKind};
