@@ -410,19 +410,53 @@ impl Drop for KeyFileWriteLock {
 /// Takes the exclusive advisory lock that guards a read-modify-write of the key
 /// file at `key_path`, creating the lock file when it does not exist.
 ///
-/// This call blocks until whichever writer holds that lock releases it, because
-/// two identity creations on one machine must both succeed rather than one of
-/// them reporting contention. Every holder does bounded work under this lock —
+/// This call waits while another writer holds that lock, because two identity
+/// creations on one machine must both succeed rather than one of them reporting
+/// contention. Every holder in this crate does bounded work under this lock —
 /// one file read, one AEAD operation per entry it writes, and one atomic write
-/// — and awaits nothing while it holds the lock, so no holder waits on a caller
-/// of this function. A holder that crashes releases the lock, because an
-/// operating system drops every advisory lock a dead process held.
+/// — and awaits nothing while it holds the lock. A holder that crashes releases
+/// the lock, because an operating system drops every advisory lock a dead
+/// process held.
+///
+/// A holder in another process can still keep the lock indefinitely: that
+/// process can be stopped (`SIGSTOP`, a debugger) or stalled on a network
+/// filesystem. This call therefore waits at most [`KEY_FILE_LOCK_WAIT`] and then
+/// returns an error. The caller runs on an async runtime's worker thread, so an
+/// unbounded wait would park that thread, and on a `current_thread` runtime the
+/// whole runtime, with no result and no error.
 ///
 /// # Errors
 ///
-/// Returns [`PlatformError::CustodyError`] when the lock file cannot be opened
-/// and when the lock cannot be taken.
+/// Returns [`PlatformError::CustodyError`] when the lock file cannot be opened,
+/// when the lock cannot be taken, and when another holder keeps the lock for
+/// longer than [`KEY_FILE_LOCK_WAIT`].
 fn lock_key_file_for_write(key_path: &Path) -> Result<KeyFileWriteLock, PlatformError> {
+    lock_key_file_for_write_within(key_path, KEY_FILE_LOCK_WAIT)
+}
+
+/// The longest time [`lock_key_file_for_write`] waits for another holder to
+/// release the key-file lock before it returns an error.
+///
+/// A holder in this crate reads the file, seals or copies its entries, and
+/// writes it once, which takes milliseconds; ten seconds leaves that work
+/// three orders of magnitude of headroom.
+const KEY_FILE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The pause between two attempts to take a contended key-file lock.
+const KEY_FILE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Takes the key-file lock as [`lock_key_file_for_write`] does, waiting at most
+/// `wait` for another holder to release it.
+///
+/// # Errors
+///
+/// Returns [`PlatformError::CustodyError`] when the lock file cannot be opened,
+/// when the lock cannot be taken, and when another holder keeps the lock for
+/// longer than `wait`.
+fn lock_key_file_for_write_within(
+    key_path: &Path,
+    wait: std::time::Duration,
+) -> Result<KeyFileWriteLock, PlatformError> {
     let path = lock_file_path(key_path);
 
     let mut options = std::fs::OpenOptions::new();
@@ -440,14 +474,29 @@ fn lock_key_file_for_write(key_path: &Path) -> Result<KeyFileWriteLock, Platform
         ))
     })?;
 
-    fs2::FileExt::lock_exclusive(&file).map_err(|e| {
-        PlatformError::CustodyError(format!(
-            "failed to take the key-file lock at {}: {e}",
-            path.display()
-        ))
-    })?;
-
-    Ok(KeyFileWriteLock { file, path })
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(KeyFileWriteLock { file, path }),
+            Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(PlatformError::CustodyError(format!(
+                        "another writer held the key-file lock at {} for longer than {} ms; \
+                         no key was read or written",
+                        path.display(),
+                        wait.as_millis()
+                    )));
+                }
+                std::thread::sleep(KEY_FILE_LOCK_POLL);
+            }
+            Err(e) => {
+                return Err(PlatformError::CustodyError(format!(
+                    "failed to take the key-file lock at {}: {e}",
+                    path.display()
+                )));
+            }
+        }
+    }
 }
 
 /// Maps handle IDs to their key type and to the identifier of the entry that
@@ -3414,7 +3463,8 @@ mod tests {
     ///
     /// Two `FileKeyCustody` objects hold two `file_write_lock` mutexes, so this
     /// advisory lock is the only thing that makes them take turns. Replacing
-    /// `fs2::FileExt::lock_exclusive` with a call that returns immediately makes
+    /// the `fs2::FileExt::try_lock_exclusive` loop with a call that returns
+    /// immediately makes
     /// the second thread set its flag inside the wait below, which fails this
     /// assertion.
     #[test]
@@ -3447,6 +3497,44 @@ mod tests {
             acquired.load(Ordering::SeqCst),
             "releasing the lock must let the waiting writer through"
         );
+    }
+
+    /// A writer whose lock another holder keeps past the wait bound gets an
+    /// error instead of waiting forever.
+    ///
+    /// Replacing the bounded `try_lock_exclusive` loop with the blocking
+    /// `fs2::FileExt::lock_exclusive` makes the second call below never return
+    /// while the first guard is held, so the receive times out and this test
+    /// fails.
+    #[test]
+    fn a_writer_gives_up_when_another_holder_keeps_the_key_file_lock() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let held = lock_key_file_for_write(&path).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter_path = path.clone();
+        std::thread::spawn(move || {
+            let result =
+                lock_key_file_for_write_within(&waiter_path, std::time::Duration::from_millis(200));
+            let _ = tx.send(result.map(|_| ()));
+        });
+
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a contended lock must return within its wait bound, not block forever");
+        match result {
+            Err(PlatformError::CustodyError(message)) => assert!(
+                message.contains("held the key-file lock"),
+                "unexpected error: {message}"
+            ),
+            other => panic!("expected a CustodyError for a contended lock, got {other:?}"),
+        }
+
+        drop(held);
+        lock_key_file_for_write_within(&path, std::time::Duration::from_millis(200))
+            .expect("the lock must be free once its holder releases it");
     }
 
     /// `append_entry` waits for the key-file lock rather than reading and

@@ -651,10 +651,17 @@ where
             .filter(|passphrase| !passphrase.is_empty())
             .ok_or(ServerError::MissingPassphrase)?;
         let key_path = data_dir.join("identity.key");
-        let key_custody = Arc::new(scp_platform::file::FileKeyCustody::new(
-            &key_path,
-            &passphrase,
-        )?);
+        // `FileKeyCustody::new` runs an Argon2id derivation and can wait up to
+        // 1.5 s for another process to finish writing a file it reserved, so
+        // it runs on the blocking pool rather than on this future's worker
+        // thread.
+        let key_custody = Arc::new(
+            tokio::task::spawn_blocking(move || {
+                scp_platform::file::FileKeyCustody::new(&key_path, &passphrase)
+            })
+            .await
+            .map_err(std::io::Error::from)??,
+        );
 
         // Build the node's DHT client for its DID method. A shipped build uses
         // the real Mainline Pkarr client, fail-closed (never an in-memory
