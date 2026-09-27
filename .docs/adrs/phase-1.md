@@ -7,7 +7,7 @@
 **Dependencies between ADRs:**
 
 ```
-ADR-003 (DID)        ADR-001 (MLS)        ADR-006 (Testing)
+ADR-003 (identifier)        ADR-001 (MLS)        ADR-006 (Testing)
      \                  /    \                  |
       \                /      \                 |
        v              v        v                |
@@ -26,7 +26,11 @@ Build order: ADR-003 + ADR-001 + ADR-006 (parallel, no deps) --> ADR-002 --> ADR
 
 ## ADR-001: MLS Wrapper (OpenMLS Integration)
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — the single ciphersuite is RFC 9420 ciphersuite 2).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The single ciphersuite this ADR fixes is therefore `MLS_128_DHKEMP256_AES128GCM_SHA256_P256`, RFC 9420 ciphersuite 2, and the Decision and Implementation text below names it. The no-negotiation rule is untouched: this ADR fixes one ciphersuite and the ruling changed which one.
+
+**Amended 2026-09-10 (a human identity names no agent key).** ADR-063, inception-derived self-certifying identity over a key-event log, overturns the agent verification method of ADR-039, the shared-DID human-agent identity model. Every sentence below names `#active` alone, and `09-security-model.md` §9.1 invariant 1 states the replacing model.
 
 ### Context
 
@@ -36,12 +40,12 @@ MLS was selected over Sender Keys (Signal protocol) because member removal cost 
 
 ### Decision
 
-Wrap OpenMLS as `scp-core/crypto/mls/` module. Single ciphersuite: `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`. No ciphersuite negotiation in v1 (spec section 9.5). The wrapper exposes SCP-specific operations and hides OpenMLS internals behind a clean interface.
+Wrap OpenMLS as `scp-core/crypto/mls/` module. Single ciphersuite: `MLS_128_DHKEMP256_AES128GCM_SHA256_P256`. No ciphersuite negotiation in v1 (spec section 9.5). The wrapper exposes SCP-specific operations and hides OpenMLS internals behind a clean interface.
 
 ### Rationale
 
 - **OpenMLS over mls-rs:** OpenMLS is the most mature MLS implementation in Rust (more production usage, more contributors). mls-rs (by Wire) is a viable fallback if OpenMLS proves insufficient.
-- **Single ciphersuite:** Eliminates downgrade attacks and simplifies implementation. X25519 for key exchange, AES-128-GCM for encryption, SHA-256 for hashing, Ed25519 for signing. This is MLS's recommended baseline ciphersuite.
+- **Single ciphersuite:** Eliminates downgrade attacks and simplifies implementation. P-256 ECDH for key exchange, AES-128-GCM for encryption, SHA-256 for hashing, ECDSA on P-256 for signing. This is MLS's recommended baseline ciphersuite.
 - **Wrapper, not fork:** SCP does not modify MLS behavior. The wrapper translates between SCP concepts (context, agent, epoch) and MLS concepts (group, member, epoch) per the mapping in spec section 9.7.1.
 
 ### Implementation
@@ -63,9 +67,9 @@ Each function below must be implemented and tested:
 
 1. **`create_group(creator_identity, credential) -> MlsGroup`**
    - Creates a new MLS group with one member (the creator).
-   - Sets ciphersuite to `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`.
+   - Sets ciphersuite to `MLS_128_DHKEMP256_AES128GCM_SHA256_P256`.
    - Returns a group handle that wraps the OpenMLS `MlsGroup`.
-   - The credential contains the creator's DID and UCAN token (spec section 9.7.1).
+   - The credential contains the creator's identifier and UCAN token (spec section 9.7.1).
 
 2. **`add_member(group, key_package) -> (Welcome, Commit)`**
    - Adds a member to the group using their pre-published KeyPackage.
@@ -94,7 +98,7 @@ Each function below must be implemented and tested:
    - **Grace window duration:** The shorter of (a) all members have sent at least one message or ACK in the new epoch, or (b) 30 seconds from local Commit processing time. The 30-second hard ceiling is not configurable — it bounds the forward secrecy window.
    - **Grace window key isolation:** Old epoch keys held during the grace window MUST be stored in a separate `EpochGraceStore` that is (1) in-memory only, (2) indexed by epoch number, (3) automatically purged when the grace window closes. The grace store MUST NOT be accessible to any code path other than `decrypt()` with a matching epoch number.
    - After the grace window closes, old epoch secrets, application key schedules, and ratchet tree states for past epochs are destroyed and MUST NOT be recoverable. This satisfies forward secrecy (spec section 9.7.2).
-   - Messages arriving after the grace window closes that reference old epochs are unrecoverable. The SDK MUST log a warning and emit a `StaleEpochMessage` event to the application layer with the sender DID and epoch number.
+   - Messages arriving after the grace window closes that reference old epochs are unrecoverable. The SDK MUST log a warning and emit a `StaleEpochMessage` event to the application layer with the sender identifier and epoch number.
 
 7. **`update(group) -> (UpdateProposal, Commit)`**
    - Issues an MLS Update proposal — generates a fresh HPKE key pair and ratchets the sender's path in the tree.
@@ -103,7 +107,7 @@ Each function below must be implemented and tested:
 
 8. **`generate_key_package(identity) -> KeyPackage`**
    - Generates a single-use KeyPackage for offline member addition.
-   - The leaf node uses an **ephemeral, context-scoped MLS signature key**; a **KeyPackage attestation** (spec §9.7.1) carried as a LeafNode extension binds that key to the member's DID and is signed by the `#active`/`#agent` verification method named by the `signing_key_id` in the member's `ScpCredential` (ADR-039) — no key signs the credential or leaf itself. This avoids requiring the hardware-backed `#0` for routine background operations (the SDK replenishes KeyPackage buffers automatically). The DID binding lives in the attestation, not in a leaf-key-equals-DID-key equality — the MLS leaf key is a per-context ephemeral key, distinct from the DID's verification methods.
+   - The leaf node uses an **ephemeral, context-scoped MLS signature key**; a **KeyPackage attestation** (spec §9.7.1) carried as a LeafNode extension binds that key to the member's identifier and is signed by the `#active` key the `signing_key_id` in the member's `ScpCredential` names — no key signs the credential or leaf itself. This keeps the root out of routine background operations (the SDK replenishes KeyPackage buffers automatically). The identity binding lives in the attestation, not in a leaf-key-equals-identity-key equality — the MLS leaf key is a per-context ephemeral key, distinct from every key the identity's key state names.
    - The SDK must maintain a buffer of at least 10 unused KeyPackages per identity (spec section 9.7.4). Replenished when buffer drops below 5.
 
 9. **`destroy_group(group) -> ()`**
@@ -122,7 +126,7 @@ Each function below must be implemented and tested:
 | `encrypt.rs` | `encrypt`, `decrypt` with generation number tracking |
 | `ratchet.rs` | `ratchet` (Commit processing), `update` (PCS), epoch key deletion |
 | `key_package.rs` | `generate_key_package`, KeyPackage buffer management |
-| `credential.rs` | SCP credential type (DID + UCAN + `signing_key_id`) for MLS LeafNode credential field. The `signing_key_id` field (ADR-039) identifies which verification method (`#active` or `#agent`) signed the leaf's KeyPackage attestation (spec §9.7.1) — no DID key signs the credential or leaf directly (the leaf is self-signed by its ephemeral MLS signature key) — enabling verifiers to resolve the correct public key from the DID document. |
+| `credential.rs` | SCP credential type (identifier + UCAN + `signing_key_id`) for MLS LeafNode credential field. The `signing_key_id` field names the operational role that signed the leaf's KeyPackage attestation (spec §9.7.1), `#active` — no identity key signs the credential or leaf directly (the leaf is self-signed by its ephemeral MLS signature key) — so a verifier resolves the public key from the signer's key state (`03-identity.md` §3.10.4). |
 | `storage.rs` | `StorageProvider` trait bridge to scp-platform storage adapters |
 | `epoch_grace.rs` | `EpochGraceStore` — in-memory old epoch key retention with timer-based purge, per-epoch indexing |
 | `error.rs` | MLS-specific error types |
@@ -133,13 +137,17 @@ Each function below must be implemented and tested:
 
 ## ADR-002: Envelope Creation, Signing, and Verification
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — the envelope's inner signature is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. This ADR now decides a P-256 inner signature: the construction is `P256_ECDSA_sign(SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id))` over the same preimage, in the 64-byte raw `r || s` form of `09-security-model.md` §9.5, and the signing dependency names the `p256` crate. The pseudonym derivation gains the seed-to-scalar step of §9.10.4 of the security-model spec, because P-256 has no analogue of the seed expansion RFC 8032 fixed for the superseded curve. The preimage's field order, the signature-inside-encryption placement, and the verification order are untouched: the ruling changed the algorithm and no part of the construction.
+
+**Amended 2026-09-10 (a human identity names no agent key).** ADR-063, inception-derived self-certifying identity over a key-event log, overturns the agent verification method of ADR-039, the shared-DID human-agent identity model. Every sentence below names `#active` alone, and `09-security-model.md` §9.1 invariant 1 states the replacing model.
 
 ### Context
 
 The SCP envelope is the wire format for all protocol messages. It has two layers: an outer envelope (visible to relays) and an inner envelope (visible only to group members after MLS decryption). The outer envelope is deliberately minimal to limit metadata exposure (Decision 2: minimal outer envelope). The inner envelope carries the full message with signatures, sequence numbers, timestamps, and payload.
 
-The envelope design implements the metadata privacy architecture from the resolved decisions: per-context pseudonyms replace sender DIDs in the outer layer (Decision 7), the outer envelope contains only routing information (Decision 2), and all sensitive metadata lives inside the encrypted blob.
+The envelope design implements the metadata privacy architecture from the resolved decisions: per-context pseudonyms replace sender identifiers in the outer layer (Decision 7), the outer envelope contains only routing information (Decision 2), and all sensitive metadata lives inside the encrypted blob.
 
 ### Decision
 
@@ -153,7 +161,7 @@ Two-layer envelope format:
 
 **Inner envelope** (inside the encrypted blob, visible only to group members):
 - `context_id` — the SCP context identifier
-- `sender_did` — the sender's full DID
+- `sender_did` — the sender's full identifier
 - `epoch` — MLS epoch number
 - `generation` — MLS generation number
 - `sequence` — SCP per-sender monotonic sequence number (spec section 9.8.5)
@@ -162,25 +170,25 @@ Two-layer envelope format:
 - `payload` — the actual message content (after bucket padding, Decision 3)
 - `provenance` — origin metadata (spec section 7.7)
 
-**Inner signature:** `Ed25519_sign(SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id))`
+**Inner signature:** `P256_ECDSA_sign(SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id))`
 
-The `signing_key_id` field (ADR-039) identifies which verification method signed the envelope (e.g., `"#active"` or `"#agent"`). It is included in the signature preimage to bind the signature to the specific key, and stored as a field on `InnerEnvelope` so verifiers can resolve the correct public key from the sender's DID document.
+The `signing_key_id` field names the operational role that signed the envelope, `"#active"`. It is included in the signature preimage to bind the signature to the specific key, and stored as a field on `InnerEnvelope` so verifiers can resolve the public key from the sender's key state (`03-identity.md` §3.10.4).
 
 Where `provenance_hash = SHA256(serialize(provenance))` if provenance is present, or `SHA256(0x00)` (hash of a single zero byte) if provenance is absent. Using a sentinel value for absent provenance ensures the signature unambiguously commits to "no provenance" — stripping provenance from a message that had it, or adding provenance to one that did not, produces an invalid signature.
 
-The inner signature is included inside the encrypted blob. Relays never see it. Group members verify it after MLS decryption. This provides the outer integrity check (spec section 9.8.1) while keeping the signing DID hidden from relays.
+The inner signature is included inside the encrypted blob. Relays never see it. Group members verify it after MLS decryption. This provides the outer integrity check (spec section 9.8.1) while keeping the signer's identity hidden from relays.
 
 ### Rationale
 
 - **Minimal outer envelope:** Relays are dumb pipes. They route by `routing_id`, store for `blob_ttl`, and delete. They learn nothing about who sent the message, what context it belongs to (only the pseudonym), or what it contains. This is the core of Decision 2.
 - **Per-context pseudonyms:** `routing_id` is derived deterministically from the sender's identity key and context ID via HMAC-SHA256. Same identity + same context = same pseudonym. Different context = different pseudonym. Relays cannot link activity across contexts (Decision 7).
-- **Signature inside encryption:** Moving the Ed25519 signature inside the encrypted blob hides the signer's identity from relays. Group members verify after decryption. This is a departure from the original spec (which had an outer Ed25519 signature) — the updated design per Decision 2 eliminates outer sender identity exposure.
+- **Signature inside encryption:** Moving the P-256 signature inside the encrypted blob hides the signer's identity from relays. Group members verify after decryption. This is a departure from the original spec (which had an outer P-256 signature) — the updated design per Decision 2 eliminates outer sender identity exposure.
 - **Bucket padding:** Plaintext is padded to fixed buckets (256B, 1KB, 4KB, 16KB, 64KB, 256KB) before encryption (Decision 3). This prevents relays from correlating message types by size. **Processing order: hash original plaintext -> hash provenance -> sign (covering both hashes) -> pad to bucket boundary -> sender-key encrypt -> MLS encrypt.** Padding occurs after signing so the signature covers the real payload content, not padding bytes. Padding integrity is guaranteed by the AEAD authenticated encryption layers (AES-256-GCM sender key and MLS), not by the inner signature.
 
 ### Implementation
 
 - **Language:** Rust
-- **Signing:** Ed25519 via the `ed25519-dalek` crate (or via OpenMLS's signing primitives)
+- **Signing:** ECDSA on P-256 via the `p256` crate (or via OpenMLS's signing primitives), producing the 64-byte raw `r || s` form of `09-security-model.md` §9.5
 - **Hashing:** SHA-256 via the `sha2` crate
 - **Pseudonym derivation:** HMAC-SHA256 via the `hmac` and `sha2` crates
 - **Serialization:** `serde` with MessagePack via `rmp-serde`
@@ -190,7 +198,7 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
 ### Dependencies
 
 - **ADR-001 (MLS):** Envelope creation calls `mls.encrypt()` on the serialized inner envelope to produce the `encrypted_blob`. Envelope parsing calls `mls.decrypt()` to recover the inner envelope.
-- **ADR-003 (DID):** The `sender_did` field references the DID created by the identity module. Pseudonym derivation requires the identity's private key.
+- **ADR-003 (identity creation):** The `sender_did` field carries the identifier the identity module created. Pseudonym derivation requires the identity's private key.
 - **Decision 7 (per-context pseudonyms):** The `routing_id` and `recipient_hint` are derived via HMAC-SHA256 from identity key + context ID.
 
 ### Acceptance Criteria
@@ -199,14 +207,14 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
    - Delegates to `key_custody.derive_pseudonym(identity_key_handle, context_id)`.
    - Deterministic: same identity key + same context_id always produces the same pseudonym keypair.
    - Different `context_id` produces a different, unlinkable pseudonym.
-   - Uses `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")` then `Ed25519_keygen(seed[0..32])`, where `seed[0..32]` is interpreted as an RFC-8032 Ed25519 seed. The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key (using the public key would be a membership-enumeration oracle — see §9.10.4.A and ADR-027). For software custody, `pseudonym_secret = HKDF-SHA256(ed25519_private_seed, salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic. For hardware custody (Android Keystore TEE, Secure Enclave) the `pseudonym_secret` is a device-local value computed inside the secure boundary (the private key is non-exportable), so hardware pseudonyms are device-local by design. The resulting PseudonymKeypair is software-managed.
+   - Uses `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")` then `P256_keygen(seed_to_scalar(seed[0..32]))`, where the seed-to-scalar step is the one §9.10.4 of the security-model spec fixes. The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key (using the public key would be a membership-enumeration oracle — see §9.10.4.A and ADR-027). For software custody, `pseudonym_secret = HKDF-SHA256(p256_private_scalar, salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic. For hardware custody (Android Keystore TEE, Secure Enclave) the `pseudonym_secret` is a device-local value computed inside the secure boundary (the private key is non-exportable), so hardware pseudonyms are device-local by design. The resulting PseudonymKeypair is software-managed.
    - The pseudonym keypair's public key is the routing identifier used in outer envelopes.
 
 2. **`create_inner_envelope(context_id, sender_did, epoch, generation, sequence, timestamp, payload, provenance, signing_key, signing_key_id) -> InnerEnvelope`**
-   - The `signing_key_id` parameter (ADR-039) identifies which verification method is signing (e.g., `"#active"` or `"#agent"`). Stored on the `InnerEnvelope` for verifier key resolution.
+   - The `signing_key_id` parameter names the operational role that is signing, `"#active"`. Stored on the `InnerEnvelope` for verifier key resolution.
    - Computes `payload_hash = SHA256(payload)` — hash of the original plaintext BEFORE padding. Enables content-addressing and deduplication by recipients.
    - Computes `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent.
-   - Computes `signature = Ed25519_sign(SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id))`.
+   - Computes `signature = P256_ECDSA_sign(SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id))`.
    - Pads payload to next bucket boundary (256B, 1KB, 4KB, 16KB, 64KB, 256KB) AFTER signing.
    - Returns the complete inner envelope struct with all fields (including padded payload, `signing_key_id`) + signature.
 
@@ -226,10 +234,10 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
    - Returns the verified inner envelope.
 
 6. **`verify_inner_signature(inner_envelope, sender_did_document) -> bool`**
-   - Resolves the correct public key from the sender's DID document using `inner_envelope.signing_key_id` (ADR-039). For example, `signing_key_id: "#active"` resolves to the `#active` verification method, `"#agent"` resolves to `#agent`.
+   - Resolves the public key from the sender's key state using `inner_envelope.signing_key_id`: `"#active"` resolves to the key that state lists `Current` in the `#active` role (`09-security-model.md` §9.7.4.2 definitions).
    - Computes `provenance_hash = SHA256(serialize(provenance))` if provenance is present, or `SHA256(0x00)` if absent.
    - Recomputes `SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id)`.
-   - Verifies the Ed25519 signature against the resolved public key.
+   - Verifies the P-256 signature against the resolved public key.
    - A mismatch indicates either payload tampering, provenance tampering, or signing key mismatch — all MUST be rejected.
 
 7. **`strip_padding(padded_payload) -> Payload`**
@@ -246,7 +254,7 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
 | `inner.rs` | `InnerEnvelope` struct, `create_inner_envelope`, `verify_inner_signature`, serialization |
 | `outer.rs` | `OuterEnvelope` struct, `create_outer_envelope`, serialization, `seal_envelope`, `open_envelope` |
 | `padding.rs` | Bucket padding: `pad_to_bucket`, `strip_padding`, bucket size constants |
-| `pseudonym.rs` | `derive_pseudonym` — HMAC-SHA256 derivation, pseudonym-to-DID verification cache |
+| `pseudonym.rs` | `derive_pseudonym` — HMAC-SHA256 derivation, pseudonym-to-identifier verification cache |
 
 **Estimated functions:** ~10-12 public functions, ~5-8 internal helpers.
 
@@ -254,7 +262,9 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
 
 ## ADR-003: DID Creation (did:dht)
 
-**Status:** Decided
+**Status:** Superseded by ADR-063 (2026-08-30)
+
+ADR-063, inception-derived self-certifying identity over a key-event log, replaces this decision. SCP does not adopt did:dht: the BitTorrent Mainline DHT is removed, the pkarr and BEP44 DNS-record encoding is retired, the `did:dht:z` self-certification bindings are dropped, and the SCP relay network carries identity instead. The identifier derives from an inception event in SCP's own encoding rather than from a z-base-32 did:dht string, an append-only key-event log replaces the mutable highest-sequence DHT record, and root recovery appends a key event that reveals the pre-committed key without renaming the identifier, so the identifier-renaming migration this ADR modeled disappears. did:web, which this ADR named as a contingency fallback, is cut; no did:web code is authorized. The DID string as an interface survives only as an optional, deferred `did:scp` facade. Two rulings below survive into ADR-063: a content signature verifies against a retired key while an attestation verifies against the current key only, and the root verification method `#0` remains a distinct root authority that asserts key status. The body below is retained as the historical record that motivated the supersession; the did:dht creation, publication, resolution, rotation, and migration it describes no longer describe SCP's identity method.
 
 ### Context
 
@@ -540,7 +550,7 @@ The SCP native relay exists because no external transport (Nostr, Matrix, etc.) 
 
 ### Decision
 
-Implement a WebSocket-based store-and-forward relay server and its corresponding client adapter. The relay protocol has exactly 6 operations.
+Implement a WebSocket-based store-and-forward relay server and its corresponding client adapter. The relay protocol has exactly six client operations: `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `QUERY`, `DELETE` and `ACK`.
 
 ### Rationale
 
@@ -566,10 +576,11 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 
 **Relay server operations:**
 
-1. **`PUBLISH { routing_id, recipient_hint, blob_ttl, blob }`**
+1. **`PUBLISH { routing_id, recipient_hint, blob_ttl, retain, blob }`**
    - Accept an opaque blob associated with a `routing_id`.
    - `recipient_hint` (optional): a per-context pseudonym (§9.10.4) indicating the intended recipient for directed delivery. If absent, the blob is broadcast to all subscribers of this `routing_id`.
-   - Store it for `blob_ttl` seconds.
+   - `retain` (optional boolean, **amended 2026-09-11**): REQUIRED true at the four retained kinds `scp:did:`, `scp:svc:`, `scp:wit:` and `scp:wcf:`, and absent at every other kind (`09-security-model.md` §9.10.12). A validating relay stores a `retain` write and gives it no TTL, which is the duty `09-security-model.md` §9.10.12 states. It rejects a write at one of those four kinds that omits the flag, and rejects the flag at any other kind; a relay that does not validate rejects a write carrying `retain: true`, which is the one test it can run, because it holds the address digest and never the preimage. `blob_ttl` is absent on a `retain` write.
+   - Store it for `blob_ttl` seconds **where the write carries one**; a `retain` write carries none (`09-security-model.md` §9.10.12).
    - Return a `blob_id` (SHA-256 hash of the blob) as confirmation.
    - Deliver immediately to any active subscribers of this `routing_id`. If `recipient_hint` is present, deliver only to the matching subscriber (optimization — the blob is still encrypted and opaque to non-recipients).
 
@@ -581,13 +592,15 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 3. **`UNSUBSCRIBE { routing_id }`**
    - Stop receiving blobs for this `routing_id` on this connection.
 
-4. **`QUERY { routing_id, since?, limit? }`**
-   - One-shot query: return stored blobs for a `routing_id`, optionally filtered by `since` timestamp, with optional `limit`.
+4. **`QUERY { routing_id, since?, after_blob?, limit?, proof_nonce? }`**
+   - One-shot query: return stored blobs for a `routing_id`, optionally filtered by `since` timestamp, with optional `limit`, in this record's backfill ordering below. **`since` filters over a blob's `stored_at`. Where `after_blob` is present, the relay returns only the blobs whose pair (`stored_at`, `blob_id`) sorts strictly after the pair (`since`, `after_blob`)**, which is the cursor of the page walk `09-security-model.md` §9.7.4.2 R9 states for a resolver. A QUERY carrying `after_blob` without `since` is rejected with `4002` MISSING_FIELD.
+   - <!-- scp:include id="relay-proof-wire-fields" from=".docs/specs/09-security-model.md" -->`QUERY` carries an optional `proof_nonce`, 32 bytes the resolver drew freshly for that query, REQUIRED on a first contact, and the `query_complete` `EVENT` that ends the response carries an optional `relay_proof`, 200 bytes, which a relay that received a `proof_nonce` and can sign under the operator identity its community-relay-list entry declares MUST return, including on a response that carried no `BLOB`. **A resolver MUST NOT read a `relay_proof` whose nonce differs from the one it sent, and the proof covers the response and not the frame.**<!-- scp:end id="relay-proof-wire-fields" --> (`09-security-model.md` §9.10.12, §9.7.4.2 R11).
    - Does not create a subscription.
 
 5. **`DELETE { blob_id }`**
    - Request deletion of a specific blob by its `blob_id`.
    - Best-effort: the relay SHOULD delete but is not trusted to comply (relays are untrusted, spec section 9.9.1).
+   - A validating relay MUST reject `DELETE` of a blob it stores at one of the four retained kinds, `scp:did:`, `scp:svc:`, `scp:wit:` and `scp:wcf:`, with `4041` RETAINED_RECORD (`09-security-model.md` §9.10.12).
 
 6. **`ACK { blob_id }`**
    - Delivery receipt. Client acknowledges receipt of a blob.
@@ -597,8 +610,8 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 
 **Relay server requirements:**
 
-- TTL enforcement: a background task deletes expired blobs.
-- No blob inspection of encrypted content: the relay never parses, validates, or inspects the contents of *encrypted, opaque* blobs (`OuterEnvelope`s and any other ciphertext). It routes by `routing_id`, stores for `blob_ttl`, and delivers — it learns nothing about who sent a message, what context it belongs to, or what it contains. The **sole, narrow exception** is the OPTIONAL DID-record validation below: a validating SCP-native relay MAY validate *public, self-certifying* DID-record frames (which carry no confidential content — they are signed, plaintext identity records) for availability / anti-suppression. This exception never applies to encrypted content and is never a trust dependency (the client always re-verifies, §3.10.2). "Untrusted dumb pipe," not "does zero validation," is the invariant.
+- TTL enforcement: a background task deletes expired blobs, and it skips a blob stored under `retain` (**amended 2026-09-11**), because such a blob carries no TTL (`09-security-model.md` §9.10.12).
+- No blob inspection of encrypted content: the relay never parses, validates, or inspects the contents of *encrypted, opaque* blobs (`OuterEnvelope`s and any other ciphertext). It routes by `routing_id`, stores for `blob_ttl`, and delivers — it learns nothing about who sent a message, what context it belongs to, or what it contains. The **sole, narrow exception** is the OPTIONAL key-event-record validation below: a validating SCP-native relay MAY validate *public, self-certifying* identifier-record frames (which carry no confidential content — they are signed, plaintext identity records) for availability / anti-suppression. This exception never applies to encrypted content and is never a trust dependency (the client always re-verifies, §3.10.2). "Untrusted dumb pipe," not "does zero validation," is the invariant.
 - No client authentication: any WebSocket client can connect, publish, subscribe, query.
 - Connection multiplexing: one WebSocket connection supports multiple subscriptions.
 - Bind address is configurable (supports deployment behind reverse proxies, VPNs, or other network configurations).
@@ -607,7 +620,7 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 
 - Implements `TransportAdapter` trait (ADR-005).
 - Manages WebSocket connection lifecycle (connect, reconnect, keepalive).
-- Maps `send(envelope)` to `PUBLISH`.
+- Maps `send(envelope)` to `PUBLISH`, which is this operation's one name.
 - Maps `subscribe(routing_id)` to `SUBSCRIBE` + stream of decoded envelopes.
 - Maps `query(routing_id, since)` to `QUERY`.
 - Maps `delete(blob_id)` to `DELETE`.
@@ -634,7 +647,7 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 
 **Rationale:** Consistent with the envelope layer (ADR-002 uses `rmp-serde`). Native binary support eliminates Base64 overhead for encrypted blobs (~33% savings). MessagePack has mature libraries in all target languages. JSON text frames rejected — debuggability is solved by tooling, not wire format.
 
-**Backfill ordering:** Oldest-first (ascending relay receipt timestamp). Enables incremental processing, natural stream transition from backfill to real-time, and gets at-risk (expiring) messages to clients first.
+**Backfill ordering:** ascending (`stored_at`, `blob_id`): oldest relay receipt first, and ascending `blob_id` among blobs one second holds. Enables incremental processing, natural stream transition from backfill to real-time, and gets at-risk (expiring) messages to clients first.
 
 **Connection URL:** `wss://<host>/scp/v1`. TLS 1.3 required (§9.13). URL path encodes protocol version — no in-band version negotiation. Relay returns HTTP 404 for unsupported versions.
 
@@ -654,29 +667,29 @@ Every message is a MessagePack map with a required `op` field (string) plus oper
 
 | Op | Fields | Response |
 |----|--------|----------|
-| `PUBLISH` | `routing_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32`, `blob: bin` | OK with `blob_id` |
+| `PUBLISH` | `routing_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32?`, `retain: bool?`, `blob: bin` | OK with `blob_id` |
 | `SUBSCRIBE` | `routing_id: bin32`, `since: u64?` | OK, then BLOB stream, then EVENT `backfill_complete` |
 | `UNSUBSCRIBE` | `routing_id: bin32` | OK |
-| `QUERY` | `routing_id: bin32`, `since: u64?`, `limit: u32?` (default 100, max 1000) | BLOB stream, then EVENT `query_complete` |
+| `QUERY` | `routing_id: bin32`, `since: u64?`, `after_blob: bin32?`, `limit: u32?` (default 100, max 1000), `proof_nonce: bin32?` | BLOB stream, then EVENT `query_complete`. <!-- scp:include id="relay-proof-wire-fields" from=".docs/specs/09-security-model.md" -->`QUERY` carries an optional `proof_nonce`, 32 bytes the resolver drew freshly for that query, REQUIRED on a first contact, and the `query_complete` `EVENT` that ends the response carries an optional `relay_proof`, 200 bytes, which a relay that received a `proof_nonce` and can sign under the operator identity its community-relay-list entry declares MUST return, including on a response that carried no `BLOB`. **A resolver MUST NOT read a `relay_proof` whose nonce differs from the one it sent, and the proof covers the response and not the frame.**<!-- scp:end id="relay-proof-wire-fields" --> |
 | `DELETE` | `blob_id: bin32` | OK (best-effort, does not confirm existence) |
 | `ACK` | `blob_id: bin32` | None (fire-and-forget) |
 | `PING` | `ts: u64` | PONG |
 
-**Constraints:** `blob_ttl` 1–604800 (7 days). `blob` 1–262144 bytes (256KB). `routing_id`, `recipient_hint`, `blob_id` are exactly 32 bytes, encoded as MessagePack `bin 32` (not hex/base64 strings).
+**Constraints:** `blob_ttl` 1–604800 (7 days), and absent on a `retain` write. `blob` 1–262144 bytes (256KB). `routing_id`, `recipient_hint`, `blob_id` are exactly 32 bytes, encoded as MessagePack `bin 32` (not hex/base64 strings).
 
 #### Relay-to-Client Messages
 
 | Op | Fields | When |
 |----|--------|------|
 | `OK` | `ref: string?`, `blob_id: bin32?` | Success response. `blob_id` present only for PUBLISH. |
-| `ERR` | `ref: string?`, `code: u16`, `msg: string` | Error response. `msg` is for logging, not parsing. |
-| `BLOB` | `routing_id: bin32`, `blob_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32`, `stored_at: u64`, `blob: bin` | Blob delivery (subscription, backfill, or query). `blob_id = SHA-256(blob)` — clients SHOULD verify. |
-| `EVENT` | `ref: string?`, `type: string`, type-specific fields | Protocol events: `backfill_complete` (with `routing_id`), `query_complete` (with `count`). |
+| `ERR` | `ref: string?`, `code: u16`, `msg: string`, `last_cosigned_head: bin32?` | Error response. `msg` is for logging, not parsing. `last_cosigned_head` is present on `4050` alone. |
+| `BLOB` | `routing_id: bin32`, `blob_id: bin32`, `recipient_hint: bin32?`, `blob_ttl: u32?`, `stored_at: u64`, `blob: bin` | Blob delivery (subscription, backfill, or query). `blob_id = SHA-256(blob)` — clients SHOULD verify. |
+| `EVENT` | `ref: string?`, `type: string`, type-specific fields | Protocol events: `backfill_complete` (with `routing_id`), `query_complete` (with `count` and `relay_proof: bin200?`). <!-- scp:include id="relay-proof-wire-fields" from=".docs/specs/09-security-model.md" -->`QUERY` carries an optional `proof_nonce`, 32 bytes the resolver drew freshly for that query, REQUIRED on a first contact, and the `query_complete` `EVENT` that ends the response carries an optional `relay_proof`, 200 bytes, which a relay that received a `proof_nonce` and can sign under the operator identity its community-relay-list entry declares MUST return, including on a response that carried no `BLOB`. **A resolver MUST NOT read a `relay_proof` whose nonce differs from the one it sent, and the proof covers the response and not the frame.**<!-- scp:end id="relay-proof-wire-fields" --> |
 | `PONG` | `ts: u64` | Keepalive response. |
 
 #### Error Codes
 
-**Client errors (4xxx):** `4000` INVALID_MESSAGE, `4001` UNKNOWN_OP, `4002` MISSING_FIELD, `4003` INVALID_FIELD, `4010` BLOB_TOO_LARGE, `4011` TTL_TOO_LONG, `4012` LIMIT_EXCEEDED, `4020` RATE_LIMITED, `4021` TOO_MANY_SUBSCRIPTIONS, `4040` DID_RECORD_REJECTED (a validating SCP-native relay rejected an operation at a DID-domain `routing_id`: a PUBLISH of a frame that failed the DID→routing_id binding or BEP44 signature, a non-superseding `seq`, any non-frame / wrong-binding / invalid-signature blob published to a slot-claimed `routing_id`, or a DELETE of the current slot blob — see the DID-Record Slot-Exclusivity subsection).
+**Client errors (4xxx):** `4000` INVALID_MESSAGE, `4001` UNKNOWN_OP, `4002` MISSING_FIELD, `4003` INVALID_FIELD, `4010` BLOB_TOO_LARGE, `4011` TTL_TOO_LONG, `4012` LIMIT_EXCEEDED, `4020` RATE_LIMITED (the code a publisher records as `EntryResult::Refused`, `03-identity.md` §3.10.10, which states what that variant carries and where each of its figures comes from), `4021` TOO_MANY_SUBSCRIPTIONS, `4041` RETAINED_RECORD (a DELETE of a retained record), `4040` DID_RECORD_REJECTED (a validating SCP-native relay rejected an operation at an identity-domain `routing_id`: a PUBLISH of a frame that failed the identifier-to-routing-id binding or chain verification, a frame the relay could place on no chain, or any blob published to a `routing_id` that already holds a chain and that is not a frame passing every check that relay runs, the frame-admission rule of `09-security-model.md` §9.7.4.2 R10 included. **Amended 2026-09-10:** the code's name carries the retired identifier-record vocabulary, and this ADR names the wire constant as it ships rather than inventing one), and four witness refusals a relay sends on a PUBLISH it has already stored, whose conditions `09-security-model.md` §9.7.4.3 states: `4050` WITNESS_STALE, carrying `last_cosigned_head`; `4051` WITNESS_CAPACITY; `4052` WITNESS_NOT_DESIGNATED; and `4053` WITNESS_CLOCK.
 
 **Server errors (5xxx):** `5000` INTERNAL_ERROR, `5001` STORAGE_FULL, `5002` SHUTTING_DOWN.
 
@@ -692,7 +705,7 @@ On abnormal close, client reconnects with exponential backoff (1s, 2s, 4s, 8s, 1
 
 #### Relay Operator Configuration
 
-Published out-of-band (relay metadata page, DID document service endpoint). Relay MAY impose limits stricter than protocol maximums:
+Published out-of-band (relay metadata page, a service-record entry). Relay MAY impose limits stricter than protocol maximums:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -700,7 +713,7 @@ Published out-of-band (relay metadata page, DID document service endpoint). Rela
 | `max_blob_ttl` | 604800 | Max TTL seconds |
 | `max_subscriptions_per_connection` | 100 | Concurrent subscriptions per WebSocket |
 | `max_query_limit` | 1000 | Max QUERY limit |
-| `rate_limit_publish` | 6000/min | PUBLISH rate per IP (100/sec). Per-IP shared across connections; operator-adjustable. Priced relays have economic DDoS resistance (§19.7). |
+| `rate_limit_publish` | 6000/min | The rate per publishing address. Per-IP shared across connections; operator-adjustable. Priced relays have economic DDoS resistance (§19.7). |
 | `rate_limit_subscribe` | 100 | Max concurrent subscriptions per connection. SUBSCRIBE operation rate is separately enforced at 20/min per connection but not exposed in `.well-known/scp`. |
 | `idle_timeout` | 90s | Seconds before idle connection close |
 
@@ -709,10 +722,10 @@ Published out-of-band (relay metadata page, DID document service endpoint). Rela
 ```rust
 /// Client-to-relay operations (scp-transport/src/native/protocol.rs)
 pub enum ClientMessage {
-    Publish { ref_id: Option<String>, routing_id: [u8; 32], recipient_hint: Option<[u8; 32]>, blob_ttl: u32, blob: Vec<u8> },
+    Publish { ref_id: Option<String>, routing_id: [u8; 32], recipient_hint: Option<[u8; 32]>, blob_ttl: Option<u32>, retain: Option<bool>, blob: Vec<u8> },
     Subscribe { ref_id: Option<String>, routing_id: [u8; 32], since: Option<u64> },
     Unsubscribe { ref_id: Option<String>, routing_id: [u8; 32] },
-    Query { ref_id: Option<String>, routing_id: [u8; 32], since: Option<u64>, limit: Option<u32> },
+    Query { ref_id: Option<String>, routing_id: [u8; 32], since: Option<u64>, after_blob: Option<[u8; 32]>, limit: Option<u32>, proof_nonce: Option<[u8; 32]> },
     Delete { ref_id: Option<String>, blob_id: [u8; 32] },
     Ack { blob_id: [u8; 32] },
     Ping { ts: u64 },
@@ -721,59 +734,14 @@ pub enum ClientMessage {
 /// Relay-to-client operations
 pub enum RelayMessage {
     Ok { ref_id: Option<String>, blob_id: Option<[u8; 32]> },
-    Err { ref_id: Option<String>, code: u16, msg: String },
-    Blob { routing_id: [u8; 32], blob_id: [u8; 32], recipient_hint: Option<[u8; 32]>, blob_ttl: u32, stored_at: u64, blob: Vec<u8> },
-    Event { ref_id: Option<String>, event_type: String },
+    Err { ref_id: Option<String>, code: u16, msg: String, last_cosigned_head: Option<[u8; 32]> },
+    Blob { routing_id: [u8; 32], blob_id: [u8; 32], recipient_hint: Option<[u8; 32]>, blob_ttl: Option<u32>, stored_at: u64, blob: Vec<u8> },
+    Event { ref_id: Option<String>, event_type: String, relay_proof: Option<[u8; 200]> },
     Pong { ts: u64 },
 }
 ```
 
 Serialized via `serde` with `rmp-serde`. The `op` field is handled by tagged enum representation. All binary fields use MessagePack's native `bin` type.
-
-#### DID-Record Slot-Exclusivity (validating SCP-native relays, OPTIONAL)
-
-This subsection is the companion ADR-004 storage-semantics update mandated by spec §3.10.2 ("Relay-side validation"), §3.10.8 ("Security Analysis"), and §9.10.12: **DID-domain `routing_id`s are slot-exclusive once a binding-valid frame claims them.** The **spec is authoritative** — §3.10.2 defines slot-exclusivity rules (a)–(d) (including the storage-derived DELETE gate) and the two-cause reversion; §3.10.8 owns the threat model (the flood-inert enumeration and the unauthenticated-DELETE-rollback vector + its closure); §9.10.12 defines the frame and validation obligations. This subsection **transcribes the relay-storage MECHANICS** that realize those spec-owned decisions (single highest-`seq` slot, eviction, cold-index reconciliation, the storage-backed DELETE gate) — it implements the spec, it does not decide the threat model. Delivered by issue #482 (story SCP-RELAYRES-003).
-
-**Motivation.** The base relay stores *multiple opaque blobs per `routing_id` with no per-`routing_id` cap* (a dumb store-and-forward pipe, above). For encrypted context blobs that is correct — the relay cannot and must not distinguish them. But a DID document rides in a public, self-certifying **DID-record frame** (`DidRecordV1`, §9.10.12) published at a deterministic DID-domain `routing_id = SHA-256("scp:did:" || did_string)` (§3.10.2). Because that address is publicly derivable, any party can PUBLISH junk there. Left as unbounded opaque storage, a flood could push the genuine record out of a bounded QUERY window (a suppression vector). A validating relay closes this by keeping a **single highest-sequence slot** per DID-domain `routing_id` and making the address slot-exclusive once claimed.
-
-**Optional, never a trust dependency.** Relay-side validation is an **OPTIONAL capability** of SCP-native relays. The protocol MUST NOT require it: foreign transports, adapters, and non-validating SCP transports (e.g. a node's alternate QUIC listener, ADR-037) store the frame as an ordinary opaque blob, and resolution stays correct via **client-side re-verification** (RELAYRES-002), the DHT, and multi-relay publishing (§3.10.8). A relay that skips, botches, or lies about validation degrades **availability only, never integrity** — the resolver ALWAYS re-verifies each record's BEP44 signature against the key it derives from the DID string itself and never trusts the relay's acceptance or the frame-supplied `public_key` (§9.10.12 "Framing is outside the signed authority"). The canonical validating relay is the WebSocket native relay of this ADR.
-
-**Validation on PUBLISH (cheapest-first).** When a validating relay receives a PUBLISH whose blob **decodes as a `DidRecordV1` frame**, it runs, in order — the whole path behind the existing per-IP PUBLISH rate limit:
-
-1. **Structural decode** (`DidRecordV1::decode`, §9.10.12). A blob that does not decode is *not a candidate DID record* — it is an opaque blob governed only by the slot-exclusivity rule below.
-2. **DID→routing_id binding.** Confirm `SHA-256("scp:did:" || did(public_key)) == routing_id`, where `did(public_key)` is the `did:dht` string derived from the frame's `public_key` (§9.6.1). A plain hash — **cheaper than a signature verify, so it runs before step 3.** A frame whose `public_key` does not hash to its `routing_id` is rejected (`DID_RECORD_REJECTED`), and — because the binding precedes the signature — a mis-addressed frame **never costs an Ed25519 verify**. This mirrors, on the data plane, the exact check `BRIDGE_REGISTER` already performs on the control plane (§10.12.4).
-3. **BEP44 signature.** Only for a blob that passed 1–2, verify the BEP44 signature over `bencode(seq, value)` against the frame's `public_key` (§9.10.12). Failure → rejected.
-4. **Single highest-sequence slot.** For a frame that passed 1–3, keep a single slot per `routing_id`: reject a frame whose `seq` is `≤` the stored slot's `seq` **unless** an equal-`seq` frame is byte-identical to the stored record (an idempotent TTL refresh — permitted, no error, refreshes storage lifetime), and replace the slot only on a strictly-higher valid `seq`. Two records at equal `seq` that are *not* byte-identical is a conflict and is rejected (§3.10.4).
-
-**Slot-exclusivity.** The moment a binding-valid, signature-valid frame first **establishes a slot** at a `routing_id`, that `routing_id` becomes slot-exclusive:
-
-- **(a)** the relay rejects any later PUBLISH there that is not a binding-valid, `seq`-advancing frame — a non-frame blob, a wrong-binding frame, an invalid signature, or a non-superseding `seq` are all rejected (`DID_RECORD_REJECTED`); the sole exception is the byte-identical equal-`seq` refresh of rule 4;
-- **(b)** when the slot is first established, the relay **evicts any pre-existing opaque blobs** stored at that `routing_id` (closing the pre-seeding gap: junk published *before* the first valid frame — while `SHA-256` one-wayness prevents the relay from recognizing the address as DID-domain — sits as ordinary opaque storage until the first valid publish evicts it);
-- **(c)** QUERY at that `routing_id` returns **only the single slot**, regardless of the `limit`;
-- **(d)** the relay rejects an (unauthenticated) **DELETE of a protected DID-record slot blob** — only a superseding PUBLISH may replace a slot. DID records are public, so an attacker can compute `blob_id = SHA-256(genuine_record)` and issue a DELETE to purge the genuine record; the cold-index seq-aware establish (see the Cold-index reconciliation note) would then *adopt* a replayed older genuine frame from storage, rolling the DID document back — an **integrity** attack, not merely availability. Since DELETE is unauthenticated on every transport, the relay gates it. Crucially, the gate is **storage-backed, not index-based**: on DELETE the relay reads the blob at `blob_id` and, because a DID-record frame is **content-addressed** (`blob_id = SHA-256(blob)`, so the bytes are immutable) and **self-certifying** (embedded `public_key` + BEP44 signature over `bencode(seq,value)`), it re-derives the `routing_id` from the frame's own `public_key` and re-runs the exact decode→binding→signature check (§3.10.2 steps 1–3); if the blob is a binding-valid DID frame, the DELETE is refused (`DID_RECORD_REJECTED`). This reconstructs the blob's protected status from the immutable bytes alone, so the gate is **immune to a cold or unpersisted slot index** — it holds after a relay restart (the in-memory index is empty) and on a store-sharing peer whose index never saw the record, not only while the index is hot. The index is consulted first only as a fast-path cache; the blob itself is the authority. This gate is enforced on every validating transport that shares the store (WebSocket, QUIC, UDP/DTLS, WebTransport). Content-addressing also makes the check-then-delete window benign (the immutable bytes at a `blob_id` cannot become unprotected between check and delete; the only residual is an unforceable "published in the microsecond after a not-present check" race, which is availability-only). Integrity holds regardless via the resolver's `seq`-monotonicity + DHT (see Reversion), but rule (d) removes the on-demand slot-reversion primitive at its root. DELETE of any non-slot blob (all encrypted context blobs, pre-seed junk, an invalid-signature frame) is unaffected.
-
-**Reversion (two distinct causes — do not conflate).** Slot-exclusivity is a property of a *claimed* slot, and the in-memory index can lose a claim for two causes with **different** consequences:
-
-1. **Blob TTL-expiry** (§9.10.2) — the slot record itself lapsed while the owner was offline past the 6-day republish cycle (§3.10.2). Here the genuine record really *is* absent from storage; the `routing_id` reverts to an unclaimed opaque-blob address. Not a suppression bypass — the record is gone because the owner stopped republishing, not by attacker action.
-2. **Relay restart / store-sharing cold index** — the in-memory index is empty but a **durable backend still holds the genuine blob**. The record is *present*; only the relay's cache forgot it. This DOES open a real, bounded, **availability-only** suppression/rollback window **on that one relay**, until a binding-valid observation re-warms the index. The earlier claim that "the genuine record is already absent" is **false** for this case and must not be relied on.
-
-What keeps the restart case availability-only (never integrity loss) is that the slot decisions are **storage-authoritative**, not index-only: the QUERY path (rule (c)) re-derives the slot from the durable blob on a cold-index read and returns only the genuine record — **largely closing the suppression window on the read path itself**, not merely relying on the client to sort out a flood; the DELETE path (rule (d)) and cold-index establish are likewise storage-backed, so a cold index cannot be used to purge or roll back the durable record. Independently, integrity holds by client re-verification in *both* cases: a *replayed old-but-genuine* record is owner-signed and passes the resolver's DID-derived-key BEP44 verify, so the rollback defense is the resolver's **client-side sequence-number monotonicity** freshness check (accept only `seq >= last_known_seq`; the highest valid `seq` is authoritative across the relay *and* the DHT — §3.10.7, spec §9.6.1 "the BEP44 sequence number is the sole authority for document freshness"; only the identity owner can increment it), backed by multi-relay publishing and the DHT. (An arbitrary *forged* blob that is not owner-signed fails the BEP44 verify outright — the always-on integrity guarantee, distinct from what handles a genuine replay.)
-
-**Storage-model note.** Slot state (which DID-domain `routing_id`s are claimed, and at what `seq`) is tracked by the validating relay as an index over its blob store; enforcement is backend-agnostic and therefore applies uniformly across every configured blob-storage backend (in-memory, SQLite, redb, S3, Postgres) without per-backend code. The index is a validating-relay concern, not a change to the opaque store's `(routing_id, blob_id)` keying or its multi-blob-per-`routing_id` contract for non-DID addresses.
-
-**Cold-index reconciliation (the index is a pure cache; every slot decision is storage-authoritative).** The index is in-memory, but a *durable* blob backend outlives it: after a relay restart the index is empty (cold) while a genuine slot record is still persisted in storage. To keep the "availability only, never integrity" invariant, the slot decisions decide from **storage** (the immutable, content-addressed, self-certifying blob), not the cache:
-
-- **establish** reconciles against storage before evicting — it re-validates the co-located blobs and **adopts the highest-`seq` binding-valid frame already present** rather than letting an incoming lower-`seq` frame win, so a *replayed old-but-genuine* frame (owner-signed, so it validates) can never evict a fresher genuine record that survived the restart (one-time O(N) scan on the first establish after a cold start, N bounded, behind the per-IP rate limit);
-- **QUERY / SUBSCRIBE-backfill** (rule (c)) re-applies slot-exclusivity over the `storage.query` result: if any returned blob is a binding-valid frame, only the highest-`seq` one **in the returned set** is returned, so a **cold index cannot leak co-located junk** alongside the genuine record. This adds no extra hot-path storage round-trip — the query is the one a fall-through QUERY runs anyway, and for an ordinary encrypted-context `routing_id` the returned blobs are all non-frames (a one-byte decode reject), so no signature work and no filtering. The index is **warmed only from a COMPLETE view** — an untruncated (`blobs.len() < limit`) and un-narrowed (`since = None`) scan; a partial/windowed query still returns the correct highest-valid-in-window blob but never warms/pins the index, so a small-`limit` query cannot pin an *older* co-located genuine frame (which can coexist only after a best-effort eviction failed) and hide the newer one on that relay;
-- **DELETE** (rule (d)) reads and re-verifies the blob at `blob_id` directly, so it refuses to purge a genuine record even on a cold index (and fails *closed* on a storage error).
-
-The one intentionally index-only decision is **opaque-PUBLISH rule (a)**: making it storage-authoritative would put an unbounded `storage.query` scan on the hot path of *every* encrypted-context PUBLISH (which is a non-frame at an unclaimed `routing_id`) — a far worse DoS than it prevents. On a cold index a junk opaque PUBLISH at a DID `routing_id` may be *accepted into storage*, but it can never *suppress* the genuine record, because the QUERY authority above filters it and the next establish/sweep evicts it; the read-path authority is the sound closure.
-
-**Active index reclamation.** Reversion of an expired slot is reconciled both lazily (on the next consult of that `routing_id`) and actively (a periodic sweep over the index that drops entries whose slot blob has TTL-expired), so a `routing_id` claimed once and then never re-queried cannot pin its index entry indefinitely — bounding index growth against an attacker who mints many keypairs.
-
-**Enforcement across co-deployed transports.** The slot index and the validation mode are shared state: when a node runs additional SCP-native transports (the QUIC listener and the UDP/DTLS listener, ADR-037) over the *same* blob store as the validating WebSocket relay, those transports enforce PUBLISH validation and registry-gated QUERY against the *same* `DidSlotRegistry` and the same `did_record_validation` mode. Slot-exclusivity is therefore a property of the shared store, not of one transport — an attacker cannot use an alternate transport to co-locate junk with the genuine slot. A transport configured non-validating (a foreign/pass-through deployment) stores frames opaquely, exactly as a foreign relay would; correctness still never depends on any of this (the client re-verifies, RELAYRES-002).
-
----
 
 ## ADR-005: Transport Abstraction Trait
 
@@ -790,7 +758,7 @@ Define a Rust trait `TransportAdapter` that all transport adapters implement. Th
 ### Rationale
 
 - **Thin interface:** The original transport trait from planning-session-04.md had 8 methods including `publish_endpoints` and `discover_endpoints`. These are transport-specific (not all transports have relay/endpoint concepts) and belong in individual adapter implementations, not the shared trait.
-- **Envelope-level abstraction:** The trait operates on `OuterEnvelope` objects. It does not know about MLS, DIDs, or inner envelopes. Transport adapters are dumb pipes for outer envelopes.
+- **Envelope-level abstraction:** The trait operates on `OuterEnvelope` objects. It does not know about MLS, identifiers, or inner envelopes. Transport adapters are dumb pipes for outer envelopes.
 - **Async with tokio:** All transport operations are inherently async (network I/O). Using tokio's async runtime is consistent with the rest of the Rust ecosystem and OpenMLS's async support.
 - **`Stream` for subscriptions:** Subscriptions return a `futures::Stream<OuterEnvelope>`, which integrates with tokio's select, merge, and other stream combinators. This enables multi-transport subscription merging.
 
@@ -898,7 +866,9 @@ pub enum TransportEvent {
 
 ## ADR-006: Platform Abstraction (In-Memory Testing Adapter)
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — the `KeyCustody` key types are both P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The `KeyType` enum this ADR defines named one variant per curve and now names both by purpose: `P256Signing` and `P256Agreement`. Every method contract below reads the same way afterwards — `sign` rejects an agreement-only handle, `dh_agree` rejects a signing-only handle — because the split was always a purpose split and the curve names hid that. The pseudonym derivation gains the seed-to-scalar step of §9.10.4 of the security-model spec, because P-256 has no analogue of the seed expansion RFC 8032 fixed for the superseded curve. This ADR's adapter is the in-memory testing one, so no custody claim changes.
 
 ### Context
 
@@ -919,7 +889,7 @@ Implement in-memory versions of all four platform traits: `KeyCustody`, `DeviceA
 - **Language:** Rust
 - **Crate:** `scp-platform`
 - **Module:** `scp-platform/testing/`
-- **Dependencies:** `ed25519-dalek` for key generation, `rand` for randomness (with seedable RNG for determinism)
+- **Dependencies:** `p256` for key generation, `rand` for randomness (with seedable RNG for determinism)
 
 ### Dependencies
 
@@ -928,12 +898,12 @@ None. This is foundational. The traits it implements are defined in `scp-platfor
 ### Acceptance Criteria
 
 1. **`InMemoryKeyCustody`**
-   - `generate_keypair(key_type) -> KeyHandle`: Generates an Ed25519 or X25519 keypair in memory. Returns an opaque handle (integer ID). Private key stored in an internal `HashMap<u64, SigningKey>` (Ed25519) or `HashMap<u64, StaticSecret>` (X25519).
-   - `sign(key_handle, data) -> Signature`: Signs data with the Ed25519 private key associated with the handle. Returns error for X25519 handles.
-   - `public_key(key_handle) -> PublicKey`: Returns the public key for a handle (Ed25519 or X25519).
+   - `generate_keypair(key_type) -> KeyHandle`: Generates a P-256 signing or P-256 agreement keypair in memory. Returns an opaque handle (integer ID). Private key stored in an internal `HashMap<u64, SigningKey>` (P-256 signing) or `HashMap<u64, SecretKey>` (P-256 agreement).
+   - `sign(key_handle, data) -> Signature`: Signs data with the P-256 private key associated with the handle. Returns error for agreement-only handles.
+   - `public_key(key_handle) -> PublicKey`: Returns the public key for a handle (signing or agreement).
    - `destroy_key(key_handle) -> ()`: Removes the private key from the internal map. Subsequent operations with this handle fail.
-   - `dh_agree(key_handle, peer_public) -> SharedSecret`: Performs X25519 ECDH. Returns error for Ed25519 handles.
-   - `derive_pseudonym(key_handle, context_id) -> PseudonymKeypair`: Computes `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`, derives an Ed25519 keypair from the first 32 bytes of the HMAC output (interpreted as an RFC-8032 seed). Returns error for X25519 handles. The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — using public key bytes would be a membership-enumeration oracle (§9.10.4.A). For software custody (InMemory, Apple software, Android software) `pseudonym_secret = HKDF-SHA256(ed25519_private_seed, salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic and pinned by §25.19 vectors. For hardware custody (Apple Secure Enclave, Android Keystore TEE API 33+) the private key is non-exportable, so `pseudonym_secret` is a device-local value computed inside the secure boundary (e.g. Android uses `SHA-256(TEE_sign("scp-pseudonym-secret-v1"))`); hardware pseudonyms are device-local by design. See §9.10.4.A of `.docs/specs/09-security-model.md`.
+   - `dh_agree(key_handle, peer_public) -> SharedSecret`: Performs P-256 ECDH. Returns error for signing-only handles.
+   - `derive_pseudonym(key_handle, context_id) -> PseudonymKeypair`: Computes `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`, derives a P-256 keypair from the first 32 bytes of the HMAC output through the seed-to-scalar step §9.10.4 of the security-model spec fixes — HKDF-Expand-SHA256 to 48 bytes, reduced modulo `n − 1`, plus one — because P-256 has no RFC-8032 seed expansion. Returns error for agreement-only handles. The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — using public key bytes would be a membership-enumeration oracle (§9.10.4.A). For software custody (InMemory, Apple software, Android software) `pseudonym_secret = HKDF-SHA256(p256_private_scalar, salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic and pinned by §25.19 vectors. For hardware custody (Apple Secure Enclave, Android Keystore TEE API 33+) the private key is non-exportable, so `pseudonym_secret` is a device-local value computed inside the secure boundary (e.g. Android uses `SHA-256(TEE_sign("scp-pseudonym-secret-v1"))`); hardware pseudonyms are device-local by design. See §9.10.4.A of `.docs/specs/09-security-model.md`.
    - `custody_type(key_handle) -> CustodyType::InMemory`.
    - Optionally accepts a seed for deterministic key generation in tests.
 
@@ -961,20 +931,20 @@ None. This is foundational. The traits it implements are defined in `scp-platfor
 /// The type of cryptographic key managed by this handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyType {
-    /// Ed25519 signing key (identity key, pseudonym keys).
-    Ed25519,
-    /// X25519 key agreement key (HPKE wrapping keys).
-    X25519,
+    /// P-256 signing key (identity key, pseudonym keys).
+    P256Signing,
+    /// P-256 key agreement key (HPKE wrapping keys).
+    P256Agreement,
 }
 
 pub trait KeyCustody: Send + Sync {
     /// Generate a new keypair of the specified type.
-    /// Ed25519 keys may be hardware-backed. X25519 wrapping keys are
+    /// P-256 keys may be hardware-backed. DHKEM(P-256) wrapping keys are
     /// always software-managed but routed through KeyCustody for API consistency.
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError>;
 
-    /// Sign data with an Ed25519 key.
-    /// Returns an error if the key handle refers to an X25519 key.
+    /// Sign data with a P-256 key.
+    /// Returns an error if the key handle refers to an agreement-only key.
     async fn sign(&self, key: &KeyHandle, data: &[u8]) -> Result<Signature, PlatformError>;
 
     /// Return the public key for a handle.
@@ -983,31 +953,32 @@ pub trait KeyCustody: Send + Sync {
     /// Destroy key material. Subsequent operations with this handle fail.
     async fn destroy_key(&self, key: &KeyHandle) -> Result<(), PlatformError>;
 
-    /// Perform X25519 Diffie-Hellman key agreement.
+    /// Perform P-256 Diffie-Hellman key agreement.
     /// Returns the 32-byte shared secret. The private key never leaves
     /// the custody boundary (scalar multiplication happens inside the adapter).
-    /// Returns an error if the key handle refers to an Ed25519 key.
+    /// Returns an error if the key handle refers to a signing-only key.
     async fn dh_agree(&self, key: &KeyHandle, peer_public: &[u8; 32]) -> Result<SharedSecret, PlatformError>;
 
     /// Derive a deterministic, context-scoped pseudonym keypair.
     ///
     /// Algorithm:
     ///   1. seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
-    ///   2. pseudonym_keypair = Ed25519_keygen(seed[0..32])   // seed is an RFC-8032 Ed25519 seed
+    ///   2. pseudonym_keypair = P256_keygen(seed_to_scalar(seed[0..32]))  // §9.10.4
     ///
     /// The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — using
     /// public key bytes would be a membership-enumeration oracle (§9.10.4.A).
-    /// For SOFTWARE custody, pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
+    /// For SOFTWARE custody, pseudonym_secret = HKDF-SHA256(p256_private_scalar,
     /// salt="scp-pseudonym-secret-v1"); this is cross-platform deterministic and pinned
     /// by §25.19 known-answer vectors. For HARDWARE custody (Android Keystore TEE API 33+,
     /// Apple Secure Enclave) the private key is non-exportable, so pseudonym_secret is a
-    /// device-local value computed inside the secure boundary (e.g. Android uses
-    /// SHA-256(TEE_sign("scp-pseudonym-secret-v1"))). Hardware pseudonyms are therefore
+    /// device-local value computed inside the secure boundary: an associated 32-byte
+    /// symmetric key generated at generate_keypair, never a signature the substrate
+    /// produces, because an ECDSA hardware signer draws its own nonce. Hardware pseudonyms are therefore
     /// device-local BY DESIGN, not cross-platform identical.
     /// See §9.10.4.A of .docs/specs/09-security-model.md.
     ///
     /// The returned PseudonymKeypair is always software-managed (derived output).
-    /// Returns an error if the key handle refers to an X25519 key.
+    /// Returns an error if the key handle refers to an agreement-only key.
     async fn derive_pseudonym(&self, key: &KeyHandle, context_id: &[u8]) -> Result<PseudonymKeypair, PlatformError>;
 
     /// The custody type for a given key handle.
@@ -1057,7 +1028,11 @@ pub trait Storage: Send + Sync {
 
 ## ADR-007: Sender-Side Key Layer
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — every sender-key signature is ECDSA on P-256 and the HPKE suite is DHKEM(P-256)).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. Each signature this ADR defines — the `SenderKeyEpochAdvance`, the `SenderKeyRequest`, and the block record — is an ECDSA signature on P-256, and each `signature` field carries the type `P256Signature`. The HPKE suite that seals a sender key to a requester is DHKEM(P-256, HKDF-SHA256), and the ephemeral wrapping keypair a requester generates is a DHKEM(P-256) keypair. The pull-based distribution model, the block-list check, and the `info` domain separation are untouched.
+
+**Amended 2026-09-10 (a human identity names no agent key).** ADR-063, inception-derived self-certifying identity over a key-event log, overturns the agent verification method of ADR-039, the shared-DID human-agent identity model. Every sentence below names `#active` alone, and `09-security-model.md` §9.1 invariant 1 states the replacing model.
 
 ### Context
 
@@ -1074,7 +1049,7 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
 - **Per-relationship blocking:** MLS removal is all-or-nothing. Sender keys allow surgical blocking: only the blocker's messages become unreadable to the blocked party. The blocked party can still read messages from everyone else in the context.
 - **AES-256 symmetric over asymmetric:** Each sender has one key that all recipients share. Storage is 32 bytes per sender key per context member. Symmetric encryption is fast. Distribution happens via MLS application messages (which are already encrypted to the group).
 - **Sender-first encryption order:** The plaintext is encrypted with the sender's AES-256 key first, then the result is encrypted with MLS. A blocked party decrypts the MLS layer (they're still a group member) but gets opaque AES-256 ciphertext from the blocker. They know a message exists but cannot read it.
-- **Protocol-notified mutual block:** When Alice blocks Dave, the protocol sends a block notification (as an MLS application message: "you have been blocked by DID X"). Dave's client automatically rotates Dave's sender key excluding Alice. Both sides complete within one message round-trip. Neither can read the other's future messages.
+- **Protocol-notified mutual block:** When Alice blocks Dave, the protocol sends a block notification (as an MLS application message: "you have been blocked by identifier X"). Dave's client automatically rotates Dave's sender key excluding Alice. Both sides complete within one message round-trip. Neither can read the other's future messages.
 - **Sender key rotation only on block, NOT on MLS epoch advances:** Old sender keys are retained for historical message decryption. Blocking is about future messages, not retroactive access. Forward secrecy for sender keys is not a goal — MLS provides forward secrecy at the group level.
 
 ### Implementation
@@ -1117,34 +1092,34 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
    /// Sender key epoch advanced — author rotated their key.
    /// Published as an MLS application message (broadcast to group).
    pub struct SenderKeyEpochAdvance {
-       pub sender_did: DID,
+       pub sender_did: [u8; 32],
        pub epoch: u64,
        pub signer_key_ref: SigningKeyId,  // Which VM signed: Active or Agent (ADR-039)
-       pub signature: Ed25519Signature,  // Signs context_id || sender_did || signer_key_ref || "key_epoch" || epoch
+       pub signature: P256Signature,  // Signs context_id || sender_did || signer_key_ref || "key_epoch" || epoch
    }
 
    /// Request for a sender's current key at a specific epoch.
    /// Sent as an MLS application message with recipient_hint to the key holder.
    pub struct SenderKeyRequest {
-       pub requester_did: DID,
-       pub sender_did: DID,        // Whose key is being requested
+       pub requester_did: [u8; 32],
+       pub sender_did: [u8; 32],        // Whose key is being requested
        pub epoch: u64,
-       pub wrapping_pubkey: X25519PublicKey,
-       pub signature: Ed25519Signature,
+       pub wrapping_pubkey: HpkeP256PublicKey,
+       pub signature: P256Signature,
    }
 
    /// Response with HPKE-encrypted sender key.
    /// Sent as an MLS application message with recipient_hint to the requester.
    pub struct SenderKeyResponse {
-       pub sender_did: DID,
+       pub sender_did: [u8; 32],
        pub epoch: u64,
        pub hpke_sealed_key: Vec<u8>,   // HPKE(requester_wrapping_pubkey, sender_key)
-       pub ephemeral_pubkey: X25519PublicKey,
+       pub ephemeral_pubkey: HpkeP256PublicKey,
    }
    ```
 
    **4a. `publish_sender_key_epoch_advance(key_custody, mls_group, context_id, sender_did, epoch) -> MlsMessage`**
-   - Constructs a `SenderKeyEpochAdvance` signed by the sender's Active Signing Key or Agent Signing Key (ADR-039): `Ed25519_sign(signing_key, SHA-256(context_id || sender_did || signer_key_ref || "key_epoch" || epoch))`. The `signer_key_ref` field records which verification method signed (e.g., `"#active"` or `"#agent"`).
+   - Constructs a `SenderKeyEpochAdvance` signed by the sender's Active Signing Key: `P256_ECDSA_sign(signing_key, SHA-256(context_id || sender_did || signer_key_ref || "key_epoch" || epoch))`. The `signer_key_ref` field records the operational role that signed, `"#active"`.
    - Sends as an MLS application message (broadcast to all group members). **O(1) cost** regardless of group size.
    - Recipients verify the signature and record the new epoch for this sender.
 
@@ -1152,12 +1127,12 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
    - Receives a `SenderKeyRequest` from another member.
    - Verifies the request signature against `requester_did`.
    - Checks block list: if `requester_did` is blocked, returns `None` (no response, the requester cannot obtain the key).
-   - If not blocked: seals the current sender key to the requester's `wrapping_pubkey` using HPKE Base mode (RFC 9180). Suite: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The `info` parameter provides domain separation: `"scp-sender-key-v1" || context_id || sender_did || epoch_bytes`. The `aad` parameter binds context: `context_id || sender_did || epoch_bytes`. The HPKE `enc` (encapsulated key) is transmitted as `ephemeral_pubkey` and `ct` (AEAD ciphertext) as `hpke_sealed_key` in the response. See §9.16.2 for the full HPKE specification.
+   - If not blocked: seals the current sender key to the requester's `wrapping_pubkey` using HPKE Base mode (RFC 9180). Suite: DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The `info` parameter provides domain separation: `"scp-sender-key-v1" || context_id || sender_did || epoch_bytes`. The `aad` parameter binds context: `context_id || sender_did || epoch_bytes`. The HPKE `enc` (encapsulated key) is transmitted as `ephemeral_pubkey` and `ct` (AEAD ciphertext) as `hpke_sealed_key` in the response. See §9.16.2 for the full HPKE specification.
    - Returns `Some(MlsMessage)` containing the `SenderKeyResponse`, sent with `recipient_hint` to the requester. **O(1) cost per request.**
 
    **4c. `request_sender_key(key_custody, mls_group, sender_did, epoch) -> MlsMessage`**
-   - Constructs a `SenderKeyRequest` with a fresh ephemeral X25519 wrapping keypair.
-   - Signs the request with the requester's Active Signing Key or Agent Signing Key (ADR-039).
+   - Constructs a `SenderKeyRequest` with a fresh ephemeral DHKEM(P-256) wrapping keypair.
+   - Signs the request with the requester's Active Signing Key.
    - Sends as an MLS application message with `recipient_hint` to the sender. **O(1) cost.**
 
    **HPKE open (recipient-side decryption):** Calls `SetupBaseR(enc, wrapping_secret_key, info)` where `enc` is `ephemeral_pubkey` from the response, then `recipient_context.Open(aad, ct)` where `ct` is `hpke_sealed_key`. The `wrapping_secret_key` is computed inside the `KeyCustody` boundary via `dh_agree(wrapping_key_handle, enc)` — the wrapping private key never leaves KeyCustody. See §9.16.2 for `info` and `aad` parameter formats.
@@ -1176,10 +1151,10 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
 
 6. **`send_block_notification(key_custody, mls_group, context_id, blocked_did, blocker_did) -> MlsMessage`**
    - Sends a signed block notification as an MLS application message.
-   - The blocker signs the notification with their Active Signing Key or Agent Signing Key (ADR-039) to prevent forgery by other group members (MLS authenticates group membership, not individual identity within application messages).
-   - Signature payload: `Ed25519_sign(signing_key, SHA-256(context_id || "block" || blocker_did || blocked_did || signing_key_id || timestamp))`.
+   - The blocker signs the notification with their Active Signing Key to prevent forgery by other group members (MLS authenticates group membership, not individual identity within application messages).
+   - Signature payload: `P256_ECDSA_sign(signing_key, SHA-256(context_id || "block" || blocker_did || blocked_did || signing_key_id || timestamp))`.
    - Message content: `{ "type": "block", "blocker": blocker_did, "blocked": blocked_did, "signing_key_id": signing_key_id, "timestamp": unix_ms, "signature": blocker_signature }`.
-   - **Verification on receipt:** The receiver MUST resolve the correct public key from the claimed blocker's DID document using the `signing_key_id` field (ADR-039), then verify the Ed25519 signature. Both `#active` and `#agent` are accepted. Discard without action if verification fails. Log the discarded notification for anomaly detection.
+   - **Verification on receipt:** The receiver MUST resolve the public key from the claimed blocker's key state using the `signing_key_id` field, then verify the P-256 signature. Only `#active` is accepted. Discard without action if verification fails. Log the discarded notification for anomaly detection.
    - On successful verification, the blocked party's client automatically calls `rotate_sender_key_for_block` excluding the blocker.
    - The block event is recorded in the context event log (ADR-011) with `EventType::MemberBlocked { blocker, blocked, signature }`.
 
@@ -1188,7 +1163,7 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
    - `get(context_id, sender_did) -> Option<SenderKey>`: Retrieve a sender's current key.
    - `set(context_id, sender_did, key)`: Store or update a sender key.
    - `remove(context_id, sender_did)`: Remove a sender key (for leave/removal).
-   - `get_all(context_id) -> HashMap<DID, SenderKey>`: Get all sender keys for a context (for key bundle on member join).
+   - `get_all(context_id) -> HashMap<identifier, SenderKey>`: Get all sender keys for a context (for key bundle on member join).
 
 ### Scope
 
@@ -1209,8 +1184,8 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
 The ultimate acceptance criterion for Phase 1 is a single integration test that exercises all 7 ADRs together:
 
 ```
-1. Alice creates a did:dht identity (ADR-003) using in-memory key custody (ADR-006)
-2. Bob creates a did:dht identity (ADR-003) using in-memory key custody (ADR-006)
+1. Alice creates an identity (`03-identity.md` §3.10.5) using in-memory key custody (ADR-006)
+2. Bob creates an identity (`03-identity.md` §3.10.5) using in-memory key custody (ADR-006)
 3. Alice creates an MLS group (ADR-001)
 4. Alice generates a sender key (ADR-007) and publishes a SenderKeyEpochAdvance
 5. Bob publishes KeyPackages (ADR-001)
@@ -1221,7 +1196,7 @@ The ultimate acceptance criterion for Phase 1 is a single integration test that 
 10. Bob receives the outer envelope via relay subscription (ADR-004, ADR-005)
 11. Bob decrypts MLS layer (ADR-001), decrypts sender key layer (ADR-007), verifies inner envelope signature (ADR-002)
 12. Bob reads Alice's message
-13. The relay never saw: Alice's DID, Bob's DID, the context ID, the message content, or any metadata beyond the routing pseudonym and blob TTL
+13. The relay never saw: Alice's identifier, Bob's identifier, the context ID, the message content, or any metadata beyond the routing pseudonym and blob TTL
 ```
 
 This test proves: identity works, encryption works, the envelope format works, sender keys work, the relay is a dumb pipe, and the transport abstraction is functional.
@@ -1231,8 +1206,23 @@ This test proves: identity works, encryption works, the envelope format works, s
 ## ADR-039: Shared-DID Human-Agent Identity Model
 
 **Date:** March 4, 2026
-**Status:** Decided
+**Status:** Superseded by ADR-063 (2026-08-30)
 **Extends:** ADR-003 (DID Creation)
+
+ADR-063, inception-derived self-certifying identity over a key-event log, replaces the shared-identity structure this record decided. A human identity's key state names one operational role, `#active`, and names no agent key. An agent holds its own identity, whose establishment events the human's key-event log anchors (`09-security-model.md` §9.1 invariant 1). How a controller produces that anchor and how a verifier checks it is unspecified as of 2026-09-10 (`.docs/specs/00-open-questions.md`), and `09-security-model.md` §9.7.4.2 R3 rejects every chain claiming a delegator until it lands. The body below is retained as the historical record that motivated the supersession; the shared identity, the `#agent` verification method, and the category permissions it describes no longer describe SCP's identity model. **The body below carries edits made after March 2026, and this paragraph names every divergence from the text its author wrote.** Ten, in the order they land:
+
+1. The three key slots and the key-continuity-fingerprint sentence were rewritten from Ed25519 to P-256 on 2026-09-10 under Alec's curve ruling, so a reader comparing them against ADR-063's account of where Ed25519 came from is reading a later edit.
+2. Enforcement Stack item 2 was replaced on 2026-06-20 by a paragraph on the persona-source seam, `MessageSigner`, and RFC #2242.
+3. Enforcement Stack item 4 gained the `hardware-pin` custody value and a citation to `27-attestations.md` §27.4.4, and lost the clause "this layer states no reading rule of its own" on 2026-09-14.
+4. A paragraph headed "KeyPackage attestation is a Category-B action" was added under the Enforcement Stack on 2026-08-02.
+5. The Category-B list reads "outlet invocation" where the March text read "tool invocation"; the rename landed 2026-07-11.
+6. Acceptance criterion 19 read "(PyO3, NAPI, UniFFI, WASM)" and now reads "(PyO3, NAPI, UniFFI)"; the WASM bridge was cut 2026-06-29.
+7. The section headed "Amendment (2026-08-25): an unproven hardware custody declaration reads as software" follows the acceptance criteria and carries the ruling of that date.
+8. That Amendment's first sentence was rewritten on 2026-09-14: it printed a sentence under Alec's name as his verbatim words, and the record supports the orchestrator having proposed that sentence and Alec having approved it with "yes do that." The rewrite states which party wrote which.
+9. That Amendment's last sentence read "Layer 4 above now cites those clauses and states no reading rule of its own, so this ADR and the spec cannot drift apart on the rule's wording" and now reads "Layer 4 above cites those clauses"; the shortening landed 2026-09-14.
+10. That Amendment's second paragraph read "§27.4.4 of the attestations spec (`.docs/specs/27-attestations.md`) states it in four clauses and §27.3.4 of the same spec restates it beside the record's construction" and now reads "§27.4.4 and §27.3.4 of the attestations spec (`.docs/specs/27-attestations.md`) each state it"; the shortening landed 2026-09-15 under the rule that no sentence counts how many places state a thing.
+
+Every other sentence below is the March 2026 text.
 
 ### Context
 
@@ -1252,9 +1242,9 @@ Human and agent share ONE DID with three verification methods:
 
 ```
 DidDocument.verification_method = [
-  #0      — Identity Key (Ed25519, hardware-backed, never rotates, derives DID)
-  #active — Human Signing Key (Ed25519, human's operational key)
-  #agent  — Agent Signing Key (Ed25519, agent software key, rotatable)
+  #0      — Identity Key (P-256, hardware-backed, never rotates, derives DID)
+  #active — Human Signing Key (P-256, human's operational key)
+  #agent  — Agent Signing Key (P-256, agent software key, rotatable)
 ]
 ```
 
@@ -1299,7 +1289,7 @@ DidDocument.verification_method = [
 
 3. **Verifier validation.** Network-level enforcement: all conformant verifiers reject Category A actions (DID document modifications) signed by `#agent`. Non-conformant SDKs can produce these signatures, but they cannot propagate through the network. The attempt is both rejected and logged as a custody violation.
 
-4. **Custody attestation.** At identity creation, the DID document includes a `ScpKeyCustodyAttestation` service entry declaring key custody model (`hardware-biometric`, `hardware-pin`, or `software`), and the entry may carry a platform attestation proof (Apple App Attest / Android Key Attestation). §27.4.4 of the attestations spec states what a consumer reads off that declaration; this layer states no reading rule of its own, and the Amendment (2026-08-25) at the end of this ADR records the human ruling §27.4.4 states. Unambiguous violations (Category A attempts with `#agent`, attestation mismatches with hardware proof) are permanently logged as `ScpCustodyViolationAttestation` records. DID owners can publish counter-attestations for reputation restoration. Absence of attestation is itself a signal.
+4. **Custody attestation.** At identity creation, the DID document includes a `ScpKeyCustodyAttestation` service entry declaring key custody model (`hardware-biometric`, `hardware-pin`, or `software`), and the entry may carry a platform attestation proof (Apple App Attest / Android Key Attestation). §27.4.4 of the attestations spec states what a consumer reads off that declaration, and the Amendment (2026-08-25) at the end of this ADR records the human ruling §27.4.4 states. Unambiguous violations (Category A attempts with `#agent`, attestation mismatches with hardware proof) are permanently logged as `ScpCustodyViolationAttestation` records. DID owners can publish counter-attestations for reputation restoration. Absence of attestation is itself a signal.
 
 5. **Behavioral signals.** Soft trust signal only — feeds into trust function (§7.1), NOT logged as violations. Timing patterns, usage anomalies, and interaction patterns provide supplementary context for trust evaluation. Explicitly excluded from violation records due to false positive risk.
 
@@ -1342,7 +1332,7 @@ Fingerprint computation (§9.11) updated to include all three verification metho
 ```
 fingerprint = SHA256("SCP-KEY-CONTINUITY-V1:" || len(did_a) || did_a || len(did_b) || did_b || a_identity_key || a_active_key || a_agent_key || b_identity_key || b_active_key || b_agent_key)
 ```
-Where `len()` is a 4-byte big-endian length prefix preventing concatenation ambiguity. The `"SCP-KEY-CONTINUITY-V1:"` domain separator prevents cross-protocol signature confusion. Agent key absence uses a domain-derived sentinel `SHA-256("SCP-ABSENT-AGENT-KEY")` instead of zero bytes to avoid collision with the Ed25519 identity point.
+Where `len()` is a 4-byte big-endian length prefix preventing concatenation ambiguity. The `"SCP-KEY-CONTINUITY-V1:"` domain separator prevents cross-protocol signature confusion. Agent key absence uses a domain-derived sentinel `SHA-256("SCP-ABSENT-AGENT-KEY")` instead of zero bytes, so the sentinel cannot collide with any encoding of a P-256 point.
 
 ### Governance
 
@@ -1390,9 +1380,9 @@ Agent key compromise (most common case — agent runtime is less secure than dev
 
 ### Amendment (2026-08-25): an unproven hardware custody declaration reads as software
 
-Alec ruled, verbatim: "either the platform proof is attached and verified, or the custody model reads as software no matter what string was written."
+The orchestrator proposed the sentence "either the platform proof is attached and verified, or the custody model reads as software no matter what string was written." on 2026-08-25, and Alec approved it that day with his own three words, "yes do that."
 
-The ruling governs Enforcement Stack layer 4 above, which stated no rule for reading a custody declaration. The ruling binds because Alec made it, not because of which file records it. §27.4.4 of the attestations spec (`.docs/specs/27-attestations.md`) states it in four clauses and §27.3.4 of the same spec restates it beside the record's construction; open question OQ-38 of that spec asks a human which file finally holds F4's normative text, and the ruling travels with those sections wherever that answer sends them. Layer 4 above now cites those clauses and states no reading rule of its own, so this ADR and the spec cannot drift apart on the rule's wording.
+The ruling governs Enforcement Stack layer 4 above, which stated no rule for reading a custody declaration. The ruling binds because Alec made it, not because of which file records it. §27.4.4 and §27.3.4 of the attestations spec (`.docs/specs/27-attestations.md`) each state it; open question OQ-38 of that spec asks a human which file finally holds F4's normative text, and the ruling travels with those sections wherever that answer sends them. Layer 4 above cites those clauses.
 
 What the clauses settle for this ADR: a `ScpKeyCustodyAttestation` entry declaring `hardware-biometric` or `hardware-pin` for a key raises no consumer's reading of that key's custody above `software` unless the entry carries a platform attestation proof and a verification of that proof returns a pass. In every case that pass does not cover, the consumer reads `software`. A declaration of `software` needs no proof. The proof stays optional for a hardware declaration too: an entry that carries none parses, and clause 2 gives every consumer `software` for the key that entry declares. Alec's sentence names no party as the verifier, this ADR names none, and open question OQ-2 of the attestations spec asks a human which party runs the verification.
 

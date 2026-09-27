@@ -29,13 +29,15 @@ Phase 1-5 ADRs
 
 ## ADR-027: Android Platform Adapter
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling) — see the amendment below.
+
+**Amendment (2026-09-10 — every SCP key is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. This ADR's Rationale called hardware-backed Ed25519 at API 33 and above "a direct win over Apple, where Secure Enclave's P-256 limitation forces software key storage". **That paragraph is withdrawn.** The gap it named came from SCP's own curve choice and not from either vendor's hardware: Apple's Secure Enclave performs P-256 operations, Android Keystore has held P-256 keys in the Trusted Execution Environment since API 23, and SCP signed with a curve only one of the two implemented. Under the ruling both adapters hold every SCP signing key in hardware, and ADR-025, the Apple platform adapter, carries the matching amendment. Two further consequences follow for this ADR. The Bouncy Castle software fallback for API levels 26 through 32 has nothing left to fall back from, because Keystore holds a P-256 signing key at every API level this SDK supports; it survives only for key agreement below API 31, which is the first level at which Keystore performs ECDH. And the root member is held by a passkey through the platform's credential provider (`09-security-model.md` §9.7.4.1 item 4), so `AndroidKeyCustody` neither generates nor stores it.
 
 ### Context
 
 SCP's platform adapter layer (ADR-006) abstracts device-specific capabilities behind four traits: `KeyCustody`, `DeviceAttestation`, `Push`, and `Storage`. These traits are exposed as UniFFI callback interfaces (ADR-021), allowing Kotlin implementations to be injected into the Rust engine. The Android adapter implements all four traits using Android's native platform security stack.
 
-Android and Apple differ fundamentally in key custody capability. Apple's Secure Enclave supports only P-256; SCP identity keys (Ed25519) must be software-backed in Keychain on Apple. Android Keystore at API 33+ (Android 13+) natively supports Ed25519 via the EdDSA algorithm. This means SCP identity keys on Android 13+ are TEE-backed in hardware — a stronger security posture than the Apple adapter. This is the defining architectural difference between the two platform adapters.
+Android and Apple reach the same key-custody floor. Android Keystore has generated and used EC P-256 keys inside the Trusted Execution Environment since API 23, and Apple's Secure Enclave performs P-256 operations, so every SCP signing key is hardware-held on both platforms once every SCP key is a P-256 key (`09-security-model.md` §9.5). The two adapters differ in their key-agreement floor and in their attestation service, not in whether a signing key reaches hardware: Keystore performs ECDH from API 31, and below that level this adapter agrees keys in software. Until 2026-09-10 this paragraph named a fundamental difference, which the amendment above traces to SCP's superseded curve rather than to either vendor's hardware.
 
 Android's hardware security landscape has two tiers: TEE (Trusted Execution Environment), present on virtually all modern Android devices, and StrongBox, an isolated secure element chip present on a subset of flagship devices. StrongBox operations are dramatically slower (10-100x) than TEE operations. For SCP's frequent signing operations during protocol participation, StrongBox latency is prohibitive. TEE-backed Keystore is the correct default.
 
@@ -43,29 +45,29 @@ Android's hardware security landscape has two tiers: TEE (Trusted Execution Envi
 
 Implement the Android platform adapter in Kotlin at `bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/`. Five files implement the four platform traits plus a factory:
 
-- **`AndroidKeyCustody.kt`** — `KeyCustodyProvider` implementation using Android Keystore. Ed25519 (`EdDSA`) at API 33+; software Ed25519 fallback (Bouncy Castle) for API 26-32. X25519 wrapping keys always software-managed. TEE-backed by default; StrongBox explicitly opt-out.
+- **`AndroidKeyCustody.kt`** — `KeyCustodyProvider` implementation using Android Keystore. EC P-256 signing keys in Keystore at every supported API level; Keystore key agreement at API 31+, with a Bouncy Castle software P-256 agreement key below it. TEE-backed by default; StrongBox explicitly opt-out.
 - **`AndroidDeviceAttestation.kt`** — `DeviceAttestationProvider` implementation using Play Integrity Standard API. Standard (server-side, low-latency) preferred over Classic (offline, high-cost) attestation.
-- **`AndroidPushProvider.kt`** — `PushProvider` implementation using Firebase Cloud Messaging. Opaque data-only payload: `{"data": {"scp": "1"}}`. No context ID, sender DID, or message content in any notification payload.
+- **`AndroidPushProvider.kt`** — `PushProvider` implementation using Firebase Cloud Messaging. Opaque data-only payload: `{"data": {"scp": "1"}}`. No context ID, sender identifier, or message content in any notification payload.
 - **`AndroidStorage.kt`** — `StorageProvider` implementation using SQLCipher. Database encryption key derived from a 32-byte symmetric key stored in Android Keystore (TEE-backed AES-256). Key ID: `scp.storage.key`.
 - **`PlatformAdapter.kt`** — `AndroidPlatformAdapter` factory. `AndroidPlatformAdapter.make()` constructs and injects all four providers. Called by the Kotlin SDK's `SCP.create()` when `custody = "platform"`.
 
-**Minimum API level:** API 26 (Android 8.0) for the SDK. API 33 (Android 13) required for hardware-backed Ed25519. Devices on API 26-32 use a software Bouncy Castle Ed25519 key with `CustodyType.Software`.
+**Minimum API level:** API 26 (Android 8.0) for the SDK. Keystore has backed EC P-256 signing keys in hardware since API 23, so every device this SDK supports reports `CustodyType.Hardware` for a signing key. API 31 (Android 12) is the first level at which Keystore performs ECDH, so a device on API 26-32 holds its key-agreement key as a software Bouncy Castle P-256 key with `CustodyType.Software`.
 
 **TEE vs StrongBox policy:** TEE is the default and only option. StrongBox is not used. StrongBox operations are dramatically slower — 10-100x latency increase over TEE for signing — which would make SCP protocol participation visibly laggy. There is no user-visible opt-in to StrongBox.
 
 **Play Integrity:** Standard integrity requests (server-side verification via the Play Integrity API). Classic attestation (which generates a signed APK certificate chain verifiable offline) is not used — it requires a server round-trip to Google's servers for each attestation and has stricter quotas. Standard provides fresh device verdicts sufficient for SCP's attestation requirements.
 
-**FCM payload:** Data-only message with no notification fields. Payload: `{"data": {"scp": "1"}}`. The `scp` field value `"1"` is the wake signal. The app wakes, connects to the SCP relay, and pulls envelopes. No context ID, sender DID, message preview, or any SCP-specific content appears in the FCM payload (§10.7 opacity requirement).
+**FCM payload:** Data-only message with no notification fields. Payload: `{"data": {"scp": "1"}}`. The `scp` field value `"1"` is the wake signal. The app wakes, connects to the SCP relay, and pulls envelopes. No context ID, sender identifier, message preview, or any SCP-specific content appears in the FCM payload (§10.7 opacity requirement).
 
 ### Rationale
 
-- **Ed25519 hardware-backed at API 33+:** Android Keystore at API 33+ natively supports the `EdDSA` algorithm with `Ed25519` parameter spec. This is a direct win over Apple, where Secure Enclave's P-256 limitation forces software key storage. Hardware-backed Ed25519 means the private key bytes never leave the TEE — signing operations happen inside the secure enclave. This is the strongest possible custody for SCP identity keys.
-- **Software fallback for API 26-32:** API 26 is the SDK minimum (matches JVM 11+ target and Android 8.0, sufficient market coverage). On API 26-32, EdDSA is not available in AndroidKeyStore. Bouncy Castle provides software Ed25519. Keys are stored encrypted in EncryptedSharedPreferences (Jetpack Security) as the next-best alternative to hardware backing. `CustodyType.Software` is reported accurately.
+- **P-256 signing keys are hardware-backed at every supported API level:** Android Keystore generates an EC P-256 key with `ECGenParameterSpec("secp256r1")` inside the TEE from API 23, so the private bytes never leave the TEE and every signature happens there. This ADR previously claimed a direct win over Apple on this point; the amendment at the head of the ADR withdraws that claim and states why.
+- **Software agreement key below API 31:** API 26 is the SDK minimum (matching the JVM 11+ target and Android 8.0). `KeyProperties.PURPOSE_AGREE_KEY` arrived at API 31, so on API 26-32 Keystore signs in hardware and cannot perform ECDH; the adapter therefore generates the key-agreement key with Bouncy Castle, stores it encrypted in EncryptedSharedPreferences (Jetpack Security), and reports `CustodyType.Software` for that key alone.
 - **TEE over StrongBox:** StrongBox is present on a fraction of devices and operates orders of magnitude slower than TEE. SCP signs messages during every send operation and during key agreement. StrongBox latency would accumulate visibly in normal usage. The TEE provides hardware isolation with acceptable latency. StrongBox is not offered as an option — "opt-in slowness" is a footgun.
 - **Play Integrity Standard over Classic:** Standard integrity requests return a verdict signed by Google's servers, sufficient for SCP's attestation purpose. Classic attestation (APK certificate chain) requires a dedicated Google Play Developer API call per attestation with stricter rate limits and is designed for offline scenarios SCP does not have. Standard is lower-cost, lower-latency, and simpler.
 - **FCM data-only payload for opacity:** FCM notification payloads visible to the device OS (notification fields) must contain no SCP-meaningful content. A data-only message with `{"scp": "1"}` carries no information except "wake up and pull" — satisfying §10.7. The FCM data payload is not displayed to the user, not logged by the OS notification system, and carries no identifying information.
 - **SQLCipher with TEE-derived key:** SQLCipher provides transparent full-database encryption. The encryption key is a 32-byte AES-256 key generated by Android Keystore (TEE-backed). The Keystore key never leaves the TEE; it encrypts/decrypts the SQLCipher key material via a Keystore-wrapped AES-GCM operation. This gives the database a hardware-rooted chain of trust without requiring SQLCipher itself to understand Android Keystore.
-- **Private keys never cross the FFI boundary:** All Ed25519 signing and X25519 DH operations happen inside `AndroidKeyCustody.kt`. The Rust engine calls the UniFFI callback interface methods with data to sign and receives signatures back. Raw private key bytes stay inside the Kotlin adapter, inside the Android Keystore TEE.
+- **Private keys never cross the FFI boundary:** Every P-256 signature and every P-256 ECDH agreement happens inside `AndroidKeyCustody.kt`. The Rust engine calls the UniFFI callback interface methods with data to sign and receives signatures back. Raw private key bytes stay inside the Kotlin adapter, inside the Android Keystore TEE.
 - **Kotlin over Rust for Android platform code:** Android Keystore, Play Integrity, and FCM are Java/Kotlin APIs with no Rust bindings. Writing thin Kotlin adapters that call these APIs and satisfy the UniFFI callback interfaces is the correct approach — it uses the idiomatic Android API surface without maintaining a JNI bridge to Rust Android Keystore bindings.
 
 ### Implementation
@@ -74,84 +76,75 @@ Implement the Android platform adapter in Kotlin at `bindings/kotlin/scp-kt-andr
 
 ```
 bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/
-  AndroidKeyCustody.kt        — KeyCustodyProvider: Android Keystore Ed25519, software fallback
+  AndroidKeyCustody.kt        — KeyCustodyProvider: Android Keystore P-256, software agreement key
   AndroidDeviceAttestation.kt — DeviceAttestationProvider: Play Integrity Standard API
   AndroidPushProvider.kt      — PushProvider: FCM registration, opaque data payload
   AndroidStorage.kt           — StorageProvider: SQLCipher + TEE-derived AES-256 key
   PlatformAdapter.kt          — AndroidPlatformAdapter.make() factory, injects all four
 ```
 
-**`AndroidKeyCustody.kt` — Ed25519 key generation via Android Keystore (API 33+):**
+**`AndroidKeyCustody.kt` — P-256 key generation via Android Keystore:**
 
 ```kotlin
 class AndroidKeyCustody : KeyCustodyProvider {
 
     override fun generateKeypair(keyType: KeyType): KeyHandle {
         val keyId = UUID.randomUUID().toString()
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && keyType == KeyType.ED25519) {
-            generateKeystoreEd25519(keyId)
-        } else if (keyType == KeyType.ED25519) {
-            generateSoftwareEd25519(keyId)
+        return if (keyType == KeyType.P256_SIGN) {
+            generateKeystoreP256Signing(keyId)
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            generateKeystoreP256Agreement(keyId)
         } else {
-            // X25519 wrapping keys are always software-managed
-            generateSoftwareX25519(keyId)
+            // Keystore performs ECDH from API 31; below it the agreement key is software.
+            generateSoftwareP256Agreement(keyId)
         }
     }
 
-    private fun generateKeystoreEd25519(keyId: String): KeyHandle {
+    private fun generateKeystoreP256Signing(keyId: String): KeyHandle {
         val spec = KeyGenParameterSpec.Builder(
             "scp.key.$keyId",
             KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY
         )
-            .setAlgorithmParameterSpec(EdDSAParameterSpec(EdDSAParameterSpec.Ed25519))
-            .setDigests()  // EdDSA does not require explicit digest
+            .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
+            .setDigests(KeyProperties.DIGEST_SHA256)
             .setUserAuthenticationRequired(false)  // SCP requires background processing
             .build()
-        val keyPairGenerator = KeyPairGenerator.getInstance("EdDSA", "AndroidKeyStore")
+        val keyPairGenerator = KeyPairGenerator.getInstance(
+            KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore"
+        )
         keyPairGenerator.initialize(spec)
         keyPairGenerator.generateKeyPair()
         return KeyHandle(id = keyId, custodyType = CustodyType.HARDWARE)
     }
 
-    private fun generateSoftwareEd25519(keyId: String): KeyHandle {
-        // Bouncy Castle Ed25519 for API 26-32; key stored in EncryptedSharedPreferences
-        val keyPair = Ed25519KeyPairGenerator().apply { init(Ed25519KeyGenerationParameters(SecureRandom())) }.generateKeyPair()
+    private fun generateSoftwareP256Agreement(keyId: String): KeyHandle {
+        // Bouncy Castle P-256 agreement key for API 26-30; stored in EncryptedSharedPreferences
+        val keyPair = KeyPairGenerator.getInstance("EC", "BC").apply {
+            initialize(ECGenParameterSpec("secp256r1"), SecureRandom())
+        }.generateKeyPair()
         softwareKeys[keyId] = keyPair
         return KeyHandle(id = keyId, custodyType = CustodyType.SOFTWARE)
     }
 
     override fun sign(keyHandle: KeyHandle, data: ByteArray): ByteArray {
-        return if (keyHandle.custodyType == CustodyType.HARDWARE) {
-            val entry = KeyStore.getInstance("AndroidKeyStore")
-                .apply { load(null) }
-                .getEntry("scp.key.${keyHandle.id}", null) as KeyStore.PrivateKeyEntry
-            Signature.getInstance("EdDSA").apply {
-                initSign(entry.privateKey)
-                update(data)
-            }.sign()
-        } else {
-            val keyPair = softwareKeys[keyHandle.id]
-                ?: throw ScpException("Key not found: ${keyHandle.id}", "SCP-CRYPTO-4001")
-            Ed25519Signer().apply {
-                init(true, keyPair.private)
-                update(data, 0, data.size)
-            }.generateSignature()
-        }
+        val entry = KeyStore.getInstance("AndroidKeyStore")
+            .apply { load(null) }
+            .getEntry("scp.key.${keyHandle.id}", null) as KeyStore.PrivateKeyEntry
+        val der = Signature.getInstance("SHA256withECDSA").apply {
+            initSign(entry.privateKey)
+            update(data)
+        }.sign()
+        // Keystore returns DER; §9.5 of the security spec fixes the 64-byte raw r || s form
+        // with s in the low half of the group order.
+        return derToRawLowS(der)
     }
 
     override fun publicKey(keyHandle: KeyHandle): ByteArray {
-        return if (keyHandle.custodyType == CustodyType.HARDWARE) {
-            val entry = KeyStore.getInstance("AndroidKeyStore")
-                .apply { load(null) }
-                .getEntry("scp.key.${keyHandle.id}", null) as KeyStore.PrivateKeyEntry
-            val encoded = entry.certificate.publicKey.encoded
-            check(encoded.size == 44) { "Expected 44-byte X.509 Ed25519 SPKI, got ${encoded.size}" }
-            encoded.takeLast(32).toByteArray()  // raw 32-byte Ed25519 pubkey
-        } else {
-            val keyPair = softwareKeys[keyHandle.id]
-                ?: throw ScpException("Key not found: ${keyHandle.id}", "SCP-CRYPTO-4001")
-            (keyPair.public as Ed25519PublicKeyParameters).encoded
-        }
+        val entry = KeyStore.getInstance("AndroidKeyStore")
+            .apply { load(null) }
+            .getEntry("scp.key.${keyHandle.id}", null) as KeyStore.PrivateKeyEntry
+        // §9.5 of the security spec fixes the 33-byte SEC1 compressed encoding.
+        return compressSec1(entry.certificate.publicKey as ECPublicKey)
     }
 
     override fun destroyKey(keyHandle: KeyHandle) {
@@ -163,33 +156,38 @@ class AndroidKeyCustody : KeyCustodyProvider {
     }
 
     override fun dhAgree(keyHandle: KeyHandle, peerPublic: ByteArray): ByteArray {
-        // X25519 wrapping keys are always software-managed
-        val keyPair = softwareKeys[keyHandle.id]
-            ?: throw ScpException("X25519 key not found: ${keyHandle.id}", "SCP-CRYPTO-4002")
-        return X25519Agreement().apply {
-            init(keyPair.private)
-        }.let {
-            val agreement = ByteArray(it.agreementSize)
-            it.calculateAgreement(X25519PublicKeyParameters(peerPublic), agreement, 0)
-            agreement
+        // Keystore agrees inside the TEE at API 31+; below it the key is software.
+        val privateKey = if (keyHandle.custodyType == CustodyType.HARDWARE) {
+            (KeyStore.getInstance("AndroidKeyStore")
+                .apply { load(null) }
+                .getEntry("scp.key.${keyHandle.id}", null) as KeyStore.PrivateKeyEntry).privateKey
+        } else {
+            softwareKeys[keyHandle.id]?.private
+                ?: throw ScpException("P-256 agreement key not found: ${keyHandle.id}", "SCP-CRYPTO-4002")
         }
+        // The shared secret is the 32-byte x-coordinate of the agreed P-256 point.
+        return KeyAgreement.getInstance("ECDH").apply {
+            init(privateKey)
+            doPhase(decodeSec1P256(peerPublic), true)
+        }.generateSecret()
     }
 
     override fun derivePseudonym(keyHandle: KeyHandle, contextId: ByteArray): PseudonymKeyHandle {
         // Algorithm: seed = HMAC-SHA256(pseudonymSecret, contextId || "scp-pseudonym")
-        // pseudonym_keypair = Ed25519_keygen(seed[0..32])   // seed is an RFC-8032 Ed25519 seed
+        // pseudonym_keypair = P256_keygen(seed_to_scalar(seed))  // §9.10.4 of the security spec
         //
         // The HMAC key is the 32-byte pseudonymSecret, NEVER the public key — public key
         // bytes would be a membership-enumeration oracle (§9.10.4.A).
         //
-        // SOFTWARE keys (Bouncy Castle, API 26-32): pseudonymSecret = HKDF-SHA256(
-        //   ikm = ed25519_private_seed, salt = "scp-pseudonym-secret-v1", info = "", len = 32).
+        // SOFTWARE keys (Bouncy Castle): pseudonymSecret = HKDF-SHA256(
+        //   ikm = p256_private_scalar, salt = "scp-pseudonym-secret-v1", info = "", len = 32).
         //   This matches Rust `derive_pseudonym_secret()` exactly, so software pseudonyms are
         //   cross-platform deterministic (pinned by §25.19 vectors).
         //
-        // HARDWARE keys (Keystore TEE, API 33+): private bytes are non-exportable, so
-        //   pseudonymSecret = SHA-256(TEE_sign("scp-pseudonym-secret-v1")) — a device-local
-        //   secret computed inside the TEE. Hardware pseudonyms are device-local BY DESIGN
+        // HARDWARE keys (Keystore TEE): private bytes are non-exportable, so
+        //   pseudonymSecret = an associated 32-byte symmetric key generated inside the TEE at
+        //   generate_keypair — never SHA-256 over a signature, because an ECDSA hardware signer
+        //   draws its own nonce. Hardware pseudonyms are device-local BY DESIGN
         //   and are NOT expected to match other devices or the software vectors.
         val pseudonymSecret = derivePseudonymSecret(keyHandle)  // HKDF (software) or TEE-sign (hardware)
         val mac = Mac.getInstance("HmacSHA256").apply {
@@ -199,9 +197,9 @@ class AndroidKeyCustody : KeyCustodyProvider {
         }
         val seed = mac.doFinal()
         pseudonymSecret.fill(0)  // zeroize secret after use
-        val pseudonymKeypair = Ed25519KeyPairGenerator().apply {
-            init(Ed25519KeyGenerationParameters(FixedSecureRandom(seed)))
-        }.generateKeyPair()
+        // §9.10.4 of the security spec fixes the seed-to-scalar step: expand to 48 bytes with
+        // HKDF-Expand-SHA256, read big-endian, reduce modulo n - 1, add one.
+        val pseudonymKeypair = p256KeypairFromScalar(seedToScalar(seed))
         val pseudonymId = UUID.randomUUID().toString()
         softwareKeys[pseudonymId] = pseudonymKeypair
         return PseudonymKeyHandle(id = pseudonymId, custodyType = CustodyType.SOFTWARE)
@@ -398,7 +396,7 @@ dependencies {
     implementation("com.google.firebase:firebase-messaging-ktx:24.1.0")
     implementation("net.zetetic:android-database-sqlcipher:4.5.4")
     implementation("androidx.sqlite:sqlite-ktx:2.4.0")
-    implementation("org.bouncycastle:bcprov-jdk18on:1.80")  // Ed25519 fallback for API 26-32
+    implementation("org.bouncycastle:bcprov-jdk18on:1.80")  // P-256 agreement key for API 26-30
     implementation("androidx.security:security-crypto:1.1.0-alpha06")  // EncryptedSharedPreferences
 }
 ```
@@ -407,25 +405,25 @@ dependencies {
 
 - **ADR-006 (Platform Abstraction Traits):** `KeyCustody`, `DeviceAttestation`, `Push`, and `Storage` trait signatures implemented here. The UniFFI callback interface names (`KeyCustodyProvider`, `DeviceAttestationProvider`, `PushProvider`, `StorageProvider`) map directly to these traits.
 - **ADR-021 (UniFFI Bridge):** Platform traits are exposed as UniFFI callback interfaces. `AndroidKeyCustody`, `AndroidDeviceAttestation`, `AndroidPushProvider`, and `AndroidStorage` are Kotlin implementations of those callback interfaces, injected from Kotlin into the Rust engine. Five callback interfaces total: `KeyCustodyProvider`, `StorageProvider`, `PushProvider`, `DeviceAttestationProvider`, `MessageListener`.
-- **ADR-025 (Apple Platform Adapter):** Structural reference. Both adapters implement the same four traits via the same UniFFI callback interface pattern. Key difference: Android 13+ achieves hardware-backed Ed25519 (unavailable on Apple due to Secure Enclave P-256 constraint).
+- **ADR-025 (Apple Platform Adapter):** Structural reference. Both adapters implement the same four traits via the same UniFFI callback interface pattern, and since the curve ruling of 2026-09-10 both hold every SCP signing key in hardware. They differ in attestation service and in the API level at which the platform performs key agreement.
 - **ADR-028 (Kotlin SDK):** The Kotlin SDK's `SCP.create()` factory calls `AndroidPlatformAdapter.make(context)` when `custody = "platform"`. The SDK owns the injection point; the platform adapter owns the implementations.
 
 ### Acceptance Criteria
 
 1. **`AndroidKeyCustody.generateKeypair(keyType)`:**
-   - For `KeyType.ED25519` on API 33+: generates key in `AndroidKeyStore` using `KeyPairGenerator.getInstance("EdDSA", "AndroidKeyStore")` with `EdDSAParameterSpec(Ed25519)`. Returns `KeyHandle` with `custodyType = CustodyType.HARDWARE`.
-   - For `KeyType.ED25519` on API 26-32: generates Bouncy Castle software key. Stores in `EncryptedSharedPreferences`. Returns `KeyHandle` with `custodyType = CustodyType.SOFTWARE`.
-   - For `KeyType.X25519`: generates Bouncy Castle software X25519 key. Returns `KeyHandle` with `custodyType = CustodyType.SOFTWARE`.
-   - Called four times during identity creation when agent delegation is enabled (ADR-039): Identity Key, Active Signing Key, Pre-Rotation Key, and Agent Signing Key. The Agent Signing Key is always software-held (Bouncy Castle, not Android Keystore TEE) since it is designed for autonomous agent operation and may need to be exported or rotated independently.
+   - For a P-256 signing key at every supported API level: generates the key in `AndroidKeyStore` using `KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")` with `ECGenParameterSpec("secp256r1")`. Returns `KeyHandle` with `custodyType = CustodyType.HARDWARE`.
+   - For a P-256 agreement key on API 31+: generates the key in `AndroidKeyStore` with `KeyProperties.PURPOSE_AGREE_KEY`. Returns `KeyHandle` with `custodyType = CustodyType.HARDWARE`.
+   - For a P-256 agreement key on API 26-30: generates a Bouncy Castle software key and stores it in `EncryptedSharedPreferences`. Returns `KeyHandle` with `custodyType = CustodyType.SOFTWARE`.
+   - For the root member: generates nothing. `09-security-model.md` §9.7.4.1 item 4 places the root in the platform credential provider as a passkey.
+   - Called twice during identity creation: for the Active Signing Key and for the Pre-Rotation Key.
 
 2. **`AndroidKeyCustody.sign(keyHandle, data)`:**
-   - For hardware handles: retrieves `PrivateKeyEntry` from `AndroidKeyStore`, calls `Signature.getInstance("EdDSA")`, returns 64-byte signature.
-   - For software handles: signs via Bouncy Castle `Ed25519Signer`. Returns 64-byte signature.
+   - Retrieves `PrivateKeyEntry` from `AndroidKeyStore`, calls `Signature.getInstance("SHA256withECDSA")`, converts the DER output to the 64-byte raw `r || s` form of `09-security-model.md` §9.5, and normalizes `s` into the low half of the group order.
+   - Rejects a request to sign under an agreement-only handle with `PlatformError.wrongKeyType`.
    - Returns `ScpException("SCP-CRYPTO-4001")` if handle not found.
 
 3. **`AndroidKeyCustody.publicKey(keyHandle)`:**
-   - For hardware handles: extracts raw 32-byte Ed25519 public key from Keystore certificate.
-   - For software handles: returns `Ed25519PublicKeyParameters.encoded`.
+   - Extracts the P-256 public point from the Keystore certificate and returns the 33-byte SEC1 compressed encoding of `09-security-model.md` §9.5.
 
 4. **`AndroidKeyCustody.destroyKey(keyHandle)`:**
    - For hardware handles: calls `KeyStore.deleteEntry("scp.key.${id}")`.
@@ -433,13 +431,13 @@ dependencies {
    - Key destruction is verifiable: subsequent `sign()` or `publicKey()` calls return `ScpException("SCP-CRYPTO-4001")`.
 
 5. **`AndroidKeyCustody.dhAgree(keyHandle, peerPublic)`:**
-   - Performs X25519 ECDH via Bouncy Castle `X25519Agreement`. Returns 32-byte shared secret.
-   - X25519 key must have been generated with `KeyType.X25519`.
+   - Performs P-256 ECDH in `AndroidKeyStore` at API 31+ and through Bouncy Castle below it. Returns the 32-byte x-coordinate of the agreed point.
+   - Rejects a request to agree under a signing-only handle with `PlatformError.wrongKeyType`.
 
 6. **`AndroidKeyCustody.derivePseudonym(keyHandle, contextId)`:**
-   - Computes `HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")`. Derives an Ed25519 keypair from the first 32 bytes (interpreted as an RFC-8032 seed).
+   - Computes `HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")`. Derives a P-256 keypair from the first 32 bytes through the seed-to-scalar step of §9.10.4 of the security-model spec.
    - Returns `PseudonymKeyHandle` with `custodyType = CustodyType.SOFTWARE` (the derived pseudonym keypair is always software-managed, even for a hardware identity key).
-   - **pseudonym_secret definition (IMPORTANT):** The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — public key bytes are public and would be a membership-enumeration oracle (§9.10.4.A). For **software** keys (API 26-32, Bouncy Castle), `pseudonym_secret = HKDF-SHA256(ed25519_private_seed, salt="scp-pseudonym-secret-v1", info="", len=32)`, byte-identical to Rust `derive_pseudonym_secret()`, so software pseudonyms are cross-platform deterministic (pinned by §25.19 vectors). For **hardware** keys (API 33+, Keystore TEE), private key bytes are non-exportable, so `pseudonym_secret = SHA-256(TEE_sign("scp-pseudonym-secret-v1"))` — a device-local secret computed inside the TEE. **Hardware pseudonyms are device-local by design** and are intentionally NOT identical across devices or to the software vectors; cross-device pseudonym identity is not a protocol requirement, since the TEE key never leaves the device. This matches ADR-006 acceptance criterion 6 (§9.10.4.A).
+   - **pseudonym_secret definition (IMPORTANT):** The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — public key bytes are public and would be a membership-enumeration oracle (§9.10.4.A). For a **software** key (Bouncy Castle), `pseudonym_secret = HKDF-SHA256(p256_private_scalar, salt="scp-pseudonym-secret-v1", info="", len=32)`, byte-identical to Rust `derive_pseudonym_secret()`, so software pseudonyms are cross-platform deterministic (pinned by §25.19 vectors). For **hardware** keys (Keystore TEE), private key bytes are non-exportable, so `pseudonym_secret` is an associated 32-byte symmetric key generated inside the TEE at `generate_keypair` — a device-local secret, never `SHA-256` over a signature, because an ECDSA hardware signer draws its own nonce and would yield a different secret on every call (§9.5 of the security-model spec). **Hardware pseudonyms are device-local by design** and are intentionally NOT identical across devices or to the software vectors; cross-device pseudonym identity is not a protocol requirement, since the TEE key never leaves the device. This matches ADR-006 acceptance criterion 6 (§9.10.4.A).
 
 7. **`AndroidDeviceAttestation.attest(challenge, deviceId)`:**
    - Calls Play Integrity Standard API via `IntegrityManagerFactory.create(context).requestIntegrityToken(...)`.
@@ -459,7 +457,7 @@ dependencies {
     - Returns `WakeSignal.Pull` on valid payload.
     - Throws `ScpException("SCP-TRANS-5001")` if `scp` field is absent.
     - Throws `ScpException("SCP-TRANS-5002")` if `scp` field has unexpected value.
-    - No context ID, sender DID, or message content is present in or extracted from the payload.
+    - No context ID, sender identifier, or message content is present in or extracted from the payload.
 
 11. **`AndroidStorage.store(key, data)` / `retrieve(key)` / `delete(key)` / `listKeys(prefix)` / `deletePrefix(prefix)` / `exists(key)`:**
     - All operations on SQLCipher database encrypted with a TEE-derived 32-byte AES-256 key.
@@ -480,7 +478,7 @@ dependencies {
     - SQLCipher tests verify database is not readable without the Keystore-derived key (open raw SQLite file, confirm unreadable).
 
 14. **Private key isolation:**
-    - No Ed25519 private key bytes appear in logs, crash reports, or cross the UniFFI FFI boundary.
+    - No P-256 private key bytes appear in logs, crash reports, or cross the UniFFI FFI boundary.
     - The Rust engine receives only signatures and public keys — never private key material.
 
 ### Scope
@@ -502,6 +500,8 @@ bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/ 
 ## ADR-028: Kotlin SDK
 
 **Status:** Decided
+
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, made resolution return a key state, and an example here writes a named placeholder where an identifier's text form (`03-identity.md` §3.1) would stand.
 
 ### Context
 
@@ -579,7 +579,7 @@ bindings/kotlin/
     src/
       main/kotlin/works/limn/scp/
         Scp.kt                             # Scp class — top-level entry point, factory, context creation
-        Identity.kt                        # Identity class, DIDDocument data class
+        Identity.kt                        # Identity class, ResolutionOutcome data class
         Context.kt                         # Context class, Flow<Message>, AutoCloseable lifecycle
         Outlets.kt                           # OutletDefinition, TestVector data classes
         Trust.kt                           # evaluateTrust(), TrustEvaluation data class
@@ -707,44 +707,45 @@ class Scp private constructor(private val identityHandle: IdentityHandle) : Auto
 
 ```kotlin
 /**
- * An SCP identity (DID). Holds the signing key handle — never exposes private key bytes.
+ * An SCP identity (identifier). Holds the signing key handle — never exposes private key bytes.
  * Constructed by Scp.create(). Use Scp.identity to access.
  */
 class Identity internal constructor(internal val handle: IdentityHandle) {
 
-    val did: String get() = handle.did()
+    val identifier: ByteArray get() = handle.identifier()
     val custodyType: String get() = handle.custodyType()
 
     companion object {
         /** Load an existing identity from storage. */
-        suspend fun load(did: String): Identity = withContext(Dispatchers.IO) {
-            Identity(NativeLib.identityLoad(did))
+        suspend fun load(identifier: ByteArray): Identity = withContext(Dispatchers.IO) {
+            Identity(NativeLib.identityLoad(identifier))
         }
     }
 
-    /** Resolve another identity's DID document. */
-    suspend fun resolve(did: String): DIDDocument = withContext(Dispatchers.IO) {
-        DIDDocument.fromRecord(NativeLib.identityResolve(did))
+    /** Resolve another identity's key state. */
+    suspend fun resolve(identifier: ByteArray): ResolutionOutcome = withContext(Dispatchers.IO) {
+        ResolutionOutcome.fromRecord(NativeLib.identityResolve(identifier))
     }
 
-    /** Rotate this identity's signing key. Returns an updated Identity with the same DID. */
+    /** Rotate this identity's signing key. Returns an updated Identity with the same identifier. */
     suspend fun rotateKey(): Identity = withContext(Dispatchers.IO) {
         Identity(NativeLib.identityRotateKey(identity = handle))
     }
 }
 
-/** A resolved DID document. */
-data class DIDDocument(
-    val did: String,
-    val verificationMethods: List<VerificationMethod>,
-    val services: List<ServiceEndpoint>,
+/** A key state resolved from an identity's key-event log. */
+data class ResolutionOutcome(
+    val verdict: ResolutionVerdict,
+    // Present on Confirmed and Adopted, absent on every other verdict.
+    val keyState: KeyState?,
+    val sources: ResolutionSources,
     val resolvedAt: Long,  // Unix milliseconds
 ) {
     companion object {
-        internal fun fromRecord(record: DIDDocumentRecord): DIDDocument = DIDDocument(
-            did = record.did,
-            verificationMethods = record.verificationMethods.map(VerificationMethod::fromRecord),
-            services = record.services.map(ServiceEndpoint::fromRecord),
+        internal fun fromRecord(record: ResolutionOutcomeRecord): ResolutionOutcome = ResolutionOutcome(
+            verdict = ResolutionVerdict.fromRecord(record.verdict),
+            keyState = record.keyState?.let(KeyState::fromRecord),
+            sources = ResolutionSources.fromRecord(record.sources),
             resolvedAt = record.resolvedAt,
         )
     }
@@ -918,7 +919,7 @@ suspend fun ucanValidate(token: String, capability: String, contextId: String): 
         NativeLib.ucanValidate(token = token, capability = capability, contextId = contextId)
     }
 
-/** Mint a UCAN token delegating capabilities to a member DID. Returns the token string. */
+/** Mint a UCAN token delegating capabilities to a member identifier. Returns the token string. */
 suspend fun ucanMint(
     identity: Identity,
     memberDid: String,
@@ -1098,7 +1099,7 @@ dependencies {
    Both commands exit 0. Zero ktlint violations. Zero detekt findings.
 
 2. **`Scp.create()` factory:**
-   - `Scp.create(custody = "in_memory")` returns an `Scp` instance with `identity.did` starting with `"did:dht:"`.
+   - `Scp.create(custody = "in_memory")` returns an `Scp` instance with a 32-byte `identity.identifier`.
    - `Scp.create(custody = "platform", platformAdapter = AndroidPlatformAdapter.make(context))` returns an `Scp` instance with hardware-backed identity on API 33+.
    - `Scp.create()` with an unknown custody string throws `IdentityException` with code `"SCP-IDENT-1001"`.
 
@@ -1106,14 +1107,14 @@ dependencies {
 
    ```kotlin
    val scp = Scp.create(custody = "in_memory")
-   assertTrue(scp.identity.did.startsWith("did:dht:"))
+   assertEquals(32, scp.identity.identifier.size)
    assertEquals("in_memory", scp.identity.custodyType)
 
-   val doc = scp.identity.resolve(scp.identity.did)
+   val outcome = scp.identity.resolve(scp.identity.identifier)
    assertTrue(doc.verificationMethods.isNotEmpty())
 
    val rotated = scp.identity.rotateKey()
-   assertEquals(scp.identity.did, rotated.did)  // DID is stable; key material rotates
+   assertEquals(scp.identity.identifier, rotated.identifier)  // the identifier is stable; key material rotates
    ```
 
 4. **`Context` lifecycle:**
@@ -1167,7 +1168,7 @@ dependencies {
        description = "Summarize text",
        inputSchema = mapOf("type" to "object", "properties" to mapOf("text" to mapOf("type" to "string"))),
        outputSchema = mapOf("type" to "object", "properties" to mapOf("summary" to mapOf("type" to "string"))),
-       operator = scp.identity.did,
+       operator = scp.identity.identifier,
    ))
    assertTrue(outletId.startsWith("outlet-"))
    ```
@@ -1228,7 +1229,7 @@ dependencies {
 |------|---------|
 | `scp-kt/build.gradle.kts` | Gradle module build — dependencies, publishing, signing, ktlint, detekt |
 | `src/main/kotlin/works/limn/scp/Scp.kt` | `Scp` class — top-level entry point, `create()` factory, `createContext()`, `joinContext()` |
-| `src/main/kotlin/works/limn/scp/Identity.kt` | `Identity` class — `did`, `custodyType`, `load()`, `resolve()`, `rotateKey()`; `DIDDocument` data class |
+| `src/main/kotlin/works/limn/scp/Identity.kt` | `Identity` class — `identifier`, `custodyType`, `load()`, `resolve()`, `rotateKey()`; `ResolutionOutcome` data class |
 | `src/main/kotlin/works/limn/scp/Context.kt` | `Context` class — `send()`, `receiveFlow()`, `invokeOutlet()`, `registerOutlet()`, `leave()`, `closeContext()`, `AutoCloseable` |
 | `src/main/kotlin/works/limn/scp/Outlets.kt` | `OutletDefinition`, `TestVector`, `OutletVerificationResult` data classes |
 | `src/main/kotlin/works/limn/scp/Trust.kt` | `evaluateTrust()`, `TrustEvaluation` data class |
@@ -1247,7 +1248,11 @@ dependencies {
 
 ## ADR-029: Offline/Sync Strategy
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, left an identity one operational role, so a verifier resolves a member's key from that member's key state (`09-security-model.md` §9.1 invariant 1, `03-identity.md` §3.10.4).
+
+**Amendment (2026-09-10 — queued-operation signatures are ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. Each `signature` field on this ADR's queued-operation and reconciliation structures carries the type `P256Signature`, and its signature-validity check verifies an ECDSA signature on P-256 against the member's resolved verification method. The offline queue model, the three reconnection cases, and the relay backfill path are untouched.
 
 ### Context
 
@@ -1362,15 +1367,15 @@ pub struct CommitRangeRequest {
     pub context_id: ContextId,
     pub from_epoch: u64,
     pub to_epoch: u64,
-    pub requester_did: DID,
-    pub signature: Ed25519Signature,
+    pub requester_did: [u8; 32],
+    pub signature: P256Signature,
 }
 
 pub struct CommitRangeResponse {
     pub context_id: ContextId,
     pub commits: Vec<Vec<u8>>,  // Serialized MLS Commit messages, in epoch order
-    pub responder_did: DID,
-    pub signature: Ed25519Signature,
+    pub responder_did: [u8; 32],
+    pub signature: P256Signature,
 }
 ```
 
@@ -1388,11 +1393,11 @@ When a member has been offline for more than 7 days, or when the epoch catch-up 
 
 **Reset protocol:**
 
-1. The reconnecting member publishes a `ResetRequest { context_id, member_did, last_known_epoch, reason, nonce, timestamp, signature }` via the relay (not MLS-encrypted — the member may not be able to encrypt at the current epoch). The request is signed by the member's Active Signing Key or Agent Signing Key (ADR-039) for authentication — either key is accepted since both are valid verification methods on the member's DID. The `nonce` is 16 random bytes (CSPRNG) and the `timestamp` is the current Unix time in seconds. The signature covers all fields except the signature itself via the canonical hash construction (§9.5.1) with domain separator `"SCP-RESET-REQUEST-V1:"`.
+1. The reconnecting member publishes a `ResetRequest { context_id, member_did, last_known_epoch, reason, nonce, timestamp, signature }` via the relay (not MLS-encrypted — the member may not be able to encrypt at the current epoch). The member signs the request with its Active Signing Key. The `nonce` is 16 random bytes (CSPRNG) and the `timestamp` is the current Unix time in seconds. The signature covers all fields except the signature itself via the canonical hash construction (§9.5.1) with domain separator `"SCP-RESET-REQUEST-V1:"`.
 
    **Anti-replay validation.** Because ResetRequest is not MLS-encrypted, it is visible to relays and any network observer. Without replay protection, an attacker who captures a valid ResetRequest can replay it to force-remove and re-add the member repeatedly, disrupting their session. The relay (or any recipient processing the request) MUST validate:
 
-   - **(a) Signature validity.** Verify the Ed25519 signature against the member's DID document (resolve `member_did`, check `#active` or `#agent` verification method).
+   - **(a) Signature validity.** Verify the P-256 signature against the key the member's key state lists `Current` in the `#active` role (resolve `member_did`, derive the key state).
    - **(b) Timestamp freshness.** Reject requests where `|relay_clock - timestamp| > 30 seconds`. This matches the freshness window used for `AccessKeyRequest` (§9.17) and `SenderKeyRequest` (§9.16.2) validation. The 30-second window accommodates reasonable clock skew while limiting the replay window.
    - **(c) Nonce uniqueness.** Maintain a deduplication cache of `(member_did, nonce)` pairs with a 60-second TTL. Reject any request whose nonce has been seen within the TTL window. The 60-second TTL is 2x the freshness window, ensuring that even a request accepted at the edge of the 30-second window cannot be replayed after nonce eviction. Cache capacity: bounded at 10,000 entries with oldest-first eviction (matching the `NonceDedup` pattern used for `SenderKeyRequest` in `scp-core/crypto/sender_keys/key_protocol.rs`).
 
@@ -1411,7 +1416,7 @@ When a member has been offline for more than 7 days, or when the epoch catch-up 
 
 **What the reset member retains:**
 
-- Their DID and identity.
+- Their identifier.
 - Their role in the context (the admin re-assigns the same role during re-add).
 - Their event log history up to the last known epoch.
 - Context metadata (params, outlets, ceiling) — this is public and queryable via the metadata routing ID (ADR-004).
@@ -1419,7 +1424,7 @@ When a member has been offline for more than 7 days, or when the epoch catch-up 
 ```rust
 pub struct ResetRequest {
     pub context_id: ContextId,
-    pub member_did: DID,
+    pub member_did: [u8; 32],
     pub last_known_epoch: u64,
     pub reason: ResetReason,
     /// 16 random bytes (CSPRNG). Prevents replay of captured requests.
@@ -1427,7 +1432,7 @@ pub struct ResetRequest {
     /// Unix timestamp (seconds) when the request was created.
     /// Recipients reject requests older than 30 seconds.
     pub timestamp: u64,
-    pub signature: Ed25519Signature,
+    pub signature: P256Signature,
 }
 
 pub enum ResetReason {
@@ -1464,7 +1469,7 @@ The Merkle event log (ADR-011) is the authoritative state record. After relay ca
 
 1. **Exchange checkpoints.** The reconnecting member generates a `ConsistencyCheckpoint` (ADR-011 criterion 8) from their local log state and sends it to the context. Online members compare and respond with their own checkpoints.
 2. **Compare Merkle roots.** If roots match at the same event count, the logs are consistent — no further action.
-3. **Behind.** If the reconnecting member's event count is less than the group's (the expected case after offline), the member obtains the missing events through the Phase 1 relay backfill (`SUBSCRIBE` with `since`, ADR-004) — relays are untrusted dumb pipes, so there is no distinct event-range request/response wire message and no peer-supplied proof. The backfilled suffix events are independently authenticated by the normal MLS receive path (per-event signature, sequence ordering, and `prev_hash` chain; spec §23.13). The member then verifies catch-up integrity **locally**: it computes a Merkle consistency proof (RFC 6962 §2.1.2; ADR-011) via `verify_consistency` that its pre-gap last-known checkpoint root is a prefix of the root it reaches by replaying the backfilled events, and gates that reached root (constant-time `ct_eq`) against the single already-authenticated signed `ConsistencyCheckpoint` target root (membership + Ed25519, spec §23.12 / §9.9.3). This is the same-log catch-up integrity check, distinct from cross-member equivocation detection (spec §23.7 step 3, §9.9.3). Note: `CommitRangeRequest` (above) is the MLS *Commit* epoch catch-up mechanism (§23.16.2) and is unrelated to event-log event recovery — the two MUST NOT be conflated.
+3. **Behind.** If the reconnecting member's event count is less than the group's (the expected case after offline), the member obtains the missing events through the Phase 1 relay backfill (`SUBSCRIBE` with `since`, ADR-004) — relays are untrusted dumb pipes, so there is no distinct event-range request/response wire message and no peer-supplied proof. The backfilled suffix events are independently authenticated by the normal MLS receive path (per-event signature, sequence ordering, and `prev_hash` chain; spec §23.13). The member then verifies catch-up integrity **locally**: it computes a Merkle consistency proof (RFC 6962 §2.1.2; ADR-011) via `verify_consistency` that its pre-gap last-known checkpoint root is a prefix of the root it reaches by replaying the backfilled events, and gates that reached root (constant-time `ct_eq`) against the single already-authenticated signed `ConsistencyCheckpoint` target root (membership + the P-256 signature, spec §23.12 / §9.9.3). This is the same-log catch-up integrity check, distinct from cross-member equivocation detection (spec §23.7 step 3, §9.9.3). Note: `CommitRangeRequest` (above) is the MLS *Commit* epoch catch-up mechanism (§23.16.2) and is unrelated to event-log event recovery — the two MUST NOT be conflated.
 4. **Divergent.** If Merkle roots differ at the same event count, equivocation has occurred (a relay showed different histories to different members, per §9.9.3). The reconnecting member raises a `EquivocationDetected` alert. Resolution follows the relay consistency protocol (§9.9.3): identify the divergent relay, flag it in reliability scoring (ADR-012), and exchange Merkle **inclusion** proofs to attribute the divergence. This is NOT a majority vote — any divergence between any two honest members detects equivocation regardless of how many peers agree with the attacker.
 
 #### 7. Multi-Device Coordination
@@ -1639,14 +1644,14 @@ pub fn classify_offline_duration(last_relay_contact: u64, now: u64) -> OfflineTi
 ```rust
 // Additions to EventType in scp-core/event_log/
 MemberReset {
-    member_did: DID,
+    member_did: [u8; 32],
     old_epoch: u64,
     new_epoch: u64,
     reason: ResetReason,
-    processed_by: DID,
+    processed_by: [u8; 32],
 },
 QueueDrained {
-    member_did: DID,
+    member_did: [u8; 32],
     message_count: u64,
     discarded_count: u64,
 },
@@ -1714,7 +1719,9 @@ QueueDrained {
 
 ## ADR-030: Event Log Pruning and Checkpointing
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amendment (2026-09-10 — the checkpoint signature is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The checkpoint signature this ADR defines is an ECDSA signature on P-256 over the same `SHA-256(context_id || checkpoint_seq || …)` preimage, and both `signature` fields carry the type `P256Signature`. The pruning boundary, the checkpoint cadence, and the retention rule are untouched.
 
 ### Context
 
@@ -1765,27 +1772,27 @@ pub struct Checkpoint {
     pub last_event_hash: [u8; 32],
     /// Full context state snapshot — deterministically serialized.
     pub state_snapshot: ContextStateSnapshot,
-    /// DID of the checkpoint creator.
-    pub creator_did: DID,
+    /// The identifier of the checkpoint creator.
+    pub creator_did: [u8; 32],
     /// Unix timestamp of checkpoint creation.
     pub created_at: u64,
-    /// Ed25519 signature over SHA-256(context_id || checkpoint_seq ||
+    /// P-256 signature over SHA-256(context_id || checkpoint_seq ||
     /// merkle_root || event_count || last_event_hash ||
     /// SHA-256(serialize(state_snapshot)) || created_at).
-    pub signature: Ed25519Signature,
+    pub signature: P256Signature,
     /// Optional governance quorum signatures (for multi-admin contexts, ADR-031).
     /// In single-admin contexts, this is empty and creator_did must be the admin.
     pub cosignatures: Vec<CosignedCheckpoint>,
 }
 
 pub struct CosignedCheckpoint {
-    pub signer_did: DID,
-    pub signature: Ed25519Signature,
+    pub signer_did: [u8; 32],
+    pub signature: P256Signature,
 }
 
 pub struct ContextStateSnapshot {
-    /// Current membership: DID -> role mapping.
-    pub membership: Vec<(DID, RoleName)>,
+    /// Current membership: [u8; 32] -> role mapping.
+    pub membership: Vec<([u8; 32], RoleName)>,
     /// Current capability ceiling.
     pub capability_ceiling: Vec<Capability>,
     /// Ceiling policy (locked, governed, admin-only).
@@ -1799,11 +1806,11 @@ pub struct ContextStateSnapshot {
     /// Registered outlets.
     pub outlets: Vec<OutletRegistration>,
     /// Active sender key epochs per member.
-    pub sender_key_epochs: Vec<(DID, u64)>,
+    pub sender_key_epochs: Vec<([u8; 32], u64)>,
     /// Current MLS epoch (None for Broadcast contexts).
     pub mls_epoch: Option<u64>,
     /// Active block relationships: (blocker, blocked).
-    pub blocks: Vec<(DID, DID)>,
+    pub blocks: Vec<([u8; 32], [u8; 32])>,
     /// Context mode (Encrypted or Broadcast).
     pub context_mode: ContextMode,
     /// Parent context IDs (empty for root contexts).
@@ -1815,9 +1822,9 @@ pub struct ContextStateSnapshot {
 
 **Checkpoint creation rules:**
 
-- In single-admin contexts (Phase 2 governance), only the admin can create checkpoints. The checkpoint is signed by the admin's Active Signing Key or Agent Signing Key (ADR-039).
+- In single-admin contexts (Phase 2 governance), only the admin can create checkpoints. The checkpoint is signed by the admin's Active Signing Key.
 - In multi-admin contexts (ADR-031), checkpoints require signatures from a governance quorum (e.g., M-of-N admins). The `cosignatures` field carries additional signer attestations.
-- Members receiving a checkpoint verify the signature(s) against known admin DID(s), then verify that the `merkle_root` matches their local Merkle root at `checkpoint_seq`. If it matches, the checkpoint is trusted. If it diverges, the member raises an equivocation alert (same mechanism as §9.9.3 consistency checkpoint divergence).
+- Members receiving a checkpoint verify the signature(s) against known admin identifier(s), then verify that the `merkle_root` matches their local Merkle root at `checkpoint_seq`. If it matches, the checkpoint is trusted. If it diverges, the member raises an equivocation alert (same mechanism as §9.9.3 consistency checkpoint divergence).
 - The `state_snapshot` is deterministically serialized (sorted keys, canonical MessagePack encoding) so that any member can independently compute `SHA-256(serialize(state_snapshot))` and verify the signature covers the correct state.
 
 #### 2. Pruning Strategies
@@ -1948,7 +1955,7 @@ pub struct FullProofChain {
 ```
 
 Verification steps:
-1. Verify `checkpoint.signature` against the checkpoint creator's DID.
+1. Verify `checkpoint.signature` against the checkpoint creator's identifier.
 2. Verify `checkpoint_inclusion` — the checkpoint event is in the current log.
 3. Verify `pruned_proof.checkpoint_root == checkpoint.merkle_root`.
 4. Verify `pruned_proof` — the target event was in the log at `checkpoint_seq`.
@@ -1974,7 +1981,7 @@ When a member joins a context with a long history, or when a member's local stat
 
 **Reconstruction protocol:**
 
-1. **Obtain the latest checkpoint.** Query the context's event log (via relay QUERY or peer request) for the most recent `Checkpoint` event. Verify its signature against the admin's DID.
+1. **Obtain the latest checkpoint.** Query the context's event log (via relay QUERY or peer request) for the most recent `Checkpoint` event. Verify its signature against the admin's identifier.
 2. **Verify checkpoint consistency.** Compute or request the current Merkle root from an online member (via consistency checkpoint exchange, ADR-011 criterion 8). Verify that the checkpoint event is included in the current log via standard inclusion proof.
 3. **Load state snapshot.** Deserialize the checkpoint's `ContextStateSnapshot`. This provides complete context state as of the checkpoint: membership, roles, governance, outlets, ceilings, blocks, and sender key epochs.
 4. **Replay post-checkpoint events.** Request events from `checkpoint_seq + 1` through the current event count. Verify each event against the Merkle tree (hash chain integrity, inclusion proof). Apply each event's state mutation to the snapshot.
@@ -2194,7 +2201,7 @@ Checkpoint {
 
    - Captures the current Merkle root, event count, and last event hash from the event log.
    - Serializes the full `ContextStateSnapshot` deterministically.
-   - Signs the checkpoint with the provided signing key (admin's Active Signing Key or Agent Signing Key per ADR-039).
+   - Signs the checkpoint with the provided signing key, the admin's Active Signing Key.
    - Appends the checkpoint as a `Checkpoint` event to the event log.
    - Persists the checkpoint to `ProtocolRepository` at `context/{id}/checkpoint/{seq:020d}`.
    - Updates `context/{id}/checkpoint_meta/latest`.
@@ -2289,11 +2296,15 @@ Checkpoint {
 
 ## ADR-031: Multi-Admin Governance Models
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, left an identity one operational key, so the one-identity-one-vote rule has no second key to deduplicate across (`09-security-model.md` §9.1 invariant 1).
+
+**Amendment (2026-09-10 — the governance-proposal signature is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The `signature` field on this ADR's governance-proposal structure carries the type `P256Signature`. The threshold models, the approval flow, and the admin-set rules are untouched.
 
 ### Context
 
-Phase 2 governance (ADR-008) uses a single-admin model: one DID holds all governance authority, and governance actions are serialized through that admin. This works for bilateral contexts, small groups, and contexts where a clear authority is appropriate. It becomes a bottleneck and a single point of failure for larger, more collaborative contexts: if the admin goes offline, no governance changes can occur (ADR-029 section 5c explicitly acknowledges this); if the admin acts unilaterally in ways members disagree with, the only recourse is exit (§9.2.1); and if the admin's key is compromised, the entire context's governance is compromised.
+Phase 2 governance (ADR-008) uses a single-admin model: one identity holds all governance authority, and governance actions are serialized through that admin. This works for bilateral contexts, small groups, and contexts where a clear authority is appropriate. It becomes a bottleneck and a single point of failure for larger, more collaborative contexts: if the admin goes offline, no governance changes can occur (ADR-029 section 5c explicitly acknowledges this); if the admin acts unilaterally in ways members disagree with, the only recourse is exit (§9.2.1); and if the admin's key is compromised, the entire context's governance is compromised.
 
 Real-world collaborative contexts — working groups, DAOs, multi-party negotiations, open-source project spaces, community moderation teams — require shared governance. Different contexts have different governance needs: a 3-person team might want 2-of-3 approval for membership changes; a community might want majority vote; a high-stakes financial context might require unanimity for ceiling changes. The spec (§5.9) explicitly declares governance as a pluggable interface with multiple models, and the sketch defines the three-method contract (`propose`, `approve`, `reject`) that all models must implement. ADR-029 section 5c already references multi-admin governance and defines the conflict resolution semantics (Merkle log order is authoritative; simultaneous conflicting proposals trigger a `GovernanceConflict` state requiring manual resolution). ADR-030 defines checkpoint cosignatures from governance quorums. This ADR completes the governance system by defining the concrete models, the proposal lifecycle, quorum rules, voting windows, deadlock recovery, and the UCAN delegation model for multi-admin contexts.
 
@@ -2337,7 +2348,7 @@ pub trait GovernanceEngine: Send + Sync {
     /// The proposer must hold `GovernancePropose` capability (UCAN-validated).
     fn propose(
         &self,
-        proposer: &DID,
+        proposer: &[u8; 32],
         action: GovernanceAction,
         context: &GovernanceContext,
     ) -> Result<ProposalId, GovernanceError>;
@@ -2347,7 +2358,7 @@ pub trait GovernanceEngine: Send + Sync {
     fn approve(
         &self,
         proposal_id: &ProposalId,
-        voter: &DID,
+        voter: &[u8; 32],
         context: &GovernanceContext,
     ) -> Result<ProposalStatus, GovernanceError>;
 
@@ -2356,7 +2367,7 @@ pub trait GovernanceEngine: Send + Sync {
     fn reject(
         &self,
         proposal_id: &ProposalId,
-        voter: &DID,
+        voter: &[u8; 32],
         context: &GovernanceContext,
     ) -> Result<ProposalStatus, GovernanceError>;
 
@@ -2365,7 +2376,7 @@ pub trait GovernanceEngine: Send + Sync {
     fn withdraw_vote(
         &self,
         proposal_id: &ProposalId,
-        voter: &DID,
+        voter: &[u8; 32],
         context: &GovernanceContext,
     ) -> Result<ProposalStatus, GovernanceError>;
 
@@ -2375,7 +2386,7 @@ pub trait GovernanceEngine: Send + Sync {
     fn cancel(
         &self,
         proposal_id: &ProposalId,
-        proposer: &DID,
+        proposer: &[u8; 32],
         context: &GovernanceContext,
     ) -> Result<ProposalStatus, GovernanceError>;
 
@@ -2390,8 +2401,8 @@ pub trait GovernanceEngine: Send + Sync {
     /// Return the governance model configuration for metadata publication.
     fn model_config(&self) -> GovernanceModelConfig;
 
-    /// Return the set of DIDs eligible to vote on proposals in this model.
-    fn eligible_voters(&self, context: &GovernanceContext) -> Vec<DID>;
+    /// Return the set of identifiers eligible to vote on proposals in this model.
+    fn eligible_voters(&self, context: &GovernanceContext) -> Vec<[u8; 32]>;
 }
 
 /// Read-only context snapshot provided to the governance engine.
@@ -2399,8 +2410,8 @@ pub trait GovernanceEngine: Send + Sync {
 /// that the ContextManager executes.
 pub struct GovernanceContext {
     pub context_id: ContextId,
-    pub members: Vec<(DID, RoleName)>,
-    pub admin_dids: Vec<DID>,
+    pub members: Vec<([u8; 32], RoleName)>,
+    pub admin_dids: Vec<[u8; 32]>,
     pub current_epoch: Option<u64>,
     pub now: u64,
 }
@@ -2417,19 +2428,19 @@ The governance model is declared at context creation via `ContextParams.governan
 pub enum GovernanceModelConfig {
     /// Single admin holds all governance authority. Phase 2 baseline.
     /// The creator is the initial (and only) admin. Admin transfer is
-    /// a governance action that replaces the admin DID.
+    /// a governance action that replaces the admin.
     SingleAdmin {
-        admin_did: DID,
+        admin_did: [u8; 32],
     },
 
     /// M-of-N threshold approval. A fixed set of designated signers;
     /// a proposal passes when at least `threshold` of them approve.
-    /// One DID = one vote regardless of signing key (ADR-039). A vote
-    /// signed by `#agent` counts the same as one signed by `#active`.
+    /// One identity = one vote. A vote
+    /// carries the weight of the identity that signed it and not of a key.
     Threshold {
-        /// The set of DIDs authorized to vote. These DIDs must hold
+        /// The set of identifiers authorized to vote. These identifiers must hold
         /// the `GovernanceVote` capability.
-        signers: Vec<DID>,
+        signers: Vec<[u8; 32]>,
         /// Minimum number of approvals required. Must satisfy:
         /// 1 <= threshold <= signers.len().
         threshold: u32,
@@ -2464,7 +2475,7 @@ pub enum GovernanceModelConfig {
 
 **Validation at context creation:**
 
-- `Threshold`: `signers` must be non-empty, `threshold` must be in `[1, signers.len()]`, all signer DIDs must be among the context's initial members, `voting_window_secs` must be in `[300, 604_800]` (5 minutes to 7 days).
+- `Threshold`: `signers` must be non-empty, `threshold` must be in `[1, signers.len()]`, all signer identifiers must be among the context's initial members, `voting_window_secs` must be in `[300, 604_800]` (5 minutes to 7 days).
 - `Majority`: `min_participation_bps` must be in `(0, 10000]`, `voting_window_secs` must be in `[300, 604_800]`.
 - `Unanimity`: `voting_window_secs` must be in `[300, 604_800]`.
 
@@ -2483,7 +2494,7 @@ pub type ProposalId = [u8; 32];
 pub struct GovernanceProposal {
     pub proposal_id: ProposalId,
     pub context_id: ContextId,
-    pub proposer_did: DID,
+    pub proposer_did: [u8; 32],
     pub action: GovernanceAction,
     pub status: ProposalStatus,
     pub created_at: u64,
@@ -2500,10 +2511,10 @@ pub struct GovernanceProposal {
 /// A signed vote on a proposal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedVote {
-    pub voter_did: DID,
+    pub voter_did: [u8; 32],
     pub vote: VoteType,
     pub timestamp: u64,
-    pub signature: Ed25519Signature,
+    pub signature: P256Signature,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2534,7 +2545,7 @@ pub enum RejectionReason {
     /// More rejections than approvals (Majority model).
     MajorityRejected,
     /// Any single rejection (Unanimity model).
-    UnanimityBroken { rejector: DID },
+    UnanimityBroken { rejector: [u8; 32] },
     /// Threshold of rejections reached making approval impossible
     /// (Threshold model: rejections > signers - threshold).
     ApprovalImpossible,
@@ -2547,11 +2558,11 @@ pub enum RejectionReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GovernanceAction {
     /// Add a member to the context.
-    AddMember { did: DID, role: RoleName },
+    AddMember { did: [u8; 32], role: RoleName },
     /// Remove a member from the context.
-    RemoveMember { did: DID, reason: Option<String> },
+    RemoveMember { did: [u8; 32], reason: Option<String> },
     /// Change a member's role.
-    ChangeRole { did: DID, new_role: RoleName },
+    ChangeRole { did: [u8; 32], new_role: RoleName },
     /// Register a new outlet.
     RegisterOutlet { registration: OutletRegistration },
     /// Remove an outlet.
@@ -2565,11 +2576,11 @@ pub enum GovernanceAction {
     /// Modify pruning policy (ADR-030).
     ModifyPruningPolicy { new_policy: PruningPolicy },
     /// Transfer single-admin authority (SingleAdmin model only).
-    TransferAdmin { new_admin: DID },
+    TransferAdmin { new_admin: [u8; 32] },
     /// Add a new signer to the threshold set (Threshold model only).
-    AddSigner { did: DID },
+    AddSigner { did: [u8; 32] },
     /// Remove a signer from the threshold set (Threshold model only).
-    RemoveSigner { did: DID },
+    RemoveSigner { did: [u8; 32] },
     /// Modify the threshold value (Threshold model only).
     ModifyThreshold { new_threshold: u32 },
     /// Create a child context (§5.13).
@@ -2577,7 +2588,7 @@ pub enum GovernanceAction {
     /// Establish an outlet interface with another context (§6.2).
     EstablishOutletInterface { interface: OutletInterface },
     /// Initiate governance-triggered member reset (ADR-029).
-    ResetMember { did: DID, reason: String },
+    ResetMember { did: [u8; 32], reason: String },
     /// Resolve a governance conflict (see section 7).
     ResolveConflict { proposal_a: ProposalId, proposal_b: ProposalId, resolution: ConflictResolution },
     /// Promote a context from ephemeral to persistent (§5.10).
@@ -2591,27 +2602,27 @@ pub enum GovernanceAction {
     /// Requires `MemberBan` capability in the context's ceiling (§5.3).
     /// In broadcast contexts: removes subscriber from registry, adds to all
     /// authors' block lists, forces key rotation on all authors (§5.14.8).
-    RevokeReadAccess { did: DID, scope: RevocationScope },
+    RevokeReadAccess { did: [u8; 32], scope: RevocationScope },
     /// Restore a member's read access to context content (§9.17).
     /// Always forward-only — historical content from before/during revocation
     /// remains inaccessible (access keys were destroyed, not archived).
     /// Requires `MemberBan` capability in the context's ceiling (§5.3).
-    RestoreReadAccess { did: DID },
+    RestoreReadAccess { did: [u8; 32] },
     /// Revoke a member's write access to context content (§9.17).
     /// Full scope: stop publishing + suppress historical content.
     /// FutureOnly scope: stop future publishing only.
-    RevokeWriteAccess { did: DID, scope: RevocationScope },
+    RevokeWriteAccess { did: [u8; 32], scope: RevocationScope },
     /// Restore a member's write access to context content (§9.17).
     /// Always forward-only — previously suppressed content remains suppressed.
-    RestoreWriteAccess { did: DID },
+    RestoreWriteAccess { did: [u8; 32] },
     /// Context-wide content key rotation (§9.17).
-    /// Not DID-targeted — rotates keys for all members.
+    /// Not identifier-targeted — rotates keys for all members.
     /// Use after compromise detection, bulk revocations, or periodic hygiene.
     RotateContentKeys { reason: Option<String> },
     /// Block an author in a broadcast context (§5.14.8).
     /// Removes the author from the broadcast context, destroying their sender
     /// key and preventing future publishing. Requires governance approval.
-    BlockAuthor { did: DID, reason: Option<String> },
+    BlockAuthor { did: [u8; 32], reason: Option<String> },
     /// Deadlock recovery: modify governance parameters without changing model type.
     /// Uses fallback quorum (majority-of-active) regardless of original model.
     /// See section 10 (Deadlock Recovery).
@@ -2620,7 +2631,7 @@ pub enum GovernanceAction {
     /// Requires the economic policy to not be locked.
     SetEconomicPolicy { policy: EconomicPolicy },
     /// Approve a spending authorization for a member (§19.5, ADR-033).
-    ApproveSpend { spender: DID, amount: Amount, purpose: String },
+    ApproveSpend { spender: [u8; 32], amount: Amount, purpose: String },
     /// Lock the context's economic policy, making it immutable (§19.3).
     /// Once locked, the economic policy cannot be changed through governance.
     LockEconomicPolicy,
@@ -2648,7 +2659,7 @@ pub enum RevocationScope {
 - If `rejections.len() > signers.len() - threshold`: approval is mathematically impossible, status becomes `Rejected { reason: ApprovalImpossible }`.
 - If `now > voting_deadline` and neither condition met: status becomes `Expired`.
 
-Votes are order-independent — the Mth approval resolves the proposal regardless of when or in what order the M votes arrived. Only DIDs in the `signers` set can vote. A signer can withdraw their vote and re-vote (changing from approve to reject or vice versa) while the proposal is `Pending`.
+Votes are order-independent — the Mth approval resolves the proposal regardless of when or in what order the M votes arrived. Only the identities the `signers` set names can vote. A signer can withdraw their vote and re-vote (changing from approve to reject or vice versa) while the proposal is `Pending`.
 
 **4c. Majority.** A proposal passes when approvals exceed 50% of eligible voters (all members holding `GovernanceVote` capability). Resolution:
 
@@ -2683,17 +2694,17 @@ Every proposal has a `voting_deadline = created_at + voting_window_secs`. The vo
 
 In single-admin governance, the context creator holds the root UCAN authority and delegates all capabilities. In multi-admin governance, UCAN authority is distributed:
 
-**Root UCAN issuer.** The context creator remains the root UCAN issuer. This is a cryptographic necessity — the UCAN delegation chain must have a single root of trust (ADR-009 step 4: "root token's `iss` is the context creator's DID"). The creator is not a privileged governor — they are the key ceremony initiator. One DID = one vote regardless of which signing key (`#active` or `#agent`) casts the vote (ADR-039). The governance engine deduplicates by DID, not by key.
+**Root UCAN issuer.** The context creator remains the root UCAN issuer. This is a cryptographic necessity — the UCAN delegation chain must have a single root of trust (ADR-009 step 4: "root token's `iss` is the context creator's identifier"). The creator is not a privileged governor — they are the key ceremony initiator. One identity = one vote. The governance engine deduplicates by identifier, not by key.
 
-**Governance capability distribution.** At context creation, the creator mints `GovernancePropose` and `GovernanceVote` UCAN tokens for each DID that the governance model designates as a voter:
+**Governance capability distribution.** At context creation, the creator mints `GovernancePropose` and `GovernanceVote` UCAN tokens for each identifier that the governance model designates as a voter:
 
-- `Threshold`: each DID in `signers` receives `GovernancePropose` + `GovernanceVote`.
+- `Threshold`: each identifier in `signers` receives `GovernancePropose` + `GovernanceVote`.
 - `Majority`: each member whose role includes `GovernanceVote` capability receives those tokens at role assignment.
 - `Unanimity`: same as Majority — all members with `GovernanceVote` in their role.
 
-**Governance action execution.** When a proposal is approved, the governance engine returns the decision to the `ContextManager`. The `ContextManager` executes the action using the creator's root authority — it mints new UCANs, revokes old ones, modifies membership, etc. The governance engine does not execute actions; it only decides whether they are approved. This separation ensures that UCAN chains remain valid (the root issuer signs all delegations) while governance authority is distributed (multiple DIDs vote on whether to authorize the action).
+**Governance action execution.** When a proposal is approved, the governance engine returns the decision to the `ContextManager`. The `ContextManager` executes the action using the creator's root authority — it mints new UCANs, revokes old ones, modifies membership, etc. The governance engine does not execute actions; it only decides whether they are approved. This separation ensures that UCAN chains remain valid (the root issuer signs all delegations) while governance authority is distributed (multiple identifiers vote on whether to authorize the action).
 
-**Signer set modification (Threshold model).** When a `Threshold` proposal to add or remove a signer is approved, the `ContextManager` mints or revokes `GovernanceVote` UCANs accordingly. Adding a signer requires the new DID to already be a context member. Removing a signer does not remove them from the context — it only removes governance authority. The `threshold` value is validated after modification: if removing a signer would make `threshold > signers.len()`, the removal is rejected.
+**Signer set modification (Threshold model).** When a `Threshold` proposal to add or remove a signer is approved, the `ContextManager` mints or revokes `GovernanceVote` UCANs accordingly. Adding a signer requires the new identifier to already be a context member. Removing a signer does not remove them from the context — it only removes governance authority. The `threshold` value is validated after modification: if removing a signer would make `threshold > signers.len()`, the removal is rejected.
 
 #### 7. Governance Conflict Resolution
 
@@ -2702,13 +2713,13 @@ ADR-029 section 5c defines the conflict scenario: two admins both offline simult
 **Conflict detection.** The `GovernanceEngine` detects conflicts when two `Approved` proposals in the event log are incompatible:
 
 - Two `RemoveMember` proposals targeting each other's proposers (mutual removal).
-- Two `ChangeRole` proposals for the same DID with different target roles.
+- Two `ChangeRole` proposals for the same identifier with different target roles.
 - Two `ModifyCeiling` proposals with different ceiling sets.
-- A `RemoveMember` and a `ChangeRole` for the same DID.
-- A `RevokeReadAccess` and a `RestoreReadAccess` for the same DID (mutually contradictory).
-- A `RevokeWriteAccess` and a `RestoreWriteAccess` for the same DID (mutually contradictory).
-- Two `RevokeReadAccess` proposals for the same DID with different scopes (Full vs FutureOnly).
-- Two `RevokeWriteAccess` proposals for the same DID with different scopes (Full vs FutureOnly).
+- A `RemoveMember` and a `ChangeRole` for the same identifier.
+- A `RevokeReadAccess` and a `RestoreReadAccess` for the same identifier (mutually contradictory).
+- A `RevokeWriteAccess` and a `RestoreWriteAccess` for the same identifier (mutually contradictory).
+- Two `RevokeReadAccess` proposals for the same identifier with different scopes (Full vs FutureOnly).
+- Two `RevokeWriteAccess` proposals for the same identifier with different scopes (Full vs FutureOnly).
 
 **Conflict resolution.** When a conflict is detected:
 
@@ -2723,7 +2734,7 @@ ADR-029 section 5c defines the conflict scenario: two admins both offline simult
 
 1. The context is frozen for new governance actions — no new proposals accepted EXCEPT `ResolveConflict`. Message sending and outlet invocation continue normally.
 2. A `GovernanceConflictDetected` event is emitted.
-3. Resolution requires an explicit `ResolveConflict` governance action from any DID with `GovernanceVote` capability. The resolution specifies which proposal wins. `ResolveConflict` is explicitly exempt from the governance freeze — it is the designated mechanism for lifting the freeze.
+3. Resolution requires an explicit `ResolveConflict` governance action from any identity with `GovernanceVote` capability. The resolution specifies which proposal wins. `ResolveConflict` is explicitly exempt from the governance freeze — it is the designated mechanism for lifting the freeze.
 4. The `ResolveConflict` action itself follows the context's governance model (requires threshold/majority/unanimity). This prevents unilateral conflict resolution.
 5. If no resolution is reached within the voting window, both proposals are invalidated and the governance freeze is lifted. The context returns to its pre-proposal state.
 
@@ -2746,7 +2757,7 @@ However, governance actions that result in membership changes (approved `AddMemb
 1. Proposal approved (governance decision).
 2. `ContextManager` executes the membership change (MLS `add_member()`/`remove_member()`).
 3. MLS Commit advances the epoch.
-4. `GovernanceActionExecuted` event appended to event log (records proposal ID, action, executor DID, resulting epoch).
+4. `GovernanceActionExecuted` event appended to event log (records proposal ID, action, executor identifier, resulting epoch).
 
 Pending proposals are NOT invalidated by epoch advances. A proposal created at epoch E is valid at epoch E+N — the proposal references a governance action, not an epoch-specific state. The only exception is group state reset (ADR-029 Tier 3), which invalidates pending proposals because the member's relationship to the group has fundamentally changed.
 
@@ -2763,7 +2774,7 @@ Checkpoint cosignature collection follows the same voting-window pattern as gove
 
 #### 10. Deadlock Recovery
 
-Deadlock occurs when the governance model requires votes from DIDs that are permanently unavailable (key loss, extended offline beyond Tier 3, deliberate non-participation).
+Deadlock occurs when the governance model requires votes from members that are permanently unavailable (key loss, extended offline beyond Tier 3, deliberate non-participation).
 
 **Detection.** A governance model is in deadlock when:
 
@@ -2785,7 +2796,7 @@ Deadlock occurs when the governance model requires votes from DIDs that are perm
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GovernanceReconfigAction {
     /// Remove an inactive signer (Threshold model).
-    RemoveInactiveSigner { did: DID },
+    RemoveInactiveSigner { did: [u8; 32] },
     /// Reduce the threshold (Threshold model). New value must be
     /// >= 1 and <= remaining active signers.
     ReduceThreshold { new_threshold: u32 },
@@ -2793,10 +2804,10 @@ pub enum GovernanceReconfigAction {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeadlockJustification {
-    /// DIDs that are unavailable.
-    pub unavailable_dids: Vec<DID>,
+    /// The identifiers that are unavailable.
+    pub unavailable_dids: Vec<[u8; 32]>,
     /// Evidence of unavailability: consecutive missed voting windows.
-    pub missed_windows: Vec<(DID, u32)>,
+    pub missed_windows: Vec<([u8; 32], u32)>,
     /// Timestamp of deadlock detection.
     pub detected_at: u64,
 }
@@ -2832,7 +2843,7 @@ Without a deadlock recovery mechanism, a Threshold(3-of-5) context where 3 signe
 
 **Why the context creator remains the UCAN root:**
 
-UCAN delegation chains require a single root issuer (ADR-016 step 4). Distributing root authority across multiple DIDs would require multi-signature UCAN tokens, which the UCAN spec does not support. The creator-as-root pattern is already established in Phase 2 and works well: the creator's cryptographic role (root issuer) is decoupled from their governance role (which may be no more than any other signer in a Threshold model). The creator cannot unilaterally mint capabilities that bypass governance — all capability changes go through the governance engine.
+UCAN delegation chains require a single root issuer (ADR-016 step 4). Distributing root authority across multiple identifiers would require multi-signature UCAN tokens, which the UCAN spec does not support. The creator-as-root pattern is already established in Phase 2 and works well: the creator's cryptographic role (root issuer) is decoupled from their governance role (which may be no more than any other signer in a Threshold model). The creator cannot unilaterally mint capabilities that bypass governance — all capability changes go through the governance engine.
 
 ### Implementation
 
@@ -2878,7 +2889,7 @@ UCAN delegation chains require a single root issuer (ADR-016 step 4). Distributi
 
 3. **`SingleAdminEngine` implementation:**
 
-   - `propose()` creates a proposal and immediately sets status to `Approved` if the proposer is the admin DID. Returns `GovernanceError::NotAdmin` if proposer is not the admin.
+   - `propose()` creates a proposal and immediately sets status to `Approved` if the proposer is the admin. Returns `GovernanceError::NotAdmin` if proposer is not the admin.
    - **Content access revocation cool-down:** `RevokeReadAccess` and `RevokeWriteAccess` actions in `SingleAdmin` contexts MUST deliver the revocation notification to the affected member before executing the access key deletion. This prevents silent, instant silencing with no recourse. The affected member receives the notification and can exercise exit-as-veto (§9.2.1) or appeal to other context members. The cool-down does not apply to multi-admin models (which already require governance approval from multiple parties).
    - `approve()`/`reject()` return current status (no-op).
    - `cancel()` sets status to `Cancelled` if the proposal is `Pending` and the caller is the admin. Returns error otherwise.
@@ -2913,23 +2924,23 @@ UCAN delegation chains require a single root issuer (ADR-016 step 4). Distributi
 // Additions to EventType in scp-core/event_log/
 GovernanceProposalCreated {
     proposal_id: ProposalId,
-    proposer_did: DID,
+    proposer_did: [u8; 32],
     action: GovernanceAction,
     voting_deadline: u64,
 },
 GovernanceVoteCast {
     proposal_id: ProposalId,
-    voter_did: DID,
+    voter_did: [u8; 32],
     vote: VoteType,
 },
 GovernanceVoteWithdrawn {
     proposal_id: ProposalId,
-    voter_did: DID,
+    voter_did: [u8; 32],
 },
 GovernanceProposalResolved {
     proposal_id: ProposalId,
     status: ProposalStatus,
-    executor_did: Option<DID>,
+    executor_did: Option<[u8; 32]>,
     resulting_epoch: Option<u64>,
 },
 GovernanceConflictDetected {
@@ -2947,7 +2958,7 @@ GovernanceDeadlockRecovery {
 GovernanceActionExecuted {
     proposal_id: ProposalId,
     action: GovernanceAction,
-    executor_did: DID,
+    executor_did: [u8; 32],
     resulting_epoch: Option<u64>,
 },
 ```
@@ -3050,7 +3061,11 @@ GovernanceActionExecuted {
 
 ## ADR-038: Content Access Key Layer
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, left an identity one operational key, so the access-key lookup has one key to find (`09-security-model.md` §9.1 invariant 1).
+
+**Amendment (2026-09-10 — access-key distribution runs over DHKEM(P-256)).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The access-key distribution is DHKEM(P-256, HKDF-SHA256) under HPKE Base mode, the ephemeral wrapping keypair a requester generates is a DHKEM(P-256) keypair, and the request's `signature` field carries the type `P256Signature`. The pull-based model, the `info` and AAD constructions, and the per-epoch rotation are untouched.
 
 ### Context
 
@@ -3099,8 +3114,8 @@ pub struct AccessKey {
     key: [u8; 32],
     /// Context this key belongs to.
     context_id: ContextId,
-    /// DID this key belongs to.
-    member_did: DID,
+    /// The identifier this key belongs to.
+    member_did: [u8; 32],
     /// Epoch counter — incremented on rotation (restoration generates new key).
     epoch: u64,
 }
@@ -3114,7 +3129,7 @@ pub struct ContentEncryptionKey {
 
 /// A CEK wrapped (encrypted) with a member's access key.
 pub struct WrappedCek {
-    /// Truncated SHA-256 of the member's DID (first 8 bytes).
+    /// Truncated SHA-256 of the member's identifier (first 8 bytes).
     /// Used as lookup key in the wrapped_ceks map.
     pub member_id: [u8; 8],
     /// AES-256-KW wrapped CEK (40 bytes: 32-byte key + 8-byte integrity check).
@@ -3124,30 +3139,30 @@ pub struct WrappedCek {
 
 #### 2. Access Key Lifecycle
 
-**Generation.** When `AddMember` executes (via governance), the executor generates a fresh random 32-byte AES-256 access key for the new member. The access key is distributed via HPKE Base mode (RFC 9180) using the same pull-based protocol and suite as sender keys (ADR-007, §9.16.2): DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The new member sends an `AccessKeyRequest`, the key holder responds with `AccessKeyResponse` containing the HPKE-sealed access key. The HPKE `info` parameter MUST use a distinct domain separator: `info = "scp-access-key-v1" || context_id || member_did || epoch_bytes`. The `aad` parameter is: `aad = context_id || member_did || epoch_bytes`. Where `epoch_bytes` is the 8-byte big-endian encoding of the access key epoch. Sender keys use `"scp-sender-key-v1"` and broadcast keys use `"scp-broadcast-key-v1"`. This prevents cross-protocol key confusion where a compromised access key response could be replayed as a sender key response — different `info` values produce different HPKE key schedules.
+**Generation.** When `AddMember` executes (via governance), the executor generates a fresh random 32-byte AES-256 access key for the new member. The access key is distributed via HPKE Base mode (RFC 9180) using the same pull-based protocol and suite as sender keys (ADR-007, §9.16.2): DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The new member sends an `AccessKeyRequest`, the key holder responds with `AccessKeyResponse` containing the HPKE-sealed access key. The HPKE `info` parameter MUST use a distinct domain separator: `info = "scp-access-key-v1" || context_id || member_did || epoch_bytes`. The `aad` parameter is: `aad = context_id || member_did || epoch_bytes`. Where `epoch_bytes` is the 8-byte big-endian encoding of the access key epoch. Sender keys use `"scp-sender-key-v1"` and broadcast keys use `"scp-broadcast-key-v1"`. This prevents cross-protocol key confusion where a compromised access key response could be replayed as a sender key response — different `info` values produce different HPKE key schedules.
 
 **Distribution.** Access keys are distributed via two new wire types:
 
 ```rust
 pub struct AccessKeyRequest {
-    pub requester_did: DID,
+    pub requester_did: [u8; 32],
     pub context_id: ContextId,
     pub epoch: u64,
     pub timestamp: u64,  // Unix milliseconds; requests older than 30s are rejected
-    pub wrapping_pubkey: X25519PublicKey,  // Ephemeral, per-request
-    /// Which verification method signed: "#active" or "#agent" (ADR-039).
+    pub wrapping_pubkey: HpkeP256PublicKey,  // Ephemeral, per-request
+    /// Which operational role signed: "#active".
     pub signing_key_id: String,
-    /// Ed25519 signature over: SHA-256(context_id || requester_did || signing_key_id || epoch || timestamp || wrapping_pubkey)
-    /// using the requester's Active Signing Key or Agent Signing Key (ADR-039). Prevents replay and impersonation.
-    pub signature: Ed25519Signature,
+    /// P-256 signature over: SHA-256(context_id || requester_did || signing_key_id || epoch || timestamp || wrapping_pubkey)
+    /// using the requester's Active Signing Key. Prevents replay and impersonation.
+    pub signature: P256Signature,
 }
 
 pub struct AccessKeyResponse {
     pub context_id: ContextId,
-    pub member_did: DID,
+    pub member_did: [u8; 32],
     pub epoch: u64,
     pub hpke_sealed_key: Vec<u8>,
-    pub ephemeral_pubkey: X25519PublicKey,
+    pub ephemeral_pubkey: HpkeP256PublicKey,
 }
 ```
 
@@ -3155,12 +3170,12 @@ pub struct AccessKeyResponse {
 
 1. Generate a fresh CEK (32 random bytes).
 2. Encrypt the message content with AES-256-GCM using the CEK.
-3. For each intended recipient: wrap the CEK with AES-256-KW using the recipient's access key. The wrapping operation is signed by the sender's Active Signing Key or Agent Signing Key (ADR-039).
+3. For each intended recipient: wrap the CEK with AES-256-KW using the recipient's access key. The wrapping operation is signed by the sender's Active Signing Key.
 4. Publish: `{ ciphertext, nonce, wrapped_ceks }`. Integrity is verified by the AES-256-GCM authentication tag — no separate content hash is stored.
 
 On receive:
 
-1. Look up own `member_id` (truncated DID hash) in `wrapped_ceks`. Note: the lookup is by DID, not by signing key — both `#active` and `#agent` operations on the same DID share the same access key (ADR-039).
+1. Look up own `member_id` (truncated identifier hash) in `wrapped_ceks`. Note: the lookup is by identifier and not by signing key, so every operation an identity performs shares one access key.
 2. Unwrap the CEK with own access key using AES-256-KW.
 3. Decrypt the ciphertext with AES-256-GCM using the unwrapped CEK. The AEAD authentication tag verifies integrity.
 
@@ -3220,7 +3235,7 @@ pub struct WrappedContent {
     /// AES-256-GCM nonce (12 bytes).
     pub nonce: [u8; 12],
     /// Per-recipient wrapped CEKs.
-    /// Key: first 8 bytes of SHA-256(member_did) — prevents DID publication.
+    /// Key: first 8 bytes of SHA-256(member_did) — prevents identifier publication.
     /// Value: AES-256-KW wrapped CEK (40 bytes).
     pub wrapped_ceks: Vec<WrappedCek>,
 }
@@ -3259,9 +3274,9 @@ AES-256-KW is the standard key-wrapping algorithm used by JOSE/JWE, CMS, and HPK
 
 A per-message CEK limits the blast radius of key compromise: one compromised CEK reveals one message, not the entire conversation. This is standard practice (Signal, MLS, age). The alternative — reusing a content key across multiple messages — would make the access key revocation mechanism less granular.
 
-**Why truncated DID hashes in wrapped_ceks:**
+**Why truncated identifier hashes in wrapped_ceks:**
 
-Publishing full DIDs in the wrapped_ceks map would leak membership information to anyone who can observe the ciphertext (relays, network observers). The truncated 8-byte hash provides a lookup key that the recipient can compute from their own DID but that does not reveal the DID to observers. Collision probability for 8-byte hashes is ~1 in 10^18 — negligible for any practical context size.
+Publishing full identifiers in the wrapped_ceks map would leak membership information to anyone who can observe the ciphertext (relays, network observers). The truncated 8-byte hash provides a lookup key that the recipient can compute from their own identifier but that does not reveal the identifier to observers. Collision probability for 8-byte hashes is ~1 in 10^18 — negligible for any practical context size.
 
 **Why forward-only restoration:**
 
@@ -3276,7 +3291,7 @@ The access key is destroyed on Full revocation and not archived. Re-wrapping his
 - **Persistence:** Via `ProtocolRepository` (§17.4). Key conventions:
   - `context/{context_id}/access_key/{did_hex}` — member's access key (encrypted at rest)
   - `context/{context_id}/access_key/{did_hex}/epoch` — current epoch counter
-  - `context/{context_id}/access_key/exclusion_list` — DIDs excluded from future wrapping
+  - `context/{context_id}/access_key/exclusion_list` — identifiers excluded from future wrapping
   - `context/{context_id}/access_key/revocation_log` — append-only revocation events
 
 ### Dependencies
@@ -3294,7 +3309,7 @@ The access key is destroyed on Full revocation and not archived. Re-wrapping his
    - `AccessKey` struct with 32-byte AES-256 key, context_id, member_did, epoch.
    - `generate_access_key(context_id, member_did) -> AccessKey` generates a cryptographically random key.
    - `AccessKeyRequest`/`AccessKeyResponse` wire types follow the pull-based protocol pattern from ADR-007.
-   - Distribution uses HPKE Base mode (RFC 9180) with DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. Info: `"scp-access-key-v1" || context_id || member_did || epoch_bytes`. AAD: `context_id || member_did || epoch_bytes`. Same suite as sender key distribution (§9.16.2).
+   - Distribution uses HPKE Base mode (RFC 9180) with DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. Info: `"scp-access-key-v1" || context_id || member_did || epoch_bytes`. AAD: `context_id || member_did || epoch_bytes`. Same suite as sender key distribution (§9.16.2).
 
 2. **CEK generation and wrapping:**
 
@@ -3374,6 +3389,8 @@ The access key is destroyed on Full revocation and not archived. Re-wrapping his
 
 **Status:** Decided
 
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, removed the record whose expiry fixed this republish interval, so the interval is no longer a protocol constant, and the identity layer republishes its key-event log and its service record to relays instead (`03-identity.md` §3.10.5).
+
 ### Context
 
 The Protocol Constants Registry (§9.18) promoted many implementation defaults to protocol-level constants. Constants like `MAX_SEQUENTIAL_COMMITS`, `RECONNECTION_TIMEOUT`, `SENDER_KEY_TIMEOUT`, `RECONNECTION_DEDUP_WINDOW`, and the nesting depth ceiling have no security or correctness basis for their specific values. The session cap default of 5 was a placeholder. The relay blob TTL is the relay operator's business. Several timeouts are hardware-dependent.
@@ -3388,7 +3405,6 @@ Reclassify protocol constants into three tiers:
 
 | Constant | Value | Rationale |
 |----------|-------|-----------|
-| `DHT_REPUBLISH_INTERVAL` | 7200s | BEP44 constraint, not SCP's choice. |
 | `SENDER_KEY_GRACE` | 30s | ADR-001 criterion 6: "not configurable — it bounds the forward secrecy window." Explicit decision not to make configurable. |
 | `BUCKET_SIZES` | [256, 1024, 4096, 16384, 65536, 262144] | Interop requirement — implementations MUST use identical bucket sizes, otherwise relays distinguish implementations by ciphertext size, defeating padding. |
 | Cryptographic primitives | (§9.18.1) | Algorithm choices are protocol-level. |
@@ -3421,7 +3437,7 @@ Reclassify protocol constants into three tiers:
 
 3. `MAX_NESTING_DEPTH` is removed as a protocol ceiling. Same rationale as chain depth — nesting costs are borne by participants, not the protocol. Contexts may set their own limit via `ContextParams::max_nesting_depth`.
 
-4. `DID_DOCUMENT_BLOB_TTL_SECS` (resolver.rs:344) is intentionally independent from `RELAY_BLOB_TTL_SECS`. It is the identity-layer publication TTL for DID documents, used by the healing publisher, and remains unchanged.
+4. `DID_DOCUMENT_BLOB_TTL_SECS` (resolver.rs:344) is intentionally independent from `RELAY_BLOB_TTL_SECS`. It is the identity layer's own publication TTL, used by the healing publisher, and remains unchanged. A validating relay retains a key-event record and never expires one (`03-identity.md` §3.10.5), so the TTL binds the service record alone.
 
 ### Migration
 
@@ -3454,12 +3470,14 @@ No protocol versioning mechanism is required for this change set.
 
 **Status:** Decided
 
+**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, publishes an identity-link attestation as an entry of the identity's service record (`03-identity.md` §3.5.3 and §3.10.13).
+
 ### Context
 
-Identity link attestations (§3.5) bind external platform identities to SCP DIDs. The original spec treated all attestation verification methods uniformly: OAuth, signed posts, DNS records, and challenge-response all shared the same trust model. In practice, these methods have fundamentally different trust properties:
+Identity link attestations (§3.5) bind external platform identities to SCP identifiers. The original spec treated all attestation verification methods uniformly: OAuth, signed posts, DNS records, and challenge-response all shared the same trust model. In practice, these methods have fundamentally different trust properties:
 
 - **OAuth and challenge-response** produce cryptographic proof of identity ownership at creation time. The SDK performs the OAuth code exchange, receives a signed ID token, and can extract a verified subject identifier. The proof is ephemeral — it exists at creation time but is not externally re-verifiable later.
-- **Signed posts and DNS records** are live external resources. No cryptographic proof exists at creation time. The proof is the continued presence of the DID in the external resource, and consumers must fetch it to verify.
+- **Signed posts and DNS records** are live external resources. No cryptographic proof exists at creation time. The proof is the continued presence of the identifier in the external resource, and consumers must fetch it to verify.
 
 The original §3.5.2 defined two alternative `proof` formats for OAuth attestations: (a) the raw JWT from the OIDC provider, or (b) an SDK-signed summary. The raw JWT path is problematic:
 
@@ -3467,13 +3485,13 @@ The original §3.5.2 defined two alternative `proof` formats for OAuth attestati
 2. **Token expiry mismatch.** JWTs expire (typically in 1 hour). An attestation containing an expired JWT requires verifiers to either (a) accept expired JWTs (defeating the purpose of JWT expiry), or (b) reject the attestation after 1 hour (defeating the purpose of attestations).
 3. **Verification requires JWKS.** Verifiers must fetch the OIDC provider's JWKS to validate the JWT. This creates a runtime dependency on external infrastructure for attestation verification.
 
-Additionally, the original spec did not define how attestations are published in DID documents, leaving discovery underspecified.
+Additionally, the original spec did not define how attestations are published, leaving discovery underspecified.
 
 ### Decision
 
 **Two attestation classes** as sub-classifications of `AttestationType::IdentityLink`:
 
-**Class 1: Cryptographic.** Verification methods: `Oauth`, `ChallengeResponse`. The provider's confirmation was cryptographically verified at creation time. The SDK extracts the minimal claim (`provider`, `subject_id`, `verified_at`), signs the full attestation envelope with the DID key, and discards the raw token. The proof is an SDK-signed self-attestation: "I verified this at creation time." Consumers check the DID signature; no external fetch required.
+**Class 1: Cryptographic.** Verification methods: `Oauth`, `ChallengeResponse`. The provider's confirmation was cryptographically verified at creation time. The SDK extracts the minimal claim (`provider`, `subject_id`, `verified_at`), signs the full attestation envelope with the identifier key, and discards the raw token. The proof is an SDK-signed self-attestation: "I verified this at creation time." Consumers check the identifier signature; no external fetch required.
 
 **Class 2: Reference.** Verification methods: `SignedPost`, `DnsRecord`. The proof is a live external resource. The attestation points to a URL or DNS record. Consumers MUST fetch and verify the proof before granting trust weight. Unverified Reference attestations carry zero trust.
 
@@ -3481,7 +3499,7 @@ Additionally, the original spec did not define how attestations are published in
 
 **Provider registry.** Seven initial providers: `github.com` (Class 2), `x.com` (Class 2), `google.com` (Class 1), `apple.com` (Class 1), `microsoft.com` (Class 1), `mastodon:<instance>` (Class 2), `dns` (Class 2). New providers by spec amendment only.
 
-**DID document service entries.** Type `ScpIdentityLinkAttestation`. Fragment `attestation-<platform>--<index>`. Max 10 per DID document.
+**Service-record entries.** Type `ScpIdentityLinkAttestation`. Fragment `attestation-<platform>--<index>`. Max 10 per service record.
 
 **`revocation_status` in signed scope.** The `revocation_status` field replaces the separate `revocation` object in the wire format. It is included in the signature scope, preventing replay of revoked attestations as active.
 
@@ -3491,7 +3509,7 @@ Additionally, the original spec did not define how attestations are published in
 
 The class distinction is not a new attestation type — it is a sub-classification within `IdentityLink`. This is deliberate. `AttestationType` has stable numeric tags (§7.4.1, `attestation_type_tag`). Adding a new variant would require a new tag and break the existing tag stability guarantee. Instead, the class is derived from the verification method, which is already a field in the wire format. Any consumer can determine the class by inspecting `evidence.method`.
 
-The self-attestation model is acceptable for identity links specifically because issuer == subject. The DID owner is the only party with incentive to create the attestation, and the only party who can perform the OAuth flow. Falsifying a link provides no protocol benefit: shadow claiming (§3.5.5) verifies the external identity independently, and social graph import only surfaces contacts who genuinely control both identities.
+The self-attestation model is acceptable for identity links specifically because issuer == subject. The identity's controller is the only party with incentive to create the attestation, and the only party who can perform the OAuth flow. Falsifying a link provides no protocol benefit: shadow claiming (§3.5.5) verifies the external identity independently, and social graph import only surfaces contacts who genuinely control both identities.
 
 ### Rejected Alternatives
 
@@ -3503,9 +3521,9 @@ The self-attestation model is acceptable for identity links specifically because
 
 ### Security Analysis
 
-**Self-attestation attack surface.** A malicious user could create a Class 1 attestation claiming to have performed OAuth verification without actually doing so. The attestation would have a valid DID signature. Defense: (a) the claim is "I control external account X" — the only use cases (shadow claiming, social graph import) independently verify the external identity, so a false claim has no effect; (b) the `subject_id` in the proof is meaningless without the external platform recognizing it, limiting social engineering; (c) stale attestations (past renewal interval) are degraded, forcing periodic re-verification.
+**Self-attestation attack surface.** A malicious user could create a Class 1 attestation claiming to have performed OAuth verification without actually doing so. The attestation would have a valid signature. Defense: (a) the claim is "I control external account X" — the only use cases (shadow claiming, social graph import) independently verify the external identity, so a false claim has no effect; (b) the `subject_id` in the proof is meaningless without the external platform recognizing it, limiting social engineering; (c) stale attestations (past renewal interval) are degraded, forcing periodic re-verification.
 
-**Reference attestation spoofing.** An attacker publishes a Reference attestation pointing to a URL containing another user's DID. Defense: Reference attestations carry zero trust until the consumer verifies the proof. The consumer checks that the DID in the external resource matches the attestation's `issuer`. The attacker cannot place the victim's DID in the victim's profile.
+**Reference attestation spoofing.** An attacker publishes a Reference attestation pointing to a URL containing another user's identifier. Defense: Reference attestations carry zero trust until the consumer verifies the proof. The consumer checks that the identifier in the external resource matches the attestation's `issuer`. The attacker cannot place the victim's identifier in the victim's profile.
 
 **Revocation replay.** An attacker intercepts a revoked attestation and strips `revocation_status: Revoked`. Defense: `revocation_status` is in the signature scope. Stripping it invalidates the signature. The original `Active` attestation still has a valid signature, but consumers check the revocation endpoint (§18.2.2) for the attestation ID.
 
@@ -3514,7 +3532,7 @@ The self-attestation model is acceptable for identity links specifically because
 1. §3.5.0 defines Class 1 (Cryptographic) and Class 2 (Reference) with verification method mapping.
 2. §3.5.1 defines the provider registry with 7 initial providers, platform value conventions, and creation flows for each class.
 3. §3.5.2 wire format includes `revocation_status` in the signature scope (replaces separate `revocation` object).
-4. §3.5.3 defines `ScpIdentityLinkAttestation` DID document service entry format with fragment naming convention and max-10 limit.
+4. §3.5.3 defines the `ScpIdentityLinkAttestation` service-record entry format with its fragment naming convention and max-10 limit.
 5. §3.5.4 defines class-specific verification procedures: Class 1 (signature-only), Class 2 (signature + proof fetch). Verification cache specified with 1-hour TTL.
 6. §3.5.6 documents security properties: no PII, self-attestation scope limits, zero-trust for unverified Reference attestations, revocation replay prevention.
 7. No new `AttestationType` variant introduced — class is derived from `evidence.method`.
@@ -3525,9 +3543,11 @@ The self-attestation model is acceptable for identity links specifically because
 
 ## ADR-045: Fuzzing Infrastructure
 
-**Status:** Decided
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
 **Date:** April 2026
 **PRs:** #1643 (initial 18 targets), #1644 (size-gate fixes), #1645 (CI workflows), #1652 (documentation follow-up)
+
+**Amendment (2026-09-10 — the deep fuzz targets build real P-256 keys).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The two fuzz targets that build real key material — the T4 validation-depth tier and `fuzz_validate_ucan_deep.rs` — generate real P-256 keys. The target taxonomy, the tier gating, and the CI workflow routing are untouched.
 
 ### Context
 
@@ -3567,7 +3587,7 @@ scp-event-log = { path = "../crates/scp-event-log" }
 | T1 — Wire Format Parsers | B1 relay wire, B2 post-MLS | Raw bytes + dict | Nightly, 15 min/target |
 | T2 — Content Trust Boundaries | B2 inner content, B3 resolution | Raw bytes + dict | Nightly, 5 min/target |
 | T3 — Invariant & Differential | Security properties, roundtrips | Mix raw + Arbitrary | Local / `workflow_dispatch` |
-| T4 — Validation Depth & State | Paths requiring semantic validity | Arbitrary + real Ed25519 | Local / `workflow_dispatch` |
+| T4 — Validation Depth & State | Paths requiring semantic validity | Arbitrary + real P-256 | Local / `workflow_dispatch` |
 
 **Trust boundaries:**
 - **B1:** Relay wire protocol — any unauthenticated TCP connection
@@ -3669,7 +3689,7 @@ fuzz/                        # Standalone cargo-fuzz crate (not workspace member
 │   ├── fuzz_merkle_proof_random.rs      # T3/B3 — Arbitrary, I1
 │   ├── fuzz_canonical_hash_differential.rs # T3/B2 — Arbitrary, I1+I10
 │   ├── fuzz_aad_differential.rs         # T3/B2 — Arbitrary, I1+I9  (target 18)
-│   └── fuzz_validate_ucan_deep.rs       # T4/B3 — Arbitrary+real Ed25519, I1+I3+I6+I7+I8
+│   └── fuzz_validate_ucan_deep.rs       # T4/B3 — Arbitrary+real P-256, I1+I3+I6+I7+I8
 ├── dicts/                   # libFuzzer dictionaries (one per target family)
 │   ├── msgpack_outer_envelope.dict
 │   ├── msgpack_inner_envelope.dict

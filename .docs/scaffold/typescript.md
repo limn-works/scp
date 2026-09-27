@@ -14,7 +14,7 @@ bindings/typescript/
   tsup.config.ts
   src/
     index.ts                  # Re-exports: Identity, Context, ScpError, etc.
-    identity.ts               # Identity class, DIDDocument
+    identity.ts               # Identity class
     context.ts                # Context class, Membership, resource management
     tools.ts                  # ToolDefinition, TestVector interfaces
     trust.ts                  # evaluateTrust(), TrustEvaluation
@@ -52,7 +52,7 @@ The TypeScript SDK runs the protocol engine **in-process on every tier**, via a 
 | **Bun/Node** | napi-rs (native addon) | Bun, Node.js | `@limn-works/scp-ts` | Server-side agents, CLI tools, MCP servers (full capability) |
 | **Browser/edge** | wasm-bindgen (`scp-client-wasm`) | Browser, Deno, Workers, edge | `@limn-works/scp-ts-wasm` | In-tab SCP participant, keys on-device (participant subset) |
 
-Browser/edge clients **do** run the protocol in-process. Per **ADR-057** (which amends ADR-055's browser-deployment conclusion), a browser client runs the full participant protocol **in-tab** over `scp-client-wasm` — MLS group state, seal/open, and event-log leaves execute locally, with the DID signing key and MLS group secrets held **on-device**; the server is untrusted and never holds key material or plaintext. This is **not** a remote thin client: there is a real in-browser protocol engine. The wasm tier is a capability **subset** — governance, economy, saga coordination, media, DHT, and broadcast hosting stay node-side behind the `scp-runtime` scope fence — so tier selection is an explicit install choice (`@limn-works/scp-ts-wasm`), with no transparent native→wasm fallback. The `@limn-works/scp-ts` package is the NAPI-backed native tier. (ADR-055's removal of the WASM **bridge** stands; ADR-057 revises only its "browser = remote thin client, no in-browser execution" conclusion.)
+Browser/edge clients **do** run the protocol in-process. Per **ADR-057** (which amends ADR-055's browser-deployment conclusion), a browser client runs the full participant protocol **in-tab** over `scp-client-wasm` — MLS group state, seal/open, and event-log leaves execute locally, with the identity signing key and MLS group secrets held **on-device**; the server is untrusted and never holds key material or plaintext. This is **not** a remote thin client: there is a real in-browser protocol engine. The wasm tier is a capability **subset** — governance, economy, saga coordination, media, and broadcast hosting stay node-side behind the `scp-runtime` scope fence — so tier selection is an explicit install choice (`@limn-works/scp-ts-wasm`), with no transparent native→wasm fallback. The `@limn-works/scp-ts` package is the NAPI-backed native tier. (ADR-055's removal of the WASM **bridge** stands; ADR-057 revises only its "browser = remote thin client, no in-browser execution" conclusion.)
 
 ### Bridge module
 
@@ -187,13 +187,13 @@ interface ToolDefinition {
   description: string;
   inputSchema: Record<string, unknown>;   // JSON Schema
   outputSchema: Record<string, unknown>;  // JSON Schema
-  operator: Identity | string;
+  operator: Identity | Uint8Array;
   testVectors?: TestVector[];
   implementationHash?: Uint8Array;
 }
 
 interface Message {
-  senderDid: string;
+  senderIdentifier: Uint8Array;
   content: string | Uint8Array;
   timestamp: number;
   sequence: number;

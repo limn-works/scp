@@ -1,5 +1,7 @@
 # Assert a Cryptographic Invariant on Every Bridge That Emits the Artifact
 
+> **Dating note (2026-09-02):** this lesson describes `migrate_identity` and the pre-rotation model as Pre-Rotation Key Custody, §9.7.4.1 of `09-security-model.md`, read before the key-event-log recovery amendment. Root-Authority Recovery and Fork Precedence, §9.7.4.2 of that spec, states the amended model. The lesson's principle stands; its spec citations are historical.
+
 **Rule**: when a wire artifact carries a spec-defined cryptographic invariant, every bridge
 that emits the artifact asserts the invariant in its own tests, recomputed from the emitted
 bytes. Registering the operation under one canonical name in `scripts/bridge-aliases.json`

@@ -2,6 +2,15 @@
 
 # ADR Completeness and Specification Gap Audit
 
+> **Annotation, 2026-09-13.** Everything below is the record as its author wrote it on the
+> date this file carries, restored unedited. The identity model it reads — did:dht, the DID document and its verification methods, the shared `#agent` key, X25519, the Mainline distributed hash table, the BEP44 record encoding and the identifier written as a `did:` string — was
+> replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity substrate,
+> whose rules `.docs/specs/09-security-model.md` §9.7.4.2 and `.docs/specs/03-identity.md`
+> §3.10 carry, and whose curve Alec settled on 2026-09-10 as ECDSA on NIST P-256
+> (`.docs/specs/09-security-model.md` §9.5). A record of what a named party read on a named
+> date states what that party read, so this annotation records what replaced the model and
+> no sentence below is edited to match.
+
 ## Executive Summary
 
 The SCP ADR corpus across Phases 1--3 (19 ADRs total) is unusually thorough for a project at this stage. Most ADRs include concrete Rust type definitions, file-level scope estimates, acceptance criteria, and integration tests. The quality is well above the typical "we decided X" ADR pattern.

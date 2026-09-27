@@ -8,7 +8,7 @@ Build blueprint for the SCP monorepo: crate organization, FFI strategy, cross-la
 
 ```
 crates/
-  scp-core/           # Protocol engine (MLS, DID, envelope, context, UCAN, event log)
+  scp-core/           # Protocol engine
   scp-transport/      # Transport abstraction + native relay + adapters
   scp-platform/       # Platform adapters (key custody, attestation, push, storage)
   scp-mcp/            # MCP adapter (JSON-RPC server/client)
@@ -27,9 +27,9 @@ bindings/
 
 | Crate | Role | Key dependencies |
 |-------|------|------------------|
-| `scp-core` | All protocol logic: MLS wrapper, DID, envelope, context lifecycle, UCAN, event log, sender keys | openmls, ed25519-dalek, sha2, hkdf, aes-gcm, serde, thiserror |
+| `scp-core` | All protocol logic: MLS wrapper, identity, envelope, context lifecycle, UCAN, event log, sender keys | openmls, p256, hpke-rs, sha2, hkdf, aes-gcm, serde, thiserror |
 | `scp-transport` | Transport trait + adapters. Native relay server/client. Multi-transport routing | tokio, tokio-tungstenite, futures |
-| `scp-platform` | Platform abstraction traits + in-memory testing adapters | ed25519-dalek, rand |
+| `scp-platform` | Platform abstraction traits + in-memory testing adapters | p256, rand |
 | `scp-mcp` | MCP JSON-RPC server/client for tool exposition | serde_json, tokio, axum |
 | `crates/scp-ffi/*` | Language-specific FFI bridges. Thin translation layers only — zero protocol logic | pyo3, uniffi, napi-rs |
 
@@ -61,6 +61,7 @@ All SDKs use language-idiomatic casing for the same logical identifiers.
 | Identity type | `Identity` | `Identity` | `Identity` | `Identity` | `Identity` | `Identity` | `Identity` | `Identity` |
 | Context type | `ContextHandle` | `Context` | `Context` | `Context` | `Context` | `Context` | `Context` | `Context` |
 | Create identity | `Identity::create` | `Identity.create()` | `Identity.create()` | `Identity.create()` | `Identity.create()` | `NewIdentity()` | `Identity.CreateAsync()` | `Identity.create()` |
+| Identity-creation config | `IdentityConfig` | `IdentityConfig` | `IdentityConfig` | `IdentityConfig` | `IdentityConfig` | `IdentityConfig` | `IdentityConfig` | `IdentityConfig` |
 | Create context | `ContextManager::create` | `Context.create()` | `Context.create()` | `Context.create()` | `Context.create()` | `NewContext()` | `Context.CreateAsync()` | `Context.create()` |
 | Send message | `ctx.send_message()` | `ctx.send()` | `ctx.send()` | `ctx.send()` | `ctx.send()` | `ctx.Send()` | `ctx.SendAsync()` | `ctx.send()` |
 | Invoke tool | `ctx.invoke_tool()` | `ctx.invoke_tool()` | `ctx.invokeTool()` | `ctx.invokeTool()` | `ctx.invokeTool()` | `ctx.InvokeTool()` | `ctx.InvokeToolAsync()` | `ctx.invokeTool()` |
@@ -72,19 +73,43 @@ All SDKs use language-idiomatic casing for the same logical identifiers.
 | UCAN revoke | `ucan::revoke` | `revoke()` | `revoke()` | `revokeUcanToken()` | `ucanRevoke()` | `UcanRevoke()` | `UcanRevokeAsync()` | `ucanRevoke()` |
 | Error base | `ScpError` | `ScpError` | `ScpError` | `ScpError` | `ScpException` | `ScpError` | `ScpException` | `ScpException` |
 | Package name | `scp-core` | `scp-python` | `@limn-works/scp-ts` | `SCP` | `works.limn:scp-kt` | `scp-go` | `Limn.Scp` | `works.limn:scp-java` |
+| Resolve identity | `IdentityBackend::resolve` | `backend.resolve()` | `backend.resolve()` | `backend.resolve()` | `backend.resolve()` | `backend.Resolve()` | `backend.ResolveAsync()` | `backend.resolve()` |
+| Read service record | `IdentityBackend::read_service_record` | `backend.read_service_record()` | `backend.readServiceRecord()` | `backend.readServiceRecord()` | `backend.readServiceRecord()` | `backend.ReadServiceRecord()` | `backend.ReadServiceRecordAsync()` | `backend.readServiceRecord()` |
+| Publish key events | `IdentityBackend::publish` | `backend.publish()` | `backend.publish()` | `backend.publish()` | `backend.publish()` | `backend.Publish()` | `backend.PublishAsync()` | `backend.publish()` |
+| Publish service record | `IdentityBackend::publish_service_record` | `backend.publish_service_record()` | `backend.publishServiceRecord()` | `backend.publishServiceRecord()` | `backend.publishServiceRecord()` | `backend.PublishServiceRecord()` | `backend.PublishServiceRecordAsync()` | `backend.publishServiceRecord()` |
+| Read a relay's declared policy | `IdentityBackend::read_policy` | `backend.read_policy()` | `backend.readPolicy()` | `backend.readPolicy()` | `backend.readPolicy()` | `backend.ReadPolicy()` | `backend.ReadPolicyAsync()` | `backend.readPolicy()` |
+| Read the fallback set | `IdentityBackend::fallback_set` | `backend.fallback_set()` | `backend.fallbackSet()` | `backend.fallbackSet()` | `backend.fallbackSet()` | `backend.FallbackSet()` | `backend.FallbackSet()` | `backend.fallbackSet()` |
+| Run one self-observation pass | `Identity::observe_self` | `identity.observe_self()` | `identity.observeSelf()` | `identity.observeSelf()` | `identity.observeSelf()` | `identity.ObserveSelf()` | `identity.ObserveSelfAsync()` | `identity.observeSelf()` |
+| Rotate the active key | `Identity::rotate_active` | `identity.rotate_active()` | `identity.rotateActive()` | `identity.rotateActive()` | `identity.rotateActive()` | `identity.RotateActive()` | `identity.RotateActiveAsync()` | `identity.rotateActive()` |
+| Name the witness set | `Identity::set_witnesses` | `identity.set_witnesses()` | `identity.setWitnesses()` | `identity.setWitnesses()` | `identity.setWitnesses()` | `identity.SetWitnesses()` | `identity.SetWitnessesAsync()` | `identity.setWitnesses()` |
+| Begin a recovery | `Recovery::begin` | `recovery.begin()` | `recovery.begin()` | `recovery.begin()` | `recovery.begin()` | `recovery.Begin()` | `recovery.BeginAsync()` | `recovery.begin()` |
+| Co-sign a pending event | `Identity::cosign` | `Identity.cosign()` | `Identity.cosign()` | `Identity.cosign()` | `Identity.cosign()` | `IdentityCosign()` | `Identity.Cosign()` | `Identity.cosign()` |
+| Attach signatures and publish | `Identity::attach` | `identity.attach()` | `identity.attach()` | `identity.attach()` | `identity.attach()` | `identity.Attach()` | `identity.AttachAsync()` | `identity.attach()` |
+| Obtain the recovery entry points | `let recovery = identity.recovery()` | `recovery = identity.recovery()` | `const recovery = identity.recovery()` | `let recovery = identity.recovery()` | `val recovery = identity.recovery()` | `recovery := identity.Recovery()` | `var recovery = identity.Recovery()` | `var recovery = identity.recovery()` |
+| Load a pending recovery | `Recovery::load_pending_recovery` | `recovery.load_pending_recovery()` | `recovery.loadPendingRecovery()` | `recovery.loadPendingRecovery()` | `recovery.loadPendingRecovery()` | `recovery.LoadPendingRecovery()` | `recovery.LoadPendingRecovery()` | `recovery.loadPendingRecovery()` |
+| Resume a recovery | `Recovery::resume_recovery` | `recovery.resume_recovery()` | `recovery.resumeRecovery()` | `recovery.resumeRecovery()` | `recovery.resumeRecovery()` | `recovery.ResumeRecovery()` | `recovery.ResumeRecoveryAsync()` | `recovery.resumeRecovery()` |
+| Abort a recovery | `Recovery::abort_recovery` | `recovery.abort_recovery()` | `recovery.abortRecovery()` | `recovery.abortRecovery()` | `recovery.abortRecovery()` | `recovery.AbortRecovery()` | `recovery.AbortRecovery()` | `recovery.abortRecovery()` |
+
+The rows above reproduce three declarations rather than restating them. <!-- scp:include id="identity-backend-methods" from=".docs/specs/03-identity.md" -->`IdentityBackend` carries six methods and no others, each naming the backend as its receiver: `resolve`, `publish`, `read_service_record`, `publish_service_record`, `read_policy` and `fallback_set`.<!-- scp:end id="identity-backend-methods" --> <!-- scp:include id="recovery-handle-declaration" from=".docs/specs/09-security-model.md" -->**`RecoveryHandle` is one enum whose variants are `FixesCommitment` and `Abandons`, each carrying the identity's 32-byte identifier, a `RecoveryPhase`, and the 32-byte preimage digest of the composed event, and `RecoveryPhase`'s four values are `Composed`, `Signed`, `PublishSent` and `Confirmed`.**<!-- scp:end id="recovery-handle-declaration" --> <!-- scp:include id="recovery-entry-points" from=".docs/specs/09-security-model.md" -->**The four recovery entry points sit on a type named `Recovery`: `begin`, `load_pending_recovery`, `resume_recovery` and `abort_recovery`**, so a binding author reads where they live rather than placing them as free functions on one platform and as statics on another.<!-- scp:end id="recovery-entry-points" -->
+
+**Name-bound enumerations are the exception to language-idiomatic casing of the identifier itself.** `09-security-model.md` §9.7.4.2's definitions state the criterion that decides which enumerations are name-bound, and no list of instances stands beside it: an enumeration added later is name-bound the moment it meets the criterion. Each binding carries the type name and every variant name the defining section spells, verbatim, and `.docs/standards/conventions.md`'s naming table is where that mapping lives. The defining section is the one that introduces the type.
 
 ### Casing rules per language
 
-| Language | Types | Functions/Methods | Constants | Modules/Packages | Files |
-|----------|-------|-------------------|-----------|-------------------|-------|
-| Rust | `PascalCase` | `snake_case` | `SCREAMING_SNAKE` | `snake_case` | `snake_case.rs` |
-| Python | `PascalCase` | `snake_case` | `SCREAMING_SNAKE` | `snake_case` | `snake_case.py` |
-| TypeScript | `PascalCase` | `camelCase` | `SCREAMING_SNAKE` | `camelCase` | `kebab-case.ts` |
-| Swift | `PascalCase` | `camelCase` | `camelCase` | `PascalCase` | `PascalCase.swift` |
-| Kotlin | `PascalCase` | `camelCase` | `SCREAMING_SNAKE` | `lowercase` | `PascalCase.kt` |
-| Go | `PascalCase` (exported) | `PascalCase` (exported) / `camelCase` (unexported) | `PascalCase` (exported) | `lowercase` | `snake_case.go` |
-| C# | `PascalCase` | `PascalCase` | `PascalCase` | `PascalCase` | `PascalCase.cs` |
-| Java | `PascalCase` | `camelCase` | `SCREAMING_SNAKE` | `lowercase` | `PascalCase.java` |
+<!-- scp:include id="name-binding-criterion" from=".docs/specs/09-security-model.md" -->**An enumeration this design defines is name-bound — its type name and every variant name identical in every SDK binding — where a binding surfaces it to callers or where it serializes on the wire, and a name is bound as the spec spells it, PascalCase, which every binding carries verbatim.** No binding recases a variant and no rule splits one on word boundaries, so a shared conformance fixture comparing a variant across languages compares one string.<!-- scp:end id="name-binding-criterion" -->
+
+The `Name-bound enum variants` column reads `.docs/standards/conventions.md`'s naming table, which states one spelling for every language, and this file states no per-language spelling of its own.
+
+| Language | Types | Functions/Methods | Constants | Name-bound enum variants | Modules/Packages | Files |
+|----------|-------|-------------------|-----------|--------------------------|-------------------|-------|
+| Rust | `PascalCase` | `snake_case` | `SCREAMING_SNAKE` | `conventions.md`'s naming table | `snake_case` | `snake_case.rs` |
+| Python | `PascalCase` | `snake_case` | `SCREAMING_SNAKE` | `conventions.md`'s naming table | `snake_case` | `snake_case.py` |
+| TypeScript | `PascalCase` | `camelCase` | `SCREAMING_SNAKE` | `conventions.md`'s naming table | `camelCase` | `kebab-case.ts` |
+| Swift | `PascalCase` | `camelCase` | `camelCase` | `conventions.md`'s naming table | `PascalCase` | `PascalCase.swift` |
+| Kotlin | `PascalCase` | `camelCase` | `SCREAMING_SNAKE` | `conventions.md`'s naming table | `lowercase` | `PascalCase.kt` |
+| Go | `PascalCase` (exported) | `PascalCase` (exported) / `camelCase` (unexported) | `PascalCase` (exported) | `conventions.md`'s naming table | `lowercase` | `snake_case.go` |
+| C# | `PascalCase` | `PascalCase` | `PascalCase` | `conventions.md`'s naming table | `PascalCase` | `PascalCase.cs` |
+| Java | `PascalCase` | `camelCase` | `SCREAMING_SNAKE` | `conventions.md`'s naming table | `lowercase` | `PascalCase.java` |
 
 ## Streaming Types
 
@@ -147,12 +172,12 @@ Tests are defined as JSON fixtures:
 {
   "test_id": "identity-create-001",
   "category": "identity",
-  "description": "Create identity with in-memory custody",
+  "description": "Create identity with passkey root custody on a desktop profile",
   "operation": "identity_create",
-  "input": { "custody": "in_memory" },
+  "input": { "custody_type": "Passkey", "custody_profile": "Desktop" },
   "expected": {
-    "did_prefix": "did:dht:",
-    "custody_type": "in_memory"
+    "identifier_len": 32,
+    "custody_type": "Passkey"
   }
 }
 ```
