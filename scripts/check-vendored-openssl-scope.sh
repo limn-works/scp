@@ -13,20 +13,19 @@
 # wheel triple, keeping build edges because `openssl-src` is a build-dependency of
 # `openssl-sys`. `scripts/check-shipped-feature-graph.sh` exempts that one function
 # from its rule that every `cargo tree` under scripts/ names `--target all` while
-# the text from that function's first line to the end of this file hashes to the
-# value it pins, so an edit anywhere in that text cancels the exemption. The
-# function takes only the triple from its caller and reads the package and
-# features from wheel_line, which runs the script FEATURE_GRAPH_GATE names. The
-# pinned text defines the function, wheel_line, is_feature_selection and count_in,
-# assigns VENDOR_CRATE and FEATURE_GRAPH_GATE, and ends with the lines that run
-# this gate: run_fixtures in a subshell, whose planted-gate overrides cannot reach
-# the parent, then `readonly` on those four functions and two variables, then
-# run_gate. A definition or assignment above the pinned text is replaced by the
-# pinned one, and one that run_gate makes, or a call that sets FEATURE_GRAPH_GATE
-# for itself, fails on the readonly name. The pin does not hold the commands those
-# functions run (cargo, bash, grep): a function of such a name defined anywhere in
-# this file shadows the command, and an alias defined above the pinned text, with
-# `shopt -s expand_aliases`, rewrites a word in it. Bash can forbid neither.
+# this whole file hashes to the value it pins, so an edit anywhere in this file
+# cancels the exemption, an edit to WHEEL_TRIPLES_PROGRAM, which lists the wheel
+# triples, or to the `some` verdict run_gate wants from each per-triple count
+# included. The function takes only the triple from its caller and reads the
+# package and features from wheel_line, which runs the script FEATURE_GRAPH_GATE
+# names. The file ends with the lines that run this
+# gate: run_fixtures in a subshell, whose planted-gate overrides cannot reach the
+# parent, then `readonly` on four functions and two variables, then run_gate. A
+# call that sets FEATURE_GRAPH_GATE for itself fails on the readonly name. The pin
+# holds this file's text and not what it reads or runs: WHEEL_MATRIX_FILE, the
+# gate FEATURE_GRAPH_GATE names, and the environment bash runs in, where a
+# function exported into the environment, or a PATH entry, named cargo, bash or
+# grep replaces that command.
 # Absence: `--target all` for every entry that gate's `--print-artifacts` writes
 # except the wheel's (`--print-wheel-entries`), which that list must name exactly
 # once beside at least one other entry, and `--workspace` for every
@@ -282,10 +281,8 @@ run_fixtures() {
   echo "   FIXTURES: $fixture_failures failed."; return 1
 }
 
-# Everything from the next line to the end of this file is the text the owner gate
-# pins (see the header): the one per-triple function, every input it reads, and the
-# lines that run this gate. A definition above this point of any name defined here
-# is replaced here; the header names what the pin does not hold.
+# The owner gate pins this whole file (see the header). The function below is the
+# one per-triple `cargo tree` its `--target all` rule exempts.
 #
 # wheel_triple_occurrences <triple>: the wheel's graph on one triple. The package
 # and features come from wheel_line, never from the caller's arguments. A cargo

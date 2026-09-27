@@ -1110,39 +1110,42 @@ assert_every_pipeline_reader_consumes_its_input() {
 #   `openssl-src` edge that only a triple the wheel does not ship for compiles.
 #   The exemption covers every `cargo tree` line that sits between
 #   that function's `name() {` line and the first following line that is exactly
-#   `}`, in the one file whose path equals TARGET_ALL_EXEMPT_FILE, and only while the
-#   text from that `name() {` line to the end of the file hashes to
-#   TARGET_ALL_EXEMPT_BLOB. That text holds the function, every definition and
-#   assignment it reads (wheel_line, which runs the script FEATURE_GRAPH_GATE
-#   names), and the lines that run that gate, which mark those names readonly
-#   before run_gate calls the function; that file's header states what bash
-#   leaves outside the pin. The pin is a positive whitelist: it admits the one
-#   text pinned here and nothing else, so an edit anywhere in that text, including
-#   a closing brace spelled `) }`, `fi }`, or `; }` that ends the function before
-#   the bare `}`, a redefinition of wheel_line, or a call that overrides
-#   FEATURE_GRAPH_GATE, changes the hash and cancels the exemption. A second
-#   `name() {` line in that file cancels it too. After an edit to that text,
-#   recompute the pin with
-#   `sed -n '<start>,$p' scripts/check-vendored-openssl-scope.sh | git hash-object --stdin`
+#   `}`, in the one file whose path equals TARGET_ALL_EXEMPT_FILE, and only while
+#   that whole file hashes to TARGET_ALL_EXEMPT_BLOB. The whole file is pinned
+#   because the exemption is sound only while the per-triple count feeds a
+#   presence proof, and the code that lists the triples (WHEEL_TRIPLES_PROGRAM)
+#   and turns each count into a `some` or `none` verdict (run_gate, report) sits
+#   outside the function. The pin is a positive whitelist: it admits the one file text pinned
+#   here and nothing else, so an edit anywhere in that file, including one that
+#   makes run_gate read a per-triple count as an absence proof, a redefinition of
+#   wheel_line, or a call that overrides FEATURE_GRAPH_GATE, changes the hash and
+#   cancels the exemption. That file's header states what bash leaves outside the
+#   pin. The range ends at the first line that is exactly `}`, so a function body
+#   closed by `) }`, `fi }`, or `; }` would stretch the range over a later brace
+#   group; the pin excludes such a body, because the pinned file closes the
+#   function with a bare `}`. A second `name() {` line in that file cancels the
+#   exemption.
+#   After an edit to that file, recompute the pin with
+#   `git hash-object --stdin < scripts/check-vendored-openssl-scope.sh`
 #   and have a human approve the new value. Every other line, including a line
 #   earlier in that file and a same-named function in another file, still has to
 #   name `--target all`.
 TARGET_ALL_EXEMPT_FILE="scripts/check-vendored-openssl-scope.sh"
 TARGET_ALL_EXEMPT_FUNCTION="wheel_triple_occurrences"
-TARGET_ALL_EXEMPT_BLOB="134d00aa7a71e618b9bc2cad7be9a5cbbc04c1d2"
+TARGET_ALL_EXEMPT_BLOB="384e7b101e2649ebaadd66caa5612915b988698d"
 
 # target_all_exempt_range <file>
 #   Emit "<start> <end>", the line numbers of TARGET_ALL_EXEMPT_FUNCTION's one
 #   `name() {` line and of the first following line that is exactly `}`, when the
-#   text from <start> to the end of the file hashes to TARGET_ALL_EXEMPT_BLOB. Emit
-#   nothing otherwise, which leaves every line under the rule.
+#   whole file hashes to TARGET_ALL_EXEMPT_BLOB. Emit nothing otherwise, which
+#   leaves every line under the rule.
 target_all_exempt_range() {
   local start end
+  [[ "$(git hash-object --stdin < "$1")" == "$TARGET_ALL_EXEMPT_BLOB" ]] || return 0
   start="$(grep -nxF "${TARGET_ALL_EXEMPT_FUNCTION}() {" "$1" | cut -d: -f1 || true)"
   [[ "$start" =~ ^[0-9]+$ ]] || return 0
   end="$(awk -v s="$start" 'NR > s && $0 == "}" { print NR; exit }' "$1")"
   [[ -n "$end" ]] || return 0
-  [[ "$(sed -n "${start},\$p" "$1" | git hash-object --stdin)" == "$TARGET_ALL_EXEMPT_BLOB" ]] || return 0
   echo "$start $end"
 }
 
@@ -1187,28 +1190,39 @@ target_all_rule_in() {
   ( cd "$1" && fixture_failures=0 && assert_every_cargo_tree_resolves_every_target >/dev/null && exit "$fixture_failures" )
 }
 
+# target_all_rule_repinned_in <dir>: the same, with TARGET_ALL_EXEMPT_BLOB set to the
+# hash of the planted file, so a case tests where the range starts and ends, not the pin.
+target_all_rule_repinned_in() {
+  ( TARGET_ALL_EXEMPT_BLOB="$(git hash-object --stdin < "$1/$TARGET_ALL_EXEMPT_FILE")" && target_all_rule_in "$1" )
+}
+
 # assert_target_all_exemption_names_one_site
 #   CRITERION: the `--target all` rule above passes a per-triple `cargo tree` inside
-#   TARGET_ALL_EXEMPT_FUNCTION of TARGET_ALL_EXEMPT_FILE while the text from that
-#   function to the end of the file hashes to TARGET_ALL_EXEMPT_BLOB, and fails a
-#   per-triple `cargo tree` in any other file, anywhere else in that file, or in a
-#   copy whose pinned text is edited, a line after the function included.
+#   TARGET_ALL_EXEMPT_FUNCTION of TARGET_ALL_EXEMPT_FILE while that whole file
+#   hashes to TARGET_ALL_EXEMPT_BLOB, and fails a per-triple `cargo tree` in any
+#   other file, anywhere else in that file, or in a copy edited anywhere, run_gate
+#   above the function and a line after the function included.
 #   Each case plants a scripts/ tree and runs the rule from the directory holding it.
+#   The earlier-line and second-definition cases run under
+#   target_all_rule_repinned_in, so the range, not a changed hash, turns them red.
+#   The closer cases turn red only through the pin: under a repin, a body closed by
+#   `) }` stretches the range over the later brace group.
 assert_target_all_exemption_names_one_site() {
   echo ">> fixture: the --target all rule exempts one pinned function in one named file and nothing else"
   # The planted lines spell the command through $cargo, so this file's own text
   # carries no per-triple invocation for the rule to read. The pinned function comes
   # from the tracked file, so the first case also proves the pin matches it.
-  local plant rc per_triple range fn head count_line pinned rest cargo=cargo
+  local plant rc per_triple range fn head count_line pinned prefix rest edited cargo=cargo
   per_triple="  tree=\"\$($cargo tree -p x --target \"\$triple\" -e no-dev)\""
   range="$(target_all_exempt_range "$TARGET_ALL_EXEMPT_FILE")"
   if [[ -z "$range" ]]; then
-    echo "   FAIL — $TARGET_ALL_EXEMPT_FILE holds no ${TARGET_ALL_EXEMPT_FUNCTION} whose text hashes to TARGET_ALL_EXEMPT_BLOB"
+    echo "   FAIL — $TARGET_ALL_EXEMPT_FILE does not hash to TARGET_ALL_EXEMPT_BLOB or holds no single ${TARGET_ALL_EXEMPT_FUNCTION}"
     fixture_failures=$((fixture_failures + 1))
     return
   fi
   fn="$(sed -n "${range% *},${range#* }p" "$TARGET_ALL_EXEMPT_FILE")"
-  pinned="$(sed -n "${range% *},\$p" "$TARGET_ALL_EXEMPT_FILE")"
+  pinned="$(cat "$TARGET_ALL_EXEMPT_FILE")"
+  prefix="$(sed -n "1,$(( ${range% *} - 1 ))p" "$TARGET_ALL_EXEMPT_FILE")"
   rest="$(sed -n "$(( ${range#* } + 1 )),\$p" "$TARGET_ALL_EXEMPT_FILE")"
   head="$(printf '%s\n' "$fn" | sed '$d' | grep -vxF '  count_in "$tree"')"
   count_line="$(printf '%s\n' "$fn" | grep -cxF '  count_in "$tree"' || true)"
@@ -1217,37 +1231,47 @@ assert_target_all_exemption_names_one_site() {
   printf '%s\n' "$pinned" > "$plant/$TARGET_ALL_EXEMPT_FILE"
   target_all_rule_in "$plant"; rc=$?
   expect "(target-all exemption) the pinned function in the named file passes its per-triple cargo tree" "PASS" "$rc"
-  printf '%s\n' "$fn" 'FEATURE_GRAPH_GATE=other-gate.sh' "$rest" > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  edited="$(printf '%s\n' "$pinned" | sed 's/^    report "\$triple" "\$n" some /    report "$triple" "$n" none /')"
+  expect "(target-all exemption) run_gate holds the presence verdict line the next case rewrites" "PASS" "$([[ "$edited" != "$pinned" ]]; echo $?)"
+  printf '%s\n' "$edited" > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  target_all_rule_in "$plant"; rc=$?
+  expect "(target-all exemption) run_gate reading the per-triple count as an absence proof cancels the exemption" "FAIL" "$rc"
+  printf '%s\n' "$prefix" "$fn" 'FEATURE_GRAPH_GATE=other-gate.sh' "$rest" > "$plant/$TARGET_ALL_EXEMPT_FILE"
   target_all_rule_in "$plant"; rc=$?
   expect "(target-all exemption) an assignment to FEATURE_GRAPH_GATE added after the function cancels the exemption" "FAIL" "$rc"
   printf '%s\n' "$pinned" 'wheel_line() { printf "x\tscp-node|\n"; }' > "$plant/$TARGET_ALL_EXEMPT_FILE"
   target_all_rule_in "$plant"; rc=$?
-  expect "(target-all exemption) a redefinition of wheel_line after the pinned text cancels the exemption" "FAIL" "$rc"
+  expect "(target-all exemption) a redefinition of wheel_line appended to the file cancels the exemption" "FAIL" "$rc"
   printf '%s\n' "$pinned" > "$plant/$TARGET_ALL_EXEMPT_FILE"
   printf '%s\n' "$pinned" > "$plant/scripts/other-gate.sh"
   target_all_rule_in "$plant"; rc=$?
   expect "(target-all exemption) the same function in another file under scripts/ FAILS" "FAIL" "$rc"
   rm -f "$plant/scripts/other-gate.sh"
-  printf '%s\n' 'other() {' "$per_triple" '}' "$pinned" > "$plant/$TARGET_ALL_EXEMPT_FILE"
-  target_all_rule_in "$plant"; rc=$?
+  printf '%s\n' "$prefix" "$fn" 'true' "$rest" > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  target_all_rule_repinned_in "$plant"; rc=$?
+  expect "(target-all exemption) under a repin, an edited copy whose one per-triple line sits in the function passes, so the repinned cases below can go green" "PASS" "$rc"
+  printf '%s\n' "$prefix" 'other() {' "$per_triple" '}' "$fn" "$rest" > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  target_all_rule_repinned_in "$plant"; rc=$?
   expect "(target-all exemption) a per-triple cargo tree earlier in the named file FAILS" "FAIL" "$rc"
-  printf '%s\n' "$fn" "$pinned" > "$plant/$TARGET_ALL_EXEMPT_FILE"
-  target_all_rule_in "$plant"; rc=$?
+  printf '%s\n' "$prefix" "$fn" "$fn" "$rest" > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  target_all_rule_repinned_in "$plant"; rc=$?
   expect "(target-all exemption) a second definition of the function cancels the exemption" "FAIL" "$rc"
-  printf '%s\n' "$(printf '%s\n' "$fn" | sed '$d')" "$per_triple" '}' "$rest" > "$plant/$TARGET_ALL_EXEMPT_FILE"
+  printf '%s\n' "$prefix" "$(printf '%s\n' "$fn" | sed '$d')" "$per_triple" '}' "$rest" > "$plant/$TARGET_ALL_EXEMPT_FILE"
   target_all_rule_in "$plant"; rc=$?
   expect "(target-all exemption) a line added to the function's body cancels the exemption" "FAIL" "$rc"
   # Each closer below ends the function on its own line, so the first bare `}`
-  # belongs to a later top-level group that holds a per-triple cargo tree.
+  # belongs to a later top-level group that holds a per-triple cargo tree, and
+  # only the pin, which the edited text no longer matches, keeps that group under
+  # the rule.
   printf '%s\n' "$head" '  (count_in "$tree") }' '{' "$per_triple" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
   target_all_rule_in "$plant"; rc=$?
-  expect "(target-all exemption) a body closed by ') }' does not stretch the exemption over a later brace group" "FAIL" "$rc"
+  expect "(target-all exemption) a body closed by ') }' cancels the exemption, which would otherwise stretch over a later brace group" "FAIL" "$rc"
   printf '%s\n' "$head" '  if true; then count_in "$tree"; fi }' '{ :' "$per_triple" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
   target_all_rule_in "$plant"; rc=$?
-  expect "(target-all exemption) a body closed by 'fi }' does not stretch the exemption over a later brace group" "FAIL" "$rc"
+  expect "(target-all exemption) a body closed by 'fi }' cancels the exemption, which would otherwise stretch over a later brace group" "FAIL" "$rc"
   printf '%s\n' "$head" '  echo "( { "; count_in "$tree"; }' '{ :' "$per_triple" '}' > "$plant/$TARGET_ALL_EXEMPT_FILE"
   target_all_rule_in "$plant"; rc=$?
-  expect "(target-all exemption) a quoted '{ ' before an inline '; }' does not stretch the exemption over a later brace group" "FAIL" "$rc"
+  expect "(target-all exemption) a quoted '{ ' before an inline '; }' cancels the exemption, which would otherwise stretch over a later brace group" "FAIL" "$rc"
   rm -rf "$plant"
 }
 
