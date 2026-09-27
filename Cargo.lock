@@ -5248,6 +5248,7 @@ dependencies = [
  "scp-protocol",
  "scp-relay-client",
  "scp-runtime",
+ "scp-testing",
  "scp-transport",
  "serde",
  "serde_json",
