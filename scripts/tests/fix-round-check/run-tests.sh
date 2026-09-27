@@ -339,8 +339,8 @@ gate_paths() {
 # answer from `scp-ffi`. It also holds one file under no crate directory, which case 9
 # changes.
 #
-# It holds a fourth manifest, `crates/scp-transport`, because three of the six entries in
-# the runner's EXTRA_FEATURE_CHECKS array name that package, and case 13 reads the three
+# It holds a fourth manifest, `crates/scp-transport`, because three entries in the runner's
+# EXTRA_FEATURE_CHECKS array name that package, and case 13 reads the three
 # `cargo check` commands they produce. It holds `bindings/python/scp_sdk/context.py` for
 # case 12, `Cargo.toml` for case 11 and `.github/workflows/ci.yml` for case 17, and the
 # fixture's base commit holds all three, so each case decides for itself whether its own
