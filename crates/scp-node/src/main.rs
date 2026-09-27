@@ -510,6 +510,16 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     let domain = require_domain();
     let http_addr = node_http_addr();
 
+    // Persistent mode: operator-configured durable blob backend (default
+    // SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` / `SCP_RELAY_STORAGE_PATH`
+    // — the same explicit selection relay-only mode makes (SCP-CAPINJECT-010).
+    // It is resolved before the storage directory, the root key file, and the
+    // two SQLCipher databases are created: `storage_from_env` exits on a
+    // backend this build did not compile, an unknown value, or a missing
+    // required variable, and a configuration error must leave no key material
+    // on disk. `tests/storage_backend_selection.rs` pins that ordering.
+    let blob_storage = startup::storage_from_env().await;
+
     // Validate the storage path upfront before attempting to open databases.
     let resolved_path = resolve_storage_path_or_exit(storage_path);
     validate_storage_path_or_exit(&resolved_path);
@@ -569,11 +579,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 custody,
                 did_method,
                 Arc::clone(&node_storage_arc),
-                // Persistent mode: operator-configured durable blob backend
-                // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
-                // `SCP_RELAY_STORAGE_PATH` — the same explicit selection
-                // relay-only mode makes (SCP-CAPINJECT-010).
-                startup::storage_from_env().await,
+                blob_storage,
             )
             .await;
         }
@@ -601,10 +607,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 custody,
                 did_method,
                 Arc::clone(&node_storage_arc),
-                // Persistent mode: operator-configured durable blob backend
-                // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
-                // `SCP_RELAY_STORAGE_PATH` (SCP-CAPINJECT-010).
-                startup::storage_from_env().await,
+                blob_storage,
             )
             .await;
         }
