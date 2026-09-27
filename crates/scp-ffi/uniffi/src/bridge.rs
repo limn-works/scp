@@ -4960,8 +4960,11 @@ impl McpUniFfiBridgeProvider {
     }
 
     /// Decides whether the agent may invoke `outlet_name` in `context_id`,
-    /// given the context's current role state: the UCAN check, then the
-    /// role-state capability check.
+    /// given the context's current role state: the role-state capability
+    /// check, then the UCAN check. The role-state check runs first because
+    /// an Invoke check's UCAN step records the token's nonce, and a refusal
+    /// after that record would spend the agent's token without running an
+    /// outlet.
     ///
     /// # Errors
     ///
@@ -4979,107 +4982,7 @@ impl McpUniFfiBridgeProvider {
         check: scp_mcp::server::CapabilityCheck,
     ) -> Result<(), scp_mcp::server::AccessRefusal> {
         use scp_mcp::server::AccessRefusal;
-        // Primary check: UCAN token validation via the full 11-step ADR-016
-        // pipeline. Verifies the token grants the outlet's kind-appropriate stem
-        // — outlet_query:{outlet_name}/outlet_query:* for Query outlets,
-        // outlet_call:{outlet_name}/outlet_call:* for Action outlets
-        // (SCP-OUT-014, §5.4.2) — for this context.
-        if let Some(ref token) = self.agent_ucan_token {
-            // Build proof resolver from optional proof tokens.
-            let mut proofs = std::collections::HashMap::new();
-            if let Some(ref tokens) = self.agent_proof_tokens {
-                for encoded in tokens {
-                    let proof_token = scp_core::crypto::ucan::validate::parse_ucan(encoded)
-                        .map_err(|e| {
-                            AccessRefusal::Unreadable(format!("malformed proof token: {e}"))
-                        })?;
-                    let cid = scp_core::crypto::ucan::mint::compute_cid(&proof_token);
-                    proofs.insert(cid, proof_token);
-                }
-            }
-            let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
-
-            // Ensure UCAN state is registered for this context, and read the
-            // outlet's registered kind so the UCAN check selects the correct
-            // split stem (SCP-OUT-014). Scope the DashMap Ref so the shard lock
-            // is released before entering with_ucan_state (a different DashMap).
-            let outlet_kind_for_ucan = {
-                let handle = context_handle_registry(bi).get(context_id).ok_or_else(|| {
-                    AccessRefusal::Unreadable(format!(
-                        "context '{context_id}' not found in handle registry"
-                    ))
-                })?;
-                bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
-                let registry = handle
-                    .outlet_registry
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                registry.get(outlet_name).map(|r| r.kind).ok_or_else(|| {
-                    AccessRefusal::Denied(format!(
-                        "outlet '{outlet_name}' not registered in context '{context_id}'"
-                    ))
-                })?
-            };
-
-            let agent_did = self.agent_did.clone();
-            bi.with_ucan_state(context_id, |ucan_state| {
-                let production_resolver = bi.did_resolver();
-                let did_resolver =
-                    scp_ffi_common::DispatchDidResolver::new(production_resolver.as_deref());
-                let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
-                    revocation_list: &ucan_state.revocation_list,
-                };
-                // Only the Invoke check made just before a `tools/call` runs
-                // its outlet records the nonce; a probe records nothing.
-                let mut nonce_adapter = scp_ffi_common::OutletGrantNonceTracker::new(
-                    &mut ucan_state.nonce_tracker,
-                    check,
-                );
-
-                let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
-                    did_resolver: &did_resolver,
-                    nonce_tracker: &mut nonce_adapter,
-                    revocation_checker: &revocation_checker,
-                    proof_resolver: &proof_resolver,
-                    ceiling: &ucan_state.ceiling_strings,
-                    context_creator_did: &ucan_state.creator_did,
-                    presenting_agent_did: &agent_did,
-                    clock_skew_tolerance_secs:
-                        scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                    clock: &scp_clock::SystemClock,
-                    // §5.4.5 HIGH-3 — outlet-invocation site resolves effective
-                    // caveats from each token's `nb` field so §7.3.8 Step 7b
-                    // (per-edge narrow) and Step 11b (time-box) run over the
-                    // proof chain's VALIDATED-NARROWED caveat set. Generic
-                    // validate/evaluate sites stay on `NoCaveatResolver`.
-                    caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
-                };
-
-                scp_core::context::outlets::validate_outlet_invocation_ucan(
-                    token,
-                    context_id,
-                    outlet_name,
-                    outlet_kind_for_ucan,
-                    &mut ctx,
-                )
-                .map_err(|e| {
-                    tracing::warn!(
-                        agent = %agent_did,
-                        outlet = %outlet_name,
-                        context = %context_id,
-                        error = %e,
-                        "UCAN validation failed for outlet invocation"
-                    );
-                    format!("UCAN authorization failed for outlet '{outlet_name}': {e}")
-                })
-            })
-            .ok_or_else(|| {
-                AccessRefusal::Unreadable(format!(
-                    "UCAN state not found for context '{context_id}'"
-                ))
-            })?
-            .map_err(AccessRefusal::Denied)?;
-        } else {
+        let Some(token) = self.agent_ucan_token.as_ref() else {
             tracing::warn!(
                 agent = %self.agent_did,
                 outlet = %outlet_name,
@@ -5089,8 +4992,7 @@ impl McpUniFfiBridgeProvider {
             return Err(AccessRefusal::Denied(
                 "UCAN token required for outlet invocation — no token provided".to_owned(),
             ));
-        }
-
+        };
         // Defense-in-depth: check role-state capabilities in addition to the
         // UCAN layer. See §7.2 and ADR-010 for the dual-check design. The
         // caller read `role_state` from the actor.
@@ -5099,8 +5001,8 @@ impl McpUniFfiBridgeProvider {
         // registered kind — OutletQuery for Query outlets, OutletCall for Action
         // outlets (§5.4.2). The two stems are independent, so a Query grant never
         // authorizes an Action call and vice versa. An outlet absent from the
-        // registry defaults to the Action stem (the UCAN gate above already
-        // required registration).
+        // registry defaults to the Action stem (the UCAN step below requires
+        // registration).
         let outlet_kind = {
             let handle = context_handle_registry(bi).get(context_id).ok_or_else(|| {
                 AccessRefusal::Unreadable(format!(
@@ -5116,24 +5018,119 @@ impl McpUniFfiBridgeProvider {
                 .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind)
         };
 
-        if scp_core::context::outlets::invoke::has_outlet_invocation_capability(
+        if !scp_core::context::outlets::invoke::has_outlet_invocation_capability(
             role_state,
             &self.agent_did,
             outlet_name,
             outlet_kind,
         ) {
-            Ok(())
-        } else {
             tracing::warn!(
                 agent = %self.agent_did,
                 outlet = %outlet_name,
                 context = %context_id,
                 "capability check failed: agent lacks the required outlet invocation capability"
             );
-            Err(AccessRefusal::Denied(
+            return Err(AccessRefusal::Denied(
                 "insufficient permissions to invoke outlet".to_owned(),
-            ))
+            ));
         }
+
+        // Primary check: UCAN token validation via the full 11-step ADR-016
+        // pipeline. Verifies the token grants the outlet's kind-appropriate stem
+        // — outlet_query:{outlet_name}/outlet_query:* for Query outlets,
+        // outlet_call:{outlet_name}/outlet_call:* for Action outlets
+        // (SCP-OUT-014, §5.4.2) — for this context.
+        // Build proof resolver from optional proof tokens.
+        let mut proofs = std::collections::HashMap::new();
+        if let Some(ref tokens) = self.agent_proof_tokens {
+            for encoded in tokens {
+                let proof_token =
+                    scp_core::crypto::ucan::validate::parse_ucan(encoded).map_err(|e| {
+                        AccessRefusal::Unreadable(format!("malformed proof token: {e}"))
+                    })?;
+                let cid = scp_core::crypto::ucan::mint::compute_cid(&proof_token);
+                proofs.insert(cid, proof_token);
+            }
+        }
+        let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
+
+        // Ensure UCAN state is registered for this context, and read the
+        // outlet's registered kind so the UCAN check selects the correct
+        // split stem (SCP-OUT-014). Scope the DashMap Ref so the shard lock
+        // is released before entering with_ucan_state (a different DashMap).
+        let outlet_kind_for_ucan = {
+            let handle = context_handle_registry(bi).get(context_id).ok_or_else(|| {
+                AccessRefusal::Unreadable(format!(
+                    "context '{context_id}' not found in handle registry"
+                ))
+            })?;
+            bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
+            let registry = handle
+                .outlet_registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.get(outlet_name).map(|r| r.kind).ok_or_else(|| {
+                AccessRefusal::Denied(format!(
+                    "outlet '{outlet_name}' not registered in context '{context_id}'"
+                ))
+            })?
+        };
+
+        let agent_did = self.agent_did.clone();
+        bi.with_ucan_state(context_id, |ucan_state| {
+            let production_resolver = bi.did_resolver();
+            let did_resolver =
+                scp_ffi_common::DispatchDidResolver::new(production_resolver.as_deref());
+            let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
+                revocation_list: &ucan_state.revocation_list,
+            };
+            // Only the Invoke check made just before a `tools/call` runs
+            // its outlet records the nonce; a probe records nothing.
+            let mut nonce_adapter =
+                scp_ffi_common::OutletGrantNonceTracker::new(&mut ucan_state.nonce_tracker, check);
+
+            let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+                did_resolver: &did_resolver,
+                nonce_tracker: &mut nonce_adapter,
+                revocation_checker: &revocation_checker,
+                proof_resolver: &proof_resolver,
+                ceiling: &ucan_state.ceiling_strings,
+                context_creator_did: &ucan_state.creator_did,
+                presenting_agent_did: &agent_did,
+                clock_skew_tolerance_secs:
+                    scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                clock: &scp_clock::SystemClock,
+                // §5.4.5 HIGH-3 — outlet-invocation site resolves effective
+                // caveats from each token's `nb` field so §7.3.8 Step 7b
+                // (per-edge narrow) and Step 11b (time-box) run over the
+                // proof chain's VALIDATED-NARROWED caveat set. Generic
+                // validate/evaluate sites stay on `NoCaveatResolver`.
+                caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
+            };
+
+            scp_core::context::outlets::validate_outlet_invocation_ucan(
+                token,
+                context_id,
+                outlet_name,
+                outlet_kind_for_ucan,
+                &mut ctx,
+            )
+            .map_err(|e| {
+                tracing::warn!(
+                    agent = %agent_did,
+                    outlet = %outlet_name,
+                    context = %context_id,
+                    error = %e,
+                    "UCAN validation failed for outlet invocation"
+                );
+                format!("UCAN authorization failed for outlet '{outlet_name}': {e}")
+            })
+        })
+        .ok_or_else(|| {
+            AccessRefusal::Unreadable(format!("UCAN state not found for context '{context_id}'"))
+        })?
+        .map_err(AccessRefusal::Denied)?;
+        Ok(())
     }
 }
 
@@ -23877,9 +23874,9 @@ mod tests {
         // `context_tools`. The server's provider holds no agent UCAN, so its
         // capability filter returns before `outlet_grant` locks the registry;
         // the task below therefore calls `validate_capability` itself with an
-        // unparseable UCAN, which locks the registry in the UCAN branch and
-        // then fails validation. The role-state branch's registry lock runs
-        // only after a UCAN validates, and this test does not reach it.
+        // unparseable UCAN. `outlet_grant` locks the registry in the
+        // role-state check, which the creator passes, then locks it again in
+        // the UCAN step, which refuses the token.
         bi.init_context_manager_with_did("did:dht:z6MkSubscriber");
         bi.context_manager_or_error()
             .expect("supervisor must be attached")
@@ -23936,6 +23933,17 @@ mod tests {
         // Drive the MCP exchange from a spawned async task — the same
         // execution context as the shipped serve loop's dispatch.
         let task_outlet_id = outlet_id.clone();
+        // A DID that is not a member of the context holds no outlet
+        // capability, so the role-state check refuses its Invoke check before
+        // the UCAN step, which is the only step that records a nonce.
+        let outsider = McpUniFfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: "did:dht:z6MkOutsider".to_owned(),
+            context_ids: vec!["ctx-test".to_owned()],
+            outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: Some("not-a-ucan".to_owned()),
+            agent_proof_tokens: None,
+        };
         let serve = tokio::spawn(async move {
             let _ = advertised_subscribe(&mut server);
             let response = server
@@ -23956,9 +23964,14 @@ mod tests {
                 &task_outlet_id,
                 scp_mcp::server::CapabilityCheck::Probe,
             );
-            (response, outlets, grant)
+            let outsider_grant = outsider.validate_capability(
+                "ctx-test",
+                &task_outlet_id,
+                scp_mcp::server::CapabilityCheck::Invoke,
+            );
+            (response, outlets, grant, outsider_grant)
         });
-        let (response, outlets, grant) = serve.await.expect(
+        let (response, outlets, grant, outsider_grant) = serve.await.expect(
             "the MCP dispatch task must not panic — a panic here is the shipped \
              serve loop dying on its first registry-backed tools/list",
         );
@@ -23968,7 +23981,19 @@ mod tests {
             "tools/list must succeed, got: {:?}",
             response.error
         );
-        // The UCAN branch read the registered outlet's kind under the
+        // The Invoke check refused the outsider at the role-state check. Had
+        // the UCAN step run first, it would have refused the unparseable
+        // token with "UCAN authorization failed", and for a token that
+        // validates it would already have recorded the nonce.
+        assert!(
+            matches!(
+                &outsider_grant,
+                Err(scp_mcp::server::AccessRefusal::Denied(msg))
+                    if msg == "insufficient permissions to invoke outlet"
+            ),
+            "the role-state check must refuse before the UCAN step, got: {outsider_grant:?}"
+        );
+        // The UCAN step read the registered outlet's kind under the
         // registry lock, and only then refused the unparseable token.
         assert!(
             matches!(

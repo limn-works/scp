@@ -2973,12 +2973,12 @@ fn b3_webhook_dispatch_wired() {
 /// advertising nothing.
 #[test]
 fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
-    // Every bridge must obtain the Supervisor receiver and construct its
-    // server through the constructor that pairs the flag with the pump. A
-    // bridge that called `McpServer::new` would compile and serve, but would
-    // advertise `resources.subscribe: false` forever — a silent capability
-    // regression the type system cannot catch because both constructors are
-    // legitimate.
+    // Every bridge must obtain the Supervisor receiver and hand it to
+    // `McpServer::with_optional_event_source`, the constructor that pairs the
+    // flag with the pump. A bridge that passed `None` to that constructor
+    // would compile and serve, but would advertise `resources.subscribe:
+    // false` forever, and the type system cannot tell that `None` from a
+    // Supervisor that has no receiver to give.
     let pyo3_mcp_src = include_str!("../../../../crates/scp-ffi/src/mcp.rs");
     let napi_mcp_src = include_str!("../../../../crates/scp-ffi/napi/src/mcp.rs");
     let uniffi_mcp_src = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
@@ -3132,7 +3132,7 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
 
 /// The resource-access gate must go red when a comment names the capability
 /// check, a stand-in role state reaches the predicate (in place of the live
-/// read or shadowing it), the predicate's verdict
+/// read, chained onto it, or shadowing it), the predicate's verdict
 /// is discarded, or the checked pieces survive only in another function.
 #[test]
 fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
@@ -3148,7 +3148,8 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
     // predicate, and return the predicate's verdict.
     let bridge = "fn validate_resource_access(&self, context_id: &str, resource: ResourceKind) \
                   -> Result<(), AccessRefusal> {\n    let bi = self.upgrade_bi()?;\n    \
-                  let role_state = Self::live_role_state(&bi, context_id)?;\n    \
+                  let role_state =\n        \
+                  Self::live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;\n    \
                   let access = resource.check_access(&role_state, &self.agent_did, context_id);\n    \
                   access.map_err(AccessRefusal::Denied)\n}\n\
                   fn context_members(&self) {}\n";
@@ -3157,7 +3158,7 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
     ));
     // A stand-in role state reaches the predicate: the live read is gone.
     let stand_in = bridge.replace(
-        "Self::live_role_state(&bi, context_id)?",
+        "Self::live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?",
         "ContextRoleState::default()",
     );
     assert!(!answers_resource_access_from_live_role_state(
@@ -3170,6 +3171,22 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
     );
     assert!(!answers_resource_access_from_live_role_state(
         &production_code(&shadowed)
+    ));
+    // The live read survives, but a call chained onto it turns a failed read
+    // into a stand-in before the predicate.
+    let chained = bridge.replace(
+        ".map_err(AccessRefusal::Unreadable)?;\n    let access",
+        ".or_else(|_| Ok(fallback.clone())).map_err(AccessRefusal::Unreadable)?;\n    let access",
+    );
+    assert!(!answers_resource_access_from_live_role_state(
+        &production_code(&chained)
+    ));
+    let unwrapped = bridge.replace(
+        ".map_err(AccessRefusal::Unreadable)?;\n    let access",
+        ".unwrap_or_else(|_| fallback.clone());\n    let access",
+    );
+    assert!(!answers_resource_access_from_live_role_state(
+        &production_code(&unwrapped)
     ));
     // The predicate call is deleted and the function answers `Ok(())`.
     let unchecked = bridge.replace(
@@ -3231,27 +3248,33 @@ fn fn_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
 /// UniFFI `role_state_of`), passes that value to `ResourceKind::check_access`,
 /// and returns that call's verdict as the function's tail expression.
 ///
-/// The live read must be the statement right before the predicate call: one
-/// `;` separates them, so no later statement can rebind `role_state` to a
-/// stand-in between the read and the check.
+/// The whole live-read statement is pinned, and it must be the statement right
+/// before the predicate call. So no later statement can rebind `role_state` to
+/// a stand-in, and no call chained onto the read (an `or_else`, an
+/// `unwrap_or_else`) can turn a failed read into a stand-in: each pinned read
+/// ends in `?`, which returns the failure as `AccessRefusal::Unreadable`.
 fn answers_resource_access_from_live_role_state(code: &str) -> bool {
     const TAIL: &str = "let access = resource.check_access(&role_state, &self.agent_did, \
                         context_id); access.map_err(AccessRefusal::Denied) }";
+    const READS: [&str; 3] = [
+        "let role_state = Self::live_role_state(&bi, context_id)\
+         .map_err(AccessRefusal::Unreadable)?;",
+        "let role_state = live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;",
+        "let role_state = Self::role_state_of(&bi, context_id) \
+         .map_err(AccessRefusal::Unreadable)? .ok_or_else(|| { \
+         AccessRefusal::Unreadable(format!( \
+         \"context '{context_id}' has no role state on this bridge instance\" )) })?;",
+    ];
     fn_body(code, "validate_resource_access").is_some_and(|body| {
         let body = body.trim_end();
         let Some(tail_at) = body.strip_suffix(TAIL).map(str::len) else {
             return false;
         };
-        [
-            "let role_state = Self::live_role_state(&bi, context_id)",
-            "let role_state = live_role_state(&bi, context_id)",
-            "let role_state = Self::role_state_of(&bi, context_id)",
-        ]
-        .iter()
-        .any(|read| {
-            body[..tail_at]
-                .rfind(read)
-                .is_some_and(|at| body[at..tail_at].matches(';').count() == 1)
+        let before_tail = body[..tail_at].trim_end();
+        READS.iter().any(|read| {
+            before_tail
+                .strip_suffix(read)
+                .is_some_and(|rest| rest.ends_with(' '))
         })
     })
 }
