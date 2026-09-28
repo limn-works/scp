@@ -10,19 +10,22 @@ you can embed it in your own program.
 Run it:
 
 ```sh
-cargo run -p scp-node --example website
+cargo run -p scp-node --features testing --example website
 ```
 
 Then open the printed URL in a browser.
 
-**On a shipped build with no identity in storage, this exits 1 — on the first run
-and every later one.** `host_site` asks for
-`IdentitySource::Persisted`, and creating a new identity needs a
-`PreRotationCustody` backend whose only implementation is the test harness, so a
-shipped build fails closed rather than mint a nullifier-backed identity. The
-example's own doc comment quotes the exact error. Reloading a stored identity
-carries no gate and works on a shipped build; what fails is creating one. Build
-with `--features testing` to run the example end to end.
+**Without `scp-node`'s `testing` feature, this exits 1 on every run**, and that
+includes `cargo run -p scp-node --example website` from a checkout. `host_site`
+asks for `IdentitySource::Persisted`, and creating a new identity needs a
+`PreRotationCustody` backend whose only implementation is the test harness, so
+a build without `testing` fails closed rather than mint a nullifier-backed
+identity. The example's own doc comment quotes the error.
+
+Each run stores its identity in a fresh directory under the system temporary
+directory, not in the `scp-node` binary's default storage directory. The binary
+reloads any identity it finds there without checking how it was created, so an
+identity a `testing` run minted must never land there.
 
 ### What this example does
 

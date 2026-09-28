@@ -66,9 +66,12 @@ failed because the findings were *symptoms of the scope*, not of the sentences. 
 asked to attack an artifact reports what is wrong with the artifact; it takes a different
 question — should this artifact be here at all — to end the loop.
 
-CLAUDE.md already names the signal: more than about three review passes surfacing a new
-spelling of the same defect means the approach is non-convergent, and the instruction is to
-stop and reframe rather than grind. Nineteen rounds is not a thorough review. It is a
+`.claude/agents/README.md` §Review rules names the signal for enforcement: "When more
+than about three review passes on one artifact each surface a new spelling of the same
+bypass, the approach does not converge: stop and reframe it." That rule speaks of a gate's
+bypasses. This lesson extends it to documentation: more than about three passes that each
+surface a new false sentence of the same kind means the scope is wrong, and the answer is
+to reframe rather than grind. Nineteen rounds is not a thorough review. It is a
 missed signal, and the cost was 700 lines that had to be removed anyway.
 
 ## How to apply

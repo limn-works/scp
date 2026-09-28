@@ -1,27 +1,32 @@
-//! Host a static website on SCP. Run: `cargo run -p scp-node --example website`
+//! Host a static website on SCP. Run:
+//! `cargo run -p scp-node --features testing --example website`
 //! Then open the printed URL.
 //!
 //! Override the port with the `PORT` env var, e.g.
-//! `PORT=9000 cargo run -p scp-node --example website`.
+//! `PORT=9000 cargo run -p scp-node --features testing --example website`.
 //!
-//! ON A SHIPPED BUILD WITH NO IDENTITY IN STORAGE THIS EXITS 1 — on the first run
-//! and every later one — and prints:
+//! WITHOUT `scp-node`'s `testing` FEATURE THIS EXITS 1 ON EVERY RUN. That covers
+//! `cargo run -p scp-node --example website` from a checkout as well as a build
+//! against the published crate. It fails with
+//! `IdentityError::NoPreRotationBackend`, whose message begins:
 //!
 //! ```text
 //! Error: NodeBuild("identity error: no production pre-rotation custody backend
-//! available; pre-rotation recovery custody is not yet implemented — see
-//! #1729 / RFC #2130")
+//! available; pre-rotation recovery custody is not yet implemented
 //! ```
 //!
 //! `host_site` asks for `IdentitySource::Persisted`, and creating a new identity
 //! requires a `PreRotationCustody` backend (spec §9.7.4.1 §3). The only
-//! implementation is the test-harness `InMemoryPreRotationCustody`, so a shipped
-//! build fails closed here instead of minting a nullifier-backed identity. The
-//! trailing tag is part of the message the program prints, quoted verbatim.
-//! Reloading a stored identity carries no gate and works on a shipped build. What
-//! fails is creating one. Given a storage directory that already holds an
-//! identity, and a custody holding that identity's key handles, this example
-//! serves the site on a shipped build too.
+//! implementation is the test-harness `InMemoryPreRotationCustody`, so a build
+//! without `testing` fails closed here instead of minting a nullifier-backed
+//! identity.
+//!
+//! Each run stores its identity in a fresh directory of its own under the system
+//! temporary directory, never in the `scp-node` binary's default storage
+//! directory. A `testing` run mints its identity with that test-harness custody,
+//! and the binary reloads whatever identity its storage directory holds without
+//! checking how it was created, so writing there would put a test-harness
+//! identity behind a shipped `scp-node --self-host`.
 //!
 //! This is a safe LOCAL demo: it uses `TlsMode::Plaintext` (plain HTTP),
 //! `Reach::Local` (no NAT/UPnP probe, loopback-only addressing), and
@@ -50,6 +55,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `CARGO_MANIFEST_DIR` makes the sample-site path independent of the
         // directory `cargo run` is invoked from.
         site_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/website-site").into()),
+        // A fresh directory per run: see the doc comment for why this example
+        // never uses the default storage directory the binary shares.
+        storage_path: Some(
+            std::env::temp_dir().join(format!("scp-website-example-{}", std::process::id())),
+        ),
         port,
         on_ready: Some(Box::new(|ready| {
             let scheme = if ready.plaintext { "http" } else { "https" };

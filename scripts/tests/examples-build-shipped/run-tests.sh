@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Cases for scripts/check-examples-build-shipped.sh.
+#
+# THE CRITERION: the gate exits 1 when an example target fails to compile or lint, when a
+# published `examples/*.rs` is no example target's source, when `cargo package --list`
+# fails, or when it checked no example target; and it exits 0 on a workspace with none of
+# those. Each case builds a one-crate workspace with no dependencies in `mktemp -d`, copies
+# the real gate into its `scripts/`, runs it there with real cargo, and asserts both the exit
+# code and the FAIL line that names the cause, so a case cannot pass on the wrong failure.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+GATE="$ROOT/scripts/check-examples-build-shipped.sh"
+PASSED=0
+FAILED=0
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+export CARGO_TARGET_DIR="$WORK/target"
+
+# new_ws NAME [EXTRA_MANIFEST_LINES]: a workspace with one package `demo` and one example `good`.
+new_ws() {
+    local ws="$WORK/$1"
+    mkdir -p "$ws/scripts" "$ws/demo/src" "$ws/demo/examples"
+    cp "$GATE" "$ws/scripts/"
+    cp "$ROOT/rust-toolchain.toml" "$ws/"
+    printf '[workspace]\nmembers = ["demo"]\nresolver = "2"\n' > "$ws/Cargo.toml"
+    printf '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\nlicense = "MIT"\ndescription = "fixture"\n%s\n' "${2:-}" > "$ws/demo/Cargo.toml"
+    echo 'pub fn f() {}' > "$ws/demo/src/lib.rs"
+    echo 'fn main() {}' > "$ws/demo/examples/good.rs"
+    echo "$ws"
+}
+
+# expect NAME WS WANT_EXIT WANT_LINE
+expect() {
+    local out code=0
+    out="$(bash "$2/scripts/check-examples-build-shipped.sh" 2>&1)" || code=$?
+    if [ "$code" = "$3" ] && printf '%s\n' "$out" | grep -qF -- "$4"; then
+        PASSED=$((PASSED + 1)); echo "ok   $1"
+    else
+        FAILED=$((FAILED + 1)); echo "FAIL $1: exit $code, want $3 with '$4'"; printf '%s\n' "$out" | tail -15
+    fi
+}
+
+ws="$(new_ws clean)"
+expect "clean workspace passes" "$ws" 0 "OK: 1 example target(s) compile"
+
+ws="$(new_ws broken)"
+echo 'fn main() { undefined_fn(); }' > "$ws/demo/examples/good.rs"
+expect "example that does not compile" "$ws" 1 "FAIL: demo example 'good' does not compile."
+
+ws="$(new_ws lint)"
+echo 'fn main() { let unused = 1; }' > "$ws/demo/examples/good.rs"
+expect "example with a warning" "$ws" 1 "FAIL: demo example 'good' does not compile."
+
+ws="$(new_ws orphan $'autoexamples = false\n[[example]]\nname = "good"\npath = "examples/good.rs"')"
+echo 'fn main() {}' > "$ws/demo/examples/orphan.rs"
+expect "autoexamples = false orphan" "$ws" 1 "FAIL: demo publishes 'examples/orphan.rs'"
+
+ws="$(new_ws decoy $'[[example]]\nname = "good"\npath = "examples/decoy/good.rs"')"
+mkdir -p "$ws/demo/examples/decoy"
+echo 'fn main() {}' > "$ws/demo/examples/decoy/good.rs"
+expect "same-name target redirected to a decoy" "$ws" 1 "FAIL: demo publishes 'examples/good.rs'"
+
+ws="$(new_ws nested)"
+mkdir -p "$ws/demo/examples/site"
+echo 'fn main() {}' > "$ws/demo/examples/site/main.rs"
+printf 'autoexamples = false\n[[example]]\nname = "good"\npath = "examples/good.rs"\n' >> "$ws/demo/Cargo.toml"
+expect "orphan in the examples/NAME/main.rs layout" "$ws" 1 "FAIL: demo publishes 'examples/site/main.rs'"
+
+ws="$(new_ws badmanifest 'readme = "MISSING.md"')"
+expect "cargo package --list failure" "$ws" 1 "FAIL: 'cargo package --list -p demo' failed"
+
+ws="$(new_ws empty)"
+rm -r "$ws/demo/examples"
+expect "no example target" "$ws" 1 "FAIL: no example target was checked"
+
+echo "$PASSED passed, $FAILED failed"
+[ "$FAILED" -eq 0 ]

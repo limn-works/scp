@@ -36,8 +36,8 @@ of them reopens a bypass this repository has already measured:
 Row 8 is answered by none of them, and deliberately so: a `build.rs` can inject any cfg
 into every target of its own package. The criterion for what this gate cannot defend
 against is **write access to the crate under test**, not "edits the manifest" — an earlier
-draft wrote the narrower indicator as the contract, which is the failure `CLAUDE.md` names
-after Caulfield.
+draft wrote the narrower indicator as the contract, which is the failure `.docs/standards/concrete-prose.md`
+§Contracts and indicators names after Caulfield.
 
 ## Eight rounds, eleven measured bypasses, and which ones the gate closes
 
@@ -228,7 +228,8 @@ behavior that a populated directory changes.
 
 When a gate's comment overstates its reach, the next author reads the comment, believes
 the property is proven, and stops checking. That is the extrapolation-as-contract failure
-`CLAUDE.md` names, written into an enforcement file.
+`.docs/standards/concrete-prose.md` §Contracts and indicators names, written into an
+enforcement file.
 
 ## What happened
 
@@ -249,27 +250,27 @@ Three jobs each looked like they covered it and none did:
 ## The trap in the obvious widening
 
 Widening the pull-request job to `cargo clippy --workspace --all-targets` on default
-features looks strictly better and fails today. Three targets need the `testing`
+features looks strictly better and fails today. Two targets need the `testing`
 feature without declaring it, and cargo aborts after the first, so measuring one at a
 time is what finds them all:
 
 | Target | Default-features result |
 |---|---|
 | `scp-ffi-uniffi` lib test (inline `#[cfg(test)]` in `src/bridge.rs`) | 8 compile errors |
-| `scp-ffi-uniffi` `tests/lifecycle.rs` | `E0599` on `Scp::new_in_memory_for_test` |
 | `scp-node` lib test (inline `#[cfg(test)]` in `src/lib.rs`) | compiles; 348 passed, 44 failed |
 
-`lifecycle` is fixed on this branch, because a `[[test]]` target can declare
-`required-features` and its two sibling stanzas already do. The other two are inline
-`#[cfg(test)]` modules, which that key cannot gate: each needs module-level gating, a
-split into `[[test]]` targets, or a widened feature, and each of those changes what a
-test asserts. Filed as issue 2393. The `scp-node` failures are the sharp case — those
+`scp-ffi-uniffi`'s `tests/lifecycle.rs` also calls the `testing`-only
+`Scp::new_in_memory_for_test`, but its crate-level `#![cfg(feature = "testing")]` compiles
+it to an empty test binary on default features, so it is not on the list. Both targets
+above are inline `#[cfg(test)]` modules, which a `[[test]]` stanza's `required-features`
+key cannot gate: each needs module-level gating, a split into `[[test]]` targets, or a
+widened feature, and each of those changes what a test asserts. Filed as issue 2393. The `scp-node` failures are the sharp case — those
 44 tests pass under `testing` and fail on default features because the code under test
 now fails closed, so gating them hides a real signal.
 
 The same defect makes `release.yml`'s clippy step fail whenever that workflow runs.
 Its trigger is `workflow_dispatch`, not a tag push, so the step has never run on a
-merge and the breakage stayed invisible. That step alone is issue 2386; the three
+merge and the breakage stayed invisible. That step alone is issue 2386; the two
 targets behind it are 2393.
 
 Run the widened invocation before adopting it.
@@ -317,4 +318,4 @@ manifest.
 Filed as issue 2386, "release.yml's clippy step cannot pass: scp-ffi-uniffi's inline test
 module needs the testing feature." It is filed rather than fixed because the two available
 fixes are not equivalent, and one of them removes a release-time assertion — which
-`CLAUDE.md` says a human approves.
+`AGENTS.md` §NEVER modify enforcement files says a human approves.

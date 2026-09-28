@@ -398,11 +398,15 @@ home line doesn't have. Honest, not fixable from here.
   hosting is a deliberate `DhtMode::Production` opt-in (which publishes the
   host's address bound to its DID to the DHT — the same IP-to-identity
   disclosure the binary gates behind `--self-host` + its banner). *(This entry
-  named that default `DhtMode::Memory`. ADR-062, capability injection, renamed
-  the shipped no-publish value to `DhtMode::Disabled` and moved `DhtMode::Memory`
-  behind `scp-node`'s `testing` feature, because the in-memory client answered
-  resolutions from a process-local map. `HostSiteConfig::defaults` sets
-  `dht: DhtMode::Disabled` at `crates/scp-node/src/self_host.rs:991`.)* No new
+  named that default `DhtMode::Memory`. ADR-062, capability injection, kept
+  `DhtMode::Memory` behind `scp-node`'s `testing` feature, because the in-memory
+  client answered resolutions from a process-local map, and added a separate
+  fail-closed variant, `DhtMode::Disabled`, which publishes nothing and answers
+  every resolution `Ok(None)`. `HostSiteConfig::defaults` in
+  `crates/scp-node/src/self_host.rs` sets `dht: DhtMode::Disabled`. The example
+  command above now exits 1 without `--features testing`, because creating an
+  identity needs a pre-rotation custody backend that only the test harness
+  provides; `crates/scp-node/examples/README.md` gives the working command.)* No new
   protocol logic, specs, ADRs, or enforcement/capability-matrix changes — a
   packaging/ergonomics refactor of the already-shipped self-host flow.
 - **2026-06-16 (ADR-052 P3a/P5)** — `ApplicationNodeBuilder` and its `.no_domain()` / `.identity_with_storage()` methods were deleted in ADR-052 Phase B-P3a (PR #1815). The `--self-host` binary path now builds `HostSiteConfig { reach: Reach::NatTraversal, tls, dht, … }` and calls `host_site_until` directly (`crates/scp-node/src/main.rs` `run_self_host`). Updated §3, §4, §5, and §6 to reflect the current API. Running log entries from 2026-06-13/2026-06-14 referenced the former typestate builder and are preserved as historical record.

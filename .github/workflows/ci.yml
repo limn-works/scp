@@ -237,9 +237,10 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
-              # The rust-clippy job runs scripts/check-examples-build-shipped.sh,
-              # so a change to that gate must trigger the job that runs it.
+              # The rust-clippy job runs scripts/check-examples-build-shipped.sh and
+              # its cases, so a change to either must trigger the job that runs it.
               - 'scripts/check-examples-build-shipped.sh'
+              - 'scripts/tests/examples-build-shipped/**'
               # The `docker-image` job builds from these two and is guarded by this
               # filter, so a change to either has to reach it.
               - 'Dockerfile'
@@ -1021,9 +1022,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # scripts/check-examples-build-shipped.sh parses cargo metadata with jq.
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+      # scripts/check-examples-build-shipped.sh parses cargo metadata with jq, which
+      # the runner image ships. This fails with a clear message if an image drops it.
+      - name: Require jq
+        run: command -v jq
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -1073,6 +1075,10 @@ jobs:
           cargo clippy -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings
           cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings
           cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings
+      # Runs scripts/check-examples-build-shipped.sh against throwaway one-crate
+      # workspaces, each carrying a defect the gate must reject.
+      - name: Run examples-build-shipped cases
+        run: bash scripts/tests/examples-build-shipped/run-tests.sh
 
   # This job runs `cargo nextest run --workspace`, so a merge gate rests on it.
   # It gates on `rust` at job level, never at step level. It carried seven

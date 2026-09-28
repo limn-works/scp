@@ -66,8 +66,9 @@
 #     because the injected cfg desynchronized the lib from its dependency features.
 #     The criterion does not rest on the exit code either way: a writer of the crate
 #     controls what its targets compile against.) Defending a gate
-#     against a writer of its own subject is unbounded, so review covers it; the
-#     enforcement-file hook deliberately protects this script and not the crates.
+#     against a writer of its own subject is unbounded, so review covers it. No
+#     hook guards this script either. AGENTS.md lists it among the enforcement
+#     files a human must approve weakening, and review enforces that rule.
 #
 # See .docs/lessons/shipped-targets-need-a-default-feature-build.md.
 set -euo pipefail
