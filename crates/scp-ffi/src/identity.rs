@@ -2706,9 +2706,10 @@ impl crate::scp::PyScp {
     /// Executes the custody migration protocol for the given DID.
     ///
     /// This method creates a `CustodyMigrationOrchestrator` and runs the 5-step
-    /// migration protocol against `NotConfiguredMigrationBackend`, whose five
-    /// operations each return "custody migration backend not configured" until an
-    /// SDK layer supplies a real one. It does not succeed by default.
+    /// migration protocol against `NotConfiguredMigrationBackend`, a backend this
+    /// method builds itself and whose five operations each return "custody
+    /// migration backend not configured". No parameter lets a caller supply
+    /// another backend, so this method fails on every call.
     ///
     /// # Arguments
     ///
@@ -2719,11 +2720,15 @@ impl crate::scp::PyScp {
     ///
     /// # Returns
     ///
-    /// A JSON string with migration outcome fields.
+    /// A JSON string with migration outcome fields, which no call reaches while
+    /// the backend is `NotConfiguredMigrationBackend`.
     ///
     /// # Errors
     ///
-    /// Raises `IdentityError` if migration fails.
+    /// Raises on every call: `ValidationError` for a malformed `did`,
+    /// `IdentityError` for an unrecognized `target`, and otherwise
+    /// `IdentityError` from the backend's first step. `bindings/python/tests/
+    /// test_real_ffi.py::test_execute_custody_migration` asserts the error.
     ///
     /// See spec §3.2.1.
     #[pyo3(name = "identity_execute_custody_migration")]
