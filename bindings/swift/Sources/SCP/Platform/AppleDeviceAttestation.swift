@@ -107,7 +107,10 @@
     /// absence of a device attestation is expected and is not penalizing, so
     /// the honest result is the typed error rather than a token.
     ///
-    /// A caller that wants to branch before it calls reads `isHardwareBacked`.
+    /// `isAppAttestSupported` reports `isSupported` only. When it reads
+    /// `false`, `attest` and `assertRequest` throw `SCP-ATTEST-9019` without
+    /// calling App Attest; when it reads `true`, either method can still throw
+    /// `SCP-ATTEST-9019`, so a caller handles that code on every call.
     ///
     /// ## Thread safety
     ///
@@ -135,10 +138,15 @@
         private let lock: NSLock
         private var generationTask: Task<String, Error>?
 
-        /// Whether this instance is running in hardware-backed mode.
+        /// The value of `DCAppAttestService.isSupported`, and nothing more.
         ///
-        /// `false` on simulator or devices where App Attest is unavailable.
-        public var isHardwareBacked: Bool {
+        /// `false` on simulator and on devices without App Attest, where
+        /// `attest` and `assertRequest` throw `SCP-ATTEST-9019`. `true` does
+        /// not mean an attestation or assertion can be produced: App Attest
+        /// can still answer `generateKey`, `attestKey` or `generateAssertion`
+        /// with `DCError.featureUnsupported`, and the adapter then throws
+        /// `SCP-ATTEST-9019` as well.
+        public var isAppAttestSupported: Bool {
             service.isSupported
         }
 
@@ -220,9 +228,11 @@
         /// 3. Calls `DCAppAttestService.attestKey(_:clientDataHash:)`.
         /// 4. Returns the raw CBOR attestation bytes.
         ///
-        /// On simulator or on a device where App Attest is unavailable, this
-        /// method throws `AttestationError.unsupported`, calls no App Attest
-        /// method, and returns no bytes.
+        /// When `DCAppAttestService.isSupported` is `false`, as on simulator,
+        /// this method throws `AttestationError.unsupported`, calls no App
+        /// Attest method, and returns no bytes. When `generateKey` or
+        /// `attestKey` answers with `DCError.featureUnsupported`, it throws the
+        /// same error after that call, and returns no bytes.
         ///
         /// - Parameters:
         ///   - challenge: Server-issued random challenge bytes.
@@ -278,12 +288,18 @@
         /// `DCAppAttestService.generateAssertion(_:clientDataHash:)`. The
         /// assertion binds the request hash to the stored App Attest key.
         ///
-        /// On simulator or on a device where App Attest is unavailable, this
-        /// method throws `AttestationError.unsupported`, calls no App Attest
-        /// method, and returns no bytes.
+        /// When `DCAppAttestService.isSupported` is `false`, as on simulator,
+        /// this method throws `AttestationError.unsupported`, calls no App
+        /// Attest method, and returns no bytes. When `generateAssertion` answers
+        /// with `DCError.featureUnsupported`, it throws the same error after
+        /// that call, and returns no bytes.
         ///
-        /// - Parameter requestHash: SHA-256 digest of the request payload.
-        /// - Returns: Assertion bytes to include in the relay request.
+        /// - Parameter requestHash: The assertion digest
+        ///   `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" ‖ BE32(len(m)) ‖ m)` of
+        ///   `09-security-model.md` §9.3.1 over the caller's request bytes `m`,
+        ///   never `SHA-256(m)` and never `m` itself. The method passes it to
+        ///   `generateAssertion` as `clientDataHash` unchanged.
+        /// - Returns: The CBOR assertion bytes App Attest returns.
         /// - Throws: `AttestationError.unsupported` when
         ///   `DCAppAttestService.isSupported` is `false`, or when
         ///   `generateAssertion` answers with `DCError.featureUnsupported`.

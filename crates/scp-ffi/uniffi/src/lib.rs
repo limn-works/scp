@@ -566,7 +566,11 @@ pub trait DeviceAttestationProvider: Send + Sync {
 
     /// Generate a per-request assertion proving key possession.
     ///
-    /// `request_hash` — SHA-256 hash of the request data being asserted.
+    /// `request_hash` — the assertion digest
+    ///   `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" ‖ BE32(len(m)) ‖ m)` of
+    ///   `09-security-model.md` §9.3.1 over the caller's request bytes `m`,
+    ///   never `SHA-256(m)` and never `m` itself. The domain separator keeps
+    ///   every `A` distinct from every attestation binding digest `D`.
     ///
     /// Returns the platform assertion object bytes (Apple: CBOR assertion;
     /// Android: integrity verdict).

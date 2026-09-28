@@ -245,10 +245,19 @@
             #expect(codes == expected.map { "SCP-ATTEST-\($0)" })
         }
 
-        @Test("isHardwareBacked reports false when App Attest is unavailable")
-        func isHardwareBackedReportsFalse() {
+        @Test("isAppAttestSupported reports false when isSupported is false")
+        func isAppAttestSupportedReportsFalse() {
             let adapter = makeAdapter(ScriptedAppAttestService(supported: false)).adapter
-            #expect(adapter.isHardwareBacked == false)
+            #expect(adapter.isAppAttestSupported == false)
+        }
+
+        @Test("isAppAttestSupported reads true while attest throws SCP-ATTEST-9019 on featureUnsupported")
+        func isAppAttestSupportedDoesNotPredictFeatureUnsupported() async {
+            let harness = makeAdapter(ScriptedAppAttestService(supported: true, key: .featureUnsupported))
+            #expect(harness.adapter.isAppAttestSupported == true)
+            await expectCode("SCP-ATTEST-9019", from: "attest") { () async throws(ScpError) -> Data in
+                try await harness.adapter.attest(challenge: challenge, deviceId: deviceId)
+            }
         }
     }
 
