@@ -270,20 +270,9 @@ On subsequent runs, the node loads the existing identity from SQLite and reuses 
 
 ### Development deployment
 
-```bash
-# Self-signed TLS. This run publishes the host's address bound to its DID to the
-# global Mainline DHT, because the full node accepts only SCP_NODE_DHT_MODE=production.
-SCP_NODE_DOMAIN=localhost \
-SCP_NODE_TLS_SELF_SIGNED=1 \
-scp-node
-```
-
-A shipped binary exits 1 on `--ephemeral` and on `SCP_NODE_DHT_MODE=memory`. The
-`--ephemeral` dispatch (`crates/scp-node/src/main.rs`, the `config.ephemeral` arm of
-`main`) and the `"memory"` match arm (`parse_dht_mode_or_exit`) both compile only under
-`--features testing`, so ADR-062, capability injection, keeps the in-memory DHT client
-and the in-memory key custody out of every released build. To run the fully in-memory
-development node, build the test-harness binary:
+For local development, build the test-harness binary and run it in ephemeral
+mode. It keeps its DHT client and key custody in memory, so it publishes nothing
+to the DHT:
 
 ```bash
 SCP_NODE_DOMAIN=localhost SCP_NODE_TLS_SELF_SIGNED=1 \
@@ -294,6 +283,26 @@ Ephemeral mode ignores `SCP_NODE_DHT_MODE`, because it wires the in-memory DHT
 client unconditionally. Pass `SCP_NODE_DHT_MODE=memory` to a `--features testing`
 build only when you want the persistent full node to keep its SQLite storage while
 its DHT stays process-local.
+
+A shipped binary exits 1 on `--ephemeral` and on `SCP_NODE_DHT_MODE=memory`. The
+`--ephemeral` dispatch (`crates/scp-node/src/main.rs`, the `config.ephemeral` arm of
+`main`) and the `"memory"` match arm (`parse_dht_mode_or_exit`) both compile only under
+`--features testing`, so ADR-062, capability injection, keeps the in-memory DHT client
+and the in-memory key custody out of every released build.
+
+Run a shipped binary with self-signed TLS only when you mean to publish. The full
+node accepts only `SCP_NODE_DHT_MODE=production`, so this run publishes the host's
+address bound to its DID to the global Mainline DHT, a location disclosure, even
+under `SCP_NODE_DOMAIN=localhost`. Its storage directory must already hold an
+identity: creating one needs a `PreRotationCustody` backend whose only
+implementation is the test harness, so on empty storage a shipped binary fails
+closed with `NoPreRotationBackend` and exits 1 before it publishes anything.
+
+```bash
+SCP_NODE_DOMAIN=localhost \
+SCP_NODE_TLS_SELF_SIGNED=1 \
+scp-node
+```
 
 ### Programmatic usage (Rust SDK)
 
