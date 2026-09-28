@@ -43,6 +43,7 @@ import type { PaymentReceiptVerificationResult } from "./economy";
 import { ContextError, mapBridgeError, mapSagaError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
 import { type BridgeContextHandle, getBridge, toCapabilityValidation } from "./internal/bridge";
+import { toNativeCustodyProvider } from "./internal/custody-adapter";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
 import { assertTestEnvironment } from "./internal/test-guard";
 import type { StreamingSagaNative, StreamingSagaOptions } from "./outlets";
@@ -472,22 +473,6 @@ export interface CustodyPublicKey {
   publicKey: Uint8Array;
 }
 
-/** The shape napi-rs marshals for a {@link CustodyPublicKey}: bytes as a number array. */
-interface NativeCustodyPublicKey {
-  keyType: string;
-  publicKey: number[];
-}
-
-/** The shape napi-rs marshals for a {@link PseudonymResult}: bytes as a number array. */
-interface NativePseudonymResult {
-  publicKey: number[];
-  keyId: string;
-}
-
-function toNativePseudonym(result: PseudonymResult): NativePseudonymResult {
-  return { publicKey: Array.from(result.publicKey), keyId: result.keyId };
-}
-
 /**
  * Caller-supplied custody backend for {@link SCP.identityCreateWithCustody}.
  *
@@ -552,7 +537,9 @@ export interface KeyCustodyProvider {
    * (spec §9.10.4.A). `publicKey` is the 33-byte compressed point and `keyId`
    * the numeric id of the new pseudonym key. The bridge requires
    * `getPublicKey(keyId)` to return the same 33 bytes, and fails the
-   * operation with `SCP-IDENT-1055` otherwise.
+   * operation with `SCP-IDENT-1055` otherwise. The same (`keyId`,
+   * `contextId`) MUST return the same pseudonym `keyId` on every call, so
+   * re-deriving names one key rather than minting another.
    */
   derivePseudonym(keyId: string, contextId: Uint8Array): PseudonymResult;
   /**
@@ -560,6 +547,8 @@ export interface KeyCustodyProvider {
    * contract as {@link derivePseudonym}, but the derivation mixes the
    * big-endian 64-bit `pseudonymEpoch` and a distinct domain separator so
    * rotating the epoch yields an unlinkable new keypair (spec §9.10.4.A).
+   * The same (`keyId`, `contextId`, `pseudonymEpoch`) MUST return the same
+   * pseudonym `keyId` on every call.
    */
   deriveRotatablePseudonym(
     keyId: string,
@@ -822,65 +811,7 @@ export class SCP {
         );
       }
     }
-    // NAPI marshals each provider method as a ThreadsafeFunction WITHOUT
-    // preserving `this`, and Rust `Vec<u8>` crosses the wire as a JS
-    // `Array<number>` (not `Uint8Array`). The adapter below (a) closes over
-    // `provider` in each arrow so `this` is bound, and (b) converts byte args
-    // inbound (`Array<number>` → `Uint8Array`) and byte returns outbound
-    // (`Uint8Array` → `Array<number>`). Methods with no byte payload
-    // (`generateKeypair`, `destroyKey`, `custodyType`) pass through unchanged.
-    // Additionally, napi-rs delivers a multi-element Rust tuple
-    // (`(String, Vec<u8>)`) to the JS callback as a SINGLE `[keyId, bytes]`
-    // array argument — not as two positional args — so the tuple callbacks
-    // (`sign`, `dhAgree`, `derivePseudonym`) accept one array and destructure
-    // it. Single-value callbacks receive their positional argument normally.
-    const adapter = {
-      generateKeypair: (keyType: string): string => provider.generateKeypair(keyType),
-      // napi-rs delivers a `(String, Vec<u8>)` tuple as a single `[keyId, bytes]`
-      // array arg (not positional), so the two-value callbacks destructure it.
-      sign: ([keyId, message]: [string, number[]]): number[] =>
-        Array.from(provider.sign(keyId, Uint8Array.from(message))),
-      getPublicKey: (keyId: string): NativeCustodyPublicKey => {
-        const { keyType, publicKey } = provider.getPublicKey(keyId);
-        return { keyType, publicKey: Array.from(publicKey) };
-      },
-      destroyKey: (keyId: string): void => provider.destroyKey(keyId),
-      dhAgree: ([keyId, peerPublic]: [string, number[]]): number[] =>
-        Array.from(provider.dhAgree(keyId, Uint8Array.from(peerPublic))),
-      derivePseudonym: ([keyId, contextId]: [string, number[]]): NativePseudonymResult =>
-        toNativePseudonym(provider.derivePseudonym(keyId, Uint8Array.from(contextId))),
-      // The Rust `(String, Vec<u8>, u64)` tuple likewise arrives as a single
-      // `[keyId, contextId, epoch]` array; the `u64` epoch crosses as a JS
-      // `bigint` (the field's declared `ts_type`).
-      deriveRotatablePseudonym: ([keyId, contextId, epoch]: [
-        string,
-        number[],
-        bigint,
-      ]): NativePseudonymResult =>
-        toNativePseudonym(
-          provider.deriveRotatablePseudonym(keyId, Uint8Array.from(contextId), epoch),
-        ),
-      // A sign-only / hardware / secure-enclave custody throws here to signal it
-      // cannot export raw private-key bytes (ADR-006). Translate that into the
-      // native error channel by returning an empty array (the Rust bridge's
-      // 32-byte check then yields `Err`): §9.10.4 best-effort paths — e.g. the
-      // post-create / post-import `PseudonymAnnouncement`, which signs via the
-      // exported key — skip gracefully, while required callers surface a custody
-      // error. Returning a value rather than re-throwing keeps the provider's
-      // synchronous exception from leaking into the host's unhandled-exception
-      // tracking (which would spuriously fail tests) while preserving the
-      // fail-closed contract. Signing itself never uses this path — it goes
-      // through `KeyCustody::sign` — so sign-only custody can still produce a
-      // signed export.
-      exportSigningKeyBytes: (keyId: string): number[] => {
-        try {
-          return Array.from(provider.exportSigningKeyBytes(keyId));
-        } catch {
-          return [];
-        }
-      },
-      custodyType: (keyId: string): string => provider.custodyType(keyId),
-    };
+    const adapter = toNativeCustodyProvider(provider);
     try {
       const raw = await (
         this.#native.identityCreateWithCustody as (p: typeof adapter) => Promise<unknown>

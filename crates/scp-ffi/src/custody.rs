@@ -785,8 +785,10 @@ pub(crate) mod test_fakes {
     /// key id raises `KeyNotFoundError` (injected by [`fake_py_custody_of`]).
     /// `fault` makes one path misbehave in one named way: `legacy32`,
     /// `wrong_public_key`, `high_s` or `junk_sig` (pseudonyms), `ed_junk_sig`
-    /// (64 junk bytes from an Ed25519 `sign`), or `transport` (`sign` raises
-    /// `ConnectionError`).
+    /// (64 junk bytes from an Ed25519 `sign`), `transport` (`sign` raises
+    /// `ConnectionError`), or `fixed_id` (every pseudonym gets id 777).
+    /// Pseudonym key ids are deterministic per (identity key id, context,
+    /// epoch), as the provider contract requires.
     const FAKE_PROVIDER_PY: &std::ffi::CStr = c"
 import hashlib, hmac
 
@@ -940,6 +942,9 @@ class FakeCustody:
 
     def destroy_key(self, key_id):
         self._count('destroy_key')
+        probe = getattr(self, 'probe', None)
+        if probe is not None:
+            probe(key_id)
         self._seeds.pop(key_id, None)
         self._pseudonyms.pop(key_id, None)
 
@@ -947,18 +952,22 @@ class FakeCustody:
         self._count('dh_agree')
         return hmac.new(self._seed(key_id), bytes(peer_public), hashlib.sha256).digest()
 
-    def _register(self, key_id, seed):
+    def _register(self, key_id, seed, context_id, epoch_tag):
         if self._fault == 'legacy32':
             return (hashlib.sha256(seed).digest(), key_id)
-        kid = str(self._next)
-        self._next += 1
+        if self._fault == 'fixed_id':
+            kid = '777'
+        else:
+            tag = hashlib.sha256(b'fake-pseudonym-key-id' + key_id.encode() + b'|'
+                                 + bytes(context_id) + epoch_tag).digest()
+            kid = str(int.from_bytes(tag[:8], 'big'))
         self._pseudonyms[kid] = seed_to_scalar(seed)
         return (compressed(self._pseudonyms[kid]), kid)
 
     def derive_pseudonym(self, key_id, context_id):
         self._count('derive_pseudonym')
         seed = hmac.new(self._seed(key_id), bytes(context_id), hashlib.sha256).digest()
-        return self._register(key_id, seed)
+        return self._register(key_id, seed, context_id, b'v1')
 
     def derive_rotatable_pseudonym(self, key_id, context_id, pseudonym_epoch):
         # Canonical v2 preimage: context_id || BE64(epoch) || 'scp-pseudonym-v2'.
@@ -967,7 +976,7 @@ class FakeCustody:
         self._count('derive_rotatable_pseudonym')
         preimage = bytes(context_id) + pseudonym_epoch.to_bytes(8, 'big') + b'scp-pseudonym-v2'
         seed = hmac.new(self._seed(key_id), preimage, hashlib.sha256).digest()
-        return self._register(key_id, seed)
+        return self._register(key_id, seed, context_id, b'v2' + pseudonym_epoch.to_bytes(8, 'big'))
 
     def export_signing_key_bytes(self, key_id):
         self._count('export_signing_key_bytes')
@@ -1082,6 +1091,20 @@ class WrongLengthCustody(P256Custody):
     /// Builds a `PyCallbackKeyCustody` over a fresh instance of the named
     /// class from [`FAKE_PROVIDER_PY`], passing `fault` when it is set.
     pub fn fake_py_custody_of(class: &std::ffi::CStr, fault: Option<&str>) -> PyCallbackKeyCustody {
+        fake_py_host_of(class, fault).0
+    }
+
+    /// [`fake_py_custody`], also returning the `FakeCustody` object so a test
+    /// can set attributes on it, such as the `probe` its `destroy_key` calls.
+    pub fn fake_py_custody_and_host(fault: Option<&str>) -> (PyCallbackKeyCustody, Py<PyAny>) {
+        fake_py_host_of(c"FakeCustody", fault)
+    }
+
+    /// [`fake_py_custody_of`], also returning the host object.
+    fn fake_py_host_of(
+        class: &std::ffi::CStr,
+        fault: Option<&str>,
+    ) -> (PyCallbackKeyCustody, Py<PyAny>) {
         Python::with_gil(|py| {
             let module =
                 PyModule::from_code(py, FAKE_PROVIDER_PY, c"fake_custody.py", c"fake_custody")
@@ -1097,9 +1120,11 @@ class WrongLengthCustody(P256Custody):
                 .expect("fake provider class");
             let obj = fault
                 .map_or_else(|| cls.call0(), |fault| cls.call1((fault,)))
-                .expect("fake provider instance");
-            let provider = PyKeyCustodyProvider::new(py, obj.unbind()).expect("valid provider");
-            PyCallbackKeyCustody::new(provider)
+                .expect("fake provider instance")
+                .unbind();
+            let provider =
+                PyKeyCustodyProvider::new(py, obj.clone_ref(py)).expect("valid provider");
+            (PyCallbackKeyCustody::new(provider), obj)
         })
     }
 
@@ -1415,7 +1440,9 @@ mod tests {
         assert_eq!(sig.as_bytes().len(), 64);
     }
 
-    fn assert_custody_error(err: PlatformError) {
+    /// Asserts that `err` is the `CustodyError` variant; tests assert the
+    /// variant, never the message text.
+    fn assert_custody_error(err: &PlatformError) {
         assert!(
             matches!(err, PlatformError::CustodyError(_)),
             "expected CustodyError, got {err:?}"
@@ -1445,6 +1472,149 @@ mod tests {
         assert_eq!(fake_calls(&custody, "sign"), 1);
     }
 
+    /// B1: deriving the same pseudonym twice returns the same key id, which
+    /// re-binds cleanly.
+    #[tokio::test]
+    async fn ffi_custody_callback_rederive_reuses_key_id() {
+        let custody = fake_callback_custody();
+        let handle = custody.generate_identity_keypair().await.expect("key");
+        let first = custody
+            .derive_pseudonym(&handle, b"ctx")
+            .await
+            .expect("first derive");
+        let second = custody
+            .derive_pseudonym(&handle, b"ctx")
+            .await
+            .expect("second derive re-binds");
+        assert_eq!(first.key_handle(), second.key_handle());
+        assert_eq!(first.routing_id(), second.routing_id());
+    }
+
+    /// B3: `destroy_key` retires the handle. A host that reuses key id 777
+    /// for a second point is refused while the first is live, and accepted
+    /// once the first is destroyed.
+    #[tokio::test]
+    async fn ffi_custody_callback_destroy_unbinds_pseudonym() {
+        let custody = FfiKeyCustody::Callback(fake_py_custody(Some("fixed_id")));
+        let handle = custody.generate_identity_keypair().await.expect("key");
+        let first = custody
+            .derive_pseudonym(&handle, b"ctx-a")
+            .await
+            .expect("first derive");
+        assert_eq!(first.key_handle().id(), 777);
+        assert_custody_error(
+            &custody
+                .derive_pseudonym(&handle, b"ctx-b")
+                .await
+                .expect_err("id 777 is bound to ctx-a's point"),
+        );
+        custody
+            .destroy_key(first.key_handle())
+            .await
+            .expect("destroy");
+        let second = custody
+            .derive_pseudonym(&handle, b"ctx-b")
+            .await
+            .expect("re-derive under the freed id");
+        assert_eq!(second.key_handle().id(), 777);
+        assert_ne!(second.public_key(), first.public_key());
+    }
+
+    /// §9.15: destroying an identity retires every pseudonym derived from it
+    /// in the adapter. The fake host's `destroy_key` drops only the identity,
+    /// so a pseudonym still reaching the host would sign; the adapter answers
+    /// `KeyNotFound` with no host call. A host that then reuses the retired
+    /// id 777 for another identity's pseudonym binds it afresh. Removing the
+    /// registry's identity sweep fails both halves.
+    #[tokio::test]
+    async fn ffi_custody_callback_identity_destroy_retires_its_pseudonyms() {
+        let adapter = fake_py_custody(Some("fixed_id"));
+        let identity = adapter.generate_identity_keypair().await.expect("key");
+        let other = adapter.generate_identity_keypair().await.expect("key");
+        let first = adapter
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect("derive");
+        assert_eq!(first.key_handle().id(), 777);
+        adapter.destroy_key(&identity).await.expect("destroy");
+        let signs = fake_calls(&adapter, "sign");
+        for result in [
+            adapter
+                .sign(first.key_handle(), &[0x42u8; 32])
+                .await
+                .map(drop),
+            adapter.public_key(first.key_handle()).await.map(drop),
+        ] {
+            assert!(matches!(result, Err(PlatformError::KeyNotFound)));
+        }
+        assert_eq!(fake_calls(&adapter, "sign"), signs, "no host call");
+        let second = adapter
+            .derive_pseudonym(&other, b"ctx-b")
+            .await
+            .expect("the host reuses id 777");
+        assert_eq!(second.key_handle().id(), 777);
+        assert_ne!(second.public_key(), first.public_key());
+        adapter
+            .sign(second.key_handle(), &[0x42u8; 32])
+            .await
+            .expect("the new pseudonym signs");
+    }
+
+    /// D5: the adapter retires a pseudonym handle (`Destroying`) before it
+    /// calls the host's `destroy_key`: a probe the host's `destroy_key` calls
+    /// reads the adapter's registry and finds the handle no longer live.
+    /// Calling the host first leaves the handle live during that call, and
+    /// this fails.
+    #[tokio::test]
+    async fn ffi_custody_callback_unbinds_before_the_host_destroy() {
+        use pyo3::types::{PyCFunction, PyDict, PyTuple};
+        let (adapter, host) = super::test_fakes::fake_py_custody_and_host(None);
+        let custody = std::sync::Arc::new(adapter);
+        let bound_during_host_destroy = std::sync::Arc::new(std::sync::Mutex::new(None::<bool>));
+        let (probe_adapter, probe_seen) = (
+            std::sync::Arc::downgrade(&custody),
+            bound_during_host_destroy.clone(),
+        );
+        Python::with_gil(|py| {
+            let probe = PyCFunction::new_closure(
+                py,
+                None,
+                None,
+                move |args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>| {
+                    let (key_id,): (String,) = args.extract()?;
+                    let custody = probe_adapter
+                        .upgrade()
+                        .expect("adapter is alive during destroy");
+                    let handle = KeyHandle::new(key_id.parse().expect("numeric key id"));
+                    *probe_seen.lock().expect("probe mutex") =
+                        Some(custody.registry.is_live(&handle));
+                    PyResult::Ok(())
+                },
+            )
+            .expect("probe function");
+            host.bind(py).setattr("probe", probe).expect("set probe");
+        });
+
+        let identity = custody
+            .generate_identity_keypair()
+            .await
+            .expect("identity key");
+        let pseudonym = custody
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect("derive");
+        assert!(custody.registry.is_live(pseudonym.key_handle()));
+        custody
+            .destroy_key(pseudonym.key_handle())
+            .await
+            .expect("destroy");
+        assert_eq!(
+            *bound_during_host_destroy.lock().expect("probe mutex"),
+            Some(false),
+            "the host's destroy_key ran while the handle was still live"
+        );
+    }
+
     /// Each host misbehavior on the pseudonym path fails closed for its own
     /// reason: a 32-byte legacy key, a `get_public_key` that disagrees with the
     /// derived point, and a signature that does not verify. A high-`s`
@@ -1454,7 +1624,7 @@ mod tests {
         let custody = FfiKeyCustody::Callback(fake_py_custody(Some("legacy32")));
         let handle = custody.generate_identity_keypair().await.expect("key");
         assert_custody_error(
-            custody
+            &custody
                 .derive_pseudonym(&handle, b"ctx")
                 .await
                 .expect_err("legacy 32-byte key"),
@@ -1463,7 +1633,7 @@ mod tests {
         let custody = FfiKeyCustody::Callback(fake_py_custody(Some("wrong_public_key")));
         let handle = custody.generate_identity_keypair().await.expect("key");
         assert_custody_error(
-            custody
+            &custody
                 .derive_pseudonym(&handle, b"ctx")
                 .await
                 .expect_err("public_key mismatch"),
@@ -1495,7 +1665,7 @@ mod tests {
             .await
             .expect("derive");
         assert_custody_error(
-            custody
+            &custody
                 .sign(pseudo.key_handle(), &digest)
                 .await
                 .expect_err("a junk 64-byte signature"),

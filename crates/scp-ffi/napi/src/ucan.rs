@@ -1387,10 +1387,10 @@ mod tests {
 
         // Create two distinct identities (creator and delegator).
         let custody_a = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+            OpaqueInMemoryKeyCustody(Box::new(InMemoryKeyCustody::new())),
         ));
         let custody_b = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+            OpaqueInMemoryKeyCustody(Box::new(InMemoryKeyCustody::new())),
         ));
         let pre_rotation_custody_a =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -1507,7 +1507,7 @@ mod tests {
         use scp_platform::testing::InMemoryKeyCustody;
 
         let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+            OpaqueInMemoryKeyCustody(Box::new(InMemoryKeyCustody::new())),
         ));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -1568,7 +1568,7 @@ mod tests {
         use scp_platform::testing::InMemoryKeyCustody;
 
         let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+            OpaqueInMemoryKeyCustody(Box::new(InMemoryKeyCustody::new())),
         ));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());

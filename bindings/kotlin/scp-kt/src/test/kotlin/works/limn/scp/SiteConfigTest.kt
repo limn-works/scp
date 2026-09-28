@@ -34,14 +34,15 @@ class SiteConfigTest {
 
     @Test
     fun `construction with all fields`() {
-        val config = SiteConfig(
-            hostname = "cdn.example.com",
-            indexPath = "/home.html",
-            maxAssetsPerDeploy = 5_000,
-            maxDeploySizeBytes = 268_435_456L,
-            deployRetentionCount = 4,
-            cspOverride = "default-src 'self'",
-        )
+        val config =
+            SiteConfig(
+                hostname = "cdn.example.com",
+                indexPath = "/home.html",
+                maxAssetsPerDeploy = 5_000,
+                maxDeploySizeBytes = 268_435_456L,
+                deployRetentionCount = 4,
+                cspOverride = "default-src 'self'",
+            )
         assertEquals("cdn.example.com", config.hostname)
         assertEquals("/home.html", config.indexPath)
         assertEquals(5_000, config.maxAssetsPerDeploy)
@@ -76,8 +77,9 @@ class SiteConfigTest {
 
     @Test
     fun `hostname exceeding 253 chars rejected`() {
-        val long = "a".repeat(63) + "." + "b".repeat(63) + "." +
-            "c".repeat(63) + "." + "d".repeat(63) + ".e"
+        val long =
+            "a".repeat(63) + "." + "b".repeat(63) + "." +
+                "c".repeat(63) + "." + "d".repeat(63) + ".e"
         assertFailsWith<IllegalArgumentException> {
             SiteConfig(hostname = long)
         }.also { assertTrue(it.message!!.contains("hostname exceeds 253 characters")) }
@@ -246,10 +248,11 @@ class SiteConfigTest {
 
     @Test
     fun `toJson with csp override`() {
-        val config = SiteConfig(
-            hostname = "cdn.example.com",
-            cspOverride = "default-src 'self'",
-        )
+        val config =
+            SiteConfig(
+                hostname = "cdn.example.com",
+                cspOverride = "default-src 'self'",
+            )
         val json = config.toJson()
         val obj = Json.parseToJsonElement(json).jsonObject
 

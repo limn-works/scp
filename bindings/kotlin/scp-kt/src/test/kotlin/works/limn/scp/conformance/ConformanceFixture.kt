@@ -64,8 +64,9 @@ object ConformanceFixtureLoader {
         return emptyList()
     }
 
-    fun loadFixturesByCategory(category: String): List<ConformanceFixture> =
-        loadFixtures().filter { it.category == category }
+    fun loadFixturesByCategory(category: String): List<ConformanceFixture> {
+        return loadFixtures().filter { it.category == category }
+    }
 }
 
 /**

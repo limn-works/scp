@@ -27,16 +27,27 @@ use scp_platform::traits::{KeyHandle, PseudonymKeypair};
 /// Parses a numeric key-id string (as returned by a `KeyCustodyProvider`) into
 /// a [`KeyHandle`].
 ///
+/// Only the canonical decimal form is accepted (the form `u64::to_string`
+/// writes, which is what every bridge sends back to the host), so one host key
+/// has exactly one spelling: `"007"`, `"+7"` and `" 7"` are rejected rather
+/// than aliased to handle 7.
+///
 /// # Errors
 ///
 /// Returns [`PlatformError::CustodyError`] if `key_id` does not parse as a
-/// `u64`.
+/// `u64`, or parses but is not in canonical decimal form.
 pub fn parse_handle(method: &str, key_id: &str) -> Result<KeyHandle, PlatformError> {
-    key_id.parse::<u64>().map(KeyHandle::new).map_err(|_| {
+    let id = key_id.parse::<u64>().map_err(|_| {
         PlatformError::CustodyError(format!(
             "KeyCustodyProvider.{method} returned a non-numeric key_id: {key_id}"
         ))
-    })
+    })?;
+    if id.to_string() != key_id {
+        return Err(PlatformError::CustodyError(format!(
+            "KeyCustodyProvider.{method} returned a non-canonical key_id: {key_id:?}"
+        )));
+    }
+    Ok(KeyHandle::new(id))
 }
 
 /// Coerces a 32-byte custody return into a fixed array.
@@ -134,11 +145,13 @@ mod tests {
         }
     }
 
-    fn custody_msg(err: PlatformError) -> String {
-        match err {
-            PlatformError::CustodyError(msg) => msg,
-            other => panic!("expected CustodyError, got {other:?}"),
-        }
+    /// Asserts that `err` is the `CustodyError` variant; tests assert the
+    /// variant, never the message text.
+    fn assert_custody_error(err: &PlatformError) {
+        assert!(
+            matches!(err, PlatformError::CustodyError(_)),
+            "expected CustodyError, got {err:?}"
+        );
     }
 
     #[test]
@@ -154,34 +167,30 @@ mod tests {
     #[test]
     fn parse_pseudonym_rejects_invalid_points() {
         let reject = |bytes: &[u8]| {
-            custody_msg(
-                parse_pseudonym("derive_pseudonym", bytes, "7")
+            assert_custody_error(
+                &parse_pseudonym("derive_pseudonym", bytes, "7")
                     .expect_err("invalid point rejected"),
-            )
+            );
         };
         // Wrong lengths: 32 (a legacy Ed25519 key) and 34.
-        assert_eq!(
-            reject(&REFERENCE_POINT[1..]),
-            "KeyCustodyProvider.derive_pseudonym: custody error: pseudonym public key must be a \
-             33-byte compressed P-256 point, got 32 bytes"
-        );
+        reject(&REFERENCE_POINT[1..]);
         let mut long = REFERENCE_POINT.to_vec();
         long.push(0x00);
-        assert!(reject(&long).contains("got 34 bytes"));
+        reject(&long);
         // Bad prefix: 33 bytes led by 0x04 (the uncompressed tag).
         let mut bad_prefix = REFERENCE_POINT;
         bad_prefix[0] = 0x04;
-        assert!(reject(&bad_prefix).contains("invalid leading byte 0x04"));
+        reject(&bad_prefix);
         // Off-curve x: x = 1 is a field element, but 1 - 3 + b is a quadratic
         // non-residue mod p, so no y exists.
         let mut off_curve = [0u8; 33];
         off_curve[0] = 0x02;
         off_curve[32] = 0x01;
-        assert!(reject(&off_curve).contains("not on the curve"));
+        reject(&off_curve);
         // x = 2^256 - 1 is not a field element at all.
         let mut not_field = [0xFFu8; 33];
         not_field[0] = 0x02;
-        assert!(reject(&not_field).contains("not on the curve"));
+        reject(&not_field);
     }
 
     /// The fail-open counterexample against the old concatenated return: a
@@ -197,10 +206,9 @@ mod tests {
             0x78, 0x0a, 0x2c, 0x78, 0x90, 0x1d, 0x3f, 0xb3, 0x37, 0x38, 0x76, 0x85, 0x11, 0xa3,
             0x06, 0x17, 0xaf, 0xa0,
         ];
-        let msg = custody_msg(
-            parse_pseudonym("derive_pseudonym", &legacy_key, "22").expect_err("32 bytes rejected"),
+        assert_custody_error(
+            &parse_pseudonym("derive_pseudonym", &legacy_key, "22").expect_err("32 bytes rejected"),
         );
-        assert!(msg.contains("got 32 bytes"), "{msg}");
 
         // The old split's first 33 bytes are a valid point; the
         // `public_key(key_id)` binding in `callback_custody::derive_pseudonym`
@@ -213,13 +221,29 @@ mod tests {
 
     #[test]
     fn parse_pseudonym_rejects_non_numeric_key_id() {
-        let msg = custody_msg(
-            parse_pseudonym("derive_rotatable_pseudonym", &REFERENCE_POINT, "xyz")
+        assert_custody_error(
+            &parse_pseudonym("derive_rotatable_pseudonym", &REFERENCE_POINT, "xyz")
                 .expect_err("non-numeric key_id is rejected"),
         );
+    }
+
+    #[test]
+    fn parse_handle_rejects_non_canonical_ids() {
+        for id in ["007", "+7", "00"] {
+            assert_custody_error(
+                &parse_handle("derive_pseudonym", id).expect_err("non-canonical id rejected"),
+            );
+        }
+        // `u64::from_str` already refuses surrounding whitespace.
+        for id in [" 7", "7 "] {
+            assert_custody_error(&parse_handle("derive_pseudonym", id).expect_err("rejected"));
+        }
+        assert_eq!(parse_handle("m", "0").expect("canonical zero").id(), 0);
         assert_eq!(
-            msg,
-            "KeyCustodyProvider.derive_rotatable_pseudonym returned a non-numeric key_id: xyz"
+            parse_handle("m", "18446744073709551615")
+                .expect("u64::MAX")
+                .id(),
+            u64::MAX
         );
     }
 }

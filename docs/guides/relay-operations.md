@@ -51,9 +51,20 @@ The resulting binaries are at:
 | Feature | What it enables |
 |---------|----------------|
 | `http3` | HTTP/3 and QUIC-based HTTP endpoint (spec SS10.15.1) |
+| `cloud-blobs` | The PostgreSQL and S3 blob storage backends (`SCP_RELAY_STORAGE_BACKEND=postgres` or `=s3`, section 4) |
+
+`scp-relay` supports one optional feature:
+
+| Feature | What it enables |
+|---------|----------------|
+| `cloud-blobs` | The PostgreSQL and S3 blob storage backends (`SCP_RELAY_STORAGE_BACKEND=postgres` or `=s3`, section 4) |
+
+A default build of either binary leaves `cloud-blobs` off. Section 4 lists which modes then exit when `SCP_RELAY_STORAGE_BACKEND` names `postgres` or `s3`, and how a cargo invocation that builds both binaries decides what each one compiles.
 
 ```bash
 cargo build --release -p scp-node --features http3
+cargo build --release -p scp-relay --features cloud-blobs
+cargo build --release -p scp-node --features cloud-blobs
 ```
 
 ---
@@ -152,14 +163,14 @@ OPTIONS:
 
 ## 4. Blob Storage Backend Selection
 
-Both `scp-relay` and `scp-node` (in relay-only mode) select a blob storage backend via `SCP_RELAY_STORAGE_BACKEND`. The value maps to a `BlobStorageBackend` enum variant:
+`scp-relay` selects a blob storage backend via `SCP_RELAY_STORAGE_BACKEND`, and so does `scp-node` in `--relay-only` mode and in its default persistent full-node mode. `scp-node --self-host` always stores blobs in SQLite under its storage directory, and exits when the variable names `postgres` or `s3`. `scp-node --ephemeral`, which only a `testing` build compiles, always stores blobs in memory, and exits on those two values the same way. The value maps to a `BlobStorageBackend` enum variant. A default build, including the container image the repository's `Dockerfile` builds, compiles neither `postgres` nor `s3`: build the binary with `--features cloud-blobs` to use them. Cargo unifies `scp-transport`'s features across every package one `cargo build` invocation builds, so `cargo build -p scp-relay -p scp-node --features scp-node/cloud-blobs` compiles both backends into `scp-relay` as well: build each binary in its own invocation when only one of them should carry the backends. `scp-relay`, and `scp-node` in `--relay-only` and persistent full-node mode, exit on either value when their build did not compile that backend, in any letter case, with `storage backend 'postgres' is not compiled into this binary` or `storage backend 's3' is not compiled into this binary`: the message names the backend in lowercase, not the value as the operator typed it. `scp-node --self-host` exits on either value in every build, with its own message: `--self-host stores blobs in SQLite under its storage directory and cannot use SCP_RELAY_STORAGE_BACKEND='<value>'`, which echoes the value as the operator typed it. `scp-node --ephemeral` exits with `--ephemeral stores blobs in memory and cannot use SCP_RELAY_STORAGE_BACKEND='<value>'`.
 
 | Value | Backend | Required env vars | Default path |
 |-------|---------|-------------------|-------------|
 | `sqlite` (default) | SQLite | `SCP_RELAY_STORAGE_PATH` | `./scp-relay.db` |
 | `redb` | redb (embedded) | `SCP_RELAY_STORAGE_PATH` | `./scp-relay.redb` |
-| `postgres` | PostgreSQL | `SCP_RELAY_DATABASE_URL` (required) | N/A |
-| `s3` | S3-compatible | `SCP_RELAY_S3_BUCKET` (required), `SCP_RELAY_S3_PREFIX` | prefix: `blobs/` |
+| `postgres` (needs `cloud-blobs`) | PostgreSQL | `SCP_RELAY_DATABASE_URL` (required) | N/A |
+| `s3` (needs `cloud-blobs`) | S3-compatible | `SCP_RELAY_S3_BUCKET` (required), `SCP_RELAY_S3_PREFIX` | prefix: `blobs/` |
 | `memory` | In-memory | none | N/A (data lost on restart) |
 
 ### Examples
@@ -168,12 +179,12 @@ Both `scp-relay` and `scp-node` (in relay-only mode) select a blob storage backe
 # SQLite (default)
 SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
 
-# PostgreSQL
+# PostgreSQL (binary built with: cargo build --release -p scp-relay --features cloud-blobs)
 SCP_RELAY_STORAGE_BACKEND=postgres \
 SCP_RELAY_DATABASE_URL="postgres://user:pass@localhost/scp_relay" \
 scp-relay
 
-# S3-compatible (e.g., MinIO)
+# S3-compatible, e.g. MinIO (binary built with --features cloud-blobs)
 SCP_RELAY_STORAGE_BACKEND=s3 \
 SCP_RELAY_S3_BUCKET=scp-blobs \
 SCP_RELAY_S3_PREFIX=production/ \

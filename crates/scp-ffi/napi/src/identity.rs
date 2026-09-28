@@ -329,7 +329,7 @@ pub(crate) async fn publish_to_shared_dht_for(
 ///
 /// Prevents key material from appearing in log output or panic messages.
 #[cfg(feature = "testing")]
-pub(crate) struct OpaqueInMemoryKeyCustody(pub(crate) InMemoryKeyCustody);
+pub(crate) struct OpaqueInMemoryKeyCustody(pub(crate) Box<InMemoryKeyCustody>);
 
 #[cfg(feature = "testing")]
 impl fmt::Debug for OpaqueInMemoryKeyCustody {
@@ -1380,7 +1380,7 @@ mod tests {
     /// initial active signing key's public key (multibase).
     async fn create_test_identity() -> (NapiIdentity, String) {
         let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+            OpaqueInMemoryKeyCustody(Box::new(InMemoryKeyCustody::new())),
         ));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -2026,7 +2026,7 @@ mod tests {
         // to simulate a caller that reached `migrate()` before any create.
         let identity = rt.block_on(async {
             let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-                OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+                OpaqueInMemoryKeyCustody(Box::new(InMemoryKeyCustody::new())),
             ));
             let pre_rotation_custody =
                 Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());

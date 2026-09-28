@@ -1034,3 +1034,8 @@ def bridge_oauth_scopes_for_mode(mode: str) -> list[str]: ...
 # -- MCP stdio allowlist (methods on SCP, not module-level) --
 # The four `py_mcp_*_stdio_allowlist` free functions were deleted in
 # Per-instance migration — see `class SCP` above for the method stubs.
+
+# -- testing hooks (built only with the `testing` feature) --
+# The §9.10.4 routing id the bridge derives for a software identity whose
+# Ed25519 seed is `seed`, in `context_id` (SCP-307, §25.19 KAT).
+def testing_pseudonym_routing_id_from_seed(seed: bytes, context_id: str) -> bytes: ...

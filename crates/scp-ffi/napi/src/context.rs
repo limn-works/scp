@@ -418,7 +418,9 @@ async fn derive_context_pseudonym_required(
             code: codes::IDENT_1054.to_owned(),
         }));
     };
-    derive_pseudonym_bytes(custody, &scp_id.identity_key, context_id).await
+    derive_pseudonym_bytes(custody, &scp_id.identity_key, context_id)
+        .await
+        .map_err(NapiError::from)
 }
 
 /// Core pseudonym-derivation sequence shared by every NAPI entry point.
@@ -430,19 +432,17 @@ async fn derive_context_pseudonym_required(
 /// a handle or the registry). Centralizing here mirrors the `PyO3` reference
 /// bridge so the 1054/1055 contract cannot drift across create / join /
 /// import.
-async fn derive_pseudonym_bytes(
+pub(crate) async fn derive_pseudonym_bytes(
     custody: &crate::custody::NapiKeyCustody,
     identity_key: &scp_platform::KeyHandle,
     context_id: &str,
-) -> napi::Result<[u8; 32]> {
+) -> Result<[u8; 32], ScpNapiError> {
     let pseudonym = custody
         .derive_pseudonym(identity_key, context_id.as_bytes())
         .await
-        .map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("pseudonym derivation failed: {e}"),
-                code: codes::IDENT_1055.to_owned(),
-            })
+        .map_err(|e| ScpNapiError::Identity {
+            message: format!("pseudonym derivation failed: {e}"),
+            code: codes::IDENT_1055.to_owned(),
         })?;
     // §9.10.4: the routing axis carries the 32-byte routing id of the 33-byte
     // P-256 pseudonym. `PseudonymKeypair::new` already rejected a malformed
@@ -476,7 +476,9 @@ async fn derive_member_pseudonym_required(
         })
     })?;
     let (custody, identity_key) = custody_and_key;
-    derive_pseudonym_bytes(&custody, &identity_key, context_id).await
+    derive_pseudonym_bytes(&custody, &identity_key, context_id)
+        .await
+        .map_err(NapiError::from)
 }
 
 /// Best-effort §9.10.4 pseudonym announcement (NAPI).
@@ -5603,7 +5605,7 @@ mod tests {
         use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
 
         let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+            OpaqueInMemoryKeyCustody(Box::new(InMemoryKeyCustody::new())),
         ));
         let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
         let dht = scp_identity::DidDht::with_client(std::sync::Arc::new(
@@ -5660,7 +5662,7 @@ mod tests {
         use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
 
         let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+            OpaqueInMemoryKeyCustody(Box::new(InMemoryKeyCustody::new())),
         ));
         let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
         let dht = DidDht::with_client(Arc::new(scp_dht::InMemoryDhtClient::new()));
@@ -5826,7 +5828,7 @@ mod tests {
 
         // custody_A: the sender identity's OWN custody — holds the agent key.
         let custody_a = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+            OpaqueInMemoryKeyCustody(Box::new(InMemoryKeyCustody::new())),
         ));
         let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
         let dht = DidDht::with_client(Arc::new(scp_dht::InMemoryDhtClient::new()));
@@ -5860,7 +5862,7 @@ mod tests {
         // NOT hold the agent key handle — so a resolver that (wrongly) sourced
         // #agent custody from the handle would fail against it.
         let custody_b = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+            OpaqueInMemoryKeyCustody(Box::new(InMemoryKeyCustody::new())),
         ));
         let handle = super::NapiContextHandle {
             context_id: format!("persona-regress-{}", uuid::Uuid::new_v4()),
@@ -7553,9 +7555,9 @@ mod tests {
         use scp_platform::testing::InMemoryKeyCustody;
         use sha2::{Digest, Sha256};
 
-        let custody = crate::custody::NapiKeyCustody::InMemory(OpaqueInMemoryKeyCustody(
+        let custody = crate::custody::NapiKeyCustody::InMemory(OpaqueInMemoryKeyCustody(Box::new(
             InMemoryKeyCustody::new(),
-        ));
+        )));
         let handle = custody
             .generate_identity_keypair()
             .await
@@ -7582,31 +7584,27 @@ mod tests {
         assert_eq!(routing_id, expected);
     }
 
-    /// §9.10.4: a custody derivation failure surfaces as `SCP-IDENT-1055`
-    /// carrying the custody cause, never as a zero routing id.
+    /// §9.10.4: a custody derivation failure surfaces as `SCP-IDENT-1055`,
+    /// never as a zero routing id.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn derive_pseudonym_bytes_failure_is_ident_1055() {
         use crate::identity::OpaqueInMemoryKeyCustody;
         use scp_platform::testing::InMemoryKeyCustody;
 
-        let custody = crate::custody::NapiKeyCustody::InMemory(OpaqueInMemoryKeyCustody(
+        let custody = crate::custody::NapiKeyCustody::InMemory(OpaqueInMemoryKeyCustody(Box::new(
             InMemoryKeyCustody::new(),
-        ));
+        )));
         let missing = scp_platform::KeyHandle::new(4242);
         let err = super::derive_pseudonym_bytes(&custody, &missing, "ctx-napi-kat")
             .await
             .expect_err("an unknown identity key must fail derivation");
-        let msg = err.to_string();
-        assert!(
-            msg.contains(codes::IDENT_1055),
-            "expected {}, got: {msg}",
-            codes::IDENT_1055
-        );
-        assert!(
-            msg.contains("pseudonym derivation failed:"),
-            "cause missing: {msg}"
-        );
+        match err {
+            crate::error::ScpNapiError::Identity { code, .. } => {
+                assert_eq!(code, codes::IDENT_1055);
+            }
+            other => panic!("expected IDENT_1055, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

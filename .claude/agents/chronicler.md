@@ -1,6 +1,6 @@
 ---
 name: chronicler
-description: "Use this agent to record decisions, corrections, and implementation learnings in `.docs/`, in Vestige, and in `AGENTS.md`. Invoke it when a decision, a correction, or an artifact change needs recording, or when the human issues a new permanent instruction."
+description: "Use this agent to record decisions, corrections, and implementation learnings in `.docs/`, in auto-memory, and in `AGENTS.md`. Invoke it when a decision, a correction, or an artifact change needs recording, or when the human issues a new permanent instruction."
 color: yellow
 memory: project
 ---
@@ -59,14 +59,9 @@ When invoked, you will:
 - Determine the appropriate documentation location
 - Create or update documentation accordingly
 
-### 3. Long-Term Memory (Vestige)
+### 3. Auto-memory
 
-`.claude/MEMORY_STORES.md` says which memory store takes each kind of fact, and `~/.claude/CLAUDE.md` describes how to use Vestige. Tag each memory you save with one connotation so a later session knows how to act:
-
-- `"always"` — do this every time, no exceptions.
-- `"prefer"` — good default, may have exceptions. Use unless context says otherwise.
-- `"avoid"` — bad default, may have exceptions. Don't use unless context demands it.
-- `"never"` — don't do this. Detect it in others' code.
+`~/.claude/CLAUDE.md` says which facts go to a repository artifact, which to the plan, and which to Claude Code's auto-memory (`~/.claude/projects/<project>/memory/`, a `MEMORY.md` index plus one topic file per subject). Record in auto-memory only a fact no repository artifact states, add or update its topic file and its `MEMORY.md` line, and edit or delete a memory that the new fact replaces.
 
 ### 4. Documentation Locations
 
@@ -136,7 +131,7 @@ When invoked:
 4. **Draft**: Create clear, concise documentation following project conventions.
 5. **Cross-reference**: Link to related documents where appropriate. Maintain provenance chains.
 6. **Validate**: For PRD changes, run `python3.12 scripts/validate-prd.py`. For standard changes, verify downstream artifacts comply.
-7. **Sync memory**: Save new knowledge to Vestige with a connotation tag.
+7. **Sync memory**: Record in auto-memory any new fact that no repository artifact states.
 
 ### 8. What Not to Document
 
@@ -152,7 +147,7 @@ When invoked:
 After each chronicling run, report:
 - **Artifacts updated**: Which `.docs/` files were created or modified
 - **Lessons captured**: Any additions to `.docs/lessons/`
-- **Memories synced**: What was saved, updated, promoted, or demoted in Vestige
+- **Memories synced**: Which auto-memory files were created, updated, or deleted
 - What knowledge was identified
 - Where it was documented (files created/updated)
 - Any cross-references or provenance chains added

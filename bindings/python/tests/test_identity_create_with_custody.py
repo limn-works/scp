@@ -168,18 +168,32 @@ class _FakeKeychain:
         # stand-in keeps the protocol surface complete.
         return hashlib.sha256(self._seeds[key_id] + bytes(peer_public)).digest()
 
-    def _register_pseudonym(self, seed: bytes) -> tuple[bytes, str]:
+    @staticmethod
+    def _pseudonym_key_id(identity: str, context_id: bytes, epoch: int | None) -> str:
+        # The provider contract requires the same (identity, context, epoch) to
+        # name the same key. The top bit keeps the id clear of the small
+        # sequential identity ids.
+        ident = identity.encode()
+        h = hashlib.sha256(b"fake-keychain-pseudonym-id")
+        h.update(len(ident).to_bytes(4, "big") + len(context_id).to_bytes(4, "big"))
+        h.update(ident + bytes(context_id))
+        if epoch is not None:
+            h.update(epoch.to_bytes(8, "big"))
+        return str(int.from_bytes(h.digest()[:8], "big") | (1 << 63))
+
+    def _register_pseudonym(self, seed: bytes, kid: str) -> tuple[bytes, str]:
         d = pseudonym_scalar(seed)
-        kid = str(self._next)
-        self._next += 1
         self._pseudonyms[kid] = d
         return p256_compressed(d), kid
 
     def derive_pseudonym(self, key_id: str, context_id: bytes) -> tuple[bytes, str]:
         # Canonical v1 recipe (§9.10.4.A) over the Ed25519 identity seed (the
         # native interim ikm until S12). Registers the P-256 pseudonym key under
-        # a fresh id and returns ``(public_key (33), key_id)``.
-        return self._register_pseudonym(canonical_pseudonym_seed(self._seeds[key_id], context_id))
+        # its deterministic id and returns ``(public_key (33), key_id)``.
+        return self._register_pseudonym(
+            canonical_pseudonym_seed(self._seeds[key_id], context_id),
+            self._pseudonym_key_id(key_id, context_id, None),
+        )
 
     def derive_rotatable_pseudonym(
         self, key_id: str, context_id: bytes, pseudonym_epoch: int
@@ -187,7 +201,9 @@ class _FakeKeychain:
         # Canonical v2 recipe (§9.10.4.A): HMAC(context_id || epoch_BE ||
         # "scp-pseudonym-v2"). Same return shape as the v1 path.
         seed = canonical_rotatable_pseudonym_seed(self._seeds[key_id], context_id, pseudonym_epoch)
-        return self._register_pseudonym(seed)
+        return self._register_pseudonym(
+            seed, self._pseudonym_key_id(key_id, context_id, pseudonym_epoch)
+        )
 
     def export_signing_key_bytes(self, key_id: str) -> bytes:
         return self._seeds[key_id]

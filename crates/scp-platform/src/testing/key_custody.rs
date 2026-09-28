@@ -14,6 +14,7 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 use crate::error::PlatformError;
+use crate::pseudonym_keys::PseudonymKeys;
 use crate::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
     Signature,
@@ -34,6 +35,9 @@ struct KeyStore {
     /// Handles in the identity role, the only pseudonym-derivation sources
     /// ([`KeyCustody::generate_identity_keypair`]).
     identity_keys: HashSet<u64>,
+    /// Derived pseudonym keys, each owned by its identity (§9.10.4, §9.15);
+    /// their handles are typed [`KeyType::P256Signing`] in `key_types`.
+    pseudonyms: PseudonymKeys,
 }
 
 impl KeyStore {
@@ -42,6 +46,7 @@ impl KeyStore {
             ed25519_keys: HashMap::new(),
             x25519_keys: HashMap::new(),
             p256_keys: HashMap::new(),
+            pseudonyms: PseudonymKeys::default(),
             key_types: HashMap::new(),
             identity_keys: HashSet::new(),
         }
@@ -67,9 +72,11 @@ impl KeyStore {
         Ok(Zeroizing::new(signing_key.to_bytes()))
     }
 
+    /// The P-256 key behind `key_id`: a generated key or a derived pseudonym.
     fn p256_key(&self, key_id: u64) -> Result<&P256SigningKey, PlatformError> {
         self.p256_keys
             .get(&key_id)
+            .or_else(|| self.pseudonyms.get(key_id))
             .ok_or(PlatformError::KeyNotFound)
     }
 }
@@ -168,6 +175,40 @@ impl InMemoryKeyCustody {
     fn next_handle(&self) -> KeyHandle {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         KeyHandle::new(id)
+    }
+
+    /// The §9.10.4 P-256 pseudonym of identity `key_id` in `context_id` at
+    /// `epoch` (`None` for v1). A re-derive returns the handle already in the
+    /// slot; the store lock is held throughout, so a concurrent destroy of the
+    /// identity lands wholly before or after.
+    async fn derive_p256_pseudonym(
+        &self,
+        key_id: u64,
+        context_id: &[u8],
+        epoch: Option<u64>,
+    ) -> Result<PseudonymKeypair, PlatformError> {
+        let mut store = self.store.lock().await;
+        // Software custody (§9.10.4.A): the ikm is the identity private
+        // seed, never the public key. Only an identity key derives, and
+        // until S12 (§9.10.4.A native interim) it is Ed25519, so its
+        // 32-byte seed is the ikm.
+        let ikm = store.derive_source(key_id)?;
+        if let Some((handle, public_key)) = store.pseudonyms.existing(key_id, context_id, epoch) {
+            drop(store);
+            return PseudonymKeypair::new(&public_key, KeyHandle::new(handle));
+        }
+        let pseudonym_key = derive_pseudonym_keypair(&ikm, context_id, epoch)
+            .map_err(|e| PlatformError::CustodyError(format!("pseudonym derivation: {e}")))?;
+        let public_key = pseudonym_key.public_key().to_compressed();
+
+        let handle = self.next_handle();
+        store
+            .pseudonyms
+            .insert(key_id, context_id, epoch, handle.id(), pseudonym_key);
+        store.key_types.insert(handle.id(), KeyType::P256Signing);
+        drop(store);
+
+        PseudonymKeypair::new(&public_key, handle)
     }
 
     /// Imports an existing Ed25519 private key and returns a handle to it.
@@ -367,12 +408,19 @@ impl KeyCustody for InMemoryKeyCustody {
             match key_type {
                 KeyType::Ed25519 => {
                     store.ed25519_keys.remove(&key_id);
+                    // Every pseudonym derived from this identity goes with it
+                    // (§9.15), under the same lock a derive holds.
+                    for pseudonym in store.pseudonyms.remove_identity(key_id) {
+                        store.key_types.remove(&pseudonym);
+                    }
                 }
                 KeyType::X25519 => {
                     store.x25519_keys.remove(&key_id);
                 }
                 KeyType::P256Signing | KeyType::HpkeP256 => {
-                    store.p256_keys.remove(&key_id);
+                    if !store.pseudonyms.remove(key_id) {
+                        store.p256_keys.remove(&key_id);
+                    }
                 }
             }
             store.key_types.remove(&key_id);
@@ -424,24 +472,7 @@ impl KeyCustody for InMemoryKeyCustody {
     ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
         let key_id = key.id();
         let context_id = context_id.to_vec();
-        async move {
-            let mut store = self.store.lock().await;
-            // Software custody (§9.10.4.A): the ikm is the identity private
-            // seed, never the public key. Only an identity key derives, and
-            // until S12 (§9.10.4.A native interim) it is Ed25519, so its
-            // 32-byte seed is the ikm.
-            let ikm = store.derive_source(key_id)?;
-            let pseudonym_key = derive_pseudonym_keypair(&ikm, &context_id, None)
-                .map_err(|e| PlatformError::CustodyError(format!("pseudonym derivation: {e}")))?;
-            let public_key = pseudonym_key.public_key().to_compressed();
-
-            let handle = self.next_handle();
-            store.p256_keys.insert(handle.id(), pseudonym_key);
-            store.key_types.insert(handle.id(), KeyType::P256Signing);
-            drop(store);
-
-            PseudonymKeypair::new(&public_key, handle)
-        }
+        async move { self.derive_p256_pseudonym(key_id, &context_id, None).await }
     }
 
     fn derive_rotatable_pseudonym(
@@ -453,22 +484,8 @@ impl KeyCustody for InMemoryKeyCustody {
         let key_id = key.id();
         let context_id = context_id.to_vec();
         async move {
-            let mut store = self.store.lock().await;
-            // Software custody (§9.10.4.A): the ikm is the identity private
-            // seed, never the public key. Only an identity key derives, and
-            // until S12 (§9.10.4.A native interim) it is Ed25519, so its
-            // 32-byte seed is the ikm.
-            let ikm = store.derive_source(key_id)?;
-            let pseudonym_key = derive_pseudonym_keypair(&ikm, &context_id, Some(pseudonym_epoch))
-                .map_err(|e| PlatformError::CustodyError(format!("pseudonym derivation: {e}")))?;
-            let public_key = pseudonym_key.public_key().to_compressed();
-
-            let handle = self.next_handle();
-            store.p256_keys.insert(handle.id(), pseudonym_key);
-            store.key_types.insert(handle.id(), KeyType::P256Signing);
-            drop(store);
-
-            PseudonymKeypair::new(&public_key, handle)
+            self.derive_p256_pseudonym(key_id, &context_id, Some(pseudonym_epoch))
+                .await
         }
     }
 
@@ -1296,5 +1313,12 @@ mod tests {
                 Err(PlatformError::CustodyError(_))
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn identity_destroy_removes_its_pseudonyms() {
+        crate::pseudonym_keys::tests::check_identity_owns_pseudonyms(&InMemoryKeyCustody::new())
+            .await
+            .unwrap();
     }
 }

@@ -8,7 +8,7 @@
 //     (the twelve §7.3.2 facts).
 // The idiomatic [CapabilityValidation] / [BehavioralRecord] / [TrustEvaluation]
 // types and the [SCP.ucanEvaluate] / [SCP.participationRecord] /
-// [SCP.evaluateTrust] wrappers (in Scp.kt) sit ON TOP of those, mirroring the
+// [SCP.evaluateTrust] wrappers (in SCP.kt) sit ON TOP of those, mirroring the
 // Python (`scp_sdk.trust`) and TypeScript (`scp.ts` / `types.ts`) SDKs
 // field-for-field.
 //

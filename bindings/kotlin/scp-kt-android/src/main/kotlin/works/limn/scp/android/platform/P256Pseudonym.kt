@@ -1,23 +1,21 @@
-// P256Pseudonym.kt — §9.10.4.A P-256 pseudonym arithmetic for AndroidKeyCustody.
+// P256Pseudonym.kt — §9.10.4 P-256 pseudonym keys for AndroidKeyCustody.
 //
-// Provenance: spec §9.10.4.A (pseudonym recipe), §9.5.1 (64-byte low-s prehash ECDSA),
-// `scp-crypto/src/pseudonym.rs` (Rust reference).
+// Provenance: spec §9.10.4 (seed-to-scalar), §9.10.4.A (pseudonym secret), §9.5
+// (RFC 6979 low-s prehash ECDSA). The scalar reduction and the signer are the Rust
+// `scp-crypto` ones, reached through the `scp-ffi-uniffi` exports in `p256_host.rs`,
+// so this host re-implements neither.
 
 package works.limn.scp.android.platform
 
-import org.bouncycastle.crypto.digests.SHA256Digest
-import org.bouncycastle.crypto.ec.CustomNamedCurves
-import org.bouncycastle.crypto.params.ECDomainParameters
-import org.bouncycastle.crypto.params.ECPrivateKeyParameters
-import org.bouncycastle.crypto.signers.ECDSASigner
-import org.bouncycastle.crypto.signers.HMacDSAKCalculator
-import java.math.BigInteger
-import java.util.UUID
-import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
+import uniffi.scp.p256PublicKey
+import uniffi.scp.p256SeedToScalar
+import uniffi.scp.p256SignPrehashRfc6979
+import java.nio.ByteBuffer
+import java.security.MessageDigest
+import uniffi.scp.ScpException as BridgeException
 
 /**
- * P-256 pseudonym key derivation and prehash signing (spec §9.10.4.A, §9.5.1).
+ * P-256 pseudonym key registration, public key and prehash signing (§9.10.4, §9.5).
  *
  *   d = int(HKDF-Expand-SHA256(prk = context_seed, info = "SCP-PSEUDONYM-P256-V1", 48))
  *       mod (n - 1) + 1
@@ -27,82 +25,143 @@ internal object P256Pseudonym {
     /** HKDF-Expand label that turns a context seed into the pseudonym scalar. */
     const val SCALAR_LABEL = "SCP-PSEUDONYM-P256-V1"
 
-    private val curve = CustomNamedCurves.getByName("secp256r1")
-    private val domain = ECDomainParameters(curve.curve, curve.g, curve.n, curve.h)
-    private val halfOrder: BigInteger = curve.n.shiftRight(1)
+    private const val DIGEST_SIZE = 32
 
     /**
      * Maps a 32-byte context seed to its pseudonym scalar, stores the scalar in [keys]
-     * under a fresh handle id, and zeroizes the seed.
+     * under [pseudonymId] as a pseudonym of [identityId], and zeroizes the seed.
      */
-    fun register(keys: MutableMap<String, BigInteger>, contextSeed: ByteArray): PseudonymKeyHandle {
-        val scalar = seedToScalar(SCALAR_LABEL, contextSeed)
-        contextSeed.fill(0)
-        val id = UUID.randomUUID().toString()
-        keys[id] = scalar
-        return PseudonymKeyHandle(id = id, custodyType = CustodyType.SOFTWARE)
-    }
-
-    /** RFC 5869 HKDF-Expand with SHA-256. */
-    fun hkdfExpand(prk: ByteArray, info: ByteArray, length: Int): ByteArray {
-        val out = ByteArray(length)
-        var block = ByteArray(0)
-        var offset = 0
-        var counter = 1
-        while (offset < length) {
-            val mac = Mac.getInstance("HmacSHA256")
-            mac.init(SecretKeySpec(prk, "HmacSHA256"))
-            mac.update(block)
-            mac.update(info)
-            mac.update(counter.toByte())
-            block = mac.doFinal()
-            val take = minOf(block.size, length - offset)
-            System.arraycopy(block, 0, out, offset, take)
-            offset += take
-            counter++
+    fun register(
+        keys: PseudonymKeys,
+        identityId: String,
+        pseudonymId: String,
+        contextSeed: ByteArray,
+    ): PseudonymKeyHandle {
+        val scalar = try {
+            bridged { p256SeedToScalar(SCALAR_LABEL.toByteArray(Charsets.UTF_8), contextSeed) }
+        } finally {
+            contextSeed.fill(0)
         }
-        block.fill(0)
-        return out
+        keys.put(identityId, pseudonymId, scalar)
+        return PseudonymKeyHandle(id = pseudonymId, custodyType = CustodyType.SOFTWARE)
     }
 
-    /** FIPS 186-5 A.2.1 seed-to-scalar (§9.10.4): 48 bytes, mod (n - 1), + 1. */
-    fun seedToScalar(label: String, seed: ByteArray): BigInteger {
-        val wide = hkdfExpand(seed, label.toByteArray(Charsets.UTF_8), 48)
-        val scalar = BigInteger(1, wide).mod(curve.n.subtract(BigInteger.ONE)).add(BigInteger.ONE)
-        wide.fill(0)
-        return scalar
+    /**
+     * The pseudonym handle id for ([identityId], [contextId], [epoch]): the same inputs
+     * always name the same handle, so re-deriving keeps the existing entry (and wipes the
+     * new scalar) instead of adding one. A `null` [epoch] is the v1 derivation.
+     */
+    fun pseudonymId(identityId: String, contextId: ByteArray, epoch: Long?): String {
+        val sha = MessageDigest.getInstance("SHA-256")
+        val identity = identityId.toByteArray(Charsets.UTF_8)
+        sha.update("scp-android-pseudonym-id-v1".toByteArray(Charsets.UTF_8))
+        sha.update(ByteBuffer.allocate(Int.SIZE_BYTES).putInt(identity.size).array())
+        sha.update(identity)
+        sha.update(ByteBuffer.allocate(Int.SIZE_BYTES).putInt(contextId.size).array())
+        sha.update(contextId)
+        if (epoch != null) sha.update(ByteBuffer.allocate(Long.SIZE_BYTES).putLong(epoch).array())
+        return "p256-" + sha.digest().joinToString("") { "%02x".format(it) }
     }
 
     /** The 33-byte SEC1 compressed encoding of `d * G`. */
-    fun compressedPublicKey(d: BigInteger): ByteArray =
-        domain.g.multiply(d).normalize().getEncoded(true)
+    fun compressedPublicKey(scalar: ByteArray): ByteArray = bridged { p256PublicKey(scalar) }
 
     /**
-     * Signs a 32-byte digest without hashing it again (RFC 6979 nonce) and returns the
-     * 64-byte `r || s` with low s (§9.5.1).
+     * Signs a 32-byte digest without hashing it again, with the RFC 6979 nonce, and
+     * returns the 64-byte low-s `r || s` (§9.5).
      *
      * @throws ScpException with code `SCP-CRYPTO-4003` if [digest] is not 32 bytes.
      */
-    fun signPrehash(d: BigInteger, digest: ByteArray): ByteArray {
-        if (digest.size != 32) {
+    fun signPrehash(scalar: ByteArray, digest: ByteArray): ByteArray {
+        if (digest.size != DIGEST_SIZE) {
             throw ScpException(
                 "P-256 pseudonym keys sign only a 32-byte digest, got ${digest.size} bytes",
                 "SCP-CRYPTO-4003",
             )
         }
-        val signer = ECDSASigner(HMacDSAKCalculator(SHA256Digest()))
-        signer.init(true, ECPrivateKeyParameters(d, domain))
-        val (r, s) = signer.generateSignature(digest)
-        val lowS = if (s > halfOrder) curve.n.subtract(s) else s
-        return to32(r) + to32(lowS)
+        return bridged { p256SignPrehashRfc6979(scalar, digest) }
     }
 
-    private fun to32(x: BigInteger): ByteArray {
-        val bytes = x.toByteArray()
-        return when {
-            bytes.size == 32 -> bytes
-            bytes.size > 32 -> bytes.copyOfRange(bytes.size - 32, bytes.size)
-            else -> ByteArray(32 - bytes.size) + bytes
+    /** Maps a bridge error to this package's [ScpException], keeping its code. */
+    private inline fun <T> bridged(call: () -> T): T = try {
+        call()
+    } catch (e: BridgeException.Validation) {
+        throw ScpException(e.msg, e.code, e)
+    } catch (e: BridgeException.Crypto) {
+        throw ScpException(e.msg, e.code, e)
+    }
+}
+
+/**
+ * The in-memory P-256 pseudonym scalars of one [AndroidKeyCustody], each owned by the
+ * identity it was derived from.
+ *
+ * Every access holds [lock]. A stored scalar array is never handed out: [withScalar]
+ * lends a copy and wipes it afterwards, so wiping a stored array on replace or remove
+ * cannot corrupt a signature in progress on another thread.
+ */
+internal class PseudonymKeys {
+    private val lock = Any()
+    private val scalars = HashMap<String, ByteArray>()
+    private val byIdentity = HashMap<String, MutableSet<String>>()
+
+    /**
+     * Identities destroyed in this process. A derivation that read its seed before its
+     * identity was destroyed must not store a scalar afterwards; handle ids are random
+     * UUIDs, so this holds one short string per destroyed identity.
+     */
+    private val retired = HashSet<String>()
+
+    /** Number of stored scalars. */
+    val size: Int get() = synchronized(lock) { scalars.size }
+
+    /**
+     * Stores [scalar] under [pseudonymId] for [identityId]. An id already present keeps
+     * its scalar (the same inputs derive the same scalar) and [scalar] is wiped.
+     *
+     * @throws ScpException with code `SCP-CRYPTO-4001` if [identityId] was destroyed;
+     *   [scalar] is wiped.
+     */
+    fun put(identityId: String, pseudonymId: String, scalar: ByteArray) {
+        synchronized(lock) {
+            if (identityId in retired) {
+                scalar.fill(0)
+                throw ScpException("Key not found: $identityId", "SCP-CRYPTO-4001")
+            }
+            if (scalars.putIfAbsent(pseudonymId, scalar) != null) {
+                scalar.fill(0)
+            } else {
+                byIdentity.getOrPut(identityId) { HashSet() }.add(pseudonymId)
+            }
+        }
+    }
+
+    /** Runs [use] on a copy of the scalar of [pseudonymId], or returns `null` if absent. */
+    fun <T> withScalar(pseudonymId: String, use: (ByteArray) -> T): T? {
+        val copy = synchronized(lock) { scalars[pseudonymId]?.copyOf() } ?: return null
+        return try {
+            use(copy)
+        } finally {
+            copy.fill(0)
+        }
+    }
+
+    /** Wipes and removes the scalar of [pseudonymId]; `false` if there was none. */
+    fun remove(pseudonymId: String): Boolean = synchronized(lock) {
+        val scalar = scalars.remove(pseudonymId) ?: return false
+        scalar.fill(0)
+        byIdentity.values.forEach { it.remove(pseudonymId) }
+        true
+    }
+
+    /**
+     * Wipes and removes every scalar derived from [identityId], and refuses any later
+     * [put] for it.
+     */
+    fun retireIdentity(identityId: String) {
+        synchronized(lock) {
+            retired.add(identityId)
+            byIdentity.remove(identityId)?.forEach { scalars.remove(it)?.fill(0) }
         }
     }
 }

@@ -1669,7 +1669,7 @@ fn derive_member_pseudonym(
     bi: &crate::runtime::PyBridgeInstance,
     importer_did: &str,
     context_id: &str,
-) -> PyResult<[u8; 32]> {
+) -> Result<[u8; 32], crate::error::ScpPyError> {
     crate::runtime::with_identity(bi, importer_did, |entry| {
         let rt = crate::runtime().map_err(|e| {
             crate::error::ScpPyError::identity_with_code(
@@ -1677,22 +1677,7 @@ fn derive_member_pseudonym(
                 codes::IDENT_1055,
             )
         })?;
-        let pseudonym = rt.block_on(async {
-            entry
-                .custody
-                .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
-                .await
-        });
-        // §9.10.4: the routing axis carries the 32-byte routing id of the
-        // 33-byte P-256 pseudonym. `PseudonymKeypair::new` already rejected a
-        // malformed host-returned point, which surfaces here as SCP-IDENT-1055.
-        let pseudonym = pseudonym.map_err(|e| {
-            crate::error::ScpPyError::identity_with_code(
-                format!("pseudonym derivation failed: {e}"),
-                codes::IDENT_1055,
-            )
-        })?;
-        Ok(*pseudonym.routing_id())
+        pseudonym_routing_id_on(rt, &entry.custody, entry.identity.identity_key, context_id)
     })
     .map_err(|e| {
         // A registry miss surfaces `with_identity`'s generic SCP-IDENT-1001;
@@ -1700,7 +1685,7 @@ fn derive_member_pseudonym(
         // (SCP-IDENT-1054) so a caller switching on `.code` gets the same code
         // for the same failure across bridges. Errors raised inside the closure
         // already carry specific codes and pass through unchanged.
-        let mapped = match e {
+        match e {
             crate::error::ScpPyError::IdentityError { message, code }
                 if code == codes::IDENT_1001 =>
             {
@@ -1710,9 +1695,34 @@ fn derive_member_pseudonym(
                 )
             }
             other => other,
-        };
-        PyErr::from(mapped)
+        }
     })
+}
+
+/// Derives the §9.10.4 routing id of `identity_key`'s pseudonym in
+/// `context_id` over `custody`: the derivation step every member-pseudonym
+/// path shares, with the SCP-IDENT-1055 failure contract.
+pub(crate) fn pseudonym_routing_id_on(
+    rt: &tokio::runtime::Runtime,
+    custody: &crate::custody::FfiKeyCustody,
+    identity_key: scp_platform::KeyHandle,
+    context_id: &str,
+) -> Result<[u8; 32], crate::error::ScpPyError> {
+    let pseudonym = rt.block_on(async {
+        custody
+            .derive_pseudonym(&identity_key, context_id.as_bytes())
+            .await
+    });
+    // §9.10.4: the routing axis carries the 32-byte routing id of the
+    // 33-byte P-256 pseudonym. `PseudonymKeypair::new` already rejected a
+    // malformed host-returned point, which surfaces here as SCP-IDENT-1055.
+    let pseudonym = pseudonym.map_err(|e| {
+        crate::error::ScpPyError::identity_with_code(
+            format!("pseudonym derivation failed: {e}"),
+            codes::IDENT_1055,
+        )
+    })?;
+    Ok(*pseudonym.routing_id())
 }
 
 /// Bridge-level local-custody gate for the bare-`DID` join-side bootstraps
@@ -6262,11 +6272,16 @@ mod tests {
         let bi = __bi();
         let err = derive_member_pseudonym(&bi, "did:dht:z6MkNoSuchIdentity", "ctx-encrypted")
             .expect_err("encrypted derivation without key material must hard-fail");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("SCP-IDENT-1054"),
-            "expected missing-key-material code SCP-IDENT-1054, got: {msg}"
-        );
+        assert_identity_code(err, codes::IDENT_1054);
+    }
+
+    /// Asserts that `err` is an identity error carrying `code`; tests assert
+    /// the typed code, never the message text.
+    fn assert_identity_code(err: crate::error::ScpPyError, code: &str) {
+        match err {
+            crate::error::ScpPyError::IdentityError { code: got, .. } => assert_eq!(got, code),
+            other => panic!("expected identity error {code}, got {other:?}"),
+        }
     }
 
     /// Registers `did` with callback custody over the fake Python provider,
@@ -6343,11 +6358,8 @@ mod tests {
         let bi = __bi();
         let did = "did:dht:z6MkPseudonymLegacyHost";
         register_fake_callback_identity(&bi, did, Some("legacy32"));
-        let msg = derive_member_pseudonym(&bi, did, "ctx")
-            .expect_err("legacy host key rejected")
-            .to_string();
-        assert!(msg.contains("SCP-IDENT-1055"), "{msg}");
-        assert!(msg.contains("got 32 bytes"), "{msg}");
+        let err = derive_member_pseudonym(&bi, did, "ctx").expect_err("legacy host key rejected");
+        assert_identity_code(err, codes::IDENT_1055);
     }
 
     /// A host whose `get_public_key(key_id)` disagrees with the point it
@@ -6358,14 +6370,9 @@ mod tests {
         let bi = __bi();
         let did = "did:dht:z6MkPseudonymWrongPublicKey";
         register_fake_callback_identity(&bi, did, Some("wrong_public_key"));
-        let msg = derive_member_pseudonym(&bi, did, "ctx")
-            .expect_err("mismatched host key rejected")
-            .to_string();
-        assert!(msg.contains("SCP-IDENT-1055"), "{msg}");
-        assert!(
-            msg.contains("does not match the derived pseudonym point"),
-            "{msg}"
-        );
+        let err =
+            derive_member_pseudonym(&bi, did, "ctx").expect_err("mismatched host key rejected");
+        assert_identity_code(err, codes::IDENT_1055);
     }
 
     /// Builds an active `PyContextHandle` for the given mode, driving the real

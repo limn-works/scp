@@ -24458,6 +24458,10 @@ mod tests {
     /// verifies against the exposed public key. Pseudonyms follow the §9.10.4
     /// P-256 recipe over the identity seed; `fault` makes the pseudonym path
     /// misbehave in one specific way so a test can reach each bridge rejection.
+    ///
+    /// Pseudonym key ids are deterministic per (identity key id, context,
+    /// epoch), as the `KeyCustodyProvider` contract requires, so deriving the
+    /// same pseudonym twice returns the same id.
     struct ProdLikeCustody {
         keys: Arc<std::sync::Mutex<std::collections::HashMap<String, ed25519_dalek::SigningKey>>>,
         pseudonyms:
@@ -24467,7 +24471,13 @@ mod tests {
         /// Host `sign` calls, shared so a test can read them after handing the
         /// provider to an adapter.
         sign_calls: Arc<std::sync::atomic::AtomicUsize>,
+        /// Called with the key id at the start of `destroy_key`, before the
+        /// host forgets the key.
+        destroy_probe: Option<DestroyProbe>,
     }
+
+    /// A callback run inside the host's `destroy_key`.
+    type DestroyProbe = Box<dyn Fn(&str) + Send + Sync>;
 
     /// One way a host's pseudonym path can misbehave.
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24479,6 +24489,9 @@ mod tests {
         WrongPublicKey,
         /// `sign` returns the high-`s` form of a valid signature.
         HighS,
+        /// Every pseudonym gets key id 777, whatever its context: a host that
+        /// reuses one id for two different points.
+        FixedId,
     }
 
     impl ProdLikeCustody {
@@ -24493,7 +24506,30 @@ mod tests {
                 next: std::sync::atomic::AtomicU64::new(1),
                 fault,
                 sign_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                destroy_probe: None,
             }
+        }
+
+        /// The deterministic u64 key id of the pseudonym for (identity key id,
+        /// context, epoch): the first 8 bytes of a domain-separated SHA-256.
+        fn pseudonym_key_id(key_id: &str, context_id: &[u8], epoch: Option<u64>) -> String {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(b"prod-like-pseudonym-key-id");
+            hasher.update((key_id.len() as u64).to_be_bytes());
+            hasher.update(key_id.as_bytes());
+            hasher.update((context_id.len() as u64).to_be_bytes());
+            hasher.update(context_id);
+            match epoch {
+                None => hasher.update([0u8]),
+                Some(e) => {
+                    hasher.update([1u8]);
+                    hasher.update(e.to_be_bytes());
+                }
+            }
+            let digest = hasher.finalize();
+            let mut id = [0u8; 8];
+            id.copy_from_slice(&digest[..8]);
+            u64::from_be_bytes(id).to_string()
         }
 
         fn key_for(&self, key_id: &str) -> Result<ed25519_dalek::SigningKey, ScpError> {
@@ -24534,10 +24570,11 @@ mod tests {
                 scp_crypto::pseudonym::derive_pseudonym_keypair(&ikm, context_id, epoch)
                     .expect("seed_to_scalar is total");
             let public_key = pseudonym.public_key().to_compressed().to_vec();
-            let id = self
-                .next
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                .to_string();
+            let id = if self.fault == PseudonymFault::FixedId {
+                "777".to_owned()
+            } else {
+                Self::pseudonym_key_id(key_id, context_id, epoch)
+            };
             self.pseudonyms
                 .lock()
                 .expect("pseudonym mutex")
@@ -24550,6 +24587,7 @@ mod tests {
     }
 
     /// The §9.10.4 routing id the recipe yields for `seed` in `context_id`.
+    #[cfg(feature = "testing")]
     fn recipe_routing_id(seed: [u8; 32], context_id: &[u8], epoch: Option<u64>) -> [u8; 32] {
         let ikm = zeroize::Zeroizing::new(seed);
         let point = scp_crypto::pseudonym::derive_pseudonym_keypair(&ikm, context_id, epoch)
@@ -24608,6 +24646,9 @@ mod tests {
         }
 
         async fn destroy_key(&self, key_id: String) -> Result<(), ScpError> {
+            if let Some(probe) = &self.destroy_probe {
+                probe(&key_id);
+            }
             self.pseudonyms
                 .lock()
                 .expect("pseudonym mutex")
@@ -24726,6 +24767,51 @@ mod tests {
         );
     }
 
+    /// §25.19 Vectors 30 and 31 through the bridge's production member
+    /// pseudonym path: with the vector's identity scalar as the host's
+    /// identity key (the §9.10.4.A software ikm), the routing id the bridge
+    /// returns for "context-alpha" is the spec's v1 routing id, compared as
+    /// the spec's hex, not recomputed.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn member_pseudonym_reproduces_spec_25_19_v1_routing_ids() {
+        const VECTORS: [(&str, &str); 2] = [
+            (
+                "32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64",
+                "b7faa05dea2cef1b7aff6a48fa5b7b9ffe217b25f3152d78d597bb9078e98307",
+            ),
+            (
+                "65d56a863d03d31ea15ade82f677058d5bbe53afedc6ff7d2b8846aa25a1bc2b",
+                "cab5ff45d21b6d0425fa7657e89fc68514965cbb4ca2b9549f4ccf430d581e7c",
+            ),
+        ];
+        for (identity_scalar, routing_id) in VECTORS {
+            let provider = ProdLikeCustody::new();
+            let keys = Arc::clone(&provider.keys);
+            let identity = scp_test()
+                .identity_create_with_custody(Box::new(provider))
+                .await
+                .expect("identity_create_with_custody");
+            let handle = identity
+                .core_id
+                .as_ref()
+                .expect("callback identity retains its core id")
+                .identity_key;
+            let scalar: [u8; 32] = hex::decode(identity_scalar)
+                .expect("hex")
+                .try_into()
+                .expect("32 bytes");
+            keys.lock().expect("keystore mutex").insert(
+                handle.id().to_string(),
+                ed25519_dalek::SigningKey::from_bytes(&scalar),
+            );
+            let derived = derive_member_pseudonym_required(&identity, "context-alpha")
+                .await
+                .expect("pseudonym derives");
+            assert_eq!(hex::encode(derived), routing_id);
+        }
+    }
+
     /// A host still returning a 32-byte Ed25519 pseudonym key fails closed with
     /// SCP-IDENT-1055, on the point length.
     #[cfg(feature = "testing")]
@@ -24733,10 +24819,7 @@ mod tests {
     async fn legacy_32_byte_host_pseudonym_is_ident_1055() {
         let (identity, _) = prod_like_identity(PseudonymFault::Legacy32).await;
         match derive_member_pseudonym_required(&identity, "ctx").await {
-            Err(ScpError::Identity { msg, code }) => {
-                assert_eq!(code, codes::IDENT_1055);
-                assert!(msg.contains("got 32 bytes"), "{msg}");
-            }
+            Err(ScpError::Identity { code, .. }) => assert_eq!(code, codes::IDENT_1055),
             other => panic!("expected IDENT_1055, got {other:?}"),
         }
     }
@@ -24748,13 +24831,7 @@ mod tests {
     async fn host_public_key_mismatch_is_ident_1055() {
         let (identity, _) = prod_like_identity(PseudonymFault::WrongPublicKey).await;
         match derive_member_pseudonym_required(&identity, "ctx").await {
-            Err(ScpError::Identity { msg, code }) => {
-                assert_eq!(code, codes::IDENT_1055);
-                assert!(
-                    msg.contains("does not match the derived pseudonym point"),
-                    "{msg}"
-                );
-            }
+            Err(ScpError::Identity { code, .. }) => assert_eq!(code, codes::IDENT_1055),
             other => panic!("expected IDENT_1055, got {other:?}"),
         }
     }
@@ -24765,7 +24842,6 @@ mod tests {
     /// strictly verifies.
     #[tokio::test]
     async fn callback_pseudonym_sign_is_strict() {
-        use std::sync::atomic::Ordering;
         let provider = ProdLikeCustody::new();
         let sign_calls = Arc::clone(&provider.sign_calls);
         let custody = CallbackKeyCustody::new(Box::new(provider));
@@ -24786,13 +24862,13 @@ mod tests {
             .expect("sign digest");
         scp_crypto::p256::verify_prehash_strict(&point, &digest, sig.as_bytes())
             .expect("strict signature under the bound point");
-        let before = sign_calls.load(Ordering::SeqCst);
+        let before = sign_calls.load(std::sync::atomic::Ordering::SeqCst);
         assert!(matches!(
             custody.sign(pseudonym.key_handle(), b"twelve bytes").await,
             Err(PlatformError::CustodyError(_))
         ));
         assert_eq!(
-            sign_calls.load(Ordering::SeqCst),
+            sign_calls.load(std::sync::atomic::Ordering::SeqCst),
             before,
             "a 12-byte input is refused before the host sign call"
         );
@@ -24828,6 +24904,162 @@ mod tests {
         );
         scp_crypto::p256::verify_prehash_strict(&point, &digest, &sig)
             .expect("strict signature under the bound point");
+    }
+
+    /// B1: a host that returns the same key id for the same (identity,
+    /// context) re-binds cleanly; both derives yield the same routing id.
+    #[tokio::test]
+    async fn rederiving_a_pseudonym_reuses_its_key_id() {
+        let custody = CallbackKeyCustody::new(Box::new(ProdLikeCustody::new()));
+        let identity = custody
+            .generate_identity_keypair()
+            .await
+            .expect("identity key");
+        let first = custody
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect("first derive");
+        let second = custody
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect("second derive re-binds");
+        assert_eq!(first.key_handle(), second.key_handle());
+        assert_eq!(first.routing_id(), second.routing_id());
+        let rotated = custody
+            .derive_rotatable_pseudonym(&identity, b"ctx", 3)
+            .await
+            .expect("rotatable derive");
+        assert_ne!(rotated.key_handle(), first.key_handle());
+    }
+
+    /// B3: `destroy_key` retires the handle. A host that reuses key id 777
+    /// for a second point is refused while the first is live, and accepted
+    /// once the first is destroyed.
+    #[tokio::test]
+    async fn destroy_unbinds_a_pseudonym_handle() {
+        let custody = CallbackKeyCustody::new(Box::new(ProdLikeCustody::with_fault(
+            PseudonymFault::FixedId,
+        )));
+        let identity = custody
+            .generate_identity_keypair()
+            .await
+            .expect("identity key");
+        let first = custody
+            .derive_pseudonym(&identity, b"ctx-a")
+            .await
+            .expect("first derive");
+        assert_eq!(first.key_handle().id(), 777);
+        let err = custody
+            .derive_pseudonym(&identity, b"ctx-b")
+            .await
+            .expect_err("id 777 is bound to ctx-a's point");
+        assert!(matches!(err, PlatformError::CustodyError(_)), "{err:?}");
+        custody
+            .destroy_key(first.key_handle())
+            .await
+            .expect("destroy");
+        let second = custody
+            .derive_pseudonym(&identity, b"ctx-b")
+            .await
+            .expect("re-derive under the freed id");
+        assert_eq!(second.key_handle().id(), 777);
+        assert_ne!(second.public_key(), first.public_key());
+    }
+
+    /// §9.15: destroying an identity retires every pseudonym derived from it
+    /// in the adapter. The host's `destroy_key` drops only the identity, so a
+    /// pseudonym still reaching the host would sign; the adapter answers
+    /// `KeyNotFound` with no host call. A host that then reuses the retired
+    /// id 777 for another identity's pseudonym binds it afresh. Removing the
+    /// registry's identity sweep fails both halves.
+    #[tokio::test]
+    async fn identity_destroy_retires_its_pseudonyms() {
+        let host = ProdLikeCustody::with_fault(PseudonymFault::FixedId);
+        let sign_calls = host.sign_calls.clone();
+        let custody = CallbackKeyCustody::new(Box::new(host));
+        let identity = custody
+            .generate_identity_keypair()
+            .await
+            .expect("identity key");
+        let other = custody
+            .generate_identity_keypair()
+            .await
+            .expect("identity key");
+        let first = custody
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect("derive");
+        assert_eq!(first.key_handle().id(), 777);
+        custody.destroy_key(&identity).await.expect("destroy");
+        let before = sign_calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            custody.sign(first.key_handle(), &[0x42u8; 32]).await,
+            Err(PlatformError::KeyNotFound)
+        ));
+        assert!(matches!(
+            custody.public_key(first.key_handle()).await,
+            Err(PlatformError::KeyNotFound)
+        ));
+        assert_eq!(
+            sign_calls.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "no host call"
+        );
+        let second = custody
+            .derive_pseudonym(&other, b"ctx-b")
+            .await
+            .expect("the host reuses id 777");
+        assert_eq!(second.key_handle().id(), 777);
+        assert_ne!(second.public_key(), first.public_key());
+        custody
+            .sign(second.key_handle(), &[0x42u8; 32])
+            .await
+            .expect("the new pseudonym signs");
+    }
+
+    /// D5: the adapter retires a pseudonym handle (`Destroying`) before it
+    /// calls the host's `destroy_key`: a probe inside the host's
+    /// `destroy_key` reads the adapter's registry and finds the handle no
+    /// longer live. Calling the host first leaves the handle live during
+    /// that call, and this fails.
+    #[tokio::test]
+    async fn destroy_unbinds_before_the_host_call() {
+        type Cell = std::sync::OnceLock<std::sync::Weak<CallbackKeyCustody>>;
+        let adapter = Arc::new(Cell::new());
+        let bound_during_host_destroy = Arc::new(std::sync::Mutex::new(None::<bool>));
+        let mut host = ProdLikeCustody::new();
+        let (probe_adapter, probe_seen) = (adapter.clone(), bound_during_host_destroy.clone());
+        host.destroy_probe = Some(Box::new(move |key_id: &str| {
+            let custody = probe_adapter
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .expect("adapter is alive during destroy");
+            let handle = KeyHandle::new(key_id.parse().expect("numeric key id"));
+            *probe_seen.lock().expect("probe mutex") = Some(custody.registry.is_live(&handle));
+        }));
+        let custody = Arc::new(CallbackKeyCustody::new(Box::new(host)));
+        adapter
+            .set(Arc::downgrade(&custody))
+            .expect("cell set once");
+
+        let identity = custody
+            .generate_identity_keypair()
+            .await
+            .expect("identity key");
+        let pseudonym = custody
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect("derive");
+        assert!(custody.registry.is_live(pseudonym.key_handle()));
+        custody
+            .destroy_key(pseudonym.key_handle())
+            .await
+            .expect("destroy");
+        assert_eq!(
+            *bound_during_host_destroy.lock().expect("probe mutex"),
+            Some(false),
+            "the host's destroy_key ran while the handle was still live"
+        );
     }
 
     /// `identity_create_with_custody` must register the callback identity in the

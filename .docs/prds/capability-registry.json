@@ -401,7 +401,7 @@
         "bindings/typescript/src/internal/native.ts",
         "bindings/swift/Sources/SCP/Scp.swift",
         "bindings/swift/Sources/SCP/Internal/ScpBindings.swift",
-        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/SCP.kt",
         ".docs/standards/sdk-capability-matrix.json",
         "crates/scp-testing/tests/integration/pipeline_wiring.rs",
         "crates/scp-protocol/src/trust/mod.rs",

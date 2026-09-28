@@ -242,6 +242,11 @@ public final class AppleKeyCustody: Sendable {
     /// See ADR-025 Biometric gating.
     let biometricPolicy: BiometricPolicy
 
+    /// Runs inside `derivePseudonymKey` after the pseudonym item is stored and
+    /// before the identity is checked again, with the identity handle. Tests
+    /// use it to destroy the identity in that window; production passes `nil`.
+    private let afterPseudonymStore: (@Sendable (_ identityHandle: String) -> Void)?
+
     // MARK: - Keychain item attribute helpers
 
     /// Returns the `kSecAttrAccount` value for a key handle.
@@ -266,12 +271,63 @@ public final class AppleKeyCustody: Sendable {
     ///
     /// See ADR-025 for the access group rationale and Biometric gating for
     /// the biometric policy design.
-    public init(accessGroup: String? = nil, biometricPolicy: BiometricPolicy = .none) {
+    public convenience init(accessGroup: String? = nil, biometricPolicy: BiometricPolicy = .none) {
+        self.init(accessGroup: accessGroup, biometricPolicy: biometricPolicy, afterPseudonymStore: nil)
+    }
+
+    /// Creates a custody that runs `afterPseudonymStore` between a pseudonym's
+    /// store and the identity re-check in `derivePseudonymKey`.
+    init(
+        accessGroup: String?,
+        biometricPolicy: BiometricPolicy,
+        afterPseudonymStore: (@Sendable (_ identityHandle: String) -> Void)?
+    ) {
         self.accessGroup = accessGroup
         self.biometricPolicy = biometricPolicy
+        self.afterPseudonymStore = afterPseudonymStore
     }
 
     // MARK: - Private Keychain helpers
+
+    /// Upper bound on `SecItemDelete` calls in one pseudonym sweep. The
+    /// file-based macOS keychain can delete one match per call; the bound
+    /// keeps a concurrent deriver from holding the sweep in a loop, and the
+    /// re-fetch after the sweep decides whether destruction is confirmed.
+    private static let maxPseudonymSweeps = 4096
+
+    /// `kSecAttrDescription` tag recording the biometric policy an item was
+    /// stored under, so a re-store can tell whether the existing item's
+    /// access control matches the current policy.
+    private nonisolated var policyTag: String {
+        "scp.policy.\(biometricPolicy.rawValue)"
+    }
+
+    /// `kSecAttrService` tag carried by every pseudonym item derived from
+    /// `identityHandle`.
+    private nonisolated func pseudonymOwnerTag(for identityHandle: String) -> String {
+        "scp.pseudonym-of.\(identityHandle)"
+    }
+
+    /// Deletes every pseudonym item tagged with `identityHandle` and returns
+    /// `true` only when a re-fetch finds none left.
+    nonisolated func destroyPseudonyms(of identityHandle: String) throws -> Bool {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: pseudonymOwnerTag(for: identityHandle)
+        ]
+        if let group = accessGroup {
+            query[kSecAttrAccessGroup as String] = group
+        }
+        for _ in 0 ..< Self.maxPseudonymSweeps {
+            let status = SecItemDelete(query as CFDictionary)
+            if status == errSecItemNotFound {
+                break
+            }
+            guard status == errSecSuccess else { throw PlatformError.keychainError(status) }
+        }
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        return SecItemCopyMatching(query as CFDictionary, nil) == errSecItemNotFound
+    }
 
     /// Builds a base Keychain query dictionary for a key handle.
     ///
@@ -370,6 +426,28 @@ public final class AppleKeyCustody: Sendable {
         return keyType
     }
 
+    /// A `SecAccessControl` requiring the currently enrolled biometric set.
+    /// `.biometryCurrentSet` invalidates access if biometrics change (new
+    /// fingerprint enrolled, Face ID reset), which triggers key rotation per
+    /// 9.12. Falls back to device passcode on hardware without biometric
+    /// sensors.
+    private nonisolated func biometricAccessControl(for handle: String) throws -> SecAccessControl {
+        var cfError: Unmanaged<CFError>?
+        guard let accessControl = SecAccessControlCreateWithFlags(
+            nil,
+            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            .biometryCurrentSet,
+            &cfError
+        ) else {
+            let errorDesc = cfError.map { ($0.takeRetainedValue() as Error).localizedDescription }
+                ?? "unknown error"
+            throw PlatformError.custodyError(
+                "Failed to create biometric access control for handle '\(handle)': \(errorDesc)"
+            )
+        }
+        return accessControl
+    }
+
     /// Stores 32-byte raw private key bytes in the Keychain under `handle`.
     ///
     /// The public key bytes are cached in the ``KeyMetadata`` label so that
@@ -385,12 +463,16 @@ public final class AppleKeyCustody: Sendable {
     ///   - handle: The opaque UUID handle that will reference this key.
     ///   - keyType: The ``KeyType`` to tag this item with.
     ///   - publicKeyBytes: The public key bytes (33 bytes for a P-256 pseudonym) to cache in metadata.
+    ///   - ownerIdentity: For a P-256 pseudonym, the identity handle it was
+    ///     derived from; the item is tagged with it so that destroying the
+    ///     identity also destroys the pseudonym (§9.15).
     /// - Throws: ``PlatformError/keychainError(_:)`` if the add operation fails.
     nonisolated func storePrivateKeyBytes(
         _ bytes: Data,
         for handle: String,
         keyType: KeyType,
-        publicKeyBytes: Data
+        publicKeyBytes: Data,
+        ownerIdentity: String? = nil
     ) throws {
         let metadata = KeyMetadata(
             keyType: keyType.rawValue,
@@ -408,51 +490,62 @@ public final class AppleKeyCustody: Sendable {
         var query = baseQuery(for: handle)
         query[kSecAttrLabel as String] = metadataLabel
         query[kSecValueData as String] = bytes as CFData
+        query[kSecAttrDescription as String] = policyTag
+        if let ownerIdentity {
+            query[kSecAttrService as String] = pseudonymOwnerTag(for: ownerIdentity)
+        }
 
         switch biometricPolicy {
         case .none:
             query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
 
         case .required:
-            // Create a SecAccessControl requiring the currently enrolled biometric
-            // set. `.biometryCurrentSet` invalidates access if biometrics change
-            // (new fingerprint enrolled, Face ID reset), which triggers key
-            // rotation per 9.12. Falls back to device passcode on hardware
-            // without biometric sensors.
-            var cfError: Unmanaged<CFError>?
-            guard let accessControl = SecAccessControlCreateWithFlags(
-                nil,
-                kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-                .biometryCurrentSet,
-                &cfError
-            ) else {
-                let errorDesc = cfError.map { ($0.takeRetainedValue() as Error).localizedDescription }
-                    ?? "unknown error"
-                throw PlatformError.custodyError(
-                    "Failed to create biometric access control for handle '\(handle)': \(errorDesc)"
-                )
-            }
-            query[kSecAttrAccessControl as String] = accessControl
+            query[kSecAttrAccessControl as String] = try biometricAccessControl(for: handle)
         }
-
         let status = SecItemAdd(query as CFDictionary, nil)
         switch status {
         case errSecSuccess:
             break
         case errSecDuplicateItem:
-            // For deterministic handles (pseudonym derivation), the item may
-            // already exist with different access control. Delete and re-add
-            // to ensure correct biometric policy is applied.
-            let deleteStatus = SecItemDelete(baseQuery(for: handle) as CFDictionary)
-            guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
-                throw PlatformError.keychainError(deleteStatus)
-            }
-            let retryStatus = SecItemAdd(query as CFDictionary, nil)
-            guard retryStatus == errSecSuccess else {
-                throw PlatformError.keychainError(retryStatus)
-            }
+            try keepOrReplaceExisting(handle: handle, query: query, ownerIdentity: ownerIdentity)
         default:
             throw PlatformError.keychainError(status)
+        }
+    }
+
+    /// Resolves an `errSecDuplicateItem` from storing `query` under `handle`.
+    ///
+    /// A deterministic handle (pseudonym derivation) re-derives the same
+    /// scalar, so an existing item stored under the current policy for the
+    /// same owner already holds these bytes. It is kept: deleting and re-adding
+    /// would leave a window in which a concurrent `sign` finds no item. An item
+    /// stored under another policy is replaced, so the current biometric policy
+    /// applies to it.
+    private nonisolated func keepOrReplaceExisting(
+        handle: String,
+        query: [String: Any],
+        ownerIdentity: String?
+    ) throws {
+        var existing = baseQuery(for: handle)
+        existing[kSecAttrDescription as String] = policyTag
+        if let ownerIdentity {
+            existing[kSecAttrService as String] = pseudonymOwnerTag(for: ownerIdentity)
+        }
+        existing[kSecMatchLimit as String] = kSecMatchLimitOne
+        let matchStatus = SecItemCopyMatching(existing as CFDictionary, nil)
+        if matchStatus == errSecSuccess {
+            return
+        }
+        guard matchStatus == errSecItemNotFound else {
+            throw PlatformError.keychainError(matchStatus)
+        }
+        let deleteStatus = SecItemDelete(baseQuery(for: handle) as CFDictionary)
+        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+            throw PlatformError.keychainError(deleteStatus)
+        }
+        let retryStatus = SecItemAdd(query as CFDictionary, nil)
+        guard retryStatus == errSecSuccess else {
+            throw PlatformError.keychainError(retryStatus)
         }
     }
 }
@@ -491,8 +584,9 @@ extension AppleKeyCustody {
             ))
             defer { contextSeed.resetBytes(in: 0 ..< contextSeed.count) }
 
-            let pseudonymKey = try P256Pseudonym.privateKey(contextSeed: contextSeed)
-            let publicKey = pseudonymKey.publicKey.compressedRepresentation
+            var scalar = try P256Pseudonym.scalar(contextSeed: contextSeed)
+            defer { scalar.resetBytes(in: 0 ..< scalar.count) }
+            let publicKey = try P256Pseudonym.publicKey(scalar: scalar)
 
             // Deterministic handle: HMAC-SHA256(identity_handle_utf8, handleMessage).
             // Same inputs -> same handle -> same Keychain slot. No accumulation.
@@ -501,11 +595,22 @@ extension AppleKeyCustody {
             )).map { String(format: "%02x", $0) }.joined()
 
             try storePrivateKeyBytes(
-                pseudonymKey.rawRepresentation,
+                scalar,
                 for: handle,
                 keyType: .p256Pseudonym,
-                publicKeyBytes: publicKey
+                publicKeyBytes: publicKey,
+                ownerIdentity: identityHandle
             )
+            afterPseudonymStore?(identityHandle)
+            // A destroyKey(identityHandle) that ran between the seed read and
+            // the store has already swept this identity's pseudonyms, so this
+            // item would outlive its identity: remove it and fail.
+            do {
+                _ = try fetchMetadata(for: identityHandle)
+            } catch {
+                _ = SecItemDelete(baseQuery(for: handle) as CFDictionary)
+                throw error
+            }
             return PseudonymResult(publicKey: publicKey, keyId: handle)
         } catch let platformErr as PlatformError {
             throw platformErr
@@ -592,7 +697,8 @@ public extension AppleKeyCustody {
     ///   unknown, ``PlatformError/biometricAuthenticationFailed(_:)`` if
     ///   biometric gating is active and authentication fails,
     ///   ``PlatformError/keychainError(_:)`` for Keychain failures,
-    ///   ``PlatformError/custodyError(_:)`` if CryptoKit rejects the key bytes.
+    ///   ``PlatformError/custodyError(_:)`` if CryptoKit or the Rust P-256
+    ///   signer rejects the key bytes.
     ///
     /// See ADR-025 Key custody and ADR-006 `sign`.
     @concurrent
@@ -609,8 +715,7 @@ public extension AppleKeyCustody {
 
         do {
             if storedType == .p256Pseudonym {
-                let pseudonymKey = try P256.Signing.PrivateKey(rawRepresentation: privateKeyBytes)
-                return try P256Pseudonym.signPrehash(key: pseudonymKey, digest: data)
+                return try P256Pseudonym.signPrehash(scalar: privateKeyBytes, digest: data)
             }
             let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: privateKeyBytes)
             return try signingKey.signature(for: data)
@@ -618,7 +723,8 @@ public extension AppleKeyCustody {
             throw platformErr
         } catch {
             throw PlatformError.custodyError(
-                "Ed25519 signing failed for handle '\(keyHandle)': \(error.localizedDescription)"
+                "\(storedType == .p256Pseudonym ? "P-256 pseudonym" : "Ed25519") signing failed for handle "
+                    + "'\(keyHandle)': \(error.localizedDescription)"
             )
         }
     }
@@ -675,8 +781,7 @@ public extension AppleKeyCustody {
                 )
                 return agreementKey.publicKey.rawRepresentation
             case .p256Pseudonym:
-                let pseudonymKey = try P256.Signing.PrivateKey(rawRepresentation: privateKeyBytes)
-                return pseudonymKey.publicKey.compressedRepresentation
+                return try P256Pseudonym.publicKey(scalar: privateKeyBytes)
             }
         } catch let platformErr as PlatformError {
             throw platformErr
@@ -689,15 +794,19 @@ public extension AppleKeyCustody {
 
     // MARK: destroyKey
 
-    /// Deletes the Keychain item for `keyHandle` and returns a destruction
-    /// attestation after confirming the item is gone.
+    /// Deletes the Keychain item for `keyHandle`, and every P-256 pseudonym
+    /// derived from it, and returns a destruction attestation after
+    /// confirming that none of them remain.
     ///
     /// ## Deletion verification
     ///
     /// After `SecItemDelete` succeeds, this method performs a re-fetch to
     /// confirm the item is no longer present. If the item still exists (i.e.,
     /// the re-fetch returns anything other than `errSecItemNotFound`), the
-    /// method throws ``PlatformError/destructionFailed(_:)``.
+    /// method throws ``PlatformError/destructionFailed(_:)``. The same holds
+    /// for the pseudonym items tagged with `keyHandle`: they are deleted
+    /// whether or not the identity item was found, and any survivor fails
+    /// the destruction.
     ///
     /// ## Attestation
     ///
@@ -721,6 +830,7 @@ public extension AppleKeyCustody {
     func destroyKey(_ keyHandle: String) async throws -> DestructionAttestation {
         let deleteQuery = baseQuery(for: keyHandle)
         let deleteStatus = SecItemDelete(deleteQuery as CFDictionary)
+        let pseudonymsGone = try destroyPseudonyms(of: keyHandle)
 
         switch deleteStatus {
         case errSecSuccess:
@@ -739,8 +849,8 @@ public extension AppleKeyCustody {
         var verifyResult: AnyObject?
         let verifyStatus = SecItemCopyMatching(verifyQuery as CFDictionary, &verifyResult)
 
-        guard verifyStatus == errSecItemNotFound else {
-            // Item still present -- destruction cannot be confirmed.
+        guard verifyStatus == errSecItemNotFound, pseudonymsGone else {
+            // An item is still present -- destruction cannot be confirmed.
             throw PlatformError.destructionFailed(keyHandle)
         }
 
@@ -859,7 +969,8 @@ public extension AppleKeyCustody {
     // MARK: deriveRotatablePseudonym
 
     /// Derives the deterministic, context-scoped, epoch-rotatable P-256
-    /// pseudonym of an Ed25519 identity key (spec §9.10.4.1).
+    /// pseudonym of an Ed25519 identity key (rotation per spec §9.10.4.1,
+    /// derivation per §9.10.4.A).
     ///
     /// Identical to ``derivePseudonym(_:contextId:)`` except step 3:
     /// `context_seed = HMAC-SHA256(pseudonym_secret,

@@ -30,8 +30,6 @@ use ::p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use ::p256::elliptic_curve::bigint::{NonZero, U256, U384};
 use ::p256::elliptic_curve::sec1::ToEncodedPoint;
 use ::p256::{NonZeroScalar, PublicKey};
-use hkdf::Hkdf;
-use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
 /// Length of a SEC1 compressed P-256 point (the signature-verification key
@@ -249,15 +247,11 @@ impl P256SigningKey {
 ///
 /// # Errors
 ///
-/// [`P256Error::ScalarDerivationFailed`]. HKDF-Expand fails only for a PRK
-/// shorter than 32 bytes or an output longer than 8160 bytes, and the result
-/// lies in `[1, n − 1]` by construction, so this is unreachable; it stays a
-/// typed error rather than a panic.
+/// [`P256Error::ScalarDerivationFailed`]. The expansion length is fixed at
+/// compile time and the result lies in `[1, n − 1]` by construction, so this
+/// is unreachable; it stays a typed error rather than a panic.
 pub fn seed_to_scalar(label: &[u8], seed: &[u8; 32]) -> Result<NonZeroScalar, P256Error> {
-    let hk = Hkdf::<Sha256>::from_prk(seed).map_err(|_| P256Error::ScalarDerivationFailed)?;
-    let mut okm = Zeroizing::new([0u8; 48]);
-    hk.expand(label, okm.as_mut())
-        .map_err(|_| P256Error::ScalarDerivationFailed)?;
+    let okm = crate::kdf::hkdf_expand::<48>(seed, label);
 
     let mut wide = U384::from_be_slice(okm.as_ref());
     let mut reduced = wide.rem(&N_MINUS_ONE);
@@ -701,26 +695,6 @@ mod tests {
             assert_eq!(P256PublicKey::from_sec1(&pk.to_compressed()).unwrap(), pk);
             assert_eq!(P256PublicKey::from_sec1(&pk.to_uncompressed()).unwrap(), pk);
         }
-    }
-
-    /// RFC 5869 Appendix A.1 (HKDF-SHA256), pinning the `hkdf` crate that
-    /// [`seed_to_scalar`] and the pseudonym secret rest on.
-    #[test]
-    fn rfc5869_a1_hkdf_sha256() {
-        let ikm = [0x0bu8; 22];
-        let salt: [u8; 13] = h("000102030405060708090a0b0c");
-        let info: [u8; 10] = h("f0f1f2f3f4f5f6f7f8f9");
-        let (prk, hk) = Hkdf::<Sha256>::extract(Some(&salt), &ikm);
-        assert_eq!(
-            hex::encode(prk),
-            "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
-        );
-        let mut okm = [0u8; 42];
-        hk.expand(&info, &mut okm).unwrap();
-        assert_eq!(
-            hex::encode(okm),
-            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
-        );
     }
 
     #[test]

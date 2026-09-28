@@ -25,10 +25,10 @@
 //! private key bytes, never from a public key. A public-key-keyed derivation
 //! would be a membership enumeration oracle.
 
-use hkdf::Hkdf;
-use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
+
+use crate::kdf::{hkdf_expand, hkdf_extract, hmac_sha256};
 
 use crate::p256::{COMPRESSED_POINT_LEN, P256Error, P256SigningKey};
 
@@ -48,52 +48,33 @@ pub const PSEUDONYM_SCALAR_LABEL: &[u8] = b"SCP-PSEUDONYM-P256-V1";
 pub const PSEUDONYM_ROUTING_PREFIX: &[u8] = b"scp-pseudonym-routing-v1:";
 
 /// Derives the `pseudonym_secret` from 32 bytes of private key material via
-/// HKDF-SHA-256 (§9.10.4.A).
-///
-/// # Panics
-///
-/// Never in practice. The single `assert!` guards an infallible invariant:
-/// HKDF-Expand with a 32-byte output length cannot fail (32 ≤ 255 · `HashLen`).
+/// HKDF-SHA-256 (§9.10.4.A). The PRK and the output block wipe on drop.
 #[must_use]
 pub fn derive_pseudonym_secret(ikm: &Zeroizing<[u8; 32]>) -> Zeroizing<[u8; 32]> {
-    let hk = Hkdf::<Sha256>::new(Some(PSEUDONYM_SECRET_SALT), ikm.as_ref());
-    let mut secret = Zeroizing::new([0u8; 32]);
-    assert!(
-        hk.expand(b"", secret.as_mut()).is_ok(),
-        "HKDF-Expand with 32-byte output is infallible"
-    );
-    secret
+    let prk = hkdf_extract(PSEUDONYM_SECRET_SALT, ikm.as_ref());
+    hkdf_expand::<32>(&prk, b"")
 }
 
 /// Computes the per-context `context_seed` (§9.10.4 v1, §9.10.4.1 v2).
-///
-/// # Panics
-///
-/// Never in practice: HMAC-SHA-256 accepts a key of any length.
 fn context_seed(
     pseudonym_secret: &Zeroizing<[u8; 32]>,
     context_id: &[u8],
     epoch: Option<u64>,
 ) -> Zeroizing<[u8; 32]> {
-    // hmac 0.13 with `zeroize`: the keyed inner/outer SHA-256 states wipe on drop.
-    let mac_result = <Hmac<Sha256> as KeyInit>::new_from_slice(pseudonym_secret.as_slice());
-    assert!(mac_result.is_ok(), "HMAC-SHA256 accepts keys of any length");
-    let mut seed = Zeroizing::new([0u8; 32]);
-    if let Ok(mut mac) = mac_result {
-        mac.update(context_id);
-        match epoch {
-            None => mac.update(PSEUDONYM_V1_DOMAIN),
-            Some(e) => {
-                mac.update(&e.to_be_bytes());
-                mac.update(PSEUDONYM_V2_DOMAIN);
-            }
-        }
-        // `CtOutput` zeroizes on drop; the extracted array is wiped explicitly.
-        let mut hmac_bytes = mac.finalize().into_bytes();
-        seed.copy_from_slice(&hmac_bytes[..32]);
-        hmac_bytes.as_mut_slice().zeroize();
-    }
-    seed
+    epoch.map_or_else(
+        || {
+            hmac_sha256(
+                pseudonym_secret.as_ref(),
+                &[context_id, PSEUDONYM_V1_DOMAIN],
+            )
+        },
+        |e| {
+            hmac_sha256(
+                pseudonym_secret.as_ref(),
+                &[context_id, &e.to_be_bytes(), PSEUDONYM_V2_DOMAIN],
+            )
+        },
+    )
 }
 
 /// Derives the per-context P-256 pseudonym key from identity private key
@@ -130,7 +111,7 @@ mod tests {
     use super::*;
 
     /// Compile-time pin for review item "zeroize HMAC/HKDF state": the SHA-256
-    /// core that `Hmac<Sha256>` and `Hkdf<Sha256>` key with the pseudonym
+    /// core that `Hmac<Sha256>` (inside `crate::kdf`) keys with the pseudonym
     /// secret or PRK, the block buffer, and the MAC output all wipe on drop.
     /// Dropping the `zeroize` feature from sha2/hmac fails this to compile.
     #[test]
@@ -140,7 +121,7 @@ mod tests {
         assert_zod::<
             hmac::digest::block_api::Buffer<<Sha256 as hmac::digest::block_api::CoreProxy>::Core>,
         >();
-        assert_zod::<hmac::digest::CtOutput<Hmac<Sha256>>>();
+        assert_zod::<hmac::digest::CtOutput<hmac::Hmac<Sha256>>>();
     }
 
     fn h<const N: usize>(s: &str) -> [u8; N] {

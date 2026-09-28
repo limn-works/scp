@@ -16,11 +16,13 @@ ed25519-dalek = { workspace = true }
 # per-context keypair derivation. All pure RustCrypto primitives already in the
 # wasm tree, so `scp-crypto` stays wasm-safe with the derivation moved here.
 #
-# scp-crypto pins the RustCrypto 0.13/0.11 line instead of the workspace's
-# hkdf 0.12 / hmac 0.12 / sha2 0.10, because only the newer line zeroizes the
-# HMAC and hash state (`zeroize` features) that holds the pseudonym secret and
-# the seed_to_scalar PRK. No type from these crates crosses scp-crypto's API.
-hkdf = "0.13"
+# scp-crypto pins the RustCrypto hmac 0.13 / sha2 0.11 line instead of the
+# workspace's hmac 0.12 / sha2 0.10, because only the newer line wipes the keyed
+# HMAC and hash state (`zeroize` features). HKDF is hand-written on Hmac<Sha256>
+# (src/kdf.rs) so the PRK and every T(i) block sit in Zeroizing buffers; the
+# hkdf crate leaves them unwiped. Wiping is best effort: compiler-made copies in
+# registers or spilled stack slots are out of reach. No type from these crates
+# crosses scp-crypto's API.
 hmac = { version = "0.13", features = ["zeroize"] }
 sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
 zeroize = { workspace = true }
@@ -36,6 +38,8 @@ thiserror = { workspace = true }
 getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
+# RFC 5869 A.1-A.3 equivalence test for the hand-written HKDF (src/kdf.rs).
+hkdf = "0.13"
 rand = { workspace = true }
 hex = { workspace = true }
 proptest = "1"

@@ -83,14 +83,17 @@ pub struct NapiKeyCustodyProvider {
     /// `(keyId: string, contextId: Uint8Array) => { publicKey, keyId }` —
     /// the §9.10.4 v1 pseudonym: `publicKey` is the 33-byte compressed P-256
     /// point and `keyId` the numeric handle of the pseudonym key. The bridge
-    /// requires `getPublicKey(keyId)` to return the same 33 bytes.
+    /// requires `getPublicKey(keyId)` to return the same 33 bytes. The same
+    /// (`keyId`, `contextId`) MUST return the same pseudonym `keyId` on every
+    /// call, so re-deriving names one key rather than minting another.
     #[napi(
         ts_type = "(keyId: string, contextId: Uint8Array) => { publicKey: Uint8Array; keyId: string }"
     )]
     pub derive_pseudonym: Function<'static, (String, Vec<u8>), NapiPseudonymResult>,
     /// `(keyId: string, contextId: Uint8Array, pseudonymEpoch: bigint) => { publicKey, keyId }`
     /// — the §9.10.4 rotatable v2 pseudonym, same return shape as
-    /// `derivePseudonym`. The provider performs the canonical derivation
+    /// `derivePseudonym`; the same (`keyId`, `contextId`, `pseudonymEpoch`)
+    /// MUST return the same pseudonym `keyId`. The provider performs the canonical derivation
     /// (HMAC key is the private-derived `pseudonym_secret`, domain
     /// `"scp-pseudonym-v2"`); the bridge does NOT synthesize the preimage.
     #[napi(
@@ -375,7 +378,7 @@ pub(crate) struct CallbackAdapter<H> {
     host: H,
     /// Every handle's type, role and life-cycle state, resolved through the
     /// host's structured `getPublicKey` for handles this adapter did not mint.
-    registry: CallbackKeyRegistry,
+    pub(crate) registry: CallbackKeyRegistry,
 }
 
 /// The adapter over the JS callbacks.
@@ -879,7 +882,9 @@ mod tests {
     /// is covered in plain `cargo test`.
     #[tokio::test]
     async fn napi_key_custody_in_memory_dispatch() {
-        let custody = NapiKeyCustody::InMemory(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let custody = NapiKeyCustody::InMemory(OpaqueInMemoryKeyCustody(Box::new(
+            InMemoryKeyCustody::new(),
+        )));
         let handle = custody
             .generate_keypair(KeyType::Ed25519)
             .await
@@ -905,7 +910,9 @@ mod tests {
     /// locally too — covered by the inherent test below).
     #[tokio::test]
     async fn napi_key_custody_in_memory_ephemeral_seed() {
-        let custody = NapiKeyCustody::InMemory(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let custody = NapiKeyCustody::InMemory(OpaqueInMemoryKeyCustody(Box::new(
+            InMemoryKeyCustody::new(),
+        )));
         let seed = custody
             .generate_ephemeral_ed25519_seed()
             .await

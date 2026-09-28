@@ -128,11 +128,28 @@ class CryptoKeychain implements KeyCustodyProvider {
     return seed;
   }
 
-  // Register the §9.10.4.A P-256 pseudonym of a context seed as a new key.
+  // The pseudonym key id for (identity, context, epoch): the provider contract
+  // requires the same inputs to name the same key. The top bit keeps it clear
+  // of the small sequential identity ids.
+  static #pseudonymKeyId(identity: string, contextId: Uint8Array, epoch?: bigint): string {
+    const h = crypto.createHash("sha256");
+    const identityBytes = Buffer.from(identity, "utf8");
+    const lengths = Buffer.alloc(8);
+    lengths.writeUInt32BE(identityBytes.length, 0);
+    lengths.writeUInt32BE(contextId.length, 4);
+    h.update("fake-keychain-pseudonym-id").update(lengths).update(identityBytes).update(contextId);
+    if (epoch !== undefined) {
+      const be = Buffer.alloc(8);
+      be.writeBigUInt64BE(epoch);
+      h.update(be);
+    }
+    return (h.digest().readBigUInt64BE(0) | (1n << 63n)).toString();
+  }
+
+  // Register the §9.10.4.A P-256 pseudonym of a context seed under `keyId`.
   // Native software custody keys the recipe on the Ed25519 identity seed.
-  #registerPseudonym(contextSeed: Uint8Array): PseudonymResult {
+  #registerPseudonym(contextSeed: Uint8Array, keyId: string): PseudonymResult {
     const d = pseudonymScalar(contextSeed);
-    const keyId = String(this.#next++);
     this.#pseudonyms.set(keyId, d);
     const point = p256Compressed(d);
     // A host still on the retired 32-byte Ed25519 pseudonym shape.
@@ -141,7 +158,10 @@ class CryptoKeychain implements KeyCustodyProvider {
   }
 
   derivePseudonym(keyId: string, contextId: Uint8Array): PseudonymResult {
-    return this.#registerPseudonym(pseudonymSeedV1(this.#identitySeed(keyId), contextId));
+    return this.#registerPseudonym(
+      pseudonymSeedV1(this.#identitySeed(keyId), contextId),
+      CryptoKeychain.#pseudonymKeyId(keyId, contextId),
+    );
   }
 
   deriveRotatablePseudonym(
@@ -151,6 +171,7 @@ class CryptoKeychain implements KeyCustodyProvider {
   ): PseudonymResult {
     return this.#registerPseudonym(
       pseudonymSeedV2(this.#identitySeed(keyId), contextId, pseudonymEpoch),
+      CryptoKeychain.#pseudonymKeyId(keyId, contextId, pseudonymEpoch),
     );
   }
 
@@ -199,11 +220,8 @@ if (!scpAvailable) {
 
     // §9.10.4: the bridge fails closed on a host pseudonym it cannot trust —
     // a retired 32-byte key, or a key id whose getPublicKey disagrees with the
-    // point the derivation returned — with SCP-IDENT-1055 and the cause.
-    for (const [fault, cause] of [
-      ["legacy32", "33-byte compressed P-256 point, got 32 bytes"],
-      ["wrongPublicKey", "does not match the derived pseudonym point"],
-    ] as const) {
+    // point the derivation returned — with SCP-IDENT-1055.
+    for (const fault of ["legacy32", "wrongPublicKey"] as const) {
       test(`an encrypted context create fails with SCP-IDENT-1055 on host fault ${fault}`, async () => {
         const scp = new SCP({ storage: { type: "in_memory" } });
         try {
@@ -219,7 +237,6 @@ if (!scpAvailable) {
           }
           expect(caught).toBeInstanceOf(ScpError);
           expect((caught as ScpError).code).toBe("SCP-IDENT-1055");
-          expect((caught as ScpError).message).toContain(cause);
         } finally {
           await scp.shutdown(1000).catch(() => {});
         }

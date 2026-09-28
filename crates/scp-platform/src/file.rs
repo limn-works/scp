@@ -83,6 +83,7 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 use crate::error::PlatformError;
+use crate::pseudonym_keys::PseudonymKeys;
 use crate::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
     Signature,
@@ -439,8 +440,9 @@ pub struct FileKeyCustody {
     handle_map: Mutex<HandleMap>,
     /// Counter for allocating new handle IDs.
     next_id: AtomicU64,
-    /// In-memory store for derived pseudonym keys (not persisted to disk).
-    pseudonym_keys: Mutex<HashMap<u64, P256SigningKey>>,
+    /// In-memory store for derived pseudonym keys, each owned by its
+    /// identity (not persisted to disk).
+    pseudonym_keys: Mutex<PseudonymKeys>,
     /// Serializes file read-modify-write operations to prevent data races
     /// when multiple tasks call `append_entry` concurrently.
     file_write_lock: StdMutex<()>,
@@ -491,7 +493,7 @@ impl FileKeyCustody {
             mac_key,
             handle_map: Mutex::new(HandleMap::new()),
             next_id: AtomicU64::new(1),
-            pseudonym_keys: Mutex::new(HashMap::new()),
+            pseudonym_keys: Mutex::new(PseudonymKeys::default()),
             file_write_lock: StdMutex::new(()),
         })
     }
@@ -540,7 +542,7 @@ impl FileKeyCustody {
             mac_key,
             handle_map: Mutex::new(handle_map),
             next_id: AtomicU64::new(next_id),
-            pseudonym_keys: Mutex::new(HashMap::new()),
+            pseudonym_keys: Mutex::new(PseudonymKeys::default()),
             file_write_lock: StdMutex::new(()),
         })
     }
@@ -754,6 +756,46 @@ impl FileKeyCustody {
         KeyHandle::new(id)
     }
 
+    /// The §9.10.4 P-256 pseudonym of identity `key_id` in `context_id` at
+    /// `epoch` (`None` for v1), held in memory only. A re-derive returns the
+    /// handle already in the slot. The insert happens under `handle_map` and
+    /// only while the identity is still there, so a derive that raced the
+    /// identity's `destroy_key` fails with `KeyNotFound` instead of leaving a
+    /// pseudonym behind.
+    async fn derive_p256_pseudonym(
+        &self,
+        key_id: u64,
+        context_id: &[u8],
+        epoch: Option<u64>,
+    ) -> Result<PseudonymKeypair, PlatformError> {
+        // Software custody (§9.10.4.A): the ikm is the identity private
+        // seed, never the public key. Only an identity key derives, and
+        // until S12 (§9.10.4.A native interim) it is Ed25519, so its
+        // 32-byte seed is the ikm.
+        let ikm = self.derive_source(key_id).await?;
+        let pseudonym_key = derive_pseudonym_keypair(&ikm, context_id, epoch)
+            .map_err(|e| PlatformError::CustodyError(format!("pseudonym derivation: {e}")))?;
+
+        // Lock order: `handle_map`, then `pseudonym_keys`, as in `destroy_key`.
+        let map = self.handle_map.lock().await;
+        if !map.entries.contains_key(&key_id) {
+            return Err(PlatformError::KeyNotFound);
+        }
+        let mut pseudonyms = self.pseudonym_keys.lock().await;
+        if let Some((existing, public_key)) = pseudonyms.existing(key_id, context_id, epoch) {
+            drop(pseudonyms);
+            drop(map);
+            return PseudonymKeypair::new(&public_key, KeyHandle::new(existing));
+        }
+        let public_key = pseudonym_key.public_key().to_compressed();
+        let pseudo_handle = self.next_handle();
+        pseudonyms.insert(key_id, context_id, epoch, pseudo_handle.id(), pseudonym_key);
+        drop(pseudonyms);
+        drop(map);
+
+        PseudonymKeypair::new(&public_key, pseudo_handle)
+    }
+
     /// Decrypts an Ed25519 signing key from the file for the given handle.
     ///
     /// Holds the `handle_map` lock across both the lookup and the file read to
@@ -792,7 +834,7 @@ impl FileKeyCustody {
     async fn load_key(&self, key_id: u64) -> Result<LoadedKey, PlatformError> {
         {
             let pseudonyms = self.pseudonym_keys.lock().await;
-            if let Some(key) = pseudonyms.get(&key_id) {
+            if let Some(key) = pseudonyms.get(key_id) {
                 return Ok(LoadedKey::P256(KeyType::P256Signing, key.clone()));
             }
         }
@@ -985,12 +1027,12 @@ impl KeyCustody for FileKeyCustody {
 
             // Pseudonym keys are in-memory only — no disk rewrite needed.
             // Check them under the held `handle_map` lock so destroy_key
-            // is atomic with concurrent map readers.
-            {
-                let mut pseudonyms = self.pseudonym_keys.lock().await;
-                if pseudonyms.remove(&key_id).is_some() {
-                    return Ok(());
-                }
+            // is atomic with concurrent map readers. The guard stays held
+            // to the end, so an identity's pseudonyms go in the same
+            // critical section as the identity.
+            let mut pseudonyms = self.pseudonym_keys.lock().await;
+            if pseudonyms.remove(key_id) {
+                return Ok(());
             }
 
             // Look up — do NOT mutate the map yet. Map mutation is
@@ -1083,6 +1125,11 @@ impl KeyCustody for FileKeyCustody {
                     *entry_index -= 1;
                 }
             }
+            // Every pseudonym derived from this identity goes with it
+            // (§9.15). A derive inserts only while holding `handle_map` and
+            // finding its identity there, so none can land after this.
+            pseudonyms.remove_identity(key_id);
+            drop(pseudonyms);
             drop(map);
 
             Ok(())
@@ -1122,24 +1169,7 @@ impl KeyCustody for FileKeyCustody {
     ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
         let key_id = key.id();
         let context_id = context_id.to_vec();
-        async move {
-            // Software custody (§9.10.4.A): the ikm is the identity private
-            // seed, never the public key. Only an identity key derives, and
-            // until S12 (§9.10.4.A native interim) it is Ed25519, so its
-            // 32-byte seed is the ikm.
-            let ikm = self.derive_source(key_id).await?;
-            let pseudonym_key = derive_pseudonym_keypair(&ikm, &context_id, None)
-                .map_err(|e| PlatformError::CustodyError(format!("pseudonym derivation: {e}")))?;
-            let public_key = pseudonym_key.public_key().to_compressed();
-
-            // Pseudonym keys are software-managed and held in memory only.
-            let pseudo_handle = self.next_handle();
-            let mut pseudonyms = self.pseudonym_keys.lock().await;
-            pseudonyms.insert(pseudo_handle.id(), pseudonym_key);
-            drop(pseudonyms);
-
-            PseudonymKeypair::new(&public_key, pseudo_handle)
-        }
+        async move { self.derive_p256_pseudonym(key_id, &context_id, None).await }
     }
 
     fn derive_rotatable_pseudonym(
@@ -1151,22 +1181,8 @@ impl KeyCustody for FileKeyCustody {
         let key_id = key.id();
         let context_id = context_id.to_vec();
         async move {
-            // Software custody (§9.10.4.A): the ikm is the identity private
-            // seed, never the public key. Only an identity key derives, and
-            // until S12 (§9.10.4.A native interim) it is Ed25519, so its
-            // 32-byte seed is the ikm.
-            let ikm = self.derive_source(key_id).await?;
-            let pseudonym_key = derive_pseudonym_keypair(&ikm, &context_id, Some(pseudonym_epoch))
-                .map_err(|e| PlatformError::CustodyError(format!("pseudonym derivation: {e}")))?;
-            let public_key = pseudonym_key.public_key().to_compressed();
-
-            // Pseudonym keys are software-managed and held in memory only.
-            let pseudo_handle = self.next_handle();
-            let mut pseudonyms = self.pseudonym_keys.lock().await;
-            pseudonyms.insert(pseudo_handle.id(), pseudonym_key);
-            drop(pseudonyms);
-
-            PseudonymKeypair::new(&public_key, pseudo_handle)
+            self.derive_p256_pseudonym(key_id, &context_id, Some(pseudonym_epoch))
+                .await
         }
     }
 
@@ -2262,5 +2278,16 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn identity_destroy_removes_its_pseudonyms() {
+        let dir = TempDir::new().unwrap();
+        crate::pseudonym_keys::tests::check_identity_owns_pseudonyms(&make_custody(
+            &dir,
+            "passphrase",
+        ))
+        .await
+        .unwrap();
     }
 }

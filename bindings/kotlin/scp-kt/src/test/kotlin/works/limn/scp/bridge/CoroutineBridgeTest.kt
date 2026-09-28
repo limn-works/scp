@@ -143,16 +143,18 @@ class CoroutineBridgeTest {
             runTest(ioDispatcher) {
                 stubBindings.contextCreateResult = 13L
                 val rules = h15TypedRulesFixture()
-                val config = works.limn.scp.ConsequenceConfig(
-                    allowAutomaticAccessRevocation = true,
-                )
+                val config =
+                    works.limn.scp.ConsequenceConfig(
+                        allowAutomaticAccessRevocation = true,
+                    )
 
-                val handle = bridge.context.create(
-                    identityHandle = 1L,
-                    paramsJson = """{"ceiling":["read"]}""",
-                    consequenceRules = rules,
-                    consequenceConfig = config,
-                )
+                val handle =
+                    bridge.context.create(
+                        identityHandle = 1L,
+                        paramsJson = """{"ceiling":["read"]}""",
+                        consequenceRules = rules,
+                        consequenceConfig = config,
+                    )
                 assertEquals(13L, handle)
 
                 val rulesJson = stubBindings.lastConsequenceRulesJson
@@ -841,37 +843,42 @@ class CoroutineBridgeTest {
 // ---------------------------------------------------------------------------
 
 private fun h15TypedRulesFixture(): List<works.limn.scp.ConsequenceRule> {
-    val velocity = works.limn.scp.ConsequenceRule(
-        trigger = works.limn.scp.ConsequenceTrigger.MessageVelocity,
-        action = works.limn.scp.ConsequenceAction.Enforcement(
-            works.limn.scp.EnforcementSeverity.SuspendCapability(
-                listOf(
-                    works.limn.scp.ConsequenceCapability.Unit("MessagesWrite"),
-                    works.limn.scp.ConsequenceCapability.OutletCall("calculator"),
-                    works.limn.scp.ConsequenceCapability.Custom("my-custom-cap"),
+    val velocity =
+        works.limn.scp.ConsequenceRule(
+            trigger = works.limn.scp.ConsequenceTrigger.MessageVelocity,
+            action =
+                works.limn.scp.ConsequenceAction.Enforcement(
+                    works.limn.scp.EnforcementSeverity.SuspendCapability(
+                        listOf(
+                            works.limn.scp.ConsequenceCapability.Unit("MessagesWrite"),
+                            works.limn.scp.ConsequenceCapability.OutletCall("calculator"),
+                            works.limn.scp.ConsequenceCapability.Custom("my-custom-cap"),
+                        ),
+                    ),
                 ),
-            ),
-        ),
-        threshold = 5,
-        windowSecs = 3600,
-    )
-    val custom = works.limn.scp.ConsequenceRule(
-        trigger = works.limn.scp.ConsequenceTrigger.Custom("spammy"),
-        action = works.limn.scp.ConsequenceAction.AssignRole("viewer"),
-        threshold = 3,
-        windowSecs = 600,
-    )
-    val warning = works.limn.scp.ConsequenceRule(
-        trigger = works.limn.scp.ConsequenceTrigger.WarningCount,
-        action = works.limn.scp.ConsequenceAction.Enforcement(
-            works.limn.scp.EnforcementSeverity.RevokeAccess(
-                did = "did:dht:z6MkSubject",
-                access = works.limn.scp.AccessScope.BOTH,
-            ),
-        ),
-        threshold = 10,
-        windowSecs = 86_400,
-    )
+            threshold = 5,
+            windowSecs = 3600,
+        )
+    val custom =
+        works.limn.scp.ConsequenceRule(
+            trigger = works.limn.scp.ConsequenceTrigger.Custom("spammy"),
+            action = works.limn.scp.ConsequenceAction.AssignRole("viewer"),
+            threshold = 3,
+            windowSecs = 600,
+        )
+    val warning =
+        works.limn.scp.ConsequenceRule(
+            trigger = works.limn.scp.ConsequenceTrigger.WarningCount,
+            action =
+                works.limn.scp.ConsequenceAction.Enforcement(
+                    works.limn.scp.EnforcementSeverity.RevokeAccess(
+                        did = "did:dht:z6MkSubject",
+                        access = works.limn.scp.AccessScope.BOTH,
+                    ),
+                ),
+            threshold = 10,
+            windowSecs = 86_400,
+        )
     return listOf(velocity, custom, warning)
 }
 

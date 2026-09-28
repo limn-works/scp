@@ -59,6 +59,7 @@ class StubIdentityAdvancedBindings : IdentityAdvancedBindings {
         """{"old_did":"did:dht:zOld","new_did":"did:dht:zNew","rotated_at":1700000000}"""
     var attestDeviceResult = "dGVzdC1hdHRlc3RhdGlvbg=="
     var verifyDeviceAttestationResult = true
+
     // Neutral delegation fixture. The real recovery surface fails closed
     // (#2240 Part A) and never returns a success payload — this value only
     // exercises the wrapper's param-forwarding / pass-through plumbing, so it
@@ -349,9 +350,10 @@ class IdentityAdvancedBridgeTest {
                 // that it throws.
                 stubAdvanced.executeRecoveryError =
                     BridgeException("recovery backend not configured", "SCP-IDENT-1022")
-                val ex = assertFailsWith<BridgeException> {
-                    advancedBridge.executeRecovery("did:dht:z6MkFail", "identity_key")
-                }
+                val ex =
+                    assertFailsWith<BridgeException> {
+                        advancedBridge.executeRecovery("did:dht:z6MkFail", "identity_key")
+                    }
                 assertEquals("SCP-IDENT-1022", ex.code)
             }
     }

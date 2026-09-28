@@ -448,7 +448,7 @@ impl Scp {
                         InMemoryKeyCustody::from_seed_bytes(**seed)
                     });
                 let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-                    crate::identity::OpaqueInMemoryKeyCustody(in_memory),
+                    crate::identity::OpaqueInMemoryKeyCustody(Box::new(in_memory)),
                 ));
                 let pre_rotation_custody =
                     Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -576,7 +576,7 @@ impl Scp {
                 use scp_platform::testing::InMemoryKeyCustody;
 
                 let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-                    crate::identity::OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+                    crate::identity::OpaqueInMemoryKeyCustody(Box::new(InMemoryKeyCustody::new())),
                 ));
                 let pre_rotation_custody =
                     Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -5062,7 +5062,7 @@ mod concurrency_cap_tests {
             .unwrap();
 
         let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+            OpaqueInMemoryKeyCustody(Box::new(InMemoryKeyCustody::new())),
         ));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());

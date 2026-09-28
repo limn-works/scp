@@ -170,6 +170,9 @@ class KeyCustodyProvider(Protocol):
         pseudonym point and the numeric id of its signing key. The bridge
         rejects (``SCP-IDENT-1055``) a point that is not a valid compressed
         P-256 point, and a key id whose :meth:`get_public_key` differs from it.
+        The same ``(key_id, context_id)`` MUST return the same pseudonym key
+        id on every call, so re-deriving names one key rather than minting
+        another.
 
         Canonical recipe (all software custody backends MUST produce identical
         bytes; ``ikm`` is the identity private key material, the 32-byte
@@ -190,9 +193,11 @@ class KeyCustodyProvider(Protocol):
         """Derive a rotatable, epoch-scoped P-256 pseudonym keypair (v2).
 
         Returns ``(public_key, key_id)``, checked as for
-        :meth:`derive_pseudonym`. Including the rotation epoch in the HMAC
-        derivation produces a different pseudonym per epoch within the same
-        context, mitigating relay-side pseudonym correlation.
+        :meth:`derive_pseudonym`; the same ``(key_id, context_id,
+        pseudonym_epoch)`` MUST return the same pseudonym key id. Including
+        the rotation epoch in the HMAC derivation produces a different
+        pseudonym per epoch within the same context, mitigating relay-side
+        pseudonym correlation.
 
         Canonical recipe: as :meth:`derive_pseudonym`, with::
 
