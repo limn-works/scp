@@ -1200,6 +1200,16 @@ if [[ $A2_LINE == *scp-clock* && $A2_LINE == *scp-ffi* && $A2_LINE == *scp-trans
 else
     report "case 22b names every changed package for the published-file assertion" 1 "the assertion 2 line reads: ${A2_LINE:-<absent>}"
 fi
+# scp-clock has no example of its own; the rust-clippy job lints it anyway, because the
+# gate passes no --no-deps and clippy lints every workspace library an example compiles.
+# A line whose reason covers example source alone sends the reader to the examples when
+# the warning sits in scp-clock's lib.
+if grep -F 'check-examples-compile.sh assertion 1 over the example targets that compile' "$HARNESS22B/out.txt" |
+    grep -qF 'without --no-deps, so it lints the example and every workspace library that example compiles'; then
+    report "case 22b says the examples gate lints each library an example compiles" 0 ""
+else
+    report "case 22b says the examples gate lints each library an example compiles" 1 "the assertion 1 line gives no library-lint reason: $(grep -F 'check-examples-compile.sh assertion 1' "$HARNESS22B/out.txt")"
+fi
 if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh over this repository' "$HARNESS22B/out.txt"; then
     report "case 22b names no unrun gate edit on a branch that left the gate alone" 1 "$(grep -F 'check-examples-compile.sh over this repository' "$HARNESS22B/out.txt")"
 else
@@ -1223,6 +1233,32 @@ if grep -qF "NOT CHECKED — scripts/check-examples-compile.sh over this reposit
     report "case 22c names the examples gate an edit left unrun" 0 ""
 else
     report "case 22c names the examples gate an edit left unrun" 1 "the output holds no NOT CHECKED line for the edited gate: $(tail -n 6 "$FIXTURE22C.harness/out.txt")"
+fi
+
+# ── Case 22d: the DOES-NOT-RUN header names every gate the run never starts ──────────
+#
+# The header's DOES-NOT-RUN list is what a reader consults for the CI commands a green run
+# leaves unproven, and a NOT CHECKED line the list has no entry for is a command the reader
+# was never told about. Every GATES_NOT_RUN entry the script does not start as a `bash`
+# command must appear between the list's heading and `# USAGE`. Deleting item 8 turns this
+# case red; so does adding a compiling gate to GATES_NOT_RUN without a list entry.
+HEADER_LIST=$(sed -n '/^# WHAT THIS SCRIPT DOES NOT RUN/,/^# USAGE/p' "$SCRIPT")
+NOT_RUN_PATHS=$(sed -n '/^GATES_NOT_RUN=(/,/^)/p' "$SCRIPT" | grep -oE '^ *scripts/[^ ]+' | tr -d ' ')
+HEADER_MISSING=""
+while IFS= read -r gate; do
+    [[ -n $gate ]] || continue
+    grep -qE "^[^#]*bash $gate" "$SCRIPT" && continue
+    [[ $HEADER_LIST == *"$gate"* ]] || HEADER_MISSING+=" $gate"
+done <<< "$NOT_RUN_PATHS"
+if [[ -n $HEADER_LIST && -n $NOT_RUN_PATHS && -z $HEADER_MISSING ]]; then
+    report "case 22d names every unstarted GATES_NOT_RUN gate in the DOES-NOT-RUN list" 0 ""
+else
+    report "case 22d names every unstarted GATES_NOT_RUN gate in the DOES-NOT-RUN list" 1 "header list read ${#HEADER_LIST} bytes, GATES_NOT_RUN read: ${NOT_RUN_PATHS:-<none>}; missing:${HEADER_MISSING:-<none>}"
+fi
+if [[ $HEADER_LIST == *'cargo package --list'* ]]; then
+    report "case 22d names cargo package --list in the DOES-NOT-RUN list" 0 ""
+else
+    report "case 22d names cargo package --list in the DOES-NOT-RUN list" 1 "the DOES-NOT-RUN list names no cargo package --list, which the examples gate runs in the rust-clippy job"
 fi
 
 # ── Case 23: the scripts/ lane against the suites CI runs over that directory ────────

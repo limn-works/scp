@@ -158,6 +158,15 @@
 #      UNRUN_LANES below to this list: it reads every `scripts/` program a job of
 #      `.github/workflows/ci.yml` starts, subtracts the GATES array below, and fails when
 #      that entry names fewer than what remains.
+#   8. Both assertions of `scripts/check-examples-compile.sh`, which the `rust-clippy` job
+#      runs and GATES_NOT_RUN below lists. Assertion 1 runs `cargo clippy -p <owner>
+#      --example <name> -- -D warnings` without `--no-deps`, so it lints each example
+#      target and every workspace library that example compiles, under the example owner's
+#      dev-target feature set rather than the unified feature set of the workspace clippy
+#      step. Assertion 2 runs `cargo package --list -p` on every workspace package, which
+#      fails on a readme key naming a missing file, and fails the gate when a published
+#      `examples/*.rs` file is no example target's source. This script prints one line per
+#      assertion, and a third when the branch edits that gate, because no run starts it.
 #
 # USAGE
 #   bash scripts/fix-round-check.sh [crate ...]
@@ -758,8 +767,9 @@ else
     # it has an example target, so its line names every package compiled. Assertion 1
     # lints each `example` target, which compiles against the owning package's normal,
     # build and dev dependencies and, below those, only normal and build dependencies,
-    # because cargo builds a dev-dependency for the package that declares it alone. Its
-    # line names each changed package that walk reaches. When cargo metadata cannot be
+    # because cargo builds a dev-dependency for the package that declares it alone. The
+    # gate passes no `--no-deps`, so clippy lints every workspace library in that walk as
+    # well as the example, and the line names each changed package that walk reaches. When cargo metadata cannot be
     # read, it names every package compiled.
     NOTES+=("scripts/check-examples-compile.sh assertion 2 over $crate_list: that gate runs cargo package --list -p on every workspace package, whether or not it has an example target, and fails when that command fails, as it does on a readme key naming a missing file, or when the package publishes an examples/*.rs file that no example target compiles, as autoexamples = false or a redirected path key leaves; the compile above never packages a crate, so either failure passes here and fails that gate in the rust-clippy job of .github/workflows/ci.yml")
     example_rc=0
@@ -789,7 +799,7 @@ print(", ".join(sorted(selected & reached)))
         example_list="$crate_list (this run could not read their targets out of cargo metadata, so some of them may have no example target)"
     fi
     if [[ -n $example_list ]]; then
-        NOTES+=("scripts/check-examples-compile.sh assertion 1 over the example targets that compile $example_list: the compile above runs cargo check, which reports no clippy lint, while that gate runs cargo clippy -- -D warnings on each example alone, in that one package's dev-target feature set and without the --features list the compile above passed, so an example with a clippy warning, or one that names an item behind a feature the compile above turned on, passes here and fails that gate in the rust-clippy job of .github/workflows/ci.yml")
+        NOTES+=("scripts/check-examples-compile.sh assertion 1 over the example targets that compile $example_list: the compile above runs cargo check, which reports no clippy lint, while that gate runs cargo clippy -- -D warnings on each example alone and without --no-deps, so it lints the example and every workspace library that example compiles, in that one package's dev-target feature set and without the --features list the compile above passed; an example with a clippy warning, an example that names an item behind a feature the compile above turned on, and a library with a clippy warning that only that narrower feature set raises, such as an import left unused when a feature is off, each pass here and fail that gate in the rust-clippy job of .github/workflows/ci.yml")
     fi
 
     declare -a SELECTED_WASM=()
@@ -993,7 +1003,7 @@ done
 # CHECKED lines below rather than by listing the rest, because the rest depends on which
 # files the branch changed. An earlier revision ended the sentence after the two commands,
 # which told a fix agent editing a binding source that nothing else was left to fail.
-skip_list="cargo nextest, cargo test and cargo build in every form, and cargo clippy in every form, which the rust-test and rust-clippy jobs of .github/workflows/ci.yml run on the pushed head; the NOT CHECKED lines below name what this branch's own changed files reached, and the DOES-NOT-RUN section of this script states all seven kinds, cargo doc and cargo deny and the docker build among them"
+skip_list="cargo nextest, cargo test and cargo build in every form, and cargo clippy in every form, which the rust-test and rust-clippy jobs of .github/workflows/ci.yml run on the pushed head; the NOT CHECKED lines below name what this branch's own changed files reached, and the DOES-NOT-RUN section of this script states all eight kinds, cargo doc and cargo deny and the docker build among them"
 for s in ${SKIPPED[@]+"${SKIPPED[@]}"}; do skip_list+="; $s"; done
 
 printf '\nfix-round-check: crates %s (%s); target dir %s; %s; %s; ran %s; skipped %s.\n' \
