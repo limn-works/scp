@@ -92,7 +92,8 @@ public nonisolated enum McpClientConfig: Sendable {
     ///   - url: The URL of the SSE endpoint.
     ///   - authToken: The bearer token sent in an `Authorization` header on
     ///     every request, or `nil` for a server that runs no bearer check. An
-    ///     SCP SSE server always runs one (ADR-015).
+    ///     SCP SSE server always runs one (ADR-015). The transport has no
+    ///     TLS, so a token is sent only to a loopback host.
     case sse(url: String, authToken: String?)
 }
 

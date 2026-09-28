@@ -4073,7 +4073,8 @@ impl Scp {
     /// Per-instance equivalent of the free-function `mcp_client_connect_sse`.
     /// `auth_token` is sent as `Authorization: Bearer <token>` on the `GET`
     /// and on every POST, or `None` for a server that runs no bearer check; an
-    /// SCP SSE server always runs one (ADR-015).
+    /// SCP SSE server always runs one (ADR-015). The transport has no TLS, so a
+    /// token is sent only to a loopback host.
     #[napi(js_name = "mcpClientConnectSse")]
     pub async fn mcp_client_connect_sse(
         &self,

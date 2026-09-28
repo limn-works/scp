@@ -1594,7 +1594,8 @@ impl crate::scp::PyScp {
 /// * `url` -- The URL of the SSE endpoint.
 /// * `auth_token` -- The bearer token sent in an `Authorization` header on
 ///   every request, or `None` for a server that runs no bearer check. An SCP
-///   SSE server always runs one (ADR-015).
+///   SSE server always runs one (ADR-015). The transport has no TLS, so a
+///   token is sent only to a loopback host.
 ///
 /// # Returns
 ///
@@ -3775,18 +3776,6 @@ mod tests {
         let ctx_id = setup_test_context(&bi, creator, false);
 
         // Create a minimal server entry directly in the registry.
-        let provider = FfiBridgeProvider {
-            bi: Arc::downgrade(&bi),
-            agent_did: creator.to_owned(),
-            context_ids: vec![ctx_id.clone()],
-            outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
-            agent_ucan_token: None,
-
-            agent_proof_tokens: None,
-        };
-        // The registry entry no longer holds the server (the transport task
-        // owns it), so the provider is only built here to prove construction.
-        drop(McpServer::new(provider));
         let handle = generate_handle_id("mcp-server");
 
         server_registry_of(&bi).insert(
@@ -3825,18 +3814,6 @@ mod tests {
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, false);
 
-        let provider = FfiBridgeProvider {
-            bi: Arc::downgrade(&bi),
-            agent_did: creator.to_owned(),
-            context_ids: vec![ctx_id.clone()],
-            outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
-            agent_ucan_token: None,
-
-            agent_proof_tokens: None,
-        };
-        // The registry entry no longer holds the server (the transport task
-        // owns it), so the provider is only built here to prove construction.
-        drop(McpServer::new(provider));
         let handle = generate_handle_id("mcp-server");
 
         server_registry_of(&bi).insert(

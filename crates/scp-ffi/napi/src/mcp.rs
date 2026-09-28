@@ -143,7 +143,10 @@ pub(crate) struct McpServerEntry {
 
 /// Internal state for an active MCP client connection.
 pub(crate) struct McpClientEntry {
-    pub(crate) client: Mutex<McpClient<McpClientTransportWrapper>>,
+    /// Shared so a call clones it out of the registry and drops the shard
+    /// guard before its network round trip; a disconnect or connect on the
+    /// same shard then never waits on a silent server.
+    pub(crate) client: Arc<Mutex<McpClient<McpClientTransportWrapper>>>,
 }
 
 // Phase D (#1695): EMPTY_*_REGISTRY fallbacks and the `mcp_*_registry()`
@@ -881,7 +884,7 @@ pub(crate) async fn mcp_client_connect_stdio_on(
 
     let handle_id = mcp_handle_id("mcp-client");
     let entry = McpClientEntry {
-        client: Mutex::new(client),
+        client: Arc::new(Mutex::new(client)),
     };
 
     bi.mcp_client_registry().insert(handle_id.clone(), entry);
@@ -899,6 +902,10 @@ pub(crate) async fn mcp_client_connect_sse_on(
     url: String,
     auth_token: Option<String>,
 ) -> napi::Result<NapiMcpClientHandle> {
+    // The same URL check the PyO3 and UniFFI twins run, so an empty or
+    // over-long URL is a validation error on every binding.
+    scp_ffi_common::validate::validate_relay_url(&url)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let client = run_mcp_client_io(codes::TRANS_5018, move || {
         let transport =
             scp_mcp::sse_client::SseClientTransport::connect(&url, auth_token.as_deref()).map_err(
@@ -918,7 +925,7 @@ pub(crate) async fn mcp_client_connect_sse_on(
 
     let handle_id = mcp_handle_id("mcp-client");
     let entry = McpClientEntry {
-        client: Mutex::new(client),
+        client: Arc::new(Mutex::new(client)),
     };
 
     bi.mcp_client_registry().insert(handle_id.clone(), entry);
@@ -957,13 +964,15 @@ pub(crate) async fn mcp_client_list_tools_on(
     let registry = Arc::clone(bi.mcp_client_registry());
     let handle_id = handle.handle_id.clone();
     let outlets = run_mcp_client_io(codes::TRANS_5022, move || {
-        let entry = registry
+        // Clone the client out so the shard guard drops before the I/O.
+        let client = registry
             .get(&handle_id)
+            .map(|entry| Arc::clone(&entry.client))
             .ok_or_else(|| ScpNapiError::Transport {
                 message: format!("MCP client handle '{handle_id}' not found"),
                 code: codes::TRANS_5020.to_owned(),
             })?;
-        let client_guard = entry.client.lock().map_err(|e| ScpNapiError::Transport {
+        let client_guard = client.lock().map_err(|e| ScpNapiError::Transport {
             message: format!("client lock poisoned: {e}"),
             code: codes::TRANS_5021.to_owned(),
         })?;
@@ -1000,8 +1009,10 @@ pub(crate) async fn mcp_client_invoke_on(
     let registry = Arc::clone(bi.mcp_client_registry());
     let handle_id = handle.handle_id.clone();
     let result = run_mcp_client_io(codes::TRANS_5025, move || {
-        let entry = registry
+        // Clone the client out so the shard guard drops before the I/O.
+        let client = registry
             .get(&handle_id)
+            .map(|entry| Arc::clone(&entry.client))
             .ok_or_else(|| ScpNapiError::Transport {
                 message: format!("MCP client handle '{handle_id}' not found"),
                 code: codes::TRANS_5023.to_owned(),
@@ -1011,7 +1022,7 @@ pub(crate) async fn mcp_client_invoke_on(
                 message: format!("invalid input JSON: {e}"),
                 code: codes::VALID_7021.to_owned(),
             })?;
-        let client_guard = entry.client.lock().map_err(|e| ScpNapiError::Transport {
+        let client_guard = client.lock().map_err(|e| ScpNapiError::Transport {
             message: format!("client lock poisoned: {e}"),
             code: codes::TRANS_5024.to_owned(),
         })?;
@@ -1239,6 +1250,88 @@ mod tests {
             timer_done < std::time::Duration::from_secs(2),
             "the connect must wait off the async worker, but the timer took {timer_done:?}"
         );
+    }
+
+    /// An empty URL fails the relay-URL validation before any connect, the
+    /// same validation error the PyO3 and UniFFI twins return.
+    #[test]
+    fn mcp_client_connect_sse_validates_the_url_napi() {
+        let bi = NapiBridgeInstance::new_napi();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let Err(err) = runtime.block_on(mcp_client_connect_sse_on(&bi, String::new(), None)) else {
+            panic!("an empty URL must be rejected");
+        };
+        let expected = napi::Error::from(ScpNapiError::from(
+            scp_ffi_common::validate::validate_relay_url("").expect_err("empty URL"),
+        ));
+        assert_eq!(err.reason, expected.reason, "got: {err}");
+        assert!(
+            !err.reason.contains(codes::TRANS_5018),
+            "a bad URL is a validation error, not a transport error: {err}"
+        );
+    }
+
+    /// A `tools/list` in flight against a silent stdio server holds a blocking
+    /// thread and its own clone of the client, not the registry shard, so a
+    /// disconnect of the same handle returns at once. The stub server writes a
+    /// notification before its `initialize` response, which the client reads
+    /// past, then answers nothing for three seconds.
+    #[test]
+    fn mcp_client_disconnect_does_not_wait_on_an_in_flight_call_napi() {
+        let bi = NapiBridgeInstance::new_napi();
+        let mut allowlist = scp_mcp::allowlist::StdioAllowlist::new_with_defaults();
+        allowlist.configure(&["sh"]).expect("allow sh");
+        let allowlist = Mutex::new(allowlist);
+        let script = "read l; \
+            echo '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}'; \
+            echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\
+            \"capabilities\":{},\"serverInfo\":{\"name\":\"stub\"}}}'; \
+            sleep 3";
+        let transport = StdioMcpTransport::spawn(
+            &allowlist,
+            &["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+        )
+        .expect("spawn stub server");
+        let mut client = McpClient::new(McpClientTransportWrapper::Stdio(transport));
+        client
+            .initialize()
+            .expect("initialize must read past the notification");
+        let handle_id = mcp_handle_id("mcp-client");
+        bi.mcp_client_registry().insert(
+            handle_id.clone(),
+            McpClientEntry {
+                client: Arc::new(Mutex::new(client)),
+            },
+        );
+        crate::increment_handle_count();
+        let handle = NapiMcpClientHandle {
+            handle_id,
+            instance_id: bi.instance_id(),
+        };
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (listed, disconnect_took) = runtime.block_on(async {
+            tokio::join!(mcp_client_list_tools_on(&bi, &handle), async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                let started = std::time::Instant::now();
+                mcp_client_disconnect_on(&bi, &handle)
+                    .await
+                    .expect("disconnect a known handle");
+                started.elapsed()
+            })
+        });
+        assert!(
+            disconnect_took < std::time::Duration::from_secs(1),
+            "disconnect waited {disconnect_took:?} on the in-flight call"
+        );
+        assert!(listed.is_err(), "the stub server closed without a tools/list response");
     }
 
     /// WU6: Two-instance regression test — disabling enforcement via the

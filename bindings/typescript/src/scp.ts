@@ -3933,7 +3933,8 @@ export class SCP {
    * Connects an MCP client to an SSE server. `authToken` is sent as
    * `Authorization: Bearer <token>` on every request; pass `null` only for a
    * server that runs no bearer check. An SCP SSE server always runs one
-   * (ADR-015).
+   * (ADR-015). The transport has no TLS, so a token is sent only to a
+   * loopback host.
    */
   async mcpClientConnectSse(url: string, authToken: string | null): Promise<unknown> {
     try {

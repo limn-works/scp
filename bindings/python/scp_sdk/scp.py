@@ -1853,7 +1853,8 @@ class SCP:
 
         *auth_token* is the bearer token sent in an ``Authorization`` header
         on every request, or ``None`` for a server that runs no bearer check.
-        An SCP SSE server always runs one (ADR-015).
+        An SCP SSE server always runs one (ADR-015). The transport has no
+        TLS, so a token is sent only to a loopback host.
         """
         from scp_sdk.mcp import McpClient, validate_client_connect
 

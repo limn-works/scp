@@ -59,6 +59,31 @@ fn sse_auth_header(auth_token: Option<&str>) -> Result<String, String> {
     Ok(format!("Authorization: Bearer {token}\r\n"))
 }
 
+/// Opens a TCP connection to `addr` (`host:port`), connecting only to the
+/// addresses it resolved to here.
+///
+/// # Errors
+///
+/// Returns an error when `addr` does not resolve or the connection fails, and
+/// when `sends_token` is set and `addr` resolves to any address that is not
+/// loopback: the transport has no TLS, so a bearer token sent to another host
+/// would cross the network in cleartext.
+fn open_stream(addr: &str, sends_token: bool) -> Result<std::net::TcpStream, String> {
+    use std::net::ToSocketAddrs;
+    let resolved: Vec<std::net::SocketAddr> = addr
+        .to_socket_addrs()
+        .map_err(|e| format!("failed to resolve {addr}: {e}"))?
+        .collect();
+    if sends_token && !resolved.iter().all(|a| a.ip().is_loopback()) {
+        return Err(format!(
+            "refusing to send the SSE bearer token to {addr}: the transport has no TLS, \
+             so a token goes only to a loopback address"
+        ));
+    }
+    std::net::TcpStream::connect(&resolved[..])
+        .map_err(|e| format!("failed to connect to {addr}: {e}"))
+}
+
 impl SseClientTransport {
     /// Connects to the SSE endpoint and establishes the transport.
     ///
@@ -69,9 +94,10 @@ impl SseClientTransport {
     ///
     /// # Errors
     ///
-    /// Returns an error if the token is malformed, or if the connection or
-    /// handshake fails; a server whose bearer check refuses the token answers
-    /// HTTP 401, which fails the handshake.
+    /// Returns an error if the token is malformed, if a token is given for a
+    /// host that is not loopback (the transport has no TLS), or if the
+    /// connection or handshake fails; a server whose bearer check refuses the
+    /// token answers HTTP 401, which fails the handshake.
     pub fn connect(url: &str, auth_token: Option<&str>) -> Result<Self, String> {
         if url.starts_with("https://") {
             return Err(
@@ -86,8 +112,7 @@ impl SseClientTransport {
         let addr = format!("{host}:{port}");
 
         // Connect and send GET request for SSE stream.
-        let stream = std::net::TcpStream::connect(&addr)
-            .map_err(|e| format!("failed to connect to {addr}: {e}"))?;
+        let stream = open_stream(&addr, auth_token.is_some())?;
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(30)))
             .map_err(|e| format!("failed to set read timeout: {e}"))?;
@@ -195,8 +220,7 @@ impl SseClientTransport {
     fn post(&self, body: &str) -> Result<(), String> {
         let (host, port, path) = parse_http_url(&self.post_url)?;
         let addr = format!("{host}:{port}");
-        let stream = std::net::TcpStream::connect(&addr)
-            .map_err(|e| format!("failed to connect to {addr}: {e}"))?;
+        let stream = open_stream(&addr, !self.auth_header.is_empty())?;
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(30)))
             .map_err(|e| format!("failed to set read timeout: {e}"))?;
@@ -338,6 +362,30 @@ mod tests {
     // -----------------------------------------------------------------------
     // URL parsing
     // -----------------------------------------------------------------------
+
+    /// The transport has no TLS, so a bearer token goes only to a loopback
+    /// address: a token for any other host is refused before a connection
+    /// opens, and a loopback host passes the check.
+    #[test]
+    fn connect_refuses_to_send_a_token_to_a_non_loopback_host() {
+        let Err(err) = SseClientTransport::connect("http://192.0.2.1:9/sse", Some("tok")) else {
+            panic!("a token for a non-loopback host must be refused");
+        };
+        assert!(err.contains("refusing to send the SSE bearer token"), "got: {err}");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let Err(err) =
+            SseClientTransport::connect(&format!("http://127.0.0.1:{port}/sse"), Some("tok"))
+        else {
+            panic!("nothing listens on the port");
+        };
+        assert!(
+            err.starts_with("failed to connect"),
+            "a loopback host must pass the check and fail only at connect, got: {err}"
+        );
+    }
 
     #[test]
     fn parse_http_url_basic() {

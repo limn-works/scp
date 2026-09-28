@@ -4611,8 +4611,11 @@ pub(crate) struct McpServerEntry {
 
 /// Internal state for an active MCP client connection.
 pub(crate) struct McpClientEntry {
-    /// The real MCP client, connected and initialized.
-    pub(crate) client: std::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>,
+    /// The real MCP client, connected and initialized. Shared so a call clones it out of the registry and drops the shard
+    /// guard before its network round trip; a disconnect or connect on the
+    /// same shard then never waits on a silent server.
+    pub(crate) client:
+        Arc<std::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>>,
 }
 
 /// Returns a reference to this `UniffiBridgeInstance`'s MCP server registry.
@@ -16555,7 +16558,7 @@ impl Scp {
         mcp_client_registry(&self.inner).insert(
             handle_id.clone(),
             McpClientEntry {
-                client: std::sync::Mutex::new(client),
+                client: Arc::new(std::sync::Mutex::new(client)),
             },
         );
         increment_handle_count();
@@ -16568,7 +16571,8 @@ impl Scp {
     /// Routes through the module-level MCP client registry. `auth_token` is
     /// sent as `Authorization: Bearer <token>` on the `GET` and on every POST,
     /// or `None` for a server that runs no bearer check; an SCP SSE server
-    /// always runs one (ADR-015).
+    /// always runs one (ADR-015). The transport has no TLS, so a token is
+    /// sent only to a loopback host.
     pub async fn mcp_client_connect_sse(
         &self,
         url: String,
@@ -16597,7 +16601,7 @@ impl Scp {
         mcp_client_registry(&self.inner).insert(
             handle_id.clone(),
             McpClientEntry {
-                client: std::sync::Mutex::new(client),
+                client: Arc::new(std::sync::Mutex::new(client)),
             },
         );
         increment_handle_count();
@@ -16634,14 +16638,15 @@ impl Scp {
 
         let bi = Arc::clone(&self.inner);
         let outlets = run_mcp_client_io(codes::TRANS_5022, move || {
-            let entry =
-                mcp_client_registry(&bi)
-                    .get(&handle)
-                    .ok_or_else(|| ScpError::Transport {
-                        msg: format!("MCP client handle '{handle}' not found"),
-                        code: codes::TRANS_5020.to_owned(),
-                    })?;
-            let client_guard = entry.client.lock().map_err(|e| ScpError::Transport {
+            // Clone the client out so the shard guard drops before the I/O.
+            let client = mcp_client_registry(&bi)
+                .get(&handle)
+                .map(|entry| Arc::clone(&entry.client))
+                .ok_or_else(|| ScpError::Transport {
+                    msg: format!("MCP client handle '{handle}' not found"),
+                    code: codes::TRANS_5020.to_owned(),
+                })?;
+            let client_guard = client.lock().map_err(|e| ScpError::Transport {
                 msg: format!("client lock poisoned: {e}"),
                 code: codes::TRANS_5021.to_owned(),
             })?;
@@ -16681,19 +16686,20 @@ impl Scp {
 
         let bi = Arc::clone(&self.inner);
         let result = run_mcp_client_io(codes::TRANS_5025, move || {
-            let entry =
-                mcp_client_registry(&bi)
-                    .get(&handle)
-                    .ok_or_else(|| ScpError::Transport {
-                        msg: format!("MCP client handle '{handle}' not found"),
-                        code: codes::TRANS_5023.to_owned(),
-                    })?;
+            // Clone the client out so the shard guard drops before the I/O.
+            let client = mcp_client_registry(&bi)
+                .get(&handle)
+                .map(|entry| Arc::clone(&entry.client))
+                .ok_or_else(|| ScpError::Transport {
+                    msg: format!("MCP client handle '{handle}' not found"),
+                    code: codes::TRANS_5023.to_owned(),
+                })?;
             let input: serde_json::Value =
                 serde_json::from_str(&input_json).map_err(|e| ScpError::Validation {
                     msg: format!("invalid input JSON: {e}"),
                     code: codes::VALID_7021.to_owned(),
                 })?;
-            let client_guard = entry.client.lock().map_err(|e| ScpError::Transport {
+            let client_guard = client.lock().map_err(|e| ScpError::Transport {
                 msg: format!("client lock poisoned: {e}"),
                 code: codes::TRANS_5024.to_owned(),
             })?;
@@ -23036,6 +23042,55 @@ mod tests {
             timer_done < std::time::Duration::from_secs(2),
             "the connect must wait off the async worker, but the timer took {timer_done:?}"
         );
+    }
+
+    /// A `tools/list` in flight against a silent stdio server holds a blocking
+    /// thread and its own clone of the client, not the registry shard, so a
+    /// disconnect of the same handle returns at once. The stub server writes a
+    /// notification before its `initialize` response, which the client reads
+    /// past, then answers nothing for three seconds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_client_disconnect_does_not_wait_on_an_in_flight_call() {
+        let scp = scp_test();
+        let mut allowlist = scp_mcp::allowlist::StdioAllowlist::new_with_defaults();
+        allowlist.configure(&["sh"]).expect("allow sh");
+        let allowlist = std::sync::Mutex::new(allowlist);
+        let script = "read l; \
+            echo '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}'; \
+            echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\
+            \"capabilities\":{},\"serverInfo\":{\"name\":\"stub\"}}}'; \
+            sleep 3";
+        let transport = McpStdioTransport::spawn(
+            &allowlist,
+            &["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+        )
+        .expect("spawn stub server");
+        let mut client =
+            scp_mcp::client::McpClient::new(McpUniFFITransportWrapper::Stdio(transport));
+        client
+            .initialize()
+            .expect("initialize must read past the notification");
+        let handle = mcp_handle_id("mcp-client");
+        mcp_client_registry(&scp.inner).insert(
+            handle.clone(),
+            McpClientEntry {
+                client: Arc::new(std::sync::Mutex::new(client)),
+            },
+        );
+
+        let (listed, disconnect_took) = tokio::join!(scp.mcp_client_list_tools(handle.clone()), async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let started = std::time::Instant::now();
+            scp.mcp_client_disconnect(handle.clone())
+                .await
+                .expect("disconnect a known handle");
+            started.elapsed()
+        });
+        assert!(
+            disconnect_took < std::time::Duration::from_secs(1),
+            "disconnect waited {disconnect_took:?} on the in-flight call"
+        );
+        assert!(listed.is_err(), "the stub server closed without a tools/list response");
     }
 
     /// `mcp_client_disconnect` must reject unknown handle.

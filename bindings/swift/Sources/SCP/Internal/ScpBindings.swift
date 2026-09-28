@@ -2869,7 +2869,8 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Routes through the module-level MCP client registry. `auth_token` is
      * sent as `Authorization: Bearer <token>` on the `GET` and on every POST,
      * or `None` for a server that runs no bearer check; an SCP SSE server
-     * always runs one (ADR-015).
+     * always runs one (ADR-015). The transport has no TLS, so a token is
+     * sent only to a loopback host.
      */
     func mcpClientConnectSse(url: String, authToken: String?) async throws  -> String
     
@@ -5870,7 +5871,8 @@ open func isLocalDid(did: String)async  -> Bool  {
      * Routes through the module-level MCP client registry. `auth_token` is
      * sent as `Authorization: Bearer <token>` on the `GET` and on every POST,
      * or `None` for a server that runs no bearer check; an SCP SSE server
-     * always runs one (ADR-015).
+     * always runs one (ADR-015). The transport has no TLS, so a token is
+     * sent only to a loopback host.
      */
 open func mcpClientConnectSse(url: String, authToken: String?)async throws  -> String  {
     return
