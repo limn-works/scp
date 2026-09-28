@@ -21590,6 +21590,19 @@ mod tests {
             host.last_peer.lock().expect("lock").is_none(),
             "a compressed peer must be rejected before the host call"
         );
+
+        // An uncompressed point whose last coordinate byte is flipped is off
+        // the curve, and is rejected before the host call.
+        let mut off_curve = peer_point;
+        off_curve[64] ^= 1;
+        assert!(matches!(
+            custody.dh_agree(&hpke, &off_curve).await,
+            Err(scp_platform::error::PlatformError::CustodyError(_))
+        ));
+        assert!(
+            host.last_peer.lock().expect("lock").is_none(),
+            "an off-curve peer must be rejected before the host call"
+        );
     }
 
     /// A fresh adapter that never minted or derived handle N (a host key
@@ -24971,7 +24984,7 @@ mod tests {
     /// pseudonym still reaching the host would sign; the adapter answers
     /// `KeyNotFound` with no host call. A host that then reuses the retired
     /// id 777 for another identity's pseudonym binds it afresh. Removing the
-    /// registry's identity sweep fails both halves.
+    /// registry's identity sweep fails the first half.
     #[tokio::test]
     async fn identity_destroy_retires_its_pseudonyms() {
         let host = ProdLikeCustody::with_fault(PseudonymFault::FixedId);

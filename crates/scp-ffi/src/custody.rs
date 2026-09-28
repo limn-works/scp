@@ -1525,7 +1525,7 @@ mod tests {
     /// so a pseudonym still reaching the host would sign; the adapter answers
     /// `KeyNotFound` with no host call. A host that then reuses the retired
     /// id 777 for another identity's pseudonym binds it afresh. Removing the
-    /// registry's identity sweep fails both halves.
+    /// registry's identity sweep fails the first half.
     #[tokio::test]
     async fn ffi_custody_callback_identity_destroy_retires_its_pseudonyms() {
         let adapter = fake_py_custody(Some("fixed_id"));

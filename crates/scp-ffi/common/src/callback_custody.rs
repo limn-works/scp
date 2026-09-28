@@ -14,7 +14,8 @@
 //!   key. The bridge never infers a type from a length.
 //! - [`CallbackKeyRegistry`] holds one slot per handle: `Live` (the key, its
 //!   public key and its [`KeyRole`]), `Destroying` while a host destroy is in
-//!   flight, and `Destroyed`, a tombstone. A handle this adapter has not seen
+//!   flight, `Abandoned` when the caller dropped that destroy before the host
+//!   answered, and `Destroyed`, a tombstone. A handle this adapter has not seen
 //!   (a host key from an earlier session) is resolved through
 //!   `get_public_key` the same way in every entry point, and binds as an
 //!   [`KeyRole::Operational`] key.
@@ -184,13 +185,34 @@ enum Slot {
     Live(RegisteredEntry),
     /// A host destroy is in flight. `prior` is the entry to restore if it
     /// fails (`None` when the handle was unknown); `token` names the destroy
-    /// that owns the slot.
+    /// that owns the slot; `abandoned` is set when the destroy retries an
+    /// `Abandoned` slot, which a failure returns to `Abandoned`.
     Destroying {
         prior: Option<RegisteredEntry>,
         token: u64,
+        abandoned: bool,
+    },
+    /// The caller dropped a destroy before the host answered, so the host
+    /// may or may not hold the key. Every lookup fails as for `Destroyed`,
+    /// and a pseudonym of an abandoned identity is retired; a new
+    /// `destroy_key` retries the host destroy.
+    Abandoned {
+        prior: Option<RegisteredEntry>,
     },
     /// Destroyed in this session.
     Destroyed,
+}
+
+impl Slot {
+    /// Whether this slot held an identity when a destroy, in flight or
+    /// abandoned, began.
+    fn identity_mid_destroy(&self) -> bool {
+        matches!(
+            self,
+            Self::Destroying { prior: Some(e), .. } | Self::Abandoned { prior: Some(e) }
+                if e.role == KeyRole::Identity
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -222,9 +244,13 @@ impl CallbackKeyRegistry {
         })
     }
 
-    /// Records a key `generate_keypair` minted. It may replace a `Destroying`
-    /// or `Destroyed` slot, because a host may hand a freed id to a new key;
-    /// the destroy in flight then leaves the new entry alone.
+    /// Records a key `generate_keypair` minted. It may replace a
+    /// `Destroying`, `Abandoned` or `Destroyed` slot, because a host may hand
+    /// a freed id to a new key; the destroy in flight then leaves the new
+    /// entry alone. When the replaced slot is an identity mid-destroy, its
+    /// pseudonyms are retired first (§9.15), because the destroy that would
+    /// retire them no longer owns the slot and the new key must own none of
+    /// them.
     ///
     /// # Errors
     ///
@@ -237,6 +263,13 @@ impl CallbackKeyRegistry {
                 "KeyCustodyProvider.generate_keypair returned key_id {} that is already live",
                 handle.id()
             )));
+        }
+        if slots
+            .map
+            .get(&handle.id())
+            .is_some_and(Slot::identity_mid_destroy)
+        {
+            retire_pseudonyms_of(&mut slots.map, handle.id());
         }
         slots.map.insert(handle.id(), Slot::Live(entry));
         drop(slots);
@@ -265,7 +298,9 @@ impl CallbackKeyRegistry {
                 "KeyCustodyProvider.get_public_key: key_id {} is already bound to another key",
                 handle.id()
             ))),
-            Some(Slot::Destroying { .. } | Slot::Destroyed) => Err(PlatformError::KeyNotFound),
+            Some(Slot::Destroying { .. } | Slot::Abandoned { .. } | Slot::Destroyed) => {
+                Err(PlatformError::KeyNotFound)
+            }
             None => {
                 let entry = RegisteredEntry {
                     key,
@@ -289,25 +324,30 @@ impl CallbackKeyRegistry {
     /// other occupant is rejected: a minted key, an identity, another key, or
     /// the same key for another source, context or epoch.
     ///
-    /// The source identity must still be live under the same lock, so a
-    /// derive whose host call raced the identity's destroy binds nothing.
+    /// The source slot must still be a live identity holding `source_key`,
+    /// the key the derive resolved, under the same lock: a derive whose host
+    /// call raced the identity's destroy binds nothing, and neither does one
+    /// whose source id the host meanwhile handed to another identity key.
     ///
     /// # Errors
     ///
     /// [`PlatformError::KeyNotFound`] if the id is being destroyed, or the
-    /// source identity is not live; [`PlatformError::CustodyError`] for any
-    /// rejected occupant, or a poisoned registry lock.
+    /// source is not a live identity holding `source_key`;
+    /// [`PlatformError::CustodyError`] for any rejected occupant, or a
+    /// poisoned registry lock.
     pub fn bind_pseudonym(
         &self,
         method: &str,
         handle: KeyHandle,
         key: RegisteredKey,
         role: KeyRole,
+        source_key: &RegisteredKey,
     ) -> Result<(), PlatformError> {
         let mut slots = self.lock()?;
         if let KeyRole::Pseudonym { source, .. } = &role {
             match slots.map.get(source) {
-                Some(Slot::Live(identity)) if identity.role == KeyRole::Identity => {}
+                Some(Slot::Live(identity))
+                    if identity.role == KeyRole::Identity && identity.key == *source_key => {}
                 _ => return Err(PlatformError::KeyNotFound),
             }
         }
@@ -328,7 +368,7 @@ impl CallbackKeyRegistry {
                 )));
             }
             Some(Slot::Destroying { .. }) => return Err(PlatformError::KeyNotFound),
-            Some(Slot::Destroyed) | None => {}
+            Some(Slot::Abandoned { .. } | Slot::Destroyed) | None => {}
         }
         slots.map.insert(
             handle.id(),
@@ -346,12 +386,15 @@ impl CallbackKeyRegistry {
     ///
     /// # Errors
     ///
-    /// [`PlatformError::KeyNotFound`] if the handle is being or was destroyed;
-    /// [`PlatformError::CustodyError`] if the registry lock is poisoned.
+    /// [`PlatformError::KeyNotFound`] if the handle is being or was destroyed,
+    /// or its destroy was abandoned; [`PlatformError::CustodyError`] if the
+    /// registry lock is poisoned.
     pub fn get(&self, handle: &KeyHandle) -> Result<Option<RegisteredEntry>, PlatformError> {
         match self.lock()?.map.get(&handle.id()) {
             Some(Slot::Live(entry)) => Ok(Some(entry.clone())),
-            Some(Slot::Destroying { .. } | Slot::Destroyed) => Err(PlatformError::KeyNotFound),
+            Some(Slot::Destroying { .. } | Slot::Abandoned { .. } | Slot::Destroyed) => {
+                Err(PlatformError::KeyNotFound)
+            }
             None => Ok(None),
         }
     }
@@ -367,8 +410,9 @@ impl CallbackKeyRegistry {
     }
 
     /// Marks a handle `Destroying` before the host destroy, known or not, so
-    /// no lookup can resolve it while the host call is in flight. Returns the
-    /// token [`Self::end_destroy`] takes.
+    /// no lookup can resolve it while the host call is in flight. An
+    /// `Abandoned` slot is accepted like a live one, so a cancelled destroy
+    /// can be retried. Returns the token [`Self::end_destroy`] takes.
     ///
     /// # Errors
     ///
@@ -376,26 +420,34 @@ impl CallbackKeyRegistry {
     /// destroyed; [`PlatformError::CustodyError`] if the lock is poisoned.
     pub fn begin_destroy(&self, handle: &KeyHandle) -> Result<u64, PlatformError> {
         let mut slots = self.lock()?;
-        let prior = match slots.map.get(&handle.id()) {
-            Some(Slot::Live(entry)) => Some(entry.clone()),
+        let (prior, abandoned) = match slots.map.get(&handle.id()) {
+            Some(Slot::Live(entry)) => (Some(entry.clone()), false),
+            Some(Slot::Abandoned { prior }) => (prior.clone(), true),
             Some(Slot::Destroying { .. } | Slot::Destroyed) => {
                 return Err(PlatformError::KeyNotFound);
             }
-            None => None,
+            None => (None, false),
         };
         slots.next_token += 1;
         let token = slots.next_token;
-        slots
-            .map
-            .insert(handle.id(), Slot::Destroying { prior, token });
+        slots.map.insert(
+            handle.id(),
+            Slot::Destroying {
+                prior,
+                token,
+                abandoned,
+            },
+        );
         drop(slots);
         Ok(token)
     }
 
     /// Ends the destroy `token` began: the slot becomes `Destroyed` when the
     /// host destroyed the key, and otherwise returns to its prior entry (or
-    /// is removed when the handle was unknown). A slot a generation took over
-    /// in the meantime is left alone.
+    /// is removed when the handle was unknown). A retry of an `Abandoned`
+    /// destroy that fails returns to `Abandoned`, because the cancelled host
+    /// call may have destroyed the key. A slot a generation took over in the
+    /// meantime is left alone.
     ///
     /// Destroying an [`KeyRole::Identity`] key destroys every pseudonym
     /// derived from it (§9.15): in the same critical section, each slot whose
@@ -416,6 +468,7 @@ impl CallbackKeyRegistry {
         let Some(Slot::Destroying {
             prior,
             token: owner,
+            abandoned,
         }) = slots.map.get(&handle.id())
         else {
             return Ok(());
@@ -423,27 +476,81 @@ impl CallbackKeyRegistry {
         if *owner != token {
             return Ok(());
         }
-        match (destroyed, prior.clone()) {
-            (true, prior) => {
+        match (destroyed, prior.clone(), *abandoned) {
+            (true, prior, _) => {
                 slots.map.insert(handle.id(), Slot::Destroyed);
                 if prior.is_some_and(|entry| entry.role == KeyRole::Identity) {
                     retire_pseudonyms_of(&mut slots.map, handle.id());
                 }
             }
-            (false, Some(entry)) => {
+            (false, prior, true) => {
+                slots.map.insert(handle.id(), Slot::Abandoned { prior });
+            }
+            (false, Some(entry), false) => {
                 slots.map.insert(handle.id(), Slot::Live(entry));
             }
-            (false, None) => {
+            (false, None, false) => {
                 slots.map.remove(&handle.id());
             }
         }
         drop(slots);
         Ok(())
     }
+
+    /// Records that the destroy `token` began was dropped before the host
+    /// answered: the slot becomes `Abandoned`, and an identity's pseudonyms
+    /// are retired (§9.15), since the host may already have destroyed it. A
+    /// slot a generation took over in the meantime is left alone.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::CustodyError`] if the registry lock is poisoned; the
+    /// slot then stays `Destroying`, which every lookup refuses.
+    fn abandon_destroy(&self, handle: KeyHandle, token: u64) -> Result<(), PlatformError> {
+        let mut slots = self.lock()?;
+        let prior = match slots.map.get(&handle.id()) {
+            Some(Slot::Destroying {
+                prior,
+                token: owner,
+                ..
+            }) if *owner == token => prior.clone(),
+            _ => return Ok(()),
+        };
+        let identity = prior
+            .as_ref()
+            .is_some_and(|entry| entry.role == KeyRole::Identity);
+        slots.map.insert(handle.id(), Slot::Abandoned { prior });
+        if identity {
+            retire_pseudonyms_of(&mut slots.map, handle.id());
+        }
+        drop(slots);
+        Ok(())
+    }
+}
+
+/// Moves a destroy's slot to `Abandoned` when the `destroy_key` future is
+/// dropped between `begin_destroy` and `end_destroy`.
+struct DestroyGuard<'a> {
+    registry: &'a CallbackKeyRegistry,
+    handle: KeyHandle,
+    token: u64,
+    armed: bool,
+}
+
+impl Drop for DestroyGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // `Drop` has no caller to return an error to. The only error is a
+            // poisoned lock, which leaves the slot `Destroying` and makes
+            // every registry call fail, so nothing resolves the handle or its
+            // pseudonyms either way.
+            let _ = self.registry.abandon_destroy(self.handle, self.token);
+        }
+    }
 }
 
 /// Marks `Destroyed` every slot whose entry (live, or the prior of a destroy
-/// in flight) is a pseudonym derived from identity `source`.
+/// in flight or abandoned) is a pseudonym derived from identity `source`.
 fn retire_pseudonyms_of(map: &mut HashMap<u64, Slot>, source: u64) {
     let derived_from = |entry: &RegisteredEntry| matches!(&entry.role, KeyRole::Pseudonym { source: s, .. } if *s == source);
     for slot in map.values_mut() {
@@ -451,8 +558,11 @@ fn retire_pseudonyms_of(map: &mut HashMap<u64, Slot>, source: u64) {
             Slot::Live(entry)
             | Slot::Destroying {
                 prior: Some(entry), ..
-            } => derived_from(entry),
-            Slot::Destroying { prior: None, .. } | Slot::Destroyed => false,
+            }
+            | Slot::Abandoned { prior: Some(entry) } => derived_from(entry),
+            Slot::Destroying { prior: None, .. }
+            | Slot::Abandoned { prior: None }
+            | Slot::Destroyed => false,
         };
         if owned {
             *slot = Slot::Destroyed;
@@ -874,7 +984,11 @@ where
 /// The slot is `Destroying` for the whole host call, so no entry point can
 /// resolve or bind the handle meanwhile. A host success leaves a `Destroyed`
 /// tombstone; a host failure restores the prior entry (or clears the marker
-/// for a handle that was unknown) and returns the host error.
+/// for a handle that was unknown) and returns the host error. When the
+/// caller drops this future before the host answers, the slot becomes
+/// `Abandoned` and an identity's pseudonyms are retired; a later
+/// `destroy_key` on the handle retries the host destroy, and a failed retry
+/// leaves it `Abandoned`.
 ///
 /// # Errors
 ///
@@ -890,8 +1004,15 @@ where
     DF: Future<Output = Result<(), PlatformError>>,
 {
     let token = registry.begin_destroy(key)?;
+    let mut guard = DestroyGuard {
+        registry,
+        handle: *key,
+        token,
+        armed: true,
+    };
     let host = host_destroy(key.id().to_string()).await;
     let ended = registry.end_destroy(key, token, host.is_ok());
+    guard.armed = false;
     host?;
     ended
 }
@@ -951,6 +1072,7 @@ where
     PF: Future<Output = Result<HostPublicKey, PlatformError>>,
 {
     let source = resolve(registry, key, &host_get_public_key).await?.0;
+    let source_key = source.key.clone();
     if source.role != KeyRole::Identity {
         return Err(source.key.wrong_type(KeyType::Ed25519));
     }
@@ -981,6 +1103,7 @@ where
             context_id: context_id.to_vec(),
             epoch,
         },
+        &source_key,
     )?;
     Ok(pseudonym)
 }
@@ -2758,9 +2881,11 @@ mod tests {
     }
 
     /// G1: a `destroy_key` future dropped while the host destroy is pending
-    /// leaves the pseudonym handle `Destroying`. A later `sign` is
+    /// leaves the pseudonym handle `Abandoned`. A later `sign` is
     /// `KeyNotFound` without calling the host, so no unverified host
-    /// signature can pass through an unbound handle.
+    /// signature can pass through an unbound handle. A retry whose host
+    /// destroy fails leaves it `Abandoned`, not live, because the cancelled
+    /// host call may have destroyed the key.
     #[tokio::test]
     async fn cancelled_destroy_leaves_the_handle_fail_closed() {
         let p = p256(0xF2);
@@ -2780,7 +2905,7 @@ mod tests {
             );
         }
         assert_eq!(polled.load(Ordering::Relaxed), 1, "the host call started");
-        assert!(matches!(slot(&registry, 7), Some(Slot::Destroying { .. })));
+        assert!(matches!(slot(&registry, 7), Some(Slot::Abandoned { .. })));
 
         let host_signs = AtomicUsize::new(0);
         let junk = |_: String, _: Vec<u8>| {
@@ -2797,7 +2922,142 @@ mod tests {
             Err(PlatformError::KeyNotFound)
         ));
         assert_eq!(host_signs.load(Ordering::Relaxed), 0);
-        assert!(matches!(slot(&registry, 7), Some(Slot::Destroying { .. })));
+        assert!(matches!(slot(&registry, 7), Some(Slot::Abandoned { .. })));
+
+        assert!(matches!(
+            destroy_key(&registry, &h, |_| async {
+                Err(PlatformError::CustodyError("host destroy failed".into()))
+            })
+            .await,
+            Err(PlatformError::CustodyError(_))
+        ));
+        assert!(matches!(slot(&registry, 7), Some(Slot::Abandoned { .. })));
+        assert!(matches!(registry.get(&h), Err(PlatformError::KeyNotFound)));
+    }
+
+    /// J1: a cancelled identity destroy retires the identity and every
+    /// pseudonym derived from it through the adapter, with no host call, and
+    /// a retried destroy calls the host exactly once and completes.
+    #[tokio::test]
+    async fn cancelled_identity_destroy_retires_its_pseudonyms() {
+        let p = p256(0xF4);
+        let registry = registry_with_pseudonym(&ed(0xF5), &p).await;
+        let identity = KeyHandle::new(1);
+        {
+            let destroy = destroy_key(&registry, &identity, |_| {
+                std::future::pending::<Result<(), PlatformError>>()
+            });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(10), destroy)
+                    .await
+                    .is_err(),
+                "the host destroy never returns"
+            );
+        }
+        let no_sign = |_: String, _: Vec<u8>| async { panic!("no host sign call") };
+        for (id, data) in [(1, &b"message"[..]), (7, &[0x11u8; 32][..])] {
+            assert!(
+                matches!(
+                    sign(&registry, &KeyHandle::new(id), data, no_sign, no_lookup).await,
+                    Err(PlatformError::KeyNotFound)
+                ),
+                "handle {id} must fail after the cancelled identity destroy"
+            );
+            assert!(matches!(
+                public_key(&registry, &KeyHandle::new(id), no_lookup).await,
+                Err(PlatformError::KeyNotFound)
+            ));
+        }
+
+        let host_destroys = AtomicUsize::new(0);
+        destroy_key(&registry, &identity, |id| {
+            assert_eq!(id, "1");
+            host_destroys.fetch_add(1, Ordering::Relaxed);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(host_destroys.load(Ordering::Relaxed), 1);
+        assert!(matches!(slot(&registry, 1), Some(Slot::Destroyed)));
+        assert!(matches!(slot(&registry, 7), Some(Slot::Destroyed)));
+    }
+
+    /// J2: the host reuses an identity's id for a new identity key while
+    /// that identity's destroy is in flight. The old identity's pseudonym is
+    /// retired, the new key owns none, and the new key stays live.
+    #[tokio::test]
+    async fn register_over_a_destroying_identity_retires_its_pseudonyms() {
+        let p = p256(0xF6);
+        let registry = registry_with_pseudonym(&ed(0xF7), &p).await;
+        let identity = KeyHandle::new(1);
+        let replacement = RegisteredKey::Ed25519(ed(0xF8).verifying_key());
+        destroy_key(&registry, &identity, |_| {
+            registry
+                .register(
+                    identity,
+                    RegisteredEntry::minted(replacement.clone(), KeyRole::Identity),
+                )
+                .unwrap();
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                registry.get(&KeyHandle::new(7)),
+                Err(PlatformError::KeyNotFound)
+            ),
+            "the old identity's pseudonym must be retired"
+        );
+        let entry = registry.get(&identity).unwrap().unwrap();
+        assert_eq!((entry.key, entry.role), (replacement, KeyRole::Identity));
+    }
+
+    /// J3: a derive from identity 1 (key A) whose host call returns after id
+    /// 1 was destroyed and handed to identity key B fails with
+    /// `KeyNotFound`, and the id it returned is not bound.
+    #[tokio::test]
+    async fn a_derive_racing_an_identity_id_reuse_binds_nothing() {
+        let registry = CallbackKeyRegistry::new();
+        let identity = KeyHandle::new(1);
+        live(
+            &registry,
+            1,
+            RegisteredKey::Ed25519(ed(0xF9).verifying_key()),
+            KeyRole::Identity,
+        );
+        let replacement = RegisteredKey::Ed25519(ed(0xFA).verifying_key());
+        let key = p256(0xFB);
+        let point = key.public_key().to_compressed().to_vec();
+        let result = derive_pseudonym(
+            &registry,
+            "derive_pseudonym",
+            &identity,
+            b"ctx",
+            None,
+            |_| {
+                let (registry, replacement) = (&registry, replacement.clone());
+                async move {
+                    destroy_key(registry, &identity, |_| async { Ok(()) }).await?;
+                    registry.register(
+                        identity,
+                        RegisteredEntry::minted(replacement, KeyRole::Identity),
+                    )?;
+                    Ok((point, "20".to_owned()))
+                }
+            },
+            |_| {
+                let answer = p256_answer(&key);
+                async move { Ok(answer) }
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(PlatformError::KeyNotFound)),
+            "{result:?}"
+        );
+        assert!(registry.get(&KeyHandle::new(20)).unwrap().is_none());
+        assert_eq!(registry.get(&identity).unwrap().unwrap().key, replacement);
     }
 
     /// The software host through the flows: every type generates with the

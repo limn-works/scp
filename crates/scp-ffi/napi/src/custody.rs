@@ -1063,6 +1063,19 @@ mod adapter_tests {
             Err(PlatformError::CustodyError(_))
         ));
         assert!(host.last_peer.lock().expect("lock").is_none());
+
+        // An uncompressed point whose last coordinate byte is flipped is off
+        // the curve, and is rejected before the host call.
+        let mut off_curve = peer_point;
+        off_curve[64] ^= 1;
+        assert!(matches!(
+            custody.dh_agree(&hpke, &off_curve).await,
+            Err(PlatformError::CustodyError(_))
+        ));
+        assert!(
+            host.last_peer.lock().expect("lock").is_none(),
+            "an off-curve peer must be rejected before the host call"
+        );
     }
 
     /// F7: each derivation reaches its own callback. Wiring
