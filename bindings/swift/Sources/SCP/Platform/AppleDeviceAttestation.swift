@@ -75,7 +75,7 @@
     /// 1. `generateKey` — creates a Secure Enclave key via App Attest service.
     /// 2. `attestKey(_:clientDataHash:)` — requests Apple's attestation object
     ///    where `clientDataHash = SHA-256(clientDataJSON)`.
-    /// 3. `generateAssertion(_:clientData:)` — per-request proof of possession.
+    /// 3. `generateAssertion(_:clientDataHash:)` — per-request proof of possession.
     ///
     /// ## Unavailable service (simulator, or a device without App Attest)
     ///
@@ -312,7 +312,7 @@
         /// calls to `attest(challenge:deviceId:)`.
         ///
         /// - Returns: An App Attest key ID string suitable for use in
-        ///   `attestKey(_:clientDataHash:)` and `generateAssertion(_:clientData:)`.
+        ///   `attestKey(_:clientDataHash:)` and `generateAssertion(_:clientDataHash:)`.
         /// - Throws: `AttestationError.serviceError` if `generateKey` fails.
         private func resolveKeyId() async throws -> String {
             // Phase 1: synchronous check under lock. Returns either the existing
