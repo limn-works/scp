@@ -601,8 +601,12 @@ public protocol ContextHandleProtocol: AnyObject, Sendable {
      * `"poisoned"` (ADR-049 §10) is surfaced here only when a snapshot/restore
      * path wrote `Poisoned` into this cached state; the watchdog poison path
      * does NOT push into this cache (it is a best-effort cached getter, not a
-     * live supervisor read). The authoritative poison signal is the
-     * `SCP-CTX-2134` error code on the next per-context operation.
+     * live supervisor read). `context_join`, `context_leave`, `context_send`,
+     * and `context_subscribe` read the supervisor's live state before they
+     * run, and each refuses a poisoned context with its own error code
+     * (`SCP-CTX-2013`, `SCP-CTX-2015`, `SCP-CTX-2019`, `SCP-CTX-2021`) and a
+     * message that names the `poisoned` state. An operation that reaches the
+     * supervisor without that gate returns `SCP-CTX-2134`.
      *
      * # Errors
      *
@@ -703,8 +707,12 @@ open func creatorDid() -> String  {
      * `"poisoned"` (ADR-049 §10) is surfaced here only when a snapshot/restore
      * path wrote `Poisoned` into this cached state; the watchdog poison path
      * does NOT push into this cache (it is a best-effort cached getter, not a
-     * live supervisor read). The authoritative poison signal is the
-     * `SCP-CTX-2134` error code on the next per-context operation.
+     * live supervisor read). `context_join`, `context_leave`, `context_send`,
+     * and `context_subscribe` read the supervisor's live state before they
+     * run, and each refuses a poisoned context with its own error code
+     * (`SCP-CTX-2013`, `SCP-CTX-2015`, `SCP-CTX-2019`, `SCP-CTX-2021`) and a
+     * message that names the `poisoned` state. An operation that reaches the
+     * supervisor without that gate returns `SCP-CTX-2134`.
      *
      * # Errors
      *
@@ -9172,9 +9180,11 @@ public struct ContextParams {
     public var mode: ContextMode
     /**
      * Capability ceiling — maximum capabilities any participant can hold.
-     * Empty list means no ceiling restriction.
+     * `None` declares no ceiling, and the context records `default_ceiling()`.
+     * `Some(list)` records exactly `list`, so `Some([])` records a ceiling
+     * that grants nothing.
      */
-    public var ceiling: [String]
+    public var ceiling: [String]?
     /**
      * Ceiling mutability policy — `Immutable` (default) or `Governed`.
      * See spec §5.3.
@@ -9249,8 +9259,10 @@ public struct ContextParams {
          */mode: ContextMode, 
         /**
          * Capability ceiling — maximum capabilities any participant can hold.
-         * Empty list means no ceiling restriction.
-         */ceiling: [String], 
+         * `None` declares no ceiling, and the context records `default_ceiling()`.
+         * `Some(list)` records exactly `list`, so `Some([])` records a ceiling
+         * that grants nothing.
+         */ceiling: [String]?, 
         /**
          * Ceiling mutability policy — `Immutable` (default) or `Governed`.
          * See spec §5.3.
@@ -9400,7 +9412,7 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
         return
             try ContextParams(
                 mode: FfiConverterTypeContextMode.read(from: &buf), 
-                ceiling: FfiConverterSequenceString.read(from: &buf), 
+                ceiling: FfiConverterOptionSequenceString.read(from: &buf), 
                 ceilingPolicy: FfiConverterTypeCeilingPolicy.read(from: &buf), 
                 governance: FfiConverterTypeGovernanceModel.read(from: &buf), 
                 memoryScope: FfiConverterTypeMemoryScope.read(from: &buf), 
@@ -9418,7 +9430,7 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
 
     public static func write(_ value: ContextParams, into buf: inout [UInt8]) {
         FfiConverterTypeContextMode.write(value.mode, into: &buf)
-        FfiConverterSequenceString.write(value.ceiling, into: &buf)
+        FfiConverterOptionSequenceString.write(value.ceiling, into: &buf)
         FfiConverterTypeCeilingPolicy.write(value.ceilingPolicy, into: &buf)
         FfiConverterTypeGovernanceModel.write(value.governance, into: &buf)
         FfiConverterTypeMemoryScope.write(value.memoryScope, into: &buf)
@@ -17690,7 +17702,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_creator_did() != 33786) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_state() != 4611) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_state() != 39119) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_add_agent_key() != 23309) {

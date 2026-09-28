@@ -1897,8 +1897,10 @@ pub struct ContextParams {
     /// See spec §5.14.
     pub mode: ContextMode,
     /// Capability ceiling — maximum capabilities any participant can hold.
-    /// Empty list means no ceiling restriction.
-    pub ceiling: Vec<String>,
+    /// `None` declares no ceiling, and the context records `default_ceiling()`.
+    /// `Some(list)` records exactly `list`, so `Some([])` records a ceiling
+    /// that grants nothing.
+    pub ceiling: Option<Vec<String>>,
     /// Ceiling mutability policy — `Immutable` (default) or `Governed`.
     /// See spec §5.3.
     pub ceiling_policy: CeilingPolicy,
@@ -3402,8 +3404,12 @@ impl ContextHandle {
     /// `"poisoned"` (ADR-049 §10) is surfaced here only when a snapshot/restore
     /// path wrote `Poisoned` into this cached state; the watchdog poison path
     /// does NOT push into this cache (it is a best-effort cached getter, not a
-    /// live supervisor read). The authoritative poison signal is the
-    /// `SCP-CTX-2134` error code on the next per-context operation.
+    /// live supervisor read). `context_join`, `context_leave`, `context_send`,
+    /// and `context_subscribe` read the supervisor's live state before they
+    /// run, and each refuses a poisoned context with its own error code
+    /// (`SCP-CTX-2013`, `SCP-CTX-2015`, `SCP-CTX-2019`, `SCP-CTX-2021`) and a
+    /// message that names the `poisoned` state. An operation that reaches the
+    /// supervisor without that gate returns `SCP-CTX-2134`.
     ///
     /// # Errors
     ///
@@ -6678,7 +6684,15 @@ fn bridge_params_to_core(
 
     let common = scp_ffi_common::context_params::CommonContextParams {
         mode: mode_str.to_owned(),
-        ceiling: params.ceiling.clone(),
+        // An absent ceiling records `default_ceiling()`, in the capability
+        // vocabulary a caller writes, so the shared parser reads it the way it
+        // reads a caller's list.
+        ceiling: params.ceiling.clone().unwrap_or_else(|| {
+            scp_core::context::roles::default_ceiling()
+                .iter()
+                .map(|cap| cap.name().into_owned())
+                .collect()
+        }),
         ceiling_policy: ceiling_policy_str.to_owned(),
         promotion_policy: promotion_policy_str.to_owned(),
         memory_scope: memory_scope_str.to_owned(),
@@ -10308,7 +10322,11 @@ impl Scp {
 
                 // Register per-context UCAN validation state (revocation list,
                 // nonce tracker, event log) for the UCAN pipeline on this instance.
-                bi.ensure_ucan_registered(&context_id, &identity.did, &params.ceiling);
+                bi.ensure_ucan_registered(
+                    &context_id,
+                    &identity.did,
+                    params.ceiling.as_deref().unwrap_or_default(),
+                );
 
                 // §9.10.4: Send pseudonym announcement to inform other members of
                 // the creator's per-context routing ID. For freshly created
@@ -10336,6 +10354,7 @@ impl Scp {
                     ceiling_strings: params
                         .ceiling
                         .iter()
+                        .flatten()
                         .filter_map(|s| {
                             scp_core::context::roles::Capability::new(s)
                                 .map(|c| c.ucan_capability_name())
@@ -10920,18 +10939,16 @@ impl Scp {
             .spawn(async move {
                 validate_did(&identity.did)?;
 
-                let state = handle.state.lock().await;
-
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Context {
-                        msg: format!(
-                            "cannot join context in {:?} state — context must be active",
-                            *state
-                        ),
+                // The supervisor actor answers the lifecycle question, never
+                // the handle's cached state — see
+                // `UniffiBridgeInstance::require_active_context`.
+                bi.require_active_context(&handle.context_id, "join context", |msg| {
+                    ScpError::Context {
+                        msg,
                         code: codes::CTX_2013.to_owned(),
-                    });
-                }
-                drop(state);
+                    }
+                })
+                .await?;
 
                 // Parse the optional spending UCAN JWT once at the bridge boundary
                 // so malformed tokens are rejected before the manager is touched.
@@ -11096,18 +11113,16 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let state = handle.state.lock().await;
-
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Context {
-                        msg: format!(
-                            "cannot leave context in {:?} state — context must be active",
-                            *state
-                        ),
+                // The supervisor actor answers the lifecycle question, never
+                // the handle's cached state — see
+                // `UniffiBridgeInstance::require_active_context`.
+                bi.require_active_context(&handle.context_id, "leave context", |msg| {
+                    ScpError::Context {
+                        msg,
                         code: codes::CTX_2015.to_owned(),
-                    });
-                }
-                drop(state);
+                    }
+                })
+                .await?;
 
                 // Route through the ADR-049 lifecycle dispatch surface.
                 let sup = bi.context_manager_or_error()?;
@@ -11292,18 +11307,16 @@ impl Scp {
             .spawn(async move {
                 validate_did(&identity.did)?;
 
-                let state = handle.state.lock().await;
-
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Context {
-                        msg: format!(
-                            "cannot send to context in {:?} state — context must be active",
-                            *state
-                        ),
+                // The supervisor actor answers the lifecycle question, never
+                // the handle's cached state — see
+                // `UniffiBridgeInstance::require_active_context`.
+                bi.require_active_context(&handle.context_id, "send to context", |msg| {
+                    ScpError::Context {
+                        msg,
                         code: codes::CTX_2019.to_owned(),
-                    });
-                }
-                drop(state);
+                    }
+                })
+                .await?;
 
                 // Validate inner envelope signing via the retained KeyCustody
                 // (SCP-214 criterion 6). This ensures the identity's mandatory
@@ -11438,18 +11451,17 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
-        let state = handle.state.lock().await;
-
-        if !matches!(*state, ContextState::Active) {
-            return Err(ScpError::Context {
-                msg: format!(
-                    "cannot subscribe to context in {:?} state — context must be active",
-                    *state
-                ),
-                code: codes::CTX_2021.to_owned(),
-            });
-        }
-        drop(state);
+        // The supervisor actor answers the lifecycle question, never
+        // the handle's cached state — see
+        // `UniffiBridgeInstance::require_active_context`.
+        self.inner
+            .require_active_context(&handle.context_id, "subscribe to context", |msg| {
+                ScpError::Context {
+                    msg,
+                    code: codes::CTX_2021.to_owned(),
+                }
+            })
+            .await?;
 
         // Signal stream completion — full transport wiring connects this
         // listener to the message pipeline in integration stories.
@@ -19556,7 +19568,7 @@ mod tests {
     fn encrypted_join_test_params() -> ContextParams {
         ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: Vec::new(),
+            ceiling: Some(Vec::new()),
             ceiling_policy: CeilingPolicy::Immutable,
             governance: GovernanceModel::SingleAdmin,
             memory_scope: MemoryScope::Ephemeral,
@@ -19570,6 +19582,269 @@ mod tests {
             consequence_rules_json: None,
             consequence_config_json: None,
         }
+    }
+
+    /// Runs join, leave, send, and subscribe against `handle` as `identity`,
+    /// and returns each call's name with its refusal.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any of the four calls succeeds, because every caller
+    /// drives a context the gate must refuse.
+    #[cfg(feature = "testing")]
+    fn lifecycle_gate_refusals(
+        scp: &Arc<crate::scp::Scp>,
+        handle: &Arc<ContextHandle>,
+        identity: &Arc<Identity>,
+    ) -> [(&'static str, ScpError); 4] {
+        struct IgnoringListener;
+        impl crate::MessageListener for IgnoringListener {
+            fn on_message(&self, _message: crate::Message) {}
+            fn on_error(&self, _error: ScpError) {}
+            fn on_complete(&self) {}
+        }
+        let rt = runtime();
+        let join = rt
+            .block_on(scp.context_join(Arc::clone(handle), Arc::clone(identity), None))
+            .expect_err("join must refuse");
+        let leave = rt
+            .block_on(scp.context_leave(Arc::clone(handle), Arc::clone(identity)))
+            .expect_err("leave must refuse");
+        let send = rt
+            .block_on(scp.context_send(
+                Arc::clone(handle),
+                Arc::clone(identity),
+                b"hi".to_vec(),
+                None,
+            ))
+            .expect_err("send must refuse");
+        let subscribe = rt
+            .block_on(scp.context_subscribe(Arc::clone(handle), Box::new(IgnoringListener)))
+            .expect_err("subscribe must refuse");
+        [
+            ("join", join),
+            ("leave", leave),
+            ("send", send),
+            ("subscribe", subscribe),
+        ]
+    }
+
+    /// Join, leave, send, and subscribe read the supervisor actor, so a
+    /// despawned actor refuses all four while the handle's cached state still
+    /// reads `Active`.
+    ///
+    /// A TTL expiry despawns the actor on the supervisor's own timer and
+    /// never writes the handle's cached state, so a gate reading that cached
+    /// state admits an operation into a context the supervisor stopped
+    /// serving.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn lifecycle_gates_read_the_supervisor_not_the_cached_handle_state() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+
+        rt.block_on(async {
+            scp.inner
+                .context_manager_or_error()
+                .expect("supervisor")
+                .despawn_actor(&context_id)
+                .await
+        });
+        assert!(matches!(
+            *rt.block_on(handle.state.lock()),
+            ContextState::Active
+        ));
+
+        for (call, err) in lifecycle_gate_refusals(&scp, &handle, &identity) {
+            assert!(
+                err.to_string().contains("no live supervisor state"),
+                "{call} on a despawned context reported: {err}"
+            );
+        }
+    }
+
+    /// Join, leave, send, and subscribe refuse a context whose actor is
+    /// resident but reports `Closing`, the state a close another member
+    /// started leaves while this handle's cached state still reads `Active`.
+    /// Each refusal carries its operation's own error code. A gate weakened
+    /// to an existence check admits all four here, because the actor answers
+    /// the lifecycle read.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn lifecycle_gates_refuse_a_resident_actor_in_closing() {
+        use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let params = ContextParams {
+            ceiling: Some(vec![
+                "messages:read".to_owned(),
+                "messages:write".to_owned(),
+                "context:close".to_owned(),
+            ]),
+            ..encrypted_join_test_params()
+        };
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), params))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+
+        let sup = scp
+            .inner
+            .context_manager_or_error()
+            .expect("supervisor")
+            .clone();
+        rt.block_on(async {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            sup.dispatch_lifecycle_command(LifecycleCommand::CloseContext {
+                payload: Box::new(CloseContextPayload {
+                    context_id: context_id.clone(),
+                    params: scp_core::context::ContextParams::default(),
+                    initiator_did: identity.did.clone().into(),
+                }),
+                reply: tx,
+            })
+            .await
+            .expect("close dispatch");
+            rx.await.expect("close reply").expect("close must succeed");
+        });
+        assert_eq!(
+            rt.block_on(scp.inner.read_live_context_state(&context_id))
+                .expect("the resident actor answers"),
+            Some(scp_core::context::ContextState::Closing),
+        );
+        assert!(matches!(
+            *rt.block_on(handle.state.lock()),
+            ContextState::Active
+        ));
+
+        let refusals = lifecycle_gate_refusals(&scp, &handle, &identity);
+        for ((call, err), code) in refusals.iter().zip([
+            codes::CTX_2013,
+            codes::CTX_2015,
+            codes::CTX_2019,
+            codes::CTX_2021,
+        ]) {
+            assert!(
+                matches!(err, ScpError::Context { code: c, msg }
+                    if c == code && msg.contains("'closing' state")),
+                "{call} on a closing context must refuse with {code}, got: {err:?}"
+            );
+        }
+    }
+
+    /// Join, leave, send, and subscribe refuse a context the supervisor still
+    /// holds while its actor is poisoned, mid-respawn, past a failed respawn,
+    /// or not answering, and each refusal carries the supervisor's answer.
+    ///
+    /// In every case the handle's cached state reads `Active`. A poisoned
+    /// context reads `Some(Poisoned)` and refuses with the operation's own
+    /// message. A context mid-respawn or past a failed respawn reads
+    /// `ActorCrashed` (`SCP-CTX-2135`), and an actor whose mailbox does not
+    /// answer reads `ActorBusy` (`SCP-CTX-2130`). A gate that folded a failed
+    /// read into `None` would report "no live supervisor state" for the last
+    /// three, and a gate that read the cached state would admit all four.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn lifecycle_gates_refuse_a_poisoned_crashed_or_unreachable_actor() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+
+        for (fault, expected) in [
+            ("poisoned", "'poisoned' state"),
+            ("mid_respawn", codes::CTX_2135),
+            ("respawn_failed", codes::CTX_2135),
+            ("unreachable", "SCP-CTX-2130"),
+        ] {
+            let handle = rt
+                .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+                .expect("context_create should succeed");
+            let context_id = handle.context_id();
+            let sup = scp
+                .inner
+                .context_manager_or_error()
+                .expect("supervisor")
+                .clone();
+            match fault {
+                "poisoned" => rt.block_on(sup.test_poison_context(&context_id)),
+                "mid_respawn" => rt.block_on(sup.test_hold_context_mid_respawn(&context_id)),
+                "respawn_failed" => rt.block_on(sup.test_fail_context_respawn(&context_id)),
+                _ => sup.test_make_actor_unreachable(&context_id),
+            }
+            assert!(matches!(
+                *rt.block_on(handle.state.lock()),
+                ContextState::Active
+            ));
+
+            for (call, err) in lifecycle_gate_refusals(&scp, &handle, &identity) {
+                assert!(
+                    format!("{err:?}").contains(expected),
+                    "{call} on a {fault} context must report {expected:?}, got: {err:?}"
+                );
+            }
+        }
+    }
+
+    /// `context_create` records `default_ceiling()` for `ceiling: None` and
+    /// exactly the declared list for `ceiling: Some(list)`, so `Some([])`
+    /// records a ceiling that grants nothing.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn context_create_records_default_ceiling_for_none_and_empty_for_some_empty() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let recorded_ceiling = |ceiling: Option<Vec<String>>| {
+            let handle = rt
+                .block_on(scp.context_create(
+                    Arc::clone(&identity),
+                    ContextParams {
+                        ceiling,
+                        ..encrypted_join_test_params()
+                    },
+                ))
+                .expect("context_create should succeed");
+            rt.block_on(
+                scp.inner
+                    .context_manager_or_error()
+                    .expect("supervisor")
+                    .get_role_state_checked(&handle.context_id()),
+            )
+            .expect("the actor answers")
+            .expect("the actor holds role state")
+            .ceiling()
+            .to_ucan_string_set()
+        };
+
+        assert_eq!(
+            recorded_ceiling(None),
+            scp_core::context::roles::default_ceiling().to_ucan_string_set(),
+            "an absent ceiling must record default_ceiling()"
+        );
+        let empty = recorded_ceiling(Some(Vec::new()));
+        assert!(
+            empty.is_empty(),
+            "an empty ceiling must record a ceiling that grants nothing: {empty:?}"
+        );
+        assert_eq!(
+            recorded_ceiling(Some(vec!["messages:read".to_owned()])),
+            std::collections::HashSet::from(["messages:read".to_owned()]),
+            "a declared ceiling must record exactly the declared list"
+        );
     }
 
     /// Test helper: build a [`SealedInvitation`] from its four wire fields (the
@@ -25348,7 +25623,7 @@ mod tests {
         fn saga_context_params(ceiling: &[&str]) -> ContextParams {
             ContextParams {
                 mode: ContextMode::Encrypted,
-                ceiling: ceiling.iter().map(|s| (*s).to_owned()).collect(),
+                ceiling: Some(ceiling.iter().map(|s| (*s).to_owned()).collect()),
                 ceiling_policy: CeilingPolicy::Immutable,
                 governance: GovernanceModel::SingleAdmin,
                 memory_scope: MemoryScope::Ephemeral,
