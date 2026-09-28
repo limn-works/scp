@@ -110,7 +110,10 @@ pub enum ClaimError {
 /// See ADR-023 acceptance criterion 7.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimRequest {
-    /// The shadow identity to claim.
+    /// The shadow identity to claim: the shadow registry key. Production
+    /// fills it with `derive_shadow_id` in `scp-node`'s bridge handlers,
+    /// `shadow:{bridge_id}:{platform_user_id}`, which is not yet the §3.5.5
+    /// `shadow_did` `Identifier`; that gap is tracked outside this crate.
     pub shadow_id: String,
 
     /// DID of the claimant (the external participant transitioning to native
@@ -186,13 +189,20 @@ use scp_did::extract_public_key_from_did;
 ///         || BE64(timestamp))
 /// ```
 ///
-/// `shadow_did` is [`ClaimRequest::shadow_id`], the shadow identity's
-/// identifier. `attestation_id` is read from the attestation the request
-/// carries, so the signed id and the verified attestation cannot differ.
-/// The platform handle is not hashed: the signed `IdentityLink` attestation
-/// that `attestation_id` names carries it, and `validate_claim_request`
-/// checks it against the shadow's handle. §25.10 Vector 22 restates this
-/// construction.
+/// The `shadow_did` field is [`ClaimRequest::shadow_id`]. Production fills it
+/// with the registry key `derive_shadow_id` in `scp-node`'s bridge handlers
+/// produces, the string `shadow:{bridge_id}:{platform_user_id}`, which is not
+/// the §3.5.5 `Identifier`; that gap is tracked outside this function.
+/// `attestation_id` is read from the attestation the request carries, so the
+/// signed id and the checked attestation cannot differ.
+///
+/// The platform handle is not hashed. Today `validate_claim_request` checks
+/// the attestation's type, subject, revocation state, and signature, and
+/// compares its `platform_handle` claim with the shadow's handle. It does not
+/// yet check the attestation's issuer or its expiry (§3.5.5 step 1a) or its
+/// evidence recency (step 1c), so until those checks land the attestation
+/// binds the handle only as far as its signature and subject do. §25.10 Vector 22
+/// restates this construction.
 ///
 /// # Errors
 ///
