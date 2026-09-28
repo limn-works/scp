@@ -1846,9 +1846,10 @@ jobs:
           # available in this job — they run in dedicated parity jobs below.
           PYTHONPATH=. pytest tests/ -v -m "not parity"
 
-  # Compile the wheel with the cargo configuration a release compiles it with, on
-  # the ubuntu-latest host, so an `openssl-src` build failure on that host fails a
-  # pull request instead of a tag push.
+  # Compile the wheel with the features a release compiles it with, read from the
+  # same `[tool.maturin]` table, on the ubuntu-latest host, so an `openssl-src`
+  # build failure on that host fails a pull request instead of a tag push. It
+  # compiles the dev profile: the release passes `--release` and this job does not.
   # `.github/workflows/build-matrix.yml` triggers on a `scp-*@*` tag push and on
   # `workflow_call`, and job python-test above runs `maturin develop --release
   # --features testing`, which REPLACES the `[tool.maturin] features` array rather
@@ -1859,8 +1860,10 @@ jobs:
   # compile nothing.
   #
   # This job carries no path filter, so it runs on every pull request and cannot be
-  # skipped for a change that breaks the build. It compiles in debug and on one
-  # target, so it is not the release matrix: it exercises neither the
+  # skipped for a change that breaks the build. It compiles the dev profile, so a
+  # failure only `[profile.release]` produces, such as a `-D warnings` lint under
+  # `cfg(not(debug_assertions))`, first fails the tag push. It compiles on one
+  # target, so it is not the release matrix either: it exercises neither the
   # manylinux_2_28 container and its `dnf install -y perl` step, nor NASM on
   # Windows, nor the aarch64 cross image. build-matrix.yml has no
   # `workflow_dispatch` of its own; run release.yml through `workflow_dispatch`
