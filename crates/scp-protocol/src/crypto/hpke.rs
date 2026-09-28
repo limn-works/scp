@@ -207,6 +207,9 @@ fn labeled_expand(
     labeled_info.extend_from_slice(info);
 
     // HKDF-Expand from an existing PRK: reconstruct the HKDF state from the PRK.
+    // Wiping that state is best effort only: `hmac` 0.12 implements no
+    // `ZeroizeOnDrop`, so the HMAC key state derived from `prk` is left in
+    // memory when `hk` drops.
     let hk = Hkdf::<Sha256>::from_prk(prk)
         .map_err(|e| HpkeError::SealFailed(format!("HKDF from_prk: {e}")))?;
     hk.expand(&labeled_info, out)
