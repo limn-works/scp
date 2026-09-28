@@ -539,7 +539,7 @@ bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/ 
 
 The UniFFI bridge (ADR-021) generates raw Kotlin bindings from the Rust protocol engine. While functional, the generated surface is not idiomatic Kotlin — it lacks coroutine suspension, `Flow<T>` streams, Android lifecycle awareness, Jetpack Compose integration, and the ergonomic patterns Kotlin developers expect. The Android platform adapter (ADR-027) provides the `KeyCustody`, `PushProvider`, `Storage`, and `DeviceAttestationProvider` implementations injected into the Rust engine via UniFFI callback interfaces.
 
-The Kotlin SDK ergonomics layer wraps the generated bindings to produce an idiomatic Kotlin API that feels native to the platform: `suspend` functions throughout, `Flow<Message>` for streaming, `LifecycleOwner`-aware cleanup, `@Composable`-ready state holders, and `AutoCloseable` resource management. The ergonomics layer is pure Kotlin — zero protocol logic, zero duplication of Rust behavior. This mirrors the ADR-014 (Python SDK) and ADR-026 (Swift SDK) pattern: flat FFI bridge → idiomatic language wrapper.
+The Kotlin SDK ergonomics layer wraps the generated bindings to produce an idiomatic Kotlin API that feels native to the platform: `suspend` functions throughout, `Flow<Message>` for streaming, `LifecycleOwner`-aware cleanup, `@Composable`-ready state holders, and one `suspend` teardown per resource with no `AutoCloseable` (amended; see the `AutoCloseable` bullet under Rationale). The ergonomics layer is pure Kotlin — zero protocol logic, zero duplication of Rust behavior. This mirrors the ADR-014 (Python SDK) and ADR-026 (Swift SDK) pattern: flat FFI bridge → idiomatic language wrapper.
 
 Kotlin 2.x with JVM 11+ is the baseline. The SDK targets both Android (API 26+) and JVM (server-side, tests). Android-specific lifecycle integration is opt-in — the core SDK runs on any JVM without Android dependencies.
 
@@ -553,7 +553,7 @@ Kotlin 2.x with JVM 11+ is the baseline. The SDK targets both Android (API 26+) 
 
 ### Decision
 
-Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/`. The SDK module imports the UniFFI-generated `NativeLib.kt` from `internal/`, re-exports its types through the ergonomics layer in `src/main/kotlin/works/limn/scp/`, and builds a pure Kotlin ergonomics layer on top. The top-level entry point is `Scp` — a class that initializes the identity and injects the Android platform adapter. `Context` is the primary interactive type — exposing `Flow<Message>` for streaming and `AutoCloseable` / explicit `close()` lifecycle.
+Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/`. The SDK module imports the UniFFI-generated `NativeLib.kt` from `internal/`, re-exports its types through the ergonomics layer in `src/main/kotlin/works/limn/scp/`, and builds a pure Kotlin ergonomics layer on top. The top-level entry point is `Scp` — a class that initializes the identity and injects the Android platform adapter. `Context` is the primary interactive type — exposing `Flow<Message>` for streaming and one `suspend` teardown, with no `AutoCloseable` (amended; see the `AutoCloseable` bullet under Rationale, which also records that ADR-048 later removed `Context` from the Kotlin surface).
 
 **Dispatcher strategy:**
 - All FFI calls (blocking Rust operations) execute on `Dispatchers.IO` via `withContext(Dispatchers.IO)`. This is the designated dispatcher for blocking I/O operations in Kotlin coroutines — it is backed by a thread pool sized for blocking work.
@@ -567,12 +567,12 @@ Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/
 **Android lifecycle integration:**
 - Android lifecycle integration is implemented via an extension function `Context.asFlow(lifecycleOwner: LifecycleOwner): Flow<Message>` in a separate `scp-kt-android` artifact. This artifact depends on `androidx.lifecycle:lifecycle-runtime-ktx` — a dependency the core SDK does not take on, keeping the JVM artifact Android-free.
 - The extension launches collection in `lifecycleOwner.lifecycleScope` and cancels when the `LifecycleOwner` reaches `DESTROYED`. This prevents resource leaks when an `Activity` or `Fragment` is destroyed while a context subscription is live.
-- `ViewModel`-based usage is the recommended pattern: create `Scp` and `Context` in a `ViewModel`, expose `Flow<Message>` as a `StateFlow<List<Message>>` using `stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())`. The `ViewModel.onCleared()` override calls `context.close()`.
+- `ViewModel`-based usage is the recommended pattern: create `Scp` and `Context` in a `ViewModel`, expose `Flow<Message>` as a `StateFlow<List<Message>>` using `stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())`. The `ViewModel.onCleared()` override launches `leave` for every tracked context on a scope it never cancels and returns without waiting (amended: `viewModelScope` is already cancelled when `onCleared()` runs, and blocking `onCleared()` on a teardown deadlocks or produces an ANR; see the `AutoCloseable` bullet under Rationale).
 
 **Jetpack Compose integration:**
-- No Compose-specific artifacts or dependencies in the SDK. Compose integration is achieved through standard Kotlin patterns the SDK already provides: `Flow<Message>` collected via `collectAsState()`, and `AutoCloseable` resources managed in `remember { }` blocks with `DisposableEffect` for cleanup.
+- No Compose-specific artifacts or dependencies in the SDK. Compose integration is achieved through standard Kotlin patterns the SDK already provides: `Flow<Message>` collected via `collectAsState()`, and resources held in `remember { }` blocks whose `DisposableEffect` `onDispose` launches their `suspend` teardown on a scope that disposal never cancels, then returns (amended; see the `AutoCloseable` bullet under Rationale).
 - Recommended pattern: `val messages by context.receiveFlow().collectAsState(initial = emptyList())`.
-- Context lifecycle in Compose: `DisposableEffect(contextId) { onDispose { context.close() } }` ensures the context is closed when the composable leaves the composition.
+- Context lifecycle in Compose: `DisposableEffect(contextId) { onDispose { teardownScope.launch { context.close() } } }` starts the context's teardown when the composable leaves the composition, where `teardownScope` outlives the composable and disposal never cancels it, so `onDispose` never blocks the composition thread (amended; see the `AutoCloseable` bullet under Rationale).
 
 **Maven Central publishing:**
 - Published as `works.limn:scp-kt` on Maven Central.
@@ -589,7 +589,7 @@ Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/
 - **Lifecycle-in-extension-artifact, not in core:** Android lifecycle (`LifecycleOwner`, `lifecycleScope`) is an Android-only API. Taking this dependency in the core SDK would force JVM targets (server-side, tests) to depend on Android-specific artifacts. Separating it into `scp-kt-android` keeps the core SDK usable on any JVM and keeps the Android extension small and focused.
 - **One suspending teardown, and no `AutoCloseable`, for any type whose teardown crosses the FFI boundary (amended; see below):** Kotlin/JVM resource management follows the `AutoCloseable` / `use { }` pattern, and this ADR originally applied it to `Context`: `context.use { }` for automatic cleanup, with `AutoCloseable.close()` as a synchronous safety net that launched a `close()` coroutine and cancelled the internal scope, matching the `deinit` + `close()` pattern in the Swift SDK. **That rule no longer holds, for the reason stated in the amendment below.** A type whose teardown reaches the Rust engine exposes exactly one `suspend` teardown function and implements no `AutoCloseable`.
 
-  **Amendment (this ADR stays Decided; this bullet supersedes the rule above).** `AutoCloseable.close()` is synchronous and returns `Unit`, so a Kotlin type whose teardown reaches the Rust engine can satisfy it only by blocking its calling thread. Every teardown that crosses the FFI boundary routes through `CoroutineBridge.ffiCall`, which suspends on that bridge's injected `ioDispatcher`. Blocking a caller on it therefore fails in two ways that this repository has each observed:
+  **Amendment (this ADR stays Decided; this bullet supersedes the rule above).** `AutoCloseable.close()` is synchronous and returns `Unit`, so a Kotlin type whose teardown reaches the Rust engine can satisfy it only by blocking its calling thread. Every teardown that crosses the FFI boundary routes through `CoroutineBridge.ffiCall` (`Relay.shutdown()`, `Node.shutdown()`) or `CoroutineBridge.ffiCallSuspend` (`SCP.shutdown(bridge, timeout)`), each of which suspends on that bridge's injected `ioDispatcher`. Blocking a caller on it therefore fails in two ways that this repository has each observed:
   - A caller that injects a `StandardTestDispatcher` parks the one thread that advances that dispatcher's scheduler, so the work the `close()` waits for can never run and `close()` never returns.
   - An Android caller blocks a main thread, which produces an ANR.
 
@@ -597,7 +597,7 @@ Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/
 
   `Context`, the type the superseded rule named, no longer exists on the Kotlin surface — ADR-048 replaced the free-function façade and its `Context` type with per-instance methods on `SCP`. `SCP.shutdown(bridge, timeout)` is `suspend` and takes a `CoroutineBridge`, so a synchronous `close()` could neither obtain that bridge nor honour that deadline. `Relay` and `Node` follow the same rule for the same reason.
 
-  This changes what a caller writes, not what teardown does: the lifecycle invariant below (leave contexts, destroy key material, close transports, flush events) is unchanged, and a caller reaches it from a coroutine rather than from a `use { }` block. `.docs/standards/sdk-common.md` §Resource Lifecycle carries the same rule in its per-language table.
+  This changes what a caller writes, not what teardown does: the lifecycle invariant in `.docs/standards/sdk-common.md` §Lifecycle invariant (leave contexts, destroy key material, close transports, flush events) is unchanged, and a caller reaches it from a coroutine rather than from a `use { }` block. `.docs/standards/sdk-common.md` §Resource Lifecycle carries the same rule in its per-language table.
 - **No Compose dependencies in SDK:** Compose APIs (`@Composable`, `State<T>`, `collectAsState()`) require the Compose compiler plugin and runtime. Shipping a Compose dependency in the SDK would force every consumer to adopt Compose or deal with unused transitive dependencies. Compose integration is trivially achieved with standard `Flow.collectAsState()` and `DisposableEffect` — patterns that are Compose-idiomatic without SDK involvement.
 - **`Scp` class (not object/singleton) as top-level entry point:** `Scp` holds per-identity state (the identity handle, the platform adapter). Multiple `Scp` instances in a process are valid (e.g., in tests, or in apps that support account switching). A Kotlin `object` singleton would prevent this. The factory pattern `Scp.create()` is a `companion object` method — idiomatic for async factory construction in Kotlin.
 - **Kotlin 2.x, JVM 11+:** Kotlin 2.x is the current stable release with full coroutines support, improved type inference, and the K2 compiler. JVM 11 is required by Android Gradle Plugin 8+ and covers all modern JVM targets. JVM 11 features (e.g., `List.of()`, `String.isBlank()`) are available; no Java 8 compatibility mode needed.
@@ -622,7 +622,7 @@ bindings/kotlin/
       main/kotlin/works/limn/scp/
         SCP.kt                             # Scp class — top-level entry point, factory, context creation
         Identity.kt                        # Identity class, ResolutionOutcome data class
-        Context.kt                         # Context class, Flow<Message>, AutoCloseable lifecycle
+        Context.kt                         # Context class, Flow<Message>, suspend close() lifecycle
         Outlets.kt                           # OutletDefinition, TestVector data classes
         Trust.kt                           # evaluateTrust(), TrustEvaluation data class
         EventLog.kt                        # EventLog class, Event, Proof, Checkpoint data classes
@@ -701,7 +701,7 @@ tasks.test {
  * @param custody Key custody method: "platform" (Android Keystore / JVM keystore)
  *                or "in_memory" (software keys, testing only).
  */
-class Scp private constructor(private val identityHandle: IdentityHandle) : AutoCloseable {
+class Scp private constructor(private val identityHandle: IdentityHandle) {
 
     val identity: Identity = Identity(identityHandle)
 
@@ -738,8 +738,8 @@ class Scp private constructor(private val identityHandle: IdentityHandle) : Auto
         Context(handle)
     }
 
-    override fun close() {
-        // Synchronous cleanup — cancels internal scope, releases handles.
+    /** One suspending teardown; no AutoCloseable (see the amended Rationale bullet). */
+    suspend fun shutdown(): Unit = withContext(Dispatchers.IO) {
         identityHandle.destroy()
     }
 }
@@ -799,9 +799,9 @@ data class ResolutionOutcome(
 ```kotlin
 /**
  * An active SCP context. Send messages, receive streams, invoke outlets.
- * Always call close() when done. Use the use { } block or DisposableEffect in Compose.
+ * Call the suspend close() from a coroutine when done; never block a thread on it.
  */
-class Context internal constructor(internal val handle: ContextHandle) : AutoCloseable {
+class Context internal constructor(internal val handle: ContextHandle) {
 
     val contextId: String get() = handle.contextId()
     val state: String get() = handle.state()
@@ -854,14 +854,20 @@ class Context internal constructor(internal val handle: ContextHandle) : AutoClo
     }
 
     /**
-     * AutoCloseable.close() — synchronous cleanup. Schedules a leave() coroutine
-     * and cancels the internal scope. Prefer calling leave() or closeContext() explicitly
-     * for graceful teardown.
+     * The one teardown path: leaves the context, then cancels the internal scope and
+     * releases the handle. Suspends until teardown finishes; this type implements no
+     * AutoCloseable (see the amended Rationale bullet).
      */
-    override fun close() {
-        scope.launch { runCatching { leave() } }
-        scope.cancel()
-        handle.destroy()
+    suspend fun close() {
+        try {
+            leave()
+        } catch (e: ContextException) {
+            // sdk-common.md §Cleanup error handling: a cleanup error is logged, never propagated.
+            logCleanupFailure(e)
+        } finally {
+            scope.cancel()
+            handle.destroy()
+        }
     }
 }
 ```
@@ -996,26 +1002,32 @@ fun Context.asLifecycleFlow(
 // ScpViewModel.kt — in works.limn.scp.android package
 
 /**
- * Base ViewModel that manages Scp and Context lifecycle.
- * Extend this to get automatic cleanup when the ViewModel is cleared.
+ * Base ViewModel that leaves every tracked context when the ViewModel is cleared.
+ * An app that owns an Scp instance shuts it down with its suspend shutdown() from a
+ * coroutine the app owns; no synchronous close() exists to call from onCleared().
  */
 abstract class ScpViewModel : ViewModel() {
 
-    protected var scpInstance: Scp? = null
     private val activeContexts = mutableListOf<works.limn.scp.Context>()
 
+    // viewModelScope is already cancelled when onCleared() runs, so a launch there never
+    // runs. Cleanup gets its own scope, which nothing cancels.
+    private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+
     protected fun trackContext(context: works.limn.scp.Context): works.limn.scp.Context {
-        activeContexts.add(context)
+        synchronized(activeContexts) { activeContexts.add(context) }
         return context
     }
 
     override fun onCleared() {
         super.onCleared()
-        viewModelScope.launch {
-            activeContexts.forEach { runCatching { it.leave() } }
-            activeContexts.clear()
-            scpInstance?.close()
-            scpInstance = null
+        val contexts = synchronized(activeContexts) {
+            activeContexts.toList().also { activeContexts.clear() }
+        }
+        // Dispatch and return: blocking the main thread on a teardown deadlocks or
+        // produces an ANR (see the amended Rationale bullet).
+        cleanupScope.launch {
+            contexts.forEach { runCatching { it.leave() }.onFailure(::logCleanupFailure) }
         }
     }
 }
@@ -1035,9 +1047,10 @@ fun ContextScreen(contextId: String) {
     val messages by context.receiveFlow()
         .collectAsStateWithLifecycle(initialValue = emptyList<Message>())
 
-    // Cleanup when the composable leaves composition
+    // Start teardown when the composable leaves composition. The scope outlives this
+    // composable and disposal never cancels it, so onDispose returns without blocking.
     DisposableEffect(contextId) {
-        onDispose { context.close() }
+        onDispose { viewModel.teardownScope.launch { context.close() } }
     }
 
     LazyColumn {
@@ -1125,9 +1138,9 @@ dependencies {
 - **ADR-021 (UniFFI Bridge):** The Kotlin SDK wraps the UniFFI-generated `NativeLib.kt`. Every SDK public method calls exactly one UniFFI bridge function. The bridge defines the flat function surface (`identityCreate`, `contextCreate`, etc.), opaque object handles (`IdentityHandle`, `ContextHandle`), value records (`ScpMessage`, `ContextParams`), the `ScpError` sealed class, and the `MessageListener` callback interface.
 - **ADR-027 (Android Platform Adapter):** The `AndroidPlatformAdapter` (implemented in ADR-027) is instantiated by `Scp.create(custody = "platform", platformAdapter = AndroidPlatformAdapter.make(context))` and injected into the Rust engine via UniFFI callback interfaces. The Kotlin SDK `Scp.create()` factory accepts a `PlatformAdapter` parameter; ADR-027 provides the Android-specific implementation.
 - **ADR-006 (Platform Abstraction):** Platform trait definitions (`KeyCustody`, `PushProvider`, `Storage`, `DeviceAttestationProvider`) shape the UniFFI callback interface contracts that the Kotlin platform adapter implements.
-- **ADR-026 (Swift SDK):** Parallel reference. Same flat delegation pattern, same "no logic in the wrapper layer" principle, same FFI bridge → idiomatic language wrapper architecture. Key differences: Kotlin uses `suspend` functions and `Flow<Message>` where Swift uses `async/await` and `AsyncStream<Message>`; Kotlin uses `AutoCloseable` + `close()` where Swift uses `deinit` + `close()`; Kotlin uses `@Observable`-equivalent via `StateFlow` where Swift uses `@Observable` macro.
+- **ADR-026 (Swift SDK):** Parallel reference. Same flat delegation pattern, same "no logic in the wrapper layer" principle, same FFI bridge → idiomatic language wrapper architecture. Key differences: Kotlin uses `suspend` functions and `Flow<Message>` where Swift uses `async/await` and `AsyncStream<Message>`; Kotlin uses one `suspend` teardown and no `AutoCloseable` (amended; see Rationale) where Swift uses `deinit` + `close()`; Kotlin uses `@Observable`-equivalent via `StateFlow` where Swift uses `@Observable` macro.
 - **ADR-014 (Python SDK) / ADR-013 (PyO3 Bridge):** The ergonomics layer pattern — flat FFI bridge → idiomatic language wrapper — is established here and applied to Kotlin. Kotlin SDK mirrors the structural choices (no logic in the wrapper layer, delegation only) and the type category decisions (opaque handles for crypto state, data classes for data).
-- **ADR-022 (TypeScript SDK):** Parallel patterns: `Flow<Message>` (Kotlin) mirrors `AsyncIterable<Message>` (TypeScript); `AutoCloseable.close()` (Kotlin) mirrors `Symbol.asyncDispose` (TypeScript). Conformance test suite is shared.
+- **ADR-022 (TypeScript SDK):** Parallel patterns: `Flow<Message>` (Kotlin) mirrors `AsyncIterable<Message>` (TypeScript); the `suspend` teardown (Kotlin) mirrors `Symbol.asyncDispose` (TypeScript). Conformance test suite is shared.
 
 ### Acceptance Criteria
 
@@ -1164,7 +1177,7 @@ dependencies {
    - `context.send(payload)` delivers an encrypted message (no throw for valid payload and active state).
    - `context.leave()` completes without throwing for a valid active context.
    - After `close()`, `send()` throws `ContextException` with code `"SCP-CTX-2001"`.
-   - `context.use { }` block calls `AutoCloseable.close()` on exit — verified by collecting the flow and asserting it completes after the block exits.
+   - `context.close()` suspends until teardown finishes, and `Context` implements no `AutoCloseable` (amended; see Rationale) — verified by collecting the flow and asserting it completes after `close()` returns.
 
 5. **Message streaming via `Flow<Message>`:**
 
@@ -1229,11 +1242,11 @@ dependencies {
 11. **Android lifecycle integration (scp-kt-android):**
     - `context.asLifecycleFlow(lifecycleOwner)` returns a `Flow<Message>` that cancels when the `LifecycleOwner` reaches `DESTROYED`.
     - Verified by creating a `TestLifecycleOwner`, collecting the flow in a test coroutine, moving the owner to `DESTROYED`, and asserting the flow completes.
-    - `ScpViewModel.onCleared()` calls `leave()` on all tracked contexts and `close()` on the `Scp` instance.
+    - `ScpViewModel.onCleared()` launches `leave()` for every tracked context on a scope it never cancels and returns without waiting for those calls (amended; see Rationale). No synchronous `close()` exists on `Scp` for `onCleared()` to call; an app shuts its `Scp` instance down with the suspend teardown from a coroutine it owns.
 
 12. **Jetpack Compose integration (no SDK artifact required):**
     - `context.receiveFlow().collectAsStateWithLifecycle(initialValue = emptyList())` compiles and recomposes correctly when messages arrive.
-    - `DisposableEffect(contextId) { onDispose { context.close() } }` calls `close()` when the composable leaves the composition — verified with `ComposeContentTestRule`.
+    - A `DisposableEffect(contextId)` whose `onDispose` launches `context.close()` on a scope that disposal never cancels starts that teardown when the composable leaves the composition, and `onDispose` returns without waiting — verified with `ComposeContentTestRule`.
 
 13. **No logic in Kotlin layer:**
     - Code review: every public SDK method body contains exactly one `NativeLib.*` call (plus `withContext` and error mapping). No branching protocol logic exists in any ergonomics-layer file.
@@ -1272,7 +1285,7 @@ dependencies {
 | `scp-kt/build.gradle.kts` | Gradle module build — dependencies, publishing, signing, ktlint, detekt |
 | `src/main/kotlin/works/limn/scp/SCP.kt` | `Scp` class — top-level entry point, `create()` factory, `createContext()`, `joinContext()` |
 | `src/main/kotlin/works/limn/scp/Identity.kt` | `Identity` class — `identifier`, `custodyType`, `load()`, `resolve()`, `rotateKey()`; `ResolutionOutcome` data class |
-| `src/main/kotlin/works/limn/scp/Context.kt` | `Context` class — `send()`, `receiveFlow()`, `invokeOutlet()`, `registerOutlet()`, `leave()`, `closeContext()`, `AutoCloseable` |
+| `src/main/kotlin/works/limn/scp/Context.kt` | `Context` class — `send()`, `receiveFlow()`, `invokeOutlet()`, `registerOutlet()`, `leave()`, `closeContext()`, suspend `close()` (no `AutoCloseable`) |
 | `src/main/kotlin/works/limn/scp/Outlets.kt` | `OutletDefinition`, `TestVector`, `OutletVerificationResult` data classes |
 | `src/main/kotlin/works/limn/scp/Trust.kt` | `evaluateTrust()`, `TrustEvaluation` data class |
 | `src/main/kotlin/works/limn/scp/EventLog.kt` | `EventLog` class, `Event`, `Proof`, `Checkpoint` data classes |
