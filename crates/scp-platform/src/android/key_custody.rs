@@ -1,10 +1,11 @@
-//! Android Keystore [`KeyCustody`] adapter.
+//! Android Keystore key custody adapter.
 //!
-//! The Android key custody adapter is implemented in Kotlin at
-//! `bindings/kotlin/scp-kt-android/.../AndroidKeyCustody.kt` and injected
-//! into the Rust engine via the UniFFI callback interface (ADR-021). This module
-//! documents the Rust-side contract and re-exports the trait types that the
-//! Kotlin adapter implements.
+//! The Kotlin class `AndroidKeyCustody` in
+//! `bindings/kotlin/scp-kt-android/.../AndroidKeyCustody.kt` implements the
+//! Kotlin `KeyCustodyProvider` interface in `Types.kt`, not [`KeyCustody`]
+//! (ADR-021); the [`super`] module docs list where the two differ. No code
+//! injects the Kotlin adapter into the Rust engine yet. This module documents
+//! the Rust-side contract and re-exports the trait types for Android builds.
 //!
 //! # Key Storage Strategy (ADR-027)
 //!

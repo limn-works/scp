@@ -1,10 +1,11 @@
-//! Firebase Cloud Messaging [`Push`] adapter for Android.
+//! Firebase Cloud Messaging push adapter for Android.
 //!
-//! The Android push provider is implemented in Kotlin at
-//! `bindings/kotlin/scp-kt-android/.../AndroidPushProvider.kt` and
-//! injected into the Rust engine via the UniFFI callback interface (ADR-021).
-//! This module documents the Rust-side contract and re-exports the trait types
-//! that the Kotlin adapter implements.
+//! The Kotlin class `AndroidPushProvider` in
+//! `bindings/kotlin/scp-kt-android/.../AndroidPushProvider.kt` implements the
+//! Kotlin `PushProvider` interface in `Types.kt`, not [`Push`] (ADR-021); the
+//! [`super`] module docs list where the two differ. No code injects the Kotlin
+//! adapter into the Rust engine yet. This module documents the Rust-side
+//! contract and re-exports the trait types for Android builds.
 //!
 //! # FCM Payload Opacity (ADR-027, section 10.7)
 //!

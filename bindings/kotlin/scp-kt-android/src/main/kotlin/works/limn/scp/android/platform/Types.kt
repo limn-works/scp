@@ -1,9 +1,9 @@
 // Types.kt — Supporting types for Android platform adapters (ADR-027)
 //
-// These types mirror the Rust `scp-platform` trait signatures (crates/scp-platform/src/traits.rs)
-// and the UniFFI callback interface contract (crates/scp-ffi/uniffi/src/bridge.rs). They will
-// eventually be replaced by UniFFI-generated Kotlin types once the full FFI binding pipeline is
-// wired. Until then, they serve as the Kotlin-side contract.
+// These types follow the Rust `scp-platform` traits (crates/scp-platform/src/traits.rs) or the
+// UniFFI callback interfaces (crates/scp-ffi/uniffi/src/lib.rs), and each interface's KDoc names
+// the declaration it follows. They will eventually be replaced by UniFFI-generated Kotlin types
+// once the full FFI binding pipeline is wired. Until then, they serve as the Kotlin-side contract.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
 // ADR-025 (Apple Platform Adapter — parallel reference).
@@ -135,9 +135,13 @@ enum class WakeSignal {
  * Platform trait for device attestation.
  *
  * Abstracts device-level attestation token generation behind a uniform interface.
- * The Android implementation uses the Play Integrity Standard API.
+ * The Android implementation requests a Classic Play Integrity token; ADR-027
+ * requires a Standard request, and story SCP-111 tracks that change.
  *
- * This interface mirrors the Rust `DeviceAttestation` trait in `scp-platform/src/traits.rs`.
+ * This interface mirrors the UniFFI `DeviceAttestationProvider` callback interface in
+ * `crates/scp-ffi/uniffi/src/lib.rs`. It does not mirror the Rust `DeviceAttestation` trait in
+ * `crates/scp-platform/src/traits.rs`, whose `attest` takes no argument and which declares a
+ * `verify` method that this interface lacks.
  *
  * See ADR-006 for the platform abstraction design and ADR-027 for the Android adapter.
  */
@@ -145,7 +149,9 @@ interface DeviceAttestationProvider {
     /**
      * Generate an attestation token for the given challenge and device ID.
      *
-     * @param challenge Server-issued random challenge bytes.
+     * @param challenge The 32-byte binding digest `D` of
+     *   `09-security-model.md` §9.3.1. ADR-025 and ADR-027 require the caller
+     *   to pass `D`. No Rust code calls this method yet.
      * @param deviceId Stable device/identity identifier bytes.
      * @return Platform-specific attestation token bytes.
      * @throws ScpException if attestation fails.
@@ -155,7 +161,10 @@ interface DeviceAttestationProvider {
     /**
      * Generate a per-request assertion.
      *
-     * @param requestHash SHA-256 hash of the request data being asserted.
+     * @param requestHash The 32-byte assertion digest `A` of
+     *   `09-security-model.md` §9.3.1 over the request bytes. ADR-025 and
+     *   ADR-027 require the caller to pass `A`, never the request bytes or
+     *   their plain SHA-256. No Rust code calls this method yet.
      * @return Platform-specific assertion token bytes.
      * @throws ScpException if assertion fails.
      */
@@ -199,8 +208,11 @@ interface PushProvider {
  * uses Android Keystore for TEE-backed Ed25519 on API 33+ and Bouncy Castle
  * for software fallback on API 26-32.
  *
- * This interface mirrors the Rust `KeyCustody` trait in `scp-platform/src/traits.rs`
- * and the UniFFI `KeyCustodyProvider` callback interface in `scp-ffi/uniffi/src/bridge.rs`.
+ * This interface follows the Rust `KeyCustody` trait in `scp-platform/src/traits.rs`: its
+ * methods take a [KeyHandle] and a [KeyType]. The UniFFI `KeyCustodyProvider` callback
+ * interface in `scp-ffi/uniffi/src/lib.rs` takes a `String` key ID and a `String` key type
+ * instead. The methods of this interface are synchronous, while the methods of both Rust
+ * declarations are `async`.
  *
  * See ADR-006 for the platform abstraction design and ADR-027 for the Android adapter.
  */
@@ -345,8 +357,10 @@ interface KeyCustodyProvider {
  * implementation ([AndroidStorage]) uses SQLCipher with a TEE-derived AES-256
  * encryption key stored in Android Keystore.
  *
- * This interface mirrors the Rust `Storage` trait in `scp-platform/src/traits.rs`
- * and the UniFFI `StorageProvider` callback interface in `scp-ffi/uniffi/src/bridge.rs`.
+ * This interface uses the method names of the UniFFI `StorageProvider` callback interface in
+ * `scp-ffi/uniffi/src/lib.rs`, where the Rust `Storage` trait in `scp-platform/src/traits.rs`
+ * names `set` and `get` as `store` and `retrieve`. The methods of this interface are
+ * synchronous, while the methods of both Rust declarations are `async`.
  *
  * All keys are UTF-8 strings. Values are opaque byte arrays. Keys are unique — storing
  * a value with an existing key replaces the previous value.
