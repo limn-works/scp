@@ -674,10 +674,6 @@ impl<H: JsCustodyHost> KeyCustody for CallbackAdapter<H> {
 /// Enum dispatch wrapper for the [`KeyCustody`] implementations the napi-rs
 /// bridge uses. Since [`KeyCustody`] is not object-safe (RPITIT), this enum
 /// wraps the concrete types and delegates each method to the active variant.
-// The `InMemory` variant exists only in `testing` builds, and each identity
-// holds one custody value, so boxing it would buy nothing. Same allowance as
-// the PyO3 `FfiKeyCustody`.
-#[allow(clippy::large_enum_variant)]
 pub(crate) enum NapiKeyCustody {
     /// Test/dev in-memory custody (feature-gated), wrapped for redacted Debug.
     #[cfg(feature = "testing")]
