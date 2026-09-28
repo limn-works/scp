@@ -340,14 +340,17 @@ pub struct CustodyPublicKey {
 
 /// Callback for platform cryptographic key management.
 ///
-/// A provider that has no key for a `key_id` returns `ScpError::Crypto`
-/// with code `SCP-CRYPTO-4061`; the bridge reports that as a missing key.
-/// Every other error is a custody failure.
-///
 /// Implemented by host code and injected into the Rust engine. No in-tree
 /// Swift or Kotlin host implements this protocol yet: `AppleKeyCustody` and
 /// `AndroidKeyCustody` implement their SDKs' own custody interfaces (UUID or
 /// hex key ids, no [`PseudonymResult`]), and S0 PR8 conforms them to it.
+///
+/// A method reports failure by returning an [`ScpError`]. Return one whose
+/// code is `SCP-CRYPTO-4006` (key not found) for a key id that was destroyed or
+/// never existed; the bridge reports it as key-not-found. Any other error,
+/// whatever its code, becomes the custody error `SCP-CRYPTO-4060` carrying the
+/// host's code and message. Throw only [`ScpError`]: `UniFFI` 0.29 panics on
+/// any other error a callback throws.
 ///
 /// # SAFETY: Thread execution context
 ///
@@ -437,7 +440,7 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// The pseudonym dies with its identity (`09-security-model.md`
     /// §9.10.4.A): `destroy_key` on `key_id` destroys it, and a derivation
     /// still in flight when `key_id` is destroyed fails with key-not-found
-    /// and stores nothing.
+    /// (`SCP-CRYPTO-4006`) and stores nothing.
     ///
     /// The same (`key_id`, `context_id`) MUST return the same pseudonym key id
     /// on every call, so re-deriving names one key rather than minting another;

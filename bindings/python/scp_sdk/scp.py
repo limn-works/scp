@@ -110,6 +110,14 @@ class KeyCustodyProvider(Protocol):
     Key identifiers are opaque, numeric-string handles your implementation
     assigns in :meth:`generate_keypair` and maps internally to real key
     material. Byte values are passed and returned as ``bytes``.
+
+    A method reports failure by raising. Raise
+    :class:`~scp_sdk.errors.KeyNotFoundError`, or any exception whose ``code``
+    is ``"SCP-CRYPTO-4006"`` (key not found), such as
+    ``CryptoError(msg, "SCP-CRYPTO-4006")``, for a key id that was destroyed
+    or never existed; the bridge reports it as key-not-found. Any other
+    exception, whatever its ``code``, becomes the custody error
+    ``SCP-CRYPTO-4060`` carrying that code and the exception text.
     """
 
     def generate_keypair(self, key_type: str) -> str:
@@ -145,7 +153,8 @@ class KeyCustodyProvider(Protocol):
         uncompressed SEC1 point for ``"hpke-p256"``. The bridge registers the
         key under the stated type and rejects a length that does not match
         it. A provider that holds no key for ``key_id`` raises
-        :class:`~scp_sdk.errors.KeyNotFoundError`, which callers receive as
+        :class:`~scp_sdk.errors.KeyNotFoundError` (or any exception whose
+        ``code`` is ``"SCP-CRYPTO-4006"``), which callers receive as
         key-not-found; any other exception is a custody error.
         """
         ...
@@ -181,7 +190,7 @@ class KeyCustodyProvider(Protocol):
         The pseudonym dies with its identity (``09-security-model.md``
         §9.10.4.A): :meth:`destroy_key` on ``key_id`` destroys it, and a
         derivation still in flight when ``key_id`` is destroyed raises
-        key-not-found and stores nothing.
+        key-not-found (``SCP-CRYPTO-4006``) and stores nothing.
 
         Canonical recipe (all software custody backends MUST produce identical
         bytes; ``ikm`` is the identity private key material, the 32-byte

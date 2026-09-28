@@ -44,7 +44,15 @@ use crate::identity::OpaqueInMemoryKeyCustody;
 /// `KeyCustodyProvider` callback interface and the Python `KeyCustodyProvider`
 /// protocol.
 ///
-/// The JS callbacks are synchronous (they return the value directly, not a
+/// Every callback returns a structured outcome, `{ ok: true, value }` or
+/// `{ ok: false, code?, message }`, and never throws: napi-rs turns an
+/// exception thrown inside a threadsafe-function callback into a process-level
+/// uncaught exception, so `custody-adapter.ts` catches each host throw and
+/// returns the failure arm. A failure whose `code` is `SCP-CRYPTO-4006` maps to
+/// [`PlatformError::KeyNotFound`]; any other failure maps to
+/// [`PlatformError::CustodyError`].
+///
+/// The JS callbacks are synchronous (they return the outcome directly, not a
 /// `Promise`) — keystore reads are fast and the bridge awaits the dispatch via
 /// [`call_host`]. Private key material never crosses into
 /// Rust ownership (ADR-006): the consumer owns the secrets and returns only
@@ -53,33 +61,43 @@ use crate::identity::OpaqueInMemoryKeyCustody;
 pub struct NapiKeyCustodyProvider {
     /// `(keyType: string) => string` — generate a keypair, return its id.
     /// `keyType` is `"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`.
-    #[napi(ts_type = "(keyType: string) => string")]
-    pub generate_keypair: Function<'static, String, String>,
+    #[napi(
+        ts_type = "(keyType: string) => { ok: boolean; value?: string; code?: string; message?: string }"
+    )]
+    pub generate_keypair: Function<'static, String, HostStringResult>,
     /// `(keyId: string, message: Uint8Array) => Uint8Array` — 64-byte sig.
     /// For a `"p256"` key `message` is a 32-byte prehash and the result is
     /// raw `r || s` (64 bytes) or DER; Rust normalises to low-s and verifies
     /// it strictly against the key's public key, rejecting any mismatch. A
     /// software host MUST derive the ECDSA nonce by RFC 6979 with SHA-256; a
     /// hardware host may use a random nonce.
-    #[napi(ts_type = "(keyId: string, message: Uint8Array) => Uint8Array")]
-    pub sign: Function<'static, (String, Vec<u8>), Vec<u8>>,
+    #[napi(
+        ts_type = "(args: [string, number[]]) => { ok: boolean; value?: number[]; code?: string; message?: string }"
+    )]
+    pub sign: Function<'static, (String, Vec<u8>), HostBytesResult>,
     /// `(keyId: string) => { keyType, publicKey }` — the key's type
     /// (`"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`) and its public
     /// key: exactly 32 bytes (Ed25519 / X25519), the 33-byte compressed SEC1
     /// point (`"p256"`) or the 65-byte uncompressed SEC1 point
     /// (`"hpke-p256"`). The bridge types the key from `keyType`, never from
     /// the length, and refuses any other length. A key id the host does not
-    /// hold throws an error whose `code` is `"KEY_NOT_FOUND"`.
-    #[napi(ts_type = "(keyId: string) => { keyType: string; publicKey: Uint8Array }")]
-    pub get_public_key: Function<'static, String, NapiCustodyPublicKey>,
+    /// hold is a failure whose `code` is `"SCP-CRYPTO-4006"`.
+    #[napi(
+        ts_type = "(keyId: string) => { ok: boolean; value?: { keyType: string; publicKey: number[] }; code?: string; message?: string }"
+    )]
+    pub get_public_key: Function<'static, String, HostPublicKeyResult>,
     /// `(keyId: string) => void` — destroy key material.
-    #[napi(ts_type = "(keyId: string) => void")]
-    pub destroy_key: Function<'static, String, ()>,
+    #[napi(
+        ts_type = "(keyId: string) => { ok: boolean; value?: undefined; code?: string; message?: string }"
+    )]
+    pub destroy_key: Function<'static, String, HostUnitResult>,
     /// `(keyId: string, peerPublic: Uint8Array) => Uint8Array` — 32 shared
     /// bytes; an `"hpke-p256"` key receives the 65-byte uncompressed peer
     /// point.
-    #[napi(ts_type = "(keyId: string, peerPublic: Uint8Array) => Uint8Array")]
-    pub dh_agree: Function<'static, (String, Vec<u8>), Vec<u8>>,
+    #[napi(
+        ts_type = "(args: [string, number[]]) => { ok: boolean; value?: number[]; code?: string; message?: string }"
+    )]
+    pub dh_agree: Function<'static, (String, Vec<u8>), HostBytesResult>,
     /// `(keyId: string, contextId: Uint8Array) => { publicKey, keyId }` —
     /// the §9.10.4 v1 pseudonym: `publicKey` is the 33-byte compressed P-256
     /// point and `keyId` the numeric handle of the pseudonym key. The bridge
@@ -87,9 +105,9 @@ pub struct NapiKeyCustodyProvider {
     /// (`keyId`, `contextId`) MUST return the same pseudonym `keyId` on every
     /// call, so re-deriving names one key rather than minting another.
     #[napi(
-        ts_type = "(keyId: string, contextId: Uint8Array) => { publicKey: Uint8Array; keyId: string }"
+        ts_type = "(args: [string, number[]]) => { ok: boolean; value?: { publicKey: number[]; keyId: string }; code?: string; message?: string }"
     )]
-    pub derive_pseudonym: Function<'static, (String, Vec<u8>), NapiPseudonymResult>,
+    pub derive_pseudonym: Function<'static, (String, Vec<u8>), HostPseudonymResult>,
     /// `(keyId: string, contextId: Uint8Array, pseudonymEpoch: bigint) => { publicKey, keyId }`
     /// — the §9.10.4 rotatable v2 pseudonym, same return shape as
     /// `derivePseudonym`; the same (`keyId`, `contextId`, `pseudonymEpoch`)
@@ -97,15 +115,19 @@ pub struct NapiKeyCustodyProvider {
     /// (HMAC key is the private-derived `pseudonym_secret`, domain
     /// `"scp-pseudonym-v2"`); the bridge does NOT synthesize the preimage.
     #[napi(
-        ts_type = "(keyId: string, contextId: Uint8Array, pseudonymEpoch: bigint) => { publicKey: Uint8Array; keyId: string }"
+        ts_type = "(args: [string, number[], bigint]) => { ok: boolean; value?: { publicKey: number[]; keyId: string }; code?: string; message?: string }"
     )]
-    pub derive_rotatable_pseudonym: Function<'static, (String, Vec<u8>, u64), NapiPseudonymResult>,
+    pub derive_rotatable_pseudonym: Function<'static, (String, Vec<u8>, u64), HostPseudonymResult>,
     /// `(keyId: string) => Uint8Array` — 32 raw private-seed bytes.
-    #[napi(ts_type = "(keyId: string) => Uint8Array")]
-    pub export_signing_key_bytes: Function<'static, String, Vec<u8>>,
+    #[napi(
+        ts_type = "(keyId: string) => { ok: boolean; value?: number[]; code?: string; message?: string }"
+    )]
+    pub export_signing_key_bytes: Function<'static, String, HostBytesResult>,
     /// `(keyId: string) => string` — `"hardware"` / `"software"` / `"in_memory"`.
-    #[napi(ts_type = "(keyId: string) => string")]
-    pub custody_type: Function<'static, String, String>,
+    #[napi(
+        ts_type = "(keyId: string) => { ok: boolean; value?: string; code?: string; message?: string }"
+    )]
+    pub custody_type: Function<'static, String, HostStringResult>,
 }
 
 /// A host key's stated type and public key, returned by `getPublicKey`.
@@ -127,41 +149,173 @@ pub struct NapiPseudonymResult {
     pub key_id: String,
 }
 
+/// A host callback outcome carrying a string (`generateKeypair`, `custodyType`).
+#[napi(object, object_to_js = false)]
+pub struct HostStringResult {
+    /// `true` when the host call succeeded and `value` holds its result.
+    pub ok: bool,
+    /// The host's result when `ok`.
+    pub value: Option<String>,
+    /// The failure's `SCP-` code when the host error carried one.
+    pub code: Option<String>,
+    /// The host error's message when not `ok`.
+    pub message: Option<String>,
+}
+
+/// A host callback outcome carrying bytes (`sign`, `getPublicKey`, `dhAgree`,
+/// `exportSigningKeyBytes`).
+#[napi(object, object_to_js = false)]
+pub struct HostBytesResult {
+    /// `true` when the host call succeeded and `value` holds its result.
+    pub ok: bool,
+    /// The host's result when `ok`.
+    pub value: Option<Vec<u8>>,
+    /// The failure's `SCP-` code when the host error carried one.
+    pub code: Option<String>,
+    /// The host error's message when not `ok`.
+    pub message: Option<String>,
+}
+
+/// A host callback outcome carrying a key's type and public key
+/// (`getPublicKey`).
+#[napi(object, object_to_js = false)]
+pub struct HostPublicKeyResult {
+    /// `true` when the host call succeeded and `value` holds its result.
+    pub ok: bool,
+    /// The host's result when `ok`.
+    pub value: Option<NapiCustodyPublicKey>,
+    /// The failure's `SCP-` code when the host error carried one.
+    pub code: Option<String>,
+    /// The host error's message when not `ok`.
+    pub message: Option<String>,
+}
+
+/// A host callback outcome with no value (`destroyKey`).
+#[napi(object, object_to_js = false)]
+pub struct HostUnitResult {
+    /// `true` when the host call succeeded.
+    pub ok: bool,
+    /// The failure's `SCP-` code when the host error carried one.
+    pub code: Option<String>,
+    /// The host error's message when not `ok`.
+    pub message: Option<String>,
+}
+
+/// A host callback outcome carrying a pseudonym (`derivePseudonym`,
+/// `deriveRotatablePseudonym`).
+#[napi(object, object_to_js = false)]
+pub struct HostPseudonymResult {
+    /// `true` when the host call succeeded and `value` holds its result.
+    pub ok: bool,
+    /// The host's result when `ok`.
+    pub value: Option<NapiPseudonymResult>,
+    /// The failure's `SCP-` code when the host error carried one.
+    pub code: Option<String>,
+    /// The host error's message when not `ok`.
+    pub message: Option<String>,
+}
+
+/// A host failure's `SCP-` code and message.
+type HostFailure = (Option<String>, Option<String>);
+
+/// One accessor over the four host outcome shapes, so every custody method
+/// maps a host failure the same way.
+trait HostOutcome {
+    type Value;
+    /// The value on success (`None` when the host sent none), or the failure.
+    fn into_outcome(self) -> Result<Option<Self::Value>, HostFailure>;
+}
+
+macro_rules! host_outcome_with_value {
+    ($ty:ty, $value:ty) => {
+        impl HostOutcome for $ty {
+            type Value = $value;
+            fn into_outcome(self) -> Result<Option<Self::Value>, HostFailure> {
+                if self.ok {
+                    Ok(self.value)
+                } else {
+                    Err((self.code, self.message))
+                }
+            }
+        }
+    };
+}
+
+host_outcome_with_value!(HostStringResult, String);
+host_outcome_with_value!(HostBytesResult, Vec<u8>);
+host_outcome_with_value!(HostPseudonymResult, NapiPseudonymResult);
+host_outcome_with_value!(HostPublicKeyResult, NapiCustodyPublicKey);
+
+impl HostOutcome for HostUnitResult {
+    type Value = ();
+    fn into_outcome(self) -> Result<Option<()>, HostFailure> {
+        if self.ok {
+            Ok(Some(()))
+        } else {
+            Err((self.code, self.message))
+        }
+    }
+}
+
+/// Maps a host callback's outcome to the custody result: the value on
+/// success, [`PlatformError::KeyNotFound`] for a `SCP-CRYPTO-4006` failure,
+/// and [`PlatformError::CustodyError`] for any other failure and for a
+/// success with no value.
+fn host_value<R: HostOutcome>(method: &str, outcome: R) -> Result<R::Value, PlatformError> {
+    match outcome.into_outcome() {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => Err(PlatformError::CustodyError(format!(
+            "KeyCustodyProvider.{method} reported success with no value"
+        ))),
+        Err((code, message)) => Err(scp_ffi_common::custody_parse::host_failure(
+            method,
+            code.as_deref(),
+            message.as_deref().unwrap_or_default(),
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NapiCallbackKeyCustody — concrete `KeyCustody` adapter over the JS callbacks
 // ---------------------------------------------------------------------------
 
-/// The `code` a JS custody callback throws when it holds no key for the key
-/// id it was given: `Object.assign(new Error(msg), { code: "KEY_NOT_FOUND" })`.
-pub(crate) const KEY_NOT_FOUND_CODE: &str = "KEY_NOT_FOUND";
-
-/// Calls a JS custody callback and awaits its result.
+/// Calls a JS custody callback and awaits its outcome.
 ///
-/// The callback runs through `call_with_return_value`, whose completion
-/// closure runs on the JS thread. A JS throw therefore reaches this closure
-/// as a value (napi's `call_async` instead re-throws it through
-/// `napi_fatal_exception`, an uncaught exception in the host). A thrown
-/// object whose `code` is [`KEY_NOT_FOUND_CODE`] is the host's typed
-/// not-found, [`PlatformError::KeyNotFound`]; any other throw, a return of the
-/// wrong JS type, or a call that cannot be queued is a custody error.
+/// The SDK's `custody-adapter.ts` returns every host call as a structured
+/// outcome, which [`host_value`] maps through the shared code table. The
+/// callback runs through `call_with_return_value`, whose completion closure
+/// runs on the JS thread, so a callback that throws anyway (a record built
+/// without the SDK adapter) reaches this closure as a value (napi's
+/// `call_async` instead re-throws it through `napi_fatal_exception`, an
+/// uncaught exception in the host) and maps through the same table by its
+/// `code`. A return of the wrong JS type, or a call that cannot be queued, is
+/// a custody error.
 async fn call_host<T, R>(
     method: &'static str,
     tsfn: &ThreadsafeFunction<T, R, T, napi::Status, false>,
     value: T,
-) -> Result<R, PlatformError>
+) -> Result<R::Value, PlatformError>
 where
     T: 'static + napi::bindgen_prelude::JsValuesTupleIntoVec,
-    R: 'static + napi::bindgen_prelude::FromNapiValue + Send,
+    R: 'static + napi::bindgen_prelude::FromNapiValue + HostOutcome + Send,
+    R::Value: Send,
 {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let status = tsfn.call_with_return_value(
         value,
         ThreadsafeFunctionCallMode::NonBlocking,
         move |result: napi::Result<R>, env: napi::Env| {
-            let result = result.map_err(|e| {
-                let reason = e.reason.clone();
-                thrown_error(method, js_error_code(&env, e).as_deref(), &reason)
-            });
+            let result = match result {
+                Ok(outcome) => host_value(method, outcome),
+                Err(e) => {
+                    let reason = e.reason.clone();
+                    Err(scp_ffi_common::custody_parse::host_failure(
+                        method,
+                        js_error_code(&env, e).as_deref(),
+                        &reason,
+                    ))
+                }
+            };
             // A send fails only when the awaiting caller was dropped, so
             // there is no one left to report to.
             let _ = tx.send(result);
@@ -178,17 +332,6 @@ where
             "KeyCustodyProvider.{method}: the call ended without a result"
         ))
     })?
-}
-
-/// The [`PlatformError`] for a JS custody callback that threw: the typed
-/// not-found when the thrown `code` is [`KEY_NOT_FOUND_CODE`], otherwise a
-/// custody error naming the callback.
-fn thrown_error(method: &str, code: Option<&str>, reason: &str) -> PlatformError {
-    if code == Some(KEY_NOT_FOUND_CODE) {
-        PlatformError::KeyNotFound
-    } else {
-        PlatformError::CustodyError(format!("KeyCustodyProvider.{method} raised: {reason}"))
-    }
 }
 
 /// The string `code` property of a thrown JS object, if it has one.
@@ -230,28 +373,40 @@ fn js_error_code(env: &napi::Env, e: napi::Error) -> Option<String> {
 /// per-field arg/return shapes.
 #[allow(clippy::type_complexity)]
 pub(crate) struct CallbackTsfns {
-    generate_keypair: ThreadsafeFunction<String, String, String, napi::Status, false>,
-    sign: ThreadsafeFunction<(String, Vec<u8>), Vec<u8>, (String, Vec<u8>), napi::Status, false>,
-    get_public_key: ThreadsafeFunction<String, NapiCustodyPublicKey, String, napi::Status, false>,
-    destroy_key: ThreadsafeFunction<String, (), String, napi::Status, false>,
-    dh_agree:
-        ThreadsafeFunction<(String, Vec<u8>), Vec<u8>, (String, Vec<u8>), napi::Status, false>,
+    generate_keypair: ThreadsafeFunction<String, HostStringResult, String, napi::Status, false>,
+    sign: ThreadsafeFunction<
+        (String, Vec<u8>),
+        HostBytesResult,
+        (String, Vec<u8>),
+        napi::Status,
+        false,
+    >,
+    get_public_key: ThreadsafeFunction<String, HostPublicKeyResult, String, napi::Status, false>,
+    destroy_key: ThreadsafeFunction<String, HostUnitResult, String, napi::Status, false>,
+    dh_agree: ThreadsafeFunction<
+        (String, Vec<u8>),
+        HostBytesResult,
+        (String, Vec<u8>),
+        napi::Status,
+        false,
+    >,
     derive_pseudonym: ThreadsafeFunction<
         (String, Vec<u8>),
-        NapiPseudonymResult,
+        HostPseudonymResult,
         (String, Vec<u8>),
         napi::Status,
         false,
     >,
     derive_rotatable_pseudonym: ThreadsafeFunction<
         (String, Vec<u8>, u64),
-        NapiPseudonymResult,
+        HostPseudonymResult,
         (String, Vec<u8>, u64),
         napi::Status,
         false,
     >,
-    export_signing_key_bytes: ThreadsafeFunction<String, Vec<u8>, String, napi::Status, false>,
-    custody_type: ThreadsafeFunction<String, String, String, napi::Status, false>,
+    export_signing_key_bytes:
+        ThreadsafeFunction<String, HostBytesResult, String, napi::Status, false>,
+    custody_type: ThreadsafeFunction<String, HostStringResult, String, napi::Status, false>,
 }
 
 /// The JS custody callbacks as the adapter calls them: one method per
@@ -1136,21 +1291,43 @@ mod adapter_tests {
         assert_eq!(host.calls("derive_pseudonym"), 1);
     }
 
-    /// D2: a thrown `code: "KEY_NOT_FOUND"` is the typed not-found and any
-    /// other throw a custody error; through `sign`, a host not-found reaches
-    /// the caller as `KeyNotFound` and a transport error as `CustodyError`.
+    /// D2: a host failure whose `code` is `SCP-CRYPTO-4006` is the typed
+    /// not-found, and any other failure, or a success with no value, a
+    /// custody error; through `sign`, a host not-found reaches the caller as
+    /// `KeyNotFound` and a transport error as `CustodyError`.
     #[tokio::test]
     async fn napi_adapter_maps_host_not_found_through_sign() {
+        let failed = |code: Option<&str>| HostBytesResult {
+            ok: false,
+            value: None,
+            code: code.map(str::to_owned),
+            message: Some("boom".to_owned()),
+        };
         assert!(matches!(
-            thrown_error("sign", Some(KEY_NOT_FOUND_CODE), "gone"),
-            PlatformError::KeyNotFound
+            host_value(
+                "sign",
+                failed(Some(scp_ffi_common::error_codes::CRYPTO_4006))
+            ),
+            Err(PlatformError::KeyNotFound)
         ));
-        for code in [None, Some("ECONNRESET"), Some("key_not_found")] {
+        for code in [None, Some("ECONNRESET"), Some("KEY_NOT_FOUND")] {
             assert!(matches!(
-                thrown_error("sign", code, "boom"),
-                PlatformError::CustodyError(_)
+                host_value("sign", failed(code)),
+                Err(PlatformError::CustodyError(_))
             ));
         }
+        assert!(matches!(
+            host_value(
+                "sign",
+                HostBytesResult {
+                    ok: true,
+                    value: None,
+                    code: None,
+                    message: None,
+                }
+            ),
+            Err(PlatformError::CustodyError(_))
+        ));
 
         let host = Arc::new(FakeHost::default());
         let custody = adapter(&host);
@@ -1170,7 +1347,13 @@ mod adapter_tests {
 
         let transport = CallbackAdapter::over(TestHost {
             host: Arc::clone(&host),
-            sign_error: Some(|| thrown_error("sign", Some("ECONNRESET"), "socket closed")),
+            sign_error: Some(|| {
+                scp_ffi_common::custody_parse::host_failure(
+                    "sign",
+                    Some("ECONNRESET"),
+                    "socket closed",
+                )
+            }),
         });
         let key = transport
             .generate_keypair(KeyType::Ed25519)

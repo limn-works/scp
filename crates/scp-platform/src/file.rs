@@ -7,6 +7,11 @@
 //!
 //! # Key File Format
 //!
+//! `17-persistence-and-storage.md` §17.8 (`FileKeyCustody` Argon2id Parameters)
+//! defines this format: the Argon2id parameters, the v4 HKDF info labels, the
+//! header, entry and associated-data layouts, and the file tag. This summary
+//! restates it; where the two differ, §17.8 governs.
+//!
 //! The key file stores zero or more encrypted key entries, each containing
 //! one Ed25519, X25519 or P-256 private key. The file begins with a global header
 //! and is followed by a sequence of key entries:
@@ -67,7 +72,7 @@
 //! - Each `sign` / `public_key` / `dh_agree` call decrypts the key,
 //!   performs the operation, and zeroizes the plaintext immediately.
 //!
-//! See GitHub issue #391 and ADR-006.
+//! See ADR-006.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

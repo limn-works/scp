@@ -488,6 +488,15 @@ export interface CustodyPublicKey {
  * your implementation assigns in {@link generateKeypair}. Byte values are
  * passed and returned as `Uint8Array`.
  *
+ * A callback reports failure by throwing. Throw an error whose `code` is
+ * `"SCP-CRYPTO-4006"` (key not found), such as
+ * `new CryptoError(msg, "SCP-CRYPTO-4006")`, for a key id that was destroyed or
+ * never existed; the SDK call then rejects with a `CryptoError` carrying that
+ * code. Any other throw, whatever its code, rejects the SDK call with the
+ * custody error `SCP-CRYPTO-4060` carrying the thrown code and message. The
+ * SDK catches every throw, so none reaches the process as an uncaught
+ * exception.
+ *
  * Only available on the NAPI (Node.js / Bun) backend — the SDK requires the
  * native addon (ADR-048). The browser tier (`@limn-works/scp-ts-wasm`, ADR-057)
  * runs the full protocol in-tab and does not use this native custody callback.
@@ -519,8 +528,8 @@ export interface KeyCustodyProvider {
    * {@link derivePseudonym} returned), and the 65-byte uncompressed SEC1
    * point for `"hpke-p256"`. The bridge registers the key under the stated
    * type and rejects a length that does not match it. A provider that holds
-   * no key for `keyId` throws a `KeyNotFoundError` (or any object whose
-   * `code` is `"KEY_NOT_FOUND"`), which callers receive as key-not-found.
+   * no key for `keyId` throws a `KeyNotFoundError` (or any error whose `code`
+   * is `"SCP-CRYPTO-4006"`), which callers receive as key-not-found.
    */
   getPublicKey(keyId: string): CustodyPublicKey;
   /**

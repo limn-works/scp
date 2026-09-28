@@ -10764,7 +10764,7 @@
     },
     {
       "id": "SCP-307",
-      "title": "Move every SCP key to P-256: scp-crypto verification, KeyCustody, MLS ciphersuite 2, HPKE DHKEM(P-256) and the JOSE ES256 codec",
+      "title": "Add P-256 beside Ed25519: scp-crypto verification, KeyCustody, MLS ciphersuite 2, HPKE DHKEM(P-256) and the JOSE ES256 codec",
       "gate": "gate-kel",
       "priority": "P0",
       "severity": "critical",

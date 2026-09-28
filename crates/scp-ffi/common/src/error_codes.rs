@@ -688,6 +688,14 @@ pub const CRYPTO_4002: &str = "SCP-CRYPTO-4002";
 pub const CRYPTO_4003: &str = "SCP-CRYPTO-4003";
 /// Decryption failed.
 pub const CRYPTO_4004: &str = "SCP-CRYPTO-4004";
+/// Key not found: the key handle is unknown or its key was destroyed.
+///
+/// Every native bridge reports `PlatformError::KeyNotFound` with this code,
+/// and a host custody callback signals key-not-found by failing with it; the
+/// bridge maps a host failure with any other code to a custody error
+/// ([`CRYPTO_4060`]). A pseudonym whose identity was destroyed fails with this
+/// code (`09-security-model.md` §9.10.4.A).
+pub const CRYPTO_4006: &str = "SCP-CRYPTO-4006";
 /// MLS group create error.
 pub const CRYPTO_4010: &str = "SCP-CRYPTO-4010";
 /// MLS proposal error.
@@ -714,14 +722,11 @@ pub const CRYPTO_4057: &str = "SCP-CRYPTO-4057";
 pub const CRYPTO_4058: &str = "SCP-CRYPTO-4058";
 /// `UniFFI` HPKE error.
 pub const CRYPTO_4059: &str = "SCP-CRYPTO-4059";
-/// `UniFFI` key custody error.
-pub const CRYPTO_4060: &str = "SCP-CRYPTO-4060";
-/// A custody host (`KeyCustodyProvider`) has no key for the given key id.
+/// Key custody error: a key custody provider, or a host's custody callback,
+/// failed for a reason other than key-not-found ([`CRYPTO_4006`]).
 ///
-/// A host raises `ScpError::Crypto` with this code; the bridge maps it to
-/// `PlatformError::KeyNotFound`, and every other host error to a custody
-/// error.
-pub const CRYPTO_4061: &str = "SCP-CRYPTO-4061";
+/// Every native bridge reports `PlatformError::CustodyError` with this code.
+pub const CRYPTO_4060: &str = "SCP-CRYPTO-4060";
 
 // -------------------------------------------------------------------------
 // Transport (SCP-TRANS- 5000--5999)

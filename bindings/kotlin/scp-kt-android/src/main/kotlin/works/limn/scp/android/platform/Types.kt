@@ -252,6 +252,11 @@ interface KeyCustodyProvider {
      * After this call, all subsequent operations with the same handle will
      * throw [ScpException] with code `SCP-CRYPTO-4001`.
      *
+     * Destroying an identity destroys every v1 and v2 pseudonym key derived
+     * from it, and a derivation still in flight when its identity is destroyed
+     * fails with key-not-found (`SCP-CRYPTO-4001`) and stores nothing
+     * (`09-security-model.md` §9.10.4.A).
+     *
      * @param keyHandle Handle to destroy.
      * @return A [DestructionAttestation] confirming the destruction.
      * @throws ScpException with code `SCP-CRYPTO-4001` if the handle is already invalid.
@@ -289,6 +294,11 @@ interface KeyCustodyProvider {
      * custody: a device-local secret inside the secure boundary — device-local
      * by design (not identical across devices).
      *
+     * The pseudonym dies with its identity (`09-security-model.md` §9.10.4.A):
+     * destroying the identity destroys every v1 and v2 pseudonym key derived
+     * from it, and a derivation still in flight when its identity is destroyed
+     * fails with key-not-found (`SCP-CRYPTO-4001`) and stores nothing.
+     *
      * @param keyHandle Handle to the identity Ed25519 key.
      * @param contextId Raw context ID bytes.
      * @return A [PseudonymKeyHandle] to the derived signing key.
@@ -318,6 +328,11 @@ interface KeyCustodyProvider {
      * salt="scp-pseudonym-secret-v1")` — cross-platform deterministic. Hardware
      * custody: a device-local secret inside the secure boundary — device-local
      * by design (not identical across devices).
+     *
+     * The pseudonym dies with its identity (`09-security-model.md` §9.10.4.A):
+     * destroying the identity destroys every v1 and v2 pseudonym key derived
+     * from it, and a derivation still in flight when its identity is destroyed
+     * fails with key-not-found (`SCP-CRYPTO-4001`) and stores nothing.
      *
      * @param keyHandle Handle to the identity Ed25519 key.
      * @param contextId Raw context ID bytes.

@@ -616,7 +616,7 @@ impl From<scp_platform::PlatformError> for ScpNapiError {
             message: format!(
                 "platform key operation failed: {e} — check key custody configuration"
             ),
-            code: codes::CRYPTO_4004.to_owned(),
+            code: scp_ffi_common::custody_parse::platform_error_code(&e).to_owned(),
         }
     }
 }

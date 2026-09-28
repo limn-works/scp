@@ -224,8 +224,9 @@ impl KeyCustody for FfiKeyCustody {
 ///
 /// Each method re-acquires the GIL via [`Python::with_gil`] and invokes the
 /// correspondingly-named Python method. Returned values are extracted into
-/// owned Rust types. Any Python exception is mapped to
-/// [`PlatformError::CustodyError`] carrying the exception text.
+/// owned Rust types. An exception whose `code` is `SCP-CRYPTO-4006` maps to
+/// [`PlatformError::KeyNotFound`]; any other exception maps to
+/// [`PlatformError::CustodyError`] carrying its code and text.
 pub struct PyKeyCustodyProvider {
     /// The Python object exposing the custody methods. Held as a GIL-
     /// independent [`Py<PyAny>`] so it can be moved across the
@@ -371,13 +372,20 @@ impl PyKeyCustodyProvider {
 
     /// Maps a provider exception: the typed host not-found
     /// ([`KeyNotFoundError`](crate::error::KeyNotFoundError), exported as
-    /// `scp_sdk.KeyNotFoundError`) is [`PlatformError::KeyNotFound`]; every
-    /// other exception is a custody error.
+    /// `scp_sdk.KeyNotFoundError`) is [`PlatformError::KeyNotFound`]; any
+    /// other exception goes through the shared host-failure mapping, where a
+    /// `code` attribute of `SCP-CRYPTO-4006` is key-not-found and anything
+    /// else is a custody error carrying its code and text.
     fn call_err(py: Python<'_>, method_name: &str, e: &PyErr) -> PlatformError {
         if e.is_instance_of::<crate::error::KeyNotFoundError>(py) {
             return PlatformError::KeyNotFound;
         }
-        PlatformError::CustodyError(format!("KeyCustodyProvider.{method_name} raised: {e}"))
+        let code = e
+            .value(py)
+            .getattr("code")
+            .ok()
+            .and_then(|c| c.extract::<String>().ok());
+        scp_ffi_common::custody_parse::host_failure(method_name, code.as_deref(), &e.to_string())
     }
 
     fn type_err(method_name: &str, e: &PyErr) -> PlatformError {
@@ -440,9 +448,10 @@ impl FfiKeyCustody {
 ///   32 bytes (Ed25519 / X25519), 33 (compressed SEC1, `"p256"`) or 65
 ///   (uncompressed SEC1, `"hpke-p256"`). The bridge types the key from
 ///   `key_type`, never from the length, and refuses any other length.
-/// - Any method raises `scp_sdk.KeyNotFoundError` for a key id the host does
-///   not hold; the bridge reports it as `KeyNotFound`. Any other exception is
-///   a custody error.
+/// - Any method raises `scp_sdk.KeyNotFoundError`, or any exception whose
+///   `code` is `SCP-CRYPTO-4006`, for a key id the host does not hold; the
+///   bridge reports it as `KeyNotFound`. Any other exception is a custody
+///   error (`SCP-CRYPTO-4060`) carrying its code and text.
 /// - `destroy_key(key_id: str) -> None`.
 /// - `dh_agree(key_id: str, peer_public: bytes) -> bytes` — 32 shared bytes;
 ///   an `"hpke-p256"` key receives the 65-byte uncompressed peer point.
@@ -890,6 +899,11 @@ def sign_prehash(d, digest, high_s):
         s = N - s
     return r.to_bytes(32, 'big') + s.to_bytes(32, 'big')
 
+class HostError(Exception):
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
 class FakeCustody:
     def __init__(self, fault=None):
         self._seeds = {}
@@ -919,6 +933,10 @@ class FakeCustody:
         self._count('sign')
         if self._fault == 'transport':
             raise ConnectionError('custody service unreachable')
+        if self._fault == 'sign_4001':
+            raise HostError('hsm offline', 'SCP-CRYPTO-4001')
+        if key_id not in self._pseudonyms and key_id not in self._seeds:
+            raise HostError('key not found: ' + key_id, 'SCP-CRYPTO-4006')
         if key_id in self._pseudonyms:
             if self._fault == 'junk_sig':
                 return bytes([0x11]) * 64
@@ -1438,6 +1456,63 @@ mod tests {
             .await
             .expect("sign with derived rotatable pseudonym handle");
         assert_eq!(sig.as_bytes().len(), 64);
+    }
+
+    /// A host exception whose `code` is `SCP-CRYPTO-4006` is key-not-found, and
+    /// one whose `code` is the generic `SCP-CRYPTO-4001` is a custody error;
+    /// the bridge reports them as `SCP-CRYPTO-4006` and `SCP-CRYPTO-4060`.
+    #[tokio::test]
+    async fn callback_host_exception_codes_map_to_typed_errors() {
+        use scp_ffi_common::error_codes as codes;
+        let custody = fake_callback_custody();
+        let identity = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("identity key");
+        let pseudonym = custody
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect("derive");
+        custody
+            .destroy_key(pseudonym.key_handle())
+            .await
+            .expect("destroy pseudonym");
+        let err = custody
+            .sign(pseudonym.key_handle(), &[0x42u8; 32])
+            .await
+            .expect_err("destroyed key");
+        assert!(matches!(err, PlatformError::KeyNotFound), "{err:?}");
+        match crate::error::ScpPyError::from(err) {
+            crate::error::ScpPyError::CryptoError { code, .. } => {
+                assert_eq!(code, codes::CRYPTO_4006);
+            }
+            other => panic!("expected CRYPTO_4006, got {other:?}"),
+        }
+
+        let custody = FfiKeyCustody::Callback(fake_py_custody(Some("sign_4001")));
+        let identity = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("identity key");
+        let err = custody
+            .sign(&identity, b"message")
+            .await
+            .expect_err("host 4001");
+        match &err {
+            PlatformError::CustodyError(m) => {
+                assert!(
+                    m.contains(codes::CRYPTO_4001) && m.contains("hsm offline"),
+                    "{m}"
+                );
+            }
+            other => panic!("4001 must be a custody error, got {other:?}"),
+        }
+        match crate::error::ScpPyError::from(err) {
+            crate::error::ScpPyError::CryptoError { code, .. } => {
+                assert_eq!(code, codes::CRYPTO_4060);
+            }
+            other => panic!("expected CRYPTO_4060, got {other:?}"),
+        }
     }
 
     /// Asserts that `err` is the `CustodyError` variant; tests assert the

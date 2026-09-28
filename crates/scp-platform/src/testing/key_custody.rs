@@ -408,15 +408,15 @@ impl KeyCustody for InMemoryKeyCustody {
         async move {
             let mut store = self.store.lock().await;
             let key_type = store.lookup_type(KeyHandle::new(key_id))?;
+            // Every pseudonym derived from this key goes with it (§9.10.4.A),
+            // whatever the key's type, under the same lock a derive holds.
+            for pseudonym in store.pseudonyms.remove_identity(key_id) {
+                store.key_types.remove(&pseudonym);
+            }
 
             match key_type {
                 KeyType::Ed25519 => {
                     store.ed25519_keys.remove(&key_id);
-                    // Every pseudonym derived from this identity goes with it
-                    // (§9.10.4.A), under the same lock a derive holds.
-                    for pseudonym in store.pseudonyms.remove_identity(key_id) {
-                        store.key_types.remove(&pseudonym);
-                    }
                 }
                 KeyType::X25519 => {
                     store.x25519_keys.remove(&key_id);
@@ -594,6 +594,52 @@ mod tests {
     /// nothing; the operational key still signs, so the refusal is its role.
     /// The identity key draws the same 32 RNG bytes as an Ed25519
     /// `generate_keypair` (ADR-046), and an import is an identity.
+    /// A destroy removes the pseudonyms seeded under the destroyed key's id
+    /// for every key type, not only Ed25519, so a non-Ed25519 identity
+    /// cannot leave a live pseudonym behind (§9.10.4.A).
+    #[tokio::test]
+    async fn destroy_clears_seeded_pseudonyms_for_every_key_type() {
+        let custody = InMemoryKeyCustody::from_seed_bytes([9u8; 32]);
+        let pseudonym_key =
+            scp_crypto::p256::P256SigningKey::from_scalar_bytes(&[5u8; 32]).unwrap();
+        for (i, key_type) in [
+            KeyType::Ed25519,
+            KeyType::X25519,
+            KeyType::P256Signing,
+            KeyType::HpkeP256,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = custody.generate_keypair(key_type).await.unwrap();
+            let pseudonym = u64::MAX - i as u64;
+            {
+                let mut store = custody.store.lock().await;
+                store.pseudonyms.insert(
+                    key.id(),
+                    b"ctx",
+                    None,
+                    pseudonym,
+                    Box::new(pseudonym_key.clone()),
+                );
+                store.key_types.insert(pseudonym, KeyType::P256Signing);
+            }
+            custody.destroy_key(&key).await.unwrap();
+            let store = custody.store.lock().await;
+            let pseudonym_kept = store.pseudonyms.get(pseudonym).is_some();
+            let type_kept = store.key_types.contains_key(&pseudonym);
+            drop(store);
+            assert!(
+                !pseudonym_kept,
+                "{key_type:?}: the destroyed key's pseudonym must be removed"
+            );
+            assert!(
+                !type_kept,
+                "{key_type:?}: the destroyed key's pseudonym must lose its type entry"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn only_identity_keys_derive() {
         let custody = InMemoryKeyCustody::from_seed_bytes([7u8; 32]);
