@@ -52,10 +52,12 @@ and do nothing while `initialize` advertised `subscribe: true` (NAPI returned
   deliberately not per-event auth-gated).
 
 ## Still genuinely OPEN (ADR-015 acceptance criteria, not regressions)
-- **AC7 — dynamic tool list on join/leave.** `active_context_ids()` is a static
-  `Vec` snapshot on all three bridges, and no `ContextEvent` variant exists for
-  outlet registration, so "agent joins/leaves ⇒ tool list updates dynamically"
-  cannot yet hold end-to-end. Real work, not a stub.
+- **AC7 — dynamic tool list.** On all three bridges `active_context_ids()`
+  returns the configured contexts whose live role state names the agent, so a
+  join or departure among the configured contexts changes the served set
+  without a restart. A context outside the configured list is never served, and
+  no `ContextEvent` variant exists for outlet registration, so no pump event
+  announces a newly registered outlet. Real work, not a stub.
 - **AC8 — `scp-mcp serve` CLI.** Still a Python console script
   (`bindings/python/pyproject.toml` → `scp_sdk.mcp:cli_main`), not a Rust binary.
 
