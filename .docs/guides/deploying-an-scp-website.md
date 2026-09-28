@@ -3,9 +3,17 @@
 An SCP self-hosted site is an ordinary Rust program that calls
 [`scp_node::host_site`](../../crates/scp-node/examples/website.rs) — the SCP node *is* the
 web server (content is published as encrypted broadcast blobs and decrypted on serve; there is
-no separate web server and no DNS requirement on the origin). See the runnable example at
+no separate web server and no DNS requirement on the origin). See the example at
 `crates/scp-node/examples/website.rs` and the background guide
 [`self-hosting-a-website-on-scp.md`](./self-hosting-a-website-on-scp.md).
+
+On every build without `scp-node`'s `testing` feature, `host_site` fails closed when it has
+to create an identity, with `IdentityError::NoPreRotationBackend` (`NodeBuild("identity
+error: no production pre-rotation custody backend available; …")`). Creating an identity
+needs a `PreRotationCustody` backend, and the only implementation is the test harness. So
+on a shipped build, each recipe below fails on its first run in an empty storage directory,
+and its `Verify` step cannot succeed. `crates/scp-node/examples/README.md` states the same
+limit for the example.
 
 What changes between deployments is **not the code** — it's a few `HostSiteConfig` fields plus
 the surrounding network plumbing. The same `host_site` call powers all three recipes below; each
@@ -17,18 +25,22 @@ The three knobs that matter:
 |---|---|
 | `reach: Reach` | `Reach::NatTraversal` = probe the external address (STUN) and open a router port via NAT-PMP/UPnP (needs `--features upnp`). `Reach::Tunnel { public_url }` = the tunnel provides external reachability; skip NAT probing entirely. *(Note: `public_url` is not yet threaded — the node publishes a loopback URL and emits a runtime warning; reachability comes from the tunnel/proxy itself, not this field.)* `Reach::Local` = no probing; loopback only (dev/demo). *(Only these three variants are valid for `host_site`. `Reach::Domain` is valid in `NodeConfig` but returns `HostSiteError::InvalidConfig` here.)* |
 | `tls: TlsMode` | `TlsMode::SelfSigned` (default) = serve self-signed HTTPS (be-your-own-CA, no DNS). `TlsMode::Plaintext` = serve plain HTTP (for when a tunnel or proxy terminates TLS in front). *(Only these two variants are valid for `host_site`. `Acme`/`Terminated`/`Custom` are valid in `NodeConfig` but return `HostSiteError::InvalidConfig` here.)* |
-| `dht: DhtMode` | `DhtMode::Disabled` (default) = turn the DHT layer off, so the node publishes nothing (it discloses no address) and its DHT resolution arm answers `Ok(None)`. `DhtMode::Production` = publish the node's public address bound to its DID to the global Mainline DHT — an IP-to-identity / approximate-location disclosure, and a deliberate opt-in. A third variant, `DhtMode::Memory`, compiles only under `scp-node`'s `testing` feature, because ADR-062, capability injection, made it test-harness-only. A consumer of the published crate cannot name it. |
+| `dht: DhtMode` | `DhtMode::Disabled` (default) = turn the DHT layer off, so the node publishes nothing (it discloses no address) and its DHT resolution arm answers `Ok(None)`. `DhtMode::Production` = publish the node's public address bound to its DID to the global Mainline DHT — an IP-to-identity / approximate-location disclosure, and a deliberate opt-in. A third variant, `DhtMode::Memory`, compiles only under `scp-node`'s `testing` feature, because ADR-062, capability injection, made it test-harness-only. A build that does not enable `testing` cannot name it. |
 
 ---
 
 > **Annotation, 2026-09-13.** Everything below is the record as its author wrote it on the
-> date this file carries, restored unedited. The identity model it reads — the Mainline distributed hash table and the identifier written as a `did:` string — was
+> date this file carries, restored unedited except for one later rename: four lines
+> below (Recipe 1's IP-exposure trade-off, the Recipe 2 and Recipe 3 code comments, and the
+> `dht` row of the At a glance table) replaced `DhtMode::Memory` with `DhtMode::Disabled`,
+> because `Disabled` is now the no-publish default and `Memory` compiles only under
+> `testing`. The identity model it reads — the Mainline distributed hash table and the identifier written as a `did:` string — was
 > replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity substrate,
 > whose rules `.docs/specs/09-security-model.md` §9.7.4.2 and `.docs/specs/03-identity.md`
 > §3.10 carry, and whose curve Alec settled on 2026-09-10 as ECDSA on NIST P-256
 > (`.docs/specs/09-security-model.md` §9.5). A record of what a named party read on a named
 > date states what that party read, so this annotation records what replaced the model and
-> no sentence below is edited to match.
+> no other sentence below is edited to match.
 
 ## Recipe 1 — Direct (raw public IP, no operator)
 

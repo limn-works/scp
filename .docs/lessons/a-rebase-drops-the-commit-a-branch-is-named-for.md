@@ -25,9 +25,13 @@ git diff origin/main...HEAD --numstat
 ```
 
 Every file-level claim any artifact makes about the branch has to name a file on that
-list. A description that names `Cargo.lock` while the list does not is a false record, and
-it costs a reviewer the whole review: approving a certificate-validation fix against a
-diff that touches no certificate-validation code examines an empty set.
+list, and every file on that list needs a line in the description. A description that
+promises a `rustls-webpki` bump while the list touches no `rustls-webpki` line is a false
+record, and it costs a reviewer the whole review: approving a certificate-validation fix
+against a diff that touches no certificate-validation code examines an empty set. The
+reverse failure is as costly: a description that says the branch changes no `deny.toml`
+while the list carries two new advisory ignores hides the one change that suppresses a
+security report.
 
 ## Why a line-by-line review misses it
 

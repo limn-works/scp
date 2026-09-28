@@ -45,7 +45,7 @@ against is **write access to the crate under test**, not "edits the manifest" �
 draft wrote the narrower indicator as the contract, which is the failure `.docs/standards/concrete-prose.md`
 §Contracts and indicators names after Caulfield.
 
-## Eight rounds, eleven measured bypasses, and which ones the gate closes
+## Eight rounds, ten measured bypasses, and which ones the gate closes
 
 The table below has thirteen rows. Three are not measured bypasses: row 2 records an
 overclaim, row 4c records a premise this branch measured and found false (the section on
@@ -65,7 +65,9 @@ described below depends on the crate by path, cargo resolves none of a dependenc
 publication produces. This gate does not run that build, so it asserts the dev-target
 closure, not the default feature set its plan item names ("shipped examples build on
 default features"). Whether to add the probe build or to narrow the gate's contract to the
-dev-target closure is a scope decision for a human; cargo does not settle it.
+dev-target closure is a scope decision for a human; cargo does not settle it. The plan of
+record's §0.5 entry for this pull request records that decision as open, and the pull
+request does not close the plan item's "default features" contract until a human makes it.
 
 Row 8 (a `build.rs` injecting a cfg) is not demonstrated. Two attempts to reproduce it
 made the gate exit 1, because the injected cfg desynchronizes the lib from its dependency
@@ -120,9 +122,14 @@ features, because `scp-runtime` dev-depends on `scp-testing`, whose NORMAL
 nothing and removed the example from the check, so it was reverted. Coverage went
 from four counted targets to eight — against the script as it stood that round, which passed
 `--examples` and skipped a feature-gated target silently. The script now names each
-target, so a `required-features` declaration no longer removes one from the count; the
-revert stands on its own ground, which is that the declaration asserted a build failure
-that does not happen.
+target, so a `required-features` declaration no longer removes one from the count.
+
+A later round restored the declaration on different ground. The revert measured the
+build inside the workspace, where the dev-dependency back-edge turns `testing` on. A
+consumer of the published crate has no dev-dependencies, so on default features the file
+fails with unresolved imports, and the declaration makes cargo name the missing
+feature instead. All four of `scp-runtime`'s examples now carry it, and the gate still
+compiles each of them.
 
 ## An example a consumer cannot compile names a missing feature edge, not a file to stop publishing
 
