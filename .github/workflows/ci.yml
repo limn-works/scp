@@ -2379,10 +2379,18 @@ jobs:
         run: cargo check
       # `cargo check` never compiles `#[cfg(test)]`, so one library test in a
       # fuzz crate — which asserts that Arbitrary MessageType discriminants
-      # still match a production enum — ran in no job.
+      # still match a production enum — ran in no job. `cargo test` exits 0
+      # when it runs zero tests, so the step fails unless the summary line
+      # reports at least one passed test.
       - name: Run fuzz crate library tests
         working-directory: fuzz
-        run: cargo test --lib
+        run: |
+          set -o pipefail
+          cargo test --lib 2>&1 | tee "$RUNNER_TEMP/fuzz-lib-tests.log"
+          if ! grep -Eq '^test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/fuzz-lib-tests.log"; then
+            echo "::error::cargo test --lib in fuzz/ ran zero tests"
+            exit 1
+          fi
 
   # ── Bridge parity (ADR-046) ────────────────────────────────────────
   # Cross-bridge runtime parity harness: drives PyO3 (in-process) and
