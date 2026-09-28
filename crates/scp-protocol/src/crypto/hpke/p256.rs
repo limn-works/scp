@@ -95,34 +95,45 @@ pub fn derive_key_pair(ikm: &[u8]) -> Result<P256SigningKey, HpkeError> {
             ikm.len()
         )));
     }
-    let dkp_prk = labeled_extract(b"", &KEM_SUITE_ID, b"dkp_prk", ikm);
-    select_candidate(|counter, candidate| expand_candidate(&dkp_prk, counter, candidate))
+    let mut source = DkpPrk(labeled_extract(b"", &KEM_SUITE_ID, b"dkp_prk", ikm));
+    select_candidate(&mut source)
 }
 
-/// One `DeriveKeyPair` expansion (RFC 9180 §7.1.3):
-/// `LabeledExpand(dkp_prk, "candidate", I2OSP(counter, 1), Nsk)`.
-fn expand_candidate(
-    dkp_prk: &[u8; 32],
-    counter: u8,
-    out: &mut [u8; PRIVATE_KEY_LEN],
-) -> Result<(), HpkeError> {
-    labeled_expand(dkp_prk, &KEM_SUITE_ID, b"candidate", &[counter], out)
+/// Where the `DeriveKeyPair` rejection loop gets the candidate for each
+/// counter.
+///
+/// The loop passes the counter to [`CandidateSource::candidate`] itself, so a
+/// caller of [`select_candidate`] hands over a source and never touches the
+/// counter. No impl exists for closures, so a call site cannot wrap a source
+/// in one that drops or replaces the counter.
+trait CandidateSource {
+    /// Writes the candidate for `counter` into `out`.
+    fn candidate(&mut self, counter: u8, out: &mut [u8; PRIVATE_KEY_LEN]) -> Result<(), HpkeError>;
 }
 
-/// The `DeriveKeyPair` rejection loop: for `counter` in `0..=255`, `expand`
+/// The production candidate source: `dkp_prk` from `DeriveKeyPair`.
+struct DkpPrk(Zeroizing<[u8; 32]>);
+
+impl CandidateSource for DkpPrk {
+    /// RFC 9180 §7.1.3:
+    /// `LabeledExpand(dkp_prk, "candidate", I2OSP(counter, 1), Nsk)`.
+    fn candidate(&mut self, counter: u8, out: &mut [u8; PRIVATE_KEY_LEN]) -> Result<(), HpkeError> {
+        labeled_expand(&self.0, &KEM_SUITE_ID, b"candidate", &[counter], out)
+    }
+}
+
+/// The `DeriveKeyPair` rejection loop: for `counter` in `0..=255`, `source`
 /// writes the candidate for that counter, and the first candidate in
 /// `[1, n − 1]` becomes the key.
 ///
-/// Private, so the only production `expand` is the `LabeledExpand` in
+/// Private, so the only production source is the [`DkpPrk`] in
 /// [`derive_key_pair`]; the tests pass fixed candidates to reach the
 /// rejection branch, which the real expansion reaches with probability
 /// about 2^-32.
-fn select_candidate(
-    mut expand: impl FnMut(u8, &mut [u8; PRIVATE_KEY_LEN]) -> Result<(), HpkeError>,
-) -> Result<P256SigningKey, HpkeError> {
+fn select_candidate(source: &mut impl CandidateSource) -> Result<P256SigningKey, HpkeError> {
     for counter in 0..=u8::MAX {
         let mut candidate = Zeroizing::new([0u8; PRIVATE_KEY_LEN]);
-        expand(counter, &mut candidate)?;
+        source.candidate(counter, &mut candidate)?;
         if let Ok(sk) = P256SigningKey::from_scalar_bytes(&candidate) {
             return Ok(sk);
         }
@@ -814,26 +825,42 @@ mod tests {
     fn select_candidate_skips_n_and_zero() -> TestResult {
         let order = arr::<32>(ORDER)?;
         let chosen = arr::<32>(SK_RM)?;
-        let mut seen = Vec::new();
-        let sk = select_candidate(|counter, out| {
-            seen.push(counter);
-            *out = match counter {
-                0 => order,
-                1 => [0u8; 32],
-                _ => chosen,
-            };
-            Ok(())
-        })?;
-        assert_eq!(seen, [0, 1, 2], "counters tried");
+        let mut source = Scripted {
+            by_counter: vec![order, [0u8; 32]],
+            rest: chosen,
+            seen: Vec::new(),
+        };
+        let sk = select_candidate(&mut source)?;
+        assert_eq!(source.seen, [0, 1, 2], "counters tried");
         assert_eq!(*sk.to_scalar_bytes(), chosen, "counter-2 candidate chosen");
         Ok(())
     }
 
-    /// `expand_candidate` at counters 0, 1 and 255 equals an independent
+    /// A test candidate source: `by_counter[counter]` when present, otherwise
+    /// `rest`. It records every counter it is asked for.
+    struct Scripted {
+        by_counter: Vec<[u8; 32]>,
+        rest: [u8; 32],
+        seen: Vec<u8>,
+    }
+
+    impl CandidateSource for Scripted {
+        fn candidate(&mut self, counter: u8, out: &mut [u8; 32]) -> Result<(), HpkeError> {
+            self.seen.push(counter);
+            *out = self
+                .by_counter
+                .get(usize::from(counter))
+                .copied()
+                .unwrap_or(self.rest);
+            Ok(())
+        }
+    }
+
+    /// The production source, [`DkpPrk`], at counters 0, 1 and 255 equals an independent
     /// HKDF-Expand of `I2OSP(32, 2) || "HPKE-v1" || "KEM" || 0x0010 ||
     /// "candidate" || counter`, and counters 1 and 255 differ from counter 0.
     #[test]
-    fn expand_candidate_binds_the_counter() -> TestResult {
+    fn dkp_prk_candidate_binds_the_counter() -> TestResult {
         let prk = arr::<32>(SK_RM)?;
         let independent = |counter: u8| -> Result<[u8; 32], String> {
             let mut info = Vec::new();
@@ -850,8 +877,9 @@ mod tests {
             Ok(out)
         };
         let mut at = [[0u8; 32]; 3];
+        let mut source = DkpPrk(Zeroizing::new(prk));
         for (slot, counter) in at.iter_mut().zip([0u8, 1, 255]) {
-            expand_candidate(&prk, counter, slot)?;
+            source.candidate(counter, slot)?;
             assert_eq!(*slot, independent(counter)?, "counter {counter}");
         }
         assert_ne!(at[1], at[0], "counter 1 differs from counter 0");
@@ -863,15 +891,18 @@ mod tests {
     /// fails with `InvalidKey`.
     #[test]
     fn select_candidate_fails_after_256_invalid_candidates() -> TestResult {
-        let order = arr::<32>(ORDER)?;
-        let mut seen = Vec::new();
-        let result = select_candidate(|counter, out| {
-            seen.push(counter);
-            *out = order;
-            Ok(())
-        });
+        let mut source = Scripted {
+            by_counter: Vec::new(),
+            rest: arr::<32>(ORDER)?,
+            seen: Vec::new(),
+        };
+        let result = select_candidate(&mut source);
         assert!(matches!(result, Err(HpkeError::InvalidKey(_))));
-        assert_eq!(seen, (0..=u8::MAX).collect::<Vec<_>>(), "counters tried");
+        assert_eq!(
+            source.seen,
+            (0..=u8::MAX).collect::<Vec<_>>(),
+            "counters tried"
+        );
         Ok(())
     }
 
