@@ -9,7 +9,8 @@ description = "SCP (Shared Context Protocol) Python SDK — cryptographic identi
 # The ceiling: the locked PyO3 0.24 builds for CPython 3.13 at most, so pip on 3.14
 # skips a release built from this file instead of failing in its sdist build. The
 # 0.1.0b2 and 0.1.0b3 releases on PyPI predate the ceiling, and pip on 3.14 falls
-# back to the 0.1.0b3 sdist while neither is yanked.
+# back to the 0.1.0b3 sdist while neither is yanked. The version above is one PyPI
+# already serves, so the ceiling reaches PyPI only in a release that raises it.
 requires-python = ">=3.10,<3.14"
 license = { text = "MIT OR Apache-2.0" }
 readme = "README.md"

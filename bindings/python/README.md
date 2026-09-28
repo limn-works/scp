@@ -44,7 +44,7 @@ asyncio.run(main())
 
 ## Requirements
 
-- CPython 3.10-3.13. CPython 3.14 and newer cannot install: the locked PyO3 0.24 builds for CPython 3.13 at most. `requires-python = ">=3.10,<3.14"` makes pip on 3.14 skip every release built from `bindings/python/pyproject.toml`. scp-python 0.1.0b2 and 0.1.0b3, which PyPI already serves, declare `>=3.10` with no ceiling, so while neither is yanked pip on 3.14 falls back to the 0.1.0b3 sdist, and that build fails in PyO3 0.24
+- CPython 3.10-3.13. CPython 3.14 and newer cannot install: the locked PyO3 0.24 builds for CPython 3.13 at most. pip on 3.14 skips a release that carries the `requires-python = ">=3.10,<3.14"` ceiling `bindings/python/pyproject.toml` declares. The two releases PyPI already serves, 0.1.0b2 and 0.1.0b3, were built before the ceiling and declare `>=3.10`, so while neither is yanked pip on 3.14 falls back to the 0.1.0b3 sdist, and that build fails in PyO3 0.24. The ceiling reaches PyPI only in a release with a new version: `bindings/python/pyproject.toml` still declares `version = "0.1.0b2"`, which PyPI already serves
 - Nothing else when a wheel exists for your platform: wheels are pre-built for CPython 3.10-3.13 on Linux x86_64 and aarch64 with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64
 - A build from source compiles OpenSSL, both when pip falls back to the source distribution because no wheel matches and when you run `maturin develop` in `bindings/python`: it needs a Rust toolchain and a full perl, plus make on Linux and macOS. On Windows, NASM is optional: with it on PATH OpenSSL builds its assembly routines, and without it the build configures OpenSSL with `no-asm`
 
