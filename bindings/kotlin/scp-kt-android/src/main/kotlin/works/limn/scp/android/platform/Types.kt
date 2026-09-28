@@ -33,8 +33,9 @@ enum class KeyType {
  * The custody type for a given key, indicating where the key material is stored
  * and how it is protected.
  *
- * See ADR-006 for the custody model: production adapters use hardware-backed
- * custody, while the testing adapter uses [InMemory].
+ * See ADR-006 for the custody model. [AndroidKeyCustody] reports [HARDWARE] for a
+ * Keystore key and [SOFTWARE] for a Bouncy Castle key; the testing adapter reports
+ * [IN_MEMORY].
  */
 enum class CustodyType {
     /** Key material is stored in memory only (testing adapter). */
@@ -166,7 +167,8 @@ interface DeviceAttestationProvider {
      *   to pass `D`. No Rust code calls this method yet.
      * @param deviceId Device ID bytes. `27-attestations.md` states that a device id is not an
      *   identifier, and ADR-027 acceptance criterion 7 requires the Android adapter not to read
-     *   this parameter.
+     *   this parameter; [AndroidDeviceAttestation] reads it into the `clientDataJSON` nonce
+     *   today (see its KDoc).
      * @return Platform-specific attestation token bytes.
      * @throws ScpException if attestation fails. ADR-027 acceptance criterion 7 requires the
      *   Android adapter to throw [ScpException] with code `SCP-ATTEST-9001` for every failure;
@@ -182,8 +184,9 @@ interface DeviceAttestationProvider {
      *   ADR-027 require the caller to pass `A`, never the request bytes or
      *   their plain SHA-256. No Rust code calls this method yet.
      * @return Platform-specific assertion token bytes.
-     * @throws ScpException if assertion fails. ADR-027 acceptance criterion 7 requires the
-     *   Android adapter to throw [ScpException] with code `SCP-ATTEST-9001` for every failure;
+     * @throws ScpException if assertion fails. ADR-027's Implementation paragraph on
+     *   `AndroidDeviceAttestation.kt` requires every failure to leave the Android adapter as
+     *   [ScpException]; acceptance criterion 8, which covers this method, names no error rule;
      *   [AndroidDeviceAttestation] converts only some exception types (see its KDoc).
      */
     suspend fun assertRequest(requestHash: ByteArray): ByteArray
@@ -331,9 +334,13 @@ interface KeyCustodyProvider {
      *   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`  // RFC-8032 seed
      *
      * Software custody: `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
-     * salt="scp-pseudonym-secret-v1")` — cross-platform deterministic. Hardware
-     * custody: a device-local secret inside the secure boundary — device-local
-     * by design (not identical across devices).
+     * salt="scp-pseudonym-secret-v1")` — cross-platform deterministic. Keystore
+     * custody ([CustodyType.HARDWARE]): [AndroidKeyCustody] computes
+     * `pseudonym_secret = SHA-256(sign(keyHandle, "scp-pseudonym-secret-v1"))`.
+     * [sign] returns that signature to any caller holding the custody object, so
+     * such a caller can recompute every pseudonym; the secret does not stay inside
+     * Keystore. This diverges from ADR-027 acceptance criterion 6, which makes the
+     * secret a symmetric key generated inside the secure boundary.
      *
      * @param keyHandle Handle to the identity Ed25519 key.
      * @param contextId Raw context ID bytes.
@@ -358,9 +365,13 @@ interface KeyCustodyProvider {
      * so v2 at any epoch never collides with the v1 [derivePseudonym] output.
      *
      * Software custody: `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
-     * salt="scp-pseudonym-secret-v1")` — cross-platform deterministic. Hardware
-     * custody: a device-local secret inside the secure boundary — device-local
-     * by design (not identical across devices).
+     * salt="scp-pseudonym-secret-v1")` — cross-platform deterministic. Keystore
+     * custody ([CustodyType.HARDWARE]): [AndroidKeyCustody] computes
+     * `pseudonym_secret = SHA-256(sign(keyHandle, "scp-pseudonym-secret-v1"))`.
+     * [sign] returns that signature to any caller holding the custody object, so
+     * such a caller can recompute every pseudonym; the secret does not stay inside
+     * Keystore. This diverges from ADR-027 acceptance criterion 6, which makes the
+     * secret a symmetric key generated inside the secure boundary.
      *
      * @param keyHandle Handle to the identity Ed25519 key.
      * @param contextId Raw context ID bytes.

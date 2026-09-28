@@ -60,14 +60,18 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      * `{"challenge":"<b64>","deviceId":"<b64>","type":"scp-device-attestation-v1"}`.
      * The nonce is `Base64(SHA-256(clientDataJSON))`. The adapter requests a
      * Classic Play Integrity token with this nonce and returns it as UTF-8
-     * encoded JWT bytes. ADR-027 acceptance criterion 7 requires a Standard
-     * token, prepared with the `cloudProjectNumber` of the package verifier's
-     * `PlayIntegrityVerifier` entry, whose `requestHash` is the lowercase
-     * hexadecimal form of the binding digest `D`, an adapter that does not
-     * read [deviceId], and an adapter that throws [ScpException] with code
-     * `SCP-ATTEST-9001` for every failure, because a UniFFI callback that
-     * throws any other exception panics the Rust caller. This adapter meets
-     * none of the four. Story SCP-111 tracks the Standard request and its
+     * encoded JWT bytes. ADR-027 acceptance criterion 7 requires the
+     * following five, and this adapter meets none of the five:
+     *   1. a Standard integrity token, not a Classic one;
+     *   2. a token prepared with the `cloudProjectNumber` of the package
+     *      verifier's `PlayIntegrityVerifier` entry;
+     *   3. a `requestHash` equal to the lowercase hexadecimal form of the
+     *      binding digest `D`;
+     *   4. an adapter that does not read [deviceId];
+     *   5. an adapter that throws [ScpException] with code `SCP-ATTEST-9001`
+     *      for every failure, because a UniFFI callback that throws any other
+     *      exception panics the Rust caller.
+     * Story SCP-111 tracks the Standard request and its
      * `requestHash`; its acceptance criteria do not yet name the
      * `cloudProjectNumber`, the [deviceId] requirement or the every-failure
      * requirement.
@@ -152,8 +156,10 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      * @throws ScpException with code `SCP-ATTEST-9001` if [attest] converts the
      *   failure; [attest] converts only an `ApiException`, a [SecurityException]
      *   or an [IllegalStateException] from the Play Integrity call, and any other
-     *   exception propagates unconverted. ADR-027 acceptance criterion 7 requires
-     *   every failure to throw [ScpException] with code `SCP-ATTEST-9001`.
+     *   exception propagates unconverted. ADR-027's Implementation paragraph
+     *   on `AndroidDeviceAttestation.kt` requires every failure to leave the
+     *   adapter as [ScpException]; acceptance criterion 8, which covers this
+     *   method, names no error rule.
      */
     override suspend fun assertRequest(requestHash: ByteArray): ByteArray {
         // Play Integrity does not have a per-request assertion flow equivalent
