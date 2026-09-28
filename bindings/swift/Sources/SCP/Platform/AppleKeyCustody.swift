@@ -242,6 +242,11 @@ public final class AppleKeyCustody: Sendable {
     /// See ADR-025 Biometric gating.
     let biometricPolicy: BiometricPolicy
 
+    /// Runs inside `derivePseudonymKey` after the pseudonym item is stored and
+    /// before the identity is checked again, with the identity handle. Tests
+    /// use it to destroy the identity in that window; production passes `nil`.
+    private let afterPseudonymStore: (@Sendable (_ identityHandle: String) -> Void)?
+
     // MARK: - Keychain item attribute helpers
 
     /// Returns the `kSecAttrAccount` value for a key handle.
@@ -266,9 +271,20 @@ public final class AppleKeyCustody: Sendable {
     ///
     /// See ADR-025 for the access group rationale and Biometric gating for
     /// the biometric policy design.
-    public init(accessGroup: String? = nil, biometricPolicy: BiometricPolicy = .none) {
+    public convenience init(accessGroup: String? = nil, biometricPolicy: BiometricPolicy = .none) {
+        self.init(accessGroup: accessGroup, biometricPolicy: biometricPolicy, afterPseudonymStore: nil)
+    }
+
+    /// Creates a custody that runs `afterPseudonymStore` between a pseudonym's
+    /// store and the identity re-check in `derivePseudonymKey`.
+    init(
+        accessGroup: String?,
+        biometricPolicy: BiometricPolicy,
+        afterPseudonymStore: (@Sendable (_ identityHandle: String) -> Void)?
+    ) {
         self.accessGroup = accessGroup
         self.biometricPolicy = biometricPolicy
+        self.afterPseudonymStore = afterPseudonymStore
     }
 
     // MARK: - Private Keychain helpers
@@ -585,6 +601,7 @@ extension AppleKeyCustody {
                 publicKeyBytes: publicKey,
                 ownerIdentity: identityHandle
             )
+            afterPseudonymStore?(identityHandle)
             // A destroyKey(identityHandle) that ran between the seed read and
             // the store has already swept this identity's pseudonyms, so this
             // item would outlive its identity: remove it and fail.

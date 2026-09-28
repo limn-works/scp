@@ -231,4 +231,20 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
         }
     }
 
+    /**
+     * A derivation still in flight when its identity is retired stores nothing: the
+     * scalar is wiped and `SCP-CRYPTO-4001` is thrown.
+     */
+    @Test
+    fun `register after the identity is retired stores nothing`() {
+        val keys = PseudonymKeys()
+        keys.retireIdentity("retired-identity")
+        val contextSeed = ByteArray(32) { 0x5a }
+        val error = assertThrows<ScpException> {
+            P256Pseudonym.register(keys, "retired-identity", "p256-retired", contextSeed)
+        }
+        assertEquals("SCP-CRYPTO-4001", error.code)
+        assertTrue(contextSeed.all { it == 0.toByte() }, "the context seed must be wiped")
+        assertEquals(0, keys.size)
+    }
 }

@@ -436,7 +436,8 @@
     // MARK: - Pseudonym Store Tests
 
     /// How a pseudonym's Keychain item is stored: a re-derive keeps the
-    /// existing item.
+    /// existing item, and a derive whose identity is destroyed mid-way stores
+    /// nothing.
     struct AppleKeyCustodyPseudonymStoreTests {
         private let custody = AppleKeyCustody(accessGroup: nil)
 
@@ -488,6 +489,37 @@
             #expect(try await custody.sign(replaced.keyId, data: digest).count == 64)
 
             try await custody.destroyKey(identity)
+        }
+
+        @Test("a derive whose identity is destroyed after the store fails and leaves no pseudonym")
+        func deriveRacingIdentityDestroyLeavesNoPseudonym() async throws {
+            // Destroys the identity item in the window between the pseudonym
+            // store and the identity re-check.
+            let racing = AppleKeyCustody(
+                accessGroup: nil,
+                biometricPolicy: .none,
+                afterPseudonymStore: { identityHandle in
+                    let query: [String: Any] = [
+                        kSecClass as String: kSecClassGenericPassword,
+                        kSecAttrAccount as String: "scp.key.\(identityHandle)"
+                    ]
+                    _ = SecItemDelete(query as CFDictionary)
+                }
+            )
+            let identity = try await racing.generateKeypair(keyType: "ed25519")
+            let error = await #expect(throws: PlatformError.self) {
+                _ = try await racing.derivePseudonym(identity, contextId: Data("raced".utf8))
+            }
+            guard case .keyNotFound = error else {
+                Issue.record("expected keyNotFound, got \(String(describing: error))")
+                return
+            }
+            let leftover: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: "scp.pseudonym-of.\(identity)",
+                kSecMatchLimit as String: kSecMatchLimitOne
+            ]
+            #expect(SecItemCopyMatching(leftover as CFDictionary, nil) == errSecItemNotFound)
         }
     }
 
