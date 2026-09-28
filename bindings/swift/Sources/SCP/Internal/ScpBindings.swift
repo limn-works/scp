@@ -1360,6 +1360,9 @@ public protocol NodeHandleProtocol: AnyObject, Sendable {
     /**
      * Returns the WebSocket URL clients should connect to for this node's
      * relay (e.g., `ws://127.0.0.1:12345/scp/v1`).
+     *
+     * Read live per call from the node's relay-URL slot, so it reflects a NAT
+     * tier change that re-pointed the node's endpoint.
      */
     func relayUrl()  -> String
     
@@ -1580,6 +1583,9 @@ open func relayPort() -> UInt16  {
     /**
      * Returns the WebSocket URL clients should connect to for this node's
      * relay (e.g., `ws://127.0.0.1:12345/scp/v1`).
+     *
+     * Read live per call from the node's relay-URL slot, so it reflects a NAT
+     * tier change that re-pointed the node's endpoint.
      */
 open func relayUrl() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -1969,6 +1975,11 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function `address_resolve`.
+     *
+     * Returns a JSON object with two keys: `resolutions` holds the
+     * `AddressResolution` objects sorted by trust level, and
+     * `unavailable_layers` names each layer this build could not query,
+     * with the reason.
      */
     func addressResolve(ownerDid: String, address: String, knownContextsJson: String?) throws  -> String
     
@@ -2440,7 +2451,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Per-instance equivalent of the free-function `economy_verify_payment_receipts`.
      *
      * Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
-     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the
+     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`](scp_core::context::actor::commands::EconomyCommand::VerifyPaymentReceipts) to the
      * supervisor, returning a JSON `{"all_valid": <bool>, "results": [...]}`
      * document with one entry per receipt. Mirrors the `PyO3` reference bridge
      * exactly. Maximum 10,000 receipts per call.
@@ -3631,13 +3642,17 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Signs each delegation with `delegator_did`'s own key, read from this
+     * instance's identity custody registry. A `delegator_did` that this
+     * instance has not registered returns `SCP-IDENT-1001`.
      */
     func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid: String, parentToken: String, capabilities: [String]) async throws  -> UcanToken
     
     /**
      * Diagnostic, read-only evaluation of a UCAN token.
      *
-     * Counterpart to [`SCP::ucan_validate`]: runs the same 11-step ADR-016
+     * Counterpart to [`Scp::ucan_validate`](crate::scp::Scp::ucan_validate): runs the same 11-step ADR-016
      * pipeline via `evaluate_ucan` but returns a structured
      * [`CapabilityValidationRecord`] (six booleans) instead of failing at the
      * first error, and never records the token's nonce (read-only probe).
@@ -3897,6 +3912,11 @@ open func addCheckpointCosignature(handle: ContextHandle, checkpointJson: String
     
     /**
      * Per-instance equivalent of the free-function `address_resolve`.
+     *
+     * Returns a JSON object with two keys: `resolutions` holds the
+     * `AddressResolution` objects sorted by trust level, and
+     * `unavailable_layers` names each layer this build could not query,
+     * with the reason.
      */
 open func addressResolve(ownerDid: String, address: String, knownContextsJson: String?)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
@@ -4995,7 +5015,7 @@ open func economyBudgetRemaining(contextId: String, did: String)throws  -> UInt6
      * Per-instance equivalent of the free-function `economy_verify_payment_receipts`.
      *
      * Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
-     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the
+     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`](scp_core::context::actor::commands::EconomyCommand::VerifyPaymentReceipts) to the
      * supervisor, returning a JSON `{"all_valid": <bool>, "results": [...]}`
      * document with one entry per receipt. Mirrors the `PyO3` reference bridge
      * exactly. Maximum 10,000 receipts per call.
@@ -7469,6 +7489,10 @@ open func trustVerifyResponse(challengeJson: String, responseJson: String)throws
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Signs each delegation with `delegator_did`'s own key, read from this
+     * instance's identity custody registry. A `delegator_did` that this
+     * instance has not registered returns `SCP-IDENT-1001`.
      */
 open func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid: String, parentToken: String, capabilities: [String])async throws  -> UcanToken  {
     return
@@ -7490,7 +7514,7 @@ open func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid
     /**
      * Diagnostic, read-only evaluation of a UCAN token.
      *
-     * Counterpart to [`SCP::ucan_validate`]: runs the same 11-step ADR-016
+     * Counterpart to [`Scp::ucan_validate`](crate::scp::Scp::ucan_validate): runs the same 11-step ADR-016
      * pipeline via `evaluate_ucan` but returns a structured
      * [`CapabilityValidationRecord`] (six booleans) instead of failing at the
      * first error, and never records the token's nonce (read-only probe).
@@ -14229,10 +14253,10 @@ extension SourceType: Equatable, Hashable {}
  * an invalid state, so there is exactly one happy path per variant. This
  * mirrors the `PyO3` bridge's `SqliteKeyMaterial`.
  *
- * - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`] directly (raw-key
+ * - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`](scp_platform::sqlite::SqliteStorage::new) directly (raw-key
  * mode; the existing, unchanged path).
  * - [`SqliteKeyMaterial::Passphrase`] feeds
- * [`SqliteStorage::with_passphrase`], which derives the `SQLCipher` PRAGMA
+ * [`SqliteStorage::with_passphrase`](scp_platform::sqlite::SqliteStorage::with_passphrase), which derives the `SQLCipher` PRAGMA
  * key from the passphrase via the shared Argon2id parameterization with a
  * persisted per-database salt sidecar.
  *
@@ -14467,22 +14491,40 @@ public protocol DeviceAttestationProvider: AnyObject, Sendable {
     /**
      * Generate a cryptographic attestation for this device.
      *
-     * `challenge` — server-provided challenge bytes (SHA-256 digested with
-     * `device_id` before submission to the platform attestation service).
-     * `device_id` — stable identifier for this device instance.
+     * `challenge` — Apple: the 32-byte binding digest `D` of
+     * `09-security-model.md` §9.3.1, which the adapter hands App Attest as
+     * `clientDataHash` unchanged and rejects when it is not 32 bytes
+     * (ADR-025 acceptance criterion 3). Android: ADR-027, the Android
+     * platform adapter, states what it binds.
+     * `device_id` — stable identifier for this device instance. The Apple
+     * adapter does not read it.
      *
-     * Returns the platform attestation object bytes (Apple: CBOR-encoded
-     * attestation; Android: Play Integrity token bytes).
+     * Returns the platform attestation bytes. Apple: the raw CBOR attestation
+     * object Apple signed (ADR-025 acceptance criterion 3). Android: the Play
+     * Integrity token bytes.
      */
     func attest(challenge: Data, deviceId: Data) async throws  -> Data
     
     /**
      * Generate a per-request assertion proving key possession.
      *
-     * `request_hash` — SHA-256 hash of the request data being asserted.
+     * `request_hash` — the 32-byte assertion digest
+     * `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" || BE32(len(m)) || m)` of
+     * `09-security-model.md` §9.3.1 over the request bytes `m`. ADR-025
+     * and ADR-027 require the caller to pass `A` on every platform, never
+     * `m` or `SHA-256(m)`. No Rust code calls this trait yet (story
+     * SCP-095 criterion 1). Apple: the adapter hands `A` to App Attest as
+     * `clientDataHash` unchanged and rejects it when it is not 32 bytes
+     * (ADR-025 acceptance criterion 3). Android: ADR-027, the Android
+     * platform adapter, acceptance criterion 8 requires a Standard
+     * integrity token whose `requestHash` is the lowercase hexadecimal
+     * form of `A`. The shipped Android adapter does not meet it yet: it
+     * passes `A` to `attest` with an empty device ID and requests a
+     * Classic token whose nonce is `Base64(SHA-256(clientDataJSON))`
+     * (story SCP-111).
      *
      * Returns the platform assertion object bytes (Apple: CBOR assertion;
-     * Android: integrity verdict).
+     * Android: Play Integrity token bytes).
      */
     func assertRequest(requestHash: Data) async throws  -> Data
     
@@ -17744,7 +17786,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_relay_port() != 32247) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_relay_url() != 19628) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_relay_url() != 35261) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_rollback_deploy() != 34442) {
@@ -17780,7 +17822,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_add_checkpoint_cosignature() != 48565) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_address_resolve() != 64098) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_address_resolve() != 23956) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_aggregate_trust_input() != 37504) {
@@ -17930,7 +17972,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_budget_remaining() != 32105) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_verify_payment_receipts() != 16710) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_verify_payment_receipts() != 40702) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_evaluate_invitation() != 11385) {
@@ -18251,10 +18293,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_response() != 16753) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 51192) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 59265) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_evaluate() != 33478) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_evaluate() != 17617) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_mint() != 2465) {
@@ -18308,10 +18350,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 20129) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 4506) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 962) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_assert_request() != 17302) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_assert_request() != 11845) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 52852) {

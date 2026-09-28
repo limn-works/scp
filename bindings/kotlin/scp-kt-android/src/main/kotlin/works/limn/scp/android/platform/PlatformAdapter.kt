@@ -14,11 +14,13 @@ import android.content.Context
  * Assembled Android platform adapter holding all four provider implementations.
  *
  * Created by [AndroidPlatformAdapter.make] and passed to the Rust engine via
- * UniFFI at SDK initialization time. Each provider implements the corresponding
- * UniFFI callback interface defined in `crates/scp-ffi/uniffi/src/bridge.rs`.
+ * UniFFI at SDK initialization time. Each provider implements a Kotlin interface in
+ * `Types.kt` that restates the corresponding UniFFI callback interface declared in
+ * `crates/scp-ffi/uniffi/src/lib.rs`.
  *
  * @property keyCustody Android Keystore key management (TEE-backed Ed25519 on API 33+).
- * @property deviceAttestation Play Integrity Standard API device attestation.
+ * @property deviceAttestation Play Integrity device attestation, which requests a Classic
+ *   token today; story SCP-111 tracks the Standard request ADR-027 requires.
  * @property push Firebase Cloud Messaging with opaque data-only payloads.
  * @property storage SQLCipher encrypted storage with TEE-derived AES-256 key.
  */

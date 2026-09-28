@@ -1,15 +1,24 @@
 //! Android platform adapter modules for SCP.
 //!
-//! This module declares and re-exports the four Android platform adapters that
-//! implement the traits defined in [`crate::traits`]. The actual implementations
-//! are in Kotlin at `bindings/kotlin/scp-kt-android/` and are injected
-//! into the Rust engine via UniFFI callback interfaces (ADR-021, ADR-027).
+//! This module declares the four Android platform adapter modules. The
+//! adapters themselves are Kotlin classes in `bindings/kotlin/scp-kt-android/`.
+//! Each Kotlin class implements a Kotlin interface in `Types.kt`, not a trait
+//! in [`crate::traits`] (ADR-021, ADR-027). The Kotlin
+//! `DeviceAttestationProvider`, `KeyCustodyProvider`, and `StorageProvider`
+//! interfaces restate the `UniFFI` callback interfaces of the same names in
+//! `crates/scp-ffi/uniffi/src/lib.rs`. The Kotlin `PushProvider` interface
+//! restates the Rust [`crate::traits::Push`] trait instead: its `register`
+//! returns a `String` token and its `handleNotification` takes a
+//! `Map<String, String>` payload and returns a `WakeSignal`, while the `UniFFI`
+//! `PushProvider` callback's `register_push` and `handle_notification` return
+//! bytes.
 //!
 //! # Adapter Modules
 //!
 //! - [`key_custody`] — Android Keystore key management (TEE-backed Ed25519 on
 //!   API 33+, Bouncy Castle software fallback on API 26-32).
-//! - [`device_attestation`] — Play Integrity Standard API for device attestation.
+//! - [`device_attestation`] — Play Integrity device attestation (a Classic
+//!   request today; story SCP-111 tracks the Standard request ADR-027 requires).
 //! - [`push_provider`] — Firebase Cloud Messaging with opaque data-only payloads.
 //! - [`storage`] — SQLCipher encrypted storage with TEE-derived AES-256 key.
 //!

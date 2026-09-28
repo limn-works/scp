@@ -1,17 +1,24 @@
-//! Play Integrity [`DeviceAttestation`] adapter for Android.
+//! Play Integrity device attestation adapter for Android.
 //!
-//! The Android device attestation adapter is implemented in Kotlin at
-//! `bindings/kotlin/scp-kt-android/.../AndroidDeviceAttestation.kt` and
-//! injected into the Rust engine via the UniFFI callback interface (ADR-021).
-//! This module documents the Rust-side contract and re-exports the trait types
-//! that the Kotlin adapter implements.
+//! The Kotlin class `AndroidDeviceAttestation` in
+//! `bindings/kotlin/scp-kt-android/.../AndroidDeviceAttestation.kt` implements
+//! the Kotlin `DeviceAttestationProvider` interface in `Types.kt`. That
+//! interface restates the `UniFFI` `DeviceAttestationProvider` callback
+//! interface in `crates/scp-ffi/uniffi/src/lib.rs`, and no Rust code calls
+//! that callback yet (story SCP-095 criterion 1). The Kotlin adapter does not
+//! implement [`DeviceAttestation`], whose `attest` takes no argument and which
+//! declares a `verify` method the Kotlin interface lacks. OQ-22 of
+//! `.docs/specs/27-attestations.md` keeps open which of the two traits is
+//! normative. This module re-exports [`DeviceAttestation`] and
+//! [`DeviceAttestationToken`] for Android builds.
 //!
-//! # Play Integrity Standard API (ADR-027)
+//! # Play Integrity request (ADR-027)
 //!
-//! Standard integrity requests return a verdict signed by Google's servers,
-//! sufficient for SCP's attestation purpose. Classic attestation (APK certificate
-//! chain) is not used -- it has stricter rate limits and is designed for offline
-//! scenarios SCP does not have.
+//! The Kotlin adapter requests a Classic integrity token, passing a nonce
+//! through `IntegrityTokenRequest.builder().setNonce(nonce)`. ADR-027 requires
+//! a Standard integrity request whose `requestHash` is the lowercase
+//! hexadecimal form of the binding digest, and story SCP-111 tracks that
+//! change.
 //!
 //! See ADR-027 in `.docs/adrs/phase-6.md` for the full design rationale.
 
