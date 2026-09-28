@@ -1227,6 +1227,10 @@ pub const ATTEST_9025: &str = "SCP-ATTEST-9025";
 /// ADR-025 acceptance criterion 3 has the Rust core pass the 32-byte binding digest `D` of `09-security-model.md`
 /// §9.3.1 as `challenge` and the 32-byte assertion digest `A` as `request_hash`,
 /// and the Apple adapter hands each to App Attest as `clientDataHash` unchanged.
+/// ADR-027, the Android platform adapter, has its acceptance criterion 7 throw
+/// this code for a `challenge` that is not 32 bytes too, so the Rust caller of
+/// the `DeviceAttestationProvider` callback reads one code for that input from
+/// either adapter.
 pub const ATTEST_9026: &str = "SCP-ATTEST-9026";
 
 // -------------------------------------------------------------------------

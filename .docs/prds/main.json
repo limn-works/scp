@@ -5464,7 +5464,7 @@
           "unmet": [
             {
               "criterion": "Implements DeviceAttestation trait for Apple platforms",
-              "evidence": "No Rust code implements the `DeviceAttestation` trait over the Apple adapter. `DeviceAttestation` in `crates/scp-platform/src/traits.rs` declares `attest(&self)`, which takes no argument and returns a `DeviceAttestationToken`, and `verify(&self, token)`. `DeviceAttestationProvider` in `crates/scp-ffi/uniffi/src/lib.rs`, the UniFFI callback interface `AppleDeviceAttestation` conforms to, declares `attest(challenge, device_id)` returning bytes and `assert_request(request_hash)`, so its method set differs from the trait's. The only implementation of `DeviceAttestation` under `crates/` is the `testing`-gated `InMemoryDeviceAttestation` in `crates/scp-platform/src/testing/attestation.rs`. No Rust code holds or calls a `DeviceAttestationProvider`, and no file under `bindings/swift/Sources` other than a doc comment in `AppleKeyCustody.swift` names `AppleDeviceAttestation`, so no production path reaches `attest(challenge:deviceId:)` or `assertRequest(requestHash:)`. GitHub issue #2515 tracks that implementation."
+              "evidence": "No Rust code implements the `DeviceAttestation` trait over the Apple adapter. `DeviceAttestation` in `crates/scp-platform/src/traits.rs` declares `attest(&self)`, which takes no argument and returns a `DeviceAttestationToken`, and `verify(&self, token)`. `DeviceAttestationProvider` in `crates/scp-ffi/uniffi/src/lib.rs`, the UniFFI callback interface `AppleDeviceAttestation` conforms to, declares `attest(challenge, device_id)` returning bytes and `assert_request(request_hash)`, so its method set differs from the trait's. The only implementation of `DeviceAttestation` under `crates/` is the `testing`-gated `InMemoryDeviceAttestation` in `crates/scp-platform/src/testing/attestation.rs`. No Rust code holds or calls a `DeviceAttestationProvider`, and no Swift code under `bindings/swift/Sources` constructs or calls `AppleDeviceAttestation`: outside `AppleDeviceAttestation.swift`, the name appears only in a doc comment in `AppleKeyCustody.swift` and a doc comment in `ApplePushProvider.swift`, so no production path reaches `attest(challenge:deviceId:)` or `assertRequest(requestHash:)`. GitHub issue #2515 tracks that implementation."
             },
             {
               "criterion": "A reader verifies the attestation offline against Apple's App Attestation Root CA under `09-security-model.md` §9.3.1 (SCP-316)",
@@ -6394,7 +6394,7 @@
           "ADR-025 — Apple adapter as parallel reference"
         ]
       },
-      "result": "AndroidDeviceAttestation.kt implemented. The adapter requests a Classic Play Integrity token through `IntegrityTokenRequest.builder().setNonce(nonce)` with a SHA-256 nonce and returns the token bytes; ADR-027 requires a Standard request, which this story still has to deliver. 14 JVM unit tests."
+      "result": "AndroidDeviceAttestation.kt implemented. The adapter requests a Classic Play Integrity token through `IntegrityTokenRequest.builder().setNonce(nonce)` with a SHA-256 nonce and returns the token bytes; ADR-027 requires a Standard request, which this story still has to deliver. `AndroidDeviceAttestationTest.kt` holds 16 JVM unit tests."
     },
     {
       "id": "SCP-112",

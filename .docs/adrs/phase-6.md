@@ -232,7 +232,7 @@ class AndroidDeviceAttestation(
         wrapped { requestStandardToken(requestHash, "requestHash must be the 32-byte assertion digest A") }
 
     // A UniFFI callback that throws anything but ScpException panics the Rust caller, so every
-    // failure (missing Play services, an IllegalArgumentException from require) leaves as ScpException.
+    // failure (missing Play services included) leaves as ScpException.
     private suspend fun wrapped(block: suspend () -> ByteArray): ByteArray =
         try {
             block()
@@ -243,7 +243,8 @@ class AndroidDeviceAttestation(
         }
 
     private suspend fun requestStandardToken(digest: ByteArray, sizeMessage: String): ByteArray {
-        require(digest.size == 32) { sizeMessage }
+        // SCP-ATTEST-9026 is the code the Apple adapter throws for a digest that is not 32 bytes.
+        if (digest.size != 32) throw ScpException(sizeMessage, CODE_INVALID_CHALLENGE)
         val hex = digest.joinToString("") { "%02x".format(it) }
         val provider = withContext(Dispatchers.IO) {
             IntegrityManagerFactory.createStandard(context)
@@ -264,6 +265,7 @@ class AndroidDeviceAttestation(
 
     companion object {
         internal const val CODE_ATTESTATION_FAILED = "SCP-ATTEST-9001"
+        internal const val CODE_INVALID_CHALLENGE = "SCP-ATTEST-9026"
     }
 }
 ```
@@ -472,13 +474,14 @@ dependencies {
    - `requestHash` is the lowercase hexadecimal form of `D`. (Amended 2026-09-27; this criterion previously set a Classic `nonce` of `Base64(SHA-256(clientDataJSON))` that named no identifier.)
    - Returns the raw integrity token bytes. The SDK obtains a verdict for the token by one HTTPS `POST` to the URL in the package verifier's `PlayIntegrityVerifier` entry, in the §9.3.1 request format, and publishes both as the context's one `play-integrity` entry in the §9.3.1 format. No peer decodes the token; each reader verifies the verdict and returns `DeviceAttestationVerdict`, and a `Verified` from it is trust in the package's verifier.
    - The SDK requests a new token and verdict before the entry passes the context's `device_attestation_max_age_secs`, and when its own entry reads `Rejected{VerdictSignatureInvalid}` after the verifier rotates its key.
-   - Every failure, a missing Google Play services installation and a `challenge` of the wrong size included, throws `ScpException` with code `SCP-ATTEST-9001`, because a UniFFI callback that throws any other exception panics the Rust caller.
+   - A `challenge` that is not 32 bytes throws `ScpException` with code `SCP-ATTEST-9026`, the code the Apple adapter throws for that input under ADR-025, the Apple platform adapter, so the Rust caller of the one `DeviceAttestationProvider` callback reads one code for that input from either adapter. Every other failure, a missing Google Play services installation included, throws `ScpException` with code `SCP-ATTEST-9001`. Both failures throw `ScpException`, because a UniFFI callback that throws any other exception panics the Rust caller. (Amended 2026-09-27; this criterion previously assigned `SCP-ATTEST-9001` to a `challenge` of the wrong size.)
    - On a device without Google Play services, `attest` throws and the SDK publishes no entry, so a reader returns `Absent`.
 
 8. **`AndroidDeviceAttestation.assertRequest(requestHash)`:**
    - Implements the shipped UniFFI trait method `assert_request(request_hash)`. The Rust caller passes the assertion digest `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" ‖ BE32(len(m)) ‖ m)` of `09-security-model.md` §9.3.1, never the caller's bytes, so no assertion's `requestHash` equals the hexadecimal form of any `D`.
    - Issues a fresh Standard integrity token whose `requestHash` is the lowercase hexadecimal form of `A`. It does not route through `attest`. (Amended 2026-09-27.)
    - Returns integrity token bytes.
+   - A `requestHash` that is not 32 bytes throws `ScpException` with code `SCP-ATTEST-9026`, the code the Apple adapter throws for that input, and every other failure throws `ScpException` with code `SCP-ATTEST-9001`, as criterion 7 states for `attest`. (Amended 2026-09-27.)
 
 9. **`AndroidPushProvider.register()`:**
    - Calls `FirebaseMessaging.getInstance().token.await()`.

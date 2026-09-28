@@ -3,8 +3,15 @@
 //! This module declares the four Android platform adapter modules. The
 //! adapters themselves are Kotlin classes in `bindings/kotlin/scp-kt-android/`.
 //! Each Kotlin class implements a Kotlin interface in `Types.kt`, not a trait
-//! in [`crate::traits`]. Those Kotlin interfaces restate the `UniFFI` callback
-//! interfaces in `crates/scp-ffi/uniffi/src/lib.rs` (ADR-021, ADR-027).
+//! in [`crate::traits`] (ADR-021, ADR-027). The Kotlin
+//! `DeviceAttestationProvider`, `KeyCustodyProvider`, and `StorageProvider`
+//! interfaces restate the `UniFFI` callback interfaces of the same names in
+//! `crates/scp-ffi/uniffi/src/lib.rs`. The Kotlin `PushProvider` interface
+//! restates the Rust [`crate::traits::Push`] trait instead: its `register`
+//! returns a `String` token and its `handleNotification` takes a
+//! `Map<String, String>` payload and returns a `WakeSignal`, while the `UniFFI`
+//! `PushProvider` callback's `register_push` and `handle_notification` return
+//! bytes.
 //!
 //! # Adapter Modules
 //!
