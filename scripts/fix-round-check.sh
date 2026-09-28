@@ -1000,7 +1000,10 @@ else
 fi
 
 # ── The summary ──────────────────────────────────────────────────────────────────────
-# `crate_list` is set above the compile step, because two of the NOT CHECKED lines name it.
+# `crate_list` is set above the compile step, because the summary line below and these
+# NOT CHECKED lines name it: the sibling-feature line, the reverse-dependency line, the
+# scripts/check-examples-compile.sh assertion 2 line, the assertion 1 line when cargo
+# metadata could not list the example targets, and the workspace-wide-input line.
 #
 # `IFS` joins an array on its FIRST character alone, so "; " would separate on ";" and drop
 # the space. The loop writes the two-character separator the summary line reads with.
