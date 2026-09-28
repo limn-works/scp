@@ -3029,12 +3029,12 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-mcp/stdio.rs",
         "crates/scp-mcp/sse.rs"
       ],
-      "description": "Implement the two MCP transport modes: stdio (standard input/output, line-delimited JSON) for local integrations (Claude Code, Cursor) and SSE (Server-Sent Events over HTTP) for web-based integrations and SDK clients on the same host. The MCP server runs as a long-lived process suitable for MCP hosts that launch servers as subprocesses.",
+      "description": "Implement the two MCP transport modes: stdio (standard input/output, line-delimited JSON) for local integrations (Claude Code, Cursor) and SSE (Server-Sent Events over HTTP) for remote and web-based integrations. The MCP server runs as a long-lived process suitable for MCP hosts that launch servers as subprocesses.",
       "acceptanceCriteria": [
         "stdio transport: reads JSON-RPC requests from stdin (line-delimited JSON).",
         "stdio transport: writes JSON-RPC responses to stdout.",
@@ -3043,7 +3043,8 @@
         "SSE transport: HTTP server (configurable host:port) serves SSE endpoint for server-to-client messages.",
         "SSE transport: POST endpoint accepts client-to-server JSON-RPC requests.",
         "SSE transport: handles connection lifecycle, reconnection, keep-alive.",
-        "SSE transport: suitable for web-based MCP clients and for SDK clients on the same host. The transport has no TLS, so every SDK's SSE client sends its bearer token only to a loopback address and refuses, before it opens a connection, a URL whose host resolves to any other address.",
+        "SSE transport: suitable for web-based MCP clients and remote integrations.",
+        "SSE transport: every SDK's SSE client sends a bearer token over plain HTTP only to a loopback address: given a token, it refuses, before it opens a connection, a URL whose host resolves to any other address.",
         "SSE transport: every request to the SSE and POST endpoints presents an `Authorization: Bearer <token>` header, and the server answers any other request with HTTP 401. `SseConfig::new` fills the token with 256 bits from the operating system's random number generator, and every SDK's SSE client takes the token and sends it on the `GET` and on every POST.",
         "SSE transport: one server serves one MCP session at a time. A new `GET /sse` that passes the bearer check ends the live session's stream and takes its place; the server answers that `GET /sse` with HTTP 409 when the ended session still holds the slot 5 seconds later, when a newer `GET /sse` arrives while it waits, or when the server shuts down while it waits, and it answers a POST that names any other session with HTTP 409.",
         "SSE transport: reconnection starts a new session. The server clears the ended session's handshake, client capabilities and subscriptions before it admits the next client, and it ignores the `Last-Event-ID` header."
@@ -3068,8 +3069,12 @@
           "tokio (async I/O)",
           "axum (HTTP/SSE)",
           "serde_json (JSON-RPC serialization)"
-        ]
-      }
+        ],
+        "audit_note": "Downgraded from done (audit): two SSE criteria are unmet. Remote integrations: neither the SSE server nor the SDK SSE client has TLS, the client refuses to send a bearer token to a host that is not loopback, and the server answers every tokenless request with HTTP 401, so no SDK client can reach an SSE server on another host. Reachability from an SDK: no bridge returns the port it bound or the bearer token SseConfig::new drew, so a caller cannot connect any client to an SSE server a bridge starts."
+      },
+      "blockedByIssues": [
+        2311
+      ]
     },
     {
       "id": "SCP-050",

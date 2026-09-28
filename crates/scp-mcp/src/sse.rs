@@ -2,10 +2,10 @@
 //!
 //! Implements the MCP SSE transport mode: an HTTP server that serves an SSE
 //! endpoint for server-to-client messages and a POST endpoint for
-//! client-to-server JSON-RPC requests. This transport is suitable for
-//! web-based MCP clients and for SDK clients on the same host: it has no TLS,
-//! so every SDK's SSE client sends its bearer token only to a loopback address
-//! (ADR-015 §5).
+//! client-to-server JSON-RPC requests. ADR-015 §5 specifies it for web-based
+//! MCP clients and remote integrations. It has no TLS yet, so every SDK's SSE
+//! client refuses to send a bearer token to a host that is not loopback, and
+//! no SDK client can reach this server from another host.
 //!
 //! ## Endpoints
 //!
