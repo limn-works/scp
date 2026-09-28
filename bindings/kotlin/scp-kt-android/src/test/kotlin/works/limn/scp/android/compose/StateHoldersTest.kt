@@ -22,7 +22,6 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -729,11 +728,11 @@ class ScpHotStreamRemountTest {
         val failure = IllegalStateException("engine already dropped the context")
 
         val failed = coordinator.unmount(coordinator.mount("k")) { throw failure }
-        runBlocking { assertNotNull(failed).join() }
+        runBlocking { checkNotNull(failed).join() }
 
         val stops = AtomicInteger(0)
         val next = coordinator.unmount(coordinator.mount("k")) { stops.incrementAndGet() }
-        runBlocking { assertNotNull(next).join() }
+        runBlocking { checkNotNull(next).join() }
 
         assertTrue("a throwing onStop cancelled the coordinator's scope", scope.isActive)
         assertEquals("a stop after a throwing onStop did not run", 1, stops.get())

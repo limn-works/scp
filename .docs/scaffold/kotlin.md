@@ -107,19 +107,24 @@ class Context internal constructor(private val handle: ContextHandle) {
             Json.decodeFromString(result)
         }
 
-    // Subscribe under NonCancellable, so a collector cancelled mid-call never drops the
-    // subscription, and release it by suspending in a finally: awaitClose's lambda runs on
-    // the collector's thread, an Android main thread under collectAsState.
+    // Subscribe under NonCancellable and record the subscription inside that block: a
+    // collector cancelled mid-call makes withContext throw on resumption and drop the block's
+    // return value. Release it by suspending in a finally: awaitClose's lambda runs on the
+    // collector's thread, an Android main thread under collectAsState.
     fun receiveFlow(): Flow<Message> = callbackFlow {
-        val subscription = withContext(NonCancellable + Dispatchers.IO) {
-            handle.subscribe { envelope ->
-                trySend(envelope.toMessage())
-            }
-        }
+        var subscription: Subscription? = null
         try {
+            withContext(NonCancellable + Dispatchers.IO) {
+                subscription = handle.subscribe { envelope ->
+                    trySend(envelope.toMessage())
+                }
+            }
             awaitClose()
         } finally {
-            withContext(NonCancellable + Dispatchers.IO) { subscription.unsubscribe() }
+            val opened = subscription
+            if (opened != null) {
+                withContext(NonCancellable + Dispatchers.IO) { opened.unsubscribe() }
+            }
         }
     }
 }

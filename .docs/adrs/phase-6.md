@@ -821,29 +821,31 @@ class Context internal constructor(internal val handle: ContextHandle) {
     /**
      * Cold Flow of incoming messages. Collection begins the UniFFI subscription;
      * cancellation ends it. Use callbackFlow for cold semantics with buffer.
-     * The subscribe call runs under NonCancellable, so a collector cancelled during
-     * it cannot drop a live subscription, and the release suspends in a finally
-     * rather than running in awaitClose's lambda on the collector's thread
-     * (ADR-028's AutoCloseable amendment).
+     * The subscribe call runs under NonCancellable and records that it subscribed
+     * inside that block, so a collector cancelled during it cannot drop a live
+     * subscription, and the release suspends in a finally rather than running in
+     * awaitClose's lambda on the collector's thread (ADR-028's AutoCloseable amendment).
      */
     fun receiveFlow(): Flow<Message> = callbackFlow {
-        withContext(NonCancellable + Dispatchers.IO) {
-            handle.subscribe(object : MessageListener {
-                override fun onMessage(message: ScpMessage) {
-                    trySend(Message.fromRecord(message))
-                }
-                override fun onError(error: ScpError) {
-                    close(ScpException.fromFfi(error))
-                }
-                override fun onComplete() {
-                    close()
-                }
-            })
-        }
+        var subscribed = false
         try {
+            withContext(NonCancellable + Dispatchers.IO) {
+                handle.subscribe(object : MessageListener {
+                    override fun onMessage(message: ScpMessage) {
+                        trySend(Message.fromRecord(message))
+                    }
+                    override fun onError(error: ScpError) {
+                        close(ScpException.fromFfi(error))
+                    }
+                    override fun onComplete() {
+                        close()
+                    }
+                })
+                subscribed = true
+            }
             awaitClose()
         } finally {
-            withContext(NonCancellable + Dispatchers.IO) { handle.unsubscribe() }
+            if (subscribed) withContext(NonCancellable + Dispatchers.IO) { handle.unsubscribe() }
         }
     }.buffer(Channel.BUFFERED)
 

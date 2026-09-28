@@ -1720,15 +1720,12 @@ class ContextBridge internal constructor(
                     }
                 }
 
-            // Subscribe on IO dispatcher since it crosses the FFI boundary. NonCancellable:
-            // a cancellation landing while contextSubscribe runs would make withContext
-            // discard the handle it returns, before the try below opens, leaving a live Rust
-            // subscription that nothing releases. No suspension point sits between this
-            // block and the try, so its finally always sees the handle.
-            val subscriptionHandle =
-                withContext(NonCancellable + bridge.ioDispatcher) {
-                    bindings.contextSubscribe(contextHandle, callback)
-                }
+            // Subscribe on IO dispatcher since it crosses the FFI boundary. The handle is
+            // recorded inside the NonCancellable block, never taken from withContext's return
+            // value: a collector cancelled while contextSubscribe runs makes withContext throw
+            // on resumption and drop whatever the block returned, which would leave a live
+            // Rust subscription that nothing releases.
+            var subscriptionHandle: Long? = null
 
             // Release the subscription by suspending on bridge.ioDispatcher, never by
             // blocking: awaitClose's lambda runs on the collector's thread, which is an
@@ -1736,10 +1733,16 @@ class ContextBridge internal constructor(
             // thread until the FFI call returns (ADR-028's AutoCloseable amendment).
             // NonCancellable lets the release run although the collector was cancelled.
             try {
+                withContext(NonCancellable + bridge.ioDispatcher) {
+                    subscriptionHandle = bindings.contextSubscribe(contextHandle, callback)
+                }
                 awaitClose()
             } finally {
-                withContext(NonCancellable + bridge.ioDispatcher) {
-                    bindings.contextUnsubscribe(subscriptionHandle)
+                val opened = subscriptionHandle
+                if (opened != null) {
+                    withContext(NonCancellable + bridge.ioDispatcher) {
+                        bindings.contextUnsubscribe(opened)
+                    }
                 }
             }
         }

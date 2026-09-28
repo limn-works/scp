@@ -536,25 +536,28 @@ fun ColdMessageFlow(
                 }
             }
 
-        // NonCancellable: a cancellation landing while contextSubscribe runs would make
-        // withContext discard the handle it returns, before the try below opens, leaving a
-        // live Rust subscription that nothing releases. Execution enters the try with no
-        // suspension point between this block and it, so its finally always sees the handle.
-        val subscriptionHandle =
-            withContext(NonCancellable + ioDispatcher) {
-                contextBindings.contextSubscribe(contextHandle, callback)
-            }
+        // The handle is recorded inside the NonCancellable block, never taken from
+        // withContext's return value: a collector cancelled while contextSubscribe runs makes
+        // withContext throw on resumption and drop whatever the block returned, which would
+        // leave a live Rust subscription that nothing releases.
+        var subscriptionHandle: Long? = null
 
         // Release the subscription by suspending on ioDispatcher, never by blocking:
         // awaitClose's lambda runs on the collector's thread, which is an Android main
         // thread under collectAsState (ADR-028's AutoCloseable amendment). NonCancellable
         // lets the release run although the collector was cancelled.
         try {
+            withContext(NonCancellable + ioDispatcher) {
+                subscriptionHandle = contextBindings.contextSubscribe(contextHandle, callback)
+            }
             awaitClose()
         } finally {
             closed.set(true)
-            withContext(NonCancellable + ioDispatcher) {
-                contextBindings.contextUnsubscribe(subscriptionHandle)
+            val opened = subscriptionHandle
+            if (opened != null) {
+                withContext(NonCancellable + ioDispatcher) {
+                    contextBindings.contextUnsubscribe(opened)
+                }
             }
         }
     }
