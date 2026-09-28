@@ -103,9 +103,10 @@
     /// interface in `crates/scp-ffi/uniffi/src/lib.rs`, which this class
     /// conforms to.
     public final class AppleDeviceAttestation: DeviceAttestationProvider, @unchecked Sendable {
-        // `@unchecked Sendable` is required because this class is injected into the
-        // Rust engine via the UniFFI `DeviceAttestationProvider` callback interface,
-        // which requires `Send + Sync` (Rust) → `Sendable` (Swift). Internal mutable
+        // `@unchecked Sendable` is required because this class conforms to the
+        // UniFFI `DeviceAttestationProvider` callback interface, whose Rust trait
+        // requires `Send + Sync` (Rust) → `Sendable` (Swift). No Rust code holds or
+        // calls that callback yet, so nothing injects this class into the Rust engine. Internal mutable
         // state (`generationTask`, `UserDefaults`) is protected by `lock`; no reference
         // semantics escape across the FFI boundary. This is the same exception as
         // `MessageListenerAdapter`. See .docs/standards/swift.md §Sendable — UniFFI exception.
@@ -147,12 +148,13 @@
 
         // MARK: - DeviceAttestationProvider
 
-        /// The `DeviceAttestationProvider` callback method Rust calls through
-        /// UniFFI to obtain an attestation.
+        /// The `DeviceAttestationProvider` callback method that returns an
+        /// attestation. No Rust code holds or calls the callback yet, so only
+        /// Swift callers reach this method.
         ///
         /// The UniFFI callback declares `ScpError` as its error type. The
         /// generated glue lowers a thrown `ScpError` into an error value that
-        /// Rust receives, and hands any other thrown type to Rust as an
+        /// a Rust caller receives, and hands any other thrown type to Rust as an
         /// unexpected callback error, which panics on the Rust side. This
         /// method therefore throws `ScpError` only: it translates each
         /// `AttestationError` through `AttestationError.scpError`, and
@@ -172,8 +174,8 @@
             }
         }
 
-        /// The `DeviceAttestationProvider` callback method Rust calls through
-        /// UniFFI to obtain an assertion. It throws `ScpError` only, for the
+        /// The `DeviceAttestationProvider` callback method that returns an
+        /// assertion. No Rust code holds or calls the callback yet. It throws `ScpError` only, for the
         /// reason `attest(challenge:deviceId:)` states.
         ///
         /// - Throws: `ScpError.Identity` carrying `SCP-ATTEST-9019` for
@@ -212,8 +214,7 @@
         ///   `AttestationError.serviceError` when `generateKey` or `attestKey`
         ///   answers with an error.
         ///   `AttestationError.internalError` when `generateKey` or `attestKey`
-        ///   answers with neither a value nor an error, or when this adapter is
-        ///   deallocated while it generates a key.
+        ///   answers with neither a value nor an error.
         func attestReportingAttestationError(
             challenge: Data,
             deviceId: Data
@@ -339,9 +340,10 @@
             case let .coalesce(task):
                 return try await task.value
             case .startNew:
-                let task = Task<String, Error> { [weak self] in
-                    guard let self else { throw AttestationError.internalError("self was deallocated") }
-                    return try await self.generateAndStoreKey()
+                // The caller's frame holds `self` across `await task.value`, so
+                // a strong capture keeps no reference alive past that await.
+                let task = Task<String, Error> {
+                    try await self.generateAndStoreKey()
                 }
                 lock.withLock { generationTask = task }
                 defer { lock.withLock { generationTask = nil } }

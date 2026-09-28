@@ -1204,7 +1204,7 @@ pub const ATTEST_9017: &str = "SCP-ATTEST-9017";
 pub const ATTEST_9018: &str = "SCP-ATTEST-9018";
 
 // Codes the Swift `AppleDeviceAttestation` adapter throws as `ScpError`
-// across the UniFFI `DeviceAttestationProvider` callback
+// from its UniFFI `DeviceAttestationProvider` callback methods
 // (`AttestationError.scpError`). Each of these three codes belongs to one of
 // the four `AttestationError` cases; the fourth case, `serviceError`, reuses
 // `ATTEST_9001`.
@@ -1216,7 +1216,7 @@ pub const ATTEST_9020: &str = "SCP-ATTEST-9020";
 /// The App Attest adapter reached a state no caller input produces.
 ///
 /// Apple's service answered a completion handler with neither a value nor an
-/// error, or the adapter was deallocated while it generated a key.
+/// error.
 pub const ATTEST_9025: &str = "SCP-ATTEST-9025";
 
 // -------------------------------------------------------------------------

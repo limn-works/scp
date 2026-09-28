@@ -184,7 +184,7 @@
 
     /// Require `call` to throw `ScpError.Identity` carrying `expectedCode`, the
     /// value the UniFFI `DeviceAttestationProvider` callback lowers into an
-    /// error Rust receives, and return the message it carried.
+    /// error a Rust caller receives, and return the message it carried.
     @discardableResult
     private func expectCode(
         _ expectedCode: String,
