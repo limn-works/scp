@@ -269,11 +269,12 @@ A `--features testing` build of the full node, on every run:
 
 The full node never reloads a stored identity: it asks `Node::start` for a newly
 generated one on every run (`IdentitySource::Generate` in `run_node_with`,
-`crates/scp-node/src/main.rs`). Generating one needs a `PreRotationCustody` backend
-whose only implementation is the test harness, so a shipped binary fails closed with
-`NoPreRotationBackend` in step 2 and exits 1 on every run, whatever its storage
-directory holds, before it publishes anything. Only `--self-host` loads an identity
-already in its storage directory.
+`crates/scp-node/src/main.rs`). On a build without `testing`, `Node::start` answers every
+`Generate` request with `NoPreRotationBackend`: that path takes no `PreRotationCustody`
+input, so no custody backend and no storage directory the operator supplies changes the
+result. A shipped binary therefore fails closed in step 2 and exits 1 on every run,
+before it publishes anything. Only `--self-host` loads an identity already in its
+storage directory.
 
 ### Development deployment
 
