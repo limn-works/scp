@@ -571,19 +571,23 @@ impl CallbackKeyRegistry {
     /// are retired (§9.15), since the host may already have destroyed it. A
     /// slot a generation took over in the meantime is left alone.
     ///
-    /// # Errors
-    ///
-    /// [`PlatformError::CustodyError`] if the registry lock is poisoned; the
-    /// slot then stays `Destroying`, which every lookup refuses.
-    fn abandon_destroy(&self, handle: KeyHandle, token: u64) -> Result<(), PlatformError> {
-        let mut slots = self.lock()?;
+    /// It cannot fail, because [`DestroyGuard`] calls it from `Drop`, which
+    /// has no caller to report to. On a poisoned lock it still records the
+    /// abandon: the step only moves slots toward `Abandoned` and `Destroyed`,
+    /// which every lookup refuses, and every other registry call still fails
+    /// closed on the poison.
+    fn abandon_destroy(&self, handle: KeyHandle, token: u64) {
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prior = match slots.map.get(&handle.id()) {
             Some(Slot::Destroying {
                 prior,
                 token: owner,
                 ..
             }) if *owner == token => prior.clone(),
-            _ => return Ok(()),
+            _ => return,
         };
         let identity = prior
             .as_ref()
@@ -593,7 +597,6 @@ impl CallbackKeyRegistry {
             retire_pseudonyms_of(&mut slots.map, handle.id());
         }
         drop(slots);
-        Ok(())
     }
 
     /// Queues host key `key_id` for [`sweep_orphans`] to destroy.
@@ -659,11 +662,7 @@ struct DestroyGuard<'a> {
 impl Drop for DestroyGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            // `Drop` has no caller to return an error to. The only error is a
-            // poisoned lock, which leaves the slot `Destroying` and makes
-            // every registry call fail, so nothing resolves the handle or its
-            // pseudonyms either way.
-            let _ = self.registry.abandon_destroy(self.handle, self.token);
+            self.registry.abandon_destroy(self.handle, self.token);
         }
     }
 }
@@ -1517,13 +1516,15 @@ pub mod fake_host {
         /// An unknown key id.
         pub fn get_public_key(&self, key_id: &str) -> Result<HostPublicKey, PlatformError> {
             self.count("get_public_key");
-            let role = locked(&self.roles)?
-                .get(key_id)
-                .copied()
-                .unwrap_or(HostRole::Operational)
-                .as_str()
-                .to_owned();
+            let role = locked(&self.roles)?.get(key_id).copied();
             self.with_key(key_id, |key| {
+                // Every key this host holds has a recorded role; a held key
+                // without one is a fake-host defect, reported, never defaulted.
+                let role = role.ok_or_else(|| {
+                    PlatformError::CustodyError(format!(
+                        "fake host recorded no role for key {key_id}"
+                    ))
+                })?;
                 let (key_type, public_key) = match key {
                     HostKey::Ed25519(sk) => ("ed25519", sk.verifying_key().to_bytes().to_vec()),
                     HostKey::P256(sk) => ("p256", sk.public_key().to_compressed().to_vec()),
@@ -1534,7 +1535,7 @@ pub mod fake_host {
                 Ok(HostPublicKey {
                     key_type: key_type.into(),
                     public_key,
-                    role,
+                    role: role.as_str().to_owned(),
                 })
             })
         }
@@ -1620,6 +1621,8 @@ pub mod fake_host {
                 return Ok((point, id.clone()));
             }
             let id = self.next_id().to_string();
+            // A pseudonym key is operational (the host contract's `role`).
+            locked(&self.roles)?.insert(id.clone(), HostRole::Operational);
             locked(&self.keys)?.insert(id.clone(), HostKey::P256(pseudonym));
             derived.insert(tuple, id.clone());
             drop(derived);
@@ -3593,6 +3596,32 @@ mod tests {
             registry.pop_orphan(),
             Err(PlatformError::CustodyError(_))
         ));
+    }
+
+    /// A destroy dropped after a panic poisoned the registry lock still
+    /// abandons its slot and retires the identity's pseudonyms.
+    #[tokio::test]
+    async fn a_poisoned_registry_still_abandons_a_dropped_destroy() {
+        let registry = registry_with_pseudonym(&ed(0xF6), &p256(0xF7)).await;
+        let identity = KeyHandle::new(1);
+        let token = registry.begin_destroy(&identity).unwrap();
+        let poisoner = std::thread::scope(|s| {
+            s.spawn(|| {
+                let _held = registry.slots.lock();
+                std::panic::resume_unwind(Box::new("poison the registry lock"));
+            })
+            .join()
+        });
+        assert!(poisoner.is_err());
+        registry.abandon_destroy(identity, token);
+        let slots = registry
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(matches!(slots.map.get(&1), Some(Slot::Abandoned { .. })));
+        assert!(matches!(slots.map.get(&7), Some(Slot::Destroyed)));
+        drop(slots);
+        assert!(!registry.is_live(&KeyHandle::new(7)));
     }
 
     /// A sweep whose host destroy fails keeps the orphan queued and
