@@ -566,13 +566,13 @@ Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/
 
 **Android lifecycle integration:**
 - Android lifecycle integration is implemented via an extension function `Flow<T>.asLifecycleFlow(owner: LifecycleOwner, minActiveState: Lifecycle.State = Lifecycle.State.STARTED): Flow<T>` in a separate `scp-kt-android` artifact (amended: ADR-048 removed `Context` from the Kotlin surface, so the extension applies to any message flow, such as one `CoroutineBridge.context` or `HotStreamFactory` returns, rather than to a `Context`). This artifact depends on `androidx.lifecycle:lifecycle-runtime-ktx` — a dependency the core SDK does not take on, keeping the JVM artifact Android-free.
-- The extension launches collection in `lifecycleOwner.lifecycleScope` and cancels when the `LifecycleOwner` reaches `DESTROYED`. This prevents resource leaks when an `Activity` or `Fragment` is destroyed while a context subscription is live.
+- The extension launches nothing (amended: it returns `flowWithLifecycle(owner.lifecycle, minActiveState)`). The returned flow runs the upstream collection only while the owner's lifecycle is at least `minActiveState`, restarts it each time the lifecycle returns to that state, and completes when the `LifecycleOwner` reaches `DESTROYED`; the caller collects it in a coroutine of its own. This prevents resource leaks when an `Activity` or `Fragment` is destroyed while a context subscription is live.
 - `ViewModel`-based usage is the recommended pattern: hold the `SCP` instance and its context handles in a `ViewModel` that extends `ScpViewModel` (amended: ADR-048 removed `Context` from the Kotlin surface), expose a message flow as a `StateFlow<List<Message>>` using `stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())`. The `ViewModel.onCleared()` override launches `leave` for every tracked context on a scope it never cancels and returns without waiting (amended: `viewModelScope` is already cancelled when `onCleared()` runs, and blocking `onCleared()` on a teardown deadlocks or risks an ANR; see the `AutoCloseable` bullet under Rationale).
 
 **Jetpack Compose integration:**
 - The core artifact `works.limn:scp-kt` takes no Compose dependency. `works.limn:scp-kt-android` carries the Compose state holders (SCP-118), and they build on standard Kotlin patterns the SDK already provides: `Flow<Message>` collected via `collectAsState()`, and resources held in `remember { }` blocks whose `DisposableEffect` `onDispose` launches their `suspend` teardown on a scope that disposal never cancels, then returns (amended; see the `AutoCloseable` bullet under Rationale).
 - Recommended pattern: collect a context's messages through `rememberScpHotStream` over a `HotStreamFactory` stream, as the next bullet and the Compose sketch under Implementation show (amended: ADR-048 removed `Context` and its `receiveFlow()` from the Kotlin surface).
-- Hot streams shared across composables (amended): `works.limn:scp-kt-android`'s Compose state holders (SCP-118) include `rememberScpHotStream(key, coordinator, start, onStop)`, which calls `start` each time a composable mounts under `key` and launches `onStop` when the last one leaves. Every mount runs `start`, so `start` MUST be idempotent or registry-backed: a registry such as `HotStreamFactory` hands every mount under one key the same subscription, while a raw subscribe would open a second one that the idempotent `onStop` does not release. Its `coordinator` parameter is a required `ScpHotStreamCoordinator`, constructed once outside composition (a ViewModel or an application container) and shared by every call in one key space, with no default. The coordinator counts live mounts per key, so a screen that leaves while another screen under that key stays composed stops nothing yet: the coordinator holds that screen's `onStop` and runs it, with every other held one, when the last screen under that key leaves, so a key that groups two different streams leaks neither. Each `onStop` MUST therefore be idempotent: the coordinator runs every held `onStop` and deduplicates none. A later mount joins the last stop it launched before its own start runs. Each stop the coordinator launches joins the stop it launched before it under that key, so that last stop completes only after every earlier one. When a mount's coordinator changes while another mount under that key stays live on the old coordinator, the moved mount's start waits until the old coordinator's last mount under that key leaves and its stop completes. A per-composition coordinator or scope would let an outgoing screen's stop release a stream an incoming screen under that key already uses. `onStop` runs on the coordinator's caller-owned scope, never blocks `onDispose`, and a throw from it is logged, never propagated (`.docs/standards/sdk-common.md` §Cleanup error handling). `.docs/lessons/kotlin/hot-stream-subscription-ownership.md` records the defects this shape prevents.
+- Hot streams shared across composables (amended): `works.limn:scp-kt-android`'s Compose state holders (SCP-118) include `rememberScpHotStream(key, coordinator, start, onStop)`, which calls `start` each time a composable mounts under `key` and launches `onStop` when the last one leaves. Every mount runs `start`, so `start` MUST be idempotent or registry-backed: a registry such as `HotStreamFactory` hands every mount under one key the same subscription, while a raw subscribe would open a second one that the idempotent `onStop` does not release. Its `coordinator` parameter is a required `ScpHotStreamCoordinator`, constructed once outside composition with the same lifetime and sharing as the `HotStreamFactory` whose subscriptions it orders (an application container, a dependency-graph singleton, or a ViewModel that every navigation destination reading that factory shares, scoped to the activity or the navigation graph; never a ViewModel scoped to one destination, whose coordinator counts only that destination's mounts, so an outgoing screen's stop releases the subscription an incoming screen showing the same context handle collects) and shared by every call that reaches that factory, with no default. The coordinator counts live mounts per key, so a screen that leaves while another screen under that key stays composed stops nothing yet: the coordinator holds that screen's `onStop` and runs it, with every other held one, when the last screen under that key leaves, so a key that groups two different streams leaks neither. Each `onStop` MUST therefore be idempotent: the coordinator runs every held `onStop` and deduplicates none. A later mount joins the last stop it launched before its own start runs. Each stop the coordinator launches joins the stop it launched before it under that key, so that last stop completes only after every earlier one. When a mount's coordinator changes while another mount under that key stays live on the old coordinator, the moved mount's start waits until the old coordinator's last mount under that key leaves and its stop completes. A per-composition coordinator or scope would let an outgoing screen's stop release a stream an incoming screen under that key already uses. `onStop` runs on the coordinator's caller-owned scope, never blocks `onDispose`, and a throw from it is logged, never propagated (`.docs/standards/sdk-common.md` §Cleanup error handling). `.docs/lessons/kotlin/hot-stream-subscription-ownership.md` records the defects this shape prevents.
 - Context lifecycle in Compose: `rememberScpContext(contextHandle, identityHandle) { ctxH, idH -> teardownScope.launch { runCatching { bridge.context.leave(ctxH, idH) }.onFailure { Log.w(TAG, "leave failed after disposal", it) } } }`. When the composable leaves the composition, `ScpContextHolder.dispose()` cancels the holder's scope and then calls that callback, which launches `leave` on `teardownScope`. `teardownScope` outlives the composable and disposal never cancels it, so `onDispose` never blocks the composition thread (amended; see the `AutoCloseable` bullet under Rationale). The launched block logs a `leave` failure instead of throwing it, because an exception escaping a root launch reaches the thread's uncaught-exception handler, which on Android kills the process (`.docs/standards/sdk-common.md` §Cleanup error handling).
 
 **Maven Central publishing:**
@@ -1104,19 +1104,21 @@ abstract class ScpViewModel : ViewModel() {
 ```kotlin
 // In a composable — scp-kt-android's state holders over standard Flow + Compose APIs
 
-// The app's ViewModel owns the scope that teardown runs on, and the coordinator every
-// hot-stream holder in one key space shares; nothing cancels that scope.
+// The app's ViewModel owns the scope that leave runs on; nothing cancels that scope.
 class MyContextViewModel : ScpViewModel() {
     val teardownScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    val hotStreams = ScpHotStreamCoordinator(teardownScope)
 }
 
+// The app container that builds the HotStreamFactory also builds one ScpHotStreamCoordinator
+// on a scope it never cancels, and passes both to every screen. A coordinator held by this
+// destination's ViewModel would count only this destination's mounts.
 @Composable
 fun ContextScreen(
     contextHandle: Long,
     identityHandle: Long,
     bridge: CoroutineBridge,
     streams: HotStreamFactory,
+    hotStreams: ScpHotStreamCoordinator,
 ) {
     val viewModel: MyContextViewModel = viewModel()
 
@@ -1134,7 +1136,7 @@ fun ContextScreen(
     // One Rust subscription per context handle, released when the last screen under it leaves.
     val incoming by rememberScpHotStream(
         key = contextHandle,
-        coordinator = viewModel.hotStreams,
+        coordinator = hotStreams,
         start = { streams.incomingMessages(contextHandle) },
         onStop = { streams.stopMessageStream(contextHandle) },
     )

@@ -256,10 +256,11 @@ class Relay internal constructor(
 
     // The only stop path. It suspends on the bridge's injected ioDispatcher. A failed
     // teardown propagates and leaves isShutdown false, so the relay still reads as live.
-    // ServerBridge.shutdownRelay sets the flag inside its bridge call, so a caller cancelled
-    // after a finished teardown still finds it set. Pass no lambda from here: it would compile
-    // to a non-suspending `shutdown$lambda` method on this class, which ServerTest's
-    // "every stop method on a lifecycle-owning type suspends" check rejects.
+    // ServerBridge.shutdownRelay sets the flag inside its bridge call, because withContext
+    // checks for cancellation as it returns: a flag set here after that call would stay false
+    // for a caller cancelled after a finished teardown. ServerTest's "every stop method on a
+    // lifecycle-owning type suspends" check skips every compiled `$lambda` body, so it catches
+    // no blocking call inside a lambda written here.
     suspend fun shutdown() {
         bridge.shutdownRelay(this)
     }

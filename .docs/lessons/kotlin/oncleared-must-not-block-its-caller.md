@@ -110,9 +110,9 @@ An earlier revision kept both and documented a caveat above them, reasoning that
 `AutoCloseable.close()` is a synchronous contract a caller opts into for `use {}`. That reasoning
 does not survive two facts. No test and no SDK code in this repository ever called either
 `close()`; only the two types' own KDoc usage examples did, through `use { }`, and this change
-rewrote them to call `shutdown()` from a coroutine. No caller outside that documentation opted
-into anything. And a rule that a type may break whenever
-an interface asks it to is not a rule; `AutoCloseable` is a choice this SDK makes, not a constraint
+rewrote them to call `shutdown()` from a coroutine under `withContext(NonCancellable)`. No caller
+outside that documentation opted into anything. And a rule that a type may break whenever an
+interface asks it to is not a rule; `AutoCloseable` is a choice this SDK makes, not a constraint
 imposed on it.
 
 Both types dropped `AutoCloseable`, leaving one suspending `shutdown()` as one canonical stop path,
@@ -133,13 +133,16 @@ here has observed.
 `Relay`, `Node`, or `SCP`. `ServerTest.every stop method on a lifecycle-owning type suspends`
 requires a `kotlin.coroutines.Continuation` parameter on every declared method named `shutdown`,
 `close`, `stop`, or `dispose`, so a non-suspending method under one of those four names fails it.
-It strips everything after `$` before matching, so a non-suspend lambda passed from `shutdown()`,
-such as one handed to `CoroutineBridge.ffiCall`, fails it too: that lambda compiles to a
-non-suspending `shutdown$lambda` method on the same class. A suspend lambda compiles to a separate
-class that the check never inspects, so `SCP.shutdown`'s lambda to `ffiCallSuspend` passes it,
-and the check cannot catch a blocking call hidden inside a suspend lambda. That is why
-`ServerBridge.shutdownRelay` and `shutdownNode` set the shutdown flag themselves and `shutdown()`
-passes no lambda. The check passes a blocking stop method under any other name.
+Before matching, it strips the `$default` and `-<hash>` suffixes Kotlin appends to a stop method's
+compiled overloads, and it skips every method whose name contains `$lambda`. A non-suspend lambda
+written inside `shutdown()`, such as one handed to `CoroutineBridge.ffiCall`, compiles to a
+non-suspending `shutdown$lambda$0` method on the same class, and the check skips it; a suspend
+lambda compiles to a separate class that the check never inspects. The check therefore catches a
+blocking call inside neither kind of lambda, nor a blocking stop method under any other name.
+`ServerBridge.shutdownRelay` and `shutdownNode` set the shutdown flag inside their bridge call for a
+different reason: `withContext` checks for cancellation as it returns, so a flag that `shutdown()`
+set after the bridge call returned would stay false when the caller was cancelled after the
+teardown finished.
 
 ## Affected files
 
