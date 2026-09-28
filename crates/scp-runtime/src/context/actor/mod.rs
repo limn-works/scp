@@ -453,9 +453,11 @@ impl ContextActor {
                         // PrepareForReplace breaks, which have an external
                         // caller that despawns/replaces — an internal TTL exit
                         // has none. Without this the dead-but-registered handle
-                        // lingers in `actors`, so `read_context_state` reports
-                        // `None` (closed mailbox) instead of the persisted
-                        // `Expired`, and the context id cannot be re-created.
+                        // lingers in `actors` with a closed mailbox, so a
+                        // lifecycle read reaches no actor (the checked read
+                        // reports `ActorBusy`, the Option form `None`) instead
+                        // of the absent answer a completed expiry gives, and
+                        // the context id cannot be re-created.
                         // `despawn_actor` removes our OWN registry entry
                         // (`&self.context_id`) under the supervisor write lock;
                         // safe to call from here — the actor holds no lock, and
