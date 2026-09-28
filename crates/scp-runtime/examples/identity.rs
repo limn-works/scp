@@ -5,7 +5,7 @@
 //! to the (in-memory) DHT.
 //!
 //! Usage, from a checkout of the repository:
-//!   `cargo run -p scp-runtime --example identity`
+//!   `cargo run -p scp-runtime --features testing --example identity`
 //!
 //! This example names three test-harness types: `InMemoryDhtClient`,
 //! `InMemoryKeyCustody`, and `InMemoryPreRotationCustody`. `scp-dht` compiles

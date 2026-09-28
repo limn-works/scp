@@ -949,6 +949,14 @@ if grep -qF 'wasm-protocol job' "$FIXTURE16.harness/out.txt"; then
 else
     report "case 16 names the CI job that compiles for that target" 1 "the NOT CHECKED line names no job: $(tail -n 5 "$FIXTURE16.harness/out.txt")"
 fi
+# The same run compiled a crate, so it must also name the examples gate it did not run:
+# deleting that NOTES entry leaves a change under crates/*/examples/ reported green here
+# and red in the rust-clippy job.
+if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh over the example targets of scp-clock' "$FIXTURE16.harness/out.txt"; then
+    report "case 16 names the examples gate it did not run" 0 ""
+else
+    report "case 16 names the examples gate it did not run" 1 "the output holds no NOT CHECKED line for scripts/check-examples-compile.sh: $(tail -n 6 "$FIXTURE16.harness/out.txt")"
+fi
 if grep -qF -- '--target wasm32-unknown-unknown' "$FIXTURE16.harness/cargo.log"; then
     report "case 16 starts no wasm compile of its own" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE16.harness/cargo.log")"
 else

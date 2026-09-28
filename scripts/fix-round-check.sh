@@ -752,6 +752,7 @@ else
     done
 
     NOTES+=("the reverse dependencies of $crate_list: cargo check -p compiles the packages it names and none of their dependents, so a changed public signature compiles here and fails to compile its dependents in the rust-clippy job of .github/workflows/ci.yml")
+    NOTES+=("scripts/check-examples-compile.sh over the example targets of $crate_list: the compile above builds them with the CI testing features on, while that gate lints each example alone in its package's dev-target feature set, where the package's own testing feature can be off, so an example that names a testing-only item compiles here and fails that gate in the rust-clippy job of .github/workflows/ci.yml")
 
     declare -a SELECTED_WASM=()
     for c in "${CRATES[@]}"; do

@@ -87,7 +87,7 @@ scp-relay
 |------|------|---------|----------|------|----------|
 | **Full node** (default) | none | SQLite (SQLCipher) | Persistent DID | `.well-known/scp` + dev API | Production deployment |
 | **Relay-only** | `--relay-only` | Configurable | None | None | Equivalent to `scp-relay` |
-| **Ephemeral** | `--ephemeral` | All in-memory | Ephemeral DID | `.well-known/scp` + dev API | Development and testing |
+| **Ephemeral** (`testing` builds only) | `--ephemeral` | All in-memory | Ephemeral DID | `.well-known/scp` + dev API | Development and testing |
 
 ```bash
 # Full node (production)
@@ -96,8 +96,8 @@ SCP_NODE_DOMAIN=relay.example.com scp-node
 # Relay-only mode
 scp-node --relay-only
 
-# Ephemeral mode (everything in memory)
-SCP_NODE_DOMAIN=localhost scp-node --ephemeral
+# Ephemeral mode (everything in memory); a shipped binary exits 1 on --ephemeral
+SCP_NODE_DOMAIN=localhost cargo run -p scp-node --features testing -- --ephemeral
 ```
 
 ---
@@ -153,7 +153,8 @@ scp-node [OPTIONS]
 
 OPTIONS:
     --relay-only            Run as a bare relay server (no identity, no HTTP)
-    --ephemeral             Use in-memory storage for all subsystems
+    --ephemeral             Use in-memory storage for all subsystems (testing builds only;
+                            a shipped binary exits 1)
     --storage-path <PATH>   SQLite database directory
     --health                TCP health probe (exit 0/1)
     --help, -h              Show help

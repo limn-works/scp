@@ -137,7 +137,8 @@ USAGE:
 
 OPTIONS:
     --relay-only            Run as a bare relay server only (no identity, no HTTP)
-    --ephemeral             Use in-memory storage for all subsystems (no persistence)
+    --ephemeral             Use in-memory storage for all subsystems (no persistence).
+                            Testing builds only: a shipped binary exits 1
     --self-host             Host a static site entirely on SCP (no DNS name required).
                             Opens an inbound port to the PUBLIC INTERNET and
                             publishes the host's IP to the DHT by default

@@ -24,8 +24,12 @@
 //! Each run stores its identity in a new directory under the system temporary
 //! directory, never in the `scp-node` binary's default storage directory.
 //! `tempfile::TempDir` creates that directory with a random name, fails if the
-//! name already exists, gives it owner-only permissions on Unix, and removes it
+//! name already exists, and removes it
 //! when `main` returns, including after Ctrl-C and after the exit-1 error above.
+//! On Unix the example sets the directory's mode to 0700 through
+//! `tempfile::Builder::permissions`, because `tempfile` otherwise uses the process
+//! default mode, and exits with an error if the mode it reads back grants any
+//! group or other bit.
 //! A run therefore never reloads an identity an earlier run or another local
 //! user left behind. A `testing` run mints its identity with that test-harness
 //! custody, and the binary reloads whatever identity its storage directory holds
@@ -56,9 +60,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A new, owner-only, randomly named directory per run, removed when
     // `storage` drops at the end of `main`. See the doc comment for why this
     // example never uses the default storage directory the binary shares.
-    let storage = tempfile::Builder::new()
-        .prefix("scp-website-example-")
-        .tempdir()?;
+    // `tempfile` creates a directory with the process default mode (0755 under
+    // umask 022) unless `permissions` is set, so the mode is set and then checked.
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("scp-website-example-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let storage = builder.tempdir()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(storage.path())?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "{} has mode {:o}; refusing to store an identity where another local user can read it",
+                storage.path().display(),
+                mode & 0o777
+            )
+            .into());
+        }
+    }
     host_site(HostSiteConfig {
         tls: TlsMode::Plaintext,
         dht: DhtMode::Disabled,
