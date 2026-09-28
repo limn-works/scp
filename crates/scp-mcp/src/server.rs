@@ -2209,9 +2209,9 @@ mod tests {
         /// Whether the provider fails to read which contexts the agent takes
         /// part in.
         participation_unreadable: bool,
-        /// Whether the provider fails to read the agent's role while every
-        /// other read of the context succeeds.
-        role_unreadable: bool,
+        /// Contexts whose role state the provider cannot read, while every
+        /// other read of them succeeds.
+        unreadable_roles: Vec<String>,
         /// Every `validate_capability` call's purpose, in call order.
         checks: std::sync::Mutex<Vec<CapabilityCheck>>,
         /// Whether an Invoke check refuses the run, as a concurrent call that
@@ -2267,7 +2267,7 @@ mod tests {
                 events: serde_json::json!([]),
                 unreadable: Vec::new(),
                 participation_unreadable: false,
-                role_unreadable: false,
+                unreadable_roles: Vec::new(),
                 checks: std::sync::Mutex::new(Vec::new()),
                 refuse_invoke: false,
                 single_use_token: false,
@@ -2285,7 +2285,7 @@ mod tests {
         }
 
         fn agent_role(&self, context_id: &str) -> Result<Option<String>, String> {
-            if self.role_unreadable {
+            if self.unreadable_roles.iter().any(|c| c == context_id) {
                 return Err(format!("role state of '{context_id}' could not be read"));
             }
             Ok(self
@@ -2709,7 +2709,7 @@ mod tests {
                     kind: OutletKind::Action,
                 },
             )],
-            role_unreadable: true,
+            unreadable_roles: vec!["ctx_a".to_owned()],
             ..MockProvider::default()
         };
         let mut server = initialized_server(provider);

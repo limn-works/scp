@@ -2808,8 +2808,8 @@ mod tests {
                   event: endpoint\r\ndata: /message?sessionId=s1\r\n\r\n",
             )
             .expect("write endpoint event");
-            let (post, _) = listener.accept().expect("accept POST");
-            (get, read_request_head(&post))
+            let (post_conn, _) = listener.accept().expect("accept POST");
+            (get, read_request_head(&post_conn))
         });
 
         let transport =
@@ -2818,8 +2818,8 @@ mod tests {
         transport
             .send_notification(&JsonRpcNotification::new("notifications/initialized", None))
             .expect("notify");
-        let (get, post) = server.join().expect("server thread");
-        for head in [&get, &post] {
+        let (get_head, post_head) = server.join().expect("server thread");
+        for head in [&get_head, &post_head] {
             assert!(
                 head.contains("\r\nAuthorization: Bearer tok-1\r\n"),
                 "every request must carry the token, got: {head}"
