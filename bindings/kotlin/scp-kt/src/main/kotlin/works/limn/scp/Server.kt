@@ -269,8 +269,7 @@ class Relay internal constructor(
         // [ServerBridge.shutdownRelay] records shutdown as soon as the FFI call returns, inside its
         // bridge block: an engine failure throws first and leaves this relay live and worth a
         // second [shutdown], while a cancellation the bridge raises after a finished teardown
-        // cannot leave it recorded live. A lambda passed from here would compile to a
-        // `shutdown$lambda` method on this class, which ServerTest's suspend check rejects.
+        // cannot leave it recorded live.
         bridge.shutdownRelay(this)
     }
 
@@ -345,8 +344,7 @@ class Node internal constructor(
         // [ServerBridge.shutdownNode] records shutdown as soon as the FFI call returns, inside its
         // bridge block: an engine failure throws first and leaves this node live and worth a
         // second [shutdown], while a cancellation the bridge raises after a finished teardown
-        // cannot leave it recorded live. A lambda passed from here would compile to a
-        // `shutdown$lambda` method on this class, which ServerTest's suspend check rejects.
+        // cannot leave it recorded live.
         bridge.shutdownNode(this)
     }
 

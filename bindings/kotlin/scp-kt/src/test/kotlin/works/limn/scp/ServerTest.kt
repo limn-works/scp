@@ -223,15 +223,13 @@ class ServerTest {
     // to the synthetic overload it emits for a defaulted parameter, and appends
     // `-<hash>` to any method whose signature carries an inline value class —
     // `SCP.shutdown(bridge, timeout: Duration)` compiles to `shutdown-8Mi8wO0`.
-    // Matching the raw JVM name would silently skip both.
+    // Matching the raw JVM name would silently skip both. A name carrying `$lambda`
+    // is excluded: it is the compiled body of a lambda written inside a stop method
+    // (`shutdown$lambda$0`), not a stop method a caller can invoke.
     @Test
     fun `every stop method on a lifecycle-owning type suspends`() {
         for (type in listOf(Relay::class.java, Node::class.java, SCP::class.java)) {
-            val stopMethods =
-                type.declaredMethods.filter { method ->
-                    method.name.substringBefore('$').substringBefore('-') in
-                        setOf("shutdown", "close", "stop", "dispose")
-                }
+            val stopMethods = type.declaredMethods.filter { isStopMethodName(it.name) }
             assertTrue(
                 stopMethods.isNotEmpty(),
                 "${type.simpleName} must declare a stop method",
@@ -247,6 +245,25 @@ class ServerTest {
                 )
             }
         }
+    }
+
+    @Test
+    fun `stop-method name filter keeps compiled stop overloads and drops lambda bodies`() {
+        for (name in listOf("shutdown", "shutdown\$default", "shutdown-8Mi8wO0", "close", "stop", "dispose")) {
+            assertTrue(isStopMethodName(name), "$name is a stop method")
+        }
+        for (name in listOf("shutdown\$lambda\$0", "close\$lambda\$1", "release", "shutdownAll")) {
+            assertFalse(isStopMethodName(name), "$name is not a stop method")
+        }
+        // The name the compiler really emits for a lambda inside a stop method.
+        val lambdaBodies =
+            LambdaInStopFixture::class.java.declaredMethods.map { it.name }.filter { "\$lambda" in it }
+        assertTrue(lambdaBodies.isNotEmpty(), "fixture must compile a lambda body method")
+        for (name in lambdaBodies) assertFalse(isStopMethodName(name), "$name is a lambda body")
+        assertTrue(
+            LambdaInStopFixture::class.java.declaredMethods.any { isStopMethodName(it.name) },
+            "fixture shutdown itself is a stop method",
+        )
     }
 
     @Test
@@ -463,4 +480,18 @@ internal class StubServerBindings : ServerBindings {
     ) {
         lastDisableContextId = contextId
     }
+}
+
+private fun isStopMethodName(jvmName: String): Boolean =
+    "\$lambda" !in jvmName &&
+        jvmName.substringBefore('$').substringBefore('-') in setOf("shutdown", "close", "stop", "dispose")
+
+private class LambdaInStopFixture {
+    var stopped = false
+
+    fun shutdown() {
+        runLater { stopped = true }
+    }
+
+    private fun runLater(block: () -> Unit) = block()
 }
