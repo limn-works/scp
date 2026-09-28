@@ -688,8 +688,13 @@ async fn run_mcp_stdio_server(
 ///
 /// `subscribe_events()` returns `None` only for a supervisor built without the
 /// channel; every NAPI supervisor path enables it (see
-/// `crate::runtime::build_supervisor_arc`). With no supervisor or no channel
-/// the bundle is unwired: the server advertises every capability the event
+/// `crate::runtime::build_supervisor_arc`). The bundle is unwired in three
+/// cases: no supervisor is attached, the supervisor has no channel, or the
+/// instance is suspended when the server is created, because
+/// `crate::runtime::supervisor` refuses a suspended instance. The last case
+/// lasts the server's life: a `resume()` does not rewire a server built
+/// while suspended, so the host creates the server again after `resume()`
+/// to get subscriptions. An unwired server advertises every capability the event
 /// pump backs as false (`resources.subscribe`, `resources.listChanged`,
 /// `tools.listChanged`), rejects `resources/subscribe`, and sends no
 /// `notifications/*/list_changed`, so those capabilities are honestly absent
@@ -708,7 +713,7 @@ fn mcp_server_bundle(
     let context_events = match crate::runtime::supervisor(bi) {
         Ok(supervisor) => supervisor.subscribe_events(),
         Err(e) => {
-            tracing::warn!("MCP server: no supervisor attached ({e})");
+            tracing::warn!("MCP server: no supervisor event source ({e})");
             None
         }
     };
@@ -2085,6 +2090,38 @@ mod tests {
             },
         );
         assert_eq!(format!("{bundle:?}"), "McpServerForTransport::Wired");
+    }
+
+    /// A server created while the instance is suspended is unwired even with
+    /// a supervisor attached, as the `mcp_server_bundle` doc states, because
+    /// `crate::runtime::supervisor` refuses a suspended instance. The same
+    /// instance, resumed, builds the wired bundle again.
+    #[test]
+    fn suspended_instance_builds_the_unwired_bundle_napi() {
+        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
+        let bi = Arc::new(NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let provider = || McpNapiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: AGENT_DID.to_owned(),
+            context_ids: vec![SUB_CTX.to_owned()],
+        };
+
+        bi.core.suspend().expect("suspend");
+        assert!(
+            bi.core.try_supervisor().is_some(),
+            "precondition: suspension keeps the supervisor attached"
+        );
+        assert_eq!(
+            format!("{:?}", mcp_server_bundle(&bi, provider())),
+            "McpServerForTransport::Unwired"
+        );
+
+        crate::runtime().block_on(bi.resume()).expect("resume");
+        assert_eq!(
+            format!("{:?}", mcp_server_bundle(&bi, provider())),
+            "McpServerForTransport::Wired"
+        );
     }
 
     /// A missing `Supervisor` degrades the subscription capability and must
