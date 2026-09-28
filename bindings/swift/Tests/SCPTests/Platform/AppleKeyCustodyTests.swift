@@ -433,6 +433,64 @@
         }
     }
 
+    // MARK: - Pseudonym Store Tests
+
+    /// How a pseudonym's Keychain item is stored: a re-derive keeps the
+    /// existing item.
+    struct AppleKeyCustodyPseudonymStoreTests {
+        private let custody = AppleKeyCustody(accessGroup: nil)
+
+        /// The `kSecAttrComment` of the generic-password item for `account`.
+        private func keychainComment(_ account: String) -> String? {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrAccount as String: account,
+                kSecReturnAttributes as String: true,
+                kSecMatchLimit as String: kSecMatchLimitOne
+            ]
+            var result: AnyObject?
+            guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+                  let attrs = result as? [String: Any]
+            else { return nil }
+            return attrs[kSecAttrComment as String] as? String
+        }
+
+        /// Sets `attributes` on the generic-password item for `account`.
+        private func updateKeychainItem(_ account: String, _ attributes: [String: Any]) -> OSStatus {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrAccount as String: account
+            ]
+            return SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        }
+
+        @Test("re-deriving a pseudonym keeps its Keychain item when the policy is unchanged")
+        func reDeriveKeepsTheExistingItem() async throws {
+            let identity = try await custody.generateKeypair(keyType: "ed25519")
+            let contextId = Data("keep-existing".utf8)
+            let first = try await custody.derivePseudonym(identity, contextId: contextId)
+            let account = "scp.key.\(first.keyId)"
+            // A delete and re-add would drop this mark.
+            #expect(updateKeychainItem(account, [kSecAttrComment as String: "kept"]) == errSecSuccess)
+
+            let again = try await custody.derivePseudonym(identity, contextId: contextId)
+            #expect(again.keyId == first.keyId)
+            #expect(again.publicKey == first.publicKey)
+            #expect(keychainComment(account) == "kept")
+
+            // An item stored under another policy is replaced under the current one.
+            let retag = updateKeychainItem(account, [kSecAttrDescription as String: "scp.policy.other"])
+            #expect(retag == errSecSuccess)
+            let replaced = try await custody.derivePseudonym(identity, contextId: contextId)
+            #expect(replaced.keyId == first.keyId)
+            #expect(keychainComment(account) == nil)
+            let digest = Data(SHA256.hash(data: Data("after replace".utf8)))
+            #expect(try await custody.sign(replaced.keyId, data: digest).count == 64)
+
+            try await custody.destroyKey(identity)
+        }
+    }
+
     // MARK: - Rotatable Pseudonym Tests
 
     /// Tests for the v2 (rotatable, epoch-bound) pseudonym derivation and the

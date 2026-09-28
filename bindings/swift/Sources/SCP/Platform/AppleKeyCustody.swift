@@ -279,6 +279,13 @@ public final class AppleKeyCustody: Sendable {
     /// re-fetch after the sweep decides whether destruction is confirmed.
     private static let maxPseudonymSweeps = 4096
 
+    /// `kSecAttrDescription` tag recording the biometric policy an item was
+    /// stored under, so a re-store can tell whether the existing item's
+    /// access control matches the current policy.
+    private nonisolated var policyTag: String {
+        "scp.policy.\(biometricPolicy.rawValue)"
+    }
+
     /// `kSecAttrService` tag carried by every pseudonym item derived from
     /// `identityHandle`.
     private nonisolated func pseudonymOwnerTag(for identityHandle: String) -> String {
@@ -467,6 +474,7 @@ public final class AppleKeyCustody: Sendable {
         var query = baseQuery(for: handle)
         query[kSecAttrLabel as String] = metadataLabel
         query[kSecValueData as String] = bytes as CFData
+        query[kSecAttrDescription as String] = policyTag
         if let ownerIdentity {
             query[kSecAttrService as String] = pseudonymOwnerTag(for: ownerIdentity)
         }
@@ -483,19 +491,45 @@ public final class AppleKeyCustody: Sendable {
         case errSecSuccess:
             break
         case errSecDuplicateItem:
-            // For deterministic handles (pseudonym derivation), the item may
-            // already exist with different access control. Delete and re-add
-            // to ensure correct biometric policy is applied.
-            let deleteStatus = SecItemDelete(baseQuery(for: handle) as CFDictionary)
-            guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
-                throw PlatformError.keychainError(deleteStatus)
-            }
-            let retryStatus = SecItemAdd(query as CFDictionary, nil)
-            guard retryStatus == errSecSuccess else {
-                throw PlatformError.keychainError(retryStatus)
-            }
+            try keepOrReplaceExisting(handle: handle, query: query, ownerIdentity: ownerIdentity)
         default:
             throw PlatformError.keychainError(status)
+        }
+    }
+
+    /// Resolves an `errSecDuplicateItem` from storing `query` under `handle`.
+    ///
+    /// A deterministic handle (pseudonym derivation) re-derives the same
+    /// scalar, so an existing item stored under the current policy for the
+    /// same owner already holds these bytes. It is kept: deleting and re-adding
+    /// would leave a window in which a concurrent `sign` finds no item. An item
+    /// stored under another policy is replaced, so the current biometric policy
+    /// applies to it.
+    private nonisolated func keepOrReplaceExisting(
+        handle: String,
+        query: [String: Any],
+        ownerIdentity: String?
+    ) throws {
+        var existing = baseQuery(for: handle)
+        existing[kSecAttrDescription as String] = policyTag
+        if let ownerIdentity {
+            existing[kSecAttrService as String] = pseudonymOwnerTag(for: ownerIdentity)
+        }
+        existing[kSecMatchLimit as String] = kSecMatchLimitOne
+        let matchStatus = SecItemCopyMatching(existing as CFDictionary, nil)
+        if matchStatus == errSecSuccess {
+            return
+        }
+        guard matchStatus == errSecItemNotFound else {
+            throw PlatformError.keychainError(matchStatus)
+        }
+        let deleteStatus = SecItemDelete(baseQuery(for: handle) as CFDictionary)
+        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+            throw PlatformError.keychainError(deleteStatus)
+        }
+        let retryStatus = SecItemAdd(query as CFDictionary, nil)
+        guard retryStatus == errSecSuccess else {
+            throw PlatformError.keychainError(retryStatus)
         }
     }
 }
