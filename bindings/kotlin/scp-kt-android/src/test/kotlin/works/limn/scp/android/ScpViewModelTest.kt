@@ -33,6 +33,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 // Every method runs on its own thread under a wall-clock limit, so a method that parks a
@@ -302,6 +303,50 @@ class ScpViewModelTest {
         assertEquals(1, viewModel.maxInFlight.get())
     }
 
+    // An inline bridge runs a post-clear leave and its onCleanupFailure call inside
+    // trackContext only while no other cleanup coroutine holds the failure lock. When one
+    // does, trackContext returns with the call still pending, and the call later runs on
+    // the thread that released the lock. The KDoc on trackContext, onCleared, and
+    // onCleanupFailure states this exception; this method keeps that statement true.
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    fun `an inline-bridge failure waits for a running onCleanupFailure and runs on its thread`() {
+        stubBindings.leaveAlwaysThrows = true
+        val ioBridge = CoroutineBridge(
+            nativeBindings = stubBindings,
+            ioDispatcher = Dispatchers.IO,
+            cpuDispatcher = Dispatchers.IO,
+        )
+        val inlineBridge = CoroutineBridge(
+            nativeBindings = stubBindings,
+            ioDispatcher = Dispatchers.Unconfined,
+            cpuDispatcher = Dispatchers.Unconfined,
+        )
+        val viewModel = OverlapProbeViewModel()
+        viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = ioBridge))
+        viewModel.callOnCleared()
+        assertTrue(viewModel.firstEntered.await(5, TimeUnit.SECONDS), "first failure never arrived")
+
+        viewModel.trackContext(TrackedContext(handle = 2L, identityHandle = 2L, bridge = inlineBridge))
+
+        assertTrue(
+            stubBindings.leaveCalledHandles.contains(2L),
+            "inline leave did not run inside trackContext",
+        )
+        assertEquals(
+            1,
+            viewModel.entered.get(),
+            "second call ran inside trackContext although the failure lock was held",
+        )
+
+        viewModel.releaseFirst.countDown()
+        assertTrue(viewModel.bothDone.await(5, TimeUnit.SECONDS), "second failure never arrived")
+        val threads = viewModel.callThreads.toList()
+        assertEquals(2, threads.size)
+        assertEquals(threads[0], threads[1], "second call did not run on the releasing thread")
+        assertNotEquals(Thread.currentThread(), threads[1], "second call ran on the trackContext caller")
+    }
+
     // A Java subclass of ScpViewModel calls `super()`, so a zero-argument JVM constructor is
     // part of this artifact's published surface. Adding a primary-constructor parameter
     // without a default removes it and fails this method.
@@ -329,7 +374,11 @@ private class OverlapProbeViewModel : ScpViewModel() {
     val bothDone = CountDownLatch(2)
     private val inFlight = AtomicInteger()
 
+    /** The thread each [onCleanupFailure] call ran on, in call order. */
+    val callThreads: MutableList<Thread> = Collections.synchronizedList(mutableListOf())
+
     override fun onCleanupFailure(context: TrackedContext, cause: Throwable) {
+        callThreads += Thread.currentThread()
         val now = inFlight.incrementAndGet()
         maxInFlight.accumulateAndGet(now) { a, b -> maxOf(a, b) }
         if (entered.incrementAndGet() == 1) {

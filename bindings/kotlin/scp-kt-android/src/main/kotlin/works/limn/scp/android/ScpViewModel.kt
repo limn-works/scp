@@ -86,13 +86,16 @@ abstract class ScpViewModel : ViewModel() {
     // `Dispatchers.Unconfined` starts the cleanup coroutine on the thread that calls
     // [onCleared] and keeps it there only until the first `leave` suspends into the
     // bridge's I/O dispatcher, so [onCleared] returns without waiting on an FFI call when
-    // that dispatcher dispatches; an inline one runs every `leave` before [onCleared] returns.
+    // that dispatcher dispatches. An inline one runs every `leave` before [onCleared] returns
+    // unless the coroutine suspends on [cleanupFailureLock], which another cleanup
+    // coroutine's [onCleanupFailure] call can hold.
     private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
 
     // Serializes [onCleanupFailure] across every cleanup coroutine: [onCleared] launches one
     // and each post-clear [trackContext] launches another, and with a dispatching bridge
     // their `leave` calls fail on different threads at once. A [Mutex] suspends a waiting
-    // coroutine instead of blocking its thread, which may be an Android main thread.
+    // coroutine instead of blocking its thread, which may be an Android main thread. Under
+    // `Dispatchers.Unconfined` a waiting coroutine resumes on the thread that unlocks it.
     private val cleanupFailureLock = Mutex()
 
     /**
@@ -106,8 +109,11 @@ abstract class ScpViewModel : ViewModel() {
      * `ViewModel.addCloseable` closes a resource added after clear: Android never calls
      * [onCleared] a second time, so tracking it would drop its `leave` silently. That
      * `leave` runs on the same cleanup coroutine path, and a failure reaches
-     * [onCleanupFailure]; with a bridge whose I/O dispatcher runs inline, both run on the
-     * calling thread before this method returns.
+     * [onCleanupFailure]. With a bridge whose I/O dispatcher runs inline, the `leave` runs on
+     * the calling thread before this method returns, and so does its [onCleanupFailure] call
+     * unless another cleanup coroutine's [onCleanupFailure] call is running at that moment.
+     * In that case this method returns first, and the call waits for the running one and then
+     * runs on the thread that ran it.
      *
      * @param context The [TrackedContext] wrapping the context handle and bridge.
      * @return The same [context] passed in, for chaining.
@@ -160,7 +166,10 @@ abstract class ScpViewModel : ViewModel() {
      * coroutine starts on the calling thread and, when the bridge's I/O dispatcher dispatches
      * (the default `Dispatchers.IO` does), leaves it at the first `leave`. A dispatcher that
      * runs inline, such as `Dispatchers.Unconfined`, runs every `leave` and every
-     * [onCleanupFailure] call on the calling thread before this method returns. Cleanup is
+     * [onCleanupFailure] call on the calling thread before this method returns, unless
+     * another cleanup coroutine's [onCleanupFailure] call is running when a `leave` fails. In
+     * that case this method returns at that failure, and the rest of the loop, its
+     * [onCleanupFailure] call included, runs on the thread that ran the other call. Cleanup is
      * best-effort — those calls run to completion only if a process outlives them. Blocking
      * until they finish is not an option: [onCleared] runs on an Android main thread, and
      * blocking that thread on FFI calls both risks an ANR and deadlocks whenever an injected
@@ -225,7 +234,9 @@ abstract class ScpViewModel : ViewModel() {
      * `Dispatchers.IO` does), that is on whichever thread resumed that coroutine, after
      * [onCleared] has already returned. A dispatcher that runs inline, such as
      * `Dispatchers.Unconfined`, runs it on the thread that called [onCleared] (an Android main
-     * thread) before [onCleared] returns. Either way it must not block its thread, for a reason
+     * thread) before [onCleared] returns, unless another cleanup coroutine's call is running
+     * at that moment: then [onCleared] returns first, and this call runs after the running one,
+     * on the thread that ran it. Either way it must not block its thread, for a reason
      * `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` states.
      *
      * Calls never overlap, so an override may update unsynchronized state, although
