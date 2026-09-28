@@ -612,9 +612,9 @@ where
     // two identity arms differ only in their `IdentitySource`; the dropped
     // explicit `SelfSignedTlsProvider::new("localhost")` is reproduced by the
     // default `TlsMode::SelfSigned`. `Domain` is a publishing reach, so M2
-    // requires `DhtMode::Production` (advisory in P1 — the in-memory DHT client
-    // publishes nothing). Each arm moves `storage` into its own config, so both
-    // arms build a config separately.
+    // requires `DhtMode::Production`, which makes `Node::start` publish through
+    // `did_method` and fail the start if that publish fails. Each arm moves
+    // `storage` into its own config, so both arms build a config separately.
     let node = if let Some(id) = identity {
         Node::start(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),

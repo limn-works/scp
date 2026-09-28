@@ -73,8 +73,8 @@ fn make_shared_dht(custody: &Arc<InMemoryKeyCustody>) -> (Arc<InMemoryDhtClient>
 ///
 /// Default `TlsMode::SelfSigned` reproduces the dropped local
 /// `SucceedingTlsProvider` (both generate a self-signed cert for the domain).
-/// `Domain` is a publishing reach → `DhtMode::Production` (M2; advisory in P1
-/// — the in-memory DHT client publishes nothing).
+/// `Domain` is a publishing reach → `DhtMode::Production` (M2), which makes the
+/// start publish through `did_method` and fail if that publish fails.
 async fn build_test_node_with(
     local_api: Option<SocketAddr>,
 ) -> (

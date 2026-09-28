@@ -407,7 +407,8 @@ async fn build_tls_node(http_port: u16) -> ApplicationNode<InMemoryStorage> {
 
     // Default `TlsMode::SelfSigned` reproduces the dropped explicit
     // `SelfSignedTlsProvider::new("localhost")` (so a QUIC server config is
-    // provisioned). `Domain` → `DhtMode::Production` (M2; advisory in P1).
+    // provisioned). `Domain` → `DhtMode::Production` (M2), which makes the
+    // start publish through `did_method` and fail if that publish fails.
     Node::start_for_testing(NodeConfig {
         http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], http_port))),
         dht: DhtMode::Production,

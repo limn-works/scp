@@ -52,7 +52,8 @@ lints and named the Rust version in one file, took the `rustls-webpki` bump and 
 branch carries no line of the `rustls-webpki` fix. A later commit added different advisory
 work: `deny.toml` sets `unsound = "all"`, ignores RUSTSEC-2026-0253 (an `lru`
 advisory) for the copy `mainline` requires, and bans any other `lru` below 0.18.2.
-`Cargo.lock` bumps `anyhow` and `event-listener`, and bumps `aws-sdk-s3` with about
+`Cargo.lock` bumps `anyhow` and `event-listener`, moves `spin` off the yanked 0.9.8 to
+0.9.9 on the `flume` and `lazy_static` edges, and bumps `aws-sdk-s3` with about
 twenty crates in its dependency tree past `lru` 0.12.5, so RUSTSEC-2026-0002, the second
 `lru` advisory, needs no ignore. The example fix required one true sentence about why a shipped build
 cannot create an identity.

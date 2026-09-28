@@ -1677,8 +1677,9 @@ impl
         // dropped `.tls_provider(SelfSignedTlsProvider::new("localhost"))` is
         // reproduced by the default `TlsMode::SelfSigned`, which installs a
         // byte-identical self-signed provider for the `Domain` reach. `Domain`
-        // is a publishing reach, so M2 requires `DhtMode::Production`
-        // (advisory in P1 — the in-memory DHT client publishes nothing).
+        // is a publishing reach, so M2 requires `DhtMode::Production`, which
+        // makes `Node::start` publish through `did_method` and fail the start
+        // if that publish fails.
         //
         // Storage goes through a production `Node::start` front door: an
         // ephemeral `InMemoryStorage` is wrapped in `EncryptingAdapter` under a
