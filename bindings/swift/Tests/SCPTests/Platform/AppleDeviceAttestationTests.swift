@@ -18,8 +18,9 @@
 // 3. When App Attest is supported, each answer of `generateKey`,
 //    `attestKey` and `generateAssertion` (a value, an error, or neither)
 //    reaches the caller of the `throws(ScpError)` methods either as bytes or
-//    as the code of its `AttestationError` case, and `assertRequest` with no
-//    stored key ID throws `SCP-ATTEST-9020`.
+//    as the code of its `AttestationError` case, `DCError.featureUnsupported`
+//    from any of the three calls reaches it as `SCP-ATTEST-9019`, and
+//    `assertRequest` with no stored key ID throws `SCP-ATTEST-9020`.
 //
 // See ADR-025 (Apple Platform Adapter) in `.docs/adrs/phase-5.md` and the
 // UniFFI `DeviceAttestationProvider` callback interface in
@@ -54,8 +55,11 @@
     private enum Answer<Value> {
         /// A value and no error.
         case value(Value)
-        /// An error and no value.
+        /// An error and no value, from a domain other than `DCErrorDomain`.
         case failure
+        /// `DCError.featureUnsupported` and no value: App Attest refuses the
+        /// call although `isSupported` reported `true`.
+        case featureUnsupported
         /// Neither a value nor an error, an answer Apple does not document.
         case neither
 
@@ -63,6 +67,7 @@
             switch self {
             case let .value(value): handler(value, nil)
             case .failure: handler(nil, NSError(domain: "AppleDeviceAttestationTests", code: 1))
+            case .featureUnsupported: handler(nil, DCError(.featureUnsupported))
             case .neither: handler(nil, nil)
             }
         }
@@ -262,8 +267,10 @@
         func attestMapsEachFailure() async {
             let scripts = [
                 FailureScript("generateKey error", ScriptedAppAttestService(supported: true, key: .failure), "SCP-ATTEST-9001", storedKeyId: nil),
+                FailureScript("generateKey featureUnsupported", ScriptedAppAttestService(supported: true, key: .featureUnsupported), "SCP-ATTEST-9019", storedKeyId: nil),
                 FailureScript("generateKey neither", ScriptedAppAttestService(supported: true, key: .neither), "SCP-ATTEST-9025", storedKeyId: nil),
                 FailureScript("attestKey error", ScriptedAppAttestService(supported: true, attestation: .failure), "SCP-ATTEST-9001", storedKeyId: scriptedKeyId),
+                FailureScript("attestKey featureUnsupported", ScriptedAppAttestService(supported: true, attestation: .featureUnsupported), "SCP-ATTEST-9019", storedKeyId: scriptedKeyId),
                 FailureScript("attestKey neither", ScriptedAppAttestService(supported: true, attestation: .neither), "SCP-ATTEST-9025", storedKeyId: scriptedKeyId)
             ]
             for script in scripts {
@@ -294,6 +301,7 @@
         func assertRequestMapsEachFailure() async {
             let scripts = [
                 FailureScript("generateAssertion error", ScriptedAppAttestService(supported: true, assertion: .failure), "SCP-ATTEST-9001", storedKeyId: scriptedKeyId),
+                FailureScript("generateAssertion featureUnsupported", ScriptedAppAttestService(supported: true, assertion: .featureUnsupported), "SCP-ATTEST-9019", storedKeyId: scriptedKeyId),
                 FailureScript("generateAssertion neither", ScriptedAppAttestService(supported: true, assertion: .neither), "SCP-ATTEST-9025", storedKeyId: scriptedKeyId)
             ]
             for script in scripts {

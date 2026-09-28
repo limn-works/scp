@@ -1209,7 +1209,10 @@ pub const ATTEST_9018: &str = "SCP-ATTEST-9018";
 // the four `AttestationError` cases; the fourth case, `serviceError`, reuses
 // `ATTEST_9001`.
 
-/// Apple App Attest is unsupported on this device (`isSupported == false`).
+/// Apple App Attest is unsupported on this device.
+///
+/// `DCAppAttestService.isSupported` is `false`, or an App Attest call answered
+/// with `DCError.featureUnsupported`.
 pub const ATTEST_9019: &str = "SCP-ATTEST-9019";
 /// No App Attest key ID is stored, so no assertion is possible.
 pub const ATTEST_9020: &str = "SCP-ATTEST-9020";

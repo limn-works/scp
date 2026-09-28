@@ -334,7 +334,7 @@ reusing `8001` would make one code string mean both "storage key not found" and
 | `SCP-ATTEST-9016` | Attestation list JSON bytes are not valid UTF-8 |
 | `SCP-ATTEST-9017` | Failed to re-serialize attestation to UTF-8 JSON |
 | `SCP-ATTEST-9018` | Cryptographic-class attestation not verifiable via browser fetch |
-| `SCP-ATTEST-9019` | Apple App Attest is unsupported on this device |
+| `SCP-ATTEST-9019` | Apple App Attest is unsupported on this device: `DCAppAttestService.isSupported` is `false`, or an App Attest call answered with `DCError.featureUnsupported` |
 | `SCP-ATTEST-9020` | No App Attest key ID is stored, so no assertion is possible |
 | `SCP-ATTEST-9025` | The App Attest adapter reached a state no caller input produces: Apple's service answered a completion handler with neither a value nor an error |
 

@@ -16,10 +16,13 @@
 
     /// Errors produced by `AppleDeviceAttestation`.
     public nonisolated enum AttestationError: Error, Sendable {
-        /// The platform App Attest service returned an error.
+        /// The platform App Attest service returned an error other than
+        /// `DCError.featureUnsupported`.
         case serviceError(String)
-        /// `DCAppAttestService` reports `isSupported == false`, so this device
-        /// cannot produce an App Attest attestation or assertion.
+        /// App Attest is unsupported: `DCAppAttestService` reports
+        /// `isSupported == false`, or an App Attest call answers with
+        /// `DCError.featureUnsupported`. This device cannot produce an App
+        /// Attest attestation or assertion.
         ///
         /// A caller catches this case to learn that the device holds no
         /// hardware attestation signal. §9.3 of the security model spec,
@@ -47,6 +50,20 @@
                 .Identity(msg: "no App Attest key ID is stored; call attest first", code: "SCP-ATTEST-9020")
             case let .internalError(msg): .Identity(msg: msg, code: "SCP-ATTEST-9025")
             }
+        }
+
+        /// The case for an error an App Attest completion handler answered
+        /// with: `unsupported` for `DCError.featureUnsupported`, which names the
+        /// condition `SCP-ATTEST-9019` names, and `serviceError` for every
+        /// other error.
+        static func fromAppAttest(_ error: Error, call: String) -> AttestationError {
+            if let dcError = error as? DCError, dcError.code == .featureUnsupported {
+                return .unsupported(
+                    "\(call) answered DCError.featureUnsupported, so App Attest cannot serve this call: "
+                        + error.localizedDescription
+                )
+            }
+            return .serviceError(error.localizedDescription)
         }
     }
 
@@ -81,7 +98,9 @@
     ///
     /// When `DCAppAttestService.isSupported` is `false`, `attest` and
     /// `assertRequest` throw `ScpError.Identity` with code `SCP-ATTEST-9019`,
-    /// which `AttestationError.unsupported` maps to. The adapter mints
+    /// which `AttestationError.unsupported` maps to. They throw the same code
+    /// when `isSupported` is `true` but an App Attest call answers with
+    /// `DCError.featureUnsupported`. The adapter mints
     /// no substitute token, because a locally fabricated token would assert a
     /// hardware guarantee that no hardware produced. §9.3 of the security model
     /// spec, "Sybil resistance and identity uniqueness", states that the
@@ -210,9 +229,10 @@
         ///   - deviceId: Stable device/identity identifier bytes.
         /// - Returns: Attestation token bytes.
         /// - Throws: `AttestationError.unsupported` when
-        ///   `DCAppAttestService.isSupported` is `false`.
+        ///   `DCAppAttestService.isSupported` is `false`, or when `generateKey`
+        ///   or `attestKey` answers with `DCError.featureUnsupported`.
         ///   `AttestationError.serviceError` when `generateKey` or `attestKey`
-        ///   answers with an error.
+        ///   answers with any other error.
         ///   `AttestationError.internalError` when `generateKey` or `attestKey`
         ///   answers with neither a value nor an error.
         func attestReportingAttestationError(
@@ -239,7 +259,7 @@
             let outcome: Result<Data, AttestationError> = await withCheckedContinuation { continuation in
                 service.attestKey(keyId, clientDataHash: clientDataHash) { attestation, error in
                     if let error {
-                        continuation.resume(returning: .failure(.serviceError(error.localizedDescription)))
+                        continuation.resume(returning: .failure(.fromAppAttest(error, call: "attestKey")))
                     } else if let attestation {
                         continuation.resume(returning: .success(attestation))
                     } else {
@@ -265,11 +285,12 @@
         /// - Parameter requestHash: SHA-256 digest of the request payload.
         /// - Returns: Assertion bytes to include in the relay request.
         /// - Throws: `AttestationError.unsupported` when
-        ///   `DCAppAttestService.isSupported` is `false`.
+        ///   `DCAppAttestService.isSupported` is `false`, or when
+        ///   `generateAssertion` answers with `DCError.featureUnsupported`.
         ///   `AttestationError.keyNotFound` when no key ID is stored, because
         ///   no `attest` call has generated a key.
         ///   `AttestationError.serviceError` when `generateAssertion` answers
-        ///   with an error.
+        ///   with any other error.
         ///   `AttestationError.internalError` when `generateAssertion` answers
         ///   with neither an assertion nor an error.
         func assertRequestReportingAttestationError(
@@ -289,7 +310,7 @@
             let outcome: Result<Data, AttestationError> = await withCheckedContinuation { continuation in
                 service.generateAssertion(keyId, clientDataHash: requestHash) { assertion, error in
                     if let error {
-                        continuation.resume(returning: .failure(.serviceError(error.localizedDescription)))
+                        continuation.resume(returning: .failure(.fromAppAttest(error, call: "generateAssertion")))
                     } else if let assertion {
                         continuation.resume(returning: .success(assertion))
                     } else {
@@ -314,7 +335,9 @@
         ///
         /// - Returns: An App Attest key ID string suitable for use in
         ///   `attestKey(_:clientDataHash:)` and `generateAssertion(_:clientDataHash:)`.
-        /// - Throws: `AttestationError.serviceError` if `generateKey` fails.
+        /// - Throws: `AttestationError.unsupported` if `generateKey` answers
+        ///   `DCError.featureUnsupported`, `AttestationError.serviceError` if it
+        ///   answers any other error.
         private func resolveKeyId() async throws -> String {
             // Phase 1: synchronous check under lock. Returns either the existing
             // key ID string, an in-flight Task to await, or nil meaning we must
@@ -357,12 +380,14 @@
         /// `withCheckedThrowingContinuation` to produce an `async` function.
         ///
         /// - Returns: The newly generated App Attest key ID.
-        /// - Throws: `AttestationError.serviceError` if the service call fails.
+        /// - Throws: `AttestationError.unsupported` if the service call answers
+        ///   `DCError.featureUnsupported`, `AttestationError.serviceError` if it
+        ///   answers any other error.
         private func generateAndStoreKey() async throws -> String {
             let keyId: String = try await withCheckedThrowingContinuation { continuation in
                 service.generateKey { keyId, error in
                     if let error {
-                        continuation.resume(throwing: AttestationError.serviceError(error.localizedDescription))
+                        continuation.resume(throwing: AttestationError.fromAppAttest(error, call: "generateKey"))
                     } else if let keyId {
                         continuation.resume(returning: keyId)
                     } else {
