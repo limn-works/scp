@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run-tests.sh — exercise all four checks in `scripts/check-toolchain-wiring.sh` against
+# run-tests.sh — exercise all five checks in `scripts/check-toolchain-wiring.sh` against
 # canned repositories.
 #
 # WHAT THIS TESTS.
@@ -68,6 +68,13 @@
 #     compiler that agrees with the pin, so each one also proves check 4 stays silent then.
 #     One state has no case: `rustc` absent from PATH, which a canned repository cannot
 #     produce without also taking `bash`, `sed`, and `grep` off PATH.
+#   * Check 5 fails when `.mise.toml` lets a mise older than 2026.9.15 run, which it does
+#     when `min_version` is absent, a soft floor only, lower than 2026.9.15, or not
+#     dot-separated integers, and fails when `settings.npm.package_manager` is absent or
+#     names a manager other than bun. It passes a `{ hard = ... }` table and a floor above
+#     2026.9.15 whose month has two digits, which a string comparison would order below
+#     2026.9.15. Every other case writes both settings, so each one also proves check 5
+#     stays silent then.
 #
 # HOW EACH CASE IS BUILT. `run_case` makes a temporary directory, writes the gate and
 # `scripts/check-resolved-rustc.sh` into `scripts/`, runs `git init` so the gate's
@@ -100,6 +107,23 @@ fi
 TMP_PARENT=$(mktemp -d)
 trap 'rm -rf "$TMP_PARENT"' EXIT
 
+# The directory holding the Python interpreter the gate's TOML checks run. When `python3.12`
+# is a mise shim, the shim exits with an untrusted-config error in a canned repository,
+# because mise demands trust for a `.mise.toml` holding a `[settings]` table and every
+# canned `.mise.toml` below holds one. The harness asks the interpreter for its own path
+# from this repository, where mise trusts the configuration, and `run_case` puts that
+# directory on PATH after `stub-bin`, so every case runs an interpreter that imports
+# tomllib. When no candidate answers, PATH keeps its order and the gate reports the
+# missing parser.
+TOML_PYTHON_DIR=""
+for toml_python_candidate in python3.12 python3 python; do
+    if toml_python_path=$(cd "$REPO_ROOT" && "$toml_python_candidate" -c 'import sys, tomllib; print(sys.executable)' 2>/dev/null) \
+        && [[ -n $toml_python_path ]]; then
+        TOML_PYTHON_DIR=$(dirname "$toml_python_path")
+        break
+    fi
+done
+
 passed=0
 failed=0
 
@@ -118,6 +142,10 @@ failed=0
 #   MISE_SOURCE     — "none" writes a `.mise.toml` naming no Rust version source, "tools"
 #                     writes a `rust` key under `[tools]`, "idiomatic" writes the
 #                     `idiomatic_version_file_enable_tools` setting, "absent" writes no file.
+#                     Every spelling except "absent", "malformed", and the "policy-*" ones
+#                     also writes `min_version = "2026.9.15"` and
+#                     `[settings.npm] package_manager = "bun"`, which check 5 requires; the
+#                     "policy-*" spellings each write those two settings with one mutated.
 #   EXTRA_ROOT_FILE — one more root-level file to create, or "" for none.
 #   EXTRA_FILES     — path and producer-function name, in pairs, for files below the root.
 #                     `run_case` creates each parent directory.
@@ -313,8 +341,60 @@ YAML
 YAML
 }
 
+# The two settings check 5 requires. `emit_mise` wraps every check-3 spelling in them, so a
+# check-3 case can fail only through check 3.
+MISE_POLICY_HEAD='min_version = "2026.9.15"\n\n'
+MISE_POLICY_TAIL='\n[settings.npm]\npackage_manager = "bun"\n'
+
 emit_mise() {
     case "$MISE_SOURCE" in
+        absent | malformed | policy-*)
+            emit_mise_body
+            ;;
+        *)
+            printf '%b' "$MISE_POLICY_HEAD"
+            emit_mise_body
+            printf '%b' "$MISE_POLICY_TAIL"
+            ;;
+    esac
+}
+
+emit_mise_body() {
+    case "$MISE_SOURCE" in
+        # Check 5 spellings. Each writes a `[tools]` table naming no Rust version source,
+        # so each one can fail only through check 5.
+        policy-min-version-absent)
+            printf '[tools]\nbun = "1.3.9"\n'
+            printf '%b' "$MISE_POLICY_TAIL"
+            ;;
+        policy-min-version-soft)
+            printf 'min_version = { soft = "2026.9.15" }\n\n[tools]\nbun = "1.3.9"\n'
+            printf '%b' "$MISE_POLICY_TAIL"
+            ;;
+        policy-min-version-lower)
+            printf 'min_version = "2026.2.22"\n\n[tools]\nbun = "1.3.9"\n'
+            printf '%b' "$MISE_POLICY_TAIL"
+            ;;
+        policy-min-version-not-numeric)
+            printf 'min_version = "latest"\n\n[tools]\nbun = "1.3.9"\n'
+            printf '%b' "$MISE_POLICY_TAIL"
+            ;;
+        policy-min-version-hard-table)
+            printf 'min_version = { hard = "2026.9.15", soft = "2026.9.20" }\n\n[tools]\nbun = "1.3.9"\n'
+            printf '%b' "$MISE_POLICY_TAIL"
+            ;;
+        policy-min-version-two-digit-month)
+            printf 'min_version = "2026.10.1"\n\n[tools]\nbun = "1.3.9"\n'
+            printf '%b' "$MISE_POLICY_TAIL"
+            ;;
+        policy-npm-manager-absent)
+            printf '%b' "$MISE_POLICY_HEAD"
+            printf '[tools]\nbun = "1.3.9"\n'
+            ;;
+        policy-npm-manager-npm)
+            printf '%b' "$MISE_POLICY_HEAD"
+            printf '[tools]\nbun = "1.3.9"\n\n[settings.npm]\npackage_manager = "npm"\n'
+            ;;
         none)
             printf '# mise names no Rust version source. rustup reads the toolchain file of\n'
             printf '# whichever directory a command runs in.\n[tools]\nbun = "1.3.9"\n"cargo:cargo-fuzz" = "latest"\n'
@@ -460,7 +540,9 @@ run_case() {
     # The canned `stub-bin` leads PATH so check 4 reads the case's rustup and rustc rather
     # than the ones running this harness, and `RUSTUP_TOOLCHAIN` carries the case's value
     # rather than whatever the harness's own shell holds.
-    output=$(PATH="$root/stub-bin:$PATH" RUSTUP_TOOLCHAIN="$CASE_RUSTUP_TOOLCHAIN" \
+    local case_path="$root/stub-bin:$PATH"
+    if [[ -n $TOML_PYTHON_DIR ]]; then case_path="$root/stub-bin:$TOML_PYTHON_DIR:$PATH"; fi
+    output=$(PATH="$case_path" RUSTUP_TOOLCHAIN="$CASE_RUSTUP_TOOLCHAIN" \
         bash "$root/scripts/$(basename "$CHECK")" 2>&1)
     actual_exit=$?
 
@@ -827,6 +909,23 @@ mise_absent() {
 }
 run_case "mise-config-absent" 1 \
     ".mise.toml does not exist" routing_ok mise_absent
+
+# ── Check 5: mise refuses to run below 2026.9.15, and installs npm tools through bun ───
+
+mise_source_case policy-min-version-absent "mise-declares-no-min-version" 1 \
+    "declares no top-level min_version"
+mise_source_case policy-min-version-soft "mise-min-version-is-soft-only" 1 \
+    "which gives mise no hard floor"
+mise_source_case policy-min-version-lower "mise-min-version-below-the-floor" 1 \
+    "which is lower than 2026.9.15"
+mise_source_case policy-min-version-not-numeric "mise-min-version-not-dot-separated-integers" 1 \
+    "which is not dot-separated integers"
+mise_source_case policy-min-version-hard-table "mise-min-version-as-a-hard-table" 0 ""
+mise_source_case policy-min-version-two-digit-month "mise-min-version-above-the-floor-with-a-two-digit-month" 0 ""
+mise_source_case policy-npm-manager-absent "mise-sets-no-npm-package-manager" 1 \
+    "sets settings.npm.package_manager to None, not 'bun'"
+mise_source_case policy-npm-manager-npm "mise-sets-npm-as-the-npm-package-manager" 1 \
+    "sets settings.npm.package_manager to 'npm', not 'bun'"
 
 # ── Check 1: every container build asserts the compiler it resolved ──────────────────
 #

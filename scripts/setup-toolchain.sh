@@ -7,7 +7,12 @@
 #
 # Prerequisites (install manually first):
 #   - Homebrew: https://brew.sh
-#   - mise: https://mise.jdx.dev (brew install mise)
+#   - mise 2026.9.15 or newer: https://mise.jdx.dev (brew install mise). `.mise.toml`
+#     sets `min_version = "2026.9.15"`, and this script exits before its first mise call
+#     when `mise --version` reports an older release. mise 2026.2.22 resolved the
+#     `npm:@napi-rs/cli = "latest"` entry by running `npm view`, and `npm` is a mise shim,
+#     so each call started mise again until about 10,000 processes filled the process
+#     table.
 #   - rustup: https://rustup.rs
 #   - Xcode Command Line Tools: xcode-select --install
 #
@@ -76,6 +81,39 @@ require_cmd git
 require_cmd brew || true
 require_cmd mise || true
 require_cmd rustup || true
+
+# True when dot-separated integer version $1 is at least $2.
+version_at_least() {
+  local -a have floor
+  IFS=. read -ra have <<< "$1"
+  IFS=. read -ra floor <<< "$2"
+  local i count=${#floor[@]}
+  (( ${#have[@]} > count )) && count=${#have[@]}
+  for (( i = 0; i < count; i++ )); do
+    (( 10#${have[i]:-0} > 10#${floor[i]:-0} )) && return 0
+    (( 10#${have[i]:-0} < 10#${floor[i]:-0} )) && return 1
+  done
+  return 0
+}
+
+# The floor comes from `.mise.toml`, so this script and mise read one value. The script
+# exits instead of counting a failure, because every step below runs mise, and a mise
+# below the floor is the release that re-enters itself through its `npm` shim.
+if command -v mise &>/dev/null; then
+  MISE_FLOOR="$(sed -n 's/^min_version = "\([0-9.]*\)"$/\1/p' "$REPO_ROOT/.mise.toml")"
+  MISE_HAVE="$(mise --version 2>/dev/null | awk '{print $1}')"
+  if [[ -z "$MISE_FLOOR" ]]; then
+    red "  ✗ .mise.toml sets no min_version string, so this script cannot check the mise version"
+    exit 1
+  elif [[ ! "$MISE_HAVE" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+    red "  ✗ 'mise --version' printed '$MISE_HAVE', which is not a version this script can compare against $MISE_FLOOR"
+    exit 1
+  elif ! version_at_least "$MISE_HAVE" "$MISE_FLOOR"; then
+    red "  ✗ mise $MISE_HAVE is older than $MISE_FLOOR, the floor .mise.toml sets. Upgrade it (brew upgrade mise) and run this script again."
+    exit 1
+  fi
+  ok "mise $MISE_HAVE is at least $MISE_FLOOR"
+fi
 
 # Xcode CLT
 if xcode-select -p &>/dev/null; then
