@@ -1,6 +1,6 @@
 ---
 name: mcp-1341-subscribe-adr015
-description: Shipped state of MCP resources/subscribe backed by Supervisor events (#1341, Track G) — earlier findings are FIXED; ADR-015 AC5's remote-integration part (no TLS; the SSE client sends a token only to loopback), AC7 (dynamic tool list) and AC8 (Rust serve binary) remain genuinely open.
+description: Shipped state of MCP resources/subscribe backed by Supervisor events (#1341, Track G) — earlier findings are FIXED; ADR-015 AC5's remote-integration part (no TLS; the SSE client sends a token only to loopback) and its web-based-client part (a browser EventSource cannot send the bearer header, and the CORS preflight gets HTTP 401), AC7 (dynamic tool list) and AC8 (Rust serve binary) remain genuinely open.
 metadata:
   type: project
 ---
@@ -66,6 +66,15 @@ and do nothing while `initialize` advertised `subscribe: true` (NAPI returned
   the server with its token protected on the path and the server and every
   SDK's SSE client implement that decision; SCP-049 lists the tracking issue in
   `blockedByIssues`.
+- **AC5 — SSE transport, web-based-client part.** ADR-015 AC5 records this
+  part as unmet too. A browser's `EventSource` cannot set an `Authorization`
+  header, so the server answers its `GET /sse` with HTTP 401. A `fetch()` that
+  sets the header is cross-origin, so the browser sends an `OPTIONS` preflight
+  first; the server answers the preflight with HTTP 401 and no
+  `Access-Control-Allow-*` header, and the browser blocks the request. It
+  stays open until ADR-015 records how a browser client presents the token and
+  which origins the server admits in a preflight, and the server implements
+  that decision; SCP-049 lists the tracking issue in `blockedByIssues`.
 - **AC7 — dynamic tool list.** On all three bridges `active_context_ids()`
   returns the configured contexts whose live role state names the agent, so a
   join or departure among the configured contexts changes the served set
