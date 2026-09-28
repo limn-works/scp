@@ -10803,7 +10803,7 @@
         "A host `KeyCustodyProvider.derive_pseudonym` and `derive_rotatable_pseudonym` return a structured result carrying the 33-byte SEC1 compressed P-256 pseudonym point and the pseudonym's key id, in the UniFFI, PyO3 and napi bridges (`09-security-model.md` §9.10.4)",
         "Each bridge binds a host pseudonym only when `get_public_key(key_id)` returns the same 33 bytes, and fails with `SCP-IDENT-1055` otherwise: a test per bridge",
         "A pseudonym key signs only a 32-byte digest, and each bridge verifies the host's 64-byte `r‖s` strictly and rejects a high-`s` signature, for a pseudonym key this adapter derived and still holds bound; PR #2514 covers handles the adapter did not bind: a test per bridge (`09-security-model.md` §9.5)",
-        "The §25.19 Vector 30 and 31 points reproduce in Swift and Kotlin custody, and the routing ids reproduce through the Rust, TypeScript and Python bridges (`25-test-vectors.md` §25.19)",
+        "The §25.19 Vector 30 and 31 points reproduce in Swift and Kotlin custody, and the v1 routing ids reproduce through the Rust, TypeScript and Python bridges. No bridge derives a v2 pseudonym on a production path, so scp-crypto's §25.19 KAT covers the v2 routing ids (`25-test-vectors.md` §25.19)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [

@@ -10,10 +10,12 @@ This file checks two things:
   output: the identity scalar, ``pseudonym_secret``, both context seeds, both
   33-byte compressed P-256 public keys, and both routing ids. It is
   stdlib-only and runs with no native extension built.
-- The production bridge path: the Vector 30 identity scalar, installed as the
+- The production bridge path: each vector's identity scalar, installed as the
   native custody's Ed25519 seed (the §9.10.4.A native interim ikm), derives on
   ``context-alpha`` to the spec's v1 routing id through the PyO3 bridge. That
-  test skips when the extension is not built with the ``testing`` feature.
+  test skips when the extension is not built with the ``testing`` feature. No
+  bridge path derives a v2 pseudonym in production; scp-crypto's §25.19 KAT
+  covers v2.
 """
 
 from __future__ import annotations
@@ -112,8 +114,9 @@ def test_prehash_signature_is_low_s_and_64_bytes() -> None:
         assert int.from_bytes(sig[32:], "big") <= (n - 1) // 2
 
 
-def test_bridge_derives_vector_30_routing_id() -> None:
-    """§25.19 Vector 30 ``rid_v1`` through the PyO3 bridge's pseudonym derivation."""
+@pytest.mark.parametrize("vector", VECTORS, ids=IDS)
+def test_bridge_derives_spec_v1_routing_id(vector: dict) -> None:
+    """§25.19 ``rid_v1`` through the PyO3 bridge's pseudonym derivation."""
     core = pytest.importorskip("scp_sdk._scp_core")
     # A `testing` build exposes the fullstack methods (see test_e2e_fullstack.py);
     # only a build without that feature may skip. In a `testing` build a missing
@@ -122,6 +125,5 @@ def test_bridge_derives_vector_30_routing_id() -> None:
         pytest.skip("extension built without the `testing` feature")
     hook = getattr(core, "testing_pseudonym_routing_id_from_seed", None)
     assert hook is not None, "a `testing` build must export testing_pseudonym_routing_id_from_seed"
-    vector = VECTORS[0]
     routing_id = hook(bytes.fromhex(vector["scalar"]), CONTEXT_ALPHA.decode())
     assert bytes(routing_id).hex() == vector["rid_v1"]

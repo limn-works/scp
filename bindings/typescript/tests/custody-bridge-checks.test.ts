@@ -11,8 +11,9 @@
  *   - `unbind` in `destroy_key`: a destroyed id can carry a new point, and
  *     the id is already unbound when the host's `destroyKey` runs.
  *
- * It also runs the §25.19 Vector 30 identity scalar through the bridge's
- * production pseudonym derivation and compares the routing id to the spec.
+ * It also runs the §25.19 Vector 30 and 31 identity scalars through the
+ * bridge's production pseudonym derivation and compares each v1 routing id to
+ * the spec.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -188,19 +189,28 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     expect(boundDuringHostDestroy).toBe(false);
   });
 
-  test("§25.19 Vector 30 routing id through the bridge's pseudonym derivation", async () => {
-    // The §25.19 identity scalar of Vector 30, installed as the native custody's
-    // Ed25519 seed (the §9.10.4.A native interim ikm), then derived on
-    // "context-alpha" by the production pseudonym path.
-    const scalar = Buffer.from(
-      "32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64",
-      "hex",
-    );
-    const routingId = await (
-      native.testingPseudonymRoutingIdFromSeed as (s: Buffer, c: string) => Promise<Buffer>
-    )(scalar, "context-alpha");
-    expect(Buffer.from(routingId).toString("hex")).toBe(
-      "b7faa05dea2cef1b7aff6a48fa5b7b9ffe217b25f3152d78d597bb9078e98307",
-    );
-  });
+  // §25.19 Vectors 30 and 31: each identity scalar, installed as the native
+  // custody's Ed25519 seed (the §9.10.4.A native interim ikm), then derived on
+  // "context-alpha" by the production pseudonym path. No bridge path derives a
+  // v2 pseudonym in production; scp-crypto's §25.19 KAT covers v2.
+  const SPEC_25_19_V1 = [
+    {
+      name: "Vector 30",
+      scalar: "32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64",
+      routingId: "b7faa05dea2cef1b7aff6a48fa5b7b9ffe217b25f3152d78d597bb9078e98307",
+    },
+    {
+      name: "Vector 31",
+      scalar: "65d56a863d03d31ea15ade82f677058d5bbe53afedc6ff7d2b8846aa25a1bc2b",
+      routingId: "cab5ff45d21b6d0425fa7657e89fc68514965cbb4ca2b9549f4ccf430d581e7c",
+    },
+  ];
+  for (const vector of SPEC_25_19_V1) {
+    test(`§25.19 ${vector.name} v1 routing id through the bridge's pseudonym derivation`, async () => {
+      const routingId = await (
+        native.testingPseudonymRoutingIdFromSeed as (s: Buffer, c: string) => Promise<Buffer>
+      )(Buffer.from(vector.scalar, "hex"), "context-alpha");
+      expect(Buffer.from(routingId).toString("hex")).toBe(vector.routingId);
+    });
+  }
 });
