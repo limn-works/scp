@@ -527,10 +527,12 @@ impl KeyCustody for PyCallbackKeyCustody {
     }
 
     async fn destroy_key(&self, key: &KeyHandle) -> Result<(), PlatformError> {
-        self.provider
-            .call_str_void("destroy_key", &key.id().to_string())?;
-        self.pseudonyms.unbind(key);
-        Ok(())
+        self.pseudonyms
+            .destroy_unbound(key, async {
+                self.provider
+                    .call_str_void("destroy_key", &key.id().to_string())
+            })
+            .await
     }
 
     async fn dh_agree(

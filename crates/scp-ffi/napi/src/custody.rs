@@ -325,13 +325,15 @@ impl KeyCustody for NapiCallbackKeyCustody {
     }
 
     async fn destroy_key(&self, key: &KeyHandle) -> Result<(), PlatformError> {
-        self.tsfns
-            .destroy_key
-            .call_async(key.id().to_string())
+        self.pseudonyms
+            .destroy_unbound(key, async {
+                self.tsfns
+                    .destroy_key
+                    .call_async(key.id().to_string())
+                    .await
+                    .map_err(|e| Self::map_call_err("destroy_key", &e))
+            })
             .await
-            .map_err(|e| Self::map_call_err("destroy_key", &e))?;
-        self.pseudonyms.unbind(key);
-        Ok(())
     }
 
     async fn dh_agree(

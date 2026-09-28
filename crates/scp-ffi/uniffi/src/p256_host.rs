@@ -14,8 +14,12 @@
 //!    deterministic nonces and returns the low-`s` `r || s` (§9.5), which the
 //!    bridge then verifies strictly.
 //!
-//! The scalar crosses the FFI boundary because the host is its custodian; the
-//! Rust side holds its copies in `Zeroizing` buffers and drops them on return.
+//! The scalar crosses the FFI boundary because the host is its custodian.
+//! Wiping is best-effort: the Rust side wipes the seed and scalar `Vec`s it is
+//! handed and its own copies (`Zeroizing`), but uniffi's lift and
+//! `rustbuffer_free` do not wipe the transfer buffers that carry the seed and
+//! the scalar across the boundary, in either direction, and the returned
+//! scalar `Vec` is freed by uniffi unwiped. The host wipes its own arrays.
 
 use scp_crypto::p256::{P256SigningKey, seed_to_scalar, sign_prehash_rfc6979};
 use scp_ffi_common::error_codes as codes;
@@ -51,6 +55,7 @@ fn signing_key(scalar: &[u8]) -> Result<P256SigningKey, ScpError> {
 /// reduction fails (unreachable for a 32-byte seed).
 #[uniffi::export]
 pub fn p256_seed_to_scalar(label: Vec<u8>, seed: Vec<u8>) -> Result<Vec<u8>, ScpError> {
+    let seed = Zeroizing::new(seed);
     let seed = exact_32("seed", &seed)?;
     let scalar = seed_to_scalar(&label, &seed).map_err(|e| ScpError::Crypto {
         msg: format!("seed_to_scalar failed: {e}"),

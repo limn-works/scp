@@ -352,7 +352,9 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// For an Ed25519 key, returns the raw 64-byte Ed25519 signature. For a
     /// pseudonym key id from `derive_pseudonym`, `message` is a 32-byte digest
     /// and the return is the 64-byte low-`s` P-256 `r || s` (§9.5); the
-    /// bridge verifies it strictly and rejects anything else. A software host
+    /// bridge verifies it strictly and rejects anything else, for a pseudonym
+    /// key this adapter derived and still holds bound; for a handle the adapter
+    /// did not bind, the bridge returns the host's bytes unchecked. A software host
     /// signs with [`crate::p256_host::p256_sign_prehash_rfc6979`] rather than
     /// its own ECDSA.
     async fn sign(&self, key_id: String, message: Vec<u8>) -> Result<Vec<u8>, ScpError>;

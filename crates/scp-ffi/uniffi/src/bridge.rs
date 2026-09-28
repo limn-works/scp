@@ -778,12 +778,14 @@ impl KeyCustody for CallbackKeyCustody {
     }
 
     async fn destroy_key(&self, key: &KeyHandle) -> Result<(), PlatformError> {
-        self.provider
-            .destroy_key(key.id().to_string())
+        self.pseudonyms
+            .destroy_unbound(key, async {
+                self.provider
+                    .destroy_key(key.id().to_string())
+                    .await
+                    .map_err(|e| PlatformError::CustodyError(e.to_string()))
+            })
             .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
-        self.pseudonyms.unbind(key);
-        Ok(())
     }
 
     async fn dh_agree(
@@ -24104,6 +24106,7 @@ mod tests {
     }
 
     /// The §9.10.4 routing id the recipe yields for `seed` in `context_id`.
+    #[cfg(feature = "testing")]
     fn recipe_routing_id(seed: [u8; 32], context_id: &[u8], epoch: Option<u64>) -> [u8; 32] {
         let ikm = zeroize::Zeroizing::new(seed);
         let point = scp_crypto::pseudonym::derive_pseudonym_keypair(&ikm, context_id, epoch)

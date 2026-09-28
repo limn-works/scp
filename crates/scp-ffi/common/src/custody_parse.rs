@@ -146,9 +146,27 @@ impl PseudonymBindings {
         }
     }
 
-    /// Removes the binding for a destroyed handle.
-    pub fn unbind(&self, key: &KeyHandle) {
-        self.points.remove(&key.id());
+    /// Destroys `key` through `host_destroy` with its binding removed first.
+    ///
+    /// The binding is removed before the host call, so a concurrent re-derive
+    /// of the same handle that binds while the host destroys lands after the
+    /// removal and survives it. When `host_destroy` fails, the removed point is
+    /// bound again unless a concurrent re-derive has already bound one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `host_destroy`.
+    pub async fn destroy_unbound(
+        &self,
+        key: &KeyHandle,
+        host_destroy: impl core::future::Future<Output = Result<(), PlatformError>>,
+    ) -> Result<(), PlatformError> {
+        let removed = self.points.remove(&key.id()).map(|(_, point)| point);
+        let result = host_destroy.await;
+        if let (Err(_), Some(point)) = (&result, removed) {
+            self.points.entry(key.id()).or_insert(point);
+        }
+        result
     }
 
     /// Checks the input to a `sign` call. Returns the bound point and the
@@ -199,6 +217,75 @@ impl PseudonymBindings {
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// Drives a future to completion on a current-thread runtime.
+    fn block_on<F: core::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(future)
+    }
+
+    /// The binding is gone during the host destroy, so a re-derive binding in
+    /// that window survives a successful destroy; a failed destroy restores
+    /// the removed binding.
+    #[test]
+    fn destroy_unbound_unbinds_before_the_host_call() {
+        let bindings = PseudonymBindings::default();
+        let pseudo = parse_pseudonym("derive_pseudonym", &REFERENCE_POINT, "9").expect("valid");
+        let handle = pseudo.key_handle();
+        bindings
+            .bind("derive_pseudonym", &pseudo, &REFERENCE_POINT)
+            .expect("bind");
+
+        // A re-derive that binds while the host destroys survives the destroy.
+        block_on(bindings.destroy_unbound(handle, async {
+            assert!(
+                bindings
+                    .check_sign_input(handle, &[0u8; 32])
+                    .expect("unbound during the host call")
+                    .is_none(),
+                "the binding is removed before the host call"
+            );
+            bindings
+                .bind("derive_pseudonym", &pseudo, &REFERENCE_POINT)
+                .expect("concurrent re-derive binds");
+            Ok(())
+        }))
+        .expect("destroy");
+        assert!(
+            bindings
+                .check_sign_input(handle, &[0u8; 32])
+                .expect("bound")
+                .is_some(),
+            "the re-derive's binding survives"
+        );
+
+        // A failed host destroy keeps the key, so its binding comes back.
+        let msg = custody_msg(
+            block_on(bindings.destroy_unbound(handle, async {
+                Err(PlatformError::CustodyError("host refused".to_owned()))
+            }))
+            .expect_err("host failure propagates"),
+        );
+        assert_eq!(msg, "host refused");
+        assert!(
+            bindings
+                .check_sign_input(handle, &[0u8; 32])
+                .expect("bound")
+                .is_some(),
+            "a failed destroy restores the binding"
+        );
+
+        // A successful destroy leaves it unbound.
+        block_on(bindings.destroy_unbound(handle, async { Ok(()) })).expect("destroy");
+        assert!(
+            bindings
+                .check_sign_input(handle, &[0u8; 32])
+                .expect("unbound")
+                .is_none()
+        );
+    }
 
     /// §25.2 reference key, compressed:
     /// `033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027`.
@@ -372,10 +459,10 @@ mod tests {
             msg.contains("already bound to a different pseudonym point"),
             "{msg}"
         );
-        bindings.unbind(first.key_handle());
+        block_on(bindings.destroy_unbound(first.key_handle(), async { Ok(()) })).expect("destroy");
         bindings
             .bind("derive_pseudonym", &second, &other)
-            .expect("bind after unbind");
+            .expect("bind after destroy");
     }
 
     const N: [u8; 32] = [
@@ -465,7 +552,7 @@ mod tests {
         );
         assert!(msg.contains("does not verify"), "{msg}");
 
-        bindings.unbind(handle);
+        block_on(bindings.destroy_unbound(handle, async { Ok(()) })).expect("destroy");
         assert!(
             bindings
                 .check_sign_input(handle, &[0u8; 12])
