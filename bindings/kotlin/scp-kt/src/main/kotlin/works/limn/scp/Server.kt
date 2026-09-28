@@ -255,7 +255,7 @@ class Relay internal constructor(
     private val bridge: ServerBridge,
     internal val handleJson: String,
 ) {
-    /** `true` once a [shutdown] call has returned without throwing. */
+    /** `true` once a [shutdown] call's FFI teardown has returned without throwing. */
     @Volatile
     var isShutdown: Boolean = false
         private set
@@ -266,10 +266,10 @@ class Relay internal constructor(
      * In-flight connection handlers drain naturally. Idempotent.
      */
     suspend fun shutdown() {
-        bridge.shutdownRelay(this)
-        // Record shutdown only after the FFI call returns: a caller who sees an exception
-        // here should read this relay as still live and still worth a second [shutdown].
-        isShutdown = true
+        // Record shutdown as soon as the FFI call returns, inside the bridge block: an engine
+        // failure throws first and leaves this relay live and worth a second [shutdown], while a
+        // cancellation the bridge raises after a finished teardown cannot leave it recorded live.
+        bridge.shutdownRelay(this) { isShutdown = true }
     }
 
     override fun toString(): String = "Relay(url=$relayUrl, relayPort=$relayPort)"
@@ -329,7 +329,7 @@ class Node internal constructor(
     private val bridge: ServerBridge,
     internal val handleJson: String,
 ) {
-    /** `true` once a [shutdown] call has returned without throwing. */
+    /** `true` once a [shutdown] call's FFI teardown has returned without throwing. */
     @Volatile
     var isShutdown: Boolean = false
         private set
@@ -340,10 +340,10 @@ class Node internal constructor(
      * In-flight connection handlers drain naturally. Idempotent.
      */
     suspend fun shutdown() {
-        bridge.shutdownNode(this)
-        // Record shutdown only after the FFI call returns: a caller who sees an exception
-        // here should read this node as still live and still worth a second [shutdown].
-        isShutdown = true
+        // Record shutdown as soon as the FFI call returns, inside the bridge block: an engine
+        // failure throws first and leaves this node live and worth a second [shutdown], while a
+        // cancellation the bridge raises after a finished teardown cannot leave it recorded live.
+        bridge.shutdownNode(this) { isShutdown = true }
     }
 
     // HTTP server lifecycle
@@ -621,21 +621,29 @@ class ServerBridge internal constructor(
      * Shuts down a running relay. Idempotent.
      *
      * @param relay The relay to shut down.
+     * @param onShutDown Runs inside the bridge call once the FFI shutdown returns.
      */
-    internal suspend fun shutdownRelay(relay: Relay) =
-        bridge.ffiCall {
-            bindings.relayShutdown(relay.handleJson)
-        }
+    internal suspend fun shutdownRelay(
+        relay: Relay,
+        onShutDown: () -> Unit,
+    ) = bridge.ffiCall {
+        bindings.relayShutdown(relay.handleJson)
+        onShutDown()
+    }
 
     /**
      * Shuts down a running node (relay + background tasks). Idempotent.
      *
      * @param node The node to shut down.
+     * @param onShutDown Runs inside the bridge call once the FFI shutdown returns.
      */
-    internal suspend fun shutdownNode(node: Node) =
-        bridge.ffiCall {
-            bindings.nodeShutdown(node.handleJson)
-        }
+    internal suspend fun shutdownNode(
+        node: Node,
+        onShutDown: () -> Unit,
+    ) = bridge.ffiCall {
+        bindings.nodeShutdown(node.handleJson)
+        onShutDown()
+    }
 
     // HTTP server lifecycle
 

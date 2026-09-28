@@ -83,7 +83,8 @@ abstract class ScpViewModel : ViewModel() {
 
     // `Dispatchers.Unconfined` starts the cleanup coroutine on the thread that calls
     // [onCleared] and keeps it there only until the first `leave` suspends into the
-    // bridge's I/O dispatcher, so [onCleared] returns without waiting on an FFI call.
+    // bridge's I/O dispatcher, so [onCleared] returns without waiting on an FFI call when
+    // that dispatcher dispatches; an inline one runs every `leave` before [onCleared] returns.
     private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
 
     /**
@@ -97,7 +98,8 @@ abstract class ScpViewModel : ViewModel() {
      * `ViewModel.addCloseable` closes a resource added after clear: Android never calls
      * [onCleared] a second time, so tracking it would drop its `leave` silently. That
      * `leave` runs on the same cleanup coroutine path, and a failure reaches
-     * [onCleanupFailure].
+     * [onCleanupFailure]; with a bridge whose I/O dispatcher runs inline, both run on the
+     * calling thread before this method returns.
      *
      * @param context The [TrackedContext] wrapping the context handle and bridge.
      * @return The same [context] passed in, for chaining.
@@ -144,9 +146,11 @@ abstract class ScpViewModel : ViewModel() {
      *   either. Its throwable is logged at warning level and the loop continues.
      *
      * What this method does not guarantee: that `leave` calls have finished. The cleanup
-     * coroutine starts on the calling thread and leaves it at the first `leave`, which
-     * suspends into the bridge's I/O dispatcher. Cleanup is best-effort — those calls run to completion only
-     * if a process outlives them. Blocking until they finish is not an option: [onCleared] runs
+     * coroutine starts on the calling thread and, when the bridge's I/O dispatcher dispatches
+     * (the default `Dispatchers.IO` does), leaves it at the first `leave`. A dispatcher that
+     * runs inline, such as `Dispatchers.Unconfined`, runs every `leave` and every
+     * [onCleanupFailure] call on the calling thread before this method returns. Cleanup is
+     * best-effort — those calls run to completion only if a process outlives them. Blocking until they finish is not an option: [onCleared] runs
      * on an Android main thread, and blocking that thread on FFI calls both risks an ANR and
      * deadlocks whenever an injected dispatcher schedules its work onto a blocked thread.
      *
@@ -205,8 +209,11 @@ abstract class ScpViewModel : ViewModel() {
      * That standard is why this method returns [Unit] rather than rethrowing, and why
      * [onCleared] keeps calling `leave` on remaining contexts after one fails.
      *
-     * Runs inside a cleanup coroutine, on whichever thread the bridge's I/O dispatcher resumed
-     * that coroutine on, after [onCleared] has already returned. It must not block that thread, for a reason
+     * Runs inside a cleanup coroutine. When the bridge's I/O dispatcher dispatches (the default
+     * `Dispatchers.IO` does), that is on whichever thread the dispatcher resumed that coroutine
+     * on, after [onCleared] has already returned. A dispatcher that runs inline, such as
+     * `Dispatchers.Unconfined`, runs it on the thread that called [onCleared] (an Android main
+     * thread) before [onCleared] returns. Either way it must not block its thread, for a reason
      * `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` states.
      *
      * A throw from an override does not propagate: [onCleared] catches it, logs it at warning

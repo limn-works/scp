@@ -252,9 +252,10 @@ class Relay internal constructor(
 
     // The only stop path. It suspends on the bridge's injected ioDispatcher. A failed
     // teardown propagates and leaves isShutdown false, so the relay still reads as live.
+    // The flag is set inside the bridge call, so a caller cancelled after a finished
+    // teardown still finds it set.
     suspend fun shutdown() {
-        bridge.shutdownRelay(this)
-        isShutdown = true
+        bridge.shutdownRelay(this) { isShutdown = true }
     }
 }
 

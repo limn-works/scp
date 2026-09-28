@@ -6,8 +6,11 @@
 
 package works.limn.scp
 
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestDispatcher
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -290,6 +293,37 @@ class ServerTest {
             assertFalse(relay.isShutdown)
         }
     }
+
+    // A caller cancelled while the engine tears down gets a CancellationException from the
+    // bridge's trailing ensureActive, although the teardown finished. The flag must still
+    // record the shutdown, or `isShutdown` reports a torn-down object as live.
+    @Test
+    fun `a node shutdown whose caller is cancelled after the teardown still marks it shut down`() {
+        runTest(testDispatcher) {
+            val node = createNode()
+            lateinit var caller: Job
+            stubBindings.afterShutdown = { caller.cancel() }
+            caller = launch { node.shutdown() }
+            advanceUntilIdle()
+            assertTrue(caller.isCancelled)
+            assertEquals(listOf(node.handleJson), stubBindings.nodeShutdownHandles)
+            assertTrue(node.isShutdown)
+        }
+    }
+
+    @Test
+    fun `a relay shutdown whose caller is cancelled after the teardown still marks it shut down`() {
+        runTest(testDispatcher) {
+            val relay = Relay.startInMemory(serverBridge)
+            lateinit var caller: Job
+            stubBindings.afterShutdown = { caller.cancel() }
+            caller = launch { relay.shutdown() }
+            advanceUntilIdle()
+            assertTrue(caller.isCancelled)
+            assertEquals(listOf(relay.handleJson), stubBindings.relayShutdownHandles)
+            assertTrue(relay.isShutdown)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -337,14 +371,19 @@ internal class StubServerBindings : ServerBindings {
     /** When set, [relayShutdown] and [nodeShutdown] record the call and then throw this. */
     var shutdownFailure: RuntimeException? = null
 
+    /** When set, [relayShutdown] and [nodeShutdown] run this after a teardown that succeeds. */
+    var afterShutdown: (() -> Unit)? = null
+
     override fun relayShutdown(handleJson: String) {
         relayShutdownHandles += handleJson
         shutdownFailure?.let { throw it }
+        afterShutdown?.invoke()
     }
 
     override fun nodeShutdown(handleJson: String) {
         nodeShutdownHandles += handleJson
         shutdownFailure?.let { throw it }
+        afterShutdown?.invoke()
     }
 
     // enableSiteProjection

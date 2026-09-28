@@ -188,13 +188,15 @@ class SCP internal constructor(
         timeout: Duration = 5.seconds,
     ) {
         val millis = timeout.inWholeMilliseconds.coerceAtLeast(0).toULong()
-        bridge.ffiCallSuspend { inner.shutdown(timeoutMillis = millis) }
-        // Record shutdown AFTER the FFI call returns so that a failed
-        // shutdown does not silence the finalizer warning — a caller
-        // who sees an exception here should know the instance is still
-        // live and still worth a second [shutdown] attempt. SetRelease
-        // orders the flip after the FFI mutation, matching Atomic default.
-        isShutdown.set(true)
+        bridge.ffiCallSuspend {
+            inner.shutdown(timeoutMillis = millis)
+            // Record shutdown as soon as the FFI call returns, inside the bridge block: an
+            // engine failure throws before this line, so a failed shutdown does not silence
+            // the finalizer warning, while a cancellation the bridge raises after a finished
+            // teardown (its trailing ensureActive, or resuming a cancelled caller) cannot
+            // leave a torn-down instance recorded as live.
+            isShutdown.set(true)
+        }
     }
 
     /**
