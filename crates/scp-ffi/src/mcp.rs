@@ -4377,6 +4377,7 @@ mod tests {
         creator: &str,
         ceiling: &[&str],
     ) {
+        crate::init_runtime().ok();
         let supervisor = Arc::clone(crate::runtime::supervisor(bi).unwrap());
         let params = scp_core::context::ContextParams {
             ceiling: ceiling
