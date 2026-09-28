@@ -71,11 +71,26 @@ subscription that a different caller had just opened.
   first coordinator releases the subscription both mounts shared. `rememberScpHotStream` keeps
   every such `Job` that has not completed, each paired with the coordinator that returned it,
   across any number of coordinator changes, and a start joins every one a different coordinator
-  returned; a mount whose `start` never ran on a coordinator skips its `onStop` there, checked
-  under that coordinator's key mutex, because it opened nothing and a mount still live on a
-  replaced coordinator may collect the subscription that `onStop` would release. Discarding an early
-  mount's `onStop` instead leaks a subscription whenever two different streams share a key, such
-  as a `contextEvents` and an `incomingMessages` stream both keyed by one context handle.
+  returned. A mount that waits on another coordinator's Job is counted on its new coordinator
+  only once that wait ends: counted while waiting, it made its new coordinator hold the `onStop`
+  of a mount moving the other way, and two crosswise moves then each waited on a Job only the
+  other's departure completed.
+- **Run one `onStop` per subscription a started mount opened.** `startMounted` and `unmount`
+  race to claim a mount with one compare-and-set; when `unmount` wins, that mount's `start`
+  never runs and its `onStop` is dropped, because it opened nothing and a mount still live on a
+  replaced coordinator may collect the subscription that `onStop` would release. A held
+  departure whose `start` returned the same object as an earlier held one's (compared by
+  identity; `HotStreamFactory` hands every caller of one subscription one `SharedFlow`) adds
+  nothing to the held list, so that list stays bounded by the number of distinct subscriptions
+  under the key, not by how many list rows scrolled past a long-lived mount. Discarding an early
+  mount's `onStop` whose `start` returned a different object instead leaks a subscription
+  whenever two different streams share a key, such as a `contextEvents` and an
+  `incomingMessages` stream both keyed by one context handle.
+- **Refuse a start and report a skipped stop once the coordinator's scope is cancelled.** A stop
+  launched on a cancelled scope never runs its body, so the coordinator logs every stop that
+  cancellation kept from running its `onStop` lambdas, completes a held departure's Job
+  exceptionally instead of reporting that its `onStop` ran, and refuses every later `start` with
+  `ScpHotStreamCoordinatorClosedException`, because no stop could release what it opened.
 
 ## Why a coordinator rather than a file-scope registry
 
@@ -83,7 +98,8 @@ subscription that a different caller had just opened.
 and `scripts/check-no-kotlin-mutable-globals.sh` states that this SDK holds no implicit
 per-process mutable state. An `object` singleton in `StateHolders.kt` would carry that state
 across mounts and would also carry it across every unrelated caller in one process, so a caller
-constructs a coordinator, owns its scope, and decides when to cancel it.
+constructs a coordinator, owns its scope, and cancels it only once every mount that passed
+that coordinator has left composition.
 
 A default parameter that built a coordinator per composition would compile, read as convenient,
 and restore defect 3 exactly, because each mount would then coordinate against itself alone.
@@ -115,7 +131,12 @@ show one context handle during a transition each count only their own mounts.
   starts releases nothing a live mount collects` removes a moved mount while its old coordinator
   still holds its `onStop`, and `a mount that moves away and back next to a live mount starts
   again and releases nothing` returns a moved mount to its first coordinator; each asserts which
-  subscription stays live.
+  subscription stays live. `crosswise coordinator moves under one key do not wait on each other`
+  moves two mounts in opposite directions and asserts that the second one starts.
+  `departures beside a live mount hold one onStop per subscription` churns a hundred mounts
+  past a live one and asserts the held list's size, and `a cancelled coordinator scope logs its
+  skipped onStop and refuses later starts` asserts the log line, the exceptional Job, and the
+  refused start.
 
 ## Anti-patterns
 

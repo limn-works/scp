@@ -18,6 +18,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -621,8 +622,8 @@ class ScpHotStreamRemountTest {
      *
      * The first mount to leave must stop nothing yet: its `onStop` would release the subscription
      * the second mount is still collecting, and that collector would then observe a SharedFlow
-     * that receives nothing further and reports no error. The last mount to leave runs both
-     * mounts' `onStop`, and the second call finds nothing left to release.
+     * that receives nothing further and reports no error. Both mounts' `start` returned one
+     * SharedFlow, so the last mount to leave runs one `onStop` for that one subscription.
      */
     @Test(timeout = DISPOSAL_TIMEOUT_MS)
     fun `an overlapping mount under one same key keeps its subscription when the other mount leaves`() {
@@ -677,7 +678,8 @@ class ScpHotStreamRemountTest {
         awaitCondition("the last mount's departure released nothing") {
             subscriptions.unsubscribeIds() == listOf(1)
         }
-        awaitCondition("the last mount's departure did not run both onStop lambdas") { stopCalls.get() == 2 }
+        Thread.sleep(SWAP_START_GRACE_MS)
+        assertEquals("the last mount's departure ran one onStop per mount, not per subscription", 1, stopCalls.get())
         assertEquals(listOf(1), subscriptions.unsubscribeIds())
         assertEquals(listOf(1), subscriptions.subscribeIds())
     }
@@ -700,8 +702,8 @@ class ScpHotStreamRemountTest {
             val coordinator =
                 ScpHotStreamCoordinator(CoroutineScope(SupervisorJob() + executor.asCoroutineDispatcher()))
             val stops = AtomicInteger(0)
-            val first = coordinator.mount("k")
-            val second = coordinator.mount("k")
+            val first = coordinator.startedMount("k")
+            val second = coordinator.startedMount("k")
 
             val held = checkNotNull(coordinator.unmount(first) { stops.incrementAndGet() })
             assertEquals("unmounting one mount twice", null, coordinator.unmount(first) { stops.incrementAndGet() })
@@ -740,8 +742,8 @@ class ScpHotStreamRemountTest {
     @Test(timeout = DISPOSAL_TIMEOUT_MS)
     fun `two different streams under one key each have their onStop run`() {
         val coordinator = ScpHotStreamCoordinator(CoroutineScope(SupervisorJob() + Dispatchers.IO))
-        val events = coordinator.mount("k")
-        val messages = coordinator.mount("k")
+        val events = coordinator.startedMount("k")
+        val messages = coordinator.startedMount("k")
         val stopped = Collections.synchronizedList(mutableListOf<String>())
 
         val held = checkNotNull(coordinator.unmount(events) { stopped += "events" })
@@ -755,13 +757,15 @@ class ScpHotStreamRemountTest {
     }
 
     /**
-     * A stop launched under a key runs after every stop launched before it under that key, even
-     * when the earlier stop reaches its dispatcher last. Otherwise a mount that captured only the
-     * later stop could start, reuse a subscription, and then lose it to the earlier stop.
+     * A stop launched under a key completes only after every stop launched before it under that
+     * key, even when the earlier stop reaches its dispatcher last. Otherwise a mount that
+     * captured only the later stop could start, reuse a subscription, and then lose it to the
+     * earlier stop.
      *
      * [QueuedDispatcher] holds every dispatched task until this method runs it, and this method
      * runs the newest task first, so the second stop reaches the free mutex before the first stop
-     * has left its dispatcher queue.
+     * has left its dispatcher queue. The second mount leaves before its start, which waits on
+     * the first stop, can run, so the second stop runs no `onStop` of its own.
      */
     @Test(timeout = DISPOSAL_TIMEOUT_MS)
     fun `a stop runs after every stop launched before it under that key`() {
@@ -769,16 +773,19 @@ class ScpHotStreamRemountTest {
         val coordinator = ScpHotStreamCoordinator(CoroutineScope(SupervisorJob() + dispatcher))
         val stopped = Collections.synchronizedList(mutableListOf<String>())
 
-        val first = checkNotNull(coordinator.unmount(coordinator.mount("k")) { stopped += "first" })
+        val first = checkNotNull(coordinator.unmount(coordinator.startedMount("k")) { stopped += "first" })
         val secondMount = coordinator.mount("k")
         assertEquals("a later mount did not capture the pending stop", first, secondMount.pendingStop)
         val second = checkNotNull(coordinator.unmount(secondMount) { stopped += "second" })
         val third = coordinator.mount("k")
         assertEquals("a later mount did not capture the newest stop", second, third.pendingStop)
+        val firstDoneAtSecond = AtomicBoolean(false)
+        second.invokeOnCompletion { firstDoneAtSecond.set(first.isCompleted) }
 
         dispatcher.runNewestFirst()
 
-        assertEquals(listOf("first", "second"), stopped.toList())
+        assertEquals("a mount that never started ran onStop", listOf("first"), stopped.toList())
+        assertTrue("the later stop finished before the earlier one", firstDoneAtSecond.get())
         assertTrue("the earlier stop did not finish", first.isCompleted)
         assertTrue("the later stop did not finish", second.isCompleted)
     }
@@ -1059,11 +1066,11 @@ class ScpHotStreamRemountTest {
         val coordinator = ScpHotStreamCoordinator(scope)
         val failure = IllegalStateException("engine already dropped the context")
 
-        val failed = coordinator.unmount(coordinator.mount("k")) { throw failure }
+        val failed = coordinator.unmount(coordinator.startedMount("k")) { throw failure }
         runBlocking { checkNotNull(failed).join() }
 
         val stops = AtomicInteger(0)
-        val next = coordinator.unmount(coordinator.mount("k")) { stops.incrementAndGet() }
+        val next = coordinator.unmount(coordinator.startedMount("k")) { stops.incrementAndGet() }
         runBlocking { checkNotNull(next).join() }
 
         assertTrue("a throwing onStop cancelled the coordinator's scope", scope.isActive)
@@ -1071,6 +1078,146 @@ class ScpHotStreamRemountTest {
         val warning = ShadowLog.getLogsForTag("ScpHotStreamCoordinator").single()
         assertEquals(Log.WARN, warning.type)
         assertEquals(failure, warning.throwable)
+    }
+
+    /**
+     * A key held by one long-lived mount keeps one held `onStop` per subscription, however many
+     * other mounts of that subscription enter and leave beside it, and holds none for a mount
+     * that left before its start ran. A held list that grew with every departure would keep
+     * every departed mount's lambda, and everything it captured, until the long-lived mount left.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `departures beside a live mount hold one onStop per subscription`() {
+        val coordinator = ScpHotStreamCoordinator(newCoordinatorScope())
+        val shared = Any()
+        val header = coordinator.startedMount("k", shared)
+        val stops = AtomicInteger(0)
+        repeat(ROW_CHURN) {
+            coordinator.unmount(coordinator.startedMount("k", shared)) { stops.incrementAndGet() }
+            coordinator.unmount(coordinator.mount("k")) { stops.incrementAndGet() }
+        }
+        coordinator.unmount(coordinator.startedMount("k", Any())) { stops.incrementAndGet() }
+
+        assertEquals("held onStop lambdas grew with departures", 2, header.state.heldStops.size)
+        assertEquals("a held onStop ran while a mount stayed live", 0, stops.get())
+        runBlocking { checkNotNull(coordinator.unmount(header) { stops.incrementAndGet() }).join() }
+        assertEquals("the key's stop did not run one onStop per subscription", 2, stops.get())
+    }
+
+    /**
+     * Cancelling a coordinator's scope skips every `onStop` it still holds. That is logged, the
+     * held departure's Job completes exceptionally instead of reporting that its `onStop` ran,
+     * and a later start is refused, because no stop could release what it opened.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `a cancelled coordinator scope logs its skipped onStop and refuses later starts`() {
+        ShadowLog.clear()
+        val scope = newCoordinatorScope()
+        val coordinator = ScpHotStreamCoordinator(scope)
+        val stops = AtomicInteger(0)
+        val staying = coordinator.startedMount("k")
+        val held = checkNotNull(coordinator.unmount(coordinator.startedMount("k")) { stops.incrementAndGet() })
+        scope.cancel()
+
+        val stop = checkNotNull(coordinator.unmount(staying) { stops.incrementAndGet() })
+        runBlocking {
+            held.join()
+            stop.join()
+        }
+
+        assertEquals("an onStop ran on a cancelled scope", 0, stops.get())
+        assertTrue("a held departure's Job reported that its onStop ran", held.isCancelled)
+        assertTrue("a skipped stop reported that it ran", stop.isCancelled)
+        assertEquals(Log.WARN, ShadowLog.getLogsForTag("ScpHotStreamCoordinator").single().type)
+
+        val started = AtomicBoolean(false)
+        val later = coordinator.mount("k")
+        val outcome = runCatching { runBlocking { coordinator.startMounted(later) { started.set(true) } } }
+        assertTrue(
+            "a start on a cancelled coordinator was not refused",
+            outcome.exceptionOrNull() is ScpHotStreamCoordinatorClosedException,
+        )
+        assertEquals("a start on a cancelled coordinator ran", false, started.get())
+    }
+
+    /** A mount on a coordinator whose scope is cancelled logs the refusal and keeps a null State. */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `a mount on a cancelled coordinator logs and never starts`() {
+        ShadowLog.clear()
+        val coordinator = ScpHotStreamCoordinator(newCoordinatorScope().also { it.cancel() })
+        val startCalls = AtomicInteger(0)
+        var flowState: State<SharedFlow<String>?>? = null
+
+        composeRule.setContent {
+            flowState =
+                rememberScpHotStream(
+                    key = "k",
+                    coordinator = coordinator,
+                    start = {
+                        startCalls.incrementAndGet()
+                        MutableSharedFlow<String>()
+                    },
+                    onStop = {},
+                )
+        }
+
+        composeRule.waitForIdle()
+        awaitCondition("the refused start was not logged") {
+            ShadowLog.getLogsForTag("ScpHotStreamCoordinator").isNotEmpty()
+        }
+        assertEquals("a start on a cancelled coordinator ran", 0, startCalls.get())
+        assertEquals(null, checkNotNull(flowState).value)
+    }
+
+    /**
+     * Two mounts that move between two coordinators crosswise under one key, each next to a
+     * mount that stays on its old coordinator, do not wait on each other. A moved mount counted
+     * on its new coordinator while it waited made that coordinator hold the other moved mount's
+     * `onStop`, so each start waited on a Job only the other's departure completed, and neither
+     * ran.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `crosswise coordinator moves under one key do not wait on each other`() {
+        val first = ScpHotStreamCoordinator(newCoordinatorScope())
+        val second = ScpHotStreamCoordinator(newCoordinatorScope())
+        val placement = listOf(MutableStateFlow(first), MutableStateFlow(first), MutableStateFlow(second))
+        val shown = List(placement.size) { MutableStateFlow(true) }
+        val starts = List(placement.size) { AtomicInteger(0) }
+        val eventFlow = MutableSharedFlow<String>()
+
+        composeRule.setContent {
+            placement.forEachIndexed { index, slot ->
+                val coordinator by slot.collectAsStateCompat()
+                val visible by shown[index].collectAsStateCompat()
+                if (visible) {
+                    key(index) {
+                        rememberScpHotStream(
+                            key = "shared-key",
+                            coordinator = coordinator,
+                            start = {
+                                starts[index].incrementAndGet()
+                                eventFlow
+                            },
+                            onStop = {},
+                        )
+                    }
+                }
+            }
+        }
+        composeRule.waitForIdle()
+        awaitCondition("the three mounts did not start") { starts.all { it.get() == 1 } }
+
+        placement[0].value = second
+        composeRule.waitForIdle()
+        placement[2].value = first
+        composeRule.waitForIdle()
+
+        awaitCondition("the mount moved to the first coordinator never started") { starts[2].get() == 2 }
+        assertEquals("a moved mount started while its old coordinator held its onStop", 1, starts[0].get())
+        shown[1].value = false
+        shown[2].value = false
+        composeRule.waitForIdle()
+        awaitCondition("the mount moved to the second coordinator never started") { starts[0].get() == 2 }
     }
 }
 
@@ -1160,6 +1307,18 @@ private fun awaitCondition(
  * disposal never cancels it.
  */
 private fun newCoordinatorScope(): CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+/**
+ * Count a mount under [key] and run its start, which returns [started], so that mount's `onStop`
+ * runs when the key's stop runs.
+ */
+private fun ScpHotStreamCoordinator.startedMount(
+    key: Any,
+    started: Any = Any(),
+): ScpHotStreamCoordinator.Mount = mount(key).also { mount -> runBlocking { startMounted<Any>(mount) { started } } }
+
+/** Mounts that enter and leave beside a live mount in the held-list bound test. */
+private const val ROW_CHURN = 100
 
 /** Real-time window in which a start that skips its pending stop's join finishes. */
 private const val START_WINDOW_MS = 500L
