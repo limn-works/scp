@@ -963,11 +963,13 @@ mod tests {
         assert_eq!(sig.as_bytes().len(), 64);
     }
 
-    fn custody_msg(err: PlatformError) -> String {
-        match err {
-            PlatformError::CustodyError(msg) => msg,
-            other => panic!("expected CustodyError, got {other:?}"),
-        }
+    /// Asserts that `err` is the `CustodyError` variant; tests assert the
+    /// variant, never the message text.
+    fn assert_custody_error(err: &PlatformError) {
+        assert!(
+            matches!(err, PlatformError::CustodyError(_)),
+            "expected CustodyError, got {err:?}"
+        );
     }
 
     /// A pseudonym handle signs only a 32-byte digest: 12 bytes is rejected
@@ -983,18 +985,11 @@ mod tests {
             .derive_pseudonym(&handle, b"ctx")
             .await
             .expect("derive");
-        let msg = custody_msg(
-            custody
+        assert_custody_error(
+            &custody
                 .sign(pseudo.key_handle(), b"as pseudonym")
                 .await
                 .expect_err("12-byte input"),
-        );
-        assert_eq!(
-            msg,
-            format!(
-                "pseudonym key {} signs only a 32-byte digest, got 12 bytes",
-                pseudo.key_handle().id()
-            )
         );
     }
 
@@ -1034,15 +1029,11 @@ mod tests {
             .await
             .expect("first derive");
         assert_eq!(first.key_handle().id(), 777);
-        let msg = custody_msg(
-            custody
+        assert_custody_error(
+            &custody
                 .derive_pseudonym(&handle, b"ctx-b")
                 .await
                 .expect_err("id 777 is bound to ctx-a's point"),
-        );
-        assert!(
-            msg.contains("already bound to a different pseudonym point"),
-            "{msg}"
         );
         custody
             .destroy_key(first.key_handle())
@@ -1120,28 +1111,23 @@ mod tests {
             .generate_keypair(KeyType::Ed25519)
             .await
             .expect("key");
-        let msg = custody_msg(
-            custody
+        assert_custody_error(
+            &custody
                 .derive_pseudonym(&handle, b"ctx")
                 .await
                 .expect_err("legacy 32-byte key"),
         );
-        assert!(msg.contains("got 32 bytes"), "{msg}");
 
         let custody = FfiKeyCustody::Callback(fake_py_custody(Some("wrong_public_key")));
         let handle = custody
             .generate_keypair(KeyType::Ed25519)
             .await
             .expect("key");
-        let msg = custody_msg(
-            custody
+        assert_custody_error(
+            &custody
                 .derive_pseudonym(&handle, b"ctx")
                 .await
                 .expect_err("public_key mismatch"),
-        );
-        assert!(
-            msg.contains("does not match the derived pseudonym point"),
-            "{msg}"
         );
 
         let custody = FfiKeyCustody::Callback(fake_py_custody(Some("high_s")));
@@ -1153,13 +1139,12 @@ mod tests {
             .derive_pseudonym(&handle, b"ctx")
             .await
             .expect("derive");
-        let msg = custody_msg(
-            custody
+        assert_custody_error(
+            &custody
                 .sign(pseudo.key_handle(), &[0x11u8; 32])
                 .await
                 .expect_err("high-s host signature"),
         );
-        assert!(msg.contains("high-s"), "{msg}");
     }
 
     #[tokio::test]

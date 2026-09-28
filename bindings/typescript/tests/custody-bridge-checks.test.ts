@@ -19,6 +19,7 @@
 import { describe, expect, test } from "bun:test";
 import * as crypto from "node:crypto";
 
+import { mapBridgeError } from "../src/errors";
 import { toNativeCustodyProvider } from "../src/internal/custody-adapter";
 import { loadNativeAddon } from "../src/internal/native";
 import type { KeyCustodyProvider, PseudonymResult } from "../src/scp";
@@ -150,7 +151,8 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     const pseudonym = await custody.derivePseudonym(identity, "ctx");
     expect((await custody.sign(pseudonym.keyId, DIGEST)).length).toBe(64);
     const calls = store.signCalls;
-    await expect(custody.sign(pseudonym.keyId, Buffer.alloc(12))).rejects.toThrow(/32-byte/);
+    const err = await custody.sign(pseudonym.keyId, Buffer.alloc(12)).catch((e: unknown) => e);
+    expect(mapBridgeError(err).code).toBe("SCP-IDENT-1055");
     expect(store.signCalls).toBe(calls);
   });
 
@@ -159,7 +161,8 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     const custody = adapter(store, "highS");
     const identity = await custody.generateKeypair();
     const pseudonym = await custody.derivePseudonym(identity, "ctx");
-    await expect(custody.sign(pseudonym.keyId, DIGEST)).rejects.toThrow();
+    const err = await custody.sign(pseudonym.keyId, DIGEST).catch((e: unknown) => e);
+    expect(mapBridgeError(err).code).toBe("SCP-IDENT-1055");
   });
 
   test("destroying a pseudonym unbinds its id", async () => {

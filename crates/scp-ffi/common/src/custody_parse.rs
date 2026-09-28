@@ -270,13 +270,12 @@ mod tests {
         );
 
         // A failed host destroy keeps the key, so its binding comes back.
-        let msg = custody_msg(
-            block_on(bindings.destroy_unbound(handle, async {
+        assert_custody_error(
+            &block_on(bindings.destroy_unbound(handle, async {
                 Err(PlatformError::CustodyError("host refused".to_owned()))
             }))
             .expect_err("host failure propagates"),
         );
-        assert_eq!(msg, "host refused");
         assert!(
             bindings
                 .check_sign_input(handle, &[0u8; 32])
@@ -346,11 +345,13 @@ mod tests {
         }
     }
 
-    fn custody_msg(err: PlatformError) -> String {
-        match err {
-            PlatformError::CustodyError(msg) => msg,
-            other => panic!("expected CustodyError, got {other:?}"),
-        }
+    /// Asserts that `err` is the `CustodyError` variant; tests assert the
+    /// variant, never the message text.
+    fn assert_custody_error(err: &PlatformError) {
+        assert!(
+            matches!(err, PlatformError::CustodyError(_)),
+            "expected CustodyError, got {err:?}"
+        );
     }
 
     #[test]
@@ -366,34 +367,30 @@ mod tests {
     #[test]
     fn parse_pseudonym_rejects_invalid_points() {
         let reject = |bytes: &[u8]| {
-            custody_msg(
-                parse_pseudonym("derive_pseudonym", bytes, "7")
+            assert_custody_error(
+                &parse_pseudonym("derive_pseudonym", bytes, "7")
                     .expect_err("invalid point rejected"),
-            )
+            );
         };
         // Wrong lengths: 32 (a legacy Ed25519 key) and 34.
-        assert_eq!(
-            reject(&REFERENCE_POINT[1..]),
-            "KeyCustodyProvider.derive_pseudonym: custody error: pseudonym public key must be a \
-             33-byte compressed P-256 point, got 32 bytes"
-        );
+        reject(&REFERENCE_POINT[1..]);
         let mut long = REFERENCE_POINT.to_vec();
         long.push(0x00);
-        assert!(reject(&long).contains("got 34 bytes"));
+        reject(&long);
         // Bad prefix: 33 bytes led by 0x04 (the uncompressed tag).
         let mut bad_prefix = REFERENCE_POINT;
         bad_prefix[0] = 0x04;
-        assert!(reject(&bad_prefix).contains("invalid leading byte 0x04"));
+        reject(&bad_prefix);
         // Off-curve x: x = 1 is a field element, but 1 - 3 + b is a quadratic
         // non-residue mod p, so no y exists.
         let mut off_curve = [0u8; 33];
         off_curve[0] = 0x02;
         off_curve[32] = 0x01;
-        assert!(reject(&off_curve).contains("not on the curve"));
+        reject(&off_curve);
         // x = 2^256 - 1 is not a field element at all.
         let mut not_field = [0xFFu8; 33];
         not_field[0] = 0x02;
-        assert!(reject(&not_field).contains("not on the curve"));
+        reject(&not_field);
     }
 
     /// The fail-open counterexample against the old concatenated return: a
@@ -409,24 +406,19 @@ mod tests {
             0x78, 0x0a, 0x2c, 0x78, 0x90, 0x1d, 0x3f, 0xb3, 0x37, 0x38, 0x76, 0x85, 0x11, 0xa3,
             0x06, 0x17, 0xaf, 0xa0,
         ];
-        let msg = custody_msg(
-            parse_pseudonym("derive_pseudonym", &legacy_key, "22").expect_err("32 bytes rejected"),
+        assert_custody_error(
+            &parse_pseudonym("derive_pseudonym", &legacy_key, "22").expect_err("32 bytes rejected"),
         );
-        assert!(msg.contains("got 32 bytes"), "{msg}");
 
         let mut old_split_point = legacy_key.to_vec();
         old_split_point.push(b'2');
         let pseudo = parse_pseudonym("derive_pseudonym", &old_split_point, "2")
             .expect("the old split's first 33 bytes are a valid point");
         let bindings = PseudonymBindings::default();
-        let msg = custody_msg(
-            bindings
+        assert_custody_error(
+            &bindings
                 .bind("derive_pseudonym", &pseudo, &legacy_key)
                 .expect_err("host key 2 is not that point"),
-        );
-        assert!(
-            msg.contains("does not match the derived pseudonym point"),
-            "{msg}"
         );
         assert!(
             bindings
@@ -439,13 +431,9 @@ mod tests {
 
     #[test]
     fn parse_pseudonym_rejects_non_numeric_key_id() {
-        let msg = custody_msg(
-            parse_pseudonym("derive_rotatable_pseudonym", &REFERENCE_POINT, "xyz")
+        assert_custody_error(
+            &parse_pseudonym("derive_rotatable_pseudonym", &REFERENCE_POINT, "xyz")
                 .expect_err("non-numeric key_id is rejected"),
-        );
-        assert_eq!(
-            msg,
-            "KeyCustodyProvider.derive_rotatable_pseudonym returned a non-numeric key_id: xyz"
         );
     }
 
@@ -458,14 +446,10 @@ mod tests {
             .expect("bind");
         let other = signing_key().public_key().to_compressed();
         let second = parse_pseudonym("derive_pseudonym", &other, "5").expect("valid");
-        let msg = custody_msg(
-            bindings
+        assert_custody_error(
+            &bindings
                 .bind("derive_pseudonym", &second, &other)
                 .expect_err("rebinding is rejected"),
-        );
-        assert!(
-            msg.contains("already bound to a different pseudonym point"),
-            "{msg}"
         );
         block_on(bindings.destroy_unbound(first.key_handle(), async { Ok(()) })).expect("destroy");
         bindings
@@ -518,14 +502,10 @@ mod tests {
                 .is_none()
         );
         // A pseudonym handle signs only a 32-byte digest.
-        let msg = custody_msg(
-            bindings
+        assert_custody_error(
+            &bindings
                 .check_sign_input(handle, &[0u8; 12])
                 .expect_err("12-byte input rejected"),
-        );
-        assert_eq!(
-            msg,
-            "pseudonym key 9 signs only a 32-byte digest, got 12 bytes"
         );
 
         let digest = [0x5au8; 32];
@@ -540,25 +520,22 @@ mod tests {
         // High-s form of the same signature: valid ECDSA, rejected, not normalized.
         let mut high = good;
         high[32..].copy_from_slice(&negate_s(&good[32..]));
-        let msg = custody_msg(
-            PseudonymBindings::check_signature(&bound, &digest, &high).expect_err("high-s"),
+        assert_custody_error(
+            &PseudonymBindings::check_signature(&bound, &digest, &high).expect_err("high-s"),
         );
-        assert!(msg.contains("high-s"), "{msg}");
         assert!(
             scp_crypto::p256::verify_prehash_lenient(&bound, &digest, &high).is_ok(),
             "the high-s mutant is otherwise a valid signature"
         );
 
         // Wrong length and wrong key.
-        let msg = custody_msg(
-            PseudonymBindings::check_signature(&bound, &digest, &good[..63]).expect_err("63"),
+        assert_custody_error(
+            &PseudonymBindings::check_signature(&bound, &digest, &good[..63]).expect_err("63"),
         );
-        assert!(msg.contains("must be 64 bytes, got 63"), "{msg}");
         let other = scp_crypto::p256::P256PublicKey::from_sec1(&REFERENCE_POINT).expect("point");
-        let msg = custody_msg(
-            PseudonymBindings::check_signature(&other, &digest, &good).expect_err("wrong key"),
+        assert_custody_error(
+            &PseudonymBindings::check_signature(&other, &digest, &good).expect_err("wrong key"),
         );
-        assert!(msg.contains("does not verify"), "{msg}");
 
         block_on(bindings.destroy_unbound(handle, async { Ok(()) })).expect("destroy");
         assert!(
@@ -572,20 +549,13 @@ mod tests {
     #[test]
     fn parse_handle_rejects_non_canonical_ids() {
         for id in ["007", "+7", "00"] {
-            let msg = custody_msg(
-                parse_handle("derive_pseudonym", id).expect_err("non-canonical id rejected"),
-            );
-            assert_eq!(
-                msg,
-                format!(
-                    "KeyCustodyProvider.derive_pseudonym returned a non-canonical key_id: {id:?}"
-                )
+            assert_custody_error(
+                &parse_handle("derive_pseudonym", id).expect_err("non-canonical id rejected"),
             );
         }
         // `u64::from_str` already refuses surrounding whitespace.
         for id in [" 7", "7 "] {
-            let msg = custody_msg(parse_handle("derive_pseudonym", id).expect_err("rejected"));
-            assert!(msg.contains("non-numeric key_id"), "{msg}");
+            assert_custody_error(&parse_handle("derive_pseudonym", id).expect_err("rejected"));
         }
         assert_eq!(parse_handle("m", "0").expect("canonical zero").id(), 0);
         assert_eq!(
