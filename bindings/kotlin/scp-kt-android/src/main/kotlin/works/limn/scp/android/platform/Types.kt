@@ -49,7 +49,12 @@ enum class CustodyType {
      */
     HARDWARE,
 
-    /** Key material is held by Bouncy Castle in the app process, not by Android Keystore. */
+    /**
+     * Key material is held by Bouncy Castle in the app process, not by Android Keystore.
+     * [AndroidKeyCustody] also writes the private key seed of each software Ed25519 key it
+     * generates (API 26-32) to an on-disk EncryptedSharedPreferences file. Software X25519
+     * keys and derived pseudonym keys stay in process memory only.
+     */
     SOFTWARE,
 }
 
@@ -57,7 +62,8 @@ enum class CustodyType {
  * Opaque handle to a cryptographic key managed by a [KeyCustodyProvider] implementation.
  *
  * @property id Unique identifier for the key. For Android Keystore keys, this maps to
- *   alias `scp.key.$id`. For software keys, this maps to a [ConcurrentHashMap] entry.
+ *   alias `scp.key.$id`. For software keys, this maps to a [ConcurrentHashMap] entry and,
+ *   for a software Ed25519 key, also to the EncryptedSharedPreferences entry `scp.ed25519.$id`.
  * @property custodyType Where the key material is stored ([CustodyType.HARDWARE] for Keystore,
  *   [CustodyType.SOFTWARE] for Bouncy Castle fallback).
  */
@@ -104,7 +110,11 @@ data class DestructionAttestation(
  * See section 9.15 of the SCP specification.
  */
 enum class DestructionMethod {
-    /** Key material was deleted from software storage (Bouncy Castle in-memory map). */
+    /**
+     * Key material was deleted from software storage: the Bouncy Castle in-memory map and,
+     * for a software Ed25519 key, its EncryptedSharedPreferences entry. [AndroidKeyCustody]
+     * removes that entry with `apply()`, which writes the removal to disk asynchronously.
+     */
     SOFTWARE_ONLY,
 
     /** Key material was deleted from Android Keystore (see [CustodyType.HARDWARE]). */
@@ -119,10 +129,14 @@ enum class DestructionMethod {
  * - `SCP-CRYPTO-4002`: X25519 key not found
  * - `SCP-CRYPTO-4003`: Wrong key type for operation
  * - `SCP-CRYPTO-4004`: Key destruction failed
- * - `SCP-CRYPTO-4005`: Cryptographic operation failed
+ * - `SCP-CRYPTO-4005`: Signing key export refused, because the key is a Keystore key
+ *   (thrown only by [KeyCustodyProvider.exportSigningKeyBytes]; retrying cannot succeed)
+ * - `SCP-TRANS-5001`: Push payload has no `scp` field
+ * - `SCP-TRANS-5002`: Push payload `scp` field is not `"1"`
  * - `SCP-STORAGE-8001`: Storage key not found
  * - `SCP-STORAGE-8002`: Storage operation failed
  * - `SCP-STORAGE-8003`: Storage encryption key derivation failed
+ * - `SCP-ATTEST-9001`: Play Integrity attestation failed
  *
  * @property code Structured SCP error code.
  */
@@ -394,8 +408,9 @@ interface KeyCustodyProvider {
      * bytes. Software-backed keys can export their private material.
      * Keystore keys ([CustodyType.HARDWARE]) are non-extractable, so the method MUST throw
      * for one, with a clear message indicating that governance signing is not supported
-     * on Keystore keys. ADR-063's curve slice replaces raw-key export
-     * with a signer for governance signing.
+     * on Keystore keys. ADR-063's curve slice requires governance signing to take a
+     * signer instead of raw-key export; until that slice lands, this method exports the
+     * seed of a software key.
      *
      * @param keyHandle Handle to an Ed25519 key.
      * @return 32-byte raw Ed25519 private key bytes.

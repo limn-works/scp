@@ -595,6 +595,9 @@ class AndroidKeyCustodyTest {
             assertEquals("SCP-CRYPTO-4005", exception.code)
             val message = exception.message.orEmpty()
             assertTrue(message.contains("ADR-063's curve slice"), message)
+            // The curve slice has not landed, so the message may not state its signer path as current.
+            assertTrue(message.contains("has not landed"), message)
+            assertTrue(!message.contains("replaces raw-key export"), message)
             assertTrue(!message.contains("GitHub issue"), message)
             // The adapter never reads KeyInfo.securityLevel, so the message may not claim a TEE.
             assertTrue(message.contains("Android Keystore custody"), message)

@@ -568,9 +568,10 @@ class AndroidKeyCustody internal constructor(
      *
      * For Keystore keys ([CustodyType.HARDWARE]): throws an error because Keystore does
      * not hand the private key bytes to the app, so a Keystore key cannot sign a governance vote through
-     * this adapter. ADR-063's curve slice removes the gap: every core function that takes a
-     * raw signing key takes a signer instead, and every key-export accessor leaves the
-     * custody adapters.
+     * this adapter. ADR-063's curve slice requires every core function that takes a raw
+     * signing key to take a signer instead, and every key-export accessor to leave the
+     * custody adapters. That slice has not landed, so this accessor still exports the seed
+     * of a software key.
      *
      * @param keyHandle Handle returned by [generateKeypair] for an Ed25519 key.
      * @return 32-byte raw Ed25519 private key bytes.
@@ -584,8 +585,8 @@ class AndroidKeyCustody internal constructor(
             throw ScpException(
                 "Cannot export signing key bytes from Android Keystore custody " +
                     "(handle '${keyHandle.id}'). Keystore keys are non-extractable. " +
-                    "ADR-063's curve slice replaces raw-key export with a signer for " +
-                    "governance signing.",
+                    "ADR-063's curve slice requires a signer in place of raw-key export " +
+                    "for governance signing; that slice has not landed.",
                 "SCP-CRYPTO-4005",
             )
         }

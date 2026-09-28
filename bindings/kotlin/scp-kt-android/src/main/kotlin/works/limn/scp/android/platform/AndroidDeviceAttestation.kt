@@ -60,8 +60,8 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      * `{"challenge":"<b64>","deviceId":"<b64>","type":"scp-device-attestation-v1"}`.
      * The nonce is `Base64(SHA-256(clientDataJSON))`. The adapter requests a
      * Classic Play Integrity token with this nonce and returns it as UTF-8
-     * encoded JWT bytes. ADR-027 acceptance criterion 7 requires the
-     * following five, and this adapter meets none of the five:
+     * encoded JWT bytes. ADR-027 acceptance criterion 7 requires, among
+     * other things, the following five, and this adapter meets none of the five:
      *   1. a Standard integrity token, not a Classic one;
      *   2. a token prepared with the `cloudProjectNumber` of the package
      *      verifier's `PlayIntegrityVerifier` entry;
