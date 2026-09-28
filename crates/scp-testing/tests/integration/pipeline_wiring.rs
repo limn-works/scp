@@ -2982,10 +2982,28 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
     let pyo3_mcp_src = include_str!("../../../../crates/scp-ffi/src/mcp.rs");
     let napi_mcp_src = include_str!("../../../../crates/scp-ffi/napi/src/mcp.rs");
     let uniffi_mcp_src = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
-    for (bridge, src, serve_fn) in [
-        ("PyO3", pyo3_mcp_src, "py_mcp_serve"),
-        ("NAPI", napi_mcp_src, "mcp_server_create_on"),
-        ("UniFFI", uniffi_mcp_src, "mcp_server_create"),
+    // Each bridge's accessor for its own instance's Supervisor, called on the
+    // `mcp_server_bundle` parameter `bi`: the scrutinee of the `match` that
+    // binds the receiver.
+    for (bridge, src, serve_fn, supervisor_of_bi) in [
+        (
+            "PyO3",
+            pyo3_mcp_src,
+            "py_mcp_serve",
+            "crate::runtime::supervisor(bi)",
+        ),
+        (
+            "NAPI",
+            napi_mcp_src,
+            "mcp_server_create_on",
+            "crate::runtime::supervisor(bi)",
+        ),
+        (
+            "UniFFI",
+            uniffi_mcp_src,
+            "mcp_server_create",
+            "bi.context_manager_or_error()",
+        ),
     ] {
         // Search the PRODUCTION code only: everything before the trailing
         // `#[cfg(test)]\nmod tests { ... }`, with comment lines removed. Each
@@ -2993,10 +3011,11 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
         // `contains` over the file stayed green after the real call was deleted.
         let code = production_code(src);
         assert!(
-            serves_the_supervisor_event_source(&code, serve_fn),
+            serves_the_supervisor_event_source(&code, serve_fn, supervisor_of_bi),
             "{bridge} `{serve_fn}` must build its server with `mcp_server_bundle`, \
-             and `mcp_server_bundle` must obtain the Supervisor ContextEvent \
-             receiver and hand THAT receiver to \
+             and `mcp_server_bundle` must, as its first statement, obtain the \
+             ContextEvent receiver from `{supervisor_of_bi}` (the bridge \
+             instance's own Supervisor) and hand THAT receiver to \
              `McpServer::with_optional_event_source`, the file's only call of \
              that constructor. Passing `None`, or building the served server \
              anywhere else, silently downgrades to resources.subscribe: false"
@@ -3009,43 +3028,68 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
 /// Supervisor's receiver and passes that receiver to
 /// `McpServer::with_optional_event_source`, which `code` calls nowhere else.
 ///
+/// "The Supervisor's receiver" is pinned by the `match` that binds it: its
+/// scrutinee is exactly `supervisor_of_bi`, the bridge's accessor for its own
+/// instance's Supervisor called on the parameter `bi`; its first arm is
+/// `Ok(supervisor) => supervisor.subscribe_events(),`; and it is the
+/// function's first statement, so no earlier statement rebinds `bi`.
+///
 /// "That receiver" is pinned two ways: the `match` is the whole initializer of
 /// `context_events` (its closing `}` is followed by `;`, so no chained call
 /// replaces its value), and every other mention of `context_events` in the
 /// body is a read through `.is_none()` or the constructor argument, so no
 /// statement rebinds or shadows it between the `match` and the constructor.
-fn serves_the_supervisor_event_source(code: &str, serve_fn: &str) -> bool {
-    const BIND: &str = "let context_events = match";
+fn serves_the_supervisor_event_source(code: &str, serve_fn: &str, supervisor_of_bi: &str) -> bool {
+    const ARM: &str = "{ Ok(supervisor) => supervisor.subscribe_events(),";
+    let bind = format!("let context_events = match {supervisor_of_bi} ");
     let bundle_wired = fn_body(code, "mcp_server_bundle").is_some_and(|body| {
-        let match_is_whole_initializer = body.find(BIND).is_some_and(|at| {
-            let rest = &body[at + BIND.len()..];
-            let Some(open) = rest.find('{') else {
+        let bi_is_the_parameter = body
+            .strip_prefix("fn mcp_server_bundle(")
+            .is_some_and(|params| params.trim_start().starts_with("bi: &"));
+        let match_is_whole_initializer = body.find(&bind).is_some_and(|at| {
+            let before = &body[..at];
+            let first_statement =
+                before.matches('{').count() == 1 && before.trim_end().ends_with('{');
+            let rest = &body[at + bind.len()..];
+            if !first_statement || !rest.starts_with(ARM) {
                 return false;
-            };
+            }
             let mut depth = 0usize;
-            rest[open..]
-                .char_indices()
+            rest.char_indices()
                 .find_map(|(i, c)| {
                     match c {
                         '{' => depth += 1,
                         '}' => depth -= 1,
                         _ => return None,
                     }
-                    (depth == 0).then_some(open + i + 1)
+                    (depth == 0).then_some(i + 1)
                 })
                 .is_some_and(|end| rest[end..].trim_start().starts_with(';'))
         });
         let mentions = body.matches("context_events").count();
         let reads = body.matches("context_events.is_none()").count();
-        match_is_whole_initializer
+        bi_is_the_parameter
+            && match_is_whole_initializer
             && mentions == reads + 2
-            && body.contains("Ok(supervisor) => supervisor.subscribe_events(),")
             && body.contains("McpServer::with_optional_event_source(provider, context_events)")
     });
     let serve_uses_bundle =
         fn_body(code, serve_fn).is_some_and(|body| body.contains("= mcp_server_bundle("));
     bundle_wired && serve_uses_bundle && code.matches("with_optional_event_source(").count() == 1
 }
+
+/// The Supervisor accessor that [`WIRED_BUNDLE`]'s `match` is taken over.
+const SUPERVISOR_OF_BI: &str = "crate::runtime::supervisor(bi)";
+
+/// A wired `mcp_server_bundle` and its serve path, as the event-source gate
+/// accepts them. The event-source self-tests derive each regression from it.
+const WIRED_BUNDLE: &str = "fn mcp_server_bundle(bi: &Bi, provider: P) -> McpServerForTransport<P> {\n    \
+                             // `subscribe_events()` returns `None` only for ...\n    \
+                             let context_events = match crate::runtime::supervisor(bi) {\n        \
+                             Ok(supervisor) => supervisor.subscribe_events(),\n        Err(_) => None,\n    };\n    \
+                             McpServer::with_optional_event_source(provider, context_events)\n}\n\
+                             fn serve() {\n    let server = mcp_server_bundle(bi, provider);\n}\n\
+                             mod tests {\n    fn t() { let _ = supervisor.subscribe_events(); }\n}\n";
 
 /// The event-source gate above must go red when the wiring it pins is deleted
 /// and only a comment or a `None` receiver remains, when a rebinding or a
@@ -3055,16 +3099,11 @@ fn serves_the_supervisor_event_source(code: &str, serve_fn: &str) -> bool {
 /// would leave the source.
 #[test]
 fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
-    let wired = "fn mcp_server_bundle(bi: &Bi, provider: P) -> McpServerForTransport<P> {\n    \
-                 // `subscribe_events()` returns `None` only for ...\n    \
-                 let context_events = match rt.supervisor() {\n        \
-                 Ok(supervisor) => supervisor.subscribe_events(),\n        Err(_) => None,\n    };\n    \
-                 McpServer::with_optional_event_source(provider, context_events)\n}\n\
-                 fn serve() {\n    let server = mcp_server_bundle(bi, provider);\n}\n\
-                 mod tests {\n    fn t() { let _ = supervisor.subscribe_events(); }\n}\n";
+    let wired = WIRED_BUNDLE;
     assert!(serves_the_supervisor_event_source(
         &production_code(wired),
-        "serve"
+        "serve",
+        SUPERVISOR_OF_BI
     ));
 
     // The receiver line survives only in the comment and the test module.
@@ -3074,7 +3113,8 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
     );
     assert!(!serves_the_supervisor_event_source(
         &production_code(&call_deleted),
-        "serve"
+        "serve",
+        SUPERVISOR_OF_BI
     ));
     // The constructor gets `None` in place of the receiver.
     let none_passed = wired.replace(
@@ -3083,7 +3123,8 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
     );
     assert!(!serves_the_supervisor_event_source(
         &production_code(&none_passed),
-        "serve"
+        "serve",
+        SUPERVISOR_OF_BI
     ));
     // The receiver is obtained, then a `None` rebinding shadows it before the
     // constructor, in the same function.
@@ -3094,7 +3135,8 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
     );
     assert!(!serves_the_supervisor_event_source(
         &production_code(&shadowed),
-        "serve"
+        "serve",
+        SUPERVISOR_OF_BI
     ));
     // A call chained onto the `match` replaces the receiver it produced.
     let chained = wired.replace(
@@ -3103,7 +3145,8 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
     );
     assert!(!serves_the_supervisor_event_source(
         &production_code(&chained),
-        "serve"
+        "serve",
+        SUPERVISOR_OF_BI
     ));
     // The bundle function stays wired, but the serve path builds its own
     // server over a `None` receiver instead of calling it.
@@ -3114,7 +3157,8 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
     );
     assert!(!serves_the_supervisor_event_source(
         &production_code(&serve_builds_its_own),
-        "serve"
+        "serve",
+        SUPERVISOR_OF_BI
     ));
     // The receiver is obtained in one function and the constructor is called
     // over a `None` receiver in another.
@@ -3126,7 +3170,59 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
                  fn serve() {\n    let server = mcp_server_bundle(bi, provider);\n}\n";
     assert!(!serves_the_supervisor_event_source(
         &production_code(split),
-        "serve"
+        "serve",
+        SUPERVISOR_OF_BI
+    ));
+}
+
+/// The event-source gate must go red when the receiver comes from anything
+/// but the bridge instance's own Supervisor: a stand-in scrutinee, the
+/// accessor called on another instance, `bi` rebound before the `match`, or
+/// an `Ok` arm that ignores the Supervisor it matched.
+#[test]
+fn mcp_wiring_gate_rejects_a_receiver_not_from_the_bridge_instance() {
+    let wired = WIRED_BUNDLE;
+    // The `match` is taken over a stand-in, not the bridge instance's
+    // Supervisor, so it never yields a receiver.
+    let stand_in_scrutinee = wired.replace(
+        "match crate::runtime::supervisor(bi) {",
+        "match Err::<&Supervisor, String>(String::new()) {",
+    );
+    assert!(!serves_the_supervisor_event_source(
+        &production_code(&stand_in_scrutinee),
+        "serve",
+        SUPERVISOR_OF_BI
+    ));
+    // The accessor is called on an instance other than the parameter `bi`.
+    let other_instance = wired.replace(
+        "match crate::runtime::supervisor(bi) {",
+        "match crate::runtime::supervisor(&detached) {",
+    );
+    assert!(!serves_the_supervisor_event_source(
+        &production_code(&other_instance),
+        "serve",
+        SUPERVISOR_OF_BI
+    ));
+    // The pinned scrutinee survives, but an earlier statement rebinds `bi` to
+    // another instance.
+    let bi_rebound = wired.replace(
+        "    let context_events = match",
+        "    let bi = &detached;\n    let context_events = match",
+    );
+    assert!(!serves_the_supervisor_event_source(
+        &production_code(&bi_rebound),
+        "serve",
+        SUPERVISOR_OF_BI
+    ));
+    // The `Ok` arm ignores the Supervisor and takes a receiver elsewhere.
+    let ok_arm_elsewhere = wired.replace(
+        "Ok(supervisor) => supervisor.subscribe_events(),",
+        "Ok(_supervisor) => detached.subscribe_events(),",
+    );
+    assert!(!serves_the_supervisor_event_source(
+        &production_code(&ok_arm_elsewhere),
+        "serve",
+        SUPERVISOR_OF_BI
     ));
 }
 
@@ -3220,19 +3316,35 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
     assert!(!answers_resource_access_from_live_role_state(
         &production_code(moved)
     ));
-    // The predicate's `messages:read` arm is replaced by a membership check.
+    // The predicate's `messages:read` arm is replaced by a membership check,
+    // or the two arms swap their requirements.
     let predicate = "pub fn check_access(self, role_state: &ContextRoleState) -> bool {\n    \
-                     role_state.member_has_capability(agent, &Capability::MessagesRead)\n}\n\
+                     match self {\n        \
+                     Self::Events | Self::Members => \
+                     role_state.member_has_capability(agent, &Capability::MessagesRead),\n        \
+                     Self::Tools => role_state.members.contains(agent),\n    }\n}\n\
                      const fn display_name(self) {}\n";
-    assert!(fn_body(&production_code(predicate), "check_access").is_some_and(checks_messages_read));
+    let arm_checks_messages_read = |src: &str| {
+        fn_body(&production_code(src), "check_access")
+            .and_then(events_and_members_arm)
+            .is_some_and(checks_messages_read)
+    };
+    assert!(arm_checks_messages_read(predicate));
     let membership_only = predicate.replace(
         "member_has_capability(agent, &Capability::MessagesRead)",
         "members.contains(agent)",
     );
-    assert!(
-        !fn_body(&production_code(&membership_only), "check_access")
-            .is_some_and(checks_messages_read)
-    );
+    assert!(!arm_checks_messages_read(&membership_only));
+    let swapped = predicate
+        .replace(
+            "Self::Events | Self::Members => role_state.member_has_capability",
+            "Self::Tools => role_state.member_has_capability",
+        )
+        .replace(
+            "Self::Tools => role_state.members.contains(agent)",
+            "Self::Events | Self::Members => role_state.members.contains(agent)",
+        );
+    assert!(!arm_checks_messages_read(&swapped));
 }
 
 /// Returns the text of the first `fn {name}(` in `code` (from
@@ -3297,6 +3409,15 @@ fn production_code(src: &str) -> String {
         .join(" ")
 }
 
+/// Returns the `Self::Events | Self::Members =>` arm of `check_access` in
+/// `body` (from [`fn_body`]): the text after that pattern up to the next
+/// `Self::` arm, or to the end of `body` when it is the last arm.
+fn events_and_members_arm(body: &str) -> Option<&str> {
+    const PATTERN: &str = "Self::Events | Self::Members =>";
+    let rest = &body[body.find(PATTERN)? + PATTERN.len()..];
+    Some(rest.find("Self::").map_or(rest, |end| &rest[..end]))
+}
+
 /// Whether `code` (from [`production_code`]) calls `member_has_capability` with
 /// `&Capability::MessagesRead` as its capability argument.
 fn checks_messages_read(code: &str) -> bool {
@@ -3338,9 +3459,10 @@ fn production_source(src: &str) -> &str {
 /// `validate_resource_access` passes it the role state that bridge read. This
 /// test pins the two parts the types cannot see: that each bridge feeds the
 /// predicate role state read from the live source rather than a stand-in, and
-/// that the predicate authorizes the events and members resources against
-/// `Capability::MessagesRead`. `scp-mcp`'s unit tests exercise the predicate's
-/// decisions.
+/// that the predicate's `Self::Events | Self::Members =>` arm calls
+/// `member_has_capability` with `Capability::MessagesRead`. It does not check
+/// how that arm uses the call's result, nor the `Tools` arm, which requires
+/// membership only; `scp-mcp`'s unit tests exercise the predicate's decisions.
 #[test]
 fn mcp_resource_access_is_answered_from_real_role_state() {
     // `ContextProvider::validate_resource_access` takes a typed `ResourceKind`,
@@ -3376,8 +3498,11 @@ fn mcp_resource_access_is_answered_from_real_role_state() {
 
     let server = production_code(include_str!("../../../../crates/scp-mcp/src/server.rs"));
     assert!(
-        fn_body(&server, "check_access").is_some_and(checks_messages_read),
-        "`ResourceKind::check_access` must authorize the events/members resources \
+        fn_body(&server, "check_access")
+            .and_then(events_and_members_arm)
+            .is_some_and(checks_messages_read),
+        "`ResourceKind::check_access` must authorize the events/members resources, \
+         in their own `Self::Events | Self::Members =>` arm, \
          against the real capability catalogue (spec §5.3.1: `messages:read` is what \
          lets an observer see content and membership) on its PRODUCTION path; a \
          test-module occurrence does not count"

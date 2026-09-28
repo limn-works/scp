@@ -25,9 +25,12 @@ and do nothing while `initialize` advertised `subscribe: true` (NAPI returned
   `tools.listChanged` hard-code is gone, not "still hard-coded."
 - **`resources/read` and `resources/subscribe` share one real predicate.** The
   phantom `resource:{type}` capability is deleted; `ContextProvider::validate_resource_access`
-  takes a typed `ResourceKind` (no string to synthesize `resource:` from) and each
-  bridge answers it against `Capability::MessagesRead` (spec §5.3.1). Not
-  "denied everywhere."
+  takes a typed `ResourceKind` (no string to synthesize `resource:` from). Each
+  bridge reads the context's live role state and passes it to the one shared
+  predicate, `ResourceKind::check_access` in `crates/scp-mcp/src/server.rs`,
+  which requires `Capability::MessagesRead` for Events and Members (spec
+  §5.3.1) and membership alone for Tools. A member without `messages:read`
+  reading `scp://<ctx>/tools` is the rule, not a defect. Not "denied everywhere."
 - **The SSE pump is owned, not leaked.** `sse_router` is deleted; `router_with_pump`
   is crate-private, returns the pump `JoinHandle`, and `run_sse` holds it in
   `stdio::AbortOnDrop` so it is aborted on bind error, graceful shutdown, AND
@@ -60,6 +63,3 @@ and do nothing while `initialize` advertised `subscribe: true` (NAPI returned
   announces a newly registered outlet. Real work, not a stub.
 - **AC8 — `scp-mcp serve` CLI.** Still a Python console script
   (`bindings/python/pyproject.toml` → `scp_sdk.mcp:cli_main`), not a Rust binary.
-
-Related: [[adr057_transport_wasm_surface_parity]] (same class — an embedder surface
-present on one layer and absent on its mirror).
