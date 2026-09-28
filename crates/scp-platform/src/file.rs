@@ -824,7 +824,7 @@ impl KeyCustody for FileKeyCustody {
                 }
             }
             // Every pseudonym derived from this identity goes with it
-            // (§9.15). A derive inserts only while holding `handle_map` and
+            // (§9.10.4.A). A derive inserts only while holding `handle_map` and
             // finding its identity there, so none can land after this.
             pseudonyms.remove_identity(key_id);
             drop(pseudonyms);

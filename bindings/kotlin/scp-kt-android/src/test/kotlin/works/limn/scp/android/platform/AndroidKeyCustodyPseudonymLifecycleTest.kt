@@ -117,7 +117,7 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
         assertTrue(keystore.hmacKeys.isEmpty())
     }
 
-    /** Destroying an identity destroys every pseudonym derived from it (§9.15). */
+    /** Destroying an identity destroys every pseudonym derived from it (§9.10.4.A). */
     @Test
     fun `destroying an identity destroys its pseudonyms`() {
         val custody = AndroidKeyCustody(InMemorySharedPreferences())

@@ -265,7 +265,7 @@ class AndroidKeyCustody internal constructor(
      * For software-backed keys: removes the entry from the [softwareKeys] map.
      *
      * For an identity key: also wipes every P-256 pseudonym scalar derived from it, and
-     * refuses any derivation from it still in flight.
+     * refuses any derivation from it still in flight (§9.10.4.A).
      *
      * After this call, all subsequent operations with the same handle will throw
      * [ScpException] with code `SCP-CRYPTO-4001`.

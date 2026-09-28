@@ -465,7 +465,7 @@ public final class AppleKeyCustody: Sendable {
     ///   - publicKeyBytes: The public key bytes (33 bytes for a P-256 pseudonym) to cache in metadata.
     ///   - ownerIdentity: For a P-256 pseudonym, the identity handle it was
     ///     derived from; the item is tagged with it so that destroying the
-    ///     identity also destroys the pseudonym (§9.15).
+    ///     identity also destroys the pseudonym (§9.10.4.A).
     /// - Throws: ``PlatformError/keychainError(_:)`` if the add operation fails.
     nonisolated func storePrivateKeyBytes(
         _ bytes: Data,

@@ -380,7 +380,7 @@ impl KeyCustody for InMemoryKeyCustody {
                 StoredKeyType::Ed25519 => {
                     store.ed25519_keys.remove(&key_id);
                     // Every pseudonym derived from this identity goes with it
-                    // (§9.15), under the same lock a derive holds.
+                    // (§9.10.4.A), under the same lock a derive holds.
                     for pseudonym in store.pseudonyms.remove_identity(key_id) {
                         store.key_types.remove(&pseudonym);
                     }
