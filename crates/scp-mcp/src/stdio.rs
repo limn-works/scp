@@ -213,7 +213,11 @@ pub fn read_response<R: std::io::BufRead>(
         if value.get("method").is_some() {
             continue;
         }
-        if serde_json::from_value::<RequestId>(line_id.clone()).ok().as_ref() != Some(id) {
+        if serde_json::from_value::<RequestId>(line_id.clone())
+            .ok()
+            .as_ref()
+            != Some(id)
+        {
             continue;
         }
         return serde_json::from_value(value)
