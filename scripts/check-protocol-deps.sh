@@ -29,7 +29,8 @@ echo "Checking scp-protocol dependency tree..."
 # that hides an edge is in use in the very crate this gate guards. The fixture
 # `assert_every_cargo_tree_resolves_every_target` in
 # scripts/check-shipped-feature-graph.sh asserts this flag across every shell
-# script under scripts/.
+# script under scripts/, except in the one function of
+# scripts/check-vendored-openssl-scope.sh that it names.
 banned="tokio|scp-platform|openmls"
 output=$(cargo tree -p scp-protocol --edges no-dev --target all 2>&1) || { echo "ERROR: cargo tree failed: $output"; exit 1; }
 matches=$(echo "$output" | grep -iE "$banned" || true)

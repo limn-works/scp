@@ -5,12 +5,15 @@ context lifecycle, messaging, and tool invocation.
 
 ## Prerequisites
 
-1. **Rust toolchain** (for building the native extension):
+1. **Rust toolchain, a full perl, and make on Linux and macOS**: step 3 compiles
+   the native extension and the OpenSSL its SQLCipher links (see
+   `bindings/python/README.md` §Requirements):
    ```bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    ```
 
-2. **Python 3.12+** (via mise):
+2. **CPython 3.10-3.13** (3.14 and newer cannot build: the locked PyO3 0.24
+   supports CPython 3.13 at most); the repository's mise config installs 3.12:
    ```bash
    mise install python@3.12
    ```

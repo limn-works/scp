@@ -4,7 +4,8 @@ A Python agent that registers tools in an SCP context, handles invocations with 
 
 ## Prerequisites
 
-- Python 3.12+
+- CPython 3.12 or 3.13 (this project's `pyproject.toml` requires 3.12 or newer, and the SDK's locked PyO3 0.24 builds for CPython 3.13 at most)
+- For the source install: a Rust toolchain and a full perl, plus make on Linux and macOS, which compile the native extension and the OpenSSL its SQLCipher links (`bindings/python/README.md` §Requirements)
 - SCP Python SDK (`pip install scp-python`, or from source: `pip install -e ../../bindings/python`)
 
 ## Build and Run

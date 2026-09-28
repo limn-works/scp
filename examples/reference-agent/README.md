@@ -37,7 +37,7 @@ section 8.5 capability filtering).
 
 ## Prerequisites
 
-- Python 3.12+
+- CPython 3.10-3.13, the range the SDK's `requires-python` declares (its locked PyO3 0.24 builds for CPython 3.13 at most)
 - `pip install scp-python` (optional -- the agent includes mock fallbacks
   for environments without the full SDK installed)
 - `pip install pytest ruff` (for testing and linting)

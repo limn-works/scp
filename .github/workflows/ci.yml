@@ -52,9 +52,13 @@ env:
 #   workspace-debug   `target/debug` under build mode — rust-test (both matrix legs),
 #                     rust-test-napi-production, rust-build-pyo3-production,
 #                     rust-build-uniffi-production, kotlin-test,
-#                     fail-closed-pre-rotation, shipped-feature-graph; and rust-doc
-#                     (its `cargo test --doc`) in part, as the paragraph after this
-#                     list says.
+#                     fail-closed-pre-rotation, shipped-feature-graph,
+#                     vendored-openssl-scope, fix-round-check-selftest, and
+#                     python-wheel-build for its registry alone: its build step sets
+#                     RUSTFLAGS, which rust-test does not, and cargo fingerprints
+#                     RUSTFLAGS into every unit, so no restored artifact matches; and
+#                     rust-doc (its `cargo test --doc`) in part, as the paragraph
+#                     after this list says.
 #   workspace-check   `target/debug` under check mode — rust-clippy, whose five
 #                     `cargo clippy` commands compile every dependency to an `.rmeta`,
 #                     and rust-doc in part (its `cargo doc --no-deps`, whose dependency
@@ -430,8 +434,40 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      # `maturin_artifact_entry` parses each maturin project file and its Cargo.toml
+      # with `tomllib`, which the Python standard library has held since 3.11, and
+      # it fails when python3.12 on PATH cannot import it.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: G1 — shipped-feature-graph ⊆ permitted-production allowlist (ZERO-nullifier mandate)
         run: bash scripts/check-shipped-feature-graph.sh
+
+  vendored-openssl-scope:
+    needs: check-draft
+    name: Vendored-OpenSSL scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
+      # `maturin_artifact_entry` parses each maturin project file and its Cargo.toml
+      # with `tomllib`, which the Python standard library has held since 3.11, and
+      # it fails when python3.12 on PATH cannot import it.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The gate reads the wheel job's matrix in build-matrix.yml with PyYAML,
+      # which the interpreter setup-python installs does not carry, and the gate fails
+      # when its interpreter cannot import it.
+      - name: Install PyYAML
+        run: python3.12 -m pip install 'pyyaml==6.0.3'
+      - name: openssl-src reaches the PyPI wheel's configuration and no other shipped configuration
+        run: bash scripts/check-vendored-openssl-scope.sh
 
   # ── Cross-layer ──────────────────────────────────────────────────────
   cross-layer:
@@ -661,20 +697,22 @@ jobs:
   # names no crate derives its crate set from the files the branch changed or
   # fails saying why.
   #
-  # This job installs what case 3 of that suite needs, which is what the 29
+  # This job installs what case 3 of that suite needs, which is what the 31
   # gates in the runner's list read: the tree-sitter grammars nine Python gates
   # parse with, the PyYAML check-workflow-compile-steps.py reads every workflow
-  # file with, the ruff check-pyi-generated.sh runs, the jq
-  # check-bridge-symmetry.sh requires, a Rust toolchain for the twelve `cargo
-  # tree` resolutions check-shipped-feature-graph.sh and check-protocol-deps.sh
-  # run, and the base ref check-cross-layer.sh diffs against. No step here
+  # file with and check-vendored-openssl-scope.sh reads the python-wheels matrix
+  # with, the Python 3.12 whose tomllib check-shipped-feature-graph.sh reads each
+  # pyproject.toml's [tool.maturin] table with, the ruff check-pyi-generated.sh
+  # runs, the jq check-bridge-symmetry.sh requires, a Rust toolchain for the `cargo tree` resolutions
+  # check-shipped-feature-graph.sh, check-protocol-deps.sh and
+  # check-vendored-openssl-scope.sh run, and the base ref check-cross-layer.sh diffs against. No step here
   # compiles a crate: the suite replaces `cargo check` and `cargo fmt` with
   # stubs, because what it tests is what the runner does with their exit codes.
   #
   # The `if:` matches the one the cross-layer job above carries, and for the
   # reason that job carries it: check-cross-layer.sh reads a declared exemption
   # out of the pull request's body, a merge_group event publishes no body, and
-  # the 29 gates this suite runs include that one. Without the condition, a pull
+  # the 31 gates this suite runs include that one. Without the condition, a pull
   # request whose exemption the cross-layer job accepted would fail this job in
   # the merge queue over an exemption the queue cannot read. Every fix round
   # pushes to a pull request, so the suite runs on the head each round produces.
@@ -699,13 +737,15 @@ jobs:
       # same reason: a breaking upstream release cannot red a required check
       # without a deliberate bump.
       # PyYAML for check-workflow-compile-steps.py, which parses every workflow
-      # file and which the toolchain-wiring job installs the same pin for.
+      # file and which the toolchain-wiring job installs the same pin for, and
+      # for check-vendored-openssl-scope.sh, which reads the python-wheels matrix
+      # of build-matrix.yml under python3.12.
       - run: pip install 'tree-sitter-rust>=0.21,<0.25' tree-sitter tree-sitter-python tree-sitter-typescript tree-sitter-kotlin tree-sitter-swift ruff==0.15.4 'pyyaml>=6,<7'
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
       - uses: dtolnay/rust-toolchain@stable
       # This job reads the `workspace-debug` cache group for its registry alone,
-      # the way job shipped-feature-graph does: the twelve `cargo tree`
+      # the way job shipped-feature-graph does: the `cargo tree`
       # resolutions the suite drives download the index and the `.crate` files,
       # and no step here compiles a crate into `target/debug`. `save-if: false`
       # keeps job rust-test the group's one writer, which is the shape the
@@ -1806,6 +1846,96 @@ jobs:
           # available in this job — they run in dedicated parity jobs below.
           PYTHONPATH=. pytest tests/ -v -m "not parity"
 
+  # Compile the wheel with the features a release compiles it with, read from the
+  # same `[tool.maturin]` table, on the ubuntu-latest host, so an `openssl-src`
+  # build failure on that host fails a pull request instead of a tag push. It
+  # compiles the dev profile: the release passes `--release` and this job does not.
+  # `.github/workflows/build-matrix.yml` triggers on a `scp-*@*` tag push and on
+  # `workflow_call`, and job python-test above runs `maturin develop --release
+  # --features testing`, which REPLACES the `[tool.maturin] features` array rather
+  # than adding to it, so until this job existed the first compile of
+  # `rusqlite/bundled-sqlcipher-vendored-openssl` was the run that cut a release.
+  # The two gates that read that feature — `scripts/check-shipped-feature-graph.sh`
+  # and `scripts/check-vendored-openssl-scope.sh` — resolve dependency graphs and
+  # compile nothing.
+  #
+  # This job carries no path filter, so it runs on every pull request and cannot be
+  # skipped for a change that breaks the build. It compiles the dev profile, so a
+  # failure only `[profile.release]` produces, such as a `-D warnings` lint under
+  # `cfg(not(debug_assertions))`, first fails the tag push. It compiles on one
+  # target, so it is not the release matrix either: it exercises neither the
+  # manylinux_2_28 container and its `dnf install -y perl` step, nor NASM on
+  # Windows, nor the aarch64 cross image. build-matrix.yml has no
+  # `workflow_dispatch` of its own; run release.yml through `workflow_dispatch`
+  # with `dry-run: true`, which calls build-matrix.yml, to exercise those before
+  # cutting a tag. No check requires that run, so a failure that only those
+  # environments produce first fails the tag push. The readelf check below reads
+  # only this host's Linux extension; no job checks the macOS or Windows extension
+  # for a dynamic OpenSSL link.
+  #
+  # It builds for CPython 3.10, the floor `requires-python` names, and 3.12, then
+  # installs each wheel into a fresh virtualenv and imports every module of the
+  # scp_sdk package, the extension among them. That fails when a module holds syntax
+  # 3.10 lacks, or runs at import time an API 3.10 lacks; an API a function body
+  # calls is not reached, because the import calls no function. It also fails when the
+  # extension names libcrypto or libssl as a dynamic dependency, because the wheel
+  # exists to carry its own OpenSSL.
+  python-wheel-build:
+    needs: check-draft
+    name: Python / wheel (vendored OpenSSL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      # The last version listed is the one `python` and `python3` resolve to.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.10
+            3.12
+      - uses: dtolnay/rust-toolchain@stable
+      # This job reads the `workspace-debug` cache group for its registry alone:
+      # the build step's RUSTFLAGS differs from job rust-test's, which sets none,
+      # and cargo fingerprints RUSTFLAGS into every unit, so each restored
+      # artifact is stale and the wheel build compiles every crate itself.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
+      # The same range `bindings/python/pyproject.toml` names in its
+      # `[build-system] requires`, so this job runs the maturin a `pip install`
+      # from the sdist would run.
+      - name: Install maturin
+        run: python3.12 -m pip install 'maturin>=1.0,<2.0'
+      # No --features and no --manifest-path: maturin reads both from the
+      # `[tool.maturin]` table of bindings/python/pyproject.toml, which is where the
+      # release reads them. RUSTFLAGS repeats the workflow-level `-D warnings` of
+      # build-matrix.yml, so a warning that fails the release fails this step too.
+      - name: Build the wheel from the project file the release builds from
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          cd bindings/python
+          maturin build --out dist -i python3.10 python3.12 --locked
+      - name: Install each wheel, import every scp_sdk module, and check the extension names no dynamic libssl or libcrypto
+        run: |
+          set -euo pipefail
+          for py in python3.10 python3.12; do
+            "$py" -m venv "/tmp/venv-$py"
+            "/tmp/venv-$py/bin/pip" install --no-index --find-links bindings/python/dist scp-python
+            # walk_packages lists every module the installed package holds, so a
+            # module no other module imports (scp_sdk/provenance.py) is parsed too.
+            so="$(cd /tmp && "/tmp/venv-$py/bin/python" -c 'import importlib, pkgutil, scp_sdk, scp_sdk._scp_core as m; [importlib.import_module(i.name) for i in pkgutil.walk_packages(scp_sdk.__path__, "scp_sdk.")]; print(m.__file__)')"
+            echo "$py imported $so"
+            # Captured first: a readelf failure then aborts under `set -e`,
+            # where inside the `if` pipeline it would read as "no OpenSSL".
+            dynamic="$(readelf -d "$so")"
+            if printf '%s\n' "$dynamic" | grep -E 'NEEDED.*(libcrypto|libssl)'; then
+              echo "::error::$so links OpenSSL dynamically; the wheel must carry the vendored build"
+              exit 1
+            fi
+          done
+
   # ── TypeScript ──────────────────────────────────────────────────────
   # ORs on `rust` for a reason spelled out above python-test: a NAPI addon
   # this job compiles reaches every Rust workspace crate through scp-core, while
@@ -2601,6 +2731,7 @@ jobs:
       - changes
       - error-codes
       - shipped-feature-graph
+      - vendored-openssl-scope
       - fail-closed-pre-rotation
       - cross-layer
       - bridge-symmetry
@@ -2644,6 +2775,7 @@ jobs:
       - rust-deny
       - python-lint
       - python-test
+      - python-wheel-build
       - typescript-check
       - typescript-wasm-check
       - scaffold-typescript-web-check

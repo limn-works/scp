@@ -2407,7 +2407,7 @@
         "Runtime shutdown is handled on module finalization (Python interpreter exit). The `Runtime` is dropped, which waits for in-flight tasks to complete (with a 5-second timeout).",
         "`maturin develop` builds the extension in-place for development.",
         "`maturin build --release` produces optimized wheels.",
-        "CI builds wheels for Linux (manylinux2014 x86_64 + aarch64), macOS (universal2), Windows (x86_64).",
+        "CI builds wheels for Linux (manylinux_2_28 x86_64 + aarch64), macOS (universal2), Windows (x86_64).",
         "`maturin publish` uploads built wheels to PyPI for `pip install scp-python` distribution.",
         "FFI safety: The tokio runtime MUST NEVER block on Python GIL acquisition. All GIL-requiring operations are dispatched via `Python::with_gil()` from non-async contexts or use PyO3's native async machinery which handles GIL release automatically.",
         "Shutdown ordering: Python cleanup (GC, __del__, atexit handlers) completes BEFORE the Rust tokio runtime is dropped. Module finalization respects this ordering to prevent use-after-free of Rust objects from Python destructor callbacks."
@@ -2881,22 +2881,22 @@
         "bindings/python/scp_sdk/py.typed",
         "bindings/python/pyproject.toml"
       ],
-      "description": "Implement the package root `__init__.py` with top-level re-exports, version declaration, and module-level convenience. Configure `pyproject.toml` with package metadata, build config, Python version constraints (3.10+), and optional dependencies. Add PEP 561 `py.typed` marker for type checking support.",
+      "description": "Implement the package root `__init__.py` with top-level re-exports, version declaration, and module-level convenience. Configure `pyproject.toml` with package metadata, build config, Python `>=3.10,<3.14` constraint, and optional dependencies. Add PEP 561 `py.typed` marker for type checking support.",
       "acceptanceCriteria": [
         "Top-level imports: `import scp_sdk` or `from scp_sdk import Identity, Context` work.",
         "The `scp` namespace alias: `import scp_sdk as scp` enables the 20-line agent from architecture.md section 3.1.",
         "Re-exports: Identity, Context, OutletDefinition, TestVector, evaluate_trust, ScpError, IdentityError, ContextError, UcanPermissionError, CryptoError, TransportError, OutletError, ValidationError.",
         "`__version__ = \"0.1.0\"` declared.",
         "`py.typed` PEP 561 marker file exists.",
-        "`pyproject.toml` declares package metadata, version, Python >=3.10 constraint, optional dependencies `[langchain]` and `[mcp]`.",
+        "`pyproject.toml` declares package metadata, version, Python `>=3.10,<3.14` constraint, optional dependencies `[langchain]` and `[mcp]`.",
         "maturin builds the `_scp_core` extension into the `scp_sdk` package directory.",
-        "Users install with `pip install scp-python` — no Rust toolchain required.",
+        "Users on a platform and CPython minor a wheel covers (CPython 3.10-3.13 on Linux x86_64 and aarch64 with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64) install with `pip install scp-python` — no Rust toolchain required. On any other platform with CPython 3.10-3.13, pip builds the sdist, which compiles OpenSSL and needs a Rust toolchain and a full perl, plus make on Linux and macOS. CPython 3.14 and newer cannot install: the locked PyO3 0.24 builds for CPython 3.13 at most. pip on 3.14 skips a release that carries the `requires-python = \">=3.10,<3.14\"` ceiling `bindings/python/pyproject.toml` declares. The two releases PyPI already serves, 0.1.0b2 and 0.1.0b3, were built before the ceiling and declare `>=3.10`, so while neither is yanked pip on 3.14 falls back to the 0.1.0b3 sdist, and that build fails in PyO3 0.24. The ceiling reaches PyPI only in a release with a new version: `bindings/python/pyproject.toml` still declares `version = \"0.1.0b2\"`, which PyPI already serves.",
         "Full PEP 484 type hints throughout all modules."
       ],
       "actionItems": [
         "Create `bindings/python/scp_sdk/__init__.py` with all re-exports and `__version__ = \"0.1.0\"`.",
         "Create `bindings/python/scp_sdk/py.typed` (empty PEP 561 marker file).",
-        "Create `bindings/python/pyproject.toml` with maturin build backend, package metadata, Python >=3.10 constraint, optional dependencies `scp-python[langchain]` and `scp-python[mcp]`.",
+        "Create `bindings/python/pyproject.toml` with maturin build backend, package metadata, Python `>=3.10,<3.14` constraint, optional dependencies `scp-python[langchain]` and `scp-python[mcp]`.",
         "Configure maturin to build `_scp_core` into the `scp_sdk` package directory."
       ],
       "blockedBy": [
@@ -3439,9 +3439,9 @@
       "files": [
         "tests/integration/phase3_integration_test.py"
       ],
-      "description": "The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with the Phase 1 and Phase 2 Rust stacks. Two Python agents on different machines exchange encrypted messages, invoke outlets, and expose SCP contexts as MCP tools. This test proves: pip install works without Rust, the 20-line agent works, async Python wraps Rust correctly, UCAN enforces on every action, MCP exposes SCP outlets to any model, the event log is queryable from Python, and the full Phase 1 + Phase 2 Rust stack is accessible through a Pythonic API.",
+      "description": "The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with the Phase 1 and Phase 2 Rust stacks. Two Python agents on different machines exchange encrypted messages, invoke outlets, and expose SCP contexts as MCP tools. This test proves: pip install works without Rust on a platform and CPython minor a wheel covers, the 20-line agent works, async Python wraps Rust correctly, UCAN enforces on every action, MCP exposes SCP outlets to any model, the event log is queryable from Python, and the full Phase 1 + Phase 2 Rust stack is accessible through a Pythonic API.",
       "acceptanceCriteria": [
-        "Install the SDK: `pip install scp-python` in a clean Python venv. No Rust toolchain. Zero compilation. Binary wheel installs in seconds.",
+        "Install the SDK: `pip install scp-python` in a clean Python venv on a platform and CPython minor a wheel covers. No Rust toolchain. Zero compilation. Binary wheel installs in seconds.",
         "Alice creates an identity in Python: `alice = await scp.Identity.create(custody=\"in_memory\")`. Calls through: Python wrapper (ADR-014) -> PyO3 bridge (ADR-013) -> scp-core Identity::create.",
         "Alice creates a context with outlets: `ctx = await scp.Context.create(creator=alice, ceiling=[\"messaging\", \"outlet_call\"], outlets=[scp.OutletDefinition(name=\"calculator\", ...)])`. Context creation mints admin UCAN tokens for Alice (ADR-016). UCAN nonce is generated and tracked. Capability ceiling is set and immutable.",
         "Bob creates an identity and joins the context: `bob = await scp.Identity.create(custody=\"in_memory\")`, `membership = await ctx.join(bob)`. Bob receives member-role UCAN tokens (ADR-016). Tokens are scoped to messages:read, messages:write, outlet_query_all, outlet_call_all. UCAN signature chain traces to Alice (context creator) as root authority.",
@@ -3457,7 +3457,7 @@
       ],
       "actionItems": [
         "Create `tests/integration/phase3_integration_test.py` with the 13-step end-to-end test.",
-        "Set up clean Python venv and verify `pip install scp-python` works without Rust toolchain.",
+        "Set up clean Python venv and verify `pip install scp-python` works without Rust toolchain on a platform and CPython minor a wheel covers.",
         "Test identity creation via Python SDK -> PyO3 bridge -> scp-core.",
         "Test context creation with outlets, UCAN minting, and ceiling enforcement.",
         "Test member join with role-scoped UCAN token delegation.",
@@ -7638,7 +7638,7 @@
       ],
       "description": "Implement the binary artifact build, sign, and distribute workflow for all SDK packages. The conformance gate (100% pass) is a prerequisite — no release without it. Covers: build matrix (Linux x86_64/aarch64, macOS universal2, Windows x86_64), artifact signing per platform, distribution to all 8 package registries, version pinning to scp-core, and the 7-step release checklist.",
       "acceptanceCriteria": [
-        "Build matrix: Linux (x86_64, aarch64) produces manylinux2014 wheels and .so; macOS (universal2) produces wheels, .dylib, .xcframework; Windows (x86_64) produces wheels and .dll",
+        "Build matrix: Linux (x86_64, aarch64) produces manylinux_2_28 wheels and .so; macOS (universal2) produces wheels, .dylib, .xcframework; Windows (x86_64) produces wheels and .dll",
         "Distribution channels: Rust (crates.io source crate), Python (PyPI maturin wheel), TypeScript Node/Bun (@limn-works/scp-ts npm napi-rs addon; browser clients are remote thin clients to a node per ADR-055), Swift (SPM XCFramework), Kotlin (Maven Central AAR), Go (Go modules source + .so), C# (NuGet native runtime pack), Java (Maven Central JAR with natives)",
         "All SDK packages pin to the exact scp-core version they were built against. Core version encoded in package metadata (Python wheel metadata, npm engines, Swift Package.swift)",
         "Signing: Rust crates verified by crates.io checksums; platform packages use native signing (Apple codesigning for .xcframework, Authenticode for .dll, GPG for Maven); PyPI uses Trusted Publishers (GitHub Actions OIDC)",
@@ -7652,7 +7652,7 @@
       "actionItems": [
         "Create `.github/workflows/build-matrix.yml` with cross-platform build jobs for all 3 OS targets and architectures",
         "Create `.github/workflows/release.yml` with the 7-step release workflow: conformance gate, changelog check, version tag, build, sign, publish, GitHub Release",
-        "Configure maturin-action for Python wheel builds (manylinux2014, macOS universal2, Windows)",
+        "Configure maturin-action for Python wheel builds (manylinux_2_28, macOS universal2, Windows)",
         "Configure napi-rs build for npm native addon",
         "Configure XCFramework build for Swift Package Manager",
         "Configure Maven publishing for Kotlin and Java",
@@ -7677,7 +7677,7 @@
         }
       ],
       "details": {
-        "Build matrix": "Linux: x86_64 + aarch64 (manylinux2014 wheels, .so). macOS: universal2 (x86_64 + arm64) (wheels, .dylib, .xcframework). Windows: x86_64 (wheels, .dll).",
+        "Build matrix": "Linux: x86_64 + aarch64 (manylinux_2_28 wheels, .so). macOS: universal2 (x86_64 + arm64) (wheels, .dylib, .xcframework). Windows: x86_64 (wheels, .dll).",
         "Distribution channels": "Rust: crates.io. Python: PyPI. TypeScript browser: npm (@limn-works/scp-ts). TypeScript Node/Bun: npm (@limn-works/scp-ts-node). Swift: SPM. Kotlin: Maven Central. Go: Go modules. C#: NuGet. Java: Maven Central.",
         "Signing requirements": "Rust: crates.io checksums. macOS/iOS: Apple codesigning. Windows: Authenticode. Maven: GPG. PyPI: Trusted Publishers (GitHub Actions OIDC).",
         "Versioning policy": "All SDKs follow SemVer 2.0. Major: breaking API changes. Minor: new features, backwards-compatible. Patch: bug fixes, security patches. All SDK packages share the same major.minor version; patch versions may differ. Rust core version is source of truth. During 0.x, minor bumps may break. API unstable until 1.0."

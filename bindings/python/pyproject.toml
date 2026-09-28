@@ -6,7 +6,12 @@ build-backend = "maturin"
 name = "scp-python"
 version = "0.1.0b2"
 description = "SCP (Shared Context Protocol) Python SDK — cryptographic identity, governed contexts, and trust for AI agents"
-requires-python = ">=3.10"
+# The ceiling: the locked PyO3 0.24 builds for CPython 3.13 at most, so pip on 3.14
+# skips a release built from this file instead of failing in its sdist build. The
+# 0.1.0b2 and 0.1.0b3 releases on PyPI predate the ceiling, and pip on 3.14 falls
+# back to the 0.1.0b3 sdist while neither is yanked. The version above is one PyPI
+# already serves, so the ceiling reaches PyPI only in a release that raises it.
+requires-python = ">=3.10,<3.14"
 license = { text = "MIT OR Apache-2.0" }
 readme = "README.md"
 keywords = ["scp", "protocol", "agents", "identity", "did", "ucan", "mls", "context"]
@@ -35,7 +40,7 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.8", "mypy>=1.13"]
 scp-mcp = "scp_sdk.mcp:cli_main"
 
 [project.urls]
-Repository = "https://github.com/limn-scp/scp-protocol-core"
+Repository = "https://github.com/limn-works/scp"
 Documentation = "https://scp.dev/docs"
 
 [tool.pytest.ini_options]
@@ -46,23 +51,29 @@ markers = [
 ]
 
 [tool.ruff]
-target-version = "py312"
+# The floor `requires-python` names: ruff reports syntax newer than the target
+# (PEP 695 `type X` and `def f[T]` among it), so code the 3.10 and 3.11 wheels
+# cannot import fails lint.
+target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "RUF"]
-# UP040/UP047: PEP 695 `type` statement and type params require Python 3.12+; we support 3.10+.
-# The `X: TypeAlias = ...` annotation is the only type-alias form legal on 3.10/3.11.
-ignore = ["UP040", "UP047"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.10"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
 
 [tool.maturin]
-features = ["extension-module"]
+# Features of `scp-ffi`, the package `manifest-path` below names. `extension-module`
+# forwards `pyo3/extension-module`. `vendored-openssl` forwards
+# `scp-platform/vendored-openssl`, which compiles OpenSSL from source into
+# SQLCipher: a `pip install` runs no linker, and this wheel installs onto a machine
+# whose OpenSSL the build never saw. `scripts/check-vendored-openssl-scope.sh` fails
+# when any second shipped artifact selects that feature.
+features = ["extension-module", "vendored-openssl"]
 manifest-path = "../../crates/scp-ffi/Cargo.toml"
 module-name = "scp_sdk._scp_core"
 python-source = "."

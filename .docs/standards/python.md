@@ -6,7 +6,7 @@ Python conventions, toolchain, and CI for the SCP Python SDK. References `sdk-co
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| Python | 3.12+ | Minimum supported version (for PEP 695 type parameter syntax, `type X` statements, `ParamSpec`). `match` (3.10), `X \| Y` union syntax (3.10) are available but 3.12 is the floor for type parameter syntax. |
+| Python | 3.10-3.13 | Supported range, as ADR phase-3 and `requires-python = ">=3.10,<3.14"` in `bindings/python/pyproject.toml` set it; wheels ship for CPython 3.10-3.13, and §Platform Wheels says why 3.14 cannot install. `match`, `X \| Y` union syntax and `ParamSpec` (3.10) are available. PEP 695 type parameter syntax and `type X` statements (3.12) are not: write a type alias as `X: TypeAlias = ...`. Ruff's `target-version = "py310"` rejects the newer syntax, and CI job `python-wheel-build` imports every `scp_sdk` module under CPython 3.10, which rejects such syntax in any module. |
 | maturin | latest | Build tool for PyO3 Rust extension |
 | ruff | latest | Linter + formatter (replaces flake8, isort, black) |
 | mypy | latest | Static type checker (`--strict` mode) |
@@ -199,8 +199,8 @@ ruff check bindings/python/
 # Type check
 mypy bindings/python/scp_sdk/ --strict
 
-# Build extension (dev mode)
-maturin develop --release
+# Build extension (dev mode), from the directory whose pyproject.toml holds [tool.maturin]
+(cd bindings/python && maturin develop --release)
 
 # Run tests
 pytest bindings/python/tests/ -v
@@ -208,15 +208,15 @@ pytest bindings/python/tests/ -v
 # Run async tests
 pytest bindings/python/tests/ -v --asyncio-mode=auto
 
-# Build wheel
-maturin build --release
+# Build wheel, from the same directory
+(cd bindings/python && maturin build --release)
 
-# Build wheels for all platforms (CI)
-maturin build --release --target x86_64-unknown-linux-gnu
-maturin build --release --target aarch64-unknown-linux-gnu
-maturin build --release --target x86_64-apple-darwin
-maturin build --release --target aarch64-apple-darwin
-maturin build --release --target x86_64-pc-windows-msvc
+# Build wheels for all platforms (CI: job python-wheels in .github/workflows/build-matrix.yml,
+# from bindings/python; Linux legs run in the manylinux_2_28 container)
+(cd bindings/python && maturin build --release --target x86_64-unknown-linux-gnu -i python3.10 python3.11 python3.12 python3.13)
+(cd bindings/python && maturin build --release --target aarch64-unknown-linux-gnu -i python3.10 python3.11 python3.12 python3.13)
+(cd bindings/python && maturin build --release --target universal2-apple-darwin -i python3.10 python3.11 python3.12 python3.13)
+(cd bindings/python && maturin build --release --target x86_64-pc-windows-msvc -i python3.10 python3.11 python3.12 python3.13)
 ```
 
 ## CI Matrix
@@ -228,17 +228,18 @@ maturin build --release --target x86_64-pc-windows-msvc
 | pyi-generated (`.pyi` ↔ PyO3 signature parity) | ubuntu-latest | 3.12 | Every PR |
 | pip-audit | ubuntu-latest | 3.12 | Every PR |
 | test | ubuntu-latest, macos-latest | 3.12, 3.13 | Every PR |
-| build-wheel | ubuntu-latest, macos-latest, windows-latest | 3.12+ | Every PR |
+| python-wheel-build (debug wheel, installed and imported) | ubuntu-latest | 3.10, 3.12 | Every PR |
+| python-wheels (release wheels) | ubuntu-latest, macos-latest, windows-latest | 3.10, 3.11, 3.12, 3.13 | Tagged release |
 | conformance | ubuntu-latest | 3.12 | Every PR |
 | publish (PyPI) | ubuntu-latest | 3.12 | Tagged release |
 
 ## Platform Wheels
 
-maturin builds binary wheels with the Rust extension embedded. Users install with `pip install scp-python` — no Rust toolchain required.
+maturin builds binary wheels with the Rust extension embedded. Users on a platform and CPython minor a wheel covers (CPython 3.10-3.13 on Linux x86_64 and aarch64 with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64) install with `pip install scp-python` — no Rust toolchain required. On any other platform with CPython 3.10-3.13, pip builds the sdist, which compiles OpenSSL and needs a Rust toolchain and a full perl, plus make on Linux and macOS. CPython 3.14 and newer cannot install: the locked PyO3 0.24 builds for CPython 3.13 at most. pip on 3.14 skips a release that carries the `requires-python = ">=3.10,<3.14"` ceiling `bindings/python/pyproject.toml` declares. The two releases PyPI already serves, 0.1.0b2 and 0.1.0b3, were built before the ceiling and declare `>=3.10`, so while neither is yanked pip on 3.14 falls back to the 0.1.0b3 sdist, and that build fails in PyO3 0.24. The ceiling reaches PyPI only in a release with a new version: `bindings/python/pyproject.toml` still declares `version = "0.1.0b2"`, which PyPI already serves.
 
 | Platform | Architecture | Wheel tag |
 |----------|-------------|-----------|
-| Linux | x86_64 | manylinux2014_x86_64 |
-| Linux | aarch64 | manylinux2014_aarch64 |
+| Linux | x86_64 | manylinux_2_28_x86_64 |
+| Linux | aarch64 | manylinux_2_28_aarch64 |
 | macOS | universal2 | macosx_11_0_universal2 |
 | Windows | x86_64 | win_amd64 |

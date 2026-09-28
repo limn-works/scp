@@ -96,7 +96,7 @@
 #
 #     Case 14 leaves one edit uncommitted and asserts that the summary names
 #     `scripts/check-cross-layer.sh` as the gate whose diff range holds no uncommitted edit.
-#     That gate reads `git diff <merge base>...HEAD` and the other 28 read the working tree,
+#     That gate reads `git diff <merge base>...HEAD` and the other 30 read the working tree,
 #     so its pass counts toward `gates N/N passed` over work it did not read.
 #
 #     Case 15 names one crate on the command line on a branch that changed another, and
@@ -108,8 +108,8 @@
 #     check` accepts an API that target rejects.
 #
 #     Case 17 changes a workflow file and asserts that the summary names the two suites
-#     the `ci-workflow-selftest` job runs over it. One gate the runner holds reads
-#     workflow files for two rules of its own, which is not coverage of that edit.
+#     the `ci-workflow-selftest` job runs over it. Four gates the runner holds read a
+#     workflow file, each for rules of its own, which is not coverage of that edit.
 #
 #     Case 22 answers `cargo metadata` with an object holding no package list and asserts
 #     that the summary names the feature set the compile step could not read, because a
@@ -160,12 +160,14 @@
 # `rustup` with scripts on a PATH this harness leads with, because the contract clauses
 # above are about what the script does with those three programs' answers, and a real
 # `cargo check` of this workspace costs between ten minutes and an hour on a developer
-# machine. Everything else stays real: case 3 runs the 29 enforcement gates
+# machine. Everything else stays real: case 3 runs the 31 enforcement gates
 # `scripts/fix-round-check.sh` names against this repository's own files, so a gate the
 # list names but the repository does not hold fails this test rather than being skipped.
-# One of those 29 gates imports PyYAML, which the standard library does not carry, so a
+# Two of those 31 gates import PyYAML, which the standard library does not carry:
+# `scripts/check-workflow-compile-steps.py` under the runner's interpreter and
+# `scripts/check-vendored-openssl-scope.sh` under python3.12, which it runs itself. A
 # developer whose interpreter lacks it sees case 3 fail on that gate; the runner prints the
-# install command when it cannot import the library.
+# install command for each interpreter that cannot import the library.
 #
 # WHY THE PINNED VERSION IS READ RATHER THAN WRITTEN. Case 2 and case 3 need a `rustc` that
 # agrees with the pin. The harness reads the channel out of `rust-toolchain.toml` at run
@@ -173,14 +175,15 @@
 #
 # WHO RUNS THIS SUITE. The `fix-round-check-selftest` job of `.github/workflows/ci.yml`
 # runs it on every pull-request head, which is the head every fix round pushes. That job
-# names no merge_group event, for the reason its own comment gives: one of the 29 gates
+# names no merge_group event, for the reason its own comment gives: one of the 31 gates
 # case 3 runs reads an exemption out of the pull request's body, and a merge_group event
 # publishes no body. The job installs what case 3 needs: the tree-sitter
 # grammars nine Python gates parse with, the PyYAML
-# `scripts/check-workflow-compile-steps.py` reads every workflow file with, the ruff
+# `scripts/check-workflow-compile-steps.py` reads every workflow file with and
+# `scripts/check-vendored-openssl-scope.sh` reads the python-wheels matrix with, the ruff
 # `scripts/check-pyi-generated.sh` runs,
-# the jq `scripts/check-bridge-symmetry.sh` requires, a Rust toolchain for the twelve
-# `cargo tree` resolutions two gates run, and the base ref `scripts/check-cross-layer.sh`
+# the jq `scripts/check-bridge-symmetry.sh` requires, a Rust toolchain for the
+# `cargo tree` resolutions three gates run, and the base ref `scripts/check-cross-layer.sh`
 # diffs against. A developer runs the same command by hand.
 #
 # Usage: bash scripts/tests/fix-round-check/run-tests.sh
@@ -235,11 +238,14 @@ trap 'rm -rf "$WORK"' EXIT
 # one case sat in it for 87 minutes behind another worktree's `cargo clippy --workspace`
 # until a 2400-second bound killed the run after case 1.
 #
-# `cargo tree` stays delegated, so the twelve resolutions inside
-# `scripts/check-shipped-feature-graph.sh` and `scripts/check-protocol-deps.sh` read this
-# repository and case 3 fails when either gate rejects the tree. `cargo tree` takes no build
-# lock: measured at 12.9 seconds and 391 ms for those two gates while another worktree held
-# it.
+# `cargo tree` stays delegated, so the `cargo tree` resolutions inside
+# `scripts/check-shipped-feature-graph.sh`, `scripts/check-protocol-deps.sh` and
+# `scripts/check-vendored-openssl-scope.sh` read this repository and case 3 fails when any
+# of the three gates rejects the tree. `cargo tree` takes no build lock: measured at 12.9
+# seconds and 391 ms for the first two gates while another worktree held it. The
+# vendored-OpenSSL gate resolves every workspace root, a root without a tracked Cargo.lock
+# from a copy of the root one, so the network can slow case 3 or turn a pass into a fail,
+# never a fail into a pass.
 #
 # WHAT THE STUBBED STEPS STILL PROVE. These cases test what the script does with a step's
 # exit code, not whether cargo formats correctly. `.github/workflows/ci.yml` runs the real
@@ -257,10 +263,10 @@ write_stubs() {
 
     # A stub `python3.12` fails the gates step and no other.
     # `scripts/fix-round-check.sh` resolves its interpreter through
-    # `command -v python3.12`, and ten of the 29 entries in its gate list run under it, so
-    # a case that plants a failing one makes the gates step fail while the compile and
-    # format steps pass. Cases that pass nothing here plant no such file and run the real
-    # interpreter.
+    # `command -v python3.12`, and eleven of the 31 entries in its gate list run under it,
+    # and `scripts/check-vendored-openssl-scope.sh` calls it too, so a case that plants a
+    # failing one makes the gates step fail while the compile and format steps pass.
+    # Cases that pass nothing here plant no such file and run the real interpreter.
     if [[ -n $python_rc ]]; then
         cat > "$dir/bin/python3.12" <<EOF
 #!/usr/bin/env bash
@@ -663,10 +669,10 @@ fi
 
 # ── Case 10: a gate the list names and the repository does not hold ──────────────────
 #
-# Every one of the 29 gates exists in this repository, so case 3 exercises the branch that
+# Every one of the 31 gates exists in this repository, so case 3 exercises the branch that
 # runs a gate and never the branch that finds one absent. Deleting the `MISSING` branch from
 # `scripts/fix-round-check.sh` would leave an absent gate uncounted and unreported: the run
-# would print `gates 28/29 passed` and exit 0, having skipped a gate rather than failing on
+# would print `gates 30/31 passed` and exit 0, having skipped a gate rather than failing on
 # it. This case deletes one gate from a fixture that is otherwise the passing fixture of
 # case 9.
 FIXTURE10="$WORK/missing-gate"
@@ -864,7 +870,7 @@ fi
 # ── Case 14: the gate whose diff range holds no uncommitted edit ─────────────────────
 #
 # `scripts/check-cross-layer.sh` decides from `git diff <merge base with origin/main>…HEAD`
-# and the other 28 gates read the working tree, so on an uncommitted edit — one of the
+# and the other 30 gates read the working tree, so on an uncommitted edit — one of the
 # three input shapes the runner's own comment names as supported — that gate passes over
 # work it never read and its pass counts toward `gates N/N passed`.
 #
@@ -957,11 +963,12 @@ fi
 
 # ── Case 17: a branch that changed a workflow file ───────────────────────────────────
 #
-# Three gates the runner holds read a workflow file, each for rules of its own and none as
+# Four gates the runner holds read a workflow file, each for rules of its own and none as
 # coverage of a workflow edit: `scripts/check-workflow-compile-steps.py` for its
 # cache-group and bindgen rules, `scripts/check-toolchain-wiring.sh` for its
-# container-build and paths-filter rules, and `scripts/check-shipped-feature-graph.sh` for
-# the cargo invocations that ship an artifact. The `ci-workflow-selftest` job runs two
+# container-build and paths-filter rules, `scripts/check-shipped-feature-graph.sh` for
+# the cargo invocations that ship an artifact, and `scripts/check-vendored-openssl-scope.sh`
+# for the python-wheels matrix of build-matrix.yml. The `ci-workflow-selftest` job runs two
 # suites over those files that no gate duplicates, so a run whose only output about a
 # changed workflow was `gates N/N passed` would read as full coverage of that edit.
 #
@@ -1256,7 +1263,7 @@ fi
 # every suite the entry names has to qualify. It iterates LANE_SUITES, the set case 23
 # above reads out of `.github/workflows/ci.yml` and subtracts the GATES array from, so a
 # suite CI gains reaches this case too and a gate the run itself starts stays out of it —
-# the `.github/` entry names those three gates in its own trailing sentence, as programs
+# the `.github/` entry names those four gates in its own trailing sentence, as programs
 # the run did start.
 #
 # The mutation it kills: adding `scripts/tests/signing-guard/run-tests.sh` back to the

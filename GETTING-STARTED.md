@@ -28,7 +28,7 @@ Add this to `~/.zshenv` for persistence.
 
 ## Toolchain
 
-rustup manages Rust, and mise manages every other tool (see `.mise.toml`):
+rustup manages Rust, and mise manages every other tool in the table below (see `.mise.toml`). Neither supplies what the Python binding's `maturin develop` needs to compile OpenSSL: a full perl, plus make on Linux and macOS. Install those from your system's package manager (see `bindings/python/README.md` §Requirements).
 
 | Tool | Version | Manager |
 |------|---------|---------|
@@ -49,16 +49,16 @@ rustup manages Rust, and mise manages every other tool (see `.mise.toml`):
 cargo build --workspace
 
 # Python binding
-cd bindings/python && maturin develop --release
+(cd bindings/python && maturin develop --release)
 
 # TypeScript binding
-cd bindings/typescript && bun install && bun run build
+(cd bindings/typescript && bun install && bun run build)
 
 # Kotlin binding
-cd bindings/kotlin && ./gradlew assembleRelease
+(cd bindings/kotlin && ./gradlew assembleRelease)
 
 # Swift binding
-cd bindings/swift && swift build
+(cd bindings/swift && swift build)
 ```
 
 ## Test

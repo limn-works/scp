@@ -48,12 +48,17 @@ build-backend = "maturin"
 [project]
 name = "scp-python"
 description = "Shared Context Protocol SDK — identity, encryption, contexts, tools for AI agents"
-requires-python = ">=3.12"
+# The ceiling: the locked PyO3 0.24 builds for CPython 3.13 at most.
+requires-python = ">=3.10,<3.14"
 # license = TBD
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
     "Topic :: Security :: Cryptography",
 ]
@@ -66,10 +71,22 @@ mcp = []  # MCP server dependencies (if any beyond stdlib)
 [tool.maturin]
 python-source = "."
 module-name = "scp_sdk._scp_core"
-features = ["pyo3/extension-module"]
+manifest-path = "../../crates/scp-ffi/Cargo.toml"
+# Features of `scp-ffi`, not of pyo3: `extension-module` forwards
+# `pyo3/extension-module`, and `vendored-openssl` forwards
+# `scp-platform/vendored-openssl`, which compiles OpenSSL from source into
+# SQLCipher because a `pip install` runs no linker and the wheel installs onto a
+# machine whose OpenSSL the build never saw. This table is the one shipped
+# configuration that vendors OpenSSL: the wheel builds from it, and so does the
+# sdist on the installing machine. `scripts/check-vendored-openssl-scope.sh`
+# fails when any second shipped artifact selects that feature.
+features = ["extension-module", "vendored-openssl"]
 
 [tool.ruff]
-target-version = "py312"
+# The floor `requires-python` names: ruff reports syntax newer than the target
+# (PEP 695 `type X` and `def f[T]` among it), so code the 3.10 and 3.11 wheels
+# cannot import fails lint.
+target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
@@ -93,7 +110,7 @@ known-first-party = ["scp_sdk"]
 
 [tool.mypy]
 strict = true
-python_version = "3.12"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

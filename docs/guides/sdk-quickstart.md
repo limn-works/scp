@@ -38,12 +38,12 @@ cargo --version
 
 ### Python
 
-- Python >= 3.12 (use `python3.12`, not system `python3` which may be Xcode 3.9)
-- Rust toolchain (required for building the native extension via `maturin`)
-- Pre-built wheels are available for Linux, macOS, and Windows
+- CPython 3.10-3.13 (macOS's system `python3` from Xcode may be 3.9). CPython 3.14 and newer cannot install: the locked PyO3 0.24 builds for CPython 3.13 at most. pip on 3.14 skips a release that carries the `requires-python = ">=3.10,<3.14"` ceiling `bindings/python/pyproject.toml` declares. The two releases PyPI already serves, 0.1.0b2 and 0.1.0b3, were built before the ceiling and declare `>=3.10`, so while neither is yanked pip on 3.14 falls back to the 0.1.0b3 sdist, and that build fails in PyO3 0.24. The ceiling reaches PyPI only in a release with a new version: `bindings/python/pyproject.toml` still declares `version = "0.1.0b2"`, which PyPI already serves
+- Pre-built wheels cover CPython 3.10-3.13 on Linux x86_64 and aarch64 with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64
+- A build from source compiles OpenSSL, both when pip falls back to the source distribution because no wheel matches and when you run `maturin develop` for development against the local workspace: it needs a Rust toolchain and a full perl, plus make on Linux and macOS (see `bindings/python/README.md` §Requirements)
 
 ```bash
-python3.12 --version  # >= 3.12
+python3 --version  # 3.10-3.13
 ```
 
 ### TypeScript

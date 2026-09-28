@@ -20,6 +20,8 @@ Messages are end-to-end encrypted via MLS. The relay (if connected) is an untrus
 
 ### Prerequisites
 
+Install the SCP Python SDK from source. It needs CPython 3.12 or 3.13 (the template's `python/pyproject.toml` requires 3.12 or newer, and the SDK's locked PyO3 0.24 builds for CPython 3.13 at most), a Rust toolchain, and a full perl, plus make on Linux and macOS: the build compiles the native extension and the OpenSSL its SQLCipher links (`bindings/python/README.md` §Requirements).
+
 ```sh
 pip install -e ../../../bindings/python
 ```
