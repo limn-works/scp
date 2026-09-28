@@ -108,8 +108,10 @@ called `runBlocking(Dispatchers.Default) { shutdown() }`, and `shutdown()` route
 
 An earlier revision kept both and documented a caveat above them, reasoning that
 `AutoCloseable.close()` is a synchronous contract a caller opts into for `use {}`. That reasoning
-does not survive two facts. Nothing in this repository ever called either `close()` — no test, no
-example, no SDK code — so no caller opted into anything. And a rule that a type may break whenever
+does not survive two facts. No test and no SDK code in this repository ever called either
+`close()`; only the two types' own KDoc usage examples did, through `use { }`, and this change
+rewrote them to call `shutdown()` from a coroutine. No caller outside that documentation opted
+into anything. And a rule that a type may break whenever
 an interface asks it to is not a rule; `AutoCloseable` is a choice this SDK makes, not a constraint
 imposed on it.
 
@@ -131,8 +133,11 @@ here has observed.
 `Relay`, `Node`, or `SCP`. `ServerTest.every stop method on a lifecycle-owning type suspends`
 requires a `kotlin.coroutines.Continuation` parameter on every declared method named `shutdown`,
 `close`, `stop`, or `dispose`, so a non-suspending method under one of those four names fails it.
-It strips everything after `$` before matching, so a lambda passed from `shutdown()` fails it too:
-the lambda compiles to a non-suspending `shutdown$lambda` method on the same class. That is why
+It strips everything after `$` before matching, so a non-suspend lambda passed from `shutdown()`,
+such as one handed to `CoroutineBridge.ffiCall`, fails it too: that lambda compiles to a
+non-suspending `shutdown$lambda` method on the same class. A suspend lambda compiles to a separate
+class that the check never inspects, so `SCP.shutdown`'s lambda to `ffiCallSuspend` passes it,
+and the check cannot catch a blocking call hidden inside a suspend lambda. That is why
 `ServerBridge.shutdownRelay` and `shutdownNode` set the shutdown flag themselves and `shutdown()`
 passes no lambda. The check passes a blocking stop method under any other name.
 

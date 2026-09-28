@@ -89,19 +89,23 @@ UniFFI generates:
 
 ### Async bridging
 
-UniFFI supports Kotlin coroutines via `uniffi-kotlin-multiplatform`. This SDK wraps blocking FFI calls in `Dispatchers.IO` to avoid depending on the multiplatform plugin until it stabilizes:
+UniFFI supports Kotlin coroutines via `uniffi-kotlin-multiplatform`. This SDK wraps blocking FFI calls in an injected `ioDispatcher` (`CoroutineBridge.ioDispatcher`, which defaults to `Dispatchers.IO`) to avoid depending on the multiplatform plugin until it stabilizes. A test injects a `StandardTestDispatcher` there, so no call, and no subscription release, may name `Dispatchers.IO` directly:
 
 ```kotlin
-class Context internal constructor(private val handle: ContextHandle) {
+class Context internal constructor(
+    private val handle: ContextHandle,
+    // Injected like CoroutineBridge.ioDispatcher, with the same default.
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+) {
     val contextId: String get() = handle.contextId()
     val state: String get() = handle.state()
 
-    suspend fun send(payload: ByteArray) = withContext(Dispatchers.IO) {
+    suspend fun send(payload: ByteArray) = withContext(ioDispatcher) {
         handle.send(payload)
     }
 
     suspend fun invokeTool(toolId: String, input: Map<String, Any>): Map<String, Any> =
-        withContext(Dispatchers.IO) {
+        withContext(ioDispatcher) {
             val json = Json.encodeToString(input)
             val result = handle.invokeTool(toolId, json)
             Json.decodeFromString(result)
@@ -114,7 +118,7 @@ class Context internal constructor(private val handle: ContextHandle) {
     fun receiveFlow(): Flow<Message> = callbackFlow {
         var subscription: Subscription? = null
         try {
-            withContext(NonCancellable + Dispatchers.IO) {
+            withContext(NonCancellable + ioDispatcher) {
                 subscription = handle.subscribe { envelope ->
                     trySend(envelope.toMessage())
                 }
@@ -123,7 +127,7 @@ class Context internal constructor(private val handle: ContextHandle) {
         } finally {
             val opened = subscription
             if (opened != null) {
-                withContext(NonCancellable + Dispatchers.IO) { opened.unsubscribe() }
+                withContext(NonCancellable + ioDispatcher) { opened.unsubscribe() }
             }
         }
     }
@@ -273,11 +277,14 @@ class ServerBridge internal constructor(
 }
 
 // Usage: call shutdown() from a coroutine the caller owns, never through runBlocking.
+// Run it under NonCancellable: a finally block usually runs because the coroutine was
+// cancelled, and in a cancelled coroutine the bridge's withContext(ioDispatcher) throws
+// CancellationException before the FFI call starts, so a bare shutdown() tears nothing down.
 val relay = Relay.startInMemory(bridge)
 try {
     println(relay.relayUrl)
 } finally {
-    relay.shutdown()
+    withContext(NonCancellable) { relay.shutdown() }
 }
 ```
 
