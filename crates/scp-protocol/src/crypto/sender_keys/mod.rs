@@ -159,6 +159,11 @@ pub enum SenderKeyError {
     #[error("signing failed: {0}")]
     SigningFailed(String),
 
+    /// A key custody call failed (`KeyCustody`). The bridges report
+    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` otherwise.
+    #[error(transparent)]
+    Custody(#[from] scp_crypto::CustodyFailure),
+
     /// Ed25519 signature verification failed due to malformed input.
     #[error("verification failed: {0}")]
     VerificationFailed(String),

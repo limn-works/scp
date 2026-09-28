@@ -143,9 +143,9 @@ pub struct AccessKeyRequestResult {
 ///
 /// # Errors
 ///
-/// Returns [`AccessKeyError::SigningFailed`] if signing fails.
+/// Returns [`AccessKeyError::Custody`] if key generation, the public-key
+/// lookup or signing fails in custody.
 /// Returns [`AccessKeyError::SerializationFailed`] if serialization fails.
-/// Returns [`AccessKeyError::KeyCustodyError`] if key generation fails.
 pub async fn request_access_key(
     key_custody: &impl KeyCustody,
     signing_key: &KeyHandle,
@@ -157,12 +157,12 @@ pub async fn request_access_key(
     let wrapping_key_handle = key_custody
         .generate_keypair(KeyType::X25519)
         .await
-        .map_err(|e| AccessKeyError::KeyCustodyError(e.to_string()))?;
+        .map_err(|e| AccessKeyError::Custody(e.into()))?;
 
     let wrapping_pubkey = key_custody
         .public_key(&wrapping_key_handle)
         .await
-        .map_err(|e| AccessKeyError::KeyCustodyError(e.to_string()))?;
+        .map_err(|e| AccessKeyError::Custody(e.into()))?;
 
     let timestamp = clock.now_secs();
 
@@ -182,7 +182,7 @@ pub async fn request_access_key(
     let signature = key_custody
         .sign(signing_key, &hash)
         .await
-        .map_err(|e| AccessKeyError::SigningFailed(e.to_string()))?;
+        .map_err(|e| AccessKeyError::Custody(e.into()))?;
 
     let request = AccessKeyRequest {
         requester_did: requester_did.to_owned(),
@@ -366,8 +366,9 @@ pub fn handle_access_key_request(
 ///
 /// # Errors
 ///
-/// Returns [`AccessKeyError::KeyCustodyError`] if the DH agreement or
-/// public-key lookup fails. Returns [`AccessKeyError::HpkeDecryptionFailed`]
+/// Returns [`AccessKeyError::Custody`] if the DH agreement or public-key
+/// lookup fails in custody, and [`AccessKeyError::KeyCustodyError`] if the
+/// custody returns a wrapping public key that is not 32 bytes. Returns [`AccessKeyError::HpkeDecryptionFailed`]
 /// if HPKE open fails or the recovered plaintext is not exactly 32 bytes.
 pub async fn open_access_key_response(
     key_custody: &impl KeyCustody,
@@ -390,14 +391,14 @@ pub async fn open_access_key_response(
     let dh = key_custody
         .dh_agree(wrapping_key_handle, &enc)
         .await
-        .map_err(|e| AccessKeyError::KeyCustodyError(e.to_string()))?;
+        .map_err(|e| AccessKeyError::Custody(e.into()))?;
     let dh_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*dh.as_bytes());
 
     // Fetch pkRm for the same handle (kem_context = enc || pkRm).
     let pk_rm = key_custody
         .public_key(wrapping_key_handle)
         .await
-        .map_err(|e| AccessKeyError::KeyCustodyError(e.to_string()))?;
+        .map_err(|e| AccessKeyError::Custody(e.into()))?;
     let pk_rm_bytes: [u8; 32] = pk_rm.as_bytes().try_into().map_err(|_| {
         AccessKeyError::KeyCustodyError("wrapping public key must be 32 bytes".to_owned())
     })?;
@@ -554,6 +555,30 @@ mod tests {
     use super::*;
     use scp_protocol::crypto::access_keys::generate_access_key;
     use scp_protocol::crypto::sender_keys::NonceDedup;
+
+    /// A requester whose custody no longer holds the signing key fails the
+    /// access-key request with the typed custody failure, so a caller sees
+    /// key-not-found as `SCP-CRYPTO-4006`.
+    #[tokio::test]
+    async fn request_access_key_carries_a_destroyed_signing_key_as_key_not_found() {
+        use scp_platform::testing::InMemoryKeyCustody;
+        let custody = InMemoryKeyCustody::new();
+        let signing_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        custody.destroy_key(&signing_key).await.unwrap();
+        let err = request_access_key(
+            &custody,
+            &signing_key,
+            "did:dht:alice",
+            "ctx-1",
+            &scp_clock::SystemClock,
+        )
+        .await
+        .expect_err("signing under a destroyed key must fail");
+        assert!(
+            matches!(&err, AccessKeyError::Custody(failure) if failure.is_key_not_found()),
+            "a destroyed signing key is a key-not-found custody failure, got {err:?}"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Wire type serialization tests

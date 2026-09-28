@@ -82,7 +82,7 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
     /**
      * The Keystore identity path end to end: the pseudonym secret is created with the
      * identity, derivation is stable, destroying the identity deletes the secret alias,
-     * and derivation then fails with `SCP-CRYPTO-4001`.
+     * and derivation then fails with `SCP-CRYPTO-4006`.
      */
     @Test
     fun `keystore identity pseudonym secret lives and dies with the identity`() {
@@ -104,7 +104,7 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
         assertFalse(keystore.containsAlias("scp.key.${identity.id}"))
 
         val error = assertThrows<ScpException> { custody.derivePseudonym(identity, contextId) }
-        assertEquals("SCP-CRYPTO-4001", error.code)
+        assertEquals("SCP-CRYPTO-4006", error.code)
     }
 
     /** A failed pseudonym-secret generation leaves no orphaned identity in Keystore. */
@@ -132,9 +132,9 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
         assertEquals(0, custody.pseudonymKeys.size)
         for (pseudonym in listOf(first, second)) {
             val signError = assertThrows<ScpException> { custody.sign(handleOf(pseudonym), digest) }
-            assertEquals("SCP-CRYPTO-4001", signError.code)
+            assertEquals("SCP-CRYPTO-4006", signError.code)
             val keyError = assertThrows<ScpException> { custody.publicKey(handleOf(pseudonym)) }
-            assertEquals("SCP-CRYPTO-4001", keyError.code)
+            assertEquals("SCP-CRYPTO-4006", keyError.code)
         }
     }
 
@@ -182,7 +182,7 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
     /**
      * Destroying a pseudonym while other threads sign with it never yields a bad
      * signature: each sign either verifies under the pseudonym's point or fails with
-     * `SCP-CRYPTO-4001`. A sign that used the stored scalar array instead of a copy
+     * `SCP-CRYPTO-4006`. A sign that used the stored scalar array instead of a copy
      * would see it wiped mid-signature.
      *
      * The signers sign without pause until the cycler finishes, so every destroy lands
@@ -229,7 +229,7 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
                         val signature = try {
                             custody.sign(handleOf(pseudonym), digest)
                         } catch (e: ScpException) {
-                            assertEquals("SCP-CRYPTO-4001", e.code, "only not-found may fail a sign")
+                            assertEquals("SCP-CRYPTO-4006", e.code, "only not-found may fail a sign")
                             null
                         }
                         if (signature != null) {
@@ -251,7 +251,7 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
 
     /**
      * A derivation still in flight when its identity is retired stores nothing: the
-     * scalar is wiped and `SCP-CRYPTO-4001` is thrown.
+     * scalar is wiped and `SCP-CRYPTO-4006` is thrown.
      */
     @Test
     fun `register after the identity is retired stores nothing`() {
@@ -261,7 +261,7 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
         val error = assertThrows<ScpException> {
             P256Pseudonym.register(keys, "retired-identity", "p256-retired", contextSeed)
         }
-        assertEquals("SCP-CRYPTO-4001", error.code)
+        assertEquals("SCP-CRYPTO-4006", error.code)
         assertTrue(contextSeed.all { it == 0.toByte() }, "the context seed must be wiped")
         assertEquals(0, keys.size)
     }

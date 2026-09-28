@@ -141,9 +141,14 @@ pub enum AccessKeyError {
     #[error("serialization failed: {0}")]
     SerializationFailed(String),
 
-    /// A key custody operation failed.
+    /// A key custody operation returned a malformed value.
     #[error("key custody error: {0}")]
     KeyCustodyError(String),
+
+    /// A key custody call failed (`KeyCustody`). The bridges report
+    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` otherwise.
+    #[error(transparent)]
+    Custody(#[from] scp_crypto::CustodyFailure),
 
     /// The epoch counter overflowed (reached `u64::MAX`).
     #[error("epoch counter overflow: already at u64::MAX")]

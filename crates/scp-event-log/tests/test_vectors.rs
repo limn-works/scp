@@ -285,6 +285,7 @@ fn different_event_order_produces_different_root() {
 // ---------------------------------------------------------------------------
 
 use scp_crypto::p256::{P256SigningKey, sign_prehash_rfc6979, verify_prehash_strict};
+use scp_crypto::{CustodyFailure, CustodyFailureKind};
 use scp_event_log::tree::{self, compute_event_canonical_hash};
 use scp_event_log::{
     Event, EventLog, EventLogSigner, EventPayload, EventType, checkpoint, payload,
@@ -342,13 +343,17 @@ struct ReferenceKeySigner(P256SigningKey);
 
 #[async_trait::async_trait]
 impl EventLogSigner for ReferenceKeySigner {
-    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
-        let digest: [u8; 32] = message
-            .try_into()
-            .map_err(|_| format!("expected a 32-byte digest, got {} bytes", message.len()))?;
+    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, CustodyFailure> {
+        let digest: [u8; 32] = message.try_into().map_err(|_| CustodyFailure {
+            kind: CustodyFailureKind::Failed,
+            detail: format!("expected a 32-byte digest, got {} bytes", message.len()),
+        })?;
         sign_prehash_rfc6979(&self.0, &digest)
             .map(|signature| signature.to_vec())
-            .map_err(|e| e.to_string())
+            .map_err(|e| CustodyFailure {
+                kind: CustodyFailureKind::Failed,
+                detail: e.to_string(),
+            })
     }
 }
 

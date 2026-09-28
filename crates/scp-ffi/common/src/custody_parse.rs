@@ -25,6 +25,49 @@ use scp_crypto::p256::P256PublicKey;
 use scp_platform::error::PlatformError;
 use scp_platform::traits::{KeyHandle, PseudonymKeypair};
 
+/// The bridge error code for a custody [`PlatformError`], one mapping for the
+/// `PyO3`, napi-rs and `UniFFI` bridges.
+///
+/// [`PlatformError::KeyNotFound`] is
+/// [`CRYPTO_4006`](crate::error_codes::CRYPTO_4006), [`PlatformError::CustodyError`] is
+/// [`CRYPTO_4060`](crate::error_codes::CRYPTO_4060), and
+/// [`PlatformError::PseudonymRejected`] is
+/// [`IDENT_1055`](crate::error_codes::IDENT_1055), the code ADR-021's
+/// 2026-09-27 amendment gives a host pseudonym the bridge cannot bind. Every
+/// other variant keeps [`CRYPTO_4004`](crate::error_codes::CRYPTO_4004).
+#[must_use]
+pub const fn platform_error_code(e: &PlatformError) -> &'static str {
+    use crate::error_codes as codes;
+    match e {
+        PlatformError::KeyNotFound => codes::CRYPTO_4006,
+        PlatformError::CustodyError(_) => codes::CRYPTO_4060,
+        PlatformError::PseudonymRejected(_) => codes::IDENT_1055,
+        PlatformError::WrongKeyType { .. }
+        | PlatformError::StorageError(_)
+        | PlatformError::AttestationError(_)
+        | PlatformError::PushError(_)
+        | PlatformError::Unsupported(_) => codes::CRYPTO_4004,
+    }
+}
+
+/// Maps a host custody callback's failure to a [`PlatformError`], one mapping
+/// for the `PyO3`, napi-rs and `UniFFI` bridges.
+///
+/// A failure carrying [`CRYPTO_4006`](crate::error_codes::CRYPTO_4006), the
+/// key-not-found code, is [`PlatformError::KeyNotFound`]. A failure with any
+/// other code, or with none, is [`PlatformError::CustodyError`] carrying the
+/// host's code and message.
+#[must_use]
+pub fn host_failure(method: &str, code: Option<&str>, message: &str) -> PlatformError {
+    if code == Some(crate::error_codes::CRYPTO_4006) {
+        return PlatformError::KeyNotFound;
+    }
+    let code = code.map(|c| format!(" ({c})")).unwrap_or_default();
+    PlatformError::CustodyError(format!(
+        "KeyCustodyProvider.{method} failed{code}: {message}"
+    ))
+}
+
 /// Parses a numeric key-id string (as returned by a `KeyCustodyProvider`) into
 /// a [`KeyHandle`].
 ///
@@ -77,17 +120,20 @@ pub const PSEUDONYM_PUBLIC_KEY_LEN: usize = scp_crypto::p256::COMPRESSED_POINT_L
 ///
 /// # Errors
 ///
-/// Returns [`PlatformError::CustodyError`] if `key_id` is not numeric or
-/// `public_key` is not a 33-byte SEC1 compressed point on P-256 (a provider
-/// still returning a 32-byte Ed25519 pseudonym fails here).
+/// Returns [`PlatformError::PseudonymRejected`] if `key_id` is not a canonical
+/// numeric key id or `public_key` is not a 33-byte SEC1 compressed point on
+/// P-256 (a provider still returning a 32-byte Ed25519 pseudonym fails here).
 pub fn parse_pseudonym(
     method: &str,
     public_key: &[u8],
     key_id: &str,
 ) -> Result<PseudonymKeypair, PlatformError> {
-    let handle = parse_handle(method, key_id)?;
+    let handle = parse_handle(method, key_id).map_err(|e| match e {
+        PlatformError::CustodyError(msg) => PlatformError::PseudonymRejected(msg),
+        other => other,
+    })?;
     PseudonymKeypair::new(public_key, handle)
-        .map_err(|e| PlatformError::CustodyError(format!("KeyCustodyProvider.{method}: {e}")))
+        .map_err(|e| PlatformError::PseudonymRejected(format!("KeyCustodyProvider.{method}: {e}")))
 }
 
 /// The pseudonym handles a callback custody adapter has derived, each bound to
@@ -111,8 +157,8 @@ impl PseudonymBindings {
     ///
     /// # Errors
     ///
-    /// Returns [`PlatformError::CustodyError`] if `host_public_key` differs from
-    /// the derived point, or if the handle is already bound to a different
+    /// Returns [`PlatformError::PseudonymRejected`] if `host_public_key` differs
+    /// from the derived point, or if the handle is already bound to a different
     /// point (a host that reuses one key id for two pseudonyms).
     pub fn bind(
         &self,
@@ -122,17 +168,17 @@ impl PseudonymBindings {
     ) -> Result<(), PlatformError> {
         let derived = pseudonym.public_key().as_bytes();
         if host_public_key != derived {
-            return Err(PlatformError::CustodyError(format!(
+            return Err(PlatformError::PseudonymRejected(format!(
                 "KeyCustodyProvider.{method}: public_key(key_id) does not match the derived \
                  pseudonym point"
             )));
         }
         let point = P256PublicKey::from_sec1(derived).map_err(|e| {
-            PlatformError::CustodyError(format!("KeyCustodyProvider.{method}: {e}"))
+            PlatformError::PseudonymRejected(format!("KeyCustodyProvider.{method}: {e}"))
         })?;
         match self.points.entry(pseudonym.key_handle().id()) {
             dashmap::Entry::Occupied(existing) if *existing.get() != point => {
-                Err(PlatformError::CustodyError(format!(
+                Err(PlatformError::PseudonymRejected(format!(
                     "KeyCustodyProvider.{method}: key_id {} is already bound to a different \
                      pseudonym point",
                     pseudonym.key_handle().id()
@@ -225,6 +271,69 @@ impl PseudonymBindings {
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_failure_maps_only_crypto_4006_to_key_not_found() {
+        use crate::error_codes as codes;
+        assert!(matches!(
+            host_failure("sign", Some(codes::CRYPTO_4006), "gone"),
+            PlatformError::KeyNotFound
+        ));
+        for code in [
+            Some(codes::CRYPTO_4001),
+            Some(codes::CRYPTO_4060),
+            Some("x"),
+            None,
+        ] {
+            match host_failure("sign", code, "hsm offline") {
+                PlatformError::CustodyError(m) => {
+                    assert!(m.contains("KeyCustodyProvider.sign failed"), "{m}");
+                    assert!(m.contains("hsm offline"), "{m}");
+                    if let Some(c) = code {
+                        assert!(m.contains(c), "{m}");
+                    }
+                }
+                other => panic!("{code:?} must be a custody error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn platform_error_code_names_key_not_found_and_custody_codes() {
+        use crate::error_codes as codes;
+        assert_eq!(
+            platform_error_code(&PlatformError::KeyNotFound),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            platform_error_code(&PlatformError::CustodyError("x".to_owned())),
+            codes::CRYPTO_4060
+        );
+        assert_eq!(
+            platform_error_code(&PlatformError::PseudonymRejected("x".to_owned())),
+            codes::IDENT_1055
+        );
+    }
+
+    #[test]
+    fn custody_failure_code_follows_the_platform_error_kind() {
+        use crate::error_codes as codes;
+        let code =
+            |e: PlatformError| codes::custody_failure_code(&scp_crypto::CustodyFailure::from(e));
+        assert_eq!(code(PlatformError::KeyNotFound), codes::CRYPTO_4006);
+        assert_eq!(
+            code(PlatformError::PseudonymRejected("x".to_owned())),
+            codes::IDENT_1055
+        );
+        assert_eq!(
+            code(PlatformError::CustodyError("x".to_owned())),
+            codes::CRYPTO_4060
+        );
+        assert_eq!(
+            code(PlatformError::StorageError("x".to_owned())),
+            codes::CRYPTO_4060
+        );
+    }
 
     /// Drives a future to completion on a current-thread runtime.
     fn block_on<F: core::future::Future>(future: F) -> F::Output {
@@ -354,6 +463,13 @@ mod tests {
         );
     }
 
+    fn assert_pseudonym_rejected(err: &PlatformError) {
+        assert!(
+            matches!(err, PlatformError::PseudonymRejected(_)),
+            "expected PseudonymRejected, got {err:?}"
+        );
+    }
+
     #[test]
     fn parse_pseudonym_accepts_point_and_key_id() {
         let pseudo = parse_pseudonym("derive_pseudonym", &REFERENCE_POINT, "123")
@@ -367,7 +483,7 @@ mod tests {
     #[test]
     fn parse_pseudonym_rejects_invalid_points() {
         let reject = |bytes: &[u8]| {
-            assert_custody_error(
+            assert_pseudonym_rejected(
                 &parse_pseudonym("derive_pseudonym", bytes, "7")
                     .expect_err("invalid point rejected"),
             );
@@ -406,7 +522,7 @@ mod tests {
             0x78, 0x0a, 0x2c, 0x78, 0x90, 0x1d, 0x3f, 0xb3, 0x37, 0x38, 0x76, 0x85, 0x11, 0xa3,
             0x06, 0x17, 0xaf, 0xa0,
         ];
-        assert_custody_error(
+        assert_pseudonym_rejected(
             &parse_pseudonym("derive_pseudonym", &legacy_key, "22").expect_err("32 bytes rejected"),
         );
 
@@ -415,7 +531,7 @@ mod tests {
         let pseudo = parse_pseudonym("derive_pseudonym", &old_split_point, "2")
             .expect("the old split's first 33 bytes are a valid point");
         let bindings = PseudonymBindings::default();
-        assert_custody_error(
+        assert_pseudonym_rejected(
             &bindings
                 .bind("derive_pseudonym", &pseudo, &legacy_key)
                 .expect_err("host key 2 is not that point"),
@@ -431,7 +547,7 @@ mod tests {
 
     #[test]
     fn parse_pseudonym_rejects_non_numeric_key_id() {
-        assert_custody_error(
+        assert_pseudonym_rejected(
             &parse_pseudonym("derive_rotatable_pseudonym", &REFERENCE_POINT, "xyz")
                 .expect_err("non-numeric key_id is rejected"),
         );
@@ -446,7 +562,7 @@ mod tests {
             .expect("bind");
         let other = signing_key().public_key().to_compressed();
         let second = parse_pseudonym("derive_pseudonym", &other, "5").expect("valid");
-        assert_custody_error(
+        assert_pseudonym_rejected(
             &bindings
                 .bind("derive_pseudonym", &second, &other)
                 .expect_err("rebinding is rejected"),

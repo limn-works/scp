@@ -442,7 +442,8 @@ pub struct MintParams<'a> {
 /// # Errors
 ///
 /// Returns [`UcanError::ExpiryTooFar`] if `lifetime_secs` exceeds 24 hours.
-/// Returns [`UcanError::MalformedToken`] if serialization or signing fails.
+/// Returns [`UcanError::MalformedToken`] if serialization fails, and
+/// [`UcanError::Custody`] if custody signing fails.
 ///
 /// See ADR-016 acceptance criterion 3 and ADR-039 acceptance criterion 6.
 pub async fn mint_ucan(
@@ -574,7 +575,7 @@ pub async fn mint_ucan(
     let sig = custody
         .sign(params.issuer_key, signing_input.as_bytes())
         .await
-        .map_err(|e| UcanError::MalformedToken(format!("signing failed: {e}")))?;
+        .map_err(|e| UcanError::Custody(e.into()))?;
 
     let sig_b64 = URL_SAFE_NO_PAD.encode(sig.as_bytes());
     let encoded = format!("{signing_input}.{sig_b64}");
@@ -702,7 +703,8 @@ pub struct DelegateParams<'a> {
 /// Returns [`UcanError::AttenuationViolation`] if any capability in
 /// `attenuated_capabilities` is not granted by the parent token.
 /// Returns [`UcanError::ExpiryTooFar`] if `lifetime_secs` exceeds 24 hours.
-/// Returns [`UcanError::MalformedToken`] if serialization or signing fails.
+/// Returns [`UcanError::MalformedToken`] if serialization fails, and
+/// [`UcanError::Custody`] if custody signing fails.
 ///
 /// See ADR-016 acceptance criterion 4.
 pub async fn delegate_ucan(
@@ -837,7 +839,7 @@ pub async fn delegate_ucan(
     let sig = custody
         .sign(params.delegator_key, signing_input.as_bytes())
         .await
-        .map_err(|e| UcanError::MalformedToken(format!("signing failed: {e}")))?;
+        .map_err(|e| UcanError::Custody(e.into()))?;
 
     let sig_b64 = URL_SAFE_NO_PAD.encode(sig.as_bytes());
     let encoded = format!("{signing_input}.{sig_b64}");

@@ -206,13 +206,12 @@ async fn resolve_stream_signer(
     let (custody, handle) = crate::runtime::with_identity(bi, identity_did, |entry| {
         Ok((entry.custody.clone(), entry.identity.active_signing_key))
     })?;
-    let public_key = custody
-        .public_key(&handle)
-        .await
-        .map_err(|e| ScpNapiError::Context {
-            message: format!("failed to resolve stream signing key for '{identity_did}': {e}"),
-            code: codes::CTX_2001.to_owned(),
-        })?;
+    let public_key = custody.public_key(&handle).await.map_err(|e| {
+        ScpNapiError::custody(
+            format!("failed to resolve stream signing key for '{identity_did}': {e}"),
+            &e,
+        )
+    })?;
     let verifying_key = scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key)
         .ok_or_else(|| ScpNapiError::Context {
         message: format!(
@@ -734,6 +733,36 @@ pub(crate) async fn outlet_stream_poll_next_on(
 // grant_credit
 // ---------------------------------------------------------------------------
 
+/// Maps a credit-grant signing failure to the caller's error. A custody
+/// failure carries `SCP-CRYPTO-4006` (key not found) or `SCP-CRYPTO-4060`; a
+/// canonicalization failure carries `SCP-CTX-2001`.
+fn credit_sign_error(e: &StreamSignerError) -> ScpNapiError {
+    e.custody_failure().map_or_else(
+        || ScpNapiError::Context {
+            message: format!("failed to sign credit grant: {e:?}"),
+            code: codes::CTX_2001.to_owned(),
+        },
+        |failure| {
+            ScpNapiError::custody_failure(format!("failed to sign credit grant: {e}"), &failure)
+        },
+    )
+}
+
+/// Maps a rejected stream cancel to the caller's error. A custody failure
+/// while signing the cancel carries `SCP-CRYPTO-4006` (key not found) or
+/// `SCP-CRYPTO-4060`; every other rejection carries its §5.4.4 code.
+fn cancel_rejected_error(e: &scp_core::context::outlets::CancelError) -> ScpNapiError {
+    e.custody_failure().map_or_else(
+        || ScpNapiError::Outlet {
+            message: format!("stream cancel rejected: {e:?}"),
+            code: cancel_error_to_code(e).to_owned(),
+        },
+        |failure| {
+            ScpNapiError::custody_failure(format!("stream cancel signing failed: {e:?}"), &failure)
+        },
+    )
+}
+
 /// Grants `grant` additional billable chunks of credit to a live stream. The
 /// bridge SIGNS the [`OutletStreamCredit`] INTERNALLY under the pinned invoker's
 /// custody key (mirroring how `cancel` signs internally) and auto-assigns the
@@ -856,12 +885,10 @@ pub(crate) async fn outlet_stream_grant_credit_on(
     );
 
     // 1. Sign the credit grant through custody.
-    let sig = signer.sign(&preimage).await.map_err(|e| {
-        napi::Error::from(ScpNapiError::Context {
-            message: format!("failed to sign credit grant: {e:?}"),
-            code: codes::CTX_2001.to_owned(),
-        })
-    })?;
+    let sig = signer
+        .sign(&preimage)
+        .await
+        .map_err(|e| napi::Error::from(credit_sign_error(&e)))?;
     let credit = OutletStreamCredit {
         request_id,
         grant,
@@ -947,12 +974,7 @@ pub(crate) async fn outlet_stream_cancel_on(
         .await
         .apply_outlet_cancel_signed(&signer, &cancel_identity)
         .await
-        .map_err(|e| {
-            napi::Error::from(ScpNapiError::Outlet {
-                message: format!("stream cancel rejected: {e:?}"),
-                code: cancel_error_to_code(&e).to_owned(),
-            })
-        })?;
+        .map_err(|e| napi::Error::from(cancel_rejected_error(&e)))?;
     Ok(())
 }
 
@@ -1665,6 +1687,57 @@ impl crate::scp::Scp {
         self.inner
             .outlet_streaming_saga_registry
             .contains_key(saga_id)
+    }
+}
+
+#[cfg(test)]
+mod custody_error_tests {
+    use super::*;
+    use scp_core::context::outlets::CancelError;
+
+    /// The code the error's `[CODE] …` rendering leads with.
+    fn code(e: &ScpNapiError) -> String {
+        let rendered = e.to_string();
+        rendered
+            .trim_start_matches('[')
+            .split(']')
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// A key-not-found custody failure while signing a credit grant or a
+    /// cancel reaches the caller as `SCP-CRYPTO-4006`, any other custody
+    /// failure as `SCP-CRYPTO-4060`, and a non-custody failure keeps its
+    /// own code.
+    #[test]
+    fn outlet_signing_custody_failures_carry_the_custody_codes() {
+        let not_found = StreamSignerError::Custody {
+            category: StreamSignerCustodyCategory::KeyNotFound,
+        };
+        let backend = StreamSignerError::Custody {
+            category: StreamSignerCustodyCategory::BackendFault,
+        };
+        assert_eq!(code(&credit_sign_error(&not_found)), codes::CRYPTO_4006);
+        assert_eq!(code(&credit_sign_error(&backend)), codes::CRYPTO_4060);
+        assert_eq!(
+            code(&credit_sign_error(&StreamSignerError::Jcs(
+                "bad".to_owned()
+            ))),
+            codes::CTX_2001
+        );
+        assert_eq!(
+            code(&cancel_rejected_error(&CancelError::Signing(not_found))),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            code(&cancel_rejected_error(&CancelError::Signing(backend))),
+            codes::CRYPTO_4060
+        );
+        assert_eq!(
+            code(&cancel_rejected_error(&CancelError::SignatureInvalid)),
+            cancel_error_to_code(&CancelError::SignatureInvalid)
+        );
     }
 }
 

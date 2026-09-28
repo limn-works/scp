@@ -19,11 +19,13 @@
 //! [`ScpSigner`] trait. Neither is called from a shipped path in S0 except the
 //! pseudonym derivation (§9.10.4), which is P-256.
 
+pub mod custody;
 mod kdf;
 pub mod p256;
 pub mod pseudonym;
 pub mod signer;
 
+pub use custody::{CustodyFailure, CustodyFailureKind};
 pub use signer::{ScpSigner, SigAlg, SignError};
 
 /// Verifies an Ed25519 signature against a public key and message bytes.

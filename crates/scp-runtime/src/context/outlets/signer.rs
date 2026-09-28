@@ -109,10 +109,12 @@ impl From<&PlatformError> for StreamSignerCustodyCategory {
             PlatformError::Unsupported(_) => Self::Unsupported,
             // `CustodyError` is the documented generic custody failure; the
             // remaining variants (`StorageError`, `AttestationError`,
-            // `PushError`) belong to sibling platform traits and are not
-            // expected from `sign`, but are mapped conservatively rather than
-            // panicking or leaking their carried string.
+            // `PushError`, and `PseudonymRejected`, which only pseudonym
+            // derivation returns) are not expected from `sign`, but are mapped
+            // conservatively rather than panicking or leaking their carried
+            // string.
             PlatformError::CustodyError(_)
+            | PlatformError::PseudonymRejected(_)
             | PlatformError::StorageError(_)
             | PlatformError::AttestationError(_)
             | PlatformError::PushError(_) => Self::BackendFault,
@@ -167,6 +169,39 @@ impl core::fmt::Display for StreamSignerError {
 }
 
 impl std::error::Error for StreamSignerError {}
+
+impl From<StreamSignerCustodyCategory> for scp_crypto::CustodyFailure {
+    /// Carries a bounded category to the bridges: [`KeyNotFound`] is
+    /// key-not-found, every other category a custody failure. The detail is the
+    /// category's fixed string, so no backend text crosses (ADR-061).
+    ///
+    /// [`KeyNotFound`]: StreamSignerCustodyCategory::KeyNotFound
+    fn from(category: StreamSignerCustodyCategory) -> Self {
+        let kind = match category {
+            StreamSignerCustodyCategory::KeyNotFound => scp_crypto::CustodyFailureKind::KeyNotFound,
+            StreamSignerCustodyCategory::WrongKeyType
+            | StreamSignerCustodyCategory::Unsupported
+            | StreamSignerCustodyCategory::BackendFault => scp_crypto::CustodyFailureKind::Failed,
+        };
+        Self {
+            kind,
+            detail: category.as_str().to_owned(),
+        }
+    }
+}
+
+impl StreamSignerError {
+    /// The custody failure behind this error, or `None` when the signer failed
+    /// before reaching custody (JCS canonicalization). The bridges report it as
+    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` otherwise.
+    #[must_use]
+    pub fn custody_failure(&self) -> Option<scp_crypto::CustodyFailure> {
+        match self {
+            Self::Custody { category } => Some((*category).into()),
+            Self::Jcs(_) => None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // StreamSigner

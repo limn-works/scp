@@ -35,7 +35,8 @@ use scp_protocol::envelope::padding::pad_to_bucket;
 ///
 /// # Errors
 ///
-/// Returns [`EnvelopeError::SigningFailed`] if the signing operation fails.
+/// Returns [`EnvelopeError::Custody`] if custody signing fails, and
+/// [`EnvelopeError::SigningFailed`] if the signature is not 64 bytes.
 /// Returns [`EnvelopeError::SerializationFailed`] if provenance serialization fails.
 /// Returns [`EnvelopeError::PayloadTooLarge`] if the payload exceeds the
 /// maximum bucket size.
@@ -57,7 +58,7 @@ pub async fn create_inner_envelope(
     let signature = key_custody
         .sign(signing_key, &canonical_hash)
         .await
-        .map_err(|e| EnvelopeError::SigningFailed(e.to_string()))?;
+        .map_err(|e| EnvelopeError::Custody(e.into()))?;
 
     // 5. Pad payload to bucket boundary.
     let padded_payload = pad_to_bucket(params.payload)?;

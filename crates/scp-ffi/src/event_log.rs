@@ -753,7 +753,13 @@ fn event_log_checkpoint_impl(
                 .await
             });
 
-            result.map_err(|e| ScpPyError::context(format!("checkpoint generation failed: {e}")))
+            result.map_err(|e| match &e {
+                scp_event_log::EventLogError::Custody(failure) => ScpPyError::custody_failure(
+                    format!("checkpoint generation failed: {e}"),
+                    failure,
+                ),
+                _ => ScpPyError::context(format!("checkpoint generation failed: {e}")),
+            })
         })
     })?;
 

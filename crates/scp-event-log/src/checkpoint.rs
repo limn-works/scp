@@ -374,7 +374,7 @@ impl CheckpointManager {
     ///
     /// # Errors
     ///
-    /// Returns [`EventLogError::SigningFailed`] if signing fails.
+    /// Returns [`EventLogError::Custody`] if signing fails.
     pub async fn maybe_create_checkpoint(
         &mut self,
         log: &EventLog,
@@ -408,7 +408,7 @@ impl CheckpointManager {
     ///
     /// # Errors
     ///
-    /// Returns [`EventLogError::SigningFailed`] if signing fails.
+    /// Returns [`EventLogError::Custody`] if signing fails.
     pub async fn force_create_checkpoint(
         &mut self,
         log: &EventLog,
@@ -900,7 +900,7 @@ pub enum CrossCheckpointResult {
 ///
 /// # Errors
 ///
-/// Returns [`EventLogError::SigningFailed`] if the signing operation fails.
+/// Returns [`EventLogError::Custody`] if the signing operation fails.
 ///
 /// See ADR-011 acceptance criterion 8.
 pub async fn generate_checkpoint(
@@ -986,7 +986,7 @@ async fn generate_checkpoint_at(
     let signature = signer
         .sign(&canonical_hash)
         .await
-        .map_err(EventLogError::SigningFailed)?;
+        .map_err(EventLogError::Custody)?;
 
     Ok(ConsistencyCheckpoint {
         context_id,

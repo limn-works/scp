@@ -511,12 +511,7 @@ pub(crate) async fn ucan_mint_on(
     // await directly without spawning a separate task.
     let token = mint_ucan(&params, custody.as_ref(), &scp_clock::SystemClock)
         .await
-        .map_err(|e| {
-            napi::Error::from(ScpNapiError::Permission {
-                message: format!("UCAN minting failed: {e}"),
-                code: scp_ffi_common::ucan_errors::ucan_error_code(&e).to_owned(),
-            })
-        })?;
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let data = NapiUcanTokenData {
         token_id: token.payload.nnc.clone(),

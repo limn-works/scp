@@ -46,6 +46,13 @@ pub enum PlatformError {
     #[error("custody error: {0}")]
     CustodyError(String),
 
+    /// A bridge rejected a pseudonym that a host custody provider derived
+    /// (spec §9.10.4): the returned key id or point is malformed,
+    /// `get_public_key(key_id)` reports a different point, or the key id is
+    /// already bound to another pseudonym point.
+    #[error("pseudonym rejected: {0}")]
+    PseudonymRejected(String),
+
     /// The custody backend does not support an optional operation.
     ///
     /// Used by [`KeyCustody::generate_ephemeral_ed25519_seed`](crate::traits::KeyCustody::generate_ephemeral_ed25519_seed)
@@ -55,4 +62,35 @@ pub enum PlatformError {
     /// a platform-specific alternative (`SecRandomCopyBytes`, etc.).
     #[error("unsupported operation: {0}")]
     Unsupported(&'static str),
+}
+
+impl From<&PlatformError> for scp_crypto::CustodyFailure {
+    /// Classifies a custody error for the error types that cannot hold a
+    /// [`PlatformError`]: [`PlatformError::KeyNotFound`] is key-not-found,
+    /// [`PlatformError::PseudonymRejected`] is a rejected pseudonym, and every
+    /// other variant is a custody failure.
+    fn from(e: &PlatformError) -> Self {
+        let kind = match e {
+            PlatformError::KeyNotFound => scp_crypto::CustodyFailureKind::KeyNotFound,
+            PlatformError::PseudonymRejected(_) => {
+                scp_crypto::CustodyFailureKind::PseudonymRejected
+            }
+            PlatformError::WrongKeyType { .. }
+            | PlatformError::StorageError(_)
+            | PlatformError::AttestationError(_)
+            | PlatformError::PushError(_)
+            | PlatformError::CustodyError(_)
+            | PlatformError::Unsupported(_) => scp_crypto::CustodyFailureKind::Failed,
+        };
+        Self {
+            kind,
+            detail: e.to_string(),
+        }
+    }
+}
+
+impl From<PlatformError> for scp_crypto::CustodyFailure {
+    fn from(e: PlatformError) -> Self {
+        Self::from(&e)
+    }
 }
