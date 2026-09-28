@@ -9,8 +9,9 @@
 //!    with `NoPreRotationBackend`.
 //! 2. **Relay-only** (`--relay-only`): Runs a bare [`RelayServer`], identical
 //!    to the standalone `scp-relay` binary.
-//! 3. **Ephemeral** (`--ephemeral`): Runs a full node with all in-memory
-//!    subsystems — nothing persists across restarts.
+//! 3. **Ephemeral** (`--ephemeral`, `testing` builds only): Runs a full node
+//!    with all in-memory subsystems — nothing persists across restarts. A
+//!    shipped build exits 1 on `--ephemeral`.
 //! 4. **Self-host** (`--self-host`): Hosts a static website entirely on SCP
 //!    (no DNS name required) — opens an inbound public port, publishes the host's
 //!    IP to the DHT by default, and serves the site over self-signed HTTPS by default
@@ -63,7 +64,8 @@ struct CliConfig {
 /// Accepts:
 ///   `--relay-only`       — relay-only mode
 ///   `--health`           — TCP health probe
-///   `--ephemeral`        — all in-memory subsystems
+///   `--ephemeral`        — all in-memory subsystems (`testing` builds only;
+///                          a shipped build exits 1)
 ///   `--storage-path <p>` — `SQLite` database directory
 ///   `--help`             — print usage and exit
 fn parse_args() -> CliConfig {

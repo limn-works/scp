@@ -115,9 +115,10 @@ crate still publishes all four.
 
 This branch added `required-features = ["testing"]` to
 `crates/scp-runtime/examples/identity.rs` on the premise that it could not build on
-shipped features, then measured the premise and found it false:
-`cargo clippy -p scp-runtime --example identity -- -D warnings` exits 0 on default
-features, because `scp-runtime` dev-depends on `scp-testing`, whose NORMAL
+shipped features, then ran a measurement that seemed to falsify the premise:
+`cargo clippy -p scp-runtime --example identity -- -D warnings` exits 0 with no
+`--features` flag. That build is the dev-target closure, not the default feature set,
+because `scp-runtime` dev-depends on `scp-testing`, whose NORMAL
 `scp-core{testing}` edge resolves `scp-runtime/testing` ON. The declaration bought
 nothing and removed the example from the check, so it was reverted. Coverage went
 from four counted targets to eight — against the script as it stood that round, which passed
