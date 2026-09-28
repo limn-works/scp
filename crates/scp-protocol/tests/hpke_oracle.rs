@@ -234,10 +234,10 @@ fn p256_round_trips_against_reference() -> TestResult {
             assert_eq!(got.as_slice(), ref_pt, "case {idx}: reference → ours");
 
             let sk_key = scp_crypto::p256::P256SigningKey::from_scalar_bytes(&sk)?;
-            let enc_point = scp_crypto::p256::P256PublicKey::from_sec1(&ref_enc)?;
-            let dh = scp_crypto::p256::ecdh_p256(&sk_key, &enc_point);
+            let enc = hpke::p256::validate_enc(&ref_enc)?;
+            let dh = scp_crypto::p256::ecdh_p256(&sk_key, enc.point());
             let got =
-                hpke::p256::custody::open_with_external_dh(&dh, &pk, &ref_enc, info, aad, &ref_ct)?;
+                hpke::p256::custody::open_with_external_dh(&dh, &pk, &enc, info, aad, &ref_ct)?;
             assert_eq!(got.as_slice(), ref_pt, "case {idx}: reference → custody");
         }
     }

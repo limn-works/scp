@@ -10,12 +10,14 @@
 //! is the 32-byte big-endian scalar (`SerializePrivateKey`). The DH output is
 //! the 32-byte x-coordinate of the shared point (RFC 9180 §7.1.1).
 //!
-//! Point validation (§9.5): every `enc` read by [`open`] or
-//! [`custody::open_with_external_dh`], and every recipient key passed to
-//! [`seal`], goes through [`P256PublicKey::from_sec1`] before any scalar
+//! Point validation (§9.5): every recipient key passed to [`seal`] and every
+//! `enc` goes through [`P256PublicKey::from_sec1`] before any scalar
 //! multiplication. That rejects a length other than 65, a leading byte other
 //! than `0x04`, a point off the curve, and the point at infinity, which closes
-//! the invalid-curve attack §9.5 names.
+//! the invalid-curve attack §9.5 names. [`open`] validates `enc` itself. The
+//! custody path takes only a [`ValidatedEnc`], whose one constructor is
+//! [`validate_enc`], so a caller holds a validated `enc` before it can ask
+//! custody for `DH(skR, enc)`.
 //!
 //! Each [`seal`] draws a fresh ephemeral key as `DeriveKeyPair(random(Nsk))`,
 //! which RFC 9180 §4 names as an implementation of `GenerateKeyPair`, so the one
@@ -153,30 +155,99 @@ pub fn open(
     aad: &[u8],
     ct: &[u8],
 ) -> Result<Vec<u8>, HpkeError> {
-    let (enc, enc_point) = parse_enc(enc)?;
+    let enc = validate_enc(enc)?;
     let sk = P256SigningKey::from_scalar_bytes(recipient_sk)
         .map_err(|e| HpkeError::InvalidKey(format!("recipient scalar: {e}")))?;
     let pk_rm = sk.public_key().to_uncompressed();
-    let dh = ecdh_p256(&sk, &enc_point);
-    decap_and_open(&dh, &pk_rm, enc, info, aad, ct)
+    let dh = ecdh_p256(&sk, enc.point());
+    decap_and_open(&dh, &pk_rm, enc.as_bytes(), info, aad, ct)
+}
+
+/// A P-256 HPKE encapsulated key that has passed §9.5 point validation:
+/// exactly 65 bytes, led by `0x04`, on the curve, and not the point at
+/// infinity.
+///
+/// [`validate_enc`] is the only constructor. [`custody::open_with_external_dh`]
+/// takes this type rather than bytes, so the order §9.5 requires (validate,
+/// then agree) is fixed by the types: the caller validates the wire `enc`,
+/// passes [`ValidatedEnc::as_bytes`] to `KeyCustody::dh_agree`, and passes the
+/// same value to the open.
+///
+/// Raw bytes do not satisfy the custody open:
+///
+/// ```compile_fail
+/// use scp_protocol::crypto::hpke::p256::custody::open_with_external_dh;
+/// let enc = [0x04u8; 65];
+/// let _ = open_with_external_dh(&[0u8; 32], &[0x04u8; 65], &enc[..], b"", b"", b"");
+/// ```
+///
+/// A [`ValidatedEnc`] does:
+///
+/// ```no_run
+/// use scp_protocol::crypto::hpke::p256::{custody::open_with_external_dh, validate_enc};
+/// # fn f(wire_enc: &[u8], dh: &[u8; 32], pk_rm: &[u8; 65]) -> Result<(), Box<dyn std::error::Error>> {
+/// let enc = validate_enc(wire_enc)?;
+/// let _ = open_with_external_dh(dh, pk_rm, &enc, b"", b"", b"");
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValidatedEnc {
+    bytes: [u8; ENC_LEN],
+    point: P256PublicKey,
+}
+
+impl ValidatedEnc {
+    /// The 65-byte uncompressed SEC1 encoding: the bytes to pass to
+    /// `KeyCustody::dh_agree` and the `enc` bound into `kem_context`.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; ENC_LEN] {
+        &self.bytes
+    }
+
+    /// The validated point.
+    #[must_use]
+    pub const fn point(&self) -> &P256PublicKey {
+        &self.point
+    }
+}
+
+/// §9.5 point validation of a wire-read `enc`.
+///
+/// # Errors
+///
+/// [`HpkeError::InvalidKey`] if `enc` is not 65 bytes, is not led by `0x04`,
+/// is not on the curve, or is the point at infinity.
+pub fn validate_enc(enc: &[u8]) -> Result<ValidatedEnc, HpkeError> {
+    let bytes: [u8; ENC_LEN] = enc.try_into().map_err(|_| {
+        HpkeError::InvalidKey(format!(
+            "P-256 HPKE enc must be {ENC_LEN} bytes, got {}",
+            enc.len()
+        ))
+    })?;
+    let point = P256PublicKey::from_sec1(&bytes)
+        .map_err(|e| HpkeError::InvalidKey(format!("P-256 HPKE enc: {e}")))?;
+    Ok(ValidatedEnc { bytes, point })
 }
 
 /// HPKE open paths for P-256 recipient keys held inside a `KeyCustody`
 /// boundary.
 pub mod custody {
-    use super::{HpkeError, PUBLIC_KEY_LEN, decap_and_open, parse_enc};
+    use super::{HpkeError, PUBLIC_KEY_LEN, ValidatedEnc, decap_and_open};
 
     /// Single-shot Base-mode HPKE open where `DH(skR, enc)` was computed inside
     /// a `KeyCustody` boundary.
     ///
     /// # Caller contract (load-bearing — read this)
     ///
-    /// For one and the same custody key handle `h` and one and the same `enc`:
+    /// In this order, for one and the same custody key handle `h`:
     ///
-    /// - `dh` = `KeyCustody::dh_agree(h, enc)`: the 32-byte x-coordinate of
-    ///   `skR · enc`.
-    /// - `recipient_pk` (`pkRm`) = the 65-byte uncompressed public key of `h`.
-    /// - `enc`: the exact encapsulated key passed to `dh_agree`.
+    /// 1. `enc` = `validate_enc(wire_enc)?` ([`validate_enc`](super::validate_enc)). §9.5
+    ///    requires this before any key agreement, and the type makes it the
+    ///    only way to call this function.
+    /// 2. `dh` = `KeyCustody::dh_agree(h, enc.as_bytes())`: the 32-byte
+    ///    x-coordinate of `skR · enc`.
+    /// 3. `recipient_pk` (`pkRm`) = the 65-byte uncompressed public key of `h`.
     ///
     /// A mismatched `dh`, `pkRm`, or `enc` fails closed as an AEAD tag
     /// mismatch, indistinguishable from a wrong-key error. `enc || pkRm` is
@@ -185,35 +256,17 @@ pub mod custody {
     ///
     /// # Errors
     ///
-    /// [`HpkeError::InvalidKey`] if `enc` is not a valid 65-byte uncompressed
-    /// P-256 point (§9.5 point validation runs here too, so a custody backend
-    /// that skipped it cannot let a malformed `enc` through);
     /// [`HpkeError::OpenFailed`] if AEAD verification fails.
     pub fn open_with_external_dh(
         dh: &[u8; 32],
         recipient_pk: &[u8; PUBLIC_KEY_LEN],
-        enc: &[u8],
+        enc: &ValidatedEnc,
         info: &[u8],
         aad: &[u8],
         ct: &[u8],
     ) -> Result<Vec<u8>, HpkeError> {
-        let (enc, _) = parse_enc(enc)?;
-        decap_and_open(dh, recipient_pk, enc, info, aad, ct)
+        decap_and_open(dh, recipient_pk, enc.as_bytes(), info, aad, ct)
     }
-}
-
-/// §9.5 point validation of a wire-read `enc`: exactly 65 bytes, led by
-/// `0x04`, on the curve, not the identity.
-fn parse_enc(enc: &[u8]) -> Result<(&[u8; ENC_LEN], P256PublicKey), HpkeError> {
-    let fixed: &[u8; ENC_LEN] = enc.try_into().map_err(|_| {
-        HpkeError::InvalidKey(format!(
-            "P-256 HPKE enc must be {ENC_LEN} bytes, got {}",
-            enc.len()
-        ))
-    })?;
-    let point = P256PublicKey::from_sec1(fixed)
-        .map_err(|e| HpkeError::InvalidKey(format!("P-256 HPKE enc: {e}")))?;
-    Ok((fixed, point))
 }
 
 /// Encap from a given ephemeral key + `KeySchedule` + AEAD seal at sequence 0.
@@ -553,8 +606,8 @@ mod tests {
     fn custody_open_recovers_rfc9180_a3_1_pt() -> TestResult {
         let (_, aad, _, ct) = ENCRYPTIONS[0];
         let sk_r = P256SigningKey::from_scalar_bytes(&arr::<32>(SK_RM)?)?;
-        let enc = unhex(ENC)?;
-        let dh = ecdh_p256(&sk_r, &P256PublicKey::from_sec1(&enc)?);
+        let enc = validate_enc(&unhex(ENC)?)?;
+        let dh = ecdh_p256(&sk_r, enc.point());
         let pt = custody::open_with_external_dh(
             &dh,
             &arr::<65>(PK_RM)?,
@@ -585,21 +638,25 @@ mod tests {
             assert_eq!(open(&sk, &enc, b"info", b"aad", &ct)?, pt, "len {len}");
 
             let sk_key = P256SigningKey::from_scalar_bytes(&sk)?;
-            let dh = ecdh_p256(&sk_key, &P256PublicKey::from_sec1(&enc)?);
-            let got = custody::open_with_external_dh(&dh, &pk, &enc, b"info", b"aad", &ct)?;
+            let valid = validate_enc(&enc)?;
+            assert_eq!(valid.as_bytes(), &enc, "ValidatedEnc keeps the wire bytes");
+            let dh = ecdh_p256(&sk_key, valid.point());
+            let got = custody::open_with_external_dh(&dh, &pk, &valid, b"info", b"aad", &ct)?;
             assert_eq!(got, pt, "custody len {len}");
         }
         Ok(())
     }
 
     /// Negative: an `enc` that is not 65 bytes is rejected as an invalid key
-    /// before any DH, on both open paths. Covers the 33-byte compressed form
+    /// before any DH: by `open`, and by `validate_enc`, the only way to reach
+    /// the custody open. Covers the 33-byte compressed form
     /// of a valid point, a 64-byte truncation, a 66-byte extension, and
     /// empty.
     #[test]
     fn open_rejects_enc_not_65_bytes() -> TestResult {
         let (sk, pk) = fresh_recipient()?;
         let (enc, ct) = seal(&pk, b"i", b"a", b"secret")?;
+        assert!(validate_enc(&enc).is_ok(), "a sealed enc must validate");
         let compressed = P256PublicKey::from_sec1(&enc)?.to_compressed();
         let mut long = enc.to_vec();
         long.push(0);
@@ -614,19 +671,17 @@ mod tests {
                 "open accepted a {len}-byte enc"
             );
             assert!(
-                matches!(
-                    custody::open_with_external_dh(&[0u8; 32], &pk, enc_bad, b"i", b"a", &ct),
-                    Err(HpkeError::InvalidKey(_))
-                ),
-                "custody open accepted a {len}-byte enc"
+                matches!(validate_enc(enc_bad), Err(HpkeError::InvalidKey(_))),
+                "validate_enc accepted a {len}-byte enc"
             );
         }
         Ok(())
     }
 
     /// Negative: a 65-byte `enc` led by `0x04` whose coordinates are off the
-    /// curve is rejected as an invalid key before any DH, on both open paths
-    /// and as a seal recipient. The off-curve point is the RFC's valid `enc`
+    /// curve is rejected as an invalid key before any DH: by `open`, by
+    /// `validate_enc` (the only way to reach the custody open), and as a seal
+    /// recipient. The off-curve point is the RFC's valid `enc`
     /// with its last `y` byte flipped, which breaks `y² = x³ − 3x + b`.
     #[test]
     fn open_rejects_enc_off_curve() -> TestResult {
@@ -659,11 +714,8 @@ mod tests {
                 hex::encode(bad)
             );
             assert!(
-                matches!(
-                    custody::open_with_external_dh(&[0u8; 32], &pk, &bad, b"i", b"a", &ct),
-                    Err(HpkeError::InvalidKey(_))
-                ),
-                "custody open accepted invalid enc {}",
+                matches!(validate_enc(&bad), Err(HpkeError::InvalidKey(_))),
+                "validate_enc accepted invalid enc {}",
                 hex::encode(bad)
             );
             assert!(
@@ -711,9 +763,10 @@ mod tests {
         ));
 
         let sk_key = P256SigningKey::from_scalar_bytes(&sk)?;
-        let dh = ecdh_p256(&sk_key, &P256PublicKey::from_sec1(&enc)?);
+        let valid = validate_enc(&enc)?;
+        let dh = ecdh_p256(&sk_key, valid.point());
         assert!(matches!(
-            custody::open_with_external_dh(&dh, &wrong_public, &enc, b"info", b"aad", &ct),
+            custody::open_with_external_dh(&dh, &wrong_public, &valid, b"info", b"aad", &ct),
             Err(HpkeError::OpenFailed(_))
         ));
         Ok(())
