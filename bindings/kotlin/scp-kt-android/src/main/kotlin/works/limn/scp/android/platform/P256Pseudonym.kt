@@ -48,8 +48,8 @@ internal object P256Pseudonym {
 
     /**
      * The pseudonym handle id for ([identityId], [contextId], [epoch]): the same inputs
-     * always name the same handle, so re-deriving replaces the entry instead of adding
-     * one. A `null` [epoch] is the v1 derivation.
+     * always name the same handle, so re-deriving keeps the existing entry (and wipes the
+     * new scalar) instead of adding one. A `null` [epoch] is the v1 derivation.
      */
     fun pseudonymId(identityId: String, contextId: ByteArray, epoch: Long?): String {
         val sha = MessageDigest.getInstance("SHA-256")
