@@ -5,11 +5,12 @@
 // These cases run against `AppleStorage` itself, opened at a database file this
 // process created under an encryption key this file holds, rather than against
 // the in-memory replica in `StorageConformanceTests.swift`. That replica shares
-// the schema, the query text, and the two parameter-binding helpers, and it
-// shares no other line of the six `AppleStorage` key-value method bodies, so a
-// defect in the rest of those six bodies reaches no assertion there.
+// the schema, the query text, the two parameter-binding helpers, and
+// `AppleStorage.readKeys(from:)`, the row loop behind `listKeys`, and it shares
+// no other line of the six `AppleStorage` key-value method bodies, so a defect
+// in the rest of those six bodies reaches no assertion there.
 //
-// Three properties these cases pin:
+// Four properties these cases pin:
 //
 // 1. The binding helpers `AppleStorage.bindText(_:to:at:)` and
 //    `AppleStorage.bindBlob(_:to:at:)`, through which every `AppleStorage`
@@ -24,16 +25,25 @@
 //    return, `exists` would answer `false` for a key the database holds, and
 //    `get` would answer `nil` for it. Acceptance criterion 5 of ADR-025 in
 //    `.docs/adrs/phase-5.md` states that property.
-// 2. `set`, `get`, `exists`, and `delete` round-trip values through the real
-//    database file, including a value of zero bytes.
+// 2. The six key-value methods round-trip values through the real database
+//    file, including a value of zero bytes, and `AppleStorage.readKeys(from:)`,
+//    the loop behind `listKeys`, throws unless its scan ends at `SQLITE_DONE`.
 // 3. Two keys that differ only after a zero byte name two rows for `set`,
-//    `get`, `exists`, and `delete`, and a prefix that carries a zero byte
-//    selects only the keys that match it past that byte for `listKeys` and
-//    `deletePrefix`. `sqlite3_bind_text` reads a negative length as "the bytes
-//    up to the first zero byte" and answers `SQLITE_OK` for that bind, so the
-//    return code property above rejects nothing there; the byte count each
-//    method passes is what separates the two keys. The same acceptance
-//    criterion states that property.
+//    `get`, `exists`, and `delete`, `listKeys` returns each of them whole, and
+//    a prefix that carries a zero byte selects only the keys that match it
+//    past that byte for `listKeys` and `deletePrefix`. `sqlite3_bind_text`
+//    reads a negative length as "the bytes up to the first zero byte" and
+//    answers `SQLITE_OK` for that bind, so the return code property above
+//    rejects nothing there; the byte count each method passes is what
+//    separates the two keys. The same acceptance criterion states that
+//    property.
+// 4. No file this storage writes carries a stored value in plaintext, which is
+//    the observable behind the same criterion's encryption clause: SQLCipher
+//    receives the 32-byte key through `PRAGMA key` before any other operation on
+//    the connection, and plain SQLite ignores that pragma without an error.
+//    `AppleStorage.open(at:encryptionKey:cipherVersion:)` throws for a
+//    connection that reports no SQLCipher version, and an open that throws
+//    after `sqlite3_open` leaves no descriptor on the database file.
 //
 // See ADR-025 in `.docs/adrs/phase-5.md`, and §17.11 and §17.13 of the
 // persistence-and-storage spec.
@@ -107,6 +117,30 @@
             throw StorageError.databaseError("could not create the kv table")
         }
         return connection
+    }
+
+    /// The paths of this process's open file descriptors whose path contains
+    /// `name`, read through `fcntl(F_GETPATH)`.
+    ///
+    /// Swift cannot call C's variadic `fcntl`. The Darwin overlay declares a
+    /// non-variadic `fcntl(_:_:_:)` whose third argument is a non-optional
+    /// `UnsafeMutableRawPointer`, so this function unwraps the buffer's base
+    /// address before the call.
+    private func openDescriptors(naming name: String) -> [String] {
+        var paths: [String] = []
+        for descriptor in 0 ..< getdtablesize() {
+            var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+            let found = buffer.withUnsafeMutableBytes { raw in
+                guard let base = raw.baseAddress else { return false }
+                return fcntl(descriptor, F_GETPATH, base) != -1
+            }
+            guard found else { continue }
+            let path = String(cString: buffer)
+            if path.contains(name) {
+                paths.append(path)
+            }
+        }
+        return paths
     }
 
     // MARK: - Bind-status tests
@@ -250,6 +284,62 @@
         }
     }
 
+    // MARK: - Key-scan tests
+
+    /// Cases that pin how `AppleStorage.readKeys(from:)`, the loop behind
+    /// `listKeys`, ends a scan.
+    struct AppleStorageKeyScanTests {
+        /// `abs` raises SQLite's "integer overflow" error for the smallest
+        /// 64-bit integer, so this statement answers `SQLITE_ROW` for `a` and
+        /// then an error for `b`. A loop that stops on any answer other than
+        /// `SQLITE_ROW` would return `["a"]` as a complete list.
+        @Test("readKeys throws when a step ends the scan with an error")
+        func readKeysThrowsOnStepError() throws {
+            let connection = try makeBareConnection()
+            defer { sqlite3_close_v2(connection) }
+
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let sql = """
+            SELECT CASE WHEN column1 = 'b' THEN abs(-9223372036854775807 - 1) ELSE column1 END
+            FROM (VALUES ('a'), ('b'))
+            """
+            #expect(sqlite3_prepare_v2(connection, sql, -1, &stmt, nil) == SQLITE_OK)
+
+            #expect(throws: StorageError.self) {
+                _ = try AppleStorage.readKeys(from: stmt)
+            }
+        }
+
+        @Test("readKeys throws when a key row reads NULL")
+        func readKeysThrowsOnNullKey() throws {
+            let connection = try makeBareConnection()
+            defer { sqlite3_close_v2(connection) }
+
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let sql = "SELECT column1 FROM (VALUES ('a'), (NULL))"
+            #expect(sqlite3_prepare_v2(connection, sql, -1, &stmt, nil) == SQLITE_OK)
+
+            #expect(throws: StorageError.self) {
+                _ = try AppleStorage.readKeys(from: stmt)
+            }
+        }
+
+        @Test("readKeys returns every key when the scan ends with SQLITE_DONE")
+        func readKeysReturnsEveryKey() throws {
+            let connection = try makeBareConnection()
+            defer { sqlite3_close_v2(connection) }
+
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let sql = "SELECT column1 FROM (VALUES ('a'), ('b'))"
+            #expect(sqlite3_prepare_v2(connection, sql, -1, &stmt, nil) == SQLITE_OK)
+
+            #expect(try AppleStorage.readKeys(from: stmt) == ["a", "b"])
+        }
+    }
+
     // MARK: - Round-trip tests
 
     /// Cases that run `AppleStorage`'s key-value methods against a real
@@ -298,6 +388,99 @@
             #expect(try await fixture.storage.get(key: "beta") == nil)
         }
 
+        @Test("listKeys returns the keys carrying a prefix, in lexicographic order")
+        func listKeysReturnsSortedPrefixMatches() async throws {
+            let fixture = try makeStorageFixture()
+            defer { fixture.removeFiles() }
+
+            try await fixture.storage.set(key: "ctx/z", value: Data([0x01]))
+            try await fixture.storage.set(key: "ctx/a", value: Data([0x02]))
+            try await fixture.storage.set(key: "other/x", value: Data([0x03]))
+
+            let keys = try await fixture.storage.listKeys(prefix: "ctx/")
+            #expect(keys == ["ctx/a", "ctx/z"])
+        }
+
+        @Test("listKeys with an empty prefix returns every key")
+        func listKeysWithEmptyPrefixReturnsEveryKey() async throws {
+            // An empty prefix has no successor, so `listKeys` takes its second
+            // branch, which binds one parameter rather than two.
+            let fixture = try makeStorageFixture()
+            defer { fixture.removeFiles() }
+
+            try await fixture.storage.set(key: "b", value: Data([0x01]))
+            try await fixture.storage.set(key: "a", value: Data([0x02]))
+
+            let keys = try await fixture.storage.listKeys(prefix: "")
+            #expect(keys == ["a", "b"])
+        }
+
+        @Test("deletePrefix removes the matching keys and counts them")
+        func deletePrefixRemovesMatchingKeys() async throws {
+            let fixture = try makeStorageFixture()
+            defer { fixture.removeFiles() }
+
+            try await fixture.storage.set(key: "ctx/a", value: Data([0x01]))
+            try await fixture.storage.set(key: "ctx/b", value: Data([0x02]))
+            try await fixture.storage.set(key: "other/x", value: Data([0x03]))
+
+            let deleted = try await fixture.storage.deletePrefix(prefix: "ctx/")
+            #expect(deleted == 2)
+            #expect(try await fixture.storage.listKeys(prefix: "") == ["other/x"])
+        }
+
+        @Test("deletePrefix with an empty prefix removes every key")
+        func deletePrefixWithEmptyPrefixRemovesEveryKey() async throws {
+            let fixture = try makeStorageFixture()
+            defer { fixture.removeFiles() }
+
+            try await fixture.storage.set(key: "a", value: Data([0x01]))
+            try await fixture.storage.set(key: "b", value: Data([0x02]))
+
+            let deleted = try await fixture.storage.deletePrefix(prefix: "")
+            #expect(deleted == 2)
+            #expect(try await fixture.storage.listKeys(prefix: "") == [])
+        }
+
+        @Test("no database file holds a stored value in plaintext")
+        func storedValueNeverAppearsInPlaintextOnDisk() async throws {
+            // Acceptance criterion 5 of ADR-025 states that the 32-byte key
+            // reaches SQLCipher through `PRAGMA key` before any other operation
+            // on the connection. Plain SQLite ignores an unknown pragma without
+            // an error, and `open(at:encryptionKey:cipherVersion:)` rejects a
+            // plain-SQLite connection because that connection answers
+            // `PRAGMA cipher_version` with no row. This case checks the
+            // outcome that check exists for, independently of the check: the
+            // bytes a stored value leaves on disk do not contain that value.
+            let fixture = try makeStorageFixture()
+            defer { fixture.removeFiles() }
+
+            let marker = Data("scp-plaintext-marker".utf8)
+            try await fixture.storage.set(key: "marker", value: marker)
+            #expect(try await fixture.storage.get(key: "marker") == marker)
+
+            // Write-ahead logging puts a fresh row in `<name>-wal` before a
+            // checkpoint moves it into the database file, so both files carry
+            // the value at some point and this case reads all three paths.
+            var bytesRead = 0
+            for suffix in ["", "-wal", "-shm"] {
+                let path = fixture.fileURL.path + suffix
+                guard FileManager.default.fileExists(atPath: path) else { continue }
+                let bytes = try Data(contentsOf: URL(fileURLWithPath: path))
+                bytesRead += bytes.count
+                #expect(
+                    bytes.range(of: marker) == nil,
+                    "the file at \(path) carries a stored value in plaintext"
+                )
+            }
+            // A case that read no bytes would pass for a plaintext build, so
+            // it requires that it searched some bytes. The page `open` writes
+            // when it creates the `kv` table meets this check by itself, so the
+            // check does not prove the stored row reached any of these files;
+            // only the marker search above looks for that row.
+            #expect(bytesRead > 0, "no database file held any bytes to search")
+        }
+
         @Test("set overwrites the value an earlier set stored")
         func setOverwritesAnEarlierValue() async throws {
             let fixture = try makeStorageFixture()
@@ -312,9 +495,10 @@
         func keysDifferingAfterAZeroByteNameTwoRows() async throws {
             // An implementation that binds a key as a C string stores both of
             // these under the five-byte key `delta`, so the second `set`
-            // overwrites the first and `get` answers `[0x02]` for both. Five of
-            // the seven assertions below fail for that implementation; a
-            // measured run of it recorded those five.
+            // overwrites the first, `get` answers `[0x02]` for both, and
+            // `listKeys` answers `["delta"]`. Six of the eight assertions below
+            // fail for that implementation; a measured run of it recorded those
+            // six.
             let fixture = try makeStorageFixture()
             defer { fixture.removeFiles() }
 
@@ -327,6 +511,7 @@
             #expect(try await fixture.storage.get(key: second) == Data([0x02]))
             #expect(try await fixture.storage.get(key: "delta") == nil)
             #expect(try await fixture.storage.exists(key: "delta") == false)
+            #expect(try await fixture.storage.listKeys(prefix: "delta") == [first, second])
 
             try await fixture.storage.delete(key: first)
             #expect(try await fixture.storage.exists(key: first) == false)
@@ -363,6 +548,97 @@
             #expect(try await fixture.storage.exists(key: below) == true)
             #expect(try await fixture.storage.exists(key: first) == false)
             #expect(try await fixture.storage.exists(key: second) == true)
+        }
+    }
+
+    // MARK: - Open and the SQLCipher gate
+
+    /// Cases that pin what `AppleStorage.open(at:encryptionKey:cipherVersion:)`
+    /// does when the connection it opened is not SQLCipher or cannot be
+    /// configured.
+    struct AppleStorageOpenTests {
+        @Test("an open that fails after sqlite3_open leaves no descriptor on the file")
+        func failedOpenClosesTheConnection() throws {
+            // `AppleStorage` closes its connection in `deinit`, and no instance
+            // exists while `open(at:encryptionKey:cipherVersion:)` still runs, so every
+            // statement that throws inside `open` must close the connection
+            // itself. A file written under one key and reopened under another
+            // makes `open` throw at the first statement SQLCipher runs against
+            // a page.
+            let fileURL: URL = try { () throws -> URL in
+                // The fixture's storage goes out of scope when this closure
+                // returns, and its `deinit` closes the first connection.
+                let fixture = try makeStorageFixture()
+                return fixture.fileURL
+            }()
+            defer {
+                for suffix in ["", "-wal", "-shm"] {
+                    try? FileManager.default.removeItem(atPath: fileURL.path + suffix)
+                }
+            }
+            #expect(openDescriptors(naming: fileURL.lastPathComponent).isEmpty)
+
+            #expect(throws: StorageError.self) {
+                _ = try AppleStorage.open(
+                    at: fileURL,
+                    encryptionKey: Data(repeating: 0x55, count: 32)
+                )
+            }
+            #expect(
+                openDescriptors(naming: fileURL.lastPathComponent).isEmpty,
+                "a failed open left a descriptor on the database file"
+            )
+        }
+
+        @Test("the SQLite library this test process linked answers PRAGMA cipher_version")
+        func linkedLibraryReportsSQLCipherVersion() throws {
+            let connection = try makeBareConnection()
+            defer { sqlite3_close_v2(connection) }
+            #expect(try !AppleStorage.sqlCipherVersion(db: connection).isEmpty)
+        }
+
+        @Test("open throws and closes the file when the connection reports no SQLCipher version")
+        func openRejectsConnectionWithoutSQLCipherVersion() throws {
+            // The probe answers the way plain SQLite answers
+            // `PRAGMA cipher_version`: with no row. Deleting the version check
+            // from `open(at:encryptionKey:cipherVersion:)` makes `open` return
+            // storage here, and this case fails.
+            let fileURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("scp-storage-test-\(UUID().uuidString).db")
+            defer {
+                for suffix in ["", "-wal", "-shm"] {
+                    try? FileManager.default.removeItem(atPath: fileURL.path + suffix)
+                }
+            }
+
+            do {
+                _ = try AppleStorage.open(
+                    at: fileURL,
+                    encryptionKey: Data(repeating: 0x2A, count: 32),
+                    cipherVersion: { _ in try AppleStorage.requireSQLCipherVersion([]) }
+                )
+                Issue.record("open returned storage on a connection that reported no SQLCipher version")
+            } catch let StorageError.databaseError(message) {
+                #expect(message.contains("cipher_version"))
+            } catch {
+                Issue.record("caught \(error), which is not StorageError.databaseError")
+            }
+            #expect(
+                openDescriptors(naming: fileURL.lastPathComponent).isEmpty,
+                "a failed open left a descriptor on the database file"
+            )
+        }
+
+        @Test("a cipher_version answer with no version rejects the connection")
+        func missingSQLCipherVersionThrows() throws {
+            // Plain SQLite answers the unknown pragma with no row.
+            #expect(throws: StorageError.self) {
+                try AppleStorage.requireSQLCipherVersion([])
+            }
+            #expect(throws: StorageError.self) {
+                try AppleStorage.requireSQLCipherVersion([""])
+            }
+            #expect(try AppleStorage.requireSQLCipherVersion(["4.6.1 community"]) == "4.6.1 community")
         }
     }
 
