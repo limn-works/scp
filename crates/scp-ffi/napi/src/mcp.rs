@@ -232,11 +232,19 @@ impl StdioMcpTransport {
             guard.validate_command(cmd).map_err(|e| e.to_string())?
         };
 
-        let mut child = Command::new(&basename)
+        let mut command = Command::new(&basename);
+        command
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        // A launcher such as `npx` or `uvx` runs the server as its own child,
+        // which holds the stdout pipe. The server gets a process group of its
+        // own, so `stop_server_process` kills the launcher and every process
+        // it started, and a call reading stdout sees EOF.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let mut child = command
             .spawn()
             .map_err(|e| format!("failed to spawn '{basename}': {e}"))?;
 
@@ -951,8 +959,9 @@ pub(crate) async fn mcp_client_disconnect_on(
         }
         .into());
     };
-    // A stdio server is dead when this returns, even while a call on the
-    // handle is in flight; that call then fails on the closed stdout.
+    // A stdio server, and every process in its process group, is dead when
+    // this returns, even while a call on the handle is in flight; that call
+    // then fails on the closed stdout.
     if let Some(server) = entry.stdio_server {
         scp_mcp::stdio::stop_server_process(&server);
     }
@@ -1281,10 +1290,13 @@ mod tests {
     /// A `tools/list` in flight against a silent stdio server holds a blocking
     /// thread and its own clone of the client, not the registry shard, so a
     /// disconnect of the same handle returns at once, and it kills the server
-    /// process, so the in-flight call ends on the closed stdout. The stub
-    /// server writes a notification before its `initialize` response, which
-    /// the client reads past, then becomes a `sleep` that never answers and
-    /// outlives the test unless the disconnect kills it.
+    /// process group, so the in-flight call ends on the closed stdout. The
+    /// stub server writes a notification before its `initialize` response,
+    /// which the client reads past, then waits on a `sleep` child that holds
+    /// the stdout pipe and never answers, as the server an `npx` or `uvx`
+    /// launcher starts does. Killing the shell alone leaves the `sleep`
+    /// holding stdout, so the call ends only when the disconnect kills the
+    /// whole group.
     #[test]
     fn mcp_client_disconnect_does_not_wait_on_an_in_flight_call_napi() {
         let bi = NapiBridgeInstance::new_napi();
@@ -1295,7 +1307,7 @@ mod tests {
             echo '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}'; \
             echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\
             \"capabilities\":{},\"serverInfo\":{\"name\":\"stub\"}}}'; \
-            exec sleep 600";
+            sleep 600 & wait";
         let transport = StdioMcpTransport::spawn(
             &allowlist,
             &["sh".to_owned(), "-c".to_owned(), script.to_owned()],
@@ -1341,9 +1353,10 @@ mod tests {
             .await
         });
         if joined.is_err() {
-            // Free the parked blocking thread, or the runtime's drop waits on
-            // it for the stub's whole sleep.
+            // Stop the stub, and do not let the runtime's drop wait on the
+            // parked blocking thread for the whole sleep.
             scp_mcp::stdio::stop_server_process(&server);
+            runtime.shutdown_background();
         }
         let (listed, disconnect_took) =
             joined.expect("the in-flight call must end once disconnect kills the server");
