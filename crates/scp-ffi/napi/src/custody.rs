@@ -472,14 +472,11 @@ impl KeyCustody for NapiCallbackKeyCustody {
 /// Enum dispatch wrapper for the [`KeyCustody`] implementations the napi-rs
 /// bridge uses. Since [`KeyCustody`] is not object-safe (RPITIT), this enum
 /// wraps the concrete types and delegates each method to the active variant.
-// The `InMemory` variant exists only in `testing` builds, and each identity
-// holds one custody value, so boxing it would buy nothing. Same allowance as
-// the PyO3 `FfiKeyCustody`.
-#[allow(clippy::large_enum_variant)]
 pub(crate) enum NapiKeyCustody {
     /// Test/dev in-memory custody (feature-gated), wrapped for redacted Debug.
+    /// Boxed so the enum stays the size of the callback variant.
     #[cfg(feature = "testing")]
-    InMemory(OpaqueInMemoryKeyCustody),
+    InMemory(Box<OpaqueInMemoryKeyCustody>),
     /// Caller-provided custody backed by JS callbacks.
     Callback(NapiCallbackKeyCustody),
 }
@@ -673,7 +670,9 @@ mod tests {
     /// is covered in plain `cargo test`.
     #[tokio::test]
     async fn napi_key_custody_in_memory_dispatch() {
-        let custody = NapiKeyCustody::InMemory(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let custody = NapiKeyCustody::InMemory(Box::new(OpaqueInMemoryKeyCustody(
+            InMemoryKeyCustody::new(),
+        )));
         let handle = custody
             .generate_keypair(KeyType::Ed25519)
             .await
@@ -699,7 +698,9 @@ mod tests {
     /// locally too — covered by the inherent test below).
     #[tokio::test]
     async fn napi_key_custody_in_memory_ephemeral_seed() {
-        let custody = NapiKeyCustody::InMemory(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let custody = NapiKeyCustody::InMemory(Box::new(OpaqueInMemoryKeyCustody(
+            InMemoryKeyCustody::new(),
+        )));
         let seed = custody
             .generate_ephemeral_ed25519_seed()
             .await

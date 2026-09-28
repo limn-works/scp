@@ -482,9 +482,9 @@ pub async fn testing_pseudonym_routing_id_from_seed(
         })?);
     let in_memory = scp_platform::testing::InMemoryKeyCustody::new();
     let identity_key = in_memory.import_ed25519_key(&seed).await;
-    let custody = crate::custody::NapiKeyCustody::InMemory(
+    let custody = crate::custody::NapiKeyCustody::InMemory(Box::new(
         crate::identity::OpaqueInMemoryKeyCustody(in_memory),
-    );
+    ));
     let routing_id =
         crate::context::derive_pseudonym_bytes(&custody, &identity_key, &context_id).await?;
     Ok(Buffer::from(routing_id.to_vec()))

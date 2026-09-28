@@ -1386,12 +1386,12 @@ mod tests {
         use scp_platform::testing::InMemoryKeyCustody;
 
         // Create two distinct identities (creator and delegator).
-        let custody_a = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+        let custody_a = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
             OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
-        ));
-        let custody_b = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+        )));
+        let custody_b = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
             OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
-        ));
+        )));
         let pre_rotation_custody_a =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         let pre_rotation_custody_b =
@@ -1506,9 +1506,9 @@ mod tests {
         use scp_identity::DidMethod;
         use scp_platform::testing::InMemoryKeyCustody;
 
-        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
             OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
-        ));
+        )));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         let dht = scp_identity::DidDht::with_client(std::sync::Arc::new(
@@ -1567,9 +1567,9 @@ mod tests {
         use scp_identity::DidMethod;
         use scp_platform::testing::InMemoryKeyCustody;
 
-        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
             OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
-        ));
+        )));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         let dht = scp_identity::DidDht::with_client(std::sync::Arc::new(
