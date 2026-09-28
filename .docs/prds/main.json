@@ -3020,7 +3020,8 @@
       "result": "MCP server with ContextProvider trait, capability filtering, tool namespacing. 42 tests.",
       "blockedByIssues": [
         2506,
-        2512
+        2512,
+        2513
       ]
     },
     {
@@ -3070,7 +3071,7 @@
           "axum (HTTP/SSE)",
           "serde_json (JSON-RPC serialization)"
         ],
-        "audit_note": "Downgraded from done (audit): two SSE criteria are unmet. The criterion 'suitable for web-based MCP clients and remote integrations' is unmet in both halves. Web-based clients: a browser's EventSource cannot set the Authorization header, so the server answers its GET /sse with HTTP 401, and the server answers a CORS preflight with HTTP 401 and no Access-Control-Allow-* header, so the browser blocks a fetch() that sets the header. Remote integrations: neither the SSE server nor the SDK SSE client has TLS, the client refuses to send a bearer token to a host that is not loopback, and the server answers every tokenless request with HTTP 401, so no SDK client can reach an SSE server on another host. Reachability from an SDK: no bridge returns the port it bound or the bearer token SseConfig::new drew, so a caller cannot connect any client to an SSE server a bridge starts."
+        "audit_note": "Downgraded from done (audit): two SSE criteria are unmet, 'suitable for web-based MCP clients and remote integrations' and 'HTTP server (configurable host:port) serves SSE endpoint for server-to-client messages'. The criterion 'suitable for web-based MCP clients and remote integrations' is unmet in both halves. Web-based clients: a browser's EventSource cannot set the Authorization header, so the server answers its GET /sse with HTTP 401, and the server answers a CORS preflight with HTTP 401 and no Access-Control-Allow-* header, so the browser blocks a fetch() that sets the header. Remote integrations: neither the SSE server nor the SDK SSE client has TLS, the client refuses to send a bearer token to a host that is not loopback, and the server answers every tokenless request with HTTP 401, so no SDK client can reach an SSE server on another host. The criterion 'HTTP server (configurable host:port) serves SSE endpoint for server-to-client messages' is unmet on every bridge: the PyO3, UniFFI and NAPI bridges each bind the SSE server to 127.0.0.1 port 0, so a caller cannot choose the host or the port, and no bridge returns the port it bound or the bearer token SseConfig::new drew, so a caller cannot connect any client to an SSE server a bridge starts."
       },
       "blockedByIssues": [
         2311,
