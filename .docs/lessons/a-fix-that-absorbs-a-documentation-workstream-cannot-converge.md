@@ -4,12 +4,26 @@ A fix that made one example compile on a shipped build grew to 1,204 inserted li
 across 37 files. Nineteen review rounds later the branch was still producing findings, and
 in the nineteenth round a reviewer falsified three claims that the two newest commits had
 added. Deleting most of the sentences about subsystems the branch never modified ended the
-loop that fixing individual sentences could not. Three such passages stayed, because
-deleting each would put back a false sentence or leave a refusal unexplained: the rustdoc
-of `identity_execute_custody_migration` in `crates/scp-ffi/src/identity.rs`, which had said
-its backend succeeds; the operator guide's paragraph on why a shipped full node exits 1;
-and the reason in the `--ephemeral` refusal message. The rule below does not admit them;
-they are the exceptions this branch took.
+loop that fixing individual sentences could not. Outside the example the branch fixed
+(`crates/scp-node/examples/website.rs` and its `README.md`), eleven passages stayed that
+explain a fail-closed backend the branch never modified: `NoPreRotationBackend` on identity
+creation, or the unconfigured custody-migration backend. Each stayed because deleting it
+would put back a false sentence or leave a refusal unexplained:
+
+- `crates/scp-ffi/src/identity.rs`: the rustdoc of `identity_execute_custody_migration`,
+  which had said its backend succeeds.
+- `crates/scp-node/src/main.rs`: item 1 of the module doc, the rustdoc of
+  `run_full_node_persistent`, and the reason in the `--ephemeral` refusal message.
+- `docs/guides/relay-operations.md`: the Identity cell of the full-node row in the modes
+  table, the comment on the full-node command below it, the identity bullet in §6, and the
+  Production deployment and Development deployment paragraphs on why a shipped full node
+  exits 1.
+- `.docs/guides/deploying-an-scp-website.md`: the opening paragraph on why each recipe
+  fails on a shipped build.
+- `.docs/guides/self-hosting-a-website-on-scp.md`: the parenthetical in the `host_site`
+  running-log entry on why the example command exits 1.
+
+The rule below does not admit them; they are the exceptions this branch took.
 
 ## The Rule
 
