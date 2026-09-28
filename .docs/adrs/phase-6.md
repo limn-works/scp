@@ -1315,7 +1315,7 @@ dependencies {
 12. **Jetpack Compose integration (`works.limn:scp-kt-android` state holders; `works.limn:scp-kt` takes no Compose dependency):**
     - `rememberScpHotStream` recomposes with the flow its `start` returned — verified in `StateHoldersTest`.
     - When a composable holding `rememberScpContext` leaves the composition, `ScpContextHolder.dispose()` cancels the holder's scope before it calls `onDispose`, so the callback launches its `leave` on a scope that disposal never cancels — verified with `ComposeContentTestRule` in `StateHoldersTest`.
-    - `rememberScpHotStream`'s disposal returns while its `onStop` is still suspended, and a start that reaches its key's mutex after its own mount's stop does not run — verified in `StateHoldersTest`.
+    - `rememberScpHotStream`'s disposal returns while its `onStop` is still suspended, and a start that reaches its key's mutex after its own mount's stop does not run — verified in `StateHoldersTest.kt`.
 
 13. **No logic in Kotlin layer:**
     - Code review: every public SDK method body contains exactly one `NativeLib.*` call (plus `withContext` and error mapping). No branching protocol logic exists in any ergonomics-layer file.
