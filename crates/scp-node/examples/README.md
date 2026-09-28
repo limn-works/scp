@@ -22,8 +22,10 @@ asks for `IdentitySource::Persisted`, and creating a new identity needs a
 a build without `testing` fails closed rather than mint a nullifier-backed
 identity. The example's own doc comment quotes the error.
 
-Each run stores its identity in a fresh directory under the system temporary
-directory, not in the `scp-node` binary's default storage directory. The binary
+Each run stores its identity in a new, randomly named, owner-only directory
+under the system temporary directory, created with `tempfile::TempDir` and
+removed when the example exits, never in the `scp-node` binary's default storage
+directory. A run never reloads an identity an earlier run left behind. The binary
 reloads any identity it finds there without checking how it was created, so an
 identity a `testing` run minted must never land there.
 

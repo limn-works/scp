@@ -21,12 +21,16 @@
 //! without `testing` fails closed here instead of minting a nullifier-backed
 //! identity.
 //!
-//! Each run stores its identity in a fresh directory of its own under the system
-//! temporary directory, never in the `scp-node` binary's default storage
-//! directory. A `testing` run mints its identity with that test-harness custody,
-//! and the binary reloads whatever identity its storage directory holds without
-//! checking how it was created, so writing there would put a test-harness
-//! identity behind a shipped `scp-node --self-host`.
+//! Each run stores its identity in a new directory under the system temporary
+//! directory, never in the `scp-node` binary's default storage directory.
+//! `tempfile::TempDir` creates that directory with a random name, fails if the
+//! name already exists, gives it owner-only permissions on Unix, and removes it
+//! when `main` returns, including after Ctrl-C and after the exit-1 error above.
+//! A run therefore never reloads an identity an earlier run or another local
+//! user left behind. A `testing` run mints its identity with that test-harness
+//! custody, and the binary reloads whatever identity its storage directory holds
+//! without checking how it was created, so writing to the binary's directory
+//! would put a test-harness identity behind a shipped `scp-node --self-host`.
 //!
 //! This is a safe LOCAL demo: it uses `TlsMode::Plaintext` (plain HTTP),
 //! `Reach::Local` (no NAT/UPnP probe, loopback-only addressing), and
@@ -49,17 +53,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             8080
         })
     });
+    // A new, owner-only, randomly named directory per run, removed when
+    // `storage` drops at the end of `main`. See the doc comment for why this
+    // example never uses the default storage directory the binary shares.
+    let storage = tempfile::Builder::new()
+        .prefix("scp-website-example-")
+        .tempdir()?;
     host_site(HostSiteConfig {
         tls: TlsMode::Plaintext,
         dht: DhtMode::Disabled,
         // `CARGO_MANIFEST_DIR` makes the sample-site path independent of the
         // directory `cargo run` is invoked from.
         site_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/website-site").into()),
-        // A fresh directory per run: see the doc comment for why this example
-        // never uses the default storage directory the binary shares.
-        storage_path: Some(
-            std::env::temp_dir().join(format!("scp-website-example-{}", std::process::id())),
-        ),
+        storage_path: Some(storage.path().to_path_buf()),
         port,
         on_ready: Some(Box::new(|ready| {
             let scheme = if ready.plaintext { "http" } else { "https" };
