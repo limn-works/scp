@@ -181,11 +181,12 @@ pub fn read_line_bounded<R: std::io::BufRead>(
 /// releases the client. Each bridge spawns the server as the leader of its
 /// own process group, and a launcher such as `npx` or `uvx` runs the real
 /// server as a member of that group that inherits the stdout pipe. On Unix
-/// (not OpenBSD or Redox, which lack `waitid`) the whole group is killed, which closes every holder of that stdout, and
-/// the in-flight [`read_response`] then fails on EOF. The group is signalled
-/// only while the leader is unreaped, because only then can its pid, the
-/// group id, name no other process: a second call (a disconnect, then the
-/// client's drop) signals nothing. Elsewhere only the direct child is killed,
+/// (not OpenBSD or Redox, which lack `waitid`) the whole group gets
+/// `SIGKILL`, which closes every holder of that stdout, and the in-flight
+/// [`read_response`] then fails on EOF. The group is signalled only while the
+/// leader is unreaped, because only then can its pid, the group id, name no
+/// other process: a second call (a disconnect, then the client's drop)
+/// signals nothing. Elsewhere only the direct child is killed,
 /// and a process it started keeps the pipe open. A poisoned lock still
 /// yields the child, because a leaked server outlives every caller.
 pub fn stop_server_process(child: &std::sync::Mutex<std::process::Child>) {

@@ -3,9 +3,13 @@
 //! Implements the MCP SSE transport mode: an HTTP server that serves an SSE
 //! endpoint for server-to-client messages and a POST endpoint for
 //! client-to-server JSON-RPC requests. ADR-015 §5 specifies it for web-based
-//! MCP clients and remote integrations. It has no TLS yet, so every SDK's SSE
-//! client refuses to send a bearer token to a host that is not loopback, and
-//! no SDK client can reach this server from another host.
+//! MCP clients and remote integrations, and it serves neither of them yet. It
+//! has no TLS, so every SDK's SSE client refuses to send a bearer token to a
+//! host that is not loopback, and no SDK client can reach this server from
+//! another host. The bearer check runs before routing and answers a
+//! browser's `EventSource`, which cannot set an `Authorization` header, and
+//! every CORS preflight (`OPTIONS`) with HTTP 401 and no
+//! `Access-Control-Allow-*` header, so no browser-hosted client can reach it.
 //!
 //! ## Endpoints
 //!
@@ -35,8 +39,11 @@
 //! outputs, resource reads) to whichever client connects next. The server
 //! emits a `retry:` field so clients respect a server-controlled
 //! reconnection interval, and a client that falls behind the broadcast
-//! channel has its stream terminated so it reconnects into a clean session
-//! rather than silently missing events.
+//! channel has its stream terminated rather than silently missing events: it
+//! resyncs only by connecting again into a clean session. The shipped
+//! [`SseClientTransport`](crate::sse_client::SseClientTransport) does not
+//! reconnect: every call on it after the stream ends fails, and its caller
+//! connects a new transport.
 //!
 //! ## Keep-alive
 //!
