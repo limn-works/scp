@@ -55,6 +55,9 @@ class CryptoKeychain implements KeyCustodyProvider {
   #seeds = new Map<string, Uint8Array>();
   // Pseudonym key ids → P-256 private scalar (§9.10.4.A).
   #pseudonyms = new Map<string, bigint>();
+  // Pseudonym key id -> the identity key id it was derived from, so destroying
+  // the identity destroys its pseudonyms (§9.10.4.A).
+  #pseudonymOwner = new Map<string, string>();
   #next = 1;
   readonly #fault: PseudonymFault | undefined;
 
@@ -110,6 +113,13 @@ class CryptoKeychain implements KeyCustodyProvider {
   destroyKey(keyId: string): void {
     this.#seeds.delete(keyId);
     this.#pseudonyms.delete(keyId);
+    this.#pseudonymOwner.delete(keyId);
+    // A pseudonym dies with its identity (§9.10.4.A).
+    for (const [kid, owner] of [...this.#pseudonymOwner]) {
+      if (owner !== keyId) continue;
+      this.#pseudonyms.delete(kid);
+      this.#pseudonymOwner.delete(kid);
+    }
   }
 
   dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array {
@@ -148,9 +158,10 @@ class CryptoKeychain implements KeyCustodyProvider {
 
   // Register the §9.10.4.A P-256 pseudonym of a context seed under `keyId`.
   // Native software custody keys the recipe on the Ed25519 identity seed.
-  #registerPseudonym(contextSeed: Uint8Array, keyId: string): PseudonymResult {
+  #registerPseudonym(owner: string, contextSeed: Uint8Array, keyId: string): PseudonymResult {
     const d = pseudonymScalar(contextSeed);
     this.#pseudonyms.set(keyId, d);
+    this.#pseudonymOwner.set(keyId, owner);
     const point = p256Compressed(d);
     // A host still on the retired 32-byte Ed25519 pseudonym shape.
     const publicKey = this.#fault === "legacy32" ? point.subarray(1) : point;
@@ -159,6 +170,7 @@ class CryptoKeychain implements KeyCustodyProvider {
 
   derivePseudonym(keyId: string, contextId: Uint8Array): PseudonymResult {
     return this.#registerPseudonym(
+      keyId,
       pseudonymSeedV1(this.#identitySeed(keyId), contextId),
       CryptoKeychain.#pseudonymKeyId(keyId, contextId),
     );
@@ -170,6 +182,7 @@ class CryptoKeychain implements KeyCustodyProvider {
     pseudonymEpoch: bigint,
   ): PseudonymResult {
     return this.#registerPseudonym(
+      keyId,
       pseudonymSeedV2(this.#identitySeed(keyId), contextId, pseudonymEpoch),
       CryptoKeychain.#pseudonymKeyId(keyId, contextId, pseudonymEpoch),
     );
@@ -199,6 +212,29 @@ class SignOnlyKeychain extends CryptoKeychain {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+describe("CryptoKeychain pseudonym lifecycle", () => {
+  test("destroying an identity destroys its v1 and v2 pseudonyms (§9.10.4.A)", () => {
+    const keychain = new CryptoKeychain();
+    const identity = keychain.generateKeypair("ed25519");
+    const other = keychain.generateKeypair("ed25519");
+    const ctx = new TextEncoder().encode("ctx");
+    const v1 = keychain.derivePseudonym(identity, ctx).keyId;
+    const v2 = keychain.deriveRotatablePseudonym(identity, ctx, 3n).keyId;
+    const kept = keychain.derivePseudonym(other, ctx).keyId;
+    const digest = new Uint8Array(crypto.createHash("sha256").update("message").digest());
+    expect(keychain.sign(v1, digest).length).toBe(64);
+    expect(keychain.sign(v2, digest).length).toBe(64);
+
+    keychain.destroyKey(identity);
+
+    for (const kid of [v1, v2]) {
+      expect(() => keychain.sign(kid, digest)).toThrow();
+      expect(() => keychain.getPublicKey(kid)).toThrow();
+    }
+    expect(keychain.sign(kept, digest).length).toBe(64);
+  });
+});
 
 if (!scpAvailable) {
   describe("identityCreateWithCustody (SKIPPED)", () => {

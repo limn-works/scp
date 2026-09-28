@@ -134,6 +134,9 @@ class _FakeKeychain:
         self._seeds: dict[str, bytes] = {}
         # Pseudonym key id -> P-256 private scalar (§9.10.4).
         self._pseudonyms: dict[str, int] = {}
+        # Pseudonym key id -> the identity key id it was derived from, so
+        # destroying the identity destroys its pseudonyms (§9.10.4.A).
+        self._pseudonym_owner: dict[str, str] = {}
         self._next = 1
 
     def generate_keypair(self, key_type: str) -> str:
@@ -158,6 +161,12 @@ class _FakeKeychain:
     def destroy_key(self, key_id: str) -> None:
         self._seeds.pop(key_id, None)
         self._pseudonyms.pop(key_id, None)
+        self._pseudonym_owner.pop(key_id, None)
+        # A pseudonym dies with its identity (§9.10.4.A).
+        owned = [kid for kid, owner in self._pseudonym_owner.items() if owner == key_id]
+        for kid in owned:
+            self._pseudonyms.pop(kid, None)
+            del self._pseudonym_owner[kid]
 
     def dh_agree(self, key_id: str, peer_public: bytes) -> bytes:
         # Not exercised by identity_create_with_custody; a deterministic
@@ -177,9 +186,10 @@ class _FakeKeychain:
             h.update(epoch.to_bytes(8, "big"))
         return str(int.from_bytes(h.digest()[:8], "big") | (1 << 63))
 
-    def _register_pseudonym(self, seed: bytes, kid: str) -> tuple[bytes, str]:
+    def _register_pseudonym(self, owner: str, seed: bytes, kid: str) -> tuple[bytes, str]:
         d = pseudonym_scalar(seed)
         self._pseudonyms[kid] = d
+        self._pseudonym_owner[kid] = owner
         return p256_compressed(d), kid
 
     def derive_pseudonym(self, key_id: str, context_id: bytes) -> tuple[bytes, str]:
@@ -187,6 +197,7 @@ class _FakeKeychain:
         # native interim ikm until S12). Registers the P-256 pseudonym key under
         # its deterministic id and returns ``(public_key (33), key_id)``.
         return self._register_pseudonym(
+            key_id,
             canonical_pseudonym_seed(self._seeds[key_id], context_id),
             self._pseudonym_key_id(key_id, context_id, None),
         )
@@ -198,7 +209,7 @@ class _FakeKeychain:
         # "scp-pseudonym-v2"). Same return shape as the v1 path.
         seed = canonical_rotatable_pseudonym_seed(self._seeds[key_id], context_id, pseudonym_epoch)
         return self._register_pseudonym(
-            seed, self._pseudonym_key_id(key_id, context_id, pseudonym_epoch)
+            key_id, seed, self._pseudonym_key_id(key_id, context_id, pseudonym_epoch)
         )
 
     def export_signing_key_bytes(self, key_id: str) -> bytes:
@@ -211,6 +222,32 @@ class _FakeKeychain:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_destroying_an_identity_destroys_its_pseudonyms() -> None:
+    """A pseudonym handle fails once its identity is destroyed (§9.10.4.A).
+
+    Covers the v1 and the v2 derivation, and leaves another identity's
+    pseudonym signing.
+    """
+    provider = _FakeKeychain()
+    identity = provider.generate_keypair("ed25519")
+    other = provider.generate_keypair("ed25519")
+    _, v1 = provider.derive_pseudonym(identity, b"ctx")
+    _, v2 = provider.derive_rotatable_pseudonym(identity, b"ctx", 3)
+    _, kept = provider.derive_pseudonym(other, b"ctx")
+    digest = hashlib.sha256(b"message").digest()
+    assert len(provider.sign(v1, digest)) == 64
+    assert len(provider.sign(v2, digest)) == 64
+
+    provider.destroy_key(identity)
+
+    for kid in (v1, v2):
+        with pytest.raises(KeyError):
+            provider.sign(kid, digest)
+        with pytest.raises(KeyError):
+            provider.get_public_key(kid)
+    assert len(provider.sign(kept, digest)) == 64
 
 
 @pytest.mark.asyncio
