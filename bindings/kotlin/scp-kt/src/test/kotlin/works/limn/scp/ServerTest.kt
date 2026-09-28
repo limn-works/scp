@@ -6,6 +6,7 @@
 
 package works.limn.scp
 
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -297,6 +298,7 @@ class ServerTest {
     // A caller cancelled while the engine tears down gets a CancellationException from the
     // bridge's trailing ensureActive, although the teardown finished. The flag must still
     // record the shutdown, or `isShutdown` reports a torn-down object as live.
+    @OptIn(ExperimentalCoroutinesApi::class)
     @Test
     fun `a node shutdown whose caller is cancelled after the teardown still marks it shut down`() {
         runTest(testDispatcher) {
@@ -311,6 +313,7 @@ class ServerTest {
         }
     }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     @Test
     fun `a relay shutdown whose caller is cancelled after the teardown still marks it shut down`() {
         runTest(testDispatcher) {
