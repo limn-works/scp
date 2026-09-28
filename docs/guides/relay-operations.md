@@ -85,12 +85,12 @@ scp-relay
 
 | Mode | Flag | Storage | Identity | HTTP | Use case |
 |------|------|---------|----------|------|----------|
-| **Full node** (default) | none | SQLite (SQLCipher) | Generated on every run; a shipped build exits 1 (`NoPreRotationBackend`) | `.well-known/scp` + dev API | `--features testing` builds only |
+| **Full node** (default) | none | SQLite (SQLCipher) | Generated on every run; a shipped build logs `no production pre-rotation custody backend available` and exits 1 | `.well-known/scp` + dev API | `--features testing` builds only |
 | **Relay-only** | `--relay-only` | Configurable | None | None | Equivalent to `scp-relay` |
 | **Ephemeral** (`testing` builds only) | `--ephemeral` | All in-memory | Ephemeral DID | `.well-known/scp` + dev API | Development and testing |
 
 ```bash
-# Full node (a shipped binary exits 1 with NoPreRotationBackend; see section 6)
+# Full node (a shipped binary logs "no production pre-rotation custody backend available" and exits 1; see section 6)
 SCP_NODE_DOMAIN=relay.example.com scp-node
 
 # Relay-only mode
@@ -270,10 +270,13 @@ A `--features testing` build of the full node, on every run:
 The full node never reloads a stored identity: it asks `Node::start` for a newly
 generated one on every run (`IdentitySource::Generate` in `run_node_with`,
 `crates/scp-node/src/main.rs`). On a build without `testing`, `Node::start` answers every
-`Generate` request with `NoPreRotationBackend`: that path takes no `PreRotationCustody`
-input, so no custody backend and no storage directory the operator supplies changes the
-result. A shipped binary therefore fails closed in step 2 and exits 1 on every run,
-before it publishes anything. Only `--self-host` loads an identity already in its
+`Generate` request with `IdentityError::NoPreRotationBackend`: that path takes no
+`PreRotationCustody` input, so no custody backend and no storage directory the operator
+supplies changes the result. The binary logs `application node failed to build` with
+the error `identity error: no production pre-rotation custody backend available; ...`,
+so search the log for that error text; the variant name never appears in it. A shipped
+binary therefore fails closed in step 2 and exits 1 on every run, before it publishes
+anything. Only `--self-host` loads an identity already in its
 storage directory.
 
 ### Development deployment
@@ -305,9 +308,9 @@ The call to `run_full_node_ephemeral` and the `"memory"` match arm
 capability injection, keeps the in-memory DHT client and the in-memory key custody out
 of every released build.
 
-Do not run the full node (no mode flag) for development. A shipped binary exits 1
-with `NoPreRotationBackend` on every run, for the reason given under Production
-deployment. `SCP_NODE_DHT_MODE` defaults to `production`, so a `--features testing`
+Do not run the full node (no mode flag) for development. A shipped binary logs
+`no production pre-rotation custody backend available` and exits 1 on every run, for
+the reason given under Production deployment. `SCP_NODE_DHT_MODE` defaults to `production`, so a `--features testing`
 build of the full node with the variable unset publishes the host's address to the
 global Mainline DHT, a location disclosure, even under `SCP_NODE_DOMAIN=localhost`.
 

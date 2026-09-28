@@ -5,8 +5,9 @@
 //! 1. **Full node** (default): Starts an [`ApplicationNode`] with DID identity,
 //!    relay, and HTTP server (`.well-known/scp` + WebSocket upgrade). Uses
 //!    persistent `SQLite` storage by default (`SQLCipher` encrypted), and asks
-//!    for a newly generated identity on every run, so a shipped build exits 1
-//!    with `NoPreRotationBackend`.
+//!    for a newly generated identity on every run, so a shipped build logs
+//!    `no production pre-rotation custody backend available`
+//!    (`IdentityError::NoPreRotationBackend`) and exits 1.
 //! 2. **Relay-only** (`--relay-only`): Runs a bare [`RelayServer`], identical
 //!    to the standalone `scp-relay` binary.
 //! 3. **Ephemeral** (`--ephemeral`, `testing` builds only): Runs a full node
@@ -506,8 +507,9 @@ fn validate_storage_path_or_exit(dir: &std::path::Path) {
 }
 
 /// Runs the full node with persistent `SQLite` storage (the default mode). A
-/// shipped build exits 1 with `NoPreRotationBackend`, because the node asks for a
-/// newly generated identity on every run.
+/// shipped build logs `no production pre-rotation custody backend available`
+/// (`IdentityError::NoPreRotationBackend`) and exits 1, because the node asks for
+/// a newly generated identity on every run.
 async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // Parse the blob backend before anything below creates the storage
     // directory, the storage key, or a store, so a backend this build cannot
@@ -1222,7 +1224,8 @@ async fn main() {
             eprintln!(
                 "ERROR: --ephemeral is a test-harness mode (in-memory DHT/custody) and is not \
                  available in this build. A shipped build creates no identity in any mode \
-                 (NoPreRotationBackend): the persistent full node exits 1 on every run, and \
+                 (no production pre-rotation custody backend available): the persistent full \
+                 node exits 1 on every run, and \
                  --self-host starts only from a storage directory that already holds an \
                  identity. Build with --features testing to run --ephemeral."
             );

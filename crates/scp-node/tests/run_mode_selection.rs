@@ -83,3 +83,21 @@ fn assert_refused(args: &[&str], self_host_env: Option<&str>, health: bool) {
         "{case} created its storage directory before refusing"
     );
 }
+
+/// The error text `docs/guides/relay-operations.md` and `main.rs` tell an
+/// operator to search a shipped full node's log for is the text the binary
+/// logs: `main` logs the `NodeError` with `%e`, so its `Display` is what the
+/// log holds, and the variant name `NoPreRotationBackend` is not in it.
+#[test]
+fn shipped_full_node_logs_the_documented_pre_rotation_error_text() {
+    let logged = scp_node::NodeError::Identity(scp_identity::IdentityError::NoPreRotationBackend)
+        .to_string();
+    assert!(
+        logged.starts_with("identity error: no production pre-rotation custody backend available"),
+        "the documented log text drifted from NodeError's Display: {logged}"
+    );
+    assert!(
+        !logged.contains("NoPreRotationBackend"),
+        "the log now names the variant; update the operator docs: {logged}"
+    );
+}
