@@ -263,10 +263,16 @@ private fun <R> rememberCollectedState(
  * Navigating away from a screen and back produces it, and so does a navigation transition that
  * keeps an outgoing screen composed while an incoming screen under that same key starts.
  *
- * A caller constructs one coordinator outside composition — in a ViewModel, in an application
- * container, or in a dependency graph — and passes that instance to every
- * [rememberScpHotStream] call that shares a key space. Constructing one inside a composition
- * gives each mount its own coordinator, which reintroduces exactly that defect, so
+ * A caller constructs one coordinator outside composition, with the same lifetime and the same
+ * sharing as the registry whose subscriptions it orders — for a `HotStreamFactory`, one
+ * coordinator per factory, held by an application container, a dependency-graph singleton, or
+ * a ViewModel that every navigation destination reading that factory shares (one scoped to the
+ * activity or to the navigation graph) — and passes that instance to every
+ * [rememberScpHotStream] call that reaches that registry. A ViewModel scoped to one navigation
+ * destination is too narrow: each destination then counts only its own mounts, so during a
+ * transition between two screens that show one context handle, the outgoing screen's stop
+ * releases the subscription the incoming screen collects. Constructing one inside a
+ * composition gives each mount its own coordinator, which reintroduces exactly that defect, so
  * [rememberScpHotStream] takes a coordinator as a required parameter and declares no default.
  *
  * This class holds per-key state: a count of live mounts, a [Mutex] that admits one start or one
@@ -505,8 +511,9 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
  *
  * Usage:
  * ```kotlin
- * // Constructed once outside composition — a ViewModel, an Application, or a DI graph owns
- * // both this scope and this coordinator.
+ * // Constructed once per HotStreamFactory, outside composition — an Application, a DI
+ * // singleton, or an activity-scoped ViewModel every destination shares owns both this scope
+ * // and this coordinator, never a ViewModel scoped to one navigation destination.
  * val streamScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
  * val streamCoordinator = ScpHotStreamCoordinator(streamScope)
  *
@@ -528,19 +535,22 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
  * @param key Recomposition key. The subscription restarts if this changes.
  * @param coordinator Orders this mount's [start] after any [onStop] an earlier mount launched
  *   under [key]. A caller constructs it outside composition and shares one instance across every
- *   mount that uses a given key space. The subscription restarts if this changes too. A start
- *   under the new coordinator waits until the replaced coordinator has run this mount's
- *   [onStop] under that same [key], because neither coordinator can order the other's lambdas.
- *   When another mount under [key] is still live on the replaced coordinator, that coordinator
- *   holds this mount's [onStop] until that other mount leaves too, so this mount's [State]
- *   stays `null` until then: a start that ran sooner would reuse a subscription that the
- *   replaced coordinator's stop later releases.
+ *   mount that reaches the registry [start] subscribes through, as [ScpHotStreamCoordinator]
+ *   states. The subscription restarts if this changes too. A start under the new coordinator
+ *   waits until every coordinator this mount has left under [key] (other than the new one) has
+ *   run or skipped this mount's [onStop], because no coordinator can order another's lambdas;
+ *   that holds across any number of changes. When another mount under [key] is still live on a
+ *   replaced coordinator, that coordinator holds this mount's [onStop] until that other mount
+ *   leaves too, so this mount's [State] stays `null` until then: a start that ran sooner would
+ *   reuse a subscription that the replaced coordinator's stop later releases.
  * @param start Suspend factory lambda that creates the [SharedFlow]. Called once each time this
  *   mount begins under a ([key], [coordinator]) pair, so a change of either one calls it again,
  *   and not at all when the mount leaves before [start] runs. Runs in a coroutine scoped to the
  *   Composable.
  * @param onStop Suspend cleanup lambda invoked once the last live mount under [key] on
- *   [coordinator] leaves composition, whether that is this mount or a later one. It must be
+ *   [coordinator] leaves composition, whether that is this mount or a later one, and skipped
+ *   when this mount left [coordinator] before its [start] ran there, because that mount opened
+ *   nothing and a mount on a replaced coordinator may still collect the subscription. It must be
  *   idempotent, because every mount under [key] has its own [onStop] run. Runs on
  *   [coordinator]'s scope, which disposal does not cancel, so it may suspend for as long as
  *   it needs. Disposal returns without waiting for it, so
@@ -570,15 +580,29 @@ fun <T> rememberScpHotStream(
     // one, so neither coordinator orders them. The underlying resource is still one key
     // space (HotStreamFactory keys its subscriptions by context handle alone), and a start
     // that ran first would reuse the subscription the stale onStop then releases. unmount
-    // returns a Job that completes once this mount's onStop has run, whether the old
+    // returns a Job that completes once this mount's onStop has run or been skipped, whether the old
     // coordinator launched that stop at once or held it for another mount under this key
     // that is still live there. This holder survives a coordinator change because it keys
     // on `key` alone. Compose runs the old effect's onDispose before the new effect, so the
     // new effect finds that Job here and its start joins it first.
-    val swappedOutStop = remember(key) { AtomicReference<Job?>(null) }
+    //
+    // The holder keeps every such Job that has not completed, each paired with the coordinator
+    // that returned it, not just the latest one. A second change before the first swapped-out
+    // stop completes would otherwise drop that stop, and the next start would run before it.
+    // A start skips a Job its own coordinator returned: that coordinator already orders it,
+    // either through the stop `mount` captures or by holding it until this new mount leaves too,
+    // so joining it would leave this mount waiting on its own departure.
+    val swappedOutStops =
+        remember(key) { AtomicReference<List<Pair<ScpHotStreamCoordinator, Job>>>(emptyList()) }
 
     DisposableEffect(key, coordinator) {
-        val pendingSwapStop = swappedOutStop.getAndSet(null)
+        val pendingSwapStops = swappedOutStops.getAndSet(emptyList()).filterNot { it.second.isCompleted }
+        // Set inside the start lambda, which runs under the coordinator's key mutex, and read by
+        // this mount's onStop under that same mutex. A mount that leaves before its start runs
+        // there — for instance while it still waits on a swapped-out coordinator's stop —
+        // opened nothing, and its onStop would release the subscription that a mount still
+        // live on the replaced coordinator collects.
+        val startRan = AtomicBoolean(false)
         // Counted when this effect applies, after composition and after every onDispose in
         // the same apply pass, and before this effect's start launches. A mount under this
         // key that leaves from here on therefore sees this one as live and stops nothing,
@@ -587,8 +611,12 @@ fun <T> rememberScpHotStream(
         // outgoing mount's unmount, and would leak when Compose abandons that composition.
         val mount = coordinator.mount(key)
         scope.launch {
-            pendingSwapStop?.join()
-            flowState.value = coordinator.startMounted(mount) { start() }
+            pendingSwapStops.forEach { (owner, stop) -> if (owner !== coordinator) stop.join() }
+            flowState.value =
+                coordinator.startMounted(mount) {
+                    startRan.set(true)
+                    start()
+                }
         }
         onDispose {
             // onDispose runs on a composition thread, which on Android is a main thread.
@@ -602,7 +630,8 @@ fun <T> rememberScpHotStream(
             // returns, so a start that a later mount begins under this same key joins that job
             // instead of racing it. Cancelling `scope` afterwards cancels only this mount's
             // start, never that stop.
-            swappedOutStop.set(coordinator.unmount(mount) { onStop() })
+            val ownStop = coordinator.unmount(mount) { if (startRan.get()) onStop() }
+            swappedOutStops.set(pendingSwapStops + listOfNotNull(ownStop?.let { coordinator to it }))
             scope.cancel()
         }
     }

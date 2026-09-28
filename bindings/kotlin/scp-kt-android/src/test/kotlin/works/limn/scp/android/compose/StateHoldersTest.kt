@@ -845,6 +845,188 @@ class ScpHotStreamRemountTest {
     }
 
     /**
+     * Two coordinator changes under one key, the second made while the first swapped-out stop
+     * is still suspended, start the third coordinator only after that first stop finishes.
+     *
+     * A holder that kept only the latest swapped-out stop dropped the first one here: the
+     * second coordinator's stop, for a mount that never started, ran `onStop` at once and
+     * released subscription 1, the third coordinator's start opened subscription 2, and the
+     * first stop then released subscription 2, leaving the third coordinator collecting a
+     * SharedFlow that receives nothing further.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `two coordinator changes under one key start only after the first swapped-out stop`() {
+        val subscriptions = FakeSubscriptionRegistry()
+        val startCalls = AtomicInteger(0)
+        val stopCalls = AtomicInteger(0)
+        val releaseFirstStop = CountDownLatch(1)
+        val coordinators = List(3) { ScpHotStreamCoordinator(newCoordinatorScope()) }
+        val activeCoordinator = MutableStateFlow(coordinators[0])
+        val eventFlow = MutableSharedFlow<String>()
+
+        composeRule.setContent {
+            val coordinator by activeCoordinator.collectAsStateCompat()
+            rememberScpHotStream(
+                key = "shared-key",
+                coordinator = coordinator,
+                start = {
+                    startCalls.incrementAndGet()
+                    subscriptions.subscribe()
+                    eventFlow
+                },
+                onStop = {
+                    if (stopCalls.incrementAndGet() == 1) {
+                        releaseFirstStop.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                    }
+                    subscriptions.unsubscribeLive()
+                },
+            )
+        }
+
+        composeRule.waitForIdle()
+        awaitCondition("the first coordinator opened no subscription") { startCalls.get() == 1 }
+
+        activeCoordinator.value = coordinators[1]
+        composeRule.waitForIdle()
+        awaitCondition("the first coordinator did not begin its stop") { stopCalls.get() == 1 }
+        activeCoordinator.value = coordinators[2]
+        composeRule.waitForIdle()
+
+        Thread.sleep(SWAP_START_GRACE_MS)
+        assertEquals("a start ran before the first swapped-out stop finished", 1, startCalls.get())
+        assertEquals("a mount that never started ran onStop", 1, stopCalls.get())
+        releaseFirstStop.countDown()
+
+        awaitCondition("the third coordinator opened no subscription") {
+            subscriptions.subscribeIds() == listOf(1, 2)
+        }
+        assertEquals(listOf(1), subscriptions.unsubscribeIds())
+        assertEquals(listOf(2), subscriptions.liveIds())
+        assertEquals("a mount that never started ran onStop", 1, stopCalls.get())
+    }
+
+    /**
+     * A mount that moves to another coordinator while a second mount under that key stays live
+     * on the first one, and then leaves before the first coordinator releases the key, releases
+     * nothing: it never started on the new coordinator, so its `onStop` there would release
+     * the subscription the staying mount still collects.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `a moved mount that leaves before it starts releases nothing a live mount collects`() {
+        val subscriptions = FakeSubscriptionRegistry()
+        val startCalls = AtomicInteger(0)
+        val firstCoordinator = ScpHotStreamCoordinator(newCoordinatorScope())
+        val secondCoordinator = ScpHotStreamCoordinator(newCoordinatorScope())
+        val movingCoordinator = MutableStateFlow(firstCoordinator)
+        val showMoving = MutableStateFlow(true)
+        val showStaying = MutableStateFlow(true)
+        val eventFlow = MutableSharedFlow<String>()
+
+        composeRule.setContent {
+            val moving by movingCoordinator.collectAsStateCompat()
+            val movingShown by showMoving.collectAsStateCompat()
+            val staying by showStaying.collectAsStateCompat()
+            listOf(moving to movingShown, firstCoordinator to staying).forEachIndexed { index, (coordinator, shown) ->
+                if (shown) {
+                    key(index) {
+                        rememberScpHotStream(
+                            key = "shared-key",
+                            coordinator = coordinator,
+                            start = {
+                                startCalls.incrementAndGet()
+                                subscriptions.subscribe()
+                                eventFlow
+                            },
+                            onStop = { subscriptions.unsubscribeLive() },
+                        )
+                    }
+                }
+            }
+        }
+
+        composeRule.waitForIdle()
+        awaitCondition("both mounts did not start") { startCalls.get() == 2 }
+
+        movingCoordinator.value = secondCoordinator
+        composeRule.waitForIdle()
+        showMoving.value = false
+        composeRule.waitForIdle()
+        // A stop that runs the moved mount's onStop on the new coordinator runs here.
+        Thread.sleep(SWAP_START_GRACE_MS)
+        assertEquals(
+            "the moved mount's departure released the staying mount's subscription",
+            listOf(1),
+            subscriptions.liveIds(),
+        )
+        assertEquals(emptyList<Int>(), subscriptions.unsubscribeIds())
+
+        showStaying.value = false
+        composeRule.waitForIdle()
+        awaitCondition("the staying mount's departure released nothing") {
+            subscriptions.unsubscribeIds() == listOf(1)
+        }
+        assertEquals(2, startCalls.get())
+    }
+
+    /**
+     * A mount that moves to another coordinator and back while a second mount under that key
+     * stays live on the first one starts again on the first coordinator at once, and the move
+     * releases nothing. The first coordinator still holds the moved mount's first `onStop`
+     * behind the staying mount, so a start that waited for it would wait on its own departure,
+     * and a stop that ran the unstarted mount's `onStop` on the second coordinator would
+     * release the subscription the staying mount collects.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `a mount that moves away and back next to a live mount starts again and releases nothing`() {
+        val subscriptions = FakeSubscriptionRegistry()
+        val startCalls = AtomicInteger(0)
+        val firstCoordinator = ScpHotStreamCoordinator(newCoordinatorScope())
+        val secondCoordinator = ScpHotStreamCoordinator(newCoordinatorScope())
+        val movingCoordinator = MutableStateFlow(firstCoordinator)
+        val showStaying = MutableStateFlow(true)
+        val eventFlow = MutableSharedFlow<String>()
+
+        composeRule.setContent {
+            val moving by movingCoordinator.collectAsStateCompat()
+            val staying by showStaying.collectAsStateCompat()
+            listOf(moving to true, firstCoordinator to staying).forEachIndexed { index, (coordinator, shown) ->
+                if (shown) {
+                    key(index) {
+                        rememberScpHotStream(
+                            key = "shared-key",
+                            coordinator = coordinator,
+                            start = {
+                                startCalls.incrementAndGet()
+                                subscriptions.subscribe()
+                                eventFlow
+                            },
+                            onStop = { subscriptions.unsubscribeLive() },
+                        )
+                    }
+                }
+            }
+        }
+
+        composeRule.waitForIdle()
+        awaitCondition("both mounts did not start") { startCalls.get() == 2 }
+
+        movingCoordinator.value = secondCoordinator
+        composeRule.waitForIdle()
+        movingCoordinator.value = firstCoordinator
+        composeRule.waitForIdle()
+
+        awaitCondition("the mount that moved back did not start again") { startCalls.get() == 3 }
+        Thread.sleep(SWAP_START_GRACE_MS)
+        assertEquals(
+            "the moves released the staying mount's subscription",
+            emptyList<Int>(),
+            subscriptions.unsubscribeIds(),
+        )
+        assertEquals(listOf(1), subscriptions.liveIds())
+        assertEquals(listOf(1), subscriptions.subscribeIds())
+    }
+
+    /**
      * A start that takes the key's mutex after its own mount's stop ran never runs: that stop
      * found nothing to release, so anything the start opened would stay open with no stop.
      */
@@ -972,9 +1154,10 @@ private fun awaitCondition(
 }
 
 /**
- * Build a scope for one [ScpHotStreamCoordinator]. A production caller owns this scope — a
- * ViewModel, an Application, or a dependency graph holds it — and composable disposal never
- * cancels it.
+ * Build a scope for one [ScpHotStreamCoordinator]. A production caller owns this scope with the
+ * same lifetime as the registry that coordinator orders — an Application, a dependency-graph
+ * singleton, or a ViewModel every navigation destination shares holds it — and composable
+ * disposal never cancels it.
  */
 private fun newCoordinatorScope(): CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 

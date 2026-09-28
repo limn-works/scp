@@ -68,7 +68,12 @@ subscription that a different caller had just opened.
   otherwise release whatever that mount's start opened. For a departure it holds, `unmount`
   returns a `Job` that the next launched stop completes, so a mount that moves to another
   coordinator while a second mount under that key stays on the first one starts only after the
-  first coordinator releases the subscription both mounts shared. Discarding an early
+  first coordinator releases the subscription both mounts shared. `rememberScpHotStream` keeps
+  every such `Job` that has not completed, each paired with the coordinator that returned it,
+  across any number of coordinator changes, and a start joins every one a different coordinator
+  returned; a mount whose `start` never ran on a coordinator skips its `onStop` there, checked
+  under that coordinator's key mutex, because it opened nothing and a mount still live on a
+  replaced coordinator may collect the subscription that `onStop` would release. Discarding an early
   mount's `onStop` instead leaks a subscription whenever two different streams share a key, such
   as a `contextEvents` and an `incomingMessages` stream both keyed by one context handle.
 
@@ -83,6 +88,12 @@ constructs a coordinator, owns its scope, and decides when to cancel it.
 A default parameter that built a coordinator per composition would compile, read as convenient,
 and restore defect 3 exactly, because each mount would then coordinate against itself alone.
 
+A coordinator must have the same lifetime and sharing as the registry whose subscriptions it
+orders: one per `HotStreamFactory`, held by an application container, a dependency-graph
+singleton, or a ViewModel that every navigation destination reading that factory shares. A
+ViewModel scoped to one navigation destination restores defect 4, because two destinations that
+show one context handle during a transition each count only their own mounts.
+
 ## How to detect a recurrence
 
 - `StreamsTest.SubscriptionOwnershipTests` cancels a subscribing coroutine from inside a stub's
@@ -96,9 +107,15 @@ and restore defect 3 exactly, because each mount would then coordinate against i
   there composes two mounts under one key at once, removes one, and asserts that no `onStop` ran
   and that their shared subscription is still live. `a stop runs after every stop launched before
   it under that key` launches two stops on a dispatcher that runs its queued tasks newest first,
-  and asserts that their `onStop` lambdas ran oldest first, and `a coordinator swap next to a live mount starts only after the old
-  coordinator stops the key` asserts that a moved mount opens a fresh subscription only after its
-  old coordinator released the shared one.
+  and asserts that their `onStop` lambdas ran oldest first, and `a coordinator swap next to a
+  live mount starts only after the old coordinator stops the key` asserts that a moved mount
+  opens a fresh subscription only after its old coordinator released the shared one. `two
+  coordinator changes under one key start only after the first swapped-out stop` holds the first
+  swapped-out `onStop` on a latch across a second change, `a moved mount that leaves before it
+  starts releases nothing a live mount collects` removes a moved mount while its old coordinator
+  still holds its `onStop`, and `a mount that moves away and back next to a live mount starts
+  again and releases nothing` returns a moved mount to its first coordinator; each asserts which
+  subscription stays live.
 
 ## Anti-patterns
 
