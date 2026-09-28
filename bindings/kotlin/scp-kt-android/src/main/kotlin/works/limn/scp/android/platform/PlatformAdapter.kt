@@ -49,9 +49,10 @@ data class AndroidPlatformAdapterImpl(
  *
  * - [AndroidKeyCustody] requires context for EncryptedSharedPreferences access (#119).
  * - [AndroidDeviceAttestation] requires context for Play Integrity API access.
- * - [AndroidPushProvider] takes a context because ADR-027 declares one on every provider
- *   constructor. It reads none: `FirebaseMessaging.getInstance()` resolves an app that
- *   `FirebaseInitProvider` already initialised.
+ * - [AndroidPushProvider] takes a context because ADR-027's reference code declares
+ *   `AndroidPushProvider(private val context: Context)`. It reads none:
+ *   `FirebaseMessaging.getInstance()` resolves an app that `FirebaseInitProvider` already
+ *   initialised.
  * - [AndroidStorage] requires context for database file and Keystore access.
  *
  * See ADR-027 in `.docs/adrs/phase-6.md` for the full design rationale.

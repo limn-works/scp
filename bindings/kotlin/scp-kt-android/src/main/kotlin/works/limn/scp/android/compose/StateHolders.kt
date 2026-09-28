@@ -388,8 +388,9 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
  * @param key Recomposition key. The subscription restarts if this changes.
  * @param coordinator Orders this mount's [start] after any [onStop] an earlier mount launched
  *   under [key]. A caller constructs it outside composition and shares one instance across every
- *   mount that uses a given key space. The subscription restarts if this changes too, because a
- *   different coordinator orders a different key space.
+ *   mount that uses a given key space. The subscription restarts if this changes too. A start
+ *   under the new coordinator waits for the `onStop` that the replaced coordinator launched
+ *   under that same [key], because neither coordinator can order the other's lambdas.
  * @param start Suspend factory lambda that creates the [SharedFlow]. Called
  *   once per [key] value. Runs in a coroutine scoped to the Composable.
  * @param onStop Suspend cleanup lambda invoked when the Composable leaves
@@ -415,8 +416,21 @@ fun <T> rememberScpHotStream(
     val flowState = remember(key, coordinator) { mutableStateOf<SharedFlow<T>?>(null) }
     val scope = remember(key, coordinator) { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
 
+    // A coordinator orders a stop and a start only when both go through that one instance.
+    // When `coordinator` changes and `key` does not, the old effect's onDispose launches
+    // onStop through the old coordinator and the new effect's start runs through the new
+    // one, so neither coordinator orders them. The underlying resource is still one key
+    // space (HotStreamFactory keys its subscriptions by context handle alone), and a start
+    // that ran first would reuse the subscription the stale onStop then releases. This
+    // holder survives a coordinator change because it keys on `key` alone. Compose runs the
+    // old effect's onDispose before the new effect, so the new effect finds that stop's Job
+    // here and its start joins it first.
+    val swappedOutStop = remember(key) { AtomicReference<Job?>(null) }
+
     DisposableEffect(key, coordinator) {
+        val pendingSwapStop = swappedOutStop.getAndSet(null)
         scope.launch {
+            pendingSwapStop?.join()
             flowState.value = coordinator.startAfterPendingStop(key) { start() }
         }
         onDispose {
@@ -429,7 +443,7 @@ fun <T> rememberScpHotStream(
             // launchStop records this stop's Job before it returns, so a start that a later
             // mount begins under this same key joins that job instead of racing it. Cancelling
             // `scope` afterwards cancels only this mount's start, never that stop.
-            coordinator.launchStop(key) { onStop() }
+            swappedOutStop.set(coordinator.launchStop(key) { onStop() })
             scope.cancel()
         }
     }

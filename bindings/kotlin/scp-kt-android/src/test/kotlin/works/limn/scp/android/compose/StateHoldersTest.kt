@@ -25,6 +25,7 @@ import org.robolectric.annotation.Config
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 @RunWith(RobolectricTestRunner::class)
@@ -537,10 +538,18 @@ class ScpHotStreamRemountTest {
      * cancelled scope, because `key` had not changed. The launch returned an
      * already-cancelled Job, `start` never ran, and the returned `State` kept the previous
      * coordinator's flow: a subscription nobody was serving, reported as a live one.
+     *
+     * The swapped-out coordinator's `onStop` and the swapped-in coordinator's `start` go
+     * through two coordinators, so neither coordinator orders them. This method holds that
+     * `onStop` open on a latch. A `start` that does not wait for it runs while subscription 1
+     * is still live, reuses it, and the released stop then leaves no live subscription, so
+     * the `startCalls` assertion below fails.
      */
     @Test(timeout = DISPOSAL_TIMEOUT_MS)
     fun `a coordinator swap under one same key opens a subscription on the new coordinator`() {
         val subscriptions = FakeSubscriptionRegistry()
+        val startCalls = AtomicInteger(0)
+        val releaseStop = CountDownLatch(1)
         val firstCoordinator = ScpHotStreamCoordinator(newCoordinatorScope())
         val secondCoordinator = ScpHotStreamCoordinator(newCoordinatorScope())
         val activeCoordinator = MutableStateFlow(firstCoordinator)
@@ -552,10 +561,14 @@ class ScpHotStreamRemountTest {
                 key = "shared-key",
                 coordinator = coordinator,
                 start = {
+                    startCalls.incrementAndGet()
                     subscriptions.subscribe()
                     eventFlow
                 },
-                onStop = { subscriptions.unsubscribeLive() },
+                onStop = {
+                    releaseStop.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                    subscriptions.unsubscribeLive()
+                },
             )
         }
 
@@ -566,6 +579,15 @@ class ScpHotStreamRemountTest {
 
         activeCoordinator.value = secondCoordinator
         composeRule.waitForIdle()
+
+        // Give an unordered start time to run on its IO thread before the stop is released.
+        Thread.sleep(SWAP_START_GRACE_MS)
+        assertEquals(
+            "the swapped-in start ran before the swapped-out stop finished",
+            1,
+            startCalls.get(),
+        )
+        releaseStop.countDown()
 
         awaitCondition("the swapped-in coordinator opened no subscription") {
             subscriptions.subscribeIds().size == 2
@@ -680,6 +702,9 @@ private const val POLL_INTERVAL_MS = 10L
  * onStop again.
  */
 private const val DISPOSAL_TIMEOUT_MS = 60_000L
+
+/** How long a coordinator-swap test lets an unordered start run before releasing a stop. */
+private const val SWAP_START_GRACE_MS = 300L
 
 private const val WAIT_TIMEOUT_MS = 5_000L
 

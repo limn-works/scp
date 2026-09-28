@@ -227,6 +227,9 @@ class PersistenceTest {
             val dbPath = dir.resolve("scp.db")
 
             val scp1 = SCP.withSqlite(dir.toFile(), passphrase = "correct horse battery staple")
+            // Tracked so tearDown shuts it down if an assertion fails before the
+            // explicit shutdown below.
+            createdInstances += scp1
             assertTrue(
                 dbPath.exists(),
                 "passphrase construction must create scp.db at ${dbPath.pathString}",
@@ -254,6 +257,9 @@ class PersistenceTest {
             dir.toFile().deleteOnExit()
 
             val scp1 = SCP.withSqlite(dir.toFile(), passphrase = "the-right-one")
+            // Tracked so tearDown shuts it down if an assertion fails before the
+            // explicit shutdown below.
+            createdInstances += scp1
             // Release the advisory lock on `scp.db.lock` first, so the reopen
             // below fails on the WRONG PASSPHRASE and not on a still-held lock.
             // While the first handle stayed open, that lock rejected the second

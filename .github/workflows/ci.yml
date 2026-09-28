@@ -257,14 +257,6 @@ jobs:
               - 'bindings/python/**'
               - 'crates/scp-ffi/src/**'
               - 'crates/scp-ffi/common/**'
-              # Two pytest suites live outside bindings/python. Without these
-              # entries an edit to either one triggers no Python job. Neither
-              # suite has a step in python-test below; a comment where each
-              # step would go says why. These entries only make an edit under
-              # either directory run Python jobs at all, and a step that reads
-              # either suite still has to be added.
-              - 'examples/reference-agent/**'
-              - 'tests/integration/**'
             typescript:
               - 'bindings/typescript/**'
               - 'crates/scp-ffi/napi/**'
@@ -1272,11 +1264,16 @@ jobs:
           # feature-on arm. --workspace activates neither http3 nor udp, so only
           # those off arms ran.
           #
-          # nextest with `--no-tests=fail`, not `cargo test <filter>`: a filter
-          # that selects nothing exits 0 under `cargo test`, so renaming this
-          # module would leave a green lane over zero assertions. `--no-tests=fail`
-          # exits 4 instead. That expression selects 12 tests today.
-          cargo nextest run --no-tests=fail -p scp-node --features http3,udp,testing --lib -E 'test(well_known)'
+          # One nextest run per feature-on arm, each selecting that one test by
+          # its exact path, with `--no-tests=fail`: a filter that selects nothing
+          # exits 0 under `cargo test`, while `--no-tests=fail` exits 4. Because
+          # each expression names exactly one test, renaming the module, deleting
+          # that arm, or re-gating it behind another feature selects nothing and
+          # fails this lane. A substring filter such as `test(well_known)` would
+          # not: it also selects well_known-named tests in http.rs and lib.rs, so
+          # it keeps selecting tests after both arms are gone.
+          cargo nextest run --no-tests=fail -p scp-node --features http3,udp,testing --lib -E 'test(=well_known::tests::advertised_transports_includes_webtransport_with_feature)'
+          cargo nextest run --no-tests=fail -p scp-node --features http3,udp,testing --lib -E 'test(=well_known::tests::advertised_transports_includes_udp_dtls_with_feature)'
           # scp-platform gates its Apple SQLCipher storage adapter behind `apple`
           # and its syncable-storage trait behind `sync`. No crate enables either,
           # so both modules' tests — including a storage_conformance! expansion
