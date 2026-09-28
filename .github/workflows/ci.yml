@@ -1053,6 +1053,15 @@ jobs:
           # and no lint or test invocation activated either feature, so 41
           # tests and both adapter modules went unlinted and unrun.
           cargo clippy -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --all-targets -- -D warnings
+          # Job rust-test-optional-features also runs code behind four more
+          # feature sets that no command above activates: scp-node's quic test
+          # files and its http3/udp well_known arms, scp-platform's `apple`
+          # SQLCipher adapter and `sync` storage module, and scp-testing's
+          # persistence_advanced tests. That job denies no warnings, so these
+          # commands are the only lint those builds get.
+          cargo clippy -p scp-node --features quic,http3,udp,testing --all-targets -- -D warnings
+          cargo clippy -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --all-targets -- -D warnings
+          cargo clippy -p scp-testing --features sync,combined --all-targets -- -D warnings
           # scp-node and scp-relay compile the PostgreSQL and S3 blob backends
           # only under their off-by-default `cloud-blobs` feature, which the
           # --workspace sweep above leaves off. The first command lints the
@@ -1255,9 +1264,10 @@ jobs:
           # activate; without them those 10 tests plus 31 in-module tests under
           # src/nostr/ and src/webrtc/ compiled into no test binary CI ran.
           cargo nextest run -p scp-transport --features quic,http3,udp,coap,nostr,webrtc
-          # scp-node declares two `[[test]]` targets gated on its own `quic`
-          # feature (quic_listener, quic_cross_transport). --workspace activates
-          # neither, so their 5 tests ran nowhere.
+          # scp-node holds two auto-discovered test files (quic_listener,
+          # quic_cross_transport), each gated on `quic` and
+          # `allow_unencrypted_storage`, which `testing` implies. --workspace
+          # activates `quic` for neither, so their 5 tests ran nowhere.
           cargo nextest run -p scp-node --features quic,testing --test quic_listener --test quic_cross_transport
           # scp-node's well_known module asserts its advertised-transport
           # list twice per transport: once for a feature-off arm and once for a
@@ -1841,14 +1851,16 @@ jobs:
           # available in this job — they run in dedicated parity jobs below.
           PYTHONPATH=. pytest tests/ -v -m "not parity"
       # `cd bindings/python` above resolves `tests/` to `bindings/python/tests/`,
-      # so pytest suites that live elsewhere in this repository run in no CI job.
-      # Two such suites exist, and neither gets a step. Each comment below says
-      # why its suite gets none.
+      # so this step runs no pytest suite that lives elsewhere in this
+      # repository. Four such suites exist. Two of them, under `scripts/`, run in
+      # their own steps (`scripts/test_check_sdk_coverage.py` and
+      # `scripts/tests/call-invariants/`). The other two run in no CI job, and
+      # each comment below says why its suite gets no step.
       #
       # `examples/reference-agent/test_agent.py` gets no step. Two of its 23
       # tests, `TestEndToEnd::test_full_lifecycle` and
       # `TestDemoScript::test_demo_exits_zero`, fail whenever `scp_sdk` imports,
-      # which the `maturin develop` step above makes true. Every one of the nine
+      # which the `maturin develop` step above makes true. Every one of the eleven
       # SDK call sites in `examples/reference-agent/agent.py` names a symbol
       # `scp_sdk` no longer defines: `Identity.create_sync`, `Identity.load_sync`,
       # `Context.create_sync`, `Context.join_sync`, `context.send_sync`,
