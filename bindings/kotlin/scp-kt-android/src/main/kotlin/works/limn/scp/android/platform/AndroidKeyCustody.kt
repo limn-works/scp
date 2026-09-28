@@ -361,7 +361,8 @@ class AndroidKeyCustody internal constructor(
      * pseudonym is device-local and stable across launches.
      *
      * The same `keyHandle` + `contextId` always yields the same point and the same
-     * handle id, so re-deriving replaces the stored scalar instead of adding one.
+     * handle id, so re-deriving keeps the existing entry (and wipes the new scalar)
+     * instead of adding one.
      *
      * @param keyHandle Handle to the identity Ed25519 key (source for derivation).
      * @param contextId Raw context ID bytes.
