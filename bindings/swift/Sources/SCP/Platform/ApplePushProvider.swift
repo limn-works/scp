@@ -1,21 +1,25 @@
 // ApplePushProvider — APNs push notification registration with opaque silent-push payloads.
 //
-// This file implements the ``PushProvider`` callback interface (defined in
-// `crates/scp-ffi/uniffi/src/lib.rs`) for Apple platforms (iOS 17+, macOS 14+).
+// This file holds the APNs push adapter for Apple platforms (iOS 17+, macOS 14+).
+// ADR-025, the Apple platform adapter, requires this adapter to conform to the
+// UniFFI `PushProvider` callback interface in `crates/scp-ffi/uniffi/src/lib.rs`.
+// The shipped actor does not conform yet (ADR-025 acceptance criterion 4).
 //
 // ## Architecture
 //
-// `ApplePushProvider` is a Swift actor that bridges the asynchronous APNs token
-// delivery lifecycle into the synchronous UniFFI callback interface. It is one of
-// the four platform providers assembled by ``ApplePlatformAdapter`` (ADR-025) and
-// injected into the Rust engine at SDK initialisation.
+// `ApplePushProvider` is a Swift actor that turns the AppDelegate callbacks that
+// deliver an APNs token into one `async` call. ADR-025 has an `ApplePlatformAdapter`
+// assemble the four platform providers and inject them into the Rust engine at SDK
+// initialisation. No `ApplePlatformAdapter` exists yet, so no code injects this
+// actor into the Rust engine.
 //
 // ## APNs Payload Opacity (§10.7)
 //
 // The relay sends **only** `{"aps": {"content-available": 1}}` — a silent push.
 // No context ID, sender DID, message preview, or any other metadata may appear
-// in the payload. Silent push wakes the app in the background; the SCP engine
-// then connects to its relay set and pulls all pending encrypted envelopes.
+// in the payload. Silent push wakes the app in the background. §10.7 then has the
+// device connect to its relays and pull pending encrypted envelopes; no Rust code
+// calls `handleNotification(payload:)` yet, so nothing performs that pull today.
 // Apple learns only that the device received a notification at a specific time.
 //
 // `handleNotification(payload:)` **enforces** this invariant on receipt: payloads
@@ -88,8 +92,14 @@
 
     /// Actor-isolated APNs push notification provider for the SCP Rust engine.
     ///
-    /// Conforms to the UniFFI-generated `PushProvider` protocol so that it can be
-    /// injected into the engine via the callback interface bridge (ADR-021).
+    /// ADR-025 in `.docs/adrs/phase-5.md` requires this actor to conform to the
+    /// UniFFI-generated `PushProvider` protocol (ADR-021), and this actor does
+    /// not conform yet: that protocol names its registration method
+    /// `registerPush()` and declares `ScpError` as its error type, while this
+    /// actor names it `register()` and throws `PushError`. UniFFI panics on the
+    /// Rust side when a callback throws a type the callback does not declare,
+    /// so the conformance has to translate each `PushError` to an `ScpError`.
+    /// Acceptance criterion 4 of ADR-025 records this gap.
     ///
     /// ## AppDelegate Integration
     ///
@@ -107,7 +117,7 @@
     /// Usage:
     /// ```swift
     /// let pushProvider = ApplePushProvider()
-    /// // Pass to SCP engine via ApplePlatformAdapter
+    /// let token = try await pushProvider.register()
     /// ```
     public actor ApplePushProvider {
         // MARK: Internal state
@@ -118,14 +128,52 @@
         /// or ``registrationDidFail(_:)``. After consumption it is set back to `nil`.
         private var tokenContinuation: CheckedContinuation<Data, Error>?
 
+        /// Asks the platform to start APNs registration. ``register()`` calls it
+        /// on the main actor before it suspends.
+        private let requestRemoteNotifications: @MainActor @Sendable () -> Void
+
+        /// The wake signal ``handleNotification(payload:)`` returns for every
+        /// payload it accepts: the UTF-8 bytes of `{"aps":{"content-available":1}}`.
+        ///
+        /// The method returns this constant, not the received bytes, because
+        /// bytes that parse to the permitted object can still carry
+        /// relay-chosen content, such as trailing whitespace or a duplicate key
+        /// that the parser collapses into one.
+        static let wakeSignal = Data(#"{"aps":{"content-available":1}}"#.utf8)
+
+        /// `true` while a ``register()`` call is suspended waiting for
+        /// ``tokenDidRegister(_:)`` or ``registrationDidFail(_:)``.
+        var hasPendingRegistration: Bool {
+            tokenContinuation != nil
+        }
+
         // MARK: Initialiser
 
-        /// Creates a new `ApplePushProvider`.
+        /// Creates a new `ApplePushProvider` that registers through the shared
+        /// application's `registerForRemoteNotifications()`.
         ///
-        /// Typically called once by ``ApplePlatformAdapter/make()``.
-        public init() {}
+        /// ADR-025 has `ApplePlatformAdapter.make()` call this initialiser once.
+        /// That factory does not exist yet.
+        public init() {
+            requestRemoteNotifications = {
+                #if canImport(UIKit)
+                    UIApplication.shared.registerForRemoteNotifications()
+                #elseif canImport(AppKit)
+                    NSApplication.shared.registerForRemoteNotifications()
+                #endif
+            }
+        }
 
-        // MARK: PushProvider implementation
+        /// Creates an `ApplePushProvider` that calls `requestRemoteNotifications`
+        /// in place of the shared application's `registerForRemoteNotifications()`.
+        /// A `swift test` host holds no APNs entitlement, so the callback tests
+        /// pass a closure that does nothing, suspend ``register()``, and drive
+        /// the AppDelegate callbacks themselves.
+        init(requestRemoteNotifications: @escaping @MainActor @Sendable () -> Void) {
+            self.requestRemoteNotifications = requestRemoteNotifications
+        }
+
+        // MARK: APNs registration and payload handling
 
         /// Register for APNs push notifications and return the device token bytes.
         ///
@@ -134,9 +182,8 @@
         /// ``tokenDidRegister(_:)`` / ``registrationDidFail(_:)``. Races a 30-second
         /// timeout so callers are never blocked indefinitely.
         ///
-        /// - Returns: The raw APNs device token bytes (typically 32 bytes). The caller
-        ///   (the SCP Rust engine via UniFFI) converts these bytes to the hex string
-        ///   that is forwarded to the relay as a `PushToken`.
+        /// - Returns: The raw APNs device token bytes (typically 32 bytes). No Rust
+        ///   code calls this method yet.
         ///
         /// - Throws:
         ///   - ``PushError/registrationAlreadyInProgress`` if a concurrent call is
@@ -149,12 +196,9 @@
             }
 
             // Trigger registration on the main thread before suspending.
+            let request = requestRemoteNotifications
             Task { @MainActor in
-                #if canImport(UIKit)
-                    UIApplication.shared.registerForRemoteNotifications()
-                #elseif canImport(AppKit)
-                    NSApplication.shared.registerForRemoteNotifications()
-                #endif
+                request()
             }
 
             // Start a 30-second timeout that calls back into the actor on expiry.
@@ -197,14 +241,14 @@
         /// format required by §10.7. Any additional field in the payload — at the top level
         /// or nested inside `aps` — is rejected with ``PushError/opaquePayloadViolation``.
         ///
-        /// When the payload is valid, the method returns the raw payload bytes as the wake
-        /// signal. The SCP engine uses the wake signal to trigger a relay pull for pending
-        /// encrypted envelopes. No context ID, sender DID, or message count is extracted
-        /// from the payload — there is nothing to extract.
+        /// When the payload is valid, the method returns ``wakeSignal``, a fixed byte
+        /// string, and never the received bytes, so a caller receives no byte the relay
+        /// chose. The permitted payload carries no context ID, sender identifier, or
+        /// message count, so the wake signal carries none. No Rust code calls this
+        /// method yet.
         ///
         /// - Parameter payload: The raw JSON bytes delivered by APNs.
-        /// - Returns: The raw `payload` bytes as the wake signal, passed opaquely to the
-        ///   SCP engine.
+        /// - Returns: ``wakeSignal``, the UTF-8 bytes of `{"aps":{"content-available":1}}`.
         ///
         /// - Throws:
         ///   - ``PushError/invalidPayload(_:)`` if the bytes cannot be parsed as JSON or the
@@ -213,9 +257,7 @@
         ///     other than `aps.content-available`.
         public func handleNotification(payload: Data) throws -> Data {
             try validateOpaquePayload(payload)
-            // The payload bytes are returned as the wake signal. The content is opaque —
-            // the engine fetches pending envelopes from the relay upon receipt.
-            return payload
+            return Self.wakeSignal
         }
 
         // MARK: AppDelegate callbacks
@@ -328,13 +370,17 @@
             // __NSCFBoolean is a NSNumber subclass; NSNumber(boolValue: true).intValue == 1,
             // so intValue alone incorrectly accepts boolean true.
             // CFGetTypeID disambiguates: CFBooleanGetTypeID() ≠ CFNumberGetTypeID().
+            // A JSON fraction such as 1.5 is a floating-point CFNumber whose
+            // intValue truncates to 1, so CFNumberIsFloatType rejects it before
+            // intValue is read.
             guard
                 let number = contentAvailable as? NSNumber,
                 CFGetTypeID(number) == CFNumberGetTypeID(),
-                number.intValue == 1
+                !CFNumberIsFloatType(number),
+                number.int64Value == 1
             else {
                 throw PushError.opaquePayloadViolation(
-                    "\"content-available\" must be integer 1 (not boolean true or other value), got \(contentAvailable)"
+                    "\"content-available\" must be integer 1 (not boolean true, a fraction, or other value), got \(contentAvailable)"
                 )
             }
         }

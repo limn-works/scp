@@ -288,8 +288,10 @@ impl PushToken {
 /// A wake signal produced by [`Push::handle_notification`].
 ///
 /// Indicates that the application should wake up and process pending messages.
-/// The payload carries transport-specific context (e.g., which context has new
-/// messages). See ADR-006.
+/// §10.7 of the infrastructure spec forbids a context ID, a sender identifier,
+/// and a message count in a push payload, so a wake signal names no context.
+/// `InMemoryPush`, the one implementation of [`Push`], copies the received
+/// payload into the wake signal unchanged. See ADR-006.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeSignal {
     /// The raw notification payload that triggered this wake signal.
