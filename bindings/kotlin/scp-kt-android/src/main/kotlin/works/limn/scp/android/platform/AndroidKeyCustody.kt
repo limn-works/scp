@@ -6,13 +6,14 @@
 // is incompatible with SCP's frequent signing operations.
 //
 // Private keys never cross the custody boundary — all signing and DH operations happen
-// inside this class. The Rust engine calls through UniFFI callback interfaces with data
-// to sign and receives signatures back. Raw private key bytes stay inside the Kotlin adapter.
+// inside this class, which returns signatures and shared secrets to its caller. Raw private
+// key bytes stay inside the Kotlin adapter, except that exportSigningKeyBytes returns a
+// software Ed25519 key's private bytes. No code passes this class to the Rust engine.
 //
 // Software Ed25519 keys (API 26-32 fallback) are persisted to EncryptedSharedPreferences
 // (Jetpack Security) so they survive process death. Without this, API 26-32 users would
 // lose their DID identity key on every process restart — causing identity loss, context
-// membership loss, and UCAN delegation loss. See issue #119.
+// membership loss, and UCAN delegation loss.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
 // ADR-025 (Apple Platform Adapter — parallel reference), section 9.12 (Compromise Recovery),
@@ -53,10 +54,11 @@ import java.security.SecureRandom
 /**
  * Android Keystore-backed key custody provider for SCP Ed25519 and X25519 keys.
  *
- * Implements the [KeyCustodyProvider] interface (mirroring the Rust `KeyCustody` trait
- * from `scp-platform/src/traits.rs`). This class is injected into the Rust engine via
- * the UniFFI callback interface at `SCP.create()` time; all signing and key-agreement
- * operations are dispatched from Rust through the UniFFI boundary into this class.
+ * Implements the Kotlin [KeyCustodyProvider] interface in `Types.kt`, whose KDoc states how
+ * it differs from the Rust `KeyCustody` trait and from the UniFFI `KeyCustodyProvider`
+ * callback interface. No code passes this class to the Rust engine: `SCP.identityCreateWithCustody`
+ * in `scp-kt` takes the UniFFI-generated `uniffi.scp.KeyCustodyProvider`, which this class
+ * does not implement.
  *
  * ## Key storage strategy
  *

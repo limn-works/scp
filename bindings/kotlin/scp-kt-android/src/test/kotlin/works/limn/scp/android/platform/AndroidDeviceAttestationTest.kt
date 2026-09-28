@@ -258,6 +258,7 @@ class AndroidDeviceAttestationTest {
         val deviceIdIdx = json.indexOf("\"deviceId\"")
         val typeIdx = json.indexOf("\"type\"")
 
+        assertTrue("challenge field must appear", challengeIdx >= 0)
         assertTrue("challenge must come before deviceId", challengeIdx < deviceIdIdx)
         assertTrue("deviceId must come before type", deviceIdIdx < typeIdx)
     }

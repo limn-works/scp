@@ -35,10 +35,10 @@ import javax.crypto.spec.GCMParameterSpec
 /**
  * Android SQLCipher-backed storage provider for SCP.
  *
- * Implements the [StorageProvider] interface (mirroring the Rust `Storage` trait
- * from `scp-platform/src/traits.rs`). This class is injected into the Rust engine via
- * the UniFFI callback interface at `SCP.create()` time; all storage operations are
- * dispatched from Rust through the UniFFI boundary into this class.
+ * Implements the Kotlin [StorageProvider] interface in `Types.kt`, whose KDoc states how it
+ * differs from the Rust `Storage` trait and from the UniFFI `StorageProvider` callback
+ * interface. No code passes this class to the Rust engine, because it does not implement the
+ * UniFFI-generated `uniffi.scp.StorageProvider`.
  *
  * ## Encryption architecture
  *

@@ -3,8 +3,8 @@
  *
  * This file implements the [PushProvider] interface for Android using Firebase Cloud
  * Messaging (FCM). It is one of the four platform providers assembled by
- * `AndroidPlatformAdapter` (ADR-027) and injected into the Rust engine at SDK
- * initialisation.
+ * `AndroidPlatformAdapter` (ADR-027). No code passes it to the Rust engine, because it
+ * does not implement the UniFFI-generated `uniffi.scp.PushProvider`.
  *
  * ## FCM Payload Opacity (§10.7)
  *

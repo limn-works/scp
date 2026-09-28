@@ -1,9 +1,10 @@
 // Types.kt — Supporting types for Android platform adapters (ADR-027)
 //
-// These types follow the Rust `scp-platform` traits (crates/scp-platform/src/traits.rs) or the
-// UniFFI callback interfaces (crates/scp-ffi/uniffi/src/lib.rs), and each interface's KDoc names
-// the declaration it follows. They will eventually be replaced by UniFFI-generated Kotlin types
-// once the full FFI binding pipeline is wired. Until then, they serve as the Kotlin-side contract.
+// These types are the Kotlin-side contract of the Android adapters. Each interface's KDoc states
+// how it differs from the Rust `scp-platform` trait (crates/scp-platform/src/traits.rs) and from
+// the UniFFI callback interface (crates/scp-ffi/uniffi/src/lib.rs) for the same capability. The
+// interfaces are not the UniFFI-generated callback interfaces of the `uniffi.scp` package, so no
+// code passes an Android adapter to the Rust engine.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
 // ADR-025 (Apple Platform Adapter — parallel reference).
@@ -177,7 +178,14 @@ interface DeviceAttestationProvider {
  * Abstracts platform-specific push notification registration and notification
  * handling. The Android implementation uses Firebase Cloud Messaging (FCM).
  *
- * This interface mirrors the Rust `Push` trait in `scp-platform/src/traits.rs`.
+ * This interface matches neither Rust declaration. [register] returns a `String` token and
+ * suspends, and [handleNotification] takes a `Map<String, String>` payload, returns a
+ * [WakeSignal], and is synchronous. The Rust `Push` trait in `crates/scp-platform/src/traits.rs`
+ * declares the same two methods, but its `register` returns a `PushToken` of bytes, its
+ * `handle_notification` takes the payload as `&[u8]`, and both methods are `async`. The UniFFI
+ * `PushProvider` callback interface in `crates/scp-ffi/uniffi/src/lib.rs` names them
+ * `register_push` and `handle_notification`. Both are `async`: `register_push` returns bytes,
+ * and `handle_notification` takes and returns bytes.
  *
  * See ADR-006 for the platform abstraction design and ADR-027 for the Android adapter.
  */
@@ -208,11 +216,20 @@ interface PushProvider {
  * uses Android Keystore for TEE-backed Ed25519 on API 33+ and Bouncy Castle
  * for software fallback on API 26-32.
  *
- * This interface follows the Rust `KeyCustody` trait in `scp-platform/src/traits.rs`: its
- * methods take a [KeyHandle] and a [KeyType]. The UniFFI `KeyCustodyProvider` callback
- * interface in `scp-ffi/uniffi/src/lib.rs` takes a `String` key ID and a `String` key type
- * instead. The methods of this interface are synchronous, while the methods of both Rust
- * declarations are `async`.
+ * This interface matches neither Rust declaration.
+ *
+ * - Method set: it declares the methods of the UniFFI `KeyCustodyProvider` callback interface in
+ *   `crates/scp-ffi/uniffi/src/lib.rs` except `custody_type`. The Rust `KeyCustody` trait in
+ *   `crates/scp-platform/src/traits.rs` does not declare `export_signing_key_bytes`, and it also
+ *   declares `custody_type`, `ed25519_to_x25519_agree`, `import_ed25519_signing_key` and
+ *   `generate_ephemeral_ed25519_seed`, which this interface lacks.
+ * - Parameters: its methods take a [KeyHandle] and a [KeyType], as the Rust trait's do, while
+ *   the UniFFI callback's methods take a `String` key ID and a `String` key type.
+ * - Return types: [destroyKey] returns a [DestructionAttestation], while both Rust declarations
+ *   return nothing, and the pseudonym methods return a [PseudonymKeyHandle], while the Rust trait
+ *   returns a `PseudonymKeypair` and the UniFFI callback returns bytes.
+ * - Synchrony: its methods are synchronous. Every method of both Rust declarations is `async`
+ *   except `custody_type`, which is synchronous in both.
  *
  * See ADR-006 for the platform abstraction design and ADR-027 for the Android adapter.
  */
@@ -357,10 +374,11 @@ interface KeyCustodyProvider {
  * implementation ([AndroidStorage]) uses SQLCipher with a TEE-derived AES-256
  * encryption key stored in Android Keystore.
  *
- * This interface uses the method names of the UniFFI `StorageProvider` callback interface in
- * `scp-ffi/uniffi/src/lib.rs`, where the Rust `Storage` trait in `scp-platform/src/traits.rs`
- * names `set` and `get` as `store` and `retrieve`. The methods of this interface are
- * synchronous, while the methods of both Rust declarations are `async`.
+ * This interface declares the six methods of the UniFFI `StorageProvider` callback interface in
+ * `crates/scp-ffi/uniffi/src/lib.rs` under the same names. The Rust `Storage` trait in
+ * `crates/scp-platform/src/traits.rs` declares the same six operations but names `set` and
+ * `get` as `store` and `retrieve`. The methods of this interface are synchronous, while every
+ * method of both Rust declarations is `async`.
  *
  * All keys are UTF-8 strings. Values are opaque byte arrays. Keys are unique — storing
  * a value with an existing key replaces the previous value.

@@ -1,8 +1,8 @@
 // PlatformAdapter.kt — Android platform adapter factory (ADR-027)
 //
 // Assembles all four Android platform providers (KeyCustody, DeviceAttestation,
-// PushProvider, Storage) into a single adapter object. Called by the Kotlin SDK's
-// SCP.create() when custody = "platform".
+// PushProvider, Storage) into a single adapter object. No code in the Kotlin SDKs calls
+// the factory, and no code passes the adapter to the Rust engine.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer).
 
@@ -14,8 +14,8 @@ import android.content.Context
  * Assembled Android platform adapter holding all four provider implementations.
  *
  * Created by [AndroidPlatformAdapter.make]. Each provider implements a Kotlin interface in
- * `Types.kt`, and each interface's KDoc names the Rust trait or the UniFFI callback
- * interface in `crates/scp-ffi/uniffi/src/lib.rs` that it follows. No code passes this
+ * `Types.kt`, and each interface's KDoc states how it differs from the Rust trait and from the
+ * UniFFI callback interface in `crates/scp-ffi/uniffi/src/lib.rs`. No code passes this
  * adapter to the Rust engine yet, because the `Types.kt` interfaces are not the
  * UniFFI-generated callback interfaces of the `uniffi.scp` package.
  *
@@ -37,20 +37,14 @@ data class AndroidPlatformAdapterImpl(
  *
  * Assembles the four platform providers ([AndroidKeyCustody],
  * [AndroidDeviceAttestation], [AndroidPushProvider], [AndroidStorage]) using
- * the provided Android [Context]. The returned [AndroidPlatformAdapterImpl] is
- * passed to `NativeLib.scpCreate()` to inject platform capabilities into the
- * Rust engine.
- *
- * ## Usage
- *
- * ```kotlin
- * val adapter = AndroidPlatformAdapter.make(applicationContext)
- * val scp = NativeLib.scpCreate(adapter)
- * ```
+ * the provided Android [Context]. No code passes the returned
+ * [AndroidPlatformAdapterImpl] to the Rust engine: its providers implement the Kotlin
+ * interfaces in `Types.kt`, and `SCP.identityCreateWithCustody` in `scp-kt` takes the
+ * UniFFI-generated `uniffi.scp.KeyCustodyProvider`, so it cannot accept them.
  *
  * ## Provider construction
  *
- * - [AndroidKeyCustody] requires context for EncryptedSharedPreferences access (#119).
+ * - [AndroidKeyCustody] requires context for EncryptedSharedPreferences access.
  * - [AndroidDeviceAttestation] requires context for Play Integrity API access.
  * - [AndroidPushProvider] requires context for FCM token retrieval.
  * - [AndroidStorage] requires context for database file and Keystore access.
