@@ -4938,7 +4938,7 @@ impl McpUniFfiBridgeProvider {
         let id = context_id.to_owned();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(async move { sup.try_get_role_state(&id).await })
+                .block_on(async move { sup.get_role_state_checked(&id).await })
         })
         .map_err(|e| format!("role state of context '{context_id}' could not be read: {e}"))
     }

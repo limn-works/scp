@@ -16756,6 +16756,18 @@ mod tests {
         assert!(s.standing_contexts.load().is_empty());
     }
 
+    /// A supervisor with no event-log provider wired reports the summary as
+    /// `NotInitialized` rather than as an empty log.
+    #[tokio::test]
+    async fn event_log_summary_without_a_provider_is_not_initialized() {
+        let s = test_supervisor();
+        let summary = s.event_log_summary(&[7u8; 32]);
+        assert!(
+            matches!(summary, Err(ContextError::NotInitialized(_))),
+            "a supervisor with no event-log provider must not summarize a log, got {summary:?}"
+        );
+    }
+
     // ---------------------------------------------------------------
     // Outlet streaming (spec §5.4.5) — pump semaphore + per-context
     // admission-tracker registry (chunk 3d).

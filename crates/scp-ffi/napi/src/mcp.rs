@@ -411,7 +411,10 @@ fn live_role_state(
 /// # Errors
 ///
 /// Fails when the actor cannot be asked or does not answer: from a
-/// current-thread runtime, or when the query fails.
+/// current-thread runtime, or when
+/// `Supervisor::get_role_state_checked`
+/// fails, which it does for a busy actor and for a context the crash watchdog
+/// poisoned or is respawning, so none of those reads as `Ok(None)`.
 fn held_role_state(
     bi: &NapiBridgeInstance,
     context_id: &str,
@@ -427,7 +430,7 @@ fn held_role_state(
     let id = context_id.to_owned();
     let query = async move {
         supervisor
-            .try_get_role_state(&id)
+            .get_role_state_checked(&id)
             .await
             .map_err(|e| format!("role state of context '{id}' could not be read: {e}"))
     };

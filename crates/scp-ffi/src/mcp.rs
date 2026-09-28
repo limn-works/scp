@@ -378,7 +378,9 @@ impl FfiBridgeProvider {
     ///
     /// Fails when the actor cannot be asked or does not answer: from a
     /// current-thread runtime, when the bridge runtime cannot start, or when
-    /// the query fails.
+    /// `Supervisor::get_role_state_checked`
+    /// fails, which it does for a busy actor and for a context the crash
+    /// watchdog poisoned or is respawning, so none of those reads as `Ok(None)`.
     fn held_role_state(
         bi: &crate::runtime::PyBridgeInstance,
         context_id: &str,
@@ -395,7 +397,7 @@ impl FfiBridgeProvider {
         let id = context_id.to_owned();
         let query = async move {
             supervisor
-                .try_get_role_state(&id)
+                .get_role_state_checked(&id)
                 .await
                 .map_err(|e| format!("role state of context '{id}' could not be read: {e}"))
         };
