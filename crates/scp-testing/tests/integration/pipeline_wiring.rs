@@ -3232,7 +3232,7 @@ const RESOURCE_BRIDGE: &str = "fn validate_resource_access(&self, context_id: &s
                   -> Result<(), AccessRefusal> {\n    use scp_mcp::server::AccessRefusal;\n    \
                   let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;\n    \
                   let role_state =\n        \
-                  Self::live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;\n    \
+                  live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;\n    \
                   let access = resource.check_access(&role_state, &self.agent_did, context_id);\n    \
                   access.map_err(AccessRefusal::Denied)\n}\n\
                   fn context_members(&self) {}\n";
@@ -3296,7 +3296,7 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
     ));
     // A stand-in role state reaches the predicate: the live read is gone.
     let stand_in = bridge.replace(
-        "Self::live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?",
+        "live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?",
         "ContextRoleState::default()",
     );
     assert!(!answers_resource_access_from_live_role_state(
@@ -3398,10 +3398,10 @@ fn fn_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// Whether the production `validate_resource_access` in `code` reads the
-/// context's role state from the live source (PyO3 and NAPI `live_role_state`,
-/// UniFFI `role_state_of`) of the provider's own bridge instance, passes that
-/// value to `ResourceKind::check_access`, and returns that call's verdict as
-/// the function's tail expression.
+/// context's role state from the live source (PyO3 `gate_role_state`, NAPI
+/// `live_role_state`, UniFFI `role_state_of`) of the provider's own bridge
+/// instance, passes that value to `ResourceKind::check_access`, and returns
+/// that call's verdict as the function's tail expression.
 ///
 /// The whole body is pinned statement by statement: the `use` of
 /// `AccessRefusal`, then `bi` bound from `self.upgrade_bi()`, then the
@@ -3409,16 +3409,16 @@ fn fn_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
 /// statement can bind `bi` to another instance or return before the check, no
 /// later statement can rebind `role_state` to a stand-in, and no call chained
 /// onto the read (an `or_else`, an `unwrap_or_else`) can turn a failed read
-/// into a stand-in: each pinned read ends in `?`, which returns the failure as
-/// `AccessRefusal::Unreadable`.
+/// into a stand-in: each pinned read ends in `?`, which returns a failed read
+/// as `AccessRefusal::Unreadable` (and PyO3's an absent context as
+/// `AccessRefusal::Denied`).
 fn answers_resource_access_from_live_role_state(code: &str) -> bool {
     const BIND: &str = "use scp_mcp::server::AccessRefusal; \
                         let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;";
     const TAIL: &str = "let access = resource.check_access(&role_state, &self.agent_did, \
                         context_id); access.map_err(AccessRefusal::Denied) }";
     const READS: [&str; 3] = [
-        "let role_state = Self::live_role_state(&bi, context_id)\
-         .map_err(AccessRefusal::Unreadable)?;",
+        "let role_state = Self::gate_role_state(&bi, context_id)?;",
         "let role_state = live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;",
         "let role_state = Self::role_state_of(&bi, context_id) \
          .map_err(AccessRefusal::Unreadable)? .ok_or_else(|| { \
