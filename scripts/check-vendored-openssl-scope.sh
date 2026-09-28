@@ -280,7 +280,7 @@ run_fixtures() {
   # run_gate against a planted owner gate and matrix.
   wheel="$(printf 'bindings/python/pyproject.toml\tscp-ffi|--features extension-module,vendored-openssl')"
   printf '%s\n' '#!/usr/bin/env bash' 'case "$1" in' \
-    "  --print-wheel-entries) printf '%s\n' $(printf '%q' "$wheel") ;;" \
+    "  --print-wheel-entries) if [ -n \"\${FAKE_WHEEL+x}\" ]; then printf '%s\n' \"\$FAKE_WHEEL\"; else printf '%s\n' $(printf '%q' "$wheel"); fi ;;" \
     "  --print-artifacts) if [ -n \"\${FAKE_ARTIFACTS+x}\" ]; then printf '%s\n' \"\$FAKE_ARTIFACTS\"; else printf '%s\n' 'scp-node|' 'scp-ffi|--no-default-features --features server' $(printf '%q' "${wheel#*$'\t'}"); fi ;;" \
     'esac' > "$dir/gate.sh"
   local want_argv
@@ -294,10 +294,19 @@ run_fixtures() {
   FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_triple_occurrences aarch64-apple-darwin scp-node --no-default-features >/dev/null
   same "$(cat "$ARGV_LOG")" "$want_argv"
   expect "a caller's package and feature arguments do not reach the one-triple resolution" PASS $?
+  # wheel_line's two guards, each fed an answer only that guard rejects: a second
+  # line that is itself a feature selection, no line, and a resolver flag in one line.
+  same "$(FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_line)" "$wheel"; expect "wheel_line PASSES one well-formed wheel entry through unchanged" PASS $?
+  FAKE_WHEEL="$(printf '%s\n' "$wheel" --no-default-features)" FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_line >/dev/null 2>&1; expect "wheel_line FAILS a two-line answer" FAIL $?
+  FAKE_WHEEL="" FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_line >/dev/null 2>&1; expect "wheel_line FAILS an empty answer" FAIL $?
+  FAKE_WHEEL="$wheel --prune openssl-src" FEATURE_GRAPH_GATE="$dir/gate.sh" wheel_line >/dev/null 2>&1; expect "wheel_line FAILS a wheel entry carrying a resolver flag" FAIL $?
   scenario() { # <label> <want>
     out="$(FEATURE_GRAPH_GATE="$dir/gate.sh" WHEEL_MATRIX_FILE="$dir/m.yml" run_gate 2>&1)"; expect "$1" "$2" $?
   }
   scenario "run_gate PASSES when only the wheel vendors" PASS
+  # The artifact list names the same pruned entry, so only wheel_line's guard can fail it.
+  FAKE_WHEEL="$wheel --prune openssl-src" FAKE_ARTIFACTS="$(printf '%s\n' 'scp-node|' "${wheel#*$'\t'} --prune openssl-src")" \
+    scenario "(presence) run_gate FAILS when the wheel entry carries a resolver flag" FAIL
   FAKE_DROPPED=x86_64-pc-windows-msvc scenario "(presence) run_gate FAILS when one wheel triple reaches no $VENDOR_CRATE" FAIL
   printf '%s\n' "$out" | grep -F "FAIL — x86_64-pc-windows-msvc reaches 0" >/dev/null; expect "(presence) it names that triple" PASS $?
   FAKE_NO_FEATURE=1 scenario "(presence) run_gate FAILS when $VENDOR_CRATE reaches the wheel and libsqlite3-sys depends on openssl-sys without bundled-sqlcipher-vendored-openssl" FAIL
