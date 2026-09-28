@@ -92,15 +92,25 @@ pub fn derive_key_pair(ikm: &[u8]) -> Result<P256SigningKey, HpkeError> {
         )));
     }
     let dkp_prk = labeled_extract(b"", &KEM_SUITE_ID, b"dkp_prk", ikm);
+    select_candidate(|counter, candidate| {
+        labeled_expand(&dkp_prk, &KEM_SUITE_ID, b"candidate", &[counter], candidate)
+    })
+}
+
+/// The `DeriveKeyPair` rejection loop: for `counter` in `0..=255`, `expand`
+/// writes the candidate for that counter, and the first candidate in
+/// `[1, n − 1]` becomes the key.
+///
+/// Private, so the only production `expand` is the `LabeledExpand` in
+/// [`derive_key_pair`]; the tests pass fixed candidates to reach the
+/// rejection branch, which the real expansion reaches with probability
+/// about 2^-32.
+fn select_candidate(
+    mut expand: impl FnMut(u8, &mut [u8; PRIVATE_KEY_LEN]) -> Result<(), HpkeError>,
+) -> Result<P256SigningKey, HpkeError> {
     for counter in 0..=u8::MAX {
         let mut candidate = Zeroizing::new([0u8; PRIVATE_KEY_LEN]);
-        labeled_expand(
-            &dkp_prk,
-            &KEM_SUITE_ID,
-            b"candidate",
-            &[counter],
-            candidate.as_mut(),
-        )?;
+        expand(counter, &mut candidate)?;
         if let Ok(sk) = P256SigningKey::from_scalar_bytes(&candidate) {
             return Ok(sk);
         }
@@ -772,14 +782,53 @@ mod tests {
         Ok(())
     }
 
+    /// The P-256 group order `n`.
+    const ORDER: &str = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551";
+
+    /// `DeriveKeyPair`'s loop rejects a candidate equal to `n` (counter 0) and
+    /// one equal to `0` (counter 1), and takes the counter-2 candidate.
+    #[test]
+    fn select_candidate_skips_n_and_zero() -> TestResult {
+        let order = arr::<32>(ORDER)?;
+        let chosen = arr::<32>(SK_RM)?;
+        let mut seen = Vec::new();
+        let sk = select_candidate(|counter, out| {
+            seen.push(counter);
+            *out = match counter {
+                0 => order,
+                1 => [0u8; 32],
+                _ => chosen,
+            };
+            Ok(())
+        })?;
+        assert_eq!(seen, [0, 1, 2], "counters tried");
+        assert_eq!(*sk.to_scalar_bytes(), chosen, "counter-2 candidate chosen");
+        Ok(())
+    }
+
+    /// `DeriveKeyPair`'s loop tries all 256 counters, 0 through 255, before it
+    /// fails with `InvalidKey`.
+    #[test]
+    fn select_candidate_fails_after_256_invalid_candidates() -> TestResult {
+        let order = arr::<32>(ORDER)?;
+        let mut seen = Vec::new();
+        let result = select_candidate(|counter, out| {
+            seen.push(counter);
+            *out = order;
+            Ok(())
+        });
+        assert!(matches!(result, Err(HpkeError::InvalidKey(_))));
+        assert_eq!(seen, (0..=u8::MAX).collect::<Vec<_>>(), "counters tried");
+        Ok(())
+    }
+
     /// Negative: a recipient scalar of zero or of the group order is rejected,
     /// and `DeriveKeyPair` rejects `ikm` shorter than `Nsk`.
     #[test]
     fn rejects_invalid_scalars_and_short_ikm() -> TestResult {
         let (_, pk) = fresh_recipient()?;
         let (enc, ct) = seal(&pk, b"i", b"a", b"x")?;
-        let order: [u8; 32] =
-            arr::<32>("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")?;
+        let order = arr::<32>(ORDER)?;
         for sk in [[0u8; 32], order] {
             assert!(matches!(
                 open(&sk, &enc, b"i", b"a", &ct),
