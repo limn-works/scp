@@ -512,6 +512,7 @@
         /// | `attestKey`, replacement key | probe assertion succeeds | already attested | discarded |
         /// | `attestKey` | probe answers `invalidKey` | service rejected it | discarded |
         /// | `attestKey` | probe answers `serverUnavailable` | unknown (`serverUnavailable`) | kept |
+        /// | `attestKey` | probe answers neither an assertion nor an error | unknown (`internalError`) | kept |
         /// | `attestKey` | probe fails otherwise | unknown (`serviceError`) | kept |
         /// | `generateAssertion` | no record | unattested key | kept |
         /// | `generateAssertion` | record | service rejected it | discarded |
@@ -583,6 +584,12 @@
                 )
             case let .failure(probeError) where (probeError as? DCError)?.code == .invalidKey:
                 return rejectKey(keyId, error)
+            case let .failure(probeError as AttestationError):
+                // `completionResult` raised this error for an answer carrying
+                // neither an assertion nor an error. `classify` returns such an
+                // error unchanged on every other path, so the probe does too,
+                // and the caller receives SCP-ATTEST-9025 for it on every path.
+                return probeError
             case let .failure(probeError) where (probeError as? DCError)?.code == .serverUnavailable:
                 return .serverUnavailable(
                     "attestKey answered invalidKey and the assertion that tells an attested key "

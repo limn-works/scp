@@ -332,8 +332,12 @@
     /// only, and every other double ignores `clientDataHash`, so no other
     /// double notices a change to the bytes `attest` hands Apple.
     private final class RecordingAppAttestService: DCAppAttestService, @unchecked Sendable {
-        /// A key ID `generateKey` hands back.
-        static let generatedKeyId = Data(repeating: 0x05, count: 32).base64EncodedString()
+        /// The key ID the `ordinal`th `generateKey` call hands back, counting
+        /// from 1. Apple returns a new key ID for every generated key, so each
+        /// call answers a different ID.
+        static func generatedKeyId(_ ordinal: Int) -> String {
+            Data(repeating: UInt8(0x50 + ordinal), count: 32).base64EncodedString()
+        }
 
         /// What Apple returns for each of three `DCError.invalidKey` conditions.
         static let invalidKeyError = NSError(
@@ -351,6 +355,7 @@
         private let lock = NSLock()
         private var attestCalls: [Call] = []
         private var assertCalls: [Call] = []
+        private var keysGenerated = 0
         private var heldAssertion: ((Data?, Error?) -> Void)?
         private let holdsFirstAssertion: Bool
         private let assertionResult: Result<Data, Error>
@@ -381,7 +386,11 @@
         }
 
         override func generateKey(completionHandler: @escaping (String?, Error?) -> Void) {
-            completionHandler(Self.generatedKeyId, nil)
+            let ordinal: Int = lock.withLock {
+                keysGenerated += 1
+                return keysGenerated
+            }
+            completionHandler(Self.generatedKeyId(ordinal), nil)
         }
 
         override func attestKey(
@@ -1266,11 +1275,12 @@
 
             #expect(first == Data([0xA1]))
             #expect(second == Data([0xA1]))
-            let call = RecordingAppAttestService.Call(
-                keyId: RecordingAppAttestService.generatedKeyId,
-                clientDataHash: challenge
-            )
-            #expect(service.attestations == [call, call])
+            // Apple attests one key once, so the second attest hands Apple the
+            // replacement key the adapter generated, under the same challenge.
+            #expect(service.attestations == [
+                .init(keyId: RecordingAppAttestService.generatedKeyId(1), clientDataHash: challenge),
+                .init(keyId: RecordingAppAttestService.generatedKeyId(2), clientDataHash: challenge)
+            ])
         }
 
         @Test("attest rejects a challenge that is not 32 bytes before it generates a key or calls Apple")
@@ -1331,7 +1341,7 @@
 
             #expect(
                 service.assertions == [
-                    .init(keyId: RecordingAppAttestService.generatedKeyId, clientDataHash: requestHash)
+                    .init(keyId: RecordingAppAttestService.generatedKeyId(1), clientDataHash: requestHash)
                 ]
             )
         }
@@ -1400,9 +1410,14 @@
         static let generatedKeyId = Data(repeating: 0x09, count: 32).base64EncodedString()
 
         private let answersKeyGeneration: Bool
+        private let attestAnswersInvalidKey: Bool
 
-        init(answersKeyGeneration: Bool) {
+        /// - Parameter attestAnswersInvalidKey: When set, `attestKey` answers
+        ///   `DCError.invalidKey`, so the adapter asks `generateAssertion`,
+        ///   which answers with nothing, whether Apple attested the key.
+        init(answersKeyGeneration: Bool, attestAnswersInvalidKey: Bool = false) {
             self.answersKeyGeneration = answersKeyGeneration
+            self.attestAnswersInvalidKey = attestAnswersInvalidKey
             super.init()
         }
 
@@ -1419,6 +1434,13 @@
             clientDataHash _: Data,
             completionHandler: @escaping (Data?, Error?) -> Void
         ) {
+            if attestAnswersInvalidKey {
+                completionHandler(
+                    nil,
+                    NSError(domain: DCErrorDomain, code: DCError.invalidKey.rawValue, userInfo: nil)
+                )
+                return
+            }
             completionHandler(nil, nil)
         }
 
@@ -1478,6 +1500,26 @@
             } catch {
                 expectInternalError(error, from: "attest")
             }
+            #expect(defaults.string(forKey: Self.keyIdStorageKey) == SilentAppAttestService.generatedKeyId)
+            #expect(defaults.string(forKey: Self.attestedKeyIdStorageKey) == nil)
+        }
+
+        @Test("attest throws SCP-ATTEST-9025 when the invalidKey probe's generateAssertion answers with nothing")
+        func attestProbeReportsEmptyAssertionAsInternalError() async {
+            let defaults = InMemoryUserDefaults()
+            let adapter = AppleDeviceAttestation(
+                service: SilentAppAttestService(answersKeyGeneration: true, attestAnswersInvalidKey: true),
+                defaults: defaults
+            )
+
+            do throws(ScpError) {
+                _ = try await adapter.attest(challenge: Data(repeating: 0x01, count: 32), deviceId: Data([0x02]))
+                Issue.record("attest returned bytes when attestKey answered invalidKey")
+            } catch {
+                expectInternalError(error, from: "attest")
+            }
+            // The probe learned nothing about the key, so the adapter keeps it
+            // and records no attestation for it.
             #expect(defaults.string(forKey: Self.keyIdStorageKey) == SilentAppAttestService.generatedKeyId)
             #expect(defaults.string(forKey: Self.attestedKeyIdStorageKey) == nil)
         }
