@@ -34,3 +34,4 @@
 # `+toolchain` sets `RUSTUP_TOOLCHAIN` for the command and everything it spawns.
 [toolchain]
 channel = "nightly-2026-05-03"
+components = ["rust-analyzer"]
