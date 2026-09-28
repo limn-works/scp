@@ -11,6 +11,7 @@ import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -330,13 +331,22 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
      * [start] returned.
      *
      * A caller cancelling this call releases that mutex, so a stop waiting on it proceeds.
+     *
+     * @throws CancellationException when [unmount] has already removed [mount], checked under
+     *   the mutex. That mount's own stop may have taken the mutex first and found nothing to
+     *   release, and a start run after it would open a subscription that no stop releases.
+     *   `Mutex.withLock` takes a free mutex without checking cancellation, so a cancelled
+     *   caller alone does not prevent that.
      */
     internal suspend fun <T> startMounted(
         mount: Mount,
         start: suspend () -> T,
     ): T {
         mount.pendingStop?.join()
-        return mount.state.mutex.withLock { start() }
+        return mount.state.mutex.withLock {
+            if (mount.unmounted.get()) throw CancellationException("mount left before its start ran")
+            start()
+        }
     }
 
     /**

@@ -10,6 +10,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.ui.test.junit4.createComposeRule
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -713,6 +714,27 @@ class ScpHotStreamRemountTest {
             dispatcherFree.countDown()
             executor.shutdown()
         }
+    }
+
+    /**
+     * A start that takes the key's mutex after its own mount's stop ran never runs: that stop
+     * found nothing to release, so anything the start opened would stay open with no stop.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `a start that reaches the mutex after its own mount's stop does not run`() {
+        val coordinator = ScpHotStreamCoordinator(CoroutineScope(SupervisorJob() + Dispatchers.IO))
+        val mount = coordinator.mount("k")
+        val stop = coordinator.unmount(mount) { }
+        runBlocking { checkNotNull(stop).join() }
+
+        val started = AtomicBoolean(false)
+        val outcome = runCatching { runBlocking { coordinator.startMounted(mount) { started.set(true) } } }
+
+        assertTrue(
+            "a start after its own mount's stop did not fail",
+            outcome.exceptionOrNull() is CancellationException,
+        )
+        assertEquals("a start after its own mount's stop ran", false, started.get())
     }
 
     /**
