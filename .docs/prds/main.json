@@ -6326,7 +6326,13 @@
         "Standard Play Integrity request flow implemented",
         "Classic attestation flow available as alternative (if decided)",
         "Attestation tokens validated server-side",
-        "Integration tests verify attestation flow end-to-end on physical device"
+        "Integration tests verify attestation flow end-to-end on physical device",
+        "`attest` requests a Standard integrity token through `IntegrityManagerFactory.createStandard(context)`, `prepareIntegrityToken` and `StandardIntegrityTokenProvider.request` (ADR-027 acceptance criterion 7)",
+        "`attest` passes `prepareIntegrityToken` the `cloudProjectNumber` of the package verifier's `PlayIntegrityVerifier` entry (ADR-027 acceptance criterion 7)",
+        "`attest` sets `requestHash` to the lowercase hexadecimal form of the binding digest `D` of `09-security-model.md` §9.3.1 that the caller passes as `challenge` (ADR-027 acceptance criterion 7)",
+        "`attest` does not read `deviceId` (ADR-027 acceptance criterion 7)",
+        "`assertRequest` requests a fresh Standard integrity token whose `requestHash` is the lowercase hexadecimal form of the assertion digest `A` of `09-security-model.md` §9.3.1 that the caller passes as `requestHash` (ADR-027 acceptance criterion 8)",
+        "`assertRequest` does not route through `attest` (ADR-027 acceptance criterion 8)"
       ],
       "actionItems": [
         "Define Android-specific DeviceAttestation implementation struct",

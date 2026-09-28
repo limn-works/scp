@@ -5,10 +5,11 @@
 // Bouncy Castle. StrongBox is explicitly NOT used due to 10-100x latency penalty that
 // is incompatible with SCP's frequent signing operations.
 //
-// Private keys never cross the custody boundary — all signing and DH operations happen
-// inside this class, which returns signatures and shared secrets to its caller. Raw private
-// key bytes stay inside the Kotlin adapter, except that exportSigningKeyBytes returns a
-// software Ed25519 key's private bytes. No code passes this class to the Rust engine.
+// Hardware-backed Ed25519 private keys never leave the TEE. This class performs all signing
+// and DH itself and returns signatures and shared secrets, and it returns a software private
+// key (Ed25519 on API 26-32, and every X25519 key) to no caller, with one exception:
+// exportSigningKeyBytes returns a software Ed25519 key's 32-byte private seed. No code passes
+// this class to the Rust engine.
 //
 // Software Ed25519 keys (API 26-32 fallback) are persisted to EncryptedSharedPreferences
 // (Jetpack Security) so they survive process death. Without this, API 26-32 users would
@@ -84,7 +85,7 @@ import java.security.SecureRandom
  * ## Thread safety
  *
  * Android Keystore operations are thread-safe. The [softwareKeys] map is a
- * [ConcurrentHashMap] for safe concurrent access from multiple UniFFI callback threads.
+ * [ConcurrentHashMap] for safe concurrent access from multiple threads.
  *
  * ## Compromise recovery
  *
@@ -108,7 +109,7 @@ class AndroidKeyCustody internal constructor(
 
     /**
      * Production constructor — creates [EncryptedSharedPreferences] backed by Android
-     * Keystore for persisting software Ed25519 keys (ADR-027, #119).
+     * Keystore for persisting software Ed25519 keys (ADR-027).
      *
      * @param context Android application context. Must be an application context
      *   (not an activity context) to avoid memory leaks from long-lived references.
@@ -714,7 +715,7 @@ class AndroidKeyCustody internal constructor(
  *
  * @param softwareKeys Shared key storage map (same instance as [AndroidKeyCustody.softwareKeys]).
  * @param softwareKeyTypes Shared key type tracking map.
- * @param encryptedPrefs Persistent storage for Ed25519 private key seeds (ADR-027, #119).
+ * @param encryptedPrefs Persistent storage for Ed25519 private key seeds (ADR-027).
  */
 internal class SoftwareKeyOps(
     private val softwareKeys: ConcurrentHashMap<String, AsymmetricCipherKeyPair>,
@@ -727,7 +728,7 @@ internal class SoftwareKeyOps(
      * Used as fallback on API 26-32 where Android Keystore does not support EdDSA.
      * The key pair is stored in [softwareKeys], tracked in [softwareKeyTypes], and
      * the private key seed is persisted to [encryptedPrefs] so it survives process
-     * death (ADR-027, #119).
+     * death (ADR-027).
      *
      * The 32-byte Ed25519 private key seed is written to EncryptedSharedPreferences
      * under the key `scp.ed25519.<keyId>`. After writing, the local byte array copy
@@ -848,7 +849,7 @@ internal class SoftwareKeyOps(
     }
 
     // -----------------------------------------------------------------------
-    // Private: EncryptedSharedPreferences persistence (ADR-027, #119)
+    // Private: EncryptedSharedPreferences persistence (ADR-027)
     // -----------------------------------------------------------------------
 
     /**

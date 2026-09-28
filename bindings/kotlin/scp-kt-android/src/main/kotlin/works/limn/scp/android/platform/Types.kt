@@ -2,9 +2,11 @@
 //
 // These types are the Kotlin-side contract of the Android adapters. Each interface's KDoc states
 // how it differs from the Rust `scp-platform` trait (crates/scp-platform/src/traits.rs) and from
-// the UniFFI callback interface (crates/scp-ffi/uniffi/src/lib.rs) for the same capability. The
-// interfaces are not the UniFFI-generated callback interfaces of the `uniffi.scp` package, so no
-// code passes an Android adapter to the Rust engine.
+// the UniFFI callback interface (crates/scp-ffi/uniffi/src/lib.rs) for the same capability. No
+// code passes an Android adapter to the Rust engine. The UniFFI bridge has no function that
+// accepts a storage, push or device attestation provider. `SCP.identityCreateWithCustody` in
+// `scp-kt` accepts a key custody provider, but only the UniFFI-generated
+// `uniffi.scp.KeyCustodyProvider`, which these interfaces are not.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
 // ADR-025 (Apple Platform Adapter — parallel reference).
@@ -141,8 +143,9 @@ enum class WakeSignal {
  *
  * This interface mirrors the UniFFI `DeviceAttestationProvider` callback interface in
  * `crates/scp-ffi/uniffi/src/lib.rs`. It does not mirror the Rust `DeviceAttestation` trait in
- * `crates/scp-platform/src/traits.rs`, whose `attest` takes no argument and which declares a
- * `verify` method that this interface lacks.
+ * `crates/scp-platform/src/traits.rs`, whose `attest` takes no argument, which declares a
+ * `verify` method that this interface lacks, and which declares no `assert_request`, while this
+ * interface declares [assertRequest].
  *
  * See ADR-006 for the platform abstraction design and ADR-027 for the Android adapter.
  */
@@ -153,7 +156,9 @@ interface DeviceAttestationProvider {
      * @param challenge The 32-byte binding digest `D` of
      *   `09-security-model.md` §9.3.1. ADR-025 and ADR-027 require the caller
      *   to pass `D`. No Rust code calls this method yet.
-     * @param deviceId Stable device/identity identifier bytes.
+     * @param deviceId Device ID bytes. `27-attestations.md` states that a device id is not an
+     *   identifier, and ADR-027 acceptance criterion 7 requires the Android adapter not to read
+     *   this parameter.
      * @return Platform-specific attestation token bytes.
      * @throws ScpException if attestation fails.
      */
@@ -202,7 +207,7 @@ interface PushProvider {
      * Handle an incoming push notification payload and produce a wake signal.
      *
      * @param payload The push notification data payload as a key-value map.
-     * @return [WakeSignal] indicating the action the engine should take.
+     * @return [WakeSignal] indicating the action the caller should take.
      * @throws ScpException if the payload is invalid.
      */
     fun handleNotification(payload: Map<String, String>): WakeSignal
@@ -219,15 +224,21 @@ interface PushProvider {
  * This interface matches neither Rust declaration.
  *
  * - Method set: it declares the methods of the UniFFI `KeyCustodyProvider` callback interface in
- *   `crates/scp-ffi/uniffi/src/lib.rs` except `custody_type`. The Rust `KeyCustody` trait in
- *   `crates/scp-platform/src/traits.rs` does not declare `export_signing_key_bytes`, and it also
- *   declares `custody_type`, `ed25519_to_x25519_agree`, `import_ed25519_signing_key` and
- *   `generate_ephemeral_ed25519_seed`, which this interface lacks.
+ *   `crates/scp-ffi/uniffi/src/lib.rs` except `custody_type`, and it names the callback's
+ *   `get_public_key` [publicKey], the name the Rust trait's `public_key` takes in Kotlin. The
+ *   Rust `KeyCustody` trait in `crates/scp-platform/src/traits.rs` does not declare
+ *   `export_signing_key_bytes`, and it also declares `custody_type`, `ed25519_to_x25519_agree`,
+ *   `import_ed25519_signing_key` and `generate_ephemeral_ed25519_seed`, which this interface
+ *   lacks.
  * - Parameters: its methods take a [KeyHandle] and a [KeyType], as the Rust trait's do, while
  *   the UniFFI callback's methods take a `String` key ID and a `String` key type.
- * - Return types: [destroyKey] returns a [DestructionAttestation], while both Rust declarations
- *   return nothing, and the pseudonym methods return a [PseudonymKeyHandle], while the Rust trait
- *   returns a `PseudonymKeypair` and the UniFFI callback returns bytes.
+ * - Return types: [generateKeypair] returns a [KeyHandle], as the Rust trait's does, while the
+ *   UniFFI callback's `generate_keypair` returns a `String` key ID. [destroyKey] returns a
+ *   [DestructionAttestation], while both Rust declarations return nothing. The pseudonym methods
+ *   return a [PseudonymKeyHandle], while the Rust trait returns a `PseudonymKeypair` and the
+ *   UniFFI callback returns bytes. [sign], [publicKey] and [dhAgree] return a [ByteArray], as the
+ *   UniFFI callback's methods return bytes, while the Rust trait returns a `Signature`, a
+ *   `PublicKey` and a `SharedSecret`.
  * - Synchrony: its methods are synchronous. Every method of both Rust declarations is `async`
  *   except `custody_type`, which is synchronous in both.
  *

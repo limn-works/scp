@@ -59,13 +59,20 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      * The nonce is `Base64(SHA-256(clientDataJSON))`. The adapter requests a
      * Classic Play Integrity token with this nonce and returns it as UTF-8
      * encoded JWT bytes. ADR-027 acceptance criterion 7 requires a Standard
-     * token whose `requestHash` is the lowercase hexadecimal form of the
-     * binding digest `D`; story SCP-111 tracks that change.
+     * token, prepared with the `cloudProjectNumber` of the package verifier's
+     * `PlayIntegrityVerifier` entry, whose `requestHash` is the lowercase
+     * hexadecimal form of the binding digest `D`, and an adapter that does not
+     * read [deviceId]. This adapter meets none of the three; story SCP-111's
+     * acceptance criteria track each one.
      *
      * @param challenge The 32-byte binding digest `D` of
      *   `09-security-model.md` §9.3.1. ADR-025 and ADR-027 require the caller
      *   to pass `D`. No Rust code calls this method yet.
-     * @param deviceId Stable device/identity identifier bytes.
+     * @param deviceId Device ID bytes, which this adapter base64-encodes into
+     *   `clientDataJSON`. No verifier checks them, and they name no identity:
+     *   `27-attestations.md` states that a device id is not an identifier, and
+     *   ADR-027 acceptance criterion 7 requires the adapter not to read this
+     *   parameter.
      * @return Play Integrity token bytes (JWT, UTF-8 encoded).
      * @throws ScpException if the Play Integrity API call fails.
      */
@@ -123,7 +130,8 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      * Classic integrity token whose nonce is `Base64(SHA-256(clientDataJSON))`.
      * ADR-027 acceptance criterion 8 requires a Standard integrity token whose
      * `requestHash` is the lowercase hexadecimal form of `A`, requested
-     * without routing through [attest]; story SCP-111 tracks that change.
+     * without routing through [attest]; story SCP-111's acceptance criteria
+     * track both requirements.
      *
      * @param requestHash The 32-byte assertion digest `A` of
      *   `09-security-model.md` §9.3.1 over the request bytes. ADR-025 and

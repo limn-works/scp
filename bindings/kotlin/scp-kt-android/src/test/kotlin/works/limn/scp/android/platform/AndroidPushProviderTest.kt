@@ -3,9 +3,8 @@
  *
  * Tests cover the [AndroidPushProvider.handleNotification] logic — payload
  * validation, wake signal generation, and error code correctness. The
- * [AndroidPushProvider.register] method requires a live Firebase instance and
- * is tested via integration tests (instrumented tests on a real or emulated
- * Android device).
+ * [AndroidPushProvider.register] method requires a live Firebase instance,
+ * and the module has no instrumented tests, so no test covers it.
  *
  * See ADR-027 (Android Platform Adapter) and §10.7 (push payload opacity).
  */

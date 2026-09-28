@@ -11,21 +11,30 @@
 //!   the same name: `attest(challenge, deviceId)` and
 //!   `assertRequest(requestHash)` take and return bytes. The
 //!   [`crate::traits::DeviceAttestation`] trait's `attest` takes no argument,
-//!   and the trait declares a `verify` method the Kotlin interface lacks.
+//!   the trait declares a `verify` method the Kotlin interface lacks, and it
+//!   declares no `assert_request`, while the Kotlin interface declares
+//!   `assertRequest`.
 //! - `KeyCustodyProvider` declares the methods of the `UniFFI`
-//!   `KeyCustodyProvider` callback except `custody_type`. The
-//!   [`crate::traits::KeyCustody`] trait does not declare
-//!   `export_signing_key_bytes`, and it also declares `custody_type`,
+//!   `KeyCustodyProvider` callback except `custody_type`, and it names the
+//!   callback's `get_public_key` `publicKey`, the name the Rust trait's
+//!   `public_key` takes in Kotlin. The [`crate::traits::KeyCustody`] trait
+//!   does not declare `export_signing_key_bytes`, and it also declares
+//!   `custody_type`,
 //!   `ed25519_to_x25519_agree`, `import_ed25519_signing_key` and
 //!   `generate_ephemeral_ed25519_seed`, which the Kotlin interface lacks. The
 //!   Kotlin methods take a `KeyHandle` and a `KeyType`, as the Rust trait's
 //!   do, while the `UniFFI` callback's methods take a `String` key ID and a
-//!   `String` key type. The Kotlin `destroyKey` returns a
-//!   `DestructionAttestation`, while both Rust declarations return nothing,
-//!   and the Kotlin pseudonym methods return a `PseudonymKeyHandle`, while the
+//!   `String` key type. The Kotlin `generateKeypair` returns a `KeyHandle`, as
+//!   the trait's does, while the callback's `generate_keypair` returns a
+//!   `String` key ID. The Kotlin `destroyKey` returns a
+//!   `DestructionAttestation`, while both Rust declarations return nothing.
+//!   The Kotlin pseudonym methods return a `PseudonymKeyHandle`, while the
 //!   trait returns a `PseudonymKeypair` and the callback returns bytes. The
-//!   Kotlin methods are synchronous; every method of both Rust declarations is
-//!   `async` except `custody_type`, which is synchronous in both.
+//!   Kotlin `sign`, `publicKey` and `dhAgree` return a `ByteArray`, as the
+//!   callback's methods return bytes, while the trait returns a `Signature`, a
+//!   `PublicKey` and a `SharedSecret`. The Kotlin methods are synchronous;
+//!   every method of both Rust declarations is `async` except `custody_type`,
+//!   which is synchronous in both.
 //! - `PushProvider`'s `register` returns a `String` token and suspends, and
 //!   its `handleNotification` takes a `Map<String, String>` payload, returns a
 //!   `WakeSignal`, and is synchronous. The [`crate::traits::Push`] trait's

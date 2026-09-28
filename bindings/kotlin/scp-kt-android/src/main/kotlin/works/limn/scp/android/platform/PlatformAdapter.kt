@@ -16,8 +16,10 @@ import android.content.Context
  * Created by [AndroidPlatformAdapter.make]. Each provider implements a Kotlin interface in
  * `Types.kt`, and each interface's KDoc states how it differs from the Rust trait and from the
  * UniFFI callback interface in `crates/scp-ffi/uniffi/src/lib.rs`. No code passes this
- * adapter to the Rust engine yet, because the `Types.kt` interfaces are not the
- * UniFFI-generated callback interfaces of the `uniffi.scp` package.
+ * adapter to the Rust engine yet. The UniFFI bridge has no function that accepts a storage,
+ * push or device attestation provider, and `SCP.identityCreateWithCustody` in `scp-kt`
+ * accepts only the UniFFI-generated `uniffi.scp.KeyCustodyProvider`, which [keyCustody]
+ * does not implement.
  *
  * @property keyCustody Android Keystore key management (TEE-backed Ed25519 on API 33+).
  * @property deviceAttestation Play Integrity device attestation, which requests a Classic
@@ -38,9 +40,10 @@ data class AndroidPlatformAdapterImpl(
  * Assembles the four platform providers ([AndroidKeyCustody],
  * [AndroidDeviceAttestation], [AndroidPushProvider], [AndroidStorage]) using
  * the provided Android [Context]. No code passes the returned
- * [AndroidPlatformAdapterImpl] to the Rust engine: its providers implement the Kotlin
- * interfaces in `Types.kt`, and `SCP.identityCreateWithCustody` in `scp-kt` takes the
- * UniFFI-generated `uniffi.scp.KeyCustodyProvider`, so it cannot accept them.
+ * [AndroidPlatformAdapterImpl] to the Rust engine: the UniFFI bridge has no function that
+ * accepts a storage, push or device attestation provider, and `SCP.identityCreateWithCustody`
+ * in `scp-kt` takes the UniFFI-generated `uniffi.scp.KeyCustodyProvider`, which the Kotlin
+ * [KeyCustodyProvider] in `Types.kt` is not.
  *
  * ## Provider construction
  *

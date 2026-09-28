@@ -2,10 +2,11 @@
 //
 // These tests exercise the software fallback path (Bouncy Castle) since Android Keystore
 // is not available in JVM unit tests. The Keystore path (API 33+, CustodyType.HARDWARE)
-// requires an Android device or emulator and is tested via instrumented tests.
+// requires an Android device or emulator; the module has no instrumented tests, so no test
+// covers it.
 //
 // Uses InMemorySharedPreferences to inject a test double for EncryptedSharedPreferences,
-// allowing verification of Ed25519 key persistence without the Android framework (#119).
+// allowing verification of Ed25519 key persistence without the Android framework.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
 // SCP-110 (Implement Android Keystore KeyCustody trait).
@@ -99,7 +100,7 @@ private class InMemorySharedPreferences : SharedPreferences {
  * - Pseudonym derivation determinism
  * - Key destruction
  * - Error handling (key not found, wrong key type)
- * - Ed25519 key persistence to EncryptedSharedPreferences (#119)
+ * - Ed25519 key persistence to EncryptedSharedPreferences
  *
  * The Build.VERSION.SDK_INT in JVM tests defaults to 0, which is below
  * API 33 (TIRAMISU), so all Ed25519 keys will use the software path.
@@ -668,7 +669,7 @@ class AndroidKeyCustodyTest {
     }
 
     // -------------------------------------------------------------------
-    // Ed25519 key persistence (#119)
+    // Ed25519 key persistence
     // -------------------------------------------------------------------
 
     @Nested

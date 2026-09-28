@@ -3,8 +3,8 @@
  *
  * This file implements the [PushProvider] interface for Android using Firebase Cloud
  * Messaging (FCM). It is one of the four platform providers assembled by
- * `AndroidPlatformAdapter` (ADR-027). No code passes it to the Rust engine, because it
- * does not implement the UniFFI-generated `uniffi.scp.PushProvider`.
+ * `AndroidPlatformAdapter` (ADR-027). No code passes it to the Rust engine, because the
+ * UniFFI bridge has no function that accepts a push provider.
  *
  * ## FCM Payload Opacity (§10.7)
  *
@@ -23,8 +23,9 @@
  * FCM token registration is asynchronous. [register] retrieves the current FCM
  * registration token via `FirebaseMessaging.getInstance().token.await()` on
  * [Dispatchers.IO][kotlinx.coroutines.Dispatchers.IO]. The token may change over
- * time (e.g., app data cleared, app restored on new device); the SCP engine handles
- * token refresh by re-calling [register] when notified of a change.
+ * time (e.g., app data cleared, app restored on new device). No code in the SDK calls
+ * [register] again when the token changes; a caller that learns of a token change must
+ * call [register] again.
  *
  * ## Thread Safety
  *
@@ -97,7 +98,7 @@ class AndroidPushProvider(
      *
      * @param payload The FCM data payload as a key-value map (from
      *   `RemoteMessage.getData()`). Expected: `{"scp": "1"}`.
-     * @return [WakeSignal.PULL] — instructs the engine to connect to the relay
+     * @return [WakeSignal.PULL] — tells the caller to connect to the relay
      *   and pull all pending encrypted envelopes.
      * @throws ScpException with code `SCP-TRANS-5001` if the `scp` field is missing.
      * @throws ScpException with code `SCP-TRANS-5002` if the `scp` field has an

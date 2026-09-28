@@ -37,8 +37,8 @@ import javax.crypto.spec.GCMParameterSpec
  *
  * Implements the Kotlin [StorageProvider] interface in `Types.kt`, whose KDoc states how it
  * differs from the Rust `Storage` trait and from the UniFFI `StorageProvider` callback
- * interface. No code passes this class to the Rust engine, because it does not implement the
- * UniFFI-generated `uniffi.scp.StorageProvider`.
+ * interface. No code passes this class to the Rust engine, because the UniFFI bridge has no
+ * function that accepts a storage provider.
  *
  * ## Encryption architecture
  *

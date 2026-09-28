@@ -21,10 +21,11 @@ import java.security.MessageDigest
 // the attestation flow:
 //   - clientDataJSON construction (fixed field order, Base64 encoding)
 //   - Nonce computation (SHA-256 + Base64)
-//   - assertRequest delegation to attest
 //
-// End-to-end integration tests with actual Play Integrity require a physical
-// device and are covered by instrumentation tests.
+// No test covers the Play Integrity request, `attest` end to end, or
+// `assertRequest`: each calls the Play Integrity API, which needs a physical
+// device with Google Play services, and the module has no instrumented tests.
+// Story SCP-111's criterion for end-to-end tests on a physical device is unmet.
 //
 // Uses Robolectric to provide android.util.Base64 on the host JVM.
 
