@@ -91,9 +91,14 @@ const DEFAULT_RETRY_MS: u64 = 3000;
 /// slot before it gives up with `409 Conflict`.
 ///
 /// Eviction ends the old stream at its next poll, and hyper drops the body,
-/// and with it the session permit, as soon as the stream ends. hyper polls
-/// the body only while it can buffer output for the socket, so an old
-/// connection whose buffers are full can hold the slot past this bound.
+/// and with it the session guard, as soon as the stream ends. The permit is
+/// released only after `SessionGuard`'s spawned task takes `state.server` and
+/// runs `reset_session`, so the old session holds the slot past this bound in
+/// two cases. First, its connection's socket buffers are full, because hyper
+/// polls the body only while it can buffer output. Second, any request holds
+/// `state.server`, which `message_handler` does for the whole of
+/// `handle_request`, including a `tools/call` that waits on its outlet for
+/// up to the outlet's timeout.
 const EVICTION_WAIT: Duration = Duration::from_secs(5);
 
 /// Configuration for the SSE transport server.
@@ -697,11 +702,14 @@ async fn sse_handler<P: ContextProvider + 'static>(
     // A client that falls behind the broadcast channel has lost events that
     // nothing can reconstruct. Rather than skipping the gap silently — a
     // client believing it is current while it is not — END the stream. The
-    // client observes the disconnect, reconnects (honoring `retry:`), is
+    // client sees the stream close. To go on it opens a new stream, is
     // admitted into a clean session (admission resets session state, above),
-    // re-initializes, re-subscribes, and re-reads capability-filtered state:
-    // a full resync by construction. "Never fall silent" is satisfied by an
-    // explicit signal instead of replay.
+    // initializes, subscribes, and reads capability-filtered state again: a
+    // full resync by construction. `SseClientTransport` does not reconnect by
+    // itself: every later call on it fails, its POST refused with 409 because
+    // the session is no longer live or its read ending on the closed stream,
+    // and its caller connects a new transport. "Never fall silent" is
+    // satisfied by an explicit signal instead of replay.
     let message_stream = BroadcastStream::new(rx).map_while(|result| match result {
         Ok((id, data)) => Some(Ok::<_, Infallible>(
             Event::default()
@@ -712,13 +720,15 @@ async fn sse_handler<P: ContextProvider + 'static>(
         Err(BroadcastStreamRecvError::Lagged(skipped)) => {
             // Deliberate tradeoff: a context co-member flooding events past
             // `channel_capacity` can push this receiver into `Lagged`, forcing
-            // the victim's stream to terminate and reconnect-resync. That cost
-            // is bounded by the client's `retry_ms` reconnect interval,
-            // self-healing (the client re-reads current state on readmission),
-            // and non-escalating (no amplification, no accumulated state) — the
-            // correct "never fall silent" choice over the deleted silent-drop,
-            // which left the victim believing it was current while it had in
-            // fact missed events.
+            // the victim's stream to terminate. The victim sees the close and
+            // resyncs only by connecting again: a client that reconnects
+            // re-reads current state on readmission, and one that does not,
+            // such as `SseClientTransport`, fails every later call rather than
+            // report stale state. The cost is non-escalating (no
+            // amplification, no accumulated state) — the correct "never fall
+            // silent" choice over the deleted silent-drop, which left the
+            // victim believing it was current while it had in fact missed
+            // events.
             tracing::warn!(
                 skipped,
                 "MCP SSE client lagged; terminating its stream to force a clean-session resync"
@@ -1901,6 +1911,55 @@ mod tests {
         }
         drop(held);
         state.session_evict.lock().unwrap().cancel();
+
+        let status = waiter.await.unwrap().status();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            state.session_slot.available_permits(),
+            1,
+            "the superseded admission must hand the permit back"
+        );
+        assert!(
+            state.live_session.lock().unwrap().is_none(),
+            "the superseded admission must not go live"
+        );
+    }
+
+    /// An admission that has taken the permit and is waiting for the server
+    /// lock, when a newer admission supersedes it, gives up with 409 under
+    /// that lock and hands the permit back. The biased wait above never runs
+    /// here: the wait has already returned the permit when the token is
+    /// cancelled, so only the check under the lock stops this admission from
+    /// going live on a cancelled token.
+    #[tokio::test]
+    async fn admission_superseded_while_it_waits_for_the_server_lock_gives_up() {
+        let state = Arc::new(AppState {
+            server: Mutex::new(McpServer::new(MockProvider::default())),
+            notifier: McpNotifier::new(&test_config()),
+            retry_ms: DEFAULT_RETRY_MS,
+            session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            session_evict: std::sync::Mutex::new(CancellationToken::new()),
+            shutdown: CancellationToken::new(),
+            live_session: std::sync::Mutex::new(None),
+        });
+        let held = Arc::clone(&state.session_slot).try_acquire_owned().unwrap();
+        let server = state.server.lock().await;
+        let waiter = tokio::spawn(sse_handler(State(Arc::clone(&state))));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        drop(held);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            state.session_slot.available_permits(),
+            0,
+            "the admission must hold the permit and wait on the server lock"
+        );
+        assert!(!waiter.is_finished());
+        state.session_evict.lock().unwrap().cancel();
+        drop(server);
 
         let status = waiter.await.unwrap().status();
         assert_eq!(status, StatusCode::CONFLICT);

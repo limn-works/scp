@@ -173,27 +173,41 @@ pub fn read_line_bounded<R: std::io::BufRead>(
     Ok(n)
 }
 
-/// Kills a stdio MCP server process and reaps it.
+/// Kills a stdio MCP server's process group and reaps the server process.
 ///
 /// Each bridge's stdio client keeps the server's [`std::process::Child`]
 /// behind its own mutex, apart from the pipes an in-flight call holds, so a
 /// disconnect stops the server at once instead of when the in-flight call
-/// releases the client. Killing the process closes its stdout, and the
-/// in-flight [`read_response`] then fails on EOF. A poisoned lock still
+/// releases the client. Each bridge spawns the server as the leader of its
+/// own process group, and a launcher such as `npx` or `uvx` runs the real
+/// server as a member of that group that inherits the stdout pipe. On Unix
+/// (not OpenBSD or Redox, which lack `waitid`) the whole group is killed, which closes every holder of that stdout, and
+/// the in-flight [`read_response`] then fails on EOF. The group is signalled
+/// only while the leader is unreaped, because only then can its pid, the
+/// group id, name no other process: a second call (a disconnect, then the
+/// client's drop) signals nothing. Elsewhere only the direct child is killed,
+/// and a process it started keeps the pipe open. A poisoned lock still
 /// yields the child, because a leaked server outlives every caller.
 pub fn stop_server_process(child: &std::sync::Mutex<std::process::Child>) {
     let mut child = child
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Both results are dropped: a disconnect or drop has no caller that could
+    // A `NOWAIT` peek reports the leader without reaping it, and fails with
+    // `ECHILD` once an earlier call has reaped it.
+    #[cfg(all(unix, not(any(target_os = "openbsd", target_os = "redox"))))]
+    {
+        use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
+        let pid = Pid::from_child(&child);
+        let peek = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+        if rustix::process::waitid(WaitId::Pid(pid), peek).is_ok() {
+            let _ = rustix::process::kill_process_group(pid, Signal::KILL);
+        }
+    }
+    // Every result is dropped: a disconnect or drop has no caller that could
     // act on a failed kill or wait.
     let _ = child.kill();
     let _ = child.wait();
 }
-
-/// Maximum number of lines a stdio client skips while it waits for the
-/// response to one request. Bounds a peer that streams notifications forever.
-pub const MAX_SKIPPED_LINES: usize = 1000;
 
 /// Reads lines from a stdio MCP server's stdout until the response to the
 /// request with `id` arrives, each line bounded by [`read_line_bounded`].
@@ -204,16 +218,24 @@ pub const MAX_SKIPPED_LINES: usize = 1000;
 /// Handing either to this call would shift every later reply by one, so both
 /// are skipped, as are blank lines and server-initiated requests.
 ///
+/// No count of skipped lines ends the wait. The request has already been
+/// written, so a server that runs it may write any number of notifications
+/// (one `resources/updated` per subscription per context event) before the
+/// response, and a call failed on a count would fail a call the server ran,
+/// which a retrying caller would run twice. A server that never answers holds
+/// the call whether it writes notifications or nothing, and a disconnect ends
+/// it through [`stop_server_process`].
+///
 /// # Errors
 ///
 /// Returns an error on EOF, on a read error or an over-long line, on a line
-/// that is not JSON, on a line carrying this `id` that is not a valid
-/// response, and after [`MAX_SKIPPED_LINES`] lines without the response.
+/// that is not JSON, and on a line carrying this `id` that is not a valid
+/// response.
 pub fn read_response<R: std::io::BufRead>(
     reader: &mut R,
     id: &RequestId,
 ) -> Result<JsonRpcResponse, String> {
-    for _ in 0..MAX_SKIPPED_LINES {
+    loop {
         let mut line = String::new();
         if read_line_bounded(reader, &mut line)? == 0 {
             return Err("server closed stdout (EOF) while waiting for response".to_owned());
@@ -241,9 +263,6 @@ pub fn read_response<R: std::io::BufRead>(
         return serde_json::from_value(value)
             .map_err(|e| format!("failed to parse response JSON: {e}"));
     }
-    Err(format!(
-        "no matching JSON-RPC response after {MAX_SKIPPED_LINES} lines"
-    ))
 }
 
 /// Serializes writes to stdout so responses from the read loop and
@@ -1016,6 +1035,60 @@ mod tests {
         assert_eq!(second.result, Some(serde_json::json!({ "n": 3 })));
         let eof = read_response(&mut reader, &RequestId::Number(4)).expect_err("EOF");
         assert!(eof.contains("EOF"), "got: {eof}");
+    }
+
+    /// No count of notifications ends the wait for a response: the server
+    /// has run the call, and failing it on a count would let a retrying
+    /// caller run it twice.
+    #[test]
+    fn read_response_skips_any_number_of_notifications_before_the_response() {
+        let notification = serde_json::to_string(&JsonRpcNotification::new(
+            crate::protocol::METHOD_RESOURCES_UPDATED,
+            None,
+        ))
+        .expect("serialize notification");
+        let mut input = format!("{notification}\n").repeat(5000);
+        input.push_str(
+            &serde_json::to_string(&JsonRpcResponse::success(
+                RequestId::Number(9),
+                serde_json::json!({}),
+            ))
+            .expect("serialize response"),
+        );
+        input.push('\n');
+        let mut reader = std::io::Cursor::new(input.into_bytes());
+        let response = read_response(&mut reader, &RequestId::Number(9)).expect("response 9");
+        assert_eq!(response.id, RequestId::Number(9));
+    }
+
+    /// A disconnect kills the server's whole process group, so a process the
+    /// server started that inherited its stdout (the real server under a
+    /// launcher such as `npx`) no longer holds the pipe open, and a reader
+    /// waiting on that stdout sees EOF. A second call, as the client's drop
+    /// makes after a disconnect, finds the leader reaped and signals nothing.
+    #[cfg(unix)]
+    #[test]
+    fn stop_server_process_kills_the_group_holding_the_stdout_pipe() {
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 600 & wait"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped());
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let mut child = command.spawn().expect("spawn server stand-in");
+        let mut stdout = child.stdout.take().expect("stdout");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = tx.send(std::io::Read::read_to_end(&mut stdout, &mut sink).map(|_| ()));
+        });
+        let child = std::sync::Mutex::new(child);
+
+        stop_server_process(&child);
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the group kill must close every holder of the stdout pipe")
+            .expect("read to EOF");
+        stop_server_process(&child);
     }
 
     /// A line that is not JSON, or an over-long line, fails the call rather

@@ -15,6 +15,9 @@ use crate::client::McpTransport;
 use crate::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 use crate::stdio::read_line_bounded;
 
+/// The error of a call on a transport whose stream has closed.
+const SSE_CLOSED: &str = "SSE connection is closed; connect a new transport";
+
 /// MCP client transport that communicates via HTTP SSE.
 ///
 /// Holds the `GET` stream open for the session and sends each message as a
@@ -252,6 +255,25 @@ impl SseClientTransport {
         Ok(stream)
     }
 
+    /// Fails once a call has seen the stream close. The server ended that
+    /// session (a newer `GET`, a lagged stream, a shutdown), so no POST is
+    /// sent under it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SSE_CLOSED`] when the stream has closed.
+    fn ensure_open(&self) -> Result<(), String> {
+        let closed = self
+            .sse_reader
+            .lock()
+            .map_err(|e| format!("SSE reader lock poisoned: {e}"))?
+            .is_none();
+        if closed {
+            return Err(SSE_CLOSED.to_owned());
+        }
+        Ok(())
+    }
+
     /// POSTs one JSON-RPC message to the session's POST URL and reads the
     /// answer's status line.
     ///
@@ -280,18 +302,29 @@ impl SseClientTransport {
     }
 }
 
-/// Maximum number of SSE stream lines to scan for a matching JSON-RPC response.
-/// If exceeded, the request fails. The TCP read timeout (30s) handles
-/// individual read stalls; this bounds the non-matching lines tolerated. An
-/// event takes at least two lines (a `data:` line and the blank line ending
-/// it), so the bound admits at most 500 events.
-const MAX_SSE_LINES: usize = 1000;
-
 impl McpTransport for SseClientTransport {
+    /// Reads the stream until the response to `request` arrives.
+    ///
+    /// No count of skipped lines ends the wait. The stream is read only
+    /// during a call, so every keep-alive and pushed notification (one
+    /// `resources/updated` per subscription per context event) since the last
+    /// call waits ahead of the response, and an SCP SSE server answers the
+    /// POST only after it has run the call. A call failed on a count would
+    /// fail a call the server ran, and a caller that retried would run it
+    /// twice. The stream's 30-second read timeout still ends a stalled read,
+    /// and an SCP SSE server writes a keep-alive every 15 seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stream has closed, before any POST, when the
+    /// POST fails, when a read fails or times out, and when the stream closes
+    /// during the wait. A closed stream stays closed: the server has ended
+    /// the session, and the caller connects a new transport.
     #[allow(clippy::significant_drop_tightening)] // sse_reader MutexGuard is borrowed by reader across the entire loop.
     fn send_request(&self, request: &JsonRpcRequest) -> Result<JsonRpcResponse, String> {
         let body = serde_json::to_string(request)
             .map_err(|e| format!("failed to serialize request: {e}"))?;
+        self.ensure_open()?;
         self.post(&body)?;
 
         // The server accepted the POST; the JSON-RPC response comes on the
@@ -301,18 +334,22 @@ impl McpTransport for SseClientTransport {
             .lock()
             .map_err(|e| format!("SSE reader lock poisoned: {e}"))?;
 
-        let reader = sse_reader.as_mut().ok_or("SSE connection is closed")?;
+        let reader = sse_reader.as_mut().ok_or(SSE_CLOSED)?;
 
         // Read SSE events until the response to this request arrives. A
         // response under another id answers an earlier request whose call
         // already failed (a read timeout, say); handing it to this call would
         // shift every later reply by one.
-        for _ in 0..MAX_SSE_LINES {
+        loop {
             let mut line = String::new();
             let n = read_line_bounded(reader, &mut line)
                 .map_err(|e| format!("failed to read SSE event: {e}"))?;
             if n == 0 {
-                return Err("SSE connection closed while waiting for response".to_owned());
+                *sse_reader = None;
+                return Err(
+                    "SSE connection closed while waiting for response; connect a new transport"
+                        .to_owned(),
+                );
             }
             let trimmed = line.trim();
             if trimmed.starts_with("data:") {
@@ -325,14 +362,12 @@ impl McpTransport for SseClientTransport {
                 }
             }
         }
-        Err(format!(
-            "no matching JSON-RPC response after {MAX_SSE_LINES} SSE lines"
-        ))
     }
 
     fn send_notification(&self, notification: &JsonRpcNotification) -> Result<(), String> {
         let body = serde_json::to_string(notification)
             .map_err(|e| format!("failed to serialize notification: {e}"))?;
+        self.ensure_open()?;
         self.post(&body)
     }
 }
@@ -648,6 +683,87 @@ mod tests {
         let response = transport.send_request(&request(3)).expect("request");
         assert_eq!(response.id, crate::protocol::RequestId::Number(3));
         drop(server.join().expect("server thread"));
+    }
+
+    /// Keep-alives and pushed notifications that piled up between calls do
+    /// not fail the next call however many there are: the server has run the
+    /// call when it answers the POST, so its response is on the stream
+    /// behind them.
+    #[test]
+    fn sse_client_reads_past_any_backlog_to_its_response() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (_, mut sse) = accept_sse(&listener);
+            let (mut conn, _) = listener.accept().expect("accept request POST");
+            read_request(&conn);
+            let mut backlog = String::new();
+            for id in 0..2000 {
+                backlog.push_str(":keepalive\r\n\r\n");
+                std::fmt::Write::write_fmt(&mut backlog, format_args!(
+                    "event: message\r\nid: {id}\r\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",\"params\":{{\"uri\":\"scp://c/events\"}}}}\r\n\r\n"
+                )).expect("format backlog");
+            }
+            backlog.push_str(
+                "event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}\r\n\r\n",
+            );
+            let writer = std::thread::spawn(move || {
+                sse.write_all(backlog.as_bytes()).expect("write backlog");
+                sse
+            });
+            conn.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("answer request POST");
+            writer.join().expect("writer thread")
+        });
+
+        let transport =
+            SseClientTransport::connect(&format!("http://127.0.0.1:{port}/sse"), Some("tok-1"))
+                .expect("connect");
+        let response = transport
+            .send_request(&request(5))
+            .expect("a backlog must not fail a call the server ran");
+        assert_eq!(response.id, crate::protocol::RequestId::Number(5));
+        drop(server.join().expect("server thread"));
+    }
+
+    /// Once a call sees the stream close, the server has ended the session:
+    /// that call fails, and every later call fails before it sends a POST, so
+    /// nothing runs under a session no stream can answer.
+    #[test]
+    fn sse_client_sends_nothing_after_its_stream_closed() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (_, sse) = accept_sse(&listener);
+            let (mut conn, _) = listener.accept().expect("accept request POST");
+            read_request(&conn);
+            drop(sse);
+            conn.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("answer request POST");
+            listener.set_nonblocking(true).expect("nonblocking");
+            listener
+        });
+
+        let transport =
+            SseClientTransport::connect(&format!("http://127.0.0.1:{port}/sse"), Some("tok-1"))
+                .expect("connect");
+        let err = transport
+            .send_request(&request(1))
+            .expect_err("a closed stream must fail the call");
+        assert!(err.contains("closed while waiting"), "got: {err}");
+        let listener = server.join().expect("server thread");
+        let err = transport
+            .send_request(&request(2))
+            .expect_err("a closed transport must fail");
+        assert_eq!(err, SSE_CLOSED);
+        let err = transport
+            .send_notification(&JsonRpcNotification::new("notifications/initialized", None))
+            .expect_err("a closed transport must fail");
+        assert_eq!(err, SSE_CLOSED);
+        assert!(
+            listener.accept().is_err(),
+            "no POST may reach the server after the stream closed"
+        );
     }
 
     /// A token that could inject a header line, or an empty one, is refused

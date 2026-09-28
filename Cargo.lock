@@ -4947,6 +4947,7 @@ dependencies = [
  "axum",
  "hex",
  "rand 0.8.8",
+ "rustix",
  "scp-clock",
  "scp-core",
  "serde",
