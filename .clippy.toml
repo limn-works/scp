@@ -16,3 +16,26 @@ future-size-threshold = 16512
 # ----- Disallowed methods -----
 # now_secs/now_millis are private to scp-clock — the compiler enforces
 # this directly. No clippy disallowed-methods entries needed.
+
+# ----- P-256 ECDH -----
+# Every P-256 scalar multiplication on a peer point goes through
+# `scp_crypto::p256::ecdh_p256`, whose `P256PublicKey` peer can only come from
+# `from_sec1`, which applies 09-security-model.md §9.5 point validation. A call
+# to `p256::ecdh` (or the `elliptic_curve::ecdh` items it re-exports) from any
+# other crate could multiply by an unvalidated point, so these entries fail
+# clippy there. Both the re-export path and the defining path are listed.
+# `allow-invalid` keeps crates without the `p256` dependency from warning that
+# a path does not resolve. `crates/scp-crypto/clippy.toml` is the one exemption,
+# and `crates/scp-runtime/clippy.toml` repeats these entries because clippy
+# reads only the nearest configuration file.
+disallowed-methods = [
+    { path = "elliptic_curve::ecdh::diffie_hellman", reason = "P-256 ECDH runs only in scp_crypto::p256::ecdh_p256, whose P256PublicKey peer has passed 09-security-model.md §9.5 point validation. Call that function.", allow-invalid = true },
+    { path = "p256::ecdh::diffie_hellman", reason = "P-256 ECDH runs only in scp_crypto::p256::ecdh_p256, whose P256PublicKey peer has passed 09-security-model.md §9.5 point validation. Call that function.", allow-invalid = true },
+    { path = "elliptic_curve::ecdh::EphemeralSecret::diffie_hellman", reason = "P-256 ECDH runs only in scp_crypto::p256::ecdh_p256, whose P256PublicKey peer has passed 09-security-model.md §9.5 point validation. Call that function.", allow-invalid = true },
+]
+disallowed-types = [
+    { path = "elliptic_curve::ecdh::SharedSecret", reason = "P-256 ECDH runs only in scp_crypto::p256::ecdh_p256, whose P256PublicKey peer has passed 09-security-model.md §9.5 point validation. Call that function.", allow-invalid = true },
+    { path = "p256::ecdh::SharedSecret", reason = "P-256 ECDH runs only in scp_crypto::p256::ecdh_p256, whose P256PublicKey peer has passed 09-security-model.md §9.5 point validation. Call that function.", allow-invalid = true },
+    { path = "elliptic_curve::ecdh::EphemeralSecret", reason = "P-256 ECDH runs only in scp_crypto::p256::ecdh_p256, whose P256PublicKey peer has passed 09-security-model.md §9.5 point validation. Call that function.", allow-invalid = true },
+    { path = "p256::ecdh::EphemeralSecret", reason = "P-256 ECDH runs only in scp_crypto::p256::ecdh_p256, whose P256PublicKey peer has passed 09-security-model.md §9.5 point validation. Call that function.", allow-invalid = true },
+]

@@ -1,0 +1,12 @@
+# Clippy configuration for scp-crypto.
+#
+# Clippy reads only the nearest configuration file, so this file replaces the
+# workspace `.clippy.toml` for this crate. It repeats the workspace thresholds
+# and leaves out the workspace's P-256 ECDH `disallowed-methods` and
+# `disallowed-types` entries: scp-crypto owns `p256::ecdh_p256`, the one function
+# those entries route every other crate to, and that function is the crate's
+# only call to `p256::ecdh::diffie_hellman`. Keep the thresholds equal to the
+# workspace file's.
+cognitive-complexity-threshold = 25
+stack-size-threshold = 900000
+future-size-threshold = 16512
