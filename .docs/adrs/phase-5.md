@@ -435,6 +435,7 @@ SCP with `.required` provides the strongest custody model Apple platforms offer:
 - §16.12.4 of the test-infrastructure spec defines `attestation_conformance!()` with an `invalid_token_rejected` case that fabricates a token and asserts `verify` returns `false`. That macro states what this project expects of every device-attestation verifier, so a verifier that accepted every non-empty token, a fabricated one included, contradicted an expectation this project had already written down.
 
 **What this amendment does not change.** `KeyDestructionAttestation.method = .softwareOnly` for Keychain-backed keys, specified under "Key destruction attestation (§9.15)" and in acceptance criterion 9, is a different mechanism and stands unchanged. That field reports the trust level of a destruction the adapter actually performed, and §9.15 of the security-model spec defines software-only as one of three recorded levels that the protocol carries as metadata without gating on it. Reporting a real destruction at its real trust level asserts nothing false, which is what separates it from a minted attestation token.
+
 ### Implementation
 
 - **Language:** Swift 6.2+
