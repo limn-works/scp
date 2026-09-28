@@ -1751,12 +1751,14 @@ impl<P: ContextProvider> McpServer<P> {
     /// When the current view cannot be read, nothing is recorded, and the next
     /// event notifies.
     ///
-    /// When no view is recorded and the client had listed before, its earlier
-    /// list of the other kind predates the context's entry into the served
-    /// set, or could not read the context's view, so that cached list lacks or
-    /// misstates the context. The half this response did not carry is then
-    /// recorded as `None`, which no current view equals, so the next event
-    /// for the context sends the list-changed pair.
+    /// When no view is recorded and the client had listed before, every list
+    /// it cached before this response predates the context's entry into the
+    /// served set, or could not read the context's view, so a cached list of
+    /// the other kind lacks or misstates the context. The half this response
+    /// did not carry is then recorded as `None`, which no current view equals,
+    /// so the next event for the context sends the list-changed pair. When the
+    /// client never listed that other kind, the pair goes out once more than
+    /// needed, which over-notifies and hides nothing.
     ///
     /// A handler must never overwrite a half its response did not carry: the
     /// pump compares the recorded view with the current one, so a half
