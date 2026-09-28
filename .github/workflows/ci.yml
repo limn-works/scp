@@ -1023,9 +1023,9 @@ jobs:
         with:
           components: clippy
       # scripts/check-examples-build-shipped.sh parses cargo metadata with jq, which
-      # the runner image ships. This fails with a clear message if an image drops it.
+      # the runner image ships. This step fails the job by name if an image drops it.
       - name: Require jq
-        run: command -v jq
+        run: command -v jq || { echo "::error::jq is not on PATH; scripts/check-examples-build-shipped.sh needs it"; exit 1; }
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
