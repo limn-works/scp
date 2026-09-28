@@ -243,7 +243,7 @@ never reached the branch that creates one. Pointing `XDG_DATA_HOME` at an empty
 directory and running the example again reproduced the reviewer's report exactly:
 the program exited 1 and printed `NodeBuild("identity error: no production
 pre-rotation custody backend available; ...")`. The example's own doc comment in
-`crates/scp-node/examples/website.rs` quotes the full message.
+`crates/scp-node/examples/website.rs` quotes the start of the message.
 
 So point every state directory the program reads at an empty one before you measure
 behavior that a populated directory changes.
