@@ -23,22 +23,104 @@ export type NativeHostResult<T> =
   | { ok: true; value: T }
   | { ok: false; code?: string; message: string };
 
-/** Runs one host call and returns its outcome; a throw becomes the failure arm. */
-function hostCall<T>(call: () => T): NativeHostResult<T> {
+type HostFailure = { ok: false; code?: string; message: string };
+
+/** Runs `read`, returning `fallback` if it throws. */
+function safely<T>(read: () => T, fallback: T): T {
   try {
-    return { ok: true, value: call() };
-  } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : String(e);
-    const code =
-      typeof e === "object" && e !== null && "code" in e && typeof e.code === "string"
-        ? e.code
-        : undefined;
-    return code === undefined ? { ok: false, message } : { ok: false, code, message };
+    return read();
+  } catch {
+    return fallback;
   }
 }
 
-function toNativePseudonym(result: PseudonymResult): NativePseudonymResult {
-  return { publicKey: Array.from(result.publicKey), keyId: result.keyId };
+/**
+ * The failure arm for a thrown value. Reading the code and message never
+ * throws, whatever was thrown (`Object.create(null)`, a revoked Proxy, an
+ * `Error` whose `message` is not a string), and the message is always a string.
+ */
+function failureOf(thrown: unknown): HostFailure {
+  const message = safely(() => {
+    if (typeof thrown === "string") return thrown;
+    const m: unknown = (thrown as { message?: unknown } | null | undefined)?.message;
+    return typeof m === "string" ? m : String(thrown);
+  }, "the host threw a value with no readable message");
+  const code = safely(() => {
+    const c: unknown = (thrown as { code?: unknown } | null | undefined)?.code;
+    return typeof c === "string" ? c : undefined;
+  }, undefined);
+  return code === undefined ? { ok: false, message } : { ok: false, code, message };
+}
+
+/** Whether `value` is a Promise or another thenable. Reading `then` may throw. */
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return (
+    ((typeof value === "object" && value !== null) || typeof value === "function") &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
+}
+
+/**
+ * Runs one host call and returns its outcome. A throw, a Promise or other
+ * thenable (every provider method is synchronous), and a return that `convert`
+ * rejects all become the failure arm, which the bridge reports as a custody
+ * error. A returned thenable is settled against a no-op handler, so its
+ * rejection never reaches the process as an unhandled rejection.
+ */
+function hostCall<T>(
+  method: string,
+  call: () => unknown,
+  convert: (raw: unknown) => T,
+): NativeHostResult<T> {
+  try {
+    const raw = call();
+    if (isThenable(raw)) {
+      safely(() => {
+        Promise.resolve(raw).catch(() => {});
+      }, undefined);
+      return {
+        ok: false,
+        message: `KeyCustodyProvider.${method} returned a Promise; provider methods must be synchronous`,
+      };
+    }
+    return { ok: true, value: convert(raw) };
+  } catch (e: unknown) {
+    return failureOf(e);
+  }
+}
+
+/** A wrongly typed host return, reported as a custody failure. */
+function wrongType(method: string, expected: string): TypeError {
+  return new TypeError(`KeyCustodyProvider.${method} returned a value that is not ${expected}`);
+}
+
+function asString(method: string): (raw: unknown) => string {
+  return (raw) => {
+    if (typeof raw !== "string") throw wrongType(method, "a string");
+    return raw;
+  };
+}
+
+function asBytes(method: string): (raw: unknown) => number[] {
+  return (raw) => {
+    if (!(raw instanceof Uint8Array)) throw wrongType(method, "a Uint8Array");
+    return Array.from(raw);
+  };
+}
+
+function asPseudonym(method: string): (raw: unknown) => NativePseudonymResult {
+  return (raw) => {
+    const result = raw as Partial<PseudonymResult> | null;
+    if (
+      typeof raw !== "object" ||
+      result === null ||
+      !(result.publicKey instanceof Uint8Array) ||
+      typeof result.keyId !== "string"
+    ) {
+      throw wrongType(method, "a { publicKey: Uint8Array, keyId: string } result");
+    }
+    return { publicKey: Array.from(result.publicKey), keyId: result.keyId };
+  };
 }
 
 /**
@@ -52,32 +134,45 @@ export function toNativeCustodyProvider(provider: KeyCustodyProvider) {
   // `provider` in each arrow so `this` is bound, (b) converts byte args
   // inbound (`Array<number>` → `Uint8Array`) and byte returns outbound
   // (`Uint8Array` → `Array<number>`), and (c) runs every host call, conversion
-  // included, through `hostCall`, so a host throw reaches Rust as a
-  // structured failure. napi-rs delivers a multi-element Rust tuple
+  // included, through `hostCall`, so a host throw, a Promise return and a
+  // wrongly typed return each reach Rust as a structured failure. napi-rs delivers a multi-element Rust tuple
   // (`(String, Vec<u8>)`) to the JS callback as a SINGLE `[keyId, bytes]`
   // array argument, not as two positional args, so the tuple callbacks
   // (`sign`, `dhAgree`, `derivePseudonym`, `deriveRotatablePseudonym`) accept
   // one array and destructure it.
   return {
     generateKeypair: (keyType: string): NativeHostResult<string> =>
-      hostCall(() => provider.generateKeypair(keyType)),
+      hostCall(
+        "generateKeypair",
+        () => provider.generateKeypair(keyType),
+        asString("generateKeypair"),
+      ),
     sign: ([keyId, message]: [string, number[]]): NativeHostResult<number[]> =>
-      hostCall(() => Array.from(provider.sign(keyId, Uint8Array.from(message)))),
+      hostCall("sign", () => provider.sign(keyId, Uint8Array.from(message)), asBytes("sign")),
     getPublicKey: (keyId: string): NativeHostResult<number[]> =>
-      hostCall(() => Array.from(provider.getPublicKey(keyId))),
+      hostCall("getPublicKey", () => provider.getPublicKey(keyId), asBytes("getPublicKey")),
+    // `destroyKey` returns nothing the bridge reads, so any non-thenable
+    // return (a `Map.delete` boolean, say) is accepted.
     destroyKey: (keyId: string): NativeHostResult<undefined> =>
-      hostCall(() => {
-        provider.destroyKey(keyId);
-        return undefined;
-      }),
+      hostCall(
+        "destroyKey",
+        () => provider.destroyKey(keyId),
+        () => undefined,
+      ),
     dhAgree: ([keyId, peerPublic]: [string, number[]]): NativeHostResult<number[]> =>
-      hostCall(() => Array.from(provider.dhAgree(keyId, Uint8Array.from(peerPublic)))),
+      hostCall(
+        "dhAgree",
+        () => provider.dhAgree(keyId, Uint8Array.from(peerPublic)),
+        asBytes("dhAgree"),
+      ),
     derivePseudonym: ([keyId, contextId]: [
       string,
       number[],
     ]): NativeHostResult<NativePseudonymResult> =>
-      hostCall(() =>
-        toNativePseudonym(provider.derivePseudonym(keyId, Uint8Array.from(contextId))),
+      hostCall(
+        "derivePseudonym",
+        () => provider.derivePseudonym(keyId, Uint8Array.from(contextId)),
+        asPseudonym("derivePseudonym"),
       ),
     // The Rust `(String, Vec<u8>, u64)` tuple likewise arrives as a single
     // `[keyId, contextId, epoch]` array; the `u64` epoch crosses as a JS
@@ -87,10 +182,10 @@ export function toNativeCustodyProvider(provider: KeyCustodyProvider) {
       number[],
       bigint,
     ]): NativeHostResult<NativePseudonymResult> =>
-      hostCall(() =>
-        toNativePseudonym(
-          provider.deriveRotatablePseudonym(keyId, Uint8Array.from(contextId), epoch),
-        ),
+      hostCall(
+        "deriveRotatablePseudonym",
+        () => provider.deriveRotatablePseudonym(keyId, Uint8Array.from(contextId), epoch),
+        asPseudonym("deriveRotatablePseudonym"),
       ),
     // A sign-only / hardware / secure-enclave custody throws here to signal it
     // cannot export raw private-key bytes (ADR-006). The failure reaches Rust
@@ -100,8 +195,12 @@ export function toNativeCustodyProvider(provider: KeyCustodyProvider) {
     // it goes through `KeyCustody::sign`, so sign-only custody can still
     // produce a signed export.
     exportSigningKeyBytes: (keyId: string): NativeHostResult<number[]> =>
-      hostCall(() => Array.from(provider.exportSigningKeyBytes(keyId))),
+      hostCall(
+        "exportSigningKeyBytes",
+        () => provider.exportSigningKeyBytes(keyId),
+        asBytes("exportSigningKeyBytes"),
+      ),
     custodyType: (keyId: string): NativeHostResult<string> =>
-      hostCall(() => provider.custodyType(keyId)),
+      hostCall("custodyType", () => provider.custodyType(keyId), asString("custodyType")),
   };
 }
