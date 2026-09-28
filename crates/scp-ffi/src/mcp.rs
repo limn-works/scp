@@ -69,8 +69,8 @@ use crate::validate;
 struct StdioClientTransport {
     /// The spawned subprocess, kept apart from the pipes an in-flight call
     /// holds so a disconnect can stop it while a call waits on its stdout.
-    /// Killed and reaped by `py_mcp_client_disconnect` or, at the latest,
-    /// when the transport is dropped via [`Drop`].
+    /// On Unix it leads its own process group. `py_mcp_client_disconnect`
+    /// or, at the latest, [`Drop`] kills that group and reaps the subprocess.
     child: Arc<Mutex<Child>>,
     /// The subprocess's stdin writer and stdout reader.
     inner: Mutex<StdioTransportInner>,
@@ -107,11 +107,19 @@ impl StdioClientTransport {
             guard.validate_command(cmd).map_err(|e| e.to_string())?
         };
 
-        let mut child = Command::new(&basename)
+        let mut server = Command::new(&basename);
+        server
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        // A launcher such as `npx` or `uvx` runs the real server as its own
+        // child, which inherits the stdout pipe. The subprocess leads a new
+        // process group so `stop_server_process` can kill that descendant
+        // too; killing the launcher alone would leave the pipe open.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut server, 0);
+        let mut child = server
             .spawn()
             .map_err(|e| format!("failed to spawn '{basename}': {e}"))?;
 
@@ -139,7 +147,8 @@ impl StdioClientTransport {
     }
 }
 
-/// Kills the subprocess and waits for it to exit on drop.
+/// Kills the subprocess and, on Unix, its process group, and waits for the
+/// subprocess to exit on drop.
 ///
 /// `std::process::Child::drop` does NOT kill the subprocess — it only closes
 /// handles. Without this impl, dropped transports leak running subprocesses.
@@ -1654,9 +1663,11 @@ impl crate::scp::PyScp {
 
 /// Disconnects from an external MCP server.
 ///
-/// Removes the client from the registry. For stdio clients, the subprocess is
-/// killed and reaped before this returns, even while a call on the handle is
-/// in flight; that call then fails on the closed stdout. For SSE clients, the
+/// Removes the client from the registry. For stdio clients, the subprocess and,
+/// on Unix, every process in its process group (such as the server an `npx`
+/// launcher started) are killed before this returns, and the subprocess is
+/// reaped, even while a call on the handle is in flight; that call then fails
+/// on the closed stdout. For SSE clients, the
 /// TCP connection closes when the last call on the handle ends, which a read
 /// timeout bounds.
 ///
@@ -1680,8 +1691,9 @@ impl crate::scp::PyScp {
 
         // A call in flight on this handle holds its own clone of
         // `state.client`, so dropping `state` does not drop the transport.
-        // Killing the stdio subprocess here ends it now; the in-flight call
-        // then fails on the closed stdout and drops the last clone.
+        // Killing the stdio subprocess's process group here ends it now; the
+        // in-flight call then fails on the closed stdout and drops the last
+        // clone.
         if let Some(server) = state.stdio_server {
             scp_mcp::stdio::stop_server_process(&server);
         }
@@ -3815,12 +3827,15 @@ mod tests {
 
     /// A `tools/list` in flight against a silent stdio server holds its own
     /// clone of the client, so dropping the registry's copy does not drop the
-    /// transport. `py_mcp_client_disconnect` kills the server process itself,
-    /// and the in-flight call then ends on the closed stdout. The stub server
-    /// answers `initialize`, then becomes a `sleep` that never answers and
-    /// outlives the test unless the disconnect kills it.
+    /// transport. `py_mcp_client_disconnect` kills the server's process
+    /// group, and the in-flight call then ends on the closed stdout. The stub
+    /// answers `initialize`, then runs `sleep` as its own child, the way `npx`
+    /// runs the real server: the trailing `true` keeps `sh` from exec'ing it.
+    /// That grandchild holds the stdout pipe, so the in-flight call ends only
+    /// when the disconnect kills it as well as the direct child.
+    #[cfg(unix)]
     #[test]
-    fn disconnect_kills_the_stdio_server_under_an_in_flight_call() {
+    fn disconnect_kills_the_stdio_servers_process_group_under_an_in_flight_call() {
         let scp = crate::scp::PyScp::new_in_memory_for_test();
         let mut allowlist = allowlist::StdioAllowlist::new_with_defaults();
         allowlist.configure(&["sh"]).expect("allow sh");
@@ -3828,7 +3843,7 @@ mod tests {
         let script = "read l; \
             echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\
             \"capabilities\":{},\"serverInfo\":{\"name\":\"stub\"}}}'; \
-            exec sleep 600";
+            sleep 600; true";
         let transport = StdioClientTransport::spawn(
             &allowlist,
             &["sh".to_owned(), "-c".to_owned(), script.to_owned()],
@@ -3870,7 +3885,7 @@ mod tests {
         );
         let failed = done_rx
             .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("the in-flight call must end once disconnect kills the server");
+            .expect("the in-flight call must end once disconnect kills the server's grandchild");
         assert!(failed, "the killed stub server sent no tools/list response");
     }
 
