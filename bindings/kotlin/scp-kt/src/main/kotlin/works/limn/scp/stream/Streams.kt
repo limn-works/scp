@@ -8,6 +8,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -280,9 +282,13 @@ class HotStreamFactory(
             // engine, and one registry write naming what that call returned. A cancellation
             // arriving between those two statements leaves a live Rust subscription that no
             // registry entry names, so neither stopContextEvents nor stopAll can release it.
-            // Every other statement in this function stays cancellable: a caller cancelling
-            // before this block opens no subscription, and a caller cancelling after it can
-            // still pass contextHandle to stopContextEvents.
+            // Every other statement in this function stays cancellable. withLock takes an
+            // uncontended mutex without checking cancellation, and withContext checks only
+            // the NonCancellable Job it installs, so ensureActive is what stops a caller that
+            // is already cancelled from opening a subscription: a caller cancelled before the
+            // block opens none, and a caller cancelled after it can still pass contextHandle
+            // to stopContextEvents.
+            currentCoroutineContext().ensureActive()
             withContext(NonCancellable + ioDispatcher) {
                 val subscriptionHandle = contextBindings.contextSubscribeEvents(contextHandle, callback)
                 slot.register(HotStreamState(readOnly, subscriptionHandle))
@@ -349,7 +355,9 @@ class HotStreamFactory(
 
             // NonCancellable covers exactly two statements, for a reason contextEvents states
             // above its own subscribe call: a cancellation landing between a subscribe call and
-            // a registry write orphans a live Rust subscription.
+            // a registry write orphans a live Rust subscription. ensureActive stops a caller
+            // that is already cancelled before it opens one, for the reason contextEvents states.
+            currentCoroutineContext().ensureActive()
             withContext(NonCancellable + ioDispatcher) {
                 val subscriptionHandle = contextBindings.contextSubscribe(contextHandle, callback)
                 slot.register(HotStreamState(readOnly, subscriptionHandle))

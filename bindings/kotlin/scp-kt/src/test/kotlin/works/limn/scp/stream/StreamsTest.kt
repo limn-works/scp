@@ -307,6 +307,30 @@ class StreamsTest {
             }
 
         @Test
+        fun `a caller cancelled before contextEvents or incomingMessages opens no subscription`() =
+            runTest {
+                // The mutex is uncontended, so withLock never suspends and never checks
+                // cancellation; only the check before the NonCancellable block can stop the call.
+                val subscribing =
+                    launch {
+                        cancel()
+                        runCatching { factory.contextEvents(EVENT_CONTEXT_HANDLE) }
+                        runCatching { factory.incomingMessages(EVENT_CONTEXT_HANDLE) }
+                    }
+                advanceUntilIdle()
+                subscribing.join()
+
+                assertEquals(0, stubBindings.eventSubscribeCount)
+                assertEquals(0, stubBindings.messageSubscribeCount)
+
+                // Nothing was registered, so a live caller subscribes afresh.
+                factory.contextEvents(EVENT_CONTEXT_HANDLE)
+                factory.incomingMessages(EVENT_CONTEXT_HANDLE)
+                assertEquals(1, stubBindings.eventSubscribeCount)
+                assertEquals(1, stubBindings.messageSubscribeCount)
+            }
+
+        @Test
         fun `a stopContextEvents cancelled while waiting for the mutex still releases`() =
             runTest {
                 val factory = HotStreamFactory(stubBindings, Dispatchers.IO)
