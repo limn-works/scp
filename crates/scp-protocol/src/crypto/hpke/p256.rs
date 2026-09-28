@@ -18,7 +18,7 @@
 //! the invalid-curve attack §9.5 names.
 //!
 //! Each [`seal`] draws a fresh ephemeral key as `DeriveKeyPair(random(Nsk))`,
-//! the `GenerateKeyPair` construction RFC 9180 §7.1.3 permits, so the one
+//! which RFC 9180 §4 names as an implementation of `GenerateKeyPair`, so the one
 //! [`derive_key_pair`] routine serves both the RFC 9180 A.3 known-answer tests
 //! and production. The HPKE context performs exactly one `Seal` at sequence
 //! number 0; nothing here exports secrets or supplies an external nonce.
@@ -78,9 +78,10 @@ const HPKE_SUITE_ID: [u8; 10] = hpke_suite_id_for(KEM_ID, KDF_ID, AEAD_ID);
 ///
 /// # Errors
 ///
-/// [`HpkeError::InvalidKey`] when `ikm` is shorter than `Nsk` (32 bytes, which
-/// RFC 9180 §7.1.3 requires), or when all 256 candidates fall outside
-/// `[1, n − 1]` (probability about 2^-8192).
+/// [`HpkeError::InvalidKey`] when `ikm` is shorter than `Nsk` (32 bytes), or
+/// when all 256 candidates fall outside `[1, n − 1]` (probability about
+/// 2^-8192). RFC 9180 §7.1.3 says `ikm` SHOULD be at least `Nsk` bytes; SCP
+/// rejects a shorter one.
 pub fn derive_key_pair(ikm: &[u8]) -> Result<P256SigningKey, HpkeError> {
     if ikm.len() < PRIVATE_KEY_LEN {
         return Err(HpkeError::InvalidKey(format!(

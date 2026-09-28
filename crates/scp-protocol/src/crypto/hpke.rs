@@ -60,7 +60,7 @@ use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use sha2::Sha256;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Pub, StaticSecret};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 pub mod p256;
 
@@ -169,9 +169,16 @@ fn labeled_extract(salt: &[u8], suite_id: &[u8], label: &[u8], ikm: &[u8]) -> Ze
     // Hkdf::extract (salt None == all-zero salt block, which is NOT what we
     // want — RFC 9180 uses an explicit possibly-empty salt). Pass Some(salt)
     // so an empty salt is the empty byte string per HKDF (RFC 5869 §2.2).
-    let (prk, _hk) = Hkdf::<Sha256>::extract(Some(salt), &labeled_ikm);
+    //
+    // `extract` returns the PRK by value and also keeps it inside the returned
+    // `Hkdf` (as HMAC key state). The by-value copy is wiped below once it
+    // sits in `Zeroizing`. Wiping the `Hkdf` copy is best effort only: `hmac`
+    // 0.12 implements no `ZeroizeOnDrop`, so that state is left in memory
+    // when `_hk` drops.
+    let (mut prk, _hk) = Hkdf::<Sha256>::extract(Some(salt), &labeled_ikm);
     let mut out = Zeroizing::new([0u8; 32]);
     out.copy_from_slice(&prk);
+    prk.as_mut_slice().zeroize();
     out
 }
 
