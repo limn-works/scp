@@ -691,7 +691,38 @@ output_len = 32                      // 32-byte derived key
 salt       = per-file 16-byte salt   // generated once, persisted with the custody file
 ```
 
-The Argon2id output is not used as a key itself. HKDF-SHA256 over it, with no salt, derives two subkeys under distinct info labels: `scp/file-key-custody/v3/entry-aead` is the AES-256-GCM key for each entry, and `scp/file-key-custody/v3/file-mac` is an HMAC-SHA256 key. The file ends with an HMAC-SHA256 tag over every byte before it. An implementation MUST refuse a file whose length is not exactly the header, plus `entry_count` entries, plus the 32-byte tag, and MUST refuse a file whose tag does not verify, on open and on every later read. The tag stops an entry from being removed, appended or replayed, and stops the entry count from being changed. It does not stop the whole file being rolled back to an earlier version.
+The Argon2id output is not used as a key itself. HKDF-SHA256 over it, with no salt, derives two subkeys under distinct info labels: `scp/file-key-custody/v4/entry-aead` is the AES-256-GCM key for each entry, and `scp/file-key-custody/v4/file-mac` is an HMAC-SHA256 key. The file ends with an HMAC-SHA256 tag over every byte before it. An implementation MUST refuse a file whose length is not exactly the header, plus `entry_count` entries, plus the 32-byte tag, and MUST refuse a file whose tag does not verify, on open and on every later read. The tag stops an entry from being removed, appended or replayed, and stops the entry count from being changed. It does not stop the whole file being rolled back to an earlier version.
+
+**The key file is a header, `entry_count` entries, and a tag, at these fixed widths.** The format version is `0x04`; an implementation MUST refuse any other version. Integers are unsigned.
+
+| Field | Offset | Width (bytes) | Encoding |
+|-------|--------|---------------|----------|
+| `version` | 0 | 1 | `0x04` |
+| `argon2id_salt` | 1 | 16 | the per-file salt above |
+| `entry_count` | 17 | 4 | little-endian |
+| entries | 21 | `entry_count` × 62 | the entry layout below, in index order from 0 |
+| `file_tag` | 21 + 62 × `entry_count` | 32 | HMAC-SHA256 under the `v4/file-mac` subkey over every byte before it |
+
+Each entry is 62 bytes:
+
+| Field | Offset in entry | Width (bytes) | Encoding |
+|-------|-----------------|---------------|----------|
+| `key_type` | 0 | 1 | `0x01` Ed25519, `0x02` X25519, `0x03` P-256 signing, `0x04` P-256 HPKE |
+| `role` | 1 | 1 | `0x00` operational, `0x01` identity |
+| `nonce` | 2 | 12 | AES-256-GCM nonce, unique per entry write |
+| `ciphertext` | 14 | 32 | the 32-byte private key under the `v4/entry-aead` subkey; a P-256 key is its big-endian scalar |
+| `aead_tag` | 46 | 16 | the AES-256-GCM tag |
+
+Each entry's AES-256-GCM associated data is 7 bytes:
+
+| Field | Offset | Width (bytes) | Encoding |
+|-------|--------|---------------|----------|
+| `version` | 0 | 1 | `0x04` |
+| `key_type` | 1 | 1 | the entry's `key_type` byte |
+| `role` | 2 | 1 | the entry's `role` byte |
+| `entry_index` | 3 | 4 | the entry's zero-based position, big-endian |
+
+Because the associated data binds the type, the role and the position, an implementation that flips an entry's type or role byte, or moves an entry to another index, fails decryption instead of reinterpreting the key. Only an entry whose role byte is `0x01` may be a pseudonym-derivation source (`09-security-model.md` §9.10.4.A). An implementation MUST refuse a decrypted P-256 scalar that is zero or not below the group order `n`. Removing an entry re-encrypts every entry whose index shifts.
 
 ## 17.9 OpenMLS StorageProvider Bridge
 
