@@ -2740,7 +2740,7 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash, sign
 | `"SCP-COSIGNED-HEAD-V1:"` | Cosigned head — one witness's signed statement of the subject chain's head at one moment; it verifies against the P-256 key the signing operator's community-relay-list entry declares, under the community-relay-list operator-key class of §9.7.1 | §9.7.4.3 |
 | `"SCP-WITNESS-CONFLICT-V1:"` | Witness conflict statement — one witness's signed statement that two chains for one subject were offered to it; it verifies under the same operator-key class | §9.7.4.3 |
 | `"scp-pseudonym-routing-v1:"` | Per-context pseudonym routing id — `SHA-256("scp-pseudonym-routing-v1:" \|\| context_pseudonym)` over the 33-byte compressed pseudonym public key, which is the 32-byte value every routing field carries; a routing-derivation prefix, NOT a §9.5.1 signature-preimage separator | §9.10.4 |
-| `"SCP-CLAIM-V1:"` | Shadow identity claim validation | §12.3 |
+| `"SCP-CLAIM-V1:"` | Shadow identity claim signature — covers `claimant_did`, `shadow_did`, `attestation_id`, and `timestamp`, in that order | §3.5.5, §12.3 |
 | `"SCP-RECEIPT-V1:"` | Payment receipt signing | §19.15.5 |
 | `"SCP-HANDLE-OUTLET-V1:"` | Handle and scope outlet request signing | §22.3.1, §22.3.5 |
 | `"SCP-CHALLENGE-REQ-V1:"` | Trust challenge request signing | §7.4 |

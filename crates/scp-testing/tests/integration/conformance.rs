@@ -1664,18 +1664,47 @@ fn conf_037_shadow_identity() {
     assert!(found.is_ok(), "shadow must be findable");
 
     print_step(4, "Verify claim hash domain separator");
+    // §3.5.5 step 2: claimant_did || shadow_did || attestation_id || timestamp.
     let claim_bytes = canonical_hash_bytes(
         b"SCP-CLAIM-V1:",
         &[
-            CanonicalField::VarBytes(b"shadow-alice-discord"),
             CanonicalField::VarBytes(b"did:dht:z6MkClaimer"),
-            CanonicalField::VarBytes(b"bridge-ctx"),
+            CanonicalField::VarBytes(b"shadow-alice-discord"),
+            CanonicalField::VarBytes(b"att-claim-001"),
             CanonicalField::U64(1_700_000_000),
         ],
     )
     .unwrap();
     let claim_hash: [u8; 32] = Sha256::digest(&claim_bytes).into();
     println!("    Claim hash: 0x{}", hex(&claim_hash));
+
+    // The production claim hash computes the same §3.5.5 preimage.
+    let request = scp_core::bridge::claiming::ClaimRequest {
+        shadow_id: "shadow-alice-discord".to_owned(),
+        claimant_did: DID::from("did:dht:z6MkClaimer"),
+        platform_handle: "@alice#1234".to_owned(),
+        identity_attestation: scp_core::trust::Attestation {
+            id: "att-claim-001".to_owned(),
+            attestation_type: scp_core::trust::AttestationType::IdentityLink,
+            issuer: DID::from("did:dht:z6MkClaimer"),
+            subject: DID::from("did:dht:z6MkClaimer"),
+            claim: serde_json::json!({"platform_handle": "@alice#1234"}),
+            evidence: None,
+            issued_at: 1_700_000_000,
+            expires_at: None,
+            renewal_interval: None,
+            renewed_at: None,
+            revocation_status: scp_core::trust::RevocationStatus::Active,
+            signature: Vec::new(),
+        },
+        timestamp: 1_700_000_000,
+        signature: Vec::new(),
+    };
+    assert_eq!(
+        scp_core::bridge::claiming::compute_claim_canonical_hash(&request).unwrap(),
+        claim_hash,
+        "production claim hash must cover the §3.5.5 field set"
+    );
 
     println!("  PASS: Shadow identity creation verified");
 }

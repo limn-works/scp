@@ -469,6 +469,7 @@ ID_DAVE = fixture_identifier("dave")
 ID_ALICE = fixture_identifier("alice")
 ID_BOB = fixture_identifier("bob")
 ID_CLAIMANT = fixture_identifier("claimant")
+ID_SHADOW = fixture_identifier("shadow")
 ID_PROPOSER = fixture_identifier("proposer")
 ID_NEW_MEMBER = fixture_identifier("new member")
 ID_HPKE_SENDER = fixture_identifier("hpke sender")
@@ -1154,11 +1155,12 @@ def emit_fingerprint() -> None:
 
 def emit_claim_and_proposal() -> None:
     section("§25.10 Shadow claim hash")
+    # §3.5.5 step 2: claimant_did || shadow_did || attestation_id || timestamp.
     claim_preimage = canonical_preimage(
         "SCP-CLAIM-V1:",
-        var_field("shadow-alice-x-12345"),
         var_field(ID_CLAIMANT),
-        var_field("bridge-test-context"),
+        var_field(ID_SHADOW),
+        var_field("att-claim-001"),
         u64(1_700_000_000),
     )
     emit("vector_22.preimage_len", len(claim_preimage))
