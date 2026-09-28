@@ -59,7 +59,9 @@
 //!   requires P-256, and no story tracks that move yet).
 //! - [`device_attestation`] — Play Integrity device attestation (a Classic
 //!   request today; story SCP-111 tracks the Standard request ADR-027 requires).
-//! - [`push_provider`] — Firebase Cloud Messaging with opaque data-only payloads.
+//! - [`push_provider`] — Firebase Cloud Messaging; checks only the `scp` wake
+//!   field of a data-only payload and does not enforce the opaque payload
+//!   §10.7 of the infrastructure spec defines.
 //! - [`storage`] — `SQLCipher` encrypted storage whose 32-byte key is derived
 //!   from a Keystore-held AES-256 key.
 //!

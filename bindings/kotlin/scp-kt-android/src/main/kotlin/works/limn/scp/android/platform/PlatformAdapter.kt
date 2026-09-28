@@ -26,7 +26,8 @@ import android.content.Context
  *   requires P-256 at every supported API level, and no story tracks that move yet).
  * @property deviceAttestation Play Integrity device attestation, which requests a Classic
  *   token today; story SCP-111 tracks the Standard request ADR-027 requires.
- * @property push Firebase Cloud Messaging with opaque data-only payloads.
+ * @property push Firebase Cloud Messaging; checks only the `scp` wake field of a data-only
+ *   payload and does not enforce the opaque payload §10.7 defines.
  * @property storage SQLCipher encrypted storage whose 32-byte key is derived from a
  *   Keystore-held AES-256 key.
  */

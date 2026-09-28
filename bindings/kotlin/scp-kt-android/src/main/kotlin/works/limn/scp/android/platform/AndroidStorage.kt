@@ -55,8 +55,11 @@ import javax.crypto.spec.GCMParameterSpec
  * 3. The first 32 bytes of that output (the ciphertext and the first 10 bytes of the tag)
  *    are the SQLCipher passphrase, which SQLCipher uses for full-database encryption.
  *
- * Keystore does not hand the AES key bytes to the app. The derived passphrase exists in
- * memory only during database open and is not persisted to disk in plaintext.
+ * Keystore does not hand the AES key bytes to the app. The derived passphrase is not
+ * persisted to disk in plaintext, but it stays in process memory: SQLCipher keeps the key
+ * in native memory for as long as the database is open, and the adapter zeroes only the
+ * returned passphrase array after open, not the 38-byte `doFinal` output or the list
+ * `take` builds from it, which stay on the JVM heap until garbage collection.
  *
  * ## Thread safety
  *
@@ -87,7 +90,8 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         try {
             // The passphrase is passed as byte[] to the SQLiteOpenHelper constructor.
             // SQLCipher 4.6+ uses the constructor-supplied key for encryption.
-            // The ByteArray source (encryptionKey) is zeroed in the finally block.
+            // The returned ByteArray (encryptionKey) is zeroed in the finally block; the
+            // intermediate copies inside getOrCreateStorageKey are not.
             // The real protection is Keystore-held key derivation — the passphrase
             // cannot be recomputed without the Android Keystore key.
             //

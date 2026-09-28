@@ -3,10 +3,12 @@
 // IMPORTANT: These are IN-MEMORY-ONLY tests. All StorageProvider contract tests run
 // against InMemoryStorageProvider, NOT the real AndroidStorage implementation. The
 // following production behaviors are NOT exercised by these tests:
-//   - Android Keystore key derivation (Bug #2: setRandomizedEncryptionRequired)
-//   - SQLCipher SQL LIKE escaping with % and _ wildcards (Bug #4)
-//   - Non-atomic deletePrefix under concurrent access (Bug #5)
-//   - Passphrase ByteArray zeroing after database open (Bug #3)
+//   - Android Keystore key derivation with setRandomizedEncryptionRequired(false), which
+//     the caller-supplied fixed GCM IV needs
+//   - SQL LIKE escaping of % and _ wildcards on real SQLCipher
+//   - Transactional deletePrefix (DELETE plus changes() in one transaction) on real
+//     SQLCipher under concurrent access
+//   - Zeroing of the passphrase ByteArray in the finally block after database open
 //
 // Instrumented tests on real devices are required to verify the full SQLCipher +
 // Android Keystore path. See ADR-027 for the testing strategy.
@@ -448,11 +450,11 @@ class AndroidStorageTest {
     // -------------------------------------------------------------------
 
     @Nested
-    inner class TeeKeyDerivation {
+    inner class KeystoreKeyDerivation {
 
         @Test
         fun `AndroidStorage class exists and implements StorageProvider`() {
-            // Verify at the type level that AndroidStorage implements the trait
+            // Verify at the type level that AndroidStorage implements the Kotlin interface
             assertTrue(StorageProvider::class.java.isAssignableFrom(AndroidStorage::class.java))
         }
 

@@ -211,7 +211,8 @@ interface DeviceAttestationProvider {
  */
 interface PushProvider {
     /**
-     * Register for push notifications and return the platform-specific token.
+     * Return the platform-specific push token. The method sends nothing to a relay; the
+     * §10.7.1 `PushRegistration` that carries the token to a relay is a separate message.
      *
      * @return The push notification registration token string.
      * @throws Exception whatever the platform token source throws when retrieval fails. The

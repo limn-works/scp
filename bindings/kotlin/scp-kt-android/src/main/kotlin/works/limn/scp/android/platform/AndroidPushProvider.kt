@@ -1,5 +1,5 @@
 /**
- * AndroidPushProvider — FCM push notification registration with opaque data-only payloads.
+ * AndroidPushProvider — FCM token retrieval and wake-signal handling for data-only payloads.
  *
  * This file implements the [PushProvider] interface for Android using Firebase Cloud
  * Messaging (FCM). It is one of the four platform providers assembled by
@@ -27,9 +27,10 @@
  * FCM token registration is asynchronous. [register] retrieves the current FCM
  * registration token via `FirebaseMessaging.getInstance().token.await()` on
  * [Dispatchers.IO][kotlinx.coroutines.Dispatchers.IO]. The token may change over
- * time (e.g., app data cleared, app restored on new device). No code in the SDK calls
- * [register] again when the token changes; a caller that learns of a token change must
- * call [register] again.
+ * time (e.g., app data cleared, app restored on new device). [register] only returns the
+ * token; it sends nothing to a relay. §10.7.1 requires the client to send its relays a new
+ * `PushRegistration` carrying the new token when the token changes, and no SDK code builds
+ * or sends a `PushRegistration` or calls [register] again when the token changes.
  *
  * ## Thread Safety
  *
@@ -81,7 +82,8 @@ class AndroidPushProvider(
 ) : PushProvider {
 
     /**
-     * Register for FCM push notifications and return the registration token.
+     * Return the current FCM registration token. The method sends nothing to a relay; see
+     * the file header for the §10.7.1 `PushRegistration` that no SDK code sends.
      *
      * Retrieves the current FCM instance token on [Dispatchers.IO]. A push sender
      * addresses FCM data messages to this device by the token; no sender in this
