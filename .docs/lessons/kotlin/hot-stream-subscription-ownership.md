@@ -123,7 +123,8 @@ show one context handle during a transition each count only their own mounts.
   there composes two mounts under one key at once, removes one, and asserts that no `onStop` ran
   and that their shared subscription is still live. `a stop runs after every stop launched before
   it under that key` launches two stops on a dispatcher that runs its queued tasks newest first,
-  and asserts that their `onStop` lambdas ran oldest first, and `a coordinator swap next to a
+  and asserts that the earlier stop completes before the later one and that the second mount,
+  which leaves before its `start` runs, has no `onStop` run for it, and `a coordinator swap next to a
   live mount starts only after the old coordinator stops the key` asserts that a moved mount
   opens a fresh subscription only after its old coordinator released the shared one. `two
   coordinator changes under one key start only after the first swapped-out stop` holds the first
