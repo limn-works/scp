@@ -14,10 +14,14 @@
 //! `enc` goes through [`P256PublicKey::from_sec1`] before any scalar
 //! multiplication. That rejects a length other than 65, a leading byte other
 //! than `0x04`, a point off the curve, and the point at infinity, which closes
-//! the invalid-curve attack §9.5 names. [`open`] validates `enc` itself. The
-//! custody path takes only a [`ValidatedEnc`], whose one constructor is
-//! [`validate_enc`], so a caller holds a validated `enc` before it can ask
-//! custody for `DH(skR, enc)`.
+//! the invalid-curve attack §9.5 names. [`open`] validates `enc` itself, before
+//! its key agreement. The custody open takes only a [`ValidatedEnc`], whose one
+//! constructor is [`validate_enc`], so the type guarantees that `enc` was
+//! validated before the open. It does not guarantee that `enc` was validated
+//! before the custody key agreement: `KeyCustody::dh_agree` takes bytes, so a
+//! caller can run it on the raw wire `enc` first. That order rests on the
+//! caller contract in [`custody::open_with_external_dh`] and on every
+//! `dh_agree` backend for P-256 HPKE keys validating its peer point.
 //!
 //! Each [`seal`] draws a fresh ephemeral key as `DeriveKeyPair(random(Nsk))`,
 //! which RFC 9180 §4 names as an implementation of `GenerateKeyPair`, so the one
@@ -186,10 +190,15 @@ pub fn open(
 /// infinity.
 ///
 /// [`validate_enc`] is the only constructor. [`custody::open_with_external_dh`]
-/// takes this type rather than bytes, so the order §9.5 requires (validate,
-/// then agree) is fixed by the types: the caller validates the wire `enc`,
-/// passes [`ValidatedEnc::as_bytes`] to `KeyCustody::dh_agree`, and passes the
-/// same value to the open.
+/// takes this type rather than bytes, so the type guarantees that `enc` was
+/// validated before the open.
+///
+/// The type does not guarantee the order §9.5 requires, validate and then
+/// agree: `KeyCustody::dh_agree` takes bytes, so a caller can run it on the
+/// raw wire `enc` before validating. That order rests on the caller contract
+/// (validate the wire `enc`, pass [`ValidatedEnc::as_bytes`] to `dh_agree`,
+/// pass the same value to the open) and on every `dh_agree` backend for P-256
+/// HPKE keys validating its peer point.
 ///
 /// Raw bytes do not satisfy the custody open:
 ///
@@ -261,8 +270,9 @@ pub mod custody {
     /// In this order, for one and the same custody key handle `h`:
     ///
     /// 1. `enc` = `validate_enc(wire_enc)?` ([`validate_enc`](super::validate_enc)). §9.5
-    ///    requires this before any key agreement, and the type makes it the
-    ///    only way to call this function.
+    ///    requires this before any key agreement. The type makes it the only
+    ///    way to call this function, but only this step order keeps the key
+    ///    agreement off an unvalidated point.
     /// 2. `dh` = `KeyCustody::dh_agree(h, enc.as_bytes())`: the 32-byte
     ///    x-coordinate of `skR · enc`.
     /// 3. `recipient_pk` (`pkRm`) = the 65-byte uncompressed public key of `h`.
