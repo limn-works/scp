@@ -230,13 +230,14 @@ fn p256_round_trips_against_reference() -> TestResult {
                     None,
                 )
                 .map_err(|e| format!("case {idx}: reference seal: {e:?}"))?;
-            let got = hpke::p256::open(&sk, &ref_enc, info, aad, &ref_ct)?;
+            let got: zeroize::Zeroizing<Vec<u8>> =
+                hpke::p256::open(&sk, &ref_enc, info, aad, &ref_ct)?;
             assert_eq!(got.as_slice(), ref_pt, "case {idx}: reference → ours");
 
             let sk_key = scp_crypto::p256::P256SigningKey::from_scalar_bytes(&sk)?;
             let enc = hpke::p256::validate_enc(&ref_enc)?;
             let dh = scp_crypto::p256::ecdh_p256(&sk_key, enc.point());
-            let got =
+            let got: zeroize::Zeroizing<Vec<u8>> =
                 hpke::p256::custody::open_with_external_dh(&dh, &pk, &enc, info, aad, &ref_ct)?;
             assert_eq!(got.as_slice(), ref_pt, "case {idx}: reference → custody");
         }

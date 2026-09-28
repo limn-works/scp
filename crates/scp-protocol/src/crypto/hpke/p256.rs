@@ -162,7 +162,8 @@ pub fn seal(
 ///
 /// `pkRm` is derived from `recipient_sk`. `enc` is taken as a slice because it
 /// arrives from the wire; its length and point are validated here. For
-/// custody-held keys use [`custody::open_with_external_dh`].
+/// custody-held keys use [`custody::open_with_external_dh`]. The plaintext is
+/// returned in [`Zeroizing`], so it is wiped when dropped.
 ///
 /// # Errors
 ///
@@ -176,7 +177,7 @@ pub fn open(
     info: &[u8],
     aad: &[u8],
     ct: &[u8],
-) -> Result<Vec<u8>, HpkeError> {
+) -> Result<Zeroizing<Vec<u8>>, HpkeError> {
     let enc = validate_enc(enc)?;
     let sk = P256SigningKey::from_scalar_bytes(recipient_sk)
         .map_err(|e| HpkeError::InvalidKey(format!("recipient scalar: {e}")))?;
@@ -260,7 +261,7 @@ pub fn validate_enc(enc: &[u8]) -> Result<ValidatedEnc, HpkeError> {
 /// HPKE open paths for P-256 recipient keys held inside a `KeyCustody`
 /// boundary.
 pub mod custody {
-    use super::{HpkeError, PUBLIC_KEY_LEN, ValidatedEnc, decap_and_open};
+    use super::{HpkeError, PUBLIC_KEY_LEN, ValidatedEnc, Zeroizing, decap_and_open};
 
     /// Single-shot Base-mode HPKE open where `DH(skR, enc)` was computed inside
     /// a `KeyCustody` boundary.
@@ -277,6 +278,8 @@ pub mod custody {
     ///    x-coordinate of `skR · enc`.
     /// 3. `recipient_pk` (`pkRm`) = the 65-byte uncompressed public key of `h`.
     ///
+    /// The plaintext is returned in [`Zeroizing`], so it is wiped when dropped.
+    ///
     /// A mismatched `dh`, `pkRm`, or `enc` fails closed as an AEAD tag
     /// mismatch, indistinguishable from a wrong-key error. `enc || pkRm` is
     /// bound into the shared secret, so a ciphertext sealed to one recipient
@@ -292,7 +295,7 @@ pub mod custody {
         info: &[u8],
         aad: &[u8],
         ct: &[u8],
-    ) -> Result<Vec<u8>, HpkeError> {
+    ) -> Result<Zeroizing<Vec<u8>>, HpkeError> {
         decap_and_open(dh, recipient_pk, enc.as_bytes(), info, aad, ct)
     }
 }
@@ -325,9 +328,9 @@ fn decap_and_open(
     info: &[u8],
     aad: &[u8],
     ct: &[u8],
-) -> Result<Vec<u8>, HpkeError> {
+) -> Result<Zeroizing<Vec<u8>>, HpkeError> {
     let ks = encap_key_schedule(dh, enc, recipient_pk, info)?;
-    aead_open(&ks, aad, ct)
+    aead_open(&ks, aad, ct).map(Zeroizing::new)
 }
 
 /// `kem_context = enc || pkRm`, DHKEM `ExtractAndExpand`, then
@@ -663,14 +666,16 @@ mod tests {
             let pt = vec![0xA5u8; len];
             let (enc, ct) = seal(&pk, b"info", b"aad", &pt)?;
             assert_eq!(ct.len(), pt.len() + TAG_LEN);
-            assert_eq!(open(&sk, &enc, b"info", b"aad", &ct)?, pt, "len {len}");
+            let opened: Zeroizing<Vec<u8>> = open(&sk, &enc, b"info", b"aad", &ct)?;
+            assert_eq!(*opened, pt, "len {len}");
 
             let sk_key = P256SigningKey::from_scalar_bytes(&sk)?;
             let valid = validate_enc(&enc)?;
             assert_eq!(valid.as_bytes(), &enc, "ValidatedEnc keeps the wire bytes");
             let dh = ecdh_p256(&sk_key, valid.point());
-            let got = custody::open_with_external_dh(&dh, &pk, &valid, b"info", b"aad", &ct)?;
-            assert_eq!(got, pt, "custody len {len}");
+            let got: Zeroizing<Vec<u8>> =
+                custody::open_with_external_dh(&dh, &pk, &valid, b"info", b"aad", &ct)?;
+            assert_eq!(*got, pt, "custody len {len}");
         }
         Ok(())
     }
