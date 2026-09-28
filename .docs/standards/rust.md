@@ -458,8 +458,10 @@ unsoundness in three `Once` into-inner methods. When `--precise` fails with a
 version conflict, read whether the conflicting requirement is `locked to` a version: a
 lockfile pin is not a blocker, so unlock that crate first with
 `cargo update -p <crate>@<locked version>` and retry. aws-sdk-s3 1.144.0 is the first
-release that requires the patched `lru ^0.18.2`, which clears both lru advisories;
-1.120.0 through 1.143.0 require `lru ^0.16.3`, which RUSTSEC-2026-0253 still covers. `--precise`
+release that requires the patched `lru ^0.18.2`, which clears RUSTSEC-2026-0253.
+1.119.0 requires `lru ^0.12.2`, which also falls under RUSTSEC-2026-0002 (patched at
+0.16.3); 1.120.0 through 1.143.0 require `lru ^0.16.3`, which clears RUSTSEC-2026-0002
+but not RUSTSEC-2026-0253. `--precise`
 refused 1.144.0 only because `Cargo.lock` held `sha2 0.11.0-rc.5`, which mainline's
 `ed25519-dalek 3.0.0-pre.6` accepts at 0.11.0 too.
 Prove the result resolves with `cargo metadata --locked --all-features`.
