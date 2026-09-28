@@ -752,8 +752,10 @@ else
     done
 
     NOTES+=("the reverse dependencies of $crate_list: cargo check -p compiles the packages it names and none of their dependents, so a changed public signature compiles here and fails to compile its dependents in the rust-clippy job of .github/workflows/ci.yml")
-    # The examples gate reads only packages with an `example` target, so the note names
-    # only those. When cargo metadata cannot be read, it names every package compiled.
+    # The examples gate compiles each `example` target against its package's whole
+    # dependency graph, so the note names each changed package that owns an example
+    # target or that one of those packages reaches through workspace dependencies of any
+    # kind. When cargo metadata cannot be read, it names every package compiled.
     example_rc=0
     example_list=""
     if [[ $metadata_rc -ne 0 ]]; then
@@ -762,16 +764,25 @@ else
         example_list=$(printf '%s' "$metadata" | "$PYTHON" -c '
 import json, sys
 selected = set(sys.argv[1:])
-print(", ".join(sorted(p["name"] for p in json.load(sys.stdin)["packages"]
-    if p["name"] in selected
-    and any("example" in t.get("kind", []) for t in p.get("targets", [])))))
+pkgs = json.load(sys.stdin)["packages"]
+deps = {p["name"]: {d["name"] for d in p.get("dependencies", [])} for p in pkgs}
+reached = set()
+todo = [p["name"] for p in pkgs
+    if any("example" in t.get("kind", []) for t in p.get("targets", []))]
+while todo:
+    n = todo.pop()
+    if n in reached:
+        continue
+    reached.add(n)
+    todo.extend(d for d in deps.get(n, ()) if d in deps)
+print(", ".join(sorted(selected & reached)))
 ' "${CRATES[@]}" 2>/dev/null) || example_rc=$?
     fi
     if [[ $example_rc -ne 0 ]]; then
         example_list="$crate_list (this run could not read their targets out of cargo metadata, so some of them may have no example target)"
     fi
     if [[ -n $example_list ]]; then
-        NOTES+=("scripts/check-examples-compile.sh over the example targets of $example_list: the compile above runs cargo check, which reports no clippy lint, while that gate runs cargo clippy -- -D warnings on each example alone, in that one package's dev-target feature set and without the --features list the compile above passed, so an example with a clippy warning, or one that names an item behind a feature the compile above turned on, passes here and fails that gate in the rust-clippy job of .github/workflows/ci.yml")
+        NOTES+=("scripts/check-examples-compile.sh over the example targets that compile $example_list: the compile above runs cargo check, which reports no clippy lint, while that gate runs cargo clippy -- -D warnings on each example alone, in that one package's dev-target feature set and without the --features list the compile above passed, so an example with a clippy warning, or one that names an item behind a feature the compile above turned on, passes here and fails that gate in the rust-clippy job of .github/workflows/ci.yml")
     fi
 
     declare -a SELECTED_WASM=()

@@ -1143,44 +1143,50 @@ fi
 
 # Case 22's metadata answer holds no package list, so the run cannot tell which compiled
 # package has an example target and names every one of them, saying why.
-if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh over the example targets of scp-clock (this run could not read their targets' "$FIXTURE22.harness/out.txt"; then
+if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh over the example targets that compile scp-clock (this run could not read their targets' "$FIXTURE22.harness/out.txt"; then
     report "case 22 names the examples gate over every package when it cannot read targets" 0 ""
 else
     report "case 22 names the examples gate over every package when it cannot read targets" 1 "the output holds no qualified NOT CHECKED line for scripts/check-examples-compile.sh: $(tail -n 6 "$FIXTURE22.harness/out.txt")"
 fi
 
-# ── Case 22b: the examples gate over the packages that have an example target ────────
+# ── Case 22b: the examples gate over the packages an example target compiles ────────
 #
 # `scripts/check-examples-compile.sh` lints every `example` target, one at a time, with
-# clippy under `-D warnings`, which this runner does not run. The fixture changes two
-# packages and its metadata answer gives an example target to one of them, so the NOT
-# CHECKED line must name that package and not the other: a line naming a package with no
-# example target reports a gate that cannot fail on the change.
+# clippy under `-D warnings`, which this runner does not run. Each example compiles
+# against its package's whole dependency graph, so a changed package with no example of
+# its own still reaches that gate through a dependent's example. The fixture changes three
+# packages. Its metadata answer gives an example target to scp-transport, which reaches
+# scp-clock through a dev-dependency on scp-ffi-napi, and no example reaches scp-ffi. The
+# NOT CHECKED line must name scp-clock and scp-transport and must not name scp-ffi.
 #
 # The mutations it kills: deleting that NOTES entry leaves a change to an example reported
-# green here and red in the rust-clippy job; dropping the target filter names scp-clock.
+# green here and red in the rust-clippy job; dropping the dependency walk leaves scp-clock
+# out; dropping the reachability filter names scp-ffi.
 FIXTURE22B="$WORK/example-targets"
 build_fixture "$FIXTURE22B"
 fixture_commit "$FIXTURE22B" crates/scp-clock/src/lib.rs
 fixture_commit "$FIXTURE22B" crates/scp-transport/src/lib.rs
+fixture_commit "$FIXTURE22B" crates/scp-ffi/src/lib.rs
 HARNESS22B="$FIXTURE22B.harness"
 write_stubs "$HARNESS22B" "$PIN_CHANNEL" 0 0 ""
 cat > "$HARNESS22B/metadata.json" <<'JSON'
 {"version":1,"target_directory":"/stub-target-dir","packages":[
  {"name":"scp-clock","dependencies":[],"targets":[{"name":"scp_clock","kind":["lib"]}]},
- {"name":"scp-transport","dependencies":[],"targets":[{"name":"scp_transport","kind":["lib"]},{"name":"relay","kind":["example"]}]}
+ {"name":"scp-ffi","dependencies":[{"name":"scp-clock","kind":null}],"targets":[{"name":"scp_ffi","kind":["lib"]}]},
+ {"name":"scp-ffi-napi","dependencies":[{"name":"scp-clock","kind":null},{"name":"serde","kind":null}],"targets":[{"name":"scp_ffi_napi","kind":["lib"]}]},
+ {"name":"scp-transport","dependencies":[{"name":"scp-ffi-napi","kind":"dev"}],"targets":[{"name":"scp_transport","kind":["lib"]},{"name":"relay","kind":["example"]}]}
 ]}
 JSON
 PATH="$HARNESS22B/bin:$PATH" bash "$FIXTURE22B/scripts/fix-round-check.sh" > "$HARNESS22B/out.txt" 2>&1
-if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh over the example targets of scp-transport:' "$HARNESS22B/out.txt"; then
-    report "case 22b names the examples gate over the package that has an example" 0 ""
+if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh over the example targets that compile scp-clock, scp-transport:' "$HARNESS22B/out.txt"; then
+    report "case 22b names the examples gate over the packages an example compiles" 0 ""
 else
-    report "case 22b names the examples gate over the package that has an example" 1 "the output holds no NOT CHECKED line naming scp-transport alone: $(tail -n 6 "$HARNESS22B/out.txt")"
+    report "case 22b names the examples gate over the packages an example compiles" 1 "the output holds no NOT CHECKED line naming scp-clock and scp-transport alone: $(tail -n 6 "$HARNESS22B/out.txt")"
 fi
-if grep -F 'check-examples-compile.sh over the example targets of' "$HARNESS22B/out.txt" | grep -qF 'scp-clock'; then
-    report "case 22b names no package without an example target" 1 "$(grep -F 'check-examples-compile.sh' "$HARNESS22B/out.txt")"
+if grep -F 'check-examples-compile.sh over the example targets that compile' "$HARNESS22B/out.txt" | grep -qF 'scp-ffi'; then
+    report "case 22b names no package that no example compiles" 1 "$(grep -F 'check-examples-compile.sh' "$HARNESS22B/out.txt")"
 else
-    report "case 22b names no package without an example target" 0 ""
+    report "case 22b names no package that no example compiles" 0 ""
 fi
 
 # ── Case 23: the scripts/ lane against the suites CI runs over that directory ────────
