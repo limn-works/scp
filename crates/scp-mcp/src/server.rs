@@ -257,7 +257,10 @@ pub enum CapabilityCheck {
     Probe,
     /// Authorizes the outlet run that [`ContextProvider::invoke_outlet`]
     /// dispatches next, after every refusal that runs no outlet. The provider
-    /// records the nonce when the check passes.
+    /// records the nonce during the check. A UCAN validator records it at
+    /// ADR-016 Step 9 and can still refuse at a later step (revocation,
+    /// expiry, a caveat time box), so a refused Invoke check may have spent
+    /// the token too.
     Invoke,
 }
 
@@ -287,7 +290,8 @@ impl std::fmt::Display for AccessRefusal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutletInvokeError {
     /// The [`CapabilityCheck::Invoke`] check refused the run. No outlet ran,
-    /// and the provider recorded no nonce.
+    /// but the check may have recorded the agent token's nonce before it
+    /// refused, so the token may be spent.
     Refused(AccessRefusal),
     /// The provider refused the call before that check, or the outlet failed
     /// after it. The message says which.
@@ -1109,16 +1113,15 @@ impl<P: ContextProvider> McpServer<P> {
         let invoked = self
             .provider
             .invoke_outlet(&context_id, tool_name, params.arguments);
-        if !matches!(invoked, Err(OutletInvokeError::Refused(_))) {
-            // An outlet run appends to the log behind `scp://{ctx}/events`,
-            // and the Invoke check that authorized it spent the agent token,
-            // which empties the tool view. No `ContextEvent` reports either
-            // change, so this queues what the pump would send for one. A
-            // failed call may have run no outlet; it costs the client one
-            // spurious read.
-            let notifications = self.notifications_for(&context_id, OUTLET_RUN_AFFECTS);
-            self.pending_notifications.extend(notifications);
-        }
+        // An outlet run appends to the log behind `scp://{ctx}/events`, and
+        // the Invoke check spent the agent token, which empties the tool view.
+        // A refused Invoke check may have spent it too: a UCAN validator
+        // records the nonce at ADR-016 Step 9 and can refuse at a later step.
+        // No `ContextEvent` reports either change, so this queues what the
+        // pump would send for one, whatever the call returned. A call that ran
+        // no outlet and spent nothing costs the client one spurious read.
+        let notifications = self.notifications_for(&context_id, OUTLET_RUN_AFFECTS);
+        self.pending_notifications.extend(notifications);
         match invoked {
             Ok(output) => {
                 // Validate output against schema if available. A registry the
@@ -2107,9 +2110,10 @@ pub(crate) struct AffectedResources {
     pub(crate) tools: bool,
 }
 
-/// The resources a `tools/call` invalidates: its outlet run appends to the
-/// event log, and the Invoke check that authorized the run spent the agent
-/// token, which removes every outlet from the tool view.
+/// The resources a `tools/call` that reaches its Invoke check invalidates:
+/// its outlet run appends to the event log, and the Invoke check, whether it
+/// passed or refused after recording the nonce, spent the agent token, which
+/// removes every outlet from the tool view.
 const OUTLET_RUN_AFFECTS: AffectedResources = AffectedResources {
     events: true,
     members: false,
@@ -2278,9 +2282,8 @@ mod tests {
         unreadable_roles: Vec<String>,
         /// Every `validate_capability` call's purpose, in call order.
         checks: std::sync::Mutex<Vec<CapabilityCheck>>,
-        /// Whether an Invoke check refuses the run, as a concurrent call that
-        /// spent the token first makes it do.
-        refuse_invoke: bool,
+        /// Whether and where an Invoke check refuses the run.
+        invoke_refusal: InvokeRefusal,
         /// Whether a passing Invoke check records the agent token's nonce, as
         /// the bridges' `OutletGrantNonceTracker` does. Off by default, so a
         /// test can make several calls.
@@ -2288,6 +2291,20 @@ mod tests {
         /// Whether a passing Invoke check recorded the nonce. Every later
         /// check then fails the token as a replay.
         token_spent: std::sync::atomic::AtomicBool,
+    }
+
+    /// Where the mock's Invoke check refuses the run.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum InvokeRefusal {
+        /// The check passes.
+        None,
+        /// The check refuses before it records the nonce, as a concurrent
+        /// call that spent the token first makes it do.
+        BeforeRecord,
+        /// The check records the nonce and then refuses, as a UCAN validator
+        /// does when a revocation, expiry or caveat time box refuses the
+        /// token after ADR-016 Step 9.
+        AfterRecord,
     }
 
     impl MockProvider {
@@ -2333,7 +2350,7 @@ mod tests {
                 participation_unreadable: false,
                 unreadable_roles: Vec::new(),
                 checks: std::sync::Mutex::new(Vec::new()),
-                refuse_invoke: false,
+                invoke_refusal: InvokeRefusal::None,
                 single_use_token: false,
                 token_spent: std::sync::atomic::AtomicBool::new(false),
             }
@@ -2394,13 +2411,20 @@ mod tests {
                 )));
             }
             if self.token_spent.load(std::sync::atomic::Ordering::SeqCst)
-                || (check == CapabilityCheck::Invoke && self.refuse_invoke)
+                || (check == CapabilityCheck::Invoke
+                    && self.invoke_refusal == InvokeRefusal::BeforeRecord)
             {
                 return Err(AccessRefusal::Denied("token replay".to_owned()));
             }
-            if check == CapabilityCheck::Invoke && self.single_use_token {
+            if check == CapabilityCheck::Invoke
+                && (self.single_use_token || self.invoke_refusal == InvokeRefusal::AfterRecord)
+            {
                 self.token_spent
                     .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            if check == CapabilityCheck::Invoke && self.invoke_refusal == InvokeRefusal::AfterRecord
+            {
+                return Err(AccessRefusal::Denied("token expired".to_owned()));
             }
             Ok(())
         }
@@ -2883,22 +2907,66 @@ mod tests {
     }
 
     /// An Invoke check that refuses inside `invoke_outlet` answers
-    /// `CAPABILITY_DENIED`, as a refused probe does, and queues no
-    /// notification, because no outlet ran.
+    /// `CAPABILITY_DENIED`, as a refused probe does. The server still re-reads
+    /// the agent's view, so a check that records the nonce and then refuses
+    /// (a UCAN refused at revocation, expiry or a caveat time box after
+    /// ADR-016 Step 9) queues the tool view change its spent token causes.
     #[test]
-    fn refused_invoke_check_answers_capability_denied_and_queues_nothing() {
-        let mut server = subscribing_server(MockProvider {
-            refuse_invoke: true,
-            ..MockProvider::default()
-        });
-        subscribe(&mut server, "scp://ctx_a/events");
-        let err = server
-            .handle_request(&send_message_call())
-            .unwrap()
-            .error
-            .expect("a refused Invoke check must refuse the call");
-        assert_eq!(err.code, protocol::CAPABILITY_DENIED);
-        assert!(server.take_pending_notifications().is_empty());
+    fn refused_invoke_check_answers_capability_denied_and_queues_view_change() {
+        for invoke_refusal in [InvokeRefusal::BeforeRecord, InvokeRefusal::AfterRecord] {
+            let spent = invoke_refusal == InvokeRefusal::AfterRecord;
+            let mut server = subscribing_server(MockProvider {
+                invoke_refusal,
+                ..MockProvider::default()
+            });
+            let list = make_request(protocol::METHOD_TOOLS_LIST, None);
+            let listed = server.handle_request(&list).unwrap();
+            assert!(
+                !listed.result.unwrap()["tools"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            subscribe(&mut server, "scp://ctx_a/events");
+            subscribe(&mut server, "scp://ctx_a/tools");
+            let err = server
+                .handle_request(&send_message_call())
+                .unwrap()
+                .error
+                .expect("a refused Invoke check must refuse the call");
+            assert_eq!(err.code, protocol::CAPABILITY_DENIED);
+            let queued = server.take_pending_notifications();
+            let updated: Vec<&str> = queued
+                .iter()
+                .filter(|n| n.method == protocol::METHOD_RESOURCES_UPDATED)
+                .map(|n| n.params.as_ref().unwrap()["uri"].as_str().unwrap())
+                .collect();
+            // The tool view is re-read, so only a check that spent the token
+            // changes it; a refusal that recorded nothing leaves it as listed.
+            let expected = if spent {
+                vec!["scp://ctx_a/events", "scp://ctx_a/tools"]
+            } else {
+                vec!["scp://ctx_a/events"]
+            };
+            assert_eq!(updated, expected);
+            assert_eq!(
+                queued
+                    .iter()
+                    .any(|n| n.method == protocol::METHOD_TOOLS_LIST_CHANGED),
+                spent,
+                "a refusal after the record spent the token, so the client must re-list"
+            );
+            if spent {
+                let relisted = server.handle_request(&list).unwrap();
+                assert!(
+                    relisted.result.unwrap()["tools"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty(),
+                    "the refused check spent the token, so the view lost every outlet"
+                );
+            }
+        }
     }
 
     /// A `tools/call` changes `scp://{ctx}/events` and, by spending the agent
