@@ -1263,7 +1263,15 @@ jobs:
           # target (nostr_roundtrip, webrtc_roundtrip) that this list must
           # activate; without them those 10 tests plus 31 in-module tests under
           # src/nostr/ and src/webrtc/ compiled into no test binary CI ran.
-          cargo nextest run -p scp-transport --features quic,http3,udp,coap,nostr,webrtc
+          # The first run takes every other transport test; each run after it
+          # selects one of those four groups with `--no-tests=fail`, so
+          # re-gating a group behind another feature, or deleting it, leaves
+          # its run with nothing to select and fails this lane.
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc -E 'not (binary(nostr_roundtrip) | binary(webrtc_roundtrip) | test(/^nostr::/) | test(/^webrtc::/))'
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --test nostr_roundtrip
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --test webrtc_roundtrip
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --lib -E 'test(/^nostr::/)'
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --lib -E 'test(/^webrtc::/)'
           # scp-node holds two auto-discovered test files (quic_listener,
           # quic_cross_transport), each gated on `quic` and
           # `allow_unencrypted_storage`, which `testing` implies. --workspace
@@ -2377,20 +2385,16 @@ jobs:
       - name: Check fuzz crate compiles
         working-directory: fuzz
         run: cargo check
-      # `cargo check` never compiles `#[cfg(test)]`, so one library test in a
-      # fuzz crate — which asserts that Arbitrary MessageType discriminants
-      # still match a production enum — ran in no job. `cargo test` exits 0
-      # when it runs zero tests, so the step fails unless the summary line
-      # reports at least one passed test.
+      # `cargo check` never compiles `#[cfg(test)]`, so the fuzz crate's one
+      # library test — which asserts that Arbitrary MessageType discriminants
+      # still match a production enum — ran in no job. This step selects that
+      # test by its exact path with `--no-tests=fail`, so renaming, deleting,
+      # or cfg-gating it selects nothing and fails the step, whatever other
+      # library tests the crate gains.
+      - uses: taiki-e/install-action@nextest
       - name: Run fuzz crate library tests
         working-directory: fuzz
-        run: |
-          set -o pipefail
-          cargo test --lib 2>&1 | tee "$RUNNER_TEMP/fuzz-lib-tests.log"
-          if ! grep -Eq '^test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/fuzz-lib-tests.log"; then
-            echo "::error::cargo test --lib in fuzz/ ran zero tests"
-            exit 1
-          fi
+        run: cargo nextest run --no-tests=fail --lib -E 'test(=tests::arb_message_type_discriminants_match_production)'
 
   # ── Bridge parity (ADR-046) ────────────────────────────────────────
   # Cross-bridge runtime parity harness: drives PyO3 (in-process) and
