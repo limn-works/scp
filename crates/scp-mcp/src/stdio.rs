@@ -561,8 +561,8 @@ mod tests {
         fn active_context_ids(&self) -> Result<Vec<String>, String> {
             Ok(self.contexts.clone())
         }
-        fn agent_role(&self, _context_id: &str) -> Option<String> {
-            Some("admin".to_owned())
+        fn agent_role(&self, _context_id: &str) -> Result<Option<String>, String> {
+            Ok(Some("admin".to_owned()))
         }
         fn agent_did(&self) -> &str {
             &self.agent_did

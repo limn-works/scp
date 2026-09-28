@@ -308,7 +308,7 @@ class TestScpMcpClientConnectValidation:
         scp = MagicMock()
         scp._native = MagicMock()
         with pytest.raises(McpError):
-            await SCP.mcp_client_connect_sse(scp, "")
+            await SCP.mcp_client_connect_sse(scp, "", None)
 
 
 # -----------------------------------------------------------------------

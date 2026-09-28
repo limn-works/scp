@@ -327,8 +327,15 @@ pub trait ContextProvider: Send + Sync {
     fn active_context_ids(&self) -> Result<Vec<ContextId>, String>;
 
     /// Returns the agent's role in the given context (e.g., `"admin"`,
-    /// `"member"`).
-    fn agent_role(&self, context_id: &str) -> Option<String>;
+    /// `"member"`), or `None` when the agent holds no role there.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the provider cannot read the context's role
+    /// state. A failed read must never be reported as `None`: the server
+    /// would then hide every `admin_only` outlet from an admin agent and
+    /// still answer `tools/list` as a success.
+    fn agent_role(&self, context_id: &str) -> Result<Option<String>, String>;
 
     /// Returns the agent's DID.
     fn agent_did(&self) -> &str;
@@ -890,13 +897,13 @@ impl<P: ContextProvider> McpServer<P> {
     ///
     /// # Errors
     ///
-    /// Returns the provider's message when it cannot read the context's
-    /// outlet registry, so neither caller reports a failed read as a context
-    /// with no outlets.
+    /// Returns the provider's message when it cannot read the agent's role
+    /// or the context's outlet registry, so neither caller reports a failed
+    /// read as an agent without a role or a context with no outlets.
     fn visible_tools(&self, context_id: &str) -> Result<Vec<ToolDefinition>, String> {
         let agent_is_admin = self
             .provider
-            .agent_role(context_id)
+            .agent_role(context_id)?
             .as_deref()
             .is_some_and(|r| r == "admin");
 
@@ -2202,6 +2209,9 @@ mod tests {
         /// Whether the provider fails to read which contexts the agent takes
         /// part in.
         participation_unreadable: bool,
+        /// Whether the provider fails to read the agent's role while every
+        /// other read of the context succeeds.
+        role_unreadable: bool,
         /// Every `validate_capability` call's purpose, in call order.
         checks: std::sync::Mutex<Vec<CapabilityCheck>>,
         /// Whether an Invoke check refuses the run, as a concurrent call that
@@ -2257,6 +2267,7 @@ mod tests {
                 events: serde_json::json!([]),
                 unreadable: Vec::new(),
                 participation_unreadable: false,
+                role_unreadable: false,
                 checks: std::sync::Mutex::new(Vec::new()),
                 refuse_invoke: false,
                 single_use_token: false,
@@ -2273,11 +2284,15 @@ mod tests {
             Ok(self.contexts.clone())
         }
 
-        fn agent_role(&self, context_id: &str) -> Option<String> {
-            self.roles
+        fn agent_role(&self, context_id: &str) -> Result<Option<String>, String> {
+            if self.role_unreadable {
+                return Err(format!("role state of '{context_id}' could not be read"));
+            }
+            Ok(self
+                .roles
                 .iter()
                 .find(|(cid, _)| cid == context_id)
-                .map(|(_, role)| role.clone())
+                .map(|(_, role)| role.clone()))
         }
 
         fn agent_did(&self) -> &str {
@@ -2674,6 +2689,55 @@ mod tests {
             tools
                 .iter()
                 .any(|t| t["name"].as_str().unwrap() == "ctx_a/call.admin_tool")
+        );
+    }
+
+    /// A failed role read fails `tools/list` and the `tools` resource
+    /// instead of hiding the admin agent's `admin_only` outlets behind a
+    /// successful answer.
+    #[test]
+    fn unreadable_role_fails_tool_listing_not_hides_admin_tools() {
+        let provider = MockProvider {
+            tools: vec![(
+                "ctx_a".to_owned(),
+                ContextOutletInfo {
+                    name: "admin_tool".to_owned(),
+                    description: Some("Admin only".to_owned()),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: None,
+                    admin_only: true,
+                    kind: OutletKind::Action,
+                },
+            )],
+            role_unreadable: true,
+            ..MockProvider::default()
+        };
+        let mut server = initialized_server(provider);
+
+        let list = make_request(protocol::METHOD_TOOLS_LIST, None);
+        let resp = server.handle_request(&list).unwrap();
+        assert!(resp.result.is_none(), "tools/list must not read as success");
+        assert_eq!(
+            resp.error
+                .expect("tools/list must fail when the role is unreadable")
+                .code,
+            protocol::INTERNAL_ERROR
+        );
+
+        let read = make_request(
+            protocol::METHOD_RESOURCES_READ,
+            Some(serde_json::json!({ "uri": "scp://ctx_a/tools" })),
+        );
+        let resp = server.handle_request(&read).unwrap();
+        assert!(
+            resp.result.is_none(),
+            "the tools resource must not read as success"
+        );
+        assert_eq!(
+            resp.error
+                .expect("the tools resource must fail when the role is unreadable")
+                .code,
+            protocol::INTERNAL_ERROR
         );
     }
 

@@ -1848,12 +1848,17 @@ class SCP:
 
     # region MCP
 
-    async def mcp_client_connect_sse(self, url: str) -> Any:
-        """Connect an MCP client via SSE transport (returns :class:`McpClient`)."""
+    async def mcp_client_connect_sse(self, url: str, auth_token: str | None) -> Any:
+        """Connect an MCP client via SSE transport (returns :class:`McpClient`).
+
+        *auth_token* is the bearer token sent in an ``Authorization`` header
+        on every request, or ``None`` for a server that runs no bearer check.
+        An SCP SSE server always runs one (ADR-015).
+        """
         from scp_sdk.mcp import McpClient, validate_client_connect
 
         validate_client_connect("sse", url=url)
-        raw = await asyncio.to_thread(self._native.py_mcp_client_connect_sse, url)
+        raw = await asyncio.to_thread(self._native.py_mcp_client_connect_sse, url, auth_token)
         return McpClient(raw)
 
     async def mcp_client_connect_stdio(self, command: list[str]) -> Any:

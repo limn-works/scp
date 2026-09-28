@@ -265,27 +265,50 @@ struct SseClientTransport {
     /// matching response. This is simpler than a persistent SSE
     /// connection but sufficient for the bridge layer.
     post_url: String,
+    /// The `Authorization: Bearer <token>` header line, CRLF included, sent
+    /// on the `GET` and on every POST; empty when the caller passed no token.
+    auth_header: String,
     /// TCP stream for reading SSE events, protected by a mutex.
     sse_reader: Mutex<Option<BufReader<std::net::TcpStream>>>,
+}
+
+/// Builds the `Authorization` header line for an SSE client token.
+///
+/// # Errors
+///
+/// Returns an error when the token is empty or holds a byte outside visible
+/// ASCII, because a CR, LF or space would let the token inject header lines.
+fn sse_auth_header(auth_token: Option<&str>) -> Result<String, String> {
+    let Some(token) = auth_token else {
+        return Ok(String::new());
+    };
+    if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err("SSE auth token must be non-empty visible ASCII".to_owned());
+    }
+    Ok(format!("Authorization: Bearer {token}\r\n"))
 }
 
 impl SseClientTransport {
     /// Connects to the SSE endpoint and establishes the transport.
     ///
     /// 1. Opens a TCP connection to the SSE endpoint.
-    /// 2. Sends a GET request for the SSE stream.
+    /// 2. Sends a GET request for the SSE stream, with `auth_token` as a
+    ///    bearer token when one is given.
     /// 3. Reads the initial `endpoint` event to learn the POST URL.
     ///
     /// # Errors
     ///
-    /// Returns an error if the connection or handshake fails.
-    fn connect(url: &str) -> Result<Self, String> {
+    /// Returns an error if the token is malformed, or if the connection or
+    /// handshake fails; a server whose bearer check refuses the token answers
+    /// HTTP 401, which fails the handshake.
+    fn connect(url: &str, auth_token: Option<&str>) -> Result<Self, String> {
         if url.starts_with("https://") {
             return Err(
                 "SSE transport does not support TLS; use http:// or add rustls dependency for HTTPS"
                     .to_owned(),
             );
         }
+        let auth_header = sse_auth_header(auth_token)?;
 
         // Parse the URL to extract host, port, and path.
         let (host, port, path) = parse_http_url(url)?;
@@ -308,6 +331,7 @@ impl SseClientTransport {
         let get_request = format!(
             "GET {path} HTTP/1.1\r\n\
              Host: {host}\r\n\
+             {auth_header}\
              Accept: text/event-stream\r\n\
              Connection: keep-alive\r\n\
              \r\n"
@@ -389,6 +413,7 @@ impl SseClientTransport {
         Ok(Self {
             _url: url.to_owned(),
             post_url,
+            auth_header,
             sse_reader: Mutex::new(Some(reader)),
         })
     }
@@ -423,10 +448,12 @@ impl McpTransport for SseClientTransport {
         let post_request = format!(
             "POST {path} HTTP/1.1\r\n\
              Host: {host}\r\n\
+             {}\
              Content-Type: application/json\r\n\
              Content-Length: {}\r\n\
              Connection: close\r\n\
              \r\n",
+            self.auth_header,
             body.len()
         );
         writer
@@ -485,10 +512,12 @@ impl McpTransport for SseClientTransport {
         let post_request = format!(
             "POST {path} HTTP/1.1\r\n\
              Host: {host}\r\n\
+             {}\
              Content-Type: application/json\r\n\
              Content-Length: {}\r\n\
              Connection: close\r\n\
              \r\n",
+            self.auth_header,
             body.len()
         );
         writer
@@ -918,16 +947,19 @@ impl ContextProvider for FfiBridgeProvider {
         Ok(served)
     }
 
-    fn agent_role(&self, context_id: &str) -> Option<String> {
-        // Look up the agent's role assignment in the context's role state.
-        // Silently returns None if the bridge has been dropped — matches the
-        // "unknown context" fallback semantics of this trait method.
-        let bi = self.upgrade_bi().ok()?;
-        Self::live_role_state(&bi, context_id)
-            .ok()?
-            .assignments
-            .get(&self.agent_did)
-            .map(|assignment| assignment.role_name.clone())
+    fn agent_role(&self, context_id: &str) -> Result<Option<String>, String> {
+        // Look up the agent's role assignment in the context's role state. A
+        // context nobody holds has no role for the agent; a dropped bridge or
+        // a failed read is an error, never `None`.
+        let bi = self.upgrade_bi()?;
+        Ok(
+            Self::held_role_state(&bi, context_id)?.and_then(|role_state| {
+                role_state
+                    .assignments
+                    .get(&self.agent_did)
+                    .map(|assignment| assignment.role_name.clone())
+            }),
+        )
     }
 
     fn agent_did(&self) -> &str {
@@ -1913,6 +1945,9 @@ impl crate::scp::PyScp {
 /// # Arguments
 ///
 /// * `url` -- The URL of the SSE endpoint.
+/// * `auth_token` -- The bearer token sent in an `Authorization` header on
+///   every request, or `None` for a server that runs no bearer check. An SCP
+///   SSE server always runs one (ADR-015).
 ///
 /// # Returns
 ///
@@ -1920,16 +1955,21 @@ impl crate::scp::PyScp {
 ///
 /// # Errors
 ///
-/// Raises `TransportError` if the connection or MCP handshake fails.
+/// Raises `TransportError` if the token is malformed, or if the connection
+/// or MCP handshake fails, including when the server refuses the token.
 #[pymethods]
 impl crate::scp::PyScp {
-    #[pyo3(name = "py_mcp_client_connect_sse")]
-    pub fn py_mcp_client_connect_sse(&self, url: &str) -> PyResult<String> {
+    #[pyo3(name = "py_mcp_client_connect_sse", signature = (url, auth_token))]
+    pub fn py_mcp_client_connect_sse(
+        &self,
+        url: &str,
+        auth_token: Option<&str>,
+    ) -> PyResult<String> {
         let bi = &*self.inner;
         validate::validate_relay_url(url)?;
 
         // Connect to the SSE endpoint.
-        let transport = SseClientTransport::connect(url)
+        let transport = SseClientTransport::connect(url, auth_token)
             .map_err(|e| ScpPyError::transport(format!("failed to connect SSE client: {e}")))?;
 
         // Create the MCP client and perform the initialize handshake.
@@ -2733,11 +2773,68 @@ mod tests {
 
     #[test]
     fn sse_connect_rejects_https() {
-        let result = SseClientTransport::connect("https://example.com/sse");
+        let result = SseClientTransport::connect("https://example.com/sse", None);
         match result {
             Err(msg) => assert!(msg.contains("TLS"), "should mention TLS in error: {msg}"),
             Ok(_) => panic!("expected error for https URL"),
         }
+    }
+
+    /// Reads one HTTP request's head from `stream`, up to the blank line.
+    fn read_request_head(stream: &std::net::TcpStream) -> String {
+        let mut reader = BufReader::new(stream);
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            let n = std::io::BufRead::read_line(&mut reader, &mut line).expect("read head");
+            if n == 0 || line == "\r\n" {
+                return head;
+            }
+            head.push_str(&line);
+        }
+    }
+
+    /// The SSE client sends its token on the `GET` and on every POST, so it
+    /// passes the bearer check an SCP SSE server always runs.
+    #[test]
+    fn sse_client_sends_the_bearer_token_on_every_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept GET");
+            let get = read_request_head(&sse);
+            sse.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n\
+                  event: endpoint\r\ndata: /message?sessionId=s1\r\n\r\n",
+            )
+            .expect("write endpoint event");
+            let (post, _) = listener.accept().expect("accept POST");
+            (get, read_request_head(&post))
+        });
+
+        let transport =
+            SseClientTransport::connect(&format!("http://127.0.0.1:{port}/sse"), Some("tok-1"))
+                .expect("connect");
+        transport
+            .send_notification(&JsonRpcNotification::new("notifications/initialized", None))
+            .expect("notify");
+        let (get, post) = server.join().expect("server thread");
+        for head in [&get, &post] {
+            assert!(
+                head.contains("\r\nAuthorization: Bearer tok-1\r\n"),
+                "every request must carry the token, got: {head}"
+            );
+        }
+    }
+
+    /// A token that could inject a header line, or an empty one, is refused
+    /// before any connection opens.
+    #[test]
+    fn sse_client_rejects_a_token_that_could_inject_headers() {
+        for token in ["", "a\r\nX-Evil: 1", "a b"] {
+            assert!(sse_auth_header(Some(token)).is_err(), "{token:?}");
+        }
+        assert_eq!(sse_auth_header(None).expect("no token"), "");
     }
 
     // -----------------------------------------------------------------------
@@ -4536,8 +4633,8 @@ mod tests {
             "upgrade_bi must fail when the bridge has been dropped"
         );
 
-        // agent_role: returns None.
-        assert!(provider.agent_role("ctx-dropped").is_none());
+        // agent_role: fails, so a dropped bridge never reads as "no role".
+        assert!(provider.agent_role("ctx-dropped").is_err());
 
         // context_tools / context_members / context_events: each fails, so
         // no read of a dropped bridge reports an empty registry, roster or log.
@@ -4633,7 +4730,12 @@ mod tests {
             "with no supervisor the denial must name the bridge, got: {denial}"
         );
         assert!(provider.context_members(&ctx_id).is_ok());
-        assert!(provider.agent_role(&ctx_id).is_some());
+        assert!(
+            provider
+                .agent_role(&ctx_id)
+                .expect("the role state reads")
+                .is_some()
+        );
         assert!(
             provider
                 .validate_resource_access(&ctx_id, ResourceKind::Events)
@@ -4666,7 +4768,12 @@ mod tests {
             );
         }
         assert!(provider.context_members(&ctx_id).is_err());
-        assert!(provider.agent_role(&ctx_id).is_none());
+        assert!(
+            provider
+                .agent_role(&ctx_id)
+                .expect("the role state reads")
+                .is_none()
+        );
 
         // The production shape: the MCP transport task on the multi-thread
         // runtime, where the query blocks one worker while the actor runs.
@@ -4767,7 +4874,12 @@ mod tests {
                 "{kind:?}: {denial}"
             );
         }
-        assert!(provider.agent_role(&revoked).is_none());
+        assert!(
+            provider
+                .agent_role(&revoked)
+                .expect("the role state reads")
+                .is_none()
+        );
         let members = provider.context_members(&revoked).unwrap();
         assert!(members.iter().all(|m| m.did != agent));
 
@@ -4785,7 +4897,12 @@ mod tests {
                 .validate_resource_access(&granted, kind)
                 .unwrap_or_else(|e| panic!("the actor grants {kind:?}: {e}"));
         }
-        assert!(provider.agent_role(&granted).is_some());
+        assert!(
+            provider
+                .agent_role(&granted)
+                .expect("the role state reads")
+                .is_some()
+        );
 
         // No write-back: each copy still holds what the bridge wrote into it.
         assert!(copy_has_agent(&revoked) && !copy_has_agent(&granted));

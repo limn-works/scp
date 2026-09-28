@@ -478,13 +478,16 @@ impl ContextProvider for McpNapiBridgeProvider {
         Ok(served)
     }
 
-    fn agent_role(&self, context_id: &str) -> Option<String> {
-        let bi = self.upgrade_bi().ok()?;
-        live_role_state(&bi, context_id)
-            .ok()?
-            .assignments
-            .get(&self.agent_did)
-            .map(|assignment| assignment.role_name.clone())
+    fn agent_role(&self, context_id: &str) -> Result<Option<String>, String> {
+        // A context nobody holds has no role for the agent; a dropped bridge
+        // or a failed read is an error, never `None`.
+        let bi = self.upgrade_bi()?;
+        Ok(held_role_state(&bi, context_id)?.and_then(|role_state| {
+            role_state
+                .assignments
+                .get(&self.agent_did)
+                .map(|assignment| assignment.role_name.clone())
+        }))
     }
 
     fn agent_did(&self) -> &str {
@@ -1478,7 +1481,10 @@ mod tests {
             "context_members must report the real roster, got: {members:?}"
         );
         assert_eq!(
-            provider.agent_role(SUB_CTX).as_deref(),
+            provider
+                .agent_role(SUB_CTX)
+                .expect("the role state reads")
+                .as_deref(),
             Some("admin"),
             "agent_role must resolve the creator's real role assignment"
         );
@@ -1594,7 +1600,12 @@ mod tests {
                 .is_ok()
         );
         assert!(provider().context_members(SUB_CTX).is_ok());
-        assert!(provider().agent_role(SUB_CTX).is_some());
+        assert!(
+            provider()
+                .agent_role(SUB_CTX)
+                .expect("the role state reads")
+                .is_some()
+        );
 
         // The actor now exists and does not hold the context; the copy still
         // names the agent as a member.
@@ -1622,7 +1633,12 @@ mod tests {
             );
         }
         assert!(provider().context_members(SUB_CTX).is_err());
-        assert!(provider().agent_role(SUB_CTX).is_none());
+        assert!(
+            provider()
+                .agent_role(SUB_CTX)
+                .expect("the role state reads")
+                .is_none()
+        );
 
         // The production shape: the MCP transport task on the multi-thread
         // runtime, where the query blocks one worker while the actor runs.
@@ -1725,7 +1741,12 @@ mod tests {
                 "{kind:?}: {denial}"
             );
         }
-        assert!(provider(revoked).agent_role(revoked).is_none());
+        assert!(
+            provider(revoked)
+                .agent_role(revoked)
+                .expect("the role state reads")
+                .is_none()
+        );
         let members = provider(revoked).context_members(revoked).unwrap();
         assert!(members.iter().all(|m| m.did != agent));
 
@@ -1742,7 +1763,12 @@ mod tests {
                 .validate_resource_access(granted, kind)
                 .unwrap_or_else(|e| panic!("the actor grants {kind:?}: {e}"));
         }
-        assert!(provider(granted).agent_role(granted).is_some());
+        assert!(
+            provider(granted)
+                .agent_role(granted)
+                .expect("the role state reads")
+                .is_some()
+        );
 
         // No write-back: each copy still holds what the bridge wrote into it.
         assert!(copy_has_agent(revoked) && !copy_has_agent(granted));
@@ -1953,5 +1979,18 @@ mod tests {
             ],
             "a missing supervisor must leave resources/list serving the context"
         );
+    }
+
+    /// A provider whose bridge instance is gone reports its role read as an
+    /// error, so `tools/list` cannot turn the failure into "no role" and hide
+    /// the agent's `admin_only` outlets.
+    #[test]
+    fn agent_role_of_dropped_bridge_is_an_error_napi() {
+        let provider = McpNapiBridgeProvider {
+            bi: std::sync::Weak::new(),
+            agent_did: "did:dht:z6MkTestUser".to_owned(),
+            context_ids: vec!["ctx-test".to_owned()],
+        };
+        assert!(provider.agent_role("ctx-test").is_err());
     }
 }

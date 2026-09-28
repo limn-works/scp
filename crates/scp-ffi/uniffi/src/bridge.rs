@@ -5170,17 +5170,20 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         access.map_err(AccessRefusal::Denied)
     }
 
-    fn agent_role(&self, context_id: &str) -> Option<String> {
+    fn agent_role(&self, context_id: &str) -> Result<Option<String>, String> {
         // Read the agent's role assignment from this instance's Supervisor
         // role state via the ADR-049 query shim
         // ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)).
-        // Returns None if the bridge instance has been dropped.
-        let bi = self.upgrade_bi().ok()?;
-        Self::role_state_of(&bi, context_id)
-            .ok()??
-            .assignments
-            .get(&self.agent_did)
-            .map(|assignment| assignment.role_name.clone())
+        // A dropped bridge or a failed read is an error, never `None`.
+        let bi = self.upgrade_bi()?;
+        Ok(
+            Self::role_state_of(&bi, context_id)?.and_then(|role_state| {
+                role_state
+                    .assignments
+                    .get(&self.agent_did)
+                    .map(|assignment| assignment.role_name.clone())
+            }),
+        )
     }
 
     fn agent_did(&self) -> &str {
@@ -23710,6 +23713,22 @@ mod tests {
             1,
             "the dispatched call runs the handler once"
         );
+    }
+
+    /// A provider whose bridge instance is gone reports its role read as an
+    /// error, so `tools/list` cannot turn the failure into "no role" and hide
+    /// the agent's `admin_only` outlets.
+    #[test]
+    fn uniffi_agent_role_of_dropped_bridge_is_an_error() {
+        let provider = McpUniFfiBridgeProvider {
+            bi: std::sync::Weak::new(),
+            agent_did: "did:dht:z6MkTestUser".to_owned(),
+            context_ids: vec!["ctx-test".to_owned()],
+            outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: None,
+            agent_proof_tokens: None,
+        };
+        assert!(scp_mcp::server::ContextProvider::agent_role(&provider, "ctx-test").is_err());
     }
 
     /// Struct-level proof: `McpUniFfiBridgeProvider.bi` is `Weak`.
