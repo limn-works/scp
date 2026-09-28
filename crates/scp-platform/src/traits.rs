@@ -1106,7 +1106,10 @@ impl<T: Storage> Storage for std::sync::Arc<T> {
 ///
 /// [`PlatformError::CustodyError`] when `data` is not 32 bytes, or when
 /// signing fails.
-#[cfg(feature = "software_platform")]
+#[cfg(all(
+    feature = "software_platform",
+    any(feature = "file", feature = "sqlite", feature = "testing")
+))]
 pub(crate) fn sign_p256_digest(
     key: &scp_crypto::p256::P256SigningKey,
     data: &[u8],
@@ -1155,7 +1158,10 @@ pub fn hpke_p256_peer(
 ///
 /// [`PlatformError::CustodyError`] when `peer_public` fails
 /// [`hpke_p256_peer`].
-#[cfg(feature = "software_platform")]
+#[cfg(all(
+    feature = "software_platform",
+    any(feature = "file", feature = "sqlite", feature = "testing")
+))]
 pub(crate) fn p256_dh_agree(
     key: &scp_crypto::p256::P256SigningKey,
     peer_public: &[u8],
@@ -1171,7 +1177,10 @@ pub(crate) fn p256_dh_agree(
 /// # Errors
 ///
 /// [`PlatformError::CustodyError`] when `peer_public` is not 32 bytes.
-#[cfg(feature = "software_platform")]
+#[cfg(all(
+    feature = "software_platform",
+    any(feature = "file", feature = "sqlite", feature = "testing")
+))]
 pub(crate) fn x25519_peer(peer_public: &[u8]) -> Result<[u8; 32], PlatformError> {
     peer_public.try_into().map_err(|_| {
         PlatformError::CustodyError(format!(
@@ -1188,7 +1197,10 @@ pub(crate) fn x25519_peer(peer_public: &[u8]) -> Result<[u8; 32], PlatformError>
 ///
 /// [`PlatformError::StorageError`] when the stored scalar is not a valid
 /// P-256 private key.
-#[cfg(feature = "software_platform")]
+#[cfg(all(
+    feature = "software_platform",
+    any(feature = "file", feature = "sqlite")
+))]
 pub(crate) fn p256_key_from_stored(
     scalar: &[u8; 32],
 ) -> Result<scp_crypto::p256::P256SigningKey, PlatformError> {
@@ -1204,7 +1216,10 @@ pub(crate) fn p256_key_from_stored(
 ///
 /// [`PlatformError::CustodyError`] when 8 consecutive draws are all invalid
 /// scalars (probability below 2^-256; a broken RNG, never bad luck).
-#[cfg(feature = "software_platform")]
+#[cfg(all(
+    feature = "software_platform",
+    any(feature = "file", feature = "sqlite")
+))]
 pub(crate) fn generate_p256_os_rng() -> Result<scp_crypto::p256::P256SigningKey, PlatformError> {
     use rand::RngCore as _;
     for _ in 0..8 {
@@ -1229,7 +1244,10 @@ pub(crate) fn generate_p256_os_rng() -> Result<scp_crypto::p256::P256SigningKey,
 /// [`PlatformError::WrongKeyType`] with `expected` [`KeyType::Ed25519`] for
 /// a source that is not an identity key (its role, whatever its type), or
 /// that is not Ed25519.
-#[cfg(feature = "software_platform")]
+#[cfg(all(
+    feature = "software_platform",
+    any(feature = "file", feature = "sqlite", feature = "testing")
+))]
 pub(crate) const fn require_derive_source(
     is_identity: bool,
     key_type: KeyType,
