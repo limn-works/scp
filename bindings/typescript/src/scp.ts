@@ -492,7 +492,9 @@ export interface KeyCustodyProvider {
    * key this is Ed25519. For a pseudonym key returned by
    * {@link derivePseudonym} `message` is a 32-byte digest and the result is
    * the P-256 prehash ECDSA `r || s` with low s (§9.5); the bridge rejects
-   * any other length and any signature that fails strict verification.
+   * any other length and any signature that fails strict verification, for a
+   * pseudonym key this adapter derived and still holds bound; for a handle the
+   * adapter did not bind, the bridge returns the host's bytes unchecked.
    */
   sign(keyId: string, message: Uint8Array): Uint8Array;
   /**
