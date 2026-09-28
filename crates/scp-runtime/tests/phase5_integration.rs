@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 use scp_did::DID;
 use scp_event_log::tree::{self, GENESIS_PREV_HASH};
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
-use scp_protocol::bridge::claiming::{ClaimRequest, claim_shadow, compute_claim_canonical_hash};
+use scp_protocol::bridge::claiming::{ClaimRequest, claim_shadow};
 use scp_protocol::bridge::provenance::{
     BridgeTrustLevel, evaluate_bridge_trust_level, mark_bridge_provenance,
 };
@@ -121,6 +121,24 @@ fn append_and_hash(log: &mut EventLog, event: &Event) -> [u8; 32] {
     hasher.update([0x00]);
     hasher.update(&serialized);
     hasher.finalize().into()
+}
+
+/// Computes the canonical SHA-256 hash of a claim request's content
+/// (matching the internal `compute_claim_canonical_hash` in claiming.rs).
+fn compute_claim_hash(request: &ClaimRequest) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"SCP-CLAIM-V1:");
+    #[allow(clippy::cast_possible_truncation)]
+    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
+        hasher.update((bytes.len() as u32).to_be_bytes());
+        hasher.update(bytes);
+    };
+    length_prefix(&mut hasher, request.shadow_id.as_bytes());
+    length_prefix(&mut hasher, request.claimant_did.as_bytes());
+    length_prefix(&mut hasher, request.platform_handle.as_bytes());
+    length_prefix(&mut hasher, request.identity_attestation.id.as_bytes());
+    hasher.update(request.timestamp.to_be_bytes());
+    hasher.finalize().to_vec()
 }
 
 /// Computes the canonical attestation bytes for signing (matches the
@@ -214,7 +232,7 @@ fn make_claim_request(
         signature: Vec::new(),
     };
 
-    let canonical_hash = compute_claim_canonical_hash(&request).expect("claim canonical hash");
+    let canonical_hash = compute_claim_hash(&request);
     let sig = signing_key.sign(&canonical_hash);
     request.signature = sig.to_bytes().to_vec();
 

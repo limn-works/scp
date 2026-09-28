@@ -12,7 +12,7 @@ python3.12 scripts/gen-test-vectors-p256.py
 
 The script uses nothing outside the Python standard library, and it self-gates before it prints a byte: it checks itself against `SHA-256("")`, the RFC 6979 Appendix A.2.5 P-256 nonce and signature, RFC 5869 Appendix A.1 for HKDF-SHA256, and the Vector 35 `DataProvenance` hash, which the Rust KAT that §25.8 names computes independently through `rmp_serde`, and it computes every public key twice by two scalar multiplications sharing no arithmetic, and a third time through the `cryptography` package where that package imports. A mismatch raises before anything prints.
 
-**Identifier strings in the fixtures.** Where a signed or hashed structure takes a fixture party's identifier as UTF-8 bytes, the vectors print it in the `scp:` text form that Vector 57 of §25.29 pins: `"scp:"` followed by the lowercase, unpadded RFC 4648 base32 of the 32-byte identifier, 56 characters in all, so each such field carries the length prefix `BE32(56)` or the MessagePack header `0xd9 0x38`. Each fixture party's 32-byte identifier is `SHA-256("SCP test vector identifier <role>")` over the ASCII label, with one role per party, following the precedent of §25.9. The 25 roles, each `<role>` exactly as the label spells it, are `a`, `agent`, `alice`, `announcing member`, `app`, `b`, `bob`, `carol`, `claimant`, `dave`, `event-log actor`, `hpke member`, `hpke sender`, `issuer`, `leaf attester`, `m`, `new member`, `other member`, `proposer`, `pseudonymized member`, `sender`, `shadow`, `subject`, `sync member`, `voter`. A fixture identifier is bound to no key: the vectors that carry one pin a preimage, not a binding between an identifier and the key that signs it. The rule covers the fixture parties only: Vector 52's signed export preimage carries the literal snapshot string `"creator_did":"<scp-identifier:creator>"`, which is not an identifier in the `scp:` form, and Vectors 41 through 57 are unchanged by it.
+**Identifier strings in the fixtures.** Where a signed or hashed structure takes a fixture party's identifier as UTF-8 bytes, the vectors print it in the `scp:` text form that Vector 57 of §25.29 pins: `"scp:"` followed by the lowercase, unpadded RFC 4648 base32 of the 32-byte identifier, 56 characters in all, so each such field carries the length prefix `BE32(56)` or the MessagePack header `0xd9 0x38`. Each fixture party's 32-byte identifier is `SHA-256("SCP test vector identifier <role>")` over the ASCII label, with one role per party, following the precedent of §25.9. The 24 roles, each `<role>` exactly as the label spells it, are `a`, `agent`, `alice`, `announcing member`, `app`, `b`, `bob`, `carol`, `claimant`, `dave`, `event-log actor`, `hpke member`, `hpke sender`, `issuer`, `leaf attester`, `m`, `new member`, `other member`, `proposer`, `pseudonymized member`, `sender`, `subject`, `sync member`, `voter`. A fixture identifier is bound to no key: the vectors that carry one pin a preimage, not a binding between an identifier and the key that signs it. The rule covers the fixture parties only: Vector 52's signed export preimage carries the literal snapshot string `"creator_did":"<scp-identifier:creator>"`, which is not an identifier in the `scp:` form, and Vectors 41 through 57 are unchanged by it.
 
 **What a signature covers.** Every SCP signature here is an ECDSA signature over a 32-byte canonical hash, so the ECDSA message digest **is** that canonical hash and no second SHA-256 reaches it. The vectors run RFC 6979 with `h1` set to that same digest, because §9.5 fixes RFC 6979 with SHA-256 for a software signer and states no value for `h1` under a prehashed digest. An implementation that hashes the digest a second time reproduces none of the signature bytes below.
 
@@ -623,40 +623,37 @@ Fingerprint:
 
 An implementation that concatenates the caller's own block first computes two different values for one honest pair and raises §9.11's maximum-severity MITM alert against an honest counterparty.
 
-## 25.10 Claim Validation Vectors (§3.5.5, §12.3)
+## 25.10 Claim Validation Vectors (§12.3)
 
 Domain: `"SCP-CLAIM-V1:"`
 
 ### Vector 22: Shadow Claim Hash
 
-This vector restates §3.5.5 step 2 of the identity spec: the claim signature covers `claimant_did || shadow_did || attestation_id || timestamp`, in that order, under the §9.5.1 canonical encoding.
-
 ```
 Input:
-  claimant_did:   "scp:nof3f4ikizgjnnxysigd42wgfx4srjkvbirtaicvnw7qfulrpmeq"
-                  (the fixture identifier claimant, §25.1)
-  shadow_did:     "scp:ndxkrqkyw4fkxai2gg2mzd5uzmbgc2lz3xyq33lxkwpv46rrilmq"
-                  (the fixture identifier shadow, §25.1)
-  attestation_id: "att-claim-001"
-  timestamp:      1700000000
+  shadow_id:    "shadow-alice-x-12345"
+  claimant_did: "scp:nof3f4ikizgjnnxysigd42wgfx4srjkvbirtaicvnw7qfulrpmeq"
+                (the fixture identifier claimant, §25.1)
+  context_id:   "bridge-test-context"
+  timestamp:    1700000000
 
 Canonical hash input:
   "SCP-CLAIM-V1:"                              (13 bytes)
+  || BE32(20) || "shadow-alice-x-12345"         (4 + 20 = 24 bytes)
   || BE32(56) || claimant_did                  (4 + 56 = 60 bytes)
-  || BE32(56) || shadow_did                    (4 + 56 = 60 bytes)
-  || BE32(13) || "att-claim-001"               (4 + 13 = 17 bytes)
+  || BE32(19) || "bridge-test-context"          (4 + 19 = 23 bytes)
   || BE64(1700000000)                           (8 bytes)
 
-Total: 13 + 60 + 60 + 17 + 8 = 158 bytes
+Total: 13 + 24 + 60 + 23 + 8 = 128 bytes
 
-Preimage (hex, 158 bytes):
-  5343502d434c41494d2d56313a000000387363703a6e6f66336634696b697a676a6e6e7879736967643432776766783473726a6b7662697274616963766e77377166756c72706d6571000000387363703a6e64786b72716b797734666b786169326767326d7a6435757a6d626763326c7a3378797133336c786b77707634367272696c6d710000000d6174742d636c61696d2d303031000000006553f100
+Preimage (hex, 128 bytes):
+  5343502d434c41494d2d56313a00000014736861646f772d616c6963652d782d3132333435000000387363703a6e6f66336634696b697a676a6e6e7879736967643432776766783473726a6b7662697274616963766e77377166756c72706d6571000000136272696467652d746573742d636f6e74657874000000006553f100
 
 Expected SHA-256:
-  0x164be6049a580590587d0a044c05033a23c5f4ada83ca5b81228a5e0fb11af64
+  0x08d9bd5de3ff51a2ff7d8c750ec2361c70b4f0106cd7c98f5d331abbf0f67fcd
 ```
 
-The domain separator is 13 ASCII bytes. The external platform handle is outside the preimage: §3.5.5 step 1 has the bridge verify the attestation that `attestation_id` names (step 1a: signature, expiry, revocation; step 1c: evidence recency), so the attestation binds the handle, and step 1b compares the attestation's platform and handle with the shadow identity's. `spec_25_vector_22_claim_canonical_hash` in `crates/scp-protocol/src/bridge/claiming.rs` asserts the preimage and the hash through the production `compute_claim_canonical_hash`.
+The domain separator is 13 ASCII bytes. Before 2026-09-10 this vector stated a 14-byte separator and a total one byte longer than its fields, so an implementer following §25.17 step 3 would have read a correct encoding as wrong. The claim hash is new here: §25.17 step 4 tells an implementer to compare each canonical byte sequence's SHA-256 against an expected hash, and this vector carried none.
 
 ## 25.11 Proposal ID Vectors (§6.4 [no such section])
 

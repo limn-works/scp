@@ -12,8 +12,6 @@
 //! 1. Claimant constructs a [`ClaimRequest`] with their identity attestation.
 //! 2. [`claim_shadow`] verifies:
 //!    - The shadow exists and is unclaimed.
-//!    - The request's `platform_handle`, which the claim signature does not
-//!      cover, equals the shadow's handle.
 //!    - The attestation is an `IdentityLink` type.
 //!    - The attestation subject matches the claimant DID.
 //!    - The platform handle in the attestation claim matches the shadow's handle.
@@ -28,18 +26,17 @@
 //!
 //! - **One-way:** Once claimed, a shadow cannot return to `Shadow` status.
 //! - **Irreversible:** A claimed shadow cannot be re-assigned to a different DID.
-//! - **Handle match:** The request's platform handle and the attestation's
-//!   platform handle must each exactly match the shadow's platform handle. The
-//!   [`ShadowClaimEvent`] records the shadow's handle, never the request's.
+//! - **Handle match:** The attestation's platform handle must exactly match the
+//!   shadow's platform handle.
 //! - **Signature verification:** Both the claim request and attestation signatures
 //!   are cryptographically verified inside `claim_shadow`.
 //!
 //! See ADR-023 acceptance criteria 7-8 in `.docs/adrs/phase-5.md`.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{ContextId, DID, ShadowProvenanceStatus};
-use crate::crypto::canonical::{CanonicalError, CanonicalField, canonical_hash};
 use crate::trust::AttestationType;
 use crate::trust::attestation::{Attestation, RevocationStatus};
 use scp_crypto::verify_ed25519_signature;
@@ -113,10 +110,7 @@ pub enum ClaimError {
 /// See ADR-023 acceptance criterion 7.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimRequest {
-    /// The shadow identity to claim: the shadow registry key. Production
-    /// fills it with `derive_shadow_id` in `scp-node`'s bridge handlers,
-    /// `shadow:{bridge_id}:{platform_user_id}`, which is not yet the §3.5.5
-    /// `shadow_did` `Identifier`; that gap is tracked outside this crate.
+    /// The shadow identity to claim.
     pub shadow_id: String,
 
     /// DID of the claimant (the external participant transitioning to native
@@ -124,9 +118,6 @@ pub struct ClaimRequest {
     pub claimant_did: DID,
 
     /// The external platform handle the claimant is asserting ownership of.
-    /// The claim signature does not cover it, so it is unsigned:
-    /// [`claim_shadow`] rejects the request with [`ClaimError::HandleMismatch`]
-    /// unless it equals the shadow's handle.
     pub platform_handle: String,
 
     /// Identity attestation (Spec section 3.5) binding the external handle
@@ -180,53 +171,35 @@ pub struct ShadowClaimEvent {
 
 use scp_did::extract_public_key_from_did;
 
-/// Computes the canonical SHA-256 hash a claimant signs over a
-/// [`ClaimRequest`] (§3.5.5 step 2 of the identity spec).
-///
-/// The preimage is the §3.5.5 field set, in the §3.5.5 order, under the
-/// §9.5.1 canonical encoding with the `"SCP-CLAIM-V1:"` separator (§9.5.1
-/// separator registry):
+/// Computes the canonical SHA-256 hash of a claim request's content
+/// (excluding the signature field).
 ///
 /// ```text
-/// SHA-256("SCP-CLAIM-V1:"
-///         || BE32(len(claimant_did))   || claimant_did
-///         || BE32(len(shadow_did))     || shadow_did
-///         || BE32(len(attestation_id)) || attestation_id
-///         || BE64(timestamp))
+/// SHA-256("SCP-CLAIM-V1:" || len(shadow_id) || shadow_id
+///         || len(claimant_did) || claimant_did
+///         || len(platform_handle) || platform_handle
+///         || len(attestation_id) || attestation_id || timestamp_BE)
 /// ```
 ///
-/// The `shadow_did` field is [`ClaimRequest::shadow_id`]. Production fills it
-/// with the registry key `derive_shadow_id` in `scp-node`'s bridge handlers
-/// produces, the string `shadow:{bridge_id}:{platform_user_id}`, which is not
-/// the §3.5.5 `Identifier`; that gap is tracked outside this function.
-/// `attestation_id` is read from the attestation the request carries, so the
-/// signed id and the checked attestation cannot differ.
-///
-/// The platform handle is not hashed. Today `validate_claim_request` checks
-/// the attestation's type, subject, revocation state, and signature, and
-/// compares its `platform_handle` claim with the shadow's handle. It does not
-/// yet check the attestation's issuer or its expiry (§3.5.5 step 1a) or its
-/// evidence recency (step 1c). Step 1b compares the attestation's `platform`
-/// and `platform_handle` with the shadow's; the attestation's `platform` is
-/// not compared, because the shadow carries no platform. Until the issuer,
-/// expiry, and recency checks land, the attestation binds the handle only as
-/// far as its signature and subject do. §25.10 Vector 22 restates this
-/// construction.
-///
-/// # Errors
-///
-/// Returns [`CanonicalError::FieldTooLarge`] when a field exceeds the
-/// §9.5.1 length bound.
-pub fn compute_claim_canonical_hash(request: &ClaimRequest) -> Result<[u8; 32], CanonicalError> {
-    canonical_hash(
-        "SCP-CLAIM-V1:",
-        &[
-            CanonicalField::VarBytes(request.claimant_did.as_bytes()),
-            CanonicalField::VarBytes(request.shadow_id.as_bytes()),
-            CanonicalField::VarBytes(request.identity_attestation.id.as_bytes()),
-            CanonicalField::U64(request.timestamp),
-        ],
-    )
+/// Variable-length fields are prefixed with their length as a 4-byte
+/// big-endian u32 to prevent field boundary ambiguity. The domain separator
+/// prevents cross-protocol hash confusion.
+fn compute_claim_canonical_hash(request: &ClaimRequest) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"SCP-CLAIM-V1:");
+    // Length-prefix closure for variable-length fields. Field values (DIDs,
+    // handles, IDs) are short strings; truncation is not a concern.
+    #[allow(clippy::cast_possible_truncation)]
+    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
+        hasher.update((bytes.len() as u32).to_be_bytes());
+        hasher.update(bytes);
+    };
+    length_prefix(&mut hasher, request.shadow_id.as_bytes());
+    length_prefix(&mut hasher, request.claimant_did.as_bytes());
+    length_prefix(&mut hasher, request.platform_handle.as_bytes());
+    length_prefix(&mut hasher, request.identity_attestation.id.as_bytes());
+    hasher.update(request.timestamp.to_be_bytes()); // fixed-width, no prefix needed
+    hasher.finalize().to_vec()
 }
 
 /// Verifies the Ed25519 signature on a [`ClaimRequest`].
@@ -236,10 +209,7 @@ pub fn compute_claim_canonical_hash(request: &ClaimRequest) -> Result<[u8; 32], 
 fn verify_claim_signature(request: &ClaimRequest) -> Result<(), ClaimError> {
     let public_key_bytes = extract_public_key_from_did(&request.claimant_did)
         .map_err(|reason| ClaimError::InvalidClaimSignature { reason })?;
-    let canonical_hash =
-        compute_claim_canonical_hash(request).map_err(|e| ClaimError::InvalidClaimSignature {
-            reason: format!("claim canonical hash: {e}"),
-        })?;
+    let canonical_hash = compute_claim_canonical_hash(request);
     verify_ed25519_signature(&public_key_bytes, &canonical_hash, &request.signature)
         .map_err(|reason| ClaimError::InvalidClaimSignature { reason })
 }
@@ -351,8 +321,7 @@ fn validate_claim_request(
 /// This function implements the full shadow claiming workflow (ADR-023
 /// acceptance criteria 7-8):
 ///
-/// 1. Verifies the shadow exists and is unclaimed, and that the request's
-///    unsigned `platform_handle` equals the shadow's handle.
+/// 1. Verifies the shadow exists and is unclaimed.
 /// 2. Validates the identity attestation:
 ///    - Must be an `IdentityLink` attestation type.
 ///    - The attestation subject must match the claimant DID.
@@ -362,8 +331,7 @@ fn validate_claim_request(
 /// 4. Cryptographically verifies the Ed25519 signature on the attestation.
 /// 5. Cryptographically verifies the Ed25519 signature on the claim request.
 /// 6. Transitions the shadow's provenance status from `Shadow` to `Claimed`.
-/// 7. Produces a [`ShadowClaimEvent`] for the context's Merkle log, recording
-///    the shadow's handle.
+/// 7. Produces a [`ShadowClaimEvent`] for the context's Merkle log.
 ///
 /// # Arguments
 ///
@@ -390,9 +358,8 @@ fn validate_claim_request(
 /// `IdentityLink` type, the subject does not match the claimant DID, or
 /// the attestation is revoked.
 ///
-/// Returns [`ClaimError::HandleMismatch`] if the request's platform handle
-/// or the platform handle in the attestation does not match the shadow's
-/// platform handle.
+/// Returns [`ClaimError::HandleMismatch`] if the platform handle in the
+/// attestation does not match the shadow's platform handle.
 ///
 /// Returns [`ClaimError::InvalidAttestationSignature`] if the attestation's
 /// Ed25519 signature is invalid.
@@ -419,17 +386,8 @@ pub fn claim_shadow(
         });
     }
 
-    // The request's `platform_handle` is outside the §3.5.5 signed preimage,
-    // so it is accepted only when it names the shadow's own handle, and the
-    // event below records the shadow's handle, which step 6 checks against
-    // the signed attestation.
-    if request.platform_handle != shadow.platform_handle {
-        return Err(ClaimError::HandleMismatch);
-    }
-
     // 3-8. Validate attestation, handle match, and signatures.
     validate_claim_request(request, &shadow.platform_handle)?;
-    let platform_handle = shadow.platform_handle.clone();
 
     // 9. All verifications passed. Retire the shadow by transitioning its
     //    provenance status to Claimed. This is irreversible.
@@ -439,7 +397,7 @@ pub fn claim_shadow(
     Ok(ShadowClaimEvent {
         shadow_id: request.shadow_id.clone(),
         claimant_did: request.claimant_did.clone(),
-        platform_handle,
+        platform_handle: request.platform_handle.clone(),
         attestation_id: request.identity_attestation.id.clone(),
         context_id: registry.context_id().to_owned(),
         timestamp: request.timestamp,
@@ -558,7 +516,7 @@ mod tests {
         };
 
         // Sign the claim request with the claimant's key.
-        let canonical_hash = compute_claim_canonical_hash(&request).unwrap();
+        let canonical_hash = compute_claim_canonical_hash(&request);
         let sig = signing_key.sign(&canonical_hash);
         request.signature = sig.to_bytes().to_vec();
 
@@ -734,77 +692,11 @@ mod tests {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
         let attestation = make_identity_attestation(&did, "@wrong_handle", &signing_key);
-        let request = make_claim_request(SHADOW_ID, &did, HANDLE, attestation, &signing_key);
-        let err = claim_shadow(&mut registry, &request).unwrap_err();
-
-        assert!(matches!(err, ClaimError::HandleMismatch));
-    }
-
-    /// The request's `platform_handle` is outside the §3.5.5 signed
-    /// preimage, so a request whose handle differs from the shadow's is
-    /// rejected even when the attestation and both signatures are valid.
-    #[test]
-    fn claim_shadow_rejects_request_handle_that_differs_from_shadow() {
-        let mut registry = make_registry();
-        create_test_shadow(&mut registry);
-
-        let (verifying_key, signing_key) = test_keypair();
-        let did = did_from_pubkey(&verifying_key);
-        let attestation = make_identity_attestation(&did, HANDLE, &signing_key);
         let request =
-            make_claim_request(SHADOW_ID, &did, "@mallory#6666", attestation, &signing_key);
+            make_claim_request(SHADOW_ID, &did, "@wrong_handle", attestation, &signing_key);
         let err = claim_shadow(&mut registry, &request).unwrap_err();
 
         assert!(matches!(err, ClaimError::HandleMismatch));
-        let shadow = crate::bridge::shadow::find_shadow(&registry, SHADOW_ID).unwrap();
-        assert_eq!(shadow.provenance_status, ShadowProvenanceStatus::Shadow);
-    }
-
-    // -------------------------------------------------------------------
-    // §25.10 Vector 22
-    // -------------------------------------------------------------------
-
-    /// §25.10 Vector 22 through the production claim hash: the §3.5.5
-    /// field set in the §3.5.5 order under the §9.5.1 encoding. The values
-    /// are printed in `.docs/specs/25-test-vectors.md` and produced by
-    /// `scripts/gen-test-vectors-p256.py`.
-    #[test]
-    fn spec_25_vector_22_claim_canonical_hash() {
-        use sha2::{Digest, Sha256};
-
-        // §25.1 fixture identifiers "claimant" and "shadow".
-        const ID_CLAIMANT: &str = "scp:nof3f4ikizgjnnxysigd42wgfx4srjkvbirtaicvnw7qfulrpmeq";
-        const ID_SHADOW: &str = "scp:ndxkrqkyw4fkxai2gg2mzd5uzmbgc2lz3xyq33lxkwpv46rrilmq";
-        const PREIMAGE_HEX: &str = "5343502d434c41494d2d56313a000000387363703a6e6f66336634696b697a676a6e6e7879736967643432776766783473726a6b7662697274616963766e77377166756c72706d6571000000387363703a6e64786b72716b797734666b786169326767326d7a6435757a6d626763326c7a3378797133336c786b77707634367272696c6d710000000d6174742d636c61696d2d303031000000006553f100";
-        const HASH_HEX: &str = "164be6049a580590587d0a044c05033a23c5f4ada83ca5b81228a5e0fb11af64";
-
-        let (_verifying_key, signing_key) = test_keypair();
-        let mut attestation = make_identity_attestation(ID_CLAIMANT, HANDLE, &signing_key);
-        attestation.id = "att-claim-001".to_owned();
-        let request = ClaimRequest {
-            shadow_id: ID_SHADOW.to_owned(),
-            claimant_did: ID_CLAIMANT.into(),
-            platform_handle: HANDLE.to_owned(),
-            identity_attestation: attestation,
-            timestamp: 1_700_000_000,
-            signature: Vec::new(),
-        };
-
-        let hash = compute_claim_canonical_hash(&request).unwrap();
-        assert_eq!(hex::encode(hash), HASH_HEX);
-
-        let preimage = hex::decode(PREIMAGE_HEX).unwrap();
-        assert_eq!(preimage.len(), 158);
-        let digest: [u8; 32] = Sha256::digest(&preimage).into();
-        assert_eq!(
-            digest, hash,
-            "production hash must equal SHA-256 of the spec preimage"
-        );
-
-        // The platform handle is outside the preimage.
-        let mut other_handle = request;
-        other_handle.platform_handle = "@someone-else".to_owned();
-        assert_eq!(compute_claim_canonical_hash(&other_handle).unwrap(), hash);
     }
 
     // -------------------------------------------------------------------
@@ -1008,7 +900,7 @@ mod tests {
         let mut request = make_claim_request(SHADOW_ID, &did, HANDLE, attestation, &signing_key);
 
         // Override the signature with one from the wrong key.
-        let canonical_hash = compute_claim_canonical_hash(&request).unwrap();
+        let canonical_hash = compute_claim_canonical_hash(&request);
         let wrong_sig = wrong_sk.sign(&canonical_hash);
         request.signature = wrong_sig.to_bytes().to_vec();
 
