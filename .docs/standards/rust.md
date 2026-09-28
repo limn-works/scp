@@ -469,8 +469,11 @@ version rather than assuming the toolchain manifest supplied the one CI runs. Tw
 diagnostics decide the outcome and both are version-sensitive: an `error` fails the run,
 and an `advisory-not-detected` warning marks an ignore entry as unnecessary. Do not delete
 an entry on an `advisory-not-detected` from a binary whose version differs from CI's. Count every copy of the crate in
-`Cargo.lock` before calling an advisory cleared: a bump that adds a patched version on top
-of unpatched duplicates leaves the unpatched ones compiling into the shipped artifact.
+`Cargo.lock` and in `fuzz/Cargo.lock` before calling an advisory cleared: a bump that adds
+a patched version on top of unpatched duplicates leaves the unpatched ones compiling into
+the shipped artifact. `fuzz/` is a standalone crate whose own lockfile resolves the
+workspace crates through path dependencies, and no CI job runs `cargo deny` against it, so
+repeat every lock-only fix there with `cd fuzz && cargo update -p <crate> --precise <version>`.
 cargo-deny reports a vulnerability advisory against every affected copy, but its
 `[advisories] unsound` key decides which copies an `unsound` informational advisory
 reaches. Its default, `"workspace"`, reports only a crate a workspace member names

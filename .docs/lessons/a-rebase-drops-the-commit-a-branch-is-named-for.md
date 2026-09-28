@@ -30,7 +30,7 @@ promises a `rustls-webpki` bump while the list touches no `rustls-webpki` line i
 record, and it costs a reviewer the whole review: approving a certificate-validation fix
 against a diff that touches no certificate-validation code examines an empty set. The
 reverse failure is as costly: a description that says the branch changes no `deny.toml`
-while the list carries two new advisory ignores hides the one change that suppresses a
+while the list carries a new advisory ignore hides the one change that suppresses a
 security report.
 
 ## Why a line-by-line review misses it
