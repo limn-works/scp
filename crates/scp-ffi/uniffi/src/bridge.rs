@@ -4664,7 +4664,6 @@ fn mcp_handle_id(prefix: &str) -> String {
 ///
 /// Imported from `scp-mcp` rather than redeclared so the client and server
 /// halves of the same line protocol cannot drift to different limits.
-use scp_mcp::stdio::MAX_LINE_BYTES as MCP_MAX_LINE_BYTES;
 
 /// Transport wrapper that delegates to either stdio or SSE.
 pub(crate) enum McpUniFFITransportWrapper {
@@ -4758,7 +4757,7 @@ impl scp_mcp::client::McpTransport for McpStdioTransport {
         &self,
         request: &scp_mcp::protocol::JsonRpcRequest,
     ) -> Result<scp_mcp::protocol::JsonRpcResponse, String> {
-        use std::io::{BufRead, Read, Write};
+        use std::io::Write;
 
         let mut guard = self
             .inner
@@ -4779,19 +4778,9 @@ impl scp_mcp::client::McpTransport for McpStdioTransport {
             .flush()
             .map_err(|e| format!("flush error: {e}"))?;
 
-        // Read response line with bounded read to prevent OOM.
-        let mut line = String::new();
-        let n = {
-            let mut bounded = (&mut guard.reader).take(MCP_MAX_LINE_BYTES);
-            bounded
-                .read_line(&mut line)
-                .map_err(|e| format!("read error: {e}"))?
-        };
-        if n == 0 {
-            return Err("EOF from subprocess".to_owned());
-        }
-
-        serde_json::from_str(line.trim()).map_err(|e| format!("parse error: {e}"))
+        // Read until this request's response, each line bounded to prevent
+        // OOM: the server interleaves notifications on the same stream.
+        scp_mcp::stdio::read_response(&mut guard.reader, &request.id)
     }
 
     fn send_notification(
@@ -4953,10 +4942,11 @@ impl McpUniFfiBridgeProvider {
     /// # Errors
     ///
     /// Returns [`AccessRefusal::Denied`](scp_mcp::server::AccessRefusal::Denied)
-    /// naming the check that refused the invocation, and
+    /// naming the check that refused the invocation (a context with no handle
+    /// has no outlet registered through this bridge, so it is denied), and
     /// [`AccessRefusal::Unreadable`](scp_mcp::server::AccessRefusal::Unreadable)
-    /// when the agent's proof tokens, the context's handle, or its UCAN state
-    /// cannot be read, so a failed read never reaches the client as a denial.
+    /// when the agent's proof tokens or the context's UCAN state cannot be
+    /// read, so a failed read never reaches the client as a denial.
     fn outlet_grant(
         &self,
         bi: &Arc<crate::runtime::UniffiBridgeInstance>,
@@ -4987,10 +4977,14 @@ impl McpUniFfiBridgeProvider {
         // authorizes an Action call and vice versa. An outlet absent from the
         // registry defaults to the Action stem (the UCAN step below requires
         // registration).
+        // The caller read `role_state` from the actor, so a context with no
+        // handle is one the actor holds with no outlet registered through this
+        // bridge (see `context_tools`): the outlet is unregistered, which is
+        // a denial and not a failed read.
         let outlet_kind = {
             let handle = context_handle_registry(bi).get(context_id).ok_or_else(|| {
-                AccessRefusal::Unreadable(format!(
-                    "context '{context_id}' not found in handle registry"
+                AccessRefusal::Denied(format!(
+                    "outlet '{outlet_name}' not registered in context '{context_id}'"
                 ))
             })?;
             let registry = handle
@@ -5042,10 +5036,8 @@ impl McpUniFfiBridgeProvider {
         // outlet's registered kind so the UCAN check selects the correct
         // split stem (SCP-OUT-014). Scope the DashMap Ref so the shard lock
         // is released before entering with_ucan_state (a different DashMap).
-        // The caller read `role_state` from the actor, so a context with no
-        // handle is one the actor holds with no outlet registered through this
-        // bridge (see `context_tools`): the outlet is unregistered, which is
-        // a denial and not a failed read.
+        // A handle removed since the lookup above is a denial for the same
+        // reason.
         let outlet_kind_for_ucan = {
             let handle = context_handle_registry(bi).get(context_id).ok_or_else(|| {
                 AccessRefusal::Denied(format!(
@@ -24290,6 +24282,46 @@ mod tests {
              registry, got: {:?}",
             outlets.iter().map(|o| o.name.clone()).collect::<Vec<_>>()
         );
+    }
+
+    /// A context the actor holds but this bridge has no handle for has no
+    /// outlet registered through the bridge, so `outlet_grant` denies it:
+    /// `tools/list` then omits that context's tools instead of failing the
+    /// whole listing as a failed read.
+    #[test]
+    fn uniffi_outlet_grant_denies_a_context_with_no_handle() {
+        let bi = Arc::new(crate::runtime::UniffiBridgeInstance::new_uniffi());
+        let provider = McpUniFfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: "did:dht:z6MkAgent".to_owned(),
+            context_ids: vec!["ctx-no-handle".to_owned()],
+            outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: Some("not-a-ucan".to_owned()),
+            agent_proof_tokens: None,
+        };
+        let role_state = scp_core::context::roles::ContextRoleState::new(
+            "ctx-no-handle",
+            "did:dht:z6MkAgent",
+            scp_core::context::roles::default_ceiling(),
+            vec![],
+            &scp_clock::SystemClock,
+        )
+        .expect("role state");
+        for check in [
+            scp_mcp::server::CapabilityCheck::Probe,
+            scp_mcp::server::CapabilityCheck::Invoke,
+        ] {
+            let grant =
+                provider.outlet_grant(&bi, &role_state, "ctx-no-handle", "any-outlet", check);
+            assert!(
+                matches!(
+                    &grant,
+                    Err(scp_mcp::server::AccessRefusal::Denied(msg))
+                        if msg.contains("not registered in context 'ctx-no-handle'")
+                ),
+                "a context with no handle must be denied, not unreadable, got: {grant:?}"
+            );
+        }
     }
 
     /// Suppression task must not hold a strong `Arc<UniffiBridgeInstance>`

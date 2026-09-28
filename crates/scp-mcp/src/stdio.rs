@@ -173,6 +173,61 @@ pub fn read_line_bounded<R: std::io::BufRead>(
     Ok(n)
 }
 
+/// Maximum number of lines a stdio client skips while it waits for the
+/// response to one request. Bounds a peer that streams notifications forever.
+pub const MAX_SKIPPED_LINES: usize = 1000;
+
+/// Reads lines from a stdio MCP server's stdout until the response to the
+/// request with `id` arrives, each line bounded by [`read_line_bounded`].
+///
+/// A server writes notifications (`tools/list_changed`,
+/// `resources/updated`, ...) to the same stream at any time, and a response
+/// under another id answers an earlier request whose call already failed.
+/// Handing either to this call would shift every later reply by one, so both
+/// are skipped, as are blank lines and server-initiated requests.
+///
+/// # Errors
+///
+/// Returns an error on EOF, on a read error or an over-long line, on a line
+/// that is not JSON, on a line carrying this `id` that is not a valid
+/// response, and after [`MAX_SKIPPED_LINES`] lines without the response.
+pub fn read_response<R: std::io::BufRead>(
+    reader: &mut R,
+    id: &RequestId,
+) -> Result<JsonRpcResponse, String> {
+    for _ in 0..MAX_SKIPPED_LINES {
+        let mut line = String::new();
+        if read_line_bounded(reader, &mut line)? == 0 {
+            return Err("server closed stdout (EOF) while waiting for response".to_owned());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(trimmed)
+            .map_err(|e| format!("failed to parse response JSON: {e}"))?;
+        // A notification has no id; a server-initiated request has a method.
+        let Some(line_id) = value.get("id") else {
+            continue;
+        };
+        if value.get("method").is_some() {
+            continue;
+        }
+        let line_id: RequestId = match serde_json::from_value(line_id.clone()) {
+            Ok(line_id) => line_id,
+            Err(_) => continue,
+        };
+        if &line_id != id {
+            continue;
+        }
+        return serde_json::from_value(value)
+            .map_err(|e| format!("failed to parse response JSON: {e}"));
+    }
+    Err(format!(
+        "no matching JSON-RPC response after {MAX_SKIPPED_LINES} lines"
+    ))
+}
+
 /// Serializes writes to stdout so responses from the read loop and
 /// notifications from the event pump interleave as whole lines.
 #[derive(Clone)]
@@ -902,6 +957,63 @@ mod tests {
         let mut reader = std::io::Cursor::new("h\u{e9}\nrest".as_bytes().to_vec());
         assert_eq!(read_line_bounded(&mut reader, &mut buf), Ok(4));
         assert_eq!(buf, "h\u{e9}\n");
+    }
+
+    /// The server writes notifications to stdout between responses, and a
+    /// response under another id answers an earlier failed call: the client
+    /// reader skips both and returns only the response to its own request,
+    /// leaving the next line for the next call.
+    #[test]
+    fn read_response_skips_notifications_and_other_ids() {
+        let line = |v: String| format!("{v}\n");
+        let notify = |method| {
+            line(
+                serde_json::to_string(&JsonRpcNotification::new(method, None))
+                    .expect("serialize notification"),
+            )
+        };
+        let respond = |id: i64| {
+            line(
+                serde_json::to_string(&JsonRpcResponse::success(
+                    RequestId::Number(id),
+                    serde_json::json!({ "n": id }),
+                ))
+                .expect("serialize response"),
+            )
+        };
+        let mut input = String::new();
+        input.push_str(&notify(crate::protocol::METHOD_TOOLS_LIST_CHANGED));
+        input.push_str(&respond(1));
+        input.push('\n');
+        input.push_str(&notify(crate::protocol::METHOD_RESOURCES_UPDATED));
+        input.push_str(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"roots/list\",\"id\":2}\n",
+        );
+        input.push_str(&respond(2));
+        input.push_str(&respond(3));
+        let mut reader = std::io::Cursor::new(input.into_bytes());
+
+        let first = read_response(&mut reader, &RequestId::Number(2)).expect("response 2");
+        assert_eq!(first.id, RequestId::Number(2));
+        assert_eq!(first.result, Some(serde_json::json!({ "n": 2 })));
+        let second = read_response(&mut reader, &RequestId::Number(3)).expect("response 3");
+        assert_eq!(second.result, Some(serde_json::json!({ "n": 3 })));
+        let eof = read_response(&mut reader, &RequestId::Number(4)).expect_err("EOF");
+        assert!(eof.contains("EOF"), "got: {eof}");
+    }
+
+    /// A line that is not JSON, or an over-long line, fails the call rather
+    /// than being skipped as noise.
+    #[test]
+    fn read_response_rejects_garbage_and_over_long_lines() {
+        let mut reader = std::io::Cursor::new(b"not json\n".to_vec());
+        let err = read_response(&mut reader, &RequestId::Number(1)).expect_err("garbage");
+        assert!(err.contains("parse"), "got: {err}");
+
+        let cap = usize::try_from(MAX_LINE_BYTES).expect("cap fits in usize on test targets");
+        let mut reader = std::io::Cursor::new(vec![b' '; cap + 1]);
+        let err = read_response(&mut reader, &RequestId::Number(1)).expect_err("over-long");
+        assert!(err.contains("byte limit"), "got: {err}");
     }
 
     /// Drives the REAL `read_loop_from` and returns its result with everything

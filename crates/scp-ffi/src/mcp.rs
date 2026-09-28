@@ -50,7 +50,7 @@ use scp_mcp::client::{McpClient, McpTransport, SystemTimestamp};
 use scp_mcp::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 use scp_mcp::server::{ContextOutletInfo, ContextProvider, McpServer, MemberInfo};
 use scp_mcp::sse_client::SseClientTransport;
-use scp_mcp::stdio::read_line_bounded;
+use scp_mcp::stdio::read_response;
 use scp_platform::traits::Storage;
 
 use crate::error::ScpPyError;
@@ -172,17 +172,12 @@ impl McpTransport for StdioClientTransport {
             .flush()
             .map_err(|e| format!("failed to flush subprocess stdin: {e}"))?;
 
-        // Read the response as a single line from stdout.
-        let mut line = String::new();
-        let bytes_read = read_line_bounded(&mut inner.reader, &mut line)
-            .map_err(|e| format!("failed to read from subprocess stdout: {e}"))?;
+        // Read until this request's response: the server interleaves
+        // notifications on the same stream.
+        let response = read_response(&mut inner.reader, &request.id)
+            .map_err(|e| format!("failed to read from subprocess stdout: {e}"));
         drop(inner);
-
-        if bytes_read == 0 {
-            return Err("subprocess closed stdout (EOF)".to_owned());
-        }
-
-        serde_json::from_str(line.trim()).map_err(|e| format!("failed to parse response JSON: {e}"))
+        response
     }
 
     fn send_notification(&self, notification: &JsonRpcNotification) -> Result<(), String> {

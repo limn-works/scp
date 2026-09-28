@@ -16,7 +16,7 @@
 //! See ADR-015 in `.docs/adrs/phase-3.md`.
 
 use scp_ffi_common::error_codes as codes;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -38,7 +38,6 @@ use crate::runtime::NapiBridgeInstance;
 ///
 /// Imported from `scp-mcp` rather than redeclared so the client and server
 /// halves of the same line protocol cannot drift to different limits.
-use scp_mcp::stdio::MAX_LINE_BYTES;
 
 // ---------------------------------------------------------------------------
 // NAPI types
@@ -278,20 +277,9 @@ impl McpTransport for StdioMcpTransport {
             .flush()
             .map_err(|e| format!("flush error: {e}"))?;
 
-        // Read response line with bounded read to prevent OOM.
-        let mut line = String::new();
-        let n = {
-            use std::io::Read;
-            let mut bounded = (&mut guard.reader).take(MAX_LINE_BYTES);
-            bounded
-                .read_line(&mut line)
-                .map_err(|e| format!("read error: {e}"))?
-        };
-        if n == 0 {
-            return Err("EOF from subprocess".to_owned());
-        }
-
-        serde_json::from_str(line.trim()).map_err(|e| format!("parse error: {e}"))
+        // Read until this request's response, each line bounded to prevent
+        // OOM: the server interleaves notifications on the same stream.
+        scp_mcp::stdio::read_response(&mut guard.reader, &request.id)
     }
 
     fn send_notification(&self, notification: &JsonRpcNotification) -> Result<(), String> {
