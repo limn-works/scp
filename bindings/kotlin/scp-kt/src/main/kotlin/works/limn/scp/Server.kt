@@ -233,9 +233,10 @@ internal data class NodeInfo(
  * must not block its calling thread waiting on a coroutine whose dispatcher it
  * does not control — because [shutdown] routes through `CoroutineBridge.ffiCall`,
  * which suspends on a bridge's injected `ioDispatcher`. A caller injecting a
- * `StandardTestDispatcher` parked one thread that advances that dispatcher's
- * scheduler and never returned, and an Android caller blocked a main thread. See
- * `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
+ * `StandardTestDispatcher` would park the one thread that advances that
+ * dispatcher's scheduler and never return, the deadlock `ScpViewModel.onCleared()`
+ * hit in its tests; an Android caller would block a main thread, which risks an
+ * ANR. See `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
  *
  * ```kotlin
  * val relay = Relay.startInMemory(bridge)

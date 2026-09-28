@@ -225,7 +225,7 @@ class Identity private constructor(private val handle: IdentityHandle) {
 
 ## Resource Management
 
-A type whose teardown reaches the Rust engine exposes exactly one `suspend` teardown function and implements no `AutoCloseable` or `Closeable`, so no `use { }` block applies to it. `AutoCloseable.close()` is synchronous, so it could reach the engine only by blocking its calling thread, which never returns under an injected `StandardTestDispatcher` and produces an ANR on an Android main thread. `.docs/standards/sdk-common.md` §"Kotlin: why no `Closeable`" and ADR-028 (as amended, `.docs/adrs/phase-6.md`) state the rule; `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` records both failures.
+A type whose teardown reaches the Rust engine exposes exactly one `suspend` teardown function and implements no `AutoCloseable` or `Closeable`, so no `use { }` block applies to it. `AutoCloseable.close()` is synchronous, so it could reach the engine only by blocking its calling thread, which never returns under an injected `StandardTestDispatcher` and risks an ANR on an Android main thread. `.docs/standards/sdk-common.md` §"Kotlin: why no `Closeable`" and ADR-028 (as amended, `.docs/adrs/phase-6.md`) state the rule; `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` records the observed deadlock and the ANR risk.
 
 ```kotlin
 class Relay internal constructor(

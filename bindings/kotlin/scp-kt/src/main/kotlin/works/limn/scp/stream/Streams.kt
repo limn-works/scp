@@ -14,7 +14,6 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -495,7 +494,8 @@ private class SubscriptionSlot(
  *    non-suspending Rust thread, so suspending [send] cannot be used.
  * 2. No double-buffering: `callbackFlow` already uses `Channel.BUFFERED` internally
  *    (64 items). Does NOT chain an additional `.buffer(Channel.BUFFERED)`.
- * 3. `awaitClose` always calls the unsubscribe function — never left empty.
+ * 3. Closing the flow always calls the unsubscribe function, and suspends on
+ *    [ioDispatcher] rather than blocking the collector's thread while it runs.
  * 4. Guards against post-close emissions with [AtomicBoolean] flag.
  *
  * @param contextBindings The context FFI bindings.
@@ -539,9 +539,15 @@ fun ColdMessageFlow(
                 contextBindings.contextSubscribe(contextHandle, callback)
             }
 
-        awaitClose {
+        // Release the subscription by suspending on ioDispatcher, never by blocking:
+        // awaitClose's lambda runs on the collector's thread, which is an Android main
+        // thread under collectAsState (ADR-028's AutoCloseable amendment). NonCancellable
+        // lets the release run although the collector was cancelled.
+        try {
+            awaitClose()
+        } finally {
             closed.set(true)
-            runBlocking(Dispatchers.IO) {
+            withContext(NonCancellable + ioDispatcher) {
                 contextBindings.contextUnsubscribe(subscriptionHandle)
             }
         }

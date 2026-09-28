@@ -579,6 +579,21 @@ class StreamsTest {
             }
 
         @Test
+        fun `ColdMessageFlow releases its subscription without parking the collector thread`() {
+            stubBindings.contextSubscribeResult = 100L
+
+            assertReleaseLeavesCollectorFree(
+                openFlow = { ffiDispatcher -> ColdMessageFlow(stubBindings, 42L, ffiDispatcher) },
+                installHooks = { onSubscribe, onUnsubscribe ->
+                    stubBindings.onSubscribe = onSubscribe
+                    stubBindings.onUnsubscribe = onUnsubscribe
+                },
+            )
+
+            assertEquals(100L, stubBindings.lastUnsubscribeHandle)
+        }
+
+        @Test
         fun `ColdMessageFlow has no double buffering`() =
             runTest(testDispatcher) {
                 stubBindings.contextSubscribeResult = 100L
@@ -655,6 +670,9 @@ class StubEventContextBindings : EventContextBindings {
     /** Runs inside [contextSubscribe], where a Rust engine would be opening a stream. */
     var onSubscribe: (() -> Unit)? = null
 
+    /** Runs inside [contextUnsubscribe], where a Rust engine would be closing a stream. */
+    var onUnsubscribe: (() -> Unit)? = null
+
     override fun contextCreate(
         identityHandle: Long,
         paramsJson: String,
@@ -704,6 +722,7 @@ class StubEventContextBindings : EventContextBindings {
     }
 
     override fun contextUnsubscribe(subscriptionHandle: Long) {
+        onUnsubscribe?.invoke()
         contextUnsubscribeCalled = true
         lastUnsubscribeHandle = subscriptionHandle
         messageUnsubscribeCount++

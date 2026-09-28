@@ -113,7 +113,7 @@ imposed on it.
 
 Both types dropped `AutoCloseable`, leaving one suspending `shutdown()` as one canonical stop path,
 which is also what agent-first API design asks for. A bounded wait was weighed and rejected: it
-still blocks a calling thread, and blocking an Android main thread up to a timeout produces an ANR,
+still blocks a calling thread, and blocking an Android main thread up to a timeout risks an ANR,
 so it trades a deadlock for an ANR rather than removing a blocking wait.
 
 That rule is not this lesson's to make. ADR-028 in `.docs/adrs/phase-6.md` originally applied
@@ -121,7 +121,8 @@ That rule is not this lesson's to make. ADR-028 in `.docs/adrs/phase-6.md` origi
 Lifecycle carried it in a per-language table; a lesson file plus a test recording the opposite
 would have left code contradicting the artifacts that govern it. Both artifacts now carry the
 amendment and its reasoning — the ADR under its `AutoCloseable` rationale bullet, the standard
-under §"Kotlin: why no `Closeable`" — and this lesson records the two failures that drove it.
+under §"Kotlin: why no `Closeable`" — and this lesson records the failure that drove it (the deadlock `ScpViewModelTest` observed)
+and the ANR it risks on an Android main thread, which nothing here has observed.
 
 `ServerTest.no lifecycle-owning type implements AutoCloseable` fails if that interface returns to
 `Relay`, `Node`, or `SCP`. `ServerTest.every stop method on a lifecycle-owning type suspends`

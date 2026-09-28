@@ -26,6 +26,7 @@ import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
+import works.limn.scp.stream.assertReleaseLeavesCollectorFree
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
@@ -549,6 +550,27 @@ class CoroutineBridgeTest {
                 advanceUntilIdle()
                 job.join()
             }
+
+        @Test
+        fun `contextSubscribe releases its subscription without parking the collector thread`() {
+            stubBindings.contextSubscribeResult = 100L
+
+            assertReleaseLeavesCollectorFree(
+                openFlow = { ffiDispatcher ->
+                    CoroutineBridge(
+                        nativeBindings = stubBindings,
+                        ioDispatcher = ffiDispatcher,
+                        cpuDispatcher = cpuDispatcher,
+                    ).context.subscribe(42L)
+                },
+                installHooks = { onSubscribe, onUnsubscribe ->
+                    stubBindings.onSubscribe = onSubscribe
+                    stubBindings.onUnsubscribe = onUnsubscribe
+                },
+            )
+
+            assertEquals(100L, stubBindings.lastUnsubscribeHandle)
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1046,15 +1068,23 @@ class StubNativeBindings : NativeBindings {
         contextSendCalled = true
     }
 
+    /** Runs inside [contextSubscribe], where a Rust engine would be opening a stream. */
+    var onSubscribe: (() -> Unit)? = null
+
+    /** Runs inside [contextUnsubscribe], where a Rust engine would be closing a stream. */
+    var onUnsubscribe: (() -> Unit)? = null
+
     override fun contextSubscribe(
         contextHandle: Long,
         callback: MessageCallback,
     ): Long {
         lastMessageCallback = callback
+        onSubscribe?.invoke()
         return contextSubscribeResult
     }
 
     override fun contextUnsubscribe(subscriptionHandle: Long) {
+        onUnsubscribe?.invoke()
         contextUnsubscribeCalled = true
         lastUnsubscribeHandle = subscriptionHandle
     }

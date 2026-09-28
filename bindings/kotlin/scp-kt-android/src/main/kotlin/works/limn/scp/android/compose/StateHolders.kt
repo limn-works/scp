@@ -66,12 +66,13 @@ class ScpContextHolder(
  *
  * Creates a [ScpContextHolder] that persists across recompositions for the
  * same [contextHandle] and [identityHandle]. When the Composable leaves composition, the
- * [onDispose] callback is invoked to clean up the context (e.g., call
- * `contextBridge.leave(handle, identityHandle)`), and the internal coroutine
- * scope is cancelled.
+ * holder's internal coroutine scope is cancelled first, and the [onDispose] callback is
+ * invoked after it to clean up the context (e.g., launch
+ * `contextBridge.leave(handle, identityHandle)` on a scope that outlives disposal).
  *
- * Per ADR-028: `DisposableEffect(contextId) { onDispose { context.close() } }`
- * ensures the context is closed when the composable leaves composition.
+ * Per ADR-028 (amended): `DisposableEffect(contextId) { onDispose { teardownScope.launch {
+ * context.close() } } }`, so the teardown runs off the composition thread and `onDispose`
+ * never blocks it.
  *
  * Usage:
  * ```kotlin
@@ -484,8 +485,12 @@ fun <T> rememberScpHotStream(
 
     DisposableEffect(key, coordinator) {
         val pendingSwapStop = swappedOutStop.getAndSet(null)
-        // Counted during composition, before any start runs, so a mount under this key that
-        // leaves from here on sees this one as live and stops nothing.
+        // Counted when this effect applies, after composition and after every onDispose in
+        // the same apply pass, and before this effect's start launches. A mount under this
+        // key that leaves from here on therefore sees this one as live and stops nothing,
+        // and a mount that left in this pass has already run its unmount. The count must
+        // stay here: a count taken during composition (in `remember`) would run before the
+        // outgoing mount's unmount, and would leak when Compose abandons that composition.
         val mount = coordinator.mount(key)
         scope.launch {
             pendingSwapStop?.join()

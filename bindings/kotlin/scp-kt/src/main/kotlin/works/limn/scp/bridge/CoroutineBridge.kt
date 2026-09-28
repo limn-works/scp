@@ -24,12 +24,12 @@ package works.limn.scp.bridge
 
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -1726,14 +1726,15 @@ class ContextBridge internal constructor(
                     bindings.contextSubscribe(contextHandle, callback)
                 }
 
-            awaitClose {
-                // Use Dispatchers.IO directly — NOT bridge.ioDispatcher — because
-                // awaitClose is a non-suspend lambda that blocks its thread via
-                // runBlocking. If bridge.ioDispatcher is a single-threaded test
-                // dispatcher, runBlocking would deadlock (blocking the only thread
-                // that the dispatcher can schedule work on). Dispatchers.IO is an
-                // unbounded thread pool that always has capacity.
-                runBlocking(kotlinx.coroutines.Dispatchers.IO) {
+            // Release the subscription by suspending on bridge.ioDispatcher, never by
+            // blocking: awaitClose's lambda runs on the collector's thread, which is an
+            // Android main thread under collectAsState, so a runBlocking there parks that
+            // thread until the FFI call returns (ADR-028's AutoCloseable amendment).
+            // NonCancellable lets the release run although the collector was cancelled.
+            try {
+                awaitClose()
+            } finally {
+                withContext(NonCancellable + bridge.ioDispatcher) {
                     bindings.contextUnsubscribe(subscriptionHandle)
                 }
             }
