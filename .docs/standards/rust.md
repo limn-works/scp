@@ -451,8 +451,13 @@ and read the upstream release notes for every version in between.
 
 **Applying the bump.** Use `cargo update -p <crate> --precise <version>`. A bare
 `cargo update -p <crate>` re-resolves unrelated edges, so read the whole `Cargo.lock` diff
-and revert every change the advisory did not require. Prove the result resolves with
-`cargo metadata --locked --all-features`.
+and revert every change the advisory did not require. When `--precise` fails with a
+version conflict, read whether the conflicting requirement is `locked to` a version: a
+lockfile pin is not a blocker, so unlock that crate first with
+`cargo update -p <crate>@<locked version>` and retry. aws-sdk-s3 1.144.0 and later drop
+the unsound `lru 0.12.5`, and `--precise` refused them only because `Cargo.lock` held
+`sha2 0.11.0-rc.5`, which mainline's `ed25519-dalek 3.0.0-pre.6` accepts at 0.11.0 too.
+Prove the result resolves with `cargo metadata --locked --all-features`.
 
 **Verifying.** Run the cargo-deny version CI runs, not whatever `cargo install` left on
 the machine. `EmbarkStudios/cargo-deny-action@v2` is a floating major tag, not a pin:
@@ -473,8 +478,10 @@ directly: cargo-deny reported the `lru` advisory RUSTSEC-2026-0253 against `lru 
 alone while `lru 0.12.5` also compiled in, and raising the direct dependency to 0.18.2
 turned the check green with both affected copies still in the build. `deny.toml`
 therefore sets `unsound = "all"`, which reports every copy in the graph. Never lower
-that key; clear a transitive copy with a bump, or with an `ignore` entry that names the
-crate that pins it and why the advisory's trigger cannot occur.
+that key. Clear a transitive copy by bumping the crate that pins it; an `ignore` entry
+for it follows the rule at the head of this section, and its comment names the pinning
+crate, shows that no release of it takes the patched version, and says why the
+advisory's trigger cannot occur.
 
 ## CI Matrix
 

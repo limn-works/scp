@@ -104,24 +104,16 @@ ignore = [
     # >= 0.0.6 clears this entry. Re-check with
     # `cargo update --dry-run -p libcrux-secrets` whenever you touch this file.
     "RUSTSEC-2026-0212",
-    # lru: `IterMut` violates Stacked Borrows. Reported by `unsound = "all"` above against
-    # lru 0.12.5 alone, which reaches the build only through aws-sdk-s3 1.119.0 (the
-    # optional S3 blob backend), whose manifest requires lru `^0.12.2`; the advisory names
-    # lru >= 0.16.3 as patched. aws-sdk-s3 builds its one `LruCache` in `s3_express.rs`
-    # and never calls `iter_mut`. An aws-sdk-s3 release that requires lru >= 0.18.2
-    # clears this entry and the next one's 0.12.5 copy.
-    "RUSTSEC-2026-0002",
     # lru: `LruCache::pop()` leaves dangling pointers when a key's `Drop` panics. Reported
-    # against lru 0.12.5 (aws-sdk-s3, above) and lru 0.16.3, which mainline 6.0.1 (the
-    # scp-dht DHT client) requires as `^0.16`; the advisory names lru >= 0.18.2 as
-    # patched, and every workspace crate that names lru directly resolves 0.18.2; the
-    # `[bans]` entry for lru below fails the check if any other crate pulls in a lower
-    # version, because both IDs here are ignored for every lru version. The
-    # keys both crates store (aws-sdk-s3's cache key, mainline's `Id` and
-    # `SocketAddrV4`) have no panicking `Drop`, so the trigger cannot occur. A mainline
-    # release that requires lru >= 0.18.2 clears the 0.16.3 copy. Re-check with
-    # `cargo update --dry-run -p mainline` and `cargo update --dry-run -p aws-sdk-s3`
-    # whenever you touch this file.
+    # against lru 0.16.3, which mainline 6.0.1 (the scp-dht DHT client) requires as
+    # `^0.16`; the advisory names lru >= 0.18.2 as patched. No mainline release clears
+    # it: every mainline release through 8.0.0 requires lru `^0.16`. Every workspace crate
+    # that names lru directly resolves 0.18.2, and the `[bans]` entry for lru below fails
+    # the check if any crate other than mainline pulls in a lower version, because this
+    # ID is ignored for every lru version. Every mainline `LruCache` is keyed by `Id`,
+    # which has no panicking `Drop`, so the trigger cannot occur. A mainline release that
+    # requires lru >= 0.18.2 clears this entry. Re-check with
+    # `cargo update --dry-run -p mainline` whenever you touch this file.
     "RUSTSEC-2026-0253",
 ]
 
@@ -129,12 +121,12 @@ ignore = [
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
-# The two lru ignores above hold an advisory ID for every lru version in the graph.
-# This ban keeps them scoped to the transitive copies they justify: an lru below the
-# patched 0.18.2 fails the check unless aws-sdk-s3 or mainline is what depends on it,
-# so a workspace crate naming an unpatched lru directly is reported.
+# The lru ignore above holds an advisory ID for every lru version in the graph. This
+# ban keeps it scoped to the transitive copy it justifies: an lru below the patched
+# 0.18.2 fails the check unless mainline is what depends on it, so a workspace crate
+# or any other dependency pulling in an unpatched lru is reported.
 deny = [
-    { crate = "lru:<0.18.2", wrappers = ["aws-sdk-s3", "mainline"], reason = "RUSTSEC-2026-0002 and RUSTSEC-2026-0253 are ignored only for these two dependents" },
+    { crate = "lru:<0.18.2", wrappers = ["mainline"], reason = "RUSTSEC-2026-0253 is ignored only for mainline's copy" },
 ]
 
 # ── Sources ─────────────────────────────────────────────────────────────────
