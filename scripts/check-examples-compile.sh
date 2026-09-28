@@ -48,6 +48,11 @@
 # published file set while the target still exists; iterating published files
 # would drop it from coverage in silence. Targets are what gets compiled.
 #
+# WHY EACH TARGET IS NAMED. The loop runs `--example NAME` per target and never
+# `--examples`. Under `--examples` cargo skips a target whose `required-features`
+# are off and exits 0; named, the same target fails. Case `requiredfeatures` in
+# scripts/tests/examples-compile/run-tests.sh pins this.
+#
 # WHY PACKAGE SCOPE IS LOAD-BEARING. `cargo clippy --workspace --examples`
 # unifies dev-dependency features across EVERY member: `crates/scp-ffi`
 # dev-depends on `scp-ffi-common` with `features = ["testing"]`, whose `testing`

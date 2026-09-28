@@ -514,9 +514,9 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // Explicit parse: a typo (e.g. "memroy") must NOT silently fall through to
     // the production DHT, which would publish the host's address to the network.
     match parse_dht_mode_or_exit() {
-        // `parse_dht_mode_or_exit` never returns `Disabled` for the full relay
-        // node (it exits with guidance to use `--self-host`); this arm exists
-        // only to keep the match exhaustive and fails closed if ever reached.
+        // `parse_dht_mode_or_exit` returns `Disabled` for `SCP_NODE_DHT_MODE=disabled`,
+        // which only `--self-host` honours; the full relay node must publish its
+        // DID, so this arm exits with guidance to use `--self-host`.
         scp_node::DhtMode::Disabled => {
             tracing::error!(
                 "DhtMode::Disabled is not a full-relay-node mode — the node must publish its DID. \
@@ -597,8 +597,8 @@ fn parse_dht_mode_or_exit() -> scp_node::DhtMode {
     // nullifier) is a test-harness value compiled only under `testing`. The
     // non-publishing `DhtMode::Disabled` value belongs to the `--self-host`
     // path (`host_site`), which resolves via the relay layer without publishing;
-    // a relay node with no published DID cannot be found, so it is not offered
-    // here. (The library-level `NodeConfig`/`HostSiteConfig::defaults` fail-safe
+    // a relay node with no published DID cannot be found, so the full node
+    // rejects it in its own match. (The library-level `NodeConfig`/`HostSiteConfig::defaults` fail-safe
     // is `Disabled` per ADR-062 §Decision 1; this binary default is the operator
     // running a public server.)
     let raw = env::var("SCP_NODE_DHT_MODE").unwrap_or_else(|_| "production".into());
@@ -650,7 +650,7 @@ fn parse_dht_mode_or_exit() -> scp_node::DhtMode {
 /// describes the cleartext exposure instead.
 ///
 /// `publishes_dht` reflects whether `SCP_NODE_DHT_MODE` resolves to `production`
-/// (publish) vs `memory` (no publish). Under `memory` the host's address is NOT
+/// (publish) vs `disabled` (no publish). Under `disabled` the host's address is NOT
 /// published to the DHT, so the IP<->DID disclosure line is replaced with a line
 /// stating the node is reachable but not DHT-discoverable.
 fn self_host_banner(port: u16, plaintext: bool, publishes_dht: bool) -> String {
@@ -783,9 +783,9 @@ const EPHEMERAL_STORE: &str = "in memory";
 /// Opens an inbound TCP port to the public internet (via NAT-PMP/UPnP when the
 /// `upnp` feature is built). Whether the host's address is published to the
 /// Mainline DHT is governed independently by `SCP_NODE_DHT_MODE`:
-/// `production` (the default) publishes; `memory` does NOT publish — the node is
+/// `production` (the default) publishes; `disabled` does NOT publish — the node is
 /// still reachable on the opened port, the address is just not DHT-discoverable
-/// (share it out-of-band). `memory` is valid with NAT probing on or off. See the
+/// (share it out-of-band). `disabled` is valid with NAT probing on or off. See the
 /// startup banner.
 async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf>) {
     exit_on_ignored_cloud_backend("--self-host", SELF_HOST_STORE);
@@ -793,9 +793,9 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
     let plaintext = self_host_plaintext();
     let skip_nat = self_host_skip_nat();
 
-    // -- DHT mode: production pkarr by default; memory for "reachable but not
+    // -- DHT mode: production pkarr by default; disabled for "reachable but not
     //    DHT-discoverable" hosting. Parsed BEFORE the banner so the banner can
-    //    state the actual disclosure posture (memory = address NOT published). --
+    //    state the actual disclosure posture (disabled = address NOT published). --
     let dht_mode = parse_dht_mode_or_exit();
     let publishes_dht = matches!(dht_mode, scp_node::DhtMode::Production);
 
@@ -1182,8 +1182,8 @@ async fn main() {
         {
             eprintln!(
                 "ERROR: --ephemeral is a test-harness mode (in-memory DHT/custody) and is not \
-                 available in this build. Run without --ephemeral for a persistent node, or set \
-                 SCP_NODE_DHT_MODE=disabled for a non-publishing node."
+                 available in this build. Run without --ephemeral for a persistent node, or run \
+                 --self-host with SCP_NODE_DHT_MODE=disabled for a non-publishing hosted site."
             );
             std::process::exit(1);
         }

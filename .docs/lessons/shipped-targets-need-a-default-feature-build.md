@@ -11,7 +11,7 @@ A build target that ships to a user MUST be compiled by a job that gates the pul
 request. `cargo package --list -p scp-node` lists `examples/website.rs`, so a broken
 example ships to crates.io.
 
-`scripts/check-examples-compile.sh` carries five mechanisms, and deleting any one
+`scripts/check-examples-compile.sh` carries six mechanisms, and deleting any one
 of them reopens a bypass this repository has already measured:
 
 1. **Lint one package at a time.** `cargo clippy --workspace --examples` unifies
@@ -32,6 +32,12 @@ of them reopens a bypass this repository has already measured:
 5. **Report a `cargo package --list` failure unconditionally.** Gating that branch on the
    crate having targets inverts it, because `autoexamples = false` empties the target set
    and that is exactly when a published example is invisible.
+6. **Name each example target in its own lint call.** The script runs
+   `cargo clippy -p "$pkg" --example "$name"` once per target and never passes
+   `--examples`. Under `--examples`, cargo skips a target whose `required-features` are
+   off and exits 0 (row 3); named with `--example NAME`, the same target makes cargo
+   fail. Collapsing the loop to one `--examples` call per package keeps mechanisms 1
+   to 5 and reopens row 3.
 
 Row 8 is answered by none of them, and deliberately so: a `build.rs` can inject any cfg
 into every target of its own package. The criterion for what this gate cannot defend
@@ -41,19 +47,25 @@ draft wrote the narrower indicator as the contract, which is the failure `.docs/
 
 ## Eight rounds, eleven measured bypasses, and which ones the gate closes
 
-The table below has thirteen rows. Two are not measured bypasses: row 2 records an
-overclaim, and row 8 is a hypothesis two reproduction attempts failed to demonstrate. The
-remaining eleven are measured bypasses, found across six of the eight rounds —
-rounds 1, 3, 4, 5, 6, and 7. They do
-not share one root, and no single change closed them.
+The table below has thirteen rows. Three are not measured bypasses: row 2 records an
+overclaim, row 4c records a premise this branch measured and found false (the section on
+`required-features` below), and row 8 is a hypothesis two reproduction attempts failed to
+demonstrate. The remaining ten are measured bypasses, found across six of the eight
+rounds — rounds 1, 3, 4, 5, 6, and 7. They do not share one root, and no single change
+closed them.
 
-Ten of the eleven are closed: rows 1, 3, 4a, 4c, 5, 6a, 6b, 7a, and 7b by the five
-mechanisms listed above, and row 6c by reading with `while IFS= read -r` instead of
-word-splitting.
+Nine of the ten are closed: rows 1, 3, 4a, 5, 6a, 6b, 7a, and 7b by the six mechanisms
+listed above, and row 6c by reading with `while IFS= read -r` instead of word-splitting.
 
-Row 4b (any nullifier other than `DhtMode::Memory`) is the one open bypass, and is meant
-to be: cargo gives an example its crate's dev-dependencies and no invocation switches that
-off.
+Row 4b (any nullifier other than `DhtMode::Memory`) is the one open bypass. No cargo
+invocation inside the workspace closes it, because cargo gives an example its crate's
+dev-dependencies. A build from outside the workspace does close it: the probe crate
+described below depends on the crate by path, cargo resolves none of a dependency's
+`[dev-dependencies]`, and so the probe compiles the examples against the feature set
+publication produces. This gate does not run that build, so it asserts the dev-target
+closure, not the default feature set its plan item names ("shipped examples build on
+default features"). Whether to add the probe build or to narrow the gate's contract to the
+dev-target closure is a scope decision for a human; cargo does not settle it.
 
 Row 8 (a `build.rs` injecting a cfg) is not demonstrated. Two attempts to reproduce it
 made the gate exit 1, because the injected cfg desynchronizes the lib from its dependency
@@ -73,7 +85,7 @@ above name their rows: a bare total drifts from the table, and an enumeration do
 | 2 | (scope overclaimed, not a bypass) | comment promised more than the check delivers |
 | 3 | `required-features = ["testing"]` | cargo skips the target and exits 0 |
 | 4a | `autoexamples = false` | file ships, target absent, target-sourced list blind |
-| 4b | any nullifier but `DhtMode::Memory` | dev-dependencies, unclosable |
+| 4b | any nullifier but `DhtMode::Memory` | dev-dependencies; open inside the workspace, closable only by a build from outside it |
 | 4c | `required-features` as standing exemption | bought nothing; the guard was satisfied rather than skipped, because the dev-dependency back-edge resolves `scp-runtime/testing` ON |
 | 5 | `cargo package --list` exit 101 swallowed | manifest error dropped a crate in silence |
 | 6a | `[[example]] path = "examples/decoy/website.rs"` | name join saw `website` on both sides |
@@ -281,8 +293,8 @@ Run the widened invocation before adopting it.
 
 The script header states this in full; it is the text an editor of the gate reads.
 In short: cargo builds an example as a dev target and gives it the crate's
-dev-dependencies, and no invocation switches that off, so the check proves that
-every example target compiles in this workspace and proves neither that an example
+dev-dependencies, and no invocation inside the workspace switches that off, so the check
+proves that every example target compiles in this workspace and proves neither that an example
 compiles for someone who installs the crate nor anything about which constructs it
 names. `DhtMode::Memory` was caught only because it sits behind `scp-node`'s OWN
 `testing` feature, which scp-node's dev-dependencies do not enable.
@@ -309,7 +321,13 @@ manifest.
   capability the binary exposes", `main.rs` carried a rustdoc comment documenting the
   no-publish banner case as `SCP_NODE_DHT_MODE=memory`, and `config.rs` carried three
   tests whose names said `dht_memory` while their bodies passed `DhtMode::Disabled`.
-  Do not read an earlier sweep's file list as the sweep. Re-run the grep.
+  That sweep fixed the banner test's comment and stopped. A reviewer's grep then found
+  four more sites in the same `main.rs`: the `run_self_host` rustdoc and its inline
+  comment, and the `self_host_banner` rustdoc, each naming `memory` as the no-publish
+  mode, and the `--ephemeral` error message, which pointed operators at
+  `SCP_NODE_DHT_MODE=disabled` on the full node, where that value exits 1.
+  Do not read an earlier sweep's file list as the sweep, including your own. Re-run the
+  grep after the fix, and read every hit in the file you just edited.
 - Grep test names, not only code and prose. A test name is a claim about what the test
   covers, and replacing a value inside the body leaves the name behind:
   `nat_traversal_plus_dht_memory_is_valid` kept its name after ADR-062, capability
