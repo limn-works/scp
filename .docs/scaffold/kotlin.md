@@ -248,14 +248,27 @@ class Relay internal constructor(
 ) {
     @Volatile
     var isShutdown: Boolean = false
-        private set
+        internal set
 
     // The only stop path. It suspends on the bridge's injected ioDispatcher. A failed
     // teardown propagates and leaves isShutdown false, so the relay still reads as live.
-    // The flag is set inside the bridge call, so a caller cancelled after a finished
-    // teardown still finds it set.
+    // ServerBridge.shutdownRelay sets the flag inside its bridge call, so a caller cancelled
+    // after a finished teardown still finds it set. Pass no lambda from here: it would compile
+    // to a non-suspending `shutdown$lambda` method on this class, which ServerTest's
+    // "every stop method on a lifecycle-owning type suspends" check rejects.
     suspend fun shutdown() {
-        bridge.shutdownRelay(this) { isShutdown = true }
+        bridge.shutdownRelay(this)
+    }
+}
+
+class ServerBridge internal constructor(
+    private val bindings: ServerBindings,
+    private val bridge: CoroutineBridge,
+) {
+    internal suspend fun shutdownRelay(relay: Relay) = bridge.ffiCall {
+        bindings.relayShutdown(relay.handleJson)
+        // Reached only when the FFI call returns; an engine failure throws first.
+        relay.isShutdown = true
     }
 }
 

@@ -131,7 +131,10 @@ here has observed.
 `Relay`, `Node`, or `SCP`. `ServerTest.every stop method on a lifecycle-owning type suspends`
 requires a `kotlin.coroutines.Continuation` parameter on every declared method named `shutdown`,
 `close`, `stop`, or `dispose`, so a non-suspending method under one of those four names fails it.
-A blocking stop method under any other name passes it.
+It strips everything after `$` before matching, so a lambda passed from `shutdown()` fails it too:
+the lambda compiles to a non-suspending `shutdown$lambda` method on the same class. That is why
+`ServerBridge.shutdownRelay` and `shutdownNode` set the shutdown flag themselves and `shutdown()`
+passes no lambda. The check passes a blocking stop method under any other name.
 
 ## Affected files
 

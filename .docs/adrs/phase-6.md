@@ -572,7 +572,7 @@ Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/
 **Jetpack Compose integration:**
 - The core artifact `works.limn:scp-kt` takes no Compose dependency. `works.limn:scp-kt-android` carries the Compose state holders (SCP-118), and they build on standard Kotlin patterns the SDK already provides: `Flow<Message>` collected via `collectAsState()`, and resources held in `remember { }` blocks whose `DisposableEffect` `onDispose` launches their `suspend` teardown on a scope that disposal never cancels, then returns (amended; see the `AutoCloseable` bullet under Rationale).
 - Recommended pattern: `val messages by context.receiveFlow().collectAsState(initial = emptyList())`.
-- Hot streams shared across composables (amended): `works.limn:scp-kt-android`'s Compose state holders (SCP-118) include `rememberScpHotStream(key, coordinator, start, onStop)`, which starts a hot stream when the first composable under `key` mounts and launches `onStop` when the last one leaves. Its `coordinator` parameter is a required `ScpHotStreamCoordinator`, constructed once outside composition (a ViewModel or an application container) and shared by every call in one key space, with no default. The coordinator counts live mounts per key, so a screen that leaves while another screen under that key stays composed stops nothing yet: the coordinator holds that screen's `onStop` and runs it, with every other held one, when the last screen under that key leaves, so a key that groups two different streams leaks neither. Each `onStop` is therefore idempotent. A later mount joins the last stop it launched before its own start runs. A per-composition coordinator or scope would let an outgoing screen's stop release a stream an incoming screen under that key already uses. `onStop` runs on the coordinator's caller-owned scope, never blocks `onDispose`, and a throw from it is logged, never propagated (`.docs/standards/sdk-common.md` §Cleanup error handling). `.docs/lessons/kotlin/hot-stream-subscription-ownership.md` records the defects this shape prevents.
+- Hot streams shared across composables (amended): `works.limn:scp-kt-android`'s Compose state holders (SCP-118) include `rememberScpHotStream(key, coordinator, start, onStop)`, which starts a hot stream when the first composable under `key` mounts and launches `onStop` when the last one leaves. Its `coordinator` parameter is a required `ScpHotStreamCoordinator`, constructed once outside composition (a ViewModel or an application container) and shared by every call in one key space, with no default. The coordinator counts live mounts per key, so a screen that leaves while another screen under that key stays composed stops nothing yet: the coordinator holds that screen's `onStop` and runs it, with every other held one, when the last screen under that key leaves, so a key that groups two different streams leaks neither. Each `onStop` MUST therefore be idempotent: the coordinator runs every held `onStop` and deduplicates none. A later mount joins the last stop it launched before its own start runs. A per-composition coordinator or scope would let an outgoing screen's stop release a stream an incoming screen under that key already uses. `onStop` runs on the coordinator's caller-owned scope, never blocks `onDispose`, and a throw from it is logged, never propagated (`.docs/standards/sdk-common.md` §Cleanup error handling). `.docs/lessons/kotlin/hot-stream-subscription-ownership.md` records the defects this shape prevents.
 - Context lifecycle in Compose: `rememberScpContext(contextHandle, identityHandle) { ctxH, idH -> teardownScope.launch { bridge.context.leave(ctxH, idH) } }`. When the composable leaves the composition, `ScpContextHolder.dispose()` cancels the holder's scope and then calls that callback, which launches `leave` on `teardownScope`. `teardownScope` outlives the composable and disposal never cancels it, so `onDispose` never blocks the composition thread (amended; see the `AutoCloseable` bullet under Rationale).
 
 **Maven Central publishing:**
@@ -706,6 +706,9 @@ class Scp private constructor(private val identityHandle: IdentityHandle) {
 
     val identity: Identity = Identity(identityHandle)
 
+    /** Set by [shutdown]; the finalizer (not shown) warns when an instance is collected with it false. */
+    private val isShutdown = AtomicBoolean(false)
+
     companion object {
         /**
          * Create an SCP instance. Generates a new identity if none exists for this device.
@@ -744,7 +747,15 @@ class Scp private constructor(private val identityHandle: IdentityHandle) {
      * AutoCloseable (see the amended Rationale bullet).
      */
     suspend fun shutdown(bridge: CoroutineBridge, timeout: Duration = 5.seconds) {
-        bridge.ffiCallSuspend { identityHandle.shutdown(timeoutMillis = timeout.inWholeMilliseconds.toULong()) }
+        // A negative duration clamps to zero; Long.toULong() alone would wrap it to ~1.8e19 ms.
+        val millis = timeout.inWholeMilliseconds.coerceAtLeast(0).toULong()
+        bridge.ffiCallSuspend {
+            identityHandle.shutdown(timeoutMillis = millis)
+            // Set inside the bridge block, once the FFI call returns: an engine failure throws
+            // before this line and leaves the flag false, and a cancellation raised after a
+            // finished teardown cannot leave the instance recorded as live.
+            isShutdown.set(true)
+        }
     }
 }
 ```
