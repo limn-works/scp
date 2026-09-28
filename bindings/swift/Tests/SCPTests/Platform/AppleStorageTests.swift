@@ -25,11 +25,13 @@
 // 2. `set`, `get`, `exists`, and `delete` round-trip values through the real
 //    database file, including a value of zero bytes.
 // 3. Two keys that differ only after a zero byte name two rows for `set`,
-//    `get`, `exists`, `delete`, and `deletePrefix`. `sqlite3_bind_text` reads a
-//    negative length as "the bytes up to the first zero byte" and answers
-//    `SQLITE_OK` for that bind, so the return code property above rejects
-//    nothing there; the byte count each method passes is what separates the
-//    two keys. The same acceptance criterion states that property.
+//    `get`, `exists`, and `delete`, and a prefix that carries a zero byte
+//    selects only the keys that match it past that byte for `listKeys` and
+//    `deletePrefix`. `sqlite3_bind_text` reads a negative length as "the bytes
+//    up to the first zero byte" and answers `SQLITE_OK` for that bind, so the
+//    return code property above rejects nothing there; the byte count each
+//    method passes is what separates the two keys. The same acceptance
+//    criterion states that property.
 //
 // See ADR-025 in `.docs/adrs/phase-5.md`, and §17.11 and §17.13 of the
 // persistence-and-storage spec.
@@ -328,6 +330,32 @@
             #expect(try await fixture.storage.exists(key: first) == false)
             #expect(try await fixture.storage.exists(key: second) == true)
             #expect(try await fixture.storage.deletePrefix(prefix: "delta") == 1)
+        }
+
+        @Test("a prefix that carries a zero byte selects only the keys past it")
+        func prefixCarryingAZeroByteSelectsOnlyItsKeys() async throws {
+            // Both `listKeys` and `deletePrefix` bind the prefix as the lower
+            // bound and its successor `delta\u{0}p` as the upper bound. A
+            // method that binds the lower bound as a C string scans from
+            // `delta` and selects both keys, answering 2; one that binds the
+            // upper bound as a C string scans up to `delta` and selects none,
+            // answering 0. The correct answer is 1 for each method. These
+            // assertions count keys rather than compare the strings
+            // `listKeys` returns.
+            let fixture = try makeStorageFixture()
+            defer { fixture.removeFiles() }
+
+            let first = "delta\u{0}one"
+            let second = "delta\u{0}two"
+            try await fixture.storage.set(key: first, value: Data([0x01]))
+            try await fixture.storage.set(key: second, value: Data([0x02]))
+
+            #expect(try await fixture.storage.listKeys(prefix: "delta\u{0}o").count == 1)
+            #expect(try await fixture.storage.listKeys(prefix: "delta\u{0}").count == 2)
+
+            #expect(try await fixture.storage.deletePrefix(prefix: "delta\u{0}o") == 1)
+            #expect(try await fixture.storage.exists(key: first) == false)
+            #expect(try await fixture.storage.exists(key: second) == true)
         }
     }
 
