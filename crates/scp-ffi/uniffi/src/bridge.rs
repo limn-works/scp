@@ -4618,8 +4618,10 @@ pub(crate) struct McpClientEntry {
     /// A stdio client's server process, which `mcp_client_disconnect` kills
     /// directly: an in-flight call's clone of `client` would otherwise keep
     /// the process alive, and a blocking thread parked on its stdout, for as
-    /// long as the server stays silent. `None` for an SSE client, whose reads
-    /// time out.
+    /// long as the server stays silent. `None` for an SSE client: its POST
+    /// read has no timeout, and a disconnect has no handle that ends it, so
+    /// a call in flight against a silent SSE server holds its blocking thread
+    /// until the server answers or closes the connection.
     pub(crate) stdio_server: Option<Arc<std::sync::Mutex<std::process::Child>>>,
 }
 
@@ -16626,7 +16628,9 @@ impl Scp {
     /// Routes through the module-level MCP client registry. A stdio client's
     /// server process group, which holds the processes the server started,
     /// is dead when this returns, even while a call on the handle is in
-    /// flight; that call then fails on the closed stdout.
+    /// flight; that call then fails on the closed stdout. A disconnect does
+    /// not end a call in flight on an SSE client: that call waits until the
+    /// server answers its POST or closes the connection.
     #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_client_disconnect(&self, handle: String) -> Result<(), ScpError> {
         validate_mcp_handle(&handle)?;
