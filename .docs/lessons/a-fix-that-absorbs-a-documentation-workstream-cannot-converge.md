@@ -50,9 +50,11 @@ test-only feature to compile. Pull request #2382, which cleared the Rust 1.98.0 
 lints and named the Rust version in one file, took the `rustls-webpki` bump and the three
 `deny.toml` deletions into main first. This branch then rebased onto that commit, so the
 branch carries no line of the `rustls-webpki` fix. A later commit added different advisory
-work: `deny.toml` sets `unsound = "all"` and ignores RUSTSEC-2026-0002 and
-RUSTSEC-2026-0253 (two `lru` advisories), and `Cargo.lock` bumps `anyhow` and
-`event-listener`. The example fix required one true sentence about why a shipped build
+work: `deny.toml` sets `unsound = "all"`, ignores RUSTSEC-2026-0253 (an `lru`
+advisory) for the copy `mainline` requires, and bans any other `lru` below 0.18.2.
+`Cargo.lock` bumps `anyhow` and `event-listener`, and bumps `aws-sdk-s3` with about
+twenty crates in its dependency tree past `lru` 0.12.5, so RUSTSEC-2026-0002, the second
+`lru` advisory, needs no ignore. The example fix required one true sentence about why a shipped build
 cannot create an identity.
 
 That one sentence became thirty. Each round a reviewer found a surface where the same

@@ -292,14 +292,17 @@ client unconditionally. Pass `SCP_NODE_DHT_MODE=memory` to a `--features testing
 build only when you want the persistent full node to keep its SQLite storage while
 its DHT stays process-local.
 
-A shipped binary exits 1 on `--ephemeral`, alone or beside another mode flag, since
-`main` refuses any two of `--relay-only`, `--self-host` (or `SCP_NODE_SELF_HOST`) and
-`--ephemeral`. The full node and `--self-host` exit 1 on `SCP_NODE_DHT_MODE=memory`;
-`--relay-only` runs no DHT client and never reads the variable. The
-`--ephemeral` dispatch (`crates/scp-node/src/main.rs`, the `config.ephemeral` arm of
-`main`) and the `"memory"` match arm (`parse_dht_mode_or_exit`) both compile only under
-`--features testing`, so ADR-062, capability injection, keeps the in-memory DHT client
-and the in-memory key custody out of every released build.
+Every build exits 1 when given two or more of `--relay-only`, `--self-host` (or
+`SCP_NODE_SELF_HOST`) and `--ephemeral`, because `main` refuses a second mode flag. A
+shipped binary also exits 1 on `--ephemeral` alone: in a build without `--features
+testing`, the `--ephemeral` branch of `main` (`crates/scp-node/src/main.rs`) prints an
+error and exits instead of calling `run_full_node_ephemeral`. In a shipped binary the
+full node and `--self-host` exit 1 on `SCP_NODE_DHT_MODE=memory`; a `--features testing`
+build accepts it on both. `--relay-only` runs no DHT client and never reads the variable.
+The call to `run_full_node_ephemeral` and the `"memory"` match arm
+(`parse_dht_mode_or_exit`) both compile only under `--features testing`, so ADR-062,
+capability injection, keeps the in-memory DHT client and the in-memory key custody out
+of every released build.
 
 Do not run the full node (no mode flag) for development. A shipped binary exits 1
 with `NoPreRotationBackend` on every run, for the reason given under Production
