@@ -137,12 +137,27 @@ pub(crate) struct McpClientEntry {
     /// guard before its network round trip; a disconnect or connect on the
     /// same shard then never waits on a silent server.
     pub(crate) client: Arc<Mutex<McpClient<McpClientTransportWrapper>>>,
-    /// A stdio client's server process, which `mcp_client_disconnect_on`
-    /// kills directly: an in-flight call's clone of `client` would otherwise
-    /// keep the process alive, and a blocking thread parked on its stdout,
-    /// for as long as the server stays silent. `None` for an SSE client,
-    /// whose reads time out.
+    /// A stdio client's server process, which the entry's `Drop` kills
+    /// directly, so every path that drops the entry (a disconnect, the
+    /// registry clear at instance shutdown, the instance's drop) stops the
+    /// server: an in-flight call's clone of `client` would otherwise keep the
+    /// process alive, and a blocking thread parked on its stdout, for as long
+    /// as the server stays silent. `None` for an SSE client: its POST read
+    /// has no timeout, and a disconnect has no handle that ends it, so a call
+    /// in flight against a silent SSE server holds its blocking thread until
+    /// the server answers or closes the connection.
     pub(crate) stdio_server: Option<Arc<Mutex<std::process::Child>>>,
+}
+
+impl Drop for McpClientEntry {
+    fn drop(&mut self) {
+        // A stdio server, and every process in its process group, is dead
+        // once the entry drops, even while a call on the handle is in flight;
+        // that call then fails on the closed stdout.
+        if let Some(server) = &self.stdio_server {
+            scp_mcp::stdio::stop_server_process(server);
+        }
+    }
 }
 
 // Phase D (#1695): EMPTY_*_REGISTRY fallbacks and the `mcp_*_registry()`
@@ -241,7 +256,12 @@ impl StdioMcpTransport {
         // A launcher such as `npx` or `uvx` runs the server as its own child,
         // which holds the stdout pipe. The server gets a process group of its
         // own, so `stop_server_process` kills the launcher and every process
-        // it started, and a call reading stdout sees EOF.
+        // it started, and a call reading stdout sees EOF. That group is not
+        // the terminal's foreground group, so a Ctrl-C or hangup reaches the
+        // host and not the server. A host killed that way runs no destructor;
+        // the server then sees EOF on stdin, which the MCP stdio transport
+        // names as its shutdown signal, and a server that ignores that EOF
+        // outlives the host.
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
         let mut child = command
@@ -380,23 +400,50 @@ impl McpNapiBridgeProvider {
 /// # Errors
 ///
 /// Fails when the actor does not hold the context or cannot be asked, and,
-/// with no supervisor attached, when the bridge holds no copy of the context;
-/// the caller then denies, because it cannot learn the current role state. The
-/// message names whichever of the two held nothing.
+/// with no supervisor attached, when the bridge holds no copy of the context.
+/// The message for an absent context names whichever of the two held nothing.
+/// [`gate_role_state`] keeps those two failures apart for the access gate.
 fn live_role_state(
     bi: &NapiBridgeInstance,
     context_id: &str,
 ) -> Result<scp_core::context::roles::ContextRoleState, String> {
-    held_role_state(bi, context_id)?.ok_or_else(|| {
-        if bi.core.try_supervisor().is_some() {
-            format!("context '{context_id}' is not held by the supervisor")
-        } else {
-            format!(
-                "context '{context_id}' is not held by this bridge, and no supervisor is \
-                 attached"
-            )
-        }
-    })
+    held_role_state(bi, context_id)?.ok_or_else(|| absent_context_message(bi, context_id))
+}
+
+/// Reads `context_id`'s role state as [`live_role_state`] does, for an access
+/// gate.
+///
+/// # Errors
+///
+/// Returns [`AccessRefusal::Denied`](scp_mcp::server::AccessRefusal::Denied)
+/// when the actor (with no supervisor, the bridge) holds no such context: the
+/// agent holds no grant in a context this instance does not hold, so
+/// `resources/list` omits it. Returns
+/// [`AccessRefusal::Unreadable`](scp_mcp::server::AccessRefusal::Unreadable)
+/// when the read itself failed, so a failed read never reaches the client as
+/// a shorter list.
+fn gate_role_state(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+) -> Result<scp_core::context::roles::ContextRoleState, scp_mcp::server::AccessRefusal> {
+    use scp_mcp::server::AccessRefusal;
+    match held_role_state(bi, context_id) {
+        Ok(Some(role_state)) => Ok(role_state),
+        Ok(None) => Err(AccessRefusal::Denied(absent_context_message(
+            bi, context_id,
+        ))),
+        Err(e) => Err(AccessRefusal::Unreadable(e)),
+    }
+}
+
+/// Names the holder that has no `context_id`: the supervisor when one is
+/// attached, otherwise this bridge.
+fn absent_context_message(bi: &NapiBridgeInstance, context_id: &str) -> String {
+    if bi.core.try_supervisor().is_some() {
+        format!("context '{context_id}' is not held by the supervisor")
+    } else {
+        format!("context '{context_id}' is not held by this bridge, and no supervisor is attached")
+    }
 }
 
 /// Reads `context_id`'s current role state from the source [`live_role_state`]
@@ -540,10 +587,12 @@ impl ContextProvider for McpNapiBridgeProvider {
         // `McpServer` lists a tool exactly when this method returns `Ok`, and
         // every `tools/call` ends in `invoke_outlet`. This bridge's
         // `invoke_outlet` is not implemented, so granting here would
-        // put tools in `tools/list` that every `tools/call` then fails. The
-        // denial keeps `tools/list` empty and refuses `tools/call` before it
-        // reaches `invoke_outlet`, so a client sees the capability as absent.
-        Err(scp_mcp::server::AccessRefusal::Denied(
+        // put tools in `tools/list` that every `tools/call` then fails. This
+        // reports the capability as unsupported: `tools/list` omits the tool,
+        // and `tools/call` answers `CAPABILITY_UNSUPPORTED` before it reaches
+        // `invoke_outlet`, so a client sees an absent capability, not a grant
+        // the agent lacks.
+        Err(scp_mcp::server::AccessRefusal::Unsupported(
             OUTLET_INVOCATION_UNAVAILABLE.to_owned(),
         ))
     }
@@ -566,9 +615,10 @@ impl ContextProvider for McpNapiBridgeProvider {
         use scp_mcp::server::AccessRefusal;
         // A dropped bridge instance or an unreadable role state is a failed
         // read, which `resources/list` reports as an error instead of
-        // omitting the context's resources.
+        // omitting the context's resources. A context the actor does not hold
+        // is a denial, which `resources/list` omits.
         let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
-        let role_state = live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;
+        let role_state = gate_role_state(&bi, context_id)?;
         let access = resource.check_access(&role_state, &self.agent_did, context_id);
         access.map_err(AccessRefusal::Denied)
     }
@@ -964,12 +1014,9 @@ pub(crate) async fn mcp_client_disconnect_on(
         }
         .into());
     };
-    // A stdio server, and every process in its process group, is dead when
-    // this returns, even while a call on the handle is in flight; that call
-    // then fails on the closed stdout.
-    if let Some(server) = entry.stdio_server {
-        scp_mcp::stdio::stop_server_process(&server);
-    }
+    // Dropping the entry kills a stdio server and its process group before
+    // this returns, even while a call on the handle is in flight.
+    drop(entry);
     Ok(())
 }
 
@@ -979,17 +1026,17 @@ pub(crate) async fn mcp_client_list_tools_on(
     handle: &NapiMcpClientHandle,
 ) -> napi::Result<Vec<NapiMcpToolInfo>> {
     crate::napi_check_handle!(&bi.core, handle);
-    let registry = Arc::clone(bi.mcp_client_registry());
-    let handle_id = handle.handle_id.clone();
+    // Clone the client out so the shard guard drops before the I/O, and the
+    // call holds neither the registry nor its entry.
+    let client = bi
+        .mcp_client_registry()
+        .get(&handle.handle_id)
+        .map(|entry| Arc::clone(&entry.client))
+        .ok_or_else(|| ScpNapiError::Transport {
+            message: format!("MCP client handle '{}' not found", handle.handle_id),
+            code: codes::TRANS_5020.to_owned(),
+        })?;
     let outlets = run_mcp_client_io(codes::TRANS_5022, move || {
-        // Clone the client out so the shard guard drops before the I/O.
-        let client = registry
-            .get(&handle_id)
-            .map(|entry| Arc::clone(&entry.client))
-            .ok_or_else(|| ScpNapiError::Transport {
-                message: format!("MCP client handle '{handle_id}' not found"),
-                code: codes::TRANS_5020.to_owned(),
-            })?;
         let client_guard = client.lock().map_err(|e| ScpNapiError::Transport {
             message: format!("client lock poisoned: {e}"),
             code: codes::TRANS_5021.to_owned(),
@@ -1024,17 +1071,17 @@ pub(crate) async fn mcp_client_invoke_on(
     invoker_did: String,
 ) -> napi::Result<NapiMcpInvokeResult> {
     crate::napi_check_handle!(&bi.core, handle);
-    let registry = Arc::clone(bi.mcp_client_registry());
-    let handle_id = handle.handle_id.clone();
+    // Clone the client out so the shard guard drops before the I/O, and the
+    // call holds neither the registry nor its entry.
+    let client = bi
+        .mcp_client_registry()
+        .get(&handle.handle_id)
+        .map(|entry| Arc::clone(&entry.client))
+        .ok_or_else(|| ScpNapiError::Transport {
+            message: format!("MCP client handle '{}' not found", handle.handle_id),
+            code: codes::TRANS_5023.to_owned(),
+        })?;
     let result = run_mcp_client_io(codes::TRANS_5025, move || {
-        // Clone the client out so the shard guard drops before the I/O.
-        let client = registry
-            .get(&handle_id)
-            .map(|entry| Arc::clone(&entry.client))
-            .ok_or_else(|| ScpNapiError::Transport {
-                message: format!("MCP client handle '{handle_id}' not found"),
-                code: codes::TRANS_5023.to_owned(),
-            })?;
         let input: serde_json::Value =
             serde_json::from_str(&input_json).map_err(|e| ScpNapiError::Transport {
                 message: format!("invalid input JSON: {e}"),
@@ -1304,6 +1351,27 @@ mod tests {
     /// whole group.
     #[test]
     fn mcp_client_disconnect_does_not_wait_on_an_in_flight_call_napi() {
+        in_flight_call_ends_on(Teardown::Disconnect);
+    }
+
+    /// The instance-shutdown twin of
+    /// `mcp_client_disconnect_does_not_wait_on_an_in_flight_call_napi`: the
+    /// shutdown hook clears the client registry while a `tools/list` is in
+    /// flight, and the cleared entry's drop kills the server process group,
+    /// though the in-flight call still holds its clone of the client.
+    #[test]
+    fn mcp_client_registry_clear_on_shutdown_kills_an_in_flight_server_napi() {
+        in_flight_call_ends_on(Teardown::Shutdown);
+    }
+
+    /// How [`in_flight_call_ends_on`] removes the client entry.
+    #[derive(Clone, Copy)]
+    enum Teardown {
+        Disconnect,
+        Shutdown,
+    }
+
+    fn in_flight_call_ends_on(teardown: Teardown) {
         let bi = NapiBridgeInstance::new_napi();
         let mut allowlist = scp_mcp::allowlist::StdioAllowlist::new_with_defaults();
         allowlist.configure(&["sh"]).expect("allow sh");
@@ -1349,9 +1417,14 @@ mod tests {
                 tokio::join!(mcp_client_list_tools_on(&bi, &handle), async {
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                     let started = std::time::Instant::now();
-                    mcp_client_disconnect_on(&bi, &handle)
-                        .await
-                        .expect("disconnect a known handle");
+                    match teardown {
+                        Teardown::Disconnect => mcp_client_disconnect_on(&bi, &handle)
+                            .await
+                            .expect("disconnect a known handle"),
+                        Teardown::Shutdown => {
+                            scp_ffi_common::bridge_instance::BridgeInstanceCore::bridge_specific_shutdown(&bi);
+                        }
+                    }
                     started.elapsed()
                 })
             })
@@ -1363,11 +1436,11 @@ mod tests {
             scp_mcp::stdio::stop_server_process(&server);
             runtime.shutdown_background();
         }
-        let (listed, disconnect_took) =
-            joined.expect("the in-flight call must end once disconnect kills the server");
+        let (listed, teardown_took) =
+            joined.expect("the in-flight call must end once the teardown kills the server");
         assert!(
-            disconnect_took < std::time::Duration::from_secs(1),
-            "disconnect waited {disconnect_took:?} on the in-flight call"
+            teardown_took < std::time::Duration::from_secs(1),
+            "the teardown waited {teardown_took:?} on the in-flight call"
         );
         assert!(
             server
@@ -1376,7 +1449,7 @@ mod tests {
                 .try_wait()
                 .expect("query the server process")
                 .is_some(),
-            "disconnect must kill the stdio server process"
+            "the teardown must kill the stdio server process"
         );
         assert!(
             listed.is_err(),
@@ -1637,7 +1710,7 @@ mod tests {
             ))
             .expect("tools/call must produce a response");
         let error = called.error.expect("tools/call must be refused");
-        assert_eq!(error.code, scp_mcp::protocol::CAPABILITY_DENIED);
+        assert_eq!(error.code, scp_mcp::protocol::CAPABILITY_UNSUPPORTED);
         assert_eq!(error.message, OUTLET_INVOCATION_UNAVAILABLE);
     }
 
@@ -1647,7 +1720,7 @@ mod tests {
     /// `context_events` returned `[]` and `context_tools` returned
     /// `Vec::new()` — empty stand-ins on a shipped path that would have gone
     /// live the moment resource authorization started admitting anyone.
-    /// (`validate_capability` denies every tool on purpose; see
+    /// (`validate_capability` reports every tool unsupported on purpose; see
     /// `napi_mcp_lists_no_tool_it_cannot_invoke`.)
     #[test]
     fn napi_provider_serves_real_context_state() {
@@ -1777,7 +1850,7 @@ mod tests {
         assert!(
             matches!(
                 &denial,
-                scp_mcp::server::AccessRefusal::Unreadable(msg)
+                scp_mcp::server::AccessRefusal::Denied(msg)
                     if msg.contains("not held by this bridge, and no supervisor is attached")
             ),
             "with no supervisor the denial must name the bridge, got: {denial}"
@@ -1815,9 +1888,9 @@ mod tests {
             assert!(
                 matches!(
                     &denial,
-                    scp_mcp::server::AccessRefusal::Unreadable(msg) if msg.contains("not held by the supervisor")
+                    scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("not held by the supervisor")
                 ),
-                "the {kind:?} denial must come from the actor query, got: {denial}"
+                "a context the actor does not hold must deny {kind:?}, not fail the read, got: {denial}"
             );
         }
         assert!(provider().context_members(SUB_CTX).is_err());
@@ -1851,6 +1924,18 @@ mod tests {
                 .block_on(async { provider().active_context_ids() })
                 .is_err(),
             "a failed participation read must not be reported as an empty served set"
+        );
+        // The resource gate reports the same failed read as unreadable, so
+        // `resources/list` fails instead of omitting the context.
+        let refusal = current_thread
+            .block_on(async { provider().validate_resource_access(SUB_CTX, ResourceKind::Events) })
+            .expect_err("a failed role-state read must not grant access");
+        assert!(
+            matches!(
+                &refusal,
+                scp_mcp::server::AccessRefusal::Unreadable(msg) if msg.contains("current-thread runtime")
+            ),
+            "a failed read must be Unreadable, not a denial, got: {refusal}"
         );
     }
 
