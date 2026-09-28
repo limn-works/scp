@@ -494,8 +494,10 @@ private class SubscriptionSlot(
  *    non-suspending Rust thread, so suspending [send] cannot be used.
  * 2. No double-buffering: `callbackFlow` already uses `Channel.BUFFERED` internally
  *    (64 items). Does NOT chain an additional `.buffer(Channel.BUFFERED)`.
- * 3. Closing the flow always calls the unsubscribe function, and suspends on
- *    [ioDispatcher] rather than blocking the collector's thread while it runs.
+ * 3. Every subscription the flow opens is released: the subscribe call runs to
+ *    completion even when the collector is cancelled during it, and closing the flow
+ *    then calls the unsubscribe function, suspending on [ioDispatcher] rather than
+ *    blocking the collector's thread while it runs.
  * 4. Guards against post-close emissions with [AtomicBoolean] flag.
  *
  * @param contextBindings The context FFI bindings.
@@ -534,8 +536,12 @@ fun ColdMessageFlow(
                 }
             }
 
+        // NonCancellable: a cancellation landing while contextSubscribe runs would make
+        // withContext discard the handle it returns, before the try below opens, leaving a
+        // live Rust subscription that nothing releases. Execution enters the try with no
+        // suspension point between this block and it, so its finally always sees the handle.
         val subscriptionHandle =
-            withContext(ioDispatcher) {
+            withContext(NonCancellable + ioDispatcher) {
                 contextBindings.contextSubscribe(contextHandle, callback)
             }
 

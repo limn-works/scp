@@ -436,7 +436,7 @@ SCP objects hold crypto state (MLS groups, key material, WebSocket connections) 
 
 Each Kotlin type therefore exposes exactly one `suspend` teardown function — `SCP.shutdown(bridge, timeout)`, `Relay.shutdown()`, `Node.shutdown()` — and a caller invokes it from a coroutine. ADR-028 in `.docs/adrs/phase-6.md` carries this amendment and the reasoning behind it; `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` records the observed deadlock and the ANR risk. Every other language in the table above keeps its idiomatic pattern, because none of them must satisfy a synchronous, `Unit`-returning interface method over a suspending call.
 
-These three functions propagate an engine failure to their caller instead of logging it, which is the one exception to §Cleanup error handling below. Each one tears down an engine-side object in a single FFI call, so no local cleanup remains for it to finish after that call fails, and a failed `SCP.shutdown` leaves that instance live: `SCP.kt` records shutdown only after the FFI call returns. Logging that failure and returning would tell a caller that state was released when it was not. A caller that must not throw from a `finally` block wraps the call in `runCatching`.
+These three functions propagate an engine failure to their caller instead of logging it, which is the one exception to §Cleanup error handling below. Each one tears down an engine-side object in a single FFI call, so no local cleanup remains for it to finish after that call fails, and a failed call leaves its object live: `SCP`, `Relay`, and `Node` each set `isShutdown` only after the FFI call returns, so a caller that retries while `isShutdown` is false retries. Logging that failure and returning would tell a caller that state was released when it was not. A caller that must not throw from a `finally` block wraps the call in `runCatching`.
 
 ### Lifecycle invariant
 
@@ -450,7 +450,7 @@ Destruction of key material is immediate and irreversible. This is by design —
 
 ### Cleanup error handling
 
-If any cleanup step fails (e.g., network unreachable when leaving a context), the resource MUST still complete local cleanup (key destruction, handle release). Errors during cleanup are logged but never propagated as exceptions — callers must not be penalized for disposing resources. The invariant: after dispose returns, all local state is released regardless of remote operation outcomes. Kotlin's `shutdown` functions are the one exception, for the reason §"Kotlin: why no `Closeable`" states.
+If any cleanup step fails (e.g., network unreachable when leaving a context), the resource MUST still complete local cleanup (key destruction, handle release). Errors during cleanup are logged but never propagated as exceptions — callers must not be penalized for disposing resources. The invariant: after dispose returns, all local state is released regardless of remote operation outcomes. Kotlin has two exceptions. Its `shutdown` functions propagate an engine failure, for the reason §"Kotlin: why no `Closeable`" states. `ScpViewModel.onCleared()` returns before its `leave` calls finish, because Android calls it on a main thread that must not block on an FFI call (ADR-028, as amended); it still logs every `leave` failure through `onCleanupFailure` and never propagates one.
 
 ## Concurrency Model
 

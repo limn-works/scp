@@ -23,7 +23,7 @@
 ## Coroutines and streams
 
 - A Rust callback (`onMessage`, `onEvent`) runs on a thread with no coroutine, so it cannot suspend: use `trySend` or `tryEmit`, and handle the `trySend` result.
-- Every `callbackFlow` releases its Rust subscription inside `awaitClose`. `HotStreamFactory` subscriptions outlive scope cancellation; stop them explicitly (`stopAll()` in teardown).
+- Every `callbackFlow` subscribes inside `withContext(NonCancellable + ioDispatcher)`, then releases its Rust subscription in the `finally` of `try { awaitClose() }` through `withContext(NonCancellable + ioDispatcher)`, never in `awaitClose`'s lambda, which runs on the collector's thread (an Android main thread under `collectAsState`). A cancellable subscribe drops the handle it returns when the collector is cancelled during the call. `HotStreamFactory` subscriptions outlive scope cancellation; stop them explicitly (`stopAll()` in teardown).
 - `ViewModel.clear()` cancels `viewModelScope` before it calls `onCleared()`, so a launch into `viewModelScope` from `onCleared()` never runs; `ScpViewModel` launches its cleanup into its own scope and returns without blocking, because Android calls `onCleared()` on the main thread. A test that clears a view model goes through `ViewModelStore.clear()`, which runs that same cancel-then-`onCleared()` sequence.
 - Compose does not cancel a `CoroutineScope` created inside `remember { }`. Pair it with `DisposableEffect { onDispose { scope.cancel() } }`, or reuse a managed scope.
 

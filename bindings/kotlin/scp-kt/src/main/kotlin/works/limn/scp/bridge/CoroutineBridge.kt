@@ -1720,9 +1720,13 @@ class ContextBridge internal constructor(
                     }
                 }
 
-            // Subscribe on IO dispatcher since it crosses the FFI boundary.
+            // Subscribe on IO dispatcher since it crosses the FFI boundary. NonCancellable:
+            // a cancellation landing while contextSubscribe runs would make withContext
+            // discard the handle it returns, before the try below opens, leaving a live Rust
+            // subscription that nothing releases. No suspension point sits between this
+            // block and the try, so its finally always sees the handle.
             val subscriptionHandle =
-                withContext(bridge.ioDispatcher) {
+                withContext(NonCancellable + bridge.ioDispatcher) {
                     bindings.contextSubscribe(contextHandle, callback)
                 }
 

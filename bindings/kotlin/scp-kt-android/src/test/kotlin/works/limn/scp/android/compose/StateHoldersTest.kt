@@ -3,33 +3,40 @@
 
 package works.limn.scp.android.compose
 
+import android.util.Log
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.State
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.ui.test.junit4.createComposeRule
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowLog
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.concurrent.thread
 
 @RunWith(RobolectricTestRunner::class)
 @Config(manifest = Config.NONE, sdk = [33])
@@ -236,12 +243,8 @@ class StateHoldersTest {
             "onStop did not start within $AWAIT_TIMEOUT_SECONDS seconds of disposal",
             onStopEntered.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
         )
-        assertEquals(
-            "disposal returned before onStop returned",
-            1L,
-            onStopReturned.count,
-        )
-
+        // Reaching this line is the check: onStop is parked on releaseOnStop, which opens only
+        // below, so a disposal that waited for onStop would have hung waitForIdle above.
         releaseOnStop.countDown()
         assertTrue(
             "onStop did not return after its latch opened",
@@ -674,31 +677,69 @@ class ScpHotStreamRemountTest {
      */
     @Test(timeout = DISPOSAL_TIMEOUT_MS)
     fun `a coordinator stops a key only when its last live mount leaves`() {
-        val coordinator = ScpHotStreamCoordinator(newCoordinatorScope())
-        val stops = AtomicInteger(0)
-        val first = coordinator.mount("k")
-        val second = coordinator.mount("k")
+        // The coordinator's one thread is held busy, so a launched stop has not reached its
+        // dispatcher, let alone the key's mutex, until dispatcherFree opens. Only
+        // startMounted's join of that stop then orders a later start after it: a start that
+        // skipped the join would take the free mutex and run first.
+        val executor = Executors.newSingleThreadExecutor()
+        val dispatcherFree = CountDownLatch(1)
+        executor.execute { dispatcherFree.await() }
+        try {
+            val coordinator =
+                ScpHotStreamCoordinator(CoroutineScope(SupervisorJob() + executor.asCoroutineDispatcher()))
+            val stops = AtomicInteger(0)
+            val first = coordinator.mount("k")
+            val second = coordinator.mount("k")
 
-        assertEquals(null, coordinator.unmount(first) { stops.incrementAndGet() })
-        assertEquals("unmounting one mount twice", null, coordinator.unmount(first) { stops.incrementAndGet() })
-        // The stop holds until the third mount is taken. A stop that completed first would
-        // release the key's state, so that mount would find no stop to capture, correctly.
-        val stopMayFinish = CompletableDeferred<Unit>()
-        val stop =
-            coordinator.unmount(second) {
-                stopMayFinish.await()
-                stops.incrementAndGet()
-            }
-        assertTrue("the last mount's unmount launched no stop", stop != null)
+            assertEquals(null, coordinator.unmount(first) { stops.incrementAndGet() })
+            assertEquals("unmounting one mount twice", null, coordinator.unmount(first) { stops.incrementAndGet() })
+            val stop = coordinator.unmount(second) { stops.incrementAndGet() }
+            assertTrue("the last mount's unmount launched no stop", stop != null)
 
-        val third = coordinator.mount("k")
-        assertEquals("a later mount did not capture the pending stop", stop, third.pendingStop)
-        assertEquals("the stop ran before its gate opened", 0, stops.get())
-        stopMayFinish.complete(Unit)
-        runBlocking {
-            coordinator.startMounted(third) { assertEquals(1, stops.get()) }
+            val third = coordinator.mount("k")
+            assertEquals("a later mount did not capture the pending stop", stop, third.pendingStop)
+
+            val stopsSeenByStart = AtomicInteger(-1)
+            val starting =
+                thread {
+                    runBlocking { coordinator.startMounted(third) { stopsSeenByStart.set(stops.get()) } }
+                }
+            // A start that skipped the join finishes inside this window, seeing no stop.
+            starting.join(START_WINDOW_MS)
+            dispatcherFree.countDown()
+            starting.join()
+
+            assertEquals("a later mount's start ran before the pending stop", 1, stopsSeenByStart.get())
+        } finally {
+            dispatcherFree.countDown()
+            executor.shutdown()
         }
-        assertEquals(1, stops.get())
+    }
+
+    /**
+     * A throwing `onStop` is logged, and neither escapes its coroutine nor cancels the
+     * coordinator's scope, so the next stop under that scope still runs. A plain [Job] scope
+     * shows the second half: an escaping throw would cancel it.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `a throwing onStop is logged and later stops still run`() {
+        ShadowLog.clear()
+        val scope = CoroutineScope(Job() + Dispatchers.IO)
+        val coordinator = ScpHotStreamCoordinator(scope)
+        val failure = IllegalStateException("engine already dropped the context")
+
+        val failed = coordinator.unmount(coordinator.mount("k")) { throw failure }
+        runBlocking { assertNotNull(failed).join() }
+
+        val stops = AtomicInteger(0)
+        val next = coordinator.unmount(coordinator.mount("k")) { stops.incrementAndGet() }
+        runBlocking { assertNotNull(next).join() }
+
+        assertTrue("a throwing onStop cancelled the coordinator's scope", scope.isActive)
+        assertEquals("a stop after a throwing onStop did not run", 1, stops.get())
+        val warning = ShadowLog.getLogsForTag("ScpHotStreamCoordinator").single()
+        assertEquals(Log.WARN, warning.type)
+        assertEquals(failure, warning.throwable)
     }
 }
 
@@ -764,6 +805,9 @@ private fun awaitCondition(
  * cancels it.
  */
 private fun newCoordinatorScope(): CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+/** Real-time window in which a start that skips its pending stop's join finishes. */
+private const val START_WINDOW_MS = 500L
 
 /**
  * Convenience extension mirroring collectAsState for MutableStateFlow

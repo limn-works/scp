@@ -552,6 +552,31 @@ class CoroutineBridgeTest {
             }
 
         @Test
+        fun `contextSubscribe releases a subscription whose collector was cancelled during subscribe`() =
+            runTest(ioDispatcher) {
+                stubBindings.contextSubscribeResult = 100L
+                // An FFI dispatcher other than the collector's, so withContext hands
+                // contextSubscribe's result back through a dispatch, where a cancelled caller
+                // would drop it.
+                val flow =
+                    CoroutineBridge(
+                        nativeBindings = stubBindings,
+                        ioDispatcher = StandardTestDispatcher(testScheduler),
+                        cpuDispatcher = cpuDispatcher,
+                    ).context.subscribe(42L)
+                lateinit var collecting: Job
+                // This stub cancels the collector while contextSubscribe is on a stack, after
+                // a Rust engine would have opened the subscription.
+                stubBindings.onSubscribe = { collecting.cancel() }
+
+                collecting = launch { flow.collect {} }
+                advanceUntilIdle()
+
+                assertTrue(stubBindings.contextUnsubscribeCalled)
+                assertEquals(100L, stubBindings.lastUnsubscribeHandle)
+            }
+
+        @Test
         fun `contextSubscribe releases its subscription without parking the collector thread`() {
             stubBindings.contextSubscribeResult = 100L
 

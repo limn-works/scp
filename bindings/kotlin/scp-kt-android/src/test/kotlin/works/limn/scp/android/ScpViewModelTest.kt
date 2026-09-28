@@ -248,7 +248,7 @@ class ScpViewModelTest {
     // A cancelled cleanup scope drops every later launch without running it, so this
     // leave would never reach TestNativeBindings.
     @Test
-    fun `a context tracked after onCleared is still left by a later onCleared`() =
+    fun `a context tracked after onCleared is left without a second onCleared`() =
         runTest(testDispatcher) {
             val viewModel = TestScpViewModel()
             viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge))
@@ -258,8 +258,9 @@ class ScpViewModelTest {
             advanceUntilIdle()
             assertEquals(listOf(1L), stubBindings.leaveCalledHandles)
 
+            // Android clears a view model once, so nothing but trackContext itself can leave
+            // a context registered after that clear.
             viewModel.trackContext(TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge))
-            viewModel.callOnCleared()
             advanceUntilIdle()
 
             assertEquals(listOf(1L, 2L), stubBindings.leaveCalledHandles)

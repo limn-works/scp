@@ -73,9 +73,11 @@ after dispatching, and another called `cleanupJob.complete()`. Neither frees any
 `SupervisorJob` whose children have all completed holds no thread, no handle, and no memory, and
 `Dispatchers.Unconfined` owns no thread to shut down. Both do turn every later
 `cleanupScope.launch` into a silent no-op, because a child launched under a cancelled or completed
-job is cancelled before it runs, so a context that `trackContext` registers after a first
-`onCleared` call never gets its `leave`. `ScpViewModelTest.a context tracked after onCleared is
-still left by a later onCleared` fails if either call returns.
+job is cancelled before it runs, so a context that `trackContext` registers after `onCleared`
+never gets its `leave`. Android clears a view model once, so `trackContext` itself launches that
+`leave` once `onCleared` has run, the way `ViewModel.addCloseable` closes a resource added after
+clear. `ScpViewModelTest.a context tracked after onCleared is left without a second onCleared`
+fails if either call returns.
 
 That same reasoning applies to any scope a class creates to outlive one dispatch: cancel it when it
 owns something worth releasing, not as a reflex once whatever work it carried has finished.

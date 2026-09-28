@@ -107,11 +107,20 @@ class Context internal constructor(private val handle: ContextHandle) {
             Json.decodeFromString(result)
         }
 
+    // Subscribe under NonCancellable, so a collector cancelled mid-call never drops the
+    // subscription, and release it by suspending in a finally: awaitClose's lambda runs on
+    // the collector's thread, an Android main thread under collectAsState.
     fun receiveFlow(): Flow<Message> = callbackFlow {
-        handle.subscribe { envelope ->
-            trySend(envelope.toMessage())
+        val subscription = withContext(NonCancellable + Dispatchers.IO) {
+            handle.subscribe { envelope ->
+                trySend(envelope.toMessage())
+            }
         }
-        awaitClose { handle.unsubscribe() }
+        try {
+            awaitClose()
+        } finally {
+            withContext(NonCancellable + Dispatchers.IO) { subscription.unsubscribe() }
+        }
     }
 }
 ```
@@ -236,13 +245,11 @@ class Relay internal constructor(
     var isShutdown: Boolean = false
         private set
 
-    // The only stop path. It suspends on the bridge's injected ioDispatcher.
+    // The only stop path. It suspends on the bridge's injected ioDispatcher. A failed
+    // teardown propagates and leaves isShutdown false, so the relay still reads as live.
     suspend fun shutdown() {
-        try {
-            bridge.shutdownRelay(this)
-        } finally {
-            isShutdown = true
-        }
+        bridge.shutdownRelay(this)
+        isShutdown = true
     }
 }
 

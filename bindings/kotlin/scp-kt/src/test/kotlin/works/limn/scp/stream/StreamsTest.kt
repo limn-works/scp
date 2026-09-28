@@ -475,6 +475,54 @@ class StreamsTest {
 
                 assertEquals(2, stubBindings.eventUnsubscribeCount)
             }
+
+        @Test
+        fun `a message completion callback removes only its own subscription`() =
+            runTest {
+                val factory = HotStreamFactory(stubBindings, StandardTestDispatcher(testScheduler))
+                factory.incomingMessages(EVENT_CONTEXT_HANDLE)
+                val staleCallback = assertNotNull(stubBindings.lastMessageCallback)
+
+                factory.stopMessageStream(EVENT_CONTEXT_HANDLE)
+                factory.incomingMessages(EVENT_CONTEXT_HANDLE)
+                staleCallback.onComplete()
+
+                factory.stopAll()
+
+                assertEquals(2, stubBindings.messageUnsubscribeCount)
+            }
+
+        @Test
+        fun `an event completion arriving during subscribe leaves no registry entry`() =
+            runTest {
+                val factory = HotStreamFactory(stubBindings, StandardTestDispatcher(testScheduler))
+                // A Rust engine ends this subscription before contextSubscribeEvents returns,
+                // so its completion reaches the slot before the slot's registry write.
+                stubBindings.onSubscribeEvents = { assertNotNull(stubBindings.lastEventCallback).onComplete() }
+                factory.contextEvents(EVENT_CONTEXT_HANDLE)
+                stubBindings.onSubscribeEvents = null
+
+                // A registry that still named the ended subscription would hand it back here.
+                factory.contextEvents(EVENT_CONTEXT_HANDLE)
+
+                assertEquals(2, stubBindings.eventSubscribeCount)
+            }
+
+        @Test
+        fun `a message completion arriving during subscribe leaves no registry entry`() =
+            runTest {
+                val factory = HotStreamFactory(stubBindings, StandardTestDispatcher(testScheduler))
+                // A Rust engine ends this subscription before contextSubscribe returns, so its
+                // completion reaches the slot before the slot's registry write.
+                stubBindings.onSubscribe = { assertNotNull(stubBindings.lastMessageCallback).onComplete() }
+                factory.incomingMessages(EVENT_CONTEXT_HANDLE)
+                stubBindings.onSubscribe = null
+
+                // A registry that still named the ended subscription would hand it back here.
+                factory.incomingMessages(EVENT_CONTEXT_HANDLE)
+
+                assertEquals(2, stubBindings.messageSubscribeCount)
+            }
     }
 
     @Nested
@@ -575,6 +623,26 @@ class StreamsTest {
                 job.cancelAndJoin()
 
                 assertTrue(stubBindings.contextUnsubscribeCalled)
+                assertEquals(100L, stubBindings.lastUnsubscribeHandle)
+            }
+
+        @Test
+        fun `ColdMessageFlow releases a subscription whose collector was cancelled during subscribe`() =
+            runTest {
+                stubBindings.contextSubscribeResult = 100L
+                // A dispatcher other than the collector's, so withContext hands contextSubscribe's
+                // result back through a dispatch, where a cancelled caller would drop it.
+                val flow = ColdMessageFlow(stubBindings, 42L, StandardTestDispatcher(testScheduler))
+                lateinit var collecting: Job
+                // This stub cancels the collector while contextSubscribe is on a stack, after
+                // a Rust engine would have opened the subscription.
+                stubBindings.onSubscribe = { collecting.cancel() }
+
+                collecting = launch { flow.collect {} }
+                advanceUntilIdle()
+
+                assertEquals(1, stubBindings.messageSubscribeCount)
+                assertEquals(1, stubBindings.messageUnsubscribeCount)
                 assertEquals(100L, stubBindings.lastUnsubscribeHandle)
             }
 

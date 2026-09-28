@@ -78,6 +78,9 @@ abstract class ScpViewModel : ViewModel() {
     private val contextsLock = Any()
     private val activeContexts = mutableListOf<TrackedContext>()
 
+    // Written and read only under [contextsLock]; true once [onCleared] has run.
+    private var cleared = false
+
     // `Dispatchers.Unconfined` starts the cleanup coroutine on the thread that calls
     // [onCleared] and keeps it there only until the first `leave` suspends into the
     // bridge's I/O dispatcher, so [onCleared] returns without waiting on an FFI call.
@@ -90,11 +93,22 @@ abstract class ScpViewModel : ViewModel() {
      * when the ViewModel is destroyed. Returns the same [TrackedContext] for
      * chaining convenience.
      *
+     * A context registered after [onCleared] has run is left at once, the way
+     * `ViewModel.addCloseable` closes a resource added after clear: Android never calls
+     * [onCleared] a second time, so tracking it would drop its `leave` silently. That
+     * `leave` runs on the same cleanup coroutine path, and a failure reaches
+     * [onCleanupFailure].
+     *
      * @param context The [TrackedContext] wrapping the context handle and bridge.
      * @return The same [context] passed in, for chaining.
      */
     fun trackContext(context: TrackedContext): TrackedContext {
-        synchronized(contextsLock) { activeContexts.add(context) }
+        val alreadyCleared =
+            synchronized(contextsLock) {
+                if (!cleared) activeContexts.add(context)
+                cleared
+            }
+        if (alreadyCleared) launchLeave(listOf(context))
         return context
     }
 
@@ -115,8 +129,9 @@ abstract class ScpViewModel : ViewModel() {
      *
      * What this method guarantees when it returns:
      * - [activeContexts] is empty, and a snapshot taken under [contextsLock] holds every
-     *   context that [trackContext] registered and [untrackContext] did not remove. A second
-     *   [onCleared] call therefore finds nothing to leave.
+     *   context that [trackContext] registered and [untrackContext] did not remove. The same
+     *   lock marks this view model cleared, so every later [trackContext] leaves its context
+     *   at once instead of tracking it.
      * - A coroutine is submitted to [cleanupScope]. That coroutine calls
      *   [CoroutineBridge.ContextBridge.leave] exactly once per snapshotted context, in
      *   snapshot order.
@@ -140,18 +155,24 @@ abstract class ScpViewModel : ViewModel() {
      * [onCleared] does not cancel [cleanupScope] afterwards. A [SupervisorJob] whose children
      * have all completed holds no thread, no handle, and no memory a cancellation would
      * release, and [Dispatchers.Unconfined] owns no thread, so cancelling that job frees
-     * nothing. Cancelling it would instead make every later
-     * [cleanupScope] launch a silent no-op, which drops `leave` for any context that
-     * [trackContext] registers after a first [onCleared] call.
+     * nothing. Cancelling it would instead make every later [cleanupScope] launch a silent
+     * no-op, which drops the `leave` that [trackContext] launches for a context registered
+     * after [onCleared].
      */
     override fun onCleared() {
         super.onCleared()
         val contexts =
             synchronized(contextsLock) {
+                cleared = true
                 val snapshot = activeContexts.toList()
                 activeContexts.clear()
                 snapshot
             }
+        launchLeave(contexts)
+    }
+
+    /** Calls `leave` on each of [contexts] in order, on a coroutine [cleanupScope] owns. */
+    private fun launchLeave(contexts: List<TrackedContext>) {
         cleanupScope.launch {
             for (ctx in contexts) {
                 val failure =

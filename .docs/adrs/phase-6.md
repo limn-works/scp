@@ -572,6 +572,7 @@ Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/
 **Jetpack Compose integration:**
 - No Compose-specific artifacts or dependencies in the SDK. Compose integration is achieved through standard Kotlin patterns the SDK already provides: `Flow<Message>` collected via `collectAsState()`, and resources held in `remember { }` blocks whose `DisposableEffect` `onDispose` launches their `suspend` teardown on a scope that disposal never cancels, then returns (amended; see the `AutoCloseable` bullet under Rationale).
 - Recommended pattern: `val messages by context.receiveFlow().collectAsState(initial = emptyList())`.
+- Hot streams shared across composables (amended): `works.limn:scp-kt-android`'s Compose state holders (SCP-118) include `rememberScpHotStream(key, coordinator, start, onStop)`, which starts a hot stream when the first composable under `key` mounts and launches `onStop` when the last one leaves. Its `coordinator` parameter is a required `ScpHotStreamCoordinator`, constructed once outside composition (a ViewModel or an application container) and shared by every call in one key space, with no default. The coordinator counts live mounts per key, so a screen that leaves while another screen under that key stays composed stops nothing, and a later mount joins the last stop it launched before its own start runs. A per-composition coordinator or scope would let an outgoing screen's stop release a stream an incoming screen under that key already uses. `onStop` runs on the coordinator's caller-owned scope, never blocks `onDispose`, and a throw from it is logged, never propagated (`.docs/standards/sdk-common.md` §Cleanup error handling). `.docs/lessons/kotlin/hot-stream-subscription-ownership.md` records the defects this shape prevents.
 - Context lifecycle in Compose: `DisposableEffect(contextId) { onDispose { teardownScope.launch { context.close() } } }` starts the context's teardown when the composable leaves the composition, where `teardownScope` outlives the composable and disposal never cancels it, so `onDispose` never blocks the composition thread (amended; see the `AutoCloseable` bullet under Rationale).
 
 **Maven Central publishing:**
@@ -597,7 +598,7 @@ Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/
 
   `Context`, the type the superseded rule named, no longer exists on the Kotlin surface — ADR-048 replaced the free-function façade and its `Context` type with per-instance methods on `SCP`. `SCP.shutdown(bridge, timeout)` is `suspend` and takes a `CoroutineBridge`, so a synchronous `close()` could neither obtain that bridge nor honour that deadline. `Relay` and `Node` follow the same rule for the same reason.
 
-  This changes what a caller writes, and one thing teardown does. The lifecycle invariant in `.docs/standards/sdk-common.md` §Lifecycle invariant (leave contexts, destroy key material, close transports, flush events) is unchanged, and a caller reaches it from a coroutine rather than from a `use { }` block. The change to teardown: these three `shutdown` functions propagate an engine failure to their caller rather than logging it, an exception to `.docs/standards/sdk-common.md` §Cleanup error handling. Each tears down an engine-side object in a single FFI call, so no local cleanup remains to finish after that call fails, and logging the failure and returning would tell a caller that state was released when it was not. `.docs/standards/sdk-common.md` §Resource Lifecycle carries the same rule in its per-language table, and §"Kotlin: why no `Closeable`" carries the exception.
+  This changes what a caller writes, and one thing teardown does. The lifecycle invariant in `.docs/standards/sdk-common.md` §Lifecycle invariant (leave contexts, destroy key material, close transports, flush events) is unchanged, and a caller reaches it from a coroutine rather than from a `use { }` block. The change to teardown: these three `shutdown` functions propagate an engine failure to their caller rather than logging it, an exception to `.docs/standards/sdk-common.md` §Cleanup error handling. Each tears down an engine-side object in a single FFI call, so no local cleanup remains to finish after that call fails, and logging the failure and returning would tell a caller that state was released when it was not. For the same reason each sets its `isShutdown` flag only after its FFI call returns, so a failed teardown leaves the object reading as live. `.docs/standards/sdk-common.md` §Resource Lifecycle carries the same rule in its per-language table, and §"Kotlin: why no `Closeable`" carries the exception.
 - **No Compose dependencies in SDK:** Compose APIs (`@Composable`, `State<T>`, `collectAsState()`) require the Compose compiler plugin and runtime. Shipping a Compose dependency in the SDK would force every consumer to adopt Compose or deal with unused transitive dependencies. Compose integration is trivially achieved with standard `Flow.collectAsState()` and `DisposableEffect` — patterns that are Compose-idiomatic without SDK involvement.
 - **`Scp` class (not object/singleton) as top-level entry point:** `Scp` holds per-identity state (the identity handle, the platform adapter). Multiple `Scp` instances in a process are valid (e.g., in tests, or in apps that support account switching). A Kotlin `object` singleton would prevent this. The factory pattern `Scp.create()` is a `companion object` method — idiomatic for async factory construction in Kotlin.
 - **Kotlin 2.x, JVM 11+:** Kotlin 2.x is the current stable release with full coroutines support, improved type inference, and the K2 compiler. JVM 11 is required by Android Gradle Plugin 8+ and covers all modern JVM targets. JVM 11 features (e.g., `List.of()`, `String.isBlank()`) are available; no Java 8 compatibility mode needed.
@@ -742,8 +743,8 @@ class Scp private constructor(private val identityHandle: IdentityHandle) {
      * One suspending teardown, which suspends on [bridge]'s injected ioDispatcher; no
      * AutoCloseable (see the amended Rationale bullet).
      */
-    suspend fun shutdown(bridge: CoroutineBridge) {
-        bridge.ffiCallSuspend { identityHandle.destroy() }
+    suspend fun shutdown(bridge: CoroutineBridge, timeout: Duration = 5.seconds) {
+        bridge.ffiCallSuspend { identityHandle.shutdown(timeoutMillis = timeout.inWholeMilliseconds.toULong()) }
     }
 }
 ```
@@ -820,20 +821,30 @@ class Context internal constructor(internal val handle: ContextHandle) {
     /**
      * Cold Flow of incoming messages. Collection begins the UniFFI subscription;
      * cancellation ends it. Use callbackFlow for cold semantics with buffer.
+     * The subscribe call runs under NonCancellable, so a collector cancelled during
+     * it cannot drop a live subscription, and the release suspends in a finally
+     * rather than running in awaitClose's lambda on the collector's thread
+     * (ADR-028's AutoCloseable amendment).
      */
     fun receiveFlow(): Flow<Message> = callbackFlow {
-        handle.subscribe(object : MessageListener {
-            override fun onMessage(message: ScpMessage) {
-                trySend(Message.fromRecord(message))
-            }
-            override fun onError(error: ScpError) {
-                close(ScpException.fromFfi(error))
-            }
-            override fun onComplete() {
-                close()
-            }
-        })
-        awaitClose { handle.unsubscribe() }
+        withContext(NonCancellable + Dispatchers.IO) {
+            handle.subscribe(object : MessageListener {
+                override fun onMessage(message: ScpMessage) {
+                    trySend(Message.fromRecord(message))
+                }
+                override fun onError(error: ScpError) {
+                    close(ScpException.fromFfi(error))
+                }
+                override fun onComplete() {
+                    close()
+                }
+            })
+        }
+        try {
+            awaitClose()
+        } finally {
+            withContext(NonCancellable + Dispatchers.IO) { handle.unsubscribe() }
+        }
     }.buffer(Channel.BUFFERED)
 
     /** Invoke a registered outlet in this context. Returns the outlet output as JSON. */
@@ -1018,27 +1029,40 @@ fun Context.asLifecycleFlow(
  */
 abstract class ScpViewModel : ViewModel() {
 
-    private val activeContexts = mutableListOf<works.limn.scp.Context>()
+    private val activeContexts = mutableListOf<TrackedContext>()
+    private var cleared = false
 
     // viewModelScope is already cancelled when onCleared() runs, so a launch there never
     // runs. Cleanup gets its own scope, which nothing cancels.
     private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
 
-    protected fun trackContext(context: works.limn.scp.Context): works.limn.scp.Context {
-        synchronized(activeContexts) { activeContexts.add(context) }
+    // A context tracked after onCleared() is left at once: Android clears a ViewModel once,
+    // so nothing else would ever leave it.
+    fun trackContext(context: TrackedContext): TrackedContext {
+        val alreadyCleared = synchronized(activeContexts) {
+            if (!cleared) activeContexts.add(context)
+            cleared
+        }
+        if (alreadyCleared) launchLeave(listOf(context))
         return context
     }
 
     override fun onCleared() {
         super.onCleared()
         val contexts = synchronized(activeContexts) {
+            cleared = true
             activeContexts.toList().also { activeContexts.clear() }
         }
         // Dispatch and return: blocking the main thread on a teardown deadlocks or
         // risks an ANR (see the amended Rationale bullet).
+        launchLeave(contexts)
+    }
+
+    private fun launchLeave(contexts: List<TrackedContext>) {
         cleanupScope.launch {
             for (ctx in contexts) {
-                val failure = runCatching { ctx.leave() }.exceptionOrNull() ?: continue
+                val failure = runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }
+                    .exceptionOrNull() ?: continue
                 // A throwing override must not stop the remaining leaves.
                 runCatching { onCleanupFailure(ctx, failure) }
                     .onFailure { Log.w("ScpViewModel", "onCleanupFailure threw", it) }
@@ -1051,7 +1075,7 @@ abstract class ScpViewModel : ViewModel() {
      * logs at warning level (sdk-common.md §Cleanup error handling); an app overrides it to
      * record, retry, or report a departure that did not land.
      */
-    protected open fun onCleanupFailure(context: works.limn.scp.Context, cause: Throwable) {
+    protected open fun onCleanupFailure(context: TrackedContext, cause: Throwable) {
         Log.w("ScpViewModel", "leave failed during ViewModel cleanup", cause)
     }
 }

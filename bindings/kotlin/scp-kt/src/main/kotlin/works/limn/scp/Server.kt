@@ -255,7 +255,7 @@ class Relay internal constructor(
     private val bridge: ServerBridge,
     internal val handleJson: String,
 ) {
-    /** `true` if [shutdown] has already been called. */
+    /** `true` once a [shutdown] call has returned without throwing. */
     @Volatile
     var isShutdown: Boolean = false
         private set
@@ -266,11 +266,10 @@ class Relay internal constructor(
      * In-flight connection handlers drain naturally. Idempotent.
      */
     suspend fun shutdown() {
-        try {
-            bridge.shutdownRelay(this)
-        } finally {
-            isShutdown = true
-        }
+        bridge.shutdownRelay(this)
+        // Record shutdown only after the FFI call returns: a caller who sees an exception
+        // here should read this relay as still live and still worth a second [shutdown].
+        isShutdown = true
     }
 
     override fun toString(): String = "Relay(url=$relayUrl, relayPort=$relayPort)"
@@ -330,7 +329,7 @@ class Node internal constructor(
     private val bridge: ServerBridge,
     internal val handleJson: String,
 ) {
-    /** `true` if [shutdown] has already been called. */
+    /** `true` once a [shutdown] call has returned without throwing. */
     @Volatile
     var isShutdown: Boolean = false
         private set
@@ -341,11 +340,10 @@ class Node internal constructor(
      * In-flight connection handlers drain naturally. Idempotent.
      */
     suspend fun shutdown() {
-        try {
-            bridge.shutdownNode(this)
-        } finally {
-            isShutdown = true
-        }
+        bridge.shutdownNode(this)
+        // Record shutdown only after the FFI call returns: a caller who sees an exception
+        // here should read this node as still live and still worth a second [shutdown].
+        isShutdown = true
     }
 
     // HTTP server lifecycle

@@ -266,6 +266,30 @@ class ServerTest {
             assertTrue(relay.isShutdown)
         }
     }
+
+    // A failed engine teardown propagates, and the type keeps reporting itself live, so a
+    // caller that retries on `!isShutdown` retries (sdk-common.md §"Kotlin: why no `Closeable`").
+    @Test
+    fun `a failed node shutdown propagates and leaves the node live`() {
+        runTest(testDispatcher) {
+            val node = createNode()
+            stubBindings.shutdownFailure = IllegalStateException("engine refused stop")
+            assertFailsWith<Exception> { node.shutdown() }
+            assertEquals(listOf(node.handleJson), stubBindings.nodeShutdownHandles)
+            assertFalse(node.isShutdown)
+        }
+    }
+
+    @Test
+    fun `a failed relay shutdown propagates and leaves the relay live`() {
+        runTest(testDispatcher) {
+            val relay = Relay.startInMemory(serverBridge)
+            stubBindings.shutdownFailure = IllegalStateException("engine refused stop")
+            assertFailsWith<Exception> { relay.shutdown() }
+            assertEquals(listOf(relay.handleJson), stubBindings.relayShutdownHandles)
+            assertFalse(relay.isShutdown)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -310,12 +334,17 @@ internal class StubServerBindings : ServerBindings {
     val relayShutdownHandles = mutableListOf<String>()
     val nodeShutdownHandles = mutableListOf<String>()
 
+    /** When set, [relayShutdown] and [nodeShutdown] record the call and then throw this. */
+    var shutdownFailure: RuntimeException? = null
+
     override fun relayShutdown(handleJson: String) {
         relayShutdownHandles += handleJson
+        shutdownFailure?.let { throw it }
     }
 
     override fun nodeShutdown(handleJson: String) {
         nodeShutdownHandles += handleJson
+        shutdownFailure?.let { throw it }
     }
 
     // enableSiteProjection

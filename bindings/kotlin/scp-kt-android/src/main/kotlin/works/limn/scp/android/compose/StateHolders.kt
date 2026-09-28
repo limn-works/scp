@@ -3,6 +3,7 @@
 
 package works.limn.scp.android.compose
 
+import android.util.Log
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.MutableState
@@ -17,6 +18,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.job
@@ -268,12 +270,29 @@ private fun <R> rememberCollectedState(
  * ordering rests on when a caller launched `onStop`, not on when `onStop` reached a dispatcher.
  * Per-key state leaves this map as soon as no live mount and no pending stop holds it.
  *
+ * An `onStop` that throws is logged at warning level and goes no further, as
+ * `.docs/standards/sdk-common.md` §Cleanup error handling requires of a cleanup error. Letting
+ * it escape would reach the thread's uncaught-exception handler, which on Android kills the
+ * process after the screen that mounted the stream is gone, and on a [scope] without a
+ * [SupervisorJob] would also cancel that scope, so every later `onStop` would never run.
+ *
  * @param scope Scope that runs every `onStop` lambda this coordinator launches. A caller owns
  *   that scope and decides when to cancel it. Composable disposal never cancels it, so an
  *   `onStop` outlives whichever mount launched it.
  */
 class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
     private val keyStates = ConcurrentHashMap<Any, KeyState>()
+
+    /**
+     * Run [onStop], logging whatever it throws. A throw that comes from cancelling this
+     * coordinator's own [scope] still propagates, because [ensureActive] rethrows it.
+     */
+    private suspend fun runStop(onStop: suspend () -> Unit) {
+        runCatching { onStop() }.onFailure { failure ->
+            currentCoroutineContext().ensureActive()
+            Log.w(COORDINATOR_TAG, "onStop threw while releasing a hot stream", failure)
+        }
+    }
 
     /**
      * One live mount under [key], as [mount] recorded it.
@@ -340,7 +359,7 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
                 if (state.liveMounts > 0) {
                     null
                 } else {
-                    scope.launch(start = CoroutineStart.LAZY) { state.mutex.withLock { onStop() } }
+                    scope.launch(start = CoroutineStart.LAZY) { state.mutex.withLock { runStop(onStop) } }
                         .also { state.lastStop = it }
                 }
             }
@@ -564,3 +583,6 @@ class ScpContextState(
 }
 
 private const val MAX_EVENT_LIST_SIZE = 100
+
+/** Log tag for failures [ScpHotStreamCoordinator] catches from `onStop`. */
+private const val COORDINATOR_TAG = "ScpHotStreamCoordinator"
