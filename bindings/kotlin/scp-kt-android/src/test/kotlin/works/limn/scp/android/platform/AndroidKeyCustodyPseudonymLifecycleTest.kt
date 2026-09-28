@@ -176,4 +176,59 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
             pool.shutdownNow()
         }
     }
+
+    /**
+     * Destroying a pseudonym while other threads sign with it never yields a bad
+     * signature: each sign either verifies under the pseudonym's point or fails with
+     * `SCP-CRYPTO-4001`. A sign that used the stored scalar array instead of a copy
+     * would see it wiped mid-signature.
+     */
+    @Test
+    fun `destroying a pseudonym while others sign never yields a bad signature`() {
+        val custody = AndroidKeyCustody(InMemorySharedPreferences())
+        val identity = custody.generateKeypair(KeyType.ED25519)
+        val contextId = "destroy-race-context".toByteArray()
+        val pseudonym = custody.derivePseudonym(identity, contextId)
+        val publicKey = custody.publicKey(handleOf(pseudonym))
+        val rounds = 300
+        val pool = Executors.newFixedThreadPool(3)
+        val start = CountDownLatch(1)
+        try {
+            val cycler = pool.submit {
+                start.await()
+                repeat(rounds) {
+                    custody.destroyKey(handleOf(pseudonym))
+                    assertEquals(pseudonym.id, custody.derivePseudonym(identity, contextId).id)
+                }
+            }
+            val signers = List(2) { thread ->
+                pool.submit<Int> {
+                    start.await()
+                    var verified = 0
+                    repeat(rounds) { round ->
+                        val digest = MessageDigest.getInstance("SHA-256")
+                            .digest("d$thread r$round".toByteArray())
+                        val signature = try {
+                            custody.sign(handleOf(pseudonym), digest)
+                        } catch (e: ScpException) {
+                            assertEquals("SCP-CRYPTO-4001", e.code, "only not-found may fail a sign")
+                            null
+                        }
+                        if (signature != null) {
+                            assertTrue(verifies(publicKey, digest, signature), "signature must verify")
+                            verified++
+                        }
+                    }
+                    verified
+                }
+            }
+            start.countDown()
+            cycler.get(60, TimeUnit.SECONDS)
+            val verified = signers.sumOf { it.get(60, TimeUnit.SECONDS) }
+            assertTrue(verified > 0, "some signatures must land between destroy and re-derive")
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
 }
