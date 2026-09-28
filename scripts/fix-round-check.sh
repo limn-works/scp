@@ -163,9 +163,9 @@
 #      --example <name> -- -D warnings` without `--no-deps`, so it lints each example
 #      target and every workspace library that example compiles, under the example owner's
 #      dev-target feature set rather than the unified feature set of the workspace clippy
-#      step. Assertion 2 runs `cargo package --list -p` on every workspace package, which
-#      fails on a readme key naming a missing file, and fails the gate when a published
-#      `examples/*.rs` file is no example target's source. This script prints one line per
+#      step. Assertion 2 runs `cargo package --list -p` on every workspace package and
+#      fails when that command fails, as it does on a readme key naming a missing file, or
+#      when a published `examples/*.rs` file is no example target's source. This script prints one line per
 #      assertion, and a third when the branch edits that gate, because no run starts it.
 #
 # USAGE
@@ -769,8 +769,8 @@ else
     # build and dev dependencies and, below those, only normal and build dependencies,
     # because cargo builds a dev-dependency for the package that declares it alone. The
     # gate passes no `--no-deps`, so clippy lints every workspace library in that walk as
-    # well as the example, and the line names each changed package that walk reaches. When cargo metadata cannot be
-    # read, it names every package compiled.
+    # well as the example, and the line names each changed package that walk reaches.
+    # When cargo metadata cannot be read, it names every package compiled.
     NOTES+=("scripts/check-examples-compile.sh assertion 2 over $crate_list: that gate runs cargo package --list -p on every workspace package, whether or not it has an example target, and fails when that command fails, as it does on a readme key naming a missing file, or when the package publishes an examples/*.rs file that no example target compiles, as autoexamples = false or a redirected path key leaves; the compile above never packages a crate, so either failure passes here and fails that gate in the rust-clippy job of .github/workflows/ci.yml")
     example_rc=0
     example_list=""
