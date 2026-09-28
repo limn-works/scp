@@ -6,6 +6,7 @@ package works.limn.scp.stream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.take
@@ -281,6 +282,61 @@ class StreamsTest {
 
                 assertEquals(2, stubBindings.eventUnsubscribeCount)
                 assertEquals(1, stubBindings.messageUnsubscribeCount)
+            }
+
+        @Test
+        fun `stopAll from a cancelled caller releases every subscription`() =
+            runTest {
+                // A dispatcher distinct from runTest's makes each removal's withContext resume
+                // its caller by dispatch, which is where a cancelled caller throws.
+                val factory = HotStreamFactory(stubBindings, StandardTestDispatcher(testScheduler))
+                factory.contextEvents(42L)
+                factory.contextEvents(43L)
+                factory.incomingMessages(42L)
+
+                val stopping =
+                    launch {
+                        cancel()
+                        factory.stopAll()
+                    }
+                advanceUntilIdle()
+                stopping.join()
+
+                assertEquals(2, stubBindings.eventUnsubscribeCount)
+                assertEquals(1, stubBindings.messageUnsubscribeCount)
+            }
+
+        @Test
+        fun `a stopContextEvents cancelled while waiting for the mutex still releases`() =
+            runTest {
+                val factory = HotStreamFactory(stubBindings, Dispatchers.IO)
+                val subscribeEntered = CountDownLatch(1)
+                val releaseSubscribe = CountDownLatch(1)
+                stubBindings.onSubscribeEvents = {
+                    subscribeEntered.countDown()
+                    releaseSubscribe.await()
+                }
+
+                val subscribing = launch(Dispatchers.Default) { factory.contextEvents(EVENT_CONTEXT_HANDLE) }
+                try {
+                    assertTrue(
+                        subscribeEntered.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                        "contextEvents did not reach its subscribe call",
+                    )
+                    val stopping = launch(Dispatchers.Default) { factory.stopContextEvents(EVENT_CONTEXT_HANDLE) }
+                    withContext(Dispatchers.Default) { withTimeoutOrNull(STOP_WAIT_MS) { stopping.join() } }
+                    stopping.cancel()
+
+                    releaseSubscribe.countDown()
+                    subscribing.join()
+                    stopping.join()
+
+                    assertEquals(1, stubBindings.eventSubscribeCount)
+                    assertEquals(1, stubBindings.eventUnsubscribeCount)
+                } finally {
+                    releaseSubscribe.countDown()
+                    subscribing.join()
+                }
             }
 
         @Test

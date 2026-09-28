@@ -369,10 +369,13 @@ class HotStreamFactory(
      * mutex a stop reads an empty registry, returns, and leaves a subscription that that same
      * in-flight call registers a moment later.
      *
+     * Waits for [eventMutex] under [NonCancellable]: a cancelled caller that found the mutex
+     * held would otherwise throw from `withLock` and leave this handle's subscription live.
+     *
      * @param contextHandle The context to stop receiving events for.
      */
     suspend fun stopContextEvents(contextHandle: Long) {
-        eventMutex.withLock { removeEventSubscription(contextHandle) }
+        withContext(NonCancellable) { eventMutex.withLock { removeEventSubscription(contextHandle) } }
     }
 
     /**
@@ -383,7 +386,7 @@ class HotStreamFactory(
      * @param contextHandle The context to stop receiving messages for.
      */
     suspend fun stopMessageStream(contextHandle: Long) {
-        messageMutex.withLock { removeMessageSubscription(contextHandle) }
+        withContext(NonCancellable) { messageMutex.withLock { removeMessageSubscription(contextHandle) } }
     }
 
     /**
@@ -392,13 +395,20 @@ class HotStreamFactory(
      * Takes each mutex once and then removes every handle under it, rather than delegating to
      * [stopContextEvents] and [stopMessageStream], because taking one non-reentrant [Mutex]
      * twice on one coroutine deadlocks that coroutine.
+     *
+     * The whole body runs under [NonCancellable], so a caller that is already cancelled still
+     * releases every handle: each removal's own `withContext` throws on resumption into a
+     * cancelled caller, which would otherwise end the loop after its first removal and leave
+     * every later Rust subscription live.
      */
     suspend fun stopAll() {
-        eventMutex.withLock {
-            activeEventSubscriptions.keys.toList().forEach { removeEventSubscription(it) }
-        }
-        messageMutex.withLock {
-            activeMessageSubscriptions.keys.toList().forEach { removeMessageSubscription(it) }
+        withContext(NonCancellable) {
+            eventMutex.withLock {
+                activeEventSubscriptions.keys.toList().forEach { removeEventSubscription(it) }
+            }
+            messageMutex.withLock {
+                activeMessageSubscriptions.keys.toList().forEach { removeMessageSubscription(it) }
+            }
         }
     }
 
