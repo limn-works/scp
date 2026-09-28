@@ -155,9 +155,13 @@
 #      `.github/workflows/release.yml` leaves it green. The `scripts/` entry names it,
 #      because the script it tests lives under `scripts/`.
 #      `scripts/tests/fix-round-check/run-tests.sh` holds the `scripts/` entry of
-#      UNRUN_LANES below to this list: it reads every `scripts/` program a job of
-#      `.github/workflows/ci.yml` starts, subtracts the GATES array below, and fails when
-#      that entry names fewer than what remains.
+#      UNRUN_LANES below to this list: its case 23 reads every `scripts/` program that
+#      `.github/workflows/ci.yml` starts with `bash`, `python3`, `python3.12`, `python3.12
+#      -m pytest` or a `./` path, on a one-line `run:` step or on any line of a `run: |`
+#      block, subtracts the GATES and GATES_NOT_RUN arrays below, and fails when that entry
+#      names fewer than what remains. The entry also names the two programs that remain and
+#      are neither a gate nor a suite. GATES_NOT_RUN is subtracted because case 22d holds
+#      each of its unstarted entries to an item of this list instead.
 #   8. Both assertions of `scripts/check-examples-compile.sh`, which the `rust-clippy` job
 #      runs and GATES_NOT_RUN below lists. Assertion 1 runs `cargo clippy -p <owner>
 #      --example <name> -- -D warnings` without `--no-deps`, so it lints each example
@@ -170,6 +174,9 @@
 #      that compiles at least one crate prints the assertion 2 line, naming every crate it
 #      compiled. That run also prints the assertion 1 line when at least one crate it
 #      compiled is a package some example target compiles, and names only those packages.
+#      A run that cannot read the example targets out of cargo metadata prints the
+#      assertion 1 line over every crate it compiled, with a clause saying some of them may
+#      have no example target.
 #      A run that compiles no crate prints neither line. A branch that edits
 #      `scripts/check-examples-compile.sh` gets one more line naming that edit, whatever it
 #      compiled.
@@ -498,9 +505,9 @@ wide_list=""
 # `crates/` is absent because the compile, format and gate steps above read it, and the
 # Rust commands they still leave unrun are the same for every run, which is why items 1,
 # 2, 3 and 6 of the DOES-NOT-RUN list state them once rather than per changed file. The
-# reverse-dependency line, the two scripts/check-examples-compile.sh lines and the wasm
-# line below are the four that name the packages a given run selected, so all four are
-# computed rather than listed here.
+# lines that name the packages a given run selected are computed below rather than listed
+# here: the sibling-feature line, the reverse-dependency line, the two
+# scripts/check-examples-compile.sh lines, the wasm line and the workspace-wide-input line.
 UNRUN_LANES=(
     "bindings/python/|ruff and pytest, which the python-lint and python-test jobs of .github/workflows/ci.yml run"
     "bindings/typescript/|biome, tsc and bun test, which the typescript-check job of .github/workflows/ci.yml runs"
@@ -510,7 +517,7 @@ UNRUN_LANES=(
     "bindings/swift/|SwiftLint, SwiftFormat and swift build, which the swift-lint and swift-build-test jobs of .github/workflows/ci.yml run"
     "fuzz/|cargo check inside fuzz/ on the nightly fuzz/rust-toolchain.toml names, which the fuzz-build job of .github/workflows/ci.yml runs"
     ".github/|scripts/tests/ci-gate/run-tests.sh, which the ci-workflow-selftest job of .github/workflows/ci.yml runs and whose ci_gate_selftest.py asserts the job structure this repository's own workflow files declare, and scripts/tests/fix-round-check/run-tests.sh, which the fix-round-check-selftest job runs and whose case 23 reads .github/workflows/ci.yml itself, so adding a suite invocation to that file turns that case red. Those two are every suite a change under .github/ can turn red: every other suite the ci-workflow-selftest, toolchain-wiring and workflow-compile-steps jobs run feeds its gate a workflow file its own fixture wrote. Three gates this run did start read a workflow file, each for rules of its own and none as coverage of a workflow edit: scripts/check-workflow-compile-steps.py reads every workflow for its cache-group and bindgen rules, scripts/check-toolchain-wiring.sh reads them for its container-build and paths-filter rules, and scripts/check-shipped-feature-graph.sh reads build-matrix.yml and release.yml for the cargo invocations that ship an artifact"
-    "scripts/|the twelve suites that .github/workflows/ci.yml runs over this directory: scripts/tests/cross-layer/run-tests.sh in the cross-layer job, scripts/tests/bridge-symmetry/run-tests.sh in the bridge-symmetry job, scripts/test_check_sdk_coverage.py and scripts/tests/call-invariants/ in the sdk-coverage job, scripts/tests/toolchain-wiring/run-tests.sh, scripts/tests/pre-commit-merge/run-tests.sh and scripts/tests/workflow-compile-steps/run-tests.sh in the toolchain-wiring job, scripts/tests/fix-round-check/run-tests.sh in the fix-round-check-selftest job, scripts/tests/agent-verdict-criterion/run-tests.sh in the agent-verdict-criterion job, scripts/tests/examples-compile/run-tests.sh in the rust-clippy job, and scripts/tests/ci-gate/run-tests.sh and scripts/tests/signing-guard/run-tests.sh in the ci-workflow-selftest job. Running a gate below against this repository's own files is not running that gate's fixture suite, which is the program that proves the gate still rejects what it exists to reject"
+    "scripts/|the twelve suites that .github/workflows/ci.yml runs over this directory: scripts/tests/cross-layer/run-tests.sh in the cross-layer job, scripts/tests/bridge-symmetry/run-tests.sh in the bridge-symmetry job, scripts/test_check_sdk_coverage.py and scripts/tests/call-invariants/ in the sdk-coverage job, scripts/tests/toolchain-wiring/run-tests.sh, scripts/tests/pre-commit-merge/run-tests.sh and scripts/tests/workflow-compile-steps/run-tests.sh in the toolchain-wiring job, scripts/tests/fix-round-check/run-tests.sh in the fix-round-check-selftest job, scripts/tests/agent-verdict-criterion/run-tests.sh in the agent-verdict-criterion job, scripts/tests/examples-compile/run-tests.sh in the rust-clippy job, and scripts/tests/ci-gate/run-tests.sh and scripts/tests/signing-guard/run-tests.sh in the ci-workflow-selftest job. Two more programs under this directory run in CI and are neither a gate nor a suite: scripts/generate-uniffi-kotlin.sh, which the kotlin-test and bridge-parity-kotlin jobs start to generate the Kotlin bindings they build, and scripts/ci-aggregate-result.py, which the ci job starts to judge every other job's result and which scripts/tests/ci-gate/run-tests.sh tests. Running a gate below against this repository's own files is not running that gate's fixture suite, which is the program that proves the gate still rejects what it exists to reject"
 )
 
 if [[ $changed_rc -eq 0 ]]; then

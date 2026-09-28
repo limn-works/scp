@@ -1276,23 +1276,48 @@ fi
 # to reject is the fixture suite that entry names. A suite the entry omits is a red CI job
 # the output gave the agent no reason to expect.
 #
-# This case reads every `scripts/` program that a job of `.github/workflows/ci.yml` starts
-# with `bash` or with `python3.12 -m pytest`, subtracts the ones the runner's own GATES
-# array starts, and fails when the entry names fewer than what remains. Adding a suite to
-# CI without adding it there turns this case red rather than going unnoticed.
+# This case reads every `scripts/` program that `.github/workflows/ci.yml` starts with
+# `bash`, `python3`, `python3.12`, `python3.12 -m pytest` or a `./` path, wherever the
+# start sits: on a one-line `run:` step or on any line of a `run: |` block. It subtracts
+# the paths the runner's GATES and GATES_NOT_RUN arrays name, and fails when the entry
+# names fewer than what remains. Adding a suite to CI without adding it there turns this
+# case red rather than going unnoticed, whichever form of `run:` step starts it.
 #
 # THE SUBTRACTION IS THE CRITERION, and it is the lane's own: `scripts/fix-round-check.sh`
 # admits an entry for a command CI runs that no step of the run starts. A path in GATES is
-# a command the run does start, so the lane owes the reader nothing about it; every other
-# path CI starts under `scripts/` is one the run leaves unread and the lane has to name.
-# Reading the GATES array off the script rather than filtering on a `scripts/test…` name
-# keeps this case closed: a suite a later round files under any other directory name still
-# has to appear in the lane.
+# a command the run does start, so the lane owes the reader nothing about it. A path in
+# GATES_NOT_RUN is one the run either starts as its toolchain precondition or names in its
+# DOES-NOT-RUN list, which case 22d holds, so the lane owes the reader nothing about it
+# either. Every other path CI starts under `scripts/` is one the run leaves unread and the
+# lane has to name. Reading both arrays off the script rather than filtering on a
+# `scripts/test…` name keeps this case closed: a suite a later round files under any other
+# directory name still has to appear in the lane.
+ci_script_starts() {
+    grep -oE '(bash +|python3(\.12)?( +-m +pytest)? +|\./)scripts/[^ "]+' | grep -oE 'scripts/[^ "]+$' | sort -u
+}
+# The extractor's own check, on a fixture holding each start form this case claims to
+# read. A narrower pattern, such as one anchored on `run:`, drops the start inside the
+# `run: |` block and turns this assertion red.
+CI_STARTS_FIXTURE=$(ci_script_starts <<'YAML'
+      - run: bash scripts/one-line.sh
+      - run: |
+          cargo clippy --workspace
+          bash scripts/in-block.sh
+      - run: python3.12 -m pytest scripts/tests/pytest-dir/ -v
+      - run: python3 scripts/plain-python.py .github/workflows/ci.yml
+      - run: ./scripts/dot-slash.sh --skip-build
+YAML
+)
+CI_STARTS_WANT=$(printf '%s\n' scripts/dot-slash.sh scripts/in-block.sh scripts/one-line.sh scripts/plain-python.py scripts/tests/pytest-dir/ | sort -u)
+if [[ $CI_STARTS_FIXTURE == "$CI_STARTS_WANT" ]]; then
+    report "case 23 reads a scripts/ start in every run-step form" 0 ""
+else
+    report "case 23 reads a scripts/ start in every run-step form" 1 "wanted: $(echo $CI_STARTS_WANT); read: $(echo $CI_STARTS_FIXTURE)"
+fi
 LANE_LINE=$(sed -n '/^UNRUN_LANES=(/,/^)/p' "$SCRIPT" | grep -F '"scripts/|')
 LANE_SUITES=$(comm -23 \
-    <(grep -oE 'run: *(bash|python3\.12 -m pytest) +scripts/[^ ]+' "$REPO_ROOT/.github/workflows/ci.yml" |
-        sed -E 's/^.* //' | sort -u) \
-    <(gate_paths | sort -u))
+    <(ci_script_starts < "$REPO_ROOT/.github/workflows/ci.yml") \
+    <({ gate_paths; printf '%s\n' "$NOT_RUN_PATHS"; } | sort -u))
 LANE_SUITE_COUNT=$(printf '%s' "$LANE_SUITES" | grep -c . || true)
 LANE_MISSING=""
 while IFS= read -r suite; do
