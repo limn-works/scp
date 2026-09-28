@@ -272,9 +272,13 @@ impl SqliteKeyCustody {
         let public_key = pseudonym_key.public_key().to_compressed();
 
         let handle = KeyHandle::new(self.next_id.fetch_add(1, Ordering::Relaxed));
-        store
-            .pseudonyms
-            .insert(key_id, context_id, epoch, handle.id(), pseudonym_key);
+        store.pseudonyms.insert(
+            key_id,
+            context_id,
+            epoch,
+            handle.id(),
+            Box::new(pseudonym_key),
+        );
         store.key_types.insert(handle.id(), KEY_TYPE_P256_PSEUDONYM);
         drop(store);
 

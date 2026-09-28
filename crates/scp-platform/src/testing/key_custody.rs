@@ -199,9 +199,13 @@ impl InMemoryKeyCustody {
         let public_key = pseudonym_key.public_key().to_compressed();
 
         let handle = self.next_handle();
-        store
-            .pseudonyms
-            .insert(key_id, context_id, epoch, handle.id(), pseudonym_key);
+        store.pseudonyms.insert(
+            key_id,
+            context_id,
+            epoch,
+            handle.id(),
+            Box::new(pseudonym_key),
+        );
         store
             .key_types
             .insert(handle.id(), StoredKeyType::P256Pseudonym);

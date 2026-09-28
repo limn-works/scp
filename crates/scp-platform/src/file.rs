@@ -554,7 +554,13 @@ impl FileKeyCustody {
         }
         let public_key = pseudonym_key.public_key().to_compressed();
         let pseudo_handle = self.next_handle();
-        pseudonyms.insert(key_id, context_id, epoch, pseudo_handle.id(), pseudonym_key);
+        pseudonyms.insert(
+            key_id,
+            context_id,
+            epoch,
+            pseudo_handle.id(),
+            Box::new(pseudonym_key),
+        );
         drop(pseudonyms);
         drop(map);
 

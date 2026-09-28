@@ -18,16 +18,19 @@ use scp_crypto::p256::P256SigningKey;
 type Slot = (u64, Vec<u8>, Option<u64>);
 
 /// The pseudonym keys of one software custody.
+///
+/// Each key is boxed, so a resize of `keys` moves only the pointer and never
+/// frees an unwiped copy of a scalar.
 #[derive(Default)]
 pub struct PseudonymKeys {
-    keys: HashMap<u64, P256SigningKey>,
+    keys: HashMap<u64, Box<P256SigningKey>>,
     slots: HashMap<Slot, u64>,
 }
 
 impl PseudonymKeys {
     /// The key behind pseudonym handle `handle`.
     pub fn get(&self, handle: u64) -> Option<&P256SigningKey> {
-        self.keys.get(&handle)
+        self.keys.get(&handle).map(|key| &**key)
     }
 
     /// The handle and compressed point already derived for `identity`,
@@ -51,7 +54,7 @@ impl PseudonymKeys {
         context_id: &[u8],
         epoch: Option<u64>,
         handle: u64,
-        key: P256SigningKey,
+        key: Box<P256SigningKey>,
     ) {
         self.keys.insert(handle, key);
         self.slots
