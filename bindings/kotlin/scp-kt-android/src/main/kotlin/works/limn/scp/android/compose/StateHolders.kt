@@ -24,6 +24,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
@@ -243,11 +244,14 @@ private fun <R> rememberCollectedState(
  * Sequences hot stream subscriptions that separate mounts open under one same key.
  *
  * Compose forgets every `remember(key)` value when a composable leaves composition, so no value
- * a composable remembers can order one mount's `onStop` against a later mount's `start`. Without
- * that ordering, navigating away from a screen and back leaves `onStop` running against whatever
- * subscription a registry holds at that moment, which is a subscription that a second mount just
- * opened: a collector then observes a [SharedFlow] that receives nothing further, and reports no
- * error.
+ * a composable remembers can order one mount's `onStop` against a later mount's `start`, or tell
+ * one mount that another mount under that same key is still collecting. A registry such as
+ * [works.limn.scp.stream.HotStreamFactory] keys a subscription by context handle alone and hands
+ * a second subscriber that same subscription, so without that knowledge a departing mount's
+ * `onStop` releases a subscription that a different, still-composed mount collects from: that
+ * collector then observes a [SharedFlow] that receives nothing further, and reports no error.
+ * Navigating away from a screen and back produces it, and so does a navigation transition that
+ * keeps an outgoing screen composed while an incoming screen under that same key starts.
  *
  * A caller constructs one coordinator outside composition — in a ViewModel, in an application
  * container, or in a dependency graph — and passes that instance to every
@@ -255,11 +259,13 @@ private fun <R> rememberCollectedState(
  * gives each mount its own coordinator, which reintroduces exactly that defect, so
  * [rememberScpHotStream] takes a coordinator as a required parameter and declares no default.
  *
- * This class holds per-key state: a [Mutex] that admits one start or one stop at a time, and one
- * [Job] naming whichever `onStop` [launchStop] launched most recently. [startAfterPendingStop]
- * joins that job before it runs a `start` lambda, so ordering rests on when a caller launched
- * `onStop`, not on when `onStop` reached a dispatcher. Per-key state leaves this map as soon as
- * no start and no stop holds it.
+ * This class holds per-key state: a count of live mounts, a [Mutex] that admits one start or one
+ * stop at a time, and one [Job] naming the most recent stop it launched. [mount] counts a mount
+ * and captures that job. [unmount] launches `onStop` only when it removes the last live mount
+ * under that key, so a mount that leaves while another mount under that key stays composed stops
+ * nothing. [startMounted] joins the stop its mount captured before it runs a `start` lambda, so
+ * ordering rests on when a caller launched `onStop`, not on when `onStop` reached a dispatcher.
+ * Per-key state leaves this map as soon as no live mount and no pending stop holds it.
  *
  * @param scope Scope that runs every `onStop` lambda this coordinator launches. A caller owns
  *   that scope and decides when to cancel it. Composable disposal never cancels it, so an
@@ -269,46 +275,88 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
     private val keyStates = ConcurrentHashMap<Any, KeyState>()
 
     /**
-     * Launch [onStop] for [key] on this coordinator's scope, and record its [Job] before
-     * returning, so a [startAfterPendingStop] call that begins afterwards joins it.
+     * One live mount under [key], as [mount] recorded it.
      *
-     * [onStop] runs under [key]'s mutex, so it never overlaps a start for that same key.
-     *
-     * @return A [Job] running [onStop].
+     * @property key Key this mount was counted under.
+     * @property state [key]'s state, which this mount holds until [unmount] releases it.
+     * @property pendingStop Stop that [unmount] launched for [key] before this mount began, or
+     *   `null` when none was recorded. [startMounted] joins it.
      */
-    internal fun launchStop(
-        key: Any,
-        onStop: suspend () -> Unit,
-    ): Job {
-        val state = acquire(key)
-        val job = scope.launch { state.mutex.withLock { onStop() } }
-        state.lastStop.set(job)
-        job.invokeOnCompletion { release(key) }
-        return job
+    internal class Mount(
+        val key: Any,
+        val state: KeyState,
+        val pendingStop: Job?,
+    ) {
+        /** Set by [unmount], so unmounting this mount twice removes it from the count once. */
+        val unmounted = AtomicBoolean(false)
     }
 
     /**
-     * Join whichever `onStop` [launchStop] recorded for [key], then run [start] under [key]'s
-     * mutex and return what [start] returned.
+     * Count one live mount under [key], and capture whichever stop [unmount] launched last for
+     * [key], so this mount's [startMounted] waits for it.
+     */
+    internal fun mount(key: Any): Mount {
+        val state = acquire(key)
+        val pendingStop =
+            synchronized(state) {
+                state.liveMounts++
+                state.lastStop
+            }
+        return Mount(key, state, pendingStop)
+    }
+
+    /**
+     * Join the stop [mount] captured, then run [start] under that key's mutex and return what
+     * [start] returned.
      *
      * A caller cancelling this call releases that mutex, so a stop waiting on it proceeds.
      */
-    internal suspend fun <T> startAfterPendingStop(
-        key: Any,
+    internal suspend fun <T> startMounted(
+        mount: Mount,
         start: suspend () -> T,
     ): T {
-        val state = acquire(key)
-        try {
-            state.lastStop.get()?.join()
-            return state.mutex.withLock { start() }
-        } finally {
-            release(key)
-        }
+        mount.pendingStop?.join()
+        return mount.state.mutex.withLock { start() }
     }
 
     /**
-     * Return [key]'s state, creating it when no start and no stop currently holds it, and count
-     * this caller as one holder.
+     * Remove [mount] from its key's live mounts. When that leaves no live mount under that key,
+     * launch [onStop] on this coordinator's scope under that key's mutex, and record its [Job]
+     * before returning, so a [mount] that begins afterwards captures it.
+     *
+     * @return A [Job] running [onStop], or `null` when another mount under that key is still
+     *   live, so [onStop] does not run, or when [mount] was already unmounted.
+     */
+    internal fun unmount(
+        mount: Mount,
+        onStop: suspend () -> Unit,
+    ): Job? {
+        if (!mount.unmounted.compareAndSet(false, true)) return null
+        val state = mount.state
+        val stopJob =
+            synchronized(state) {
+                state.liveMounts--
+                if (state.liveMounts > 0) {
+                    null
+                } else {
+                    scope.launch(start = CoroutineStart.LAZY) { state.mutex.withLock { onStop() } }
+                        .also { state.lastStop = it }
+                }
+            }
+        if (stopJob == null) {
+            release(mount.key)
+        } else {
+            // This mount's hold on the state passes to its stop, so a later mount finds the
+            // recorded stop until that stop completes.
+            stopJob.invokeOnCompletion { release(mount.key) }
+            stopJob.start()
+        }
+        return stopJob
+    }
+
+    /**
+     * Return [key]'s state, creating it when nothing holds it, and count this caller as one
+     * holder.
      *
      * [ConcurrentHashMap.compute] runs this function while it holds that key's bin lock, and
      * [release] removes an entry under that same lock, so no caller acquires a state that
@@ -332,15 +380,19 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
      * One key's coordination state.
      *
      * @property mutex Admits one start lambda or one stop lambda at a time for this key.
-     * @property lastStop Job of whichever stop lambda [launchStop] launched most recently for
-     *   this key, or `null` when [launchStop] has launched none since this state was created.
-     * @property holders Count of starts and stops holding this state. [ScpHotStreamCoordinator]
-     *   removes this state from its map when that count reaches zero, which happens only after
-     *   every stop this state recorded has completed.
+     * @property liveMounts Count of mounts that [mount] counted and [unmount] has not yet
+     *   removed. Guarded by this object's monitor.
+     * @property lastStop Job of the stop [unmount] launched most recently for this key, or
+     *   `null` when it has launched none since this state was created. Guarded by this object's
+     *   monitor.
+     * @property holders Count of live mounts and pending stops holding this state.
+     *   [ScpHotStreamCoordinator] removes this state from its map when that count reaches zero,
+     *   which happens only after every stop this state recorded has completed.
      */
-    private class KeyState {
+    internal class KeyState {
         val mutex = Mutex()
-        val lastStop = AtomicReference<Job?>(null)
+        var liveMounts = 0
+        var lastStop: Job? = null
         val holders = AtomicInteger(0)
     }
 }
@@ -350,12 +402,14 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
  *
  * Creates a hot stream subscription that persists across recompositions
  * for the same [key]. The [start] suspend lambda is launched in a
- * coroutine scope tied to the Composable's lifetime. When the Composable
- * leaves composition, [onStop] is invoked to unsubscribe from the Rust
+ * coroutine scope tied to the Composable's lifetime. When the last mount under
+ * [key] leaves composition, [onStop] is invoked to unsubscribe from the Rust
  * engine (e.g., call `hotStreamFactory.stopContextEvents(handle)`).
  *
  * [coordinator] sequences those two lambdas across mounts: a [start] for one key waits for an
- * [onStop] that an earlier mount launched under that same key. A caller holds that coordinator
+ * [onStop] that an earlier mount launched under that same key, and a mount that leaves while
+ * another mount under that same key is still composed runs no [onStop], because a registry
+ * such as `HotStreamFactory` hands both mounts one subscription. A caller holds that coordinator
  * outside composition, because Compose forgets everything this function remembers when a mount
  * ends. [ScpHotStreamCoordinator] states what a per-composition coordinator would break.
  *
@@ -393,9 +447,10 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
  *   under that same [key], because neither coordinator can order the other's lambdas.
  * @param start Suspend factory lambda that creates the [SharedFlow]. Called
  *   once per [key] value. Runs in a coroutine scoped to the Composable.
- * @param onStop Suspend cleanup lambda invoked when the Composable leaves
- *   composition. Runs on [coordinator]'s scope, which disposal does not cancel, so
- *   it may suspend for as long as it needs. Disposal returns without waiting for it, so
+ * @param onStop Suspend cleanup lambda invoked when this Composable leaves
+ *   composition as the last live mount under [key] on [coordinator]. Runs on
+ *   [coordinator]'s scope, which disposal does not cancel, so it may suspend for as long as
+ *   it needs. Disposal returns without waiting for it, so
  *   `onStop` finishes only if a process outlives it.
  * @return Compose [State] holding the [SharedFlow], or `null` until
  *   the subscription is established.
@@ -429,9 +484,12 @@ fun <T> rememberScpHotStream(
 
     DisposableEffect(key, coordinator) {
         val pendingSwapStop = swappedOutStop.getAndSet(null)
+        // Counted during composition, before any start runs, so a mount under this key that
+        // leaves from here on sees this one as live and stops nothing.
+        val mount = coordinator.mount(key)
         scope.launch {
             pendingSwapStop?.join()
-            flowState.value = coordinator.startAfterPendingStop(key) { start() }
+            flowState.value = coordinator.startMounted(mount) { start() }
         }
         onDispose {
             // onDispose runs on a composition thread, which on Android is a main thread.
@@ -440,10 +498,11 @@ fun <T> rememberScpHotStream(
             // schedules work back onto a parked thread — SCP-117's failure, in a
             // second spelling. See
             // `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
-            // launchStop records this stop's Job before it returns, so a start that a later
-            // mount begins under this same key joins that job instead of racing it. Cancelling
-            // `scope` afterwards cancels only this mount's start, never that stop.
-            swappedOutStop.set(coordinator.launchStop(key) { onStop() })
+            // unmount runs onStop only when this was the last live mount under this key, and
+            // records that stop's Job before it returns, so a start that a later mount begins
+            // under this same key joins that job instead of racing it. Cancelling `scope`
+            // afterwards cancels only this mount's start, never that stop.
+            swappedOutStop.set(coordinator.unmount(mount) { onStop() })
             scope.cancel()
         }
     }

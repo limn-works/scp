@@ -13,7 +13,7 @@ a caller's only route back to a live subscription: `stopContextEvents`, `stopMes
 starts one such subscription when a composable enters composition, and stops it when that
 composable leaves.
 
-Three defects shared one root: no code tied a subscription's lifetime to whichever caller owned
+Four defects shared one root: no code tied a subscription's lifetime to whichever caller owned
 it, so a subscription could outlive every reference naming it, or a stop could release a
 subscription that a different caller had just opened.
 
@@ -32,6 +32,11 @@ subscription that a different caller had just opened.
    entry a registry held, which was that second mount's entry, and unsubscribed it. That caller
    collected a `SharedFlow` that received nothing further and reported no error, so membership
    changes and revocations stopped arriving. Navigating away from a screen and back produced it.
+4. Two mounts under one `key` composed at the same time — a navigation transition keeps an
+   outgoing screen composed while an incoming screen starts — share one subscription, because
+   `contextEvents` hands a second caller the entry it already holds. Ordering a stop before a
+   later start does nothing here: the first mount to leave ran `stopContextEvents(handle)` and
+   released the subscription the second mount was still collecting, with the same silent result.
 
 ## Decision
 
@@ -50,10 +55,12 @@ subscription that a different caller had just opened.
   calls `ConcurrentHashMap.remove(key, value)`, which deletes an entry only when that entry is
   that callback's own `HotStreamState`. A stale completion callback therefore never deletes a
   later subscription carrying one same context handle.
-- **Hold cross-mount ordering state outside composition.** `ScpHotStreamCoordinator` holds one
-  `Mutex` and one most-recent stop `Job` per key. `rememberScpHotStream` takes a coordinator as a
-  required parameter with no default: `launchStop` records a stop's `Job` before `onDispose`
-  returns, and `startAfterPendingStop` joins that job before it runs a `start` lambda.
+- **Hold cross-mount ownership state outside composition.** `ScpHotStreamCoordinator` holds a
+  live-mount count, one `Mutex`, and one most-recent stop `Job` per key. `rememberScpHotStream`
+  takes a coordinator as a required parameter with no default. `mount` counts a mount during
+  composition and captures the pending stop; `unmount` launches `onStop` only when it removes the
+  last live mount under that key, and records that stop's `Job` before `onDispose` returns;
+  `startMounted` joins the captured stop before it runs a `start` lambda.
 
 ## Why a coordinator rather than a file-scope registry
 
@@ -75,7 +82,9 @@ and restore defect 3 exactly, because each mount would then coordinate against i
 - `ScpHotStreamRemountTest` in
   `bindings/kotlin/scp-kt-android/src/test/kotlin/works/limn/scp/android/compose/StateHoldersTest.kt`
   drives one composable out of composition and back under one same key against a fake registry,
-  and asserts that a subscription live at test end is one a second mount opened.
+  and asserts that a subscription live at test end is one a second mount opened. A second test
+  there composes two mounts under one key at once, removes one, and asserts that no `onStop` ran
+  and that their shared subscription is still live.
 
 ## Anti-patterns
 

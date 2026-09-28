@@ -7,6 +7,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.State
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.ui.test.junit4.createComposeRule
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -15,6 +16,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -596,6 +598,97 @@ class ScpHotStreamRemountTest {
             subscriptions.unsubscribeIds() == listOf(1)
         }
         assertEquals(listOf(2), subscriptions.liveIds())
+    }
+
+    /**
+     * Two mounts under one key, composed at the same time, share one subscription, because a
+     * registry such as `HotStreamFactory` hands a second subscriber the subscription it already
+     * holds. A navigation transition keeps an outgoing screen composed while an incoming screen
+     * starts, which produces exactly this overlap.
+     *
+     * The first mount to leave must stop nothing: its `onStop` would release the subscription
+     * the second mount is still collecting, and that collector would then observe a SharedFlow
+     * that receives nothing further and reports no error. Only the last mount to leave stops it.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `an overlapping mount under one same key keeps its subscription when the other mount leaves`() {
+        val subscriptions = FakeSubscriptionRegistry()
+        val startCalls = AtomicInteger(0)
+        val stopCalls = AtomicInteger(0)
+        val showFirst = MutableStateFlow(true)
+        val showSecond = MutableStateFlow(false)
+        val coordinator = ScpHotStreamCoordinator(newCoordinatorScope())
+        val eventFlow = MutableSharedFlow<String>()
+
+        composeRule.setContent {
+            val first by showFirst.collectAsStateCompat()
+            val second by showSecond.collectAsStateCompat()
+            listOf(first, second).forEachIndexed { index, shown ->
+                if (shown) {
+                    key(index) {
+                        rememberScpHotStream(
+                            key = "shared-key",
+                            coordinator = coordinator,
+                            start = {
+                                startCalls.incrementAndGet()
+                                subscriptions.subscribe()
+                                eventFlow
+                            },
+                            onStop = {
+                                stopCalls.incrementAndGet()
+                                subscriptions.unsubscribeLive()
+                            },
+                        )
+                    }
+                }
+            }
+        }
+
+        composeRule.waitForIdle()
+        awaitCondition("the first mount opened no subscription") { startCalls.get() == 1 }
+
+        showSecond.value = true
+        composeRule.waitForIdle()
+        awaitCondition("the second mount ran no start") { startCalls.get() == 2 }
+
+        showFirst.value = false
+        composeRule.waitForIdle()
+        // A stop that the first mount's departure launched has this long to run.
+        Thread.sleep(SWAP_START_GRACE_MS)
+        assertEquals("the first mount's departure ran onStop", 0, stopCalls.get())
+        assertEquals(listOf(1), subscriptions.liveIds())
+
+        showSecond.value = false
+        composeRule.waitForIdle()
+        awaitCondition("the last mount's departure released nothing") {
+            subscriptions.unsubscribeIds() == listOf(1)
+        }
+        assertEquals(1, stopCalls.get())
+        assertEquals(listOf(1), subscriptions.subscribeIds())
+    }
+
+    /**
+     * [ScpHotStreamCoordinator.unmount] launches `onStop` only for the last live mount under a
+     * key, and a later mount under that key joins that stop before its start runs.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `a coordinator stops a key only when its last live mount leaves`() {
+        val coordinator = ScpHotStreamCoordinator(newCoordinatorScope())
+        val stops = AtomicInteger(0)
+        val first = coordinator.mount("k")
+        val second = coordinator.mount("k")
+
+        assertEquals(null, coordinator.unmount(first) { stops.incrementAndGet() })
+        assertEquals("unmounting one mount twice", null, coordinator.unmount(first) { stops.incrementAndGet() })
+        val stop = coordinator.unmount(second) { stops.incrementAndGet() }
+        assertTrue("the last mount's unmount launched no stop", stop != null)
+
+        val third = coordinator.mount("k")
+        assertEquals("a later mount did not capture the pending stop", stop, third.pendingStop)
+        runBlocking {
+            coordinator.startMounted(third) { assertEquals(1, stops.get()) }
+        }
+        assertEquals(1, stops.get())
     }
 }
 
