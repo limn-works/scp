@@ -66,7 +66,7 @@ publication produces. This gate does not run that build, so it asserts the dev-t
 closure, not the default feature set its plan item names ("shipped examples build on
 default features"). Whether to add the probe build or to narrow the gate's contract to the
 dev-target closure is a scope decision for a human; cargo does not settle it. The plan of
-record's §0.5 entry for this pull request records that decision as open, and the pull
+record's entry for this pull request records that decision as open, and the pull
 request does not close the plan item's "default features" contract until a human makes it.
 
 Row 8 (a `build.rs` injecting a cfg) is not demonstrated. Two attempts to reproduce it
