@@ -13,6 +13,7 @@ import androidx.lifecycle.ViewModel
 import works.limn.scp.bridge.CoroutineBridge
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
@@ -83,12 +84,12 @@ abstract class ScpViewModel : ViewModel() {
     // Written and read only under [contextsLock]; true once [onCleared] has run.
     private var cleared = false
 
-    // `Dispatchers.Unconfined` starts the cleanup coroutine on the thread that calls
-    // [onCleared] and keeps it there only until the first `leave` suspends into the
-    // bridge's I/O dispatcher, so [onCleared] returns without waiting on an FFI call when
-    // that dispatcher dispatches. An inline one runs every `leave` before [onCleared] returns
-    // unless the coroutine suspends on [cleanupFailureLock], which another cleanup
-    // coroutine's [onCleanupFailure] call can hold.
+    // [launchLeave] starts each cleanup coroutine undispatched on the thread that calls
+    // [onCleared] or [trackContext], and `Dispatchers.Unconfined` keeps it there only until
+    // the first `leave` suspends into the bridge's I/O dispatcher, so [onCleared] returns
+    // without waiting on an FFI call when that dispatcher dispatches. An inline one runs every
+    // `leave` before [onCleared] returns unless the coroutine suspends on
+    // [cleanupFailureLock], which another cleanup coroutine's [onCleanupFailure] call can hold.
     private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
 
     // Serializes [onCleanupFailure] across every cleanup coroutine: [onCleared] launches one
@@ -110,10 +111,12 @@ abstract class ScpViewModel : ViewModel() {
      * [onCleared] a second time, so tracking it would drop its `leave` silently. That
      * `leave` runs on the same cleanup coroutine path, and a failure reaches
      * [onCleanupFailure]. With a bridge whose I/O dispatcher runs inline, the `leave` runs on
-     * the calling thread before this method returns, and so does its [onCleanupFailure] call
-     * unless another cleanup coroutine's [onCleanupFailure] call is running at that moment.
-     * In that case this method returns first, and the call waits for the running one and then
-     * runs on the thread that ran it.
+     * the calling thread before this method returns, even when the caller is itself a
+     * coroutine on `Dispatchers.Unconfined`, such as an [onCleanupFailure] override that
+     * retries. So does its [onCleanupFailure] call, unless an [onCleanupFailure] call is
+     * running at that moment, the retrying override's own included. In that case this method
+     * returns first, and the call waits for the running one and then runs on the thread that
+     * ran it.
      *
      * @param context The [TrackedContext] wrapping the context handle and bridge.
      * @return The same [context] passed in, for chaining.
@@ -196,9 +199,17 @@ abstract class ScpViewModel : ViewModel() {
         launchLeave(contexts)
     }
 
-    /** Calls `leave` on each of [contexts] in order, on a coroutine [cleanupScope] owns. */
+    /**
+     * Calls `leave` on each of [contexts] in order, on a coroutine [cleanupScope] owns.
+     *
+     * [CoroutineStart.UNDISPATCHED] runs the coroutine on the calling thread up to its first
+     * suspension. A default start would, when the caller already runs inside a
+     * `Dispatchers.Unconfined` coroutine (a retry from [onCleanupFailure] does), queue it on
+     * that thread's unconfined event loop until the caller's coroutine suspends, and the
+     * inline-bridge guarantees in the KDoc of [trackContext] and [onCleared] would not hold.
+     */
     private fun launchLeave(contexts: List<TrackedContext>) {
-        cleanupScope.launch {
+        cleanupScope.launch(start = CoroutineStart.UNDISPATCHED) {
             for (ctx in contexts) {
                 val failure =
                     runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }

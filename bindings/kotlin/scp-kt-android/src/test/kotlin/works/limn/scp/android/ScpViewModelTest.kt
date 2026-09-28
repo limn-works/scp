@@ -274,7 +274,7 @@ class ScpViewModelTest {
     // `leave` in parallel on Dispatchers.IO. Without the lock around onCleanupFailure, the
     // second failure enters the override while the first is still inside it.
     @Test
-    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     fun `onCleanupFailure calls from parallel cleanup coroutines never overlap`() {
         stubBindings.leaveAlwaysThrows = true
         val ioBridge = CoroutineBridge(
@@ -309,7 +309,7 @@ class ScpViewModelTest {
     // the thread that released the lock. The KDoc on trackContext, onCleared, and
     // onCleanupFailure states this exception; this method keeps that statement true.
     @Test
-    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     fun `an inline-bridge failure waits for a running onCleanupFailure and runs on its thread`() {
         stubBindings.leaveAlwaysThrows = true
         val ioBridge = CoroutineBridge(
@@ -345,6 +345,35 @@ class ScpViewModelTest {
         assertEquals(2, threads.size)
         assertEquals(threads[0], threads[1], "second call did not run on the releasing thread")
         assertNotEquals(Thread.currentThread(), threads[1], "second call ran on the trackContext caller")
+    }
+
+    // An override that retries calls trackContext from inside a cleanup coroutine on
+    // Dispatchers.Unconfined. A default-start launch there is queued on the thread's unconfined
+    // event loop, so the retry's inline leave would run only after the override returned.
+    // Undispatched start runs it inside trackContext, as trackContext's KDoc states; the
+    // retry's own failure waits for the retrying override and still runs before onCleared
+    // returns, on the calling thread.
+    @Test
+    fun `an inline leave retried from onCleanupFailure runs before trackContext returns`() {
+        stubBindings.leaveAlwaysThrows = true
+        val inlineBridge = CoroutineBridge(
+            nativeBindings = stubBindings,
+            ioDispatcher = Dispatchers.Unconfined,
+            cpuDispatcher = Dispatchers.Unconfined,
+        )
+        val retry = TrackedContext(handle = 2L, identityHandle = 2L, bridge = inlineBridge)
+        val viewModel = RetryingViewModel(retry, stubBindings)
+        viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = inlineBridge))
+
+        viewModel.callOnCleared()
+
+        assertEquals(
+            listOf(1L, 2L),
+            viewModel.leftWhenRetryReturned,
+            "retried leave ran after trackContext returned",
+        )
+        assertEquals(listOf(1L, 2L), viewModel.failedHandles)
+        assertEquals(listOf(Thread.currentThread(), Thread.currentThread()), viewModel.callThreads)
     }
 
     // A Java subclass of ScpViewModel calls `super()`, so a zero-argument JVM constructor is
@@ -398,6 +427,39 @@ private class OverlapProbeViewModel : ScpViewModel() {
                 override fun <T : ViewModel> create(modelClass: Class<T>): T = self as T
             }
         ViewModelProvider(store, factory)[OverlapProbeViewModel::class.java]
+        store.clear()
+    }
+}
+
+/** Retries the first failed departure once by tracking [retry] from inside the override. */
+private class RetryingViewModel(
+    private val retry: TrackedContext,
+    private val bindings: TestNativeBindings,
+) : ScpViewModel() {
+    val failedHandles = mutableListOf<Long>()
+    val callThreads = mutableListOf<Thread>()
+
+    /** The bridge's recorded `leave` handles at the moment the retry's trackContext returned. */
+    var leftWhenRetryReturned: List<Long> = emptyList()
+
+    override fun onCleanupFailure(context: TrackedContext, cause: Throwable) {
+        failedHandles += context.handle
+        callThreads += Thread.currentThread()
+        if (context !== retry) {
+            trackContext(retry)
+            leftWhenRetryReturned = bindings.leaveCalledHandles.toList()
+        }
+    }
+
+    fun callOnCleared() {
+        val store = ViewModelStore()
+        val self = this
+        val factory =
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T = self as T
+            }
+        ViewModelProvider(store, factory)[RetryingViewModel::class.java]
         store.clear()
     }
 }
