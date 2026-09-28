@@ -336,6 +336,10 @@ pub struct CustodyPublicKey {
     /// X25519), the 33-byte compressed SEC1 point (`"p256"`), or the 65-byte
     /// uncompressed SEC1 point (`"hpke-p256"`).
     pub public_key: Vec<u8>,
+    /// `"identity"` or `"operational"`: the role
+    /// [`KeyCustodyProvider::generate_keypair`] minted the key in. A pseudonym
+    /// key is `"operational"`.
+    pub role: String,
 }
 
 /// Callback for platform cryptographic key management.
@@ -389,6 +393,15 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// does not match the stated type, or an invalid point is an error, and
     /// the bridge binds nothing. The bridge asks this for every key id it has
     /// not yet registered, whichever operation names it first.
+    ///
+    /// `role` is the role `generate_keypair` minted the key in, recorded by
+    /// the host for the key's lifetime and reported across sessions; a
+    /// pseudonym key is `"operational"`. A key id the bridge has not seen
+    /// binds as an identity only when `role` is `"identity"`, so an identity
+    /// from an earlier session can still derive pseudonyms. Any other role
+    /// string is an error. The bridge cannot check the host's word: a host
+    /// that reports `"identity"` for a key it minted as `"operational"` lets
+    /// that key derive pseudonyms, which is outside Rust's control.
     async fn get_public_key(&self, key_id: String) -> Result<CustodyPublicKey, ScpError>;
 
     /// Destroy key material for `key_id`. Subsequent operations must fail.
@@ -400,9 +413,13 @@ pub trait KeyCustodyProvider: Send + Sync {
 
     /// Generate a new keypair. `key_type` is `"ed25519"`, `"x25519"`,
     /// `"p256"` (ECDSA P-256 signing) or `"hpke-p256"` (P-256 ECDH for HPKE).
+    /// `role` is `"identity"` (an identity key, the only pseudonym-derivation
+    /// source) or `"operational"`. The host records `role` and reports it
+    /// from [`Self::get_public_key`] for the key's lifetime; the bridge
+    /// refuses and destroys a key whose reported role differs.
     ///
     /// Returns an opaque key identifier string.
-    async fn generate_keypair(&self, key_type: String) -> Result<String, ScpError>;
+    async fn generate_keypair(&self, key_type: String, role: String) -> Result<String, ScpError>;
 
     /// Perform Diffie-Hellman key agreement.
     ///

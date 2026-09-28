@@ -9,6 +9,7 @@ import type { KeyCustodyProvider, PseudonymResult } from "../scp";
 export interface NativeCustodyPublicKey {
   keyType: string;
   publicKey: number[];
+  role: string;
 }
 
 /** The shape napi-rs marshals for a {@link PseudonymResult}: bytes as a number array. */
@@ -62,17 +63,18 @@ export function toNativeCustodyProvider(provider: KeyCustodyProvider) {
   // structured failure. napi-rs delivers a multi-element Rust tuple
   // (`(String, Vec<u8>)`) to the JS callback as a SINGLE `[keyId, bytes]`
   // array argument, not as two positional args, so the tuple callbacks
-  // (`sign`, `dhAgree`, `derivePseudonym`, `deriveRotatablePseudonym`) accept
+  // (`generateKeypair`, `sign`, `dhAgree`, `derivePseudonym`,
+  // `deriveRotatablePseudonym`) accept
   // one array and destructure it.
   return {
-    generateKeypair: (keyType: string): NativeHostResult<string> =>
-      hostCall(() => provider.generateKeypair(keyType)),
+    generateKeypair: ([keyType, role]: [string, string]): NativeHostResult<string> =>
+      hostCall(() => provider.generateKeypair(keyType, role)),
     sign: ([keyId, message]: [string, number[]]): NativeHostResult<number[]> =>
       hostCall(() => Array.from(provider.sign(keyId, Uint8Array.from(message)))),
     getPublicKey: (keyId: string): NativeHostResult<NativeCustodyPublicKey> =>
       hostCall(() => {
-        const { keyType, publicKey } = provider.getPublicKey(keyId);
-        return { keyType, publicKey: Array.from(publicKey) };
+        const { keyType, publicKey, role } = provider.getPublicKey(keyId);
+        return { keyType, publicKey: Array.from(publicKey), role };
       }),
     destroyKey: (keyId: string): NativeHostResult<undefined> =>
       hostCall(() => {

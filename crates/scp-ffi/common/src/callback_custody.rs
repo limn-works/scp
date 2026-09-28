@@ -17,8 +17,14 @@
 //!   flight, `Abandoned` when the caller dropped that destroy before the host
 //!   answered, and `Destroyed`, a tombstone. A handle this adapter has not seen
 //!   (a host key from an earlier session) is resolved through
-//!   `get_public_key` the same way in every entry point, and binds as an
-//!   [`KeyRole::Operational`] key.
+//!   `get_public_key` the same way in every entry point, and binds in the role
+//!   the host's answer states: [`KeyRole::Identity`] when the host reports
+//!   `"identity"`, [`KeyRole::Operational`] when it reports `"operational"`.
+//! - A host key minted by a `generate_keypair` future the caller dropped
+//!   before the handle was registered is queued, and the next generation
+//!   destroys it on the host first ([`sweep_orphans`]). The queue lives in
+//!   this registry, so a process that exits before its next generation
+//!   leaves the queued key on the host.
 //! - Every host signature is verified: an Ed25519 signature strictly over the
 //!   data under the registered verifying key, a P-256 signature through
 //!   [`p256_host_signature`].
@@ -65,8 +71,59 @@ pub fn parse_key_type(key_type: &str) -> Option<KeyType> {
     }
 }
 
+/// The role a host records for a key it minted: the second argument of the
+/// provider's `generate_keypair` and the `role` of its `get_public_key`
+/// answer.
+///
+/// The host records the role `generate_keypair` named and reports it for
+/// the key's lifetime, across adapter instances, so a new adapter resolves
+/// an identity key from an earlier session as an identity. A pseudonym key a
+/// derivation minted is `"operational"`. Rust cannot check the host's word:
+/// a host that reports `"identity"` for a key it minted as operational lets
+/// that key derive pseudonyms, and that is outside the bridge's control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostRole {
+    /// `"identity"`: minted by `generate_identity_keypair`, the only role a
+    /// pseudonym may be derived from.
+    Identity,
+    /// `"operational"`: every other key, pseudonym keys included.
+    Operational,
+}
+
+impl HostRole {
+    /// The host-protocol string for this role.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Operational => "operational",
+        }
+    }
+
+    /// The role a host-protocol string names, or `None` for any other string.
+    #[must_use]
+    pub fn parse(role: &str) -> Option<Self> {
+        match role {
+            "identity" => Some(Self::Identity),
+            "operational" => Some(Self::Operational),
+            _ => None,
+        }
+    }
+
+    /// The host role a registry role is minted or reported as: `Identity`
+    /// for [`KeyRole::Identity`], `Operational` for every other role.
+    #[must_use]
+    pub const fn of(role: &KeyRole) -> Self {
+        match role {
+            KeyRole::Identity => Self::Identity,
+            KeyRole::Pseudonym { .. } | KeyRole::Operational => Self::Operational,
+        }
+    }
+}
+
 /// A host's `get_public_key` answer: the key's type, as the protocol string
-/// [`key_type_str`] names, and its public key.
+/// [`key_type_str`] names, its public key, and the role the host recorded
+/// when it minted the key ([`HostRole`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPublicKey {
     /// `"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`.
@@ -75,6 +132,8 @@ pub struct HostPublicKey {
     /// SEC1 point (`"p256"`), or the 65-byte uncompressed SEC1 point
     /// (`"hpke-p256"`).
     pub public_key: Vec<u8>,
+    /// `"identity"` or `"operational"` ([`HostRole`]).
+    pub role: String,
 }
 
 /// A key the adapter holds, with its public key.
@@ -128,8 +187,9 @@ impl RegisteredKey {
 /// What a key is for, which decides what may be derived from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyRole {
-    /// An identity key (`#0`), minted by `generate_identity_keypair`: the only
-    /// role a pseudonym may be derived from.
+    /// An identity key (`#0`), minted by `generate_identity_keypair` or
+    /// resolved from a host that reports `"identity"`: the only role a
+    /// pseudonym may be derived from.
     Identity,
     /// A pseudonym derived from identity key `source` for `context_id` at
     /// `epoch` (`None` for the v1 derivation).
@@ -142,7 +202,7 @@ pub enum KeyRole {
         epoch: Option<u64>,
     },
     /// Any other key: minted by `generate_keypair`, or a host key resolved
-    /// through `get_public_key`, whose role the host protocol does not state.
+    /// through `get_public_key` whose host role is `"operational"`.
     Operational,
 }
 
@@ -219,6 +279,10 @@ impl Slot {
 struct Slots {
     map: HashMap<u64, Slot>,
     next_token: u64,
+    /// Host key ids minted by a generation whose future was dropped, or
+    /// whose rejection destroy failed, before the key was registered or
+    /// destroyed. [`sweep_orphans`] destroys them.
+    orphans: Vec<String>,
 }
 
 /// Handle → slot for the handles one adapter instance has seen.
@@ -276,10 +340,11 @@ impl CallbackKeyRegistry {
         Ok(())
     }
 
-    /// Binds a host key resolved through `get_public_key` as an
-    /// [`KeyRole::Operational`] key. Resolution is a lookup a host may answer
-    /// twice (two concurrent resolutions), so an id already live with the
-    /// same key returns the existing entry, role and all.
+    /// Binds a host key resolved through `get_public_key` in the role the
+    /// host reported: [`KeyRole::Identity`] for [`HostRole::Identity`],
+    /// [`KeyRole::Operational`] otherwise. Resolution is a lookup a host may
+    /// answer twice (two concurrent resolutions), so an id already live with
+    /// the same key returns the existing entry, role and all.
     ///
     /// # Errors
     ///
@@ -290,6 +355,7 @@ impl CallbackKeyRegistry {
         &self,
         handle: KeyHandle,
         key: RegisteredKey,
+        role: HostRole,
     ) -> Result<RegisteredEntry, PlatformError> {
         let mut slots = self.lock()?;
         let bound = match slots.map.get(&handle.id()) {
@@ -304,7 +370,10 @@ impl CallbackKeyRegistry {
             None => {
                 let entry = RegisteredEntry {
                     key,
-                    role: KeyRole::Operational,
+                    role: match role {
+                        HostRole::Identity => KeyRole::Identity,
+                        HostRole::Operational => KeyRole::Operational,
+                    },
                     origin: Origin::Resolved,
                 };
                 slots.map.insert(handle.id(), Slot::Live(entry.clone()));
@@ -526,6 +595,55 @@ impl CallbackKeyRegistry {
         drop(slots);
         Ok(())
     }
+
+    /// Queues host key `key_id` for [`sweep_orphans`] to destroy.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::CustodyError`] if the registry lock is poisoned.
+    fn queue_orphan(&self, key_id: String) -> Result<(), PlatformError> {
+        self.lock()?.orphans.push(key_id);
+        Ok(())
+    }
+
+    /// Takes one queued orphan host key id.
+    fn pop_orphan(&self) -> Result<Option<String>, PlatformError> {
+        Ok(self.lock()?.orphans.pop())
+    }
+
+    /// The host key ids queued for [`sweep_orphans`].
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn orphans(&self) -> Vec<String> {
+        self.lock()
+            .map_or_else(|_| Vec::new(), |slots| slots.orphans.clone())
+    }
+}
+
+/// Queues a host key id for [`sweep_orphans`] when dropped armed: the key
+/// was minted, or its sweep began, and the key is neither registered nor
+/// destroyed on the host.
+struct OrphanGuard<'a> {
+    registry: &'a CallbackKeyRegistry,
+    key_id: Option<String>,
+}
+
+impl OrphanGuard<'_> {
+    /// The key is registered or destroyed: nothing to queue.
+    fn disarm(&mut self) {
+        self.key_id = None;
+    }
+}
+
+impl Drop for OrphanGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(key_id) = self.key_id.take() {
+            // `Drop` has no caller to return an error to. The only error is a
+            // poisoned lock, which makes every registry call fail, so no
+            // later operation of this adapter succeeds either way.
+            let _ = self.registry.queue_orphan(key_id);
+        }
+    }
 }
 
 /// Moves a destroy's slot to `Abandoned` when the `destroy_key` future is
@@ -570,21 +688,38 @@ fn retire_pseudonyms_of(map: &mut HashMap<u64, Slot>, source: u64) {
     }
 }
 
-/// Validates a host's structured `get_public_key` answer.
-///
-/// The stated `key_type` must be a protocol string, and the public key must
-/// have exactly that type's length (Ed25519 32, X25519 32, P-256 signing 33,
-/// HPKE P-256 65) and be a valid key: a non-weak Ed25519 point, or a P-256
-/// point on the curve that is not the identity.
+/// The role a host's `get_public_key` answer states.
 ///
 /// # Errors
 ///
-/// [`PlatformError::CustodyError`] for an unknown type, a wrong length or an
-/// invalid key.
+/// [`PlatformError::CustodyError`] for a role string other than
+/// `"identity"` or `"operational"`.
+pub fn host_role(method: &str, answer: &HostPublicKey) -> Result<HostRole, PlatformError> {
+    HostRole::parse(&answer.role).ok_or_else(|| {
+        PlatformError::CustodyError(format!(
+            "KeyCustodyProvider.{method} returned unknown key role {:?}",
+            answer.role
+        ))
+    })
+}
+
+/// Validates a host's structured `get_public_key` answer.
+///
+/// The stated `role` must be a [`HostRole`] string, the stated `key_type` a
+/// protocol string, and the public key must have exactly that type's length
+/// (Ed25519 32, X25519 32, P-256 signing 33, HPKE P-256 65) and be a valid
+/// key: a non-weak Ed25519 point, or a P-256 point on the curve that is not
+/// the identity.
+///
+/// # Errors
+///
+/// [`PlatformError::CustodyError`] for an unknown role or type, a wrong
+/// length or an invalid key.
 pub fn registered_key(
     method: &str,
     answer: &HostPublicKey,
 ) -> Result<RegisteredKey, PlatformError> {
+    host_role(method, answer)?;
     let key_type = parse_key_type(&answer.key_type).ok_or_else(|| {
         PlatformError::CustodyError(format!(
             "KeyCustodyProvider.{method} returned unknown key type {:?}",
@@ -778,17 +913,27 @@ pub fn x25519_peer(peer_public: &[u8]) -> Result<[u8; 32], PlatformError> {
 /// `KeyCustody::generate_keypair` (role [`KeyRole::Operational`]) and
 /// `generate_identity_keypair` (role [`KeyRole::Identity`]) over a host.
 ///
-/// Asks the host for a key of `key_type`, then for its public key, which
-/// must state the requested type and pass [`registered_key`], and registers
-/// the handle. When the key id is not numeric, the host's answer is refused,
-/// or the registry refuses the id (it is live), the new host key is
-/// destroyed before the error is returned, so no host key is orphaned; a
-/// destroy that also fails is appended to the error.
+/// First destroys any orphaned host key ([`sweep_orphans`]). Then asks the
+/// host for a key of `key_type` in the [`HostRole`] of `role`, and for its
+/// public key, which must state the requested type and role and pass
+/// [`registered_key`], and registers the handle. When the key id is not
+/// numeric, the host's answer is refused, or the registry refuses the id (it
+/// is live), the new host key is destroyed before the error is returned; a
+/// destroy that also fails is appended to the error, and the key id is
+/// queued for the next sweep.
+///
+/// From the moment the host returns a key id until the handle is registered
+/// or the host key destroyed, an armed guard holds the id: a caller that
+/// drops this future at any await in between leaves the id queued, and the
+/// adapter's next generation destroys it on the host. A key queued when the
+/// adapter itself is dropped stays on the host, because a new adapter has no
+/// record of it.
 ///
 /// # Errors
 ///
-/// Any host error; [`PlatformError::CustodyError`] for a non-numeric key id,
-/// a refused public key, another stated type, or a live key id.
+/// An orphan destroy that fails (see [`sweep_orphans`]); any host error;
+/// [`PlatformError::CustodyError`] for a non-numeric key id, a refused public
+/// key, another stated type or role, or a live key id.
 pub async fn generate_keypair<G, GF, P, PF, D, DF>(
     registry: &CallbackKeyRegistry,
     key_type: KeyType,
@@ -798,20 +943,24 @@ pub async fn generate_keypair<G, GF, P, PF, D, DF>(
     host_destroy: D,
 ) -> Result<KeyHandle, PlatformError>
 where
-    G: FnOnce(&'static str) -> GF,
+    G: FnOnce(&'static str, &'static str) -> GF,
     GF: Future<Output = Result<String, PlatformError>>,
     P: FnOnce(String) -> PF,
     PF: Future<Output = Result<HostPublicKey, PlatformError>>,
-    D: FnOnce(String) -> DF,
+    D: Fn(String) -> DF + Sync,
     DF: Future<Output = Result<(), PlatformError>>,
 {
-    let key_id = host_generate(key_type_str(key_type)).await?;
+    sweep_orphans(registry, &host_destroy).await?;
+    let host_role_wanted = HostRole::of(&role);
+    let key_id = host_generate(key_type_str(key_type), host_role_wanted.as_str()).await?;
+    let mut orphan = OrphanGuard {
+        registry,
+        key_id: Some(key_id.clone()),
+    };
     let registered = async {
         let handle = crate::custody_parse::parse_handle("generate_keypair", &key_id)?;
-        let key = registered_key(
-            "get_public_key",
-            &host_get_public_key(key_id.clone()).await?,
-        )?;
+        let answer = host_get_public_key(key_id.clone()).await?;
+        let key = registered_key("get_public_key", &answer)?;
         if key.key_type() != key_type {
             return Err(PlatformError::CustodyError(format!(
                 "KeyCustodyProvider.generate_keypair({}) produced a {} key",
@@ -819,29 +968,83 @@ where
                 key_type_str(key.key_type())
             )));
         }
+        let reported = host_role("get_public_key", &answer)?;
+        if reported != host_role_wanted {
+            return Err(PlatformError::CustodyError(format!(
+                "KeyCustodyProvider.generate_keypair asked for a {} key, and get_public_key \
+                 reports it as {}",
+                host_role_wanted.as_str(),
+                reported.as_str()
+            )));
+        }
         registry.register(handle, RegisteredEntry::minted(key, role))?;
         Ok(handle)
     }
     .await;
     match registered {
-        Ok(handle) => Ok(handle),
-        Err(e) => Err(match host_destroy(key_id).await {
-            Ok(()) => e,
-            Err(destroy_err) => PlatformError::CustodyError(format!(
-                "{e}; destroying the rejected host key also failed: {destroy_err}"
-            )),
-        }),
+        Ok(handle) => {
+            orphan.disarm();
+            Ok(handle)
+        }
+        Err(e) => match host_destroy(key_id).await {
+            Ok(()) => {
+                orphan.disarm();
+                Err(e)
+            }
+            // The guard stays armed: the id is queued for the next sweep.
+            Err(destroy_err) => Err(PlatformError::CustodyError(format!(
+                "{e}; destroying the rejected host key also failed, and it is queued for \
+                 the next generation to destroy: {destroy_err}"
+            ))),
+        },
     }
+}
+
+/// Destroys every host key queued as an orphan ([`OrphanGuard`]).
+///
+/// A key the host reports as [`PlatformError::KeyNotFound`] is already gone.
+/// Each id leaves the queue only under an armed guard, so a sweep dropped
+/// mid-destroy re-queues the id it was destroying and leaves the rest queued.
+///
+/// # Errors
+///
+/// [`PlatformError::CustodyError`] naming the first key whose destroy failed
+/// with any other error; that key and every key not yet reached stay queued.
+pub async fn sweep_orphans<D, DF>(
+    registry: &CallbackKeyRegistry,
+    host_destroy: &D,
+) -> Result<(), PlatformError>
+where
+    D: Fn(String) -> DF + Sync,
+    DF: Future<Output = Result<(), PlatformError>>,
+{
+    while let Some(key_id) = registry.pop_orphan()? {
+        let mut guard = OrphanGuard {
+            registry,
+            key_id: Some(key_id.clone()),
+        };
+        match host_destroy(key_id.clone()).await {
+            Ok(()) | Err(PlatformError::KeyNotFound) => guard.disarm(),
+            Err(e) => {
+                return Err(PlatformError::CustodyError(format!(
+                    "destroying orphaned host key {key_id} failed: {e}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The live entry for `key`, resolving a handle this adapter has not seen
 /// through the host's `get_public_key`. Every entry point calls this, so no
 /// result depends on which ran first.
 ///
-/// A host keeps its keys across adapter instances, so a handle from an
-/// earlier session is still the host's key. Its structured answer passes
-/// [`registered_key`] and binds the handle as an [`KeyRole::Operational`]
-/// key. Returns the entry and whether this call asked the host.
+/// A host keeps its keys, and the role it minted each with, across adapter
+/// instances, so a handle from an earlier session is still the host's key.
+/// Its structured answer passes [`registered_key`] and binds the handle in
+/// the role the host reports ([`CallbackKeyRegistry::bind_resolved`]): an
+/// identity minted in an earlier session resolves as an identity. Returns
+/// the entry and whether this call asked the host.
 ///
 /// # Errors
 ///
@@ -863,7 +1066,8 @@ where
     }
     let answer = host_get_public_key(key.id().to_string()).await?;
     let found = registered_key("get_public_key", &answer)?;
-    Ok((registry.bind_resolved(*key, found)?, true))
+    let role = host_role("get_public_key", &answer)?;
+    Ok((registry.bind_resolved(*key, found, role)?, true))
 }
 
 /// `KeyCustody::sign` over a host provider.
@@ -910,7 +1114,7 @@ where
 ///
 /// Returns the registered public key. For a handle already registered, the
 /// host's current answer must still pass [`registered_key`] and name the
-/// same key; a resolution asks the host once.
+/// same key in the same role; a resolution asks the host once.
 ///
 /// # Errors
 ///
@@ -927,10 +1131,15 @@ where
 {
     let (entry, asked) = resolve(registry, key, &host_get_public_key).await?;
     if !asked {
-        let current = registered_key(
-            "get_public_key",
-            &host_get_public_key(key.id().to_string()).await?,
-        )?;
+        let answer = host_get_public_key(key.id().to_string()).await?;
+        let current = registered_key("get_public_key", &answer)?;
+        if host_role("get_public_key", &answer)? != HostRole::of(&entry.role) {
+            return Err(PlatformError::CustodyError(
+                "KeyCustodyProvider.get_public_key reports another role than the one \
+                 registered for this key_id"
+                    .into(),
+            ));
+        }
         if current != entry.key {
             return Err(PlatformError::CustodyError(
                 "KeyCustodyProvider.get_public_key returned a different key than the one \
@@ -1047,7 +1256,8 @@ where
 /// no derive call. The host returns the pseudonym as separate
 /// `(public_key, key_id)` fields; the point must be a 33-byte compressed
 /// P-256 point, the key id numeric, and the host's own
-/// `get_public_key(key_id)` must answer `"p256"` with the same point. The
+/// `get_public_key(key_id)` must answer `"p256"` with the same point in the
+/// `"operational"` role. The
 /// handle is then bound as a [`KeyRole::Pseudonym`] of `(key, context_id,
 /// epoch)` ([`CallbackKeyRegistry::bind_pseudonym`]).
 ///
@@ -1087,7 +1297,14 @@ where
         RegisteredKey::P256Signing(P256PublicKey::from_sec1(&public_key).map_err(|e| {
             PlatformError::CustodyError(format!("KeyCustodyProvider.{method}: {e}"))
         })?);
-    let confirmed = registered_key("get_public_key", &host_get_public_key(key_id).await?)?;
+    let answer = host_get_public_key(key_id).await?;
+    let confirmed = registered_key("get_public_key", &answer)?;
+    if host_role("get_public_key", &answer)? != HostRole::Operational {
+        return Err(PlatformError::CustodyError(format!(
+            "KeyCustodyProvider.{method}: get_public_key(key_id) reports the pseudonym key as \
+             an identity"
+        )));
+    }
     if confirmed != derived {
         return Err(PlatformError::CustodyError(format!(
             "KeyCustodyProvider.{method}: get_public_key(key_id) does not match the derived \
@@ -1126,7 +1343,7 @@ pub mod fake_host {
     use scp_crypto::p256::{P256PublicKey, P256SigningKey, ecdh_p256, sign_prehash_rfc6979};
     use scp_platform::error::PlatformError;
 
-    use super::HostPublicKey;
+    use super::{HostPublicKey, HostRole};
 
     /// The P-256 group order `n`, big-endian.
     const N: [u8; 32] = [
@@ -1189,7 +1406,7 @@ pub mod fake_host {
         out
     }
 
-    /// A key the host holds.
+    /// A key the host holds, with the role it was minted in.
     enum HostKey {
         Ed25519(ed25519_dalek::SigningKey),
         P256(P256SigningKey),
@@ -1209,6 +1426,8 @@ pub mod fake_host {
     #[derive(Default)]
     pub struct FakeHost {
         keys: Mutex<HashMap<String, HostKey>>,
+        /// The role each key id was minted in; a pseudonym is operational.
+        roles: Mutex<HashMap<String, HostRole>>,
         derived: Mutex<HashMap<Derivation, String>>,
         next: AtomicUsize,
         calls: Mutex<HashMap<&'static str, usize>>,
@@ -1218,6 +1437,11 @@ pub mod fake_host {
 
     impl FakeHost {
         /// How many calls to `method` reached the host.
+        /// Whether the host still holds `key_id`.
+        pub fn holds(&self, key_id: &str) -> bool {
+            locked(&self.keys).is_ok_and(|keys| keys.contains_key(key_id))
+        }
+
         pub fn calls(&self, method: &str) -> usize {
             locked(&self.calls).map_or(0, |calls| calls.get(method).copied().unwrap_or(0))
         }
@@ -1243,13 +1467,17 @@ pub mod fake_host {
                 .ok_or(PlatformError::KeyNotFound)?)
         }
 
-        /// `generate_keypair`: `ed25519`, `p256` or `hpke-p256`; numeric ids
-        /// from 1.
+        /// `generate_keypair`: `ed25519`, `p256` or `hpke-p256`, recording
+        /// `role` for `get_public_key`; numeric ids from 1.
         ///
         /// # Errors
         ///
-        /// Any other key type.
-        pub fn generate_keypair(&self, key_type: &str) -> Result<String, PlatformError> {
+        /// Any other key type or role.
+        pub fn generate_keypair(
+            &self,
+            key_type: &str,
+            role: &str,
+        ) -> Result<String, PlatformError> {
             self.count("generate_keypair");
             let id = self.next_id();
             let scalar = [u8::try_from(id % 64).unwrap_or(0) + 0x40; 32];
@@ -1267,6 +1495,10 @@ pub mod fake_host {
                     )));
                 }
             };
+            let role = HostRole::parse(role).ok_or_else(|| {
+                PlatformError::CustodyError(format!("fake host does not mint {role} keys"))
+            })?;
+            locked(&self.roles)?.insert(id.to_string(), role);
             locked(&self.keys)?.insert(id.to_string(), key);
             Ok(id.to_string())
         }
@@ -1278,20 +1510,24 @@ pub mod fake_host {
         /// An unknown key id.
         pub fn get_public_key(&self, key_id: &str) -> Result<HostPublicKey, PlatformError> {
             self.count("get_public_key");
+            let role = locked(&self.roles)?
+                .get(key_id)
+                .copied()
+                .unwrap_or(HostRole::Operational)
+                .as_str()
+                .to_owned();
             self.with_key(key_id, |key| {
-                Ok(match key {
-                    HostKey::Ed25519(sk) => HostPublicKey {
-                        key_type: "ed25519".into(),
-                        public_key: sk.verifying_key().to_bytes().to_vec(),
-                    },
-                    HostKey::P256(sk) => HostPublicKey {
-                        key_type: "p256".into(),
-                        public_key: sk.public_key().to_compressed().to_vec(),
-                    },
-                    HostKey::HpkeP256(sk) => HostPublicKey {
-                        key_type: "hpke-p256".into(),
-                        public_key: sk.public_key().to_uncompressed().to_vec(),
-                    },
+                let (key_type, public_key) = match key {
+                    HostKey::Ed25519(sk) => ("ed25519", sk.verifying_key().to_bytes().to_vec()),
+                    HostKey::P256(sk) => ("p256", sk.public_key().to_compressed().to_vec()),
+                    HostKey::HpkeP256(sk) => {
+                        ("hpke-p256", sk.public_key().to_uncompressed().to_vec())
+                    }
+                };
+                Ok(HostPublicKey {
+                    key_type: key_type.into(),
+                    public_key,
+                    role,
                 })
             })
         }
@@ -1405,6 +1641,7 @@ pub mod fake_host {
         /// An unknown key id.
         pub fn destroy_key(&self, key_id: &str) -> Result<(), PlatformError> {
             self.count("destroy_key");
+            locked(&self.roles)?.remove(key_id);
             locked(&self.keys)?
                 .remove(key_id)
                 .map(|_| ())
@@ -1442,7 +1679,13 @@ mod tests {
         HostPublicKey {
             key_type: key_type.to_owned(),
             public_key: public_key.to_vec(),
+            role: "operational".to_owned(),
         }
+    }
+
+    fn as_identity(mut a: HostPublicKey) -> HostPublicKey {
+        a.role = "identity".to_owned();
+        a
     }
 
     fn ed_answer(key: &ed25519_dalek::SigningKey) -> HostPublicKey {
@@ -2127,7 +2370,7 @@ mod tests {
             &registry,
             KeyType::HpkeP256,
             KeyRole::Operational,
-            |_| async { Ok("11".to_owned()) },
+            |_, _| async { Ok("11".to_owned()) },
             |_| {
                 let a = host.lock().unwrap().clone();
                 async move { Ok(a) }
@@ -2656,7 +2899,7 @@ mod tests {
             registry,
             key_type,
             KeyRole::Operational,
-            |_| async move { Ok(key_id) },
+            |_, _| async move { Ok(key_id) },
             |_| async move { public_key },
             |id| async move {
                 destroyed.lock().unwrap().push(id);
@@ -2709,6 +2952,17 @@ mod tests {
                 Ok(answer("x25519", &e.verifying_key().to_bytes())),
             ),
             (KeyType::X25519, "17", Ok(ed_answer(&e))),
+            // M2: the host reports another role than the one requested, or
+            // no known role.
+            (KeyType::Ed25519, "18", Ok(as_identity(ed_answer(&e)))),
+            (
+                KeyType::P256Signing,
+                "19",
+                Ok(HostPublicKey {
+                    role: "admin".to_owned(),
+                    ..p256_answer(&valid)
+                }),
+            ),
         ];
         for (key_type, key_id, public_key) in cases {
             let registry = CallbackKeyRegistry::new();
@@ -2806,7 +3060,7 @@ mod tests {
             Err(PlatformError::KeyNotFound)
         ));
         assert!(matches!(
-            registry.bind_resolved(h, x.clone()),
+            registry.bind_resolved(h, x.clone(), HostRole::Operational),
             Err(PlatformError::KeyNotFound)
         ));
 
@@ -3073,7 +3327,7 @@ mod tests {
             &registry,
             KeyType::Ed25519,
             KeyRole::Identity,
-            |t| async move { host.generate_keypair(t) },
+            |t, r| async move { host.generate_keypair(t, r) },
             gpk,
             |id| async move { host.destroy_key(&id) },
         )
@@ -3133,5 +3387,233 @@ mod tests {
             public_key(&registry, &identity, gpk).await,
             Err(PlatformError::KeyNotFound)
         ));
+    }
+    /// Mints an Ed25519 key in `role` on `host` through a first registry.
+    async fn mint_on(host: &fake_host::FakeHost, role: KeyRole) -> KeyHandle {
+        let first = CallbackKeyRegistry::new();
+        generate_keypair(
+            &first,
+            KeyType::Ed25519,
+            role,
+            |t, r| async move { host.generate_keypair(t, r) },
+            |id: String| async move { host.get_public_key(&id) },
+            |id| async move { host.destroy_key(&id) },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// An identity a host minted in an earlier session resolves as an
+    /// identity in a new registry, and derives a pseudonym there.
+    #[tokio::test]
+    async fn an_earlier_sessions_identity_derives_in_a_new_registry() {
+        let host = fake_host::FakeHost::default();
+        let host = &host;
+        let identity = mint_on(host, KeyRole::Identity).await;
+
+        let registry = CallbackKeyRegistry::new();
+        let gpk = |id: String| async move { host.get_public_key(&id) };
+        let pseudonym = derive_pseudonym(
+            &registry,
+            "derive_pseudonym",
+            &identity,
+            b"ctx",
+            None,
+            |id| async move { host.derive_pseudonym(&id, b"ctx", None) },
+            gpk,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            registry.get(&identity).unwrap().unwrap().role,
+            KeyRole::Identity
+        );
+        assert_eq!(
+            registry.get(pseudonym.key_handle()).unwrap().unwrap().role,
+            pseudonym_role(identity.id(), b"ctx", None)
+        );
+        assert_eq!(host.calls("derive_pseudonym"), 1);
+    }
+
+    /// An operational key a host minted in an earlier session resolves as
+    /// operational in a new registry, and its derive is refused before any
+    /// host derive call.
+    #[tokio::test]
+    async fn an_earlier_sessions_operational_key_cannot_derive() {
+        let host = fake_host::FakeHost::default();
+        let host = &host;
+        let operational = mint_on(host, KeyRole::Operational).await;
+
+        let registry = CallbackKeyRegistry::new();
+        let result = derive_pseudonym(
+            &registry,
+            "derive_pseudonym",
+            &operational,
+            b"ctx",
+            None,
+            |id| async move { host.derive_pseudonym(&id, b"ctx", None) },
+            |id: String| async move { host.get_public_key(&id) },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(PlatformError::WrongKeyType { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            registry.get(&operational).unwrap().unwrap().role,
+            KeyRole::Operational
+        );
+        assert_eq!(host.calls("derive_pseudonym"), 0);
+    }
+
+    /// A host whose answer changes a registered key's role, or reports a
+    /// derived pseudonym as an identity, is refused.
+    #[tokio::test]
+    async fn a_changed_or_identity_pseudonym_role_is_refused() {
+        let host = fake_host::FakeHost::default();
+        let host = &host;
+        let registry = CallbackKeyRegistry::new();
+        let identity = generate_keypair(
+            &registry,
+            KeyType::Ed25519,
+            KeyRole::Identity,
+            |t, r| async move { host.generate_keypair(t, r) },
+            |id: String| async move { host.get_public_key(&id) },
+            |id| async move { host.destroy_key(&id) },
+        )
+        .await
+        .unwrap();
+        let demoted = |id: String| async move {
+            host.get_public_key(&id).map(|a| HostPublicKey {
+                role: "operational".to_owned(),
+                ..a
+            })
+        };
+        assert!(matches!(
+            public_key(&registry, &identity, demoted).await,
+            Err(PlatformError::CustodyError(_))
+        ));
+
+        let identity_id = identity.id().to_string();
+        let promoting = |id: String| {
+            let promote = id != identity_id;
+            async move {
+                host.get_public_key(&id)
+                    .map(|a| if promote { as_identity(a) } else { a })
+            }
+        };
+        let result = derive_pseudonym(
+            &registry,
+            "derive_pseudonym",
+            &identity,
+            b"ctx",
+            None,
+            |id| async move { host.derive_pseudonym(&id, b"ctx", None) },
+            promoting,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(PlatformError::CustodyError(_))),
+            "{result:?}"
+        );
+    }
+
+    /// A caller that drops `generate_keypair` between the host's mint
+    /// and its `get_public_key` leaves the minted id queued, and the next
+    /// generation destroys it on the host before minting.
+    #[tokio::test]
+    async fn a_dropped_generation_is_swept_by_the_next() {
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
+
+        let host = fake_host::FakeHost::default();
+        let host = &host;
+        let registry = CallbackKeyRegistry::new();
+        {
+            let mut fut = pin!(generate_keypair(
+                &registry,
+                KeyType::Ed25519,
+                KeyRole::Identity,
+                |t, r| async move { host.generate_keypair(t, r) },
+                |_: String| std::future::pending::<Result<HostPublicKey, PlatformError>>(),
+                |id| async move { host.destroy_key(&id) },
+            ));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        }
+        assert!(host.holds("1"), "the host minted key 1");
+        assert_eq!(registry.orphans(), vec!["1".to_owned()]);
+        assert!(registry.get(&KeyHandle::new(1)).unwrap().is_none());
+
+        generate_keypair(
+            &registry,
+            KeyType::Ed25519,
+            KeyRole::Operational,
+            |t, r| async move { host.generate_keypair(t, r) },
+            |id: String| async move { host.get_public_key(&id) },
+            |id| async move { host.destroy_key(&id) },
+        )
+        .await
+        .unwrap();
+        assert!(!host.holds("1"), "the sweep destroyed the orphan");
+        assert!(registry.orphans().is_empty());
+    }
+
+    /// A sweep whose host destroy fails keeps the orphan queued and
+    /// fails the generation before any mint; a host that no longer holds the
+    /// key counts as destroyed.
+    #[tokio::test]
+    async fn a_failed_sweep_keeps_the_orphan_and_mints_nothing() {
+        let registry = CallbackKeyRegistry::new();
+        registry.queue_orphan("7".to_owned()).unwrap();
+        registry.queue_orphan("8".to_owned()).unwrap();
+        let result = generate_keypair(
+            &registry,
+            KeyType::Ed25519,
+            KeyRole::Operational,
+            |_, _| async { panic!("no mint while an orphan is undestroyed") },
+            |_: String| async { panic!("no lookup") },
+            |id| async move {
+                if id == "8" {
+                    Err(PlatformError::CustodyError("host busy".into()))
+                } else {
+                    Err(PlatformError::KeyNotFound)
+                }
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(PlatformError::CustodyError(_))),
+            "{result:?}"
+        );
+        assert_eq!(registry.orphans(), vec!["7".to_owned(), "8".to_owned()]);
+
+        sweep_orphans(&registry, &|id: String| async move {
+            if id == "8" {
+                Ok(())
+            } else {
+                Err(PlatformError::KeyNotFound)
+            }
+        })
+        .await
+        .unwrap();
+        assert!(registry.orphans().is_empty());
+    }
+
+    /// A rejected key whose destroy fails is queued for the next sweep.
+    #[tokio::test]
+    async fn a_rejected_key_whose_destroy_fails_is_queued() {
+        let registry = CallbackKeyRegistry::new();
+        let result = generate_keypair(
+            &registry,
+            KeyType::Ed25519,
+            KeyRole::Operational,
+            |_, _| async { Ok("not-a-number".to_owned()) },
+            |_: String| async { panic!("no lookup for a non-numeric id") },
+            |_| async { Err(PlatformError::CustodyError("host busy".into())) },
+        )
+        .await;
+        assert!(matches!(result, Err(PlatformError::CustodyError(_))));
+        assert_eq!(registry.orphans(), vec!["not-a-number".to_owned()]);
     }
 }

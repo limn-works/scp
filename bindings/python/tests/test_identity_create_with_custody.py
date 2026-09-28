@@ -139,11 +139,14 @@ class _FakeKeychain:
         # Pseudonym key id -> the identity key id it was derived from, so
         # destroying the identity destroys its pseudonyms (§9.10.4.A).
         self._pseudonym_owner: dict[str, str] = {}
+        # Key id -> the role generate_keypair minted it in.
+        self._roles: dict[str, str] = {}
         self._next = 1
 
-    def generate_keypair(self, key_type: str) -> str:
+    def generate_keypair(self, key_type: str, role: str) -> str:
         kid = str(self._next)
         self._next += 1
+        self._roles[kid] = role
         # Deterministic-per-id seed keeps the test reproducible while still
         # producing a valid Ed25519 key.
         self._seeds[kid] = hashlib.sha256(b"scp-test-custody/" + kid.encode()).digest()
@@ -155,15 +158,16 @@ class _FakeKeychain:
             return p256_sign_prehash(self._pseudonyms[key_id], bytes(message))
         return ed25519_sign(self._seeds[key_id], bytes(message))
 
-    def get_public_key(self, key_id: str) -> tuple[str, bytes]:
+    def get_public_key(self, key_id: str) -> tuple[str, bytes, str]:
         if key_id in self._pseudonyms:
-            return "p256", p256_compressed(self._pseudonyms[key_id])
+            return "p256", p256_compressed(self._pseudonyms[key_id]), "operational"
         if key_id not in self._seeds:
             raise KeyNotFoundError(f"unknown key id: {key_id}")
-        return "ed25519", ed25519_publickey(self._seeds[key_id])
+        return "ed25519", ed25519_publickey(self._seeds[key_id]), self._roles[key_id]
 
     def destroy_key(self, key_id: str) -> None:
         self._seeds.pop(key_id, None)
+        self._roles.pop(key_id, None)
         self._pseudonyms.pop(key_id, None)
         self._pseudonym_owner.pop(key_id, None)
         # A pseudonym dies with its identity (§9.10.4.A).

@@ -471,6 +471,8 @@ export interface CustodyPublicKey {
   keyType: string;
   /** The public key in the exact encoding its type names. */
   publicKey: Uint8Array;
+  /** `"identity"` or `"operational"`: the role the key was minted in. */
+  role: string;
 }
 
 /**
@@ -505,9 +507,12 @@ export interface KeyCustodyProvider {
   /**
    * Generate a keypair and return its opaque id. `keyType` is `"ed25519"`,
    * `"x25519"`, `"p256"` (ECDSA P-256 signing) or `"hpke-p256"` (P-256 ECDH
-   * for HPKE).
+   * for HPKE). `role` is `"identity"` (the only source a pseudonym derives
+   * from) or `"operational"`. Record `role` and report it from
+   * {@link getPublicKey} for the key's lifetime; the bridge refuses and
+   * destroys a key whose reported role differs.
    */
-  generateKeypair(keyType: string): string;
+  generateKeypair(keyType: string, role: string): string;
   /**
    * Sign `message` under `keyId`. An Ed25519 key returns the 64-byte
    * signature. A `"p256"` key, or a pseudonym key returned by
@@ -530,6 +535,14 @@ export interface KeyCustodyProvider {
    * type and rejects a length that does not match it. A provider that holds
    * no key for `keyId` throws a `KeyNotFoundError` (or any error whose `code`
    * is `"SCP-CRYPTO-4006"`), which callers receive as key-not-found.
+   *
+   * `role` is the role {@link generateKeypair} minted the key in, reported in
+   * every session; a pseudonym key is `"operational"`. A key id the bridge
+   * has not seen binds as an identity only when `role` is `"identity"`, so an
+   * identity from an earlier session can still derive pseudonyms. The bridge
+   * cannot check this answer: a provider that reports `"identity"` for a key
+   * it minted as `"operational"` lets that key derive pseudonyms, and that is
+   * outside the native core's control.
    */
   getPublicKey(keyId: string): CustodyPublicKey;
   /**

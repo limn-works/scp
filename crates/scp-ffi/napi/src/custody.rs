@@ -59,12 +59,16 @@ use crate::identity::OpaqueInMemoryKeyCustody;
 /// public bytes / opaque key-id strings.
 #[napi(object, object_to_js = false)]
 pub struct NapiKeyCustodyProvider {
-    /// `(keyType: string) => string` — generate a keypair, return its id.
-    /// `keyType` is `"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`.
+    /// `(keyType: string, role: string) => string` — generate a keypair,
+    /// return its id. `keyType` is `"ed25519"`, `"x25519"`, `"p256"` or
+    /// `"hpke-p256"`; `role` is `"identity"` (the only pseudonym-derivation
+    /// source) or `"operational"`. The host records `role` and reports it from
+    /// `getPublicKey` for the key's lifetime; the bridge refuses and destroys
+    /// a key whose reported role differs.
     #[napi(
-        ts_type = "(keyType: string) => { ok: boolean; value?: string; code?: string; message?: string }"
+        ts_type = "(args: [string, string]) => { ok: boolean; value?: string; code?: string; message?: string }"
     )]
-    pub generate_keypair: Function<'static, String, HostStringResult>,
+    pub generate_keypair: Function<'static, (String, String), HostStringResult>,
     /// `(keyId: string, message: Uint8Array) => Uint8Array` — 64-byte sig.
     /// For a `"p256"` key `message` is a 32-byte prehash and the result is
     /// raw `r || s` (64 bytes) or DER; Rust normalises to low-s and verifies
@@ -81,9 +85,15 @@ pub struct NapiKeyCustodyProvider {
     /// point (`"p256"`) or the 65-byte uncompressed SEC1 point
     /// (`"hpke-p256"`). The bridge types the key from `keyType`, never from
     /// the length, and refuses any other length. A key id the host does not
-    /// hold is a failure whose `code` is `"SCP-CRYPTO-4006"`.
+    /// hold is a failure whose `code` is `"SCP-CRYPTO-4006"`. `role` is the
+    /// role `generateKeypair` minted the key in, reported across sessions; a
+    /// pseudonym key is `"operational"`. A key id the bridge has not seen
+    /// binds as an identity only when `role` is `"identity"`. The bridge
+    /// cannot check the host's word: a host that reports `"identity"` for a
+    /// key it minted as `"operational"` lets that key derive pseudonyms,
+    /// which is outside Rust's control.
     #[napi(
-        ts_type = "(keyId: string) => { ok: boolean; value?: { keyType: string; publicKey: number[] }; code?: string; message?: string }"
+        ts_type = "(keyId: string) => { ok: boolean; value?: { keyType: string; publicKey: number[]; role: string }; code?: string; message?: string }"
     )]
     pub get_public_key: Function<'static, String, HostPublicKeyResult>,
     /// `(keyId: string) => void` — destroy key material.
@@ -137,6 +147,8 @@ pub struct NapiCustodyPublicKey {
     pub key_type: String,
     /// The public key in the exact encoding its type names.
     pub public_key: Vec<u8>,
+    /// `"identity"` or `"operational"`: the role the key was minted in.
+    pub role: String,
 }
 
 /// A host pseudonym derivation result: the 33-byte compressed P-256 point and
@@ -373,7 +385,13 @@ fn js_error_code(env: &napi::Env, e: napi::Error) -> Option<String> {
 /// per-field arg/return shapes.
 #[allow(clippy::type_complexity)]
 pub(crate) struct CallbackTsfns {
-    generate_keypair: ThreadsafeFunction<String, HostStringResult, String, napi::Status, false>,
+    generate_keypair: ThreadsafeFunction<
+        (String, String),
+        HostStringResult,
+        (String, String),
+        napi::Status,
+        false,
+    >,
     sign: ThreadsafeFunction<
         (String, Vec<u8>),
         HostBytesResult,
@@ -417,6 +435,7 @@ pub(crate) trait JsCustodyHost: Send + Sync {
     fn generate_keypair(
         &self,
         key_type: String,
+        role: String,
     ) -> impl Future<Output = Result<String, PlatformError>> + Send;
     fn sign(
         &self,
@@ -454,8 +473,12 @@ pub(crate) trait JsCustodyHost: Send + Sync {
 }
 
 impl JsCustodyHost for CallbackTsfns {
-    async fn generate_keypair(&self, key_type: String) -> Result<String, PlatformError> {
-        call_host("generate_keypair", &self.generate_keypair, key_type).await
+    async fn generate_keypair(
+        &self,
+        key_type: String,
+        role: String,
+    ) -> Result<String, PlatformError> {
+        call_host("generate_keypair", &self.generate_keypair, (key_type, role)).await
     }
 
     async fn sign(&self, key_id: String, data: Vec<u8>) -> Result<Vec<u8>, PlatformError> {
@@ -467,6 +490,7 @@ impl JsCustodyHost for CallbackTsfns {
         Ok(HostPublicKey {
             key_type: answer.key_type,
             public_key: answer.public_key,
+            role: answer.role,
         })
     }
 
@@ -625,7 +649,7 @@ impl<H: JsCustodyHost> CallbackAdapter<H> {
             &self.registry,
             key_type,
             role,
-            |type_str| h.generate_keypair(type_str.to_owned()),
+            |type_str, role_str| h.generate_keypair(type_str.to_owned(), role_str.to_owned()),
             |key_id| h.get_public_key(key_id),
             |key_id| h.destroy_key(key_id),
         )
@@ -1100,8 +1124,12 @@ mod adapter_tests {
     }
 
     impl JsCustodyHost for TestHost {
-        async fn generate_keypair(&self, key_type: String) -> Result<String, PlatformError> {
-            self.host.generate_keypair(&key_type)
+        async fn generate_keypair(
+            &self,
+            key_type: String,
+            role: String,
+        ) -> Result<String, PlatformError> {
+            self.host.generate_keypair(&key_type, &role)
         }
 
         async fn sign(&self, key_id: String, data: Vec<u8>) -> Result<Vec<u8>, PlatformError> {
@@ -1378,7 +1406,7 @@ mod adapter_tests {
             .await
             .expect("p256 generation");
         let resolved = KeyHandle::new(
-            host.generate_keypair("p256")
+            host.generate_keypair("p256", "operational")
                 .expect("host-side key")
                 .parse()
                 .expect("numeric id"),

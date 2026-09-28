@@ -8329,7 +8329,7 @@ class SignOnlyCustody:
         self._key_id = str(key_id)
         self.export_calls = 0
 
-    def generate_keypair(self, key_type):
+    def generate_keypair(self, key_type, role):
         return self._key_id
 
     def sign(self, key_id, message):
@@ -8338,7 +8338,8 @@ class SignOnlyCustody:
         return ed25519_sign(str(key_id), bytes(message))
 
     def get_public_key(self, key_id):
-        return ('ed25519', ed25519_public_key(str(key_id)))
+        # The provider's single key is the identity the test wires.
+        return ('ed25519', ed25519_public_key(str(key_id)), 'identity')
 
     def destroy_key(self, key_id):
         return None

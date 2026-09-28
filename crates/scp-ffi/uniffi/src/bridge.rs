@@ -754,8 +754,8 @@ impl CallbackKeyCustody {
             &self.registry,
             key_type,
             role,
-            |type_str| async move {
-                p.generate_keypair(type_str.to_owned())
+            |type_str, role_str| async move {
+                p.generate_keypair(type_str.to_owned(), role_str.to_owned())
                     .await
                     .map_err(host_err("generate_keypair"))
             },
@@ -778,6 +778,7 @@ async fn host_public_key(
     Ok(scp_ffi_common::callback_custody::HostPublicKey {
         key_type: answer.key_type,
         public_key: answer.public_key,
+        role: answer.role,
     })
 }
 
@@ -19448,7 +19449,11 @@ mod tests {
             Err(Self::refuse("destroy_key"))
         }
 
-        async fn generate_keypair(&self, _key_type: String) -> Result<String, ScpError> {
+        async fn generate_keypair(
+            &self,
+            _key_type: String,
+            _role: String,
+        ) -> Result<String, ScpError> {
             Err(Self::refuse("generate_keypair"))
         }
 
@@ -21463,6 +21468,7 @@ mod tests {
             Ok(crate::CustodyPublicKey {
                 key_type: answer.key_type,
                 public_key: answer.public_key,
+                role: answer.role,
             })
         }
 
@@ -21472,9 +21478,13 @@ mod tests {
                 .map_err(|e| fake_host_err(&e))
         }
 
-        async fn generate_keypair(&self, key_type: String) -> Result<String, ScpError> {
+        async fn generate_keypair(
+            &self,
+            key_type: String,
+            role: String,
+        ) -> Result<String, ScpError> {
             self.host
-                .generate_keypair(&key_type)
+                .generate_keypair(&key_type, &role)
                 .map_err(|e| fake_host_err(&e))
         }
 
@@ -21637,7 +21647,9 @@ mod tests {
         use scp_platform::KeyCustody;
 
         let host = Arc::new(scp_ffi_common::callback_custody::fake_host::FakeHost::default());
-        let id = host.generate_keypair("p256").expect("host-side key");
+        let id = host
+            .generate_keypair("p256", "operational")
+            .expect("host-side key");
         let point =
             P256PublicKey::from_sec1(&host.get_public_key(&id).expect("host point").public_key)
                 .expect("a valid point");
@@ -21728,7 +21740,7 @@ mod tests {
             .await
             .expect("p256 generation");
         let resolved = KeyHandle::new(
-            host.generate_keypair("p256")
+            host.generate_keypair("p256", "operational")
                 .expect("host-side key")
                 .parse()
                 .expect("numeric id"),
@@ -21832,6 +21844,7 @@ mod tests {
             Ok(crate::CustodyPublicKey {
                 key_type: "ed25519".to_owned(),
                 public_key: self.signing_key.verifying_key().to_bytes().to_vec(),
+                role: "identity".to_owned(),
             })
         }
 
@@ -21839,7 +21852,11 @@ mod tests {
             Ok(())
         }
 
-        async fn generate_keypair(&self, _key_type: String) -> Result<String, ScpError> {
+        async fn generate_keypair(
+            &self,
+            _key_type: String,
+            _role: String,
+        ) -> Result<String, ScpError> {
             // Single fixed key; handle id `1` is what the test wires.
             Ok("1".to_owned())
         }
@@ -24507,6 +24524,8 @@ mod tests {
         /// Called with the key id at the start of `destroy_key`, before the
         /// host forgets the key.
         destroy_probe: Option<DestroyProbe>,
+        /// The role each key id was minted in, as `get_public_key` reports it.
+        roles: std::sync::Mutex<std::collections::HashMap<String, String>>,
     }
 
     /// A callback run inside the host's `destroy_key`.
@@ -24543,6 +24562,7 @@ mod tests {
                 fault,
                 sign_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 destroy_probe: None,
+                roles: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         }
 
@@ -24679,12 +24699,23 @@ mod tests {
                 return Ok(crate::CustodyPublicKey {
                     key_type: "p256".to_owned(),
                     public_key: point.to_vec(),
+                    role: "operational".to_owned(),
                 });
             }
             let sk = self.key_for(&key_id)?;
+            let role = self
+                .roles
+                .lock()
+                .expect("role mutex")
+                .get(&key_id)
+                .cloned()
+                // No recorded role is a host defect; an unparseable role
+                // makes the bridge refuse the key.
+                .unwrap_or_else(|| "missing".to_owned());
             Ok(crate::CustodyPublicKey {
                 key_type: "ed25519".to_owned(),
                 public_key: sk.verifying_key().to_bytes().to_vec(),
+                role,
             })
         }
 
@@ -24697,10 +24728,15 @@ mod tests {
                 .expect("pseudonym mutex")
                 .remove(&key_id);
             self.keys.lock().expect("keystore mutex").remove(&key_id);
+            self.roles.lock().expect("role mutex").remove(&key_id);
             Ok(())
         }
 
-        async fn generate_keypair(&self, _key_type: String) -> Result<String, ScpError> {
+        async fn generate_keypair(
+            &self,
+            _key_type: String,
+            role: String,
+        ) -> Result<String, ScpError> {
             use rand::RngCore;
             // Derive a deterministic-per-call seed from an OS draw so each key is
             // distinct (a fresh `#0`, `#active`, … per identity).
@@ -24715,6 +24751,10 @@ mod tests {
                 .lock()
                 .expect("keystore mutex")
                 .insert(id.clone(), sk);
+            self.roles
+                .lock()
+                .expect("role mutex")
+                .insert(id.clone(), role);
             Ok(id)
         }
 
@@ -24956,7 +24996,7 @@ mod tests {
     async fn callback_host_failure_codes_map_to_typed_errors() {
         let custody = CallbackKeyCustody::new(Box::new(ProdLikeCustody::new()));
         let identity = custody
-            .generate_keypair(KeyType::Ed25519)
+            .generate_identity_keypair()
             .await
             .expect("identity key");
         let pseudonym = custody

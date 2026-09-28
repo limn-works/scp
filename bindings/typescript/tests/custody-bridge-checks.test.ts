@@ -75,6 +75,8 @@ class Store {
   pseudonyms = new Map<string, bigint>();
   /** Pseudonym key id -> the identity key id it was derived from. */
   pseudonymOwner = new Map<string, string>();
+  /** Key id -> the role `generateKeypair` minted it in. */
+  roles = new Map<string, string>();
   next = 1;
   signCalls = 0;
   /** Called with the key id at the start of the host's `destroyKey`. */
@@ -87,9 +89,10 @@ class StoreKeychain implements KeyCustodyProvider {
     readonly fault?: Fault,
   ) {}
 
-  generateKeypair(_keyType: string): string {
+  generateKeypair(_keyType: string, role: string): string {
     const kid = String(this.store.next++);
     this.store.seeds.set(kid, new Uint8Array(crypto.randomBytes(32)));
+    this.store.roles.set(kid, role);
     return kid;
   }
 
@@ -110,15 +113,24 @@ class StoreKeychain implements KeyCustodyProvider {
 
   getPublicKey(keyId: string): CustodyPublicKey {
     const d = this.store.pseudonyms.get(keyId);
-    if (d !== undefined) return { keyType: "p256", publicKey: p256Compressed(d) };
+    if (d !== undefined) {
+      return { keyType: "p256", publicKey: p256Compressed(d), role: "operational" };
+    }
     const seed = this.store.seeds.get(keyId);
-    if (seed !== undefined) return { keyType: "ed25519", publicKey: ed25519Public(seed) };
+    if (seed !== undefined) {
+      return {
+        keyType: "ed25519",
+        publicKey: ed25519Public(seed),
+        role: this.store.roles.get(keyId) ?? "missing",
+      };
+    }
     throw new Error(`unknown key id: ${keyId}`);
   }
 
   destroyKey(keyId: string): void {
     this.store.destroyProbe?.(keyId);
     this.store.seeds.delete(keyId);
+    this.store.roles.delete(keyId);
     this.store.pseudonyms.delete(keyId);
     this.store.pseudonymOwner.delete(keyId);
     // A pseudonym dies with its identity (§9.10.4.A).

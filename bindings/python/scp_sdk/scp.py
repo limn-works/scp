@@ -120,11 +120,15 @@ class KeyCustodyProvider(Protocol):
     ``SCP-CRYPTO-4060`` carrying that code and the exception text.
     """
 
-    def generate_keypair(self, key_type: str) -> str:
+    def generate_keypair(self, key_type: str, role: str) -> str:
         """Generate a keypair and return its id.
 
         ``key_type`` is ``"ed25519"``, ``"x25519"``, ``"p256"`` (ECDSA P-256
-        signing) or ``"hpke-p256"`` (P-256 ECDH for HPKE).
+        signing) or ``"hpke-p256"`` (P-256 ECDH for HPKE). ``role`` is
+        ``"identity"`` (the only source a pseudonym derives from) or
+        ``"operational"``. Record ``role`` and report it from
+        :meth:`get_public_key` for the key's lifetime; the bridge refuses and
+        destroys a key whose reported role differs.
         """
         ...
 
@@ -141,8 +145,8 @@ class KeyCustodyProvider(Protocol):
         """
         ...
 
-    def get_public_key(self, key_id: str) -> tuple[str, bytes]:
-        """Return ``(key_type, public_key)`` for ``key_id``.
+    def get_public_key(self, key_id: str) -> tuple[str, bytes, str]:
+        """Return ``(key_type, public_key, role)`` for ``key_id``.
 
         ``key_type`` is the type the key was generated with (``"ed25519"``,
         ``"x25519"``, ``"p256"`` or ``"hpke-p256"``); a pseudonym key id from
@@ -156,6 +160,15 @@ class KeyCustodyProvider(Protocol):
         :class:`~scp_sdk.errors.KeyNotFoundError` (or any exception whose
         ``code`` is ``"SCP-CRYPTO-4006"``), which callers receive as
         key-not-found; any other exception is a custody error.
+
+        ``role`` is the role :meth:`generate_keypair` minted the key in,
+        reported in every session; a pseudonym key id is ``"operational"``.
+        A key id the bridge has not seen binds as an identity only when
+        ``role`` is ``"identity"``, so an identity from an earlier session
+        can still derive pseudonyms. The bridge cannot check this answer: a
+        provider that reports ``"identity"`` for a key it minted as
+        ``"operational"`` lets that key derive pseudonyms, and that is outside
+        the Rust core's control.
         """
         ...
 

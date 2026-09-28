@@ -306,6 +306,29 @@ impl PyKeyCustodyProvider {
         })
     }
 
+    /// Calls `method_name(first, second)` with two Python `str` arguments on the
+    /// Python object under a fresh GIL and extracts the result as `T`.
+    fn call_str_str<T>(
+        &self,
+        method_name: &str,
+        first: &str,
+        second: &str,
+    ) -> Result<T, PlatformError>
+    where
+        T: for<'py> pyo3::FromPyObject<'py>,
+    {
+        Python::with_gil(|py| {
+            let result = self
+                .obj
+                .bind(py)
+                .call_method1(method_name, (first, second))
+                .map_err(|e| Self::call_err(py, method_name, &e))?;
+            result
+                .extract::<T>()
+                .map_err(|e| Self::type_err(method_name, &e))
+        })
+    }
+
     /// Calls `method_name(key_id, payload)` (payload as Python `bytes`) on the
     /// Python object under a fresh GIL and extracts the result as `T`.
     fn call_str_bytes<T>(
@@ -434,20 +457,29 @@ impl FfiKeyCustody {
 /// Concrete [`KeyCustody`] adapter delegating to a [`PyKeyCustodyProvider`].
 ///
 /// The provider returns:
-/// - `generate_keypair(key_type: str) -> str` — a numeric key-id string;
-///   `key_type` is `"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`.
+/// - `generate_keypair(key_type: str, role: str) -> str` — a numeric key-id
+///   string; `key_type` is `"ed25519"`, `"x25519"`, `"p256"` or
+///   `"hpke-p256"`, and `role` is `"identity"` (the only pseudonym-derivation
+///   source) or `"operational"`. The host records `role` and reports it from
+///   `get_public_key` for the key's lifetime; the bridge refuses and destroys
+///   a key whose reported role differs.
 /// - `sign(key_id: str, message: bytes) -> bytes` — a 64-byte Ed25519 sig;
 ///   for a `"p256"` key or a pseudonym key id, `message` is the 32-byte
 ///   digest and the result is raw `r ‖ s` or DER, which the bridge normalises
 ///   to low-`s` and verifies strictly under the key's registered point.
 ///   A software host MUST derive the ECDSA nonce by RFC 6979 with SHA-256; a
 ///   hardware host (Secure Enclave, `StrongBox`/TEE) may use a random nonce.
-/// - `get_public_key(key_id: str) -> tuple[str, bytes]` — `(key_type,
-///   public_key)`: the key's type (`"ed25519"`, `"x25519"`, `"p256"` or
-///   `"hpke-p256"`; a pseudonym key is `"p256"`) and its public key, exactly
+/// - `get_public_key(key_id: str) -> tuple[str, bytes, str]` — `(key_type,
+///   public_key, role)`: the key's type (`"ed25519"`, `"x25519"`, `"p256"` or
+///   `"hpke-p256"`; a pseudonym key is `"p256"`), its public key, exactly
 ///   32 bytes (Ed25519 / X25519), 33 (compressed SEC1, `"p256"`) or 65
-///   (uncompressed SEC1, `"hpke-p256"`). The bridge types the key from
-///   `key_type`, never from the length, and refuses any other length.
+///   (uncompressed SEC1, `"hpke-p256"`), and the role `generate_keypair`
+///   minted it in (a pseudonym key is `"operational"`). The bridge types the
+///   key from `key_type`, never from the length, and refuses any other
+///   length. A key id the bridge has not seen binds as an identity only when
+///   `role` is `"identity"`. The bridge cannot check the host's word: a host
+///   that reports `"identity"` for a key it minted as `"operational"` lets
+///   that key derive pseudonyms, which is outside Rust's control.
 /// - Any method raises `scp_sdk.KeyNotFoundError`, or any exception whose
 ///   `code` is `SCP-CRYPTO-4006`, for a key id the host does not hold; the
 ///   bridge reports it as `KeyNotFound`. Any other exception is a custody
@@ -474,21 +506,22 @@ pub struct PyCallbackKeyCustody {
 }
 
 impl PyKeyCustodyProvider {
-    /// `get_public_key(key_id)` as the structured `(key_type, public_key)`
-    /// answer the shared flows take.
+    /// `get_public_key(key_id)` as the structured `(key_type, public_key,
+    /// role)` answer the shared flows take.
     fn host_public_key(
         &self,
         key_id: &str,
     ) -> std::future::Ready<Result<scp_ffi_common::callback_custody::HostPublicKey, PlatformError>>
     {
         std::future::ready(
-            self.call_str::<(String, Vec<u8>)>("get_public_key", key_id)
-                .map(
-                    |(key_type, public_key)| scp_ffi_common::callback_custody::HostPublicKey {
+            self.call_str::<(String, Vec<u8>, String)>("get_public_key", key_id)
+                .map(|(key_type, public_key, role)| {
+                    scp_ffi_common::callback_custody::HostPublicKey {
                         key_type,
                         public_key,
-                    },
-                ),
+                        role,
+                    }
+                }),
         )
     }
 }
@@ -557,7 +590,9 @@ impl PyCallbackKeyCustody {
             &self.registry,
             key_type,
             role,
-            |type_str| std::future::ready(p.call_str("generate_keypair", type_str)),
+            |type_str, role_str| {
+                std::future::ready(p.call_str_str("generate_keypair", type_str, role_str))
+            },
             |key_id| p.host_public_key(&key_id),
             |key_id| std::future::ready(p.call_str_void("destroy_key", &key_id)),
         )
@@ -908,6 +943,7 @@ class FakeCustody:
     def __init__(self, fault=None):
         self._seeds = {}
         self._key_types = {}
+        self._roles = {}
         self._pseudonyms = {}
         self._next = 1
         self._fault = fault
@@ -921,12 +957,13 @@ class FakeCustody:
             raise KeyNotFoundError(key_id)
         return self._seeds[key_id]
 
-    def generate_keypair(self, key_type):
+    def generate_keypair(self, key_type, role):
         self._count('generate_keypair')
         kid = str(self._next)
         self._next += 1
         self._seeds[kid] = hashlib.sha256(kid.encode()).digest()
         self._key_types[kid] = key_type
+        self._roles[kid] = role
         return kid
 
     def sign(self, key_id, message):
@@ -947,6 +984,11 @@ class FakeCustody:
         return ed_sign(seed, bytes(message))
 
     def get_public_key(self, key_id):
+        # The role generate_keypair recorded; a pseudonym key is operational.
+        key_type, public_key = self._public(key_id)
+        return (key_type, public_key, self._roles.get(key_id, 'operational'))
+
+    def _public(self, key_id):
         self._count('get_public_key')
         if key_id in self._pseudonyms:
             point = compressed(self._pseudonyms[key_id])
@@ -964,6 +1006,7 @@ class FakeCustody:
         if probe is not None:
             probe(key_id)
         self._seeds.pop(key_id, None)
+        self._roles.pop(key_id, None)
         self._pseudonyms.pop(key_id, None)
 
     def dh_agree(self, key_id, peer_public):
@@ -1025,18 +1068,18 @@ class P256Custody(FakeCustody):
         self._types = {}
         self.dh_peers = []
 
-    def generate_keypair(self, key_type):
-        kid = super().generate_keypair(key_type)
+    def generate_keypair(self, key_type, role):
+        kid = super().generate_keypair(key_type, role)
         self._types[kid] = key_type
         return kid
 
-    def get_public_key(self, key_id):
+    def _public(self, key_id):
         t = self._types.get(key_id)
         if t == 'p256':
             return ('p256', G_COMPRESSED)
         if t == 'hpke-p256':
             return ('hpke-p256', bytes([4]) + GX.to_bytes(32, 'big') + GY.to_bytes(32, 'big'))
-        return super().get_public_key(key_id)
+        return super()._public(key_id)
 
     def sign(self, key_id, message):
         if self._types.get(key_id) != 'p256':
@@ -1059,10 +1102,10 @@ class P256Custody(FakeCustody):
 class BadP256Custody(P256Custody):
     '''Returns a 32-byte public key and an unverifiable signature for P-256.'''
 
-    def get_public_key(self, key_id):
+    def _public(self, key_id):
         if self._types.get(key_id) == 'hpke-p256':
             return ('hpke-p256', bytes([7]) * 32)
-        return super().get_public_key(key_id)
+        return super()._public(key_id)
 
     def sign(self, key_id, message):
         if self._types.get(key_id) == 'p256':
@@ -1090,7 +1133,7 @@ class WrongLengthCustody(P256Custody):
             return bytes([5]) * 72
         return super().sign(key_id, message)
 
-    def get_public_key(self, key_id):
+    def _public(self, key_id):
         t = self._types.get(key_id)
         if t == 'ed25519':
             return ('ed25519', bytes([6]) * 31)
@@ -1098,7 +1141,7 @@ class WrongLengthCustody(P256Custody):
             if key_id in self._served:
                 return ('p256', TWO_G_COMPRESSED)
             self._served.add(key_id)
-        return super().get_public_key(key_id)
+        return super()._public(key_id)
 ";
 
     /// Builds a `PyCallbackKeyCustody` over a fresh `FakeCustody(fault)`.
@@ -1466,7 +1509,7 @@ mod tests {
         use scp_ffi_common::error_codes as codes;
         let custody = fake_callback_custody();
         let identity = custody
-            .generate_keypair(KeyType::Ed25519)
+            .generate_identity_keypair()
             .await
             .expect("identity key");
         let pseudonym = custody
@@ -1887,7 +1930,7 @@ mod tests {
                 .provider
                 .obj
                 .bind(py)
-                .call_method1("generate_keypair", ("p256",))
+                .call_method1("generate_keypair", ("p256", "operational"))
                 .and_then(|id| id.extract::<String>())
                 .expect("host-side key")
         });
