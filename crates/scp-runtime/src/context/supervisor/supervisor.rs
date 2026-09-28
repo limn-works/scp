@@ -3138,8 +3138,11 @@ impl Supervisor {
                 // with a clean budget and does not inherit a previous
                 // instance's crash count or sticky poison (ADR-049 §10). A
                 // create that registers no actor restores that history when
-                // `_crash_window` drops.
-                let _crash_window = self.begin_bootstrap_window(&context_id);
+                // `crash_window` drops. Every exit drops it before the reply,
+                // as the `ImportContext` arm does, so a caller that reads
+                // `read_context_state_checked` on receiving the reply sees the
+                // settled window, never the bootstrap's marker-only one.
+                let crash_window = self.begin_bootstrap_window(&context_id);
                 // ADR-049 Phase 2A finalization: bootstrap now builds the
                 // actor-shape `ActorDeps` (self-sourced from the
                 // supervisor's provider slots, scoped to the creator's
@@ -3155,6 +3158,7 @@ impl Supervisor {
                             scp_protocol::context::builder::ContextCreationError::CreationFailed(
                                 format!("create_context: deps unavailable: {e}"),
                             );
+                        drop(crash_window);
                         let _ = reply.send(Err(err));
                         return Outcome::err_mutated(sketch);
                     }
@@ -3207,6 +3211,7 @@ impl Supervisor {
                             scp_protocol::context::builder::ContextCreationError::CreationFailed(
                                 msg.clone(),
                             );
+                        drop(crash_window);
                         let _ = reply.send(Err(err));
                         return Outcome::err_mutated(ContextError::CreationFailed(msg));
                     }
@@ -3223,6 +3228,7 @@ impl Supervisor {
                             scp_protocol::context::builder::ContextCreationError::CreationFailed(
                                 msg.clone(),
                             );
+                        drop(crash_window);
                         let _ = reply.send(Err(err));
                         return Outcome::err_mutated(ContextError::PersistenceFailed(msg));
                     }
@@ -3263,6 +3269,7 @@ impl Supervisor {
                         (Outcome::err_mutated(sketch), Err(err))
                     }
                 };
+                drop(crash_window);
                 let _ = reply.send(reply_result);
                 outcome
             }
@@ -3359,6 +3366,7 @@ impl Supervisor {
                             self.key_package_stores.remove(&owning_did);
                         }
                         let sketch = standing_outcome_error_sketch(&e);
+                        drop(crash_window);
                         let _ = reply.send(Err(e));
                         return Outcome::err_mutated(sketch);
                     }
@@ -21818,6 +21826,145 @@ mod tests {
         assert!(
             !sup.crash_windows.contains_key(&clean),
             "a bootstrap over an id with no crash history leaves no window"
+        );
+    }
+
+    /// Reads `read_context_state_checked` for `id` at the instant a bootstrap
+    /// arm sends its reply: tokio's oneshot `send` wakes the receiver's waker
+    /// synchronously, so `wake` runs before the arm executes its next line.
+    struct StateReadAtReply {
+        sup: Arc<Supervisor>,
+        id: String,
+        seen: std::sync::Mutex<
+            Option<Result<Option<scp_protocol::context::ContextState>, ContextError>>,
+        >,
+    }
+
+    impl std::task::Wake for StateReadAtReply {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let read =
+                futures::FutureExt::now_or_never(self.sup.read_context_state_checked(&self.id))
+                    .expect("a checked read of an id no actor serves completes without awaiting");
+            *self.seen.lock().expect("probe lock") = Some(read);
+        }
+    }
+
+    /// Dispatch `cmd`, whose reply goes to `rx`, and return the checked state
+    /// read taken when the reply was sent, together with the reply.
+    async fn state_read_at_reply<T: Send>(
+        sup: &Arc<Supervisor>,
+        id: &str,
+        mut rx: tokio::sync::oneshot::Receiver<T>,
+        cmd: LifecycleCommand,
+    ) -> (
+        Result<Option<scp_protocol::context::ContextState>, ContextError>,
+        T,
+    ) {
+        let probe = Arc::new(StateReadAtReply {
+            sup: Arc::clone(sup),
+            id: id.to_owned(),
+            seen: std::sync::Mutex::new(None),
+        });
+        {
+            let waker = std::task::Waker::from(Arc::clone(&probe));
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(
+                std::future::Future::poll(std::pin::Pin::new(&mut rx), &mut cx).is_pending(),
+                "no reply before dispatch"
+            );
+        }
+        sup.dispatch_lifecycle_command(cmd)
+            .await
+            .expect("bootstrap commands dispatch directly");
+        let reply = rx.await.expect("the arm sends a reply");
+        let seen = probe
+            .seen
+            .lock()
+            .expect("probe lock")
+            .take()
+            .expect("the reply woke the probe");
+        (seen, reply)
+    }
+
+    /// Every failing exit of the `CreateContext` and `ImportContext` arms
+    /// drops its bootstrap window before it replies. A caller that reads the
+    /// checked state the moment it receives the error sees the restored
+    /// poisoned window (`Ok(Some(Poisoned))`), never the bootstrap's
+    /// marker-only window (`Err(ActorCrashed)`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_bootstrap_restores_the_crash_window_before_it_replies() {
+        use scp_protocol::context::ContextState;
+        let poison = |sup: &Supervisor, id: &str| {
+            sup.crash_windows.entry(id.to_owned()).or_default().poisoned = true;
+        };
+        let create = |id: &str| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let payload = Box::new(crate::context::actor::commands::CreateContextPayload {
+                context_id: id.to_owned(),
+                params: scp_protocol::context::ContextParams::default(),
+                creator_did: DID("did:dht:z6MkReplyOrderCreator".to_owned()),
+                local_pseudonym: None,
+            });
+            (LifecycleCommand::CreateContext { payload, reply: tx }, rx)
+        };
+
+        // Create, `build_actor_deps` fails: no providers are attached.
+        let sup = Arc::new(Supervisor::for_query_shim());
+        let id = hex::encode([0xC1u8; 32]);
+        poison(&sup, &id);
+        let (cmd, rx) = create(&id);
+        let (seen, reply) = state_read_at_reply(&sup, &id, rx, cmd).await;
+        assert!(reply.is_err(), "a create without providers fails");
+        assert!(
+            matches!(seen, Ok(Some(ContextState::Poisoned))),
+            "create, deps failure: the reply must follow the window restore, got {seen:?}"
+        );
+
+        // Create, refused by the terminal-snapshot precheck.
+        let id = hex::encode([0xC2u8; 32]);
+        let map = MapPersistence::default();
+        let mut snap = import_test_snapshot(&id, "did:dht:z6MkReplyOrderCreator");
+        snap.state = ContextState::Closed;
+        map.contexts.insert(id.clone(), snap);
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup = supervisor_with_clock_and_persistence(clock, Box::new(map));
+        poison(&sup, &id);
+        let (cmd, rx) = create(&id);
+        let (seen, reply) = state_read_at_reply(&sup, &id, rx, cmd).await;
+        assert!(reply.is_err(), "a create over a closed snapshot is refused");
+        assert!(
+            matches!(seen, Ok(Some(ContextState::Poisoned))),
+            "create, terminal precheck: the reply must follow the window restore, got {seen:?}"
+        );
+
+        // Import, `build_actor_deps` fails after the export verifies.
+        let sup = Arc::new(Supervisor::for_query_shim());
+        let id = hex::encode([0xC3u8; 32]);
+        poison(&sup, &id);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let export = signed_import_export_with_member(
+            &id,
+            "did:key:reply-order-creator",
+            "did:key:reply-order-member",
+            &signing_key,
+        )
+        .await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::ImportContext {
+            export: Box::new(export),
+            verifying_key: Box::new(signing_key.verifying_key()),
+            local_pseudonym: None,
+            reply: tx,
+        };
+        let (seen, reply) = state_read_at_reply(&sup, &id, rx, cmd).await;
+        assert!(reply.is_err(), "an import without providers fails");
+        assert!(
+            matches!(seen, Ok(Some(ContextState::Poisoned))),
+            "import, deps failure: the reply must follow the window restore, got {seen:?}"
         );
     }
 
