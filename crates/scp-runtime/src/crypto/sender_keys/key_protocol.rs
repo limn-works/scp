@@ -50,7 +50,8 @@ pub struct SenderKeyRequestResult {
 ///
 /// # Errors
 ///
-/// Returns [`SenderKeyError::SigningFailed`] if the signing operation fails.
+/// Returns [`SenderKeyError::Custody`] if custody signing fails, and
+/// [`SenderKeyError::SigningFailed`] if the signature is not 64 bytes.
 /// Returns [`SenderKeyError::SerializationFailed`] if serialization fails.
 pub async fn publish_sender_key_epoch_advance(
     key_custody: &impl KeyCustody,
@@ -65,7 +66,7 @@ pub async fn publish_sender_key_epoch_advance(
     let signature = key_custody
         .sign(signing_key, &hash)
         .await
-        .map_err(|e| SenderKeyError::SigningFailed(e.to_string()))?;
+        .map_err(|e| SenderKeyError::Custody(e.into()))?;
 
     let sig_bytes: [u8; 64] = signature
         .into_bytes()
@@ -96,9 +97,9 @@ pub async fn publish_sender_key_epoch_advance(
 ///
 /// # Errors
 ///
-/// Returns [`SenderKeyError::SigningFailed`] if signing fails.
+/// Returns [`SenderKeyError::Custody`] if key generation, the public-key
+/// lookup or signing fails in custody.
 /// Returns [`SenderKeyError::SerializationFailed`] if serialization fails.
-/// Returns [`SenderKeyError::KeyCustodyError`] if key generation fails.
 pub async fn request_sender_key(
     key_custody: &impl KeyCustody,
     signing_key: &KeyHandle,
@@ -111,12 +112,12 @@ pub async fn request_sender_key(
     let wrapping_key_handle = key_custody
         .generate_keypair(KeyType::X25519)
         .await
-        .map_err(|e| SenderKeyError::KeyCustodyError(e.to_string()))?;
+        .map_err(|e| SenderKeyError::Custody(e.into()))?;
 
     let wrapping_pubkey = key_custody
         .public_key(&wrapping_key_handle)
         .await
-        .map_err(|e| SenderKeyError::KeyCustodyError(e.to_string()))?;
+        .map_err(|e| SenderKeyError::Custody(e.into()))?;
 
     // Generate cryptographic nonce and timestamp for replay protection.
     let mut nonce = [0u8; REQUEST_NONCE_SIZE];
@@ -136,7 +137,7 @@ pub async fn request_sender_key(
     let signature = key_custody
         .sign(signing_key, &hash)
         .await
-        .map_err(|e| SenderKeyError::SigningFailed(e.to_string()))?;
+        .map_err(|e| SenderKeyError::Custody(e.into()))?;
 
     let wrap_bytes: [u8; 32] = wrapping_pubkey.into_bytes().try_into().map_err(|_| {
         SenderKeyError::KeyCustodyError("X25519 public key must be 32 bytes".into())
@@ -326,8 +327,9 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
 ///
 /// # Errors
 ///
-/// Returns [`SenderKeyError::KeyCustodyError`] if the DH agreement or
-/// public-key lookup fails. Returns [`SenderKeyError::HpkeDecryptionFailed`]
+/// Returns [`SenderKeyError::Custody`] if the DH agreement or public-key
+/// lookup fails in custody, and [`SenderKeyError::KeyCustodyError`] if the
+/// custody returns a wrapping public key that is not 32 bytes. Returns [`SenderKeyError::HpkeDecryptionFailed`]
 /// if HPKE open fails (wrong key/`info`/`aad`, tampered `enc`/`ct`) or the
 /// recovered plaintext is not exactly 32 bytes.
 pub async fn open_sender_key_response(
@@ -344,14 +346,14 @@ pub async fn open_sender_key_response(
     let dh = key_custody
         .dh_agree(wrapping_key_handle, &enc)
         .await
-        .map_err(|e| SenderKeyError::KeyCustodyError(e.to_string()))?;
+        .map_err(|e| SenderKeyError::Custody(e.into()))?;
     let dh_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*dh.as_bytes());
 
     // Fetch pkRm for the same handle, needed for kem_context = enc || pkRm.
     let pk_rm = key_custody
         .public_key(wrapping_key_handle)
         .await
-        .map_err(|e| SenderKeyError::KeyCustodyError(e.to_string()))?;
+        .map_err(|e| SenderKeyError::Custody(e.into()))?;
     let pk_rm_bytes: [u8; 32] = pk_rm.as_bytes().try_into().map_err(|_| {
         SenderKeyError::KeyCustodyError("wrapping public key must be 32 bytes".to_owned())
     })?;
@@ -395,7 +397,8 @@ pub async fn open_sender_key_response(
 ///
 /// # Errors
 ///
-/// Returns [`SenderKeyError::SigningFailed`] if the signing operation fails.
+/// Returns [`SenderKeyError::Custody`] if custody signing fails, and
+/// [`SenderKeyError::SigningFailed`] if the signature is not 64 bytes.
 /// Returns [`SenderKeyError::SerializationFailed`] if serialization fails.
 #[allow(clippy::similar_names)] // blocker_did/blocked_did are domain terms
 pub async fn send_block_notification(
@@ -420,7 +423,7 @@ pub async fn send_block_notification(
     let signature = key_custody
         .sign(signing_key, &hash)
         .await
-        .map_err(|e| SenderKeyError::SigningFailed(e.to_string()))?;
+        .map_err(|e| SenderKeyError::Custody(e.into()))?;
 
     let sig_bytes: [u8; 64] = signature
         .into_bytes()
@@ -456,7 +459,8 @@ pub async fn send_block_notification(
 ///
 /// Returns [`SenderKeyError::EpochOverflow`] if the epoch counter is at
 /// `u64::MAX` and cannot be incremented.
-/// Returns [`SenderKeyError::SigningFailed`] if signing the epoch advance fails.
+/// Returns [`SenderKeyError::Custody`] if custody signing of the epoch advance
+/// fails.
 /// Returns [`SenderKeyError::SerializationFailed`] if serialization fails.
 pub async fn rotate_sender_key_for_block<S: BuildHasher + Send + Sync>(
     key_custody: &impl KeyCustody,

@@ -63,3 +63,34 @@ pub enum PlatformError {
     #[error("unsupported operation: {0}")]
     Unsupported(&'static str),
 }
+
+impl From<&PlatformError> for scp_crypto::CustodyFailure {
+    /// Classifies a custody error for the error types that cannot hold a
+    /// [`PlatformError`]: [`PlatformError::KeyNotFound`] is key-not-found,
+    /// [`PlatformError::PseudonymRejected`] is a rejected pseudonym, and every
+    /// other variant is a custody failure.
+    fn from(e: &PlatformError) -> Self {
+        let kind = match e {
+            PlatformError::KeyNotFound => scp_crypto::CustodyFailureKind::KeyNotFound,
+            PlatformError::PseudonymRejected(_) => {
+                scp_crypto::CustodyFailureKind::PseudonymRejected
+            }
+            PlatformError::WrongKeyType { .. }
+            | PlatformError::StorageError(_)
+            | PlatformError::AttestationError(_)
+            | PlatformError::PushError(_)
+            | PlatformError::CustodyError(_)
+            | PlatformError::Unsupported(_) => scp_crypto::CustodyFailureKind::Failed,
+        };
+        Self {
+            kind,
+            detail: e.to_string(),
+        }
+    }
+}
+
+impl From<PlatformError> for scp_crypto::CustodyFailure {
+    fn from(e: PlatformError) -> Self {
+        Self::from(&e)
+    }
+}

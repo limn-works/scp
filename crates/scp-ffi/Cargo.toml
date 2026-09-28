@@ -56,6 +56,9 @@ async-trait = { workspace = true }
 pyo3 = { version = "0.24.1", features = ["experimental-async", "multiple-pymethods"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+# `CustodyFailure`, the typed custody error the runtime carries to the bridge;
+# tests also recompute P-256 pseudonym points and signatures.
+scp-crypto = { path = "../scp-crypto" }
 scp-core = { path = "../scp-core" }
 scp-identity = { path = "../scp-identity" }
 # The real Mainline DHT backend (PkarrDhtClient) is compiled unconditionally —
@@ -102,8 +105,6 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 scp-ffi-common = { path = "common", features = ["testing", "custody"] }
 # Tests need InMemoryKeyCustody.
 scp-platform = { path = "../scp-platform", features = ["testing"] }
-# Tests recompute and verify P-256 pseudonym points and signatures.
-scp-crypto = { path = "../scp-crypto" }
 # Tests construct `InMemoryDhtClient` directly (the §17.17.3 DHT nullifier) via
 # the `FfiDhtClient::InMemory` test seam. `features = ["testing"]` (no
 # slash-string in a feature list) is fine per the ADR-062 §Decision 1 invariant.

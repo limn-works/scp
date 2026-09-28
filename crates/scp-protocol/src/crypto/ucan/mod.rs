@@ -68,6 +68,11 @@ pub enum UcanError {
     #[error("malformed token: {0}")]
     MalformedToken(String),
 
+    /// A key custody call failed (`KeyCustody`). The bridges report
+    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` otherwise.
+    #[error(transparent)]
+    Custody(#[from] scp_crypto::CustodyFailure),
+
     /// JSON deserialization of the header or payload failed.
     #[error("deserialization failed: {0}")]
     DeserializationFailed(String),

@@ -315,6 +315,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn custody_failure_code_follows_the_platform_error_kind() {
+        use crate::error_codes as codes;
+        let code =
+            |e: PlatformError| codes::custody_failure_code(&scp_crypto::CustodyFailure::from(e));
+        assert_eq!(code(PlatformError::KeyNotFound), codes::CRYPTO_4006);
+        assert_eq!(
+            code(PlatformError::PseudonymRejected("x".to_owned())),
+            codes::IDENT_1055
+        );
+        assert_eq!(
+            code(PlatformError::CustodyError("x".to_owned())),
+            codes::CRYPTO_4060
+        );
+        assert_eq!(
+            code(PlatformError::StorageError("x".to_owned())),
+            codes::CRYPTO_4060
+        );
+    }
+
     /// Drives a future to completion on a current-thread runtime.
     fn block_on<F: core::future::Future>(future: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()

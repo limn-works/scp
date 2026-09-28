@@ -186,6 +186,19 @@ pub enum CancelError {
     Signing(super::signer::StreamSignerError),
 }
 
+impl CancelError {
+    /// The custody failure behind a [`Self::Signing`] error, or `None`. A
+    /// bridge reports it to the local caller as `SCP-CRYPTO-4006` or
+    /// `SCP-CRYPTO-4060`; the wire slug stays [`cancel_error_to_slug`]'s.
+    #[must_use]
+    pub fn custody_failure(&self) -> Option<scp_crypto::CustodyFailure> {
+        match self {
+            Self::Signing(e) => e.custody_failure(),
+            Self::SignatureInvalid | Self::CursorAdvanced { .. } => None,
+        }
+    }
+}
+
 /// Routes a [`CancelError`] to its §5.4.4 slug.
 #[must_use]
 pub const fn cancel_error_to_slug(err: &CancelError) -> &'static str {

@@ -57,8 +57,8 @@ use scp_protocol::envelope::EnvelopeError;
 ///
 /// # Errors
 ///
-/// Returns [`EnvelopeError::PseudonymDerivationFailed`] if the underlying
-/// key custody operation fails (e.g., key handle not found, wrong key type).
+/// Returns [`EnvelopeError::Custody`] if the underlying key custody operation
+/// fails (e.g., key handle not found, wrong key type).
 pub async fn derive_pseudonym(
     key_custody: &impl KeyCustody,
     identity_key_handle: &KeyHandle,
@@ -67,7 +67,7 @@ pub async fn derive_pseudonym(
     key_custody
         .derive_pseudonym(identity_key_handle, context_id)
         .await
-        .map_err(|e| EnvelopeError::PseudonymDerivationFailed(e.to_string()))
+        .map_err(|e| EnvelopeError::Custody(e.into()))
 }
 
 /// Derives a rotatable, epoch-scoped pseudonym keypair (v2).
@@ -90,8 +90,8 @@ pub async fn derive_pseudonym(
 ///
 /// # Errors
 ///
-/// Returns [`EnvelopeError::PseudonymDerivationFailed`] if the underlying
-/// key custody operation fails (e.g., key handle not found, wrong key type).
+/// Returns [`EnvelopeError::Custody`] if the underlying key custody operation
+/// fails (e.g., key handle not found, wrong key type).
 pub async fn derive_rotatable_pseudonym(
     key_custody: &impl KeyCustody,
     identity_key_handle: &KeyHandle,
@@ -101,7 +101,7 @@ pub async fn derive_rotatable_pseudonym(
     key_custody
         .derive_rotatable_pseudonym(identity_key_handle, context_id, pseudonym_epoch)
         .await
-        .map_err(|e| EnvelopeError::PseudonymDerivationFailed(e.to_string()))
+        .map_err(|e| EnvelopeError::Custody(e.into()))
 }
 
 #[cfg(test)]

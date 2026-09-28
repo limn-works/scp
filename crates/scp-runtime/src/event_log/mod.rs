@@ -29,12 +29,8 @@ pub struct KeyCustodySigner<'a, C: KeyCustody> {
 
 #[async_trait::async_trait]
 impl<C: KeyCustody> EventLogSigner for KeyCustodySigner<'_, C> {
-    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
-        let sig = self
-            .custody
-            .sign(self.key, message)
-            .await
-            .map_err(|e| e.to_string())?;
+    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, scp_crypto::CustodyFailure> {
+        let sig = self.custody.sign(self.key, message).await?;
         Ok(sig.into_bytes())
     }
 }

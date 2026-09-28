@@ -300,6 +300,11 @@ pub enum ContextError {
     #[error("crypto operation failed: {0}")]
     CryptoFailed(String),
 
+    /// A key custody call failed (`KeyCustody`). The bridges report
+    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` otherwise.
+    #[error(transparent)]
+    Custody(#[from] scp_crypto::CustodyFailure),
+
     /// A transport operation failed during messaging.
     #[error("transport operation failed: {0}")]
     TransportFailed(String),

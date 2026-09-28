@@ -3663,7 +3663,7 @@ impl crate::scp::PyScp {
                     }),
                 )
             })
-            .map_err(|e| PyRuntimeError::new_err(format!("context export failed: {e}")))?;
+            .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))?;
 
         scp_core::context::export_import::serialize_export(&export)
             .map_err(|e| PyRuntimeError::new_err(format!("export serialization failed: {e}")))
@@ -5023,18 +5023,12 @@ impl crate::scp::PyScp {
                 };
                 sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
                     .await
-                    .map_err(|e| {
-                        crate::error::ScpPyError::context(format!(
-                            "supervisor dispatch_broadcast_command_with_custody failed: {e}"
-                        ))
-                    })?;
+                    .map_err(crate::error::ScpPyError::from)?;
                 rx.await
                     .map_err(|e| {
                         crate::error::ScpPyError::context(format!("shim reply dropped: {e}"))
                     })?
-                    .map_err(|e| {
-                        crate::error::ScpPyError::context(format!("broadcast publish failed: {e}"))
-                    })?;
+                    .map_err(crate::error::ScpPyError::from)?;
                 Ok(())
             })
         })
@@ -5140,21 +5134,13 @@ impl crate::scp::PyScp {
                 };
                 sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
                     .await
-                    .map_err(|e| {
-                        crate::error::ScpPyError::context(format!(
-                            "supervisor dispatch_broadcast_command_with_custody failed: {e}"
-                        ))
-                    })?;
+                    .map_err(crate::error::ScpPyError::from)?;
                 let envelope = rx
                     .await
                     .map_err(|e| {
                         crate::error::ScpPyError::context(format!("shim reply dropped: {e}"))
                     })?
-                    .map_err(|e| {
-                        crate::error::ScpPyError::context(format!(
-                            "broadcast publish asset failed: {e}"
-                        ))
-                    })?;
+                    .map_err(crate::error::ScpPyError::from)?;
 
                 // Compute blob_id as SHA-256 of the serialized envelope.
                 let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
@@ -5283,21 +5269,13 @@ impl crate::scp::PyScp {
                     };
                     sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
                         .await
-                        .map_err(|e| {
-                            crate::error::ScpPyError::context(format!(
-                                "supervisor dispatch_broadcast_command_with_custody failed: {e}"
-                            ))
-                        })?;
+                        .map_err(crate::error::ScpPyError::from)?;
                     let envelope = rx
                         .await
                         .map_err(|e| {
                             crate::error::ScpPyError::context(format!("shim reply dropped: {e}"))
                         })?
-                        .map_err(|e| {
-                            crate::error::ScpPyError::context(format!(
-                                "broadcast publish asset failed: {e}"
-                            ))
-                        })?;
+                        .map_err(crate::error::ScpPyError::from)?;
 
                     let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
                         crate::error::ScpPyError::context(format!(
@@ -6409,6 +6387,97 @@ mod tests {
             err.contains("SCP-CRYPTO-4006"),
             "expected key-not-found SCP-CRYPTO-4006, got: {err}"
         );
+    }
+
+    /// A custody that no longer holds the exporter's `#active` key fails the
+    /// export with `SCP-CRYPTO-4006`: the runtime carries the custody failure
+    /// as a typed value, and the bridge maps its kind to the code. Reverting
+    /// the runtime to a text error would report a context code instead.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn context_export_with_a_destroyed_signing_key_is_crypto_4006() {
+        use scp_platform::KeyCustody as _;
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = Arc::clone(&scp.inner);
+            let creator_identity = scp.identity_create(py, "in_memory", None).unwrap();
+            let creator = creator_identity.did().to_owned();
+            let ctx_id = format!("export-key-not-found-{}", uuid::Uuid::new_v4());
+            crate::runtime::register_context(&bi, &ctx_id, &creator, &[]).unwrap();
+            let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+            let rt = crate::runtime().unwrap();
+            rt.block_on(sup.create_context(
+                ctx_id.clone(),
+                scp_core::context::ContextParams::default(),
+                scp_did::DID(creator.clone()),
+                None,
+            ))
+            .unwrap();
+            let (custody, key) = crate::runtime::with_identity(&bi, &creator, |entry| {
+                Ok((
+                    Arc::clone(&entry.custody),
+                    entry.identity.active_signing_key,
+                ))
+            })
+            .expect("registered identity");
+            rt.block_on(custody.destroy_key(&key))
+                .expect("destroy_key should succeed");
+
+            let err = scp
+                .context_export(py, &ctx_id)
+                .expect_err("export with a destroyed signing key must fail")
+                .to_string();
+            assert!(
+                err.contains("SCP-CRYPTO-4006"),
+                "expected key-not-found SCP-CRYPTO-4006, got: {err}"
+            );
+        });
+    }
+
+    /// A broadcast author whose `#active` key the custody no longer holds
+    /// fails the publish with `SCP-CRYPTO-4006`: the supervisor carries the
+    /// signing failure as `ContextError::Custody`, and the bridge maps its kind.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn broadcast_publish_with_a_destroyed_signing_key_is_crypto_4006() {
+        use scp_platform::KeyCustody as _;
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = Arc::clone(&scp.inner);
+            let creator_identity = scp.identity_create(py, "in_memory", None).unwrap();
+            let creator = creator_identity.did().to_owned();
+            let dict = PyDict::new(py);
+            dict.set_item("mode", "broadcast").unwrap();
+            // Broadcast contexts require MemoryScope::Full (spec §5.14).
+            dict.set_item("memory_scope", "full").unwrap();
+            let handle = scp
+                .context_create(&creator, &dict)
+                .expect("broadcast context_create should succeed");
+            let (custody, key) = crate::runtime::with_identity(&bi, &creator, |entry| {
+                Ok((
+                    Arc::clone(&entry.custody),
+                    entry.identity.active_signing_key,
+                ))
+            })
+            .expect("registered identity");
+            crate::runtime()
+                .unwrap()
+                .block_on(custody.destroy_key(&key))
+                .expect("destroy_key should succeed");
+
+            let err = scp
+                .broadcast_publish(&handle, &creator, b"hi".to_vec())
+                .expect_err("broadcast publish with a destroyed signing key must fail")
+                .to_string();
+            assert!(
+                err.contains("SCP-CRYPTO-4006"),
+                "expected key-not-found SCP-CRYPTO-4006, got: {err}"
+            );
+        });
     }
 
     /// Builds an active `PyContextHandle` for the given mode, driving the real

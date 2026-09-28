@@ -501,9 +501,17 @@ pub(crate) fn event_log_checkpoint_on(
                     &signer,
                 )
                 .await
-                .map_err(|e| ScpNapiError::Context {
-                    message: format!("checkpoint generation failed: {e}"),
-                    code: codes::CTX_2023.to_owned(),
+                .map_err(|e| match &e {
+                    scp_event_log::EventLogError::Custody(failure) => {
+                        ScpNapiError::custody_failure(
+                            format!("checkpoint generation failed: {e}"),
+                            failure,
+                        )
+                    }
+                    _ => ScpNapiError::Context {
+                        message: format!("checkpoint generation failed: {e}"),
+                        code: codes::CTX_2023.to_owned(),
+                    },
                 })
             })
         })
@@ -560,9 +568,17 @@ pub(crate) fn event_log_checkpoint_by_did_on(
                     &signer,
                 )
                 .await
-                .map_err(|e| ScpNapiError::Context {
-                    message: format!("checkpoint generation failed: {e}"),
-                    code: codes::CTX_2023.to_owned(),
+                .map_err(|e| match &e {
+                    scp_event_log::EventLogError::Custody(failure) => {
+                        ScpNapiError::custody_failure(
+                            format!("checkpoint generation failed: {e}"),
+                            failure,
+                        )
+                    }
+                    _ => ScpNapiError::Context {
+                        message: format!("checkpoint generation failed: {e}"),
+                        code: codes::CTX_2023.to_owned(),
+                    },
                 })
             })
         })

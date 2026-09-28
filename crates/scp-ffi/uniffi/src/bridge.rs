@@ -1395,6 +1395,7 @@ impl From<scp_core::context::ContextError> for ScpError {
     fn from(e: scp_core::context::ContextError) -> Self {
         use scp_core::context::ContextError as CE;
         match &e {
+            CE::Custody(failure) => Self::custody_failure(format!("{e}"), failure),
             // Surface the canonical rate-limit code on the typed
             // envelope so Swift / Kotlin callers can detect
             // rate-limit rejection without string-matching on the
@@ -1629,6 +1630,9 @@ impl From<scp_core::crypto::mls::error::MlsError> for ScpError {
 
 impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpError {
     fn from(e: scp_core::crypto::sender_keys::SenderKeyError) -> Self {
+        if let scp_core::crypto::sender_keys::SenderKeyError::Custody(failure) = &e {
+            return Self::custody_failure(format!("sender key operation failed: {e}"), failure);
+        }
         Self::Crypto {
             msg: format!(
                 "sender key operation failed: {e} — verify key material and encryption parameters"
@@ -1640,6 +1644,9 @@ impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpError {
 
 impl From<scp_core::crypto::ucan::UcanError> for ScpError {
     fn from(e: scp_core::crypto::ucan::UcanError) -> Self {
+        if let scp_core::crypto::ucan::UcanError::Custody(failure) = &e {
+            return Self::custody_failure(format!("UCAN signing failed: {e}"), failure);
+        }
         // Canonical UCAN→error-code mapping — see `scp-ffi/src/error.rs`
         // for the full rationale. All bridges route through the shared
         // `scp_ffi_common::ucan_errors` module.
@@ -1653,6 +1660,9 @@ impl From<scp_core::crypto::ucan::UcanError> for ScpError {
 
 impl From<scp_core::envelope::EnvelopeError> for ScpError {
     fn from(e: scp_core::envelope::EnvelopeError) -> Self {
+        if let scp_core::envelope::EnvelopeError::Custody(failure) = &e {
+            return Self::custody_failure(format!("envelope operation failed: {e}"), failure);
+        }
         Self::Crypto {
             msg: format!(
                 "envelope operation failed: {e} — check payload size, signing keys, and encryption state"
@@ -1664,6 +1674,9 @@ impl From<scp_core::envelope::EnvelopeError> for ScpError {
 
 impl From<scp_event_log::EventLogError> for ScpError {
     fn from(e: scp_event_log::EventLogError) -> Self {
+        if let scp_event_log::EventLogError::Custody(failure) = &e {
+            return Self::custody_failure(format!("event log operation failed: {e}"), failure);
+        }
         Self::Context {
             msg: format!(
                 "event log operation failed: {e} — verify log integrity and sequence numbers"
@@ -1765,6 +1778,22 @@ impl ScpError {
     pub(crate) fn custody(msg: String, e: &scp_platform::PlatformError) -> Self {
         let code = scp_ffi_common::custody_parse::platform_error_code(e).to_owned();
         if matches!(e, scp_platform::PlatformError::PseudonymRejected(_)) {
+            Self::Identity { msg, code }
+        } else {
+            Self::Crypto { msg, code }
+        }
+    }
+}
+
+impl ScpError {
+    /// A custody failure the runtime carried as a typed
+    /// [`CustodyFailure`](scp_crypto::CustodyFailure), coded by
+    /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code):
+    /// key-not-found is `SCP-CRYPTO-4006`, a rejected host pseudonym
+    /// `SCP-IDENT-1055`, and any other custody failure `SCP-CRYPTO-4060`.
+    pub(crate) fn custody_failure(msg: String, e: &scp_crypto::CustodyFailure) -> Self {
+        let code = scp_ffi_common::error_codes::custody_failure_code(e).to_owned();
+        if matches!(e.kind, scp_crypto::CustodyFailureKind::PseudonymRejected) {
             Self::Identity { msg, code }
         } else {
             Self::Crypto { msg, code }
@@ -5883,9 +5912,17 @@ async fn event_log_checkpoint_impl(
                                 &signer,
                             )
                             .await
-                            .map_err(|e| ScpError::Context {
-                                msg: format!("checkpoint generation failed: {e}"),
-                                code: codes::CTX_2027.to_owned(),
+                            .map_err(|e| match &e {
+                                scp_event_log::EventLogError::Custody(failure) => {
+                                    ScpError::custody_failure(
+                                        format!("checkpoint generation failed: {e}"),
+                                        failure,
+                                    )
+                                }
+                                _ => ScpError::Context {
+                                    msg: format!("checkpoint generation failed: {e}"),
+                                    code: codes::CTX_2027.to_owned(),
+                                },
                             })
                         })
                     })
@@ -6008,9 +6045,17 @@ async fn event_log_checkpoint_by_did_impl(
                                 &signer,
                             )
                             .await
-                            .map_err(|e| ScpError::Context {
-                                msg: format!("checkpoint generation failed: {e}"),
-                                code: codes::CTX_2027.to_owned(),
+                            .map_err(|e| match &e {
+                                scp_event_log::EventLogError::Custody(failure) => {
+                                    ScpError::custody_failure(
+                                        format!("checkpoint generation failed: {e}"),
+                                        failure,
+                                    )
+                                }
+                                _ => ScpError::Context {
+                                    msg: format!("checkpoint generation failed: {e}"),
+                                    code: codes::CTX_2027.to_owned(),
+                                },
                             })
                         })
                     })
@@ -6375,6 +6420,32 @@ pub(crate) async fn enforce_caller_principal_binding(
     Ok(())
 }
 
+/// Resolves the context-export signing key handle, failing closed with
+/// `ScpError::Context` (CTX-2040) when the handle carries no signing-key
+/// handle or no custody provider. `context_export` calls it before
+/// `export_context`, so [`sign_export_snapshot_via_custody`] runs only with a
+/// key and a custody present, and its error is the custody's own.
+fn export_signing_key(handle: &ContextHandle) -> Result<KeyHandle, ScpError> {
+    let key_handle = handle.signing_key.ok_or_else(|| ScpError::Context {
+        msg: "no signing key on context handle — context export \
+                  requires an identity with an active signing key"
+            .to_owned(),
+        code: codes::CTX_2040.to_owned(),
+    })?;
+    let has_custody = handle.callback_custody.is_some();
+    #[cfg(feature = "testing")]
+    let has_custody = has_custody || handle.in_memory_custody.is_some();
+    if !has_custody {
+        return Err(ScpError::Context {
+            msg: "no custody provider on context handle — context export \
+                      requires an identity created with custody"
+                .to_owned(),
+            code: codes::CTX_2040.to_owned(),
+        });
+    }
+    Ok(key_handle)
+}
+
 /// Signs the §23.16.8 context-export snapshot digest via the exporter
 /// identity's [`KeyCustody::sign`] — delegating to whichever backend backs the
 /// handle (platform/software callback custody OR in-memory custody) — instead
@@ -6394,70 +6465,45 @@ pub(crate) async fn enforce_caller_principal_binding(
 /// `in_memory_custody`, matching the resolution order of every other
 /// key-bearing `UniFFI` path.
 ///
-/// Fail-closed: returns `ScpError::Context` (CTX-2040) when no signing-key
-/// handle or custody provider is present, and validates that the returned
-/// signature is exactly 64 bytes (Ed25519) — so a misbehaving custody can
-/// never yield an under-length signature that would later fail verification
-/// in a confusing place. The caller (`context_export`) never emits an
-/// unsigned export on any error path.
+/// Returns the custody's [`PlatformError`](scp_platform::PlatformError), which
+/// `export_context` carries as `ContextError::Custody` so the caller sees
+/// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` otherwise. It
+/// validates that the returned signature is exactly 64 bytes (Ed25519), so a
+/// misbehaving custody can never yield an under-length signature that would
+/// later fail verification in a confusing place. The caller
+/// (`context_export`) never emits an unsigned export on any error path.
 async fn sign_export_snapshot_via_custody(
     handle: &ContextHandle,
+    key_handle: &KeyHandle,
     hash: &[u8; 32],
-) -> Result<[u8; 64], ScpError> {
-    let key_handle = handle.signing_key.ok_or_else(|| ScpError::Context {
-        msg: "no signing key on context handle — context export \
-                  requires an identity with an active signing key"
-            .to_owned(),
-        code: codes::CTX_2040.to_owned(),
-    })?;
-
+) -> Result<[u8; 64], scp_platform::PlatformError> {
     let signature = if let Some(ref cb) = handle.callback_custody {
-        cb.sign(&key_handle, hash).await.map_err(|e| {
-            ScpError::custody(
-                format!("platform custody failed to sign context export snapshot: {e}"),
-                &e,
-            )
-        })?
+        cb.sign(key_handle, hash).await?
     } else {
         #[cfg(feature = "testing")]
         {
             if let Some(ref imc) = handle.in_memory_custody {
-                imc.0.sign(&key_handle, hash).await.map_err(|e| {
-                    ScpError::custody(
-                        format!("in-memory custody failed to sign context export snapshot: {e}"),
-                        &e,
-                    )
-                })?
+                imc.0.sign(key_handle, hash).await?
             } else {
-                return Err(ScpError::Context {
-                    msg: "no custody provider on context handle — context export \
-                              requires an identity created with custody"
-                        .to_owned(),
-                    code: codes::CTX_2040.to_owned(),
-                });
+                return Err(scp_platform::PlatformError::CustodyError(
+                    "no custody provider on context handle".to_owned(),
+                ));
             }
         }
         #[cfg(not(feature = "testing"))]
         {
-            return Err(ScpError::Context {
-                msg: "no custody provider on context handle — context export \
-                          requires an identity created with custody"
-                    .to_owned(),
-                code: codes::CTX_2040.to_owned(),
-            });
+            return Err(scp_platform::PlatformError::CustodyError(
+                "no custody provider on context handle".to_owned(),
+            ));
         }
     };
 
-    let bytes: [u8; 64] = signature
-        .as_bytes()
-        .try_into()
-        .map_err(|_| ScpError::Context {
-            msg: format!(
-                "custody sign returned {} bytes, expected 64 (Ed25519) for context export snapshot",
-                signature.as_bytes().len()
-            ),
-            code: codes::CTX_2040.to_owned(),
-        })?;
+    let bytes: [u8; 64] = signature.as_bytes().try_into().map_err(|_| {
+        scp_platform::PlatformError::CustodyError(format!(
+            "custody sign returned {} bytes, expected 64 (Ed25519) for context export snapshot",
+            signature.as_bytes().len()
+        ))
+    })?;
     Ok(bytes)
 }
 
@@ -11414,9 +11460,17 @@ impl Scp {
                             &core_id.active_signing_key,
                         )
                         .await
-                        .map_err(|e| ScpError::Crypto {
-                            msg: format!("inner envelope signing failed: {e}"),
-                            code: codes::CRYPTO_4001.to_owned(),
+                        .map_err(|e| match &e {
+                            scp_core::envelope::EnvelopeError::Custody(failure) => {
+                                ScpError::custody_failure(
+                                    format!("inner envelope signing failed: {e}"),
+                                    failure,
+                                )
+                            }
+                            _ => ScpError::Crypto {
+                                msg: format!("inner envelope signing failed: {e}"),
+                                code: codes::CRYPTO_4001.to_owned(),
+                            },
                         })?;
                     } else {
                         #[cfg(feature = "testing")]
@@ -11427,9 +11481,17 @@ impl Scp {
                                 &core_id.active_signing_key,
                             )
                             .await
-                            .map_err(|e| ScpError::Crypto {
-                                msg: format!("inner envelope signing failed: {e}"),
-                                code: codes::CRYPTO_4001.to_owned(),
+                            .map_err(|e| match &e {
+                                scp_core::envelope::EnvelopeError::Custody(failure) => {
+                                    ScpError::custody_failure(
+                                        format!("inner envelope signing failed: {e}"),
+                                        failure,
+                                    )
+                                }
+                                _ => ScpError::Crypto {
+                                    msg: format!("inner envelope signing failed: {e}"),
+                                    code: codes::CRYPTO_4001.to_owned(),
+                                },
                             })?;
                         }
                     }
@@ -19073,13 +19135,18 @@ impl Scp {
                 // (`new_multi_thread`), so a runtime handle is always present
                 // and `block_in_place` is legal here.
                 let rt = tokio::runtime::Handle::current();
+                let key_handle = export_signing_key(&handle)?;
                 let export = manager
                     .export_context(
                         &ctx_id,
                         scp_did::DID::from(creator_did),
                         |hash: &[u8; 32]| {
                             tokio::task::block_in_place(|| {
-                                rt.block_on(sign_export_snapshot_via_custody(&handle, hash))
+                                rt.block_on(sign_export_snapshot_via_custody(
+                                    &handle,
+                                    &key_handle,
+                                    hash,
+                                ))
                             })
                         },
                     )
@@ -19345,6 +19412,66 @@ mod tests {
     /// logic through an owned `Scp` instance.
     fn scp_test() -> Arc<crate::scp::Scp> {
         crate::scp::Scp::new_in_memory_for_test()
+    }
+
+    /// Every runtime error that carries a custody failure reaches the caller
+    /// with the custody code: key-not-found as `SCP-CRYPTO-4006`, any other
+    /// custody failure as `SCP-CRYPTO-4060`, a rejected host pseudonym as
+    /// `SCP-IDENT-1055`. Broadcast publish signing and join key agreement
+    /// arrive as `ContextError::Custody`.
+    #[test]
+    fn custody_failures_carry_the_custody_codes_in_every_carrier() {
+        use scp_crypto::{CustodyFailure, CustodyFailureKind as K};
+        fn failure(kind: K) -> CustodyFailure {
+            CustodyFailure {
+                kind,
+                detail: "custody detail".to_owned(),
+            }
+        }
+        fn crypto_code(e: ScpError) -> String {
+            match e {
+                ScpError::Crypto { code, .. } => code,
+                other => panic!("expected a crypto error, got {other:?}"),
+            }
+        }
+        fn identity_code(e: ScpError) -> String {
+            match e {
+                ScpError::Identity { code, .. } => code,
+                other => panic!("expected an identity error, got {other:?}"),
+            }
+        }
+        use scp_core::context::ContextError;
+        assert_eq!(
+            crypto_code(ContextError::Custody(failure(K::KeyNotFound)).into()),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            crypto_code(ContextError::Custody(failure(K::Failed)).into()),
+            codes::CRYPTO_4060
+        );
+        assert_eq!(
+            identity_code(ContextError::Custody(failure(K::PseudonymRejected)).into()),
+            codes::IDENT_1055
+        );
+        assert_eq!(
+            crypto_code(
+                scp_core::crypto::sender_keys::SenderKeyError::Custody(failure(K::KeyNotFound))
+                    .into()
+            ),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            crypto_code(scp_core::crypto::ucan::UcanError::Custody(failure(K::KeyNotFound)).into()),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            crypto_code(scp_core::envelope::EnvelopeError::Custody(failure(K::KeyNotFound)).into()),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            crypto_code(scp_event_log::EventLogError::Custody(failure(K::Failed)).into()),
+            codes::CRYPTO_4060
+        );
     }
 
     /// A `KeyCustodyProvider` whose every method returns an error, used to prove
@@ -20328,6 +20455,83 @@ mod tests {
             entry.routing_id, [0u8; 32],
             "encrypted join routing id must be a real derived pseudonym"
         );
+    }
+
+    /// A custody that no longer holds the exporter's `#active` key fails the
+    /// export with `SCP-CRYPTO-4006`: the runtime carries the custody failure
+    /// as a typed value, and the bridge maps its kind to the code. Reverting
+    /// the runtime to a text error would report a context code instead.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn context_export_with_a_destroyed_signing_key_is_crypto_4006() {
+        use scp_platform::traits::KeyCustody;
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let custody = handle
+            .in_memory_custody
+            .as_ref()
+            .expect("an in-memory identity retains its custody on the handle");
+        let key = handle
+            .signing_key
+            .expect("the handle retains the signing key");
+        rt.block_on(custody.0.destroy_key(&key))
+            .expect("destroy_key should succeed");
+
+        let err = rt
+            .block_on(scp.context_export(Arc::clone(&handle)))
+            .expect_err("export with a destroyed signing key must fail");
+        match err {
+            ScpError::Crypto { code, .. } => assert_eq!(code, codes::CRYPTO_4006),
+            other => panic!("expected Crypto CRYPTO_4006, got: {other:?}"),
+        }
+    }
+
+    /// A broadcast author whose `#active` key the custody no longer holds
+    /// fails the publish with `SCP-CRYPTO-4006`: the supervisor carries the
+    /// signing failure as `ContextError::Custody`, and the bridge maps its kind.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn broadcast_publish_with_a_destroyed_signing_key_is_crypto_4006() {
+        use scp_platform::traits::KeyCustody;
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            // Broadcast contexts require MemoryScope::Full (spec §5.14).
+            memory_scope: MemoryScope::Full,
+            ..encrypted_join_test_params()
+        };
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), params))
+            .expect("broadcast context_create should succeed");
+        let custody = identity
+            .in_memory_custody
+            .as_ref()
+            .expect("an in-memory identity retains its custody");
+        let key = identity
+            .core_id
+            .as_ref()
+            .expect("an in-memory identity retains its core identity")
+            .active_signing_key;
+        rt.block_on(custody.0.destroy_key(&key))
+            .expect("destroy_key should succeed");
+
+        let err = rt
+            .block_on(scp.broadcast_publish(handle, Arc::clone(&identity), b"hi".to_vec()))
+            .expect_err("broadcast publish with a destroyed signing key must fail");
+        match err {
+            ScpError::Crypto { code, .. } => assert_eq!(code, codes::CRYPTO_4006),
+            other => panic!("expected Crypto CRYPTO_4006, got: {other:?}"),
+        }
     }
 
     /// `context_import` (re-home) registers a discovery `KnownContext`
@@ -21470,7 +21674,9 @@ mod tests {
         // The §23.16.8 digest is opaque to the signer — any 32-byte hash works
         // to prove the signing path.
         let hash = [0x42u8; 32];
-        let signature = super::sign_export_snapshot_via_custody(&handle, &hash)
+        let key_handle =
+            super::export_signing_key(&handle).expect("the handle carries a key and a custody");
+        let signature = super::sign_export_snapshot_via_custody(&handle, &key_handle, &hash)
             .await
             .expect("sign-only custody must produce a context-export signature");
 
@@ -21483,14 +21689,13 @@ mod tests {
             .expect("signature must verify against the sign-only custody public key");
     }
 
-    /// `sign_export_snapshot_via_custody` must fail closed when the handle
-    /// carries no signing-key handle — never returning a bogus signature.
+    /// `export_signing_key` must fail closed when the handle carries no
+    /// signing-key handle, so no export is signed.
     #[tokio::test]
     async fn export_snapshot_signing_fails_closed_without_signing_key() {
         let scp = scp_test();
         let handle = test_handle_for(&scp); // signing_key: None, no custody
-        let hash = [0u8; 32];
-        let result = super::sign_export_snapshot_via_custody(&handle, &hash).await;
+        let result = super::export_signing_key(&handle);
         let err = result.expect_err("missing signing key must be rejected");
         match err {
             ScpError::Context { ref code, .. } => assert_eq!(code, codes::CTX_2040),
