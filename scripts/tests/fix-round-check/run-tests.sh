@@ -1224,7 +1224,9 @@ fi
 # reads as covered while the rust-clippy job runs the gate over every workspace package.
 #
 # The mutation it kills: deleting the CHANGED loop after GATES_NOT_RUN leaves this run
-# with no line naming the gate it never ran.
+# with no line naming the gate it never ran. The run compiles no crate, so header item 8
+# says it prints neither assertion line; moving either line out of the branch that
+# compiles a crate turns the second check red.
 FIXTURE22C="$WORK/examples-gate-edit"
 build_fixture "$FIXTURE22C"
 fixture_commit "$FIXTURE22C" scripts/check-examples-compile.sh
@@ -1233,6 +1235,11 @@ if grep -qF "NOT CHECKED — scripts/check-examples-compile.sh over this reposit
     report "case 22c names the examples gate an edit left unrun" 0 ""
 else
     report "case 22c names the examples gate an edit left unrun" 1 "the output holds no NOT CHECKED line for the edited gate: $(tail -n 6 "$FIXTURE22C.harness/out.txt")"
+fi
+if grep -qE 'NOT CHECKED — scripts/check-examples-compile\.sh assertion [12] ' "$FIXTURE22C.harness/out.txt"; then
+    report "case 22c prints no examples-gate assertion line on a run that compiled no crate" 1 "$(grep -F 'check-examples-compile.sh assertion' "$FIXTURE22C.harness/out.txt")"
+else
+    report "case 22c prints no examples-gate assertion line on a run that compiled no crate" 0 ""
 fi
 
 # ── Case 22d: the DOES-NOT-RUN header names every gate the run never starts ──────────

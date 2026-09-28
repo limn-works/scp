@@ -165,8 +165,14 @@
 #      dev-target feature set rather than the unified feature set of the workspace clippy
 #      step. Assertion 2 runs `cargo package --list -p` on every workspace package and
 #      fails when that command fails, as it does on a readme key naming a missing file, or
-#      when a published `examples/*.rs` file is no example target's source. This script prints one line per
-#      assertion, and a third when the branch edits that gate, because no run starts it.
+#      when a published `examples/*.rs` file is no example target's source. No run starts
+#      that gate, so this script prints up to three NOT CHECKED lines for it. A run
+#      that compiles at least one crate prints the assertion 2 line, naming every crate it
+#      compiled. That run also prints the assertion 1 line when at least one crate it
+#      compiled is a package some example target compiles, and names only those packages.
+#      A run that compiles no crate prints neither line. A branch that edits
+#      `scripts/check-examples-compile.sh` gets one more line naming that edit, whatever it
+#      compiled.
 #
 # USAGE
 #   bash scripts/fix-round-check.sh [crate ...]
@@ -762,7 +768,8 @@ else
     done
 
     NOTES+=("the reverse dependencies of $crate_list: cargo check -p compiles the packages it names and none of their dependents, so a changed public signature compiles here and fails to compile its dependents in the rust-clippy job of .github/workflows/ci.yml")
-    # scripts/check-examples-compile.sh makes two assertions, and each gets its own line.
+    # scripts/check-examples-compile.sh makes two assertions, and each gets its own line
+    # when it reads a package this run compiled.
     # Assertion 2 runs `cargo package --list` on every workspace package, whether or not
     # it has an example target, so its line names every package compiled. Assertion 1
     # lints each `example` target, which compiles against the owning package's normal,
