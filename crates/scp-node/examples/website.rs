@@ -23,9 +23,13 @@
 //!
 //! Each run stores its identity in a new directory under the system temporary
 //! directory, never in the `scp-node` binary's default storage directory.
-//! `tempfile::TempDir` creates that directory with a random name, fails if the
-//! name already exists, and removes it
-//! when `main` returns, including after Ctrl-C and after the exit-1 error above.
+//! `tempfile::TempDir` creates that directory with a new random name, never
+//! reuses an existing directory, and removes it when `main` returns. `main`
+//! returns after the exit-1 error above, and after a Ctrl-C or SIGTERM once the
+//! site is serving. `host_site` installs its signal handlers only when it starts
+//! serving, so a Ctrl-C during startup (opening storage, building the node,
+//! deploying the site) ends the process through the default signal action and
+//! leaves the directory behind, still mode 0700, under a name no later run reuses.
 //! On Unix the example sets the directory's mode to 0700 through
 //! `tempfile::Builder::permissions`, because `tempfile` otherwise uses the process
 //! default mode, and exits with an error if the mode it reads back grants any

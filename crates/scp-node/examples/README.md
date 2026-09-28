@@ -24,9 +24,11 @@ identity. The example's own doc comment quotes the error.
 
 Each run stores its identity in a new, randomly named directory under the
 system temporary directory, created with `tempfile::TempDir` and removed when
-the example exits. On Unix the example sets that directory's mode to 0700 and
-exits with an error if it reads back any group or other bit. The example never
-uses the `scp-node` binary's default storage directory, and a run never reloads
+`main` returns: after an error, or after a Ctrl-C once the site is serving.
+`host_site` installs its signal handlers only when it starts serving, so a
+Ctrl-C during startup kills the process and leaves the directory behind. On
+Unix the example sets that directory's mode to 0700 and exits with an error
+if it reads back any group or other bit. The example never uses the `scp-node` binary's default storage directory, and a run never reloads
 an identity an earlier run left behind. The binary reloads any identity it finds
 in its default directory without checking how it was created, so an
 identity a `testing` run minted must never land there.

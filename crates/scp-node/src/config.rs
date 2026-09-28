@@ -1465,7 +1465,7 @@ mod tests {
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             // Domain is publishing-capable; this test opts into Production for the
-            // public-hosting path (advisory; Memory is equally valid).
+            // public-hosting path (advisory; `DhtMode::Disabled` is equally valid).
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -1507,8 +1507,8 @@ mod tests {
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             // NatTraversal is publishing-capable; this test opts into Production
-            // to exercise the public path (advisory in P1; Memory is equally
-            // valid — see Test 12).
+            // to exercise the public path (advisory in P1; `DhtMode::Disabled` is
+            // equally valid — see Test 12).
             dht: DhtMode::Production,
             nat: NatSlot::Custom(Arc::new(MockNatStrategy {
                 tier: ReachabilityTier::Stun { external_addr },
@@ -1610,7 +1610,7 @@ mod tests {
         let node1 = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             // Domain is publishing-capable; this test opts into Production for the
-            // public-hosting path (advisory; Memory is equally valid).
+            // public-hosting path (advisory; `DhtMode::Disabled` is equally valid).
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -1632,7 +1632,7 @@ mod tests {
         let node2 = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             // Domain is publishing-capable; this test opts into Production for the
-            // public-hosting path (advisory; Memory is equally valid).
+            // public-hosting path (advisory; `DhtMode::Disabled` is equally valid).
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -1928,7 +1928,8 @@ mod tests {
         // over the SAME storage but a fresh custodyB (no keys) must be rejected
         // by the builder's persisted-identity validation, surfaced through the
         // config-level entry point. Domain is publishing-capable; opt into
-        // Production to exercise the public path (Memory is equally valid).
+        // Production to exercise the public path (`DhtMode::Disabled` is equally
+        // valid).
         let storage = Arc::new(InMemoryStorage::new());
         let custody_a = Arc::new(InMemoryKeyCustody::new());
         let did_method_a = Arc::new(make_test_dht(&custody_a));
@@ -2127,7 +2128,7 @@ mod tests {
         // The new TLS-axis rule (fix 1): ACME needs a DNS name, which only a
         // Domain reach provides. `TlsMode::Acme` on Local / Tunnel / NatTraversal
         // must be a loud `InvalidConfig`, not a silent no-op. There is no DHT
-        // validity rule to interfere (Memory is valid for every reach), so this
+        // validity rule to interfere (every `DhtMode` is valid on every reach), so this
         // cleanly isolates the Acme×Reach rejection. Validation runs before any
         // build, so no NAT
         // strategy is needed.

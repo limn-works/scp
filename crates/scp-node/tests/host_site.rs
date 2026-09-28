@@ -82,8 +82,8 @@ async fn host_site_serves_a_deployed_site_over_http_and_shuts_down() {
 
     let config = HostSiteConfig {
         // Hermetic + offline: plaintext (no TLS dance), Reach::Local (skip NAT,
-        // no router port), in-memory DHT (nothing published; Local is a
-        // non-publishing reach so Memory is valid).
+        // no router port), and the default `DhtMode::Disabled` (nothing
+        // published).
         tls: TlsMode::Plaintext,
         site_dir: Some(site_dir.clone()),
         port,

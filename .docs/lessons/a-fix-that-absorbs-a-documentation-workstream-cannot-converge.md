@@ -7,8 +7,9 @@ added. Deleting most of the sentences about subsystems the branch never modified
 loop that fixing individual sentences could not. Outside the example the branch fixed
 (`crates/scp-node/examples/website.rs` and its `README.md`), eleven passages stayed that
 explain a fail-closed backend the branch never modified: `NoPreRotationBackend` on identity
-creation, or the unconfigured custody-migration backend. Each stayed because deleting it
-would put back a false sentence or leave a refusal unexplained:
+creation, or the unconfigured custody-migration backend. Each stayed because it replaced a
+false sentence: either a claim that a backend succeeds, or a documented command that exits 1
+with no reason given, which reads as a promise that the command works:
 
 - `crates/scp-ffi/src/identity.rs`: the rustdoc of `identity_execute_custody_migration`,
   which had said its backend succeeds.
@@ -23,17 +24,23 @@ would put back a false sentence or leave a refusal unexplained:
 - `.docs/guides/self-hosting-a-website-on-scp.md`: the parenthetical in the `host_site`
   running-log entry on why the example command exits 1.
 
-The rule below does not admit them; they are the exceptions this branch took.
+The rule below admits them, because each one corrects a false sentence rather than
+explaining a subsystem the branch only reads.
 
 ## The Rule
 
-**A change may document the surface it modifies. It may not document a subsystem it only
-reads.** When a fix needs to explain adjacent behavior, state the mechanism the fix
-depends on and stop. Explaining that mechanism across every bridge and SDK is a separate
-workstream, and adopting it silently converts a reviewable fix into an unreviewable one.
+**A change may document the surface it modifies, and may replace a false sentence on any
+surface. It may not add explanation of a subsystem it only reads.** A sentence that claims
+a fail-closed backend succeeds, or that documents a command without saying it fails, is
+false wherever it sits, and correcting it on sight is in scope. When a fix needs to explain
+adjacent behavior, state the mechanism the fix depends on and stop. Explaining that
+mechanism across every bridge and SDK is a separate workstream, and adopting it silently
+converts a reviewable fix into an unreviewable one.
 
-The test: for each sentence added, does the branch change the code the sentence describes?
-When the answer is no for most of the diff, the branch has absorbed someone else's work.
+The test: for each sentence added, does the branch change the code the sentence describes,
+or does the sentence replace one that was false? When the answer is no to both, the
+sentence is out of scope. When it is no to both for most of the diff, the branch has
+absorbed someone else's work.
 
 ## What happened
 
@@ -99,7 +106,8 @@ missed signal, and the cost was 700 lines that had to be removed anyway.
 ## How to apply
 
 - Before adding explanatory prose to a surface, check whether the branch changes that
-  surface. When it does not, the prose belongs to whoever owns that surface.
+  surface. When it does not, the prose belongs to whoever owns that surface, unless it
+  replaces a sentence there that is false.
 - When a fix seems to require explaining a subsystem on many surfaces, that requirement is
   the evidence the subsystem's documentation is a workstream. File it; do not adopt it.
 - Write preconditions on state. A sentence claiming what only some build could have done
