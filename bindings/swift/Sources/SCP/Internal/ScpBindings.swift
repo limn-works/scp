@@ -9660,6 +9660,12 @@ public struct CustodyPublicKey {
      * uncompressed SEC1 point (`"hpke-p256"`).
      */
     public var publicKey: Data
+    /**
+     * `"identity"` or `"operational"`: the role
+     * [`KeyCustodyProvider::generate_keypair`] minted the key in. A pseudonym
+     * key is `"operational"`.
+     */
+    public var role: String
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -9671,9 +9677,15 @@ public struct CustodyPublicKey {
          * The public key in that type's one encoding: 32 bytes (Ed25519,
          * X25519), the 33-byte compressed SEC1 point (`"p256"`), or the 65-byte
          * uncompressed SEC1 point (`"hpke-p256"`).
-         */publicKey: Data) {
+         */publicKey: Data, 
+        /**
+         * `"identity"` or `"operational"`: the role
+         * [`KeyCustodyProvider::generate_keypair`] minted the key in. A pseudonym
+         * key is `"operational"`.
+         */role: String) {
         self.keyType = keyType
         self.publicKey = publicKey
+        self.role = role
     }
 }
 
@@ -9690,12 +9702,16 @@ extension CustodyPublicKey: Equatable, Hashable {
         if lhs.publicKey != rhs.publicKey {
             return false
         }
+        if lhs.role != rhs.role {
+            return false
+        }
         return true
     }
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(keyType)
         hasher.combine(publicKey)
+        hasher.combine(role)
     }
 }
 
@@ -9709,13 +9725,15 @@ public struct FfiConverterTypeCustodyPublicKey: FfiConverterRustBuffer {
         return
             try CustodyPublicKey(
                 keyType: FfiConverterString.read(from: &buf), 
-                publicKey: FfiConverterData.read(from: &buf)
+                publicKey: FfiConverterData.read(from: &buf), 
+                role: FfiConverterString.read(from: &buf)
         )
     }
 
     public static func write(_ value: CustodyPublicKey, into buf: inout [UInt8]) {
         FfiConverterString.write(value.keyType, into: &buf)
         FfiConverterData.write(value.publicKey, into: &buf)
+        FfiConverterString.write(value.role, into: &buf)
     }
 }
 
@@ -14926,6 +14944,15 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      * does not match the stated type, or an invalid point is an error, and
      * the bridge binds nothing. The bridge asks this for every key id it has
      * not yet registered, whichever operation names it first.
+     *
+     * `role` is the role `generate_keypair` minted the key in, recorded by
+     * the host for the key's lifetime and reported across sessions; a
+     * pseudonym key is `"operational"`. A key id the bridge has not seen
+     * binds as an identity only when `role` is `"identity"`, so an identity
+     * from an earlier session can still derive pseudonyms. Any other role
+     * string is an error. The bridge cannot check the host's word: a host
+     * that reports `"identity"` for a key it minted as `"operational"` lets
+     * that key derive pseudonyms, which is outside Rust's control.
      */
     func getPublicKey(keyId: String) async throws  -> CustodyPublicKey
     
@@ -14941,10 +14968,14 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
     /**
      * Generate a new keypair. `key_type` is `"ed25519"`, `"x25519"`,
      * `"p256"` (ECDSA P-256 signing) or `"hpke-p256"` (P-256 ECDH for HPKE).
+     * `role` is `"identity"` (an identity key, the only pseudonym-derivation
+     * source) or `"operational"`. The host records `role` and reports it
+     * from [`Self::get_public_key`] for the key's lifetime; the bridge
+     * refuses and destroys a key whose reported role differs.
      *
      * Returns an opaque key identifier string.
      */
-    func generateKeypair(keyType: String) async throws  -> String
+    func generateKeypair(keyType: String, role: String) async throws  -> String
     
     /**
      * Perform Diffie-Hellman key agreement.
@@ -15210,6 +15241,7 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
         generateKeypair: { (
             uniffiHandle: UInt64,
             keyType: RustBuffer,
+            role: RustBuffer,
             uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
             uniffiCallbackData: UInt64,
             uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
@@ -15220,7 +15252,8 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
                 return try await uniffiObj.generateKeypair(
-                     keyType: try FfiConverterString.lift(keyType)
+                     keyType: try FfiConverterString.lift(keyType),
+                     role: try FfiConverterString.lift(role)
                 )
             }
 
@@ -18638,13 +18671,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 31392) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 61541) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 42836) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_destroy_key() != 41195) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_generate_keypair() != 32558) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_generate_keypair() != 43280) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_dh_agree() != 46704) {
