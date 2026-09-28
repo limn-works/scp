@@ -1,8 +1,9 @@
 // AndroidKeyCustodyTest.kt — Unit tests for AndroidKeyCustody (SCP-110)
 //
 // These tests exercise the software fallback path (Bouncy Castle) since Android Keystore
-// is not available in JVM unit tests. The Keystore path (API 33+, CustodyType.HARDWARE)
-// requires an Android device or emulator and is tested via instrumented tests.
+// is not available in JVM unit tests. AndroidKeyCustodyPseudonymLifecycleTest runs the
+// Keystore path (API 33+, CustodyType.HARDWARE) against a fake KeystoreKeys; no on-device
+// test of the real Keystore exists yet.
 //
 // Uses InMemorySharedPreferences to inject a test double for EncryptedSharedPreferences,
 // allowing verification of Ed25519 key persistence without the Android framework (#119).
@@ -46,7 +47,7 @@ private fun hex(text: String): ByteArray =
  * [getAll], [getString], [edit] with [putString], [remove], and [apply]/[commit].
  * All other SharedPreferences methods throw [UnsupportedOperationException].
  */
-private class InMemorySharedPreferences : SharedPreferences {
+internal class InMemorySharedPreferences : SharedPreferences {
     private val store = ConcurrentHashMap<String, Any?>()
 
     override fun getAll(): MutableMap<String, *> = store.toMutableMap()

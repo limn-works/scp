@@ -24,16 +24,12 @@ package works.limn.scp.android.platform
 import android.content.Context
 import android.content.SharedPreferences
 import android.os.Build
-import android.security.keystore.KeyGenParameterSpec
-import android.security.keystore.KeyProperties
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKeys
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.Signature
-import java.security.spec.NamedParameterSpec
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import org.bouncycastle.crypto.AsymmetricCipherKeyPair
@@ -99,9 +95,15 @@ import java.security.SecureRandom
  * @property encryptedPrefs Persistent storage for software Ed25519 private key seeds.
  *   In production, this is an [EncryptedSharedPreferences] instance backed by Android
  *   Keystore. In tests, a plain [SharedPreferences] can be injected.
+ * @property keystore The Android Keystore operations of the hardware identity path;
+ *   JVM tests inject a fake.
+ * @property keystoreEd25519 Whether Ed25519 identities are generated in [keystore]
+ *   (API 33+) rather than in software.
  */
 class AndroidKeyCustody internal constructor(
     private val encryptedPrefs: SharedPreferences,
+    private val keystore: KeystoreKeys = AndroidKeystoreKeys,
+    private val keystoreEd25519: Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU,
 ) : KeyCustodyProvider {
 
     /**
@@ -153,9 +155,10 @@ class AndroidKeyCustody internal constructor(
      *
      * Pseudonym keys are in-memory: they are re-derived on demand from the identity
      * key's pseudonym secret, so they are never persisted. One entry exists per
-     * (identity, context, epoch), because re-deriving replaces it.
+     * (identity, context, epoch), because re-deriving keeps the existing one, and
+     * destroying the identity destroys all of its entries.
      */
-    internal val pseudonymKeys = ConcurrentHashMap<String, ByteArray>()
+    internal val pseudonymKeys = PseudonymKeys()
 
     /**
      * Delegate for Bouncy Castle software key operations.
@@ -190,7 +193,7 @@ class AndroidKeyCustody internal constructor(
     override fun generateKeypair(keyType: KeyType): KeyHandle {
         val keyId = UUID.randomUUID().toString()
         return when {
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && keyType == KeyType.ED25519 -> {
+            keystoreEd25519 && keyType == KeyType.ED25519 -> {
                 generateKeystoreEd25519(keyId)
             }
             keyType == KeyType.ED25519 -> {
@@ -222,7 +225,7 @@ class AndroidKeyCustody internal constructor(
      * @throws ScpException with code `SCP-CRYPTO-4003` if the key is not Ed25519.
      */
     override fun sign(keyHandle: KeyHandle, data: ByteArray): ByteArray {
-        pseudonymKeys[keyHandle.id]?.let { return P256Pseudonym.signPrehash(it, data) }
+        pseudonymKeys.withScalar(keyHandle.id) { P256Pseudonym.signPrehash(it, data) }?.let { return it }
         return if (keyHandle.custodyType == CustodyType.HARDWARE) {
             signWithKeystore(keyHandle, data)
         } else {
@@ -245,7 +248,7 @@ class AndroidKeyCustody internal constructor(
      * @throws ScpException with code `SCP-CRYPTO-4001` if the key is not found.
      */
     override fun publicKey(keyHandle: KeyHandle): ByteArray {
-        pseudonymKeys[keyHandle.id]?.let { return P256Pseudonym.compressedPublicKey(it) }
+        pseudonymKeys.withScalar(keyHandle.id) { P256Pseudonym.compressedPublicKey(it) }?.let { return it }
         return if (keyHandle.custodyType == CustodyType.HARDWARE) {
             publicKeyFromKeystore(keyHandle)
         } else {
@@ -261,6 +264,9 @@ class AndroidKeyCustody internal constructor(
      *
      * For software-backed keys: removes the entry from the [softwareKeys] map.
      *
+     * For an identity key: also wipes every P-256 pseudonym scalar derived from it, and
+     * refuses any derivation from it still in flight.
+     *
      * After this call, all subsequent operations with the same handle will throw
      * [ScpException] with code `SCP-CRYPTO-4001`.
      *
@@ -270,15 +276,18 @@ class AndroidKeyCustody internal constructor(
      * @throws ScpException with code `SCP-CRYPTO-4004` if destruction cannot be confirmed.
      */
     override fun destroyKey(keyHandle: KeyHandle): DestructionAttestation {
-        pseudonymKeys.remove(keyHandle.id)?.let {
-            it.fill(0)
+        if (pseudonymKeys.remove(keyHandle.id)) {
             return DestructionAttestation(method = DestructionMethod.SOFTWARE_ONLY, confirmed = true)
         }
-        return if (keyHandle.custodyType == CustodyType.HARDWARE) {
+        val attestation = if (keyHandle.custodyType == CustodyType.HARDWARE) {
             destroyKeystoreKey(keyHandle)
         } else {
             softwareKeyOps.destroy(keyHandle)
         }
+        // After the identity is gone no new derivation can start, and retiring wipes
+        // the ones already stored and refuses the ones still in flight.
+        pseudonymKeys.retireIdentity(keyHandle.id)
+        return attestation
     }
 
     /**
@@ -366,7 +375,7 @@ class AndroidKeyCustody internal constructor(
         // v1 HMAC body: contextId || "scp-pseudonym".
         val seed = contextSeed(keyHandle, contextId, "scp-pseudonym".toByteArray(Charsets.UTF_8))
         val id = P256Pseudonym.pseudonymId(keyHandle.id, contextId, null)
-        return P256Pseudonym.register(pseudonymKeys, id, seed)
+        return P256Pseudonym.register(pseudonymKeys, keyHandle.id, id, seed)
     }
 
     /**
@@ -405,7 +414,7 @@ class AndroidKeyCustody internal constructor(
             epochBe + "scp-pseudonym-v2".toByteArray(Charsets.UTF_8),
         )
         val id = P256Pseudonym.pseudonymId(keyHandle.id, contextId, pseudonymEpoch)
-        return P256Pseudonym.register(pseudonymKeys, id, seed)
+        return P256Pseudonym.register(pseudonymKeys, keyHandle.id, id, seed)
     }
 
     /** Rejects a software identity handle recorded as X25519 with `SCP-CRYPTO-4003`. */
@@ -427,7 +436,7 @@ class AndroidKeyCustody internal constructor(
      */
     private fun contextSeed(keyHandle: KeyHandle, contextId: ByteArray, suffix: ByteArray): ByteArray {
         if (keyHandle.custodyType == CustodyType.HARDWARE) {
-            return PseudonymSecret.keystoreContextSeed(keyHandle.id, contextId, suffix)
+            return PseudonymSecret.keystoreContextSeed(keystore, keyHandle.id, contextId, suffix)
         }
         val keyPair = softwareKeys[keyHandle.id]
             ?: throw ScpException("Key not found: ${keyHandle.id}", "SCP-CRYPTO-4001")
@@ -506,20 +515,22 @@ class AndroidKeyCustody internal constructor(
      * to sign messages during relay connections and message processing without user
      * interaction.
      */
+    @Suppress("TooGenericExceptionCaught") // any failure must delete the half-made identity
     private fun generateKeystoreEd25519(keyId: String): KeyHandle {
         val keystoreAlias = "scp.key.$keyId"
-        val spec = KeyGenParameterSpec.Builder(
-            keystoreAlias,
-            KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY,
-        )
-            .setAlgorithmParameterSpec(NamedParameterSpec.ED25519)
-            .setDigests() // EdDSA does not require explicit digest
-            .setUserAuthenticationRequired(false) // SCP requires background processing
-            .build()
-        val keyPairGenerator = KeyPairGenerator.getInstance("EdDSA", "AndroidKeyStore")
-        keyPairGenerator.initialize(spec)
-        keyPairGenerator.generateKeyPair()
-        PseudonymSecret.generateInKeystore(keyId)
+        keystore.generateEd25519(keystoreAlias)
+        try {
+            keystore.generateHmacSha256(PseudonymSecret.alias(keyId))
+        } catch (e: Exception) {
+            // An identity without its pseudonym secret could never derive a pseudonym,
+            // and no handle to it is returned, so it would sit orphaned in Keystore.
+            try {
+                keystore.deleteEntry(keystoreAlias)
+            } catch (cleanup: Exception) {
+                e.addSuppressed(cleanup)
+            }
+            throw e
+        }
         return KeyHandle(id = keyId, custodyType = CustodyType.HARDWARE)
     }
 
@@ -580,21 +591,20 @@ class AndroidKeyCustody internal constructor(
      */
     private fun destroyKeystoreKey(keyHandle: KeyHandle): DestructionAttestation {
         val keystoreAlias = "scp.key.${keyHandle.id}"
-        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
 
-        if (!keyStore.containsAlias(keystoreAlias)) {
+        if (!keystore.containsAlias(keystoreAlias)) {
             throw ScpException(
                 "Key not found in Keystore: ${keyHandle.id}",
                 "SCP-CRYPTO-4001",
             )
         }
 
-        keyStore.deleteEntry(keystoreAlias)
+        keystore.deleteEntry(keystoreAlias)
         val secretAlias = PseudonymSecret.alias(keyHandle.id)
-        if (keyStore.containsAlias(secretAlias)) keyStore.deleteEntry(secretAlias)
+        if (keystore.containsAlias(secretAlias)) keystore.deleteEntry(secretAlias)
 
         // Verify deletion per section 9.15 — re-fetch must confirm absence
-        if (keyStore.containsAlias(keystoreAlias) || keyStore.containsAlias(secretAlias)) {
+        if (keystore.containsAlias(keystoreAlias) || keystore.containsAlias(secretAlias)) {
             throw ScpException(
                 "Key destruction failed: entry persisted after deletion for ${keyHandle.id}",
                 "SCP-CRYPTO-4004",

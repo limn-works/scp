@@ -29,10 +29,11 @@ internal object P256Pseudonym {
 
     /**
      * Maps a 32-byte context seed to its pseudonym scalar, stores the scalar in [keys]
-     * under [pseudonymId], and zeroizes the seed.
+     * under [pseudonymId] as a pseudonym of [identityId], and zeroizes the seed.
      */
     fun register(
-        keys: MutableMap<String, ByteArray>,
+        keys: PseudonymKeys,
+        identityId: String,
         pseudonymId: String,
         contextSeed: ByteArray,
     ): PseudonymKeyHandle {
@@ -41,7 +42,7 @@ internal object P256Pseudonym {
         } finally {
             contextSeed.fill(0)
         }
-        keys.put(pseudonymId, scalar)?.fill(0)
+        keys.put(identityId, pseudonymId, scalar)
         return PseudonymKeyHandle(id = pseudonymId, custodyType = CustodyType.SOFTWARE)
     }
 
@@ -88,5 +89,79 @@ internal object P256Pseudonym {
         throw ScpException(e.msg, e.code, e)
     } catch (e: BridgeException.Crypto) {
         throw ScpException(e.msg, e.code, e)
+    }
+}
+
+/**
+ * The in-memory P-256 pseudonym scalars of one [AndroidKeyCustody], each owned by the
+ * identity it was derived from.
+ *
+ * Every access holds [lock]. A stored scalar array is never handed out: [withScalar]
+ * lends a copy and wipes it afterwards, so wiping a stored array on replace or remove
+ * cannot corrupt a signature in progress on another thread.
+ */
+internal class PseudonymKeys {
+    private val lock = Any()
+    private val scalars = HashMap<String, ByteArray>()
+    private val byIdentity = HashMap<String, MutableSet<String>>()
+
+    /**
+     * Identities destroyed in this process. A derivation that read its seed before its
+     * identity was destroyed must not store a scalar afterwards; handle ids are random
+     * UUIDs, so this holds one short string per destroyed identity.
+     */
+    private val retired = HashSet<String>()
+
+    /** Number of stored scalars. */
+    val size: Int get() = synchronized(lock) { scalars.size }
+
+    /**
+     * Stores [scalar] under [pseudonymId] for [identityId]. An id already present keeps
+     * its scalar (the same inputs derive the same scalar) and [scalar] is wiped.
+     *
+     * @throws ScpException with code `SCP-CRYPTO-4001` if [identityId] was destroyed;
+     *   [scalar] is wiped.
+     */
+    fun put(identityId: String, pseudonymId: String, scalar: ByteArray) {
+        synchronized(lock) {
+            if (identityId in retired) {
+                scalar.fill(0)
+                throw ScpException("Key not found: $identityId", "SCP-CRYPTO-4001")
+            }
+            if (scalars.putIfAbsent(pseudonymId, scalar) != null) {
+                scalar.fill(0)
+            } else {
+                byIdentity.getOrPut(identityId) { HashSet() }.add(pseudonymId)
+            }
+        }
+    }
+
+    /** Runs [use] on a copy of the scalar of [pseudonymId], or returns `null` if absent. */
+    fun <T> withScalar(pseudonymId: String, use: (ByteArray) -> T): T? {
+        val copy = synchronized(lock) { scalars[pseudonymId]?.copyOf() } ?: return null
+        return try {
+            use(copy)
+        } finally {
+            copy.fill(0)
+        }
+    }
+
+    /** Wipes and removes the scalar of [pseudonymId]; `false` if there was none. */
+    fun remove(pseudonymId: String): Boolean = synchronized(lock) {
+        val scalar = scalars.remove(pseudonymId) ?: return false
+        scalar.fill(0)
+        byIdentity.values.forEach { it.remove(pseudonymId) }
+        true
+    }
+
+    /**
+     * Wipes and removes every scalar derived from [identityId], and refuses any later
+     * [put] for it.
+     */
+    fun retireIdentity(identityId: String) {
+        synchronized(lock) {
+            retired.add(identityId)
+            byIdentity.remove(identityId)?.forEach { scalars.remove(it)?.fill(0) }
+        }
     }
 }
