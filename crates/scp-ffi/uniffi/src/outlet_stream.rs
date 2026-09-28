@@ -238,13 +238,12 @@ async fn resolve_stream_signer(
         let (custody, key_handle) = entry.value();
         (Arc::clone(custody), *key_handle)
     };
-    let public_key = custody
-        .public_key(&handle)
-        .await
-        .map_err(|e| ScpError::Context {
-            msg: format!("failed to resolve stream signing key for '{identity_did}': {e}"),
-            code: codes::CTX_2001.to_owned(),
-        })?;
+    let public_key = custody.public_key(&handle).await.map_err(|e| {
+        ScpError::custody(
+            format!("failed to resolve stream signing key for '{identity_did}': {e}"),
+            &e,
+        )
+    })?;
     let verifying_key = scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key)
         .ok_or_else(|| ScpError::Context {
         msg: format!(

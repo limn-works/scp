@@ -494,10 +494,20 @@ export interface CustodyPublicKey {
  * `"SCP-CRYPTO-4006"` (key not found), such as
  * `new CryptoError(msg, "SCP-CRYPTO-4006")`, for a key id that was destroyed or
  * never existed; the SDK call then rejects with a `CryptoError` carrying that
- * code. Any other throw, whatever its code, rejects the SDK call with the
- * custody error `SCP-CRYPTO-4060` carrying the thrown code and message. The
- * SDK catches every throw, so none reaches the process as an uncaught
- * exception.
+ * code. Any other throw, whatever its code or value, rejects the SDK call with
+ * the custody error `SCP-CRYPTO-4060` carrying the thrown code and message.
+ * Every SDK operation that calls the provider reports these two codes,
+ * including the pseudonym derivation inside `createContext` and the identity
+ * key reads and signatures of identity operations; the one exception is
+ * `SCP-IDENT-1055`, reported when the bridge rejects the pseudonym a
+ * {@link derivePseudonym} call returned.
+ *
+ * Every callback must be synchronous and return the type its signature names.
+ * A callback that returns a Promise or other thenable, or a value of the wrong
+ * type, fails the SDK call with `SCP-CRYPTO-4060`; the SDK attaches a handler
+ * to a returned thenable, so its rejection is swallowed. No throw, returned
+ * value or rejected thenable reaches the process as an uncaught exception or
+ * an unhandled rejection.
  *
  * Only available on the NAPI (Node.js / Bun) backend — the SDK requires the
  * native addon (ADR-048). The browser tier (`@limn-works/scp-ts-wasm`, ADR-057)

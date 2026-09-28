@@ -221,7 +221,7 @@ class AndroidKeyCustody internal constructor(
      *   32-byte digest, signed without a second hash as P-256 ECDSA with an RFC 6979
      *   nonce and low s (§9.5).
      * @return 64-byte signature.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if the key is not found.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if the key is not found.
      * @throws ScpException with code `SCP-CRYPTO-4003` if the key is not Ed25519.
      */
     override fun sign(keyHandle: KeyHandle, data: ByteArray): ByteArray {
@@ -245,7 +245,7 @@ class AndroidKeyCustody internal constructor(
      * @param keyHandle Handle returned by [generateKeypair] or [derivePseudonym].
      * @return Raw 32-byte public key bytes, or the 33-byte compressed P-256 point for a
      *   pseudonym handle.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if the key is not found.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if the key is not found.
      */
     override fun publicKey(keyHandle: KeyHandle): ByteArray {
         pseudonymKeys.withScalar(keyHandle.id) { P256Pseudonym.compressedPublicKey(it) }?.let { return it }
@@ -268,11 +268,11 @@ class AndroidKeyCustody internal constructor(
      * refuses any derivation from it still in flight (§9.10.4.A).
      *
      * After this call, all subsequent operations with the same handle will throw
-     * [ScpException] with code `SCP-CRYPTO-4001`.
+     * [ScpException] with code `SCP-CRYPTO-4006`.
      *
      * @param keyHandle Handle to destroy.
      * @return [DestructionAttestation] confirming the destruction method and verification.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if the handle is already invalid.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if the handle is already invalid.
      * @throws ScpException with code `SCP-CRYPTO-4004` if destruction cannot be confirmed.
      */
     override fun destroyKey(keyHandle: KeyHandle): DestructionAttestation {
@@ -300,7 +300,7 @@ class AndroidKeyCustody internal constructor(
      * @param keyHandle Handle to an X25519 key from [generateKeypair].
      * @param peerPublic 32-byte X25519 public key of the peer.
      * @return 32-byte X25519 shared secret.
-     * @throws ScpException with code `SCP-CRYPTO-4002` if the X25519 key is not found.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if the X25519 key is not found.
      */
     override fun dhAgree(keyHandle: KeyHandle, peerPublic: ByteArray): ByteArray {
         if (peerPublic.size != 32) {
@@ -324,7 +324,7 @@ class AndroidKeyCustody internal constructor(
         val keyPair = softwareKeys[keyHandle.id]
             ?: throw ScpException(
                 "X25519 key not found: ${keyHandle.id}",
-                "SCP-CRYPTO-4002",
+                "SCP-CRYPTO-4006",
             )
         val agreement = X25519Agreement()
         agreement.init(keyPair.private)
@@ -367,7 +367,7 @@ class AndroidKeyCustody internal constructor(
      * @param keyHandle Handle to the identity Ed25519 key (source for derivation).
      * @param contextId Raw context ID bytes.
      * @return [PseudonymKeyHandle] referencing the derived signing key.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if the identity key or its
+     * @throws ScpException with code `SCP-CRYPTO-4006` if the identity key or its
      *   pseudonym secret is not found.
      * @throws ScpException with code `SCP-CRYPTO-4003` if the identity key is not Ed25519.
      */
@@ -394,7 +394,7 @@ class AndroidKeyCustody internal constructor(
      * @param contextId Raw context ID bytes.
      * @param pseudonymEpoch Rotation epoch counter, mixed in as a big-endian u64.
      * @return [PseudonymKeyHandle] referencing the derived signing key.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if the identity key or its
+     * @throws ScpException with code `SCP-CRYPTO-4006` if the identity key or its
      *   pseudonym secret is not found.
      * @throws ScpException with code `SCP-CRYPTO-4003` if the identity key is not Ed25519.
      */
@@ -440,7 +440,7 @@ class AndroidKeyCustody internal constructor(
             return PseudonymSecret.keystoreContextSeed(keystore, keyHandle.id, contextId, suffix)
         }
         val keyPair = softwareKeys[keyHandle.id]
-            ?: throw ScpException("Key not found: ${keyHandle.id}", "SCP-CRYPTO-4001")
+            ?: throw ScpException("Key not found: ${keyHandle.id}", "SCP-CRYPTO-4006")
         return PseudonymSecret.softwareContextSeed(
             keyPair.private as Ed25519PrivateKeyParameters,
             contextId,
@@ -463,7 +463,7 @@ class AndroidKeyCustody internal constructor(
      * @throws ScpException with code `SCP-CRYPTO-4003` if the key is not Ed25519.
      * @throws ScpException with code `SCP-CRYPTO-4005` if the key is hardware-backed
      *   (TEE keys are non-extractable).
-     * @throws ScpException with code `SCP-CRYPTO-4001` if the key is not found.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if the key is not found.
      */
     override fun exportSigningKeyBytes(keyHandle: KeyHandle): ByteArray {
         if (keyHandle.custodyType == CustodyType.HARDWARE) {
@@ -487,7 +487,7 @@ class AndroidKeyCustody internal constructor(
         val keyPair = softwareKeys[keyHandle.id]
             ?: throw ScpException(
                 "Key not found: ${keyHandle.id}",
-                "SCP-CRYPTO-4001",
+                "SCP-CRYPTO-4006",
             )
 
         val privateParams = keyPair.private as Ed25519PrivateKeyParameters
@@ -547,7 +547,7 @@ class AndroidKeyCustody internal constructor(
         val entry = keyStore.getEntry(keystoreAlias, null) as? KeyStore.PrivateKeyEntry
             ?: throw ScpException(
                 "Key not found in Keystore: ${keyHandle.id}",
-                "SCP-CRYPTO-4001",
+                "SCP-CRYPTO-4006",
             )
         return Signature.getInstance("EdDSA").apply {
             initSign(entry.privateKey)
@@ -568,7 +568,7 @@ class AndroidKeyCustody internal constructor(
         val entry = keyStore.getEntry(keystoreAlias, null) as? KeyStore.PrivateKeyEntry
             ?: throw ScpException(
                 "Key not found in Keystore: ${keyHandle.id}",
-                "SCP-CRYPTO-4001",
+                "SCP-CRYPTO-4006",
             )
         val encoded = entry.certificate.publicKey.encoded
         // X.509 SubjectPublicKeyInfo for Ed25519 is 44 bytes: 12-byte header + 32-byte key (RFC 8410 §3)
@@ -596,7 +596,7 @@ class AndroidKeyCustody internal constructor(
         if (!keystore.containsAlias(keystoreAlias)) {
             throw ScpException(
                 "Key not found in Keystore: ${keyHandle.id}",
-                "SCP-CRYPTO-4001",
+                "SCP-CRYPTO-4006",
             )
         }
 
@@ -695,7 +695,7 @@ internal class SoftwareKeyOps(
         val keyPair = softwareKeys[keyHandle.id]
             ?: throw ScpException(
                 "Key not found: ${keyHandle.id}",
-                "SCP-CRYPTO-4001",
+                "SCP-CRYPTO-4006",
             )
 
         // Enforce Ed25519 type
@@ -720,7 +720,7 @@ internal class SoftwareKeyOps(
         val keyPair = softwareKeys[keyHandle.id]
             ?: throw ScpException(
                 "Key not found: ${keyHandle.id}",
-                "SCP-CRYPTO-4001",
+                "SCP-CRYPTO-4006",
             )
 
         val storedType = softwareKeyTypes[keyHandle.id]
@@ -756,7 +756,7 @@ internal class SoftwareKeyOps(
         if (removed == null) {
             throw ScpException(
                 "Key not found: ${keyHandle.id}",
-                "SCP-CRYPTO-4001",
+                "SCP-CRYPTO-4006",
             )
         }
 

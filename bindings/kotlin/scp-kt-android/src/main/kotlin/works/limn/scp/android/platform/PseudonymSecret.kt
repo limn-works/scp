@@ -37,7 +37,7 @@ internal object PseudonymSecret {
     /**
      * The context seed of the hardware identity [keyId], computed inside Keystore.
      *
-     * @throws ScpException with code `SCP-CRYPTO-4001` if the identity has no pseudonym
+     * @throws ScpException with code `SCP-CRYPTO-4006` if the identity has no pseudonym
      *   secret (a key generated before this secret existed must be regenerated).
      */
     fun keystoreContextSeed(
@@ -48,7 +48,7 @@ internal object PseudonymSecret {
     ): ByteArray = keystore.hmacSha256(alias(keyId), contextId, suffix)
         ?: throw ScpException(
             "Pseudonym secret not found in Keystore for identity $keyId",
-            "SCP-CRYPTO-4001",
+            "SCP-CRYPTO-4006",
         )
 
     /** The context seed of a software identity; the secret is wiped after keying the MAC. */

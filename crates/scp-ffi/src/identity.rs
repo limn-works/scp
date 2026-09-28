@@ -1150,9 +1150,10 @@ impl crate::scp::PyScp {
                         .public_key(&identity.identity_key)
                         .await
                         .map_err(|e| {
-                            ScpPyError::identity(format!(
-                                "failed to read identity key after identity create: {e}"
-                            ))
+                            ScpPyError::custody(
+                                format!("failed to read identity key after identity create: {e}"),
+                                &e,
+                            )
                         })?;
                     let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
 
@@ -1273,9 +1274,10 @@ impl crate::scp::PyScp {
                         .public_key(&identity.identity_key)
                         .await
                         .map_err(|e| {
-                            ScpPyError::identity(format!(
-                                "failed to read identity key after identity create: {e}"
-                            ))
+                            ScpPyError::custody(
+                                format!("failed to read identity key after identity create: {e}"),
+                                &e,
+                            )
                         })?;
                     let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
 
@@ -1428,9 +1430,10 @@ impl crate::scp::PyScp {
                         .public_key(&identity.identity_key)
                         .await
                         .map_err(|e| {
-                            ScpPyError::identity(format!(
-                                "failed to read identity key after identity create: {e}"
-                            ))
+                            ScpPyError::custody(
+                                format!("failed to read identity key after identity create: {e}"),
+                                &e,
+                            )
                         })?;
                     let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
 
@@ -2495,7 +2498,9 @@ impl crate::scp::PyScp {
             // Phase 2: sign (no DashMap lock held — safe to block_on).
             let sig = rt
                 .block_on(custody.sign(&key_handle, &built.canonical_bytes))
-                .map_err(|e| ScpPyError::identity(format!("Ed25519 signing failed: {e}")))?;
+                .map_err(|e| {
+                    ScpPyError::custody(format!("link attestation signing failed: {e}"), &e)
+                })?;
             attestation.signature = sig.as_bytes().to_vec();
 
             // Phase 3: re-acquire lock, verify key unchanged (TOCTOU guard), store.

@@ -402,8 +402,8 @@ impl CallbackKeyRegistry {
     ///
     /// [`PlatformError::KeyNotFound`] if the id is being destroyed, or the
     /// source is not a live identity holding `source_key`;
-    /// [`PlatformError::CustodyError`] for any rejected occupant, or a
-    /// poisoned registry lock.
+    /// [`PlatformError::PseudonymRejected`] for any rejected occupant;
+    /// [`PlatformError::CustodyError`] for a poisoned registry lock.
     pub fn bind_pseudonym(
         &self,
         method: &str,
@@ -430,7 +430,7 @@ impl CallbackKeyRegistry {
                     && existing.origin == Origin::Resolved
                     && existing.role == KeyRole::Operational => {}
             Some(Slot::Live(_)) => {
-                return Err(PlatformError::CustodyError(format!(
+                return Err(PlatformError::PseudonymRejected(format!(
                     "KeyCustodyProvider.{method}: key_id {} is already bound to another key \
                      or derivation",
                     handle.id()
@@ -1264,8 +1264,9 @@ where
 /// # Errors
 ///
 /// [`PlatformError::WrongKeyType`] for `key`, or as in [`resolve`]; any host
-/// error; [`PlatformError::CustodyError`] for a malformed return, a point the
-/// host's `get_public_key` does not confirm, or a refused bind.
+/// error; [`PlatformError::PseudonymRejected`] (reported as `SCP-IDENT-1055`)
+/// for a malformed pseudonym, a malformed `get_public_key(key_id)` answer, a
+/// point or role that answer does not confirm, or a refused bind.
 pub async fn derive_pseudonym<H, HF, P, PF>(
     registry: &CallbackKeyRegistry,
     method: &str,
@@ -1295,18 +1296,23 @@ where
     let pseudonym = crate::custody_parse::parse_pseudonym(method, &public_key, &key_id)?;
     let derived =
         RegisteredKey::P256Signing(P256PublicKey::from_sec1(&public_key).map_err(|e| {
-            PlatformError::CustodyError(format!("KeyCustodyProvider.{method}: {e}"))
+            PlatformError::PseudonymRejected(format!("KeyCustodyProvider.{method}: {e}"))
         })?);
     let answer = host_get_public_key(key_id).await?;
-    let confirmed = registered_key("get_public_key", &answer)?;
-    if host_role("get_public_key", &answer)? != HostRole::Operational {
-        return Err(PlatformError::CustodyError(format!(
+    // A malformed answer about the pseudonym key refuses the pseudonym.
+    let rejected = |e| match e {
+        PlatformError::CustodyError(msg) => PlatformError::PseudonymRejected(msg),
+        other => other,
+    };
+    let confirmed = registered_key("get_public_key", &answer).map_err(rejected)?;
+    if host_role("get_public_key", &answer).map_err(rejected)? != HostRole::Operational {
+        return Err(PlatformError::PseudonymRejected(format!(
             "KeyCustodyProvider.{method}: get_public_key(key_id) reports the pseudonym key as \
              an identity"
         )));
     }
     if confirmed != derived {
-        return Err(PlatformError::CustodyError(format!(
+        return Err(PlatformError::PseudonymRejected(format!(
             "KeyCustodyProvider.{method}: get_public_key(key_id) does not match the derived \
              pseudonym point"
         )));
@@ -2627,7 +2633,7 @@ mod tests {
             let ret = (key.public_key().to_compressed().to_vec(), "20");
             let result = d(source, context, epoch, ret, p256_answer(key)).await;
             assert!(
-                matches!(result, Err(PlatformError::CustodyError(_))),
+                matches!(result, Err(PlatformError::PseudonymRejected(_))),
                 "{result:?}"
             );
             assert_eq!(registry.get(&KeyHandle::new(20)).unwrap(), bound);
@@ -2638,7 +2644,7 @@ mod tests {
             let before = registry.get(&KeyHandle::new(id.parse().unwrap())).unwrap();
             let result = d(1, b"x", None, (point.clone(), id), p256_answer(&pseudo)).await;
             assert!(
-                matches!(result, Err(PlatformError::CustodyError(_))),
+                matches!(result, Err(PlatformError::PseudonymRejected(_))),
                 "{id}: {result:?}"
             );
             assert_eq!(
@@ -2655,7 +2661,7 @@ mod tests {
         ] {
             let result = d(1, b"y", None, (point.clone(), "21"), confirm).await;
             assert!(
-                matches!(result, Err(PlatformError::CustodyError(_))),
+                matches!(result, Err(PlatformError::PseudonymRejected(_))),
                 "{result:?}"
             );
             assert!(registry.get(&KeyHandle::new(21)).unwrap().is_none());
@@ -2669,7 +2675,7 @@ mod tests {
             answer("p256", &[2u8; 32]),
         )
         .await;
-        assert!(matches!(result, Err(PlatformError::CustodyError(_))));
+        assert!(matches!(result, Err(PlatformError::PseudonymRejected(_))));
         assert!(registry.get(&KeyHandle::new(21)).unwrap().is_none());
     }
 
@@ -3513,7 +3519,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(result, Err(PlatformError::CustodyError(_))),
+            matches!(result, Err(PlatformError::PseudonymRejected(_))),
             "{result:?}"
         );
     }

@@ -19,7 +19,7 @@
 import { describe, expect, test } from "bun:test";
 import * as crypto from "node:crypto";
 
-import { KeyNotFoundError, ScpError } from "../src/errors";
+import { CryptoError, KeyNotFoundError, ScpError } from "../src/errors";
 import type { CustodyPublicKey, KeyCustodyProvider, PseudonymResult } from "../src/scp";
 import { SCP } from "../src/scp";
 import {
@@ -49,7 +49,7 @@ try {
 // ---------------------------------------------------------------------------
 
 /** A host fault the fixture can inject into its pseudonym results. */
-type PseudonymFault = "legacy32" | "wrongPublicKey";
+type PseudonymFault = "legacy32" | "wrongPublicKey" | "deriveKeyNotFound";
 
 class CryptoKeychain implements KeyCustodyProvider {
   #seeds = new Map<string, Uint8Array>();
@@ -177,6 +177,10 @@ class CryptoKeychain implements KeyCustodyProvider {
   }
 
   derivePseudonym(keyId: string, contextId: Uint8Array): PseudonymResult {
+    // A host whose key is gone reports the contract's key-not-found code.
+    if (this.#fault === "deriveKeyNotFound") {
+      throw new CryptoError(`key not found: ${keyId}`, "SCP-CRYPTO-4006");
+    }
     return this.#registerPseudonym(
       keyId,
       pseudonymSeedV1(this.#identitySeed(keyId), contextId),
@@ -257,6 +261,30 @@ if (!scpAvailable) {
         const identity = await scp.identityCreateWithCustody(provider);
         expect(identity.did).toMatch(/^did:dht:/);
         expect(identity.custodyType).toBe("callback");
+      } finally {
+        await scp.shutdown(1000).catch(() => {});
+      }
+    });
+
+    // §9.10.4.A: a host that reports key-not-found while deriving fails the
+    // production context create with that code, not a derivation identity code.
+    test("an encrypted context create fails with SCP-CRYPTO-4006 when the host reports key-not-found", async () => {
+      const scp = new SCP({ storage: { type: "in_memory" } });
+      try {
+        const identity = await scp.identityCreateWithCustody(
+          new CryptoKeychain("deriveKeyNotFound"),
+        );
+        let caught: unknown;
+        try {
+          await scp.contextCreate(
+            identity,
+            JSON.stringify({ ceiling: ["messages:read"], memoryScope: "ephemeral" }),
+          );
+        } catch (err) {
+          caught = err;
+        }
+        expect(caught).toBeInstanceOf(ScpError);
+        expect((caught as ScpError).code).toBe("SCP-CRYPTO-4006");
       } finally {
         await scp.shutdown(1000).catch(() => {});
       }

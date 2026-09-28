@@ -991,10 +991,10 @@ impl Scp {
             rt.block_on(custody.sign(&key_handle, &built.canonical_bytes))
         })
         .map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("Ed25519 signing failed: {e}"),
-                code: codes::IDENT_1041.to_owned(),
-            })
+            NapiError::from(ScpNapiError::custody(
+                format!("link attestation signing failed: {e}"),
+                &e,
+            ))
         })?;
         attestation.signature = sig.as_bytes().to_vec();
 

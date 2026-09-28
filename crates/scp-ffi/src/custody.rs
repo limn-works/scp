@@ -1027,7 +1027,9 @@ class FakeCustody:
 
     def derive_pseudonym(self, key_id, context_id):
         self._count('derive_pseudonym')
-        seed = hmac.new(self._seed(key_id), bytes(context_id), hashlib.sha256).digest()
+        if key_id not in self._seeds:
+            raise HostError('key not found: ' + key_id, 'SCP-CRYPTO-4006')
+        seed = hmac.new(self._seeds[key_id], bytes(context_id), hashlib.sha256).digest()
         return self._register(key_id, seed, context_id, b'v1')
 
     def derive_rotatable_pseudonym(self, key_id, context_id, pseudonym_epoch):
@@ -1567,6 +1569,15 @@ mod tests {
         );
     }
 
+    /// Asserts that `err` is the `PseudonymRejected` variant the bridge
+    /// reports for a host pseudonym it cannot bind (spec §9.10.4).
+    fn assert_pseudonym_rejected(err: &PlatformError) {
+        assert!(
+            matches!(err, PlatformError::PseudonymRejected(_)),
+            "expected PseudonymRejected, got {err:?}"
+        );
+    }
+
     /// A pseudonym handle signs only a 32-byte digest: 12 bytes is a
     /// `CustodyError` before the host is called, while the same handle signs
     /// a digest through the host.
@@ -1620,7 +1631,7 @@ mod tests {
             .await
             .expect("first derive");
         assert_eq!(first.key_handle().id(), 777);
-        assert_custody_error(
+        assert_pseudonym_rejected(
             &custody
                 .derive_pseudonym(&handle, b"ctx-b")
                 .await
@@ -1741,7 +1752,7 @@ mod tests {
     async fn ffi_custody_callback_pseudonym_faults_fail_closed() {
         let custody = FfiKeyCustody::Callback(fake_py_custody(Some("legacy32")));
         let handle = custody.generate_identity_keypair().await.expect("key");
-        assert_custody_error(
+        assert_pseudonym_rejected(
             &custody
                 .derive_pseudonym(&handle, b"ctx")
                 .await
@@ -1750,7 +1761,7 @@ mod tests {
 
         let custody = FfiKeyCustody::Callback(fake_py_custody(Some("wrong_public_key")));
         let handle = custody.generate_identity_keypair().await.expect("key");
-        assert_custody_error(
+        assert_pseudonym_rejected(
             &custody
                 .derive_pseudonym(&handle, b"ctx")
                 .await

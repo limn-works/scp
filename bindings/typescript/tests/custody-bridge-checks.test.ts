@@ -15,11 +15,14 @@
  *   - `retire_pseudonyms_of`: destroying an identity retires its pseudonyms,
  *     so they sign nothing and a host may reuse their ids.
  *
- * Two tests fail if `hostCall` in `src/internal/custody-adapter.ts` stops
- * catching host throws: a host throw must reject the SDK call with a typed
- * error (key-not-found `SCP-CRYPTO-4006` for a host error carrying that code,
- * the custody error `SCP-CRYPTO-4060` for any other host error) and
- * never reach the process as an uncaught exception.
+ * The host-failure tests fail if `hostCall` in
+ * `src/internal/custody-adapter.ts` stops turning a host failure into a typed
+ * rejection: a host throw (including a thrown value with no readable
+ * message), a Promise return and a wrongly typed return must each reject the
+ * SDK call with a typed error (key-not-found `SCP-CRYPTO-4006` for a host
+ * error carrying that code, the custody error `SCP-CRYPTO-4060` otherwise)
+ * and never reach the process as an uncaught exception or an unhandled
+ * rejection.
  *
  * It also runs the §25.19 Vector 30 and 31 identity scalars through the
  * bridge's production pseudonym derivation and compares each v1 routing id to
@@ -185,24 +188,51 @@ function adapter(store: Store, fault?: Fault): TestingCustody {
   return new Ctor(toNativeCustodyProvider(new StoreKeychain(store, fault)));
 }
 
+/**
+ * A provider over `store` whose `overrides` replace some methods, typed
+ * loosely so a test can return what a misbehaving host returns.
+ */
+function adapterWith(store: Store, overrides: Record<string, () => unknown>): TestingCustody {
+  const Ctor = native.TestingCallbackCustody as TestingCustodyCtor;
+  const provider = Object.assign(new StoreKeychain(store), overrides) as KeyCustodyProvider;
+  return new Ctor(toNativeCustodyProvider(provider));
+}
+
 const DIGEST = crypto.createHash("sha256").update("custody-bridge-checks").digest();
 
 /**
  * Runs `body` and returns every error that reached the process as an uncaught
- * exception meanwhile, waiting two macrotasks for a late report.
+ * exception or an unhandled rejection meanwhile, waiting two macrotasks for a
+ * late report.
  */
 async function uncaughtDuring(body: () => Promise<void>): Promise<unknown[]> {
   const seen: unknown[] = [];
   const record = (e: unknown) => seen.push(e);
   process.on("uncaughtException", record);
+  process.on("unhandledRejection", record);
   try {
     await body();
     await new Promise((resolve) => setTimeout(resolve, 0));
     await new Promise((resolve) => setTimeout(resolve, 0));
   } finally {
     process.off("uncaughtException", record);
+    process.off("unhandledRejection", record);
   }
   return seen;
+}
+
+/** Awaits `call`, returning its rejection mapped to an SDK error. */
+async function rejectionOf(call: () => Promise<unknown>): Promise<Error & { code?: string }> {
+  let err: unknown;
+  const escaped = await uncaughtDuring(async () => {
+    err = await call().then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+  });
+  expect(escaped).toEqual([]);
+  expect(err).toBeDefined();
+  return mapBridgeError(err);
 }
 
 describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () => {
@@ -289,6 +319,57 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     expect(mapped.code).toBe("SCP-CRYPTO-4060");
     expect(mapped.message).toContain("SCP-CRYPTO-4001");
     expect(mapped.message).toContain("hsm offline");
+  });
+
+  test("an async host method's rejection is a custody error, never an unhandled rejection", async () => {
+    const store = new Store();
+    const custody = adapterWith(store, {
+      sign: () => Promise.reject(new Error("async keystore offline")),
+    });
+    const identity = await custody.generateKeypair();
+    const pseudonym = await custody.derivePseudonym(identity, "ctx");
+    const mapped = await rejectionOf(() => custody.sign(pseudonym.keyId, DIGEST));
+    expect(mapped).toBeInstanceOf(CryptoError);
+    expect(mapped.code).toBe("SCP-CRYPTO-4060");
+    expect(mapped.message).toContain("Promise");
+  });
+
+  test("a wrongly typed or asynchronous host return is a custody error", async () => {
+    const wrongType = adapterWith(new Store(), { generateKeypair: () => 42 });
+    const mapped = await rejectionOf(() => wrongType.generateKeypair());
+    expect(mapped).toBeInstanceOf(CryptoError);
+    expect(mapped.code).toBe("SCP-CRYPTO-4060");
+    expect(mapped.message).toContain("not a string");
+
+    const asyncKeypair = adapterWith(new Store(), { generateKeypair: () => Promise.resolve("1") });
+    expect((await rejectionOf(() => asyncKeypair.generateKeypair())).code).toBe("SCP-CRYPTO-4060");
+
+    // A thenable whose `then` rejects is settled against a no-op handler.
+    const thenable = adapterWith(new Store(), {
+      generateKeypair: () => ({
+        // biome-ignore lint/suspicious/noThenProperty: a host-returned thenable is the case under test
+        then: (_: unknown, reject: (e: unknown) => void) => reject(new Error("late")),
+      }),
+    });
+    expect((await rejectionOf(() => thenable.generateKeypair())).code).toBe("SCP-CRYPTO-4060");
+  });
+
+  test("a thrown value with no readable message is a custody error", async () => {
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+    for (const thrown of [Object.create(null), proxy, Object.assign(new Error(), { message: 7 })]) {
+      const store = new Store();
+      const custody = adapterWith(store, {
+        sign: () => {
+          throw thrown;
+        },
+      });
+      const identity = await custody.generateKeypair();
+      const pseudonym = await custody.derivePseudonym(identity, "ctx");
+      const mapped = await rejectionOf(() => custody.sign(pseudonym.keyId, DIGEST));
+      expect(mapped).toBeInstanceOf(CryptoError);
+      expect(mapped.code).toBe("SCP-CRYPTO-4060");
+    }
   });
 
   test("the adapter unbinds a pseudonym before the host's destroyKey runs", async () => {

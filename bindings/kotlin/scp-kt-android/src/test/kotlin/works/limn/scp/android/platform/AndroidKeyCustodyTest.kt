@@ -233,12 +233,12 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `sign throws SCP-CRYPTO-4001 for missing key`() {
+        fun `sign throws SCP-CRYPTO-4006 for missing key`() {
             val fakeHandle = KeyHandle(id = "nonexistent-key", custodyType = CustodyType.SOFTWARE)
             val exception = assertThrows<ScpException> {
                 custody.sign(fakeHandle, "data".toByteArray())
             }
-            assertEquals("SCP-CRYPTO-4001", exception.code)
+            assertEquals("SCP-CRYPTO-4006", exception.code)
         }
 
         @Test
@@ -290,12 +290,12 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `publicKey throws SCP-CRYPTO-4001 for missing key`() {
+        fun `publicKey throws SCP-CRYPTO-4006 for missing key`() {
             val fakeHandle = KeyHandle(id = "nonexistent-key", custodyType = CustodyType.SOFTWARE)
             val exception = assertThrows<ScpException> {
                 custody.publicKey(fakeHandle)
             }
-            assertEquals("SCP-CRYPTO-4001", exception.code)
+            assertEquals("SCP-CRYPTO-4006", exception.code)
         }
 
         @Test
@@ -350,45 +350,45 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `destroyKey makes subsequent sign fail with SCP-CRYPTO-4001`() {
+        fun `destroyKey makes subsequent sign fail with SCP-CRYPTO-4006`() {
             val handle = custody.generateKeypair(KeyType.ED25519)
             custody.destroyKey(handle)
 
             val exception = assertThrows<ScpException> {
                 custody.sign(handle, "data".toByteArray())
             }
-            assertEquals("SCP-CRYPTO-4001", exception.code)
+            assertEquals("SCP-CRYPTO-4006", exception.code)
         }
 
         @Test
-        fun `destroyKey makes subsequent publicKey fail with SCP-CRYPTO-4001`() {
+        fun `destroyKey makes subsequent publicKey fail with SCP-CRYPTO-4006`() {
             val handle = custody.generateKeypair(KeyType.ED25519)
             custody.destroyKey(handle)
 
             val exception = assertThrows<ScpException> {
                 custody.publicKey(handle)
             }
-            assertEquals("SCP-CRYPTO-4001", exception.code)
+            assertEquals("SCP-CRYPTO-4006", exception.code)
         }
 
         @Test
-        fun `destroyKey throws SCP-CRYPTO-4001 for already-destroyed key`() {
+        fun `destroyKey throws SCP-CRYPTO-4006 for already-destroyed key`() {
             val handle = custody.generateKeypair(KeyType.ED25519)
             custody.destroyKey(handle)
 
             val exception = assertThrows<ScpException> {
                 custody.destroyKey(handle)
             }
-            assertEquals("SCP-CRYPTO-4001", exception.code)
+            assertEquals("SCP-CRYPTO-4006", exception.code)
         }
 
         @Test
-        fun `destroyKey throws SCP-CRYPTO-4001 for nonexistent key`() {
+        fun `destroyKey throws SCP-CRYPTO-4006 for nonexistent key`() {
             val fakeHandle = KeyHandle(id = "nonexistent-key", custodyType = CustodyType.SOFTWARE)
             val exception = assertThrows<ScpException> {
                 custody.destroyKey(fakeHandle)
             }
-            assertEquals("SCP-CRYPTO-4001", exception.code)
+            assertEquals("SCP-CRYPTO-4006", exception.code)
         }
     }
 
@@ -441,12 +441,12 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `dhAgree throws SCP-CRYPTO-4002 for missing key`() {
+        fun `dhAgree throws SCP-CRYPTO-4006 for missing key`() {
             val fakeHandle = KeyHandle(id = "nonexistent-key", custodyType = CustodyType.SOFTWARE)
             val exception = assertThrows<ScpException> {
                 custody.dhAgree(fakeHandle, ByteArray(32))
             }
-            assertEquals("SCP-CRYPTO-4002", exception.code)
+            assertEquals("SCP-CRYPTO-4006", exception.code)
         }
 
         @Test
@@ -608,12 +608,12 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `derivePseudonym throws SCP-CRYPTO-4001 for missing identity key`() {
+        fun `derivePseudonym throws SCP-CRYPTO-4006 for missing identity key`() {
             val fakeHandle = KeyHandle(id = "nonexistent-key", custodyType = CustodyType.SOFTWARE)
             val exception = assertThrows<ScpException> {
                 custody.derivePseudonym(fakeHandle, "ctx".toByteArray())
             }
-            assertEquals("SCP-CRYPTO-4001", exception.code)
+            assertEquals("SCP-CRYPTO-4006", exception.code)
         }
 
         @Test
@@ -649,8 +649,8 @@ class AndroidKeyCustodyTest {
 
         @Test
         fun `ScpException carries correct error code`() {
-            val exception = ScpException("test message", "SCP-CRYPTO-4001")
-            assertEquals("SCP-CRYPTO-4001", exception.code)
+            val exception = ScpException("test message", "SCP-CRYPTO-4006")
+            assertEquals("SCP-CRYPTO-4006", exception.code)
             assertEquals("test message", exception.message)
         }
 

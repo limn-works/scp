@@ -481,10 +481,12 @@ async fn publish_to_resolver_dht_for<C: KeyCustody + Send + Sync>(
 /// Custody resolution order: platform/software callback custody first, then
 /// (only in `testing` builds) the retained in-memory custody.
 /// Failures carry the cross-bridge contract codes: missing key material →
-/// `IDENT_1054`, derivation failure → `IDENT_1055`, custody unavailable in
-/// this build → `IDENT_1056`. A host pseudonym whose point is not a valid
-/// 33-byte P-256 point, or whose `get_public_key(key_id)` differs from it,
-/// fails in `callback_custody::derive_pseudonym` → `IDENT_1055`.
+/// `IDENT_1054`, custody unavailable in this build → `IDENT_1056`, and a
+/// custody derivation failure → its custody code ([`ScpError::custody`]):
+/// key-not-found → `CRYPTO_4006` (§9.10.4.A), any other custody failure →
+/// `CRYPTO_4060`. A host pseudonym whose point is not a valid 33-byte P-256
+/// point, or whose `get_public_key(key_id)` differs from it, fails in
+/// `callback_custody::derive_pseudonym` → `IDENT_1055`.
 ///
 /// Callers gate this themselves: `context_create`/`context_join` skip it for
 /// broadcast contexts (soft `None`, spec §5.14), while `context_import` calls
@@ -506,10 +508,7 @@ async fn derive_member_pseudonym_required(
     let pseudonym = if let Some(ref cb) = identity.callback_custody {
         cb.derive_pseudonym(&identity_key, context_id.as_bytes())
             .await
-            .map_err(|e| ScpError::Identity {
-                msg: format!("pseudonym derivation failed: {e}"),
-                code: codes::IDENT_1055.to_owned(),
-            })?
+            .map_err(|e| ScpError::custody(format!("pseudonym derivation failed: {e}"), &e))?
     } else {
         #[cfg(feature = "testing")]
         {
@@ -525,10 +524,7 @@ async fn derive_member_pseudonym_required(
             imc.0
                 .derive_pseudonym(&identity_key, context_id.as_bytes())
                 .await
-                .map_err(|e| ScpError::Identity {
-                    msg: format!("pseudonym derivation failed: {e}"),
-                    code: codes::IDENT_1055.to_owned(),
-                })?
+                .map_err(|e| ScpError::custody(format!("pseudonym derivation failed: {e}"), &e))?
         }
         #[cfg(not(feature = "testing"))]
         {
@@ -541,7 +537,7 @@ async fn derive_member_pseudonym_required(
         }
     };
     // §9.10.4: the routing axis carries the 32-byte routing id of the 33-byte
-    // P-256 pseudonym. `PseudonymKeypair::new` already rejected a malformed
+    // P-256 pseudonym. `parse_pseudonym` already rejected a malformed
     // host-returned point, which surfaced above as IDENT_1055.
     Ok(*pseudonym.routing_id())
 }
@@ -1408,6 +1404,13 @@ impl From<scp_identity::IdentityError> for ScpError {
         use scp_identity::IdentityError as IE;
         use scp_platform::PreRotationCustodyError as PE;
 
+        // A custody failure keeps its custody code (key-not-found is
+        // SCP-CRYPTO-4006), not the generic identity code.
+        let e = match e {
+            IE::Platform(pe) => return Self::from(pe),
+            other => other,
+        };
+
         if let IE::PreRotation(pre_err) = &e {
             let code = match pre_err {
                 PE::HandleNotFound => codes::IDENT_1047,
@@ -1828,12 +1831,29 @@ impl From<scp_transport::TransportError> for ScpError {
     }
 }
 
+impl ScpError {
+    /// A custody [`PlatformError`](scp_platform::PlatformError) carrying `msg`,
+    /// coded by
+    /// [`platform_error_code`](scp_ffi_common::custody_parse::platform_error_code):
+    /// every bridge path reports key-not-found as `SCP-CRYPTO-4006`, any other
+    /// custody failure as `SCP-CRYPTO-4060`, and a rejected host pseudonym as
+    /// `SCP-IDENT-1055`.
+    pub(crate) fn custody(msg: String, e: &scp_platform::PlatformError) -> Self {
+        let code = scp_ffi_common::custody_parse::platform_error_code(e).to_owned();
+        if matches!(e, scp_platform::PlatformError::PseudonymRejected(_)) {
+            Self::Identity { msg, code }
+        } else {
+            Self::Crypto { msg, code }
+        }
+    }
+}
+
 impl From<scp_platform::PlatformError> for ScpError {
     fn from(e: scp_platform::PlatformError) -> Self {
-        Self::Crypto {
-            msg: format!("platform key operation failed: {e} — check key custody configuration"),
-            code: scp_ffi_common::custody_parse::platform_error_code(&e).to_owned(),
-        }
+        Self::custody(
+            format!("platform key operation failed: {e} — check key custody configuration"),
+            &e,
+        )
     }
 }
 
@@ -4363,10 +4383,7 @@ async fn identity_create_link_attestation_impl(
             msg: format!("tokio join error: {e}"),
             code: codes::IDENT_1041.to_owned(),
         })?
-        .map_err(|e| ScpError::Identity {
-            msg: format!("Ed25519 signing failed: {e}"),
-            code: codes::IDENT_1041.to_owned(),
-        })?;
+        .map_err(|e| ScpError::custody(format!("link attestation signing failed: {e}"), &e))?;
     attestation.signature = sig.as_bytes().to_vec();
 
     // Store custody for later verification lookups. Shared with
@@ -6471,25 +6488,22 @@ async fn sign_export_snapshot_via_custody(
     })?;
 
     let signature = if let Some(ref cb) = handle.callback_custody {
-        cb.sign(&key_handle, hash)
-            .await
-            .map_err(|e| ScpError::Context {
-                msg: format!("platform custody failed to sign context export snapshot: {e}"),
-                code: codes::CTX_2040.to_owned(),
-            })?
+        cb.sign(&key_handle, hash).await.map_err(|e| {
+            ScpError::custody(
+                format!("platform custody failed to sign context export snapshot: {e}"),
+                &e,
+            )
+        })?
     } else {
         #[cfg(feature = "testing")]
         {
             if let Some(ref imc) = handle.in_memory_custody {
-                imc.0
-                    .sign(&key_handle, hash)
-                    .await
-                    .map_err(|e| ScpError::Context {
-                        msg: format!(
-                            "in-memory custody failed to sign context export snapshot: {e}"
-                        ),
-                        code: codes::CTX_2040.to_owned(),
-                    })?
+                imc.0.sign(&key_handle, hash).await.map_err(|e| {
+                    ScpError::custody(
+                        format!("in-memory custody failed to sign context export snapshot: {e}"),
+                        &e,
+                    )
+                })?
             } else {
                 return Err(ScpError::Context {
                     msg: "no custody provider on context handle — context export \
@@ -24895,6 +24909,28 @@ mod tests {
         }
     }
 
+    /// §9.10.4.A: a host that reports key-not-found (`SCP-CRYPTO-4006`) while
+    /// deriving the creator's pseudonym fails the production `context_create`
+    /// with `SCP-CRYPTO-4006`, not a pseudonym-derivation identity code.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn context_create_surfaces_host_key_not_found_as_crypto_4006() {
+        let rt = runtime();
+        let scp = scp_test();
+        let provider = ProdLikeCustody::with_fault(PseudonymFault::None);
+        let keys = Arc::clone(&provider.keys);
+        let identity = rt
+            .block_on(scp.identity_create_with_custody(Box::new(provider)))
+            .expect("identity_create_with_custody");
+        // The host loses every key, so it answers the derivation with 4006.
+        keys.lock().expect("keystore mutex").clear();
+        match rt.block_on(scp.context_create(identity, encrypted_join_test_params())) {
+            Err(ScpError::Crypto { code, .. }) => assert_eq!(code, codes::CRYPTO_4006),
+            Err(other) => panic!("expected CRYPTO_4006, got {other:?}"),
+            Ok(_) => panic!("context_create succeeded without the creator's key"),
+        }
+    }
+
     /// A host still returning a 32-byte Ed25519 pseudonym key fails closed with
     /// SCP-IDENT-1055, on the point length.
     #[cfg(feature = "testing")]
@@ -25090,7 +25126,10 @@ mod tests {
             .derive_pseudonym(&identity, b"ctx-b")
             .await
             .expect_err("id 777 is bound to ctx-a's point");
-        assert!(matches!(err, PlatformError::CustodyError(_)), "{err:?}");
+        assert!(
+            matches!(err, PlatformError::PseudonymRejected(_)),
+            "{err:?}"
+        );
         custody
             .destroy_key(first.key_handle())
             .await

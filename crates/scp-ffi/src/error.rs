@@ -402,6 +402,13 @@ impl From<scp_identity::IdentityError> for ScpPyError {
         use scp_identity::IdentityError as IE;
         use scp_platform::PreRotationCustodyError as PE;
 
+        // A custody failure keeps its custody code (key-not-found is
+        // SCP-CRYPTO-4006), not the generic identity code.
+        let e = match e {
+            IE::Platform(pe) => return Self::from(pe),
+            other => other,
+        };
+
         if let IE::PreRotation(pre_err) = &e {
             let code = match pre_err {
                 PE::HandleNotFound => codes::IDENT_1047,
@@ -880,14 +887,29 @@ impl From<scp_transport::TransportError> for ScpPyError {
 
 // Platform errors → ScpPyError::CryptoError (key custody)
 
+impl ScpPyError {
+    /// A custody [`PlatformError`](scp_platform::PlatformError) carrying
+    /// `message`, coded by
+    /// [`platform_error_code`](scp_ffi_common::custody_parse::platform_error_code):
+    /// every bridge path reports key-not-found as `SCP-CRYPTO-4006`, any other
+    /// custody failure as `SCP-CRYPTO-4060`, and a rejected host pseudonym as
+    /// `SCP-IDENT-1055`.
+    pub(crate) fn custody(message: String, e: &scp_platform::PlatformError) -> Self {
+        let code = scp_ffi_common::custody_parse::platform_error_code(e).to_owned();
+        if matches!(e, scp_platform::PlatformError::PseudonymRejected(_)) {
+            Self::IdentityError { message, code }
+        } else {
+            Self::CryptoError { message, code }
+        }
+    }
+}
+
 impl From<scp_platform::PlatformError> for ScpPyError {
     fn from(e: scp_platform::PlatformError) -> Self {
-        Self::CryptoError {
-            message: format!(
-                "platform key operation failed: {e} — check key custody configuration"
-            ),
-            code: scp_ffi_common::custody_parse::platform_error_code(&e).to_owned(),
-        }
+        Self::custody(
+            format!("platform key operation failed: {e} — check key custody configuration"),
+            &e,
+        )
     }
 }
 

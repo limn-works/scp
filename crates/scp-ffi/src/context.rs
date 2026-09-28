@@ -1589,7 +1589,10 @@ fn resolve_verifying_key(
         let public_key = rt
             .block_on(async move { custody.public_key(&handle).await })
             .map_err(|e| {
-                crate::error::ScpPyError::context(format!("failed to resolve verifying key: {e}"))
+                crate::error::ScpPyError::custody(
+                    format!("failed to resolve verifying key: {e}"),
+                    &e,
+                )
             })?;
         // 32-byte length + canonical-point decode: the shared conversion tail
         // in scp-ffi-common, identical across all FFI bridges. A `None`
@@ -1701,7 +1704,9 @@ fn derive_member_pseudonym(
 
 /// Derives the §9.10.4 routing id of `identity_key`'s pseudonym in
 /// `context_id` over `custody`: the derivation step every member-pseudonym
-/// path shares, with the SCP-IDENT-1055 failure contract.
+/// path shares. A failure carries its custody code: key-not-found →
+/// SCP-CRYPTO-4006 (§9.10.4.A), a host pseudonym the bridge cannot bind →
+/// SCP-IDENT-1055, any other custody failure → SCP-CRYPTO-4060.
 pub(crate) fn pseudonym_routing_id_on(
     rt: &tokio::runtime::Runtime,
     custody: &crate::custody::FfiKeyCustody,
@@ -1717,10 +1722,7 @@ pub(crate) fn pseudonym_routing_id_on(
     // 33-byte P-256 pseudonym. `PseudonymKeypair::new` already rejected a
     // malformed host-returned point, which surfaces here as SCP-IDENT-1055.
     let pseudonym = pseudonym.map_err(|e| {
-        crate::error::ScpPyError::identity_with_code(
-            format!("pseudonym derivation failed: {e}"),
-            codes::IDENT_1055,
-        )
+        crate::error::ScpPyError::custody(format!("pseudonym derivation failed: {e}"), &e)
     })?;
     Ok(*pseudonym.routing_id())
 }
@@ -6373,6 +6375,40 @@ mod tests {
         let err =
             derive_member_pseudonym(&bi, did, "ctx").expect_err("mismatched host key rejected");
         assert_identity_code(err, codes::IDENT_1055);
+    }
+
+    /// §9.10.4.A: a host that reports key-not-found (`SCP-CRYPTO-4006`) while
+    /// deriving the creator's pseudonym fails the production `context_create`
+    /// with `SCP-CRYPTO-4006`, not a pseudonym-derivation identity code.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn context_create_surfaces_host_key_not_found_as_crypto_4006() {
+        use scp_platform::KeyCustody as _;
+        crate::init_runtime().ok();
+        let bi_arc = __bi();
+        let did = "did:dht:z6MkPseudonymHostKeyNotFound";
+        let key_id = register_fake_callback_identity(&bi_arc, did, None);
+        let custody =
+            crate::runtime::with_identity(&bi_arc, did, |entry| Ok(entry.custody.clone()))
+                .expect("registered identity");
+        crate::runtime()
+            .expect("runtime")
+            .block_on(custody.destroy_key(&scp_platform::KeyHandle::new(key_id)))
+            .expect("host destroys the identity key");
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi_arc),
+        };
+        let err = Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("mode", "encrypted").unwrap();
+            scp.context_create(did, &dict)
+                .expect_err("derivation under a destroyed key must fail")
+                .to_string()
+        });
+        assert!(
+            err.contains("SCP-CRYPTO-4006"),
+            "expected key-not-found SCP-CRYPTO-4006, got: {err}"
+        );
     }
 
     /// Builds an active `PyContextHandle` for the given mode, driving the real
