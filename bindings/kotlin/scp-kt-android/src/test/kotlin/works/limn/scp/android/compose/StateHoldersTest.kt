@@ -30,6 +30,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowLog
+import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -615,9 +616,10 @@ class ScpHotStreamRemountTest {
      * holds. A navigation transition keeps an outgoing screen composed while an incoming screen
      * starts, which produces exactly this overlap.
      *
-     * The first mount to leave must stop nothing: its `onStop` would release the subscription
+     * The first mount to leave must stop nothing yet: its `onStop` would release the subscription
      * the second mount is still collecting, and that collector would then observe a SharedFlow
-     * that receives nothing further and reports no error. Only the last mount to leave stops it.
+     * that receives nothing further and reports no error. The last mount to leave runs both
+     * mounts' `onStop`, and the second call finds nothing left to release.
      */
     @Test(timeout = DISPOSAL_TIMEOUT_MS)
     fun `an overlapping mount under one same key keeps its subscription when the other mount leaves`() {
@@ -672,13 +674,15 @@ class ScpHotStreamRemountTest {
         awaitCondition("the last mount's departure released nothing") {
             subscriptions.unsubscribeIds() == listOf(1)
         }
-        assertEquals(1, stopCalls.get())
+        awaitCondition("the last mount's departure did not run both onStop lambdas") { stopCalls.get() == 2 }
+        assertEquals(listOf(1), subscriptions.unsubscribeIds())
         assertEquals(listOf(1), subscriptions.subscribeIds())
     }
 
     /**
-     * [ScpHotStreamCoordinator.unmount] launches `onStop` only for the last live mount under a
-     * key, and a later mount under that key joins that stop before its start runs.
+     * [ScpHotStreamCoordinator.unmount] launches a stop only for the last live mount under a
+     * key, that stop runs the `onStop` an earlier departure left held as well as its own, and a
+     * later mount under that key joins that stop before its start runs.
      */
     @Test(timeout = DISPOSAL_TIMEOUT_MS)
     fun `a coordinator stops a key only when its last live mount leaves`() {
@@ -714,11 +718,32 @@ class ScpHotStreamRemountTest {
             dispatcherFree.countDown()
             starting.join()
 
-            assertEquals("a later mount's start ran before the pending stop", 1, stopsSeenByStart.get())
+            assertEquals("a later mount's start ran before the pending stop", 2, stopsSeenByStart.get())
         } finally {
             dispatcherFree.countDown()
             executor.shutdown()
         }
+    }
+
+    /**
+     * Two mounts under one key that hold different subscriptions, such as a `contextEvents`
+     * stream and an `incomingMessages` stream keyed by one context handle, each have their own
+     * `onStop` run. Discarding the first departure's `onStop` would leave its subscription open
+     * with no stop to release it.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `two different streams under one key each have their onStop run`() {
+        val coordinator = ScpHotStreamCoordinator(CoroutineScope(SupervisorJob() + Dispatchers.IO))
+        val events = coordinator.mount("k")
+        val messages = coordinator.mount("k")
+        val stopped = Collections.synchronizedList(mutableListOf<String>())
+
+        assertEquals(null, coordinator.unmount(events) { stopped += "events" })
+        assertEquals("the first departure released a subscription still mounted", emptyList<String>(), stopped)
+        val stop = coordinator.unmount(messages) { stopped += "messages" }
+        runBlocking { checkNotNull(stop).join() }
+
+        assertEquals(listOf("events", "messages"), stopped.toList())
     }
 
     /**
@@ -855,12 +880,6 @@ private fun <T> MutableStateFlow<T>.collectAsStateCompat() =
  */
 private fun hotEventFlow() =
     MutableSharedFlow<String>(replay = 0, extraBufferCapacity = HOT_FLOW_BUFFER)
-
-/**
- * Extension property to check if a CoroutineScope is still active.
- */
-private val kotlinx.coroutines.CoroutineScope.isActive: Boolean
-    get() = coroutineContext[kotlinx.coroutines.Job]?.isActive == true
 
 private const val SETTLE_DELAY_MS = 100L
 

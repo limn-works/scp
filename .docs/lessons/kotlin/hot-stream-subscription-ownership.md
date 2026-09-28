@@ -56,11 +56,15 @@ subscription that a different caller had just opened.
   that callback's own `HotStreamState`. A stale completion callback therefore never deletes a
   later subscription carrying one same context handle.
 - **Hold cross-mount ownership state outside composition.** `ScpHotStreamCoordinator` holds a
-  live-mount count, one `Mutex`, and one most-recent stop `Job` per key. `rememberScpHotStream`
-  takes a coordinator as a required parameter with no default. `mount` counts a mount during
-  composition and captures the pending stop; `unmount` launches `onStop` only when it removes the
-  last live mount under that key, and records that stop's `Job` before `onDispose` returns;
-  `startMounted` joins the captured stop before it runs a `start` lambda.
+  live-mount count, one `Mutex`, the `onStop` lambdas of mounts that left early, and one
+  most-recent stop `Job` per key. `rememberScpHotStream` takes a coordinator as a required
+  parameter with no default. `mount` counts a mount when its effect applies and captures the
+  pending stop; `unmount` holds a departing mount's `onStop` while another mount under that key
+  is live, and when it removes the last live mount it launches one stop that runs every held
+  `onStop` and its own, and records that stop's `Job` before `onDispose` returns;
+  `startMounted` joins the captured stop before it runs a `start` lambda. Discarding an early
+  mount's `onStop` instead leaks a subscription whenever two different streams share a key, such
+  as a `contextEvents` and an `incomingMessages` stream both keyed by one context handle.
 
 ## Why a coordinator rather than a file-scope registry
 
