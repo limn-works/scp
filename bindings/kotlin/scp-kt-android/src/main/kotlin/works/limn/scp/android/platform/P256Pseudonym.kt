@@ -119,14 +119,14 @@ internal class PseudonymKeys {
      * Stores [scalar] under [pseudonymId] for [identityId]. An id already present keeps
      * its scalar (the same inputs derive the same scalar) and [scalar] is wiped.
      *
-     * @throws ScpException with code `SCP-CRYPTO-4001` if [identityId] was destroyed;
+     * @throws ScpException with code `SCP-CRYPTO-4006` if [identityId] was destroyed;
      *   [scalar] is wiped.
      */
     fun put(identityId: String, pseudonymId: String, scalar: ByteArray) {
         synchronized(lock) {
             if (identityId in retired) {
                 scalar.fill(0)
-                throw ScpException("Key not found: $identityId", "SCP-CRYPTO-4001")
+                throw ScpException("Key not found: $identityId", "SCP-CRYPTO-4006")
             }
             if (scalars.putIfAbsent(pseudonymId, scalar) != null) {
                 scalar.fill(0)
