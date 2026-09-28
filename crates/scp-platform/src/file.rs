@@ -521,18 +521,20 @@ impl FileKeyCustody {
 
     /// The §9.10.4 P-256 pseudonym of identity `key_id` in `context_id` at
     /// `epoch` (`None` for v1), held in memory only. A re-derive returns the
-    /// handle already in the slot. The insert happens under `handle_map` and
-    /// only while the identity is still there, so a derive that raced the
-    /// identity's `destroy_key` fails with `KeyNotFound` instead of leaving a
-    /// pseudonym behind.
+    /// handle already in the slot. `handle_map` stays locked from the identity
+    /// lookup through the pseudonym insert, as `destroy_key` locks it to remove
+    /// the identity, so a derive either finishes before the destroy (which
+    /// then removes the pseudonym) or starts after it and fails with
+    /// `KeyNotFound` (§9.10.4.A).
     async fn derive_p256_pseudonym(
         &self,
         key_id: u64,
         context_id: &[u8],
         epoch: Option<u64>,
     ) -> Result<PseudonymKeypair, PlatformError> {
-        let handle = KeyHandle::new(key_id);
-        let (_key_bytes, signing_key) = self.decrypt_ed25519_key(&handle).await?;
+        // Lock order: `handle_map`, then `pseudonym_keys`, as in `destroy_key`.
+        let map = self.handle_map.lock().await;
+        let (_key_bytes, signing_key) = self.decrypt_ed25519_key_locked(&map, key_id)?;
 
         // Software custody (§9.10.4.A): the ikm is the identity private
         // seed, never the public key. Until S12 the identity key is
@@ -541,11 +543,6 @@ impl FileKeyCustody {
         let pseudonym_key = derive_pseudonym_keypair(&ikm, context_id, epoch)
             .map_err(|e| PlatformError::CustodyError(format!("pseudonym derivation: {e}")))?;
 
-        // Lock order: `handle_map`, then `pseudonym_keys`, as in `destroy_key`.
-        let map = self.handle_map.lock().await;
-        if !map.entries.contains_key(&key_id) {
-            return Err(PlatformError::KeyNotFound);
-        }
         let mut pseudonyms = self.pseudonym_keys.lock().await;
         if let Some((existing, public_key)) = pseudonyms.existing(key_id, context_id, epoch) {
             drop(pseudonyms);
@@ -577,9 +574,20 @@ impl FileKeyCustody {
         handle: &KeyHandle,
     ) -> Result<(Zeroizing<[u8; KEY_LEN]>, SigningKey), PlatformError> {
         let map = self.handle_map.lock().await;
+        self.decrypt_ed25519_key_locked(&map, handle.id())
+    }
+
+    /// Decrypts the Ed25519 signing key for handle `handle_id` under a
+    /// `handle_map` lock the caller holds, so the caller can keep the identity
+    /// from being destroyed until it is done with the key.
+    fn decrypt_ed25519_key_locked(
+        &self,
+        map: &HandleMap,
+        handle_id: u64,
+    ) -> Result<(Zeroizing<[u8; KEY_LEN]>, SigningKey), PlatformError> {
         let (key_type, entry_index) = map
             .entries
-            .get(&handle.id())
+            .get(&handle_id)
             .copied()
             .ok_or(PlatformError::KeyNotFound)?;
         if key_type != StoredKeyType::Ed25519 {
@@ -589,7 +597,6 @@ impl FileKeyCustody {
             });
         }
         let data = self.read_file()?;
-        drop(map);
         let key_bytes = self.decrypt_entry(&data, entry_index)?;
         let signing_key = SigningKey::from_bytes(&key_bytes);
         Ok((key_bytes, signing_key))
@@ -1626,5 +1633,75 @@ mod tests {
         ))
         .await
         .unwrap();
+    }
+
+    /// Whichever of a pseudonym derive and its identity's destroy runs first,
+    /// no pseudonym of the destroyed identity can sign afterwards (§9.10.4.A).
+    #[tokio::test]
+    async fn derive_and_identity_destroy_leave_no_signing_pseudonym_in_either_order() {
+        let dir = TempDir::new().unwrap();
+        let custody = make_custody(&dir, "passphrase");
+        let digest = [7u8; 32];
+
+        let destroyed_first = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        custody.destroy_key(&destroyed_first).await.unwrap();
+        let err = custody
+            .derive_pseudonym(&destroyed_first, b"ctx")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PlatformError::KeyNotFound), "{err:?}");
+
+        let derived_first = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let pseudonym = custody
+            .derive_pseudonym(&derived_first, b"ctx")
+            .await
+            .unwrap();
+        custody.destroy_key(&derived_first).await.unwrap();
+        let err = custody
+            .sign(pseudonym.key_handle(), &digest)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PlatformError::KeyNotFound), "{err:?}");
+    }
+
+    /// A derive racing its identity's destroy on another thread never leaves a
+    /// pseudonym that signs: the derive either fails with `KeyNotFound` or
+    /// finishes before the destroy, which then removes the pseudonym.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn derive_racing_identity_destroy_leaves_no_signing_pseudonym() {
+        let dir = TempDir::new().unwrap();
+        let custody = std::sync::Arc::new(make_custody(&dir, "passphrase"));
+        let digest = [9u8; 32];
+        for round in 0..200u32 {
+            let identity = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+            let context = round.to_be_bytes();
+            let deriver = {
+                let custody = std::sync::Arc::clone(&custody);
+                tokio::spawn(async move { custody.derive_pseudonym(&identity, &context).await })
+            };
+            let destroyer = {
+                let custody = std::sync::Arc::clone(&custody);
+                tokio::spawn(async move { custody.destroy_key(&identity).await })
+            };
+            destroyer.await.unwrap().unwrap();
+            match deriver.await.unwrap() {
+                Ok(pseudonym) => {
+                    let err = custody
+                        .sign(pseudonym.key_handle(), &digest)
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        matches!(err, PlatformError::KeyNotFound),
+                        "round {round}: {err:?}"
+                    );
+                }
+                Err(err) => {
+                    assert!(
+                        matches!(err, PlatformError::KeyNotFound),
+                        "round {round}: {err:?}"
+                    );
+                }
+            }
+        }
     }
 }
