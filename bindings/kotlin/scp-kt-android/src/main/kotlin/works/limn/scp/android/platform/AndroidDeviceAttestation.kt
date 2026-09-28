@@ -176,7 +176,7 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
     /**
      * Build the deterministic clientDataJSON string.
      *
-     * Field order is fixed to ensure cross-platform determinism:
+     * Field order is fixed so the legacy nonce is deterministic for a given input:
      * `{"challenge":"<b64>","deviceId":"<b64>","type":"scp-device-attestation-v1"}`
      *
      * Uses [Base64.NO_WRAP] for single-line Base64 encoding (no line breaks).

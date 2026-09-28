@@ -6258,15 +6258,15 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidKeyCustody.kt"
       ],
-      "description": "Implement the KeyCustody platform trait for Android Keystore. Android Keystore provides TEE-backed key custody; Ed25519 support requires API 33+ (Android 13+). StrongBox is available but dramatically slower than TEE-backed operations. Must decide minimum API level (API 33+ for Ed25519 Keystore, or software fallback for older devices) and TEE vs StrongBox policy (performance vs security tradeoff). Mirrors the Apple adapter structure from ADR-025. Emulator Keystore behavior differs from hardware — test on physical devices.",
+      "description": "Implement the KeyCustody platform trait for Android Keystore. Android Keystore provides TEE-backed key custody; Ed25519 support requires API 33+ (Android 13+). StrongBox is available but dramatically slower than TEE-backed operations. Must decide minimum API level (API 33+ for Ed25519 Keystore, or software fallback for older devices) and TEE vs StrongBox policy (performance vs security tradeoff). Mirrors the Apple adapter structure from ADR-025. Emulator Keystore behavior differs from hardware — test on physical devices.\n\nStatus reopened 2026-09-28: ADR-027, as amended on 2026-09-10, requires an EC P-256 signing key in Keystore at every supported API level, P-256 key agreement in Keystore from API 31 with a Bouncy Castle software P-256 agreement key below it, and (acceptance criterion 6) a hardware `pseudonym_secret` that is a 32-byte symmetric key generated inside the TEE, never `SHA-256` over a signature. The shipped adapter generates Ed25519 and X25519 keys and derives the hardware pseudonym secret from a signature. It reports every Keystore key as `CustodyType.HARDWARE` without reading `KeyInfo.securityLevel`, so \"TEE-backed key operations used exclusively\" is unmet, and `AndroidKeyCustody` implements the Kotlin `KeyCustodyProvider` interface, not the Rust `KeyCustody` trait. This story tracks the move to P-256 and the TEE-generated pseudonym secret.",
       "acceptanceCriteria": [
         "KeyCustody trait implemented for Android Keystore matching the same platform trait signatures as ADR-025",
-        "Ed25519 key generation uses Android Keystore on API 33+ devices",
-        "Software fallback path exists for devices below API 33",
+        "P-256 signing key generation uses Android Keystore at every supported API level, and P-256 key agreement uses Android Keystore from API 31 and a Bouncy Castle software key on API 26-30 (ADR-027 acceptance criteria 1 and 5)",
+        "A hardware identity key's pseudonym_secret is a 32-byte symmetric key generated inside the TEE at generateKeypair, never SHA-256 over a signature (ADR-027 acceptance criterion 6)",
         "TEE-backed key operations used exclusively; StrongBox is not offered due to prohibitive latency for SCP's frequent signing operations (ADR-027)",
         "Key destruction verification via Android Keystore attestation per §9.15",
         "Compromise recovery follows same 6 steps from §9.12 with Android-specific key rotation",
@@ -6369,11 +6369,11 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidPushProvider.kt"
       ],
-      "description": "Implement the PushProvider platform trait for Android using Firebase Cloud Messaging (FCM). FCM payload format must parallel the APNs opacity decision in ADR-025 — payloads must be opaque to the push infrastructure. FCM payload constraints and opacity requirements must be respected.",
+      "description": "Implement the PushProvider platform trait for Android using Firebase Cloud Messaging (FCM). FCM payload format must parallel the APNs opacity decision in ADR-025 — payloads must be opaque to the push infrastructure. FCM payload constraints and opacity requirements must be respected.\n\nStatus reopened 2026-09-28: `handleNotification` checks only the `scp` field and accepts extra fields, so the criterion \"FCM payload format is opaque\" is unmet. No SDK code wakes the app, connects to a relay, or pulls envelopes on a push, so \"Push notification delivery triggers SCP message fetch\" is unmet, and no integration test exists, so \"Integration tests verify push delivery flow\" is unmet. The Kotlin `PushProvider` interface matches neither the Rust `Push` trait nor the UniFFI `PushProvider` callback interface, so \"PushProvider trait implemented for Android using FCM matching ADR-025 trait signatures\" is unmet.",
       "acceptanceCriteria": [
         "PushProvider trait implemented for Android using FCM matching ADR-025 trait signatures",
         "FCM payload format is opaque — no plaintext protocol data exposed to push infrastructure",
@@ -6418,11 +6418,11 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidStorage.kt"
       ],
-      "description": "Implement the Storage platform trait for Android with TEE-backed key derivation for SQLCipher database encryption. The database encryption key must be derived using TEE-backed key derivation, not stored in plaintext. Mirrors ADR-025 Apple adapter storage structure.",
+      "description": "Implement the Storage platform trait for Android with TEE-backed key derivation for SQLCipher database encryption. The database encryption key must be derived using TEE-backed key derivation, not stored in plaintext. Mirrors ADR-025 Apple adapter storage structure.\n\nStatus reopened 2026-09-28: the shipped adapter derives the SQLCipher key from a Keystore AES-256 key but never reads `KeyInfo.securityLevel`, so it does not show that the key is TEE-backed, and the unit tests run against the test-only `InMemoryStorageProvider`, not SQLCipher. The criteria \"SQLCipher database encryption key derived via TEE-backed key derivation\" and \"Unit tests verify encrypted storage round-trip\" are unmet. `AndroidStorage` implements the Kotlin `StorageProvider` interface, not the Rust `Storage` trait, so the criterion \"Storage trait implemented for Android matching ADR-025 trait signatures\" is unmet as well.",
       "acceptanceCriteria": [
         "Storage trait implemented for Android matching ADR-025 trait signatures",
         "SQLCipher database encryption key derived via TEE-backed key derivation",

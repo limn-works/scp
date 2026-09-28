@@ -252,8 +252,8 @@ interface PushProvider {
  * behind a uniform interface. The Android implementation ([AndroidKeyCustody])
  * uses Android Keystore for Ed25519 on API 33+ and Bouncy Castle
  * for software fallback on API 26-32. ADR-027, as amended on 2026-09-10, requires a P-256
- * signing key in Keystore at every supported API level instead; no story tracks that move
- * yet.
+ * signing key in Keystore at every supported API level instead; story SCP-110 tracks that
+ * move.
  *
  * This interface matches neither Rust declaration.
  *

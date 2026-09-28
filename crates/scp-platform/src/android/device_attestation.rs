@@ -9,9 +9,11 @@
 //! [`DeviceAttestation`], whose `attest` takes no argument, which declares a
 //! `verify` method the Kotlin interface lacks, and which declares no
 //! `assert_request`, while the Kotlin interface declares `assertRequest`. OQ-22 of
-//! `.docs/specs/27-attestations.md` keeps open which of the two traits is
-//! normative. This module re-exports [`DeviceAttestation`] and
-//! [`DeviceAttestationToken`] for Android builds.
+//! `.docs/specs/27-attestations.md` keeps two questions open: which of the two
+//! traits is normative, and whether that trait's `attest` takes the binding
+//! digest `D` or `D`'s two inputs (a challenge and an identifier). This
+//! module re-exports [`DeviceAttestation`] and [`DeviceAttestationToken`] for
+//! Android builds.
 //!
 //! # Play Integrity request (ADR-027)
 //!

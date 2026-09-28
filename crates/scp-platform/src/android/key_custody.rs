@@ -29,8 +29,8 @@
 //! ADR-027, as amended on 2026-09-10, requires a different scheme: an EC
 //! P-256 signing key in Keystore at every supported API level, and P-256 key
 //! agreement in Keystore from API 31 with a Bouncy Castle software P-256
-//! agreement key below it. The adapter has not moved to P-256, and no story
-//! tracks that move yet.
+//! agreement key below it. The adapter has not moved to P-256; story SCP-110
+//! tracks that move.
 //!
 //! # `StrongBox`
 //!

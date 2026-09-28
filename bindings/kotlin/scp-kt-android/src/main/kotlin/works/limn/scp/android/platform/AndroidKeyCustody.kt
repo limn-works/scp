@@ -6,7 +6,7 @@
 // is incompatible with SCP's frequent signing operations. ADR-027, as amended on 2026-09-10,
 // requires a different scheme: an EC P-256 signing key in Keystore at every supported API
 // level, and P-256 key agreement in Keystore from API 31 with a Bouncy Castle software P-256
-// agreement key below it. This class has not moved to P-256, and no story tracks that move yet.
+// agreement key below it. This class has not moved to P-256; story SCP-110 tracks that move.
 //
 // Android Keystore does not hand a Keystore-held Ed25519 private key to the app. This class never
 // reads KeyInfo.securityLevel, so it does not know whether Keystore put the key in the TEE or in
@@ -358,10 +358,14 @@ class AndroidKeyCustody internal constructor(
      *
      *   This construction diverges from ADR-027 acceptance criterion 6, which makes the
      *   hardware `pseudonym_secret` a 32-byte symmetric key generated inside the TEE at key
-     *   generation and never `SHA-256` over a signature. [sign] signs the same message for any
-     *   caller, so any caller can compute `pseudonymSecret` (see [sign]). The software path
-     *   prevents the §9.10.4.A membership enumeration oracle, because only the holder of the
-     *   private key bytes can run the HKDF; the hardware path does not prevent it.
+     *   generation and never `SHA-256` over a signature, because an ECDSA hardware signer
+     *   draws its own nonce and would yield a different secret on every call.
+     *
+     *   Neither path keeps `pseudonymSecret` from a caller of this class. On the hardware path,
+     *   [sign] signs "scp-pseudonym-secret-v1" for any caller, and SHA-256 of that signature is
+     *   the secret. On the software path, [exportSigningKeyBytes] returns the private seed that
+     *   the HKDF takes as input. A caller holding the secret derives every pseudonym private
+     *   key of the identity.
      *
      *   **Limitation:** Hardware-derived pseudonyms produce different values than Rust's
      *   HKDF-based derivation for the same logical key, because the Keystore key material is
@@ -391,9 +395,9 @@ class AndroidKeyCustody internal constructor(
         }
 
         // Derive pseudonym_secret: HKDF for software keys, Keystore-sign for hardware keys.
-        // Only the software path prevents the membership enumeration oracle (spec §9.10.4.A).
-        // The hardware path does not: sign() signs "scp-pseudonym-secret-v1" for any caller,
-        // which ADR-027 acceptance criterion 6 forbids.
+        // Neither path keeps the secret from a caller of this class: exportSigningKeyBytes()
+        // returns the software HKDF input, and sign() signs "scp-pseudonym-secret-v1" for a
+        // hardware key. ADR-027 acceptance criterion 6 forbids SHA-256 over a signature.
         val pseudonymSecret = derivePseudonymSecret(keyHandle)
 
         // v1 HMAC body: contextId || "scp-pseudonym".
@@ -468,9 +472,9 @@ class AndroidKeyCustody internal constructor(
         }
 
         // Derive pseudonym_secret: HKDF for software keys, Keystore-sign for hardware keys.
-        // Only the software path prevents the membership enumeration oracle (spec §9.10.4.A).
-        // The hardware path does not: sign() signs "scp-pseudonym-secret-v1" for any caller,
-        // which ADR-027 acceptance criterion 6 forbids.
+        // Neither path keeps the secret from a caller of this class: exportSigningKeyBytes()
+        // returns the software HKDF input, and sign() signs "scp-pseudonym-secret-v1" for a
+        // hardware key. ADR-027 acceptance criterion 6 forbids SHA-256 over a signature.
         val pseudonymSecret = derivePseudonymSecret(keyHandle)
 
         // v2 HMAC body: contextId || BE64(epoch) || "scp-pseudonym-v2". The distinct domain
@@ -513,7 +517,9 @@ class AndroidKeyCustody internal constructor(
      * because Ed25519 signing is deterministic (RFC 8032). The 64-byte signature is hashed
      * to 32 bytes for use as an HMAC key. This diverges from ADR-027 acceptance criterion 6,
      * which makes the hardware secret a TEE-generated symmetric key and never `SHA-256` over a
-     * signature: [sign] returns the same signature to any caller.
+     * signature, because an ECDSA hardware signer draws its own nonce. [sign] returns the same
+     * signature to any caller, and [exportSigningKeyBytes] returns a software key's HKDF input
+     * to any caller, so neither secret is confined to this class.
      */
     private fun derivePseudonymSecret(keyHandle: KeyHandle): ByteArray {
         val salt = "scp-pseudonym-secret-v1".toByteArray(Charsets.UTF_8)

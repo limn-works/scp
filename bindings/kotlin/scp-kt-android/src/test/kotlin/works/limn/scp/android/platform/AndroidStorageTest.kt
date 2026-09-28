@@ -25,7 +25,8 @@
 //    production class structure without requiring Android runtime dependencies.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
-// SCP-113 (Android Storage trait with SQLCipher and a Keystore-derived key).
+// SCP-113 (Android Storage trait with TEE-backed SQLCipher; the adapter derives the SQLCipher
+// key from a Keystore-held AES-256 key and does not check that Keystore put it in the TEE).
 
 package works.limn.scp.android.platform
 

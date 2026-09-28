@@ -67,7 +67,7 @@ import kotlinx.coroutines.withContext
  * ```kotlin
  * val pushProvider = AndroidPushProvider(applicationContext)
  *
- * // Register for push notifications
+ * // Fetch the FCM token; sending a §10.7.1 PushRegistration to each relay is the caller's job
  * val token = pushProvider.register()
  *
  * // In FirebaseMessagingService.onMessageReceived:
