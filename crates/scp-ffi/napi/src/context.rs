@@ -162,17 +162,11 @@ pub struct NapiContextHandle {
 }
 
 /// Internal context lifecycle state string helper.
+///
+/// Delegates to [`crate::runtime::context_state_str`] so the handle's cached
+/// string and a lifecycle-gate error name each state the same way.
 const fn state_str(state: &ContextState) -> &'static str {
-    match state {
-        ContextState::Creating => "creating",
-        ContextState::Active => "active",
-        ContextState::Closing => "closing",
-        ContextState::Closed => "closed",
-        ContextState::Expired => "expired",
-        ContextState::MigratingOut => "migrating_out",
-        ContextState::Tombstoned => "tombstoned",
-        ContextState::Poisoned => "poisoned",
-    }
+    crate::runtime::context_state_str(state)
 }
 
 #[napi]
@@ -184,7 +178,15 @@ impl NapiContextHandle {
         self.context_id.clone()
     }
 
-    /// Returns the context's current lifecycle state.
+    /// Returns the lifecycle state this handle cached at the last transition
+    /// this bridge observed.
+    ///
+    /// This is a best-effort snapshot, not a live supervisor read. A TTL
+    /// expiry the supervisor applied on its own timer, a close another member
+    /// initiated, a migration that tombstoned the context, and an actor the
+    /// crash watchdog poisoned all leave it reading `"active"`. Join, leave,
+    /// send, and subscribe read the supervisor instead, so each can refuse
+    /// while this getter still reads `"active"`.
     ///
     /// # Errors
     ///
@@ -558,6 +560,19 @@ struct ParsedContextParams {
     economic_policy: Option<String>,
 }
 
+/// `default_ceiling()` rendered as the `{resource}:{action}` capability strings
+/// a `context_create` caller supplies.
+///
+/// `parse_context_params` carries a caller's vocabulary to the shared
+/// `build_context_params` parser, so a default this bridge substitutes has to
+/// arrive in the same form a caller would have written.
+fn default_ceiling_strings() -> Vec<String> {
+    scp_core::context::roles::default_ceiling()
+        .iter()
+        .map(|cap| cap.name().into_owned())
+        .collect()
+}
+
 /// Parses the JSON context-parameters surface into a [`ParsedContextParams`].
 ///
 /// Delegates all validation and `ContextParams` construction to the shared
@@ -579,14 +594,44 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
     })?;
 
     let mode_str = params["mode"].as_str().unwrap_or("Encrypted").to_owned();
-    let ceiling: Vec<String> = params["ceiling"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
+    // ceiling: string[] (default: `default_ceiling()`).
+    //
+    // An absent key and a `null` value both mean "this caller declared no
+    // ceiling", and `default_ceiling`'s own doc comment states that every FFI
+    // bridge applies it "when no explicit ceiling is provided". A supplied
+    // array stands as written, so an empty array declares a ceiling that
+    // grants nothing rather than reading as an absent key, and the supervisor
+    // installs that empty ceiling as the actor's ceiling. The supervisor
+    // installs this vector verbatim, so this substitution is the only place an
+    // omitted declaration receives its default. Any other JSON
+    // type, and any non-string entry inside the array, is a malformed
+    // declaration and rejects, because dropping the entry would hand the
+    // caller a narrower ceiling than the one they wrote and hide the mistake
+    // behind a context that refuses the capability.
+    // `PyContextParams::from_py_dict` rejects the same two shapes through
+    // `extract::<Vec<String>>()`.
+    let ceiling: Vec<String> = match &params["ceiling"] {
+        serde_json::Value::Null => default_ceiling_strings(),
+        serde_json::Value::Array(entries) => entries
+            .iter()
+            .map(|entry| {
+                entry.as_str().map(str::to_owned).ok_or_else(|| {
+                    NapiError::from(ScpNapiError::Validation {
+                        message: format!("ceiling entries must be capability strings, got {entry}"),
+                        code: codes::VALID_7000.to_owned(),
+                    })
+                })
+            })
+            .collect::<napi::Result<Vec<String>>>()?,
+        other => {
+            return Err(NapiError::from(ScpNapiError::Validation {
+                message: format!(
+                    "ceiling must be an array of capability strings or omitted, got {other}"
+                ),
+                code: codes::VALID_7000.to_owned(),
+            }));
+        }
+    };
     let ceiling_policy = params["ceilingPolicy"]
         .as_str()
         .unwrap_or("immutable")
@@ -884,14 +929,16 @@ pub(crate) async fn context_join_on(
     crate::napi_check_handle!(&bi.core, handle);
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    let state_str = handle.current_state_str().map_err(NapiError::from)?;
-    if state_str != "active" {
-        return Err(ScpNapiError::Context {
-            message: format!("cannot join context in {state_str:?} state — context must be active"),
+    // The supervisor actor answers the lifecycle question, never the handle's
+    // cached string — see `crate::runtime::require_active_context`.
+    crate::runtime::require_active_context(bi, &handle.context_id, "join context", |msg| {
+        ScpNapiError::Context {
+            message: msg,
             code: codes::CTX_2013.to_owned(),
         }
-        .into());
-    }
+    })
+    .await
+    .map_err(NapiError::from)?;
 
     // Parse the optional spending UCAN JWT once at the bridge boundary so
     // malformed tokens are rejected before any expensive crypto work. Mirrors
@@ -1580,16 +1627,14 @@ pub(crate) async fn context_leave_on(
     identity_did: String,
 ) -> napi::Result<()> {
     crate::napi_check_handle!(&bi.core, handle);
-    let state_str = handle.current_state_str().map_err(NapiError::from)?;
-    if state_str != "active" {
-        return Err(ScpNapiError::Context {
-            message: format!(
-                "cannot leave context in {state_str:?} state — context must be active"
-            ),
+    crate::runtime::require_active_context(bi, &handle.context_id, "leave context", |msg| {
+        ScpNapiError::Context {
+            message: msg,
             code: codes::CTX_2015.to_owned(),
         }
-        .into());
-    }
+    })
+    .await
+    .map_err(NapiError::from)?;
 
     // Cancel the subscription task before leaving so the background relay
     // listener stops promptly.
@@ -1753,16 +1798,14 @@ pub(crate) async fn context_send_on(
     crate::napi_check_handle!(&bi.core, handle);
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    let state_str = handle.current_state_str().map_err(NapiError::from)?;
-    if state_str != "active" {
-        return Err(ScpNapiError::Context {
-            message: format!(
-                "cannot send to context in {state_str:?} state — context must be active"
-            ),
+    crate::runtime::require_active_context(bi, &handle.context_id, "send to context", |msg| {
+        ScpNapiError::Context {
+            message: msg,
             code: codes::CTX_2019.to_owned(),
         }
-        .into());
-    }
+    })
+    .await
+    .map_err(NapiError::from)?;
 
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let did = DID(identity_did.clone());
@@ -1917,14 +1960,14 @@ impl ActiveFlagGuard {
     }
 }
 
-/// Per-bridge-instance implementation of [`Scp::context_subscribe`](crate::scp::Scp::context_subscribe).
-pub(crate) async fn context_subscribe_on(
+/// Admits one subscription on `handle`: refuses a second concurrent
+/// subscription (`CTX_2022`) and a context the supervisor does not report
+/// `Active` (`CTX_2021`), and returns the guard that resets the handle's
+/// subscription flag when it drops.
+async fn subscribe_admission(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
-    identity_did: String,
-    on_message: napi::threadsafe_function::ThreadsafeFunction<Option<NapiMessage>>,
-) -> napi::Result<()> {
-    crate::napi_check_handle!(&bi.core, handle);
+) -> napi::Result<ActiveFlagGuard> {
     // Guard: prevent duplicate subscriptions. The AtomicBool is swapped to
     // true on the first call; subsequent calls see `true` and bail.
     // The flag is reset to `false` by the spawned task when it exits (via
@@ -1950,17 +1993,27 @@ pub(crate) async fn context_subscribe_on(
     // where the flag is held but un-guarded.
     let outer_guard = ActiveFlagGuard(Some(Arc::clone(&handle.subscription_active)));
 
-    let state_str = handle.current_state_str().map_err(NapiError::from)?;
-    if state_str != "active" {
-        // `outer_guard` Drop resets the flag.
-        return Err(ScpNapiError::Context {
-            message: format!(
-                "cannot subscribe to context in {state_str:?} state — context must be active"
-            ),
+    // `outer_guard` Drop resets the flag on the error return.
+    crate::runtime::require_active_context(bi, &handle.context_id, "subscribe to context", |msg| {
+        ScpNapiError::Context {
+            message: msg,
             code: codes::CTX_2021.to_owned(),
         }
-        .into());
-    }
+    })
+    .await
+    .map_err(NapiError::from)?;
+    Ok(outer_guard)
+}
+
+/// Per-bridge-instance implementation of [`Scp::context_subscribe`](crate::scp::Scp::context_subscribe).
+pub(crate) async fn context_subscribe_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    identity_did: String,
+    on_message: napi::threadsafe_function::ThreadsafeFunction<Option<NapiMessage>>,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
+    let outer_guard = subscribe_admission(bi, handle).await?;
 
     // `identity_did` is validated at the API boundary and reused below as the
     // heartbeat author DID for the periodic suppression-detection scheduler
@@ -5684,6 +5737,8 @@ mod tests {
                 pre_rotation_custody,
             },
         );
+        // Balances the decrement `NapiContextHandle`'s `Drop` runs.
+        crate::increment_handle_count();
         let handle = super::NapiContextHandle {
             context_id: format!("persona-test-{}", uuid::Uuid::new_v4()),
             state: std::sync::Mutex::new(super::ContextState::Active),
@@ -5845,6 +5900,8 @@ mod tests {
         let custody_b = Arc::new(crate::custody::NapiKeyCustody::InMemory(
             OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
         ));
+        // Balances the decrement `NapiContextHandle`'s `Drop` runs.
+        crate::increment_handle_count();
         let handle = super::NapiContextHandle {
             context_id: format!("persona-regress-{}", uuid::Uuid::new_v4()),
             state: std::sync::Mutex::new(super::ContextState::Active),
@@ -6427,6 +6484,8 @@ mod tests {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
         let instance_id = bi.instance_id();
 
+        // Balances the decrement `NapiContextHandle`'s `Drop` runs.
+        crate::increment_handle_count();
         let mut handle = NapiContextHandle {
             context_id: "test-ctx-econ".to_owned(),
             state: Mutex::new(ContextState::Active),
@@ -6513,6 +6572,322 @@ mod tests {
             "rejection should name the untracked proposal"
         );
         crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// Builds a handle whose cached string reads `"active"` for a context this
+    /// bridge registered, so a test can exercise the gap between that string
+    /// and whatever the supervisor reports.
+    ///
+    /// Builds through `test_active_on`, which increments the process-global
+    /// handle count that `NapiContextHandle`'s `Drop` decrements, so the
+    /// fixture leaves the count balanced.
+    fn active_handle_for(
+        bi: &Arc<crate::runtime::NapiBridgeInstance>,
+        context_id: &str,
+        creator_did: &str,
+    ) -> super::NapiContextHandle {
+        super::NapiContextHandle::test_active_on(bi, context_id.to_owned(), creator_did.to_owned())
+    }
+
+    /// A context no supervisor actor serves fails every lifecycle gate closed.
+    ///
+    /// `register_test_context` registers the bridge's per-context UCAN state
+    /// without spawning an actor, which is the state a completed TTL expiry
+    /// leaves behind. The handle's cached string still reads `"active"`, so a
+    /// gate reading that string would admit join, leave, send, and subscribe
+    /// into a context the supervisor stopped serving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lifecycle_gates_fail_closed_without_a_supervisor_actor() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-no-actor-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiNoActorCreator";
+        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+        assert_eq!(handle.state().expect("state"), "active");
+
+        let join = super::context_join_on(&bi, &handle, creator.to_owned(), None)
+            .await
+            .expect_err("join must refuse a context no actor serves");
+        assert!(
+            join.to_string().contains("no live supervisor state"),
+            "join reported: {join}"
+        );
+
+        let leave = super::context_leave_on(&bi, &handle, creator.to_owned())
+            .await
+            .expect_err("leave must refuse a context no actor serves");
+        assert!(
+            leave.to_string().contains("no live supervisor state"),
+            "leave reported: {leave}"
+        );
+
+        let send = super::context_send_on(&bi, &handle, creator.to_owned(), b"hi".to_vec(), None)
+            .await
+            .expect_err("send must refuse a context no actor serves");
+        assert!(
+            send.to_string().contains("no live supervisor state"),
+            "send reported: {send}"
+        );
+
+        let Err(subscribe) = super::subscribe_admission(&bi, &handle).await else {
+            panic!("subscribe must refuse a context no actor serves");
+        };
+        assert!(
+            subscribe.to_string().contains("no live supervisor state"),
+            "subscribe reported: {subscribe}"
+        );
+        assert!(
+            !handle
+                .subscription_active
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a refused subscribe must reset the subscription flag"
+        );
+    }
+
+    /// Join, leave, send, and subscribe refuse a context whose actor is
+    /// resident but reports `Closing`, the state a close another member
+    /// started leaves while this handle's cached string still reads "active".
+    /// A gate weakened to an existence check admits all four here, because the
+    /// actor answers the lifecycle read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lifecycle_gates_refuse_a_resident_actor_in_closing() {
+        use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-closing-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiClosingCreator";
+        // The creator needs `context:close` for the supervisor's close to run.
+        let mut params = ContextParams::default();
+        params.ceiling.push(
+            scp_core::context::roles::Capability::new("context:close")
+                .expect("context:close parses"),
+        );
+        test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
+        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+
+        let admitted = super::subscribe_admission(&bi, &handle)
+            .await
+            .expect("an Active context admits a subscription");
+        drop(admitted);
+
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sup.dispatch_lifecycle_command(LifecycleCommand::CloseContext {
+            payload: Box::new(CloseContextPayload {
+                context_id: ctx_id.clone(),
+                params: ContextParams::default(),
+                initiator_did: DID(creator.to_owned()),
+            }),
+            reply: tx,
+        })
+        .await
+        .expect("close dispatch");
+        rx.await.expect("close reply").expect("close must succeed");
+        assert_eq!(
+            crate::runtime::read_live_context_state(&bi, &ctx_id)
+                .await
+                .expect("the resident actor answers"),
+            Some(scp_core::context::ContextState::Closing),
+        );
+        assert_eq!(handle.state().expect("state"), "active");
+
+        let closing = "'closing' state";
+        let join = super::context_join_on(&bi, &handle, creator.to_owned(), None)
+            .await
+            .expect_err("join must refuse a closing context");
+        assert!(join.to_string().contains(closing), "join reported: {join}");
+        let leave = super::context_leave_on(&bi, &handle, creator.to_owned())
+            .await
+            .expect_err("leave must refuse a closing context");
+        assert!(
+            leave.to_string().contains(closing),
+            "leave reported: {leave}"
+        );
+        let send = super::context_send_on(&bi, &handle, creator.to_owned(), b"hi".to_vec(), None)
+            .await
+            .expect_err("send must refuse a closing context");
+        assert!(send.to_string().contains(closing), "send reported: {send}");
+        let Err(subscribe) = super::subscribe_admission(&bi, &handle).await else {
+            panic!("subscribe must refuse a closing context");
+        };
+        assert!(
+            subscribe.to_string().contains(closing),
+            "subscribe reported: {subscribe}"
+        );
+    }
+
+    /// Join, leave, send, and subscribe refuse a context the supervisor still
+    /// holds while its actor is poisoned, mid-respawn, past a failed respawn,
+    /// or not answering, and each refusal carries the supervisor's own answer.
+    ///
+    /// In every case the handle's cached string reads "active" and the gate
+    /// reads the supervisor: a poisoned context reads `Some(Poisoned)` and
+    /// refuses with the operation's code, a context mid-respawn or past a
+    /// failed respawn reads `ActorCrashed` (`SCP-CTX-2135`), and an actor whose
+    /// mailbox does not answer reads `ActorBusy` (`SCP-CTX-2130`). A gate that
+    /// folded a failed read into `None` would report "no live supervisor
+    /// state" for the last three, and a gate that read the cached string
+    /// would admit all four.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lifecycle_gates_refuse_a_poisoned_crashed_or_unreachable_actor() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let creator = "did:key:z6MkNapiGateFaultCreator";
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+
+        for (fault, expected) in [
+            ("poisoned", "'poisoned' state"),
+            ("mid_respawn", codes::CTX_2135),
+            ("respawn_failed", codes::CTX_2135),
+            ("unreachable", "SCP-CTX-2130"),
+        ] {
+            let ctx_id = format!("napi-gate-{fault}-{}", uuid::Uuid::new_v4());
+            crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator, &[]).await;
+            crate::runtime::register_test_context(&bi, &ctx_id, creator);
+            let handle = active_handle_for(&bi, &ctx_id, creator);
+            match fault {
+                "poisoned" => sup.test_poison_context(&ctx_id).await,
+                "mid_respawn" => sup.test_hold_context_mid_respawn(&ctx_id).await,
+                "respawn_failed" => sup.test_fail_context_respawn(&ctx_id).await,
+                _ => sup.test_make_actor_unreachable(&ctx_id),
+            }
+            assert_eq!(handle.state().expect("state"), "active");
+
+            let join = super::context_join_on(&bi, &handle, creator.to_owned(), None)
+                .await
+                .expect_err("join must refuse");
+            let leave = super::context_leave_on(&bi, &handle, creator.to_owned())
+                .await
+                .expect_err("leave must refuse");
+            let send =
+                super::context_send_on(&bi, &handle, creator.to_owned(), b"hi".to_vec(), None)
+                    .await
+                    .expect_err("send must refuse");
+            let Err(subscribe) = super::subscribe_admission(&bi, &handle).await else {
+                panic!("subscribe must refuse a {fault} context");
+            };
+            for (call, err) in [
+                ("join", join),
+                ("leave", leave),
+                ("send", send),
+                ("subscribe", subscribe),
+            ] {
+                assert!(
+                    err.to_string().contains(expected),
+                    "{call} on a {fault} context must report {expected:?}, got: {err}"
+                );
+            }
+            assert!(
+                !handle
+                    .subscription_active
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "a refused subscribe must reset the subscription flag ({fault})"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Ceiling: an absent declaration and an empty one are different
+    // -------------------------------------------------------------------
+
+    /// The capability names `default_ceiling()` carries, in the form a
+    /// `context_create` caller writes them.
+    fn default_ceiling_names() -> std::collections::HashSet<String> {
+        scp_core::context::roles::default_ceiling()
+            .iter()
+            .map(|cap| cap.name().into_owned())
+            .collect()
+    }
+
+    /// The capability names a parsed ceiling carries.
+    fn parsed_ceiling_names(params_json: &str) -> std::collections::HashSet<String> {
+        super::parse_context_params(params_json)
+            .expect("params must parse")
+            .core
+            .ceiling
+            .iter()
+            .map(|cap| cap.name().into_owned())
+            .collect()
+    }
+
+    /// An absent `ceiling` key resolves to `default_ceiling()`.
+    ///
+    /// `default_ceiling`'s doc comment says every FFI bridge applies it "when
+    /// no explicit ceiling is provided". Before this test existed the parser
+    /// read an absent key as an empty vector, and the supervisor installed
+    /// that empty vector verbatim as the actor's ceiling.
+    #[test]
+    fn parse_context_params_resolves_an_absent_ceiling_to_default_ceiling() {
+        let actual = parsed_ceiling_names(r#"{"mode":"Encrypted"}"#);
+        assert_eq!(actual.len(), 11, "default_ceiling() carries 11 entries");
+        assert_eq!(actual, default_ceiling_names());
+    }
+
+    /// A `ceiling` key holding `null` declares no ceiling, the same as an
+    /// absent key.
+    #[test]
+    fn parse_context_params_resolves_a_null_ceiling_to_default_ceiling() {
+        let actual = parsed_ceiling_names(r#"{"mode":"Encrypted","ceiling":null}"#);
+        assert_eq!(actual, default_ceiling_names());
+    }
+
+    /// An empty `ceiling` array stands as written: a deny-all context.
+    #[test]
+    fn parse_context_params_keeps_an_empty_ceiling_empty() {
+        let parsed = super::parse_context_params(r#"{"mode":"Encrypted","ceiling":[]}"#)
+            .expect("params must parse");
+        assert!(
+            parsed.core.ceiling.is_empty(),
+            "an explicit [] grants nothing"
+        );
+        assert!(parsed.ceiling.is_empty());
+    }
+
+    /// A supplied `ceiling` array stands as written, with no default merged in.
+    #[test]
+    fn parse_context_params_keeps_a_supplied_ceiling_as_written() {
+        let actual = parsed_ceiling_names(r#"{"mode":"Encrypted","ceiling":["messages:write"]}"#);
+        assert_eq!(
+            actual,
+            std::iter::once("messages:write".to_owned()).collect::<std::collections::HashSet<_>>()
+        );
+    }
+
+    /// A `ceiling` value that is neither `null` nor an array is a malformed
+    /// declaration, so the parser rejects it instead of reading it as
+    /// deny-all or as absent.
+    #[test]
+    fn parse_context_params_rejects_a_non_array_ceiling() {
+        let err = super::parse_context_params(r#"{"mode":"Encrypted","ceiling":"messages:write"}"#)
+            .err()
+            .expect("a string ceiling must not parse");
+        assert!(
+            err.to_string().contains("ceiling must be"),
+            "parser reported: {err}"
+        );
+    }
+
+    /// A non-string entry inside the `ceiling` array rejects rather than
+    /// dropping out of the parsed ceiling.
+    ///
+    /// Dropping the entry would build a context whose ceiling is narrower than
+    /// the one the caller wrote, and every later mint, delegate, and validate
+    /// would refuse the missing capability with no record of the parse. The
+    /// `PyO3` bridge rejects the same shape through
+    /// `extract::<Vec<String>>()`.
+    #[test]
+    fn parse_context_params_rejects_a_non_string_ceiling_entry() {
+        let err =
+            super::parse_context_params(r#"{"mode":"Encrypted","ceiling":["messages:write",7]}"#)
+                .err()
+                .expect("a numeric ceiling entry must not parse");
+        assert!(
+            err.to_string().contains("ceiling entries must be"),
+            "parser reported: {err}"
+        );
     }
 
     /// A rejected direct-execute leaves context membership/role state unchanged

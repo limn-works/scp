@@ -1913,6 +1913,94 @@ pub fn sync_ceiling_from_params(
     })
 }
 
+/// Reads a context's lifecycle state from that context's supervisor actor.
+///
+/// An absent actor reads as `None` instead of as an error. An absent actor the
+/// crash watchdog poisoned reads as `Some(Poisoned)`, because the supervisor
+/// keeps that flag outside the actor (ADR-049 §10).
+///
+/// [`require_active_context`] is the gate form: it turns `None` into an error so
+/// a gate never admits an operation on an absent answer.
+///
+/// An actor the supervisor still holds but this call could not reach — a
+/// mailbox send that timed out against a saturated mailbox, or a wedged actor
+/// that took longer than the reply timeout — reads as an error, never as
+/// `Ok(None)`. `Supervisor::read_context_state` folds that outcome into
+/// `None`; this function calls `Supervisor::read_context_state_checked`, which
+/// keeps the two outcomes apart.
+///
+/// # Errors
+///
+/// Returns [`ScpNapiError::Context`] when this instance holds no supervisor,
+/// when an actor serves `context_id` but did not answer the state read, and
+/// when the crash watchdog despawned `context_id`'s actor for a respawn it has
+/// not finished or its last respawn failed (ADR-049 §10). The state read
+/// reports an actor the supervisor never held as `Ok(None)`, so a caller
+/// distinguishes "no actor serves this context" from "this bridge could not
+/// get an answer".
+pub async fn read_live_context_state(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+) -> Result<Option<scp_core::context::ContextState>, ScpNapiError> {
+    let sup = supervisor(bi).map_err(|e| ScpNapiError::Context {
+        message: e.to_string(),
+        code: codes::CTX_2000.to_owned(),
+    })?;
+    let sup = Arc::clone(sup);
+    sup.read_context_state_checked(context_id)
+        .await
+        .map_err(ScpNapiError::from)
+}
+
+/// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`.
+///
+/// The lifecycle gate reads the supervisor actor, never the `state` string
+/// [`NapiContextHandle`](crate::context::NapiContextHandle) caches. That string
+/// records only the transitions THIS bridge observed, so a TTL expiry the
+/// supervisor applied on its own timer, a close another member initiated, a
+/// migration that tombstoned the context, and an actor the watchdog poisoned
+/// all leave it reading `"active"`. A gate reading that string admits an
+/// operation into a context the supervisor stopped serving.
+///
+/// Fails closed: a context no actor serves refuses the operation. `mk_err`
+/// wraps the refusal message in the error variant and the error code the
+/// calling operation reports, so a lifecycle refusal keeps whichever
+/// [`ScpNapiError`] variant that operation already returned.
+///
+/// # Errors
+///
+/// Returns whatever `mk_err` builds when the supervisor reports any state other
+/// than `Active` and when no actor serves `context_id`, and
+/// [`ScpNapiError::Context`] when the supervisor query itself fails.
+pub async fn require_active_context<F>(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+    verb: &str,
+    mk_err: F,
+) -> Result<(), ScpNapiError>
+where
+    F: FnOnce(String) -> ScpNapiError,
+{
+    match read_live_context_state(bi, context_id).await? {
+        Some(scp_core::context::ContextState::Active) => Ok(()),
+        Some(other) => Err(mk_err(format!(
+            "cannot {verb} in '{}' state -- context must be active",
+            context_state_str(&other)
+        ))),
+        None => Err(mk_err(format!(
+            "context '{context_id}' has no live supervisor state -- refusing to run a \
+             lifecycle-gated operation against a context no actor serves"
+        ))),
+    }
+}
+
+/// Renders a [`ContextState`](scp_core::context::ContextState) as the lowercase
+/// name a lifecycle-gate error reports.
+#[must_use]
+pub const fn context_state_str(state: &scp_core::context::ContextState) -> &'static str {
+    scp_ffi_common::context_state_str(state)
+}
+
 /// Registers an outlet handler for an outlet in a context.
 ///
 /// The handler will be called when the outlet is invoked. The outlet must already
@@ -2015,6 +2103,62 @@ pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_
     };
 
     map.entry(context_id.to_owned()).or_insert(state);
+}
+
+/// Attaches a supervisor to `bi` if none is attached, then creates `context_id`
+/// inside it under `creator_did` with `ceiling` as the capability ceiling.
+///
+/// [`register_test_context`] alone registers the bridge's UCAN state; it does
+/// NOT create the context inside a supervisor, so every lifecycle gate refuses
+/// a context a test only registered. Tests call this to give the context the
+/// actor a real `context_create` would have spawned. It mirrors the `PyO3`
+/// reference bridge's `create_supervisor_context_for_test`.
+///
+/// `ceiling` entries take the colon form the TypeScript surface accepts
+/// (`"outlet:register"`, `"messages:write"`). An empty slice creates the context
+/// with `default_ceiling()`.
+///
+/// # Panics
+///
+/// Panics when a `ceiling` entry fails the §5.4.2.1 capability parser, when no
+/// supervisor can be attached, or when `create_context` rejects the request —
+/// each one is a broken test fixture rather than a condition under test.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)] // A broken test fixture panics; production paths keep the deny.
+pub(crate) async fn create_supervisor_context_for_test(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+    creator_did: &str,
+    ceiling: &[&str],
+) {
+    init_supervisor_for_test_on(bi);
+    let capabilities: Vec<scp_core::context::roles::Capability> = if ceiling.is_empty() {
+        scp_core::context::roles::default_ceiling()
+            .iter()
+            .cloned()
+            .collect()
+    } else {
+        ceiling
+            .iter()
+            .map(|entry| {
+                scp_core::context::roles::Capability::new(entry)
+                    .unwrap_or_else(|| panic!("test ceiling entry {entry:?} must parse"))
+            })
+            .collect()
+    };
+    let params = scp_core::context::ContextParams {
+        ceiling: capabilities,
+        ..scp_core::context::ContextParams::default()
+    };
+    let sup = Arc::clone(supervisor(bi).expect("test supervisor must be attached"));
+    sup.create_context(
+        context_id.to_owned(),
+        params,
+        scp_did::DID(creator_did.to_owned()),
+        None,
+    )
+    .await
+    .expect("test supervisor context creation must succeed");
 }
 
 // ---------------------------------------------------------------------------
