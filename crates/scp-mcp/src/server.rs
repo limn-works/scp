@@ -1391,11 +1391,18 @@ impl<P: ContextProvider> McpServer<P> {
 
         self.subscriptions.insert(params.uri);
         // The subscribe response carries neither list, so it overwrites no
-        // recorded half. It records a view only when none is recorded, which
-        // means the client holds neither list of this context and no cached
-        // list can go stale. A failed read records nothing, which makes the
-        // next event notify.
-        if let Ok(served) = self.provider.active_context_ids() {
+        // recorded half, and it records a view only in a session that has not
+        // listed. There the client holds no cached list that can go stale, and
+        // the recorded view lets the next event announce a change. A session
+        // that listed and has no view recorded for this context listed before
+        // the context joined the served set, or could not read its view then,
+        // so its cached lists lack or misstate the context; recording the
+        // current view would make the pump's next event for the context
+        // silent. A failed read records nothing, which makes the next event
+        // notify.
+        if !self.client_listed.load(std::sync::atomic::Ordering::SeqCst)
+            && let Ok(served) = self.provider.active_context_ids()
+        {
             self.record_view(&served, &context_id, |_| {});
         }
 
@@ -1571,7 +1578,9 @@ impl<P: ContextProvider> McpServer<P> {
     /// and become exactly the activity oracle the subscribe gate prevents.
     ///
     /// The subscription is *filtered*, not dropped: suspension is reversible
-    /// (`ReadAccessRestored`, `CapabilitiesSuspended` expiry) and MCP has no
+    /// (a governance `RestoreAccess`, which the pump sees as
+    /// `GovernanceActionExecuted` and, for the read capability,
+    /// `ReadAccessRestored`) and MCP has no
     /// server-initiated unsubscribe notification, so silently forgetting the
     /// registration would leave a client permanently stale after restoration
     /// with no way to learn it must re-subscribe.
@@ -1585,8 +1594,9 @@ impl<P: ContextProvider> McpServer<P> {
     /// client drops the context from its cached lists.
     ///
     /// When `active_context_ids()` fails, the server forgets no context and
-    /// sends only that pair, and only for a context a list response found
-    /// served, so the client's re-list surfaces the failure.
+    /// sends only that pair, and only for a context a list response or an
+    /// earlier event found served, so the client's re-list surfaces the
+    /// failure.
     #[must_use]
     pub fn notifications_for_event(
         &self,
@@ -4004,6 +4014,28 @@ mod tests {
                 "{absorb} must not absorb a tool change the client never re-read"
             );
         }
+    }
+
+    /// A session that listed holds a cached tool list. A context that joined
+    /// the served set after that list has no recorded view, and a
+    /// `resources/subscribe` for it must not record one: the pump's event for
+    /// the join must still announce the context the cached list lacks.
+    #[test]
+    fn a_subscribe_after_a_list_does_not_absorb_a_context_the_list_lacks() {
+        let mut server = subscribing_server(MockProvider::default());
+        let list = make_request(protocol::METHOD_TOOLS_LIST, None);
+        assert!(server.handle_request(&list).unwrap().error.is_none());
+
+        // The actor applies the join before the pump evaluates its event.
+        server.provider.contexts.push("ctx_new".to_owned());
+        subscribe(&mut server, "scp://ctx_new/events");
+
+        assert!(
+            list_changed_pair_sent(
+                &server.notifications_for_event("ctx_new", &members_and_tools_event())
+            ),
+            "a subscribe must not absorb a context the client's cached list lacks"
+        );
     }
 
     /// The mirror case: a `tools/list` gives the client no resource list, so

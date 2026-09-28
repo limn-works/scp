@@ -212,8 +212,9 @@ impl McpTransport for StdioClientTransport {
 
 /// Enum-based transport to avoid orphan rule issues with `Box<dyn McpTransport>`.
 ///
-/// Since both [`StdioClientTransport`] and [`SseClientTransport`] are defined
-/// in this module, and [`McpTransport`] is from `scp-mcp`, we cannot implement
+/// [`StdioClientTransport`] is defined in this module, [`SseClientTransport`]
+/// comes from `scp_mcp::sse_client` (the one SSE client every bridge shares),
+/// and [`McpTransport`] is from `scp-mcp`, so we cannot implement
 /// `McpTransport` for `Box<dyn McpTransport>` due to orphan rules. This enum
 /// dispatch avoids that problem.
 enum ClientTransport {
@@ -3102,11 +3103,12 @@ mod tests {
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
-    /// A refused Invoke check runs no outlet and appends no event, and the
-    /// trait's `invoke_outlet` passes its Invoke check as `authorize`: with no
-    /// UCAN token, that check refuses. The actor holds the context and grants
-    /// the creator `outlet:call:*`, so the role-state read and the role-state
-    /// check both pass and the refusal can only come from the missing token.
+    /// A refused capability check runs no outlet and appends no event, and the
+    /// trait's `invoke_outlet` passes its capability check as `authorize`: with
+    /// no UCAN token, `outlet_grant` refuses before any other step. The check
+    /// kind never matters on this path;
+    /// `invoke_outlet_records_the_token_nonce_and_refuses_its_replay` proves
+    /// that `invoke_outlet` passes the Invoke check.
     #[test]
     fn refused_invoke_check_runs_no_outlet() {
         let creator = "did:dht:z6MkCreatorRefusedInvoke";
@@ -3142,6 +3144,130 @@ mod tests {
         );
         assert_eq!(event_count(&bi, &ctx_id), 0, "no outlet may have run");
         crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// `invoke_outlet` passes the Invoke check, which records the agent
+    /// token's nonce, so the same token cannot run a second `tools/call`. A
+    /// Probe records nothing, so probing first leaves the token unspent. Had
+    /// `invoke_outlet` passed the Probe check, the second call would run.
+    ///
+    /// The bridge copy names the token's issuer as the context's creator, so
+    /// the UCAN step accepts the root token; the actor names the agent as the
+    /// creator holding `outlet:call:*`, so the role-state check passes.
+    #[test]
+    fn invoke_outlet_records_the_token_nonce_and_refuses_its_replay() {
+        use scp_platform::traits::KeyCustody as _;
+        crate::init_runtime().ok();
+        let runtime = crate::runtime().unwrap();
+        let custody = scp_platform::testing::InMemoryKeyCustody::new();
+        let key = runtime
+            .block_on(custody.generate_keypair(scp_platform::traits::KeyType::Ed25519))
+            .unwrap();
+        let mut public_key = [0_u8; 32];
+        public_key.copy_from_slice(
+            runtime
+                .block_on(custody.public_key(&key))
+                .unwrap()
+                .as_bytes(),
+        );
+        let issuer = scp_did::did_dht_from_public_key(&public_key).0;
+        let agent = "did:dht:z6MkAgentReplayedToken";
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, &issuer, true);
+        hold_on_actor(&bi, &ctx_id, agent, &["messages:read", "outlet:call:*"]);
+        register_sum_handler(&bi, &ctx_id);
+        let capabilities = vec!["outlet:call:*".to_owned()];
+        let params = scp_core::crypto::ucan::mint::MintParams {
+            issuer_did: &issuer,
+            issuer_key: &key,
+            audience_did: agent,
+            context_id: &ctx_id,
+            capabilities: &capabilities,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        };
+        let token = runtime
+            .block_on(scp_core::crypto::ucan::mint::mint_ucan(
+                &params,
+                &custody,
+                &scp_clock::SystemClock,
+            ))
+            .unwrap();
+        let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: agent.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+            outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: Some(token.encoded),
+            agent_proof_tokens: None,
+        };
+        for _ in 0..2 {
+            provider
+                .validate_capability(
+                    &ctx_id,
+                    "calculator",
+                    scp_mcp::server::CapabilityCheck::Probe,
+                )
+                .expect("a probe records no nonce, so it passes every time");
+        }
+        let args = serde_json::json!({"a": 1, "b": 2});
+        let output = provider
+            .invoke_outlet(&ctx_id, "calculator", args.clone())
+            .expect("the first call with a fresh token runs the outlet");
+        assert_eq!(output, serde_json::json!({"result": 3.0}));
+        let replayed = provider.invoke_outlet(&ctx_id, "calculator", args);
+        assert!(
+            matches!(
+                &replayed,
+                Err(scp_mcp::server::OutletInvokeError::Refused(
+                    scp_mcp::server::AccessRefusal::Denied(msg)
+                )) if msg.contains("UCAN authorization failed")
+            ),
+            "a replayed token must be refused by the UCAN step: {replayed:?}"
+        );
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// `py_mcp_client_connect_sse` sends the caller's token on its `GET`, so a
+    /// Python client passes the bearer check an SCP SSE server always runs.
+    /// The listener reads the request head and then closes the connection, so
+    /// the connect fails after the header has gone out.
+    #[test]
+    fn py_mcp_client_connect_sse_sends_the_bearer_token() {
+        use std::io::BufRead;
+        let scp = crate::scp::PyScp { inner: __bi() };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().expect("accept GET");
+            let mut reader = std::io::BufReader::new(conn);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).expect("read head");
+                if n == 0 || line == "\r\n" {
+                    break;
+                }
+                head.push_str(&line);
+            }
+            head
+        });
+        let result =
+            scp.py_mcp_client_connect_sse(&format!("http://127.0.0.1:{port}/sse"), Some("tok-1"));
+        let head = server.join().expect("server thread");
+        assert!(
+            head.contains("\r\nAuthorization: Bearer tok-1\r\n"),
+            "the GET must carry the caller's bearer token, got: {head:?}"
+        );
+        assert!(
+            result.is_err(),
+            "the listener closed the stream, so the connect must fail"
+        );
     }
 
     #[test]

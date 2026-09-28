@@ -264,10 +264,12 @@ impl SseClientTransport {
     }
 }
 
-/// Maximum number of SSE events to scan for a matching JSON-RPC response.
+/// Maximum number of SSE stream lines to scan for a matching JSON-RPC response.
 /// If exceeded, the request fails. The TCP read timeout (30s) handles
-/// individual read stalls; this bounds total non-matching events tolerated.
-const MAX_SSE_EVENTS: usize = 1000;
+/// individual read stalls; this bounds the non-matching lines tolerated. An
+/// event takes at least two lines (a `data:` line and the blank line ending
+/// it), so the bound admits at most 500 events.
+const MAX_SSE_LINES: usize = 1000;
 
 impl McpTransport for SseClientTransport {
     #[allow(clippy::significant_drop_tightening)] // sse_reader MutexGuard is borrowed by reader across the entire loop.
@@ -289,7 +291,7 @@ impl McpTransport for SseClientTransport {
         // response under another id answers an earlier request whose call
         // already failed (a read timeout, say); handing it to this call would
         // shift every later reply by one.
-        for _ in 0..MAX_SSE_EVENTS {
+        for _ in 0..MAX_SSE_LINES {
             let mut line = String::new();
             let n = read_line_bounded(reader, &mut line)
                 .map_err(|e| format!("failed to read SSE event: {e}"))?;
@@ -308,7 +310,7 @@ impl McpTransport for SseClientTransport {
             }
         }
         Err(format!(
-            "no matching JSON-RPC response after {MAX_SSE_EVENTS} SSE events"
+            "no matching JSON-RPC response after {MAX_SSE_LINES} SSE lines"
         ))
     }
 

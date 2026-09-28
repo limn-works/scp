@@ -1290,6 +1290,55 @@ mod tests {
         drop(keep_open);
     }
 
+    /// A lagged receiver makes the stdio pump over-notify and keep running:
+    /// the resync sends the list-changed pair and one `resources/updated` per
+    /// authorized subscription, and the events the channel still holds are
+    /// delivered after it. A pump that returned on the lag would deliver none
+    /// of them; one that dropped the resync would send no list-changed pair.
+    #[tokio::test]
+    async fn a_lagged_pump_resyncs_and_keeps_delivering() {
+        use scp_core::context::membership::ContextEvent;
+
+        let uri = "scp://ctx_a/events";
+        let (event_tx, server, pump) = wired_subscribed_server(uri);
+        let events = pump.into_receiver();
+        // The channel holds 16 events, so 20 sends drop the oldest four.
+        for _ in 0..20 {
+            event_tx
+                .send((
+                    "ctx_a".to_owned(),
+                    ContextEvent::ContentKeysRotated { reason: None },
+                ))
+                .expect("event send");
+        }
+        drop(event_tx);
+        let sink = VecSink::default();
+        pump_events(
+            Arc::new(tokio::sync::Mutex::new(server)),
+            events,
+            sink.clone(),
+        )
+        .await;
+
+        let notifications = sink.notifications().await;
+        let count = |method: &str| notifications.iter().filter(|n| n.contains(method)).count();
+        assert_eq!(
+            count(crate::protocol::METHOD_TOOLS_LIST_CHANGED),
+            1,
+            "{notifications:?}"
+        );
+        assert_eq!(
+            count(crate::protocol::METHOD_RESOURCES_LIST_CHANGED),
+            1,
+            "{notifications:?}"
+        );
+        assert_eq!(
+            count(crate::protocol::METHOD_RESOURCES_UPDATED),
+            17,
+            "one resync update plus one per event the channel still held: {notifications:?}"
+        );
+    }
+
     /// A [`ClientChannel`] that records every write in one ordered log and
     /// parks the first notification until the test releases it, so a test can
     /// hold the pump mid-write while the read loop handles a request.

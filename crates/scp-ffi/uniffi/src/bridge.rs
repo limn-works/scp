@@ -21040,16 +21040,26 @@ mod tests {
     /// it. Phase D (#1695): replaces the old `UNSET_INSTANCE_ID` stamp
     /// which only worked against the deleted process-wide default.
     fn test_handle_for(scp: &Arc<crate::scp::Scp>) -> Arc<ContextHandle> {
+        test_handle_with(scp, "did:dht:z6MkTestUser", Vec::new())
+    }
+
+    /// [`test_handle_for`] with `creator_did` as the handle's creator and
+    /// `ceiling_strings` as its UCAN ceiling.
+    fn test_handle_with(
+        scp: &Arc<crate::scp::Scp>,
+        creator_did: &str,
+        ceiling_strings: Vec<String>,
+    ) -> Arc<ContextHandle> {
         let instance_id = scp.instance_id();
         Arc::new(ContextHandle {
             context_id: "ctx-test".to_owned(),
             state: tokio::sync::Mutex::new(ContextState::Active),
-            creator_did: "did:dht:z6MkTestUser".to_owned(),
+            creator_did: creator_did.to_owned(),
             #[cfg(feature = "testing")]
             in_memory_custody: None,
             callback_custody: None,
             signing_key: None,
-            ceiling_strings: Vec::new(),
+            ceiling_strings,
             outlet_registry: std::sync::Mutex::new(
                 scp_core::context::outlets::OutletRegistry::new(),
             ),
@@ -23709,6 +23719,148 @@ mod tests {
                 "the {kind:?} denial must name messages:read, got: {denial}"
             );
         }
+    }
+
+    /// `invoke_outlet` passes the Invoke check, which records the agent
+    /// token's nonce, so the same token cannot run a second `tools/call`. A
+    /// Probe records nothing, so probing first leaves the token unspent. Had
+    /// `invoke_outlet` passed the Probe check, the second call would run.
+    ///
+    /// The handle names the token's issuer as the context's creator, so the
+    /// UCAN step accepts the root token; the actor names the agent as the
+    /// creator holding `outlet:call:*`, so the role-state check passes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uniffi_invoke_outlet_records_the_token_nonce_and_refuses_its_replay() {
+        use scp_platform::traits::KeyCustody as _;
+        let custody = InMemoryKeyCustody::new();
+        let key = custody
+            .generate_keypair(scp_platform::traits::KeyType::Ed25519)
+            .await
+            .expect("keypair");
+        let mut public_key = [0_u8; 32];
+        public_key.copy_from_slice(
+            custody
+                .public_key(&key)
+                .await
+                .expect("public key")
+                .as_bytes(),
+        );
+        let issuer = scp_did::did_dht_from_public_key(&public_key).0;
+        let agent = "did:dht:z6MkAgentReplayedToken";
+
+        let scp = scp_test();
+        let bi = Arc::clone(&scp.inner);
+        bi.init_context_manager_with_did(agent);
+        bi.context_manager_or_error()
+            .expect("supervisor must be attached")
+            .clone()
+            .create_context(
+                "ctx-test".to_owned(),
+                scp_core::context::ContextParams {
+                    ceiling: vec![
+                        scp_core::context::roles::Capability::MessagesRead,
+                        scp_core::context::roles::Capability::OutletCallAll,
+                    ],
+                    ..scp_core::context::ContextParams::default()
+                },
+                scp_did::DID(agent.to_owned()),
+                None,
+            )
+            .await
+            .expect("context creation must succeed");
+        let handle = test_handle_with(&scp, &issuer, vec!["outlet_call:*".to_owned()]);
+        register_context_handle(&bi, &handle);
+        handle
+            .outlet_registry
+            .lock()
+            .expect("registry lock")
+            .insert(scp_core::context::outlets::OutletRegistration {
+                outlet_id: "calculator".to_owned(),
+                kind: scp_core::context::outlets::OutletKind::Action,
+                name: "Calculator".to_owned(),
+                description: "A simple calculator".to_owned(),
+                schema: scp_core::context::outlets::OutletSchema {
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: serde_json::json!({"type": "object"}),
+                    aggregate_schema: None,
+                },
+                implementation_hash: [0xAA; 32],
+                test_vectors: vec![],
+                operator_did: "did:dht:z6MkOperator".into(),
+                cost: None,
+                message_catalog: Vec::new(),
+                registered_at: 0,
+                signature: Vec::new(),
+            });
+        let ran = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ran_in_handler = Arc::clone(&ran);
+        handle.outlet_handlers.lock().expect("handler lock").insert(
+            "calculator".to_owned(),
+            Arc::new(
+                move |input: serde_json::Value| -> Result<serde_json::Value, String> {
+                    ran_in_handler.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(serde_json::json!({"sum": input["a"]}))
+                },
+            ),
+        );
+
+        let capabilities = vec!["outlet:call:*".to_owned()];
+        let params = scp_core::crypto::ucan::mint::MintParams {
+            issuer_did: &issuer,
+            issuer_key: &key,
+            audience_did: agent,
+            context_id: "ctx-test",
+            capabilities: &capabilities,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        };
+        let token =
+            scp_core::crypto::ucan::mint::mint_ucan(&params, &custody, &scp_clock::SystemClock)
+                .await
+                .expect("mint");
+        let provider = McpUniFfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: agent.to_owned(),
+            context_ids: vec!["ctx-test".to_owned()],
+            outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: Some(token.encoded),
+            agent_proof_tokens: None,
+        };
+        use scp_mcp::server::ContextProvider as _;
+        for _ in 0..2 {
+            provider
+                .validate_capability(
+                    "ctx-test",
+                    "calculator",
+                    scp_mcp::server::CapabilityCheck::Probe,
+                )
+                .expect("a probe records no nonce, so it passes every time");
+        }
+        let args = serde_json::json!({"a": 1});
+        let output = provider
+            .invoke_outlet("ctx-test", "calculator", args.clone())
+            .expect("the first call with a fresh token runs the outlet");
+        assert_eq!(output, serde_json::json!({"sum": 1}));
+        let replayed = provider.invoke_outlet("ctx-test", "calculator", args);
+        assert!(
+            matches!(
+                &replayed,
+                Err(scp_mcp::server::OutletInvokeError::Refused(
+                    scp_mcp::server::AccessRefusal::Denied(msg)
+                )) if msg.contains("UCAN authorization failed")
+            ),
+            "a replayed token must be refused by the UCAN step: {replayed:?}"
+        );
+        assert_eq!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the replayed call runs no outlet"
+        );
     }
 
     /// `run_outlet` asks for the Invoke check, which spends the agent token,
