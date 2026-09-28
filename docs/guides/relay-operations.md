@@ -300,17 +300,11 @@ A shipped binary exits 1 on `--ephemeral`, alone or beside another mode flag, si
 `--features testing`, so ADR-062, capability injection, keeps the in-memory DHT client
 and the in-memory key custody out of every released build.
 
-A shipped binary run with self-signed TLS, as below, exits 1 with
-`NoPreRotationBackend` on every run, for the reason given under Production
+Do not run the full node (no mode flag) for development. A shipped binary exits 1
+with `NoPreRotationBackend` on every run, for the reason given under Production
 deployment. `SCP_NODE_DHT_MODE` defaults to `production`, so a `--features testing`
-build of the same command, with the variable unset, publishes the host's address to the
+build of the full node with the variable unset publishes the host's address to the
 global Mainline DHT, a location disclosure, even under `SCP_NODE_DOMAIN=localhost`.
-
-```bash
-SCP_NODE_DOMAIN=localhost \
-SCP_NODE_TLS_SELF_SIGNED=1 \
-scp-node
-```
 
 ### Programmatic usage (Rust SDK)
 
@@ -433,6 +427,12 @@ scp-node --relay-only --health  # checks SCP_RELAY_BIND_ADDR
 ```
 
 The health probe attempts a TCP connection to the bind address and exits immediately. It does not initialize tracing or start any servers.
+
+`scp-node` checks its run mode before it probes: with two of `--relay-only`, `--self-host`
+(or `SCP_NODE_SELF_HOST`) and `--ephemeral` selected, `--health` prints `ERROR: ... each
+select a run mode; select exactly one.` and exits 1 whatever the listener's state. So
+`scp-node --relay-only --health` exits 1 in an environment that sets `SCP_NODE_SELF_HOST`
+to `1` or `true`; leave that variable out of the relay container's environment.
 
 ### Container health check
 
