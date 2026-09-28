@@ -11,10 +11,11 @@
 //! the 32-byte x-coordinate of the shared point (RFC 9180 §7.1.1).
 //!
 //! Point validation (§9.5): every recipient key passed to [`seal`] and every
-//! `enc` goes through [`P256PublicKey::from_sec1`] before any scalar
-//! multiplication. That rejects a length other than 65, a leading byte other
-//! than `0x04`, a point off the curve, and the point at infinity, which closes
-//! the invalid-curve attack §9.5 names. [`open`] validates `enc` itself, before
+//! `enc` that [`open`] or [`validate_enc`] receives goes through
+//! [`P256PublicKey::from_sec1`] before any scalar multiplication. That rejects
+//! a length other than 65, a leading byte other than `0x04`, a point off the
+//! curve, and the point at infinity, which closes the invalid-curve attack
+//! §9.5 names. [`open`] validates `enc` itself, before
 //! its key agreement. The custody open takes only a [`ValidatedEnc`], whose one
 //! constructor is [`validate_enc`], so the type guarantees that `enc` was
 //! validated before the open. It does not guarantee that `enc` was validated
