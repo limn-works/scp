@@ -21,6 +21,9 @@
 //    as the code of its `AttestationError` case, `DCError.featureUnsupported`
 //    from any of the three calls reaches it as `SCP-ATTEST-9019`, and
 //    `assertRequest` with no stored key ID throws `SCP-ATTEST-9020`.
+//    `assertRequest` passes the stored key ID and `requestHash` to
+//    `generateAssertion` unchanged, and `attest` attests the key ID
+//    `generateKey` produced.
 //
 // See ADR-025 (Apple Platform Adapter) in `.docs/adrs/phase-5.md` and the
 // UniFFI `DeviceAttestationProvider` callback interface in
@@ -78,8 +81,26 @@
     /// script says, so a test drives each adapter path without the App Attest
     /// entitlement. Every answer defaults to a value, so an adapter that
     /// ignored `isSupported == false` would store a key ID and return bytes.
+    /// It records the key ID and `clientDataHash` the adapter passes to
+    /// `attestKey` and `generateAssertion`, so a test can check the arguments
+    /// App Attest receives.
     private final class ScriptedAppAttestService: DCAppAttestService {
         private let reportsSupport: Bool
+        private let lock = NSLock()
+        private var attestKeyArguments: (keyId: String, clientDataHash: Data)?
+        private var generateAssertionArguments: (keyId: String, clientDataHash: Data)?
+
+        /// The key ID of the last `attestKey` call, or `nil` if none was made.
+        var attestKeyKeyId: String? {
+            lock.withLock { attestKeyArguments?.keyId }
+        }
+
+        /// The key ID and `clientDataHash` of the last `generateAssertion`
+        /// call, or `nil` if none was made.
+        var generateAssertionCall: (keyId: String, clientDataHash: Data)? {
+            lock.withLock { generateAssertionArguments }
+        }
+
         private let key: Answer<String>
         private let attestation: Answer<Data>
         private let assertion: Answer<Data>
@@ -106,18 +127,20 @@
         }
 
         override func attestKey(
-            _: String,
-            clientDataHash _: Data,
+            _ keyId: String,
+            clientDataHash: Data,
             completionHandler: @escaping (Data?, Error?) -> Void
         ) {
+            lock.withLock { attestKeyArguments = (keyId, clientDataHash) }
             attestation.deliver(to: completionHandler)
         }
 
         override func generateAssertion(
-            _: String,
-            clientDataHash _: Data,
+            _ keyId: String,
+            clientDataHash: Data,
             completionHandler: @escaping (Data?, Error?) -> Void
         ) {
+            lock.withLock { generateAssertionArguments = (keyId, clientDataHash) }
             assertion.deliver(to: completionHandler)
         }
     }
@@ -264,11 +287,13 @@
     // MARK: - Supported-service tests
 
     struct AppleDeviceAttestationSupportedTests {
-        @Test("attest returns the attestation App Attest answers with and stores the generated key ID")
+        @Test("attest returns the attestation App Attest answers with, attests the generated key ID and stores it")
         func attestReturnsAttestation() async throws {
-            let harness = makeAdapter(ScriptedAppAttestService(supported: true))
+            let service = ScriptedAppAttestService(supported: true)
+            let harness = makeAdapter(service)
             let token = try await harness.adapter.attest(challenge: challenge, deviceId: deviceId)
             #expect(token == scriptedAttestation)
+            #expect(service.attestKeyKeyId == scriptedKeyId)
             #expect(harness.defaults.string(forKey: keyIdDefaultsKey) == scriptedKeyId)
         }
 
@@ -299,11 +324,19 @@
             }
         }
 
-        @Test("assertRequest returns the assertion App Attest answers with for the stored key ID")
+        @Test("assertRequest passes the stored key ID and requestHash unchanged to generateAssertion and returns its assertion")
         func assertRequestReturnsAssertion() async throws {
-            let harness = makeAdapter(ScriptedAppAttestService(supported: true), storedKeyId: scriptedKeyId)
+            let service = ScriptedAppAttestService(supported: true)
+            // A stored key ID other than the one `generateKey` would answer
+            // with, so a test that passed shows the adapter asserted with the
+            // stored key and generated none.
+            let storedKeyId = "stored-app-attest-key"
+            let harness = makeAdapter(service, storedKeyId: storedKeyId)
             let assertion = try await harness.adapter.assertRequest(requestHash: requestHash)
             #expect(assertion == scriptedAssertion)
+            let call = try #require(service.generateAssertionCall)
+            #expect(call.keyId == storedKeyId)
+            #expect(call.clientDataHash == requestHash)
         }
 
         @Test("assertRequest maps each generateAssertion failure to its SCP-ATTEST code")
