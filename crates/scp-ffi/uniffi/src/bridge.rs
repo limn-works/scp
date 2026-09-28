@@ -4731,11 +4731,20 @@ impl McpStdioTransport {
             guard.validate_command(cmd).map_err(|e| e.to_string())?
         };
 
-        let mut child = Command::new(&basename)
+        let mut command = Command::new(&basename);
+        command
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        // The server leads its own process group, so the group kill in
+        // `stop_server_process` also reaches the processes it starts: a
+        // package runner (`npx`, `uvx`) starts the real server as a child
+        // that inherits the stdout pipe, and an in-flight call ends only
+        // once every holder of that pipe is dead.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let mut child = command
             .spawn()
             .map_err(|e| format!("failed to spawn '{basename}': {e}"))?;
 
@@ -16615,8 +16624,9 @@ impl Scp {
     /// Per-instance equivalent of the free-function `mcp_client_disconnect`.
     ///
     /// Routes through the module-level MCP client registry. A stdio client's
-    /// server process is dead when this returns, even while a call on the
-    /// handle is in flight; that call then fails on the closed stdout.
+    /// server process group, which holds the processes the server started,
+    /// is dead when this returns, even while a call on the handle is in
+    /// flight; that call then fails on the closed stdout.
     #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_client_disconnect(&self, handle: String) -> Result<(), ScpError> {
         validate_mcp_handle(&handle)?;
@@ -23064,10 +23074,12 @@ mod tests {
     /// A `tools/list` in flight against a silent stdio server holds a blocking
     /// thread and its own clone of the client, not the registry shard, so a
     /// disconnect of the same handle returns at once, and it kills the server
-    /// process, so the in-flight call ends on the closed stdout. The stub
-    /// server writes a notification before its `initialize` response, which
-    /// the client reads past, then becomes a `sleep` that never answers and
-    /// outlives the test unless the disconnect kills it.
+    /// process group, so the in-flight call ends on the closed stdout. The
+    /// stub server writes a notification before its `initialize` response,
+    /// which the client reads past, then starts a `sleep` in the background
+    /// and waits on it. The `sleep` inherits the stdout pipe, as the real
+    /// server a package runner (`npx`, `uvx`) starts does, so the call ends
+    /// only if the disconnect kills the server's descendants too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_client_disconnect_does_not_wait_on_an_in_flight_call() {
         let scp = scp_test();
@@ -23078,7 +23090,7 @@ mod tests {
             echo '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}'; \
             echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\
             \"capabilities\":{},\"serverInfo\":{\"name\":\"stub\"}}}'; \
-            exec sleep 600";
+            sleep 30 & wait";
         let transport = McpStdioTransport::spawn(
             &allowlist,
             &["sh".to_owned(), "-c".to_owned(), script.to_owned()],
@@ -23116,7 +23128,7 @@ mod tests {
             scp_mcp::stdio::stop_server_process(&server);
         }
         let (listed, disconnect_took) =
-            joined.expect("the in-flight call must end once disconnect kills the server");
+            joined.expect("the in-flight call must end once disconnect kills the server's group");
         assert!(
             disconnect_took < std::time::Duration::from_secs(1),
             "disconnect waited {disconnect_took:?} on the in-flight call"
@@ -23691,13 +23703,6 @@ mod tests {
         assert_eq!(result.unwrap(), "prompt_agent");
     }
 
-    // -----------------------------------------------------------------------
-    // #1549 round-2 regression: UniFFI MCP provider + suppression task
-    // must hold `Weak<UniffiBridgeInstance>`, not `Arc`, so the spawned
-    // server task cannot pin the instance alive past the caller's last
-    // `Arc` drop.
-    // -----------------------------------------------------------------------
-
     /// A denied resource read names the requirement the gate checked for that
     /// kind: membership for `Tools`, `messages:read` for `Events`/`Members`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -23768,7 +23773,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn uniffi_invoke_outlet_records_the_token_nonce_and_refuses_its_replay() {
         use scp_platform::traits::KeyCustody as _;
-        let custody = InMemoryKeyCustody::new();
+        let custody = scp_platform::testing::InMemoryKeyCustody::new();
         let key = custody
             .generate_keypair(scp_platform::traits::KeyType::Ed25519)
             .await
@@ -24018,6 +24023,13 @@ mod tests {
             "the dispatched call runs the handler once"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // #1549 round-2 regression: UniFFI MCP provider + suppression task
+    // must hold `Weak<UniffiBridgeInstance>`, not `Arc`, so the spawned
+    // server task cannot pin the instance alive past the caller's last
+    // `Arc` drop.
+    // -----------------------------------------------------------------------
 
     /// A provider whose bridge instance is gone reports its role read as an
     /// error, so `tools/list` cannot turn the failure into "no role" and hide
