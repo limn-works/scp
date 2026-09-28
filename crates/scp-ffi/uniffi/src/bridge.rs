@@ -23646,7 +23646,6 @@ mod tests {
         for (context_id, outlet, arguments) in [
             ("ctx-unknown", "calculator", args.clone()),
             ("ctx-test", "nonexistent", args.clone()),
-            ("ctx-test", "calculator", serde_json::json!("bad")),
             // Registered, but no handler: nothing would run.
             ("ctx-test", "calculator", args.clone()),
         ] {
@@ -23668,6 +23667,24 @@ mod tests {
                     Ok(serde_json::json!({"sum": input["a"]}))
                 },
             ),
+        );
+
+        // The handler is registered, so only the schema check can refuse
+        // this input before the token is spent.
+        assert!(
+            provider
+                .run_outlet(
+                    "ctx-test",
+                    "calculator",
+                    serde_json::json!("bad"),
+                    authorize
+                )
+                .is_err()
+        );
+        assert_eq!(
+            asked.get(),
+            0,
+            "an input the schema rejects must not spend the token"
         );
 
         let refused = provider.run_outlet("ctx-test", "calculator", args.clone(), || {

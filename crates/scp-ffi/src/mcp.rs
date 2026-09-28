@@ -3447,11 +3447,6 @@ mod tests {
         );
         assert!(
             provider
-                .run_outlet(&ctx_id, "calculator", serde_json::json!("bad"), authorize)
-                .is_err()
-        );
-        assert!(
-            provider
                 .run_outlet(&ctx_id, "calculator", args.clone(), authorize)
                 .is_err(),
             "no handler is registered yet"
@@ -3459,6 +3454,18 @@ mod tests {
         assert_eq!(asked.get(), 0, "a refused call must not spend the token");
 
         register_sum_handler(&bi, &ctx_id);
+        // The handler is registered, so only the schema check can refuse
+        // this input before the token is spent.
+        assert!(
+            provider
+                .run_outlet(&ctx_id, "calculator", serde_json::json!("bad"), authorize)
+                .is_err()
+        );
+        assert_eq!(
+            asked.get(),
+            0,
+            "an input the schema rejects must not spend the token"
+        );
         assert!(
             provider
                 .run_outlet(&ctx_id, "calculator", args, authorize)
