@@ -209,21 +209,24 @@ impl SseClientTransport {
         })
     }
 
-    /// POSTs one JSON-RPC message to the session's POST URL and reads the
-    /// answer's status line.
+    /// Opens a connection to the session's POST URL and writes one JSON-RPC
+    /// message to it, returning the connection with its answer unread.
+    ///
+    /// The connection has no read timeout. An SCP SSE server writes the
+    /// POST's status line only after it has run the message and broadcast
+    /// the response, so the wait covers the call itself (a `tools/call`
+    /// waits on its outlet for up to the outlet's timeout) and any wait for
+    /// the server lock. A deadline here would fail calls the server ran, and a caller
+    /// that retried would run them twice. A server that exits closes the
+    /// connection, which ends the read.
     ///
     /// # Errors
     ///
-    /// Returns an error when the connection or write fails, or when the server
-    /// answers outside 2xx: 401 when its bearer check refuses the token, 409
-    /// when a newer `GET` took the session over, 400 or 413 for a refused body.
-    fn post(&self, body: &str) -> Result<(), String> {
+    /// Returns an error when the connection or the write fails.
+    fn send_post(&self, body: &str) -> Result<std::net::TcpStream, String> {
         let (host, port, path) = parse_http_url(&self.post_url)?;
         let addr = format!("{host}:{port}");
         let stream = open_stream(&addr, !self.auth_header.is_empty())?;
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-            .map_err(|e| format!("failed to set read timeout: {e}"))?;
         let mut writer = std::io::BufWriter::new(&stream);
         let head = format!(
             "POST {path} HTTP/1.1\r\n\
@@ -246,6 +249,19 @@ impl SseClientTransport {
             .flush()
             .map_err(|e| format!("failed to flush POST: {e}"))?;
         drop(writer);
+        Ok(stream)
+    }
+
+    /// POSTs one JSON-RPC message to the session's POST URL and reads the
+    /// answer's status line.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the connection or write fails, or when the server
+    /// answers outside 2xx: 401 when its bearer check refuses the token, 409
+    /// when a newer `GET` took the session over, 400 or 413 for a refused body.
+    fn post(&self, body: &str) -> Result<(), String> {
+        let stream = self.send_post(body)?;
 
         let mut status_line = String::new();
         let n = read_line_bounded(&mut BufReader::new(&stream), &mut status_line)
@@ -590,6 +606,47 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(10),
             "a refused POST must fail at once, not after the stream's read timeout"
         );
+        drop(server.join().expect("server thread"));
+    }
+
+    /// A POST's connection carries no read timeout, and a call whose POST
+    /// the server answers only after broadcasting the response still
+    /// succeeds. An SCP SSE server answers each POST after it has run the
+    /// call, so a read deadline on the POST would fail calls the server ran.
+    #[test]
+    fn sse_client_waits_for_a_post_answer_sent_after_the_call_ran() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (_, mut sse) = accept_sse(&listener);
+            let (mut probe, _) = listener.accept().expect("accept probe POST");
+            read_request(&probe);
+            // The client may already have dropped the probe connection.
+            let _ = probe.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n");
+            let (mut conn, _) = listener.accept().expect("accept request POST");
+            read_request(&conn);
+            sse.write_all(
+                b"event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}\r\n\r\n",
+            )
+            .expect("write response");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            conn.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("answer request POST");
+            sse
+        });
+
+        let transport =
+            SseClientTransport::connect(&format!("http://127.0.0.1:{port}/sse"), Some("tok-1"))
+                .expect("connect");
+        let probe = transport.send_post("{}").expect("probe POST");
+        assert_eq!(
+            probe.read_timeout().expect("read timeout"),
+            None,
+            "the POST's answer comes after the call ran, so its read must have no deadline"
+        );
+        drop(probe);
+        let response = transport.send_request(&request(3)).expect("request");
+        assert_eq!(response.id, crate::protocol::RequestId::Number(3));
         drop(server.join().expect("server thread"));
     }
 

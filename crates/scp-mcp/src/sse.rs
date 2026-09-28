@@ -56,7 +56,6 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -219,112 +218,138 @@ impl Default for ShutdownHandle {
 // Shared state
 // ---------------------------------------------------------------------------
 
-/// The server→client push fabric for an SSE session.
-///
-/// Notifications share the SSE event-ID sequence with request responses. The
-/// ids exist for wire framing and diagnostics only: reconnection is a full
-/// resync into a freshly reset session (see the module docs), so there is no
-/// replay machinery and no resume path for the ids to serve.
-pub(crate) struct McpNotifier {
-    /// Broadcast sender for SSE messages to connected clients.
-    ///
-    /// **Shared across sequential sessions, not minted per session.** This
-    /// sender lives on [`AppState`] for the server's whole lifetime; each
-    /// admitted session subscribes a fresh receiver, but they all draw from
-    /// this one sender. Cross-session non-leakage therefore does *not* come
-    /// from channel identity — it comes from two facts that hold together,
-    /// both serialized on the `state.server` mutex:
-    /// 1. every server→client emission's **broadcast is serialized inside** that
-    ///    mutex's critical section, and every principal-content-bearing emission
-    ///    is also *computed* under it (see [`message_handler`] and
-    ///    [`pump_events`]), and
-    /// 2. [`reset_session`](McpServer::reset_session) runs under the *same*
-    ///    mutex at admission (see [`sse_handler`]).
-    ///
-    /// A POST parked on the lock that acquires it just after a reset finds
-    /// its `sessionId` no longer live (see [`AppState::live_session`]) and is
-    /// refused before dispatch, so no prior session's decrypted data (member
-    /// lists, tool outputs, resource reads) can cross to the next client on
-    /// this shared channel.
-    ///
-    /// **Load-bearing:** this safety holds only while `reset_session` stays
-    /// atomic w.r.t. the server lock *and* emission never moves outside it. If
-    /// either changes, the shared channel becomes a cross-principal exposure
-    /// vector, and the fix at that point is per-session channel identity — mint
-    /// the channel at admission, drop it at reset. [`Self::broadcast`] and
-    /// [`Self::notify`] take the lock's guard, so an emission outside the
-    /// lock does not compile.
-    tx: broadcast::Sender<(u64, String)>,
-    /// Monotonically increasing event ID counter.
-    ///
-    /// `fetch_add` makes every assigned id unique, which is all the two
-    /// consumers — SSE `id:` framing and synthetic request ids for incoming
-    /// notifications — require. Two concurrent broadcasts may publish out of
-    /// id order; nothing observes or depends on wire-order ids because
-    /// resume does not exist.
-    next_event_id: AtomicU64,
-}
+/// The notifier lives in its own module so that its sender stays private:
+/// code elsewhere in this file reaches the channel only through the methods
+/// below.
+mod notifier {
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-impl McpNotifier {
-    /// Creates the push fabric for an SSE server built from `config`.
-    fn new(config: &SseConfig) -> Self {
-        let (tx, _rx) = broadcast::channel(config.channel_capacity);
-        Self {
-            tx,
-            next_event_id: AtomicU64::new(1),
-        }
+    use tokio::sync::broadcast;
+
+    use super::SseConfig;
+    use crate::protocol::JsonRpcNotification;
+    use crate::server::{ContextProvider, McpServer};
+
+    /// The server→client push fabric for an SSE session.
+    ///
+    /// Notifications share the SSE event-ID sequence with request responses. The
+    /// ids exist for wire framing and diagnostics only: reconnection is a full
+    /// resync into a freshly reset session (see the module docs), so there is no
+    /// replay machinery and no resume path for the ids to serve.
+    pub(super) struct McpNotifier {
+        /// Broadcast sender for SSE messages to connected clients.
+        ///
+        /// **Shared across sequential sessions, not minted per session.** This
+        /// sender lives on [`AppState`](super::AppState) for the server's whole
+        /// lifetime; each admitted session subscribes a fresh receiver, but they
+        /// all draw from this one sender. Cross-session non-leakage therefore
+        /// does *not* come from channel identity — it comes from two facts that hold together,
+        /// both serialized on the `state.server` mutex:
+        /// 1. every server→client emission's **broadcast is serialized inside** that
+        ///    mutex's critical section, and every principal-content-bearing emission
+        ///    is also *computed* under it (see
+        ///    [`message_handler`](super::message_handler) and
+        ///    [`pump_events`](super::pump_events)), and
+        /// 2. [`reset_session`](McpServer::reset_session) runs under the *same*
+        ///    mutex at admission (see [`sse_handler`](super::sse_handler)).
+        ///
+        /// A POST parked on the lock that acquires it just after a reset finds
+        /// its `sessionId` no longer live (see
+        /// [`AppState::live_session`](super::AppState::live_session)) and is
+        /// refused before dispatch, so no prior session's decrypted data (member
+        /// lists, tool outputs, resource reads) can cross to the next client on
+        /// this shared channel.
+        ///
+        /// **Load-bearing:** this safety holds only while `reset_session` stays
+        /// atomic w.r.t. the server lock *and* emission never moves outside it. If
+        /// either changes, the shared channel becomes a cross-principal exposure
+        /// vector, and the fix at that point is per-session channel identity — mint
+        /// the channel at admission, drop it at reset. This field is private to
+        /// the `notifier` module, so code outside it can only subscribe (see
+        /// [`Self::subscribe`]) or emit through [`Self::broadcast`] and
+        /// [`Self::notify`]. Both take the guard of a locked
+        /// `Mutex<McpServer<P>>`, so an emission with no such lock held does not
+        /// compile. The type cannot tell `state.server` from another mutex of
+        /// that type; `state.server` is the only one this transport builds.
+        tx: broadcast::Sender<(u64, String)>,
+        /// Monotonically increasing event ID counter.
+        ///
+        /// `fetch_add` makes every assigned id unique, which is all the two
+        /// consumers — SSE `id:` framing and synthetic request ids for incoming
+        /// notifications — require. Two concurrent broadcasts may publish out of
+        /// id order; nothing observes or depends on wire-order ids because
+        /// resume does not exist.
+        next_event_id: AtomicU64,
     }
 
-    /// Broadcasts a JSON payload to all connected SSE clients. Returns the
-    /// assigned event ID.
-    ///
-    /// `_held` is the guard of the `state.server` lock. Requiring it makes a
-    /// broadcast after the caller released that lock fail to compile, which
-    /// keeps every emission inside the critical section described on
-    /// [`Self::tx`].
-    fn broadcast<P: ContextProvider>(
-        &self,
-        _held: &tokio::sync::MutexGuard<'_, McpServer<P>>,
-        data: String,
-    ) -> u64 {
-        let id = self.next_event_id.fetch_add(1, Ordering::SeqCst);
-        let _ = self.tx.send((id, data));
-        id
-    }
-
-    /// Sends a JSON-RPC notification to all connected SSE clients.
-    ///
-    /// Returns the number of connected clients the notification was
-    /// broadcast to, or 0 if serialization fails or nobody is connected.
-    /// A return of 0 with nobody connected is not an error: the transport is
-    /// single-session and every admission resets the session, so a later
-    /// client starts from a fresh handshake and re-reads current state
-    /// rather than depending on notifications sent before it attached.
-    ///
-    /// `held` is the guard of the `state.server` lock, as for
-    /// [`Self::broadcast`].
-    fn notify<P: ContextProvider>(
-        &self,
-        held: &tokio::sync::MutexGuard<'_, McpServer<P>>,
-        notification: &JsonRpcNotification,
-    ) -> usize {
-        match serde_json::to_string(notification) {
-            Ok(json) => {
-                self.broadcast(held, json);
-                self.tx.receiver_count()
-            }
-            Err(e) => {
-                tracing::error!("failed to serialize MCP notification: {e}");
-                0
+    impl McpNotifier {
+        /// Creates the push fabric for an SSE server built from `config`.
+        pub(super) fn new(config: &SseConfig) -> Self {
+            let (tx, _rx) = broadcast::channel(config.channel_capacity);
+            Self {
+                tx,
+                next_event_id: AtomicU64::new(1),
             }
         }
-    }
 
-    /// Reserves the next event ID in the shared sequence.
-    fn next_id(&self) -> u64 {
-        self.next_event_id.fetch_add(1, Ordering::SeqCst)
+        /// Broadcasts a JSON payload to all connected SSE clients. Returns the
+        /// assigned event ID.
+        ///
+        /// `_held` is the guard of the `state.server` lock. Requiring it makes a
+        /// broadcast with no `Mutex<McpServer<P>>` locked fail to compile, which
+        /// keeps every emission inside the critical section described on
+        /// [`Self::tx`].
+        pub(super) fn broadcast<P: ContextProvider>(
+            &self,
+            _held: &tokio::sync::MutexGuard<'_, McpServer<P>>,
+            data: String,
+        ) -> u64 {
+            let id = self.next_event_id.fetch_add(1, Ordering::SeqCst);
+            let _ = self.tx.send((id, data));
+            id
+        }
+
+        /// Sends a JSON-RPC notification to all connected SSE clients.
+        ///
+        /// Returns the number of connected clients the notification was
+        /// broadcast to, or 0 if serialization fails or nobody is connected.
+        /// A return of 0 with nobody connected is not an error: the transport is
+        /// single-session and every admission resets the session, so a later
+        /// client starts from a fresh handshake and re-reads current state
+        /// rather than depending on notifications sent before it attached.
+        ///
+        /// `held` is the guard of the `state.server` lock, as for
+        /// [`Self::broadcast`].
+        pub(super) fn notify<P: ContextProvider>(
+            &self,
+            held: &tokio::sync::MutexGuard<'_, McpServer<P>>,
+            notification: &JsonRpcNotification,
+        ) -> usize {
+            match serde_json::to_string(notification) {
+                Ok(json) => {
+                    self.broadcast(held, json);
+                    self.tx.receiver_count()
+                }
+                Err(e) => {
+                    tracing::error!("failed to serialize MCP notification: {e}");
+                    0
+                }
+            }
+        }
+
+        /// Reserves the next event ID in the shared sequence.
+        pub(super) fn next_id(&self) -> u64 {
+            self.next_event_id.fetch_add(1, Ordering::SeqCst)
+        }
+
+        /// Subscribes a receiver to every later emission. Subscribing sends
+        /// nothing, so it needs no guard.
+        pub(super) fn subscribe(&self) -> broadcast::Receiver<(u64, String)> {
+            self.tx.subscribe()
+        }
     }
 }
+use notifier::McpNotifier;
 
 /// Shared state between the SSE endpoint and the POST endpoint.
 pub(crate) struct AppState<P: ContextProvider> {
@@ -660,7 +685,7 @@ async fn sse_handler<P: ContextProvider + 'static>(
         .live_session
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session_id.clone());
-    let rx = state.notifier.tx.subscribe();
+    let rx = state.notifier.subscribe();
     // Released only once the session is live and its receiver subscribed.
     drop(server);
 
@@ -1250,7 +1275,7 @@ mod tests {
     #[tokio::test]
     async fn message_handler_processes_initialize() {
         let state = test_state();
-        let mut rx = state.notifier.tx.subscribe();
+        let mut rx = state.notifier.subscribe();
 
         assert_eq!(post(&state, initialize_body(1)).await, StatusCode::ACCEPTED);
 
@@ -1264,7 +1289,7 @@ mod tests {
     #[tokio::test]
     async fn message_handler_processes_ping() {
         let state = test_state();
-        let mut rx = state.notifier.tx.subscribe();
+        let mut rx = state.notifier.subscribe();
 
         let ping = serde_json::json!({ "jsonrpc": "2.0", "method": METHOD_PING, "id": 42 });
         assert_eq!(post(&state, ping).await, StatusCode::ACCEPTED);
@@ -1281,7 +1306,7 @@ mod tests {
     #[tokio::test]
     async fn message_handler_handles_notification() {
         let state = test_state();
-        let mut rx = state.notifier.tx.subscribe();
+        let mut rx = state.notifier.subscribe();
         let initialized = serde_json::json!({ "jsonrpc": "2.0", "method": METHOD_INITIALIZED });
 
         assert_eq!(
@@ -1339,7 +1364,7 @@ mod tests {
     #[tokio::test]
     async fn send_notification_broadcasts_to_receivers() {
         let state = test_state();
-        let mut rx = state.notifier.tx.subscribe();
+        let mut rx = state.notifier.subscribe();
 
         let notif = McpServer::<MockProvider>::tools_list_changed_notification();
         let count = state.notifier.notify(&state.server.lock().await, &notif);
@@ -1418,7 +1443,7 @@ mod tests {
         });
 
         // A client attaches to the SSE stream.
-        let mut client = state.notifier.tx.subscribe();
+        let mut client = state.notifier.subscribe();
 
         let pump = tokio::spawn(pump_events(Arc::clone(&state), pump_source.into_receiver()));
 
@@ -1458,7 +1483,7 @@ mod tests {
             live_session: std::sync::Mutex::new(None),
         });
 
-        let mut client = state.notifier.tx.subscribe();
+        let mut client = state.notifier.subscribe();
         let pump = tokio::spawn(pump_events(Arc::clone(&state), pump_source.into_receiver()));
 
         event_tx
@@ -1480,7 +1505,7 @@ mod tests {
     #[tokio::test]
     async fn broadcast_assigns_sequential_ids() {
         let state = test_state();
-        let mut rx = state.notifier.tx.subscribe();
+        let mut rx = state.notifier.subscribe();
 
         let held = state.server.lock().await;
         let id1 = state.notifier.broadcast(&held, "msg-1".to_owned());
@@ -2117,11 +2142,11 @@ mod tests {
     #[tokio::test]
     async fn synthetic_notification_ids_are_unique() {
         let state = test_state();
-        let mut rx = state.notifier.tx.subscribe();
+        let mut rx = state.notifier.subscribe();
         assert_eq!(post(&state, initialize_body(0)).await, StatusCode::ACCEPTED);
         next_response(&mut rx).await;
 
-        let before = state.notifier.next_event_id.load(Ordering::SeqCst);
+        let before = state.notifier.next_id();
         let initialized = serde_json::json!({ "jsonrpc": "2.0", "method": METHOD_INITIALIZED });
         for _ in 0..2 {
             assert_eq!(
@@ -2130,9 +2155,9 @@ mod tests {
             );
         }
         assert_eq!(
-            state.notifier.next_event_id.load(Ordering::SeqCst),
-            before + 2,
-            "each notification must draw exactly one fresh id"
+            state.notifier.next_id(),
+            before + 3,
+            "each notification must draw exactly one fresh id between the two reservations"
         );
         assert!(nothing_broadcast(&mut rx));
     }
@@ -2348,7 +2373,7 @@ mod tests {
         let (server, _pump) = subscribed_server("scp://ctx_a/events", event_rx);
         let state = test_state();
         *state.server.lock().await = server;
-        let mut rx = state.notifier.tx.subscribe();
+        let mut rx = state.notifier.subscribe();
 
         let call = serde_json::json!({
             "jsonrpc": "2.0",
@@ -2404,7 +2429,7 @@ mod tests {
     #[tokio::test]
     async fn response_broadcast_is_serialized_under_the_server_lock() {
         let state = test_state();
-        let mut rx = state.notifier.tx.subscribe();
+        let mut rx = state.notifier.subscribe();
 
         // Stand in for the reset task / next admission holding the server lock.
         let guard = state.server.lock().await;
