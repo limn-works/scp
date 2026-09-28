@@ -92,9 +92,17 @@ pub fn derive_key_pair(ikm: &[u8]) -> Result<P256SigningKey, HpkeError> {
         )));
     }
     let dkp_prk = labeled_extract(b"", &KEM_SUITE_ID, b"dkp_prk", ikm);
-    select_candidate(|counter, candidate| {
-        labeled_expand(&dkp_prk, &KEM_SUITE_ID, b"candidate", &[counter], candidate)
-    })
+    select_candidate(|counter, candidate| expand_candidate(&dkp_prk, counter, candidate))
+}
+
+/// One `DeriveKeyPair` expansion (RFC 9180 §7.1.3):
+/// `LabeledExpand(dkp_prk, "candidate", I2OSP(counter, 1), Nsk)`.
+fn expand_candidate(
+    dkp_prk: &[u8; 32],
+    counter: u8,
+    out: &mut [u8; PRIVATE_KEY_LEN],
+) -> Result<(), HpkeError> {
+    labeled_expand(dkp_prk, &KEM_SUITE_ID, b"candidate", &[counter], out)
 }
 
 /// The `DeriveKeyPair` rejection loop: for `counter` in `0..=255`, `expand`
@@ -803,6 +811,36 @@ mod tests {
         })?;
         assert_eq!(seen, [0, 1, 2], "counters tried");
         assert_eq!(*sk.to_scalar_bytes(), chosen, "counter-2 candidate chosen");
+        Ok(())
+    }
+
+    /// `expand_candidate` at counters 0, 1 and 255 equals an independent
+    /// HKDF-Expand of `I2OSP(32, 2) || "HPKE-v1" || "KEM" || 0x0010 ||
+    /// "candidate" || counter`, and counters 1 and 255 differ from counter 0.
+    #[test]
+    fn expand_candidate_binds_the_counter() -> TestResult {
+        let prk = arr::<32>(SK_RM)?;
+        let independent = |counter: u8| -> Result<[u8; 32], String> {
+            let mut info = Vec::new();
+            info.extend_from_slice(&[0x00, 0x20]);
+            info.extend_from_slice(b"HPKE-v1");
+            info.extend_from_slice(b"KEM\x00\x10");
+            info.extend_from_slice(b"candidate");
+            info.push(counter);
+            let mut out = [0u8; 32];
+            hkdf::Hkdf::<sha2::Sha256>::from_prk(&prk)
+                .map_err(|e| e.to_string())?
+                .expand(&info, &mut out)
+                .map_err(|e| e.to_string())?;
+            Ok(out)
+        };
+        let mut at = [[0u8; 32]; 3];
+        for (slot, counter) in at.iter_mut().zip([0u8, 1, 255]) {
+            expand_candidate(&prk, counter, slot)?;
+            assert_eq!(*slot, independent(counter)?, "counter {counter}");
+        }
+        assert_ne!(at[1], at[0], "counter 1 differs from counter 0");
+        assert_ne!(at[2], at[0], "counter 255 differs from counter 0");
         Ok(())
     }
 
