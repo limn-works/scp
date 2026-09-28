@@ -130,10 +130,12 @@ identity as examples/identity.rs is not included in the published package`.
 
 A reviewer then traced the cause one step further. `scp-runtime` declares `scp-dht` as a
 normal dependency, which survives publication, and every other consumer of `scp-dht` in
-this workspace already carries `scp-dht/testing` inside its own `testing` feature list:
-`crates/scp-identity/Cargo.toml`, `crates/scp-node/Cargo.toml`, `crates/scp-ffi/Cargo.toml`,
-`crates/scp-ffi/napi/Cargo.toml`, `crates/scp-ffi/common/Cargo.toml`, and
-`crates/scp-ffi/uniffi/Cargo.toml`. Story SCP-CAPINJECT-001 of the capability-injection PRD,
+this workspace that declares a `testing` feature already carries `scp-dht/testing` inside
+that feature's list: `crates/scp-identity/Cargo.toml`, `crates/scp-node/Cargo.toml`,
+`crates/scp-ffi/Cargo.toml`, `crates/scp-ffi/napi/Cargo.toml`,
+`crates/scp-ffi/common/Cargo.toml`, `crates/scp-ffi/uniffi/Cargo.toml`, and
+`crates/scp-testing/Cargo.toml`. `crates/scp-transport/Cargo.toml` also depends on `scp-dht`
+and declares no `testing` feature, so it has no list to carry the edge. Story SCP-CAPINJECT-001 of the capability-injection PRD,
 `.docs/prds/adr062-capability-injection.json`, requires that edge of each consumer, and
 `scp-runtime` was the one consumer that omitted it. Adding `scp-dht/testing` to the
 `testing` list in `crates/scp-runtime/Cargo.toml` makes the example compile for a consumer,
