@@ -1114,4 +1114,23 @@ mod tests {
             CounterpartyPolicy::Redacted
         );
     }
+
+    /// §25.14 Vector 27: the pseudonym the production `pseudonymize_did`
+    /// derives from the spec inputs. The member is the §25.1 fixture
+    /// identifier pseudonymized member.
+    #[test]
+    fn spec_25_vector_27_pseudonymize_did() {
+        let pseudonym = pseudonymize_did(
+            &DID::from("scp:op44kdck7awcy7szako3hn72h4himmwiez3ongmzxlcao3syf7na"),
+            "test-context-01",
+            b"test-pseudonym-key",
+        );
+        assert_eq!(
+            pseudonym,
+            DID::from(
+                "did:pseudo:8fac3766eee1f083b0e52ee261c3ae79773ceed3dc1fb36ed171cbe91022fa60"
+            ),
+            "§25.14 Vector 27 pseudonym drift"
+        );
+    }
 }

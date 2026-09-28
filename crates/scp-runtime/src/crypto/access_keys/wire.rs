@@ -654,6 +654,26 @@ mod tests {
     // HPKE info string tests
     // -----------------------------------------------------------------------
 
+    /// §25.12 Vector 25: the access-key HPKE info string the production
+    /// `build_hpke_info` builds from the spec inputs. The member is the
+    /// §25.1 fixture identifier hpke member.
+    #[test]
+    fn spec_25_vector_25_access_key_hpke_info() {
+        let info = build_hpke_info(
+            "hpke-test-context",
+            "scp:4ggxxxop37nk6djtrfoclzjx6s7bi44zcsf6v4qit2zpoctr5tea",
+            42,
+        );
+        assert_eq!(info.len(), 106, "§25.12 Vector 25 length drift");
+        assert_eq!(
+            hex::encode(&info),
+            "7363702d6163636573732d6b65792d76310000001168706b652d746573742d636f6e74657874\
+             000000387363703a3467677878786f7033376e6b36646a7472666f636c7a6a78367337626934\
+             347a637366367634716974327a706f63747235746561000000000000002a",
+            "§25.12 Vector 25 info drift"
+        );
+    }
+
     #[test]
     fn build_hpke_info_uses_correct_domain_separator() {
         let info = build_hpke_info("ctx-1", "did:dht:alice", 0);

@@ -10,9 +10,9 @@ This section carries known-answer test vectors for SCP's cryptographic construct
 python3.12 scripts/gen-test-vectors-p256.py
 ```
 
-The script uses nothing outside the Python standard library, and it self-gates before it prints a byte: it checks itself against `SHA-256("")`, the RFC 6979 Appendix A.2.5 P-256 nonce and signature, RFC 5869 Appendix A.1 for HKDF-SHA256, and this section's own curve-independent `DataProvenance` hash (Vector 35), and it computes every public key twice by two scalar multiplications sharing no arithmetic, and a third time through the `cryptography` package where that package imports. A mismatch raises before anything prints.
+The script uses nothing outside the Python standard library, and it self-gates before it prints a byte: it checks itself against `SHA-256("")`, the RFC 6979 Appendix A.2.5 P-256 nonce and signature, RFC 5869 Appendix A.1 for HKDF-SHA256, and the Vector 35 `DataProvenance` hash, which the Rust KAT that §25.8 names computes independently through `rmp_serde`, and it computes every public key twice by two scalar multiplications sharing no arithmetic, and a third time through the `cryptography` package where that package imports. A mismatch raises before anything prints.
 
-**Identifier strings in the fixtures.** The vectors that print a fixture string of the shape `"did:dht:z6Mk…"` or `"did:key:…"` where a signed structure takes an identifier as UTF-8 bytes predate the change to the key-event-log identity. They are not current: a parser rejects such a string with `IdentityError::NonCanonicalIdentifier` (`03-identity.md` §3.1), and the P-256 slice regenerates those vectors with identifiers in the `scp:` text form. Vector 57 of §25.29 pins that form.
+**Identifier strings in the fixtures.** Where a signed or hashed structure takes a fixture party's identifier as UTF-8 bytes, the vectors print it in the `scp:` text form that Vector 57 of §25.29 pins: `"scp:"` followed by the lowercase, unpadded RFC 4648 base32 of the 32-byte identifier, 56 characters in all, so each such field carries the length prefix `BE32(56)` or the MessagePack header `0xd9 0x38`. Each fixture party's 32-byte identifier is `SHA-256("SCP test vector identifier <role>")` over the ASCII label, with one role per party, following the precedent of §25.9. The 24 roles, each `<role>` exactly as the label spells it, are `a`, `agent`, `alice`, `announcing member`, `app`, `b`, `bob`, `carol`, `claimant`, `dave`, `event-log actor`, `hpke member`, `hpke sender`, `issuer`, `leaf attester`, `m`, `new member`, `other member`, `proposer`, `pseudonymized member`, `sender`, `subject`, `sync member`, `voter`. A fixture identifier is bound to no key: the vectors that carry one pin a preimage, not a binding between an identifier and the key that signs it. The rule covers the fixture parties only: Vector 52's signed export preimage carries the literal snapshot string `"creator_did":"<scp-identifier:creator>"`, which is not an identifier in the `scp:` form, and Vectors 41 through 57 are unchanged by it.
 
 **What a signature covers.** Every SCP signature here is an ECDSA signature over a 32-byte canonical hash, so the ECDSA message digest **is** that canonical hash and no second SHA-256 reaches it. The vectors run RFC 6979 with `h1` set to that same digest, because §9.5 fixes RFC 6979 with SHA-256 for a software signer and states no value for `h1` under a prehashed digest. An implementation that hashes the digest a second time reproduces none of the signature bytes below.
 
@@ -133,7 +133,8 @@ Input:
   version:           256 (0x0100 — SCP/1.0)
   message_type:      0x00 (Standard discriminator byte)
   context_id:       "test-context-01"
-  sender_did:       "did:dht:z6MkTest"
+  sender_did:       "scp:hv6a3pfs4qcibthh3kaekzhfo2xxqlfnie7ups6hvcsqsmkipyla"
+                    (the identifier SHA-256("SCP test vector identifier sender") in text form)
   epoch:            1
   generation_number: 0
   sequence_number:  0
@@ -147,7 +148,7 @@ Canonical hash input (concatenated bytes):
   || BE16(256)                                  (2 bytes — version, 0x01 0x00)
   || 0x00                                      (1 byte — message_type discriminator)
   || BE32(15) || "test-context-01"             (4 + 15 = 19 bytes)
-  || BE32(16) || "did:dht:z6MkTest"           (4 + 16 = 20 bytes)
+  || BE32(56) || sender_did                    (4 + 56 = 60 bytes)
   || BE64(1)                                   (8 bytes — epoch)
   || BE64(0)                                   (8 bytes — generation_number)
   || BE64(0)                                   (8 bytes — sequence_number)
@@ -156,16 +157,16 @@ Canonical hash input (concatenated bytes):
   || BE32(32) || SHA-256(0x00)                 (4 + 32 = 36 bytes — absent provenance)
   || BE32(7)  || "#active"                     (4 + 7 = 11 bytes)
 
-Total: 22 + 2 + 1 + 19 + 20 + 8 + 8 + 8 + 8 + 36 + 36 + 11 = 179 bytes
+Total: 22 + 2 + 1 + 19 + 60 + 8 + 8 + 8 + 8 + 36 + 36 + 11 = 219 bytes
 
-Preimage (hex, 179 bytes):
-  5343502d494e4e45522d454e56454c4f50452d56313a0100000000000f746573742d636f6e746578742d3031000000106469643a6468743a7a364d6b54657374000000000000000100000000000000000000000000000000000000006553f10000000020b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9000000206e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d0000000723616374697665
+Preimage (hex, 219 bytes):
+  5343502d494e4e45522d454e56454c4f50452d56313a0100000000000f746573742d636f6e746578742d3031000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c61000000000000000100000000000000000000000000000000000000006553f10000000020b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9000000206e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d0000000723616374697665
 
 Canonical hash SHA-256(preimage) (32 bytes):
-  0xe3fe1d0310b5eb15de46f22afa1995735253ce07b9960acfbdc50901c4c04c32
+  0xcdc77fc58cb85548ba41ba1f5f074182a6af339847af091bf33020eb9fefab59
 
 RFC 6979 signature over the canonical hash, reference key, 64-byte raw r || s:
-  0x1e71a01bc73549f3aafd387df0b1efc866fcb008a0af0aba0c714178aab23a073b2448f046955ba5baa61a2d41ff800dee49d03d8671586b0b710282d857e05f
+  0xe497dc3efd4154502252aefe673479166c0550d7b85255caa9dacab08178eb2109bb6c4226340c1bed189e7c5c187ae54f484dd174954a6debd301823116bf46
 
 Verification vector:
   public key: 0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
@@ -190,14 +191,14 @@ Canonical hash input changes:
   Position 8 (provenance_hash): BE32(32) || 0xabcdef...
   (replaces the SHA-256(0x00) sentinel)
 
-Preimage (hex, 179 bytes):
-  5343502d494e4e45522d454e56454c4f50452d56313a0100000000000f746573742d636f6e746578742d3031000000106469643a6468743a7a364d6b54657374000000000000000100000000000000000000000000000000000000006553f10000000020b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde900000020abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567890000000723616374697665
+Preimage (hex, 219 bytes):
+  5343502d494e4e45522d454e56454c4f50452d56313a0100000000000f746573742d636f6e746578742d3031000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c61000000000000000100000000000000000000000000000000000000006553f10000000020b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde900000020abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567890000000723616374697665
 
 Canonical hash SHA-256(preimage) (32 bytes):
-  0x225dae627d1d452ef405c454f5360f3963aa0f7b0aa1e25fcd079c28899a0bac
+  0xdfb243d4574dec6c798782906e381ed875f18b9b2b14a8bd87d0b2e8df1e1c1b
 
 RFC 6979 signature over the canonical hash, reference key, 64-byte raw r || s:
-  0xd367c6babbc1c5f428a28b791b4315d6e48a03364b17d93a5539bc5481eac746226afabede6626a059cbbbf9de31a30d6137b9532cde98fdea84fe1c4ebfd77c
+  0x5a52a4b0e87965a109a82439cd905eae241543be579e42d963713feae3f312406c2b0fdc15deaf5d3d40b41990f147c4c63cd702e16d2e656386bcf922a97203
 
 Verification vector:
   public key: 0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
@@ -215,27 +216,28 @@ Domain: `"SCP-VOTE-V1:"`
 ```
 Input:
   proposal_id:  0x0102030405060708091011121314151617181920212223242526272829303132
-  voter_did:    "did:dht:z6MkVoter"
+  voter_did:    "scp:bbxkpyevxkco6odwvddqgluf3ug2a3qj3lacn4olgxtpshuk4a6a"
+                (the identifier SHA-256("SCP test vector identifier voter") in text form)
   vote_type:    VoteType::Approve (JSON: "Approve", 9 bytes with quotes)
   timestamp:    1700000000
 
 Canonical hash input (per §9.5.2 SignedVote):
   "SCP-VOTE-V1:"                                           (12 bytes)
   || proposal_id                                            (32 bytes, fixed-length)
-  || BE32(17)  || "did:dht:z6MkVoter"                      (4 + 17 = 21 bytes)
+  || BE32(56)  || voter_did                                (4 + 56 = 60 bytes)
   || BE32(9)   || "\"Approve\""                             (4 + 9 = 13 bytes, JSON)
   || BE64(1700000000)                                       (8 bytes)
 
-Total: 12 + 32 + 21 + 13 + 8 = 86 bytes
+Total: 12 + 32 + 60 + 13 + 8 = 125 bytes
 
-Preimage (hex, 86 bytes):
-  5343502d564f54452d56313a0102030405060708091011121314151617181920212223242526272829303132000000116469643a6468743a7a364d6b566f7465720000000922417070726f766522000000006553f100
+Preimage (hex, 125 bytes):
+  5343502d564f54452d56313a0102030405060708091011121314151617181920212223242526272829303132000000387363703a6262786b70796576786b636f366f647776646471676c7566337567326133716a336c61636e346f6c677874707368756b346136610000000922417070726f766522000000006553f100
 
 Canonical hash SHA-256(preimage) (32 bytes):
-  0x30a5f33bc023a00c7f2f3deafe20a9097d5e3ab1ac5d3155fecc7196f61a9713
+  0x3a0c35742f6ddd8c3a935f924ede5ca85ad905c1312ca99e18eb618223769c67
 
 RFC 6979 signature over the canonical hash, reference key, 64-byte raw r || s:
-  0x6f6892475ccb7bbeba00223ff906ff4cd9a5d92fa6551b8944561c4f2d36fe296d4a622332cee863aee40b52e38e61a3e88b2fb0ae683770026a23a580777050
+  0xa67326a389ccc007e8980df47d08fd7c650967dbcda44518d161515a04f4df986a6255182635d282d4c77a9ae8948a8986ab48235ef93d377038454a341ed891
 
 Verification vector:
   public key: 0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
@@ -257,7 +259,8 @@ Domain: `"SCP-RESET-REQUEST-V1:"`
 ```
 Input:
   context_id:       "sync-test-context"
-  member_did:       "did:dht:z6MkSync"
+  member_did:       "scp:ufveadjgygwpujfense3z6e6jwthxmug26owvhrjnvzdfjkjrq5q"
+                    (the identifier SHA-256("SCP test vector identifier sync member") in text form)
   last_known_epoch: 42
   reason:           "extended offline (8 days)" (ResetReason::ExtendedOffline { offline_duration_secs: 691200 } → Display string)
   nonce:            0x01020304050607080910111213141516 (16 bytes)
@@ -266,22 +269,22 @@ Input:
 Canonical hash input (per §23.5.2, field order from code):
   "SCP-RESET-REQUEST-V1:"                     (21 bytes)
   || BE32(17) || "sync-test-context"           (4 + 17 = 21 bytes)
-  || BE32(16) || "did:dht:z6MkSync"           (4 + 16 = 20 bytes)
+  || BE32(56) || member_did                    (4 + 56 = 60 bytes)
   || BE64(42)                                  (8 bytes — last_known_epoch)
   || BE32(25) || "extended offline (8 days)"   (4 + 25 = 29 bytes — reason)
   || nonce                                     (16 bytes, fixed-length, no length prefix)
   || BE64(1700000000)                          (8 bytes)
 
-Total: 21 + 21 + 20 + 8 + 29 + 16 + 8 = 123 bytes
+Total: 21 + 21 + 60 + 8 + 29 + 16 + 8 = 163 bytes
 
-Preimage (hex, 123 bytes):
-  5343502d52455345542d524551554553542d56313a0000001173796e632d746573742d636f6e74657874000000106469643a6468743a7a364d6b53796e63000000000000002a00000019657874656e646564206f66666c696e6520283820646179732901020304050607080910111213141516000000006553f100
+Preimage (hex, 163 bytes):
+  5343502d52455345542d524551554553542d56313a0000001173796e632d746573742d636f6e74657874000000387363703a7566766561646a6779677770756a66656e7365337a3665366a777468786d756732366f777668726a6e767a64666a6b6a72713571000000000000002a00000019657874656e646564206f66666c696e6520283820646179732901020304050607080910111213141516000000006553f100
 
 Canonical hash SHA-256(preimage) (32 bytes):
-  0xbb28e647cd66832e23e8fa9570f3e05f938bab15c10b03488109d84c75eacefd
+  0x1c0dc57c74a1b6f1072d65aa87c8d2de3ed3ed921c22d6754e5d6f8137ae8b6e
 
 RFC 6979 signature over the canonical hash, reference key, 64-byte raw r || s:
-  0x31489688422b7e418b1dcd66353b9f689ccdb2128470c57dd2295d59ed28d93f0206cb8496630ae70fd3a04e79ad65d4f53a9582dbd3d31a45a68550d420022c
+  0xadfb7ae6be806d4e7bef5f97a7e996d5b071e31d488ca331b144928119cd137a21071a52305eea42a704daef9cc498e09eec8dec0720ab76bcdb7d88f85dfed2
 
 Verification vector:
   public key: 0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
@@ -290,7 +293,7 @@ Verification vector:
   verdict:    accept
 ```
 
-The `nonce` above carries 16 bytes, which is the width the field list states and the width the 123-byte total assumes. Before 2026-09-10 this vector printed a 17-byte literal beside the label "16 bytes", so an implementer following §25.17 step 3 would have measured 124 bytes against a stated 123 and read a correct encoding as wrong.
+The `nonce` above carries 16 bytes, which is the width the field list states and the width the 163-byte total assumes. Before 2026-09-10 this vector printed a 17-byte literal beside the label "16 bytes", so an implementer following §25.17 step 3 would have measured one byte more than the stated total and read a correct encoding as wrong.
 
 ## 25.7 Envelope Padding Vectors (§9.10)
 
@@ -449,59 +452,64 @@ Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log
 
 **MessagePack layout of a signed `Event`.** The seven fields serialize positionally, so an implementer reproduces the bytes without reading Rust: a 7-element array holding the `EventType` variant **name** as a string, the actor DID as a string, the timestamp as an unsigned integer, the sequence as an unsigned integer, the one-element `EventPayload` array holding the payload as a MessagePack binary, the 32-byte `prev_hash` as a 32-element array of unsigned integers, and the 64-byte signature as a MessagePack binary. The signed value is `SHA-256("SCP-EVENT-V1:" || BE16(event_type_tag) || BE32(len(actor_did)) || actor_did || BE64(timestamp) || BE64(sequence) || BE32(len(payload)) || payload || prev_hash)`.
 
-**The actor DID is an opaque UTF-8 string here.** This vector states its actor DID as a literal fixture string, which §25.1's note on fixture strings covers, rather than deriving one from the signing key, and pins the typed-leaf preimage and the RFC 6962 root, which is what it exists to pin.
+**The actor and payload identifiers are fixture identifiers.** Each is `SHA-256("SCP test vector identifier <role>")` in the `scp:` text form, with the role in parentheses below (§25.1). The actor identifier is not derived from the signing key: this vector pins the typed-leaf preimage and the RFC 6962 root, not a binding between an identifier and a key.
 
 ```
 Signing key: the §25.2 reference P-256 key (seed 0x9d61b1…7f60)
-Actor DID:   "did:dht:z6MkEventLogKat"
+Actor DID:   "scp:gweyicxangesw4cafjfvafnt2cusxvt7nxked4z6356q4fzkmqoa"  (event-log actor)
 Context ID:  "ctx-kat"
 
 Events (append order; each prev_hash = previous leaf hash, genesis = [0u8;32]):
 
   seq 0  AppBound                 ts 1700000000  tag 74
-         payload = rmp(AppBoundPayload{ app_did:"did:key:app", app_name:"Scheduler",
+         payload = rmp(AppBoundPayload{ app_did:"scp:n5hzj47neu6axurs4j5c2raqo3bvyxmuhir75dypf5enuktwmzga" (app),
+                       app_name:"Scheduler",
                        app_version:"1.0.0", capabilities:["outlet:call:*"] })
-         leaf = 0x1af68450213d8e584be72c8f573aa4ca10dd3a9b9fc465857a751a33a3aaca63
+         leaf = 0x5f0b7494633bf4e50df0734a73431985184a88ac0d31700f25cf32923b232ba9
 
   seq 1  SpendApproved            ts 1700000001  tag 65
-         payload = rmp(SpendApprovedPayload{ spender:"did:key:agent", amount:5000,
+         payload = rmp(SpendApprovedPayload{ spender:"scp:gugakbvop4hkbtpmivkcnpm6z75kvk5nrk35wnfiwkxn2tv5cegq" (agent),
+                       amount:5000,
                        purpose:"inference" })
-         leaf = 0xb8654f49e00c329133f562666670b341ac2928d6e260ef7d31385dc60bb79fa1
+         leaf = 0x69ac3c845a002b16f0ef612b73419f8cc56ecb061c062328a5c4efbca97c5e79
 
   seq 2  TtlExtended              ts 1700000002  tag 62
          payload = rmp(TtlExtendedPayload{ old_deadline_unix:1700000000,
                        new_deadline_unix:1800000000, proposal_id:[0xAB;32],
-                       consenting_members:["did:key:a","did:key:b"] })
-         leaf = 0xe0c4fe4394c6befeaabfd65f829e31402c0cb570da352250204da7b8dd4d2026
+                       consenting_members:["scp:i3cbnrsij6l54zihsollo6mzasshwszcz5uoi6j5a3hv7x4s24ca" (a),
+                       "scp:ihyapxk7wahtonmyfkolh4c2sq5vd52u3f477ik3xc5fontsqima" (b)] })
+         leaf = 0x4312aeeb911f88a1ba67ed94aa796f4a5660e1c701fa41945dc0f94cf3245465
 
   seq 3  RecoveryEpochAdvanced    ts 1700000003  tag 73
          payload = rmp(RecoveryEpochAdvancedPayload{ old_epoch:7, new_epoch:8 })
-         leaf = 0x7601b953cbdb0facc67e8d14534d2d867db1d3294ef1ebaf794c36b8387fb5e2
+         leaf = 0x65857aebf0d00dc53adf6cb23911b12aeee9b1e57a416c947fe82f2b2c7716b1
 
   seq 4  ContextTombstoned        ts 1700000004  tag 60
          payload = rmp(ContextTombstonedPayload{ destination_id:"ctx-dest",
                        migration_proposal_id:[0xCD;32] })
-         leaf = 0x3e4c5cb18baeed919c6285ee855f32b465ad8403484d90c5e4e7439e830ef341
+         leaf = 0xf03d157ae6a4b86f88fdd93140b9e7a57d362d285e80d3f8e9d1a99a0124270b
 
   seq 5  ConsequenceTriggered     ts 1700000005  tag 67
-         payload = b"member_did=did:key:m;rule_index=2;trigger_kind=absence;action_type=suspend"
-         leaf = 0x65a70c03fe2c73563338f2ff54d2407babebede0f04feace8396a6d41165ee06
+         payload = b"member_did=scp:ni4vblzmv5aysoj57nmwlnrzkznatwiks2txqtva66hma3sgqneq;rule_index=2;trigger_kind=absence;action_type=suspend"
+                   (m)
+         leaf = 0xe0a65df7a50bb297bf0b06d197dbe21479615b229b81a7c90fb9ff5cbc3e8f42
 
   seq 6  CommitBroadcastSucceeded ts 1700000006  tag 71
          payload = b"operation=join;attempts=3"
-         leaf = 0x1e317e79707690629bd4e34ad028e7afd8b0c1a6d1ecf8c274c8050938522108
+         leaf = 0x74348229437898c2ab6a19e86ced221d41146301c51aaee2c67ef1ff061a6a69
 
   seq 7  RoleAssigned             ts 1700000007  tag 6
-         payload = rmp(RoleAssignedPayload{ subject_did:"did:key:carol", role:"admin" })
-         leaf = 0xd2fcaa28f52acc06a9baa5dfcbd85cef2e56742eb03a9ec5fc3baf9b7af50426
+         payload = rmp(RoleAssignedPayload{ subject_did:"scp:mu3leerpopwlqi4da5g65wgpv5cp4lmvxfpebotmnyugveds37qa" (carol),
+                       role:"admin" })
+         leaf = 0x08a3d79d1f54dec672c3194a60ef6c391c3465a92af01304c603395098ea3649
 
   seq 8  MemberJoined             ts 1700000008  tag 4
-         payload = rmp(MembershipChangePayload{ subject_did:"did:key:dave",
+         payload = rmp(MembershipChangePayload{ subject_did:"scp:xwseckbpifculwol66dbthmywocvxzfskyzedf2wg6qqr3pywu2q" (dave),
                        role_name:"member" })
-         leaf = 0x6bcce39bd338159ac4044e4189d632a606067594c1390e7042cfc4e7b6a7f6e6
+         leaf = 0x2cd931312eea90d2e786f34b1c1891717a803acdbe3a2237416b9139ac4b8b29
 
 RFC 6962 tree::root over the 9 leaves:
-  0x0696f04e8cb022c6c33b9fd066bb975da568898588119f94d1846939e3c83c40
+  0xd161de08f68888a0b13e7fb03e8bbc25758701ab247beb7b6bc2232c87971500
 ```
 
 **Only a software signer reproduces these leaves.** Each leaf hashes the event's signature bytes, so the leaf hash inherits the RFC 6979 determinism of the signature. A hardware signer produces a different signature for the same canonical hash and therefore a different leaf and a different root, which is correct behavior and not a conformance failure. A conformance check for such a signer verifies each event's signature against the signer's public key and compares the root only against a tree it built from its own events.
@@ -512,21 +520,23 @@ A `ConsistencyCheckpoint` generated over the Vector 32 log MUST carry `merkle_ro
 
 ```
 checkpoint.merkle_root == tree::root (Vector 32)
-  = 0x0696f04e8cb022c6c33b9fd066bb975da568898588119f94d1846939e3c83c40
+  = 0xd161de08f68888a0b13e7fb03e8bbc25758701ab247beb7b6bc2232c87971500
 checkpoint.event_count == 9
 ```
 
-Regenerate both vectors with `python3.12 scripts/gen-test-vectors-p256.py` (§25.1). `crates/scp-event-log/tests/test_vectors.rs` is one of the unported test files §25.18 names, which states which artifact governs until the port lands.
+Regenerate both vectors with `python3.12 scripts/gen-test-vectors-p256.py` (§25.1). `crates/scp-event-log/tests/test_vectors.rs` asserts every leaf, the root, and the checkpoint invariant.
 
 ### Vector 35: `DataProvenance` -> `provenance_hash` KAT (§24.3.3)
 
-Pins the canonical provenance-hash encoding — `SHA-256(rmp_serde::to_vec(DataProvenance))`, positional MessagePack in struct-declaration field order (§24.3.3). This is the single encoding used by the signed BroadcastEnvelope `provenance_hash` (§5.14.5), the inner-envelope provenance hash, and the FFI event-log `ProvenanceAttached` / `ProvenanceReceived` payloads — so this hash is identical whether computed on a signed path or recorded in an event log. `payment_amount` (an `Amount`) encodes as a **native MessagePack integer** (`uint`) here: ADR-060's decimal-string wire form applies only to human-readable encodings (JSON); binary MessagePack keeps the native `u64`, so this KAT is byte-identical to its pre-ADR-060 value.
+Pins the canonical provenance-hash encoding — `SHA-256(rmp_serde::to_vec(DataProvenance))`, positional MessagePack in struct-declaration field order (§24.3.3). This is the single encoding used by the signed BroadcastEnvelope `provenance_hash` (§5.14.5), the inner-envelope provenance hash, and the FFI event-log `ProvenanceAttached` / `ProvenanceReceived` payloads — so this hash is identical whether computed on a signed path or recorded in an event log. `payment_amount` (an `Amount`) encodes as a **native MessagePack integer** (`uint`) here: ADR-060's decimal-string wire form applies only to human-readable encodings (JSON); binary MessagePack keeps the native `u64`, so ADR-060 changes no byte of this KAT.
 
 ```
 DataProvenance (all fields populated; field order per §24.2.1):
   source_context:     "ctx-kat-provenance"
   source_type:        Persistent
-  counterparties:     ["did:key:alice", "did:key:bob"]
+  counterparties:     ["scp:nog6fhpyfhhmerfnq7ggtjk4m7hme7rkfovqrce2jnecf7tdu54q",
+                       "scp:gnv52mckv7p7qq5zgbetmtpnglpjrtr5nurq66dxczjzqs3f2k2a"]
+                      (the fixture identifiers alice and bob, §25.1)
   purpose:            Some("kat")
   discovery_method:   SharedContext("ctx-shared")
   age:                300 s
@@ -538,14 +548,14 @@ DataProvenance (all fields populated; field order per §24.2.1):
   payment_receipt_id: Some([0x11; 32])
 
 provenance_hash = SHA-256(rmp_serde::to_vec(DataProvenance))
-  = 0x12ea6cf53e3e2fe1c851214d6c9b1acf1338e835bcb91271c8bcdf04e553ce68
+  = 0xfa9cbfad74121473e2df010ac3b39f74bc30912d9168bc2efc77a25077ad1c01
 
 Absent-provenance sentinel (ADR-002):
   provenance_hash = SHA-256(0x00)
   = 0x6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d
 ```
 
-Reference implementation and assertions: `crates/scp-protocol/src/crypto/sender_keys/broadcast.rs` (`vector_35_data_provenance_hash_kat`). Regenerate with `cargo test -p scp-protocol vector_35_data_provenance_hash_kat -- --nocapture`.
+Reference implementation and assertions: `crates/scp-protocol/src/crypto/sender_keys/broadcast.rs` (`vector_35_data_provenance_hash_kat`), which encodes the struct through `rmp_serde`. The generator (§25.1) encodes the same value with its own MessagePack writer and self-gates on this hash.
 
 ## 25.9 Key Continuity Fingerprint Vectors (§9.11)
 
@@ -622,24 +632,28 @@ Domain: `"SCP-CLAIM-V1:"`
 ```
 Input:
   shadow_id:    "shadow-alice-x-12345"
-  claimant_did: "did:dht:z6MkClaim"
+  claimant_did: "scp:nof3f4ikizgjnnxysigd42wgfx4srjkvbirtaicvnw7qfulrpmeq"
+                (the fixture identifier claimant, §25.1)
   context_id:   "bridge-test-context"
   timestamp:    1700000000
 
 Canonical hash input:
   "SCP-CLAIM-V1:"                              (13 bytes)
   || BE32(20) || "shadow-alice-x-12345"         (4 + 20 = 24 bytes)
-  || BE32(17) || "did:dht:z6MkClaim"           (4 + 17 = 21 bytes)
+  || BE32(56) || claimant_did                  (4 + 56 = 60 bytes)
   || BE32(19) || "bridge-test-context"          (4 + 19 = 23 bytes)
   || BE64(1700000000)                           (8 bytes)
 
-Total: 13 + 24 + 21 + 23 + 8 = 89 bytes
+Total: 13 + 24 + 60 + 23 + 8 = 128 bytes
+
+Preimage (hex, 128 bytes):
+  5343502d434c41494d2d56313a00000014736861646f772d616c6963652d782d3132333435000000387363703a6e6f66336634696b697a676a6e6e7879736967643432776766783473726a6b7662697274616963766e77377166756c72706d6571000000136272696467652d746573742d636f6e74657874000000006553f100
 
 Expected SHA-256:
-  0xf3469482bb1d91d18e7167d21666fad9476b0559625257589075df6ebca23642
+  0x08d9bd5de3ff51a2ff7d8c750ec2361c70b4f0106cd7c98f5d331abbf0f67fcd
 ```
 
-The domain separator is 13 ASCII bytes and the preimage is 89. Before 2026-09-10 this vector stated 14 and 90, so an implementer following §25.17 step 3 would have read a correct encoding as wrong. The claim hash is new here: §25.17 step 4 tells an implementer to compare each canonical byte sequence's SHA-256 against an expected hash, and this vector carried none.
+The domain separator is 13 ASCII bytes. Before 2026-09-10 this vector stated a 14-byte separator and a total one byte longer than its fields, so an implementer following §25.17 step 3 would have read a correct encoding as wrong. The claim hash is new here: §25.17 step 4 tells an implementer to compare each canonical byte sequence's SHA-256 against an expected hash, and this vector carried none.
 
 ## 25.11 Proposal ID Vectors (§6.4 [no such section])
 
@@ -650,26 +664,28 @@ Domain: `"SCP-PROPOSAL-V1:"`
 ```
 Input:
   context_id:   "gov-proposal-context"
-  proposer_did: "did:dht:z6MkProposer"
-  action_bytes: {"AddMember":{"did":"did:dht:z6MkNewMember","role":"member"}}
-                (61 bytes — the compact JSON of GovernanceAction::AddMember)
-                hex: 0x7b224164644d656d626572223a7b22646964223a226469643a6468743a7a364d6b4e65774d656d626572222c22726f6c65223a226d656d626572227d7d
+  proposer_did: "scp:flrkfgy6ehrwj35ay57p36ldffarlcmh2mj7smr7rauyvpreyqfa"
+                (the fixture identifier proposer, §25.1)
+  action_bytes: {"AddMember":{"did":"scp:ykcz3x3dycntc6lkxzbe3nixvd7w5c37riaowlh26lczdnc5vmja","role":"member"}}
+                (96 bytes — the compact JSON of GovernanceAction::AddMember, whose
+                 "did" is the fixture identifier new member, §25.1)
+                hex: 0x7b224164644d656d626572223a7b22646964223a227363703a796b637a3378336479636e7463366c6b787a6265336e697876643777356333377269616f776c6832366c637a646e6335766d6a61222c22726f6c65223a226d656d626572227d7d
   timestamp:    1700000000
 
 Canonical hash input (per §9.5.2 GovernanceProposal ID):
   "SCP-PROPOSAL-V1:"                           (16 bytes)
   || BE32(20) || "gov-proposal-context"         (4 + 20 = 24 bytes)
-  || BE32(20) || "did:dht:z6MkProposer"        (4 + 20 = 24 bytes)
-  || BE32(61) || action_bytes                   (4 + 61 = 65 bytes, length-prefixed)
+  || BE32(56) || proposer_did                  (4 + 56 = 60 bytes)
+  || BE32(96) || action_bytes                   (4 + 96 = 100 bytes, length-prefixed)
   || BE64(1700000000)                           (8 bytes)
 
-Total: 16 + 24 + 24 + 65 + 8 = 137 bytes
+Total: 16 + 24 + 60 + 100 + 8 = 208 bytes
 
-Preimage (hex, 137 bytes):
-  5343502d50524f504f53414c2d56313a00000014676f762d70726f706f73616c2d636f6e74657874000000146469643a6468743a7a364d6b50726f706f7365720000003d7b224164644d656d626572223a7b22646964223a226469643a6468743a7a364d6b4e65774d656d626572222c22726f6c65223a226d656d626572227d7d000000006553f100
+Preimage (hex, 208 bytes):
+  5343502d50524f504f53414c2d56313a00000014676f762d70726f706f73616c2d636f6e74657874000000387363703a666c726b66677936656872776a3335617935377033366c64666661726c636d68326d6a37736d7237726175797670726579716661000000607b224164644d656d626572223a7b22646964223a227363703a796b637a3378336479636e7463366c6b787a6265336e697876643777356333377269616f776c6832366c637a646e6335766d6a61222c22726f6c65223a226d656d626572227d7d000000006553f100
 
 Proposal ID:
-  0xcd423e7b6272c9cfd25a6e636922bab94cc3c8df48a50bc649bb856cb5f25d65
+  0x15ff55609885bc70e5c7828697ce978af7c09b8d12d058fee276822d1d34e7f6
 
 Note: action_bytes is the canonical JSON serialization of the GovernanceAction
 enum (compact, no whitespace — equivalent to serde_json::to_vec in Rust or
@@ -689,19 +705,20 @@ These vectors verify the domain separation between sender key and access key HPK
 ```
 Input:
   context_id: "hpke-test-context"
-  sender_did: "did:dht:z6MkSender"
+  sender_did: "scp:jx35aojrkpxu2pjy7k6v6blpsotz5iakm7yui2t3rc6lmthfcbpa"
+              (the fixture identifier hpke sender, §25.1)
   epoch:      42
 
 Info string (concatenated bytes):
   "scp-sender-key-v1"                     (17 bytes)
   || BE32(17) || "hpke-test-context"       (4 + 17 = 21 bytes)
-  || BE32(18) || "did:dht:z6MkSender"     (4 + 18 = 22 bytes)
+  || BE32(56) || sender_did              (4 + 56 = 60 bytes)
   || BE64(42)                              (8 bytes)
 
-Total: 17 + 21 + 22 + 8 = 68 bytes
+Total: 17 + 21 + 60 + 8 = 106 bytes
 
-Info string (hex, 68 bytes):
-  0x7363702d73656e6465722d6b65792d76310000001168706b652d746573742d636f6e74657874000000126469643a6468743a7a364d6b53656e646572000000000000002a
+Info string (hex, 106 bytes):
+  0x7363702d73656e6465722d6b65792d76310000001168706b652d746573742d636f6e74657874000000387363703a6a783335616f6a726b70787532706a79376b367636626c70736f747a3569616b6d377975693274337263366c6d74686663627061000000000000002a
 ```
 
 Note: the sender key info string uses 4-byte BE length-prefixed context_id and sender_did fields, matching the access key info string structure. Length prefixes prevent boundary-shift collisions with adversarial inputs.
@@ -711,24 +728,25 @@ Note: the sender key info string uses 4-byte BE length-prefixed context_id and s
 ```
 Input:
   context_id: "hpke-test-context"
-  member_did: "did:dht:z6MkMember"
+  member_did: "scp:4ggxxxop37nk6djtrfoclzjx6s7bi44zcsf6v4qit2zpoctr5tea"
+              (the fixture identifier hpke member, §25.1)
   epoch:      42
 
 Info string (concatenated bytes):
   "scp-access-key-v1"                     (17 bytes)
   || BE32(17) || "hpke-test-context"       (4 + 17 = 21 bytes)
-  || BE32(18) || "did:dht:z6MkMember"     (4 + 18 = 22 bytes)
+  || BE32(56) || member_did              (4 + 56 = 60 bytes)
   || BE64(42)                              (8 bytes)
 
-Total: 17 + 21 + 22 + 8 = 68 bytes
+Total: 17 + 21 + 60 + 8 = 106 bytes
 
-Info string (hex, 68 bytes):
-  0x7363702d6163636573732d6b65792d76310000001168706b652d746573742d636f6e74657874000000126469643a6468743a7a364d6b4d656d626572000000000000002a
+Info string (hex, 106 bytes):
+  0x7363702d6163636573732d6b65792d76310000001168706b652d746573742d636f6e74657874000000387363703a3467677878786f7033376e6b36646a7472666f636c7a6a78367337626934347a637366367634716974327a706f63747235746561000000000000002a
 ```
 
 Note: Both the sender key and access key info strings use 4-byte BE length-prefixed context_id and DID fields. Domain separation between the two is provided by distinct prefix strings (`"scp-sender-key-v1"` vs `"scp-access-key-v1"`), which ensures the two info strings can never collide even with adversarial inputs.
 
-Both prefixes are 17 ASCII bytes and both info strings are 68. Before 2026-09-10 these two vectors stated 18 and 69, so an implementer following §25.17 step 3 would have read a correct encoding as wrong.
+Both prefixes are 17 ASCII bytes. Before 2026-09-10 these two vectors stated an 18-byte prefix and a total one byte longer than their fields, so an implementer following §25.17 step 3 would have read a correct encoding as wrong.
 
 **Neither vector prints a KEM output.** These two vectors pin the `info` strings and the domain separation between them, which is what §9.16.2 and §9.17.1 fix. The KEM itself is DHKEM(P-256, HKDF-SHA256) with the encodings RFC 9180 §7.1 fixes, and RFC 9180 Appendix A.3 already publishes known-answer vectors for it, so no vector here restates them.
 
@@ -746,8 +764,9 @@ Note: this is the *signature* construction (used by `verify_signature`). The *at
 Input:
   id:                "att-001"
   attestation_type:  "identity_link"
-  issuer:            "did:dht:z6MkIssuer"
-  subject:           "did:dht:z6MkIssuer"  (same as issuer for self-attestation)
+  issuer:            "scp:mhe6nmpij74wrgb46ngrakeetnlycmnfmcgppkfqqufyl7kkl3ia"
+                     (the fixture identifier issuer, §25.1)
+  subject:           the issuer's identifier (same as issuer for self-attestation)
   issued_at:         1700000000
   expires_at:        absent (no expiry — use absent sentinel)
   claim:             AttestationClaim { platform: "google.com", platform_handle: "alice@gmail.com",
@@ -760,15 +779,15 @@ Canonical hash input:
   "SCP-IDENTITY-LINK-ATTESTATION-V1:"         (33 bytes, no length prefix)
   || BE32(7)   || "att-001"                    (4 + 7 = 11 bytes — id)
   || BE32(13)  || "identity_link"              (4 + 13 = 17 bytes — attestation_type)
-  || BE32(18)  || "did:dht:z6MkIssuer"        (4 + 18 = 22 bytes — issuer)
-  || BE32(18)  || "did:dht:z6MkIssuer"        (4 + 18 = 22 bytes — subject)
+  || BE32(56)  || issuer                     (4 + 56 = 60 bytes — issuer)
+  || BE32(56)  || subject                    (4 + 56 = 60 bytes — subject)
   || BE64(1700000000)                          (8 bytes — issued_at)
   || SHA-256(0x00)                              (32 bytes, raw — no length prefix — absent expires_at sentinel)
   || BE32(80)  || msgpack(claim)               (4 + 80 = 84 bytes — claim as MessagePack)
   || BE32(110) || msgpack(evidence)            (4 + 110 = 114 bytes — evidence as MessagePack)
   || BE32(7)   || msgpack(revocation_status)    (4 + 7 = 11 bytes — revocation_status as MessagePack)
 
-Total: 33 + 11 + 17 + 22 + 22 + 8 + 32 + 84 + 114 + 11 = 354 bytes
+Total: 33 + 11 + 17 + 60 + 60 + 8 + 32 + 84 + 114 + 11 = 430 bytes
 
 MessagePack sub-structures (name-keyed maps; a `None` field is omitted, so
 `platform_id` and `verifier_did` do not appear):
@@ -782,14 +801,14 @@ MessagePack sub-structures (name-keyed maps; a `None` field is omitted, so
   msgpack(revocation_status), 7 bytes:
     0xa6416374697665
 
-Preimage (hex, 354 bytes):
-  5343502d4944454e544954592d4c494e4b2d4154544553544154494f4e2d56313a000000076174742d3030310000000d6964656e746974795f6c696e6b000000126469643a6468743a7a364d6b497373756572000000126469643a6468743a7a364d6b497373756572000000006553f1006e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d0000005083a8706c6174666f726daa676f6f676c652e636f6daf706c6174666f726d5f68616e646c65af616c69636540676d61696c2e636f6da96c696e6b5f74797065b073656c665f6174746573746174696f6e0000006e83a66d6574686f64a56f61757468a570726f6f66d9477b2270726f7669646572223a22676f6f676c652e636f6d222c227375626a6563745f6964223a223132333435222c2276657269666965645f6174223a313730303030303030307dab76657269666965645f6174ce6553f10000000007a6416374697665
+Preimage (hex, 430 bytes):
+  5343502d4944454e544954592d4c494e4b2d4154544553544154494f4e2d56313a000000076174742d3030310000000d6964656e746974795f6c696e6b000000387363703a6d6865366e6d70696a37347772676234366e6772616b6565746e6c79636d6e666d636770706b6671717566796c376b6b6c336961000000387363703a6d6865366e6d70696a37347772676234366e6772616b6565746e6c79636d6e666d636770706b6671717566796c376b6b6c336961000000006553f1006e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d0000005083a8706c6174666f726daa676f6f676c652e636f6daf706c6174666f726d5f68616e646c65af616c69636540676d61696c2e636f6da96c696e6b5f74797065b073656c665f6174746573746174696f6e0000006e83a66d6574686f64a56f61757468a570726f6f66d9477b2270726f7669646572223a22676f6f676c652e636f6d222c227375626a6563745f6964223a223132333435222c2276657269666965645f6174223a313730303030303030307dab76657269666965645f6174ce6553f10000000007a6416374697665
 
 Canonical hash SHA-256(preimage) (32 bytes):
-  0xf96d0d2c24da118b3e31f20fc082e1b0c23daa0114d9b747eddbc16339924927
+  0x7c30340a9e30605a1569b44e5f5bf9902b7b79246f9984c858c1d5b13a8bd66f
 
 RFC 6979 signature over the canonical hash, reference key, 64-byte raw r || s:
-  0xe66d1b5884fc5f58ed627e49aac5db247d5c2129e0411e0a2154b9f603ffe94c05a358e3a31b20f28656741a36f90adb500a75261cb9725526f9fe7b2b54550f
+  0x060e1ff0cd840e9fe7257d86f1702d15a19ae2fe26c78341903ec1e705ceeb2945b5917b8a8b400a4f3178267313f3573ab2556d4248bf6dc7bbe88ecd297318
 
 Verification vector:
   public key: 0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
@@ -812,20 +831,21 @@ Domain: `"SCP-PSEUDONYM-V1:"`
 Input:
   pseudonym_key:  0x746573742d70736575646f6e796d2d6b6579 ("test-pseudonym-key", 18 bytes)
   context_id:     "test-context-01"
-  did:            "did:dht:z6MkTest"
+  did:            "scp:op44kdck7awcy7szako3hn72h4himmwiez3ongmzxlcao3syf7na"
+                  (the fixture identifier pseudonymized member, §25.1)
 
 Canonical hash input:
   "SCP-PSEUDONYM-V1:"                           (17 bytes, no length prefix)
   || BE32(18)  || "test-pseudonym-key"           (4 + 18 = 22 bytes)
   || BE32(15)  || "test-context-01"              (4 + 15 = 19 bytes)
-  || BE32(16)  || "did:dht:z6MkTest"            (4 + 16 = 20 bytes)
+  || BE32(56)  || did                           (4 + 56 = 60 bytes)
 
-Total: 17 + 22 + 19 + 20 = 78 bytes
+Total: 17 + 22 + 19 + 60 = 118 bytes
 
 Expected SHA-256:
-  0xa1545542cd8834cc0599f07e5c730dee3005c01097dde63abf906110f1a8e28d
+  0x8fac3766eee1f083b0e52ee261c3ae79773ceed3dc1fb36ed171cbe91022fa60
 
-Result: did:pseudo:a1545542cd8834cc0599f07e5c730dee3005c01097dde63abf906110f1a8e28d
+Result: did:pseudo:8fac3766eee1f083b0e52ee261c3ae79773ceed3dc1fb36ed171cbe91022fa60
 ```
 
 The pseudonym is deterministic: the same (key, context, DID) triple always produces the same pseudonym. Different keys or contexts produce unrelated pseudonyms for the same DID.
@@ -868,22 +888,23 @@ Domain: `"SCP-ATTESTATION-ID-V1:"`
 
 ```
 Input:
-  issuer:           "did:dht:z6MkIssuer"
+  issuer:           "scp:mhe6nmpij74wrgb46ngrakeetnlycmnfmcgppkfqqufyl7kkl3ia"
+                    (the fixture identifier issuer, §25.1)
   platform:         "google.com"
   platform_handle:  "alice@gmail.com"
   issued_at:        1700000000
 
 Canonical hash input:
   "SCP-ATTESTATION-ID-V1:"                      (22 bytes, no length prefix)
-  || BE32(18)  || "did:dht:z6MkIssuer"          (4 + 18 = 22 bytes)
+  || BE32(56)  || issuer                        (4 + 56 = 60 bytes)
   || BE32(10)  || "google.com"                   (4 + 10 = 14 bytes)
   || BE32(15)  || "alice@gmail.com"              (4 + 15 = 19 bytes)
   || BE64(1700000000)                            (8 bytes)
 
-Total: 22 + 22 + 14 + 19 + 8 = 85 bytes
+Total: 22 + 60 + 14 + 19 + 8 = 123 bytes
 
 Expected SHA-256:
-  0x97eedd3adfbd0dc8ee901c9f2baf57c151ddf81e3cf49e7ae3b559f4cd2176e0
+  0xe742f0c58ad19c527626b51608d3d8ef2a4093188fa98f1a70041f7b59044ce2
 ```
 
 ## 25.17 Verification Procedure
@@ -910,7 +931,7 @@ To verify an implementation against these test vectors:
 
 §25.1 names the generator, states how to run it, states which values it produces, and states which published known-answer tests it checks itself against. A value printed above that the generator does not reproduce is a defect in this section.
 
-**Four shipped artifacts still carry the superseded signature algorithm.** `crates/scp-runtime/tests/test_vectors.rs`, `crates/scp-event-log/tests/test_vectors.rs`, `tests/conformance/vectors/outlet_streaming_saga_vectors.json` and `tests/conformance/vectors/outlet_registration_v2.json` assert or carry the values these vectors printed before 2026-09-10, under the algorithm §9.5 of the security-model spec superseded on that date. The artifact flow puts the spec first, so this section is the authority for every byte above until each artifact is regenerated on P-256, and an implementer comparing against one of them today reproduces the superseded values.
+**Three shipped artifacts still carry the superseded signature algorithm.** `tests/conformance/vectors/outlet_streaming_saga_vectors.json` and `tests/conformance/vectors/outlet_registration_v2.json` carry the values these vectors printed before 2026-09-10, under the algorithm §9.5 of the security-model spec superseded on that date. The `vector_37_*` tests in `crates/scp-mls/src/keypackage_attestation.rs` pin the superseded Vector 37: a 211-byte signing preimage, the signing hash `50cf61db5a97e0ddbd762de07e107684dfd0f00cfe53bad2750a70103ac38957`, and a 245-byte body; the change that moves MLS to ciphersuite 2 and KeyPackage attestations to 65-byte P-256 keys (S0 PR4 of the identity workstream) replaces them with assertions of the Vector 37 printed in §25.23. The artifact flow puts the spec first, so this section is the authority for every byte above until each artifact is regenerated on P-256, and an implementer comparing against one of them today reproduces the superseded values.
 
 Independent implementations SHOULD run the generator, compare its output against the values printed above, and then embed those outputs in their own test suites.
 
@@ -1027,7 +1048,8 @@ These vectors pin the on-the-wire **pseudonym announcement** — the `MessagePac
 ```
 Input:
   tag:        "\0scp:pseudonym-announce:v1"   (PSEUDONYM_ANNOUNCEMENT_TAG, 26 bytes, NUL-prefixed)
-  member_did: "did:dht:z6MkPseudonymKatFixtureMemberAAAAAAAAAAAAAA"  (51 bytes)
+  member_did: "scp:z5glr2inbuzd33xrfkdgpjejz4x7z4r2jxcsfvdxbwtgoi73xx2q"
+              (the fixture identifier announcing member, §25.1; 56 bytes)
   pseudonym:  0x42 × 32
 
 MessagePack layout:
@@ -1035,12 +1057,12 @@ MessagePack layout:
   0xa3 "tag"                             key
   0xba <26 bytes>  "\0scp:pseudonym-announce:v1"   str8 value (NUL-prefixed magic tag)
   0xaa "member_did"                      key
-  0xd9 0x33 <51 bytes> "did:dht:z6Mk…AA"  str8 value
+  0xd9 0x38 <56 bytes> "scp:z5gl…xx2q"    str8 value
   0xa9 "pseudonym"                        key
   0xc4 0x20 <32 bytes> 0x42×32            bin8 value (serde_bytes)
 
 Expected bytes (hex, single continuous string):
-  83a3746167ba007363703a70736575646f6e796d2d616e6e6f756e63653a7631aa6d656d6265725f646964d9336469643a6468743a7a364d6b50736575646f6e796d4b6174466978747572654d656d6265724141414141414141414141414141a970736575646f6e796dc4204242424242424242424242424242424242424242424242424242424242424242
+  83a3746167ba007363703a70736575646f6e796d2d616e6e6f756e63653a7631aa6d656d6265725f646964d9387363703a7a35676c7232696e62757a6433337872666b6467706a656a7a3478377a3472326a78637366766478627774676f69373378783271a970736575646f6e796dc4204242424242424242424242424242424242424242424242424242424242424242
 ```
 
 **Classifier decisions.** `classify_pseudonym_announcement(plaintext, sender_did, context_id, registry)` returns a `PseudonymAnnouncementDecision` over the four-step §9.10.4 validation. The reject `reason` strings are stable `&'static str`s and are part of this vector — a change to any is wire-observable:
@@ -1054,7 +1076,7 @@ Expected bytes (hex, single continuous string):
 | broadcast context | member | golden announce / `None` | `Rejected` | `pseudonym announcement received on broadcast context` |
 | cross-DID collision | member | golden announce / `Some({other → 0x42×32})` | `Rejected` | `pseudonym announcement collides with another member's routing ID` |
 
-where `member = "did:dht:z6MkPseudonymKatFixtureMemberAAAAAAAAAAAAAA"`, `other = "did:dht:z6MkPseudonymKatFixtureOtherBBBBBBBBBBBBBBB"`, and `ctx = "ctx-adr057-pseudonym-kat"`.
+where `member = "scp:z5glr2inbuzd33xrfkdgpjejz4x7z4r2jxcsfvdxbwtgoi73xx2q"` (the fixture identifier announcing member), `other = "scp:ur5v4nca7x4lfagd2fojmjydguxwjwvfz2tur63s3x3k5vvqmppa"` (the fixture identifier other member), and `ctx = "ctx-adr057-pseudonym-kat"`.
 
 This vector is mechanically enforced on BOTH native and `wasm32` by `pseudonym_wire_and_classifier_match_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_cross_target_kat.rs` (native `#[test]` + `#[wasm_bindgen_test]`, run under `wasm-pack test --node`): `native == golden` and `wasm == golden` together prove `native == wasm` (ADR-057 T-1 / Prerequisite 5). The pure predicate + classifier unit tests also live in `crates/scp-protocol/src/context/pseudonym.rs`.
 
@@ -1072,8 +1094,10 @@ Note: this is the *signature* construction for the generic trust attestation env
 Input:
   id:                "att-trust-001"
   attestation_type:  Endorsement  (type tag 4 per attestation_type_tag())
-  issuer:            "did:dht:z6MkIssuer"
-  subject:           "did:dht:z6MkSubject"
+  issuer:            "scp:mhe6nmpij74wrgb46ngrakeetnlycmnfmcgppkfqqufyl7kkl3ia"
+                     (the fixture identifier issuer, §25.1)
+  subject:           "scp:ktarg6aqtsju6mh2ws3hk7t5kmsvmckq7d5eqwsmaw5di3e3p4ta"
+                     (the fixture identifier subject, §25.1)
   claim:             {"level": "gold", "score": 42}
                        JCS: {"level":"gold","score":42}  (27 bytes)
   evidence:          absent (use absent sentinel)
@@ -1086,24 +1110,24 @@ Canonical hash input:
   "SCP-ATTESTATION-V1:"                          (19 bytes, no length prefix)
   || BE32(13) || "att-trust-001"                  (4 + 13 = 17 bytes — id)
   || BE16(4)                                      (2 bytes — attestation_type tag)
-  || BE32(18) || "did:dht:z6MkIssuer"            (4 + 18 = 22 bytes — issuer)
-  || BE32(19) || "did:dht:z6MkSubject"           (4 + 19 = 23 bytes — subject)
+  || BE32(56) || issuer                          (4 + 56 = 60 bytes — issuer)
+  || BE32(56) || subject                         (4 + 56 = 60 bytes — subject)
   || BE32(27) || {"level":"gold","score":42}      (4 + 27 = 31 bytes — claim as JCS)
   || SHA-256(0x00)                                 (32 bytes, raw — no length prefix — absent evidence sentinel)
   || BE64(1700000000)                              (8 bytes — issued_at)
   || SHA-256(0x00)                                 (32 bytes, raw — no length prefix — absent expires_at sentinel)
   || BE32(7)  || msgpack(Active)                  (4 + 7 = 11 bytes — revocation_status as MessagePack)
 
-Total: 19 + 17 + 2 + 22 + 23 + 31 + 32 + 8 + 32 + 11 = 197 bytes
+Total: 19 + 17 + 2 + 60 + 60 + 31 + 32 + 8 + 32 + 11 = 272 bytes
 
-Preimage (hex, 197 bytes):
-  5343502d4154544553544154494f4e2d56313a0000000d6174742d74727573742d3030310004000000126469643a6468743a7a364d6b497373756572000000136469643a6468743a7a364d6b5375626a6563740000001b7b226c6576656c223a22676f6c64222c2273636f7265223a34327d6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d000000006553f1006e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d00000007a6416374697665
+Preimage (hex, 272 bytes):
+  5343502d4154544553544154494f4e2d56313a0000000d6174742d74727573742d3030310004000000387363703a6d6865366e6d70696a37347772676234366e6772616b6565746e6c79636d6e666d636770706b6671717566796c376b6b6c336961000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d6177356469336533703474610000001b7b226c6576656c223a22676f6c64222c2273636f7265223a34327d6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d000000006553f1006e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d00000007a6416374697665
 
 Expected SHA-256 (= canonical_attestation_bytes output):
-  0x6d07c76821a2ae4dd830ca117aa9fd8e30232cca72459a4d129432f56d87a08c
+  0xe1ccf47b4b1a50bd91342c14df9630a5abc8cf51c2dbe1ad7099348d9fe6d018
 
 RFC 6979 signature over the canonical hash, reference key, 64-byte raw r || s:
-  0x767f500caf5ecbc3e2d9f73376a16a36cb68c5d32c9c4be48cd5aae7b8615174589cb95e07ed2c6027c0a21a260cd90605ab2598f3cc96dce2d437dcfa530647
+  0xc09daa8f076cfc13d93b9a1a6ae51d3d03c335ca9e62a120d1d3f55050e9884a7dd4eb8e302a9c542acee0310e3626032fcd2c825ddd22797f3d5be4e189bf1a
 
 Verification vector:
   public key: 0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
@@ -1112,9 +1136,9 @@ Verification vector:
   verdict:    accept
 ```
 
-The P-256 signature is computed over the 32-byte canonical hash. Sign with the reference key (§25.2) and verify per §25.17 step 5. The preimage carries no key material, so the canonical hash above is unchanged from the value this vector pinned before 2026-09-10 and only the signature is new.
+The P-256 signature is computed over the 32-byte canonical hash. Sign with the reference key (§25.2) and verify per §25.17 step 5.
 
-`vector_34_trust_attestation_signature` in `crates/scp-runtime/tests/test_vectors.rs` pins the expected hash, reconstructs the preimage byte-for-byte, and verifies a signed attestation through the production `verify_attestation` path. Its hash assertion still holds, and its signature path is one of the unported artifacts §25.18 names.
+`vector_34_trust_attestation_signature` in `crates/scp-runtime/tests/test_vectors.rs` asserts the expected hash through `canonical_attestation_bytes` and the signature bytes above against the P-256 reference key.
 
 ## 25.21 Outlet Streaming Conformance Vectors (§5.4.5)
 
@@ -1204,7 +1228,8 @@ Before 2026-09-10 the `leaf_encryption_key` seed was the §25.2 secondary seed. 
 ```
 Input:
   signing key:         reference P-256 key (§25.2, seed 0x9d61b1…7f60)
-  did:                 "did:dht:z6MkLeafAttest"                (22 bytes)
+  did:                 "scp:gomjxlxjt4kesb5fghb6tpykrvhsxdduwwlo3uwgmvh2jhoqvjyq"
+                       (the fixture identifier leaf attester, §25.1; 56 bytes)
   leaf_signature_key:  0x0423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da6   (65 bytes, §25.2 secondary public key, uncompressed)
   leaf_encryption_key: 0x04bb9fe4749210aad657fb3937fa97a0d79c976c442c54176ccce88477e1b32f304661cb77defd365843a4d43584afc760fed0d9a889d9cb3dd155986b446f4550   (65 bytes, from fixed seed 0x33×32 — LeafNode ratchet-tree HPKE key)
   init_key:            0x041f75a6a31cc4516a2eb0b28511c45160b976b44e8c31ec377b0c2cb67b05f0ad3195794c4fc38b105bd5f5e1239a3c73feb58bd815cbfd2fe049c084f7f88a8a   (65 bytes, from fixed seed 0x11×32 — KeyPackage Welcome-seal HPKE key)
@@ -1215,7 +1240,7 @@ Input:
 
 Canonical hash input (per §9.5.1 / §9.5.2 KeyPackageAttestation):
   "SCP-KEYPACKAGE-ATTESTATION-V1:"                 (30 bytes, no length prefix)
-  || BE32(22) || "did:dht:z6MkLeafAttest"          (4 + 22 = 26 bytes — did)
+  || BE32(56) || did                              (4 + 56 = 60 bytes — did)
   || leaf_signature_key                            (65 bytes, fixed-length, no length prefix)
   || leaf_encryption_key                           (65 bytes, fixed-length, no length prefix)
   || init_key                                      (65 bytes, fixed-length, no length prefix)
@@ -1224,20 +1249,20 @@ Canonical hash input (per §9.5.1 / §9.5.2 KeyPackageAttestation):
   || BE64(1700000000)                              (8 bytes — issued_at)
   || BE64(1700086400)                              (8 bytes — expires_at)
 
-Total preimage: 30 + 26 + 65 + 65 + 65 + 65 + 11 + 8 + 8 = 343 bytes
+Total preimage: 30 + 60 + 65 + 65 + 65 + 65 + 11 + 8 + 8 = 377 bytes
 
-Preimage (hex, 343 bytes):
-  0x5343502d4b45595041434b4147452d4154544553544154494f4e2d56313a000000166469643a6468743a7a364d6b4c6561664174746573740423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da604bb9fe4749210aad657fb3937fa97a0d79c976c442c54176ccce88477e1b32f304661cb77defd365843a4d43584afc760fed0d9a889d9cb3dd155986b446f4550041f75a6a31cc4516a2eb0b28511c45160b976b44e8c31ec377b0c2cb67b05f0ad3195794c4fc38b105bd5f5e1239a3c73feb58bd815cbfd2fe049c084f7f88a8a04ff08966117691da4f3f0a3bbc4a63cab7193008d316127821b1e09b9e2aef925eaa5de2932cc294a2cc58f36e31a9a245f67404ad14d142d0e423901aa44cac30000000723616374697665000000006553f1000000000065554280
+Preimage (hex, 377 bytes):
+  0x5343502d4b45595041434b4147452d4154544553544154494f4e2d56313a000000387363703a676f6d6a786c786a74346b6573623566676862367470796b727668737864647577776c6f337577676d7668326a686f71766a79710423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da604bb9fe4749210aad657fb3937fa97a0d79c976c442c54176ccce88477e1b32f304661cb77defd365843a4d43584afc760fed0d9a889d9cb3dd155986b446f4550041f75a6a31cc4516a2eb0b28511c45160b976b44e8c31ec377b0c2cb67b05f0ad3195794c4fc38b105bd5f5e1239a3c73feb58bd815cbfd2fe049c084f7f88a8a04ff08966117691da4f3f0a3bbc4a63cab7193008d316127821b1e09b9e2aef925eaa5de2932cc294a2cc58f36e31a9a245f67404ad14d142d0e423901aa44cac30000000723616374697665000000006553f1000000000065554280
 
 Canonical hash SHA-256(preimage) (32 bytes):
-  0xb57dafbe5f12cf5d83a0b90e7fd4df9bea53a22e96f80a75a7d844c63041ae71
+  0xf3e2825b6d0534827fec7a6b196b729578ef47be0c0847f6e8879cf5242aa4ad
 
 RFC 6979 signature over the canonical hash, reference key, 64-byte raw r || s:
-  0x308c4e5612215e13119b098ac3318a40c0fb393fefea4a65b40c56e38740829e2a94359e5f99476aba4ace58db8fc8c6b39eaf31673d1c81800ce2e972ad69ac
+  0xe84f59744b0fba5ebc162f26a59d027694c1fae7c73dcdeb8d776e357bbf12632abea2a97205d75ca50e3914eec8af68f7315e27dd6f9296136e75ecb044ff24
 
 scp_keypackage_attestation (0xFF03) extension body = 8 fields in preimage order
-(NO domain separator) || 64-byte signature (313 + 64 = 377 bytes):
-  0x000000166469643a6468743a7a364d6b4c6561664174746573740423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da604bb9fe4749210aad657fb3937fa97a0d79c976c442c54176ccce88477e1b32f304661cb77defd365843a4d43584afc760fed0d9a889d9cb3dd155986b446f4550041f75a6a31cc4516a2eb0b28511c45160b976b44e8c31ec377b0c2cb67b05f0ad3195794c4fc38b105bd5f5e1239a3c73feb58bd815cbfd2fe049c084f7f88a8a04ff08966117691da4f3f0a3bbc4a63cab7193008d316127821b1e09b9e2aef925eaa5de2932cc294a2cc58f36e31a9a245f67404ad14d142d0e423901aa44cac30000000723616374697665000000006553f1000000000065554280308c4e5612215e13119b098ac3318a40c0fb393fefea4a65b40c56e38740829e2a94359e5f99476aba4ace58db8fc8c6b39eaf31673d1c81800ce2e972ad69ac
+(NO domain separator) || 64-byte signature (347 + 64 = 411 bytes):
+  0x000000387363703a676f6d6a786c786a74346b6573623566676862367470796b727668737864647577776c6f337577676d7668326a686f71766a79710423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da604bb9fe4749210aad657fb3937fa97a0d79c976c442c54176ccce88477e1b32f304661cb77defd365843a4d43584afc760fed0d9a889d9cb3dd155986b446f4550041f75a6a31cc4516a2eb0b28511c45160b976b44e8c31ec377b0c2cb67b05f0ad3195794c4fc38b105bd5f5e1239a3c73feb58bd815cbfd2fe049c084f7f88a8a04ff08966117691da4f3f0a3bbc4a63cab7193008d316127821b1e09b9e2aef925eaa5de2932cc294a2cc58f36e31a9a245f67404ad14d142d0e423901aa44cac30000000723616374697665000000006553f1000000000065554280e84f59744b0fba5ebc162f26a59d027694c1fae7c73dcdeb8d776e357bbf12632abea2a97205d75ca50e3914eec8af68f7315e27dd6f9296136e75ecb044ff24
 
 Verification vector:
   public key: 0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
