@@ -151,7 +151,16 @@ fn create_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
     let ctx_id = context_id.clone();
 
     rt.block_on(async move {
-        let params = scp_core::context::ContextParams::default();
+        // The fixture creates the context with `default_ceiling()`, the ceiling
+        // `PyContextParams::from_py_dict` resolves when a caller declares none,
+        // so the supervisor holds the ceiling a real `context_create` gives it.
+        let params = scp_core::context::ContextParams {
+            ceiling: scp_core::context::roles::default_ceiling()
+                .iter()
+                .cloned()
+                .collect(),
+            ..scp_core::context::ContextParams::default()
+        };
         supervisor
             .create_context(ctx_id.clone(), params, creator.clone(), None)
             .await
@@ -1425,7 +1434,15 @@ fn create_test_context_with_id(bi: &PyBridgeInstance, creator_did: &str, context
     let ctx_id = context_id.to_owned();
 
     rt.block_on(async move {
-        let params = scp_core::context::ContextParams::default();
+        // Same `default_ceiling()` the id-generating sibling uses, for the same
+        // reason.
+        let params = scp_core::context::ContextParams {
+            ceiling: scp_core::context::roles::default_ceiling()
+                .iter()
+                .cloned()
+                .collect(),
+            ..scp_core::context::ContextParams::default()
+        };
         supervisor
             .create_context(ctx_id.clone(), params, creator.clone(), None)
             .await

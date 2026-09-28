@@ -1653,6 +1653,148 @@ where
     f(entry.value_mut())
 }
 
+// ---------------------------------------------------------------------------
+// Live supervisor lifecycle state
+// ---------------------------------------------------------------------------
+
+/// Runs `fut` to completion under whichever tokio regime the calling thread
+/// sits in, and returns whatever `fut` produced.
+///
+/// A caller reaches this function from one of three regimes:
+///
+/// 1. a Python call that carries no ambient tokio runtime (`PyO3` methods are
+///    synchronous, and the Python SDK dispatches them through
+///    `asyncio.to_thread`);
+/// 2. a task running on a multi-thread runtime, where `Runtime::block_on`
+///    panics but `block_in_place` is legal; and
+/// 3. a task running on a current-thread runtime, where `Runtime::block_on`
+///    and `block_in_place` both panic.
+///
+/// This function reads the ambient handle, then picks the bridge that regime
+/// permits: the shared runtime's `block_on`, `block_in_place` around the
+/// ambient handle, or a private current-thread runtime on a fresh thread. The
+/// supervisor query itself only awaits a mailbox channel, so a private runtime
+/// drives it to completion while the per-context actor keeps running on the
+/// shared runtime. `scripts/check-block-in-place.py` excludes
+/// `crates/scp-ffi/**` because every FFI bridge needs a synchronous-to-async
+/// seam of exactly this shape.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` when the shared tokio runtime is absent,
+/// when a private current-thread runtime fails to build, or when the fresh
+/// thread ends before it sends an answer.
+fn block_on_supervisor_query<T, F>(fut: F) -> Result<T, ScpPyError>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Err(_) => {
+            let rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
+            Ok(rt.block_on(fut))
+        }
+        Ok(handle)
+            if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) =>
+        {
+            Ok(tokio::task::block_in_place(|| handle.block_on(fut)))
+        }
+        Ok(_) => {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => drop(tx.send(rt.block_on(fut))),
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        "live supervisor query could not build a private runtime; \
+                         the caller fails closed"
+                    ),
+                }
+            });
+            rx.recv().map_err(|_| {
+                ScpPyError::context(
+                    "live supervisor query ended before the supervisor answered".to_owned(),
+                )
+            })
+        }
+    }
+}
+
+/// Reads a context's lifecycle state from that context's supervisor actor, and
+/// fails when no actor serves the context.
+///
+/// The join, leave, send, and receive gates in `context.rs` read through this
+/// function, never through the handle.
+/// [`PyContextHandle`](crate::context::PyContextHandle) carries a `state`
+/// string, and that string records the last transition THIS bridge observed: a
+/// TTL expiry the supervisor applied on its own timer, a close another member
+/// initiated, a migration that tombstoned the context, and an actor the
+/// watchdog poisoned all leave that string reading `"active"`. A gate reading
+/// that string therefore admits an operation into a context the supervisor had
+/// already stopped serving. The handle's `state` getter stays a cached
+/// snapshot, because its documented contract says so; a gate does not.
+///
+/// Fails closed. A context the supervisor holds no actor for yields
+/// [`ScpPyError::ContextError`], so no caller passes a gate on an absent
+/// answer.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` when the supervisor reports no actor for
+/// `context_id`, and every error [`read_live_context_state`] returns.
+pub fn live_context_state(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Result<scp_core::context::ContextState, ScpPyError> {
+    read_live_context_state(bi, context_id)?.ok_or_else(|| {
+        ScpPyError::context(format!(
+            "context '{context_id}' has no live supervisor state — refusing to run a \
+             lifecycle-gated operation against a context no actor serves"
+        ))
+    })
+}
+
+/// Reads a context's lifecycle state from that context's supervisor actor.
+///
+/// `Ok(None)` means the supervisor holds no actor for `context_id`. An absent
+/// actor the crash watchdog poisoned reads as `Some(Poisoned)`, because the
+/// supervisor keeps that flag outside the actor (ADR-049 §10).
+///
+/// An actor the supervisor still holds but this call could not reach — a
+/// mailbox send that timed out against a saturated mailbox, or a wedged actor
+/// that took longer than the reply timeout — reads as an error, never as
+/// `Ok(None)`. `Supervisor::read_context_state` folds that outcome into
+/// `None`; this function calls `Supervisor::read_context_state_checked`, which
+/// keeps the two apart, so no caller reads an actor that did not answer as an
+/// absent context.
+///
+/// [`live_context_state`] is the gate form: it turns `None` into an error so a
+/// gate never admits an operation on an absent answer.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` when the supervisor is unavailable, when
+/// the sync-to-async bridge to the supervisor fails (the shared tokio runtime
+/// is absent, or a private current-thread runtime fails to build or answer),
+/// when an actor serves `context_id` but did not answer the state read, and
+/// when the crash watchdog despawned `context_id`'s actor for a respawn it has
+/// not finished or its last respawn failed (ADR-049 §10).
+pub fn read_live_context_state(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Result<Option<scp_core::context::ContextState>, ScpPyError> {
+    let sup = Arc::clone(supervisor(bi)?);
+    let ctx = context_id.to_owned();
+    block_on_supervisor_query(async move { sup.read_context_state_checked(&ctx).await })?
+        .map_err(ScpPyError::from)
+}
+
 /// Returns the IDs of all registered contexts where the given DID is a member.
 ///
 /// Used by `py_mcp_load_contexts` to return locally known contexts when
@@ -1802,6 +1944,63 @@ pub fn sync_ceiling_from_params(
         st.ceiling_strings = ceiling_strings;
         Ok(())
     })
+}
+
+/// Test-only: spawns the per-context supervisor actor whose lifecycle state
+/// [`live_context_state`] reads, carrying `ceiling` as the context's capability
+/// ceiling.
+///
+/// [`register_context`] alone registers FFI state and attaches a supervisor to
+/// the bridge instance; it does NOT create the context inside that supervisor,
+/// so a unit test that only calls it leaves every lifecycle gate failing
+/// closed. Tests call this to give the context the actor a real
+/// `context_create` would have created.
+///
+/// `ceiling` entries take the colon form the Python surface accepts
+/// (`"outlet:register"`, `"messages:write"`). An empty slice creates the context
+/// with `default_ceiling()`, the ceiling `PyContextParams::from_py_dict`
+/// resolves when a caller declares none.
+///
+/// # Panics
+///
+/// Panics when a `ceiling` entry fails the §5.4.2.1 capability parser, when the
+/// tokio runtime is unavailable, or when `create_context` rejects the request —
+/// each one is a broken test fixture rather than a condition under test.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)] // A broken test fixture panics; production paths keep the deny.
+pub(crate) fn create_supervisor_context_for_test(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    creator_did: &str,
+    ceiling: &[&str],
+) {
+    let capabilities: Vec<scp_core::context::roles::Capability> = if ceiling.is_empty() {
+        scp_core::context::roles::default_ceiling()
+            .iter()
+            .cloned()
+            .collect()
+    } else {
+        ceiling
+            .iter()
+            .map(|entry| {
+                scp_core::context::roles::Capability::new(entry)
+                    .unwrap_or_else(|| panic!("test ceiling entry {entry:?} must parse"))
+            })
+            .collect()
+    };
+    let params = scp_core::context::ContextParams {
+        ceiling: capabilities,
+        ..scp_core::context::ContextParams::default()
+    };
+    let sup = Arc::clone(supervisor(bi).expect("test supervisor must be attached"));
+    let rt = super::runtime().expect("tokio runtime must be initialized");
+    rt.block_on(sup.create_context(
+        context_id.to_owned(),
+        params,
+        scp_did::DID(creator_did.to_owned()),
+        None,
+    ))
+    .expect("test supervisor context creation must succeed");
 }
 
 /// Closes the receive channel for a context by dropping the sender (SCP-216).
