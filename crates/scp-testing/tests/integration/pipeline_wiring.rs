@@ -3232,10 +3232,70 @@ const RESOURCE_BRIDGE: &str = "fn validate_resource_access(&self, context_id: &s
                   -> Result<(), AccessRefusal> {\n    use scp_mcp::server::AccessRefusal;\n    \
                   let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;\n    \
                   let role_state =\n        \
-                  live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;\n    \
+                  gate_role_state(&bi, context_id)?;\n    \
                   let access = resource.check_access(&role_state, &self.agent_did, context_id);\n    \
                   access.map_err(AccessRefusal::Denied)\n}\n\
                   fn context_members(&self) {}\n";
+
+/// A `gate_role_state` that splits an unheld context from a failed read, as the
+/// split gate accepts it. The split self-test derives each regression from it.
+const SPLIT_GATE: &str = "fn gate_role_state(bi: &Bi, context_id: &str) \
+                  -> Result<ContextRoleState, AccessRefusal> {\n    \
+                  use scp_mcp::server::AccessRefusal;\n    \
+                  match held_role_state(bi, context_id) {\n        \
+                  Ok(Some(role_state)) => Ok(role_state),\n        \
+                  Ok(None) => Err(AccessRefusal::Denied(format!(\n            \
+                  \"context '{context_id}' is not held by the supervisor\"\n        ))),\n        \
+                  Err(e) => Err(AccessRefusal::Unreadable(e)),\n    }\n}\n\
+                  fn held_role_state(bi: &Bi) {}\n";
+
+/// The split gate must go red when an unheld context is reported as a failed
+/// read, which `McpServer` answers with an internal error, when a failed read is
+/// reported as a denial, when an unheld context reaches the predicate as a
+/// stand-in role state, or when the split survives only in another function.
+#[test]
+fn mcp_access_gate_rejects_an_unsplit_role_state_read() {
+    assert!(splits_absent_context_from_failed_read(&production_code(
+        SPLIT_GATE
+    )));
+    let absent_as_unreadable = SPLIT_GATE.replace(
+        "Ok(None) => Err(AccessRefusal::Denied(",
+        "Ok(None) => Err(AccessRefusal::Unreadable(",
+    );
+    assert!(!splits_absent_context_from_failed_read(&production_code(
+        &absent_as_unreadable
+    )));
+    let failed_as_denied = SPLIT_GATE.replace(
+        "Err(e) => Err(AccessRefusal::Unreadable(e)),",
+        "Err(e) => Err(AccessRefusal::Denied(e)),",
+    );
+    assert!(!splits_absent_context_from_failed_read(&production_code(
+        &failed_as_denied
+    )));
+    let absent_as_stand_in = SPLIT_GATE.replace(
+        "Ok(None) => Err(AccessRefusal::Denied(format!(",
+        "Ok(None) => Ok(ContextRoleState::default()), Ok(_) => Err(AccessRefusal::Denied(format!(",
+    );
+    assert!(!splits_absent_context_from_failed_read(&production_code(
+        &absent_as_stand_in
+    )));
+    let read_elsewhere = SPLIT_GATE.replace(
+        "match held_role_state(bi, context_id) {",
+        "match cached_role_state(bi, context_id) {",
+    );
+    assert!(!splits_absent_context_from_failed_read(&production_code(
+        &read_elsewhere
+    )));
+    let moved = SPLIT_GATE
+        .replace("fn gate_role_state(", "fn other_gate(")
+        .replace(
+            "fn held_role_state(bi: &Bi) {}",
+            "fn gate_role_state(bi: &Bi) -> Result<(), AccessRefusal> { Ok(()) }",
+        );
+    assert!(!splits_absent_context_from_failed_read(&production_code(
+        &moved
+    )));
+}
 
 /// The resource-access gate must go red when the live read targets an instance
 /// other than the provider's own bridge instance (a stand-in `bi`, or `bi`
@@ -3296,7 +3356,7 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
     ));
     // A stand-in role state reaches the predicate: the live read is gone.
     let stand_in = bridge.replace(
-        "live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?",
+        "gate_role_state(&bi, context_id)?",
         "ContextRoleState::default()",
     );
     assert!(!answers_resource_access_from_live_role_state(
@@ -3313,14 +3373,14 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
     // The live read survives, but a call chained onto it turns a failed read
     // into a stand-in before the predicate.
     let chained = bridge.replace(
-        ".map_err(AccessRefusal::Unreadable)?;\n    let access",
-        ".or_else(|_| Ok(fallback.clone())).map_err(AccessRefusal::Unreadable)?;\n    let access",
+        "?;\n    let access",
+        ".or_else(|_| Ok(fallback.clone()))?;\n    let access",
     );
     assert!(!answers_resource_access_from_live_role_state(
         &production_code(&chained)
     ));
     let unwrapped = bridge.replace(
-        ".map_err(AccessRefusal::Unreadable)?;\n    let access",
+        "?;\n    let access",
         ".unwrap_or_else(|_| fallback.clone());\n    let access",
     );
     assert!(!answers_resource_access_from_live_role_state(
@@ -3353,7 +3413,7 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
     ));
     // The live read and the predicate call survive only in ANOTHER function.
     let moved = "fn validate_resource_access(&self) -> Result<(), String> { Ok(()) }\n\
-                 fn other(&self) { let role_state = Self::live_role_state(&bi, context_id)?; \
+                 fn other(&self) { let role_state = Self::gate_role_state(&bi, context_id)?; \
                  resource.check_access(&role_state, &self.agent_did, context_id) }\n";
     assert!(!answers_resource_access_from_live_role_state(
         &production_code(moved)
@@ -3398,32 +3458,28 @@ fn fn_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// Whether the production `validate_resource_access` in `code` reads the
-/// context's role state from the live source (PyO3 `gate_role_state`, NAPI
-/// `live_role_state`, UniFFI `role_state_of`) of the provider's own bridge
-/// instance, passes that value to `ResourceKind::check_access`, and returns
-/// that call's verdict as the function's tail expression.
+/// context's role state through the bridge's `gate_role_state` (an associated
+/// function on PyO3 and UniFFI, a free function on NAPI) from the provider's
+/// own bridge instance, passes that value to `ResourceKind::check_access`, and
+/// returns that call's verdict as the function's tail expression.
 ///
 /// The whole body is pinned statement by statement: the `use` of
 /// `AccessRefusal`, then `bi` bound from `self.upgrade_bi()`, then the
-/// live-read statement, then the predicate call and its verdict. So no
+/// `gate_role_state` read, then the predicate call and its verdict. So no
 /// statement can bind `bi` to another instance or return before the check, no
 /// later statement can rebind `role_state` to a stand-in, and no call chained
-/// onto the read (an `or_else`, an `unwrap_or_else`) can turn a failed read
-/// into a stand-in: each pinned read ends in `?`, which returns a failed read
-/// as `AccessRefusal::Unreadable` (and PyO3's an absent context as
-/// `AccessRefusal::Denied`).
+/// onto the read (an `or_else`, an `unwrap_or_else`) can turn a refused read
+/// into a stand-in: the pinned read ends in `?`, which returns
+/// `gate_role_state`'s refusal. [`splits_absent_context_from_failed_read`]
+/// checks which refusal `gate_role_state` returns.
 fn answers_resource_access_from_live_role_state(code: &str) -> bool {
     const BIND: &str = "use scp_mcp::server::AccessRefusal; \
                         let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;";
     const TAIL: &str = "let access = resource.check_access(&role_state, &self.agent_did, \
                         context_id); access.map_err(AccessRefusal::Denied) }";
-    const READS: [&str; 3] = [
+    const READS: [&str; 2] = [
         "let role_state = Self::gate_role_state(&bi, context_id)?;",
-        "let role_state = live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;",
-        "let role_state = Self::role_state_of(&bi, context_id) \
-         .map_err(AccessRefusal::Unreadable)? .ok_or_else(|| { \
-         AccessRefusal::Unreadable(format!( \
-         \"context '{context_id}' has no role state on this bridge instance\" )) })?;",
+        "let role_state = gate_role_state(&bi, context_id)?;",
     ];
     fn_body(code, "validate_resource_access").is_some_and(|body| {
         let body = body.trim_end();
@@ -3439,6 +3495,36 @@ fn answers_resource_access_from_live_role_state(code: &str) -> bool {
                 .is_some_and(|signature| {
                     signature.trim_end().ends_with('{') && signature.matches('{').count() == 1
                 })
+        })
+    })
+}
+
+/// Whether the `gate_role_state` in `code` (from [`production_code`]) matches
+/// on the bridge's live role-state read of `bi` and answers each outcome with
+/// its own refusal: a held context yields its role state, a context the actor
+/// does not hold yields `AccessRefusal::Denied`, and a failed read yields
+/// `AccessRefusal::Unreadable` carrying the read's error.
+///
+/// `McpServer` omits a denied context from `resources/list` and `tools/list`,
+/// and answers `Unreadable` with an internal error. So a bridge that reports
+/// an unheld context as `Unreadable` fails a whole list with a server fault
+/// where a sibling bridge omits the context, and a bridge that reports a
+/// failed read as `Denied` hides the failure as a shorter list.
+fn splits_absent_context_from_failed_read(code: &str) -> bool {
+    const READS: [&str; 3] = [
+        "match Self::held_role_state(bi, context_id) {",
+        "match held_role_state(bi, context_id) {",
+        "match Self::role_state_of(bi, context_id) {",
+    ];
+    const HELD_THEN_ABSENT: &str =
+        " Ok(Some(role_state)) => Ok(role_state), Ok(None) => Err(AccessRefusal::Denied(";
+    const FAILED: &str = " Err(e) => Err(AccessRefusal::Unreadable(e)), }";
+    fn_body(code, "gate_role_state").is_some_and(|body| {
+        READS.iter().any(|read| {
+            body.find(read).is_some_and(|at| {
+                let arms = &body[at + read.len()..];
+                arms.starts_with(HELD_THEN_ABSENT) && arms.contains(FAILED)
+            })
         })
     })
 }
@@ -3509,9 +3595,15 @@ fn production_source(src: &str) -> &str {
 /// synthesized again. The rule has one definition,
 /// `scp_mcp::server::ResourceKind::check_access`, and each bridge's
 /// `validate_resource_access` passes it the role state that bridge read. This
-/// test pins the two parts the types cannot see: that each bridge feeds the
+/// test pins the three parts the types cannot see: that each bridge feeds the
 /// predicate role state read from the live source of its own bridge instance
-/// rather than a stand-in, and that the predicate's
+/// rather than a stand-in; that each bridge's `gate_role_state` answers a
+/// context the actor does not hold with `AccessRefusal::Denied` and a failed
+/// read with `AccessRefusal::Unreadable`, and that PyO3's and UniFFI's
+/// `validate_capability` reads through that same `gate_role_state` (NAPI's
+/// `validate_capability` is a stub against SCP-048, the MCP server tool
+/// listing and capability filtering story, and denies every outlet); and that
+/// the predicate's
 /// `Self::Events | Self::Members =>` arm calls `member_has_capability` with
 /// `Capability::MessagesRead`. It does not check
 /// how that arm uses the call's result, nor the `Tools` arm, which requires
@@ -3540,13 +3632,32 @@ fn mcp_resource_access_is_answered_from_real_role_state() {
             include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs"),
         ),
     ] {
+        let code = production_code(src);
         assert!(
-            answers_resource_access_from_live_role_state(&production_code(src)),
+            answers_resource_access_from_live_role_state(&code),
             "{bridge}'s production `validate_resource_access` must read the context's \
-             role state from the live source of its own bridge instance and pass that value to \
-             `ResourceKind::check_access`; a stand-in role state, a deleted predicate \
+             role state through `gate_role_state` from its own bridge instance and pass that \
+             value to `ResourceKind::check_access`; a stand-in role state, a deleted predicate \
              call, or a call in some other function does not count"
         );
+        assert!(
+            splits_absent_context_from_failed_read(&code),
+            "{bridge}'s production `gate_role_state` must match on its live role-state read \
+             and answer a context the actor does not hold with `AccessRefusal::Denied` and a \
+             failed read with `AccessRefusal::Unreadable`, as its sibling bridges do; an unheld \
+             context reported as `Unreadable` fails `resources/list` with an internal error"
+        );
+        if bridge != "NAPI" {
+            assert!(
+                fn_body(&code, "validate_capability").is_some_and(|body| body.contains(
+                    "let role_state = Self::gate_role_state(&bi, context_id)?; \
+                     self.outlet_grant(&bi, &role_state, context_id, outlet_name, check)"
+                )),
+                "{bridge}'s production `validate_capability` must read the context's role state \
+                 through `gate_role_state` and pass it to `outlet_grant`, so `tools/list` omits a \
+                 context the actor does not hold as `resources/list` does"
+            );
+        }
     }
 
     let server = production_code(include_str!("../../../../crates/scp-mcp/src/server.rs"));
