@@ -23998,7 +23998,13 @@ mod tests {
             std::sync::Mutex<std::collections::HashMap<String, scp_crypto::p256::P256SigningKey>>,
         next: std::sync::atomic::AtomicU64,
         fault: PseudonymFault,
+        /// Called with the key id at the start of `destroy_key`, before the
+        /// host forgets the key.
+        destroy_probe: Option<DestroyProbe>,
     }
+
+    /// A callback run inside the host's `destroy_key`.
+    type DestroyProbe = Box<dyn Fn(&str) + Send + Sync>;
 
     /// One way a host's pseudonym path can misbehave.
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24026,6 +24032,7 @@ mod tests {
                 pseudonyms: std::sync::Mutex::new(std::collections::HashMap::new()),
                 next: std::sync::atomic::AtomicU64::new(1),
                 fault,
+                destroy_probe: None,
             }
         }
 
@@ -24154,6 +24161,9 @@ mod tests {
         }
 
         async fn destroy_key(&self, key_id: String) -> Result<(), ScpError> {
+            if let Some(probe) = &self.destroy_probe {
+                probe(&key_id);
+            }
             self.pseudonyms
                 .lock()
                 .expect("pseudonym mutex")
@@ -24422,6 +24432,50 @@ mod tests {
             .expect("re-derive under the freed id");
         assert_eq!(second.key_handle().id(), 777);
         assert_ne!(second.public_key(), first.public_key());
+    }
+
+    /// The adapter unbinds a pseudonym handle before it calls the host's
+    /// `destroy_key`: a probe inside the host's `destroy_key` reads the
+    /// adapter's bindings and finds the handle already unbound. Calling the
+    /// host first leaves the handle bound during that call, and this fails.
+    #[tokio::test]
+    async fn destroy_unbinds_before_the_host_call() {
+        type Cell = std::sync::OnceLock<std::sync::Weak<CallbackKeyCustody>>;
+        let adapter = Arc::new(Cell::new());
+        let bound_during_host_destroy = Arc::new(std::sync::Mutex::new(None::<bool>));
+        let mut host = ProdLikeCustody::new();
+        let (probe_adapter, probe_seen) = (adapter.clone(), bound_during_host_destroy.clone());
+        host.destroy_probe = Some(Box::new(move |key_id: &str| {
+            let custody = probe_adapter
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .expect("adapter is alive during destroy");
+            let handle = KeyHandle::new(key_id.parse().expect("numeric key id"));
+            *probe_seen.lock().expect("probe mutex") = Some(custody.pseudonyms.is_bound(&handle));
+        }));
+        let custody = Arc::new(CallbackKeyCustody::new(Box::new(host)));
+        adapter
+            .set(Arc::downgrade(&custody))
+            .expect("cell set once");
+
+        let identity = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("identity key");
+        let pseudonym = custody
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect("derive");
+        assert!(custody.pseudonyms.is_bound(pseudonym.key_handle()));
+        custody
+            .destroy_key(pseudonym.key_handle())
+            .await
+            .expect("destroy");
+        assert_eq!(
+            *bound_during_host_destroy.lock().expect("probe mutex"),
+            Some(false),
+            "the host's destroy_key ran while the handle was still bound"
+        );
     }
 
     /// `identity_create_with_custody` must register the callback identity in the

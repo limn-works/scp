@@ -169,6 +169,14 @@ impl PseudonymBindings {
         result
     }
 
+    /// Whether `key` is bound to a pseudonym point. Tests read it from inside
+    /// a host `destroy_key` to prove the bridge unbinds before calling the host.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn is_bound(&self, key: &KeyHandle) -> bool {
+        self.points.contains_key(&key.id())
+    }
+
     /// Checks the input to a `sign` call. Returns the bound point and the
     /// digest when `key` is a pseudonym handle, and `None` for any other handle.
     ///

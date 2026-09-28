@@ -771,6 +771,9 @@ class FakeCustody:
         return hashlib.sha256(self._seeds[key_id]).digest()
 
     def destroy_key(self, key_id):
+        probe = getattr(self, 'probe', None)
+        if probe is not None:
+            probe(key_id)
         self._seeds.pop(key_id, None)
         self._pseudonyms.pop(key_id, None)
 
@@ -810,14 +813,21 @@ class FakeCustody:
 
     /// Builds a `PyCallbackKeyCustody` over a fresh `FakeCustody(fault)`.
     pub fn fake_py_custody(fault: Option<&str>) -> PyCallbackKeyCustody {
+        fake_py_custody_and_host(fault).0
+    }
+
+    /// [`fake_py_custody`], also returning the `FakeCustody` object so a test
+    /// can set attributes on it, such as the `probe` its `destroy_key` calls.
+    pub fn fake_py_custody_and_host(fault: Option<&str>) -> (PyCallbackKeyCustody, Py<PyAny>) {
         Python::with_gil(|py| {
             let module =
                 PyModule::from_code(py, FAKE_PROVIDER_PY, c"fake_custody.py", c"fake_custody")
                     .expect("fake provider module compiles");
             let cls = module.getattr("FakeCustody").expect("FakeCustody class");
-            let obj = cls.call1((fault,)).expect("FakeCustody instance");
-            let provider = PyKeyCustodyProvider::new(py, obj.unbind()).expect("valid provider");
-            PyCallbackKeyCustody::new(provider)
+            let obj = cls.call1((fault,)).expect("FakeCustody instance").unbind();
+            let provider =
+                PyKeyCustodyProvider::new(py, obj.clone_ref(py)).expect("valid provider");
+            (PyCallbackKeyCustody::new(provider), obj)
         })
     }
 
@@ -1044,6 +1054,60 @@ mod tests {
             .expect("re-derive under the freed id");
         assert_eq!(second.key_handle().id(), 777);
         assert_ne!(second.public_key(), first.public_key());
+    }
+
+    /// The adapter unbinds a pseudonym handle before it calls the host's
+    /// `destroy_key`: a probe the host's `destroy_key` calls reads the
+    /// adapter's bindings and finds the handle already unbound. Calling the
+    /// host first leaves the handle bound during that call, and this fails.
+    #[tokio::test]
+    async fn ffi_custody_callback_unbinds_before_the_host_destroy() {
+        use pyo3::types::{PyCFunction, PyDict, PyTuple};
+        let (adapter, host) = super::test_fakes::fake_py_custody_and_host(None);
+        let custody = std::sync::Arc::new(adapter);
+        let bound_during_host_destroy = std::sync::Arc::new(std::sync::Mutex::new(None::<bool>));
+        let (probe_adapter, probe_seen) = (
+            std::sync::Arc::downgrade(&custody),
+            bound_during_host_destroy.clone(),
+        );
+        Python::with_gil(|py| {
+            let probe = PyCFunction::new_closure(
+                py,
+                None,
+                None,
+                move |args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>| {
+                    let (key_id,): (String,) = args.extract()?;
+                    let custody = probe_adapter
+                        .upgrade()
+                        .expect("adapter is alive during destroy");
+                    let handle = KeyHandle::new(key_id.parse().expect("numeric key id"));
+                    *probe_seen.lock().expect("probe mutex") =
+                        Some(custody.pseudonyms.is_bound(&handle));
+                    PyResult::Ok(())
+                },
+            )
+            .expect("probe function");
+            host.bind(py).setattr("probe", probe).expect("set probe");
+        });
+
+        let identity = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("identity key");
+        let pseudonym = custody
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect("derive");
+        assert!(custody.pseudonyms.is_bound(pseudonym.key_handle()));
+        custody
+            .destroy_key(pseudonym.key_handle())
+            .await
+            .expect("destroy");
+        assert_eq!(
+            *bound_during_host_destroy.lock().expect("probe mutex"),
+            Some(false),
+            "the host's destroy_key ran while the handle was still bound"
+        );
     }
 
     /// Each host misbehavior on the pseudonym path fails closed for its own

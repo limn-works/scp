@@ -581,6 +581,17 @@ impl TestingCallbackCustody {
         Ok(Buffer::from(signature.as_bytes().to_vec()))
     }
 
+    /// Whether the adapter has `key_id` bound to a pseudonym point. A host
+    /// `destroyKey` calls it to prove the adapter unbinds before the host call.
+    ///
+    /// # Errors
+    ///
+    /// `SCP-IDENT-1055` if `key_id` is not a numeric key id.
+    #[napi(js_name = "isBound")]
+    pub fn is_bound(&self, key_id: String) -> napi::Result<bool> {
+        Ok(self.inner.pseudonyms.is_bound(&testing_handle(&key_id)?))
+    }
+
     /// Destroys `key_id` through the adapter (which unbinds a pseudonym).
     ///
     /// # Errors

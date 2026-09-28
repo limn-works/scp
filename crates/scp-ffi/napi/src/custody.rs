@@ -151,7 +151,7 @@ pub(crate) struct NapiCallbackKeyCustody {
     tsfns: CallbackTsfns,
     /// Pseudonym key ids bound to the point their derivation returned; a
     /// `sign` on one of them is checked strictly against that point.
-    pseudonyms: scp_ffi_common::custody_parse::PseudonymBindings,
+    pub(crate) pseudonyms: scp_ffi_common::custody_parse::PseudonymBindings,
 }
 
 impl fmt::Debug for NapiCallbackKeyCustody {

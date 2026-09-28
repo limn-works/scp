@@ -8,7 +8,8 @@
  *   - `check_sign_input`: a pseudonym key signs only a 32-byte digest, and a
  *     shorter input never reaches the host;
  *   - `check_signature`: a high-s host signature is rejected;
- *   - `unbind` in `destroy_key`: a destroyed id can carry a new point.
+ *   - `unbind` in `destroy_key`: a destroyed id can carry a new point, and
+ *     the id is already unbound when the host's `destroyKey` runs.
  *
  * It also runs the §25.19 Vector 30 identity scalar through the bridge's
  * production pseudonym derivation and compares the routing id to the spec.
@@ -35,6 +36,7 @@ interface TestingCustody {
   derivePseudonym(identityKeyId: string, contextId: string): Promise<PseudonymResult>;
   sign(keyId: string, data: Buffer): Promise<Buffer>;
   destroyKey(keyId: string): Promise<void>;
+  isBound(keyId: string): boolean;
 }
 
 type TestingCustodyCtor = new (
@@ -61,6 +63,8 @@ class Store {
   pseudonyms = new Map<string, bigint>();
   next = 1;
   signCalls = 0;
+  /** Called with the key id at the start of the host's `destroyKey`. */
+  destroyProbe?: (keyId: string) => void;
 }
 
 class StoreKeychain implements KeyCustodyProvider {
@@ -95,6 +99,7 @@ class StoreKeychain implements KeyCustodyProvider {
   }
 
   destroyKey(keyId: string): void {
+    this.store.destroyProbe?.(keyId);
     this.store.seeds.delete(keyId);
     this.store.pseudonyms.delete(keyId);
   }
@@ -167,6 +172,20 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     expect(beta.keyId).toBe(alpha.keyId);
     expect(Buffer.from(beta.publicKey).equals(Buffer.from(alpha.publicKey))).toBe(false);
     expect((await custody.sign(beta.keyId, DIGEST)).length).toBe(64);
+  });
+
+  test("the adapter unbinds a pseudonym before the host's destroyKey runs", async () => {
+    const store = new Store();
+    const custody = adapter(store);
+    const identity = await custody.generateKeypair();
+    const pseudonym = await custody.derivePseudonym(identity, "ctx");
+    expect(custody.isBound(pseudonym.keyId)).toBe(true);
+    let boundDuringHostDestroy: boolean | undefined;
+    store.destroyProbe = (keyId) => {
+      boundDuringHostDestroy = custody.isBound(keyId);
+    };
+    await custody.destroyKey(pseudonym.keyId);
+    expect(boundDuringHostDestroy).toBe(false);
   });
 
   test("§25.19 Vector 30 routing id through the bridge's pseudonym derivation", async () => {
