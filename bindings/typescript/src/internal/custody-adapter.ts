@@ -16,7 +16,7 @@ export interface NativePseudonymResult {
  * failure travels as `{ ok: false, code?, message }`, never as a thrown
  * exception: napi-rs turns an exception thrown inside a threadsafe-function
  * callback into a process-level uncaught exception. The bridge maps a failure
- * whose `code` is `"SCP-CRYPTO-4001"` to key-not-found and any other failure
+ * whose `code` is `"SCP-CRYPTO-4006"` to key-not-found and any other failure
  * to a custody error.
  */
 export type NativeHostResult<T> =

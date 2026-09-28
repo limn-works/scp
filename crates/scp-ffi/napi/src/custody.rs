@@ -47,7 +47,7 @@ use crate::identity::OpaqueInMemoryKeyCustody;
 /// `{ ok: false, code?, message }`, and never throws: napi-rs turns an
 /// exception thrown inside a threadsafe-function callback into a process-level
 /// uncaught exception, so `custody-adapter.ts` catches each host throw and
-/// returns the failure arm. A failure whose `code` is `SCP-CRYPTO-4001` maps to
+/// returns the failure arm. A failure whose `code` is `SCP-CRYPTO-4006` maps to
 /// [`PlatformError::KeyNotFound`]; any other failure maps to
 /// [`PlatformError::CustodyError`].
 ///
@@ -222,7 +222,7 @@ impl HostOutcome for HostUnitResult {
 }
 
 /// Maps a host callback's outcome to the custody result: the value on
-/// success, [`PlatformError::KeyNotFound`] for a `SCP-CRYPTO-4001` failure,
+/// success, [`PlatformError::KeyNotFound`] for a `SCP-CRYPTO-4006` failure,
 /// and [`PlatformError::CustodyError`] for any other failure, for a success
 /// with no value, and for a call the bridge could not complete.
 fn host_value<R: HostOutcome>(
@@ -237,14 +237,11 @@ fn host_value<R: HostOutcome>(
         Ok(None) => Err(PlatformError::CustodyError(format!(
             "KeyCustodyProvider.{method} reported success with no value"
         ))),
-        Err((Some(code), _)) if code == scp_ffi_common::error_codes::CRYPTO_4001 => {
-            Err(PlatformError::KeyNotFound)
-        }
-        Err((code, message)) => Err(PlatformError::CustodyError(format!(
-            "KeyCustodyProvider.{method} failed{}: {}",
-            code.map(|c| format!(" ({c})")).unwrap_or_default(),
-            message.unwrap_or_default()
-        ))),
+        Err((code, message)) => Err(scp_ffi_common::custody_parse::host_failure(
+            method,
+            code.as_deref(),
+            message.as_deref().unwrap_or_default(),
+        )),
     }
 }
 

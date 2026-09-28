@@ -13,7 +13,8 @@
  *
  * Two tests fail if `hostCall` in `src/internal/custody-adapter.ts` stops
  * catching host throws: a host throw must reject the SDK call with a typed
- * error (key-not-found for `SCP-CRYPTO-4001`, a custody error otherwise) and
+ * error (key-not-found `SCP-CRYPTO-4006` for a host error carrying that code,
+ * the custody error `SCP-CRYPTO-4060` for any other host error) and
  * never reach the process as an uncaught exception.
  *
  * It also runs the §25.19 Vector 30 and 31 identity scalars through the
@@ -62,7 +63,7 @@ try {
 }
 
 /** A host fault the store injects into pseudonym signing or key ids. */
-type Fault = "highS" | "fixedId" | "signThrows";
+type Fault = "highS" | "fixedId" | "signThrows" | "sign4001";
 
 /** The host's key store, with a count of `sign` calls that reach it. */
 class Store {
@@ -91,9 +92,10 @@ class StoreKeychain implements KeyCustodyProvider {
   sign(keyId: string, message: Uint8Array): Uint8Array {
     this.store.signCalls++;
     if (this.fault === "signThrows") throw new Error("keystore offline");
+    if (this.fault === "sign4001") throw new CryptoError("hsm offline", "SCP-CRYPTO-4001");
     const d = this.store.pseudonyms.get(keyId);
     // The contract's key-not-found signal (`KeyCustodyProvider` in `src/scp.ts`).
-    if (d === undefined) throw new CryptoError(`key not found: ${keyId}`, "SCP-CRYPTO-4001");
+    if (d === undefined) throw new CryptoError(`key not found: ${keyId}`, "SCP-CRYPTO-4006");
     const sig = p256SignPrehash(d, message);
     if (this.fault !== "highS") return sig;
     const s = bytesToBigInt(sig.subarray(32));
@@ -187,7 +189,7 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     expect((await custody.sign(pseudonym.keyId, DIGEST)).length).toBe(64);
     const calls = store.signCalls;
     const err = await custody.sign(pseudonym.keyId, Buffer.alloc(12)).catch((e: unknown) => e);
-    expect(mapBridgeError(err).code).toBe("SCP-IDENT-1055");
+    expect(mapBridgeError(err).code).toBe("SCP-CRYPTO-4060");
     expect(store.signCalls).toBe(calls);
   });
 
@@ -197,7 +199,7 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     const identity = await custody.generateKeypair();
     const pseudonym = await custody.derivePseudonym(identity, "ctx");
     const err = await custody.sign(pseudonym.keyId, DIGEST).catch((e: unknown) => e);
-    expect(mapBridgeError(err).code).toBe("SCP-IDENT-1055");
+    expect(mapBridgeError(err).code).toBe("SCP-CRYPTO-4060");
   });
 
   test("destroying a pseudonym unbinds its id", async () => {
@@ -229,7 +231,7 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     expect(uncaught).toEqual([]);
     const mapped = mapBridgeError(err);
     expect(mapped).toBeInstanceOf(CryptoError);
-    expect(mapped.code).toBe("SCP-CRYPTO-4001");
+    expect(mapped.code).toBe("SCP-CRYPTO-4006");
     expect((await custody.sign(kept.keyId, DIGEST)).length).toBe(64);
   });
 
@@ -244,8 +246,20 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     });
     expect(uncaught).toEqual([]);
     const mapped = mapBridgeError(err);
-    expect(mapped.code).toBe("SCP-IDENT-1055");
+    expect(mapped.code).toBe("SCP-CRYPTO-4060");
     expect(mapped.message).toContain("keystore offline");
+  });
+
+  test("a host error carrying the generic SCP-CRYPTO-4001 is a custody error, not key-not-found", async () => {
+    const store = new Store();
+    const custody = adapter(store, "sign4001");
+    const identity = await custody.generateKeypair();
+    const pseudonym = await custody.derivePseudonym(identity, "ctx");
+    const err = await custody.sign(pseudonym.keyId, DIGEST).catch((e: unknown) => e);
+    const mapped = mapBridgeError(err);
+    expect(mapped.code).toBe("SCP-CRYPTO-4060");
+    expect(mapped.message).toContain("SCP-CRYPTO-4001");
+    expect(mapped.message).toContain("hsm offline");
   });
 
   test("the adapter unbinds a pseudonym before the host's destroyKey runs", async () => {

@@ -423,6 +423,15 @@ async fn derive_context_pseudonym_required(
         .map_err(NapiError::from)
 }
 
+/// The error a failed custody pseudonym derivation surfaces as:
+/// `SCP-IDENT-1055` carrying the custody error.
+pub(crate) fn pseudonym_derivation_failed(e: &scp_platform::PlatformError) -> ScpNapiError {
+    ScpNapiError::Identity {
+        message: format!("pseudonym derivation failed: {e}"),
+        code: codes::IDENT_1055.to_owned(),
+    }
+}
+
 /// Core pseudonym-derivation sequence shared by every NAPI entry point.
 ///
 /// Holds the single authoritative definition of the derivation-failure code
@@ -440,10 +449,7 @@ pub(crate) async fn derive_pseudonym_bytes(
     let pseudonym = custody
         .derive_pseudonym(identity_key, context_id.as_bytes())
         .await
-        .map_err(|e| ScpNapiError::Identity {
-            message: format!("pseudonym derivation failed: {e}"),
-            code: codes::IDENT_1055.to_owned(),
-        })?;
+        .map_err(|e| pseudonym_derivation_failed(&e))?;
     // §9.10.4: the routing axis carries the 32-byte routing id of the 33-byte
     // P-256 pseudonym. `PseudonymKeypair::new` already rejected a malformed
     // host-returned point, which surfaced above as SCP-IDENT-1055.

@@ -481,10 +481,11 @@ export interface PseudonymResult {
  * passed and returned as `Uint8Array`.
  *
  * A callback reports failure by throwing. Throw an error whose `code` is
- * `"SCP-CRYPTO-4001"`, such as `new CryptoError(msg, "SCP-CRYPTO-4001")`, for
- * a key id that was destroyed or never existed; the SDK call then rejects with
- * a `CryptoError` carrying that code. Any other throw rejects the SDK call with
- * a custody error. The SDK catches every throw, so none reaches the process as
+ * `"SCP-CRYPTO-4006"` (key not found), such as
+ * `new CryptoError(msg, "SCP-CRYPTO-4006")`, for a key id that was destroyed or
+ * never existed; the SDK call then rejects with a `CryptoError` carrying that
+ * code. Any other throw, whatever its code, rejects the SDK call with the
+ * custody error `SCP-CRYPTO-4060` carrying the thrown code and message. The SDK catches every throw, so none reaches the process as
  * an uncaught exception.
  *
  * Only available on the NAPI (Node.js / Bun) backend — the SDK requires the

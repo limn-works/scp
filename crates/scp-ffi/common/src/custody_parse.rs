@@ -25,6 +25,45 @@ use scp_crypto::p256::P256PublicKey;
 use scp_platform::error::PlatformError;
 use scp_platform::traits::{KeyHandle, PseudonymKeypair};
 
+/// The bridge error code for a custody [`PlatformError`], one mapping for the
+/// `PyO3`, napi-rs and `UniFFI` bridges.
+///
+/// [`PlatformError::KeyNotFound`] is [`CRYPTO_4006`](crate::error_codes::CRYPTO_4006)
+/// and [`PlatformError::CustodyError`] is
+/// [`CRYPTO_4060`](crate::error_codes::CRYPTO_4060). Every other variant keeps
+/// [`CRYPTO_4004`](crate::error_codes::CRYPTO_4004).
+#[must_use]
+pub const fn platform_error_code(e: &PlatformError) -> &'static str {
+    use crate::error_codes as codes;
+    match e {
+        PlatformError::KeyNotFound => codes::CRYPTO_4006,
+        PlatformError::CustodyError(_) => codes::CRYPTO_4060,
+        PlatformError::WrongKeyType { .. }
+        | PlatformError::StorageError(_)
+        | PlatformError::AttestationError(_)
+        | PlatformError::PushError(_)
+        | PlatformError::Unsupported(_) => codes::CRYPTO_4004,
+    }
+}
+
+/// Maps a host custody callback's failure to a [`PlatformError`], one mapping
+/// for the `PyO3`, napi-rs and `UniFFI` bridges.
+///
+/// A failure carrying [`CRYPTO_4006`](crate::error_codes::CRYPTO_4006), the
+/// key-not-found code, is [`PlatformError::KeyNotFound`]. A failure with any
+/// other code, or with none, is [`PlatformError::CustodyError`] carrying the
+/// host's code and message.
+#[must_use]
+pub fn host_failure(method: &str, code: Option<&str>, message: &str) -> PlatformError {
+    if code == Some(crate::error_codes::CRYPTO_4006) {
+        return PlatformError::KeyNotFound;
+    }
+    let code = code.map(|c| format!(" ({c})")).unwrap_or_default();
+    PlatformError::CustodyError(format!(
+        "KeyCustodyProvider.{method} failed{code}: {message}"
+    ))
+}
+
 /// Parses a numeric key-id string (as returned by a `KeyCustodyProvider`) into
 /// a [`KeyHandle`].
 ///
@@ -225,6 +264,45 @@ impl PseudonymBindings {
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_failure_maps_only_crypto_4006_to_key_not_found() {
+        use crate::error_codes as codes;
+        assert!(matches!(
+            host_failure("sign", Some(codes::CRYPTO_4006), "gone"),
+            PlatformError::KeyNotFound
+        ));
+        for code in [
+            Some(codes::CRYPTO_4001),
+            Some(codes::CRYPTO_4060),
+            Some("x"),
+            None,
+        ] {
+            match host_failure("sign", code, "hsm offline") {
+                PlatformError::CustodyError(m) => {
+                    assert!(m.contains("KeyCustodyProvider.sign failed"), "{m}");
+                    assert!(m.contains("hsm offline"), "{m}");
+                    if let Some(c) = code {
+                        assert!(m.contains(c), "{m}");
+                    }
+                }
+                other => panic!("{code:?} must be a custody error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn platform_error_code_names_key_not_found_and_custody_codes() {
+        use crate::error_codes as codes;
+        assert_eq!(
+            platform_error_code(&PlatformError::KeyNotFound),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            platform_error_code(&PlatformError::CustodyError("x".to_owned())),
+            codes::CRYPTO_4060
+        );
+    }
 
     /// Drives a future to completion on a current-thread runtime.
     fn block_on<F: core::future::Future>(future: F) -> F::Output {

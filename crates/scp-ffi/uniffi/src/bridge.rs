@@ -719,12 +719,18 @@ impl CallbackKeyCustody {
             .provider
             .get_public_key(pseudonym.key_handle().id().to_string())
             .await
-            .map_err(|e| {
-                PlatformError::CustodyError(format!("KeyCustodyProvider.{method}: {e}"))
-            })?;
+            .map_err(|e| host_err(method, &e))?;
         self.pseudonyms.bind(method, &pseudonym, &host_public_key)?;
         Ok(pseudonym)
     }
+}
+
+/// Maps a host custody callback's [`ScpError`] through the shared
+/// host-failure mapping: `SCP-CRYPTO-4006` is [`PlatformError::KeyNotFound`],
+/// and any other code is [`PlatformError::CustodyError`] carrying the host's
+/// code and message.
+fn host_err(method: &str, e: &ScpError) -> PlatformError {
+    scp_ffi_common::custody_parse::host_failure(method, Some(e.code()), &e.to_string())
 }
 
 impl fmt::Debug for CallbackKeyCustody {
@@ -747,7 +753,7 @@ impl KeyCustody for CallbackKeyCustody {
             .provider
             .generate_keypair(type_str)
             .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            .map_err(|e| host_err("generate_keypair", &e))?;
         // Parse the returned key_id string as a u64 handle identifier via the
         // shared helper (unifies the error text with the PyO3/napi bridges).
         scp_ffi_common::custody_parse::parse_handle("generate_keypair", &key_id)
@@ -759,7 +765,7 @@ impl KeyCustody for CallbackKeyCustody {
             .provider
             .sign(key.id().to_string(), data.to_vec())
             .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            .map_err(|e| host_err("sign", &e))?;
         if let Some((point, digest)) = pseudonym {
             scp_ffi_common::custody_parse::PseudonymBindings::check_signature(
                 &point, &digest, &sig_bytes,
@@ -773,7 +779,7 @@ impl KeyCustody for CallbackKeyCustody {
             .provider
             .get_public_key(key.id().to_string())
             .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            .map_err(|e| host_err("get_public_key", &e))?;
         Ok(PublicKey::new(pk_bytes))
     }
 
@@ -783,7 +789,7 @@ impl KeyCustody for CallbackKeyCustody {
                 self.provider
                     .destroy_key(key.id().to_string())
                     .await
-                    .map_err(|e| PlatformError::CustodyError(e.to_string()))
+                    .map_err(|e| host_err("destroy_key", &e))
             })
             .await
     }
@@ -797,7 +803,7 @@ impl KeyCustody for CallbackKeyCustody {
             .provider
             .dh_agree(key.id().to_string(), peer_public.to_vec())
             .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            .map_err(|e| host_err("dh_agree", &e))?;
         Ok(SharedSecret::new(scp_ffi_common::custody_parse::expect_32(
             "dh_agree", &shared,
         )?))
@@ -812,7 +818,7 @@ impl KeyCustody for CallbackKeyCustody {
             .provider
             .derive_pseudonym(key.id().to_string(), context_id.to_vec())
             .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            .map_err(|e| host_err("derive_pseudonym", &e))?;
         self.bind_pseudonym("derive_pseudonym", result).await
     }
 
@@ -834,7 +840,7 @@ impl KeyCustody for CallbackKeyCustody {
             .provider
             .derive_rotatable_pseudonym(key.id().to_string(), context_id.to_vec(), pseudonym_epoch)
             .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            .map_err(|e| host_err("derive_rotatable_pseudonym", &e))?;
         self.bind_pseudonym("derive_rotatable_pseudonym", result)
             .await
     }
@@ -850,7 +856,7 @@ impl KeyCustody for CallbackKeyCustody {
             .provider
             .dh_agree(ed25519_handle.id().to_string(), peer_x25519_public.to_vec())
             .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            .map_err(|e| host_err("dh_agree", &e))?;
         Ok(SharedSecret::new(scp_ffi_common::custody_parse::expect_32(
             "ed25519_to_x25519_agree",
             &shared,
@@ -955,7 +961,7 @@ impl CallbackKeyCustody {
             .provider
             .export_signing_key_bytes(handle.id().to_string())
             .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            .map_err(|e| host_err("export_signing_key_bytes", &e))?;
         // Private seed material: wrap the parsed 32-byte array in `Zeroizing`
         // so the intermediate seed buffer is wiped on drop, matching the PyO3
         // and NAPI callback custody paths (ADR-006).
@@ -1275,6 +1281,25 @@ pub enum ScpError {
         /// The shared context id that forced serialization.
         contended_context: String,
     },
+}
+
+impl ScpError {
+    /// The error's `SCP-{CATEGORY}-{NUMBER}` code.
+    #[must_use]
+    pub(crate) fn code(&self) -> &str {
+        match self {
+            Self::Identity { code, .. }
+            | Self::Context { code, .. }
+            | Self::Permission { code, .. }
+            | Self::Crypto { code, .. }
+            | Self::Transport { code, .. }
+            | Self::Outlet { code, .. }
+            | Self::Validation { code, .. }
+            | Self::SagaAborted { code, .. }
+            | Self::SagaNeedsRepair { code, .. }
+            | Self::SagaBusy { code, .. } => code,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1731,7 +1756,7 @@ impl From<scp_platform::PlatformError> for ScpError {
     fn from(e: scp_platform::PlatformError) -> Self {
         Self::Crypto {
             msg: format!("platform key operation failed: {e} — check key custody configuration"),
-            code: codes::CRYPTO_4004.to_owned(),
+            code: scp_ffi_common::custody_parse::platform_error_code(&e).to_owned(),
         }
     }
 }
@@ -24019,6 +24044,9 @@ mod tests {
         /// Every pseudonym gets key id 777, whatever its context: a host that
         /// reuses one id for two different points.
         FixedId,
+        /// `sign` fails with the generic `SCP-CRYPTO-4001`, which is not the
+        /// key-not-found code.
+        SignFails4001,
     }
 
     impl ProdLikeCustody {
@@ -24064,9 +24092,10 @@ mod tests {
                 .expect("keystore mutex")
                 .get(key_id)
                 .cloned()
-                .ok_or_else(|| ScpError::Identity {
+                // The contract's key-not-found signal (`KeyCustodyProvider` in `lib.rs`).
+                .ok_or_else(|| ScpError::Crypto {
                     msg: format!("unknown key_id {key_id}"),
-                    code: codes::IDENT_1010.to_owned(),
+                    code: codes::CRYPTO_4006.to_owned(),
                 })
         }
 
@@ -24126,6 +24155,12 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::KeyCustodyProvider for ProdLikeCustody {
         async fn sign(&self, key_id: String, message: Vec<u8>) -> Result<Vec<u8>, ScpError> {
+            if self.fault == PseudonymFault::SignFails4001 {
+                return Err(ScpError::Crypto {
+                    msg: "hsm offline".to_owned(),
+                    code: codes::CRYPTO_4001.to_owned(),
+                });
+            }
             if let Some(pseudonym) = self.pseudonym_for(&key_id) {
                 let digest: [u8; 32] =
                     message
@@ -24400,6 +24435,60 @@ mod tests {
             .await
             .expect_err("high-s host signature");
         assert!(matches!(err, PlatformError::CustodyError(_)), "{err:?}");
+    }
+
+    /// A host failure carrying `SCP-CRYPTO-4006` is key-not-found, and one
+    /// carrying the generic `SCP-CRYPTO-4001` is a custody error; the bridge
+    /// reports them as `SCP-CRYPTO-4006` and `SCP-CRYPTO-4060`.
+    #[tokio::test]
+    async fn callback_host_failure_codes_map_to_typed_errors() {
+        let custody = CallbackKeyCustody::new(Box::new(ProdLikeCustody::new()));
+        let identity = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("identity key");
+        let pseudonym = custody
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect("derive");
+        custody
+            .destroy_key(pseudonym.key_handle())
+            .await
+            .expect("destroy pseudonym");
+        let err = custody
+            .sign(pseudonym.key_handle(), &[0x42u8; 32])
+            .await
+            .expect_err("destroyed key");
+        assert!(matches!(err, PlatformError::KeyNotFound), "{err:?}");
+        match ScpError::from(err) {
+            ScpError::Crypto { code, .. } => assert_eq!(code, codes::CRYPTO_4006),
+            other => panic!("expected CRYPTO_4006, got {other:?}"),
+        }
+
+        let custody = CallbackKeyCustody::new(Box::new(ProdLikeCustody::with_fault(
+            PseudonymFault::SignFails4001,
+        )));
+        let identity = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("identity key");
+        let err = custody
+            .sign(&identity, b"message")
+            .await
+            .expect_err("host 4001");
+        match &err {
+            PlatformError::CustodyError(m) => {
+                assert!(
+                    m.contains(codes::CRYPTO_4001) && m.contains("hsm offline"),
+                    "{m}"
+                );
+            }
+            other => panic!("4001 must be a custody error, got {other:?}"),
+        }
+        match ScpError::from(err) {
+            ScpError::Crypto { code, .. } => assert_eq!(code, codes::CRYPTO_4060),
+            other => panic!("expected CRYPTO_4060, got {other:?}"),
+        }
     }
 
     /// B1: a host that returns the same key id for the same (identity,

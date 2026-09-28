@@ -417,7 +417,7 @@ pub trait KeyCustody: Send + Sync {
     ///
     /// Destroying an identity destroys every v1 and v2 pseudonym key derived
     /// from it, and a derivation still in flight when its identity is destroyed
-    /// fails with key-not-found (`SCP-CRYPTO-4001`) and stores nothing
+    /// fails with key-not-found (`SCP-CRYPTO-4006`) and stores nothing
     /// (`09-security-model.md` §9.10.4.A).
     ///
     /// # Errors
@@ -472,7 +472,7 @@ pub trait KeyCustody: Send + Sync {
     /// The pseudonym dies with its identity (`09-security-model.md` §9.10.4.A):
     /// destroying the identity destroys every v1 and v2 pseudonym key derived
     /// from it, and a derivation still in flight when its identity is destroyed
-    /// fails with key-not-found (`SCP-CRYPTO-4001`) and stores nothing.
+    /// fails with key-not-found (`SCP-CRYPTO-4006`) and stores nothing.
     ///
     /// # Errors
     ///
@@ -508,7 +508,7 @@ pub trait KeyCustody: Send + Sync {
     /// The pseudonym dies with its identity (`09-security-model.md` §9.10.4.A):
     /// destroying the identity destroys every v1 and v2 pseudonym key derived
     /// from it, and a derivation still in flight when its identity is destroyed
-    /// fails with key-not-found (`SCP-CRYPTO-4001`) and stores nothing.
+    /// fails with key-not-found (`SCP-CRYPTO-4006`) and stores nothing.
     ///
     /// # Errors
     ///

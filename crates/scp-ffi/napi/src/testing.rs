@@ -500,18 +500,15 @@ pub struct TestingCallbackCustody {
     inner: crate::custody::NapiCallbackKeyCustody,
 }
 
-fn custody_err(e: &scp_platform::PlatformError) -> napi::Error {
-    if matches!(e, scp_platform::PlatformError::KeyNotFound) {
-        return napi::Error::from(ScpNapiError::from(scp_platform::PlatformError::KeyNotFound));
-    }
-    napi::Error::from(ScpNapiError::Identity {
-        message: e.to_string(),
-        code: codes::IDENT_1055.to_owned(),
-    })
+/// The error production reports for a custody failure outside derivation:
+/// the bridge's `From<PlatformError>` (`SCP-CRYPTO-4006` for key-not-found,
+/// `SCP-CRYPTO-4060` for a custody error).
+fn custody_err(e: scp_platform::PlatformError) -> napi::Error {
+    napi::Error::from(ScpNapiError::from(e))
 }
 
 fn testing_handle(key_id: &str) -> napi::Result<scp_platform::KeyHandle> {
-    scp_ffi_common::custody_parse::parse_handle("testing", key_id).map_err(|e| custody_err(&e))
+    scp_ffi_common::custody_parse::parse_handle("testing", key_id).map_err(custody_err)
 }
 
 #[napi]
@@ -532,7 +529,8 @@ impl TestingCallbackCustody {
     ///
     /// # Errors
     ///
-    /// `SCP-IDENT-1055` carrying the adapter's custody error.
+    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` for any other
+    /// custody error, as production reports them.
     #[napi(js_name = "generateKeypair")]
     pub async fn generate_keypair(&self) -> napi::Result<String> {
         use scp_platform::KeyCustody;
@@ -540,14 +538,15 @@ impl TestingCallbackCustody {
             .generate_keypair(scp_platform::KeyType::Ed25519)
             .await
             .map(|h| h.id().to_string())
-            .map_err(|e| custody_err(&e))
+            .map_err(custody_err)
     }
 
     /// Derives and binds the v1 pseudonym of `identity_key_id` in `context_id`.
     ///
     /// # Errors
     ///
-    /// `SCP-IDENT-1055` carrying the adapter's custody error.
+    /// `SCP-IDENT-1055` carrying the adapter's custody error, as production
+    /// derivation reports it.
     #[napi(js_name = "derivePseudonym")]
     pub async fn derive_pseudonym(
         &self,
@@ -560,7 +559,7 @@ impl TestingCallbackCustody {
             .inner
             .derive_pseudonym(&identity, context_id.as_bytes())
             .await
-            .map_err(|e| custody_err(&e))?;
+            .map_err(|e| napi::Error::from(crate::context::pseudonym_derivation_failed(&e)))?;
         Ok(crate::custody::NapiPseudonymResult {
             public_key: pseudonym.public_key().as_bytes().to_vec(),
             key_id: pseudonym.key_handle().id().to_string(),
@@ -571,7 +570,8 @@ impl TestingCallbackCustody {
     ///
     /// # Errors
     ///
-    /// `SCP-IDENT-1055` carrying the adapter's custody error.
+    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` for any other
+    /// custody error, as production reports them.
     #[napi]
     pub async fn sign(&self, key_id: String, data: Buffer) -> napi::Result<Buffer> {
         use scp_platform::KeyCustody;
@@ -580,7 +580,7 @@ impl TestingCallbackCustody {
             .inner
             .sign(&key, data.as_ref())
             .await
-            .map_err(|e| custody_err(&e))?;
+            .map_err(custody_err)?;
         Ok(Buffer::from(signature.as_bytes().to_vec()))
     }
 
@@ -589,7 +589,7 @@ impl TestingCallbackCustody {
     ///
     /// # Errors
     ///
-    /// `SCP-IDENT-1055` if `key_id` is not a numeric key id.
+    /// `SCP-CRYPTO-4060` if `key_id` is not a numeric key id.
     #[napi(js_name = "isBound")]
     pub fn is_bound(&self, key_id: String) -> napi::Result<bool> {
         Ok(self.inner.pseudonyms.is_bound(&testing_handle(&key_id)?))
@@ -599,14 +599,12 @@ impl TestingCallbackCustody {
     ///
     /// # Errors
     ///
-    /// `SCP-IDENT-1055` carrying the adapter's custody error.
+    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` for any other
+    /// custody error, as production reports them.
     #[napi(js_name = "destroyKey")]
     pub async fn destroy_key(&self, key_id: String) -> napi::Result<()> {
         use scp_platform::KeyCustody;
         let key = testing_handle(&key_id)?;
-        self.inner
-            .destroy_key(&key)
-            .await
-            .map_err(|e| custody_err(&e))
+        self.inner.destroy_key(&key).await.map_err(custody_err)
     }
 }
