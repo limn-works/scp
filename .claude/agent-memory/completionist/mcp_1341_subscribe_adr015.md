@@ -1,24 +1,27 @@
 ---
 name: mcp-1341-subscribe-adr015
-description: SHIPPED state of #1341 (MCP resources/subscribe backed by Supervisor events) on branch fix/mcp-subscribe-honest — four earlier findings are now FIXED; only ADR-015 AC7 (dynamic tool list) and AC8 (Rust serve binary) remain genuinely open.
+description: Shipped state of MCP resources/subscribe backed by Supervisor events (#1341, Track G) — earlier findings are FIXED; only ADR-015 AC7 (dynamic tool list) and AC8 (Rust serve binary) remain genuinely open.
 metadata:
   type: project
 ---
 
-Branch `fix/mcp-subscribe-honest` (rebased on origin/main) landed #1341 and the
-full-roster review fixes on top. This note records the SHIPPED end state — do not
-report the fixed items as open.
+Track G of the nullifier-seal plan landed #1341 and its review fixes. This note
+records the shipped end state — do not report the fixed items as open.
 
 **Origin:** the old seam let PyO3/UniFFI return `Ok(())` from `subscribe_resource`
 and do nothing while `initialize` advertised `subscribe: true` (NAPI returned
 `Err` — three-way divergence). That false guarantee is gone.
 
-## FIXED on this branch (re-verify against code before re-citing as open)
-- **`resources.subscribe` is honest and structural.** `McpServer::with_event_source`
-  is the ONLY constructor that sets `event_source_wired`, and it returns the
-  `#[must_use] ContextEventPump` in the same call. `resources.subscribe`,
+## FIXED (re-verify against code before re-citing as open)
+- **`resources.subscribe` is honest and structural.** The crate-private
+  `McpServer::wired_pair` is the ONLY code that sets `event_source_wired`, and it
+  returns the `#[must_use] ContextEventPump` in the same call. Production reaches
+  it through `McpServer::with_optional_event_source`; the public
+  `with_event_source` wrapper compiles only under `cfg(any(test, feature =
+  "testing"))`, so it is never the production seam. `resources.subscribe`,
   `resources.listChanged` AND `tools.listChanged` at `initialize` are all derived
-  from `event_source_wired` (`crates/scp-mcp/src/server.rs` ~504-514) — the
+  from `event_source_wired` (the `let wired = self.event_source_wired;` binding in
+  `McpServer`'s `initialize` handler in `crates/scp-mcp/src/server.rs`) — the
   `tools.listChanged` hard-code is gone, not "still hard-coded."
 - **`resources/read` and `resources/subscribe` share one real predicate.** The
   phantom `resource:{type}` capability is deleted; `ContextProvider::validate_resource_access`
