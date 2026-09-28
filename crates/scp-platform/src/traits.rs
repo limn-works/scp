@@ -1052,7 +1052,13 @@ impl<T: Storage> Storage for std::sync::Arc<T> {
 ///
 /// [`PlatformError::CustodyError`] when `data` is not 32 bytes, or when
 /// signing fails.
-#[cfg(feature = "software_platform")]
+// Compiled exactly when a caller is: `file.rs`, `testing/key_custody.rs`, and
+// `sqlite/key_custody.rs` (which needs `software_platform` too).
+#[cfg(any(
+    feature = "file",
+    feature = "testing",
+    all(feature = "sqlite", feature = "software_platform")
+))]
 pub(crate) fn sign_pseudonym_digest(
     key: &scp_crypto::p256::P256SigningKey,
     data: &[u8],
