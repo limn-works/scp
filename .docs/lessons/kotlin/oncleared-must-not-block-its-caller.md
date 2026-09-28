@@ -45,31 +45,37 @@ method does not control. Dispatch the work and return.
 on FFI calls risks an ANR, so the honest guarantee is the one worth documenting, not a stronger one
 bought with a deadlock.
 
-## Injecting the cleanup dispatcher
+## Why the tests stay deterministic without a cleanup-dispatcher parameter
 
-`ScpViewModel` takes `cleanupDispatcher: CoroutineDispatcher = Dispatchers.IO` and builds its
-cleanup scope from it. A test passes the same `TestDispatcher` it gave `CoroutineBridge`, so
-`advanceUntilIdle()` runs the cleanup coroutine and every `leave` it makes. A cleanup scope hardwired
-to `Dispatchers.IO` would leave the test racing an IO thread that may not have enqueued its
-continuation yet when `advanceUntilIdle()` returns.
+`ScpViewModel` has only a zero-argument constructor, because a Java subclass calls `super()`, and
+it builds its cleanup scope as `CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)`.
+`Dispatchers.Unconfined` starts the cleanup coroutine on the thread that calls `onCleared()` and
+keeps it there only until the first `leave` suspends into `withContext(ioDispatcher)`. From then
+on, the coroutine resumes on the bridge's `ioDispatcher`. A test gives `CoroutineBridge` a
+`StandardTestDispatcher` as that `ioDispatcher`, so `advanceUntilIdle()` on the same scheduler runs
+every `leave` and every resumption between them. A cleanup scope hardwired to `Dispatchers.IO`
+would leave the test racing an IO thread that may not have enqueued its continuation yet when
+`advanceUntilIdle()` returns.
 
 ## Make a deadlock fail instead of hang
 
 `ScpViewModelTest` carries a class-level
 `@Timeout(value = 30, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)`.
 `SEPARATE_THREAD` runs each method on its own thread and aborts it at the limit, so a reintroduced
-block fails the build in 31 seconds. `.github/workflows/ci.yml` sets no `timeout-minutes`, so
-without that annotation one deadlocked test consumes a 360-minute runner per pull request.
+block fails as one named test in 31 seconds. Without that annotation, a deadlocked test holds the
+`kotlin-test` runner until that job's 45-minute `timeout-minutes` expires, and it surfaces as a job
+timeout rather than as a named failing test.
 
-## Do not cancel a cleanup scope after dispatching to it
+## Do not end a cleanup scope after dispatching to it
 
-`onCleared()` first shipped its non-blocking form with `cleanupJob.invokeOnCompletion { cleanupScope.cancel() }`
-appended. That cancellation frees nothing: a `SupervisorJob` whose children have all completed
-holds no thread, no handle, and no memory, and `cleanupDispatcher` belongs to whoever constructed
-that ViewModel, so cancelling a job never shuts a dispatcher down. It does turn every later
-`cleanupScope.launch` into a silent no-op, so a context that `trackContext` registers after a first
+One revision of `onCleared()` appended `cleanupJob.invokeOnCompletion { cleanupScope.cancel() }`
+after dispatching, and another called `cleanupJob.complete()`. Neither frees anything: a
+`SupervisorJob` whose children have all completed holds no thread, no handle, and no memory, and
+`Dispatchers.Unconfined` owns no thread to shut down. Both do turn every later
+`cleanupScope.launch` into a silent no-op, because a child launched under a cancelled or completed
+job is cancelled before it runs, so a context that `trackContext` registers after a first
 `onCleared` call never gets its `leave`. `ScpViewModelTest.a context tracked after onCleared is
-still left by a later onCleared` fails if that cancellation returns.
+still left by a later onCleared` fails if either call returns.
 
 That same reasoning applies to any scope a class creates to outlive one dispatch: cancel it when it
 owns something worth releasing, not as a reflex once whatever work it carried has finished.
@@ -119,8 +125,9 @@ under §"Kotlin: why no `Closeable`" — and this lesson records the two failure
 
 `ServerTest.no lifecycle-owning type implements AutoCloseable` fails if that interface returns to
 `Relay`, `Node`, or `SCP`. `ServerTest.every stop method on a lifecycle-owning type suspends`
-matches on a `kotlin.coroutines.Continuation` parameter, so a non-suspending stop method fails it
-under any name — `close`, `stop`, or `dispose`.
+requires a `kotlin.coroutines.Continuation` parameter on every declared method named `shutdown`,
+`close`, `stop`, or `dispose`, so a non-suspending method under one of those four names fails it.
+A blocking stop method under any other name passes it.
 
 ## Affected files
 

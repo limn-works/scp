@@ -207,10 +207,12 @@ class ServerTest {
         }
     }
 
-    // Every declared method that stops one of these types suspends. A non-suspending
-    // stop method under any name — `close`, `stop`, `dispose` — reintroduces that
-    // same blocking shape, so this method matches on behaviour rather than on one
-    // interface name. Kotlin compiles a suspend function to a JVM method taking a
+    // Every declared method named `shutdown`, `close`, `stop`, or `dispose` on one of
+    // these types suspends. A non-suspending method under any of those four names
+    // reintroduces that same blocking shape. This method matches those four names and
+    // nothing else: a blocking stop method under another name (`release`, `terminate`),
+    // or a blocking top-level extension, which `declaredMethods` never lists, passes it.
+    // Kotlin compiles a suspend function to a JVM method taking a
     // trailing `kotlin.coroutines.Continuation`, which is how it is recognised here.
     //
     // Two JVM-name suffixes are stripped before matching. Kotlin appends `$default`

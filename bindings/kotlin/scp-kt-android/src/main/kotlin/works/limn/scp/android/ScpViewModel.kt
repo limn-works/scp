@@ -118,12 +118,15 @@ abstract class ScpViewModel : ViewModel() {
      *   context that [trackContext] registered and [untrackContext] did not remove. A second
      *   [onCleared] call therefore finds nothing to leave.
      * - A coroutine is submitted to [cleanupScope]. That coroutine calls
-     *   [CoroutineBridge.ContextBridge.leave] once per snapshotted context, in snapshot
-     *   order, unless one `leave` throws [CancellationException].
-     * - A `leave` call that throws any exception other than [CancellationException] does not
-     *   stop remaining `leave` calls. A `leave` call that throws [CancellationException]
-     *   does stop them, because that exception reports that this cleanup coroutine was
-     *   cancelled, and a coroutine must never swallow its own cancellation.
+     *   [CoroutineBridge.ContextBridge.leave] exactly once per snapshotted context, in
+     *   snapshot order.
+     * - A `leave` call that throws, whatever it throws, does not stop remaining `leave`
+     *   calls. Its throwable goes to [onCleanupFailure]. That includes a
+     *   [CancellationException]: nothing cancels [cleanupScope], so a cancellation that
+     *   `leave` throws never reports that this cleanup coroutine was cancelled. It comes from
+     *   inside `leave`, for example from an injected I/O dispatcher that rejected the task.
+     * - An [onCleanupFailure] override that throws does not stop remaining `leave` calls
+     *   either. Its throwable is logged at warning level and the loop continues.
      *
      * What this method does not guarantee: that `leave` calls have finished. The cleanup
      * coroutine starts on the calling thread and leaves it at the first `leave`, which
@@ -151,23 +154,29 @@ abstract class ScpViewModel : ViewModel() {
             }
         cleanupScope.launch {
             for (ctx in contexts) {
-                runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }
-                    .onFailure { failure ->
-                        if (failure is CancellationException) throw failure
-                        onCleanupFailure(ctx, failure)
+                val failure =
+                    runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }
+                        .exceptionOrNull() ?: continue
+                runCatching { onCleanupFailure(ctx, failure) }
+                    .onFailure { overrideFailure ->
+                        Log.w(
+                            TAG,
+                            "onCleanupFailure threw; remaining contexts are still left " +
+                                "(contextHandle=${ctx.handle})",
+                            overrideFailure,
+                        )
                     }
             }
         }
     }
 
     /**
-     * Called once per context whose `leave` threw anything other than
-     * [CancellationException].
+     * Called once per context whose `leave` threw, with whatever `leave` threw.
      *
      * A `leave` reaches a runtime that rejects it deliberately, so an SDK that drops such a
      * rejection tells an app author nothing: `SCP-CTX-2015`, a `PermissionDenied`, and a
-     * fail-closed persist error all reach this point. Override to fail closed, to retry, or
-     * to tell a user that a departure did not land.
+     * fail-closed persist error all reach this point. Override to record the failure, to
+     * retry, or to tell a user that a departure did not land.
      *
      * A default body logs at warning level, which is what `.docs/standards/sdk-common.md`
      * §Cleanup error handling requires: "Errors during cleanup are logged but never
@@ -179,12 +188,16 @@ abstract class ScpViewModel : ViewModel() {
      * that coroutine on, after [onCleared] has already returned. It must not block that thread, for a reason
      * `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` states.
      *
-     * A throw from an override propagates into that cleanup coroutine and stops `leave` calls
-     * for every context after this one, so an override that wants remaining calls attempted
-     * catches its own errors.
+     * A throw from an override does not propagate: [onCleared] catches it, logs it at warning
+     * level, and still calls `leave` on every remaining context, so throwing here fails
+     * nothing closed. [onCleared] catches it because an uncaught throw from that coroutine
+     * would reach the thread's uncaught-exception handler, which on Android kills the
+     * process after the screen that owned this ViewModel is gone.
      *
      * @param context Tracked context whose `leave` failed.
-     * @param cause Throwable that `leave` threw, never a [CancellationException].
+     * @param cause Throwable that `leave` threw. A [CancellationException] here was raised
+     *   inside `leave`; it never means the cleanup coroutine was cancelled, because nothing
+     *   cancels that coroutine.
      */
     protected open fun onCleanupFailure(context: TrackedContext, cause: Throwable) {
         Log.w(
