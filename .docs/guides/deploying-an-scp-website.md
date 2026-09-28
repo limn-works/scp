@@ -10,10 +10,12 @@ no separate web server and no DNS requirement on the origin). See the example at
 On every build without `scp-node`'s `testing` feature, `host_site` fails closed when it has
 to create an identity, with `IdentityError::NoPreRotationBackend` (`NodeBuild("identity
 error: no production pre-rotation custody backend available; …")`). Creating an identity
-needs a `PreRotationCustody` backend, and the only implementation is the test harness. So
-on a shipped build, each recipe below fails on its first run in an empty storage directory,
-and its `Verify` step cannot succeed. `crates/scp-node/examples/README.md` states the same
-limit for the example.
+takes `Node::start`'s `Generate` path, which on a build without `testing` returns
+`NoPreRotationBackend` whatever custody or storage the caller supplies: that path takes no
+`PreRotationCustody` input. A failed run persists no identity, so the next run against the
+same storage directory takes the same path. So on a shipped build, each recipe below fails
+on every run, and its `Verify` step cannot succeed. `crates/scp-node/examples/README.md`
+states the same limit for the example.
 
 What changes between deployments is **not the code** — it's a few `HostSiteConfig` fields plus
 the surrounding network plumbing. The same `host_site` call powers all three recipes below; each

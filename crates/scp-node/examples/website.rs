@@ -15,11 +15,13 @@
 //! available; pre-rotation recovery custody is not yet implemented
 //! ```
 //!
-//! `host_site` asks for `IdentitySource::Persisted`, and creating a new identity
-//! requires a `PreRotationCustody` backend (spec §9.7.4.1 §3). The only
-//! implementation is the test-harness `InMemoryPreRotationCustody`, so a build
-//! without `testing` fails closed here instead of minting a nullifier-backed
-//! identity.
+//! `host_site` asks for `IdentitySource::Persisted`, which `Node::start`
+//! resolves by loading the stored identity or, when the directory holds none,
+//! creating one on its `Generate` path. On a build without `testing` that path
+//! returns `NoPreRotationBackend` whatever custody or storage is supplied: it
+//! takes no `PreRotationCustody` input, the backend spec §9.7.4.1 §3 requires,
+//! so it fails closed here instead of minting a nullifier-backed identity. A
+//! failed run persists no identity, so every later run takes the same path.
 //!
 //! Each run stores its identity in a new directory under the system temporary
 //! directory, never in the `scp-node` binary's default storage directory.

@@ -17,10 +17,13 @@ Then open the printed URL in a browser.
 
 **Without `scp-node`'s `testing` feature, this exits 1 on every run**, and that
 includes `cargo run -p scp-node --example website` from a checkout. `host_site`
-asks for `IdentitySource::Persisted`, and creating a new identity needs a
-`PreRotationCustody` backend whose only implementation is the test harness, so
-a build without `testing` fails closed rather than mint a nullifier-backed
-identity. The example's own doc comment quotes the error.
+asks for `IdentitySource::Persisted`, which `Node::start` resolves by loading
+the stored identity or, when the directory holds none, creating one on its
+`Generate` path. On a build without `testing` that path returns
+`NoPreRotationBackend` whatever custody or storage is supplied: it takes no
+`PreRotationCustody` input, so it fails closed rather than mint a
+nullifier-backed identity. A failed run persists no identity, so every later
+run takes the same path. The example's own doc comment quotes the error.
 
 Each run stores its identity in a new, randomly named directory under the
 system temporary directory, created with `tempfile::TempDir` and removed when
