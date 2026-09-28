@@ -9646,6 +9646,96 @@ public func FfiConverterTypeContextReconnectResult_lower(_ value: ContextReconne
 
 
 /**
+ * A host key's stated type and public key, returned by
+ * [`KeyCustodyProvider::get_public_key`].
+ */
+public struct CustodyPublicKey {
+    /**
+     * `"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`.
+     */
+    public var keyType: String
+    /**
+     * The public key in that type's one encoding: 32 bytes (Ed25519,
+     * X25519), the 33-byte compressed SEC1 point (`"p256"`), or the 65-byte
+     * uncompressed SEC1 point (`"hpke-p256"`).
+     */
+    public var publicKey: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * `"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`.
+         */keyType: String, 
+        /**
+         * The public key in that type's one encoding: 32 bytes (Ed25519,
+         * X25519), the 33-byte compressed SEC1 point (`"p256"`), or the 65-byte
+         * uncompressed SEC1 point (`"hpke-p256"`).
+         */publicKey: Data) {
+        self.keyType = keyType
+        self.publicKey = publicKey
+    }
+}
+
+#if compiler(>=6)
+extension CustodyPublicKey: Sendable {}
+#endif
+
+
+extension CustodyPublicKey: Equatable, Hashable {
+    public static func ==(lhs: CustodyPublicKey, rhs: CustodyPublicKey) -> Bool {
+        if lhs.keyType != rhs.keyType {
+            return false
+        }
+        if lhs.publicKey != rhs.publicKey {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(keyType)
+        hasher.combine(publicKey)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCustodyPublicKey: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CustodyPublicKey {
+        return
+            try CustodyPublicKey(
+                keyType: FfiConverterString.read(from: &buf), 
+                publicKey: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CustodyPublicKey, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.keyType, into: &buf)
+        FfiConverterData.write(value.publicKey, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCustodyPublicKey_lift(_ buf: RustBuffer) throws -> CustodyPublicKey {
+    return try FfiConverterTypeCustodyPublicKey.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCustodyPublicKey_lower(_ value: CustodyPublicKey) -> RustBuffer {
+    return FfiConverterTypeCustodyPublicKey.lower(value)
+}
+
+
+/**
  * A DID document returned by identity resolution.
  *
  * See ADR-002 (DID) and spec §3 (Identity).
@@ -14776,6 +14866,10 @@ public func FfiConverterCallbackInterfaceDeviceAttestationProvider_lower(_ v: De
 /**
  * Callback for platform cryptographic key management.
  *
+ * A provider that has no key for a `key_id` returns `ScpError::Crypto`
+ * with code `SCP-CRYPTO-4061`; the bridge reports that as a missing key.
+ * Every other error is a custody failure.
+ *
  * Swift SDK: Secure Enclave / Keychain.
  * Kotlin SDK: Android Keystore.
  *
@@ -14811,13 +14905,18 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
     func sign(keyId: String, message: Data) async throws  -> Data
     
     /**
-     * Return the public key bytes for `key_id`: 32 bytes (Ed25519, X25519),
-     * the 33-byte compressed SEC1 point (`"p256"`, and a pseudonym key id,
-     * byte-identical to the point `derive_pseudonym` returned), or the
-     * 65-byte uncompressed SEC1 point (`"hpke-p256"`). Any other length is
-     * an error.
+     * Return the type and public key of `key_id` as a [`CustodyPublicKey`].
+     *
+     * The bridge types the key by `key_type` alone and requires exactly that
+     * type's length: 32 bytes (`"ed25519"`, `"x25519"`), the 33-byte
+     * compressed SEC1 point (`"p256"`, and a pseudonym key id, whose point is
+     * byte-identical to the one `derive_pseudonym` returned), or the 65-byte
+     * uncompressed SEC1 point (`"hpke-p256"`). An unknown type, a length that
+     * does not match the stated type, or an invalid point is an error, and
+     * the bridge binds nothing. The bridge asks this for every key id it has
+     * not yet registered, whichever operation names it first.
      */
-    func getPublicKey(keyId: String) async throws  -> Data
+    func getPublicKey(keyId: String) async throws  -> CustodyPublicKey
     
     /**
      * Destroy key material for `key_id`. Subsequent operations must fail.
@@ -15000,7 +15099,7 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
             uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
         ) in
             let makeCall = {
-                () async throws -> Data in
+                () async throws -> CustodyPublicKey in
                 guard let uniffiObj = try? FfiConverterCallbackInterfaceKeyCustodyProvider.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
@@ -15009,11 +15108,11 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
                 )
             }
 
-            let uniffiHandleSuccess = { (returnValue: Data) in
+            let uniffiHandleSuccess = { (returnValue: CustodyPublicKey) in
                 uniffiFutureCallback(
                     uniffiCallbackData,
                     UniffiForeignFutureStructRustBuffer(
-                        returnValue: FfiConverterData.lower(returnValue),
+                        returnValue: FfiConverterTypeCustodyPublicKey_lower(returnValue),
                         callStatus: RustCallStatus()
                     )
                 )
@@ -18445,7 +18544,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 31392) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 63235) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 61541) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_destroy_key() != 15699) {
