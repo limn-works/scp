@@ -14680,7 +14680,11 @@ public protocol DeviceAttestationProvider: AnyObject, Sendable {
     /**
      * Generate a per-request assertion proving key possession.
      *
-     * `request_hash` — SHA-256 hash of the request data being asserted.
+     * `request_hash` — the assertion digest
+     * `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" ‖ BE32(len(m)) ‖ m)` of
+     * `09-security-model.md` §9.3.1 over the caller's request bytes `m`,
+     * never `SHA-256(m)` and never `m` itself. The domain separator keeps
+     * every `A` distinct from every attestation binding digest `D`.
      *
      * Returns the platform assertion object bytes (Apple: CBOR assertion;
      * Android: integrity verdict).
@@ -14920,6 +14924,10 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
     
     /**
      * Destroy key material for `key_id`. Subsequent operations must fail.
+     *
+     * Destroying an identity key also destroys its `pseudonym_secret` and
+     * every v1 and v2 pseudonym key derived from it, so each such pseudonym
+     * key id then fails too (`09-security-model.md` §9.10.4.A).
      */
     func destroyKey(keyId: String) async throws 
     
@@ -14967,6 +14975,11 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      * A host maps the seed with [`crate::p256_host::p256_seed_to_scalar`]
      * rather than reducing it itself.
      *
+     * The pseudonym dies with its identity (`09-security-model.md`
+     * §9.10.4.A): `destroy_key` on `key_id` destroys it, and a derivation
+     * still in flight when `key_id` is destroyed fails with key-not-found
+     * and stores nothing.
+     *
      * The same (`key_id`, `context_id`) MUST return the same pseudonym key id
      * on every call, so re-deriving names one key rather than minting another;
      * the bridge's per-key-id point bindings grow with the distinct ids a
@@ -14986,6 +14999,9 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      *
      * The same (`key_id`, `context_id`, `pseudonym_epoch`) MUST return the
      * same pseudonym key id on every call, as for `derive_pseudonym`.
+     * Destroying `key_id` destroys this pseudonym, and an in-flight
+     * derivation fails and stores nothing, as for `derive_pseudonym`
+     * (`09-security-model.md` §9.10.4.A).
      *
      * The `pseudonym_epoch` is passed through to the provider so it performs
      * the canonical v2 derivation itself. Bridges MUST NOT synthesize a
@@ -18609,7 +18625,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 4506) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_assert_request() != 17302) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_assert_request() != 3156) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 31392) {
@@ -18618,7 +18634,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 61541) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_destroy_key() != 15699) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_destroy_key() != 41195) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_generate_keypair() != 32558) {
@@ -18627,10 +18643,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_dh_agree() != 46704) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 30099) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 9223) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 42755) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 41285) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 44263) {

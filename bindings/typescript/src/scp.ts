@@ -523,7 +523,12 @@ export interface KeyCustodyProvider {
    * `code` is `"KEY_NOT_FOUND"`), which callers receive as key-not-found.
    */
   getPublicKey(keyId: string): CustodyPublicKey;
-  /** Destroy key material for `keyId`; subsequent operations must fail. */
+  /**
+   * Destroy key material for `keyId`; subsequent operations must fail.
+   * Destroying an identity key also destroys its `pseudonym_secret` and every
+   * v1 and v2 pseudonym key derived from it, so each such pseudonym `keyId`
+   * then fails too (spec §9.10.4.A).
+   */
   destroyKey(keyId: string): void;
   /**
    * Return the 32-byte shared secret with `peerPublic`. An X25519 key
@@ -539,7 +544,10 @@ export interface KeyCustodyProvider {
    * `getPublicKey(keyId)` to return the same 33 bytes, and fails the
    * operation with `SCP-IDENT-1055` otherwise. The same (`keyId`,
    * `contextId`) MUST return the same pseudonym `keyId` on every call, so
-   * re-deriving names one key rather than minting another.
+   * re-deriving names one key rather than minting another. The pseudonym
+   * dies with its identity (spec §9.10.4.A): `destroyKey(keyId)` destroys it,
+   * and a derivation still in flight when `keyId` is destroyed fails with
+   * key-not-found and stores nothing.
    */
   derivePseudonym(keyId: string, contextId: Uint8Array): PseudonymResult;
   /**
@@ -548,7 +556,8 @@ export interface KeyCustodyProvider {
    * big-endian 64-bit `pseudonymEpoch` and a distinct domain separator so
    * rotating the epoch yields an unlinkable new keypair (spec §9.10.4.A).
    * The same (`keyId`, `contextId`, `pseudonymEpoch`) MUST return the same
-   * pseudonym `keyId` on every call.
+   * pseudonym `keyId` on every call, and it dies with its identity as for
+   * {@link derivePseudonym}.
    */
   deriveRotatablePseudonym(
     keyId: string,

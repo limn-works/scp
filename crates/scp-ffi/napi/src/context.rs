@@ -5604,9 +5604,9 @@ mod tests {
         use scp_identity::DidMethod;
         use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
 
-        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-            OpaqueInMemoryKeyCustody(Box::new(InMemoryKeyCustody::new())),
-        ));
+        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
+            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+        )));
         let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
         let dht = scp_identity::DidDht::with_client(std::sync::Arc::new(
             scp_dht::InMemoryDhtClient::new(),
@@ -5661,9 +5661,9 @@ mod tests {
         use scp_identity::{DidDht, DidMethod};
         use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
 
-        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-            OpaqueInMemoryKeyCustody(Box::new(InMemoryKeyCustody::new())),
-        ));
+        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
+            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+        )));
         let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
         let dht = DidDht::with_client(Arc::new(scp_dht::InMemoryDhtClient::new()));
         let (identity, document, pre_rotation_handle) = if with_agent_key {
@@ -5827,9 +5827,9 @@ mod tests {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
 
         // custody_A: the sender identity's OWN custody — holds the agent key.
-        let custody_a = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-            OpaqueInMemoryKeyCustody(Box::new(InMemoryKeyCustody::new())),
-        ));
+        let custody_a = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
+            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+        )));
         let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
         let dht = DidDht::with_client(Arc::new(scp_dht::InMemoryDhtClient::new()));
         let (identity, document, pre_rotation_handle) = dht
@@ -5861,9 +5861,9 @@ mod tests {
         // custody_B: a DIFFERENT, empty custody on the context handle. It does
         // NOT hold the agent key handle — so a resolver that (wrongly) sourced
         // #agent custody from the handle would fail against it.
-        let custody_b = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-            OpaqueInMemoryKeyCustody(Box::new(InMemoryKeyCustody::new())),
-        ));
+        let custody_b = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
+            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+        )));
         let handle = super::NapiContextHandle {
             context_id: format!("persona-regress-{}", uuid::Uuid::new_v4()),
             state: std::sync::Mutex::new(super::ContextState::Active),
@@ -7555,7 +7555,7 @@ mod tests {
         use scp_platform::testing::InMemoryKeyCustody;
         use sha2::{Digest, Sha256};
 
-        let custody = crate::custody::NapiKeyCustody::InMemory(OpaqueInMemoryKeyCustody(Box::new(
+        let custody = crate::custody::NapiKeyCustody::InMemory(Box::new(OpaqueInMemoryKeyCustody(
             InMemoryKeyCustody::new(),
         )));
         let handle = custody
@@ -7592,7 +7592,7 @@ mod tests {
         use crate::identity::OpaqueInMemoryKeyCustody;
         use scp_platform::testing::InMemoryKeyCustody;
 
-        let custody = crate::custody::NapiKeyCustody::InMemory(OpaqueInMemoryKeyCustody(Box::new(
+        let custody = crate::custody::NapiKeyCustody::InMemory(Box::new(OpaqueInMemoryKeyCustody(
             InMemoryKeyCustody::new(),
         )));
         let missing = scp_platform::KeyHandle::new(4242);

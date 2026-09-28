@@ -21,6 +21,38 @@ pub mod outlet_id;
 pub mod ucan_errors;
 pub mod validate;
 
+/// The refusal text a bridge's pre-authorization lifecycle gate reports after
+/// `cannot {verb}: `.
+///
+/// The outlet PRD's SCP-OUT-031 PR-2a note records that the raw lifecycle
+/// state never reaches an FFI caller before authorization. A lifecycle gate
+/// that runs before a bridge authorizes the caller, as the outlet and UCAN
+/// entry points need, therefore reports this one text for every non-`Active`
+/// state, for a context no actor serves, and for a state read that failed
+/// (`ActorCrashed` for a context mid-respawn or past a failed respawn,
+/// `ActorBusy` for an actor that did not answer).
+pub const CONTEXT_NOT_ACTIVE_WITHHELD: &str = "context is not active";
+
+/// Renders a lifecycle state as the lowercase name a bridge's lifecycle-gate
+/// refusal reports, such as `'closing'` in "cannot send in 'closing' state".
+///
+/// A bridge renders the state through this function so that an SDK matches
+/// one vocabulary whichever bridge it links.
+#[must_use]
+pub const fn context_state_str(state: &scp_protocol::context::ContextState) -> &'static str {
+    use scp_protocol::context::ContextState as S;
+    match state {
+        S::Creating => "creating",
+        S::Active => "active",
+        S::Closing => "closing",
+        S::Closed => "closed",
+        S::Expired => "expired",
+        S::MigratingOut => "migrating_out",
+        S::Tombstoned => "tombstoned",
+        S::Poisoned => "poisoned",
+    }
+}
+
 mod bridge_id;
 pub use bridge_id::generate_bridge_id;
 
@@ -235,3 +267,49 @@ pub mod server;
 // in-memory nullifier arm is `testing`-gated. Unconditional so every bridge
 // shares one DHT type regardless of which feature set it enables.
 pub mod dht;
+
+#[cfg(test)]
+mod tests {
+    use super::{CONTEXT_NOT_ACTIVE_WITHHELD, context_state_str};
+    use scp_protocol::context::ContextState as S;
+
+    /// Every lifecycle state, in declaration order, paired with the name an
+    /// SDK decodes. `position` matches exhaustively, so adding a variant
+    /// stops this module compiling until the table names it.
+    const EXPECTED: [(S, &str); 8] = [
+        (S::Creating, "creating"),
+        (S::Active, "active"),
+        (S::Closing, "closing"),
+        (S::Closed, "closed"),
+        (S::Expired, "expired"),
+        (S::MigratingOut, "migrating_out"),
+        (S::Tombstoned, "tombstoned"),
+        (S::Poisoned, "poisoned"),
+    ];
+
+    const fn position(state: &S) -> usize {
+        match state {
+            S::Creating => 0,
+            S::Active => 1,
+            S::Closing => 2,
+            S::Closed => 3,
+            S::Expired => 4,
+            S::MigratingOut => 5,
+            S::Tombstoned => 6,
+            S::Poisoned => 7,
+        }
+    }
+
+    #[test]
+    fn context_state_str_pins_every_variant_name() {
+        for (index, (state, name)) in EXPECTED.iter().enumerate() {
+            assert_eq!(position(state), index, "table row {index} names {name}");
+            assert_eq!(context_state_str(state), *name);
+        }
+    }
+
+    #[test]
+    fn context_not_active_withheld_text_is_pinned() {
+        assert_eq!(CONTEXT_NOT_ACTIVE_WITHHELD, "context is not active");
+    }
+}

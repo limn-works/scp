@@ -67,6 +67,8 @@ type Fault = "highS" | "fixedId";
 class Store {
   seeds = new Map<string, Uint8Array>();
   pseudonyms = new Map<string, bigint>();
+  /** Pseudonym key id -> the identity key id it was derived from. */
+  pseudonymOwner = new Map<string, string>();
   next = 1;
   signCalls = 0;
   /** Called with the key id at the start of the host's `destroyKey`. */
@@ -109,6 +111,13 @@ class StoreKeychain implements KeyCustodyProvider {
     this.store.destroyProbe?.(keyId);
     this.store.seeds.delete(keyId);
     this.store.pseudonyms.delete(keyId);
+    this.store.pseudonymOwner.delete(keyId);
+    // A pseudonym dies with its identity (§9.10.4.A).
+    for (const [kid, owner] of [...this.store.pseudonymOwner]) {
+      if (owner !== keyId) continue;
+      this.store.pseudonyms.delete(kid);
+      this.store.pseudonymOwner.delete(kid);
+    }
   }
 
   dhAgree(_keyId: string, _peerPublic: Uint8Array): Uint8Array {
@@ -125,6 +134,7 @@ class StoreKeychain implements KeyCustodyProvider {
     const pseudonymId =
       this.fault === "fixedId" ? "777" : (h.readBigUInt64BE(0) | (1n << 63n)).toString();
     this.store.pseudonyms.set(pseudonymId, d);
+    this.store.pseudonymOwner.set(pseudonymId, keyId);
     return { publicKey: p256Compressed(d), keyId: pseudonymId };
   }
 
@@ -193,6 +203,22 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     expect(beta.keyId).toBe(alpha.keyId);
     expect(Buffer.from(beta.publicKey).equals(Buffer.from(alpha.publicKey))).toBe(false);
     expect((await custody.sign(beta.keyId, DIGEST)).length).toBe(64);
+  });
+
+  test("destroying an identity through the bridge destroys its pseudonym (§9.10.4.A)", async () => {
+    const store = new Store();
+    const custody = adapter(store);
+    const identity = await custody.generateKeypair();
+    const other = await custody.generateKeypair();
+    const pseudonym = await custody.derivePseudonym(identity, "ctx");
+    const kept = await custody.derivePseudonym(other, "ctx");
+    expect((await custody.sign(pseudonym.keyId, DIGEST)).length).toBe(64);
+    await custody.destroyKey(identity);
+    // The host no longer holds the scalar, so its `sign` has nothing to sign
+    // with; asserted on the store because a host `sign` that throws surfaces
+    // in bun as an uncaught error beside the bridge's rejection.
+    expect(store.pseudonyms.has(pseudonym.keyId)).toBe(false);
+    expect((await custody.sign(kept.keyId, DIGEST)).length).toBe(64);
   });
 
   test("the adapter unbinds a pseudonym before the host's destroyKey runs", async () => {

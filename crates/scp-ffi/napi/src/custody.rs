@@ -679,8 +679,9 @@ impl<H: JsCustodyHost> KeyCustody for CallbackAdapter<H> {
 /// wraps the concrete types and delegates each method to the active variant.
 pub(crate) enum NapiKeyCustody {
     /// Test/dev in-memory custody (feature-gated), wrapped for redacted Debug.
+    /// Boxed so the enum stays the size of the callback variant.
     #[cfg(feature = "testing")]
-    InMemory(OpaqueInMemoryKeyCustody),
+    InMemory(Box<OpaqueInMemoryKeyCustody>),
     /// Caller-provided custody backed by JS callbacks.
     Callback(NapiCallbackKeyCustody),
 }
@@ -882,7 +883,7 @@ mod tests {
     /// is covered in plain `cargo test`.
     #[tokio::test]
     async fn napi_key_custody_in_memory_dispatch() {
-        let custody = NapiKeyCustody::InMemory(OpaqueInMemoryKeyCustody(Box::new(
+        let custody = NapiKeyCustody::InMemory(Box::new(OpaqueInMemoryKeyCustody(
             InMemoryKeyCustody::new(),
         )));
         let handle = custody
@@ -910,7 +911,7 @@ mod tests {
     /// locally too — covered by the inherent test below).
     #[tokio::test]
     async fn napi_key_custody_in_memory_ephemeral_seed() {
-        let custody = NapiKeyCustody::InMemory(OpaqueInMemoryKeyCustody(Box::new(
+        let custody = NapiKeyCustody::InMemory(Box::new(OpaqueInMemoryKeyCustody(
             InMemoryKeyCustody::new(),
         )));
         let seed = custody

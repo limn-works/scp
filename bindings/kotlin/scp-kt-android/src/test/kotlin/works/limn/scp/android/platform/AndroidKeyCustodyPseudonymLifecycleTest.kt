@@ -3,8 +3,8 @@
 // Covers the Keystore identity path through a fake KeystoreKeys (JVM tests cannot reach
 // AndroidKeyStore), destruction of an identity's pseudonyms, and concurrent re-derivation.
 //
-// Provenance: spec §9.10.4 (pseudonym derivation), §9.10.4.A (pseudonym secret), §9.15
-// (key destruction verification), ADR-027 (Android Platform Adapter).
+// Provenance: spec §9.10.4 (pseudonym derivation), §9.10.4.A (pseudonym secret, and
+// a pseudonym dies with its identity), ADR-027 (Android Platform Adapter).
 
 package works.limn.scp.android.platform
 
@@ -117,7 +117,7 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
         assertTrue(keystore.hmacKeys.isEmpty())
     }
 
-    /** Destroying an identity destroys every pseudonym derived from it (§9.15). */
+    /** Destroying an identity destroys every pseudonym derived from it (§9.10.4.A). */
     @Test
     fun `destroying an identity destroys its pseudonyms`() {
         val custody = AndroidKeyCustody(InMemorySharedPreferences())
@@ -263,6 +263,29 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
         }
         assertEquals("SCP-CRYPTO-4001", error.code)
         assertTrue(contextSeed.all { it == 0.toByte() }, "the context seed must be wiped")
+        assertEquals(0, keys.size)
+    }
+
+    /**
+     * [PseudonymKeys.withScalar] lends a copy: removing the pseudonym inside the block
+     * wipes the stored array but not the lent one, and the lent copy is wiped once the
+     * block returns.
+     */
+    @Test
+    fun `withScalar lends a copy that survives removal and is wiped afterwards`() {
+        val keys = PseudonymKeys()
+        val original = ByteArray(32) { (it + 1).toByte() }
+        keys.put("identity", "p", original.copyOf())
+        var lent: ByteArray? = null
+        val result = keys.withScalar("p") { scalar ->
+            lent = scalar
+            assertTrue(keys.remove("p"), "the pseudonym must be stored")
+            assertArrayEquals(original, scalar, "removal must not wipe the lent copy")
+            "done"
+        }
+        assertEquals("done", result)
+        val captured = checkNotNull(lent) { "withScalar must run the block" }
+        assertTrue(captured.all { it == 0.toByte() }, "the lent copy must be wiped after the block")
         assertEquals(0, keys.size)
     }
 }

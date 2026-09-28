@@ -465,7 +465,7 @@ public final class AppleKeyCustody: Sendable {
     ///   - publicKeyBytes: The public key bytes (33 bytes for a P-256 pseudonym) to cache in metadata.
     ///   - ownerIdentity: For a P-256 pseudonym, the identity handle it was
     ///     derived from; the item is tagged with it so that destroying the
-    ///     identity also destroys the pseudonym (§9.15).
+    ///     identity also destroys the pseudonym (§9.10.4.A).
     /// - Throws: ``PlatformError/keychainError(_:)`` if the add operation fails.
     nonisolated func storePrivateKeyBytes(
         _ bytes: Data,
@@ -515,29 +515,30 @@ public final class AppleKeyCustody: Sendable {
 
     /// Resolves an `errSecDuplicateItem` from storing `query` under `handle`.
     ///
-    /// A deterministic handle (pseudonym derivation) re-derives the same
-    /// scalar, so an existing item stored under the current policy for the
-    /// same owner already holds these bytes. It is kept: deleting and re-adding
-    /// would leave a window in which a concurrent `sign` finds no item. An item
-    /// stored under another policy is replaced, so the current biometric policy
-    /// applies to it.
+    /// Only a pseudonym (`ownerIdentity` set) has a deterministic handle: a
+    /// re-derivation yields the same scalar, so an existing item stored under
+    /// the current policy for the same owner already holds these bytes. It is
+    /// kept, because deleting and re-adding would leave a window in which a
+    /// concurrent `sign` finds no item. Any other item, and a pseudonym item
+    /// stored under another policy, is replaced, so the new bytes and the
+    /// current biometric policy apply.
     private nonisolated func keepOrReplaceExisting(
         handle: String,
         query: [String: Any],
         ownerIdentity: String?
     ) throws {
-        var existing = baseQuery(for: handle)
-        existing[kSecAttrDescription as String] = policyTag
         if let ownerIdentity {
+            var existing = baseQuery(for: handle)
+            existing[kSecAttrDescription as String] = policyTag
             existing[kSecAttrService as String] = pseudonymOwnerTag(for: ownerIdentity)
-        }
-        existing[kSecMatchLimit as String] = kSecMatchLimitOne
-        let matchStatus = SecItemCopyMatching(existing as CFDictionary, nil)
-        if matchStatus == errSecSuccess {
-            return
-        }
-        guard matchStatus == errSecItemNotFound else {
-            throw PlatformError.keychainError(matchStatus)
+            existing[kSecMatchLimit as String] = kSecMatchLimitOne
+            let matchStatus = SecItemCopyMatching(existing as CFDictionary, nil)
+            if matchStatus == errSecSuccess {
+                return
+            }
+            guard matchStatus == errSecItemNotFound else {
+                throw PlatformError.keychainError(matchStatus)
+            }
         }
         let deleteStatus = SecItemDelete(baseQuery(for: handle) as CFDictionary)
         guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {

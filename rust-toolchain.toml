@@ -62,7 +62,7 @@
 # fuzz check in `.github/workflows/ci.yml` read the channel out of it at run time.
 [toolchain]
 channel = "1.98.0"
-components = ["clippy", "rustfmt"]
+components = ["clippy", "rustfmt", "rust-analyzer"]
 targets = [
     "wasm32-unknown-unknown",
     "aarch64-apple-darwin",

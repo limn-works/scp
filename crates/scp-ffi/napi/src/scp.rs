@@ -447,9 +447,9 @@ impl Scp {
                     .map_or_else(InMemoryKeyCustody::new, |seed| {
                         InMemoryKeyCustody::from_seed_bytes(**seed)
                     });
-                let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-                    crate::identity::OpaqueInMemoryKeyCustody(Box::new(in_memory)),
-                ));
+                let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
+                    crate::identity::OpaqueInMemoryKeyCustody(in_memory),
+                )));
                 let pre_rotation_custody =
                     Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
                 let dht = crate::identity::shared_did_method()?;
@@ -575,9 +575,9 @@ impl Scp {
             "in_memory" => {
                 use scp_platform::testing::InMemoryKeyCustody;
 
-                let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-                    crate::identity::OpaqueInMemoryKeyCustody(Box::new(InMemoryKeyCustody::new())),
-                ));
+                let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
+                    crate::identity::OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+                )));
                 let pre_rotation_custody =
                     Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
                 let dht = crate::identity::shared_did_method()?;
@@ -5061,9 +5061,9 @@ mod concurrency_cap_tests {
             .build()
             .unwrap();
 
-        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
-            OpaqueInMemoryKeyCustody(Box::new(InMemoryKeyCustody::new())),
-        ));
+        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
+            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+        )));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         let dht = scp_identity::DidDht::with_client(Arc::new(scp_dht::InMemoryDhtClient::new()));

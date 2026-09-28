@@ -202,9 +202,13 @@ impl InMemoryKeyCustody {
         let public_key = pseudonym_key.public_key().to_compressed();
 
         let handle = self.next_handle();
-        store
-            .pseudonyms
-            .insert(key_id, context_id, epoch, handle.id(), pseudonym_key);
+        store.pseudonyms.insert(
+            key_id,
+            context_id,
+            epoch,
+            handle.id(),
+            Box::new(pseudonym_key),
+        );
         store.key_types.insert(handle.id(), KeyType::P256Signing);
         drop(store);
 
@@ -409,7 +413,7 @@ impl KeyCustody for InMemoryKeyCustody {
                 KeyType::Ed25519 => {
                     store.ed25519_keys.remove(&key_id);
                     // Every pseudonym derived from this identity goes with it
-                    // (§9.15), under the same lock a derive holds.
+                    // (§9.10.4.A), under the same lock a derive holds.
                     for pseudonym in store.pseudonyms.remove_identity(key_id) {
                         store.key_types.remove(&pseudonym);
                     }

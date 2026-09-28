@@ -151,7 +151,12 @@ class KeyCustodyProvider(Protocol):
         ...
 
     def destroy_key(self, key_id: str) -> None:
-        """Destroy key material for ``key_id``; subsequent ops must fail."""
+        """Destroy key material for ``key_id``; subsequent ops must fail.
+
+        Destroying an identity key also destroys its ``pseudonym_secret`` and
+        every v1 and v2 pseudonym key derived from it, so each such pseudonym
+        key id then fails too (``09-security-model.md`` §9.10.4.A).
+        """
         ...
 
     def dh_agree(self, key_id: str, peer_public: bytes) -> bytes:
@@ -173,6 +178,10 @@ class KeyCustodyProvider(Protocol):
         The same ``(key_id, context_id)`` MUST return the same pseudonym key
         id on every call, so re-deriving names one key rather than minting
         another.
+        The pseudonym dies with its identity (``09-security-model.md``
+        §9.10.4.A): :meth:`destroy_key` on ``key_id`` destroys it, and a
+        derivation still in flight when ``key_id`` is destroyed raises
+        key-not-found and stores nothing.
 
         Canonical recipe (all software custody backends MUST produce identical
         bytes; ``ikm`` is the identity private key material, the 32-byte
@@ -194,7 +203,8 @@ class KeyCustodyProvider(Protocol):
 
         Returns ``(public_key, key_id)``, checked as for
         :meth:`derive_pseudonym`; the same ``(key_id, context_id,
-        pseudonym_epoch)`` MUST return the same pseudonym key id. Including
+        pseudonym_epoch)`` MUST return the same pseudonym key id, and it dies
+        with its identity as for :meth:`derive_pseudonym` (§9.10.4.A). Including
         the rotation epoch in the HMAC derivation produces a different
         pseudonym per epoch within the same context, mitigating relay-side
         pseudonym correlation.
