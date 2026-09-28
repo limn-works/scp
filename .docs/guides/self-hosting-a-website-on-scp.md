@@ -404,11 +404,14 @@ home line doesn't have. Honest, not fixable from here.
   fail-closed variant, `DhtMode::Disabled`, which publishes nothing and answers
   every resolution `Ok(None)`. `HostSiteConfig::defaults` in
   `crates/scp-node/src/self_host.rs` sets `dht: DhtMode::Disabled`. The example
-  command above now exits 1 without `--features testing`, because
-  `Node::start`'s identity-creation (`Generate`) path returns
-  `NoPreRotationBackend` on every build without `testing`, whatever custody or
-  storage the caller supplies; `crates/scp-node/examples/README.md` gives the
-  working command.)* No new
+  command above now builds without `testing` and exits 1 on every run, because
+  the example gives `Node::start` an empty storage directory and, on a build
+  without `testing`, its identity-creation (`Generate`) path returns
+  `NoPreRotationBackend` whatever custody or storage the caller supplies. A `testing` build
+  is not a way to run it: it mints the identity through the test-harness
+  `InMemoryPreRotationCustody`. No build runs the example without that
+  stand-in until a production `PreRotationCustody` backend exists;
+  `crates/scp-node/examples/README.md` states the limit.)* No new
   protocol logic, specs, ADRs, or enforcement/capability-matrix changes — a
   packaging/ergonomics refactor of the already-shipped self-host flow.
 - **2026-06-16 (ADR-052 P3a/P5)** — `ApplicationNodeBuilder` and its `.no_domain()` / `.identity_with_storage()` methods were deleted in ADR-052 Phase B-P3a (PR #1815). The `--self-host` binary path now builds `HostSiteConfig { reach: Reach::NatTraversal, tls, dht, … }` and calls `host_site_until` directly (`crates/scp-node/src/main.rs` `run_self_host`). Updated §3, §4, §5, and §6 to reflect the current API. Running log entries from 2026-06-13/2026-06-14 referenced the former typestate builder and are preserved as historical record.

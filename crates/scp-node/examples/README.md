@@ -7,23 +7,24 @@ library call, [`scp_node::host_site`]. It is the same deploy + serve core that
 the turnkey `scp-node --self-host` binary runs, exposed as a library function so
 you can embed it in your own program.
 
-Run it:
+**Until a production `PreRotationCustody` backend exists ([#1729]), no build
+runs this example without a test-harness stand-in.** `cargo run -p scp-node
+--example website` compiles, then exits 1 on every run. `host_site` asks for
+`IdentitySource::Persisted`, which `Node::start` resolves by loading the stored
+identity or, when the directory holds none, creating one on its `Generate`
+path. The example gives it a new, empty directory on every run, so every run
+takes `Generate`. On a build without `scp-node`'s `testing` feature that path
+returns `NoPreRotationBackend` whatever custody or storage is supplied: it
+takes no `PreRotationCustody` input, so it fails closed rather than mint a
+nullifier-backed identity. The example's own doc comment quotes the error.
 
-```sh
-cargo run -p scp-node --features testing --example website
-```
-
-Then open the printed URL in a browser.
-
-**Without `scp-node`'s `testing` feature, this exits 1 on every run**, and that
-includes `cargo run -p scp-node --example website` from a checkout. `host_site`
-asks for `IdentitySource::Persisted`, which `Node::start` resolves by loading
-the stored identity or, when the directory holds none, creating one on its
-`Generate` path. On a build without `testing` that path returns
-`NoPreRotationBackend` whatever custody or storage is supplied: it takes no
-`PreRotationCustody` input, so it fails closed rather than mint a
-nullifier-backed identity. A failed run persists no identity, so every later
-run takes the same path. The example's own doc comment quotes the error.
+A `testing` build is not a way to run it. `testing` mints the identity through
+`scp_platform::testing::InMemoryPreRotationCustody`, the test-harness
+pre-rotation stand-in, which holds the pre-rotation key only in process
+memory. The key is gone when the process exits, so spec §9.7.4.1 recovery from
+`#0` compromise is unreachable for that identity. The same
+feature also turns on `allow_unencrypted_storage` and the `scp-platform` and
+`scp-dht` test doubles.
 
 Each run stores its identity in a new, randomly named directory under the
 system temporary directory, created with `tempfile::TempDir` and removed when
@@ -31,10 +32,10 @@ system temporary directory, created with `tempfile::TempDir` and removed when
 `host_site` installs its signal handlers only when it starts serving, so a
 Ctrl-C during startup kills the process and leaves the directory behind. On
 Unix the example sets that directory's mode to 0700 and exits with an error
-if it reads back any group or other bit. The example never uses the `scp-node` binary's default storage directory, and a run never reloads
-an identity an earlier run left behind. The binary reloads any identity it finds
-in its default directory without checking how it was created, so an
-identity a `testing` run minted must never land there.
+if it reads back any group or other bit. The example never uses the `scp-node` binary's default storage directory, and a
+run never reloads an identity an earlier run left behind. The binary reloads any
+identity it finds in its default directory without checking how it was created
+([#2558]), so an identity a `testing` build minted must never land there.
 
 ### What this example does
 
@@ -67,7 +68,12 @@ SCP_NODE_DHT_MODE=disabled scp-node --self-host --site-dir ./my-site
 
 `--self-host` on its own defaults to publishing: `SCP_NODE_DHT_MODE` defaults to
 `production`, which puts the host's public IP, bound to its DID, on the global
-Mainline DHT. Set it to `disabled` for a site that publishes nothing. This path
-hits the same wall as the example above.
+Mainline DHT. Set it to `disabled` for a site that publishes nothing. When its
+default storage directory holds no identity, this path exits with the same
+`NoPreRotationBackend` error as the example above. When that directory already
+holds an identity, the binary reloads it and serves, whatever build created it
+([#2558]).
 
 [`scp_node::host_site`]: https://docs.rs/scp-node
+[#1729]: https://github.com/limn-works/scp/issues/1729
+[#2558]: https://github.com/limn-works/scp/issues/2558

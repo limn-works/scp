@@ -9,13 +9,25 @@ no separate web server and no DNS requirement on the origin). See the example at
 
 On every build without `scp-node`'s `testing` feature, `host_site` fails closed when it has
 to create an identity, with `IdentityError::NoPreRotationBackend` (`NodeBuild("identity
-error: no production pre-rotation custody backend available; …")`). Creating an identity
-takes `Node::start`'s `Generate` path, which on a build without `testing` returns
-`NoPreRotationBackend` whatever custody or storage the caller supplies: that path takes no
+error: no production pre-rotation custody backend available; …")`). `host_site` first
+reloads any identity its storage directory holds, and creates one on `Node::start`'s
+`Generate` path only when the directory holds none. On a build without `testing`, that path
+returns `NoPreRotationBackend` whatever custody or storage the caller supplies: it takes no
 `PreRotationCustody` input. A failed run persists no identity, so the next run against the
-same storage directory takes the same path. So on a shipped build, each recipe below fails
-on every run, and its `Verify` step cannot succeed. `crates/scp-node/examples/README.md`
-states the same limit for the example.
+same directory takes the same path. So on a shipped build, each recipe below fails on every
+run whose `storage_path` directory holds no identity, and its `Verify` step cannot succeed.
+No build creates an identity without a test-harness stand-in until a production
+`PreRotationCustody` backend exists ([#1729](https://github.com/limn-works/scp/issues/1729)):
+a `testing` build mints it through `InMemoryPreRotationCustody`, which holds the
+pre-rotation key only in process memory, so spec §9.7.4.1 recovery from `#0` compromise is
+unreachable for that identity.
+
+A shipped build that finds an identity in its `storage_path` directory reloads it and serves,
+without checking how it was created ([#2558](https://github.com/limn-works/scp/issues/2558)).
+Each recipe uses `storage_path: Some("./data")`, so a recipe run once from a `testing` build
+leaves an identity that a shipped build then serves with. Never point a shipped build at a
+directory a `testing` build wrote. `crates/scp-node/examples/README.md` states the same limits
+for the example.
 
 What changes between deployments is **not the code** — it's a few `HostSiteConfig` fields plus
 the surrounding network plumbing. The same `host_site` call powers all three recipes below; each

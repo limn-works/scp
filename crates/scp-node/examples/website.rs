@@ -1,13 +1,8 @@
-//! Host a static website on SCP. Run:
-//! `cargo run -p scp-node --features testing --example website`
-//! Then open the printed URL.
+//! Host a static website on SCP with `scp_node::host_site`.
 //!
-//! Override the port with the `PORT` env var, e.g.
-//! `PORT=9000 cargo run -p scp-node --features testing --example website`.
-//!
-//! WITHOUT `scp-node`'s `testing` FEATURE THIS EXITS 1 ON EVERY RUN. That covers
-//! `cargo run -p scp-node --example website` from a checkout as well as a build
-//! against the published crate. It fails with
+//! UNTIL A PRODUCTION `PreRotationCustody` BACKEND EXISTS, NO BUILD RUNS THIS
+//! EXAMPLE WITHOUT A TEST-HARNESS STAND-IN. `cargo run -p scp-node --example
+//! website` compiles, then exits 1 on every run with
 //! `IdentityError::NoPreRotationBackend`, whose message begins:
 //!
 //! ```text
@@ -15,13 +10,21 @@
 //! available; pre-rotation recovery custody is not yet implemented
 //! ```
 //!
+//! A `testing` build is not a way to run it: `testing` mints the identity
+//! through `scp_platform::testing::InMemoryPreRotationCustody`, which holds the
+//! pre-rotation key only in process memory, so spec §9.7.4.1 recovery from `#0`
+//! compromise is unreachable for that identity. `README.md` beside this file
+//! states the same limit.
+//!
 //! `host_site` asks for `IdentitySource::Persisted`, which `Node::start`
 //! resolves by loading the stored identity or, when the directory holds none,
-//! creating one on its `Generate` path. On a build without `testing` that path
+//! creating one on its `Generate` path. Every run uses a new, empty directory
+//! (below), so every run takes `Generate`. On a build without `testing` that path
 //! returns `NoPreRotationBackend` whatever custody or storage is supplied: it
 //! takes no `PreRotationCustody` input, the backend spec §9.7.4.1 §3 requires,
-//! so it fails closed here instead of minting a nullifier-backed identity. A
-//! failed run persists no identity, so every later run takes the same path.
+//! so it fails closed here instead of minting a nullifier-backed identity.
+//!
+//! The `PORT` env var overrides the listen port, which defaults to 8080.
 //!
 //! Each run stores its identity in a new directory under the system temporary
 //! directory, never in the `scp-node` binary's default storage directory.
