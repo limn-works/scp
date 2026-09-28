@@ -4613,15 +4613,20 @@ pub(crate) struct McpServerEntry {
 pub(crate) struct McpClientEntry {
     /// The real MCP client, connected and initialized. Shared so a call clones it out of the registry and drops the shard
     /// guard before its network round trip; a disconnect or connect on the
-    /// same shard then never waits on a silent server.
-    pub(crate) client: Arc<std::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>>,
+    /// same shard then never waits on a silent server. The lock is async and
+    /// a call takes it before it enters the blocking pool, so the handle's
+    /// calls hold at most one blocking thread between them: a call queued
+    /// behind a call that a silent server stalls waits as a future, not as a
+    /// parked thread.
+    pub(crate) client:
+        Arc<tokio::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>>,
     /// A stdio client's server process, which `mcp_client_disconnect` kills
     /// directly: an in-flight call's clone of `client` would otherwise keep
     /// the process alive, and a blocking thread parked on its stdout, for as
     /// long as the server stays silent. `None` for an SSE client: its POST
     /// read has no timeout, and a disconnect has no handle that ends it, so
-    /// a call in flight against a silent SSE server holds its blocking thread
-    /// until the server answers or closes the connection.
+    /// the one call in flight against a silent SSE server holds its blocking
+    /// thread until the server answers or closes the connection.
     pub(crate) stdio_server: Option<Arc<std::sync::Mutex<std::process::Child>>>,
 }
 
@@ -4946,6 +4951,36 @@ impl McpUniFfiBridgeProvider {
         .map_err(|e| format!("role state of context '{context_id}' could not be read: {e}"))
     }
 
+    /// Reads `context_id`'s role state through [`Self::role_state_of`], for
+    /// an access gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccessRefusal::Denied`](scp_mcp::server::AccessRefusal::Denied)
+    /// when no actor holds such a context, including when no supervisor is
+    /// attached: the agent holds no grant in a context this instance does not
+    /// hold, so `tools/list` and `resources/list` omit it. Returns
+    /// [`AccessRefusal::Unreadable`](scp_mcp::server::AccessRefusal::Unreadable)
+    /// when the read itself failed, so a failed read never reaches the client
+    /// as a shorter list.
+    fn gate_role_state(
+        bi: &crate::runtime::UniffiBridgeInstance,
+        context_id: &str,
+    ) -> Result<scp_core::context::roles::ContextRoleState, scp_mcp::server::AccessRefusal> {
+        use scp_mcp::server::AccessRefusal;
+        match Self::role_state_of(bi, context_id) {
+            Ok(Some(role_state)) => Ok(role_state),
+            Ok(None) => Err(AccessRefusal::Denied(
+                if bi.core.try_supervisor().is_some() {
+                    format!("context '{context_id}' is not held by the supervisor")
+                } else {
+                    format!("context '{context_id}' is not held: no supervisor is attached")
+                },
+            )),
+            Err(e) => Err(AccessRefusal::Unreadable(e)),
+        }
+    }
+
     /// Decides whether the agent may invoke `outlet_name` in `context_id`,
     /// given the context's current role state: the role-state capability
     /// check, then the UCAN check. The role-state check runs first because
@@ -5153,13 +5188,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     ) -> Result<(), scp_mcp::server::AccessRefusal> {
         use scp_mcp::server::AccessRefusal;
         let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
-        let role_state = Self::role_state_of(&bi, context_id)
-            .map_err(AccessRefusal::Unreadable)?
-            .ok_or_else(|| {
-                AccessRefusal::Unreadable(format!(
-                    "context '{context_id}' has no role state on this bridge instance"
-                ))
-            })?;
+        let role_state = Self::gate_role_state(&bi, context_id)?;
         let access = resource.check_access(&role_state, &self.agent_did, context_id);
         access.map_err(AccessRefusal::Denied)
     }
@@ -5235,15 +5264,10 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         use scp_mcp::server::AccessRefusal;
         // A dropped bridge instance, an unreadable role state, or a failed
         // read inside `outlet_grant` is a failed read, which `tools/list`
-        // reports as an error instead of omitting the context's tools.
+        // reports as an error instead of omitting the context's tools. A
+        // context no actor holds is a denial, which `tools/list` omits.
         let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
-        let role_state = Self::role_state_of(&bi, context_id)
-            .map_err(AccessRefusal::Unreadable)?
-            .ok_or_else(|| {
-                AccessRefusal::Unreadable(format!(
-                    "context '{context_id}' has no role state on this bridge instance"
-                ))
-            })?;
+        let role_state = Self::gate_role_state(&bi, context_id)?;
         self.outlet_grant(&bi, &role_state, context_id, outlet_name, check)
     }
 
@@ -5520,8 +5544,13 @@ impl McpUniFfiBridgeProvider {
 ///
 /// `subscribe_events()` returns `None` only for a supervisor built without the
 /// channel; production supervisors always enable it (see
-/// `crate::runtime::build_supervisor`). With no supervisor or no channel the
-/// bundle is unwired: the server advertises every capability the event pump
+/// `crate::runtime::build_supervisor`). The bundle is unwired in three cases:
+/// no supervisor is attached, the supervisor has no channel, or the instance
+/// is suspended when the server is created, because
+/// `context_manager_or_error` refuses a suspended instance. The last case
+/// lasts the server's life: a `resume()` does not rewire a server built while
+/// suspended, so the host creates the server again after `resume()` to get
+/// subscriptions. An unwired server advertises every capability the event pump
 /// backs as false (`resources.subscribe`, `resources.listChanged`,
 /// `tools.listChanged`), rejects `resources/subscribe`, and sends no
 /// `notifications/*/list_changed`, so those capabilities are honestly absent
@@ -5546,7 +5575,7 @@ fn mcp_server_bundle(
     let context_events = match bi.context_manager_or_error() {
         Ok(supervisor) => supervisor.subscribe_events(),
         Err(e) => {
-            tracing::warn!("MCP server: no supervisor attached ({e})");
+            tracing::warn!("MCP server: no supervisor event source ({e})");
             None
         }
     };
@@ -16570,7 +16599,7 @@ impl Scp {
         mcp_client_registry(&self.inner).insert(
             handle_id.clone(),
             McpClientEntry {
-                client: Arc::new(std::sync::Mutex::new(client)),
+                client: Arc::new(tokio::sync::Mutex::new(client)),
                 stdio_server: Some(server),
             },
         );
@@ -16614,7 +16643,7 @@ impl Scp {
         mcp_client_registry(&self.inner).insert(
             handle_id.clone(),
             McpClientEntry {
-                client: Arc::new(std::sync::Mutex::new(client)),
+                client: Arc::new(tokio::sync::Mutex::new(client)),
                 stdio_server: None,
             },
         );
@@ -16657,20 +16686,18 @@ impl Scp {
     ) -> Result<Vec<McpOutletInfo>, ScpError> {
         validate_mcp_handle(&handle)?;
 
-        let bi = Arc::clone(&self.inner);
-        let outlets = run_mcp_client_io(codes::TRANS_5022, move || {
-            // Clone the client out so the shard guard drops before the I/O.
-            let client = mcp_client_registry(&bi)
-                .get(&handle)
-                .map(|entry| Arc::clone(&entry.client))
-                .ok_or_else(|| ScpError::Transport {
-                    msg: format!("MCP client handle '{handle}' not found"),
-                    code: codes::TRANS_5020.to_owned(),
-                })?;
-            let client_guard = client.lock().map_err(|e| ScpError::Transport {
-                msg: format!("client lock poisoned: {e}"),
-                code: codes::TRANS_5021.to_owned(),
+        // Clone the client out so the shard guard drops before the I/O, and
+        // take its lock before entering the blocking pool (see
+        // `McpClientEntry::client`).
+        let client = mcp_client_registry(&self.inner)
+            .get(&handle)
+            .map(|entry| Arc::clone(&entry.client))
+            .ok_or_else(|| ScpError::Transport {
+                msg: format!("MCP client handle '{handle}' not found"),
+                code: codes::TRANS_5020.to_owned(),
             })?;
+        let client_guard = client.lock_owned().await;
+        let outlets = run_mcp_client_io(codes::TRANS_5022, move || {
             client_guard.list_tools().map_err(|e| ScpError::Transport {
                 msg: format!("tools/list failed: {e}"),
                 code: codes::TRANS_5022.to_owned(),
@@ -16705,25 +16732,23 @@ impl Scp {
         validate_context_id(&context_id)?;
         validate_did(&invoker_did)?;
 
-        let bi = Arc::clone(&self.inner);
-        let result = run_mcp_client_io(codes::TRANS_5025, move || {
-            // Clone the client out so the shard guard drops before the I/O.
-            let client = mcp_client_registry(&bi)
-                .get(&handle)
-                .map(|entry| Arc::clone(&entry.client))
-                .ok_or_else(|| ScpError::Transport {
-                    msg: format!("MCP client handle '{handle}' not found"),
-                    code: codes::TRANS_5023.to_owned(),
-                })?;
-            let input: serde_json::Value =
-                serde_json::from_str(&input_json).map_err(|e| ScpError::Validation {
-                    msg: format!("invalid input JSON: {e}"),
-                    code: codes::VALID_7021.to_owned(),
-                })?;
-            let client_guard = client.lock().map_err(|e| ScpError::Transport {
-                msg: format!("client lock poisoned: {e}"),
-                code: codes::TRANS_5024.to_owned(),
+        // Clone the client out so the shard guard drops before the I/O, and
+        // take its lock before entering the blocking pool (see
+        // `McpClientEntry::client`).
+        let client = mcp_client_registry(&self.inner)
+            .get(&handle)
+            .map(|entry| Arc::clone(&entry.client))
+            .ok_or_else(|| ScpError::Transport {
+                msg: format!("MCP client handle '{handle}' not found"),
+                code: codes::TRANS_5023.to_owned(),
             })?;
+        let input: serde_json::Value =
+            serde_json::from_str(&input_json).map_err(|e| ScpError::Validation {
+                msg: format!("invalid input JSON: {e}"),
+                code: codes::VALID_7021.to_owned(),
+            })?;
+        let client_guard = client.lock_owned().await;
+        let result = run_mcp_client_io(codes::TRANS_5025, move || {
             client_guard
                 .invoke(&outlet_name, input, &context_id, &invoker_did)
                 .map_err(|e| ScpError::Transport {
@@ -23110,7 +23135,7 @@ mod tests {
         mcp_client_registry(&scp.inner).insert(
             handle.clone(),
             McpClientEntry {
-                client: Arc::new(std::sync::Mutex::new(client)),
+                client: Arc::new(tokio::sync::Mutex::new(client)),
                 stdio_server: Some(Arc::clone(&server)),
             },
         );
@@ -23150,6 +23175,92 @@ mod tests {
             listed.is_err(),
             "the killed stub server sent no tools/list response"
         );
+    }
+
+    /// A call queued behind one that a silent server stalls waits on the
+    /// handle's async lock as a future and holds no blocking thread, so a
+    /// silent server holds at most one blocking thread per handle however
+    /// many calls queue on it. The runtime has two blocking threads: the
+    /// stalled call holds one, and a probe `spawn_blocking` must still run
+    /// while a second call waits behind the first. Were the second call to
+    /// wait on its lock inside the blocking pool, the probe would find the
+    /// pool full and time out.
+    #[test]
+    fn a_queued_mcp_client_call_holds_no_blocking_thread() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        rt.block_on(async {
+            let scp = scp_test();
+            let mut allowlist = scp_mcp::allowlist::StdioAllowlist::new_with_defaults();
+            allowlist.configure(&["sh"]).expect("allow sh");
+            let allowlist = std::sync::Mutex::new(allowlist);
+            let script = "read l; \
+                echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\
+                \"capabilities\":{},\"serverInfo\":{\"name\":\"stub\"}}}'; \
+                sleep 30 & wait";
+            let transport = McpStdioTransport::spawn(
+                &allowlist,
+                &["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+            )
+            .expect("spawn stub server");
+            let server = transport.server_process();
+            let mut client =
+                scp_mcp::client::McpClient::new(McpUniFFITransportWrapper::Stdio(transport));
+            client.initialize().expect("initialize the stub server");
+            let handle = mcp_handle_id("mcp-client");
+            mcp_client_registry(&scp.inner).insert(
+                handle.clone(),
+                McpClientEntry {
+                    client: Arc::new(tokio::sync::Mutex::new(client)),
+                    stdio_server: Some(Arc::clone(&server)),
+                },
+            );
+
+            let short = std::time::Duration::from_millis(300);
+            let joined = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(
+                    scp.mcp_client_list_tools(handle.clone()),
+                    async {
+                        tokio::time::sleep(short).await;
+                        scp.mcp_client_list_tools(handle.clone()).await
+                    },
+                    async {
+                        tokio::time::sleep(short * 2).await;
+                        let probe = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            tokio::task::spawn_blocking(|| ()),
+                        )
+                        .await;
+                        scp.mcp_client_disconnect(handle.clone())
+                            .await
+                            .expect("disconnect a known handle");
+                        probe
+                    }
+                )
+            })
+            .await;
+            if joined.is_err() {
+                scp_mcp::stdio::stop_server_process(&server);
+            }
+            let (first, second, probe) =
+                joined.expect("both calls must end once disconnect kills the server");
+            assert!(
+                matches!(probe, Ok(Ok(()))),
+                "a blocking task must run while a call waits behind a stalled one"
+            );
+            assert!(
+                first.is_err(),
+                "the killed stub server sent no tools/list response"
+            );
+            assert!(
+                second.is_err(),
+                "the second call ran after the server was killed"
+            );
+        });
     }
 
     /// `mcp_client_disconnect` must reject unknown handle.
@@ -24222,6 +24333,88 @@ mod tests {
             },
         );
         assert_eq!(format!("{bundle:?}"), "McpServerForTransport::Wired");
+    }
+
+    /// A server created while the instance is suspended is unwired even with
+    /// a supervisor attached, as the `mcp_server_bundle` doc states, because
+    /// `context_manager_or_error` refuses a suspended instance. The same
+    /// instance, resumed, builds the wired bundle again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspended_instance_builds_the_unwired_bundle_uniffi() {
+        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
+        let bi = Arc::new(crate::runtime::UniffiBridgeInstance::new_uniffi());
+        bi.init_context_manager_with_did("did:dht:z6MkSubscriber");
+        let provider = || McpUniFfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: "did:dht:z6MkSubscriber".to_owned(),
+            context_ids: vec!["ctx-1".to_owned()],
+            outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: None,
+            agent_proof_tokens: None,
+        };
+
+        bi.core.suspend().expect("suspend");
+        assert!(
+            bi.core.try_supervisor().is_some(),
+            "precondition: suspension keeps the supervisor attached"
+        );
+        assert_eq!(
+            format!("{:?}", mcp_server_bundle(&bi, provider())),
+            "McpServerForTransport::Unwired"
+        );
+
+        bi.resume().await.expect("resume");
+        assert_eq!(
+            format!("{:?}", mcp_server_bundle(&bi, provider())),
+            "McpServerForTransport::Wired"
+        );
+    }
+
+    /// A context no actor holds is a denial at both access gates, so
+    /// `tools/list` and `resources/list` omit it rather than fail with
+    /// `internal_error`; the denial names whether a supervisor is attached. A
+    /// failed read (here, a suspended instance) stays unreadable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn absent_context_is_denied_and_a_failed_read_is_unreadable_uniffi() {
+        use scp_mcp::server::{AccessRefusal, CapabilityCheck, ContextProvider as _, ResourceKind};
+
+        let bi = Arc::new(crate::runtime::UniffiBridgeInstance::new_uniffi());
+        let provider = McpUniFfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: "did:dht:z6MkSubscriber".to_owned(),
+            context_ids: vec!["ctx-absent".to_owned()],
+            outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: None,
+            agent_proof_tokens: None,
+        };
+        let gates = |needle: &str| {
+            let resource = provider.validate_resource_access("ctx-absent", ResourceKind::Events);
+            assert!(
+                matches!(&resource, Err(AccessRefusal::Denied(m)) if m.contains(needle)),
+                "validate_resource_access: want Denied naming {needle:?}, got {resource:?}"
+            );
+            let tool = provider.validate_capability("ctx-absent", "t", CapabilityCheck::Probe);
+            assert!(
+                matches!(&tool, Err(AccessRefusal::Denied(m)) if m.contains(needle)),
+                "validate_capability: want Denied naming {needle:?}, got {tool:?}"
+            );
+        };
+
+        gates("no supervisor is attached");
+        bi.init_context_manager_with_did("did:dht:z6MkSubscriber");
+        gates("is not held by the supervisor");
+
+        bi.core.suspend().expect("suspend");
+        let resource = provider.validate_resource_access("ctx-absent", ResourceKind::Events);
+        assert!(
+            matches!(&resource, Err(AccessRefusal::Unreadable(m)) if m.contains("suspended")),
+            "a suspended read must be Unreadable, got {resource:?}"
+        );
+        let tool = provider.validate_capability("ctx-absent", "t", CapabilityCheck::Probe);
+        assert!(
+            matches!(&tool, Err(AccessRefusal::Unreadable(m)) if m.contains("suspended")),
+            "a suspended read must be Unreadable, got {tool:?}"
+        );
     }
 
     /// Creates a live, supervisor-backed context whose creator is
