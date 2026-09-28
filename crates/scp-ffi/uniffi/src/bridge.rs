@@ -4614,8 +4614,7 @@ pub(crate) struct McpClientEntry {
     /// The real MCP client, connected and initialized. Shared so a call clones it out of the registry and drops the shard
     /// guard before its network round trip; a disconnect or connect on the
     /// same shard then never waits on a silent server.
-    pub(crate) client:
-        Arc<std::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>>,
+    pub(crate) client: Arc<std::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>>,
 }
 
 /// Returns a reference to this `UniffiBridgeInstance`'s MCP server registry.
@@ -4661,12 +4660,6 @@ fn mcp_handle_id(prefix: &str) -> String {
 // ---------------------------------------------------------------------------
 // MCP transport implementations
 // ---------------------------------------------------------------------------
-
-/// Maximum bytes per line from MCP transport (10 MiB). Prevents OOM from
-/// unbounded line reads by a malicious or broken peer.
-///
-/// Imported from `scp-mcp` rather than redeclared so the client and server
-/// halves of the same line protocol cannot drift to different limits.
 
 /// Transport wrapper that delegates to either stdio or SSE.
 pub(crate) enum McpUniFFITransportWrapper {
@@ -23078,19 +23071,23 @@ mod tests {
             },
         );
 
-        let (listed, disconnect_took) = tokio::join!(scp.mcp_client_list_tools(handle.clone()), async {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            let started = std::time::Instant::now();
-            scp.mcp_client_disconnect(handle.clone())
-                .await
-                .expect("disconnect a known handle");
-            started.elapsed()
-        });
+        let (listed, disconnect_took) =
+            tokio::join!(scp.mcp_client_list_tools(handle.clone()), async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                let started = std::time::Instant::now();
+                scp.mcp_client_disconnect(handle.clone())
+                    .await
+                    .expect("disconnect a known handle");
+                started.elapsed()
+            });
         assert!(
             disconnect_took < std::time::Duration::from_secs(1),
             "disconnect waited {disconnect_took:?} on the in-flight call"
         );
-        assert!(listed.is_err(), "the stub server closed without a tools/list response");
+        assert!(
+            listed.is_err(),
+            "the stub server closed without a tools/list response"
+        );
     }
 
     /// `mcp_client_disconnect` must reject unknown handle.

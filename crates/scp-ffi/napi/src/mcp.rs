@@ -30,16 +30,6 @@ use crate::error::ScpNapiError;
 use crate::runtime::NapiBridgeInstance;
 
 // ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Maximum bytes per line from MCP transport (10 MiB). Prevents OOM from
-/// unbounded line reads by a malicious or broken peer.
-///
-/// Imported from `scp-mcp` rather than redeclared so the client and server
-/// halves of the same line protocol cannot drift to different limits.
-
-// ---------------------------------------------------------------------------
 // NAPI types
 // ---------------------------------------------------------------------------
 
@@ -1253,7 +1243,7 @@ mod tests {
     }
 
     /// An empty URL fails the relay-URL validation before any connect, the
-    /// same validation error the PyO3 and UniFFI twins return.
+    /// same validation error the `PyO3` and `UniFFI` twins return.
     #[test]
     fn mcp_client_connect_sse_validates_the_url_napi() {
         let bi = NapiBridgeInstance::new_napi();
@@ -1331,7 +1321,10 @@ mod tests {
             disconnect_took < std::time::Duration::from_secs(1),
             "disconnect waited {disconnect_took:?} on the in-flight call"
         );
-        assert!(listed.is_err(), "the stub server closed without a tools/list response");
+        assert!(
+            listed.is_err(),
+            "the stub server closed without a tools/list response"
+        );
     }
 
     /// WU6: Two-instance regression test — disabling enforcement via the

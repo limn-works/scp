@@ -371,7 +371,10 @@ mod tests {
         let Err(err) = SseClientTransport::connect("http://192.0.2.1:9/sse", Some("tok")) else {
             panic!("a token for a non-loopback host must be refused");
         };
-        assert!(err.contains("refusing to send the SSE bearer token"), "got: {err}");
+        assert!(
+            err.contains("refusing to send the SSE bearer token"),
+            "got: {err}"
+        );
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();

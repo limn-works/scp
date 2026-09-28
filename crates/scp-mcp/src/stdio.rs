@@ -213,11 +213,7 @@ pub fn read_response<R: std::io::BufRead>(
         if value.get("method").is_some() {
             continue;
         }
-        let line_id: RequestId = match serde_json::from_value(line_id.clone()) {
-            Ok(line_id) => line_id,
-            Err(_) => continue,
-        };
-        if &line_id != id {
+        if serde_json::from_value::<RequestId>(line_id.clone()).ok().as_ref() != Some(id) {
             continue;
         }
         return serde_json::from_value(value)
@@ -986,9 +982,7 @@ mod tests {
         input.push_str(&respond(1));
         input.push('\n');
         input.push_str(&notify(crate::protocol::METHOD_RESOURCES_UPDATED));
-        input.push_str(
-            "{\"jsonrpc\":\"2.0\",\"method\":\"roots/list\",\"id\":2}\n",
-        );
+        input.push_str("{\"jsonrpc\":\"2.0\",\"method\":\"roots/list\",\"id\":2}\n");
         input.push_str(&respond(2));
         input.push_str(&respond(3));
         let mut reader = std::io::Cursor::new(input.into_bytes());
