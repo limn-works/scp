@@ -14,8 +14,10 @@
 // 1. The binding helpers `AppleStorage.bindText(_:to:at:)` and
 //    `AppleStorage.bindBlob(_:to:at:)`, through which every `AppleStorage`
 //    method binds its parameters, throw when SQLite rejects a bind, and bind
-//    an empty value as zero bytes rather than as `NULL`. No case here makes
-//    SQLite reject a bind inside one of the six methods. SQLite reports a
+//    an empty value as zero bytes rather than as `NULL`. Each of the six
+//    methods throws when SQLite rejects a bind inside it: the cases in
+//    `AppleStorageRejectedBindTests` lower the connection's length limit so
+//    SQLite rejects a key, a prefix, a successor, or a value. SQLite reports a
 //    rejected bind through a return code and leaves that parameter reading
 //    `NULL`, and a statement carrying `NULL` where a key
 //    belongs still steps to `SQLITE_DONE`: `delete` would remove no row and
@@ -356,6 +358,198 @@
             #expect(try await fixture.storage.deletePrefix(prefix: "delta\u{0}o") == 1)
             #expect(try await fixture.storage.exists(key: first) == false)
             #expect(try await fixture.storage.exists(key: second) == true)
+        }
+    }
+
+    // MARK: - Rejected binds inside the six methods
+
+    /// Run `operation` and record an issue unless it throws the
+    /// `StorageError.databaseError` a bind rejected with `SQLITE_TOOBIG`
+    /// produces.
+    ///
+    /// The message check separates a bind that threw from a bind whose error a
+    /// method discarded: after a discarded bind, `set` still throws, because
+    /// the `kv` table's `NOT NULL` constraints reject the `NULL` SQLite left
+    /// in that parameter, and the message then names that constraint.
+    private func expectRejectedBind(
+        _ operation: () async throws -> some Any,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) async {
+        let tooBig = String(cString: sqlite3_errstr(SQLITE_TOOBIG))
+        do {
+            let answer = try await operation()
+            Issue.record(
+                "SQLite rejected a bind, and the method answered \(answer) instead of throwing",
+                sourceLocation: sourceLocation
+            )
+        } catch let StorageError.databaseError(message) {
+            #expect(message == tooBig, sourceLocation: sourceLocation)
+        } catch {
+            Issue.record("the method threw \(error), not StorageError.databaseError", sourceLocation: sourceLocation)
+        }
+    }
+
+    /// Cases that make SQLite reject a bind inside each of the six key-value
+    /// methods, and assert that the method throws.
+    ///
+    /// Each case lowers the connection's `SQLITE_LIMIT_LENGTH` through
+    /// `AppleStorage.setLengthLimit(_:)` and then passes a key, a prefix, or
+    /// a value longer than the applied limit, so `sqlite3_bind_text` or
+    /// `sqlite3_bind_blob` answers `SQLITE_TOOBIG` for that parameter. A
+    /// method that discarded that code would run its statement with `NULL` in
+    /// that parameter: `get` would answer `nil` and `exists` would answer
+    /// `false` for a key the database holds, `delete` would remove no row and
+    /// return, `listKeys` would answer no keys, and `deletePrefix` would
+    /// answer 0.
+    ///
+    /// `listKeys` and `deletePrefix` bind a prefix and, when
+    /// `AppleStorage.prefixSuccessor(_:)` answers one, that prefix's
+    /// successor. The successor cases make SQLite reject the successor's bind
+    /// alone: a prefix ending in the byte `0x7F` gets a successor ending in
+    /// the byte `0x80`, which `String(decoding:as:)` replaces with the
+    /// three-byte U+FFFD, so the successor is two bytes longer than its
+    /// prefix. No case makes SQLite reject the prefix's bind alone, because
+    /// every successor holds at least as many bytes as its prefix, so a
+    /// length limit that rejects the prefix rejects the successor too. A
+    /// method that discarded the prefix bind's code therefore still throws
+    /// from the successor's bind in the prefix cases. When `prefixSuccessor`
+    /// answers `nil`, the prefix is empty, and no length limit rejects an
+    /// empty bind, so no case here reaches the bind in that branch.
+    struct AppleStorageRejectedBindTests {
+        /// The length limit these cases request. SQLite raises a request
+        /// below its compiled minimum to that minimum, so each case reads the
+        /// limit `setLengthLimit(_:)` answers.
+        private static let requestedLimit: Int32 = 1
+
+        /// A key one byte longer than `limit`.
+        private static func overLimitKey(_ limit: Int32) -> String {
+            String(repeating: "k", count: Int(limit) + 1)
+        }
+
+        /// A prefix `limit - 1` bytes long whose successor is `limit + 1`
+        /// bytes long, so SQLite accepts the prefix's bind and rejects the
+        /// successor's.
+        private static func prefixWithOverLimitSuccessor(_ limit: Int32) throws -> String {
+            let prefix = String(repeating: "k", count: Int(limit) - 2) + "\u{7F}"
+            let successor = try #require(AppleStorage.prefixSuccessor(prefix))
+            try #require(prefix.utf8.count < Int(limit))
+            try #require(successor.utf8.count > Int(limit))
+            return prefix
+        }
+
+        @Test("set throws when SQLite rejects the key's bind")
+        func setThrowsOnRejectedKeyBind() async throws {
+            let fixture = try makeStorageFixture()
+            defer { fixture.removeFiles() }
+
+            let limit = await fixture.storage.setLengthLimit(Self.requestedLimit)
+            await expectRejectedBind {
+                try await fixture.storage.set(key: Self.overLimitKey(limit), value: Data([0x01]))
+            }
+        }
+
+        @Test("set throws when SQLite rejects the value's bind")
+        func setThrowsOnRejectedValueBind() async throws {
+            let fixture = try makeStorageFixture()
+            defer { fixture.removeFiles() }
+
+            let limit = await fixture.storage.setLengthLimit(Self.requestedLimit)
+            await expectRejectedBind {
+                try await fixture.storage.set(key: "k", value: Data(repeating: 0x01, count: Int(limit) + 1))
+            }
+        }
+
+        @Test("get throws when SQLite rejects the key's bind for a key the database holds")
+        func getThrowsOnRejectedKeyBind() async throws {
+            let fixture = try makeStorageFixture()
+            defer { fixture.removeFiles() }
+
+            let original = await fixture.storage.setLengthLimit(-1)
+            let key = Self.overLimitKey(Self.requestedLimit + 64)
+            try await fixture.storage.set(key: key, value: Data([0x01]))
+            let limit = await fixture.storage.setLengthLimit(Self.requestedLimit)
+            try #require(key.utf8.count > Int(limit))
+
+            await expectRejectedBind { try await fixture.storage.get(key: key) }
+
+            _ = await fixture.storage.setLengthLimit(original)
+            #expect(try await fixture.storage.get(key: key) == Data([0x01]))
+        }
+
+        @Test("exists throws when SQLite rejects the key's bind for a key the database holds")
+        func existsThrowsOnRejectedKeyBind() async throws {
+            let fixture = try makeStorageFixture()
+            defer { fixture.removeFiles() }
+
+            let original = await fixture.storage.setLengthLimit(-1)
+            let key = Self.overLimitKey(Self.requestedLimit + 64)
+            try await fixture.storage.set(key: key, value: Data([0x01]))
+            let limit = await fixture.storage.setLengthLimit(Self.requestedLimit)
+            try #require(key.utf8.count > Int(limit))
+
+            await expectRejectedBind { try await fixture.storage.exists(key: key) }
+
+            _ = await fixture.storage.setLengthLimit(original)
+            #expect(try await fixture.storage.exists(key: key) == true)
+        }
+
+        @Test("delete throws when SQLite rejects the key's bind and leaves the row in place")
+        func deleteThrowsOnRejectedKeyBind() async throws {
+            let fixture = try makeStorageFixture()
+            defer { fixture.removeFiles() }
+
+            let original = await fixture.storage.setLengthLimit(-1)
+            let key = Self.overLimitKey(Self.requestedLimit + 64)
+            try await fixture.storage.set(key: key, value: Data([0x01]))
+            let limit = await fixture.storage.setLengthLimit(Self.requestedLimit)
+            try #require(key.utf8.count > Int(limit))
+
+            await expectRejectedBind { try await fixture.storage.delete(key: key) }
+
+            _ = await fixture.storage.setLengthLimit(original)
+            #expect(try await fixture.storage.exists(key: key) == true)
+        }
+
+        @Test("listKeys throws when SQLite rejects the prefix's bind")
+        func listKeysThrowsOnRejectedPrefixBind() async throws {
+            let fixture = try makeStorageFixture()
+            defer { fixture.removeFiles() }
+
+            let limit = await fixture.storage.setLengthLimit(Self.requestedLimit)
+            await expectRejectedBind {
+                try await fixture.storage.listKeys(prefix: Self.overLimitKey(limit))
+            }
+        }
+
+        @Test("listKeys throws when SQLite rejects the successor's bind")
+        func listKeysThrowsOnRejectedSuccessorBind() async throws {
+            let fixture = try makeStorageFixture()
+            defer { fixture.removeFiles() }
+
+            let limit = await fixture.storage.setLengthLimit(Self.requestedLimit)
+            let prefix = try Self.prefixWithOverLimitSuccessor(limit)
+            await expectRejectedBind { try await fixture.storage.listKeys(prefix: prefix) }
+        }
+
+        @Test("deletePrefix throws when SQLite rejects the prefix's bind")
+        func deletePrefixThrowsOnRejectedPrefixBind() async throws {
+            let fixture = try makeStorageFixture()
+            defer { fixture.removeFiles() }
+
+            let limit = await fixture.storage.setLengthLimit(Self.requestedLimit)
+            await expectRejectedBind {
+                try await fixture.storage.deletePrefix(prefix: Self.overLimitKey(limit))
+            }
+        }
+
+        @Test("deletePrefix throws when SQLite rejects the successor's bind")
+        func deletePrefixThrowsOnRejectedSuccessorBind() async throws {
+            let fixture = try makeStorageFixture()
+            defer { fixture.removeFiles() }
+
+            let limit = await fixture.storage.setLengthLimit(Self.requestedLimit)
+            let prefix = try Self.prefixWithOverLimitSuccessor(limit)
+            await expectRejectedBind { try await fixture.storage.deletePrefix(prefix: prefix) }
         }
     }
 

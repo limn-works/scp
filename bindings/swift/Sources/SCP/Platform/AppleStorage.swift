@@ -398,6 +398,27 @@
             return String(cString: sqlite3_errmsg(handle))
         }
 
+        /// Ask SQLite to cap every string and blob on this connection at
+        /// `bytes`, and return the cap SQLite applied.
+        ///
+        /// SQLite raises a request below its compiled minimum to that minimum
+        /// and lowers a request above its compiled maximum to that maximum, so
+        /// a caller reads the returned cap instead of assuming its request.
+        /// Once the cap is in force, `sqlite3_bind_text` and
+        /// `sqlite3_bind_blob` answer `SQLITE_TOOBIG` for a value longer than
+        /// the cap. `AppleStorageTests` calls this method to make SQLite reject
+        /// a bind inside each of the six key-value methods.
+        ///
+        /// - Parameter bytes: The `SQLITE_LIMIT_LENGTH` value to request. SQLite
+        ///   leaves the cap unchanged for a negative value, so
+        ///   `setLengthLimit(-1)` reads the cap in force.
+        /// - Returns: The `SQLITE_LIMIT_LENGTH` value SQLite holds after the
+        ///   request.
+        func setLengthLimit(_ bytes: Int32) -> Int32 {
+            _ = sqlite3_limit(db, SQLITE_LIMIT_LENGTH, bytes)
+            return sqlite3_limit(db, SQLITE_LIMIT_LENGTH, -1)
+        }
+
         // MARK: Key-value operations
 
         /// Store `value` under `key`, overwriting any existing value.
