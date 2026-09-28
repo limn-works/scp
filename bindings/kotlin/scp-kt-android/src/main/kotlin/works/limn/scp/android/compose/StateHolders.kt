@@ -73,9 +73,8 @@ class ScpContextHolder(
  * invoked after it to clean up the context (e.g., launch
  * `contextBridge.leave(handle, identityHandle)` on a scope that outlives disposal).
  *
- * Per ADR-028 (amended): `DisposableEffect(contextId) { onDispose { teardownScope.launch {
- * context.close() } } }`, so the teardown runs off the composition thread and `onDispose`
- * never blocks it.
+ * Per ADR-028 (amended): [onDispose] launches its teardown on a scope that outlives
+ * disposal, so the teardown runs off the composition thread and `onDispose` never blocks it.
  *
  * Usage:
  * ```kotlin

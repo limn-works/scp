@@ -442,11 +442,15 @@ class StateHoldersTest {
     fun `rememberScpContext disposes scope on cleanup`() {
         val showComposable = MutableStateFlow(true)
         var capturedHolder: ScpContextHolder? = null
+        var scopeActiveAtOnDispose: Boolean? = null
 
         composeRule.setContent {
             val show by showComposable.collectAsStateCompat()
             if (show) {
-                capturedHolder = rememberScpContext(contextHandle = 1L, identityHandle = 2L) { _, _ -> }
+                capturedHolder =
+                    rememberScpContext(contextHandle = 1L, identityHandle = 2L) { _, _ ->
+                        scopeActiveAtOnDispose = capturedHolder?.scope?.isActive
+                    }
             }
         }
 
@@ -458,6 +462,7 @@ class StateHoldersTest {
         composeRule.waitForIdle()
 
         assertTrue(!holder!!.scope.isActive)
+        assertEquals("onDispose ran before the holder's scope was cancelled", false, scopeActiveAtOnDispose)
     }
 }
 
