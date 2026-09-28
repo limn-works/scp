@@ -265,4 +265,27 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
         assertTrue(contextSeed.all { it == 0.toByte() }, "the context seed must be wiped")
         assertEquals(0, keys.size)
     }
+
+    /**
+     * [PseudonymKeys.withScalar] lends a copy: removing the pseudonym inside the block
+     * wipes the stored array but not the lent one, and the lent copy is wiped once the
+     * block returns.
+     */
+    @Test
+    fun `withScalar lends a copy that survives removal and is wiped afterwards`() {
+        val keys = PseudonymKeys()
+        val original = ByteArray(32) { (it + 1).toByte() }
+        keys.put("identity", "p", original.copyOf())
+        var lent: ByteArray? = null
+        val result = keys.withScalar("p") { scalar ->
+            lent = scalar
+            assertTrue(keys.remove("p"), "the pseudonym must be stored")
+            assertArrayEquals(original, scalar, "removal must not wipe the lent copy")
+            "done"
+        }
+        assertEquals("done", result)
+        val captured = checkNotNull(lent) { "withScalar must run the block" }
+        assertTrue(captured.all { it == 0.toByte() }, "the lent copy must be wiped after the block")
+        assertEquals(0, keys.size)
+    }
 }
