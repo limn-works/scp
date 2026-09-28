@@ -337,8 +337,12 @@ pub struct PseudonymResult {
 /// code is `SCP-CRYPTO-4006` (key not found) for a key id that was destroyed or
 /// never existed; the bridge reports it as key-not-found. Any other error,
 /// whatever its code, becomes the custody error `SCP-CRYPTO-4060` carrying the
-/// host's code and message. Throw only [`ScpError`]: `UniFFI` 0.29 panics on
-/// any other error a callback throws.
+/// host's code and message. Every SDK operation that calls the provider
+/// reports these two codes, including the pseudonym derivation inside
+/// `context_create` and the identity key reads and signatures of identity
+/// operations; the one exception is `SCP-IDENT-1055`, reported when the bridge
+/// rejects the pseudonym a `derive_pseudonym` call returned. Throw only
+/// [`ScpError`]: `UniFFI` 0.29 panics on any other error a callback throws.
 ///
 /// # SAFETY: Thread execution context
 ///

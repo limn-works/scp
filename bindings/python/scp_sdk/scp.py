@@ -116,7 +116,12 @@ class KeyCustodyProvider(Protocol):
     ``CryptoError(msg, "SCP-CRYPTO-4006")``, for a key id that was destroyed
     or never existed; the bridge reports it as key-not-found. Any other
     exception, whatever its ``code``, becomes the custody error
-    ``SCP-CRYPTO-4060`` carrying that code and the exception text.
+    ``SCP-CRYPTO-4060`` carrying that code and the exception text. Every SDK
+    operation that calls the provider reports these two codes, including the
+    pseudonym derivation inside ``context_create`` and the identity key reads
+    and signatures of identity operations; the one exception is
+    ``SCP-IDENT-1055``, reported when the bridge rejects the pseudonym a
+    :meth:`derive_pseudonym` call returned.
     """
 
     def generate_keypair(self, key_type: str) -> str:

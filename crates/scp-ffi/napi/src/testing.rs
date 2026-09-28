@@ -466,8 +466,8 @@ pub(crate) fn fullstack_seed_peer_pseudonym_on(
 ///
 /// # Errors
 ///
-/// `SCP-VALID-7005` when `seed` is not 32 bytes; `SCP-IDENT-1055` when the
-/// derivation fails.
+/// `SCP-VALID-7005` when `seed` is not 32 bytes; the custody code of a failed
+/// derivation (`SCP-CRYPTO-4006`, `SCP-CRYPTO-4060` or `SCP-IDENT-1055`).
 #[napi(js_name = "testingPseudonymRoutingIdFromSeed")]
 pub async fn testing_pseudonym_routing_id_from_seed(
     seed: Buffer,
@@ -545,8 +545,9 @@ impl TestingCallbackCustody {
     ///
     /// # Errors
     ///
-    /// `SCP-IDENT-1055` carrying the adapter's custody error, as production
-    /// derivation reports it.
+    /// The adapter's custody error coded as production derivation reports it:
+    /// `SCP-CRYPTO-4006` for key-not-found, `SCP-IDENT-1055` for a host
+    /// pseudonym the bridge cannot bind, `SCP-CRYPTO-4060` otherwise.
     #[napi(js_name = "derivePseudonym")]
     pub async fn derive_pseudonym(
         &self,

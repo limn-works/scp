@@ -206,13 +206,12 @@ async fn resolve_stream_signer(
     let (custody, handle) = crate::runtime::with_identity(bi, identity_did, |entry| {
         Ok((entry.custody.clone(), entry.identity.active_signing_key))
     })?;
-    let public_key = custody
-        .public_key(&handle)
-        .await
-        .map_err(|e| ScpNapiError::Context {
-            message: format!("failed to resolve stream signing key for '{identity_did}': {e}"),
-            code: codes::CTX_2001.to_owned(),
-        })?;
+    let public_key = custody.public_key(&handle).await.map_err(|e| {
+        ScpNapiError::custody(
+            format!("failed to resolve stream signing key for '{identity_did}': {e}"),
+            &e,
+        )
+    })?;
     let verifying_key = scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key)
         .ok_or_else(|| ScpNapiError::Context {
         message: format!(

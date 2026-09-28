@@ -396,8 +396,8 @@ pub struct NapiMessage {
 /// member cannot send application data on a pseudonymous routing axis — so
 /// derivation failure MUST be a typed error rather than a swallowed `None`.
 /// Codes match the `PyO3` reference bridge exactly so the same failure yields the
-/// same `.code` across bridges: missing key material → SCP-IDENT-1054,
-/// derivation failure (including an invalid P-256 point) → SCP-IDENT-1055.
+/// same `.code` across bridges: missing key material → SCP-IDENT-1054, and a
+/// custody derivation failure → its custody code ([`pseudonym_derivation_failed`]).
 ///
 /// Un-gated for production: pseudonym derivation runs through retained
 /// callback custody (OS-keychain/HSM), exactly like the rest of the signing
@@ -423,19 +423,19 @@ async fn derive_context_pseudonym_required(
         .map_err(NapiError::from)
 }
 
-/// The error a failed custody pseudonym derivation surfaces as:
-/// `SCP-IDENT-1055` carrying the custody error.
+/// The error a failed custody pseudonym derivation surfaces as, coded by
+/// `platform_error_code`: key-not-found → `SCP-CRYPTO-4006` (a key destroyed
+/// mid-derivation fails as key-not-found, §9.10.4.A), a host pseudonym the
+/// bridge cannot bind → `SCP-IDENT-1055`, any other custody failure →
+/// `SCP-CRYPTO-4060`.
 pub(crate) fn pseudonym_derivation_failed(e: &scp_platform::PlatformError) -> ScpNapiError {
-    ScpNapiError::Identity {
-        message: format!("pseudonym derivation failed: {e}"),
-        code: codes::IDENT_1055.to_owned(),
-    }
+    ScpNapiError::custody(format!("pseudonym derivation failed: {e}"), e)
 }
 
 /// Core pseudonym-derivation sequence shared by every NAPI entry point.
 ///
 /// Holds the single authoritative definition of the derivation-failure code
-/// contract (derivation failure, including a host-returned pseudonym key that
+/// contract ([`pseudonym_derivation_failed`]; a host-returned pseudonym key that
 /// is not a valid 33-byte P-256 point → SCP-IDENT-1055). The missing-key-material code (SCP-IDENT-1054) is surfaced
 /// by the callers that resolve custody (which know whether the lookup came from
 /// a handle or the registry). Centralizing here mirrors the `PyO3` reference
@@ -7570,11 +7570,11 @@ mod tests {
         assert_eq!(routing_id, expected);
     }
 
-    /// §9.10.4: a custody derivation failure surfaces as `SCP-IDENT-1055`,
-    /// never as a zero routing id.
+    /// §9.10.4.A: deriving under a key custody does not hold fails as
+    /// key-not-found (`SCP-CRYPTO-4006`), never as a zero routing id.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn derive_pseudonym_bytes_failure_is_ident_1055() {
+    async fn derive_pseudonym_bytes_unknown_key_is_crypto_4006() {
         use crate::identity::OpaqueInMemoryKeyCustody;
         use scp_platform::testing::InMemoryKeyCustody;
 
@@ -7586,10 +7586,10 @@ mod tests {
             .await
             .expect_err("an unknown identity key must fail derivation");
         match err {
-            crate::error::ScpNapiError::Identity { code, .. } => {
-                assert_eq!(code, codes::IDENT_1055);
+            crate::error::ScpNapiError::Crypto { code, .. } => {
+                assert_eq!(code, codes::CRYPTO_4006);
             }
-            other => panic!("expected IDENT_1055, got {other:?}"),
+            other => panic!("expected CRYPTO_4006, got {other:?}"),
         }
     }
 

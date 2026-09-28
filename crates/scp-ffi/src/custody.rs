@@ -811,6 +811,8 @@ class FakeCustody:
         return (compressed(self._pseudonyms[kid]), kid)
 
     def derive_pseudonym(self, key_id, context_id):
+        if key_id not in self._seeds:
+            raise HostError('key not found: ' + key_id, 'SCP-CRYPTO-4006')
         seed = hmac.new(self._seeds[key_id], bytes(context_id), hashlib.sha256).digest()
         return self._register(key_id, seed, context_id, b'v1')
 
@@ -1047,6 +1049,15 @@ mod tests {
         );
     }
 
+    /// Asserts that `err` is the `PseudonymRejected` variant the bridge
+    /// reports for a host pseudonym it cannot bind (spec §9.10.4).
+    fn assert_pseudonym_rejected(err: &PlatformError) {
+        assert!(
+            matches!(err, PlatformError::PseudonymRejected(_)),
+            "expected PseudonymRejected, got {err:?}"
+        );
+    }
+
     /// A pseudonym handle signs only a 32-byte digest: 12 bytes is rejected
     /// before the host is called.
     #[tokio::test]
@@ -1104,7 +1115,7 @@ mod tests {
             .await
             .expect("first derive");
         assert_eq!(first.key_handle().id(), 777);
-        assert_custody_error(
+        assert_pseudonym_rejected(
             &custody
                 .derive_pseudonym(&handle, b"ctx-b")
                 .await
@@ -1186,7 +1197,7 @@ mod tests {
             .generate_keypair(KeyType::Ed25519)
             .await
             .expect("key");
-        assert_custody_error(
+        assert_pseudonym_rejected(
             &custody
                 .derive_pseudonym(&handle, b"ctx")
                 .await
@@ -1198,7 +1209,7 @@ mod tests {
             .generate_keypair(KeyType::Ed25519)
             .await
             .expect("key");
-        assert_custody_error(
+        assert_pseudonym_rejected(
             &custody
                 .derive_pseudonym(&handle, b"ctx")
                 .await

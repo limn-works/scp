@@ -46,6 +46,13 @@ pub enum PlatformError {
     #[error("custody error: {0}")]
     CustodyError(String),
 
+    /// A bridge rejected a pseudonym that a host custody provider derived
+    /// (spec §9.10.4): the returned key id or point is malformed,
+    /// `get_public_key(key_id)` reports a different point, or the key id is
+    /// already bound to another pseudonym point.
+    #[error("pseudonym rejected: {0}")]
+    PseudonymRejected(String),
+
     /// The custody backend does not support an optional operation.
     ///
     /// Used by [`KeyCustody::generate_ephemeral_ed25519_seed`](crate::traits::KeyCustody::generate_ephemeral_ed25519_seed)

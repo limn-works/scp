@@ -197,9 +197,10 @@ fn resolve_stream_signer(
     let public_key = rt
         .block_on(async { custody.public_key(&handle).await })
         .map_err(|e| {
-            ScpPyError::context(format!(
-                "failed to resolve stream signing key for '{identity_did}': {e}"
-            ))
+            ScpPyError::custody(
+                format!("failed to resolve stream signing key for '{identity_did}': {e}"),
+                &e,
+            )
         })?;
     let verifying_key = scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key)
         .ok_or_else(|| {
