@@ -169,10 +169,10 @@ class AndroidPushProviderTest {
 
     @Test
     fun `payload with scp field and extra fields still returns Pull`() {
-        // FCM data messages may contain additional fields from the relay.
-        // As long as "scp" == "1", the handler accepts it. The opacity
-        // requirement (§10.7) is enforced at the relay side — the client
-        // validates only the wake signal field.
+        // As long as "scp" == "1", the handler accepts a payload with other
+        // fields. §10.7 puts the opacity requirement on the push sender;
+        // handleNotification checks only the wake signal field and does not
+        // enforce opacity.
         val payload = mapOf("scp" to "1", "extra" to "ignored")
         val signal = provider.handleNotification(payload)
         assertEquals(WakeSignal.PULL, signal)

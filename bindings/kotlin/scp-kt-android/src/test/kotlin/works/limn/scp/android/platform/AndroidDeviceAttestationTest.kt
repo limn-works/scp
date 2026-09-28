@@ -206,7 +206,10 @@ class AndroidDeviceAttestationTest {
     // -----------------------------------------------------------------------
 
     @Test
-    fun `ATTESTATION_TYPE constant matches spec value`() {
+    fun `ATTESTATION_TYPE constant holds the legacy clientDataJSON type value`() {
+        // Spec 27 quotes "scp-device-attestation-v1" only as part of the
+        // clientDataJSON construction that the 2026-09-27 amendments to
+        // ADR-025 and ADR-027 replaced; no normative text requires it.
         assertEquals("scp-device-attestation-v1", AndroidDeviceAttestation.ATTESTATION_TYPE)
     }
 

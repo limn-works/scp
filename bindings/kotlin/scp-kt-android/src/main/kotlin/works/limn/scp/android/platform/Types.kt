@@ -199,7 +199,9 @@ interface PushProvider {
      * Register for push notifications and return the platform-specific token.
      *
      * @return The push notification registration token string.
-     * @throws ScpException if token retrieval fails.
+     * @throws Exception whatever the platform token source throws when retrieval fails. The
+     *   interface does not require [ScpException], and [AndroidPushProvider] converts no
+     *   failure to it.
      */
     suspend fun register(): String
 

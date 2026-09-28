@@ -6320,12 +6320,15 @@
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidDeviceAttestation.kt"
       ],
-      "description": "Implement the DeviceAttestation platform trait for Android using Play Integrity API. Must decide integration level: standard requests vs classic attestation. Mirrors the Apple adapter structure from ADR-025. Play Integrity API integration pattern must be determined (standard vs classic).\n\nStatus reopened 2026-09-27: ADR-027's amendment of that date sets the Standard request's `requestHash` to the hexadecimal binding digest `D` of `09-security-model.md` §9.3.1 and names a verifier whose signed verdict a reader checks. The shipped adapter calls the Classic API's `setNonce` with a `clientDataJSON` digest, and no component validates a token, so the criterion \"Attestation tokens validated server-side\" is unmet. SCP-316 implements the reader; this story keeps the minting side.",
+      "description": "Implement device attestation for Android with the Play Integrity Standard API in `AndroidDeviceAttestation`, the adapter ADR-027 acceptance criteria 7 and 8 specify. The adapter implements the UniFFI callback methods `attest(challenge, device_id)` and `assert_request(request_hash)`; OQ-22 of `27-attestations.md` §27.7, the choice of trait, stays open.\n\nStatus reopened 2026-09-27: ADR-027's amendment of that date sets the Standard request's `requestHash` to the hexadecimal binding digest `D` of `09-security-model.md` §9.3.1 and names a verifier whose signed verdict a reader checks. The shipped adapter calls the Classic API's `setNonce` with a `clientDataJSON` digest, accepts a `challenge` of any length, and no component obtains or checks a verdict, so the criteria below are unmet. SCP-316 implements the reader; this story keeps the minting side.",
       "acceptanceCriteria": [
-        "DeviceAttestation trait implemented for Android using Play Integrity API matching ADR-025 trait signatures",
-        "Standard Play Integrity request flow implemented",
-        "Classic attestation flow available as alternative (if decided)",
-        "Attestation tokens validated server-side",
+        "`AndroidDeviceAttestation` implements the UniFFI callback methods `attest(challenge, device_id)` and `assert_request(request_hash)`; this story does not choose between the two device-attestation traits, which OQ-22 of `27-attestations.md` §27.7 keeps open (ADR-027 acceptance criteria 7 and 8)",
+        "`attest` rejects a `challenge` that is not 32 bytes (ADR-027 acceptance criterion 7)",
+        "Every failure of `attest`, a missing Google Play services installation and a `challenge` of the wrong size included, throws `ScpException` with code `SCP-ATTEST-9001` (ADR-027 acceptance criterion 7)",
+        "`attest` returns the raw integrity token bytes (ADR-027 acceptance criterion 7)",
+        "The SDK obtains a verdict for the token by one HTTPS `POST` to the URL in the package verifier's `PlayIntegrityVerifier` entry, in the `09-security-model.md` §9.3.1 request format, and publishes token and verdict as the context's one `play-integrity` entry in the §9.3.1 format (ADR-027 acceptance criterion 7)",
+        "The SDK requests a new token and verdict before the entry passes the context's `device_attestation_max_age_secs`, and when its own entry reads `Rejected{VerdictSignatureInvalid}` after the verifier rotates its key (ADR-027 acceptance criterion 7)",
+        "On a device without Google Play services, `attest` throws and the SDK publishes no entry (ADR-027 acceptance criterion 7)",
         "Integration tests verify attestation flow end-to-end on physical device",
         "`attest` requests a Standard integrity token through `IntegrityManagerFactory.createStandard(context)`, `prepareIntegrityToken` and `StandardIntegrityTokenProvider.request` (ADR-027 acceptance criterion 7)",
         "`attest` passes `prepareIntegrityToken` the `cloudProjectNumber` of the package verifier's `PlayIntegrityVerifier` entry (ADR-027 acceptance criterion 7)",
@@ -6337,7 +6340,6 @@
       "actionItems": [
         "Define Android-specific DeviceAttestation implementation struct",
         "Implement Play Integrity standard request flow",
-        "Evaluate and optionally implement classic attestation flow",
         "Wire attestation into SCP identity verification pipeline",
         "Test on physical Android device"
       ],
@@ -6358,11 +6360,8 @@
         }
       ],
       "details": {
-        "stubADR": true,
-        "note": "ADR not yet fully written — story derived from expected approach and known constraints",
-        "expectedDecisions": {
-          "playIntegrityLevel": "Standard requests vs classic attestation"
-        },
+        "stubADR": false,
+        "note": "ADR-027 acceptance criteria 7 and 8, as amended 2026-09-27, settle the Standard request and the requestHash values; OQ-22 of 27-attestations.md §27.7, the choice of trait, stays open",
         "references": [
           "ADR-025 — Apple adapter as parallel reference"
         ]

@@ -8,15 +8,18 @@
  *
  * ## FCM Payload Opacity (§10.7)
  *
- * The relay sends **only** `{"data": {"scp": "1"}}` — a data-only message with no
- * notification fields. No context ID, sender DID, message preview, or any other
- * metadata may appear in the FCM payload. The app wakes, connects to the SCP relay,
- * and pulls all pending encrypted envelopes. FCM learns only that the device
- * received a data message at a specific time.
+ * §10.7 requires the sender of a push to send **only** `{"data": {"scp": "1"}}`, a
+ * data-only message with no notification fields. No context ID, sender DID, message
+ * preview, or any other metadata may appear in the FCM payload, so FCM learns only that
+ * the device received a data message at a specific time. No relay or other code in this
+ * repository sends an FCM message, and no SDK code wakes the app, connects to a relay,
+ * or pulls envelopes: the caller does all three when [handleNotification] returns
+ * [WakeSignal.PULL].
  *
- * [handleNotification] **enforces** this invariant on receipt: payloads missing the
- * `scp` field or containing an unexpected value are rejected with [ScpException]
- * error codes `SCP-TRANS-5001` and `SCP-TRANS-5002` respectively.
+ * [handleNotification] checks only the `scp` field. It rejects a payload that lacks the
+ * field with [ScpException] code `SCP-TRANS-5001`, and a payload whose field is not
+ * `"1"` with code `SCP-TRANS-5002`. It accepts a payload that carries other fields
+ * beside `"scp": "1"`, so it does not enforce the opacity requirement.
  *
  * ## Token Registration Lifecycle
  *
@@ -47,9 +50,10 @@ import kotlinx.coroutines.withContext
 /**
  * [PushProvider] implementation for Android using Firebase Cloud Messaging.
  *
- * Handles FCM token registration and validates incoming data-only push payloads
- * against the §10.7 opacity requirement. The relay sends `{"data": {"scp": "1"}}`
- * as the sole push payload format; any deviation is rejected.
+ * Retrieves the FCM registration token and checks the `scp` field of incoming data-only
+ * push payloads. §10.7 requires the sender to send `{"data": {"scp": "1"}}` as the sole
+ * push payload; [handleNotification] rejects a missing or wrong `scp` field and accepts
+ * any other fields beside it.
  *
  * @param context Android application [Context], used for Firebase initialisation.
  *   Callers should pass the application context to avoid activity lifecycle leaks.
@@ -76,12 +80,15 @@ class AndroidPushProvider(
     /**
      * Register for FCM push notifications and return the registration token.
      *
-     * Retrieves the current FCM instance token on [Dispatchers.IO]. The token
-     * is a server-side identifier that the SCP relay uses to target data-only
-     * push messages to this device.
+     * Retrieves the current FCM instance token on [Dispatchers.IO]. A push sender
+     * addresses FCM data messages to this device by the token; no sender in this
+     * repository does so.
      *
      * @return The FCM registration token string.
-     * @throws ScpException if Firebase is not initialised or token retrieval fails.
+     * @throws IllegalStateException from `FirebaseMessaging.getInstance()` if Firebase is
+     *   not initialised. The method converts no failure to [ScpException].
+     * @throws Exception whatever exception the FCM token task failed with, rethrown by
+     *   `await()` unconverted.
      */
     override suspend fun register(): String {
         return withContext(Dispatchers.IO) {
@@ -122,7 +129,8 @@ class AndroidPushProvider(
     }
 }
 
-// Relay sends this FCM message structure — opaque, data-only:
+// §10.7 requires a push sender to send this FCM message structure — opaque, data-only.
+// No code in this repository sends it:
 // {
 //   "to": "<fcm_token>",
 //   "data": {

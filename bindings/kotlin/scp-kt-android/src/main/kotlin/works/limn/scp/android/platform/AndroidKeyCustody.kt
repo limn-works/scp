@@ -7,12 +7,14 @@
 //
 // Hardware-backed Ed25519 private keys never leave the TEE. This class performs all signing
 // and DH itself and returns signatures and shared secrets, and it returns a software private
-// key (Ed25519 on API 26-32, and every X25519 key) to no caller, with one exception:
+// key (Ed25519 on API 26-32, every derived pseudonym key on every API level, and every
+// X25519 key) to no caller, with one exception:
 // exportSigningKeyBytes returns a software Ed25519 key's 32-byte private seed. No code passes
 // this class to the Rust engine.
 //
-// Software Ed25519 keys (API 26-32 fallback) are persisted to EncryptedSharedPreferences
-// (Jetpack Security) so they survive process death. Without this, API 26-32 users would
+// Software Ed25519 keys that generateKeypair creates (API 26-32 fallback) are persisted to
+// EncryptedSharedPreferences (Jetpack Security) so they survive process death; derived
+// pseudonym keys are held in memory only. Without this, API 26-32 users would
 // lose their DID identity key on every process restart — causing identity loss, context
 // membership loss, and UCAN delegation loss.
 //
@@ -69,8 +71,9 @@ import java.security.SecureRandom
  *   Apple's Secure Enclave (which only supports P-256). [CustodyType.HARDWARE] is reported.
  *
  * - **Ed25519 on API 26-32:** `EdDSA` is not available in Android Keystore on these API
- *   levels. Bouncy Castle provides software Ed25519. Keys are stored in [softwareKeys]
- *   in-memory. [CustodyType.SOFTWARE] is reported.
+ *   levels. Bouncy Castle provides software Ed25519. The key pair is held in [softwareKeys]
+ *   in memory, and its 32-byte private seed is persisted to [encryptedPrefs] so the key
+ *   survives process death. [CustodyType.SOFTWARE] is reported.
  *
  * - **X25519 (all API levels):** X25519 key agreement is not supported by Android Keystore
  *   at any API level. All X25519 wrapping keys are software-managed via Bouncy Castle,
@@ -533,8 +536,10 @@ class AndroidKeyCustody internal constructor(
      * the Bouncy Castle [Ed25519PrivateKeyParameters] and returns a copy.
      *
      * For hardware-backed keys ([CustodyType.HARDWARE]): throws an error because TEE keys
-     * are non-extractable. Governance signing on hardware-backed keys requires a future
-     * architectural change to use a Signer trait instead of raw key export.
+     * are non-extractable, so a hardware-backed key cannot sign a governance vote through
+     * this adapter. ADR-063's curve slice removes the gap: every core function that takes a
+     * raw signing key takes a signer instead, and every key-export accessor leaves the
+     * custody adapters.
      *
      * @param keyHandle Handle returned by [generateKeypair] for an Ed25519 key.
      * @return 32-byte raw Ed25519 private key bytes.
