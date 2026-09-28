@@ -137,6 +137,12 @@ pub(crate) struct McpClientEntry {
     /// guard before its network round trip; a disconnect or connect on the
     /// same shard then never waits on a silent server.
     pub(crate) client: Arc<Mutex<McpClient<McpClientTransportWrapper>>>,
+    /// A stdio client's server process, which `mcp_client_disconnect_on`
+    /// kills directly: an in-flight call's clone of `client` would otherwise
+    /// keep the process alive, and a blocking thread parked on its stdout,
+    /// for as long as the server stays silent. `None` for an SSE client,
+    /// whose reads time out.
+    pub(crate) stdio_server: Option<Arc<Mutex<std::process::Child>>>,
 }
 
 // Phase D (#1695): EMPTY_*_REGISTRY fallbacks and the `mcp_*_registry()`
@@ -195,11 +201,13 @@ impl McpTransport for McpClientTransportWrapper {
 
 /// Stdio MCP transport: communicates with a subprocess via stdin/stdout.
 pub(crate) struct StdioMcpTransport {
+    /// The server process, apart from the pipes an in-flight call holds, so
+    /// a disconnect can stop it while a call waits on its stdout.
+    child: Arc<Mutex<std::process::Child>>,
     inner: Mutex<StdioTransportInner>,
 }
 
 struct StdioTransportInner {
-    child: std::process::Child,
     stdin: std::process::ChildStdin,
     reader: BufReader<std::process::ChildStdout>,
 }
@@ -240,12 +248,14 @@ impl StdioMcpTransport {
         let reader = BufReader::new(stdout);
 
         Ok(Self {
-            inner: Mutex::new(StdioTransportInner {
-                child,
-                stdin,
-                reader,
-            }),
+            child: Arc::new(Mutex::new(child)),
+            inner: Mutex::new(StdioTransportInner { stdin, reader }),
         })
+    }
+
+    /// The server process, for [`McpClientEntry::stdio_server`].
+    fn server_process(&self) -> Arc<Mutex<std::process::Child>> {
+        Arc::clone(&self.child)
     }
 }
 
@@ -302,10 +312,7 @@ impl McpTransport for StdioMcpTransport {
 
 impl Drop for StdioMcpTransport {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.inner.lock() {
-            let _ = guard.child.kill();
-            let _ = guard.child.wait();
-        }
+        scp_mcp::stdio::stop_server_process(&self.child);
     }
 }
 
@@ -861,6 +868,7 @@ pub(crate) async fn mcp_client_connect_stdio_on(
             code: codes::TRANS_5015.to_owned(),
         })
     })?;
+    let server = transport.server_process();
 
     let client = run_mcp_client_io(codes::TRANS_5016, move || {
         let mut client = McpClient::new(McpClientTransportWrapper::Stdio(transport));
@@ -875,6 +883,7 @@ pub(crate) async fn mcp_client_connect_stdio_on(
     let handle_id = mcp_handle_id("mcp-client");
     let entry = McpClientEntry {
         client: Arc::new(Mutex::new(client)),
+        stdio_server: Some(server),
     };
 
     bi.mcp_client_registry().insert(handle_id.clone(), entry);
@@ -916,6 +925,7 @@ pub(crate) async fn mcp_client_connect_sse_on(
     let handle_id = mcp_handle_id("mcp-client");
     let entry = McpClientEntry {
         client: Arc::new(Mutex::new(client)),
+        stdio_server: None,
     };
 
     bi.mcp_client_registry().insert(handle_id.clone(), entry);
@@ -934,13 +944,17 @@ pub(crate) async fn mcp_client_disconnect_on(
     handle: &NapiMcpClientHandle,
 ) -> napi::Result<()> {
     crate::napi_check_handle!(&bi.core, handle);
-    let removed = bi.mcp_client_registry().remove(&handle.handle_id);
-    if removed.is_none() {
+    let Some((_, entry)) = bi.mcp_client_registry().remove(&handle.handle_id) else {
         return Err(ScpNapiError::Transport {
             message: format!("MCP client handle '{}' not found", handle.handle_id),
             code: codes::TRANS_5019.to_owned(),
         }
         .into());
+    };
+    // A stdio server is dead when this returns, even while a call on the
+    // handle is in flight; that call then fails on the closed stdout.
+    if let Some(server) = entry.stdio_server {
+        scp_mcp::stdio::stop_server_process(&server);
     }
     Ok(())
 }
@@ -1266,9 +1280,11 @@ mod tests {
 
     /// A `tools/list` in flight against a silent stdio server holds a blocking
     /// thread and its own clone of the client, not the registry shard, so a
-    /// disconnect of the same handle returns at once. The stub server writes a
-    /// notification before its `initialize` response, which the client reads
-    /// past, then answers nothing for three seconds.
+    /// disconnect of the same handle returns at once, and it kills the server
+    /// process, so the in-flight call ends on the closed stdout. The stub
+    /// server writes a notification before its `initialize` response, which
+    /// the client reads past, then becomes a `sleep` that never answers and
+    /// outlives the test unless the disconnect kills it.
     #[test]
     fn mcp_client_disconnect_does_not_wait_on_an_in_flight_call_napi() {
         let bi = NapiBridgeInstance::new_napi();
@@ -1279,12 +1295,13 @@ mod tests {
             echo '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}'; \
             echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\
             \"capabilities\":{},\"serverInfo\":{\"name\":\"stub\"}}}'; \
-            sleep 3";
+            exec sleep 600";
         let transport = StdioMcpTransport::spawn(
             &allowlist,
             &["sh".to_owned(), "-c".to_owned(), script.to_owned()],
         )
         .expect("spawn stub server");
+        let server = transport.server_process();
         let mut client = McpClient::new(McpClientTransportWrapper::Stdio(transport));
         client
             .initialize()
@@ -1294,6 +1311,7 @@ mod tests {
             handle_id.clone(),
             McpClientEntry {
                 client: Arc::new(Mutex::new(client)),
+                stdio_server: Some(Arc::clone(&server)),
             },
         );
         crate::increment_handle_count();
@@ -1307,23 +1325,44 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let (listed, disconnect_took) = runtime.block_on(async {
-            tokio::join!(mcp_client_list_tools_on(&bi, &handle), async {
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                let started = std::time::Instant::now();
-                mcp_client_disconnect_on(&bi, &handle)
-                    .await
-                    .expect("disconnect a known handle");
-                started.elapsed()
+        // The timeout is built inside `block_on`, because its timer needs the
+        // runtime's reactor.
+        let joined = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(mcp_client_list_tools_on(&bi, &handle), async {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    let started = std::time::Instant::now();
+                    mcp_client_disconnect_on(&bi, &handle)
+                        .await
+                        .expect("disconnect a known handle");
+                    started.elapsed()
+                })
             })
+            .await
         });
+        if joined.is_err() {
+            // Free the parked blocking thread, or the runtime's drop waits on
+            // it for the stub's whole sleep.
+            scp_mcp::stdio::stop_server_process(&server);
+        }
+        let (listed, disconnect_took) =
+            joined.expect("the in-flight call must end once disconnect kills the server");
         assert!(
             disconnect_took < std::time::Duration::from_secs(1),
             "disconnect waited {disconnect_took:?} on the in-flight call"
         );
         assert!(
+            server
+                .lock()
+                .expect("server lock")
+                .try_wait()
+                .expect("query the server process")
+                .is_some(),
+            "disconnect must kill the stdio server process"
+        );
+        assert!(
             listed.is_err(),
-            "the stub server closed without a tools/list response"
+            "the killed stub server sent no tools/list response"
         );
     }
 

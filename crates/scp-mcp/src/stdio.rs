@@ -173,6 +173,24 @@ pub fn read_line_bounded<R: std::io::BufRead>(
     Ok(n)
 }
 
+/// Kills a stdio MCP server process and reaps it.
+///
+/// Each bridge's stdio client keeps the server's [`std::process::Child`]
+/// behind its own mutex, apart from the pipes an in-flight call holds, so a
+/// disconnect stops the server at once instead of when the in-flight call
+/// releases the client. Killing the process closes its stdout, and the
+/// in-flight [`read_response`] then fails on EOF. A poisoned lock still
+/// yields the child, because a leaked server outlives every caller.
+pub fn stop_server_process(child: &std::sync::Mutex<std::process::Child>) {
+    let mut child = child
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Both results are dropped: a disconnect or drop has no caller that could
+    // act on a failed kill or wait.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Maximum number of lines a stdio client skips while it waits for the
 /// response to one request. Bounds a peer that streams notifications forever.
 pub const MAX_SKIPPED_LINES: usize = 1000;

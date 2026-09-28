@@ -4615,6 +4615,12 @@ pub(crate) struct McpClientEntry {
     /// guard before its network round trip; a disconnect or connect on the
     /// same shard then never waits on a silent server.
     pub(crate) client: Arc<std::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>>,
+    /// A stdio client's server process, which `mcp_client_disconnect` kills
+    /// directly: an in-flight call's clone of `client` would otherwise keep
+    /// the process alive, and a blocking thread parked on its stdout, for as
+    /// long as the server stays silent. `None` for an SSE client, whose reads
+    /// time out.
+    pub(crate) stdio_server: Option<Arc<std::sync::Mutex<std::process::Child>>>,
 }
 
 /// Returns a reference to this `UniffiBridgeInstance`'s MCP server registry.
@@ -4693,11 +4699,13 @@ impl scp_mcp::client::McpTransport for McpUniFFITransportWrapper {
 
 /// Stdio MCP transport: communicates with a subprocess via stdin/stdout.
 pub(crate) struct McpStdioTransport {
+    /// The server process, apart from the pipes an in-flight call holds, so
+    /// a disconnect can stop it while a call waits on its stdout.
+    child: Arc<std::sync::Mutex<std::process::Child>>,
     inner: std::sync::Mutex<McpStdioTransportInner>,
 }
 
 struct McpStdioTransportInner {
-    child: std::process::Child,
     stdin: std::process::ChildStdin,
     reader: std::io::BufReader<std::process::ChildStdout>,
 }
@@ -4739,12 +4747,14 @@ impl McpStdioTransport {
         let reader = std::io::BufReader::new(stdout);
 
         Ok(Self {
-            inner: std::sync::Mutex::new(McpStdioTransportInner {
-                child,
-                stdin,
-                reader,
-            }),
+            child: Arc::new(std::sync::Mutex::new(child)),
+            inner: std::sync::Mutex::new(McpStdioTransportInner { stdin, reader }),
         })
+    }
+
+    /// The server process, for [`McpClientEntry::stdio_server`].
+    fn server_process(&self) -> Arc<std::sync::Mutex<std::process::Child>> {
+        Arc::clone(&self.child)
     }
 }
 
@@ -4811,10 +4821,7 @@ impl scp_mcp::client::McpTransport for McpStdioTransport {
 
 impl Drop for McpStdioTransport {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.inner.lock() {
-            let _ = guard.child.kill();
-            let _ = guard.child.wait();
-        }
+        scp_mcp::stdio::stop_server_process(&self.child);
     }
 }
 
@@ -16530,20 +16537,21 @@ impl Scp {
         }
 
         let bi = Arc::clone(&self.inner);
-        let client =
+        let (client, server) =
             run_mcp_client_io(codes::TRANS_5016, move || {
                 let transport = McpStdioTransport::spawn(bi.core.mcp_allowlist(), &command)
                     .map_err(|e| ScpError::Transport {
                         msg: format!("failed to connect stdio MCP client: {e}"),
                         code: codes::TRANS_5015.to_owned(),
                     })?;
+                let server = transport.server_process();
                 let mut client =
                     scp_mcp::client::McpClient::new(McpUniFFITransportWrapper::Stdio(transport));
                 client.initialize().map_err(|e| ScpError::Transport {
                     msg: format!("MCP initialize handshake failed: {e}"),
                     code: codes::TRANS_5016.to_owned(),
                 })?;
-                Ok(client)
+                Ok((client, server))
             })
             .await?;
 
@@ -16552,6 +16560,7 @@ impl Scp {
             handle_id.clone(),
             McpClientEntry {
                 client: Arc::new(std::sync::Mutex::new(client)),
+                stdio_server: Some(server),
             },
         );
         increment_handle_count();
@@ -16595,6 +16604,7 @@ impl Scp {
             handle_id.clone(),
             McpClientEntry {
                 client: Arc::new(std::sync::Mutex::new(client)),
+                stdio_server: None,
             },
         );
         increment_handle_count();
@@ -16604,17 +16614,21 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `mcp_client_disconnect`.
     ///
-    /// Routes through the module-level MCP client registry.
+    /// Routes through the module-level MCP client registry. A stdio client's
+    /// server process is dead when this returns, even while a call on the
+    /// handle is in flight; that call then fails on the closed stdout.
     #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_client_disconnect(&self, handle: String) -> Result<(), ScpError> {
         validate_mcp_handle(&handle)?;
 
-        let removed = mcp_client_registry(&self.inner).remove(&handle);
-        if removed.is_none() {
+        let Some((_, entry)) = mcp_client_registry(&self.inner).remove(&handle) else {
             return Err(ScpError::Transport {
                 msg: format!("MCP client handle '{handle}' not found"),
                 code: codes::TRANS_5019.to_owned(),
             });
+        };
+        if let Some(server) = entry.stdio_server {
+            scp_mcp::stdio::stop_server_process(&server);
         }
 
         Ok(())
@@ -23049,9 +23063,11 @@ mod tests {
 
     /// A `tools/list` in flight against a silent stdio server holds a blocking
     /// thread and its own clone of the client, not the registry shard, so a
-    /// disconnect of the same handle returns at once. The stub server writes a
-    /// notification before its `initialize` response, which the client reads
-    /// past, then answers nothing for three seconds.
+    /// disconnect of the same handle returns at once, and it kills the server
+    /// process, so the in-flight call ends on the closed stdout. The stub
+    /// server writes a notification before its `initialize` response, which
+    /// the client reads past, then becomes a `sleep` that never answers and
+    /// outlives the test unless the disconnect kills it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_client_disconnect_does_not_wait_on_an_in_flight_call() {
         let scp = scp_test();
@@ -23062,12 +23078,13 @@ mod tests {
             echo '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}'; \
             echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\
             \"capabilities\":{},\"serverInfo\":{\"name\":\"stub\"}}}'; \
-            sleep 3";
+            exec sleep 600";
         let transport = McpStdioTransport::spawn(
             &allowlist,
             &["sh".to_owned(), "-c".to_owned(), script.to_owned()],
         )
         .expect("spawn stub server");
+        let server = transport.server_process();
         let mut client =
             scp_mcp::client::McpClient::new(McpUniFFITransportWrapper::Stdio(transport));
         client
@@ -23078,10 +23095,11 @@ mod tests {
             handle.clone(),
             McpClientEntry {
                 client: Arc::new(std::sync::Mutex::new(client)),
+                stdio_server: Some(Arc::clone(&server)),
             },
         );
 
-        let (listed, disconnect_took) =
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             tokio::join!(scp.mcp_client_list_tools(handle.clone()), async {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 let started = std::time::Instant::now();
@@ -23089,14 +23107,32 @@ mod tests {
                     .await
                     .expect("disconnect a known handle");
                 started.elapsed()
-            });
+            })
+        })
+        .await;
+        if joined.is_err() {
+            // Free the parked blocking thread, or the runtime's shutdown
+            // waits on it for the stub's whole sleep.
+            scp_mcp::stdio::stop_server_process(&server);
+        }
+        let (listed, disconnect_took) =
+            joined.expect("the in-flight call must end once disconnect kills the server");
         assert!(
             disconnect_took < std::time::Duration::from_secs(1),
             "disconnect waited {disconnect_took:?} on the in-flight call"
         );
         assert!(
+            server
+                .lock()
+                .expect("server lock")
+                .try_wait()
+                .expect("query the server process")
+                .is_some(),
+            "disconnect must kill the stdio server process"
+        );
+        assert!(
             listed.is_err(),
-            "the stub server closed without a tools/list response"
+            "the killed stub server sent no tools/list response"
         );
     }
 

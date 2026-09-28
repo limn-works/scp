@@ -67,16 +67,17 @@ use crate::validate;
 /// JSON-RPC messages synchronously. The subprocess's stderr is inherited by
 /// the parent process for debugging.
 struct StdioClientTransport {
-    /// The subprocess handle, protected by a mutex for thread-safe access.
-    /// Holds the child process, its stdin writer, and stdout reader.
+    /// The spawned subprocess, kept apart from the pipes an in-flight call
+    /// holds so a disconnect can stop it while a call waits on its stdout.
+    /// Killed and reaped by `py_mcp_client_disconnect` or, at the latest,
+    /// when the transport is dropped via [`Drop`].
+    child: Arc<Mutex<Child>>,
+    /// The subprocess's stdin writer and stdout reader.
     inner: Mutex<StdioTransportInner>,
 }
 
 /// Interior state for [`StdioClientTransport`], protected by a mutex.
 struct StdioTransportInner {
-    /// The spawned subprocess. Kept alive for the transport lifetime.
-    /// Killed and reaped when the transport is dropped via [`Drop`].
-    child: Child,
     /// Buffered writer to the subprocess's stdin.
     writer: std::io::BufWriter<std::process::ChildStdin>,
     /// Buffered reader from the subprocess's stdout.
@@ -127,12 +128,14 @@ impl StdioClientTransport {
         let reader = BufReader::new(stdout);
 
         Ok(Self {
-            inner: Mutex::new(StdioTransportInner {
-                child,
-                writer,
-                reader,
-            }),
+            child: Arc::new(Mutex::new(child)),
+            inner: Mutex::new(StdioTransportInner { writer, reader }),
         })
+    }
+
+    /// The subprocess, for [`McpClientState::stdio_server`].
+    fn server_process(&self) -> Arc<Mutex<Child>> {
+        Arc::clone(&self.child)
     }
 }
 
@@ -142,10 +145,7 @@ impl StdioClientTransport {
 /// handles. Without this impl, dropped transports leak running subprocesses.
 impl Drop for StdioClientTransport {
     fn drop(&mut self) {
-        if let Ok(mut inner) = self.inner.lock() {
-            let _ = inner.child.kill();
-            let _ = inner.child.wait();
-        }
+        scp_mcp::stdio::stop_server_process(&self.child);
     }
 }
 
@@ -1119,6 +1119,12 @@ pub(crate) struct McpClientState {
     url: Option<String>,
     /// The real MCP client, connected and initialized.
     client: Arc<Mutex<McpClient<ClientTransport, SystemTimestamp>>>,
+    /// A stdio client's subprocess, which `py_mcp_client_disconnect` kills
+    /// directly: an in-flight call's clone of `client` would otherwise keep
+    /// the subprocess alive, and a thread parked on its stdout, for as long
+    /// as the server stays silent. `None` for an SSE client, whose reads
+    /// time out.
+    stdio_server: Option<Arc<Mutex<Child>>>,
 }
 
 // Phase D (#1695): `server_registry()` / `client_registry()` default-bridge
@@ -1563,6 +1569,7 @@ impl crate::scp::PyScp {
         // per-instance (lives on `CoreFields::mcp_allowlist`).
         let transport = StdioClientTransport::spawn(bi.core.mcp_allowlist(), &command)
             .map_err(|e| ScpPyError::transport(format!("failed to connect stdio client: {e}")))?;
+        let server = transport.server_process();
 
         // Create the MCP client and perform the initialize handshake.
         let mut client = McpClient::new(ClientTransport::Stdio(transport));
@@ -1577,6 +1584,7 @@ impl crate::scp::PyScp {
             url: None,
 
             client: Arc::new(Mutex::new(client)),
+            stdio_server: Some(server),
         };
 
         client_registry_of(bi).insert(handle.clone(), state);
@@ -1635,6 +1643,7 @@ impl crate::scp::PyScp {
             url: Some(url.to_owned()),
 
             client: Arc::new(Mutex::new(client)),
+            stdio_server: None,
         };
 
         client_registry_of(bi).insert(handle.clone(), state);
@@ -1645,9 +1654,11 @@ impl crate::scp::PyScp {
 
 /// Disconnects from an external MCP server.
 ///
-/// Removes the client from the registry and drops the transport connection.
-/// For stdio clients, the subprocess is killed via `StdioClientTransport::drop`.
-/// For SSE clients, the TCP connection is closed.
+/// Removes the client from the registry. For stdio clients, the subprocess is
+/// killed and reaped before this returns, even while a call on the handle is
+/// in flight; that call then fails on the closed stdout. For SSE clients, the
+/// TCP connection closes when the last call on the handle ends, which a read
+/// timeout bounds.
 ///
 /// # Arguments
 ///
@@ -1667,11 +1678,13 @@ impl crate::scp::PyScp {
             ScpPyError::transport(format!("MCP client handle '{handle}' not found"))
         })?;
 
-        // Dropping `state` drops the Arc<Mutex<McpClient>>, which drops the
-        // McpClient, which drops the ClientTransport. For stdio transports,
-        // the Drop impl on StdioClientTransport kills and waits on the
-        // subprocess, preventing resource leaks.
-        drop(state);
+        // A call in flight on this handle holds its own clone of
+        // `state.client`, so dropping `state` does not drop the transport.
+        // Killing the stdio subprocess here ends it now; the in-flight call
+        // then fails on the closed stdout and drops the last clone.
+        if let Some(server) = state.stdio_server {
+            scp_mcp::stdio::stop_server_process(&server);
+        }
 
         Ok(())
     }
@@ -3798,6 +3811,67 @@ mod tests {
         let allowlist = Mutex::new(allowlist::StdioAllowlist::new_with_defaults());
         let result = StdioClientTransport::spawn(&allowlist, &[]);
         assert!(result.is_err());
+    }
+
+    /// A `tools/list` in flight against a silent stdio server holds its own
+    /// clone of the client, so dropping the registry's copy does not drop the
+    /// transport. `py_mcp_client_disconnect` kills the server process itself,
+    /// and the in-flight call then ends on the closed stdout. The stub server
+    /// answers `initialize`, then becomes a `sleep` that never answers and
+    /// outlives the test unless the disconnect kills it.
+    #[test]
+    fn disconnect_kills_the_stdio_server_under_an_in_flight_call() {
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        let mut allowlist = allowlist::StdioAllowlist::new_with_defaults();
+        allowlist.configure(&["sh"]).expect("allow sh");
+        let allowlist = Mutex::new(allowlist);
+        let script = "read l; \
+            echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\
+            \"capabilities\":{},\"serverInfo\":{\"name\":\"stub\"}}}'; \
+            exec sleep 600";
+        let transport = StdioClientTransport::spawn(
+            &allowlist,
+            &["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+        )
+        .expect("spawn stub server");
+        let server = transport.server_process();
+        let mut client = McpClient::new(ClientTransport::Stdio(transport));
+        client.initialize().expect("initialize against the stub");
+        let client = Arc::new(Mutex::new(client));
+        let handle = generate_handle_id("mcp-client");
+        client_registry_of(&scp.inner).insert(
+            handle.clone(),
+            McpClientState {
+                transport: "stdio".to_owned(),
+                command: None,
+                url: None,
+                client: Arc::clone(&client),
+                stdio_server: Some(Arc::clone(&server)),
+            },
+        );
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let listed = client.lock().expect("client lock").list_tools();
+            let _ = done_tx.send(listed.is_err());
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        scp.py_mcp_client_disconnect(&handle)
+            .expect("disconnect a known handle");
+
+        assert!(
+            server
+                .lock()
+                .expect("server lock")
+                .try_wait()
+                .expect("query the server process")
+                .is_some(),
+            "disconnect must kill the stdio server process"
+        );
+        let failed = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the in-flight call must end once disconnect kills the server");
+        assert!(failed, "the killed stub server sent no tools/list response");
     }
 
     /// WU6: Two-instance regression test — disabling enforcement via the
