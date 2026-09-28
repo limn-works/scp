@@ -1136,10 +1136,11 @@ pub(crate) struct McpClientState {
 /// backs as false (`resources.subscribe`, `resources.listChanged`,
 /// `tools.listChanged`), rejects `resources/subscribe`, and sends no
 /// `notifications/*/list_changed`, so those capabilities are honestly absent
-/// rather than accepted-and-never-delivered. Absence removes only these
-/// pump-backed capabilities: the server still serves `tools/*` and
-/// `resources/list|read`. Serving is not failed outright, because that would
-/// deny working functionality over an optional feature.
+/// rather than accepted-and-never-delivered. Serving is not failed outright,
+/// because that would deny working functionality over an optional feature:
+/// the server still serves `tools/list` and `resources/list|read`. It runs a
+/// `tools/call` only with a supervisor attached; with none, it refuses every
+/// `tools/call` (`ContextManager not yet attached`).
 ///
 /// One call decides both halves: the server that advertises
 /// `resources.subscribe` and the pump that honours it, folded into one

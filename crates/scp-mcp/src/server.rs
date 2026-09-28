@@ -972,8 +972,8 @@ impl<P: ContextProvider> McpServer<P> {
     /// Handles `tools/list` -- returns all tools the agent can access across
     /// all active contexts, filtered by capability.
     fn handle_tools_list(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
-        let served = match self.record_served_contexts() {
-            Ok(served) => served,
+        let (served, listed_before) = match self.record_served_contexts() {
+            Ok(recorded) => recorded,
             Err(msg) => return internal_error(request.id.clone(), &msg),
         };
         let mut tools: Vec<ToolDefinition> = Vec::new();
@@ -992,7 +992,9 @@ impl<P: ContextProvider> McpServer<P> {
         // Record the tools half of each context's view only, because this
         // response carries no resource list.
         for (context_id, value) in listed {
-            self.record_view(&served, context_id, |view| view.tools = value);
+            self.record_view(&served, context_id, listed_before, |view| {
+                view.tools = Some(value);
+            });
         }
 
         let result = ToolsListResult {
@@ -1199,8 +1201,8 @@ impl<P: ContextProvider> McpServer<P> {
     fn handle_resources_list(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
         let mut resources: Vec<ResourceDefinition> = Vec::new();
 
-        let served = match self.record_served_contexts() {
-            Ok(served) => served,
+        let (served, listed_before) = match self.record_served_contexts() {
+            Ok(recorded) => recorded,
             Err(msg) => return internal_error(request.id.clone(), &msg),
         };
         let mut listed: Vec<(&ContextId, Vec<ResourceKind>)> = Vec::new();
@@ -1227,7 +1229,9 @@ impl<P: ContextProvider> McpServer<P> {
         // Record the readable half of each context's view only, because this
         // response carries no tool list.
         for (context_id, readable) in listed {
-            self.record_view(&served, context_id, |view| view.readable = readable);
+            self.record_view(&served, context_id, listed_before, |view| {
+                view.readable = Some(readable);
+            });
         }
 
         let result = ResourcesListResult {
@@ -1403,7 +1407,7 @@ impl<P: ContextProvider> McpServer<P> {
         if !self.client_listed.load(std::sync::atomic::Ordering::SeqCst)
             && let Ok(served) = self.provider.active_context_ids()
         {
-            self.record_view(&served, &context_id, |_| {});
+            self.record_view(&served, &context_id, false, |_| {});
         }
 
         JsonRpcResponse::success(
@@ -1716,32 +1720,43 @@ impl<P: ContextProvider> McpServer<P> {
     /// Returns `active_context_ids()` and records each returned context in
     /// `served_contexts`, because the response built from it puts that
     /// context in the client's cached `tools/list` or `resources/list`.
+    /// Also returns whether the client had listed in this session before this
+    /// call, which [`Self::record_view`] needs.
     ///
     /// # Errors
     ///
     /// Returns the provider's message when it cannot read participation; no
     /// context is recorded then.
-    fn record_served_contexts(&self) -> Result<Vec<ContextId>, String> {
+    fn record_served_contexts(&self) -> Result<(Vec<ContextId>, bool), String> {
         let active = self.provider.active_context_ids()?;
-        self.client_listed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let listed_before = self
+            .client_listed
+            .swap(true, std::sync::atomic::Ordering::SeqCst);
         self.served_contexts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extend(active.iter().cloned());
-        Ok(active)
+        Ok((active, listed_before))
     }
 
     /// Applies `listed` to the [`ContextView`] recorded for `context_id`.
     /// `listed` writes the half of the view that a response just gave the
     /// client, and nothing else.
     ///
-    /// When no view is recorded, the client holds no list of this context
-    /// from this session, so this first records the provider's current view
-    /// and then applies `listed`. A half recorded that way cannot hide a
-    /// change from the client, because the client has no cached list of that
-    /// half. When the current view cannot be read, nothing is recorded, and
-    /// the next event notifies.
+    /// When no view is recorded and the client had not listed in this
+    /// session before (`listed_before` is false), the client holds no list of
+    /// this context, so this first records the provider's current view and
+    /// then applies `listed`. A half recorded that way cannot hide a change
+    /// from the client, because the client has no cached list of that half.
+    /// When the current view cannot be read, nothing is recorded, and the next
+    /// event notifies.
+    ///
+    /// When no view is recorded and the client had listed before, its earlier
+    /// list of the other kind predates the context's entry into the served
+    /// set, or could not read the context's view, so that cached list lacks or
+    /// misstates the context. The half this response did not carry is then
+    /// recorded as `None`, which no current view equals, so the next event
+    /// for the context sends the list-changed pair.
     ///
     /// A handler must never overwrite a half its response did not carry: the
     /// pump compares the recorded view with the current one, so a half
@@ -1751,6 +1766,7 @@ impl<P: ContextProvider> McpServer<P> {
         &self,
         served: &[ContextId],
         context_id: &str,
+        listed_before: bool,
         listed: impl FnOnce(&mut ContextView),
     ) {
         let recorded = self
@@ -1760,6 +1776,11 @@ impl<P: ContextProvider> McpServer<P> {
             .contains_key(context_id);
         let fresh = if recorded {
             None
+        } else if listed_before {
+            Some(ContextView {
+                tools: None,
+                readable: None,
+            })
         } else {
             match self.context_view(served, context_id) {
                 Some(view) => Some(view),
@@ -1819,7 +1840,10 @@ impl<P: ContextProvider> McpServer<P> {
                 Err(ResourceDenial::NotParticipant | ResourceDenial::Denied(_)) => {}
             }
         }
-        Some(ContextView { tools, readable })
+        Some(ContextView {
+            tools: Some(tools),
+            readable: Some(readable),
+        })
     }
 
     /// Builds the notifications a client needs after the pump's broadcast
@@ -2023,13 +2047,18 @@ enum ResourceDenial {
 /// What one served context contributes to a client's `tools/list` and
 /// `resources/list`: the capability-filtered tool definitions, and the
 /// resource kinds the agent may read.
+///
+/// In a recorded view, `None` marks a half the client has not listed since
+/// the context joined its served set. A current view has both halves, so it
+/// never equals a record with a `None` half, and the next event for the
+/// context sends the list-changed pair.
 #[derive(Debug, Clone, PartialEq)]
 struct ContextView {
     /// The serialized [`McpServer::visible_tools`] answer.
-    tools: Value,
+    tools: Option<Value>,
     /// The kinds [`McpServer::resource_access`] admits, in [`RESOURCE_KINDS`]
     /// order.
-    readable: Vec<ResourceKind>,
+    readable: Option<Vec<ResourceKind>>,
 }
 
 /// Creates an internal error response.
@@ -4036,6 +4065,35 @@ mod tests {
             ),
             "a subscribe must not absorb a context the client's cached list lacks"
         );
+    }
+
+    /// A session that listed one kind holds a cached list of that kind. A
+    /// context that joined the served set after that list has no recorded
+    /// view, and a list of the other kind must record only the half it
+    /// carried: the pump's event for the join must still announce the
+    /// context the earlier list lacks. Runs both orders.
+    #[test]
+    fn a_list_of_the_other_kind_does_not_absorb_a_context_the_first_list_lacks() {
+        for (first, second) in [
+            (protocol::METHOD_TOOLS_LIST, protocol::METHOD_RESOURCES_LIST),
+            (protocol::METHOD_RESOURCES_LIST, protocol::METHOD_TOOLS_LIST),
+        ] {
+            let mut server = subscribing_server(MockProvider::default());
+            let req = make_request(first, None);
+            assert!(server.handle_request(&req).unwrap().error.is_none());
+
+            // The actor applies the join before the pump evaluates its event.
+            server.provider.contexts.push("ctx_new".to_owned());
+            let req = make_request(second, None);
+            assert!(server.handle_request(&req).unwrap().error.is_none());
+
+            assert!(
+                list_changed_pair_sent(
+                    &server.notifications_for_event("ctx_new", &members_and_tools_event())
+                ),
+                "{second} must not absorb a context the client's cached {first} lacks"
+            );
+        }
     }
 
     /// The mirror case: a `tools/list` gives the client no resource list, so
