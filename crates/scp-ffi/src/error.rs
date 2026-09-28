@@ -59,6 +59,16 @@ pyo3::create_exception!(
     ScpError,
     "A cryptographic operation failed (MLS, sender keys, encryption, decryption)."
 );
+// The typed host not-found of the custody-provider protocol: a
+// `KeyCustodyProvider` raises it when it holds no key for the key id it was
+// given, and the bridge maps it to `PlatformError::KeyNotFound`. Every other
+// provider exception is a custody error.
+pyo3::create_exception!(
+    scp_sdk,
+    KeyNotFoundError,
+    CryptoError,
+    "A KeyCustodyProvider has no key for the given key id."
+);
 pyo3::create_exception!(
     scp_sdk,
     TransportError,
@@ -926,6 +936,7 @@ pub fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("IdentityError", m.py().get_type::<IdentityError>())?;
     m.add("ContextError", m.py().get_type::<ContextError>())?;
     m.add("CryptoError", m.py().get_type::<CryptoError>())?;
+    m.add("KeyNotFoundError", m.py().get_type::<KeyNotFoundError>())?;
     m.add("TransportError", m.py().get_type::<TransportError>())?;
     m.add("UcanError", m.py().get_type::<UcanError>())?;
     m.add("ValidationError", m.py().get_type::<ValidationError>())?;

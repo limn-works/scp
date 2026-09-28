@@ -325,7 +325,23 @@ pub struct PseudonymResult {
     pub key_id: String,
 }
 
+/// A host key's stated type and public key, returned by
+/// [`KeyCustodyProvider::get_public_key`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CustodyPublicKey {
+    /// `"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`.
+    pub key_type: String,
+    /// The public key in that type's one encoding: 32 bytes (Ed25519,
+    /// X25519), the 33-byte compressed SEC1 point (`"p256"`), or the 65-byte
+    /// uncompressed SEC1 point (`"hpke-p256"`).
+    pub public_key: Vec<u8>,
+}
+
 /// Callback for platform cryptographic key management.
+///
+/// A provider that has no key for a `key_id` returns `ScpError::Crypto`
+/// with code `SCP-CRYPTO-4061`; the bridge reports that as a missing key.
+/// Every other error is a custody failure.
 ///
 /// Swift SDK: Secure Enclave / Keychain.
 /// Kotlin SDK: Android Keystore.
@@ -359,12 +375,17 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// `StrongBox`/TEE) may use a random nonce.
     async fn sign(&self, key_id: String, message: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 
-    /// Return the public key bytes for `key_id`: 32 bytes (Ed25519, X25519),
-    /// the 33-byte compressed SEC1 point (`"p256"`, and a pseudonym key id,
-    /// byte-identical to the point `derive_pseudonym` returned), or the
-    /// 65-byte uncompressed SEC1 point (`"hpke-p256"`). Any other length is
-    /// an error.
-    async fn get_public_key(&self, key_id: String) -> Result<Vec<u8>, ScpError>;
+    /// Return the type and public key of `key_id` as a [`CustodyPublicKey`].
+    ///
+    /// The bridge types the key by `key_type` alone and requires exactly that
+    /// type's length: 32 bytes (`"ed25519"`, `"x25519"`), the 33-byte
+    /// compressed SEC1 point (`"p256"`, and a pseudonym key id, whose point is
+    /// byte-identical to the one `derive_pseudonym` returned), or the 65-byte
+    /// uncompressed SEC1 point (`"hpke-p256"`). An unknown type, a length that
+    /// does not match the stated type, or an invalid point is an error, and
+    /// the bridge binds nothing. The bridge asks this for every key id it has
+    /// not yet registered, whichever operation names it first.
+    async fn get_public_key(&self, key_id: String) -> Result<CustodyPublicKey, ScpError>;
 
     /// Destroy key material for `key_id`. Subsequent operations must fail.
     async fn destroy_key(&self, key_id: String) -> Result<(), ScpError>;

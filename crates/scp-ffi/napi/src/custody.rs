@@ -21,6 +21,7 @@ use std::fmt;
 use napi::bindgen_prelude::Function;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
+use scp_ffi_common::callback_custody::{self as flow, CallbackKeyRegistry, HostPublicKey, KeyRole};
 use scp_platform::error::PlatformError;
 use scp_platform::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
@@ -45,7 +46,7 @@ use crate::identity::OpaqueInMemoryKeyCustody;
 ///
 /// The JS callbacks are synchronous (they return the value directly, not a
 /// `Promise`) — keystore reads are fast and the bridge awaits the dispatch via
-/// [`ThreadsafeFunction::call_async`]. Private key material never crosses into
+/// [`call_host`]. Private key material never crosses into
 /// Rust ownership (ADR-006): the consumer owns the secrets and returns only
 /// public bytes / opaque key-id strings.
 #[napi(object, object_to_js = false)]
@@ -62,11 +63,15 @@ pub struct NapiKeyCustodyProvider {
     /// hardware host may use a random nonce.
     #[napi(ts_type = "(keyId: string, message: Uint8Array) => Uint8Array")]
     pub sign: Function<'static, (String, Vec<u8>), Vec<u8>>,
-    /// `(keyId: string) => Uint8Array` — 32 public-key bytes (Ed25519 /
-    /// X25519), 33-byte compressed SEC1 (`"p256"`) or 65-byte uncompressed
-    /// SEC1 (`"hpke-p256"`).
-    #[napi(ts_type = "(keyId: string) => Uint8Array")]
-    pub get_public_key: Function<'static, String, Vec<u8>>,
+    /// `(keyId: string) => { keyType, publicKey }` — the key's type
+    /// (`"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`) and its public
+    /// key: exactly 32 bytes (Ed25519 / X25519), the 33-byte compressed SEC1
+    /// point (`"p256"`) or the 65-byte uncompressed SEC1 point
+    /// (`"hpke-p256"`). The bridge types the key from `keyType`, never from
+    /// the length, and refuses any other length. A key id the host does not
+    /// hold throws an error whose `code` is `"KEY_NOT_FOUND"`.
+    #[napi(ts_type = "(keyId: string) => { keyType: string; publicKey: Uint8Array }")]
+    pub get_public_key: Function<'static, String, NapiCustodyPublicKey>,
     /// `(keyId: string) => void` — destroy key material.
     #[napi(ts_type = "(keyId: string) => void")]
     pub destroy_key: Function<'static, String, ()>,
@@ -100,6 +105,15 @@ pub struct NapiKeyCustodyProvider {
     pub custody_type: Function<'static, String, String>,
 }
 
+/// A host key's stated type and public key, returned by `getPublicKey`.
+#[napi(object)]
+pub struct NapiCustodyPublicKey {
+    /// `"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`.
+    pub key_type: String,
+    /// The public key in the exact encoding its type names.
+    pub public_key: Vec<u8>,
+}
+
 /// A host pseudonym derivation result: the 33-byte compressed P-256 point and
 /// the key id of the pseudonym key, as separate fields (§9.10.4).
 #[napi(object)]
@@ -114,6 +128,95 @@ pub struct NapiPseudonymResult {
 // NapiCallbackKeyCustody — concrete `KeyCustody` adapter over the JS callbacks
 // ---------------------------------------------------------------------------
 
+/// The `code` a JS custody callback throws when it holds no key for the key
+/// id it was given: `Object.assign(new Error(msg), { code: "KEY_NOT_FOUND" })`.
+pub(crate) const KEY_NOT_FOUND_CODE: &str = "KEY_NOT_FOUND";
+
+/// Calls a JS custody callback and awaits its result.
+///
+/// The callback runs through `call_with_return_value`, whose completion
+/// closure runs on the JS thread. A JS throw therefore reaches this closure
+/// as a value (napi's `call_async` instead re-throws it through
+/// `napi_fatal_exception`, an uncaught exception in the host). A thrown
+/// object whose `code` is [`KEY_NOT_FOUND_CODE`] is the host's typed
+/// not-found, [`PlatformError::KeyNotFound`]; any other throw, a return of the
+/// wrong JS type, or a call that cannot be queued is a custody error.
+async fn call_host<T, R>(
+    method: &'static str,
+    tsfn: &ThreadsafeFunction<T, R, T, napi::Status, false>,
+    value: T,
+) -> Result<R, PlatformError>
+where
+    T: 'static + napi::bindgen_prelude::JsValuesTupleIntoVec,
+    R: 'static + napi::bindgen_prelude::FromNapiValue + Send,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let status = tsfn.call_with_return_value(
+        value,
+        ThreadsafeFunctionCallMode::NonBlocking,
+        move |result: napi::Result<R>, env: napi::Env| {
+            let result = result.map_err(|e| {
+                let reason = e.reason.clone();
+                thrown_error(method, js_error_code(&env, e).as_deref(), &reason)
+            });
+            // A send fails only when the awaiting caller was dropped, so
+            // there is no one left to report to.
+            let _ = tx.send(result);
+            Ok(())
+        },
+    );
+    if status != napi::Status::Ok {
+        return Err(PlatformError::CustodyError(format!(
+            "KeyCustodyProvider.{method}: the call could not be queued ({status})"
+        )));
+    }
+    rx.await.map_err(|_| {
+        PlatformError::CustodyError(format!(
+            "KeyCustodyProvider.{method}: the call ended without a result"
+        ))
+    })?
+}
+
+/// The [`PlatformError`] for a JS custody callback that threw: the typed
+/// not-found when the thrown `code` is [`KEY_NOT_FOUND_CODE`], otherwise a
+/// custody error naming the callback.
+fn thrown_error(method: &str, code: Option<&str>, reason: &str) -> PlatformError {
+    if code == Some(KEY_NOT_FOUND_CODE) {
+        PlatformError::KeyNotFound
+    } else {
+        PlatformError::CustodyError(format!("KeyCustodyProvider.{method} raised: {reason}"))
+    }
+}
+
+/// The string `code` property of a thrown JS object, if it has one.
+fn js_error_code(env: &napi::Env, e: napi::Error) -> Option<String> {
+    use napi::bindgen_prelude::{FromNapiValue, ToNapiValue};
+    use napi::sys;
+    let raw_env = env.raw();
+    // SAFETY: this runs inside a threadsafe-function completion on the JS
+    // thread, with the live `env` napi passed to it. `to_napi_value` returns
+    // the referenced thrown value (or a fresh error when there is none), and
+    // each property read is checked for success and type before use.
+    unsafe {
+        let thrown = napi::Error::to_napi_value(raw_env, e).ok()?;
+        let mut kind = 0;
+        if sys::napi_typeof(raw_env, thrown, &raw mut kind) != sys::Status::napi_ok
+            || kind != sys::ValueType::napi_object
+        {
+            return None;
+        }
+        let mut code = std::ptr::null_mut();
+        if sys::napi_get_named_property(raw_env, thrown, c"code".as_ptr(), &raw mut code)
+            != sys::Status::napi_ok
+            || sys::napi_typeof(raw_env, code, &raw mut kind) != sys::Status::napi_ok
+            || kind != sys::ValueType::napi_string
+        {
+            return None;
+        }
+        String::from_napi_value(raw_env, code).ok()
+    }
+}
+
 /// Threadsafe-function handles for each custody operation. Built once from a
 /// [`NapiKeyCustodyProvider`] at `identityCreateWithCustody` time; thereafter
 /// callable from any tokio worker thread driving the async custody trait.
@@ -123,10 +226,10 @@ pub struct NapiPseudonymResult {
 /// type alias that meaningfully simplifies them without obscuring the
 /// per-field arg/return shapes.
 #[allow(clippy::type_complexity)]
-struct CallbackTsfns {
+pub(crate) struct CallbackTsfns {
     generate_keypair: ThreadsafeFunction<String, String, String, napi::Status, false>,
     sign: ThreadsafeFunction<(String, Vec<u8>), Vec<u8>, (String, Vec<u8>), napi::Status, false>,
-    get_public_key: ThreadsafeFunction<String, Vec<u8>, String, napi::Status, false>,
+    get_public_key: ThreadsafeFunction<String, NapiCustodyPublicKey, String, napi::Status, false>,
     destroy_key: ThreadsafeFunction<String, (), String, napi::Status, false>,
     dh_agree:
         ThreadsafeFunction<(String, Vec<u8>), Vec<u8>, (String, Vec<u8>), napi::Status, false>,
@@ -148,19 +251,148 @@ struct CallbackTsfns {
     custody_type: ThreadsafeFunction<String, String, String, napi::Status, false>,
 }
 
-/// Concrete [`KeyCustody`] adapter delegating to JS callbacks. The
-/// callbacks run on the Node.js event loop (marshalled via
-/// [`ThreadsafeFunction`]); the bridge awaits each via `call_async`.
-pub(crate) struct NapiCallbackKeyCustody {
-    tsfns: CallbackTsfns,
-    /// Key types of the handles this adapter minted (the callback protocol
-    /// cannot report them).
-    registry: scp_ffi_common::callback_custody::CallbackKeyRegistry,
+/// The JS custody callbacks as the adapter calls them: one method per
+/// callback, each returning the host's answer or a [`PlatformError`].
+/// [`CallbackTsfns`] is the production host; a test host stands in for Node
+/// so the adapter's wiring runs under plain `cargo test`.
+pub(crate) trait JsCustodyHost: Send + Sync {
+    fn generate_keypair(
+        &self,
+        key_type: String,
+    ) -> impl Future<Output = Result<String, PlatformError>> + Send;
+    fn sign(
+        &self,
+        key_id: String,
+        data: Vec<u8>,
+    ) -> impl Future<Output = Result<Vec<u8>, PlatformError>> + Send;
+    fn get_public_key(
+        &self,
+        key_id: String,
+    ) -> impl Future<Output = Result<HostPublicKey, PlatformError>> + Send;
+    fn destroy_key(&self, key_id: String)
+    -> impl Future<Output = Result<(), PlatformError>> + Send;
+    fn dh_agree(
+        &self,
+        key_id: String,
+        peer: Vec<u8>,
+    ) -> impl Future<Output = Result<Vec<u8>, PlatformError>> + Send;
+    fn derive_pseudonym(
+        &self,
+        key_id: String,
+        context_id: Vec<u8>,
+    ) -> impl Future<Output = Result<(Vec<u8>, String), PlatformError>> + Send;
+    fn derive_rotatable_pseudonym(
+        &self,
+        key_id: String,
+        context_id: Vec<u8>,
+        epoch: u64,
+    ) -> impl Future<Output = Result<(Vec<u8>, String), PlatformError>> + Send;
+    fn export_signing_key_bytes(
+        &self,
+        key_id: String,
+    ) -> impl Future<Output = Result<Vec<u8>, PlatformError>> + Send;
+    /// Fire-and-forget: the answer is advisory and has no synchronous path.
+    fn notify_custody_type(&self, key_id: String);
 }
 
-impl fmt::Debug for NapiCallbackKeyCustody {
+impl JsCustodyHost for CallbackTsfns {
+    async fn generate_keypair(&self, key_type: String) -> Result<String, PlatformError> {
+        call_host("generate_keypair", &self.generate_keypair, key_type).await
+    }
+
+    async fn sign(&self, key_id: String, data: Vec<u8>) -> Result<Vec<u8>, PlatformError> {
+        call_host("sign", &self.sign, (key_id, data)).await
+    }
+
+    async fn get_public_key(&self, key_id: String) -> Result<HostPublicKey, PlatformError> {
+        let answer = call_host("get_public_key", &self.get_public_key, key_id).await?;
+        Ok(HostPublicKey {
+            key_type: answer.key_type,
+            public_key: answer.public_key,
+        })
+    }
+
+    async fn destroy_key(&self, key_id: String) -> Result<(), PlatformError> {
+        call_host("destroy_key", &self.destroy_key, key_id).await
+    }
+
+    async fn dh_agree(&self, key_id: String, peer: Vec<u8>) -> Result<Vec<u8>, PlatformError> {
+        call_host("dh_agree", &self.dh_agree, (key_id, peer)).await
+    }
+
+    async fn derive_pseudonym(
+        &self,
+        key_id: String,
+        context_id: Vec<u8>,
+    ) -> Result<(Vec<u8>, String), PlatformError> {
+        call_host(
+            "derive_pseudonym",
+            &self.derive_pseudonym,
+            (key_id, context_id),
+        )
+        .await
+        .map(|r| (r.public_key, r.key_id))
+    }
+
+    async fn derive_rotatable_pseudonym(
+        &self,
+        key_id: String,
+        context_id: Vec<u8>,
+        epoch: u64,
+    ) -> Result<(Vec<u8>, String), PlatformError> {
+        call_host(
+            "derive_rotatable_pseudonym",
+            &self.derive_rotatable_pseudonym,
+            (key_id, context_id, epoch),
+        )
+        .await
+        .map(|r| (r.public_key, r.key_id))
+    }
+
+    async fn export_signing_key_bytes(&self, key_id: String) -> Result<Vec<u8>, PlatformError> {
+        call_host(
+            "export_signing_key_bytes",
+            &self.export_signing_key_bytes,
+            key_id,
+        )
+        .await
+    }
+
+    fn notify_custody_type(&self, key_id: String) {
+        // The advisory answer is discarded (see `custody_type`), so a failed
+        // enqueue loses nothing.
+        let _ = self
+            .custody_type
+            .call(key_id, ThreadsafeFunctionCallMode::NonBlocking);
+    }
+}
+
+/// Concrete [`KeyCustody`] adapter delegating to a [`JsCustodyHost`]. In
+/// production the host is the JS callbacks ([`NapiCallbackKeyCustody`]),
+/// which run on the Node.js event loop and are awaited through
+/// [`call_host`].
+pub(crate) struct CallbackAdapter<H> {
+    host: H,
+    /// Every handle's type, role and life-cycle state, resolved through the
+    /// host's structured `getPublicKey` for handles this adapter did not mint.
+    registry: CallbackKeyRegistry,
+}
+
+/// The adapter over the JS callbacks.
+pub(crate) type NapiCallbackKeyCustody = CallbackAdapter<CallbackTsfns>;
+
+impl<H> fmt::Debug for CallbackAdapter<H> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("NapiCallbackKeyCustody([js])")
+    }
+}
+
+impl<H> CallbackAdapter<H> {
+    fn over(host: H) -> Self {
+        Self {
+            host,
+            registry: CallbackKeyRegistry::new(),
+        }
     }
 }
 
@@ -177,81 +409,89 @@ impl NapiCallbackKeyCustody {
     /// Returns a `napi::Error` if any callback cannot be promoted to a
     /// threadsafe function.
     pub fn from_provider(provider: NapiKeyCustodyProvider) -> napi::Result<Self> {
-        Ok(Self {
-            registry: scp_ffi_common::callback_custody::CallbackKeyRegistry::new(),
-            tsfns: CallbackTsfns {
-                generate_keypair: provider
-                    .generate_keypair
-                    .build_threadsafe_function()
-                    .weak::<false>()
-                    .build()?,
-                sign: provider
-                    .sign
-                    .build_threadsafe_function()
-                    .weak::<false>()
-                    .build()?,
-                get_public_key: provider
-                    .get_public_key
-                    .build_threadsafe_function()
-                    .weak::<false>()
-                    .build()?,
-                destroy_key: provider
-                    .destroy_key
-                    .build_threadsafe_function()
-                    .weak::<false>()
-                    .build()?,
-                dh_agree: provider
-                    .dh_agree
-                    .build_threadsafe_function()
-                    .weak::<false>()
-                    .build()?,
-                derive_pseudonym: provider
-                    .derive_pseudonym
-                    .build_threadsafe_function()
-                    .weak::<false>()
-                    .build()?,
-                derive_rotatable_pseudonym: provider
-                    .derive_rotatable_pseudonym
-                    .build_threadsafe_function()
-                    .weak::<false>()
-                    .build()?,
-                export_signing_key_bytes: provider
-                    .export_signing_key_bytes
-                    .build_threadsafe_function()
-                    .weak::<false>()
-                    .build()?,
-                custody_type: provider
-                    .custody_type
-                    .build_threadsafe_function()
-                    .weak::<false>()
-                    .build()?,
-            },
-        })
+        Ok(Self::over(CallbackTsfns {
+            generate_keypair: provider
+                .generate_keypair
+                .build_threadsafe_function()
+                .weak::<false>()
+                .build()?,
+            sign: provider
+                .sign
+                .build_threadsafe_function()
+                .weak::<false>()
+                .build()?,
+            get_public_key: provider
+                .get_public_key
+                .build_threadsafe_function()
+                .weak::<false>()
+                .build()?,
+            destroy_key: provider
+                .destroy_key
+                .build_threadsafe_function()
+                .weak::<false>()
+                .build()?,
+            dh_agree: provider
+                .dh_agree
+                .build_threadsafe_function()
+                .weak::<false>()
+                .build()?,
+            derive_pseudonym: provider
+                .derive_pseudonym
+                .build_threadsafe_function()
+                .weak::<false>()
+                .build()?,
+            derive_rotatable_pseudonym: provider
+                .derive_rotatable_pseudonym
+                .build_threadsafe_function()
+                .weak::<false>()
+                .build()?,
+            export_signing_key_bytes: provider
+                .export_signing_key_bytes
+                .build_threadsafe_function()
+                .weak::<false>()
+                .build()?,
+            custody_type: provider
+                .custody_type
+                .build_threadsafe_function()
+                .weak::<false>()
+                .build()?,
+        }))
     }
+}
 
-    fn map_call_err(method: &str, e: &napi::Error) -> PlatformError {
-        PlatformError::CustodyError(format!("KeyCustodyProvider.{method} raised: {e}"))
+impl<H: JsCustodyHost> CallbackAdapter<H> {
+    /// Mints a key of `key_type` in `role` through the shared flow.
+    async fn generate(&self, key_type: KeyType, role: KeyRole) -> Result<KeyHandle, PlatformError> {
+        let h = &self.host;
+        flow::generate_keypair(
+            &self.registry,
+            key_type,
+            role,
+            |type_str| h.generate_keypair(type_str.to_owned()),
+            |key_id| h.get_public_key(key_id),
+            |key_id| h.destroy_key(key_id),
+        )
+        .await
     }
 
     /// Exports the raw Ed25519 signing key via the provider's
-    /// `export_signing_key_bytes` callback.
+    /// `exportSigningKeyBytes` callback, after the handle resolves to an
+    /// Ed25519 key.
     ///
     /// # Errors
     ///
-    /// Returns [`PlatformError::CustodyError`] if the callback raises or
-    /// returns a non-32-byte value.
+    /// [`PlatformError::WrongKeyType`] for a handle of another type, before
+    /// any export call; [`PlatformError::KeyNotFound`] for a handle the host
+    /// does not hold; [`PlatformError::CustodyError`] if the callback raises
+    /// or returns a non-32-byte value.
     pub async fn export_ed25519_signing_key(
         &self,
         handle: &KeyHandle,
     ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
-        scp_ffi_common::callback_custody::require_ed25519(&self.registry, handle)?;
-        let bytes = zeroize::Zeroizing::new(
-            self.tsfns
-                .export_signing_key_bytes
-                .call_async(handle.id().to_string())
-                .await
-                .map_err(|e| Self::map_call_err("export_signing_key_bytes", &e))?,
-        );
+        let h = &self.host;
+        flow::require_ed25519(&self.registry, handle, |key_id| h.get_public_key(key_id)).await?;
+        let bytes =
+            zeroize::Zeroizing::new(h.export_signing_key_bytes(handle.id().to_string()).await?);
         let arr = zeroize::Zeroizing::new(scp_ffi_common::custody_parse::expect_32(
             "export_signing_key_bytes",
             &bytes,
@@ -260,79 +500,39 @@ impl NapiCallbackKeyCustody {
     }
 }
 
-impl KeyCustody for NapiCallbackKeyCustody {
+impl<H: JsCustodyHost> KeyCustody for CallbackAdapter<H> {
     // The shared flows in `scp_ffi_common::callback_custody` hold every
-    // key-type, length and P-256 validation rule; each closure is one
-    // `call_async` on the JS callback.
+    // key-type, length, role and signature rule; each closure is one host
+    // callback. Every entry point resolves a handle this adapter has not
+    // registered through `getPublicKey`.
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
-        let t = &self.tsfns;
-        scp_ffi_common::callback_custody::generate_keypair(
-            &self.registry,
-            key_type,
-            |type_str| async move {
-                t.generate_keypair
-                    .call_async(type_str.to_owned())
-                    .await
-                    .map_err(|e| Self::map_call_err("generate_keypair", &e))
-            },
-            |key_id| async move {
-                t.get_public_key
-                    .call_async(key_id)
-                    .await
-                    .map_err(|e| Self::map_call_err("get_public_key", &e))
-            },
-            |key_id| async move {
-                t.destroy_key
-                    .call_async(key_id)
-                    .await
-                    .map_err(|e| Self::map_call_err("destroy_key", &e))
-            },
-        )
-        .await
+        self.generate(key_type, KeyRole::Operational).await
+    }
+
+    async fn generate_identity_keypair(&self) -> Result<KeyHandle, PlatformError> {
+        self.generate(KeyType::Ed25519, KeyRole::Identity).await
     }
 
     async fn sign(&self, key: &KeyHandle, data: &[u8]) -> Result<Signature, PlatformError> {
-        let t = &self.tsfns;
-        scp_ffi_common::callback_custody::sign(
+        let h = &self.host;
+        flow::sign(
             &self.registry,
             key,
             data,
-            |key_id, data| async move {
-                t.sign
-                    .call_async((key_id, data))
-                    .await
-                    .map_err(|e| Self::map_call_err("sign", &e))
-            },
-            |key_id| async move {
-                t.get_public_key
-                    .call_async(key_id)
-                    .await
-                    .map_err(|e| Self::map_call_err("get_public_key", &e))
-            },
+            |key_id, data| h.sign(key_id, data),
+            |key_id| h.get_public_key(key_id),
         )
         .await
     }
 
     async fn public_key(&self, key: &KeyHandle) -> Result<PublicKey, PlatformError> {
-        let t = &self.tsfns;
-        scp_ffi_common::callback_custody::public_key(&self.registry, key, |key_id| async move {
-            t.get_public_key
-                .call_async(key_id)
-                .await
-                .map_err(|e| Self::map_call_err("get_public_key", &e))
-        })
-        .await
+        let h = &self.host;
+        flow::public_key(&self.registry, key, |key_id| h.get_public_key(key_id)).await
     }
 
     async fn destroy_key(&self, key: &KeyHandle) -> Result<(), PlatformError> {
-        let t = &self.tsfns;
-        scp_ffi_common::callback_custody::destroy_key(&self.registry, key, |key_id| async move {
-            t.destroy_key
-                .call_async(key_id)
-                .await
-                .map_err(|e| Self::map_call_err("destroy_key", &e))
-        })
-        .await
+        let h = &self.host;
+        flow::destroy_key(&self.registry, key, |key_id| h.destroy_key(key_id)).await
     }
 
     async fn dh_agree(
@@ -340,17 +540,13 @@ impl KeyCustody for NapiCallbackKeyCustody {
         key: &KeyHandle,
         peer_public: &[u8],
     ) -> Result<SharedSecret, PlatformError> {
-        let t = &self.tsfns;
-        scp_ffi_common::callback_custody::dh_agree(
+        let h = &self.host;
+        flow::dh_agree(
             &self.registry,
             key,
             peer_public,
-            |key_id, peer| async move {
-                t.dh_agree
-                    .call_async((key_id, peer))
-                    .await
-                    .map_err(|e| Self::map_call_err("dh_agree", &e))
-            },
+            |key_id, peer| h.dh_agree(key_id, peer),
+            |key_id| h.get_public_key(key_id),
         )
         .await
     }
@@ -360,24 +556,15 @@ impl KeyCustody for NapiCallbackKeyCustody {
         key: &KeyHandle,
         context_id: &[u8],
     ) -> Result<PseudonymKeypair, PlatformError> {
-        let t = &self.tsfns;
-        scp_ffi_common::callback_custody::derive_pseudonym(
+        let h = &self.host;
+        flow::derive_pseudonym(
             &self.registry,
             "derive_pseudonym",
             key,
-            |key_id| async move {
-                t.derive_pseudonym
-                    .call_async((key_id, context_id.to_vec()))
-                    .await
-                    .map(|r| (r.public_key, r.key_id))
-                    .map_err(|e| Self::map_call_err("derive_pseudonym", &e))
-            },
-            |key_id| async move {
-                t.get_public_key
-                    .call_async(key_id)
-                    .await
-                    .map_err(|e| Self::map_call_err("get_public_key", &e))
-            },
+            context_id,
+            None,
+            |key_id| h.derive_pseudonym(key_id, context_id.to_vec()),
+            |key_id| h.get_public_key(key_id),
         )
         .await
     }
@@ -397,24 +584,15 @@ impl KeyCustody for NapiCallbackKeyCustody {
         // the v1 platform adapter does not re-append its own "scp-pseudonym"
         // domain separator (which would corrupt the v2 domain). Mirrors the
         // UniFFI / PyO3 CallbackKeyCustody contract.
-        let t = &self.tsfns;
-        scp_ffi_common::callback_custody::derive_pseudonym(
+        let h = &self.host;
+        flow::derive_pseudonym(
             &self.registry,
             "derive_rotatable_pseudonym",
             key,
-            |key_id| async move {
-                t.derive_rotatable_pseudonym
-                    .call_async((key_id, context_id.to_vec(), pseudonym_epoch))
-                    .await
-                    .map(|r| (r.public_key, r.key_id))
-                    .map_err(|e| Self::map_call_err("derive_rotatable_pseudonym", &e))
-            },
-            |key_id| async move {
-                t.get_public_key
-                    .call_async(key_id)
-                    .await
-                    .map_err(|e| Self::map_call_err("get_public_key", &e))
-            },
+            context_id,
+            Some(pseudonym_epoch),
+            |key_id| h.derive_rotatable_pseudonym(key_id, context_id.to_vec(), pseudonym_epoch),
+            |key_id| h.get_public_key(key_id),
         )
         .await
     }
@@ -426,17 +604,19 @@ impl KeyCustody for NapiCallbackKeyCustody {
     ) -> Result<SharedSecret, PlatformError> {
         // The JS callback protocol does not expose a distinct birational
         // conversion; the provider manages key types internally, so delegate
-        // to dh_agree (matches the UniFFI/PyO3 contract).
-        scp_ffi_common::callback_custody::require_ed25519(&self.registry, ed25519_handle)?;
+        // to dh_agree (matches the UniFFI/PyO3 contract) once the handle
+        // resolves to an Ed25519 key.
+        let h = &self.host;
+        flow::require_ed25519(&self.registry, ed25519_handle, |key_id| {
+            h.get_public_key(key_id)
+        })
+        .await?;
         // Wrap the raw shared secret in `Zeroizing` so the intermediate heap
         // buffer is wiped on drop once it has been copied into `SharedSecret`
         // (defense-in-depth, matching `export_ed25519_signing_key`; ADR-006).
         let shared = zeroize::Zeroizing::new(
-            self.tsfns
-                .dh_agree
-                .call_async((ed25519_handle.id().to_string(), peer_x25519_public.to_vec()))
-                .await
-                .map_err(|e| Self::map_call_err("dh_agree", &e))?,
+            h.dh_agree(ed25519_handle.id().to_string(), peer_x25519_public.to_vec())
+                .await?,
         );
         Ok(SharedSecret::new(scp_ffi_common::custody_parse::expect_32(
             "ed25519_to_x25519_agree",
@@ -452,10 +632,7 @@ impl KeyCustody for NapiCallbackKeyCustody {
         // security decision — membership is enforced by MLS keys), so a
         // callback-backed key is reported as `Software`, the correct class
         // for any non-HSM software keystore the SDK consumer would wire here.
-        let _ = self.tsfns.custody_type.call(
-            key.id().to_string(),
-            ThreadsafeFunctionCallMode::NonBlocking,
-        );
+        self.host.notify_custody_type(key.id().to_string());
         CustodyType::Software
     }
 
@@ -563,6 +740,14 @@ impl KeyCustody for NapiKeyCustody {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.generate_keypair(key_type).await,
             Self::Callback(kc) => kc.generate_keypair(key_type).await,
+        }
+    }
+
+    async fn generate_identity_keypair(&self) -> Result<KeyHandle, PlatformError> {
+        match self {
+            #[cfg(feature = "testing")]
+            Self::InMemory(kc) => kc.0.generate_identity_keypair().await,
+            Self::Callback(kc) => kc.generate_identity_keypair().await,
         }
     }
 
@@ -733,96 +918,134 @@ mod tests {
     }
 }
 
-/// A13: the P-256 round trip through the shared flows this adapter calls.
-///
-/// A `ThreadsafeFunction` needs a live Node.js runtime, so these closures
-/// stand in for the `call_async` closures of [`NapiCallbackKeyCustody`], one
-/// per callback, with the same argument shapes. The TypeScript SDK test covers
-/// the JS side.
+/// The adapter itself ([`CallbackAdapter`]) over a software host that stands
+/// in for the JS callbacks, one method per callback: a `ThreadsafeFunction`
+/// needs a live Node.js runtime. The TypeScript SDK test covers the JS side.
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-mod p256_flow_tests {
+mod adapter_tests {
+    use std::sync::Arc;
+
     use scp_crypto::p256::{
         P256PublicKey, P256SigningKey, ecdh_p256, normalize_low_s, verify_prehash_strict,
     };
-    use scp_ffi_common::callback_custody::{
-        self as flow, CallbackKeyRegistry, fake_host::FakeP256Host,
-    };
-    use scp_platform::error::PlatformError;
-    use scp_platform::traits::KeyType;
+    use scp_ffi_common::callback_custody::fake_host::FakeHost;
 
-    async fn generate(
-        registry: &CallbackKeyRegistry,
-        host: &FakeP256Host,
-        key_type: KeyType,
-    ) -> scp_platform::traits::KeyHandle {
-        flow::generate_keypair(
-            registry,
-            key_type,
-            |type_str| async move { host.generate_keypair(type_str) },
-            |key_id| async move { host.get_public_key(&key_id) },
-            |key_id| async move { host.destroy_key(&key_id) },
-        )
-        .await
-        .expect("p256 generation")
+    use super::*;
+
+    /// A [`JsCustodyHost`] over the shared fake host. `sign_error`, when set,
+    /// replaces every `sign` answer after the host call.
+    struct TestHost {
+        host: Arc<FakeHost>,
+        sign_error: Option<fn() -> PlatformError>,
     }
 
-    #[tokio::test]
-    async fn napi_callback_flow_p256_sign_and_dh_agree_round_trip() {
-        let host = FakeP256Host::default();
-        let registry = CallbackKeyRegistry::new();
-        let host = &host;
+    impl JsCustodyHost for TestHost {
+        async fn generate_keypair(&self, key_type: String) -> Result<String, PlatformError> {
+            self.host.generate_keypair(&key_type)
+        }
 
-        let signer = generate(&registry, host, KeyType::P256Signing).await;
-        let public = P256PublicKey::from_sec1(
-            flow::public_key(&registry, &signer, |key_id| async move {
-                host.get_public_key(&key_id)
-            })
+        async fn sign(&self, key_id: String, data: Vec<u8>) -> Result<Vec<u8>, PlatformError> {
+            let answer = self.host.sign(&key_id, &data)?;
+            self.sign_error.map_or(Ok(answer), |e| Err(e()))
+        }
+
+        async fn get_public_key(&self, key_id: String) -> Result<HostPublicKey, PlatformError> {
+            self.host.get_public_key(&key_id)
+        }
+
+        async fn destroy_key(&self, key_id: String) -> Result<(), PlatformError> {
+            self.host.destroy_key(&key_id)
+        }
+
+        async fn dh_agree(&self, key_id: String, peer: Vec<u8>) -> Result<Vec<u8>, PlatformError> {
+            self.host.dh_agree(&key_id, &peer)
+        }
+
+        async fn derive_pseudonym(
+            &self,
+            key_id: String,
+            context_id: Vec<u8>,
+        ) -> Result<(Vec<u8>, String), PlatformError> {
+            self.host.derive_pseudonym(&key_id, &context_id, None)
+        }
+
+        async fn derive_rotatable_pseudonym(
+            &self,
+            key_id: String,
+            context_id: Vec<u8>,
+            epoch: u64,
+        ) -> Result<(Vec<u8>, String), PlatformError> {
+            self.host
+                .derive_pseudonym(&key_id, &context_id, Some(epoch))
+        }
+
+        async fn export_signing_key_bytes(&self, key_id: String) -> Result<Vec<u8>, PlatformError> {
+            self.host.export_signing_key_bytes(&key_id)
+        }
+
+        fn notify_custody_type(&self, _key_id: String) {}
+    }
+
+    fn adapter(host: &Arc<FakeHost>) -> CallbackAdapter<TestHost> {
+        CallbackAdapter::over(TestHost {
+            host: Arc::clone(host),
+            sign_error: None,
+        })
+    }
+
+    /// A13: P-256 sign and HPKE `dh_agree` through the adapter. The host
+    /// signs with a high `s` in DER; the adapter returns the raw low-`s`
+    /// signature that strictly verifies. The host receives the peer as the
+    /// 65-byte uncompressed point, and a compressed peer never reaches it.
+    #[tokio::test]
+    async fn napi_adapter_p256_sign_and_dh_agree_round_trip() {
+        let host = Arc::new(FakeHost::default());
+        let custody = adapter(&host);
+
+        let signer = custody
+            .generate_keypair(KeyType::P256Signing)
             .await
-            .expect("public key")
-            .as_bytes(),
+            .expect("p256 generation");
+        let public = P256PublicKey::from_sec1(
+            custody
+                .public_key(&signer)
+                .await
+                .expect("public key")
+                .as_bytes(),
         )
         .expect("a valid point");
         for i in 0u8..16 {
             let digest = [i; 32];
-            let sig: [u8; 64] = flow::sign(
-                &registry,
-                &signer,
-                &digest,
-                |key_id, data| async move { host.sign(&key_id, &data) },
-                // A minted handle needs no lookup; one would fail the sign.
-                |_| async {
-                    Err(scp_platform::error::PlatformError::CustodyError(
-                        "unexpected get_public_key lookup".into(),
-                    ))
-                },
-            )
-            .await
-            .expect("sign")
-            .as_bytes()
-            .try_into()
-            .expect("raw r || s");
+            let sig: [u8; 64] = custody
+                .sign(&signer, &digest)
+                .await
+                .expect("sign")
+                .as_bytes()
+                .try_into()
+                .expect("raw r || s");
             assert_eq!(normalize_low_s(&sig).expect("valid"), sig, "low s");
             verify_prehash_strict(&public, &digest, &sig).expect("strict verify");
         }
 
-        let hpke = generate(&registry, host, KeyType::HpkeP256).await;
-        let hpke_public = P256PublicKey::from_sec1(
-            flow::public_key(&registry, &hpke, |key_id| async move {
-                host.get_public_key(&key_id)
-            })
+        let hpke = custody
+            .generate_keypair(KeyType::HpkeP256)
             .await
-            .expect("public key")
-            .as_bytes(),
+            .expect("hpke-p256 generation");
+        let hpke_public = P256PublicKey::from_sec1(
+            custody
+                .public_key(&hpke)
+                .await
+                .expect("public key")
+                .as_bytes(),
         )
         .expect("a valid point");
         let peer = P256SigningKey::from_scalar_bytes(&[0x33; 32]).expect("scalar");
         let peer_point = peer.public_key().to_uncompressed();
-        let shared = flow::dh_agree(&registry, &hpke, &peer_point, |key_id, p| async move {
-            host.dh_agree(&key_id, &p)
-        })
-        .await
-        .expect("dh_agree");
+        let shared = custody
+            .dh_agree(&hpke, &peer_point)
+            .await
+            .expect("dh_agree");
         assert_eq!(shared.as_bytes(), ecdh_p256(&peer, &hpke_public).as_slice());
         assert_eq!(
             host.last_peer.lock().expect("lock").as_deref(),
@@ -830,14 +1053,157 @@ mod p256_flow_tests {
         );
 
         *host.last_peer.lock().expect("lock") = None;
-        let compressed = peer.public_key().to_compressed();
         assert!(matches!(
-            flow::dh_agree(&registry, &hpke, &compressed, |key_id, p| async move {
-                host.dh_agree(&key_id, &p)
-            })
-            .await,
+            custody
+                .dh_agree(&hpke, &peer.public_key().to_compressed())
+                .await,
             Err(PlatformError::CustodyError(_))
         ));
         assert!(host.last_peer.lock().expect("lock").is_none());
+    }
+
+    /// F7: each derivation reaches its own callback. Wiring
+    /// `derive_rotatable_pseudonym` to the plain callback (or the reverse)
+    /// changes the call counts and the derived point.
+    #[tokio::test]
+    async fn napi_adapter_routes_each_derivation_to_its_callback() {
+        let host = Arc::new(FakeHost::default());
+        let custody = adapter(&host);
+        let identity = custody
+            .generate_identity_keypair()
+            .await
+            .expect("identity generation");
+        let seed = zeroize::Zeroizing::new(
+            <[u8; 32]>::try_from(
+                host.export_signing_key_bytes(&identity.id().to_string())
+                    .expect("seed")
+                    .as_slice(),
+            )
+            .expect("32 bytes"),
+        );
+        let expected = |epoch| {
+            scp_crypto::pseudonym::derive_pseudonym_keypair(&seed, b"ctx", epoch)
+                .expect("derive")
+                .public_key()
+                .to_compressed()
+        };
+
+        let rotatable = custody
+            .derive_rotatable_pseudonym(&identity, b"ctx", 3)
+            .await
+            .expect("rotatable derive");
+        assert_eq!(host.calls("derive_rotatable_pseudonym"), 1);
+        assert_eq!(host.calls("derive_pseudonym"), 0);
+        assert_eq!(
+            rotatable.public_key().as_bytes(),
+            expected(Some(3)).as_slice()
+        );
+
+        let plain = custody
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect("plain derive");
+        assert_eq!(host.calls("derive_pseudonym"), 1);
+        assert_eq!(host.calls("derive_rotatable_pseudonym"), 1);
+        assert_eq!(plain.public_key().as_bytes(), expected(None).as_slice());
+
+        // An operational key is not a derive source (§9.10.4.A interim).
+        let operational = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("ed25519 generation");
+        assert!(matches!(
+            custody.derive_pseudonym(&operational, b"ctx").await,
+            Err(PlatformError::WrongKeyType { .. })
+        ));
+        assert_eq!(host.calls("derive_pseudonym"), 1);
+    }
+
+    /// D2: a thrown `code: "KEY_NOT_FOUND"` is the typed not-found and any
+    /// other throw a custody error; through `sign`, a host not-found reaches
+    /// the caller as `KeyNotFound` and a transport error as `CustodyError`.
+    #[tokio::test]
+    async fn napi_adapter_maps_host_not_found_through_sign() {
+        assert!(matches!(
+            thrown_error("sign", Some(KEY_NOT_FOUND_CODE), "gone"),
+            PlatformError::KeyNotFound
+        ));
+        for code in [None, Some("ECONNRESET"), Some("key_not_found")] {
+            assert!(matches!(
+                thrown_error("sign", code, "boom"),
+                PlatformError::CustodyError(_)
+            ));
+        }
+
+        let host = Arc::new(FakeHost::default());
+        let custody = adapter(&host);
+        let key = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("ed25519 generation");
+        // The host drops the key behind the adapter's back, so the not-found
+        // comes from the host `sign` call, not from a lookup.
+        host.destroy_key(&key.id().to_string())
+            .expect("host destroy");
+        assert!(matches!(
+            custody.sign(&key, b"m").await,
+            Err(PlatformError::KeyNotFound)
+        ));
+        assert_eq!(host.calls("sign"), 1);
+
+        let transport = CallbackAdapter::over(TestHost {
+            host: Arc::clone(&host),
+            sign_error: Some(|| thrown_error("sign", Some("ECONNRESET"), "socket closed")),
+        });
+        let key = transport
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("ed25519 generation");
+        assert!(matches!(
+            transport.sign(&key, b"m").await,
+            Err(PlatformError::CustodyError(_))
+        ));
+        assert_eq!(host.calls("sign"), 2);
+    }
+
+    /// F2: `export_ed25519_signing_key` and `ed25519_to_x25519_agree` refuse a
+    /// P-256 handle, minted or resolved, with `WrongKeyType` before any host
+    /// export or agreement call.
+    #[tokio::test]
+    async fn napi_adapter_ed25519_only_paths_refuse_p256() {
+        let host = Arc::new(FakeHost::default());
+        let custody = adapter(&host);
+        let minted = custody
+            .generate_keypair(KeyType::P256Signing)
+            .await
+            .expect("p256 generation");
+        let resolved = KeyHandle::new(
+            host.generate_keypair("p256")
+                .expect("host-side key")
+                .parse()
+                .expect("numeric id"),
+        );
+        for handle in [minted, resolved] {
+            assert!(matches!(
+                custody.export_ed25519_signing_key(&handle).await,
+                Err(PlatformError::WrongKeyType { .. })
+            ));
+            assert!(matches!(
+                custody.ed25519_to_x25519_agree(&handle, &[9u8; 32]).await,
+                Err(PlatformError::WrongKeyType { .. })
+            ));
+        }
+        assert_eq!(host.calls("export_signing_key_bytes"), 0);
+        assert_eq!(host.calls("dh_agree"), 0);
+
+        let ed = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("ed25519 generation");
+        custody
+            .export_ed25519_signing_key(&ed)
+            .await
+            .expect("an Ed25519 key exports");
+        assert_eq!(host.calls("export_signing_key_bytes"), 1);
     }
 }

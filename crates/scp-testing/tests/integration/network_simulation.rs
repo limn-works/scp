@@ -65,6 +65,11 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
+    fn generate_identity_keypair(
+        &self,
+    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+        async { Err(PlatformError::CustodyError("not supported".into())) }
+    }
     fn sign(
         &self,
         _: &KeyHandle,
@@ -190,10 +195,7 @@ async fn end_to_end_network_demo() {
         .await
         .unwrap();
     let alice_pubkey = alice_custody.public_key(&alice_sign_key).await.unwrap();
-    let alice_identity_key = alice_custody
-        .generate_keypair(KeyType::Ed25519)
-        .await
-        .unwrap();
+    let alice_identity_key = alice_custody.generate_identity_keypair().await.unwrap();
 
     let bob_custody = InMemoryKeyCustody::from_seed_bytes({
         let mut __s = [0u8; 32];

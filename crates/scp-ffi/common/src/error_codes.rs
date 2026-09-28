@@ -716,6 +716,12 @@ pub const CRYPTO_4058: &str = "SCP-CRYPTO-4058";
 pub const CRYPTO_4059: &str = "SCP-CRYPTO-4059";
 /// `UniFFI` key custody error.
 pub const CRYPTO_4060: &str = "SCP-CRYPTO-4060";
+/// A custody host (`KeyCustodyProvider`) has no key for the given key id.
+///
+/// A host raises `ScpError::Crypto` with this code; the bridge maps it to
+/// `PlatformError::KeyNotFound`, and every other host error to a custody
+/// error.
+pub const CRYPTO_4061: &str = "SCP-CRYPTO-4061";
 
 // -------------------------------------------------------------------------
 // Transport (SCP-TRANS- 5000--5999)

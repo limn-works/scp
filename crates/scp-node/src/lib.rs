@@ -3730,6 +3730,16 @@ impl KeyCustody for NoOpCustody {
         )))
     }
 
+    fn generate_identity_keypair(
+        &self,
+    ) -> impl std::future::Future<
+        Output = Result<scp_platform::KeyHandle, scp_platform::PlatformError>,
+    > + Send {
+        std::future::ready(Err(scp_platform::PlatformError::StorageError(
+            "NoOpCustody: not configured".to_owned(),
+        )))
+    }
+
     fn public_key(
         &self,
         _handle: &scp_platform::KeyHandle,

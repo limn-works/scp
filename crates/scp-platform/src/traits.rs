@@ -385,6 +385,30 @@ pub trait KeyCustody: Send + Sync {
         key_type: KeyType,
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send;
 
+    /// Generate the identity key (`#0`) of a new identity: an Ed25519 key in
+    /// the identity role.
+    ///
+    /// A key's role is fixed when custody first holds it. Only an identity
+    /// key may be the source of [`derive_pseudonym`](Self::derive_pseudonym)
+    /// and [`derive_rotatable_pseudonym`](Self::derive_rotatable_pseudonym)
+    /// (§9.10.4.A). A key from [`generate_keypair`](Self::generate_keypair)
+    /// is operational, and a derived pseudonym key is a pseudonym; neither
+    /// ever derives. [`import_ed25519_signing_key`](Self::import_ed25519_signing_key)
+    /// installs the new identity key of a migrated identity, so it also
+    /// holds its key in the identity role.
+    ///
+    /// Software backends draw exactly as `generate_keypair(KeyType::Ed25519)`
+    /// does, so the ADR-046 byte parity holds whichever of the two mints the
+    /// identity key.
+    ///
+    /// # Errors
+    ///
+    /// As [`generate_keypair`](Self::generate_keypair). A backend that holds
+    /// no identity keys returns [`PlatformError::Unsupported`].
+    fn generate_identity_keypair(
+        &self,
+    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send;
+
     /// Sign data with an Ed25519 key, or a 32-byte digest with a
     /// [`KeyType::P256Signing`] key (including a pseudonym handle,
     /// [`PseudonymKeypair::key_handle`]).
@@ -487,8 +511,12 @@ pub trait KeyCustody: Send + Sync {
     /// # Errors
     ///
     /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
-    /// Returns [`PlatformError::WrongKeyType`] if the handle refers to an
-    /// X25519 key.
+    /// Returns [`PlatformError::WrongKeyType`] (with `expected`
+    /// [`KeyType::Ed25519`]) if the handle is not an identity key
+    /// ([`generate_identity_keypair`](Self::generate_identity_keypair)): an
+    /// operational or pseudonym key of any type, Ed25519 included, and every
+    /// non-Ed25519 key. Until S12 (§9.10.4.A native interim) the identity key
+    /// is Ed25519.
     fn derive_pseudonym(
         &self,
         key: &KeyHandle,
@@ -518,8 +546,12 @@ pub trait KeyCustody: Send + Sync {
     /// # Errors
     ///
     /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
-    /// Returns [`PlatformError::WrongKeyType`] if the handle refers to an
-    /// X25519 key.
+    /// Returns [`PlatformError::WrongKeyType`] (with `expected`
+    /// [`KeyType::Ed25519`]) if the handle is not an identity key
+    /// ([`generate_identity_keypair`](Self::generate_identity_keypair)): an
+    /// operational or pseudonym key of any type, Ed25519 included, and every
+    /// non-Ed25519 key. Until S12 (§9.10.4.A native interim) the identity key
+    /// is Ed25519.
     fn derive_rotatable_pseudonym(
         &self,
         key: &KeyHandle,
@@ -1184,6 +1216,37 @@ pub(crate) fn generate_p256_os_rng() -> Result<scp_crypto::p256::P256SigningKey,
     Err(PlatformError::CustodyError(
         "OS RNG produced no valid P-256 scalar in 8 draws".into(),
     ))
+}
+
+/// The pseudonym-derivation source check shared by the software backends:
+/// the source must be an identity key
+/// ([`KeyCustody::generate_identity_keypair`]), and until S12 (§9.10.4.A
+/// native interim) an Ed25519 one.
+///
+/// # Errors
+///
+/// [`PlatformError::WrongKeyType`] with `expected` [`KeyType::Ed25519`] for
+/// a source that is not an identity key (its role, whatever its type), or
+/// that is not Ed25519.
+#[cfg(feature = "software_platform")]
+pub(crate) const fn require_derive_source(
+    is_identity: bool,
+    key_type: KeyType,
+) -> Result<(), PlatformError> {
+    if !is_identity {
+        return Err(PlatformError::WrongKeyType {
+            expected: KeyType::Ed25519,
+            actual: key_type,
+        });
+    }
+    // Until S12 (§9.10.4.A native interim): the identity key is Ed25519.
+    if !matches!(key_type, KeyType::Ed25519) {
+        return Err(PlatformError::WrongKeyType {
+            expected: KeyType::Ed25519,
+            actual: key_type,
+        });
+    }
+    Ok(())
 }
 
 /// Performs X25519 key agreement using an Ed25519 signing key via birational conversion.

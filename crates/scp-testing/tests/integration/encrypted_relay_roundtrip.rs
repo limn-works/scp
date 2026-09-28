@@ -77,6 +77,11 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
+    fn generate_identity_keypair(
+        &self,
+    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+        async { Err(PlatformError::CustodyError("not supported".into())) }
+    }
 
     fn sign(
         &self,
