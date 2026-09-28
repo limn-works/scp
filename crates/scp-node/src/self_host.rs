@@ -879,8 +879,12 @@ pub struct HostSiteReady {
 /// config (share the address out-of-band) — never an error. [`DhtMode::Memory`]
 /// is the test-harness-only analog and is not a shipped option.
 ///
-/// See the runnable example at `crates/scp-node/examples/website.rs` and the
-/// guide `.docs/guides/self-hosting-a-website-on-scp.md`.
+/// See the example at `crates/scp-node/examples/website.rs` and the guide
+/// `.docs/guides/self-hosting-a-website-on-scp.md`. Until a production
+/// `PreRotationCustody` backend exists, the example exits 1 with
+/// `IdentityError::NoPreRotationBackend` on every build without the `testing`
+/// feature, and a `testing` build runs it only through the test-harness
+/// `InMemoryPreRotationCustody` stand-in.
 pub struct HostSiteConfig {
     // --- Required (irreducible; no whole-struct Default — M4) ---
     /// How the hosted site is reached from the outside (addressing XOR).
@@ -1171,9 +1175,13 @@ fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool
 /// shutdown.
 ///
 /// See [`HostSiteConfig`] for configuration (including the local-demo vs
-/// public-hosting distinction), the runnable example at
+/// public-hosting distinction), the example at
 /// `crates/scp-node/examples/website.rs`, and the guide
-/// `.docs/guides/self-hosting-a-website-on-scp.md`.
+/// `.docs/guides/self-hosting-a-website-on-scp.md`. Until a production
+/// `PreRotationCustody` backend exists, the example exits 1 with
+/// `IdentityError::NoPreRotationBackend` on every build without the `testing`
+/// feature, and a `testing` build runs it only through the test-harness
+/// `InMemoryPreRotationCustody` stand-in.
 ///
 /// The default [`DhtMode::Disabled`] publishes nothing to the network (fail-safe).
 /// To make the site publicly reachable, opt in with [`DhtMode::Production`],
