@@ -13,13 +13,13 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use scp_crypto::p256::P256SigningKey;
 use tokio::sync::Mutex;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 use super::SqliteStorage;
 use crate::error::PlatformError;
+use crate::pseudonym_keys::PseudonymKeys;
 use crate::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
     Signature, Storage,
@@ -72,8 +72,9 @@ struct SqliteKeyStore {
     ed25519_keys: HashMap<u64, SigningKey>,
     /// In-memory cache of X25519 static secrets, indexed by handle ID.
     x25519_keys: HashMap<u64, StaticSecret>,
-    /// Derived P-256 pseudonym keys, indexed by handle ID (never persisted).
-    p256_pseudonym_keys: HashMap<u64, P256SigningKey>,
+    /// Derived P-256 pseudonym keys, each owned by its identity (never
+    /// persisted).
+    pseudonyms: PseudonymKeys,
 }
 
 /// Persistent [`KeyCustody`] backed by [`SqliteStorage`] with `SQLCipher` encryption.
@@ -192,7 +193,7 @@ impl SqliteKeyCustody {
                 key_types,
                 ed25519_keys,
                 x25519_keys,
-                p256_pseudonym_keys: HashMap::new(),
+                pseudonyms: PseudonymKeys::default(),
             }),
             next_id: AtomicU64::new(next_id),
         })
@@ -234,6 +235,50 @@ impl SqliteKeyCustody {
             .get(&handle.id())
             .copied()
             .ok_or(PlatformError::KeyNotFound)
+    }
+
+    /// The §9.10.4 P-256 pseudonym of identity `key_id` in `context_id` at
+    /// `epoch` (`None` for v1). A re-derive returns the handle already in the
+    /// slot; the store lock is held throughout, so a concurrent destroy of the
+    /// identity lands wholly before or after. Pseudonyms are cached only,
+    /// never persisted: they re-derive from the identity key.
+    async fn derive_p256_pseudonym(
+        &self,
+        key_id: u64,
+        context_id: &[u8],
+        epoch: Option<u64>,
+    ) -> Result<PseudonymKeypair, PlatformError> {
+        let mut store = self.store.lock().await;
+        let kt = Self::lookup_type(&store, KeyHandle::new(key_id))?;
+        if kt != KEY_TYPE_ED25519 {
+            return Err(wrong_type(kt, KeyType::Ed25519));
+        }
+        if let Some((handle, public_key)) = store.pseudonyms.existing(key_id, context_id, epoch) {
+            drop(store);
+            return PseudonymKeypair::new(&public_key, KeyHandle::new(handle));
+        }
+        let signing_key = store
+            .ed25519_keys
+            .get(&key_id)
+            .ok_or(PlatformError::KeyNotFound)?;
+
+        // Software custody (§9.10.4.A): the ikm is the identity private
+        // seed, never the public key. Until S12 the identity key is
+        // Ed25519, so its 32-byte seed is the ikm.
+        let ikm = Zeroizing::new(signing_key.to_bytes());
+        let pseudonym_key =
+            scp_crypto::pseudonym::derive_pseudonym_keypair(&ikm, context_id, epoch)
+                .map_err(|e| PlatformError::CustodyError(format!("pseudonym derivation: {e}")))?;
+        let public_key = pseudonym_key.public_key().to_compressed();
+
+        let handle = KeyHandle::new(self.next_id.fetch_add(1, Ordering::Relaxed));
+        store
+            .pseudonyms
+            .insert(key_id, context_id, epoch, handle.id(), pseudonym_key);
+        store.key_types.insert(handle.id(), KEY_TYPE_P256_PSEUDONYM);
+        drop(store);
+
+        PseudonymKeypair::new(&public_key, handle)
     }
 }
 
@@ -288,8 +333,8 @@ impl KeyCustody for SqliteKeyCustody {
 
             if kt == KEY_TYPE_P256_PSEUDONYM {
                 let key = store
-                    .p256_pseudonym_keys
-                    .get(&key_id)
+                    .pseudonyms
+                    .get(key_id)
                     .ok_or(PlatformError::KeyNotFound)?;
                 return crate::traits::sign_pseudonym_digest(key, data);
             }
@@ -335,8 +380,8 @@ impl KeyCustody for SqliteKeyCustody {
                 }
                 KEY_TYPE_P256_PSEUDONYM => {
                     let key = store
-                        .p256_pseudonym_keys
-                        .get(&key_id)
+                        .pseudonyms
+                        .get(key_id)
                         .ok_or(PlatformError::KeyNotFound)?;
                     Ok(PublicKey::new(key.public_key().to_compressed().to_vec()))
                 }
@@ -357,13 +402,18 @@ impl KeyCustody for SqliteKeyCustody {
             match kt {
                 KEY_TYPE_ED25519 => {
                     store.ed25519_keys.remove(&key_id);
+                    // Every pseudonym derived from this identity goes with it
+                    // (§9.15), under the same lock a derive holds.
+                    for pseudonym in store.pseudonyms.remove_identity(key_id) {
+                        store.key_types.remove(&pseudonym);
+                    }
                 }
                 KEY_TYPE_X25519 => {
                     store.x25519_keys.remove(&key_id);
                 }
                 KEY_TYPE_P256_PSEUDONYM => {
                     // Never persisted, so there is no stored row to remove.
-                    store.p256_pseudonym_keys.remove(&key_id);
+                    store.pseudonyms.remove(key_id);
                     store.key_types.remove(&key_id);
                     return Ok(());
                 }
@@ -413,38 +463,7 @@ impl KeyCustody for SqliteKeyCustody {
     ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
         let key_id = key.id();
         let context_id = context_id.to_vec();
-        async move {
-            let mut store = self.store.lock().await;
-            let kt = Self::lookup_type(&store, KeyHandle::new(key_id))?;
-
-            if kt != KEY_TYPE_ED25519 {
-                return Err(wrong_type(kt, KeyType::Ed25519));
-            }
-
-            let signing_key = store
-                .ed25519_keys
-                .get(&key_id)
-                .ok_or(PlatformError::KeyNotFound)?;
-
-            // Software custody (§9.10.4.A): the ikm is the identity private
-            // seed, never the public key. Until S12 the identity key is
-            // Ed25519, so its 32-byte seed is the ikm.
-            let ikm = Zeroizing::new(signing_key.to_bytes());
-            let pseudonym_key =
-                scp_crypto::pseudonym::derive_pseudonym_keypair(&ikm, &context_id, None).map_err(
-                    |e| PlatformError::CustodyError(format!("pseudonym derivation: {e}")),
-                )?;
-            let public_key = pseudonym_key.public_key().to_compressed();
-
-            // Cached only, never persisted: pseudonyms are deterministically
-            // re-derivable from the identity key.
-            let handle = KeyHandle::new(self.next_id.fetch_add(1, Ordering::Relaxed));
-            store.p256_pseudonym_keys.insert(handle.id(), pseudonym_key);
-            store.key_types.insert(handle.id(), KEY_TYPE_P256_PSEUDONYM);
-            drop(store);
-
-            PseudonymKeypair::new(&public_key, handle)
-        }
+        async move { self.derive_p256_pseudonym(key_id, &context_id, None).await }
     }
 
     fn derive_rotatable_pseudonym(
@@ -456,38 +475,8 @@ impl KeyCustody for SqliteKeyCustody {
         let key_id = key.id();
         let context_id = context_id.to_vec();
         async move {
-            let mut store = self.store.lock().await;
-            let kt = Self::lookup_type(&store, KeyHandle::new(key_id))?;
-
-            if kt != KEY_TYPE_ED25519 {
-                return Err(wrong_type(kt, KeyType::Ed25519));
-            }
-
-            let signing_key = store
-                .ed25519_keys
-                .get(&key_id)
-                .ok_or(PlatformError::KeyNotFound)?;
-
-            // Software custody (§9.10.4.A): the ikm is the identity private
-            // seed, never the public key. Until S12 the identity key is
-            // Ed25519, so its 32-byte seed is the ikm.
-            let ikm = Zeroizing::new(signing_key.to_bytes());
-            let pseudonym_key = scp_crypto::pseudonym::derive_pseudonym_keypair(
-                &ikm,
-                &context_id,
-                Some(pseudonym_epoch),
-            )
-            .map_err(|e| PlatformError::CustodyError(format!("pseudonym derivation: {e}")))?;
-            let public_key = pseudonym_key.public_key().to_compressed();
-
-            // Cached only, never persisted: pseudonyms are deterministically
-            // re-derivable from the identity key.
-            let handle = KeyHandle::new(self.next_id.fetch_add(1, Ordering::Relaxed));
-            store.p256_pseudonym_keys.insert(handle.id(), pseudonym_key);
-            store.key_types.insert(handle.id(), KEY_TYPE_P256_PSEUDONYM);
-            drop(store);
-
-            PseudonymKeypair::new(&public_key, handle)
+            self.derive_p256_pseudonym(key_id, &context_id, Some(pseudonym_epoch))
+                .await
         }
     }
 
@@ -754,5 +743,15 @@ mod tests {
         let custody = temp_custody(dir.path()).await;
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         assert_eq!(custody.custody_type(&handle), CustodyType::Software);
+    }
+
+    #[tokio::test]
+    async fn identity_destroy_removes_its_pseudonyms() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::pseudonym_keys::tests::check_identity_owns_pseudonyms(
+            &temp_custody(dir.path()).await,
+        )
+        .await
+        .unwrap();
     }
 }
