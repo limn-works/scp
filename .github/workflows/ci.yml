@@ -237,10 +237,10 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
-              # The rust-clippy job runs scripts/check-examples-build-shipped.sh and
+              # The rust-clippy job runs scripts/check-examples-compile.sh and
               # its cases, so a change to either must trigger the job that runs it.
-              - 'scripts/check-examples-build-shipped.sh'
-              - 'scripts/tests/examples-build-shipped/**'
+              - 'scripts/check-examples-compile.sh'
+              - 'scripts/tests/examples-compile/**'
               # The `docker-image` job builds from these two and is guarded by this
               # filter, so a change to either has to reach it.
               - 'Dockerfile'
@@ -1022,10 +1022,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # scripts/check-examples-build-shipped.sh parses cargo metadata with jq, which
+      # scripts/check-examples-compile.sh parses cargo metadata with jq, which
       # the runner image ships. This step fails the job by name if an image drops it.
       - name: Require jq
-        run: command -v jq || { echo "::error::jq is not on PATH; scripts/check-examples-build-shipped.sh needs it"; exit 1; }
+        run: command -v jq || { echo "::error::jq is not on PATH; scripts/check-examples-compile.sh needs it"; exit 1; }
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -1060,7 +1060,7 @@ jobs:
           # Asserts two things: every example target compiles, and every
           # published examples/*.rs is some target's source. The script header
           # states what the check cannot prove; do not restate it here.
-          bash scripts/check-examples-build-shipped.sh
+          bash scripts/check-examples-compile.sh
           # scp-node and scp-relay compile the PostgreSQL and S3 blob backends
           # only under their off-by-default `cloud-blobs` feature, which the
           # --workspace sweep above leaves off. The first command lints the
@@ -1075,10 +1075,10 @@ jobs:
           cargo clippy -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings
           cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings
           cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings
-      # Runs scripts/check-examples-build-shipped.sh against throwaway one-crate
-      # workspaces, each carrying a defect the gate must reject.
-      - name: Run examples-build-shipped cases
-        run: bash scripts/tests/examples-build-shipped/run-tests.sh
+      # Runs scripts/check-examples-compile.sh against throwaway one- and two-crate
+      # workspaces, each carrying a defect the gate must reject or a layout it must accept.
+      - name: Run examples-compile cases
+        run: bash scripts/tests/examples-compile/run-tests.sh
 
   # This job runs `cargo nextest run --workspace`, so a merge gate rests on it.
   # It gates on `rust` at job level, never at step level. It carried seven

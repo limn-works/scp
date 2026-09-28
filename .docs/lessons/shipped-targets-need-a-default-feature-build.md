@@ -11,7 +11,7 @@ A build target that ships to a user MUST be compiled by a job that gates the pul
 request. `cargo package --list -p scp-node` lists `examples/website.rs`, so a broken
 example ships to crates.io.
 
-`scripts/check-examples-build-shipped.sh` carries five mechanisms, and deleting any one
+`scripts/check-examples-compile.sh` carries five mechanisms, and deleting any one
 of them reopens a bypass this repository has already measured:
 
 1. **Lint one package at a time.** `cargo clippy --workspace --examples` unifies
@@ -187,7 +187,7 @@ Reintroducing `DhtMode::Memory` settled it:
 |---|---|---|---|
 | `cargo clippy --workspace --examples -- -D warnings` | **exit 0** | exit 0 | exit 0 |
 | `cargo clippy -p scp-node --examples -- -D warnings` | exit 101, `E0599` | **exit 0** | exit 0 |
-| `bash scripts/check-examples-build-shipped.sh` | exit 1, `E0599` | exit 1, names the target | exit 0 |
+| `bash scripts/check-examples-compile.sh` | exit 1, `E0599` | exit 1, names the target | exit 0 |
 
 The table carries two defect columns and one control column, so the case below is
 the third defect, not a fourth. It was found later: renaming
