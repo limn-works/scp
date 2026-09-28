@@ -246,13 +246,26 @@ class ServerTest {
     }
 
     @Test
-    fun `shutdown marks a node shut down`() =
+    fun `shutdown stops a node through the bridge and marks it shut down`() {
         runTest(testDispatcher) {
             val node = createNode()
             assertFalse(node.isShutdown)
             node.shutdown()
+            assertEquals(listOf(node.handleJson), stubBindings.nodeShutdownHandles)
             assertTrue(node.isShutdown)
         }
+    }
+
+    @Test
+    fun `shutdown stops a relay through the bridge and marks it shut down`() {
+        runTest(testDispatcher) {
+            val relay = Relay.startInMemory(serverBridge)
+            assertFalse(relay.isShutdown)
+            relay.shutdown()
+            assertEquals(listOf(relay.handleJson), stubBindings.relayShutdownHandles)
+            assertTrue(relay.isShutdown)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -294,9 +307,16 @@ internal class StubServerBindings : ServerBindings {
         passphrase: String?,
     ): String = nodeStartInMemoryResult
 
-    override fun relayShutdown(handleJson: String) { /* no-op stub */ }
+    val relayShutdownHandles = mutableListOf<String>()
+    val nodeShutdownHandles = mutableListOf<String>()
 
-    override fun nodeShutdown(handleJson: String) { /* no-op stub */ }
+    override fun relayShutdown(handleJson: String) {
+        relayShutdownHandles += handleJson
+    }
+
+    override fun nodeShutdown(handleJson: String) {
+        nodeShutdownHandles += handleJson
+    }
 
     // enableSiteProjection
     data class EnableArgs(

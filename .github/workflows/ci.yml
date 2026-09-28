@@ -1267,8 +1267,12 @@ jobs:
           # scp-node holds two auto-discovered test files (quic_listener,
           # quic_cross_transport), each gated on `quic` and
           # `allow_unencrypted_storage`, which `testing` implies. --workspace
-          # activates `quic` for neither, so their 5 tests ran nowhere.
-          cargo nextest run -p scp-node --features quic,testing --test quic_listener --test quic_cross_transport
+          # activates `quic` for neither, so their 5 tests ran nowhere. One run
+          # per file with `--no-tests=fail` (see the well_known lanes below), so
+          # re-gating either file leaves its run with nothing to select and fails
+          # this lane.
+          cargo nextest run --no-tests=fail -p scp-node --features quic,testing --test quic_listener
+          cargo nextest run --no-tests=fail -p scp-node --features quic,testing --test quic_cross_transport
           # scp-node's well_known module asserts its advertised-transport
           # list twice per transport: once for a feature-off arm and once for a
           # feature-on arm. --workspace activates neither http3 nor udp, so only
@@ -1285,13 +1289,22 @@ jobs:
           cargo nextest run --no-tests=fail -p scp-node --features http3,udp,testing --lib -E 'test(=well_known::tests::advertised_transports_includes_webtransport_with_feature)'
           cargo nextest run --no-tests=fail -p scp-node --features http3,udp,testing --lib -E 'test(=well_known::tests::advertised_transports_includes_udp_dtls_with_feature)'
           # scp-platform gates its Apple SQLCipher storage adapter behind `apple`
-          # and its syncable-storage trait behind `sync`. No crate enables either,
-          # so both modules' tests — including a storage_conformance! expansion
-          # over SyncableStorage — compiled into nothing.
-          cargo nextest run -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing
+          # and its syncable-storage trait behind `sync`. --workspace enables
+          # neither (only scp-testing's opt-in `sync` feature enables
+          # `scp-platform/sync`), so both modules' tests — including a
+          # storage_conformance! expansion over SyncableStorage — compiled into
+          # nothing. Each run below selects one of those three groups by module
+          # path with `--no-tests=fail`, so deleting or re-gating a group fails
+          # this lane; the crate's other tests already run under --workspace.
+          cargo nextest run --no-tests=fail -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --lib -E 'test(/^apple::/)'
+          cargo nextest run --no-tests=fail -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --lib -E 'test(/^syncable::tests::storage_conformance::/)'
+          cargo nextest run --no-tests=fail -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --lib -E 'test(/^syncable::tests::/) - test(/^syncable::tests::storage_conformance::/)'
           # persistence_advanced holds two tests gated on scp-testing's `sync` and
-          # `combined` features, which --workspace does not activate.
-          cargo nextest run -p scp-testing --features sync,combined --test persistence_advanced
+          # `combined` features, which --workspace does not activate; its other
+          # tests already run under --workspace. One run per gated test, each
+          # naming it exactly, with `--no-tests=fail`.
+          cargo nextest run --no-tests=fail -p scp-testing --features sync,combined --test persistence_advanced -E 'test(=syncable_storage_export_apply_roundtrip)'
+          cargo nextest run --no-tests=fail -p scp-testing --features sync,combined --test persistence_advanced -E 'test(=combined_node_storage_both_traits_roundtrip)'
           # scp-node and scp-relay compile the PostgreSQL and S3 arms of
           # `storage_from_env` only under their off-by-default `cloud-blobs`
           # feature, which --workspace leaves off. Run the two binaries' backend

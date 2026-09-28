@@ -318,7 +318,7 @@ private class TestScpViewModel(
  * Test stub for [NativeBindings] that tracks leave calls per context handle.
  */
 @Suppress("TooManyFunctions")
-private class TestNativeBindings : NativeBindings {
+internal class TestNativeBindings : NativeBindings {
     val leaveCalledHandles = mutableListOf<Long>()
     var leaveThrowsForHandle: Long? = null
 
@@ -519,4 +519,4 @@ private class TestNativeBindings : NativeBindings {
 /**
  * Test-specific exception for simulating leave failures in [TestNativeBindings].
  */
-private class ScpLeaveException(message: String) : IllegalStateException(message)
+internal class ScpLeaveException(message: String) : IllegalStateException(message)

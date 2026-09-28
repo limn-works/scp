@@ -9,6 +9,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.ui.test.junit4.createComposeRule
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -680,11 +681,20 @@ class ScpHotStreamRemountTest {
 
         assertEquals(null, coordinator.unmount(first) { stops.incrementAndGet() })
         assertEquals("unmounting one mount twice", null, coordinator.unmount(first) { stops.incrementAndGet() })
-        val stop = coordinator.unmount(second) { stops.incrementAndGet() }
+        // The stop holds until the third mount is taken. A stop that completed first would
+        // release the key's state, so that mount would find no stop to capture, correctly.
+        val stopMayFinish = CompletableDeferred<Unit>()
+        val stop =
+            coordinator.unmount(second) {
+                stopMayFinish.await()
+                stops.incrementAndGet()
+            }
         assertTrue("the last mount's unmount launched no stop", stop != null)
 
         val third = coordinator.mount("k")
         assertEquals("a later mount did not capture the pending stop", stop, third.pendingStop)
+        assertEquals("the stop ran before its gate opened", 0, stops.get())
+        stopMayFinish.complete(Unit)
         runBlocking {
             coordinator.startMounted(third) { assertEquals(1, stops.get()) }
         }
