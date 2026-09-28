@@ -3,8 +3,8 @@
 // Covers the Keystore identity path through a fake KeystoreKeys (JVM tests cannot reach
 // AndroidKeyStore), destruction of an identity's pseudonyms, and concurrent re-derivation.
 //
-// Provenance: spec §9.10.4 (pseudonym derivation), §9.10.4.A (pseudonym secret), §9.15
-// (key destruction verification), ADR-027 (Android Platform Adapter).
+// Provenance: spec §9.10.4 (pseudonym derivation), §9.10.4.A (pseudonym secret, and
+// a pseudonym dies with its identity), ADR-027 (Android Platform Adapter).
 
 package works.limn.scp.android.platform
 
