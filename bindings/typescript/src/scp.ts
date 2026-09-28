@@ -480,6 +480,13 @@ export interface PseudonymResult {
  * your implementation assigns in {@link generateKeypair}. Byte values are
  * passed and returned as `Uint8Array`.
  *
+ * A callback reports failure by throwing. Throw an error whose `code` is
+ * `"SCP-CRYPTO-4001"`, such as `new CryptoError(msg, "SCP-CRYPTO-4001")`, for
+ * a key id that was destroyed or never existed; the SDK call then rejects with
+ * a `CryptoError` carrying that code. Any other throw rejects the SDK call with
+ * a custody error. The SDK catches every throw, so none reaches the process as
+ * an uncaught exception.
+ *
  * Only available on the NAPI (Node.js / Bun) backend — the SDK requires the
  * native addon (ADR-048). The browser tier (`@limn-works/scp-ts-wasm`, ADR-057)
  * runs the full protocol in-tab and does not use this native custody callback.

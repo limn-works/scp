@@ -612,6 +612,14 @@ impl From<scp_core::bridge::shadow::ShadowError> for ScpNapiError {
 
 impl From<scp_platform::PlatformError> for ScpNapiError {
     fn from(e: scp_platform::PlatformError) -> Self {
+        if matches!(e, scp_platform::PlatformError::KeyNotFound) {
+            // A destroyed or unknown key, including a pseudonym whose identity
+            // was destroyed (`09-security-model.md` §9.10.4.A).
+            return Self::Crypto {
+                message: "key not found — the key handle was destroyed or never existed".to_owned(),
+                code: codes::CRYPTO_4001.to_owned(),
+            };
+        }
         Self::Crypto {
             message: format!(
                 "platform key operation failed: {e} — check key custody configuration"

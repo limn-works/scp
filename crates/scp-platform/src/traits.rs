@@ -415,6 +415,11 @@ pub trait KeyCustody: Send + Sync {
     /// After this call, all subsequent operations with the same handle will
     /// return [`PlatformError::KeyNotFound`].
     ///
+    /// Destroying an identity destroys every v1 and v2 pseudonym key derived
+    /// from it, and a derivation still in flight when its identity is destroyed
+    /// fails with key-not-found (`SCP-CRYPTO-4001`) and stores nothing
+    /// (`09-security-model.md` §9.10.4.A).
+    ///
     /// # Errors
     ///
     /// Returns [`PlatformError::KeyNotFound`] if the handle is already invalid.
@@ -464,6 +469,11 @@ pub trait KeyCustody: Send + Sync {
     /// For contexts that support pseudonym rotation (BLACK-001 mitigation),
     /// use [`derive_rotatable_pseudonym`](KeyCustody::derive_rotatable_pseudonym) instead.
     ///
+    /// The pseudonym dies with its identity (`09-security-model.md` §9.10.4.A):
+    /// destroying the identity destroys every v1 and v2 pseudonym key derived
+    /// from it, and a derivation still in flight when its identity is destroyed
+    /// fails with key-not-found (`SCP-CRYPTO-4001`) and stores nothing.
+    ///
     /// # Errors
     ///
     /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
@@ -494,6 +504,11 @@ pub trait KeyCustody: Send + Sync {
     /// the v1 separator `"scp-pseudonym"` so that epoch 0 in v2 produces a
     /// different pseudonym than the v1 derivation. This prevents accidental
     /// domain confusion.
+    ///
+    /// The pseudonym dies with its identity (`09-security-model.md` §9.10.4.A):
+    /// destroying the identity destroys every v1 and v2 pseudonym key derived
+    /// from it, and a derivation still in flight when its identity is destroyed
+    /// fails with key-not-found (`SCP-CRYPTO-4001`) and stores nothing.
     ///
     /// # Errors
     ///

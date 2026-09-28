@@ -501,6 +501,9 @@ pub struct TestingCallbackCustody {
 }
 
 fn custody_err(e: &scp_platform::PlatformError) -> napi::Error {
+    if matches!(e, scp_platform::PlatformError::KeyNotFound) {
+        return napi::Error::from(ScpNapiError::from(scp_platform::PlatformError::KeyNotFound));
+    }
     napi::Error::from(ScpNapiError::Identity {
         message: e.to_string(),
         code: codes::IDENT_1055.to_owned(),
