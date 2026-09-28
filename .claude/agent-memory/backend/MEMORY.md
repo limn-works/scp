@@ -4,8 +4,6 @@
 - [scp-node live slot](project_liveslot_collapse_scp_node.md) — one `LiveSlot<NodePublishedState>`; three design points that look wrong when re-derived.
 - [Attestation revocation list gets a writer](project_attestation_revocation_writer_2335.md) — Alec chose a writer on the verify-on-ingest path over a fail-closed checker ("Do NOT re-litigate that choice"); the step order that keeps the writer sound.
 - [cargo-deny reports only the highest duplicate](finding_cargo_deny_highest_version_only.md) — a dependency bump can turn the gate green while unpatched copies still ship; check every copy in `Cargo.lock`.
-- [finding-cargo-deny-highest-version-only](finding_cargo_deny_highest_version_only.md) — cargo-deny flags only the HIGHEST version of a duplicated crate; a dep bump can green the gate while unsound copies still ship. Also: local cargo-deny 0.19 misses `unsound` advisories that CI's 0.20.2 catches
-- [project-2028-2029-welcome-ceiling-followups](project_2028_2029_welcome_ceiling_followups.md) — testing traps: scp-testing persistence.rs is `#![cfg(any())]`-dead; CI enables `*/testing` so production `cfg!(testing)` arms are untestable
 
 ## Build and tool traps
 - `clippy::too_many_lines` counts only code lines, so deleting comments from a function at the limit changes nothing; remove or fold code lines.
