@@ -62,7 +62,12 @@ warn_return_any = true
 warn_unused_configs = true
 
 [tool.maturin]
-features = ["extension-module"]
+# Features of `scp-ffi`, the package `manifest-path` below names. `extension-module`
+# forwards `pyo3/extension-module`. `vendored-openssl` forwards
+# `scp-platform/vendored-openssl`, which compiles OpenSSL from source into
+# SQLCipher, because a `pip install` of the wheel runs no linker and the wheel
+# installs onto a machine whose OpenSSL the build never saw.
+features = ["extension-module", "vendored-openssl"]
 manifest-path = "../../crates/scp-ffi/Cargo.toml"
 module-name = "scp_sdk._scp_core"
 python-source = "."

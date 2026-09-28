@@ -185,6 +185,22 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false, feat
 unicode-normalization = "0.1"
 arc-swap = "1"
 futures = "0.3"
+# SQLCipher compiles from the bundled amalgamation and takes its crypto from the
+# build host. For a Linux or Android target libsqlite3-sys 0.30 emits a dynamic link
+# to `crypto`, which the linker resolves in that target's library path: the build
+# host's libcrypto for a native Linux build, and no library at all for a cross build
+# whose sysroot holds no libcrypto. On an Apple host building an Apple target it
+# builds against CommonCrypto from the Security framework unless OPENSSL_DIR (or
+# both OPENSSL_LIB_DIR and OPENSSL_INCLUDE_DIR) is set, in which case it links that
+# OpenSSL's libcrypto dynamically; on a Windows host building a Windows target its
+# build script panics unless OPENSSL_DIR (or both OPENSSL_LIB_DIR and
+# OPENSSL_INCLUDE_DIR) names an OpenSSL installation.
+# A build that must embed OpenSSL statically instead — the PyPI wheel, which runs on
+# a machine this build never saw — selects `scp-platform/vendored-openssl`, which adds
+# `rusqlite/bundled-sqlcipher-vendored-openssl` to this same package. Naming that
+# feature here instead vendors OpenSSL into every artifact the workspace ships,
+# including the `scp-relay` and `scp-node` binaries, whose operators patch OpenSSL by
+# upgrading the runtime container's `libssl3`.
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 redb = "2"
 static_assertions = "1.1"
