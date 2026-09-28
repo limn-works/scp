@@ -948,11 +948,10 @@ where
 /// as [`PlatformError::KeyNotFound`], which each bridge's test provider turns
 /// into that bridge's typed not-found; and counts every call by method.
 #[cfg(any(test, feature = "testing"))]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::missing_panics_doc)]
 pub mod fake_host {
     use std::collections::HashMap;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard};
 
     use ed25519_dalek::Signer;
     use scp_crypto::p256::{P256PublicKey, P256SigningKey, ecdh_p256, sign_prehash_rfc6979};
@@ -967,6 +966,17 @@ pub mod fake_host {
         0x25, 0x51,
     ];
 
+    /// Locks `m`, reporting a poisoned lock as a custody error.
+    fn locked<T>(m: &Mutex<T>) -> Result<MutexGuard<'_, T>, PlatformError> {
+        m.lock()
+            .map_err(|_| PlatformError::CustodyError("fake host lock poisoned".into()))
+    }
+
+    /// A DER length byte. Every length here is below 128, the short form.
+    fn der_len(len: usize) -> u8 {
+        u8::try_from(len).unwrap_or(u8::MAX)
+    }
+
     /// `n - s` for a big-endian `s < n`.
     #[must_use]
     pub fn negate(s: &[u8]) -> [u8; 32] {
@@ -978,7 +988,8 @@ pub mod fake_host {
             if d < 0 {
                 d += 256;
             }
-            out[i] = u8::try_from(d).unwrap();
+            // `d` is in 0..=255 here, so its low byte is its value.
+            out[i] = d.to_le_bytes()[0];
         }
         out
     }
@@ -991,10 +1002,10 @@ pub mod fake_host {
         }
         let mut out = vec![0x02];
         if v[0] & 0x80 != 0 {
-            out.push(u8::try_from(v.len() + 1).unwrap());
+            out.push(der_len(v.len() + 1));
             out.push(0);
         } else {
-            out.push(u8::try_from(v.len()).unwrap());
+            out.push(der_len(v.len()));
         }
         out.extend_from_slice(v);
         out
@@ -1004,7 +1015,7 @@ pub mod fake_host {
     #[must_use]
     pub fn der(r: &[u8], s: &[u8]) -> Vec<u8> {
         let body = [der_int(r), der_int(s)].concat();
-        let mut out = vec![0x30, u8::try_from(body.len()).unwrap()];
+        let mut out = vec![0x30, der_len(body.len())];
         out.extend_from_slice(&body);
         out
     }
@@ -1016,8 +1027,9 @@ pub mod fake_host {
         HpkeP256(P256SigningKey),
     }
 
-    fn p256_copy(key: &P256SigningKey) -> P256SigningKey {
-        P256SigningKey::from_scalar_bytes(&key.to_scalar_bytes()).expect("a valid scalar")
+    fn p256_copy(key: &P256SigningKey) -> Result<P256SigningKey, PlatformError> {
+        P256SigningKey::from_scalar_bytes(&key.to_scalar_bytes())
+            .map_err(|e| PlatformError::CustodyError(e.to_string()))
     }
 
     /// A derivation's source key id, context id and epoch.
@@ -1038,11 +1050,13 @@ pub mod fake_host {
     impl FakeHost {
         /// How many calls to `method` reached the host.
         pub fn calls(&self, method: &str) -> usize {
-            self.calls.lock().unwrap().get(method).copied().unwrap_or(0)
+            locked(&self.calls).map_or(0, |calls| calls.get(method).copied().unwrap_or(0))
         }
 
         fn count(&self, method: &'static str) {
-            *self.calls.lock().unwrap().entry(method).or_default() += 1;
+            if let Ok(mut calls) = locked(&self.calls) {
+                *calls.entry(method).or_default() += 1;
+            }
         }
 
         fn next_id(&self) -> usize {
@@ -1055,10 +1069,7 @@ pub mod fake_host {
             key_id: &str,
             f: impl FnOnce(&HostKey) -> Result<T, PlatformError>,
         ) -> Result<T, PlatformError> {
-            f(self
-                .keys
-                .lock()
-                .unwrap()
+            f(locked(&self.keys)?
                 .get(key_id)
                 .ok_or(PlatformError::KeyNotFound)?)
         }
@@ -1072,20 +1083,22 @@ pub mod fake_host {
         pub fn generate_keypair(&self, key_type: &str) -> Result<String, PlatformError> {
             self.count("generate_keypair");
             let id = self.next_id();
-            let scalar = [u8::try_from(id % 64).unwrap() + 0x40; 32];
+            let scalar = [u8::try_from(id % 64).unwrap_or(0) + 0x40; 32];
+            let p256 = || {
+                P256SigningKey::from_scalar_bytes(&scalar)
+                    .map_err(|e| PlatformError::CustodyError(e.to_string()))
+            };
             let key = match key_type {
                 "ed25519" => HostKey::Ed25519(ed25519_dalek::SigningKey::from_bytes(&scalar)),
-                "p256" => HostKey::P256(P256SigningKey::from_scalar_bytes(&scalar).unwrap()),
-                "hpke-p256" => {
-                    HostKey::HpkeP256(P256SigningKey::from_scalar_bytes(&scalar).unwrap())
-                }
+                "p256" => HostKey::P256(p256()?),
+                "hpke-p256" => HostKey::HpkeP256(p256()?),
                 other => {
                     return Err(PlatformError::CustodyError(format!(
                         "fake host does not hold {other} keys"
                     )));
                 }
             };
-            self.keys.lock().unwrap().insert(id.to_string(), key);
+            locked(&self.keys)?.insert(id.to_string(), key);
             Ok(id.to_string())
         }
 
@@ -1149,9 +1162,9 @@ pub mod fake_host {
         /// curve point.
         pub fn dh_agree(&self, key_id: &str, peer: &[u8]) -> Result<Vec<u8>, PlatformError> {
             self.count("dh_agree");
-            *self.last_peer.lock().unwrap() = Some(peer.to_vec());
+            *locked(&self.last_peer)? = Some(peer.to_vec());
             let key = self.with_key(key_id, |key| match key {
-                HostKey::HpkeP256(sk) => Ok(p256_copy(sk)),
+                HostKey::HpkeP256(sk) => p256_copy(sk),
                 _ => Err(PlatformError::CustodyError(
                     "fake host agrees with HPKE keys only".into(),
                 )),
@@ -1190,15 +1203,12 @@ pub mod fake_host {
                     .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
             let point = pseudonym.public_key().to_compressed().to_vec();
             let tuple = (key_id.to_owned(), context_id.to_vec(), epoch);
-            let mut derived = self.derived.lock().unwrap();
+            let mut derived = locked(&self.derived)?;
             if let Some(id) = derived.get(&tuple) {
                 return Ok((point, id.clone()));
             }
             let id = self.next_id().to_string();
-            self.keys
-                .lock()
-                .unwrap()
-                .insert(id.clone(), HostKey::P256(pseudonym));
+            locked(&self.keys)?.insert(id.clone(), HostKey::P256(pseudonym));
             derived.insert(tuple, id.clone());
             drop(derived);
             Ok((point, id))
@@ -1226,9 +1236,7 @@ pub mod fake_host {
         /// An unknown key id.
         pub fn destroy_key(&self, key_id: &str) -> Result<(), PlatformError> {
             self.count("destroy_key");
-            self.keys
-                .lock()
-                .unwrap()
+            locked(&self.keys)?
                 .remove(key_id)
                 .map(|_| ())
                 .ok_or(PlatformError::KeyNotFound)

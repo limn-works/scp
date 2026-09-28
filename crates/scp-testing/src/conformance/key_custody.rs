@@ -182,7 +182,8 @@ macro_rules! key_custody_conformance {
                         public_key.as_bytes(),
                         &digest,
                         signature.as_bytes(),
-                    );
+                    )
+                    .expect("the P-256 signature must verify strictly");
                 }
 
                 for data in [&[0u8; 31][..], &[0u8; 33][..], &[][..], b"not a digest"] {
@@ -216,7 +217,8 @@ macro_rules! key_custody_conformance {
                 let (peer, expected) =
                     $crate::conformance::key_custody::test_helpers::p256_peer_and_shared_secret(
                         public_key.as_bytes(),
-                    );
+                    )
+                    .expect("the HPKE public key is a valid P-256 point");
                 let shared = custody
                     .dh_agree(&handle, &peer)
                     .await
@@ -236,7 +238,8 @@ macro_rules! key_custody_conformance {
                     .await
                     .expect("generate_keypair(HpkeP256) should succeed");
                 let off_curve =
-                    $crate::conformance::key_custody::test_helpers::off_curve_p256_point();
+                    $crate::conformance::key_custody::test_helpers::off_curve_p256_point()
+                        .expect("the generator is a valid point");
                 let result = custody.dh_agree(&handle, &off_curve).await;
                 assert!(
                     matches!(result, Err(scp_platform::PlatformError::CustodyError(_))),
@@ -260,13 +263,15 @@ macro_rules! key_custody_conformance {
                 let (peer, _) =
                     $crate::conformance::key_custody::test_helpers::p256_peer_and_shared_secret(
                         public_key.as_bytes(),
-                    );
+                    )
+                    .expect("the HPKE public key is a valid P-256 point");
                 let mut prefix_05 = peer.clone();
                 prefix_05[0] = 0x05;
                 let mut prefix_02 = peer.clone();
                 prefix_02[0] = 0x02;
                 let compressed =
-                    $crate::conformance::key_custody::test_helpers::compress_p256_point(&peer);
+                    $crate::conformance::key_custody::test_helpers::compress_p256_point(&peer)
+                        .expect("the peer is a valid P-256 point");
                 for (label, bad) in [
                     ("0x05 prefix", prefix_05),
                     ("0x02 prefix on 65 bytes", prefix_02),
@@ -299,7 +304,8 @@ macro_rules! key_custody_conformance {
                 let (peer, _) =
                     $crate::conformance::key_custody::test_helpers::p256_peer_and_shared_secret(
                         hpke_public.as_bytes(),
-                    );
+                    )
+                    .expect("the HPKE public key is a valid P-256 point");
                 custody
                     .destroy_key(&signing)
                     .await
@@ -410,73 +416,76 @@ pub mod test_helpers {
     /// Verifies a raw 64-byte P-256 signature over a 32-byte digest under
     /// the strict (low-`s`) rule, against a 33-byte compressed public key.
     ///
+    /// # Errors
+    ///
+    /// The public key is not a valid P-256 point, or the signature does not
+    /// verify strictly.
+    ///
     /// # Panics
     ///
-    /// Panics if the public key is not a 33-byte compressed P-256 point or the
-    /// signature does not verify strictly.
-    #[allow(clippy::expect_used)]
-    pub fn verify_p256_prehash_strict(public_key: &[u8], digest: &[u8; 32], signature: &[u8]) {
+    /// Panics if the public key is not 33 bytes (the compressed point).
+    pub fn verify_p256_prehash_strict(
+        public_key: &[u8],
+        digest: &[u8; 32],
+        signature: &[u8],
+    ) -> Result<(), scp_crypto::p256::P256Error> {
         assert_eq!(
             public_key.len(),
             scp_crypto::p256::COMPRESSED_POINT_LEN,
             "a P-256 signing public key is the 33-byte compressed point"
         );
-        let pk = scp_crypto::p256::P256PublicKey::from_sec1(public_key)
-            .expect("public key must be a valid P-256 point");
+        let pk = scp_crypto::p256::P256PublicKey::from_sec1(public_key)?;
         scp_crypto::p256::verify_prehash_strict(&pk, digest, signature)
-            .expect("P-256 signature must verify strictly");
     }
 
     /// Returns a fixed peer's uncompressed public key and the shared secret
     /// that peer computes with `own_public` (`ecdh_p256` from the peer side).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `own_public` is not a valid P-256 point.
-    #[allow(clippy::expect_used)]
-    #[must_use]
-    pub fn p256_peer_and_shared_secret(own_public: &[u8]) -> (Vec<u8>, [u8; 32]) {
-        let own = scp_crypto::p256::P256PublicKey::from_sec1(own_public)
-            .expect("own public key must be a valid P-256 point");
-        let peer = scp_crypto::p256::P256SigningKey::from_scalar_bytes(&[0x2Au8; 32])
-            .expect("0x2A.. is a valid scalar");
+    /// `own_public` is not a valid P-256 point.
+    pub fn p256_peer_and_shared_secret(
+        own_public: &[u8],
+    ) -> Result<(Vec<u8>, [u8; 32]), scp_crypto::p256::P256Error> {
+        let own = scp_crypto::p256::P256PublicKey::from_sec1(own_public)?;
+        let peer = scp_crypto::p256::P256SigningKey::from_scalar_bytes(&[0x2Au8; 32])?;
         let shared = scp_crypto::p256::ecdh_p256(&peer, &own);
-        (peer.public_key().to_uncompressed().to_vec(), *shared)
+        Ok((peer.public_key().to_uncompressed().to_vec(), *shared))
     }
 
     /// The 33-byte compressed encoding of a 65-byte uncompressed point.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `uncompressed` is not a valid P-256 point.
-    #[allow(clippy::expect_used)]
-    #[must_use]
-    pub fn compress_p256_point(uncompressed: &[u8]) -> Vec<u8> {
-        scp_crypto::p256::P256PublicKey::from_sec1(uncompressed)
-            .expect("a valid P-256 point")
+    /// `uncompressed` is not a valid P-256 point.
+    pub fn compress_p256_point(
+        uncompressed: &[u8],
+    ) -> Result<Vec<u8>, scp_crypto::p256::P256Error> {
+        Ok(scp_crypto::p256::P256PublicKey::from_sec1(uncompressed)?
             .to_compressed()
-            .to_vec()
+            .to_vec())
     }
 
     /// A 65-byte uncompressed SEC1 encoding (`0x04 ‖ x ‖ y`) of a point that
     /// is not on P-256: the generator with the last bit of `y` flipped.
     ///
-    /// # Panics
+    /// # Errors
     ///
     /// Never in practice; the generator scalar is a constant.
-    #[allow(clippy::expect_used)]
-    #[must_use]
-    pub fn off_curve_p256_point() -> [u8; 65] {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tweaked point is still on the curve.
+    pub fn off_curve_p256_point() -> Result<[u8; 65], scp_crypto::p256::P256Error> {
         let mut one = [0u8; 32];
         one[31] = 1;
-        let generator =
-            scp_crypto::p256::P256SigningKey::from_scalar_bytes(&one).expect("1 is a valid scalar");
+        let generator = scp_crypto::p256::P256SigningKey::from_scalar_bytes(&one)?;
         let mut point = generator.public_key().to_uncompressed();
         point[64] ^= 1;
         assert!(
             scp_crypto::p256::P256PublicKey::from_sec1(&point).is_err(),
             "the tweaked generator must be off the curve"
         );
-        point
+        Ok(point)
     }
 }

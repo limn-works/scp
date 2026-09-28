@@ -110,6 +110,10 @@ const ENTRY_KEY_INFO: &[u8] = b"scp/file-key-custody/v4/entry-aead";
 /// HKDF-SHA256 info label for the whole-file HMAC-SHA256 subkey.
 const FILE_MAC_INFO: &[u8] = b"scp/file-key-custody/v4/file-mac";
 
+/// The entry-encryption key and the file-MAC key, in that order, that
+/// [`FileKeyCustody::derive_keys`] derives from a passphrase.
+type KeyFileSubkeys = (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>);
+
 /// Argon2id salt length in bytes.
 const SALT_LEN: usize = 16;
 
@@ -545,11 +549,10 @@ impl FileKeyCustody {
     /// and salt: Argon2id through [`crate::kdf::derive_argon2id_key`] (the
     /// single source of the Argon2id parameterization, spec §17.6 / §17.8),
     /// then HKDF-SHA256 under [`ENTRY_KEY_INFO`] and [`FILE_MAC_INFO`].
-    #[allow(clippy::type_complexity)]
     fn derive_keys(
         passphrase: &str,
         salt: &[u8; SALT_LEN],
-    ) -> Result<(Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>), PlatformError> {
+    ) -> Result<KeyFileSubkeys, PlatformError> {
         let master = crate::kdf::derive_argon2id_key(passphrase.as_bytes(), salt)?;
         let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, master.as_ref());
         let mut entry_key = Zeroizing::new([0u8; 32]);
