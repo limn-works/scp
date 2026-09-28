@@ -457,9 +457,11 @@ kept change in the pull request. spin 0.9.9 is the case: 0.9.8 is yanked, and 0.
 unsoundness in three `Once` into-inner methods. When `--precise` fails with a
 version conflict, read whether the conflicting requirement is `locked to` a version: a
 lockfile pin is not a blocker, so unlock that crate first with
-`cargo update -p <crate>@<locked version>` and retry. aws-sdk-s3 1.144.0 and later drop
-the unsound `lru 0.12.5`, and `--precise` refused them only because `Cargo.lock` held
-`sha2 0.11.0-rc.5`, which mainline's `ed25519-dalek 3.0.0-pre.6` accepts at 0.11.0 too.
+`cargo update -p <crate>@<locked version>` and retry. aws-sdk-s3 1.144.0 is the first
+release that requires the patched `lru ^0.18.2`, which clears both lru advisories;
+1.120.0 through 1.143.0 require `lru ^0.16.3`, which RUSTSEC-2026-0253 still covers. `--precise`
+refused 1.144.0 only because `Cargo.lock` held `sha2 0.11.0-rc.5`, which mainline's
+`ed25519-dalek 3.0.0-pre.6` accepts at 0.11.0 too.
 Prove the result resolves with `cargo metadata --locked --all-features`.
 
 **Verifying.** Run the cargo-deny version CI runs, not whatever `cargo install` left on

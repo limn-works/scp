@@ -100,12 +100,22 @@ ignore = [
     # aarch64. Transitive via
     # openmls_rust_crypto -> hpke-rs -> libcrux-sha3 -> libcrux-traits 0.0.6 -> libcrux-secrets.
     # The advisory names libcrux-secrets >= 0.0.6 as patched. libcrux-sha3 0.0.8 requires
-    # libcrux-traits `=0.0.6`, which requires libcrux-secrets `=0.0.5`, so libcrux-secrets
-    # moves only when libcrux-sha3 does, and no update of libcrux-secrets or libcrux-traits
-    # alone can clear this entry. libcrux-sha3 0.0.10 requires libcrux-traits `=0.0.8`,
-    # which requires libcrux-secrets `=0.0.6`, so either release that clears
-    # RUSTSEC-2026-0207 above clears this entry too; re-check with the two commands named
-    # there.
+    # libcrux-traits `=0.0.6`, which requires libcrux-secrets `=0.0.5`, and libcrux-sha3
+    # 0.0.10 requires libcrux-traits `=0.0.8`, which requires libcrux-secrets `=0.0.6`, so
+    # no update of libcrux-secrets or libcrux-traits alone clears this entry.
+    # `Cargo.lock` also lists hpke-rs-libcrux 0.6.1 and seven crates under it that pin
+    # libcrux-secrets `=0.0.5` (libcrux-aead, libcrux-aesgcm, libcrux-chacha20poly1305,
+    # libcrux-curve25519, libcrux-hkdf, libcrux-ml-kem and libcrux-p256), because hpke-rs
+    # declares hpke-rs-libcrux as an optional dependency. No crate in the graph enables
+    # hpke-rs's `libcrux` feature, so neither `cargo tree --all-features` nor the graph this
+    # file checks (`[graph] all-features = true`) contains any of them, and the one compiled
+    # path to libcrux-secrets 0.0.5 runs through libcrux-sha3. Either release that clears
+    # RUSTSEC-2026-0207 above clears this entry too, unless a crate in the graph has since
+    # enabled hpke-rs's `libcrux` feature. Re-check
+    # whenever you touch this file with
+    # `cargo tree --workspace --all-features --target all -i libcrux-secrets@0.0.5`, which
+    # lists every compiled crate that still holds 0.0.5 and fails with "did not match any
+    # packages" once none does.
     "RUSTSEC-2026-0212",
     # lru: `LruCache::pop()` leaves dangling pointers when a key's `Drop` panics. Reported
     # against lru 0.16.3, which mainline 6.0.1 (the scp-dht DHT client) requires as
