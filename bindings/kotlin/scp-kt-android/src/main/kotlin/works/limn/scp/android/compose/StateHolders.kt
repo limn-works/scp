@@ -465,9 +465,9 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
  * under that key leaves, because a registry such as `HotStreamFactory` hands both mounts one
  * subscription. A [key] should name one subscription: two streams under one key each have their
  * [onStop] run, but a stream whose mount leaves first stays open until the other one's mount
- * leaves too. A caller holds that coordinator
- * outside composition, because Compose forgets everything this function remembers when a mount
- * ends. [ScpHotStreamCoordinator] states what a per-composition coordinator would break.
+ * leaves too. A caller holds that coordinator outside composition, because Compose forgets
+ * everything this function remembers when a mount ends. [ScpHotStreamCoordinator] states what a
+ * per-composition coordinator would break.
  *
  * The returned [State] is initially `null` until the [start] coroutine
  * completes and the [SharedFlow] is available. Callers should handle the
@@ -560,8 +560,9 @@ fun <T> rememberScpHotStream(
             // second spelling. See
             // `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
             // unmount launches a stop only when this was the last live mount under this key
-            // (holding onStop for that stop otherwise), and records that stop's Job before it returns, so a start that a later mount begins
-            // under this same key joins that job instead of racing it. Cancelling `scope`
+            // (holding onStop for that stop otherwise), and records that stop's Job before it
+            // returns, so a start that a later mount begins under this same key joins that job
+            // instead of racing it. Cancelling `scope`
             // afterwards cancels only this mount's start, never that stop.
             swappedOutStop.set(coordinator.unmount(mount) { onStop() })
             scope.cancel()

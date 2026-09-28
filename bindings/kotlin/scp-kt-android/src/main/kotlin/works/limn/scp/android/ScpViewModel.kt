@@ -150,9 +150,10 @@ abstract class ScpViewModel : ViewModel() {
      * (the default `Dispatchers.IO` does), leaves it at the first `leave`. A dispatcher that
      * runs inline, such as `Dispatchers.Unconfined`, runs every `leave` and every
      * [onCleanupFailure] call on the calling thread before this method returns. Cleanup is
-     * best-effort — those calls run to completion only if a process outlives them. Blocking until they finish is not an option: [onCleared] runs
-     * on an Android main thread, and blocking that thread on FFI calls both risks an ANR and
-     * deadlocks whenever an injected dispatcher schedules its work onto a blocked thread.
+     * best-effort — those calls run to completion only if a process outlives them. Blocking
+     * until they finish is not an option: [onCleared] runs on an Android main thread, and
+     * blocking that thread on FFI calls both risks an ANR and deadlocks whenever an injected
+     * dispatcher schedules its work onto a blocked thread.
      *
      * Uses a dedicated [cleanupScope] because `viewModelScope` is already cancelled before
      * [onCleared] is called, so a coroutine launched there would be dropped without running.
