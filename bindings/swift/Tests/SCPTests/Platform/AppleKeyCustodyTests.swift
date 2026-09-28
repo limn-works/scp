@@ -278,8 +278,6 @@
 
             // Cleanup
             try await custody.destroyKey(handle)
-            try await custody.destroyKey(first.keyId)
-            // second.keyId is deterministic and equals first.keyId, so already destroyed
         }
 
         @Test("derivePseudonym produces different keys for different contexts")
@@ -296,8 +294,6 @@
 
             // Cleanup
             try await custody.destroyKey(handle)
-            try await custody.destroyKey(pseudoA.keyId)
-            try await custody.destroyKey(pseudoB.keyId)
         }
 
         @Test("derivePseudonym with X25519 key throws wrongKeyType")
@@ -347,7 +343,35 @@
 
             // Cleanup
             try await custody.destroyKey(identityHandle)
-            try await custody.destroyKey(pseudonym.keyId)
+        }
+
+        @Test("destroying an identity destroys every pseudonym derived from it")
+        func destroyIdentityDestroysPseudonyms() async throws {
+            let identity = try await custody.generateKeypair(keyType: "ed25519")
+            let first = try await custody.derivePseudonym(identity, contextId: Data("context-a".utf8))
+            let second = try await custody.deriveRotatablePseudonym(
+                identity, contextId: Data("context-b".utf8), pseudonymEpoch: 3
+            )
+            let digest = Data(SHA256.hash(data: Data("before destroy".utf8)))
+            _ = try await custody.sign(first.keyId, data: digest)
+            _ = try await custody.sign(second.keyId, data: digest)
+
+            let attestation = try await custody.destroyKey(identity)
+            #expect(attestation.confirmed)
+            for pseudonym in [first, second] {
+                let signError = await #expect(throws: PlatformError.self) {
+                    _ = try await custody.sign(pseudonym.keyId, data: digest)
+                }
+                let keyError = await #expect(throws: PlatformError.self) {
+                    _ = try await custody.publicKey(pseudonym.keyId)
+                }
+                for error in [signError, keyError] {
+                    guard case .keyNotFound = error else {
+                        Issue.record("expected keyNotFound, got \(String(describing: error))")
+                        continue
+                    }
+                }
+            }
         }
 
         /// (n - 1) / 2 for P-256, the largest low-s value (§9.5.1).
@@ -436,8 +460,6 @@
 
             // Cleanup
             try await custody.destroyKey(handle)
-            try await custody.destroyKey(first.keyId)
-            // second.keyId is deterministic and equals first.keyId, so already destroyed
         }
 
         @Test("deriveRotatablePseudonym produces different keys for different epochs")
@@ -463,8 +485,6 @@
 
             // Cleanup
             try await custody.destroyKey(handle)
-            try await custody.destroyKey(epoch1.keyId)
-            try await custody.destroyKey(epoch2.keyId)
         }
 
         @Test("deriveRotatablePseudonym with X25519 key throws wrongKeyType")
@@ -566,8 +586,6 @@
 
                 // Cleanup
                 try await custody.destroyKey(handle)
-                try await custody.destroyKey(staticPseudonym.keyId)
-                try await custody.destroyKey(rotatablePseudonym.keyId)
             }
         }
     }
