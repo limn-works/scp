@@ -10846,7 +10846,16 @@
         "crates/scp-testing/tests/integration/encryption.rs",
         "crates/scp-testing/tests/integration/network_simulation.rs",
         "scripts/ffi-export-allowlist.json",
-        "scripts/gen-test-vectors-p256.py"
+        "scripts/gen-test-vectors-p256.py",
+        ".docs/standards/sdk-common.md",
+        "crates/scp-ffi/napi/src/error.rs",
+        "crates/scp-ffi/napi/src/outlet_stream.rs",
+        "crates/scp-ffi/src/error.rs",
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/src/outlet_stream.rs",
+        "crates/scp-ffi/uniffi/src/outlet_stream.rs",
+        "crates/scp-platform/src/error.rs",
+        "crates/scp-runtime/src/context/outlets/signer.rs"
       ],
       "description": "Architecture slice S0 of the key-event-log identity substrate. ADR-063 moves every SCP key to ECDSA over NIST P-256 with SHA-256, and `09-security-model.md` §9.5 states the encoding and verification rules. This story adds P-256 to the wasm-safe `scp-crypto` crate and to `KeyCustody`, moves MLS to RFC 9420 ciphersuite 2 and HPKE to DHKEM(P-256), and adds the JOSE ES256 codec. S12 (SCP-315) wires that codec to UCAN. The key-event preimage types are SCP-308.",
       "acceptanceCriteria": [
