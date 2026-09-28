@@ -13,10 +13,10 @@
 // this class to the Rust engine.
 //
 // Software Ed25519 keys that generateKeypair creates (API 26-32 fallback) are persisted to
-// EncryptedSharedPreferences (Jetpack Security) so they survive process death; derived
-// pseudonym keys are held in memory only. Without this, API 26-32 users would
-// lose their DID identity key on every process restart — causing identity loss, context
-// membership loss, and UCAN delegation loss.
+// EncryptedSharedPreferences (Jetpack Security) so they survive process death. Without this,
+// API 26-32 users would lose their DID identity key on every process restart — causing
+// identity loss, context membership loss, and UCAN delegation loss. Derived pseudonym keys
+// are held in memory only.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
 // ADR-025 (Apple Platform Adapter — parallel reference), section 9.12 (Compromise Recovery),
