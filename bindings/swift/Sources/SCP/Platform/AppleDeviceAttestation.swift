@@ -1,6 +1,5 @@
 #if os(iOS) || os(macOS)
 
-    import CryptoKit
     import DeviceCheck
     import Foundation
 
@@ -35,6 +34,11 @@
         case keyNotFound
         /// An internal invariant was violated.
         case internalError(String)
+        /// The attestation `challenge` or the assertion `requestHash` is not 32
+        /// bytes, so it is not the binding digest `D` or the assertion digest
+        /// `A` of `09-security-model.md` §9.3.1 that App Attest takes as
+        /// `clientDataHash`.
+        case invalidChallenge(String)
     }
 
     extension AttestationError {
@@ -49,6 +53,7 @@
             case .keyNotFound:
                 .Identity(msg: "no App Attest key ID is stored; call attest first", code: "SCP-ATTEST-9020")
             case let .internalError(msg): .Identity(msg: msg, code: "SCP-ATTEST-9025")
+            case let .invalidChallenge(msg): .Identity(msg: msg, code: "SCP-ATTEST-9026")
             }
         }
 
@@ -88,11 +93,21 @@
     /// and obtain an Apple-signed attestation certificate. The key ID is
     /// persisted in `UserDefaults` so subsequent calls reuse the same key.
     ///
-    /// Attestation steps (per ADR-025 §"Device attestation"):
+    /// Attestation steps (per ADR-025 acceptance criterion 3):
     /// 1. `generateKey` — creates a Secure Enclave key via App Attest service.
-    /// 2. `attestKey(_:clientDataHash:)` — requests Apple's attestation object
-    ///    where `clientDataHash = SHA-256(clientDataJSON)`.
-    /// 3. `generateAssertion(_:clientDataHash:)` — per-request proof of possession.
+    /// 2. `attestKey(_:clientDataHash:)` — requests Apple's attestation object,
+    ///    with the 32-byte `challenge` as `clientDataHash`, unchanged. ADR-025
+    ///    has the Rust core pass the binding digest `D` of
+    ///    `09-security-model.md` §9.3.1 as `challenge`.
+    /// 3. `generateAssertion(_:clientDataHash:)` — per-request proof of
+    ///    possession, with the 32-byte `requestHash` as `clientDataHash`,
+    ///    unchanged. ADR-025 has the Rust core pass the assertion digest `A`
+    ///    of §9.3.1 as `requestHash`.
+    ///
+    /// The adapter hashes nothing. It rejects a `challenge` or a
+    /// `requestHash` that is not 32 bytes with `SCP-ATTEST-9026`, which
+    /// `AttestationError.invalidChallenge` maps to, and otherwise hands it to
+    /// App Attest as it arrived.
     ///
     /// ## Unavailable service (simulator, or a device without App Attest)
     ///
@@ -189,7 +204,8 @@
         /// `throws(AttestationError)`, so the compiler rejects any other type.
         ///
         /// - Throws: `ScpError.Identity` carrying `SCP-ATTEST-9019` for
-        ///   `AttestationError.unsupported`, `SCP-ATTEST-9001` for
+        ///   `AttestationError.unsupported`, `SCP-ATTEST-9026` for
+        ///   `AttestationError.invalidChallenge`, `SCP-ATTEST-9001` for
         ///   `AttestationError.serviceError`, or `SCP-ATTEST-9025` for
         ///   `AttestationError.internalError`, in the cases
         ///   `attestReportingAttestationError(challenge:deviceId:)` lists.
@@ -206,7 +222,8 @@
         /// reason `attest(challenge:deviceId:)` states.
         ///
         /// - Throws: `ScpError.Identity` carrying `SCP-ATTEST-9019` for
-        ///   `AttestationError.unsupported`, `SCP-ATTEST-9020` for
+        ///   `AttestationError.unsupported`, `SCP-ATTEST-9026` for
+        ///   `AttestationError.invalidChallenge`, `SCP-ATTEST-9020` for
         ///   `AttestationError.keyNotFound`, `SCP-ATTEST-9001` for
         ///   `AttestationError.serviceError`, or `SCP-ATTEST-9025` for
         ///   `AttestationError.internalError`, in the cases
@@ -219,14 +236,19 @@
             }
         }
 
-        /// Generate an attestation for the given challenge and device ID.
+        /// Generate an attestation for the given challenge.
         ///
         /// On a real device with App Attest available:
-        /// 1. Retrieves or generates the App Attest key ID.
-        /// 2. Computes `clientDataHash = SHA-256(clientDataJSON)` where
-        ///    `clientDataJSON = {"challenge":"<b64>","deviceId":"<b64>","type":"scp-device-attestation-v1"}`.
-        /// 3. Calls `DCAppAttestService.attestKey(_:clientDataHash:)`.
-        /// 4. Returns the raw CBOR attestation bytes.
+        /// 1. Checks that `challenge` is 32 bytes, before any App Attest call.
+        /// 2. Retrieves or generates the App Attest key ID.
+        /// 3. Calls `DCAppAttestService.attestKey(_:clientDataHash:)` with
+        ///    `challenge` as `clientDataHash`, unchanged.
+        /// 4. Returns the raw CBOR attestation object Apple signed.
+        ///
+        /// ADR-025 acceptance criterion 3 has the Rust core pass the binding
+        /// digest `D` of `09-security-model.md` §9.3.1 as `challenge`. This
+        /// adapter does not read `deviceId`, because `D` already binds the
+        /// identity.
         ///
         /// When `DCAppAttestService.isSupported` is `false`, as on simulator,
         /// this method throws `AttestationError.unsupported`, calls no App
@@ -235,24 +257,33 @@
         /// same error after that call, and returns no bytes.
         ///
         /// - Parameters:
-        ///   - challenge: Server-issued random challenge bytes.
-        ///   - deviceId: Stable device/identity identifier bytes.
-        /// - Returns: Attestation token bytes.
+        ///   - challenge: The 32-byte §9.3.1 binding digest `D`.
+        ///   - deviceId: Not read by this adapter.
+        /// - Returns: The raw CBOR attestation object Apple signed.
         /// - Throws: `AttestationError.unsupported` when
         ///   `DCAppAttestService.isSupported` is `false`, or when `generateKey`
         ///   or `attestKey` answers with `DCError.featureUnsupported`.
+        ///   `AttestationError.invalidChallenge` when App Attest is supported
+        ///   and `challenge` is not 32 bytes; this method then generates no
+        ///   key and calls no App Attest method.
         ///   `AttestationError.serviceError` when `generateKey` or `attestKey`
         ///   answers with any other error.
         ///   `AttestationError.internalError` when `generateKey` or `attestKey`
         ///   answers with neither a value nor an error.
         func attestReportingAttestationError(
             challenge: Data,
-            deviceId: Data
+            deviceId _: Data
         ) async throws(AttestationError) -> Data {
             guard service.isSupported else {
                 throw AttestationError.unsupported(
                     "DCAppAttestService.isSupported is false on this device, so App Attest cannot "
                         + "produce an attestation. This adapter mints no substitute token."
+                )
+            }
+            guard challenge.count == 32 else {
+                throw AttestationError.invalidChallenge(
+                    "the attestation challenge is \(challenge.count) bytes; App Attest takes the "
+                        + "32-byte binding digest D of 09-security-model.md §9.3.1 as clientDataHash"
                 )
             }
 
@@ -264,10 +295,9 @@
             } catch {
                 throw AttestationError.serviceError(error.localizedDescription)
             }
-            let clientDataHash = computeClientDataHash(challenge: challenge, deviceId: deviceId)
 
             let outcome: Result<Data, AttestationError> = await withCheckedContinuation { continuation in
-                service.attestKey(keyId, clientDataHash: clientDataHash) { attestation, error in
+                service.attestKey(keyId, clientDataHash: challenge) { attestation, error in
                     if let error {
                         continuation.resume(returning: .failure(.fromAppAttest(error, call: "attestKey")))
                     } else if let attestation {
@@ -294,7 +324,7 @@
         /// with `DCError.featureUnsupported`, it throws the same error after
         /// that call, and returns no bytes.
         ///
-        /// - Parameter requestHash: The assertion digest
+        /// - Parameter requestHash: The 32-byte assertion digest
         ///   `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" ‖ BE32(len(m)) ‖ m)` of
         ///   `09-security-model.md` §9.3.1 over the caller's request bytes `m`,
         ///   never `SHA-256(m)` and never `m` itself. The method passes it to
@@ -303,6 +333,9 @@
         /// - Throws: `AttestationError.unsupported` when
         ///   `DCAppAttestService.isSupported` is `false`, or when
         ///   `generateAssertion` answers with `DCError.featureUnsupported`.
+        ///   `AttestationError.invalidChallenge` when App Attest is supported
+        ///   and `requestHash` is not 32 bytes; this method then calls no App
+        ///   Attest method.
         ///   `AttestationError.keyNotFound` when no key ID is stored, because
         ///   no `attest` call has generated a key.
         ///   `AttestationError.serviceError` when `generateAssertion` answers
@@ -316,6 +349,12 @@
                 throw AttestationError.unsupported(
                     "DCAppAttestService.isSupported is false on this device, so App Attest cannot "
                         + "produce an assertion. This adapter mints no substitute token."
+                )
+            }
+            guard requestHash.count == 32 else {
+                throw AttestationError.invalidChallenge(
+                    "the assertion request hash is \(requestHash.count) bytes; App Attest takes the "
+                        + "32-byte assertion digest A of 09-security-model.md §9.3.1 as clientDataHash"
                 )
             }
 
@@ -415,20 +454,6 @@
             }
             storeKeyId(keyId)
             return keyId
-        }
-
-        /// Compute the client data hash for App Attest.
-        ///
-        /// Uses structured JSON encoding to prevent length-confusion on naive byte
-        /// concatenation. Per ADR-025 (updated): `clientDataHash = SHA256(clientDataJSON)`
-        /// where `clientDataJSON = {"challenge":"<b64>","deviceId":"<b64>","type":"scp-device-attestation-v1"}`.
-        /// Field order is fixed to ensure cross-platform determinism.
-        ///
-        /// The relay reconstructs this JSON with the same fixed-field-order formula
-        /// to verify the nonce embedded in the App Attest leaf certificate.
-        private func computeClientDataHash(challenge: Data, deviceId: Data) -> Data {
-            let json = "{\"challenge\":\"\(challenge.base64EncodedString())\",\"deviceId\":\"\(deviceId.base64EncodedString())\",\"type\":\"scp-device-attestation-v1\"}"
-            return Data(SHA256.hash(data: Data(json.utf8)))
         }
 
         // MARK: Persistence (UserDefaults)

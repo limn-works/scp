@@ -1205,8 +1205,8 @@ pub const ATTEST_9018: &str = "SCP-ATTEST-9018";
 
 // Codes the Swift `AppleDeviceAttestation` adapter throws as `ScpError`
 // from its UniFFI `DeviceAttestationProvider` callback methods
-// (`AttestationError.scpError`). Each of these three codes belongs to one of
-// the four `AttestationError` cases; the fourth case, `serviceError`, reuses
+// (`AttestationError.scpError`). Each of these four codes belongs to one of
+// the five `AttestationError` cases; the fifth case, `serviceError`, reuses
 // `ATTEST_9001`.
 
 /// Apple App Attest is unsupported on this device.
@@ -1221,6 +1221,14 @@ pub const ATTEST_9020: &str = "SCP-ATTEST-9020";
 /// Apple's service answered a completion handler with neither a value nor an
 /// error.
 pub const ATTEST_9025: &str = "SCP-ATTEST-9025";
+/// The attestation challenge or the assertion request hash is not 32 bytes.
+///
+/// ADR-025 acceptance criterion 3 has the Rust core pass the 32-byte binding
+/// digest `D` of `09-security-model.md` §9.3.1 as `challenge` and the 32-byte
+/// assertion digest `A` as `request_hash`, and the Apple adapter hands each to
+/// App Attest as `clientDataHash` unchanged. The Apple adapter throws this code
+/// for either input when it is not 32 bytes, before it calls App Attest.
+pub const ATTEST_9026: &str = "SCP-ATTEST-9026";
 
 // -------------------------------------------------------------------------
 // Economy (SCP-ECON- 12000--12999)
