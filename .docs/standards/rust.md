@@ -451,7 +451,10 @@ and read the upstream release notes for every version in between.
 
 **Applying the bump.** Use `cargo update -p <crate> --precise <version>`. A bare
 `cargo update -p <crate>` re-resolves unrelated edges, so read the whole `Cargo.lock` diff
-and revert every change the advisory did not require. When `--precise` fails with a
+and revert every change the advisory did not require, except a move off a yanked version,
+which `cargo update -p <crate>@<new> --precise <old>` reports as `was yanked`; name each
+kept change in the pull request. spin 0.9.9 is the case: 0.9.8 is yanked, and 0.9.9 fixes
+unsoundness in three `Once` into-inner methods. When `--precise` fails with a
 version conflict, read whether the conflicting requirement is `locked to` a version: a
 lockfile pin is not a blocker, so unlock that crate first with
 `cargo update -p <crate>@<locked version>` and retry. aws-sdk-s3 1.144.0 and later drop

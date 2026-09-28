@@ -99,10 +99,13 @@ ignore = [
     # libcrux-secrets 0.0.5: potentially incorrect output of constant-time swap/select on
     # aarch64. Transitive via
     # openmls_rust_crypto -> hpke-rs -> libcrux-sha3 -> libcrux-traits 0.0.6 -> libcrux-secrets.
-    # The advisory names libcrux-secrets >= 0.0.6 as patched; libcrux-traits 0.0.6 requires
-    # libcrux-secrets 0.0.5, so a libcrux-traits release that requires libcrux-secrets
-    # >= 0.0.6 clears this entry. Re-check with
-    # `cargo update --dry-run -p libcrux-secrets` whenever you touch this file.
+    # The advisory names libcrux-secrets >= 0.0.6 as patched. libcrux-sha3 0.0.8 requires
+    # libcrux-traits `=0.0.6`, which requires libcrux-secrets `=0.0.5`, so libcrux-secrets
+    # moves only when libcrux-sha3 does, and no update of libcrux-secrets or libcrux-traits
+    # alone can clear this entry. libcrux-sha3 0.0.10 requires libcrux-traits `=0.0.8`,
+    # which requires libcrux-secrets `=0.0.6`, so either release that clears
+    # RUSTSEC-2026-0207 above clears this entry too; re-check with the two commands named
+    # there.
     "RUSTSEC-2026-0212",
     # lru: `LruCache::pop()` leaves dangling pointers when a key's `Drop` panics. Reported
     # against lru 0.16.3, which mainline 6.0.1 (the scp-dht DHT client) requires as
@@ -112,8 +115,11 @@ ignore = [
     # the check if any crate other than mainline pulls in a lower version, because this
     # ID is ignored for every lru version. Every mainline `LruCache` is keyed by `Id`,
     # which has no panicking `Drop`, so the trigger cannot occur. A mainline release that
-    # requires lru >= 0.18.2 clears this entry. Re-check with
-    # `cargo update --dry-run -p mainline` whenever you touch this file.
+    # requires lru >= 0.18.2 clears this entry. scp-dht requires mainline `"6"`, so a
+    # clearing release will most likely be a later major that `cargo update --dry-run`
+    # never offers. Re-check whenever you touch this file: `cargo info mainline` prints
+    # the newest release after `latest`, and `cargo info mainline@<latest> --verbose`
+    # lists that release's lru requirement.
     "RUSTSEC-2026-0253",
 ]
 
