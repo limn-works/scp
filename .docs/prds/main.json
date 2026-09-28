@@ -10846,7 +10846,18 @@
         "crates/scp-testing/tests/integration/encryption.rs",
         "crates/scp-testing/tests/integration/network_simulation.rs",
         "scripts/ffi-export-allowlist.json",
-        "scripts/gen-test-vectors-p256.py"
+        "scripts/gen-test-vectors-p256.py",
+        ".docs/specs/03-identity.md",
+        "crates/scp-client-wasm/tests/pseudonym_cross_target_kat.rs",
+        "crates/scp-event-log/tests/test_vectors.rs",
+        "crates/scp-protocol/src/bridge/claiming.rs",
+        "crates/scp-protocol/src/context/governance/mod.rs",
+        "crates/scp-protocol/src/crypto/sender_keys/broadcast.rs",
+        "crates/scp-protocol/src/provenance/attach.rs",
+        "crates/scp-runtime/src/crypto/access_keys/wire.rs",
+        "crates/scp-runtime/tests/phase5_integration.rs",
+        "crates/scp-runtime/tests/test_vectors.rs",
+        "crates/scp-testing/tests/integration/conformance.rs"
       ],
       "description": "Architecture slice S0 of the key-event-log identity substrate. ADR-063 moves every SCP key to ECDSA over NIST P-256 with SHA-256, and `09-security-model.md` §9.5 states the encoding and verification rules. This story adds P-256 to the wasm-safe `scp-crypto` crate and to `KeyCustody`, moves MLS to RFC 9420 ciphersuite 2 and HPKE to DHKEM(P-256), and adds the JOSE ES256 codec. S12 (SCP-315) wires that codec to UCAN. The key-event preimage types are SCP-308.",
       "acceptanceCriteria": [
@@ -10862,7 +10873,11 @@
         "Each bridge binds a host pseudonym only when `get_public_key(key_id)` returns the same 33 bytes, and fails with `SCP-IDENT-1055` otherwise: a test per bridge",
         "A pseudonym key signs only a 32-byte digest, and each bridge verifies the host's 64-byte `r‖s` strictly and rejects a high-`s` signature, for a pseudonym key this adapter derived and still holds bound; PR #2514 covers handles the adapter did not bind: a test per bridge (`09-security-model.md` §9.5)",
         "The §25.19 Vector 30 and 31 points reproduce in Swift and Kotlin custody, and the v1 routing ids reproduce through the Rust, TypeScript and Python bridges. No bridge derives a v2 pseudonym on a production path, so scp-crypto's §25.19 KAT covers the v2 routing ids (`25-test-vectors.md` §25.19)",
-        "No unwrap() or expect() in library code"
+        "No unwrap() or expect() in library code",
+        "`python3.12 scripts/gen-test-vectors-p256.py` reproduces every value `25-test-vectors.md` §25 prints, and each fixture party's identifier inside a §25 signed or hashed structure is the 56-character `scp:` text form of `SHA-256(\"SCP test vector identifier <role>\")` for a role §25.1 lists (`25-test-vectors.md` §25.1)",
+        "Every §25 vector the regeneration changed is asserted by a Rust test that computes it through the production function that builds that structure, with these exceptions, each checked against the printed bytes with the `scp-crypto` P-256 primitives and carrying a comment that names the change which moves its production path: the Vector 5-8, 26, 34 and 37 signatures, the Vector 32 append and Vector 33 until slice S12 moves production signing to P-256; Vector 37 until S0 PR4; Vectors 20 and 38 until the root-set slice replaces `compute_key_continuity_fingerprint`",
+        "`compute_claim_canonical_hash` returns `SHA-256(\"SCP-CLAIM-V1:\" || BE32(len) || claimant_did || BE32(len) || shadow_did || BE32(len) || attestation_id || BE64(timestamp))` under the §9.5.1 canonical encoding, and `spec_25_vector_22_claim_canonical_hash` asserts the §25.10 Vector 22 preimage and hash through it (`03-identity.md` §3.5.5 step 2)",
+        "`claim_shadow` returns `ClaimError::HandleMismatch` and leaves the shadow in `Shadow` status when the request's `platform_handle` differs from the shadow's handle: `claim_shadow_rejects_request_handle_that_differs_from_shadow` asserts both"
       ],
       "actionItems": [
         "Add P-256 verification, low-s, point validation, DER-to-raw conversion and SHA-256 to `scp-crypto`.",

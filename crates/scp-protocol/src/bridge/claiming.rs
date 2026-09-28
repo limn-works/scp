@@ -12,6 +12,8 @@
 //! 1. Claimant constructs a [`ClaimRequest`] with their identity attestation.
 //! 2. [`claim_shadow`] verifies:
 //!    - The shadow exists and is unclaimed.
+//!    - The request's `platform_handle`, which the claim signature does not
+//!      cover, equals the shadow's handle.
 //!    - The attestation is an `IdentityLink` type.
 //!    - The attestation subject matches the claimant DID.
 //!    - The platform handle in the attestation claim matches the shadow's handle.
@@ -26,8 +28,9 @@
 //!
 //! - **One-way:** Once claimed, a shadow cannot return to `Shadow` status.
 //! - **Irreversible:** A claimed shadow cannot be re-assigned to a different DID.
-//! - **Handle match:** The attestation's platform handle must exactly match the
-//!   shadow's platform handle.
+//! - **Handle match:** The request's platform handle and the attestation's
+//!   platform handle must each exactly match the shadow's platform handle. The
+//!   [`ShadowClaimEvent`] records the shadow's handle, never the request's.
 //! - **Signature verification:** Both the claim request and attestation signatures
 //!   are cryptographically verified inside `claim_shadow`.
 //!
@@ -121,6 +124,9 @@ pub struct ClaimRequest {
     pub claimant_did: DID,
 
     /// The external platform handle the claimant is asserting ownership of.
+    /// The claim signature does not cover it, so it is unsigned:
+    /// [`claim_shadow`] rejects the request with [`ClaimError::HandleMismatch`]
+    /// unless it equals the shadow's handle.
     pub platform_handle: String,
 
     /// Identity attestation (Spec section 3.5) binding the external handle
@@ -200,9 +206,12 @@ use scp_did::extract_public_key_from_did;
 /// the attestation's type, subject, revocation state, and signature, and
 /// compares its `platform_handle` claim with the shadow's handle. It does not
 /// yet check the attestation's issuer or its expiry (§3.5.5 step 1a) or its
-/// evidence recency (step 1c), so until those checks land the attestation
-/// binds the handle only as far as its signature and subject do. §25.10 Vector 22
-/// restates this construction.
+/// evidence recency (step 1c). Step 1b compares the attestation's `platform`
+/// and `platform_handle` with the shadow's; the attestation's `platform` is
+/// not compared, because the shadow carries no platform. Until the issuer,
+/// expiry, and recency checks land, the attestation binds the handle only as
+/// far as its signature and subject do. §25.10 Vector 22 restates this
+/// construction.
 ///
 /// # Errors
 ///
@@ -342,7 +351,8 @@ fn validate_claim_request(
 /// This function implements the full shadow claiming workflow (ADR-023
 /// acceptance criteria 7-8):
 ///
-/// 1. Verifies the shadow exists and is unclaimed.
+/// 1. Verifies the shadow exists and is unclaimed, and that the request's
+///    unsigned `platform_handle` equals the shadow's handle.
 /// 2. Validates the identity attestation:
 ///    - Must be an `IdentityLink` attestation type.
 ///    - The attestation subject must match the claimant DID.
@@ -352,7 +362,8 @@ fn validate_claim_request(
 /// 4. Cryptographically verifies the Ed25519 signature on the attestation.
 /// 5. Cryptographically verifies the Ed25519 signature on the claim request.
 /// 6. Transitions the shadow's provenance status from `Shadow` to `Claimed`.
-/// 7. Produces a [`ShadowClaimEvent`] for the context's Merkle log.
+/// 7. Produces a [`ShadowClaimEvent`] for the context's Merkle log, recording
+///    the shadow's handle.
 ///
 /// # Arguments
 ///

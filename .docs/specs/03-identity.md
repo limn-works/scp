@@ -291,7 +291,7 @@ When a bridge connector creates a shadow identity for an external platform parti
    }
    ```
 
-   The signature covers `SHA-256("SCP-CLAIM-V1:" || BE32(len(claimant_did)) || claimant_did || BE32(len(shadow_did)) || shadow_did || BE32(len(attestation_id)) || attestation_id || BE64(timestamp))`: the four fields in this order under the §9.5.1 canonical encoding, with the `"SCP-CLAIM-V1:"` separator. `attestation_id` is the `id` of the carried `attestation`. The external platform handle is outside the preimage: step 1a verifies the attestation's signature, expiry, and revocation state, and step 1c its evidence recency, so the attestation binds the handle, and step 1b compares that handle with the shadow identity's. §25.10 Vector 22 gives the bytes.
+   The signature covers `SHA-256("SCP-CLAIM-V1:" || BE32(len(claimant_did)) || claimant_did || BE32(len(shadow_did)) || shadow_did || BE32(len(attestation_id)) || attestation_id || BE64(timestamp))`: the four fields in this order under the §9.5.1 canonical encoding, with the `"SCP-CLAIM-V1:"` separator. `attestation_id` is the `id` of the carried `attestation`. The external platform handle is outside the preimage: step 1a verifies the attestation's signature, expiry, and revocation state, and step 1c its evidence recency, so the attestation binds the handle, and step 1b compares the attestation's platform and handle with the shadow identity's. §25.10 Vector 22 gives the bytes.
 
 3. **Bridge verification.** The bridge operator verifies:
    a. The attestation links the claimant's identifier to the shadow identity's external identity.
