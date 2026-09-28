@@ -24,6 +24,8 @@ import java.security.SecureRandom
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -182,6 +184,10 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
      * signature: each sign either verifies under the pseudonym's point or fails with
      * `SCP-CRYPTO-4001`. A sign that used the stored scalar array instead of a copy
      * would see it wiped mid-signature.
+     *
+     * The signers sign without pause until the cycler finishes, so every destroy lands
+     * while a sign may be in flight. Before each destroy the cycler waits for one more
+     * verified signature, so every cycle overlaps signing whatever the scheduler does.
      */
     @Test
     fun `destroying a pseudonym while others sign never yields a bad signature`() {
@@ -191,23 +197,35 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
         val pseudonym = custody.derivePseudonym(identity, contextId)
         val publicKey = custody.publicKey(handleOf(pseudonym))
         val rounds = 300
+        val verified = AtomicInteger(0)
+        val done = AtomicBoolean(false)
         val pool = Executors.newFixedThreadPool(3)
         val start = CountDownLatch(1)
         try {
             val cycler = pool.submit {
                 start.await()
-                repeat(rounds) {
-                    custody.destroyKey(handleOf(pseudonym))
-                    assertEquals(pseudonym.id, custody.derivePseudonym(identity, contextId).id)
+                try {
+                    repeat(rounds) {
+                        val seen = verified.get()
+                        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
+                        while (verified.get() == seen) {
+                            check(System.nanoTime() < deadline) { "no signature verified within 30 s" }
+                            Thread.onSpinWait()
+                        }
+                        custody.destroyKey(handleOf(pseudonym))
+                        assertEquals(pseudonym.id, custody.derivePseudonym(identity, contextId).id)
+                    }
+                } finally {
+                    done.set(true)
                 }
             }
             val signers = List(2) { thread ->
-                pool.submit<Int> {
+                pool.submit {
                     start.await()
-                    var verified = 0
-                    repeat(rounds) { round ->
+                    var round = 0
+                    while (!done.get()) {
                         val digest = MessageDigest.getInstance("SHA-256")
-                            .digest("d$thread r$round".toByteArray())
+                            .digest("d$thread r${round++}".toByteArray())
                         val signature = try {
                             custody.sign(handleOf(pseudonym), digest)
                         } catch (e: ScpException) {
@@ -216,17 +234,17 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
                         }
                         if (signature != null) {
                             assertTrue(verifies(publicKey, digest, signature), "signature must verify")
-                            verified++
+                            verified.incrementAndGet()
                         }
                     }
-                    verified
                 }
             }
             start.countDown()
             cycler.get(60, TimeUnit.SECONDS)
-            val verified = signers.sumOf { it.get(60, TimeUnit.SECONDS) }
-            assertTrue(verified > 0, "some signatures must land between destroy and re-derive")
+            signers.forEach { it.get(60, TimeUnit.SECONDS) }
+            assertTrue(verified.get() >= rounds, "a signature must verify before every destroy")
         } finally {
+            done.set(true)
             pool.shutdownNow()
         }
     }
