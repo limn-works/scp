@@ -23,7 +23,11 @@
 //! - **Dynamic updates** -- emits `notifications/tools/list_changed` when an
 //!   event or a `tools/call` changes the capability-filtered tool set. A
 //!   `tools/call` queues its notifications, and the transport drains them
-//!   with [`McpServer::take_pending_notifications`].
+//!   with [`McpServer::take_pending_notifications`]. A change that no
+//!   [`ContextEvent`] reports and no `tools/call` causes sends no
+//!   notification: the agent token reaching its expiry or a caveat time box
+//!   closing, a revocation of that token, and an outlet registration or
+//!   removal.
 //!
 //! The server uses trait-based abstractions ([`ContextProvider`]) so it can
 //! be tested independently of the full SCP stack.
@@ -266,13 +270,17 @@ pub enum CapabilityCheck {
 
 /// Why a [`ContextProvider`] gate refused access.
 ///
-/// `tools/list` and `resources/list` leave a [`Self::Denied`] item out of a
-/// successful response, and answer an [`Self::Unreadable`] one with an error,
-/// so a failed read never reaches the client as a shorter list.
+/// `tools/list` and `resources/list` leave a [`Self::Denied`] or
+/// [`Self::Unsupported`] item out of a successful response, and answer an
+/// [`Self::Unreadable`] one with an error, so a failed read never reaches the
+/// client as a shorter list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccessRefusal {
     /// The agent lacks the grant. The message names what it lacks.
     Denied(String),
+    /// This server cannot run the operation, whatever grant the agent holds.
+    /// The message names what is missing.
+    Unsupported(String),
     /// The provider could not read the state that decides the grant, such as
     /// the context's role state, so it cannot say whether the agent holds it.
     Unreadable(String),
@@ -281,7 +289,7 @@ pub enum AccessRefusal {
 impl std::fmt::Display for AccessRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Denied(msg) | Self::Unreadable(msg) => f.write_str(msg),
+            Self::Denied(msg) | Self::Unsupported(msg) | Self::Unreadable(msg) => f.write_str(msg),
         }
     }
 }
@@ -375,8 +383,9 @@ pub trait ContextProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`AccessRefusal::Denied`] if the agent lacks the required
-    /// capability, and [`AccessRefusal::Unreadable`] if the provider cannot
-    /// read the state that decides it.
+    /// capability, [`AccessRefusal::Unsupported`] if this provider cannot run
+    /// the tool whatever the agent holds, and [`AccessRefusal::Unreadable`] if
+    /// the provider cannot read the state that decides it.
     fn validate_capability(
         &self,
         context_id: &str,
@@ -414,8 +423,9 @@ pub trait ContextProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`AccessRefusal::Denied`] if the agent may not read the
-    /// resource, and [`AccessRefusal::Unreadable`] if the provider cannot read
-    /// the context's role state.
+    /// resource, [`AccessRefusal::Unsupported`] if this provider cannot serve
+    /// it whatever the agent holds, and [`AccessRefusal::Unreadable`] if the
+    /// provider cannot read the context's role state.
     fn validate_resource_access(
         &self,
         context_id: &str,
@@ -852,7 +862,9 @@ impl<P: ContextProvider> McpServer<P> {
         // `tools/call` fills produce them, and both return nothing on an unwired
         // server, so without an event source they can never be sent, and
         // claiming otherwise is the same false guarantee `resources.subscribe:
-        // true` used to make.
+        // true` used to make. A wired server sends them only for a change a
+        // `ContextEvent` or a `tools/call` reveals; `METHOD_RESOURCES_LIST_CHANGED`
+        // names the changes that send none.
         let wired = self.event_source_wired;
         let result = InitializeResult {
             protocol_version: MCP_PROTOCOL_VERSION.to_owned(),
@@ -968,7 +980,7 @@ impl<P: ContextProvider> McpServer<P> {
             .validate_capability(context_id, tool_name, CapabilityCheck::Probe)
         {
             Ok(()) => Ok(true),
-            Err(AccessRefusal::Denied(_)) => Ok(false),
+            Err(AccessRefusal::Denied(_) | AccessRefusal::Unsupported(_)) => Ok(false),
             Err(AccessRefusal::Unreadable(msg)) => Err(msg),
         }
     }
@@ -1217,7 +1229,11 @@ impl<P: ContextProvider> McpServer<P> {
                     Err(ResourceDenial::Unreadable(msg)) => {
                         return internal_error(request.id.clone(), &msg);
                     }
-                    Err(ResourceDenial::NotParticipant | ResourceDenial::Denied(_)) => continue,
+                    Err(
+                        ResourceDenial::NotParticipant
+                        | ResourceDenial::Denied(_)
+                        | ResourceDenial::Unsupported(_),
+                    ) => continue,
                 }
                 readable.push(kind);
                 resources.push(ResourceDefinition {
@@ -1274,6 +1290,7 @@ impl<P: ContextProvider> McpServer<P> {
             .validate_resource_access(context_id, kind)
             .map_err(|refusal| match refusal {
                 AccessRefusal::Denied(msg) => ResourceDenial::Denied(msg),
+                AccessRefusal::Unsupported(msg) => ResourceDenial::Unsupported(msg),
                 AccessRefusal::Unreadable(msg) => ResourceDenial::Unreadable(msg),
             })
     }
@@ -1303,6 +1320,14 @@ impl<P: ContextProvider> McpServer<P> {
                     request_id.clone(),
                     JsonRpcError {
                         code: protocol::CAPABILITY_DENIED,
+                        message: msg,
+                        data: Some(serde_json::json!({ "uri": uri })),
+                    },
+                )),
+                ResourceDenial::Unsupported(msg) => Box::new(JsonRpcResponse::error(
+                    request_id.clone(),
+                    JsonRpcError {
+                        code: protocol::CAPABILITY_UNSUPPORTED,
                         message: msg,
                         data: Some(serde_json::json!({ "uri": uri })),
                     },
@@ -1842,7 +1867,11 @@ impl<P: ContextProvider> McpServer<P> {
             match self.resource_access(served, context_id, kind) {
                 Ok(()) => readable.push(kind),
                 Err(ResourceDenial::Unreadable(_)) => return None,
-                Err(ResourceDenial::NotParticipant | ResourceDenial::Denied(_)) => {}
+                Err(
+                    ResourceDenial::NotParticipant
+                    | ResourceDenial::Denied(_)
+                    | ResourceDenial::Unsupported(_),
+                ) => {}
             }
         }
         Some(ContextView {
@@ -1921,8 +1950,9 @@ impl<P: ContextProvider> McpServer<P> {
     // -----------------------------------------------------------------------
 
     /// The `tools/call` error response for a `check` the provider refuses:
-    /// `CAPABILITY_DENIED` for a denial, an internal error for a failed read,
-    /// and `None` when the check passes.
+    /// `CAPABILITY_DENIED` for a denial, `CAPABILITY_UNSUPPORTED` for an
+    /// operation this provider cannot run, an internal error for a failed
+    /// read, and `None` when the check passes.
     fn capability_refusal(
         &self,
         request: &JsonRpcRequest,
@@ -2044,6 +2074,9 @@ enum ResourceDenial {
     /// The provider's [`ContextProvider::validate_resource_access`] refused,
     /// with its message.
     Denied(String),
+    /// The provider cannot serve the resource whatever the agent holds, with
+    /// its message.
+    Unsupported(String),
     /// The provider could not read the state that decides access, with its
     /// message.
     Unreadable(String),
@@ -2079,10 +2112,19 @@ fn internal_error(id: RequestId, message: &str) -> JsonRpcResponse {
 }
 
 /// The `tools/call` error response for a capability `refusal`:
-/// `CAPABILITY_DENIED` for a denial, and an internal error for a failed read.
+/// `CAPABILITY_DENIED` for a denial, `CAPABILITY_UNSUPPORTED` for an operation
+/// this server cannot run, and an internal error for a failed read.
 fn refusal_response(request: &JsonRpcRequest, refusal: AccessRefusal) -> JsonRpcResponse {
     match refusal {
         AccessRefusal::Unreadable(msg) => internal_error(request.id.clone(), &msg),
+        AccessRefusal::Unsupported(msg) => JsonRpcResponse::error(
+            request.id.clone(),
+            JsonRpcError {
+                code: protocol::CAPABILITY_UNSUPPORTED,
+                message: msg,
+                data: None,
+            },
+        ),
         AccessRefusal::Denied(msg) => JsonRpcResponse::error(
             request.id.clone(),
             JsonRpcError {
@@ -2267,8 +2309,14 @@ mod tests {
         roles: Vec<(String, String)>,               // (context_id, role)
         tools: Vec<(String, ContextOutletInfo)>,    // (context_id, tool)
         denied_capabilities: Vec<(String, String)>, // (context_id, tool_name)
+        /// Tools this provider cannot run whatever the agent holds, as
+        /// `(context_id, tool_name)`.
+        unsupported_capabilities: Vec<(String, String)>,
         /// Resources the agent may NOT read, as `(context_id, kind)`.
         denied_resources: Vec<(String, ResourceKind)>,
+        /// Resources this provider cannot serve whatever the agent holds, as
+        /// `(context_id, kind)`.
+        unsupported_resources: Vec<(String, ResourceKind)>,
         invoke_result: Result<Value, String>,
         members: Vec<(String, MemberInfo)>,
         events: Value,
@@ -2327,7 +2375,9 @@ mod tests {
                 ],
                 tools: Vec::new(),
                 denied_capabilities: Vec::new(),
+                unsupported_capabilities: Vec::new(),
                 denied_resources: Vec::new(),
+                unsupported_resources: Vec::new(),
                 invoke_result: Ok(serde_json::json!({"status": "ok"})),
                 members: vec![
                     (
@@ -2410,6 +2460,15 @@ mod tests {
                     "capability denied: {tool_name} in {context_id}"
                 )));
             }
+            if self
+                .unsupported_capabilities
+                .iter()
+                .any(|(cid, tn)| cid == context_id && tn == tool_name)
+            {
+                return Err(AccessRefusal::Unsupported(format!(
+                    "outlet invocation unavailable: {tool_name} in {context_id}"
+                )));
+            }
             if self.token_spent.load(std::sync::atomic::Ordering::SeqCst)
                 || (check == CapabilityCheck::Invoke
                     && self.invoke_refusal == InvokeRefusal::BeforeRecord)
@@ -2446,6 +2505,16 @@ mod tests {
             resource: ResourceKind,
         ) -> Result<(), AccessRefusal> {
             self.read(context_id).map_err(AccessRefusal::Unreadable)?;
+            if self
+                .unsupported_resources
+                .iter()
+                .any(|(cid, kind)| cid == context_id && *kind == resource)
+            {
+                return Err(AccessRefusal::Unsupported(format!(
+                    "resource unavailable: {} in {context_id}",
+                    resource.uri_suffix()
+                )));
+            }
             if self
                 .denied_resources
                 .iter()
@@ -2894,6 +2963,76 @@ mod tests {
             vec![CapabilityCheck::Probe],
             "a call refused for its input must not reach the recording check"
         );
+    }
+
+    /// A tool the provider cannot run whatever the agent holds stays out of
+    /// `tools/list`, and a `tools/call` for it answers
+    /// `CAPABILITY_UNSUPPORTED`, not `CAPABILITY_DENIED`: a denial tells the
+    /// client a grant would help, and no grant helps here. The refusal comes
+    /// from the Probe, so no Invoke check runs.
+    #[test]
+    fn unsupported_tool_is_unlisted_and_its_call_answers_capability_unsupported() {
+        let provider = MockProvider {
+            unsupported_capabilities: vec![("ctx_a".to_owned(), "send_message".to_owned())],
+            ..MockProvider::default()
+        };
+        let mut server = initialized_server(provider);
+        let list = make_request(protocol::METHOD_TOOLS_LIST, None);
+        let result = server.handle_request(&list).unwrap().result.unwrap();
+        let names: Vec<&str> = result["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"ctx_a/send_message"));
+        assert!(names.contains(&"ctx_b/send_message"));
+        server.provider.checks.lock().unwrap().clear();
+
+        let err = server
+            .handle_request(&send_message_call())
+            .unwrap()
+            .error
+            .unwrap();
+        assert_eq!(err.code, protocol::CAPABILITY_UNSUPPORTED);
+        assert!(err.message.contains("outlet invocation unavailable"));
+        assert_eq!(
+            *server.provider.checks.lock().unwrap(),
+            vec![CapabilityCheck::Probe]
+        );
+    }
+
+    /// A resource the provider cannot serve stays out of `resources/list`,
+    /// and `resources/read` and `resources/subscribe` answer it with
+    /// `CAPABILITY_UNSUPPORTED`.
+    #[test]
+    fn unsupported_resource_is_unlisted_and_answers_capability_unsupported() {
+        let provider = MockProvider {
+            unsupported_resources: vec![("ctx_a".to_owned(), ResourceKind::Events)],
+            ..MockProvider::default()
+        };
+        let mut server = subscribing_server(provider);
+        let list = make_request(protocol::METHOD_RESOURCES_LIST, None);
+        let result = server.handle_request(&list).unwrap().result.unwrap();
+        let uris: Vec<&str> = result["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["uri"].as_str().unwrap())
+            .collect();
+        assert!(!uris.contains(&"scp://ctx_a/events"));
+        assert!(uris.contains(&"scp://ctx_a/members"));
+        for method in [
+            protocol::METHOD_RESOURCES_READ,
+            protocol::METHOD_RESOURCES_SUBSCRIBE,
+        ] {
+            let req = make_request(
+                method,
+                Some(serde_json::json!({"uri": "scp://ctx_a/events"})),
+            );
+            let err = server.handle_request(&req).unwrap().error.unwrap();
+            assert_eq!(err.code, protocol::CAPABILITY_UNSUPPORTED, "{method}");
+        }
     }
 
     fn send_message_call() -> JsonRpcRequest {

@@ -63,6 +63,9 @@ pub const CAPABILITY_DENIED: i64 = -32005;
 /// Tool execution failed.
 pub const TOOL_EXECUTION_ERROR: i64 = -32006;
 
+/// The server cannot perform the operation, whatever capability the caller holds.
+pub const CAPABILITY_UNSUPPORTED: i64 = -32007;
+
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 request ID
 // ---------------------------------------------------------------------------
@@ -242,11 +245,18 @@ pub const METHOD_TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
 /// MCP notification: `notifications/resources/list_changed` -- the resources
 /// this agent may read may have changed, so the client re-lists them.
 ///
-/// The server sends it when the agent's served contexts, readable resource kinds or
-/// tool view changed, a `tools/call` that spent the agent's token included;
-/// when it cannot read which contexts it serves; and when the event pump
-/// lagged and resynchronizes. A join or leave is one such change, not the only
-/// one.
+/// The server compares the agent's served contexts, readable resource kinds and
+/// tool view after each runtime `ContextEvent` and after each `tools/call`, and
+/// sends it when that comparison finds a change, a `tools/call` that spent the
+/// agent's token included; when it cannot read which contexts it serves; and
+/// when the event pump lagged and resynchronizes. A join or leave is one such
+/// change, not the only one.
+///
+/// A change that no `ContextEvent` reports and no `tools/call` causes sends no
+/// notice: the agent token reaching its expiry or a caveat time box closing, a
+/// revocation of that token, and an outlet registration or removal. The client
+/// sees such a change at its next list, as a refused call, or through the notice
+/// that the next comparison for that context sends.
 pub const METHOD_RESOURCES_LIST_CHANGED: &str = "notifications/resources/list_changed";
 
 // ---------------------------------------------------------------------------
@@ -1012,6 +1022,7 @@ mod tests {
             TOOL_NOT_FOUND,
             CAPABILITY_DENIED,
             TOOL_EXECUTION_ERROR,
+            CAPABILITY_UNSUPPORTED,
         ];
         for code in mcp_codes {
             assert!(
