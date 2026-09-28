@@ -20,10 +20,14 @@
 //!   `notifications/resources/updated` for every subscribed resource the
 //!   event invalidates.
 //! - **MCP lifecycle** (`initialize`, `notifications/initialized`, `ping`).
-//! - **Dynamic updates** -- emits `notifications/tools/list_changed` when an
-//!   event or a `tools/call` changes the capability-filtered tool set. A
-//!   `tools/call` queues its notifications, and the transport drains them
-//!   with [`McpServer::take_pending_notifications`]. A change that no
+//! - **Dynamic updates** -- emits `notifications/tools/list_changed` when a
+//!   `tools/call`, or a [`ContextEvent`] that `affected_resources` classes
+//!   as a membership, capability or lifecycle change, changes the
+//!   capability-filtered tool set. Any other event runs no comparison, so it
+//!   sends the notice only when the server cannot read which contexts it
+//!   serves. A `tools/call` queues its notifications,
+//!   and the transport drains them with
+//!   [`McpServer::take_pending_notifications`]. A change that no compared
 //!   [`ContextEvent`] reports and no `tools/call` causes sends no
 //!   notification: the agent token reaching its expiry or a caveat time box
 //!   closing, a revocation of that token, and an outlet registration or
@@ -4106,6 +4110,47 @@ mod tests {
             !sent
                 .iter()
                 .any(|n| n.method == protocol::METHOD_TOOLS_LIST_CHANGED)
+        );
+    }
+
+    /// `METHOD_RESOURCES_LIST_CHANGED` documents that only a membership,
+    /// capability or lifecycle event runs the view comparison. A view change
+    /// that coincides with an events-only event goes unannounced until the
+    /// next compared event, which announces it.
+    #[test]
+    fn only_a_compared_event_announces_a_view_change() {
+        let mut server = subscribing_server(MockProvider::default());
+        let list = make_request(protocol::METHOD_TOOLS_LIST, None);
+        assert!(server.handle_request(&list).unwrap().error.is_none());
+
+        server
+            .provider
+            .denied_capabilities
+            .push(("ctx_a".to_owned(), BUILTIN_TOOLS[0].tool_name().to_owned()));
+        let list_changed = |notifs: &[JsonRpcNotification]| -> Vec<String> {
+            notifs
+                .iter()
+                .filter(|n| {
+                    n.method == protocol::METHOD_TOOLS_LIST_CHANGED
+                        || n.method == protocol::METHOD_RESOURCES_LIST_CHANGED
+                })
+                .map(|n| n.method.clone())
+                .collect()
+        };
+
+        let sent = server.notifications_for_event("ctx_a", &events_only_event());
+        assert!(
+            list_changed(&sent).is_empty(),
+            "an events-only event runs no comparison: {sent:?}"
+        );
+
+        let expired = server.notifications_for_event("ctx_a", &members_and_tools_event());
+        assert_eq!(
+            list_changed(&expired),
+            vec![
+                protocol::METHOD_TOOLS_LIST_CHANGED.to_owned(),
+                protocol::METHOD_RESOURCES_LIST_CHANGED.to_owned(),
+            ]
         );
     }
 
