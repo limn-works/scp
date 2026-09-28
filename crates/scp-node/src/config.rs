@@ -1419,10 +1419,10 @@ mod tests {
     async fn domain_generate_produces_did_dht_identity() {
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            // Domain is publishing-capable; this test opts into Production to
-            // exercise the public-hosting path (advisory in P1 — the test's
-            // TestDidDht uses an in-memory client, so nothing is published
-            // offline). `DhtMode::Disabled` would be equally valid (see Test 11).
+            // Domain is publishing-capable; Production makes the start publish
+            // through the TestDidDht in-memory client and fail if that publish
+            // fails. `DhtMode::Disabled` would skip the publish, so this test
+            // would stop covering the publishing path (see Test 11).
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -1464,8 +1464,8 @@ mod tests {
 
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            // Domain is publishing-capable; this test opts into Production for the
-            // public-hosting path (advisory; `DhtMode::Disabled` is equally valid).
+            // Domain is publishing-capable; Production makes the start publish and
+            // fail if that publish fails, where `DhtMode::Disabled` would skip it.
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -1506,9 +1506,9 @@ mod tests {
         let external_addr = SocketAddr::from(([198, 51, 100, 7], 32891));
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            // NatTraversal is publishing-capable; this test opts into Production
-            // to exercise the public path (advisory in P1; `DhtMode::Disabled` is
-            // equally valid — see Test 12).
+            // NatTraversal is publishing-capable; Production makes the start
+            // publish and fail if that publish fails. `DhtMode::Disabled` would
+            // skip the publish (see Test 12).
             dht: DhtMode::Production,
             nat: NatSlot::Custom(Arc::new(MockNatStrategy {
                 tier: ReachabilityTier::Stun { external_addr },
@@ -1609,8 +1609,8 @@ mod tests {
 
         let node1 = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            // Domain is publishing-capable; this test opts into Production for the
-            // public-hosting path (advisory; `DhtMode::Disabled` is equally valid).
+            // Domain is publishing-capable; Production makes the start publish and
+            // fail if that publish fails, where `DhtMode::Disabled` would skip it.
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -1631,8 +1631,8 @@ mod tests {
 
         let node2 = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            // Domain is publishing-capable; this test opts into Production for the
-            // public-hosting path (advisory; `DhtMode::Disabled` is equally valid).
+            // Domain is publishing-capable; Production makes the start publish and
+            // fail if that publish fails, where `DhtMode::Disabled` would skip it.
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -2001,9 +2001,9 @@ mod tests {
         let storage =
             Arc::new(SqliteStorage::new(dir.path(), &key).expect("open encrypted SqliteStorage"));
 
-        // Domain is publishing-capable; this test opts into Production to exercise
-        // the public-hosting path (advisory in P1 — the TestDidDht uses an
-        // in-memory client, so nothing is published offline). Domain + default
+        // Domain is publishing-capable; Production makes the start publish
+        // through the TestDidDht in-memory client (no network) and fail if that
+        // publish fails, where `DhtMode::Disabled` would skip it. Domain + default
         // SelfSigned builds offline (no network/CA).
         let node = Node::start(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),

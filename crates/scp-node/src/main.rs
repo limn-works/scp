@@ -1072,10 +1072,12 @@ async fn run_node_with<
         (TlsMode::Acme { email: None }, None)
     };
 
-    // `Domain` is a publishing reach, so M2 requires `DhtMode::Production`
-    // (advisory in P1 — dropped before lowering, so no runtime behavior
-    // change). `run_node_with` is generic over `S: EncryptedStorage`, so the
-    // production `Node::start` (not `start_for_testing`) is the correct entry.
+    // `Domain` is a publishing reach: `DhtMode::Production` makes `Node::start`
+    // publish through `did_method` and fail the start if that publish fails.
+    // The caller's DHT mode already chose `did_method` (the Pkarr client, or
+    // the in-memory client in a `testing` build). `run_node_with` is generic
+    // over `S: EncryptedStorage`, so the production `Node::start` (not
+    // `start_for_testing`) is the correct entry.
     let node = match Node::start(NodeConfig {
         tls,
         dns_provider,

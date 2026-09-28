@@ -176,9 +176,9 @@ async fn build_self_host_node() -> BuiltNode {
     let blob_storage_handle = blob_storage.clone();
 
     // `Node::start` requires `S: EncryptedStorage`, satisfied by `SqliteStorage`.
-    // `NatTraversal` (no_domain) is a publishing reach → `DhtMode::Production`
-    // (M2; advisory in P1). The `FixedTierNatStrategy` is supplied via
-    // `NatSlot::Custom`.
+    // `NatTraversal` (no_domain) is a publishing reach: `DhtMode::Production`
+    // makes the start publish and fail if that publish fails. The
+    // `FixedTierNatStrategy` is supplied via `NatSlot::Custom`.
     let node = Node::start(NodeConfig {
         nat: NatSlot::Custom(Arc::new(FixedTierNatStrategy)),
         dht: DhtMode::Production,

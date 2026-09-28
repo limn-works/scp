@@ -292,7 +292,8 @@ client unconditionally. Pass `SCP_NODE_DHT_MODE=memory` to a `--features testing
 build only when you want the persistent full node to keep its SQLite storage while
 its DHT stays process-local.
 
-Every build exits 1 when given two or more of `--relay-only`, `--self-host` (or
+`--help` or `-h` prints usage and exits 0 before `main` checks any mode flag. Without
+it, every build exits 1 when given two or more of `--relay-only`, `--self-host` (or
 `SCP_NODE_SELF_HOST`) and `--ephemeral`, because `main` refuses a second mode flag. A
 shipped binary also exits 1 on `--ephemeral` alone: in a build without `--features
 testing`, the `--ephemeral` branch of `main` (`crates/scp-node/src/main.rs`) prints an
