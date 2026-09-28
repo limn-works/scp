@@ -126,6 +126,31 @@ fn parse_cli_from(
     }
 }
 
+/// Returns the error to print when the configuration selects more than one run
+/// mode, or `None` when it selects at most one.
+///
+/// `--relay-only`, `--self-host` (or `SCP_NODE_SELF_HOST`), and `--ephemeral`
+/// each select a run mode, and [`main`] dispatches on the first one it finds.
+/// Without this check a second mode flag is silently ignored: a shipped binary
+/// given `--self-host --ephemeral` would run a DHT-publishing self-host node
+/// instead of refusing `--ephemeral`. Two mode flags therefore fail closed.
+fn conflicting_modes(config: &CliConfig) -> Option<String> {
+    let selected: Vec<&str> = [
+        (config.relay_only, "--relay-only"),
+        (config.self_host, "--self-host (or SCP_NODE_SELF_HOST)"),
+        (config.ephemeral, "--ephemeral"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
+    (selected.len() > 1).then(|| {
+        format!(
+            "ERROR: {} each select a run mode; select exactly one.",
+            selected.join(" and ")
+        )
+    })
+}
+
 /// Prints usage information and exits with code 0.
 fn print_help() -> ! {
     eprintln!(
@@ -366,7 +391,7 @@ async fn run_full_node_ephemeral() {
     eprintln!(
         "WARNING: Ephemeral mode — ALL subsystems use in-memory implementations.\n\
          Private keys, storage, and DID documents will be LOST on restart.\n\
-         Use persistent mode (default, without --ephemeral) for production."
+         This mode exists only in testing builds; a shipped build refuses --ephemeral."
     );
     tracing::warn!(
         "using InMemoryKeyCustody — private keys exist only in memory and are \
@@ -1143,6 +1168,11 @@ async fn main() {
         print_help();
     }
 
+    if let Some(error) = conflicting_modes(&config) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+
     // --health: probe the appropriate bind address and exit.
     if config.health {
         let addr: SocketAddr = if config.relay_only {
@@ -1183,8 +1213,10 @@ async fn main() {
         {
             eprintln!(
                 "ERROR: --ephemeral is a test-harness mode (in-memory DHT/custody) and is not \
-                 available in this build. Run without --ephemeral for a persistent node, or run \
-                 --self-host with SCP_NODE_DHT_MODE=disabled for a non-publishing hosted site."
+                 available in this build. A shipped build creates no identity in any mode \
+                 (NoPreRotationBackend): the persistent full node exits 1 on every run, and \
+                 --self-host starts only from a storage directory that already holds an \
+                 identity. Build with --features testing to run --ephemeral."
             );
             std::process::exit(1);
         }
@@ -1424,6 +1456,51 @@ mod tests {
             Some(PathBuf::from("/tmp/env-site")),
             "SCP_NODE_SITE_DIR must be used when --site-dir is absent"
         );
+    }
+
+    /// Two run-mode selections fail closed instead of one silently winning:
+    /// `--ephemeral` beside `--self-host`, the `SCP_NODE_SELF_HOST` fallback,
+    /// or `--relay-only` is refused, as is `--relay-only` beside self-host.
+    #[test]
+    fn two_run_modes_are_refused() {
+        for (args, env_self_host, named) in [
+            (&["--self-host", "--ephemeral"][..], false, "--ephemeral"),
+            (&["--ephemeral"][..], true, "SCP_NODE_SELF_HOST"),
+            (&["--relay-only", "--ephemeral"][..], false, "--relay-only"),
+            (&["--relay-only", "--self-host"][..], false, "--self-host"),
+            (&["--relay-only"][..], true, "--relay-only"),
+        ] {
+            let mut full = vec!["scp-node"];
+            full.extend_from_slice(args);
+            let cfg = parse_cli_from(&argv(&full), env_self_host, None, None);
+            let error = conflicting_modes(&cfg);
+            assert!(
+                error.as_deref().is_some_and(|e| e.contains(named)),
+                "{args:?} (env {env_self_host}) must be refused naming {named}: {error:?}"
+            );
+        }
+    }
+
+    /// Zero or one run-mode selection passes.
+    #[test]
+    fn one_run_mode_is_accepted() {
+        for (args, env_self_host) in [
+            (&[][..], false),
+            (&["--ephemeral"][..], false),
+            (&["--relay-only"][..], false),
+            (&["--self-host"][..], false),
+            (&[][..], true),
+            (&["--self-host"][..], true),
+        ] {
+            let mut full = vec!["scp-node"];
+            full.extend_from_slice(args);
+            let cfg = parse_cli_from(&argv(&full), env_self_host, None, None);
+            assert_eq!(
+                conflicting_modes(&cfg),
+                None,
+                "{args:?} (env {env_self_host})"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
