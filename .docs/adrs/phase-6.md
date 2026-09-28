@@ -738,9 +738,12 @@ class Scp private constructor(private val identityHandle: IdentityHandle) {
         Context(handle)
     }
 
-    /** One suspending teardown; no AutoCloseable (see the amended Rationale bullet). */
-    suspend fun shutdown(): Unit = withContext(Dispatchers.IO) {
-        identityHandle.destroy()
+    /**
+     * One suspending teardown, which suspends on [bridge]'s injected ioDispatcher; no
+     * AutoCloseable (see the amended Rationale bullet).
+     */
+    suspend fun shutdown(bridge: CoroutineBridge) {
+        bridge.ffiCallSuspend { identityHandle.destroy() }
     }
 }
 ```
@@ -861,13 +864,20 @@ class Context internal constructor(internal val handle: ContextHandle) {
     suspend fun close() {
         try {
             leave()
-        } catch (e: ContextException) {
+        } catch (e: CancellationException) {
+            throw e // the caller's own cancellation, not a cleanup error
+        } catch (e: Exception) {
             // sdk-common.md §Cleanup error handling: a cleanup error is logged, never propagated.
             logCleanupFailure(e)
         } finally {
             scope.cancel()
             handle.destroy()
         }
+    }
+
+    private fun logCleanupFailure(cause: Throwable) {
+        System.getLogger("works.limn.scp.Context")
+            .log(System.Logger.Level.WARNING, "leave failed during close()", cause)
     }
 }
 ```
@@ -1027,8 +1037,22 @@ abstract class ScpViewModel : ViewModel() {
         // Dispatch and return: blocking the main thread on a teardown deadlocks or
         // produces an ANR (see the amended Rationale bullet).
         cleanupScope.launch {
-            contexts.forEach { runCatching { it.leave() }.onFailure(::logCleanupFailure) }
+            for (ctx in contexts) {
+                val failure = runCatching { ctx.leave() }.exceptionOrNull() ?: continue
+                // A throwing override must not stop the remaining leaves.
+                runCatching { onCleanupFailure(ctx, failure) }
+                    .onFailure { Log.w("ScpViewModel", "onCleanupFailure threw", it) }
+            }
         }
+    }
+
+    /**
+     * Called once per context whose leave() threw, with whatever it threw. The default body
+     * logs at warning level (sdk-common.md §Cleanup error handling); an app overrides it to
+     * record, retry, or report a departure that did not land.
+     */
+    protected open fun onCleanupFailure(context: works.limn.scp.Context, cause: Throwable) {
+        Log.w("ScpViewModel", "leave failed during ViewModel cleanup", cause)
     }
 }
 ```
@@ -1037,6 +1061,14 @@ abstract class ScpViewModel : ViewModel() {
 
 ```kotlin
 // In a composable — no SDK modifications needed; uses standard Flow + Compose APIs
+
+// The app's ViewModel owns the scope that context teardown runs on; nothing cancels it.
+class MyContextViewModel : ScpViewModel() {
+    val teardownScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val contexts = mutableMapOf<String, Context>()
+
+    fun getContext(contextId: String): Context = checkNotNull(contexts[contextId])
+}
 
 @Composable
 fun ContextScreen(contextId: String) {
@@ -1242,7 +1274,7 @@ dependencies {
 11. **Android lifecycle integration (scp-kt-android):**
     - `context.asLifecycleFlow(lifecycleOwner)` returns a `Flow<Message>` that cancels when the `LifecycleOwner` reaches `DESTROYED`.
     - Verified by creating a `TestLifecycleOwner`, collecting the flow in a test coroutine, moving the owner to `DESTROYED`, and asserting the flow completes.
-    - `ScpViewModel.onCleared()` launches `leave()` for every tracked context on a scope it never cancels and returns without waiting for those calls (amended; see Rationale). No synchronous `close()` exists on `Scp` for `onCleared()` to call; an app shuts its `Scp` instance down with the suspend teardown from a coroutine it owns.
+    - `ScpViewModel.onCleared()` launches `leave()` for every tracked context on a scope it never cancels and returns without waiting for those calls (amended; see Rationale). A `leave()` that throws, whatever it throws, does not stop the remaining calls: each throwable goes to `ScpViewModel.onCleanupFailure(context, cause)`, a `protected open` hook whose default body logs at warning level, and a throw from an override is logged and does not stop them either. No synchronous `close()` exists on `Scp` for `onCleared()` to call; an app shuts its `Scp` instance down with the suspend teardown from a coroutine it owns.
 
 12. **Jetpack Compose integration (no SDK artifact required):**
     - `context.receiveFlow().collectAsStateWithLifecycle(initialValue = emptyList())` compiles and recomposes correctly when messages arrive.

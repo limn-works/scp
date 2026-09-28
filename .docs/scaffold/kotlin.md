@@ -225,27 +225,33 @@ class Identity private constructor(private val handle: IdentityHandle) {
 
 ## Resource Management
 
-Use `AutoCloseable` interface and `use { }` blocks:
+A type whose teardown reaches the Rust engine exposes exactly one `suspend` teardown function and implements no `AutoCloseable` or `Closeable`, so no `use { }` block applies to it. `AutoCloseable.close()` is synchronous, so it could reach the engine only by blocking its calling thread, which never returns under an injected `StandardTestDispatcher` and produces an ANR on an Android main thread. `.docs/standards/sdk-common.md` §"Kotlin: why no `Closeable`" and ADR-028 (as amended, `.docs/adrs/phase-6.md`) state the rule; `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` records both failures.
 
 ```kotlin
-class Context : AutoCloseable {
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+class Relay internal constructor(
+    private val bridge: ServerBridge,
+    // ...
+) {
+    @Volatile
+    var isShutdown: Boolean = false
+        private set
 
-    override fun close() {
-        scope.launch { leave() }
-        scope.cancel()
-        handle.let { ffi.ContextFree(it) }
-    }
-
-    suspend fun closeGracefully() {
-        leave()
-        handle.let { ffi.ContextFree(it) }
+    // The only stop path. It suspends on the bridge's injected ioDispatcher.
+    suspend fun shutdown() {
+        try {
+            bridge.shutdownRelay(this)
+        } finally {
+            isShutdown = true
+        }
     }
 }
 
-// Usage
-Context.create(params).use { ctx ->
-    ctx.send(payload)
+// Usage: call shutdown() from a coroutine the caller owns, never through runBlocking.
+val relay = Relay.startInMemory(bridge)
+try {
+    println(relay.relayUrl)
+} finally {
+    relay.shutdown()
 }
 ```
 
