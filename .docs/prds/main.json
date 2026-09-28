@@ -300,7 +300,10 @@
         "SCP-312",
         "SCP-313",
         "SCP-314",
-        "SCP-315"
+        "SCP-315",
+        "SCP-316",
+        "SCP-317",
+        "SCP-318"
       ]
     }
   ],
@@ -5396,22 +5399,22 @@
       "gate": "gate-5",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift"
       ],
-      "description": "Implement Apple App Attest device attestation adapter in `scp-platform/apple/app_attest.rs`. Implements the `DeviceAttestation` trait for Apple platforms.\n\nApp Attest integration: attestation flow, server-side verification, fraud metric handling. App Attest provides hardware-backed device attestation that can be verified server-side.\n\nPer §9.15 key destruction verification: hardware-attested is the strongest trust level. App Attest provides the attestation primitive for this.\n\nThis is a stub ADR (ADR-025) — implementation details will be refined when the full ADR is written.",
+      "description": "Implement Apple App Attest device attestation adapter in `scp-platform/apple/app_attest.rs`. Implements the `DeviceAttestation` trait for Apple platforms.\n\nApp Attest integration: attestation flow, server-side verification, fraud metric handling. App Attest provides hardware-backed device attestation that can be verified server-side.\n\nPer §9.15 key destruction verification: hardware-attested is the strongest trust level. App Attest provides the attestation primitive for this.\n\nThis is a stub ADR (ADR-025) — implementation details will be refined when the full ADR is written.\n\nStatus reopened 2026-09-27: ADR-025's amendment of that date replaces the `clientDataJSON` binding with the binding digest `D` of `09-security-model.md` §9.3.1 and withdraws the synthetic software-only token. The shipped adapter mints the JSON binding, returns the synthetic token when App Attest is unsupported, and no code verifies an attestation against Apple's root, so the criterion \"Server-side verification validates attestation against Apple's attestation root\" is unmet. SCP-316 implements the reader; this story keeps the minting side.",
       "acceptanceCriteria": [
         "Implements DeviceAttestation trait for Apple platforms",
         "Attestation request generates App Attest attestation object",
-        "Server-side verification validates attestation against Apple's attestation root",
+        "A reader verifies the attestation offline against Apple's App Attestation Root CA under `09-security-model.md` §9.3.1 (SCP-316)",
         "Fraud metric handling integrated (risk metric from Apple)",
         "Attestation bound to specific key material",
         "Tests pass with App Attest sandbox environment"
       ],
       "actionItems": [
         "Implement DeviceAttestation::attest() using App Attest API (DCAppAttestService)",
-        "Implement DeviceAttestation::verify() for server-side attestation verification",
+        "Leave verification to the reader of `09-security-model.md` §9.3.1, a pure function in `scp-protocol` (SCP-316); the adapter implements no verify method",
         "Handle attestation key generation and binding to SCP identity",
         "Implement fraud metric extraction and reporting",
         "Handle App Attest error cases (unsupported device, service unavailable)",
@@ -5425,6 +5428,10 @@
         {
           "file": ".docs/adrs/phase-5.md",
           "section": "### What This ADR Will Decide"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.3.1 Reading a device attestation"
         }
       ],
       "details": {
@@ -6309,11 +6316,11 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidDeviceAttestation.kt"
       ],
-      "description": "Implement the DeviceAttestation platform trait for Android using Play Integrity API. Must decide integration level: standard requests vs classic attestation. Mirrors the Apple adapter structure from ADR-025. Play Integrity API integration pattern must be determined (standard vs classic).",
+      "description": "Implement the DeviceAttestation platform trait for Android using Play Integrity API. Must decide integration level: standard requests vs classic attestation. Mirrors the Apple adapter structure from ADR-025. Play Integrity API integration pattern must be determined (standard vs classic).\n\nStatus reopened 2026-09-27: ADR-027's amendment of that date sets the Standard request's `requestHash` to the hexadecimal binding digest `D` of `09-security-model.md` §9.3.1 and names a verifier whose signed verdict a reader checks. The shipped adapter calls the Classic API's `setNonce` with a `clientDataJSON` digest, and no component validates a token, so the criterion \"Attestation tokens validated server-side\" is unmet. SCP-316 implements the reader; this story keeps the minting side.",
       "acceptanceCriteria": [
         "DeviceAttestation trait implemented for Android using Play Integrity API matching ADR-025 trait signatures",
         "Standard Play Integrity request flow implemented",
@@ -6338,6 +6345,10 @@
         {
           "file": ".docs/adrs/phase-6.md",
           "section": "## ADR-027: Android Platform Adapter"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.3.1 Reading a device attestation"
         }
       ],
       "details": {
@@ -10422,7 +10433,7 @@
         "crates/scp-ffi/uniffi/src/bridge.rs",
         "bindings/swift/Sources/SCP/Trust.swift",
         "bindings/swift/Tests/SCPTests/TrustTests.swift",
-        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/SCP.kt",
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Trust.kt",
         "bindings/kotlin/scp-kt/src/test/kotlin/works/limn/scp/TrustTest.kt"
       ],
@@ -10436,7 +10447,7 @@
         "Tests model nonce state instead of emitting prose: TypeScript bun-addon-backed tests and Python pytest mocks for ucan_evaluate distinguish that the read-only diagnostic records NO nonce while the throwing gate (ucan_validate) DOES record it, a multi-token AND test asserts evaluate_trust is false when any single token fails a stage, and real-addon evaluate assertions run unskipped (the real-napi evaluate test cases are not gated out)",
         "All gates pass on the changed surfaces: in bindings/typescript with the .node addon built, bun run check && bun run lint && bun test succeed; in bindings/python, python3.12 -m ruff check . && python3.12 -m ruff format --check . && python3.12 -m pytest tests/ succeed (with DYLD_LIBRARY_PATH set); python3.12 scripts/validate-prd.py exits 0; and the Rust workspace build and clippy are unchanged and green",
         "The narrow optional-challenge core+bridge change lands and is fail-closed: the read-only diagnostic crates/scp-protocol/src/crypto/ucan/validate.rs fn evaluate_ucan takes required_capability: Option<&CapabilityUri> (grep finds the Option signature), while the enforcement gate fn validate_ucan keeps required_capability: &CapabilityUri (mandatory, not Option); and all three bridges accept an optional capability on ucan_evaluate (crates/scp-ffi/src/ucan.rs capability: Option<&str>; crates/scp-ffi/napi/src/ucan.rs and crates/scp-ffi/uniffi/src/bridge.rs capability: Option<String>), coercing an empty/whitespace capability to no-challenge (capability.filter(|c| !c.trim().is_empty()) appears in each of the three bridge files); the Rust workspace build and clippy stay green",
-        "The Swift and Kotlin SDKs expose the structured op idiomatically at parity with Python/TypeScript: bindings/swift/Sources/SCP/Trust.swift defines a CapabilityValidation struct with the six booleans (tokensValid, signaturesValid, withinCeiling, nonceValid, notRevoked, timeBoundsValid) and an allValid computed property, and a public SCP.ucanEvaluate method returning it plus a public SCP.evaluateTrust method consuming it; bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Trust.kt defines a CapabilityValidation data class with the same six booleans and an allValid val, and bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt exposes a suspend SCP.ucanEvaluate returning it and a suspend SCP.evaluateTrust consuming it (grep finds ucanEvaluate, evaluateTrust, and CapabilityValidation in those files); neither SDK reverse-engineers which check failed by parsing error prose"
+        "The Swift and Kotlin SDKs expose the structured op idiomatically at parity with Python/TypeScript: bindings/swift/Sources/SCP/Trust.swift defines a CapabilityValidation struct with the six booleans (tokensValid, signaturesValid, withinCeiling, nonceValid, notRevoked, timeBoundsValid) and an allValid computed property, and a public SCP.ucanEvaluate method returning it plus a public SCP.evaluateTrust method consuming it; bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Trust.kt defines a CapabilityValidation data class with the same six booleans and an allValid val, and bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/SCP.kt exposes a suspend SCP.ucanEvaluate returning it and a suspend SCP.evaluateTrust consuming it (grep finds ucanEvaluate, evaluateTrust, and CapabilityValidation in those files); neither SDK reverse-engineers which check failed by parsing error prose"
       ],
       "sources": [
         {
@@ -10485,7 +10496,7 @@
         ".docs/standards/sdk-capability-matrix.json",
         "bindings/swift/Sources/SCP/Trust.swift",
         "bindings/swift/Tests/SCPTests/TrustTests.swift",
-        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/SCP.kt",
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Trust.kt",
         "bindings/kotlin/scp-kt/src/test/kotlin/works/limn/scp/TrustTest.kt"
       ],
@@ -10504,7 +10515,7 @@
         "A real-FFI Python test (bindings/python/tests/test_real_ffi.py) and a real-napi TypeScript test (bindings/typescript/tests/real-napi.test.ts) build a multi-member context, perform governance actions (add member, change role, remove member) and child-context creation, and assert the leaf-derived facts move accordingly (governance_actions_by and/or governance_actions_against > 0, role_progression_count > 0, context_creation_count matches the child contexts created); the real-addon tests run unskipped",
         "The capability matrix .docs/standards/sdk-capability-matrix.json flips the participation_record python, typescript, kotlin, and swift cells all to true and removes every exemption on that row (the kotlin and swift idiomatic SDK wrappers now exist over the UniFFI ParticipationRecordView export), and python3.12 scripts/check-sdk-coverage.py exits 0",
         "All local gates pass: cargo clippy --workspace --all-targets with the in-memory-custody/testing feature set is green; in bindings/typescript with the .node addon built bun run check && bun run lint && bun test succeed; in bindings/python python3.12 -m ruff check . && python3.12 -m ruff format --check . && python3.12 -m pytest tests/ succeed with DYLD_LIBRARY_PATH set; and python3.12 scripts/validate-prd.py exits 0",
-        "The Swift and Kotlin SDKs expose participation_record idiomatically at parity with Python/TypeScript: bindings/swift/Sources/SCP/Trust.swift defines a BehavioralRecord struct with exactly the twelve fields (subjectDid, participationDurationSecs, governanceActionsAgainst, governanceActionsBy, outletInvocationCount, outletInvocationCountAnchored, contextCreationCount, roleProgressionCount, attestationCount, attestationCountAnchored, computedAt, eventLogRoot) and a public SCP.participationRecord method returning it; bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Trust.kt defines a BehavioralRecord data class with the same twelve fields and bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt exposes an SCP.participationRecord method returning it (grep finds participationRecord and BehavioralRecord in those files); both SDKs' evaluateTrust derives its Layer-2 behavioral record from the typed op and folds the empty-log SCP-CTX-2076 case into a zeroed record"
+        "The Swift and Kotlin SDKs expose participation_record idiomatically at parity with Python/TypeScript: bindings/swift/Sources/SCP/Trust.swift defines a BehavioralRecord struct with exactly the twelve fields (subjectDid, participationDurationSecs, governanceActionsAgainst, governanceActionsBy, outletInvocationCount, outletInvocationCountAnchored, contextCreationCount, roleProgressionCount, attestationCount, attestationCountAnchored, computedAt, eventLogRoot) and a public SCP.participationRecord method returning it; bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Trust.kt defines a BehavioralRecord data class with the same twelve fields and bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/SCP.kt exposes an SCP.participationRecord method returning it (grep finds participationRecord and BehavioralRecord in those files); both SDKs' evaluateTrust derives its Layer-2 behavioral record from the typed op and folds the empty-log SCP-CTX-2076 case into a zeroed record"
       ],
       "sources": [
         {
@@ -10569,7 +10580,7 @@
         "bindings/swift/Sources/SCP/Trust.swift",
         "bindings/swift/Tests/SCPTests/TrustTests.swift",
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Trust.kt",
-        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/SCP.kt",
         "bindings/kotlin/scp-kt/src/test/kotlin/works/limn/scp/TrustTest.kt",
         ".docs/standards/sdk-capability-matrix.json",
         "scripts/check-sdk-coverage.py"
@@ -10586,8 +10597,8 @@
         "The typed op is exported by all three bridges, each carrying the eight fields: the PyO3 bridge exports `PyScp::attestation_summaries(context_id, subject_did, cached_attestations_json)` returning `Vec<PyAttestationSummary>` (a `#[pyclass(name = \"AttestationSummary\")]` registered on the module), the NAPI bridge exports `Scp.attestationSummaries` returning `Vec<NapiAttestationSummary>`, and the UniFFI bridge exports `Scp::attestation_summaries` returning `Vec<AttestationSummaryView>` (grep finds `PyAttestationSummary`, `NapiAttestationSummary`, and `AttestationSummaryView`); each bridge validates `context_id` and `subject_did` at the boundary the way `participation_record` does, and maps a trust-store fault to the context-fault code `SCP-CTX-2000` rather than folding it into an empty result. One test per bridge drives the op with a `context_id` the boundary rejects and asserts the typed boundary error, and one test per bridge drives the op against a `TrustProtocolRepository` whose `get_cached_attestations` returns a `TrustError` and asserts the op surfaces the `SCP-CTX-2000` context fault. The second test is the one that can go red on a fault folded into an empty result: an empty vector is also what a subject holding no attestations returns, so a caller reading an empty `attestations` array cannot tell a healthy subject from an unreachable store",
         "`attestation_type` crosses as the serde variant name of `scp_core::trust::AttestationType`: a Rust test asserts the eight variants render as \"IdentityLink\", \"CapabilityDelegation\", \"OutletIntegrity\", \"Endorsement\", \"RoleAssignment\", \"AgentCapability\", \"ContextEndorsement\", and \"ParticipationWitness\" in the summary's `type` string",
         "All four SDKs redeclare `AttestationSummary` with exactly the eight fields and no others — bindings/python/scp_sdk/trust.py (`id`, `type`, `issuer`, `claim`, `signature_valid`, `evidence_valid`, `not_expired`, `fresh`), bindings/typescript/src/types.ts, bindings/swift/Sources/SCP/Trust.swift, and bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Trust.kt (`id`, `type`, `issuer`, `claim`, `signatureValid`, `evidenceValid`, `notExpired`, `fresh`) — with `evidence_valid`/`evidenceValid` typed `bool | None`, `boolean | null`, `Bool?`, and `Boolean?` respectively; no declaration carries a field named exactly `valid` or exactly `revoked`, and one test per binding constructs an `AttestationSummary` passing all eight fields by name, which fails to compile (Swift, Kotlin, TypeScript) or raises `TypeError` (Python) if the field set differs",
-        "All four SDKs expose the wrapper over the typed op: bindings/python/scp_sdk/trust.py defines a public `attestation_summaries`, bindings/typescript/src/scp.ts defines a public `attestationSummaries` method on the SCP class routed through the `mapBridgeError` chokepoint, bindings/swift/Sources/SCP/Trust.swift defines a public `SCP.attestationSummaries`, and bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt defines a suspend `SCP.attestationSummaries`, each returning the eight-field `AttestationSummary` collection (grep finds the four symbols)",
-        "Each of the four `evaluate_trust`/`evaluateTrust` implementations passes the op's result into the `TrustEvaluation` it returns, so no binding constructs Layer 3 from a literal: grep finds `attestation_summaries(` inside `evaluate_trust` in bindings/python/scp_sdk/trust.py, `this.attestationSummaries(` inside `evaluateTrust` in bindings/typescript/src/scp.ts, `attestationSummaries(` inside `evaluateTrust` in bindings/swift/Sources/SCP/Trust.swift, and `attestationSummaries(` inside `evaluateTrust` in bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt; and one test per binding drives `evaluate_trust`/`evaluateTrust` against a bridge whose `attestation_summaries` raises the `SCP-CTX-2000` context fault and asserts the call raises the typed error rather than returning a `TrustEvaluation` whose `attestations` is empty, which is the SDK-layer half of the fail-open shape criterion 8 pins at the bridge",
+        "All four SDKs expose the wrapper over the typed op: bindings/python/scp_sdk/trust.py defines a public `attestation_summaries`, bindings/typescript/src/scp.ts defines a public `attestationSummaries` method on the SCP class routed through the `mapBridgeError` chokepoint, bindings/swift/Sources/SCP/Trust.swift defines a public `SCP.attestationSummaries`, and bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/SCP.kt defines a suspend `SCP.attestationSummaries`, each returning the eight-field `AttestationSummary` collection (grep finds the four symbols)",
+        "Each of the four `evaluate_trust`/`evaluateTrust` implementations passes the op's result into the `TrustEvaluation` it returns, so no binding constructs Layer 3 from a literal: grep finds `attestation_summaries(` inside `evaluate_trust` in bindings/python/scp_sdk/trust.py, `this.attestationSummaries(` inside `evaluateTrust` in bindings/typescript/src/scp.ts, `attestationSummaries(` inside `evaluateTrust` in bindings/swift/Sources/SCP/Trust.swift, and `attestationSummaries(` inside `evaluateTrust` in bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/SCP.kt; and one test per binding drives `evaluate_trust`/`evaluateTrust` against a bridge whose `attestation_summaries` raises the `SCP-CTX-2000` context fault and asserts the call raises the typed error rather than returning a `TrustEvaluation` whose `attestations` is empty, which is the SDK-layer half of the fail-open shape criterion 8 pins at the bridge",
         "No construction site can supply an empty array by default: the `attestations` field carries no default in any of the four `TrustEvaluation` declarations. Python reaches that state through `attestations: list[AttestationSummary] = field(kw_only=True)`, not through a bare deletion of `= field(default_factory=list)`: `capability_validation` and `behavioral_record` precede `attestations` and keep the defaults SCP-302 and SCP-303 gave them, and a `@dataclass` whose plain non-default field follows a default field raises `TypeError` when Python evaluates the class body, so a bare deletion would break `import scp_sdk.trust` and every Python test with it. `field(kw_only=True)` makes `attestations` a required keyword-only argument, which removes the default, leaves in place the declaration order that Decision 1 of ADR-059, structured capability and trust validation across the FFI, holds identical across the four bindings, and needs Python 3.10, which the `requires-python` key of bindings/python/pyproject.toml already sets as the floor. Verification: grep -cF \"attestations: list[AttestationSummary] = field(default_factory=list)\" in bindings/python/scp_sdk/trust.py returns 0 and grep -cF \"attestations: list[AttestationSummary] = field(kw_only=True)\" in the same file returns 1; grep -cF \"attestations: [AttestationSummary] = []\" in bindings/swift/Sources/SCP/Trust.swift and grep -cF \"attestations: List<AttestationSummary> = emptyList()\" in bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Trust.kt each return 0; grep -rF \"attestations: []\" in bindings/typescript/src reports no match; and a Python test asserts that `TrustEvaluation(subject_did=\"<scp-identifier:bob>\", context_id=\"ctx-123\")` raises `TypeError`",
         "The duplicate TypeScript facade is deleted, not wired: bindings/typescript/src/trust.ts no longer declares `evaluateTrust`, `TrustEvaluation`, `BehavioralRecord`, `Attestation`, `Endorsement`, or `ChallengeResult` (grep -c each returns 0 in that file), bindings/typescript/src/index.ts exports `TrustEvaluation`, `BehavioralRecord`, and `AttestationSummary` from ./types instead, and `grep -rF \"/^\\\\[SCP-CTX-\" bindings/typescript/src` and `grep -rF contextsParticipated bindings/typescript/src` each report no match (both constructions live only in that facade today); bindings/typescript/tests/trust-facade.test.ts is deleted and the comment in bindings/typescript/tests/scp-typed-errors.test.ts that names `evaluateTrust in trust.ts` as the consumer is rewritten to name `SCP.evaluateTrust` in scp.ts; `bun run check` passes with no unresolved import",
         "The three tests that assert the default empty array are retired and replaced by assertions over a populated array: bindings/python/tests/test_trust.py, bindings/swift/Tests/SCPTests/TrustTests.swift, and bindings/kotlin/scp-kt/src/test/kotlin/works/limn/scp/TrustTest.kt each construct a `TrustEvaluation` with an explicit non-empty `attestations` value and assert its per-field content (grep -c \"attestations == []\", \"attestations.isEmpty\", and \"attestations.isEmpty()\" in those three files returns 0)",
@@ -11190,6 +11201,192 @@
         {
           "file": ".docs/adrs/ADR-063-inception-derived-identity-key-event-log.md",
           "section": "### Implementation constraints"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-316",
+      "title": "Implement the device-attestation reader that verifies an ScpDeviceAttestation service-record entry",
+      "gate": "gate-kel",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/trust/device_attestation.rs",
+        "crates/scp-protocol/src/trust/mod.rs",
+        "crates/scp-protocol/src/trust/sybil.rs"
+      ],
+      "description": "Implement the reader `09-security-model.md` §9.3.1 defines as a pure function in `scp-protocol`: its inputs are the subject's `read_service_record` verdict, the subject's resolved key state, the context's `ContextSybilPolicy`, the reader's current time and, for a Play Integrity entry, the verifier's resolved key state; it selects the subject's `ScpDeviceAttestation` entries, returns `DeviceAttestationVerdict`, and performs no I/O. No code verifies a device attestation today: `evaluate_sybil_resistance` tests `require_device_attestation` against the presence of a caller-supplied map key (`27-attestations.md` §27.4.3). This story adds the policy fields (`device_attestation_challenge`, `device_attestation_max_age_secs`, `accepted_app_ids`, `accepted_validation_categories`, `require_validation_category`, `accepted_android_packages`, whose elements name each package's verifier), the per-subject, per-context tag `T`, the binding digest `D` over the identifier, the context id and the challenge, the assertion digest `A`, the App Attest offline checks against a pinned Apple App Attestation Root CA, the Play Integrity verdict checks, the caching rule, and the fail-closed signal `evaluate_sybil_resistance` reads. A `Verified` proves an accepted app on genuine platform hardware minted the entry for this identifier and context; it proves no distinct device, and a Play Integrity `Verified` is trust in the verifier the context names for the package. Minting over `D` and `A` stays with SCP-095 (App Attest) and SCP-111 (Play Integrity), and the owner-side producer that publishes, renews and deletes entries is SCP-317. The caller obtains the service-record verdict from `IdentityBackend::read_service_record` (SCP-006) and each key state from SCP-310's resolution, and passes them in.",
+      "acceptanceCriteria": [
+        "`device_attestation_binding_digest(identifier, context_id, challenge)` returns SHA-256 over the 26 bytes `SCP-DEVICE-ATTESTATION-V1:`, `BE32(56)`, the 56-byte `scp:` text form, `BE32(n)`, the n UTF-8 bytes of the context id, and the 32-byte challenge, and a unit test pins the `122 + n`-byte preimage for one context id",
+        "`device_attestation_tag(identifier, context_id, challenge)` returns SHA-256 over the 30 bytes `SCP-DEVICE-ATTESTATION-TAG-V1:`, `BE32(56)`, the 56-byte `scp:` text form, `BE32(n)`, the n UTF-8 bytes of the context id and the 32-byte challenge; a unit test pins the `126 + n`-byte preimage for one context id, and a test shows two contexts sharing one challenge yield different tags",
+        "`device_assertion_digest(m)` returns SHA-256 over the 24 bytes `SCP-DEVICE-ASSERTION-V1:`, `BE32(len(m))` and `m`, and a test shows it differs from `device_attestation_binding_digest` for inputs whose concatenated bytes are equal",
+        "`ContextSybilPolicy` carries `device_attestation_challenge: [u8; 32]`, `device_attestation_max_age_secs: u64`, `accepted_app_ids: Vec<AcceptedAppId>` (each with `app_id`, `platform: ApplePlatform` and `accepted_bundle_versions`), `accepted_validation_categories: Vec<u32>`, `require_validation_category: bool` and `accepted_android_packages: Vec<AcceptedAndroidPackage>` (each with `package_name`, `signing_cert_sha256: [u8; 32]` and `verifier_identifier: [u8; 32]`), and no other device-attestation field",
+        "`ContextSybilPolicy::casual()`, `standard()` and `high_trust()` each set `require_device_attestation` to false, add no `DeviceAttestation` `RequiredSignal`, and set the challenge to 32 zero bytes, `device_attestation_max_age_secs` to 2,592,000, the three accepted lists to empty and `require_validation_category` to false, and a test asserts each value for each preset",
+        "Policy validation rejects a `device_attestation_max_age_secs` above 31,536,000, a `DeviceAttestation` `RequiredSignal` whose `min_strength` is not 1, and an `accepted_app_ids` that lists one (`app_id`, `platform`) pair in two elements, and every sum with the maximum age saturates: a test with a `notBefore` near `u64::MAX` shows no overflow",
+        "A test shows a policy listing one `app_id` twice under one `platform`, with different `accepted_bundle_versions`, fails validation, and one listing that `app_id` once as `Ios` and once as `MacOs` passes",
+        "A policy whose challenge is 32 zero bytes returns `Rejected { cause: ContextChallengeUnset }` before the service record is read",
+        "A service-record verdict of `Absent` returns `DeviceAttestationVerdict::Absent`",
+        "A service-record verdict of `Rejected` or `Inconclusive` returns `Unverifiable { cause: ServiceRecordUnavailable }`",
+        "A record with no `ScpDeviceAttestation` entry whose second field is the unpadded base64url of the tag `T` the reader computes returns `Absent`, and a test shows an entry carrying the raw challenge in place of `T` is skipped",
+        "An entry whose first field is not `app-attest` or `play-integrity`, or whose tag is another context's, is skipped whatever its field count, and a test shows a malformed entry for another context leaves the verdict for this context unchanged",
+        "An entry whose tag matches with the wrong field count for its platform tag, or a field that is not canonical base64url under §9.3.1 \"Canonical encodings\", returns `Rejected { cause: MalformedEntry }`, and a test shows a field with nonzero unused trailing bits and a field with `=` padding each return `MalformedEntry`",
+        "More than `MAX_DEVICE_ATTESTATIONS_PER_CHALLENGE` (1) entries with a matching tag return `Rejected { cause: TooManyEntries }` before any certificate is parsed",
+        "An App Attest object that is not a CBOR map holding exactly `fmt` (`apple-appattest`), `attStmt` and a byte-string `authData`, whose `attStmt` holds other than exactly `x5c` or `x5c` and a byte-string `receipt`, whose `x5c` is not two byte strings, or that carries a CBOR tag anywhere, returns `Rejected { cause: MalformedToken }`; an `attStmt` without `receipt` passes this check, and tests show an extra top-level key and a tagged `receipt` each return `MalformedToken`",
+        "An attestation object whose top-level map, `attStmt` or `x5c` is not in RFC 8949 §4.2.1 core deterministic encoding, checked by re-encoding and comparing bytes, returns `Rejected { cause: MalformedToken }`; tests show an indefinite-length `authData`, and `authData` present twice with the valid value first and with it second, each return `MalformedToken`; the extensions map inside `authData` is not re-encoded",
+        "`authData` shorter than 55 bytes, or shorter than `55 + L`, returns `Rejected { cause: AuthDataTruncated }`, and a credential ID length `L` other than 32 returns `Rejected { cause: CredentialIdLengthInvalid }`",
+        "A COSE key or extensions map after the credential ID that does not decode returns `Rejected { cause: MalformedToken }`, and the reader locates the extensions without reading the flags byte's extension-data bit",
+        "A chain that does not verify to the pinned Apple App Attestation Root CA with validity checked at the credential certificate's `notBefore`, or a `notBefore` later than the reader's time plus 300 seconds, returns `Rejected { cause: CertificateChainInvalid }`; a `notBefore` 299 seconds ahead passes; and a test shows a recorded attestation still passes after its credential certificate's `notAfter`",
+        "A certificate in `x5c` that differs from its rebuild, the DER `SEQUENCE` of the received `tbsCertificate` bytes, a copy of `tbsCertificate.signature` as the outer `signatureAlgorithm`, and a zero-unused-bits `BIT STRING` holding the DER `ECDSA-Sig-Value` of the parsed `r` and `s`, returns `Rejected { cause: CertificateChainInvalid }`; tests show a certificate with a long-form outer length, a leaf whose outer AlgorithmIdentifier carries `NULL` parameters, a `signatureValue` with nonzero unused bits, and an outer `signatureAlgorithm` that differs from `tbsCertificate.signature` each return `CertificateChainInvalid`; chain verification accepts either value of `s`, and a test shows a chain signature with high `s` still verifies",
+        "An App Attest entry whose credential certificate `notBefore` plus `device_attestation_max_age_secs` precedes the reader's time returns `Rejected { cause: Expired }`",
+        "A credential certificate without extension `1.2.840.113635.100.8.2` returns `Rejected { cause: MalformedToken }`",
+        "An extension nonce unequal to `SHA-256(authData || D)` returns `Rejected { cause: NonceMismatch }`, and tests show an attestation minted for one identifier fails for another and one minted for one context id fails for another",
+        "A credential ID unequal to SHA-256 of the 65-byte uncompressed credential public key returns `Rejected { cause: KeyIdMismatch }`",
+        "Before it selects an App ID, the reader takes the macOS path when extension `1.2.840.113635.100.8.7`'s `[1026]` element equals `macosx` or extension `1.2.840.113635.100.8.6` is present, and the iOS path when `[1026]` is absent or equals `iphoneos` and 8.6 is absent; a certificate without 8.7 takes the iOS path, a `[1026]` naming another system without 8.6 returns `Rejected { cause: PlatformUnreported }`; tests use the iOS 14.4 sample of veehaitch/devicecheck-appattest and the iOS 17.6.1 sample of splitsecure/go-app-attest",
+        "A nonzero counter at `authData` bytes 33 to 36 returns `Rejected { cause: CounterNotZero }`",
+        "An AAGUID of `appattestdevelop` returns `Rejected { cause: DevelopmentEnvironment }`, and an AAGUID other than it and `appattest` followed by seven zero bytes returns `Rejected { cause: MalformedToken }`",
+        "The reader selects the `AcceptedAppId` whose `app_id` hashes to the `rpIdHash` and whose `platform` equals the path taken; an `rpIdHash` matching no `app_id`, including under an empty list, returns `Rejected { cause: AppIdNotAccepted }`, an `app_id` that matches only under the other `platform` returns `Rejected { cause: PlatformMismatch }`, and a test with one `app_id` listed once as `Ios` and once as `MacOs` selects the element for the path taken",
+        "On the macOS path, a credential certificate without extension `1.2.840.113635.100.8.6`, or whose `SEQUENCE { [3] EXPLICIT OCTET STRING }` does not hold the 66 bytes base64 `MEAMAjExMDowCQwCb2uhAwEB/zAJDAJvYaEDAQH/MAsMBG9kZWyhAwEB/zAVDARvc2duoAYMBHJzZWMwBaYDAgEB` encodes, returns `Rejected { cause: AclBlobMismatch }`; on the iOS path the extension is not read; and a test shows a Mac attestation matched against an App ID labelled `Ios` returns `PlatformMismatch` and never skips the `aclBlob` check",
+        "An `apple_validation_category_01` value that is not a 4-byte byte string returns `Rejected { cause: MalformedToken }`; a value of 0, 7, 8 or 9, or one the context does not accept, returns `Rejected { cause: ValidationCategoryNotAccepted }`, and an empty `accepted_validation_categories` accepts 4 alone; an absent key returns `ValidationCategoryNotAccepted` on the macOS path and on the iOS path when `require_validation_category` is true, and passes on the iOS path when it is false",
+        "An `apple_bundle_version_01` value that is not a text string returns `Rejected { cause: MalformedToken }`; when the App ID's `accepted_bundle_versions` is not empty, a value outside it or an absent key returns `Rejected { cause: BundleVersionNotAccepted }`",
+        "A Play Integrity entry under a policy whose `accepted_android_packages` is empty returns `Unverifiable { cause: NoVerifierNamed }`",
+        "A Play Integrity verdict field of 176 zero bytes returns `Unverifiable { cause: VerdictAbsent }`, and a verdict field of any length other than 176 bytes, or with `token_issued_at` later than `checked_at`, returns `Rejected { cause: MalformedEntry }`",
+        "The reader selects the `AcceptedAndroidPackage` whose `package_name` hashes to `package_hash`, whose `signing_cert_sha256` equals `cert_digest`, and whose `verifier_identifier` equals the verdict's `verifier`; a verdict matching no element on `package_hash` and `cert_digest` returns `Rejected { cause: PackageNotAccepted }`, one matching on those two where no such element names its `verifier` returns `Unverifiable { cause: VerdictFromUnnamedVerifier }`, and a test with one package listed under two verifiers accepts a verdict from either",
+        "A verdict whose `checked_at` exceeds the reader's time plus 300 seconds returns `Rejected { cause: NotYetValid }`, and one whose `token_issued_at` plus `device_attestation_max_age_secs` precedes the reader's time returns `Rejected { cause: Expired }`",
+        "A test shows a verdict for an accepted package, signed by the verifier another accepted package names, returns `Unverifiable { cause: VerdictFromUnnamedVerifier }`",
+        "A verifier whose key-state verdict is neither `Confirmed` nor `Adopted` returns `Unverifiable { cause: VerifierKeyStateUnresolved }`",
+        "The verdict preimage's `subject` is the identifier being read: a test in which the reader's own identifier differs from the subject shows a valid verdict passes",
+        "A verdict signature that fails against the verifier's Current `Active` key over the 238-byte `SCP-PLAY-INTEGRITY-VERDICT-V1:` preimage, which carries `package_hash` and `cert_digest`, returns `Rejected { cause: VerdictSignatureInvalid }`, and a test shows a verdict signed by the verifier's previous `#active` key fails after rotation",
+        "When the one matching entry passes, the reader returns `Verified { attestation }` with `VerifiedDeviceAttestation { platform, entry_id, credential, minted_at }`, where `credential` is the App Attest key ID or `SHA-256(token)` and `minted_at` is the credential certificate's `notBefore` or `token_issued_at`",
+        "The reader keys a cached outcome on the context's `context_id`, the SHA-256 of the service record's `03-identity.md` §3.10.13 signature preimage, the policy digest `P` under the `SCP-DEVICE-ATTESTATION-POLICY-V1:` separator with the list and element encodings §9.3.1 states, and for Play Integrity the verdict's verifier's key-state head, and drops a cached `Verified` or `Rejected` when any changes; a cached `Verified` lapses at `minted_at` plus the maximum age; `NotYetValid`, `CertificateChainInvalid` and every `Unverifiable` outcome are never cached; a unit test pins `P`'s preimage for one policy, and tests show a challenge change, a different record at the same sequence and a verifier rotation each force a fresh read",
+        "When two contexts share one challenge and one policy, an outcome cached for one context is never served for the other, and a test caches a `Verified` for one context and shows the other context's read evaluates from scratch",
+        "The reader uses a cached outcome only within a read in which the supplied service-record verdict is `Adopted` for the record whose hash forms the key and, for Play Integrity, the supplied verifier key state is `Confirmed` or `Adopted` at the head in the key; tests show a rotated subject `#active` key, and a verifier whose key state leaves `Confirmed` or `Adopted`, each leave no cached `Verified` in use",
+        "On `Verified` the reader adds one `DeviceAttestation` `TrustSignal` with strength 1 and `verified_at` set to the verified `minted_at`; on every other outcome the category is absent from the signal map, and a test shows `Absent`, `Rejected` and `Unverifiable` each leave `signal_breadth` unchanged; a `RequiredSignal` for that category passes when the category is present and the reader's time minus `verified_at` is at most its `max_age_secs`",
+        "`evaluate_sybil_resistance` admits a context with `require_device_attestation` only on `Verified`, and a test shows `Absent`, `Rejected` and `Unverifiable` each fail the gate",
+        "The reader is a pure function in `scp-protocol` that contacts no party: the module has no network dependency, which `cargo tree -p scp-protocol` shows"
+      ],
+      "actionItems": [
+        "Add `device_attestation.rs` with `DeviceAttestationVerdict`, `VerifiedDeviceAttestation`, `DeviceAttestationPlatform`, `DeviceAttestationRejection` (twenty-one values) and `DeviceAttestationUnverifiable` (five values), and declare it in `trust/mod.rs`.",
+        "Add the six `ContextSybilPolicy` fields, `AcceptedAppId`, `ApplePlatform`, `AcceptedAndroidPackage`, and the `MAX_DEVICE_ATTESTATIONS_PER_CHALLENGE` constant (1), with the defaults and bounds of §9.3.1 and the preset values it states.",
+        "Implement the tag, binding and assertion digests, the tag-matching entry parser, the App Attest checks with the pinned root certificate and the platform-path rules, the Play Integrity verdict checks, and the policy digest `P`.",
+        "Replace the map-key test in `evaluate_sybil_resistance` with a signal present only on `Verified`, of strength 1, whose `verified_at` is the verified `minted_at`.",
+        "Write one test per outcome, using a recorded production App Attest object and a signed test verdict."
+      ],
+      "blockedBy": [
+        "SCP-006",
+        "SCP-310"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.3.1 Reading a device attestation"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "## ADR-025: Apple Platform Adapter"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-027: Android Platform Adapter"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-317",
+      "title": "Implement the owner-side device-attestation producer that publishes, renews and deletes ScpDeviceAttestation entries",
+      "gate": "gate-kel",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/identity/device_attestation.rs",
+        "crates/scp-runtime/src/identity/mod.rs",
+        "crates/scp-ffi/uniffi/src/lib.rs",
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/napi/src/identity.rs"
+      ],
+      "description": "Implement the producer `09-security-model.md` §9.3.1 \"What the owner's SDK does\" defines, in `scp-runtime`'s identity module, and expose it through every bridge. For each context whose `ContextSybilPolicy` weights the device-attestation signal, the producer computes `D` and the tag `T` with the functions SCP-316 adds to `scp-protocol`, calls the platform adapter's `attest` with `D` as `challenge` (the adapter hashes no identifier), strips `receipt` from an App Attest object, and publishes the context's one entry in a service-record write that replaces any earlier entry for that context. For Play Integrity it reads the `PlayIntegrityVerifier` entry of the verifier `accepted_android_packages` names for its package, builds the Android adapter with that entry's Cloud project number for the call, and obtains the verdict by one HTTPS `POST` to the entry's URL in the §9.3.1 request format. It re-attests before `minted_at` plus `device_attestation_max_age_secs` and when its own Play Integrity entry reads `Rejected{VerdictSignatureInvalid}`, deletes the entry when the owner leaves the context, and publishes nothing when a new entry would exceed the attestation caps of 32 entries and 131,055 bytes, `MAX_SERVICE_RECORD_ENTRIES`, or the service-record frame's 262,111-byte value limit, never removing a transport entry to make room. The reference verifier service is SCP-318; tests here use a test HTTPS verifier. The platform-side mint stays with SCP-095 and SCP-111, and the reader with SCP-316.",
+      "acceptanceCriteria": [
+        "The producer computes `D` and `A` in Rust and passes them to `DeviceAttestationProvider.attest` as `challenge` and to `assert_request` as `request_hash`, and a test with a recording adapter shows the adapter receives `D` byte for byte",
+        "An App Attest entry is `app-attest.<T>.<attestation object>` with `attStmt.receipt` removed, every key App Attest check 1 does not admit dropped, and the object re-encoded in RFC 8949 §4.2.1 core deterministic encoding, `authData` and each certificate copied byte for byte, and a Play Integrity entry is `play-integrity.<T>.<token>.<verdict>` with the 176-byte verdict; every field is canonical base64url, and a test feeds a non-deterministically encoded Apple object and shows the published entry passes SCP-316's canonical-encoding checks",
+        "The producer reads the verifier's `PlayIntegrityVerifier` entry for its package, requests the token under that entry's Cloud project number, sends the RFC 8785 request body with `challenge`, `context_id`, `package_name`, `subject` and a `token` of at most 16,384 bytes to the entry's URL by HTTPS `POST`, and assembles the 176-byte verdict from a `200` response; a `422` `{\"error\":\"verdict_refused\"}`, a `200` body that is not the canonical RFC 8785 serialization of the six-member object, or any other response publishes no entry",
+        "Publishing a new entry for a context replaces its earlier entry in one service-record write, and a test shows no published record carries two entries with one `T`",
+        "The producer re-attests before `minted_at` plus `device_attestation_max_age_secs`, using saturating addition, and requests a new token and verdict when its own Play Integrity entry reads `Rejected{VerdictSignatureInvalid}`",
+        "Leaving a context deletes that context's entry in the next service-record write",
+        "When a new entry would take attestation entries past 32 entries or 131,055 bytes, or the record past `MAX_SERVICE_RECORD_ENTRIES`, or the service-record frame's `value` (the preimage bytes after the separator plus the 64-byte signature, per `09-security-model.md` §9.10.12) past 262,111 bytes, the producer publishes nothing, removes no other entry, and the context's reader returns `Absent`; a test with a record near the cap shows every `SCPRelay` and `SCPCapabilities` entry survives",
+        "An adapter failure publishes no entry, and a test shows the context's reader returns `Absent`",
+        "The UniFFI, PyO3 and NAPI bridges each expose the producer, and a bridge test drives it end to end with the test HTTPS verifier"
+      ],
+      "actionItems": [
+        "Add the producer to `scp-runtime` using the tag, binding and assertion digests SCP-316 adds to `scp-protocol`.",
+        "Wire the `PlayIntegrityVerifier` lookup, the HTTPS `POST` to the verifier, the service-record write, and the leave-context hook.",
+        "Expose the producer through the three bridges.",
+        "Write the tests above against a recording adapter and a test HTTPS verifier."
+      ],
+      "blockedBy": [
+        "SCP-316"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.3.1 Reading a device attestation"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "## ADR-025: Apple Platform Adapter"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-027: Android Platform Adapter"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-318",
+      "title": "Implement the reference Play Integrity verifier service in scp-node",
+      "gate": "gate-kel",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/play_integrity_verifier.rs",
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-node/src/http.rs",
+        "crates/scp-node/src/config.rs"
+      ],
+      "description": "Implement the verifier side `09-security-model.md` §9.3.1 defines, as a reference service in `scp-node` that an app developer runs under the identity whose Google Cloud project Google links to the app's package. It serves the HTTPS `POST` verdict endpoint, decodes each token through Google's `decodeIntegrityToken`, runs the five checks §9.3.1 lists, signs the 238-byte `SCP-PLAY-INTEGRITY-VERDICT-V1:` preimage with its `#active` key, and publishes one `PlayIntegrityVerifier` service-record entry per package it serves (`18-addressability-and-deployment.md` §18.2.2). No such service exists today, so no owner can obtain a verdict and no Play Integrity entry can read `Verified`. The owner-side client is SCP-317, and the reader that checks the verdict is SCP-316.",
+      "acceptanceCriteria": [
+        "The service publishes, for each configured package, a `PlayIntegrityVerifier` entry with id `<identifier>#play-integrity-verifier-<index>` and serviceEndpoint `<package_name> <cloud project number> <https URL>`, and a test parses the published entry back into those three fields",
+        "A request body longer than 32,768 bytes, one that is not byte for byte the RFC 8785 (JCS) serialization of an object with exactly the members `challenge`, `context_id`, `package_name`, `subject` and `token`, a `challenge` that is not canonical base64url of 32 bytes, or a `token` longer than 16,384 bytes returns `422` with the body `{\"error\":\"verdict_refused\"}` and calls Google zero times; tests show a body with reordered members, one with added whitespace, and one with a repeated member each return the refusal",
+        "The service computes `D` from the request's `subject`, `context_id` and `challenge` and returns `422` `{\"error\":\"verdict_refused\"}` unless `requestDetails.requestHash` equals `D` in lowercase hexadecimal, `requestDetails.requestPackageName` and `appIntegrity.packageName` equal the request's `package_name` and a configured package, `appRecognitionVerdict` is `PLAY_RECOGNIZED`, `certificateSha256Digest` holds exactly one 32-byte digest, and `deviceRecognitionVerdict` contains `MEETS_DEVICE_INTEGRITY`; one test per check, against a stubbed Google decoder, shows each failure returns the same body",
+        "A passing request returns `200` with the RFC 8785 serialization of `cert_digest`, `checked_at`, `package_hash`, `signature`, `token_issued_at` and `verifier`, and a test shows the 176-byte verdict assembled from it passes SCP-316's reader for the request's subject and context",
+        "The signature is the verifier's `#active` key over the 238-byte preimage, and a test pins the preimage bytes for one fixed request",
+        "The service authenticates no caller and rate-limits requests per source address, and a test shows a request over the limit returns without calling Google",
+        "A Google error, timeout or quota refusal returns `422` `{\"error\":\"verdict_refused\"}` and signs nothing"
+      ],
+      "actionItems": [
+        "Add `play_integrity_verifier.rs` with the request parser, the Google `decodeIntegrityToken` client, the five checks, the verdict signer and the response writer.",
+        "Route the endpoint in `http.rs`, add the package list and Cloud project number to `config.rs`, and publish the `PlayIntegrityVerifier` entries through the node's service-record write.",
+        "Write the tests above against a stubbed Google decoder."
+      ],
+      "blockedBy": [
+        "SCP-316"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.3.1 Reading a device attestation"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.2.2 Existing Endpoint Types (Cross-Reference)"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-027: Android Platform Adapter"
         }
       ],
       "details": {}

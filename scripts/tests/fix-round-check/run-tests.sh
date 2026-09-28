@@ -80,9 +80,19 @@
 #     line would take the Python half of a round to have been checked.
 #
 #     Case 13 changes a file under `crates/scp-transport/` and asserts that the run issues
-#     the second `cargo check` the `rust-clippy` job's second command mirrors. Without it,
-#     an edit inside a `#[cfg(feature = "quic")]` module compiles nothing and reports
-#     `compile ok`.
+#     one `cargo check` for each feature set of that package that a cargo command in
+#     `.github/workflows/ci.yml` names and the workspace command never activates. The
+#     `rust-clippy` job lints two of them, the optional transports and the PostgreSQL and
+#     S3 blob backends; the `rust-test-optional-features` job tests the third, the
+#     blob-backend features `combined,local-cache`. Without them, an edit inside a
+#     `#[cfg(feature = "quic")]` module compiles nothing and reports `compile ok`.
+#
+#     Case 13b changes a file under `crates/scp-node/` and one under `crates/scp-relay/`,
+#     and asserts that the run compiles each package's `cloud-blobs` feature in a check of
+#     its own over every target, scp-node's with `testing`, as the `rust-clippy` job does;
+#     that check also compiles the backend-selection test target the
+#     `rust-test-optional-features` job builds under the same features. It also asserts
+#     that no check names both packages with `cloud-blobs` on.
 #
 #     Case 14 leaves one edit uncommitted and asserts that the summary names
 #     `scripts/check-cross-layer.sh` as the gate whose diff range holds no uncommitted edit.
@@ -339,8 +349,8 @@ gate_paths() {
 # answer from `scp-ffi`. It also holds one file under no crate directory, which case 9
 # changes.
 #
-# It holds a fourth manifest, `crates/scp-transport`, because two of the three entries in
-# the runner's EXTRA_FEATURE_CHECKS array name that package, and case 13 reads both
+# It holds a fourth manifest, `crates/scp-transport`, because three entries in the runner's
+# EXTRA_FEATURE_CHECKS array name that package, and case 13 reads the three
 # `cargo check` commands they produce. It holds `bindings/python/scp_sdk/context.py` for
 # case 12, `Cargo.toml` for case 11 and `.github/workflows/ci.yml` for case 17, and the
 # fixture's base commit holds all three, so each case decides for itself whether its own
@@ -752,17 +762,18 @@ fi
 # reports `compile ok` having compiled nothing.
 #
 # The mutation it kills: emptying EXTRA_FEATURE_CHECKS in `scripts/fix-round-check.sh`
-# leaves the run issuing one featureless `cargo check` and reporting `compile ok`, and
-# every other assertion in this file still passes.
+# leaves the run issuing one featureless `cargo check` and reporting `compile ok`. Case 13
+# catches that mutation for the scp-transport entries, and case 13b catches it for the
+# scp-node and scp-relay entries.
 FIXTURE13="$WORK/optional-features"
 build_fixture "$FIXTURE13"
 fixture_commit "$FIXTURE13" crates/scp-transport/src/lib.rs
 run_fixture "$FIXTURE13"
 rc=$(cat "$FIXTURE13.harness/rc.txt")
 if [[ $rc -eq 0 ]]; then
-    report "case 13 exits 0 when both transport compiles pass" 0 ""
+    report "case 13 exits 0 when every scp-transport compile passes" 0 ""
 else
-    report "case 13 exits 0 when both transport compiles pass" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE13.harness/out.txt")"
+    report "case 13 exits 0 when every scp-transport compile passes" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE13.harness/out.txt")"
 fi
 if grep -qF 'check -p scp-transport --all-targets --features quic,http3,udp,coap' "$FIXTURE13.harness/cargo.log"; then
     report "case 13 compiles the optional transports the workspace command never activates" 0 ""
@@ -773,6 +784,81 @@ if grep -qF 'check -p scp-transport --all-targets --features combined,local-cach
     report "case 13 compiles the blob-backend features the optional-feature test lane names" 0 ""
 else
     report "case 13 compiles the blob-backend features the optional-feature test lane names" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13.harness/cargo.log")"
+fi
+# The PostgreSQL and S3 backends compile only under features no workspace member's
+# dependency declaration requests, and the `rust-clippy` job names them in its own command.
+if grep -qF 'check -p scp-transport --all-targets --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup' "$FIXTURE13.harness/cargo.log"; then
+    report "case 13 compiles the cloud blob backends the rust-clippy job lints" 0 ""
+else
+    report "case 13 compiles the cloud blob backends the rust-clippy job lints" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13.harness/cargo.log")"
+fi
+
+# ── Case 13b: each binary's cloud-blobs feature in checks of its own ─────────────────
+#
+# CI lints and tests the PostgreSQL and S3 blob backends of the two binaries in one
+# command per package. The `rust-clippy` job runs `cargo clippy -p scp-node --features cloud-blobs,testing
+# --all-targets` and `cargo clippy -p scp-relay --features cloud-blobs --all-targets`, and the
+# `rust-test-optional-features` job runs `cargo nextest run -p scp-node --features cloud-blobs,testing
+# --test storage_backend_selection` and `cargo nextest run -p scp-relay --features cloud-blobs
+# --test storage_backend`. A joint command would let cargo unify scp-transport's features
+# across both packages, so one package's `cloud-blobs` would compile the backends into the
+# other package and hide that package's own mis-wired `cloud-blobs`. Each package's
+# `--all-targets` check compiles the test target its test-lane command builds, under the
+# same features, so no separate check mirrors the test lane. The `rust-doc` job and
+# `.github/workflows/docs.yml` turn on both packages' `cloud-blobs` in one command, because
+# rustdoc needs only the backend modules compiled; this script mirrors no rustdoc command.
+#
+# The mutations it kills: deleting either the scp-node or the scp-relay entry from
+# EXTRA_FEATURE_CHECKS (the two positive assertions), and a runner that issues one cargo
+# command turning on cloud-blobs for both packages (the negative assertion). Today's runner
+# passes one `-p` per EXTRA_FEATURE_CHECKS entry, so only a rewrite of that loop can emit
+# such a command; the three probe logs below prove the negative assertion goes red on it.
+FIXTURE13B="$WORK/binary-cloud-blobs"
+build_fixture "$FIXTURE13B"
+for crate in scp-node scp-relay; do
+    mkdir -p "$FIXTURE13B/crates/$crate/src"
+    printf '[package]\nname = "%s"\nversion = "0.0.0"\n' "$crate" > "$FIXTURE13B/crates/$crate/Cargo.toml"
+    printf '// fixture source\n' > "$FIXTURE13B/crates/$crate/src/lib.rs"
+done
+fixture_commit "$FIXTURE13B" crates/scp-node/src/lib.rs
+fixture_commit "$FIXTURE13B" crates/scp-relay/src/lib.rs
+run_fixture "$FIXTURE13B"
+rc=$(cat "$FIXTURE13B.harness/rc.txt")
+if [[ $rc -eq 0 ]]; then
+    report "case 13b exits 0 when the cloud-blobs compiles pass" 0 ""
+else
+    report "case 13b exits 0 when the cloud-blobs compiles pass" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE13B.harness/out.txt")"
+fi
+for expected in \
+    'check -p scp-node --all-targets --features cloud-blobs,testing' \
+    'check -p scp-relay --all-targets --features cloud-blobs'; do
+    if grep -qF -- "$expected" "$FIXTURE13B.harness/cargo.log"; then
+        report "case 13b runs \`$expected\`" 0 ""
+    else
+        report "case 13b runs \`$expected\`" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13B.harness/cargo.log")"
+    fi
+done
+# A joint check is any one cargo invocation that names both packages and `cloud-blobs`,
+# whatever the order of its `-p` flags and wherever its `--features` sits.
+joint_cloud_blobs_check() {
+    awk 'index($0, "scp-node") && index($0, "scp-relay") && index($0, "cloud-blobs") { found = 1 } END { exit !found }' "$1"
+}
+JOINT_PROBE="$WORK/joint-cloud-blobs-probe.log"
+for mutant in \
+    'check -p scp-node -p scp-relay --all-targets --features cloud-blobs' \
+    'check -p scp-relay -p scp-node --all-targets --features scp-node/cloud-blobs,scp-relay/cloud-blobs' \
+    'check --features cloud-blobs -p scp-node -p scp-relay --all-targets'; do
+    printf 'check -p scp-node --all-targets\n%s\n' "$mutant" > "$JOINT_PROBE"
+    if joint_cloud_blobs_check "$JOINT_PROBE"; then
+        report "case 13b's joint-check detector rejects \`$mutant\`" 0 ""
+    else
+        report "case 13b's joint-check detector rejects \`$mutant\`" 1 "the detector passed a log whose second line is that joint check"
+    fi
+done
+if joint_cloud_blobs_check "$FIXTURE13B.harness/cargo.log"; then
+    report "case 13b starts no check that turns on cloud-blobs for both binaries at once" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13B.harness/cargo.log")"
+else
+    report "case 13b starts no check that turns on cloud-blobs for both binaries at once" 0 ""
 fi
 
 # ── Case 14: the gate whose diff range holds no uncommitted edit ─────────────────────

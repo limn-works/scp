@@ -7,7 +7,7 @@
 // AttestationType / ThresholdRequirement / AttestorInfo (§7.3.5 threshold
 // verification). The SDK exposes typed shapes (no stringly-typed JSON) and
 // serializes to the Rust serde wire format at the bridge boundary —
-// [SCP.aggregateTrustInput] in Scp.kt calls the encoders below before
+// [SCP.aggregateTrustInput] in SCP.kt calls the encoders below before
 // crossing FFI. Models are plain data classes with `buildJsonObject` encoders
 // (the Trust.kt cached-attestation family convention) because they interlock
 // with [CachedAttestationEnvelope]; freeform fields are [JsonElement].
@@ -264,9 +264,7 @@ fun encodeMerkleRootJson(merkleRoot: List<UByte>): String {
  * variant strings; the three penalty fields are always emitted explicitly
  * (the Rust serde defaults when not overridden).
  */
-fun encodeThresholdRequirementsJson(
-    requirements: Map<AttestationType, ThresholdRequirement>,
-): String =
+fun encodeThresholdRequirementsJson(requirements: Map<AttestationType, ThresholdRequirement>): String =
     Json.encodeToString(
         JsonObject.serializer(),
         buildJsonObject {

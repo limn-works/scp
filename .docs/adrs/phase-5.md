@@ -328,11 +328,13 @@ WebRTC library integration is platform-specific (webrtc-rs for native, browser W
 
 ## ADR-025: Apple Platform Adapter
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling and the passkey root custody ruling); 2026-09-27 (SCP-307, the structured pseudonym result) — see the amendments below.
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling and the passkey root custody ruling); 2026-09-27 (SCP-307, the structured pseudonym result); 2026-09-27 (the device-attestation binding and offline verification) — see the amendments below.
 
 **Amendment (2026-09-10 — every SCP key is ECDSA on P-256, and root custody defaults to a passkey).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. `09-security-model.md` §9.7.4.1 item 4 states the passkey default. This ADR's Context named the Secure Enclave's P-256-only support as "the key constraint shaping this ADR" and called it "not a limitation the protocol can design around". That sentence inverted cause and effect: Apple fixed the hardware and SCP chose the curve. Three consequences for this ADR, each written into the text below. The Secure Enclave now holds SCP operational signing keys on Apple platforms, so the Rationale's "Why Keychain … not Secure Enclave" argument is withdrawn. Acceptance criterion 8, which forbade `AppleKeyCustody` from generating or using a Secure Enclave key for SCP signing, is inverted and restated. The root member is held by a passkey through Apple's passkey provider, so no Keychain generic-password item holds it.
 
 **Amendment (2026-09-27 — SCP-307).** When `AppleKeyCustody` implements the UniFFI `KeyCustodyProvider` (ADR-021, as its 2026-09-27 amendment states), `derivePseudonym` returns a `PseudonymResult` (the 33-byte compressed point and the pseudonym's key id) rather than the `PseudonymKeypair` below.
+
+**Amendment (2026-09-27 — App Attest binds the identifier, the context and its challenge, and a peer verifies the attestation offline).** `09-security-model.md` §9.3.1, reading a device attestation, owns the construction and the reader's procedure, and this ADR carries them into the Apple adapter. Three consequences, each written into the text below. First, `clientDataHash` is the binding digest `D = SHA-256("SCP-DEVICE-ATTESTATION-V1:" ‖ BE32(56) ‖ identifier_text ‖ BE32(n) ‖ context_id ‖ challenge)`, where `identifier_text` is the identifier's `scp:` text form, `context_id` is the UTF-8 bytes of the context's id, and `challenge` is the context's 32-byte `device_attestation_challenge`. That replaces both earlier inputs this ADR carried: the Decision's `SHA-256(challenge || deviceID)` and acceptance criterion 3's `SHA-256(clientDataJSON)`, which disagreed with each other and named no identifier. App Attest therefore writes `SHA-256(authData ‖ D)` as the credential certificate's nonce. The Rust core computes `D` and passes it to the adapter as the shipped trait's `challenge`, and the adapter hashes no identifier. Second, no relay and no Apple endpoint verifies the attestation. The adapter publishes the attestation object in an `ScpDeviceAttestation` service-record entry, and every reader verifies offline the certificate chain to Apple's App Attestation Root CA at the credential certificate's `notBefore`, the context's maximum age, the nonce, the key ID, the App ID, the counter, the AAGUID, the platform path the certificate's extensions select, the `aclBlob` on the macOS path, and the `apple_validation_category_01` and `apple_bundle_version_01` extensions. The adapter strips `receipt` from the attestation object before publishing, because no peer can use it, and the SDK re-attests before the entry passes the context's `device_attestation_max_age_secs`. Assertions carry the assertion digest `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" ‖ BE32(len(m)) ‖ m)` as their client data, so no assertion input equals a `D`. Third, an unsupported device and a simulator publish no entry, so the synthetic software-only token this ADR once decided is withdrawn, as the no-dev-stand-in tenet of `AGENTS.md` requires. A reader returns `Rejected{MalformedToken}` for a placeholder token. The shipped `AppleDeviceAttestation` still builds the JSON document and still returns the synthetic token; story SCP-095 of `.docs/prds/main.json` stands in progress until it changes, and story SCP-316 implements the reader.
 
 ### Context
 
@@ -360,7 +362,7 @@ Implement the Apple platform adapter in Swift (`bindings/swift/Sources/SCP/Platf
 
 **Key custody:** `AppleKeyCustody` generates each P-256 operational signing key inside the Secure Enclave through `SecKeyCreateRandomKey` with `kSecAttrTokenIDSecureEnclave`, and the enclave performs every signature and every ECDH agreement on that key. The enclave never releases the private bytes, so no code path exports them and none crosses the Swift/Rust FFI boundary. The Keychain holds the enclave key references and the material the enclave cannot hold, as generic password items with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` protection, tagged with a `scp.key.<key_id>` label and access group `$(AppIdentifierPrefix).dev.limn.scp`. The root member is held by the system passkey provider and this class neither generates nor stores it.
 
-**Device attestation:** `AppleDeviceAttestation` uses `DCAppAttestService` (App Attest). A Secure Enclave-backed P-256 key is generated via `generateKey(completionHandler:)`. Attestations are requested via `attestKey(_:clientDataHash:completionHandler:)` where `clientDataHash` is `SHA-256(challenge || deviceID)`. Assertions are generated via `generateAssertion(_:clientData:completionHandler:)` for subsequent operations. The attestation token is forwarded to the SCP relay for server-side verification via Apple's attestation service endpoints. On simulator and in environments where App Attest is unavailable, the adapter falls back to a software-only attestation with `method: .softwareOnly`.
+**Device attestation:** `AppleDeviceAttestation` uses `DCAppAttestService` (App Attest). A Secure Enclave-backed P-256 key is generated via `generateKey(completionHandler:)`. Attestations are requested via `attestKey(_:clientDataHash:completionHandler:)` where `clientDataHash` is the binding digest `D` of `09-security-model.md` §9.3.1, which the Rust core computes over the identifier's `scp:` text form, the context id and the context's `device_attestation_challenge` and passes to the adapter as `challenge`. Assertions are generated via `generateAssertion(_:clientData:completionHandler:)` for subsequent operations. The adapter publishes the attestation object in an `ScpDeviceAttestation` service-record entry, and each reader verifies it offline against Apple's App Attestation Root CA under §9.3.1. On simulator and in environments where App Attest is unavailable, the adapter publishes no entry and returns an error to its caller.
 
 **Push notifications:** `ApplePushProvider` wraps UNUserNotificationCenter and registers with APNs via `UIApplication.registerForRemoteNotifications()` / `NSApplication.registerForRemoteNotifications()`. The APNs payload is strictly opaque per §10.7: `{"aps": {"content-available": 1}}` with no additional fields. A content-available notification (silent push) wakes the app. The app then connects to its relay set and pulls all pending encrypted envelopes. No context ID, sender identifier, message preview, or other metadata is included in the payload. Apple/Google learn only that the device received a notification at a specific time.
 
@@ -457,10 +459,11 @@ let status = SecItemAdd(query as CFDictionary, nil)
 let service = DCAppAttestService.shared
 service.generateKey { keyId, error in
     guard let keyId else { /* handle error */ return }
-    let clientDataJSON = "{\"challenge\":\"\(Data(challenge).base64EncodedString())\",\"deviceId\":\"\(deviceId.base64EncodedString())\",\"type\":\"scp-device-attestation-v1\"}"
-    let clientDataHash = Data(SHA256.hash(data: Data(clientDataJSON.utf8)))
+    // challenge is D (09-security-model.md §9.3.1), computed by the Rust core and passed through
+    // DeviceAttestationProvider.attest(challenge:deviceId:); the adapter hashes no identifier.
+    let clientDataHash = challenge
     service.attestKey(keyId, clientDataHash: clientDataHash) { attestation, error in
-        // attestation: Data — forward to relay for server-side verification
+        // attestation: Data — strip attStmt.receipt, then publish in an ScpDeviceAttestation entry
     }
 }
 
@@ -528,10 +531,10 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
    - No Keychain item ever uses `kSecAttrAccessibleAlways` or an iCloud-synced protection class.
 
 3. **`AppleDeviceAttestation` — App Attest:**
-   - `attest() -> DeviceAttestationToken`: Generates an App Attest key via `DCAppAttestService.generateKey`, requests attestation with `clientDataHash = SHA256(clientDataJSON)` where `clientDataJSON = '{"challenge":"<base64(challenge)>","deviceId":"<base64(deviceId)>","type":"scp-device-attestation-v1"}'` (fields in this exact order, RFC 4648 base64, no line breaks). Returns a `DeviceAttestationToken` containing the raw attestation bytes and the key ID.
-   - `verify(token: DeviceAttestationToken) -> Bool`: Verifies the attestation token structure. Full verification is server-side (relay calls Apple's attestation endpoint). Client-side verification checks that the attestation bytes are non-empty and the key ID is present.
-   - On simulator or when App Attest is unavailable: `DCAppAttestService.shared.isSupported == false` → returns a synthetic token with `method: .softwareOnly`. Does not crash or throw; the caller receives a valid (but software-only) token.
-   - `generateAssertion(keyId: String, clientData: Data) -> Data`: Generates a per-request assertion via `DCAppAttestService.generateAssertion(_:clientData:)`. Used for subsequent authenticated operations after initial attestation.
+   - `attest(challenge, deviceId) -> Data`: Generates an App Attest key via `DCAppAttestService.generateKey`, requests attestation with `clientDataHash = D`, the binding digest of `09-security-model.md` §9.3.1 over the identifier's `scp:` text form, the context id and the context's `device_attestation_challenge`. The Rust core computes `D` and passes it as the shipped trait method `attest(challenge, device_id)`'s `challenge`; the adapter rejects a `challenge` that is not 32 bytes, hashes no identifier, and does not read `device_id`. Returns the raw attestation object, which the Rust core publishes, with `attStmt.receipt` removed, as the context's one `app-attest` entry in the §9.3.1 format. The SDK re-attests before the credential certificate's `notBefore` plus the context's `device_attestation_max_age_secs`. (Amended 2026-09-27; this criterion previously hashed a `clientDataJSON` document that named no identifier.)
+   - The adapter does not verify. Every reader runs the offline checks of `09-security-model.md` §9.3.1 on the published entry and returns `DeviceAttestationVerdict`; story SCP-316 implements that reader in Rust.
+   - On simulator or when App Attest is unavailable: `DCAppAttestService.shared.isSupported == false` → `attest()` throws `PlatformError.attestationUnavailable`, a case the shipped enum does not yet carry, and the SDK publishes no entry, so a reader returns `Absent`. (Amended 2026-09-27; this criterion previously returned a synthetic software-only token.)
+   - `generateAssertion(keyId: String, clientData: Data) -> Data`: Generates a per-request assertion via `DCAppAttestService.generateAssertion(_:clientData:)`. Used for subsequent authenticated operations after initial attestation. `clientData` is the assertion digest `A` of `09-security-model.md` §9.3.1 over the caller's request bytes, never the caller's bytes themselves. (Amended 2026-09-27.)
 
 4. **`ApplePushProvider` — APNs:**
    - `register() -> PushToken`: Registers with APNs via `registerForRemoteNotifications()`. Returns the device token as hex string. Fails with `PlatformError.pushRegistrationFailed(String)` if APNs registration fails.
@@ -577,7 +580,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
    - Tests run on real devices (CI must include a physical iOS device lane for Keychain and App Attest tests). Simulator-only tests use `#if targetEnvironment(simulator)` fallback paths.
    - `AppleKeyCustody` round-trip test: `generateKeypair(.p256Signing)` → `sign(data)` → `publicKey()` → verify signature → `destroyKey()` → confirm re-fetch fails.
    - `AppleStorage` round-trip test: `store(key, data)` → `retrieve(key)` → `listKeys(prefix)` → `delete(key)` → `exists(key) == false`.
-   - `AppleDeviceAttestation` test on real device: `attest()` returns non-empty token. On simulator: returns software-only token without crashing.
+   - `AppleDeviceAttestation` test on real device: `attest()` returns an attestation object whose credential-certificate nonce equals `SHA-256(authData ‖ D)`. On simulator: `attest()` throws `PlatformError.attestationUnavailable` without crashing.
    - `ApplePushProvider` test: `register()` returns a non-empty token string. `handleNotification` rejects non-opaque payloads.
 
 8. **Secure Enclave signing keys (inverted by the 2026-09-10 amendment):**
@@ -594,7 +597,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 10. **Conditional compilation:**
     - All Apple platform APIs are gated behind `#if os(iOS) || os(macOS)`.
     - Background processing code is gated behind `#if canImport(UIKit)` (iOS) vs `#if canImport(AppKit)` (macOS).
-    - Simulator fallback paths are gated behind `#if targetEnvironment(simulator)`.
+    - Simulator paths are gated behind `#if targetEnvironment(simulator)`, and none of them produces an attestation token.
 
 ### Scope
 

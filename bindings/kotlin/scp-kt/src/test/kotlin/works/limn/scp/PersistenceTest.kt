@@ -27,16 +27,6 @@
 
 package works.limn.scp
 
-import java.io.File
-import java.nio.file.Files
-import kotlin.io.path.exists
-import kotlin.io.path.pathString
-import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
-import kotlin.test.assertNotEquals
-import kotlin.test.assertTrue
-import uniffi.scp.ScpException
-import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.runBlocking
@@ -46,8 +36,18 @@ import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import uniffi.scp.ScpException
 import works.limn.scp.bridge.CoroutineBridge
 import works.limn.scp.conformance.ConformanceStubBindings
+import java.io.File
+import java.nio.file.Files
+import kotlin.io.path.exists
+import kotlin.io.path.pathString
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertNotEquals
+import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.seconds
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class PersistenceTest {
@@ -86,9 +86,9 @@ class PersistenceTest {
         }
     }
 
-    /// Stable 32-byte SQLCipher key. The specific value does not matter;
-    /// only that the same key is reused across the two constructions
-    /// that simulate process restart.
+    // / Stable 32-byte SQLCipher key. The specific value does not matter;
+    // / only that the same key is reused across the two constructions
+    // / that simulate process restart.
     private val sqliteKey: ByteArray = ByteArray(32) { 0x42 }
 
     private val createdInstances = mutableListOf<SCP>()

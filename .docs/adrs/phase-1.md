@@ -989,6 +989,8 @@ pub trait KeyCustody: Send + Sync {
 
 pub trait DeviceAttestation: Send + Sync {
     async fn attest(&self) -> Result<DeviceAttestationToken, PlatformError>;
+    /// Amended 2026-09-27: no reader calls this. A device attestation is read by the pure
+    /// function of 09-security-model.md §9.3.1 in scp-protocol (SCP-316), never by a trait method.
     async fn verify(&self, token: &DeviceAttestationToken) -> Result<bool, PlatformError>;
 }
 

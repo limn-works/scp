@@ -35,7 +35,8 @@
 #              a second.
 #   compile    `cargo check -p <crate> --all-targets` over the crates this run selects,
 #              with the subset of the CI feature list those crates own, and one further
-#              `cargo check` for each optional feature set a cargo command in
+#              `cargo check --all-targets` for each entry of the EXTRA_FEATURE_CHECKS
+#              array below: one per optional feature set that a cargo command in
 #              `.github/workflows/ci.yml` names for a selected package. This is the step
 #              that takes minutes, and the one whose cost the summary line reports.
 #   format     `cargo fmt --all -- --check`, the command the `rust-fmt` job of
@@ -632,10 +633,27 @@ PYEOF
 # `server` is absent from this list although three CI commands name it: `default =
 # ["server"]` in the manifest of each of scp-ffi, scp-ffi-napi and scp-ffi-uniffi, so the
 # `cargo check` above already compiles every module that feature gates.
+#
+# Four CI lint and test commands compile the `cloud-blobs` features of scp-node and
+# scp-relay, one package per command. The `rust-clippy` job lints each package over every
+# target, and the `rust-test-optional-features` job builds only each package's
+# backend-selection test target under the same features; both jobs add `testing` for
+# scp-node. One `--all-targets` entry per package therefore compiles every target either
+# job builds. Those commands and this list keep the two packages apart because cargo
+# unifies scp-transport's features across every package one invocation builds: a joint
+# command compiles the PostgreSQL and S3 backends into one package through the other
+# package's `cloud-blobs`, and so hides that package's own mis-wired `cloud-blobs`. The `cargo test --doc` and `cargo doc` commands of the
+# `rust-doc` job, and the `cargo doc` command of `.github/workflows/docs.yml`, turn on
+# `scp-node/cloud-blobs` and `scp-relay/cloud-blobs` together on purpose: rustdoc needs
+# only `postgres_blob.rs` and `s3_blob.rs` compiled, and either package's feature
+# compiles them. No entry here mirrors those three commands.
 EXTRA_FEATURE_CHECKS=(
     "scp-transport|quic,http3,udp,coap"
     "scp-transport|combined,local-cache"
     "scp-testing|sqlite"
+    "scp-transport|sqlite-blob,redb-blob,postgres-blob,s3-blob,startup"
+    "scp-node|cloud-blobs,testing"
+    "scp-relay|cloud-blobs"
 )
 
 # The packages the `wasm-protocol` job of `.github/workflows/ci.yml` compiles for

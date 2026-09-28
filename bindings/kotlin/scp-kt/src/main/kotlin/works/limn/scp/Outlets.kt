@@ -117,8 +117,9 @@ internal class ScpOutletStreamNative(
             estimatedChunkCount = estimatedChunkCount,
         )
 
-    override suspend fun outletStreamPollNext(handleId: String): ByteArray? =
-        inner.outletStreamPollNext(handleId = handleId)
+    override suspend fun outletStreamPollNext(handleId: String): ByteArray? {
+        return inner.outletStreamPollNext(handleId = handleId)
+    }
 
     override suspend fun outletStreamGrantCredit(
         handleId: String,
