@@ -6308,7 +6308,7 @@
           "ADR-025 — Apple adapter as parallel reference"
         ]
       },
-      "result": "AndroidKeyCustody.kt + Types.kt implemented. TEE-backed Ed25519 on API 33+, Bouncy Castle fallback for API 26-32, software X25519. 32 JVM unit tests. Commits: 77f48a0, 87fc586."
+      "result": "AndroidKeyCustody.kt and Types.kt implemented. Ed25519 keys are held by Android Keystore on API 33+ and reported as `CustodyType.HARDWARE` without a `KeyInfo.securityLevel` check, so the adapter does not know whether a key sits in the TEE or in software; API 26-32 falls back to Bouncy Castle software keys, and X25519 keys are software keys. ADR-027 requires P-256. `AndroidKeyCustodyTest.kt` holds 53 JVM unit tests."
     },
     {
       "id": "SCP-111",
@@ -6410,7 +6410,7 @@
           "ADR-025 — Apple adapter as parallel reference"
         ]
       },
-      "result": "AndroidPushProvider.kt implemented. FCM data-only opaque payload, SCP-PUSH-5001/5002 error codes. 10 JVM unit tests. Commits: b37d2f0, 87fc586."
+      "result": "AndroidPushProvider.kt implemented. `register` returns the FCM token, and `handleNotification` checks only the `scp` field of a data-only payload, throwing `SCP-TRANS-5001` when the field is missing and `SCP-TRANS-5002` when it is not `\"1\"`; it accepts extra fields, so it does not enforce §10.7 opacity. `AndroidPushProviderTest.kt` holds 14 JVM unit tests."
     },
     {
       "id": "SCP-113",
@@ -6461,7 +6461,7 @@
           "ADR-025 — Apple adapter as parallel reference"
         ]
       },
-      "result": "AndroidStorage.kt implemented with TEE-backed AES-256 key derivation via Android Keystore. InMemoryStorageProvider for testing. 548-line test suite. Commit 775403b."
+      "result": "AndroidStorage.kt implemented. The SQLCipher key is derived from an AES-256 key held by Android Keystore; the adapter does not read `KeyInfo.securityLevel`, so it does not know whether the key sits in the TEE or in software. `AndroidStorageTest.kt` holds 46 JVM unit tests, which run against the test-only `InMemoryStorageProvider`, not against SQLCipher."
     },
     {
       "id": "SCP-114",

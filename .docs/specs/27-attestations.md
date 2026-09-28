@@ -282,7 +282,7 @@ ADR-027, the Android platform adapter (`.docs/adrs/phase-6.md:446`), states the 
 **In the shipped code, nothing binds a token to the identifier it is filed under.** §9.3.1 of the security spec binds it through `D`, and the shipped code computes no `D`. *Derivation from three shipped call sites:*
 
 1. The `clientDataJSON` carries `challenge` and `deviceId`. Neither is an identifier.
-2. The Android adapter's `attest(challenge, deviceId)` (`AndroidDeviceAttestation.kt:69`) does carry a `deviceId` into `clientDataJSON`, and a device id is not an identifier. Its separate per-request assertion method, `assertRequest(requestHash)`, passes an empty device id: `return attest(challenge = requestHash, deviceId = ByteArray(0))`.
+2. The Android adapter's `attest(challenge, deviceId)` (the `attest` method in `AndroidDeviceAttestation.kt`) does carry a `deviceId` into `clientDataJSON`, and a device id is not an identifier. Its separate per-request assertion method, `assertRequest(requestHash)`, passes an empty device id: `return attest(challenge = requestHash, deviceId = ByteArray(0))`.
 3. The only Rust code that files a token into a published record calls `attest()` with no arguments and stores the result verbatim (`DhtDidMethod::attach_device_attestation` in the `scp-identity` crate):
 
 ```rust
