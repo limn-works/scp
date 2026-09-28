@@ -5572,11 +5572,14 @@ impl Supervisor {
     /// bootstrap ends [`Self::read_context_state_checked`] reports the id as
     /// `ActorCrashed`, never as `Ok(None)`. An id with no window gets none
     /// here. The returned guard ends the
-    /// window when it drops: when an actor serves the id, it clears the
-    /// marker and reaps the now-empty window; when none does (the bootstrap
-    /// failed), it puts the prior window back, so a poisoned or
-    /// respawn-failed context that a failed import or create left without an
-    /// actor still reads as `Poisoned` or `ActorCrashed`.
+    /// window when it drops, reading whether any actor serves the id rather
+    /// than whether this bootstrap registered one: when an actor serves the
+    /// id, it clears the marker and reaps the now-empty window; when none
+    /// does, it puts the prior window back, so a poisoned or respawn-failed
+    /// context that a failed import or create left without an actor still
+    /// reads as `Poisoned` or `ActorCrashed`. A bootstrap refused against a
+    /// live actor that still serves the id takes the first branch, so that
+    /// actor's earlier crash count is not restored.
     ///
     /// Called under `bootstrap_spawn_lock`, and the caller keeps the guard
     /// inside that lock's scope. Every writer of the respawn marker holds the
@@ -11715,8 +11718,11 @@ impl Supervisor {
     }
 
     /// Returns the payment receipts captured in `context_id` (spec §19.11),
-    /// optionally narrowed by `filter`. Empty `Vec` iff the context is unknown.
-    /// Routes through the actor mailbox via [`Self::dispatch_query`].
+    /// optionally narrowed by `filter`. Empty `Vec` when the context is
+    /// unknown, when no receipt matches, and when the actor could not be
+    /// reached (busy, crashed, or poisoned), so an empty answer does not
+    /// prove the context has no receipts. Routes through the actor mailbox
+    /// via [`Self::dispatch_query`].
     ///
     /// Reads the actor-owned per-context local receipt buffer — `PaymentReceived`
     /// is per-payee application activity excluded from the canonical Merkle log
@@ -11768,8 +11774,9 @@ impl Supervisor {
     }
 
     /// Returns a clone of the context's creation parameters, or `None`
-    /// if the context is unknown. Routes through the actor mailbox via
-    /// [`Self::dispatch_query`].
+    /// when the context is unknown or its actor could not be reached (busy,
+    /// crashed, or poisoned); `None` alone does not prove the context is
+    /// absent. Routes through the actor mailbox via [`Self::dispatch_query`].
     #[must_use]
     pub async fn context_params(
         &self,
@@ -11789,9 +11796,17 @@ impl Supervisor {
         }
     }
 
-    /// Returns a clone of the context's role state, or `None` if the
-    /// context is unknown. Routes through the actor mailbox via
+    /// Returns a clone of the context's role state, or `None` when no
+    /// reachable actor answered. Routes through the actor mailbox via
     /// [`Self::dispatch_query`].
+    ///
+    /// `None` does not mean the context is unknown. This form collapses an
+    /// unreachable actor (a saturated or wedged mailbox that misses
+    /// `SEND_TIMEOUT` or `REPLY_TIMEOUT`), a crashed context awaiting
+    /// respawn, and a poisoned context into the same `None` a
+    /// never-registered context reports. A caller whose decision turns on
+    /// absence calls [`Self::get_role_state_checked`], which reports each of
+    /// those outcomes as an error.
     #[must_use]
     pub async fn get_role_state(
         &self,
@@ -21890,66 +21905,50 @@ mod tests {
         (seen, reply)
     }
 
-    /// Every failing exit of the `CreateContext` and `ImportContext` arms
-    /// drops its bootstrap window before it replies. A caller that reads the
-    /// checked state the moment it receives the error sees the restored
-    /// poisoned window (`Ok(Some(Poisoned))`), never the bootstrap's
-    /// marker-only window (`Err(ActorCrashed)`).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_failed_bootstrap_restores_the_crash_window_before_it_replies() {
-        use scp_protocol::context::ContextState;
-        let poison = |sup: &Supervisor, id: &str| {
-            sup.crash_windows.entry(id.to_owned()).or_default().poisoned = true;
-        };
-        let create = |id: &str| {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let payload = Box::new(crate::context::actor::commands::CreateContextPayload {
-                context_id: id.to_owned(),
-                params: scp_protocol::context::ContextParams::default(),
-                creator_did: DID("did:dht:z6MkReplyOrderCreator".to_owned()),
-                local_pseudonym: None,
-            });
-            (LifecycleCommand::CreateContext { payload, reply: tx }, rx)
-        };
+    /// Marks `id` poisoned in `sup`'s crash windows, so a bootstrap that
+    /// restores the window before it replies leaves a checked read at the
+    /// reply reading `Ok(Some(Poisoned))`.
+    fn poison_crash_window(sup: &Supervisor, id: &str) {
+        sup.crash_windows.entry(id.to_owned()).or_default().poisoned = true;
+    }
 
-        // Create, `build_actor_deps` fails: no providers are attached.
-        let sup = Arc::new(Supervisor::for_query_shim());
-        let id = hex::encode([0xC1u8; 32]);
-        poison(&sup, &id);
-        let (cmd, rx) = create(&id);
-        let (seen, reply) = state_read_at_reply(&sup, &id, rx, cmd).await;
-        assert!(reply.is_err(), "a create without providers fails");
-        assert!(
-            matches!(seen, Ok(Some(ContextState::Poisoned))),
-            "create, deps failure: the reply must follow the window restore, got {seen:?}"
-        );
+    /// A `CreateContext` command for `id` with `params`, and its reply receiver.
+    fn reply_order_create(
+        id: &str,
+        params: scp_protocol::context::ContextParams,
+    ) -> (
+        LifecycleCommand,
+        tokio::sync::oneshot::Receiver<
+            Result<
+                crate::context::ContextHandle,
+                scp_protocol::context::builder::ContextCreationError,
+            >,
+        >,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let payload = Box::new(crate::context::actor::commands::CreateContextPayload {
+            context_id: id.to_owned(),
+            params,
+            creator_did: DID("did:dht:z6MkReplyOrderCreator".to_owned()),
+            local_pseudonym: None,
+        });
+        (LifecycleCommand::CreateContext { payload, reply: tx }, rx)
+    }
 
-        // Create, refused by the terminal-snapshot precheck.
-        let id = hex::encode([0xC2u8; 32]);
-        let map = MapPersistence::default();
-        let mut snap = import_test_snapshot(&id, "did:dht:z6MkReplyOrderCreator");
-        snap.state = ContextState::Closed;
-        map.contexts.insert(id.clone(), snap);
-        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
-        let sup = supervisor_with_clock_and_persistence(clock, Box::new(map));
-        poison(&sup, &id);
-        let (cmd, rx) = create(&id);
-        let (seen, reply) = state_read_at_reply(&sup, &id, rx, cmd).await;
-        assert!(reply.is_err(), "a create over a closed snapshot is refused");
-        assert!(
-            matches!(seen, Ok(Some(ContextState::Poisoned))),
-            "create, terminal precheck: the reply must follow the window restore, got {seen:?}"
-        );
-
-        // Import, `build_actor_deps` fails after the export verifies.
-        let sup = Arc::new(Supervisor::for_query_shim());
-        let id = hex::encode([0xC3u8; 32]);
-        poison(&sup, &id);
+    /// An `ImportContext` command for a validly signed export of `id`, and its
+    /// reply receiver.
+    async fn reply_order_import(
+        id: &str,
+        member: &str,
+    ) -> (
+        LifecycleCommand,
+        tokio::sync::oneshot::Receiver<Result<crate::context::ContextHandle, ContextError>>,
+    ) {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         let export = signed_import_export_with_member(
-            &id,
+            id,
             "did:key:reply-order-creator",
-            "did:key:reply-order-member",
+            member,
             &signing_key,
         )
         .await;
@@ -21960,11 +21959,134 @@ mod tests {
             local_pseudonym: None,
             reply: tx,
         };
+        (cmd, rx)
+    }
+
+    /// Every failing exit of the `CreateContext` arm drops its bootstrap
+    /// window before it replies. A caller that reads the checked state the
+    /// moment it receives the error sees the restored poisoned window
+    /// (`Ok(Some(Poisoned))`), never the bootstrap's marker-only window
+    /// (`Err(ActorCrashed)`).
+    ///
+    /// The test drives one failure through each explicit `drop(crash_window)`
+    /// that precedes a `reply.send` in the arm: the deps failure, the
+    /// terminal-snapshot refusal, the snapshot read fault, and the failed
+    /// `create_context` tail, whose drop the timeout arm shares.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_create_restores_the_crash_window_before_it_replies() {
+        use scp_protocol::context::{ContextParams, ContextState};
+
+        // `build_actor_deps` fails: no providers are attached.
+        let sup = Arc::new(Supervisor::for_query_shim());
+        let id = hex::encode([0xC1u8; 32]);
+        poison_crash_window(&sup, &id);
+        let (cmd, rx) = reply_order_create(&id, ContextParams::default());
+        let (seen, reply) = state_read_at_reply(&sup, &id, rx, cmd).await;
+        assert!(reply.is_err(), "a create without providers fails");
+        assert!(
+            matches!(seen, Ok(Some(ContextState::Poisoned))),
+            "create, deps failure: the reply must follow the window restore, got {seen:?}"
+        );
+
+        // Refused by the terminal-snapshot precheck.
+        let id = hex::encode([0xC2u8; 32]);
+        let map = MapPersistence::default();
+        let mut snap = import_test_snapshot(&id, "did:dht:z6MkReplyOrderCreator");
+        snap.state = ContextState::Closed;
+        map.contexts.insert(id.clone(), snap);
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup = supervisor_with_clock_and_persistence(clock, Box::new(map));
+        poison_crash_window(&sup, &id);
+        let (cmd, rx) = reply_order_create(&id, ContextParams::default());
+        let (seen, reply) = state_read_at_reply(&sup, &id, rx, cmd).await;
+        assert!(reply.is_err(), "a create over a closed snapshot is refused");
+        assert!(
+            matches!(seen, Ok(Some(ContextState::Poisoned))),
+            "create, terminal precheck: the reply must follow the window restore, got {seen:?}"
+        );
+
+        // The terminal-snapshot precheck cannot read the snapshot.
+        let id = hex::encode([0xC4u8; 32]);
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup = supervisor_with_clock_and_persistence(clock, Box::new(ErringLoadPersistence));
+        poison_crash_window(&sup, &id);
+        let (cmd, rx) = reply_order_create(&id, ContextParams::default());
+        let (seen, reply) = state_read_at_reply(&sup, &id, rx, cmd).await;
+        assert!(
+            reply.is_err(),
+            "a create whose snapshot read faults is refused"
+        );
+        assert!(
+            matches!(seen, Ok(Some(ContextState::Poisoned))),
+            "create, snapshot read fault: the reply must follow the window restore, got {seen:?}"
+        );
+
+        // Deps and precheck pass and `create_context` fails: the params
+        // demand a protocol major this build does not speak.
+        let id = hex::encode([0xC5u8; 32]);
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup = supervisor_with_clock_and_persistence(clock, Box::new(MapPersistence::default()));
+        poison_crash_window(&sup, &id);
+        let params = ContextParams {
+            min_protocol_version: Some((9, 0)),
+            ..ContextParams::default()
+        };
+        let (cmd, rx) = reply_order_create(&id, params);
+        let (seen, reply) = state_read_at_reply(&sup, &id, rx, cmd).await;
+        assert!(
+            matches!(
+                reply,
+                Err(
+                    scp_protocol::context::builder::ContextCreationError::StateTransition(
+                        scp_protocol::context::ContextError::VersionIncompatible { .. }
+                    )
+                )
+            ),
+            "the create must fail inside `create_context`, got {reply:?}"
+        );
+        assert!(
+            matches!(seen, Ok(Some(ContextState::Poisoned))),
+            "create, failed tail: the reply must follow the window restore, got {seen:?}"
+        );
+    }
+
+    /// Every failing exit of the `ImportContext` arm drops its bootstrap
+    /// window before it replies, with the same observable result as
+    /// [`a_failed_create_restores_the_crash_window_before_it_replies`]. The
+    /// test drives the deps failure and the failed `import_context` tail,
+    /// whose drop the timeout arm shares.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_import_restores_the_crash_window_before_it_replies() {
+        use scp_protocol::context::ContextState;
+
+        // `build_actor_deps` fails after the export verifies.
+        let sup = Arc::new(Supervisor::for_query_shim());
+        let id = hex::encode([0xC3u8; 32]);
+        poison_crash_window(&sup, &id);
+        let (cmd, rx) = reply_order_import(&id, "did:key:reply-order-member").await;
         let (seen, reply) = state_read_at_reply(&sup, &id, rx, cmd).await;
         assert!(reply.is_err(), "an import without providers fails");
         assert!(
             matches!(seen, Ok(Some(ContextState::Poisoned))),
             "import, deps failure: the reply must follow the window restore, got {seen:?}"
+        );
+
+        // Deps build and `import_context` rejects the export: the supervisor
+        // clock predates the snapshot's creation time, so the export reads
+        // as future-dated.
+        let id = hex::encode([0xC6u8; 32]);
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_000_000_000));
+        let sup = supervisor_with_clock_and_persistence(clock, Box::new(MapPersistence::default()));
+        poison_crash_window(&sup, &id);
+        let (cmd, rx) = reply_order_import(&id, "did:key:reply-order-tail-member").await;
+        let (seen, reply) = state_read_at_reply(&sup, &id, rx, cmd).await;
+        assert!(
+            matches!(&reply, Err(ContextError::PersistenceFailed(msg)) if msg.contains("future-dated")),
+            "the import must fail inside `import_context`, got {reply:?}"
+        );
+        assert!(
+            matches!(seen, Ok(Some(ContextState::Poisoned))),
+            "import, failed tail: the reply must follow the window restore, got {seen:?}"
         );
     }
 
