@@ -491,6 +491,31 @@
             try await custody.destroyKey(identity)
         }
 
+        @Test("storing a non-pseudonym key over an existing item replaces it")
+        func nonPseudonymStoreReplacesTheExistingItem() async throws {
+            let handle = UUID().uuidString
+            let account = "scp.key.\(handle)"
+            let first = Data(repeating: 0x11, count: 32)
+            let second = Data(repeating: 0x22, count: 32)
+            try custody.storePrivateKeyBytes(first, for: handle, keyType: .ed25519, publicKeyBytes: first)
+            // A kept item would still carry this mark.
+            #expect(updateKeychainItem(account, [kSecAttrComment as String: "kept"]) == errSecSuccess)
+
+            try custody.storePrivateKeyBytes(second, for: handle, keyType: .ed25519, publicKeyBytes: second)
+            #expect(keychainComment(account) == nil)
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrAccount as String: account,
+                kSecReturnData as String: true,
+                kSecMatchLimit as String: kSecMatchLimitOne
+            ]
+            var result: AnyObject?
+            #expect(SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess)
+            #expect(result as? Data == second)
+
+            try await custody.destroyKey(handle)
+        }
+
         @Test("a derive whose identity is destroyed after the store fails and leaves no pseudonym")
         func deriveRacingIdentityDestroyLeavesNoPseudonym() async throws {
             // Destroys the identity item in the window between the pseudonym
