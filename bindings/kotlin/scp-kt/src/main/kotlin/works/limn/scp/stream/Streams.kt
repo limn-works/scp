@@ -389,7 +389,8 @@ class HotStreamFactory(
     /**
      * Stop receiving messages for the given context handle.
      *
-     * Takes [messageMutex] for a reason [stopContextEvents] states about [eventMutex].
+     * Takes [messageMutex], and waits for it under [NonCancellable], for the reasons
+     * [stopContextEvents] states about [eventMutex].
      *
      * @param contextHandle The context to stop receiving messages for.
      */

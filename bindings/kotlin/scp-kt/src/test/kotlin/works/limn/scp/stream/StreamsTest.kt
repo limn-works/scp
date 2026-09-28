@@ -364,6 +364,39 @@ class StreamsTest {
             }
 
         @Test
+        fun `a stopMessageStream cancelled while waiting for the mutex still releases`() =
+            runTest {
+                val factory = HotStreamFactory(stubBindings, Dispatchers.IO)
+                val subscribeEntered = CountDownLatch(1)
+                val releaseSubscribe = CountDownLatch(1)
+                stubBindings.onSubscribe = {
+                    subscribeEntered.countDown()
+                    releaseSubscribe.await()
+                }
+
+                val subscribing = launch(Dispatchers.Default) { factory.incomingMessages(EVENT_CONTEXT_HANDLE) }
+                try {
+                    assertTrue(
+                        subscribeEntered.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                        "incomingMessages did not reach its subscribe call",
+                    )
+                    val stopping = launch(Dispatchers.Default) { factory.stopMessageStream(EVENT_CONTEXT_HANDLE) }
+                    withContext(Dispatchers.Default) { withTimeoutOrNull(STOP_WAIT_MS) { stopping.join() } }
+                    stopping.cancel()
+
+                    releaseSubscribe.countDown()
+                    subscribing.join()
+                    stopping.join()
+
+                    assertEquals(1, stubBindings.messageSubscribeCount)
+                    assertEquals(1, stubBindings.messageUnsubscribeCount)
+                } finally {
+                    releaseSubscribe.countDown()
+                    subscribing.join()
+                }
+            }
+
+        @Test
         fun `hot stream error callback emits error event`() =
             runTest {
                 val flow = factory.contextEvents(42L)
