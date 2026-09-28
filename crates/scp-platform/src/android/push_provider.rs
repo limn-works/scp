@@ -9,13 +9,14 @@
 //!
 //! # FCM Payload Opacity (ADR-027, section 10.7)
 //!
-//! Section 10.7 requires the sender of a push to send **only**
-//! `{"data": {"scp": "1"}}`, a data-only message with no notification fields.
-//! No context ID, sender DID, message preview, or any SCP-specific content may
-//! appear in the FCM payload. No relay or other code in this repository sends
-//! an FCM message, and no SDK code wakes the app, connects to a relay, or pulls
-//! envelopes: the caller does all three when the Kotlin adapter returns
-//! `WakeSignal.PULL`.
+//! Section 10.7 requires a push payload to carry only a wake signal: no
+//! sender, no context, no count, no preview. Its §10.7.1 step 5 gives that
+//! payload as `{ "scp": 1 }`. ADR-027 carries the wake signal to Android as
+//! the FCM data-only message `{"data": {"scp": "1"}}`, with no notification
+//! fields and no other SCP-specific content. No relay or other code in this
+//! repository sends an FCM message, and no SDK code wakes the app, connects to
+//! a relay, or pulls envelopes: the caller does all three when the Kotlin
+//! adapter returns `WakeSignal.PULL`.
 //!
 //! See ADR-027 in `.docs/adrs/phase-6.md` for the full design rationale.
 

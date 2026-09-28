@@ -7,7 +7,9 @@
 //! injects the Kotlin adapter into the Rust engine yet. This module documents
 //! the Rust-side contract and re-exports the trait types for Android builds.
 //!
-//! # Key Storage Strategy (ADR-027)
+//! # Key Storage Strategy
+//!
+//! The Kotlin adapter ships an Ed25519 and X25519 scheme:
 //!
 //! - **Ed25519 on API 33+ (Android 13+):** Android Keystore natively supports
 //!   `EdDSA` with `Ed25519` parameter spec. Keys are TEE-backed -- the private
@@ -20,6 +22,12 @@
 //! - **X25519 (all API levels):** Always software-managed via Bouncy Castle.
 //!   Android Keystore does not support X25519. [`CustodyType::Software`] is
 //!   reported.
+//!
+//! ADR-027, as amended on 2026-09-10, requires a different scheme: an EC
+//! P-256 signing key in Keystore at every supported API level, and P-256 key
+//! agreement in Keystore from API 31 with a Bouncy Castle software P-256
+//! agreement key below it. The adapter has not moved to P-256, and no story
+//! tracks that move yet.
 //!
 //! # TEE vs StrongBox
 //!

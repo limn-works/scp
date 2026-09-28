@@ -41,7 +41,9 @@ import java.security.MessageDigest
  * verifier, named in the context's `accepted_android_packages`, to decode the
  * token and sign a verdict, and requires each reader to check that verdict.
  * §9.3.1 of `09-security-model.md` defines the procedure. No code implements
- * the verifier or the reader yet; story SCP-316 tracks the reader.
+ * the verifier, the producer that publishes the token and verdict, or the
+ * reader yet: story SCP-318 tracks the reference verifier, SCP-317 the
+ * producer, and SCP-316 the reader.
  *
  * See ADR-027 in `.docs/adrs/phase-6.md` and `crates/scp-ffi/uniffi/src/lib.rs`
  * `DeviceAttestationProvider`.

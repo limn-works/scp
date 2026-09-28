@@ -16,8 +16,10 @@ package works.limn.scp.android.platform
 /**
  * The type of cryptographic key managed by a [KeyHandle].
  *
- * See ADR-006: Ed25519 keys are used for identity and signing,
- * X25519 keys are used for key agreement (HPKE wrapping keys).
+ * The shipped variants name curves: Ed25519 keys are used for identity and signing,
+ * X25519 keys are used for key agreement (HPKE wrapping keys). ADR-006, as amended on
+ * 2026-09-10, names the two key types by purpose, `P256Signing` and `P256Agreement`; this
+ * enum has not moved to them.
  */
 enum class KeyType {
     /** Ed25519 signing key (identity keys, active signing keys, pseudonym keys). */
@@ -221,7 +223,9 @@ interface PushProvider {
  * Abstracts key generation, signing, key agreement, and pseudonym derivation
  * behind a uniform interface. The Android implementation ([AndroidKeyCustody])
  * uses Android Keystore for TEE-backed Ed25519 on API 33+ and Bouncy Castle
- * for software fallback on API 26-32.
+ * for software fallback on API 26-32. ADR-027, as amended on 2026-09-10, requires a P-256
+ * signing key in Keystore at every supported API level instead; no story tracks that move
+ * yet.
  *
  * This interface matches neither Rust declaration.
  *
@@ -368,7 +372,8 @@ interface KeyCustodyProvider {
      * bytes. Software-backed keys can export their private material.
      * Hardware-backed TEE keys are non-extractable and MUST throw an error
      * with a clear message indicating that governance signing is not supported
-     * on hardware-backed keys until a Signer trait is adopted.
+     * on hardware-backed keys. ADR-063's curve slice replaces raw-key export
+     * with a signer for governance signing.
      *
      * @param keyHandle Handle to an Ed25519 key.
      * @return 32-byte raw Ed25519 private key bytes.
@@ -384,8 +389,8 @@ interface KeyCustodyProvider {
  * Platform trait for encrypted key-value storage.
  *
  * Abstracts persistent, encrypted storage behind a uniform interface. The Android
- * implementation ([AndroidStorage]) uses SQLCipher with a TEE-derived AES-256
- * encryption key stored in Android Keystore.
+ * implementation ([AndroidStorage]) uses SQLCipher with a 32-byte key derived from an
+ * AES-256 key that Android Keystore holds in the TEE.
  *
  * This interface declares the six methods of the UniFFI `StorageProvider` callback interface in
  * `crates/scp-ffi/uniffi/src/lib.rs` under the same names. The Rust `Storage` trait in

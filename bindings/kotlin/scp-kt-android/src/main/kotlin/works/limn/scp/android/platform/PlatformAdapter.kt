@@ -21,11 +21,13 @@ import android.content.Context
  * accepts only the UniFFI-generated `uniffi.scp.KeyCustodyProvider`, which [keyCustody]
  * does not implement.
  *
- * @property keyCustody Android Keystore key management (TEE-backed Ed25519 on API 33+).
+ * @property keyCustody Android Keystore key management (TEE-backed Ed25519 on API 33+ today;
+ *   ADR-027 requires P-256 at every supported API level, and no story tracks that move yet).
  * @property deviceAttestation Play Integrity device attestation, which requests a Classic
  *   token today; story SCP-111 tracks the Standard request ADR-027 requires.
  * @property push Firebase Cloud Messaging with opaque data-only payloads.
- * @property storage SQLCipher encrypted storage with TEE-derived AES-256 key.
+ * @property storage SQLCipher encrypted storage whose 32-byte key is derived from a TEE-held
+ *   AES-256 key.
  */
 data class AndroidPlatformAdapterImpl(
     val keyCustody: KeyCustodyProvider,

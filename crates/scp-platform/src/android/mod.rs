@@ -54,11 +54,13 @@
 //! # Adapter Modules
 //!
 //! - [`key_custody`] — Android Keystore key management (TEE-backed Ed25519 on
-//!   API 33+, Bouncy Castle software fallback on API 26-32).
+//!   API 33+, Bouncy Castle software fallback on API 26-32, today; ADR-027
+//!   requires P-256, and no story tracks that move yet).
 //! - [`device_attestation`] — Play Integrity device attestation (a Classic
 //!   request today; story SCP-111 tracks the Standard request ADR-027 requires).
 //! - [`push_provider`] — Firebase Cloud Messaging with opaque data-only payloads.
-//! - [`storage`] — `SQLCipher` encrypted storage with TEE-derived AES-256 key.
+//! - [`storage`] — `SQLCipher` encrypted storage whose 32-byte key is derived
+//!   from a TEE-held AES-256 key.
 //!
 //! # Conditional Compilation
 //!

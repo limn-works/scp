@@ -3,14 +3,21 @@
 // Ed25519 key custody using Android Keystore (TEE-backed) on API 33+ and Bouncy Castle
 // software fallback on API 26-32. X25519 wrapping keys are always software-managed via
 // Bouncy Castle. StrongBox is explicitly NOT used due to 10-100x latency penalty that
-// is incompatible with SCP's frequent signing operations.
+// is incompatible with SCP's frequent signing operations. ADR-027, as amended on 2026-09-10,
+// requires a different scheme: an EC P-256 signing key in Keystore at every supported API
+// level, and P-256 key agreement in Keystore from API 31 with a Bouncy Castle software P-256
+// agreement key below it. This class has not moved to P-256, and no story tracks that move yet.
 //
 // Hardware-backed Ed25519 private keys never leave the TEE. This class performs all signing
-// and DH itself and returns signatures and shared secrets, and it returns a software private
-// key (Ed25519 on API 26-32, every derived pseudonym key on every API level, and every
-// X25519 key) to no caller, with one exception:
-// exportSigningKeyBytes returns a software Ed25519 key's 32-byte private seed. No code passes
-// this class to the Rust engine.
+// and DH itself and returns signatures and shared secrets. Two paths hand a caller a software
+// private key or the material that derives one:
+// - exportSigningKeyBytes returns a software Ed25519 key's 32-byte private seed.
+// - sign signs any caller-supplied bytes with a hardware identity key, and derivePseudonymSecret
+//   derives every pseudonym secret of that key from its signature over the public string
+//   "scp-pseudonym-secret-v1". A caller that signs that string derives every pseudonym private
+//   key of the identity. ADR-027 acceptance criterion 6 forbids this construction.
+// No other path returns a software private key (Ed25519 on API 26-32, a derived pseudonym key,
+// or an X25519 key). No code passes this class to the Rust engine.
 //
 // Software Ed25519 keys that generateKeypair creates (API 26-32 fallback) are persisted to
 // EncryptedSharedPreferences (Jetpack Security) so they survive process death. Without this,
@@ -67,8 +74,7 @@ import java.security.SecureRandom
  *
  * - **Ed25519 on API 33+ (Android 13+):** Android Keystore natively supports `EdDSA`
  *   with `Ed25519` parameter spec. Keys are TEE-backed — the private key bytes never
- *   leave the Trusted Execution Environment. This is a stronger security posture than
- *   Apple's Secure Enclave (which only supports P-256). [CustodyType.HARDWARE] is reported.
+ *   leave the Trusted Execution Environment. [CustodyType.HARDWARE] is reported.
  *
  * - **Ed25519 on API 26-32:** `EdDSA` is not available in Android Keystore on these API
  *   levels. Bouncy Castle provides software Ed25519. The key pair is held in [softwareKeys]
@@ -78,6 +84,9 @@ import java.security.SecureRandom
  * - **X25519 (all API levels):** X25519 key agreement is not supported by Android Keystore
  *   at any API level. All X25519 wrapping keys are software-managed via Bouncy Castle,
  *   stored in [softwareKeys]. [CustodyType.SOFTWARE] is reported.
+ *
+ * ADR-027, as amended on 2026-09-10, requires P-256 in place of this scheme; the file header
+ * states the required scheme.
  *
  * ## TEE vs StrongBox
  *
@@ -209,6 +218,11 @@ class AndroidKeyCustody internal constructor(
      * For software-backed keys ([CustodyType.SOFTWARE]): Bouncy Castle's [Ed25519Signer]
      * performs the signing with key material from [softwareKeys].
      *
+     * The method signs any [data] and applies no domain separation. For a hardware key, a
+     * signature over `"scp-pseudonym-secret-v1"` is the input [derivePseudonymSecret] hashes
+     * into the key's pseudonym secret, so a caller that signs that string derives every
+     * pseudonym private key of the identity.
+     *
      * @param keyHandle Handle returned by [generateKeypair] for an Ed25519 key.
      * @param data The bytes to sign.
      * @return 64-byte Ed25519 signature.
@@ -335,6 +349,11 @@ class AndroidKeyCustody internal constructor(
      *   2. `pseudonymSecret = SHA-256(signatureBytes)` (compress 64-byte signature to 32-byte secret).
      *   3. `seed = HMAC-SHA256(pseudonymSecret, contextId || "scp-pseudonym")`.
      *   4. Derive an Ed25519 keypair from the first 32 bytes of `seed`.
+     *
+     *   This construction diverges from ADR-027 acceptance criterion 6, which makes the
+     *   hardware `pseudonym_secret` a 32-byte symmetric key generated inside the TEE at key
+     *   generation and never `SHA-256` over a signature. [sign] signs the same message for any
+     *   caller, so any caller can compute `pseudonymSecret` (see [sign]).
      *
      *   **Limitation:** Hardware-derived pseudonyms produce different values than Rust's
      *   HKDF-based derivation for the same logical key, because the TEE key material is
@@ -482,7 +501,9 @@ class AndroidKeyCustody internal constructor(
      *
      * For hardware keys: `SHA-256(TEE_sign("scp-pseudonym-secret-v1"))` — deterministic
      * because Ed25519 signing is deterministic (RFC 8032). The 64-byte signature is hashed
-     * to 32 bytes for use as an HMAC key.
+     * to 32 bytes for use as an HMAC key. This diverges from ADR-027 acceptance criterion 6,
+     * which makes the hardware secret a TEE-generated symmetric key and never `SHA-256` over a
+     * signature: [sign] returns the same signature to any caller.
      */
     private fun derivePseudonymSecret(keyHandle: KeyHandle): ByteArray {
         val salt = "scp-pseudonym-secret-v1".toByteArray(Charsets.UTF_8)
@@ -553,8 +574,8 @@ class AndroidKeyCustody internal constructor(
             throw ScpException(
                 "Cannot export signing key bytes from hardware-backed TEE custody " +
                     "(handle '${keyHandle.id}'). Hardware keys are non-extractable. " +
-                    "Governance signing on hardware-backed keys requires a Signer trait " +
-                    "(see GitHub issue for architectural fix).",
+                    "ADR-063's curve slice replaces raw-key export with a signer for " +
+                    "governance signing.",
                 "SCP-CRYPTO-4005",
             )
         }

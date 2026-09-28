@@ -8,9 +8,10 @@
  *
  * ## FCM Payload Opacity (§10.7)
  *
- * §10.7 requires the sender of a push to send **only** `{"data": {"scp": "1"}}`, a
- * data-only message with no notification fields. No context ID, sender DID, message
- * preview, or any other metadata may appear in the FCM payload, so FCM learns only that
+ * §10.7 requires a push payload to carry only a wake signal: no sender, no context, no
+ * count, no preview. Its §10.7.1 step 5 gives that payload as `{ "scp": 1 }`. ADR-027
+ * carries the wake signal to Android as the FCM data-only message `{"data": {"scp": "1"}}`,
+ * with no notification fields and no other SCP-specific content, so FCM learns only that
  * the device received a data message at a specific time. No relay or other code in this
  * repository sends an FCM message, and no SDK code wakes the app, connects to a relay,
  * or pulls envelopes: the caller does all three when [handleNotification] returns
@@ -51,9 +52,9 @@ import kotlinx.coroutines.withContext
  * [PushProvider] implementation for Android using Firebase Cloud Messaging.
  *
  * Retrieves the FCM registration token and checks the `scp` field of incoming data-only
- * push payloads. §10.7 requires the sender to send `{"data": {"scp": "1"}}` as the sole
- * push payload; [handleNotification] rejects a missing or wrong `scp` field and accepts
- * any other fields beside it.
+ * push payloads. ADR-027 carries §10.7's wake signal as the FCM data-only message
+ * `{"data": {"scp": "1"}}`; [handleNotification] rejects a missing or wrong `scp` field and
+ * accepts any other fields beside it.
  *
  * @param context Android application [Context], used for Firebase initialisation.
  *   Callers should pass the application context to avoid activity lifecycle leaks.
@@ -99,9 +100,10 @@ class AndroidPushProvider(
     /**
      * Handle an incoming FCM data-only push notification.
      *
-     * Validates that the payload conforms to the opaque format required by §10.7:
-     * the `scp` field must be present with value `"1"`. No context ID, sender DID,
-     * or message content is present in or extracted from the payload.
+     * Checks only the `scp` field: it must be present with value `"1"`. The method
+     * neither checks nor reads any other field, so it accepts a payload that carries
+     * other fields beside `"scp": "1"` and does not enforce the §10.7 opacity
+     * requirement.
      *
      * @param payload The FCM data payload as a key-value map (from
      *   `RemoteMessage.getData()`). Expected: `{"scp": "1"}`.
@@ -112,8 +114,8 @@ class AndroidPushProvider(
      *   unexpected value.
      */
     override fun handleNotification(payload: Map<String, String>): WakeSignal {
-        // FCM data payload: {"scp": "1"}
-        // The value "1" is the wake signal. No context ID or sender information is present.
+        // ADR-027's FCM data payload is {"scp": "1"}; the value "1" is the wake signal.
+        // Only this field is checked or read; any other field passes unexamined.
         val scpField = payload["scp"]
             ?: throw ScpException(
                 "FCM payload missing 'scp' field",
@@ -129,7 +131,7 @@ class AndroidPushProvider(
     }
 }
 
-// §10.7 requires a push sender to send this FCM message structure — opaque, data-only.
+// ADR-027 gives a push sender this FCM message structure — opaque, data-only.
 // No code in this repository sends it:
 // {
 //   "to": "<fcm_token>",

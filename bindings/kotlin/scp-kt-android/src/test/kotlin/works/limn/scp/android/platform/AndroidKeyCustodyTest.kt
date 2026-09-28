@@ -3,7 +3,8 @@
 // These tests exercise the software fallback path (Bouncy Castle) since Android Keystore
 // is not available in JVM unit tests. The Keystore path (API 33+, CustodyType.HARDWARE)
 // requires an Android device or emulator; the module has no instrumented tests, so no test
-// covers it.
+// covers it. The one exception is exportSigningKeyBytes's rejection of a hardware handle,
+// which throws before it reads Keystore.
 //
 // Uses InMemorySharedPreferences to inject a test double for EncryptedSharedPreferences,
 // allowing verification of Ed25519 key persistence without the Android framework.
@@ -574,6 +575,27 @@ class AndroidKeyCustodyTest {
                 KeyHandle(id = pseudonym.id, custodyType = pseudonym.custodyType),
             )
             assertEquals(32, pubKey.size)
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Signing-key export
+    // -------------------------------------------------------------------
+
+    @Nested
+    inner class ExportSigningKeyBytes {
+
+        @Test
+        fun `exportSigningKeyBytes rejects a hardware handle with SCP-CRYPTO-4005 citing ADR-063`() {
+            // The hardware branch throws before it reads Android Keystore, so a JVM test reaches it.
+            val hardwareHandle = KeyHandle(id = "tee-key", custodyType = CustodyType.HARDWARE)
+            val exception = assertThrows<ScpException> {
+                custody.exportSigningKeyBytes(hardwareHandle)
+            }
+            assertEquals("SCP-CRYPTO-4005", exception.code)
+            val message = exception.message.orEmpty()
+            assertTrue(message.contains("ADR-063's curve slice"), message)
+            assertTrue(!message.contains("GitHub issue"), message)
         }
     }
 
