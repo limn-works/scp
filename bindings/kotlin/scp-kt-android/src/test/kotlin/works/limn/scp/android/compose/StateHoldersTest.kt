@@ -11,6 +11,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.ui.test.junit4.createComposeRule
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -33,11 +34,13 @@ import org.robolectric.shadows.ShadowLog
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingDeque
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
+import kotlin.coroutines.CoroutineContext
 
 @RunWith(RobolectricTestRunner::class)
 @Config(manifest = Config.NONE, sdk = [33])
@@ -700,10 +703,11 @@ class ScpHotStreamRemountTest {
             val first = coordinator.mount("k")
             val second = coordinator.mount("k")
 
-            assertEquals(null, coordinator.unmount(first) { stops.incrementAndGet() })
+            val held = checkNotNull(coordinator.unmount(first) { stops.incrementAndGet() })
             assertEquals("unmounting one mount twice", null, coordinator.unmount(first) { stops.incrementAndGet() })
             val stop = coordinator.unmount(second) { stops.incrementAndGet() }
             assertTrue("the last mount's unmount launched no stop", stop != null)
+            assertTrue("a held departure's Job completed before any stop ran", !held.isCompleted)
 
             val third = coordinator.mount("k")
             assertEquals("a later mount did not capture the pending stop", stop, third.pendingStop)
@@ -719,6 +723,8 @@ class ScpHotStreamRemountTest {
             starting.join()
 
             assertEquals("a later mount's start ran before the pending stop", 2, stopsSeenByStart.get())
+            runBlocking { held.join() }
+            assertEquals("a held departure's Job completed before its onStop ran", 2, stops.get())
         } finally {
             dispatcherFree.countDown()
             executor.shutdown()
@@ -738,12 +744,104 @@ class ScpHotStreamRemountTest {
         val messages = coordinator.mount("k")
         val stopped = Collections.synchronizedList(mutableListOf<String>())
 
-        assertEquals(null, coordinator.unmount(events) { stopped += "events" })
+        val held = checkNotNull(coordinator.unmount(events) { stopped += "events" })
+        assertTrue("a held departure's Job completed while a mount stayed live", !held.isCompleted)
         assertEquals("the first departure released a subscription still mounted", emptyList<String>(), stopped)
         val stop = coordinator.unmount(messages) { stopped += "messages" }
         runBlocking { checkNotNull(stop).join() }
 
         assertEquals(listOf("events", "messages"), stopped.toList())
+        runBlocking { held.join() }
+    }
+
+    /**
+     * A stop launched under a key runs after every stop launched before it under that key, even
+     * when the earlier stop reaches its dispatcher last. Otherwise a mount that captured only the
+     * later stop could start, reuse a subscription, and then lose it to the earlier stop.
+     *
+     * [QueuedDispatcher] holds every dispatched task until this method runs it, and this method
+     * runs the newest task first, so the second stop reaches the free mutex before the first stop
+     * has left its dispatcher queue.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `a stop runs after every stop launched before it under that key`() {
+        val dispatcher = QueuedDispatcher()
+        val coordinator = ScpHotStreamCoordinator(CoroutineScope(SupervisorJob() + dispatcher))
+        val stopped = Collections.synchronizedList(mutableListOf<String>())
+
+        val first = checkNotNull(coordinator.unmount(coordinator.mount("k")) { stopped += "first" })
+        val secondMount = coordinator.mount("k")
+        assertEquals("a later mount did not capture the pending stop", first, secondMount.pendingStop)
+        val second = checkNotNull(coordinator.unmount(secondMount) { stopped += "second" })
+        val third = coordinator.mount("k")
+        assertEquals("a later mount did not capture the newest stop", second, third.pendingStop)
+
+        dispatcher.runNewestFirst()
+
+        assertEquals(listOf("first", "second"), stopped.toList())
+        assertTrue("the earlier stop did not finish", first.isCompleted)
+        assertTrue("the later stop did not finish", second.isCompleted)
+    }
+
+    /**
+     * A mount that moves to another coordinator while a second mount under that key stays live
+     * on the first coordinator has its `onStop` held there, and that held `onStop` runs when the
+     * second mount leaves. A start through the new coordinator that ran before then would reuse
+     * the shared subscription, which that held `onStop` and the second mount's `onStop` then
+     * release, and the moved mount would collect a SharedFlow that receives nothing further.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `a coordinator swap next to a live mount starts only after the old coordinator stops the key`() {
+        val subscriptions = FakeSubscriptionRegistry()
+        val startCalls = AtomicInteger(0)
+        val firstCoordinator = ScpHotStreamCoordinator(newCoordinatorScope())
+        val secondCoordinator = ScpHotStreamCoordinator(newCoordinatorScope())
+        val movingCoordinator = MutableStateFlow(firstCoordinator)
+        val showStaying = MutableStateFlow(true)
+        val eventFlow = MutableSharedFlow<String>()
+
+        composeRule.setContent {
+            val moving by movingCoordinator.collectAsStateCompat()
+            val staying by showStaying.collectAsStateCompat()
+            listOf(moving to true, firstCoordinator to staying).forEachIndexed { index, (coordinator, shown) ->
+                if (shown) {
+                    key(index) {
+                        rememberScpHotStream(
+                            key = "shared-key",
+                            coordinator = coordinator,
+                            start = {
+                                startCalls.incrementAndGet()
+                                subscriptions.subscribe()
+                                eventFlow
+                            },
+                            onStop = { subscriptions.unsubscribeLive() },
+                        )
+                    }
+                }
+            }
+        }
+
+        composeRule.waitForIdle()
+        awaitCondition("both mounts did not start") { startCalls.get() == 2 }
+        assertEquals(listOf(1), subscriptions.subscribeIds())
+
+        movingCoordinator.value = secondCoordinator
+        composeRule.waitForIdle()
+        // A start through the new coordinator that does not wait for the held stop runs here.
+        Thread.sleep(SWAP_START_GRACE_MS)
+        assertEquals("the moved mount started while the old coordinator held its onStop", 2, startCalls.get())
+        assertEquals(listOf(1), subscriptions.liveIds())
+
+        showStaying.value = false
+        composeRule.waitForIdle()
+        awaitCondition("the old coordinator's stop released nothing") {
+            subscriptions.unsubscribeIds() == listOf(1)
+        }
+        awaitCondition("the moved mount opened no subscription after that stop") {
+            subscriptions.subscribeIds() == listOf(1, 2)
+        }
+        assertEquals(3, startCalls.get())
+        assertEquals(listOf(2), subscriptions.liveIds())
     }
 
     /**
@@ -832,6 +930,29 @@ private class FakeSubscriptionRegistry {
     fun unsubscribeIds(): List<Int> = synchronized(lock) { unsubscribed.toList() }
 
     fun liveIds(): List<Int> = synchronized(lock) { listOfNotNull(live) }
+}
+
+/**
+ * Holds every task dispatched to it until [runNewestFirst] runs it, so a test decides which of
+ * two launched coroutines runs first.
+ */
+private class QueuedDispatcher : CoroutineDispatcher() {
+    private val tasks = LinkedBlockingDeque<Runnable>()
+
+    override fun dispatch(
+        context: CoroutineContext,
+        block: Runnable,
+    ) {
+        tasks.addLast(block)
+    }
+
+    /** Run queued tasks on this thread, newest first, until none is left. */
+    fun runNewestFirst() {
+        while (true) {
+            val task = tasks.pollLast() ?: return
+            task.run()
+        }
+    }
 }
 
 /**

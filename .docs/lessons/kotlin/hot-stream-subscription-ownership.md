@@ -62,7 +62,13 @@ subscription that a different caller had just opened.
   pending stop; `unmount` holds a departing mount's `onStop` while another mount under that key
   is live, and when it removes the last live mount it launches one stop that runs every held
   `onStop` and its own, and records that stop's `Job` before `onDispose` returns;
-  `startMounted` joins the captured stop before it runs a `start` lambda. Discarding an early
+  `startMounted` joins the captured stop before it runs a `start` lambda. Each launched stop joins
+  the stop launched before it under that key before it takes that key's mutex, because a mount
+  captures only the newest stop, and an older stop that reached its dispatcher last would
+  otherwise release whatever that mount's start opened. For a departure it holds, `unmount`
+  returns a `Job` that the next launched stop completes, so a mount that moves to another
+  coordinator while a second mount under that key stays on the first one starts only after the
+  first coordinator releases the subscription both mounts shared. Discarding an early
   mount's `onStop` instead leaks a subscription whenever two different streams share a key, such
   as a `contextEvents` and an `incomingMessages` stream both keyed by one context handle.
 
@@ -88,7 +94,11 @@ and restore defect 3 exactly, because each mount would then coordinate against i
   drives one composable out of composition and back under one same key against a fake registry,
   and asserts that a subscription live at test end is one a second mount opened. A second test
   there composes two mounts under one key at once, removes one, and asserts that no `onStop` ran
-  and that their shared subscription is still live.
+  and that their shared subscription is still live. `a stop runs after every stop launched before
+  it under that key` launches two stops on a dispatcher that runs its queued tasks newest first,
+  and asserts that their `onStop` lambdas ran oldest first, and `a coordinator swap next to a live mount starts only after the old
+  coordinator stops the key` asserts that a moved mount opens a fresh subscription only after its
+  old coordinator released the shared one.
 
 ## Anti-patterns
 
