@@ -70,8 +70,9 @@ struct StdioClientTransport {
     /// The spawned subprocess, kept apart from the pipes an in-flight call
     /// holds so a disconnect can stop it while a call waits on its stdout.
     /// On Unix it leads its own process group. `py_mcp_client_disconnect`
-    /// or, at the latest, [`Drop`] kills that group and reaps the subprocess.
-    child: Arc<Mutex<Child>>,
+    /// or, at the latest, [`Drop`] kills that group and reaps the subprocess
+    /// through [`stop_stdio_server`], which empties the slot.
+    child: Arc<Mutex<Option<Child>>>,
     /// The subprocess's stdin writer and stdout reader.
     inner: Mutex<StdioTransportInner>,
 }
@@ -136,14 +137,34 @@ impl StdioClientTransport {
         let reader = BufReader::new(stdout);
 
         Ok(Self {
-            child: Arc::new(Mutex::new(child)),
+            child: Arc::new(Mutex::new(Some(child))),
             inner: Mutex::new(StdioTransportInner { writer, reader }),
         })
     }
 
     /// The subprocess, for [`McpClientState::stdio_server`].
-    fn server_process(&self) -> Arc<Mutex<Child>> {
+    fn server_process(&self) -> Arc<Mutex<Option<Child>>> {
         Arc::clone(&self.child)
+    }
+}
+
+/// Kills a stdio server's process group and reaps the server, once.
+///
+/// The server leaves its slot under the slot's lock, so a later call (the
+/// transport's [`Drop`] after `py_mcp_client_disconnect`) finds the slot
+/// empty and signals nothing. A second `stop_server_process` on the same
+/// reaped `Child` would not be safe: it decides whether to signal the group
+/// from a `waitid` on the raw pid, and once the server is reaped that pid can
+/// belong to another child of this process, such as a second stdio server
+/// leading its own group. The lock is held until the server is reaped, so a
+/// disconnect returns only after the server is gone even when the drop runs
+/// concurrently.
+fn stop_stdio_server(slot: &Mutex<Option<Child>>) {
+    let mut slot = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(child) = slot.take() {
+        scp_mcp::stdio::stop_server_process(&Mutex::new(child));
     }
 }
 
@@ -154,7 +175,7 @@ impl StdioClientTransport {
 /// handles. Without this impl, dropped transports leak running subprocesses.
 impl Drop for StdioClientTransport {
     fn drop(&mut self) {
-        scp_mcp::stdio::stop_server_process(&self.child);
+        stop_stdio_server(&self.child);
     }
 }
 
@@ -1162,9 +1183,10 @@ pub(crate) struct McpClientState {
     /// A stdio client's subprocess, which `py_mcp_client_disconnect` kills
     /// directly: an in-flight call's clone of `client` would otherwise keep
     /// the subprocess alive, and a thread parked on its stdout, for as long
-    /// as the server stays silent. `None` for an SSE client, whose reads
-    /// time out.
-    stdio_server: Option<Arc<Mutex<Child>>>,
+    /// as the server stays silent. `None` for an SSE client: a disconnect
+    /// does not end an in-flight SSE call, which waits on a POST with no read
+    /// timeout until the server answers or closes the connection.
+    stdio_server: Option<Arc<Mutex<Option<Child>>>>,
 }
 
 // Phase D (#1695): `server_registry()` / `client_registry()` default-bridge
@@ -1177,8 +1199,13 @@ pub(crate) struct McpClientState {
 ///
 /// `subscribe_events()` returns `None` only for a supervisor built without the
 /// channel; production supervisors always enable it (see
-/// `crate::runtime::build_supervisor`). With no supervisor or no channel the
-/// bundle is unwired: the server advertises every capability the event pump
+/// `crate::runtime::build_supervisor`). The bundle is unwired in three cases:
+/// no supervisor is attached, the supervisor has no channel, or the instance
+/// is suspended when the server is created, because
+/// `crate::runtime::supervisor` refuses a suspended instance. The last case
+/// lasts the server's life: `resume()` does not rewire a server built while
+/// suspended, so the host creates the server again after `resume()` to get
+/// subscriptions. An unwired server advertises every capability the event pump
 /// backs as false (`resources.subscribe`, `resources.listChanged`,
 /// `tools.listChanged`), rejects `resources/subscribe`, and sends no
 /// `notifications/*/list_changed`, so those capabilities are honestly absent
@@ -1201,7 +1228,7 @@ fn mcp_server_bundle(
     let context_events = match crate::runtime::supervisor(bi) {
         Ok(supervisor) => supervisor.subscribe_events(),
         Err(e) => {
-            tracing::warn!("MCP server: no supervisor attached ({e})");
+            tracing::warn!("MCP server: no supervisor event source ({e})");
             None
         }
     };
@@ -1698,9 +1725,10 @@ impl crate::scp::PyScp {
 /// on Unix, every process in its process group (such as the server an `npx`
 /// launcher started) are killed before this returns, and the subprocess is
 /// reaped, even while a call on the handle is in flight; that call then fails
-/// on the closed stdout. For SSE clients, the
-/// TCP connection closes when the last call on the handle ends, which a read
-/// timeout bounds.
+/// on the closed stdout. For SSE clients, a disconnect does not end an
+/// in-flight call: the call waits on a POST with no read timeout until the
+/// server answers or closes the connection, and the transport's
+/// connections close when that last call on the handle ends.
 ///
 /// # Arguments
 ///
@@ -1726,7 +1754,7 @@ impl crate::scp::PyScp {
         // in-flight call then fails on the closed stdout and drops the last
         // clone.
         if let Some(server) = state.stdio_server {
-            scp_mcp::stdio::stop_server_process(&server);
+            stop_stdio_server(&server);
         }
 
         Ok(())
@@ -3906,18 +3934,35 @@ mod tests {
             .expect("disconnect a known handle");
 
         assert!(
-            server
-                .lock()
-                .expect("server lock")
-                .try_wait()
-                .expect("query the server process")
-                .is_some(),
-            "disconnect must kill the stdio server process"
+            server.lock().expect("server lock").is_none(),
+            "disconnect must kill and reap the stdio server process"
         );
         let failed = done_rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the in-flight call must end once disconnect kills the server's grandchild");
         assert!(failed, "the killed stub server sent no tools/list response");
+    }
+
+    /// `stop_stdio_server` reaps the server and empties its slot, so the
+    /// second stop that a disconnect followed by the transport's drop makes
+    /// finds no `Child` and never runs `stop_server_process` on a reaped one,
+    /// whose raw pid may by then name another group-leading child. Pid reuse
+    /// cannot be forced in a test, so the test checks the empty slot, which
+    /// is what keeps the second stop from signalling.
+    #[cfg(unix)]
+    #[test]
+    fn stop_stdio_server_reaps_the_server_and_empties_its_slot() {
+        let mut command = Command::new("sleep");
+        command.arg("600");
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let slot = Mutex::new(Some(command.spawn().expect("spawn group leader")));
+        stop_stdio_server(&slot);
+        assert!(
+            slot.lock().expect("slot lock").is_none(),
+            "the first stop must reap the server and empty its slot"
+        );
+        stop_stdio_server(&slot);
+        assert!(slot.lock().expect("slot lock").is_none());
     }
 
     /// WU6: Two-instance regression test — disabling enforcement via the
@@ -4850,6 +4895,49 @@ mod tests {
             pyo3_mcp_provider(&bi, "ctx-wired", "did:dht:z6MkWiredBundle"),
         );
         assert_eq!(format!("{bundle:?}"), "McpServerForTransport::Wired");
+    }
+
+    /// A server created while the instance is suspended is unwired even with
+    /// a supervisor attached, as the `mcp_server_bundle` doc states, because
+    /// `crate::runtime::supervisor` refuses a suspended instance. The same
+    /// instance, resumed, builds the wired bundle again.
+    #[test]
+    fn suspended_instance_builds_the_unwired_bundle_pyo3() {
+        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
+        crate::init_runtime().ok();
+        let bi = __bi();
+        crate::runtime::init_context_manager_for_test(&bi);
+
+        bi.core.suspend().expect("suspend");
+        assert!(
+            bi.core.try_supervisor().is_some(),
+            "precondition: suspension keeps the supervisor attached"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                mcp_server_bundle(
+                    &bi,
+                    pyo3_mcp_provider(&bi, "ctx-suspended", "did:dht:z6MkSuspendedBundle"),
+                )
+            ),
+            "McpServerForTransport::Unwired"
+        );
+
+        crate::runtime()
+            .expect("runtime")
+            .block_on(bi.resume())
+            .expect("resume");
+        assert_eq!(
+            format!(
+                "{:?}",
+                mcp_server_bundle(
+                    &bi,
+                    pyo3_mcp_provider(&bi, "ctx-suspended", "did:dht:z6MkSuspendedBundle"),
+                )
+            ),
+            "McpServerForTransport::Wired"
+        );
     }
 
     /// A missing `Supervisor` removes only the pump-backed capabilities
