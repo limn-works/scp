@@ -466,11 +466,15 @@ and an `advisory-not-detected` warning marks an ignore entry as unnecessary. Do 
 an entry on an `advisory-not-detected` from a binary whose version differs from CI's. Count every copy of the crate in
 `Cargo.lock` before calling an advisory cleared: a bump that adds a patched version on top
 of unpatched duplicates leaves the unpatched ones compiling into the shipped artifact.
-cargo-deny does not reliably report every affected copy: on 0.20.2 it
-reported both `libcrux-sha3 0.0.6` and `0.0.7`, but reported an `lru` advisory against
-`lru 0.16.3` alone while `lru 0.12.5` also compiled in, and raising the direct dependency
-turned the check green with both affected copies still in the build. The `Cargo.lock`
-count is the only check that covers every copy.
+cargo-deny reports a vulnerability advisory against every affected copy, but its
+`[advisories] unsound` key decides which copies an `unsound` informational advisory
+reaches. Its default, `"workspace"`, reports only a crate a workspace member names
+directly: cargo-deny reported the `lru` advisory RUSTSEC-2026-0253 against `lru 0.16.3`
+alone while `lru 0.12.5` also compiled in, and raising the direct dependency to 0.18.2
+turned the check green with both affected copies still in the build. `deny.toml`
+therefore sets `unsound = "all"`, which reports every copy in the graph. Never lower
+that key; clear a transitive copy with a bump, or with an `ignore` entry that names the
+crate that pins it and why the advisory's trigger cannot occur.
 
 ## CI Matrix
 
