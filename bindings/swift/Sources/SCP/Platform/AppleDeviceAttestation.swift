@@ -18,12 +18,36 @@
     public nonisolated enum AttestationError: Error, Sendable {
         /// The platform App Attest service returned an error.
         case serviceError(String)
-        /// App Attest is not supported and no fallback was possible.
+        /// `DCAppAttestService` reports `isSupported == false`, so this device
+        /// cannot produce an App Attest attestation or assertion.
+        ///
+        /// A caller catches this case to learn that the device holds no
+        /// hardware attestation signal. §9.3 of the security model spec,
+        /// "Sybil resistance and identity uniqueness", states that the absence
+        /// of a device attestation is expected and is not penalizing, so the
+        /// caller presents no attestation rather than presenting a weaker one.
         case unsupported(String)
-        /// The stored App Attest key ID is missing; call `attest` first.
+        /// No App Attest key ID is stored, because no `attest` call has
+        /// generated a key; call `attest` first.
         case keyNotFound
         /// An internal invariant was violated.
         case internalError(String)
+    }
+
+    extension AttestationError {
+        /// The `ScpError` that carries this error across the UniFFI
+        /// `DeviceAttestationProvider` callback, with one `SCP-ATTEST-` code
+        /// per case, so Rust tells every case apart by its code.
+        /// `crates/scp-ffi/common/src/error_codes.rs` registers each code.
+        var scpError: ScpError {
+            switch self {
+            case let .serviceError(msg): .Identity(msg: msg, code: "SCP-ATTEST-9001")
+            case let .unsupported(msg): .Identity(msg: msg, code: "SCP-ATTEST-9019")
+            case .keyNotFound:
+                .Identity(msg: "no App Attest key ID is stored; call attest first", code: "SCP-ATTEST-9020")
+            case let .internalError(msg): .Identity(msg: msg, code: "SCP-ATTEST-9025")
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -33,10 +57,6 @@
     private enum StorageKey {
         /// `UserDefaults` key under which the App Attest key ID is persisted.
         static let appAttestKeyId = "dev.limn.scp.appAttest.keyId"
-        /// Prefix for synthetic software-only attestation tokens.
-        static let softwareTokenPrefix = "software-attestation-"
-        /// Prefix for synthetic software-only assertion tokens.
-        static let softwareAssertionPrefix = "software-assertion-"
     }
 
     // ---------------------------------------------------------------------------
@@ -57,21 +77,31 @@
     ///    where `clientDataHash = SHA-256(clientDataJSON)`.
     /// 3. `generateAssertion(_:clientData:)` — per-request proof of possession.
     ///
-    /// ## Software fallback (simulator / unavailable)
+    /// ## Unavailable service (simulator, or a device without App Attest)
     ///
-    /// When `DCAppAttestService.shared.isSupported` is `false`, the adapter
-    /// returns a deterministic synthetic token and never throws. The caller
-    /// receives a valid-shaped but software-only token, allowing the protocol to
-    /// proceed in development and simulator environments.
+    /// When `DCAppAttestService.isSupported` is `false`, `attest` and
+    /// `assertRequest` throw `ScpError.Identity` with code `SCP-ATTEST-9019`,
+    /// which `AttestationError.unsupported` maps to. The adapter mints
+    /// no substitute token, because a locally fabricated token would assert a
+    /// hardware guarantee that no hardware produced. §9.3 of the security model
+    /// spec, "Sybil resistance and identity uniqueness", states that the
+    /// absence of a device attestation is expected and is not penalizing, so
+    /// the honest result is the typed error rather than a token.
+    ///
+    /// A caller that wants to branch before it calls reads `isHardwareBacked`.
     ///
     /// ## Thread safety
     ///
     /// `AppleDeviceAttestation` is `final` and conforms to `Sendable`. Internal
     /// mutable state (`generationTask`, `UserDefaults`) is protected by `NSLock`.
-    /// All async methods use `withCheckedThrowingContinuation` to bridge the
-    /// completion-handler APIs to structured concurrency.
+    /// `attestKey` and `generateAssertion` bridge to structured concurrency
+    /// through `withCheckedContinuation` and return Apple's answer as a
+    /// `Result`; `generateKey` bridges through
+    /// `withCheckedThrowingContinuation`.
     ///
-    /// See ADR-025 and `crates/scp-platform/src/traits.rs` `DeviceAttestation`.
+    /// See ADR-025 and the UniFFI `DeviceAttestationProvider` callback
+    /// interface in `crates/scp-ffi/uniffi/src/lib.rs`, which this class
+    /// conforms to.
     public final class AppleDeviceAttestation: DeviceAttestationProvider, @unchecked Sendable {
         // `@unchecked Sendable` is required because this class is injected into the
         // Rust engine via the UniFFI `DeviceAttestationProvider` callback interface,
@@ -117,7 +147,50 @@
 
         // MARK: - DeviceAttestationProvider
 
-        /// Generate an attestation token for the given challenge and device ID.
+        /// The `DeviceAttestationProvider` callback method Rust calls through
+        /// UniFFI to obtain an attestation.
+        ///
+        /// The UniFFI callback declares `ScpError` as its error type. The
+        /// generated glue lowers a thrown `ScpError` into an error value that
+        /// Rust receives, and hands any other thrown type to Rust as an
+        /// unexpected callback error, which panics on the Rust side. This
+        /// method therefore throws `ScpError` only: it translates each
+        /// `AttestationError` through `AttestationError.scpError`, and
+        /// `attestReportingAttestationError(challenge:deviceId:)` declares
+        /// `throws(AttestationError)`, so the compiler rejects any other type.
+        ///
+        /// - Throws: `ScpError.Identity` carrying `SCP-ATTEST-9019` for
+        ///   `AttestationError.unsupported`, `SCP-ATTEST-9001` for
+        ///   `AttestationError.serviceError`, or `SCP-ATTEST-9025` for
+        ///   `AttestationError.internalError`, in the cases
+        ///   `attestReportingAttestationError(challenge:deviceId:)` lists.
+        public func attest(challenge: Data, deviceId: Data) async throws(ScpError) -> Data {
+            do throws(AttestationError) {
+                return try await attestReportingAttestationError(challenge: challenge, deviceId: deviceId)
+            } catch {
+                throw error.scpError
+            }
+        }
+
+        /// The `DeviceAttestationProvider` callback method Rust calls through
+        /// UniFFI to obtain an assertion. It throws `ScpError` only, for the
+        /// reason `attest(challenge:deviceId:)` states.
+        ///
+        /// - Throws: `ScpError.Identity` carrying `SCP-ATTEST-9019` for
+        ///   `AttestationError.unsupported`, `SCP-ATTEST-9020` for
+        ///   `AttestationError.keyNotFound`, `SCP-ATTEST-9001` for
+        ///   `AttestationError.serviceError`, or `SCP-ATTEST-9025` for
+        ///   `AttestationError.internalError`, in the cases
+        ///   `assertRequestReportingAttestationError(requestHash:)` lists.
+        public func assertRequest(requestHash: Data) async throws(ScpError) -> Data {
+            do throws(AttestationError) {
+                return try await assertRequestReportingAttestationError(requestHash: requestHash)
+            } catch {
+                throw error.scpError
+            }
+        }
+
+        /// Generate an attestation for the given challenge and device ID.
         ///
         /// On a real device with App Attest available:
         /// 1. Retrieves or generates the App Attest key ID.
@@ -126,102 +199,106 @@
         /// 3. Calls `DCAppAttestService.attestKey(_:clientDataHash:)`.
         /// 4. Returns the raw CBOR attestation bytes.
         ///
-        /// On simulator or when App Attest is unavailable:
-        /// Returns a synthetic token of the form
-        /// `"software-attestation-<UUID>"` (UTF-8 encoded).
+        /// On simulator or on a device where App Attest is unavailable, this
+        /// method throws `AttestationError.unsupported`, calls no App Attest
+        /// method, and returns no bytes.
         ///
         /// - Parameters:
         ///   - challenge: Server-issued random challenge bytes.
         ///   - deviceId: Stable device/identity identifier bytes.
         /// - Returns: Attestation token bytes.
-        /// - Throws: `AttestationError.serviceError` if the App Attest service
-        ///   returns an error on a real device.
-        public func attest(challenge: Data, deviceId: Data) async throws -> Data {
+        /// - Throws: `AttestationError.unsupported` when
+        ///   `DCAppAttestService.isSupported` is `false`.
+        ///   `AttestationError.serviceError` when `generateKey` or `attestKey`
+        ///   answers with an error.
+        ///   `AttestationError.internalError` when `generateKey` or `attestKey`
+        ///   answers with neither a value nor an error, or when this adapter is
+        ///   deallocated while it generates a key.
+        func attestReportingAttestationError(
+            challenge: Data,
+            deviceId: Data
+        ) async throws(AttestationError) -> Data {
             guard service.isSupported else {
-                return softwareAttestationToken()
+                throw AttestationError.unsupported(
+                    "DCAppAttestService.isSupported is false on this device, so App Attest cannot "
+                        + "produce an attestation. This adapter mints no substitute token."
+                )
             }
 
-            let keyId = try await resolveKeyId()
+            let keyId: String
+            do {
+                keyId = try await resolveKeyId()
+            } catch let error as AttestationError {
+                throw error
+            } catch {
+                throw AttestationError.serviceError(error.localizedDescription)
+            }
             let clientDataHash = computeClientDataHash(challenge: challenge, deviceId: deviceId)
 
-            return try await withCheckedThrowingContinuation { continuation in
+            let outcome: Result<Data, AttestationError> = await withCheckedContinuation { continuation in
                 service.attestKey(keyId, clientDataHash: clientDataHash) { attestation, error in
                     if let error {
-                        continuation.resume(throwing: AttestationError.serviceError(error.localizedDescription))
+                        continuation.resume(returning: .failure(.serviceError(error.localizedDescription)))
                     } else if let attestation {
-                        continuation.resume(returning: attestation)
+                        continuation.resume(returning: .success(attestation))
                     } else {
-                        continuation.resume(throwing: AttestationError.internalError(
+                        continuation.resume(returning: .failure(.internalError(
                             "attestKey returned neither attestation nor error"
-                        ))
+                        )))
                     }
                 }
             }
+            return try outcome.get()
         }
 
         /// Generate a per-request assertion for a previously attested key.
         ///
         /// On a real device with App Attest available, calls
-        /// `DCAppAttestService.generateAssertion(_:clientData:)`. The assertion
-        /// binds the request hash to the stored App Attest key.
+        /// `DCAppAttestService.generateAssertion(_:clientDataHash:)`. The
+        /// assertion binds the request hash to the stored App Attest key.
         ///
-        /// On simulator or when App Attest is unavailable, returns a synthetic
-        /// assertion of the form `"software-assertion-<UUID>"` (UTF-8 encoded).
+        /// On simulator or on a device where App Attest is unavailable, this
+        /// method throws `AttestationError.unsupported`, calls no App Attest
+        /// method, and returns no bytes.
         ///
         /// - Parameter requestHash: SHA-256 digest of the request payload.
         /// - Returns: Assertion bytes to include in the relay request.
-        /// - Throws: `AttestationError.keyNotFound` if no key ID is stored
-        ///   (i.e., `attest` was never called).
-        ///   `AttestationError.serviceError` if the App Attest service fails.
-        public func assertRequest(requestHash: Data) async throws -> Data {
+        /// - Throws: `AttestationError.unsupported` when
+        ///   `DCAppAttestService.isSupported` is `false`.
+        ///   `AttestationError.keyNotFound` when no key ID is stored, because
+        ///   no `attest` call has generated a key.
+        ///   `AttestationError.serviceError` when `generateAssertion` answers
+        ///   with an error.
+        ///   `AttestationError.internalError` when `generateAssertion` answers
+        ///   with neither an assertion nor an error.
+        func assertRequestReportingAttestationError(
+            requestHash: Data
+        ) async throws(AttestationError) -> Data {
             guard service.isSupported else {
-                return softwareAssertionToken()
+                throw AttestationError.unsupported(
+                    "DCAppAttestService.isSupported is false on this device, so App Attest cannot "
+                        + "produce an assertion. This adapter mints no substitute token."
+                )
             }
 
             guard let keyId = loadKeyId() else {
                 throw AttestationError.keyNotFound
             }
 
-            return try await withCheckedThrowingContinuation { continuation in
+            let outcome: Result<Data, AttestationError> = await withCheckedContinuation { continuation in
                 service.generateAssertion(keyId, clientDataHash: requestHash) { assertion, error in
                     if let error {
-                        continuation.resume(throwing: AttestationError.serviceError(error.localizedDescription))
+                        continuation.resume(returning: .failure(.serviceError(error.localizedDescription)))
                     } else if let assertion {
-                        continuation.resume(returning: assertion)
+                        continuation.resume(returning: .success(assertion))
                     } else {
-                        continuation.resume(throwing: AttestationError.internalError(
+                        continuation.resume(returning: .failure(.internalError(
                             "generateAssertion returned neither assertion nor error"
-                        ))
+                        )))
                     }
                 }
             }
-        }
-
-        // MARK: - Token verification (client-side)
-
-        /// Perform client-side format validation of an attestation token.
-        ///
-        /// Full server-side verification is performed by the SCP relay, which
-        /// calls Apple's App Attest attestation endpoint. This method is a
-        /// lightweight sanity check only:
-        /// - Hardware tokens: non-empty bytes.
-        /// - Software tokens: UTF-8 string with `"software-attestation-"` prefix.
-        ///
-        /// - Parameter token: Raw attestation bytes to validate.
-        /// - Returns: `true` if the token passes format validation.
-        public func verify(token: Data) -> Bool {
-            if token.isEmpty {
-                return false
-            }
-            // Software-only tokens carry the known prefix; hardware tokens are
-            // CBOR-encoded and will not start with this prefix.
-            if let string = String(data: token, encoding: .utf8),
-               string.hasPrefix(StorageKey.softwareTokenPrefix) {
-                return true
-            }
-            // Non-empty non-software bytes are assumed valid for client-side
-            // purposes; full verification is server-side.
-            return true
+            return try outcome.get()
         }
 
         // MARK: - Private helpers
@@ -334,34 +411,6 @@
             lock.lock()
             defer { lock.unlock() }
             defaults.set(keyId, forKey: StorageKey.appAttestKeyId)
-        }
-
-        // MARK: Software fallback tokens
-
-        /// Returns a synthetic software-only attestation token.
-        ///
-        /// Used when `DCAppAttestService.shared.isSupported == false` (simulator
-        /// or devices without App Attest). The token is a UUID-suffixed string
-        /// encoded as UTF-8 bytes. It is valid for client-side format checks but
-        /// will be treated as `method: .softwareOnly` by the relay.
-        ///
-        /// - Returns: UTF-8-encoded synthetic attestation token.
-        private func softwareAttestationToken() -> Data {
-            let token = "\(StorageKey.softwareTokenPrefix)\(UUID().uuidString)"
-            // Encoding cannot fail for a pure ASCII string.
-            return token.data(using: .utf8) ?? Data(token.utf8)
-        }
-
-        /// Returns a synthetic software-only assertion token.
-        ///
-        /// Used when `DCAppAttestService.shared.isSupported == false` (simulator
-        /// or devices without App Attest). The token is a UUID-suffixed string
-        /// encoded as UTF-8 bytes.
-        ///
-        /// - Returns: UTF-8-encoded synthetic assertion token.
-        private func softwareAssertionToken() -> Data {
-            let token = "\(StorageKey.softwareAssertionPrefix)\(UUID().uuidString)"
-            return token.data(using: .utf8) ?? Data(token.utf8)
         }
     }
 

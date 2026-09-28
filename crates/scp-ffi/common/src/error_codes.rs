@@ -1166,7 +1166,11 @@ pub const STORAGE_8004: &str = "SCP-STORAGE-8004";
 // Attestation (SCP-ATTEST- 9000--9999)
 // -------------------------------------------------------------------------
 
-/// Device attestation provider call failed (Play Integrity API error).
+/// Device attestation provider call failed.
+///
+/// The Android adapter throws it when a Play Integrity token request fails,
+/// and the Apple adapter throws it when Apple's App Attest service answers
+/// with an error that no narrower `SCP-ATTEST-` code names.
 pub const ATTEST_9001: &str = "SCP-ATTEST-9001";
 
 /// Attestation signature verification requires raw JSON, which is absent.
@@ -1198,6 +1202,22 @@ pub const ATTEST_9017: &str = "SCP-ATTEST-9017";
 
 /// Cryptographic-class verification method not verifiable via browser fetch.
 pub const ATTEST_9018: &str = "SCP-ATTEST-9018";
+
+// Codes the Swift `AppleDeviceAttestation` adapter throws as `ScpError`
+// across the UniFFI `DeviceAttestationProvider` callback
+// (`AttestationError.scpError`). Each of these three codes belongs to one of
+// the four `AttestationError` cases; the fourth case, `serviceError`, reuses
+// `ATTEST_9001`.
+
+/// Apple App Attest is unsupported on this device (`isSupported == false`).
+pub const ATTEST_9019: &str = "SCP-ATTEST-9019";
+/// No App Attest key ID is stored, so no assertion is possible.
+pub const ATTEST_9020: &str = "SCP-ATTEST-9020";
+/// The App Attest adapter reached a state no caller input produces.
+///
+/// Apple's service answered a completion handler with neither a value nor an
+/// error, or the adapter was deallocated while it generated a key.
+pub const ATTEST_9025: &str = "SCP-ATTEST-9025";
 
 // -------------------------------------------------------------------------
 // Economy (SCP-ECON- 12000--12999)
