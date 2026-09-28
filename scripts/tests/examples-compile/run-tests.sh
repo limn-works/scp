@@ -78,6 +78,12 @@ expect "orphan in the examples/NAME/main.rs layout" "$ws" 1 "FAIL: demo publishe
 ws="$(new_ws badmanifest 'readme = "MISSING.md"')"
 expect "cargo package --list failure" "$ws" 1 "FAIL: 'cargo package --list -p demo' failed"
 
+# The same manifest error on a crate with no example target: `autoexamples = false` hides
+# `examples/good.rs` from cargo, so a gate that reported the failure only for a package
+# with targets would print no package line here, and this case would go red.
+ws="$(new_ws badmanifestnotargets $'readme = "MISSING.md"\nautoexamples = false')"
+expect "cargo package --list failure on a crate with no example target" "$ws" 1 "FAIL: 'cargo package --list -p demo' failed"
+
 ws="$(new_ws empty)"
 rm -r "$ws/demo/examples"
 expect "no example target" "$ws" 1 "FAIL: no example target was checked"
