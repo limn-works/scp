@@ -598,12 +598,16 @@ impl CallbackKeyRegistry {
 
     /// Queues host key `key_id` for [`sweep_orphans`] to destroy.
     ///
-    /// # Errors
-    ///
-    /// [`PlatformError::CustodyError`] if the registry lock is poisoned.
-    fn queue_orphan(&self, key_id: String) -> Result<(), PlatformError> {
-        self.lock()?.orphans.push(key_id);
-        Ok(())
+    /// It cannot fail, because [`OrphanGuard`] calls it from `Drop`, which has
+    /// no caller to report to. A poisoned lock still guards a well-formed
+    /// queue: pushing an id breaks no invariant of the slot map, and every
+    /// other registry call still fails closed on the poison.
+    fn queue_orphan(&self, key_id: String) {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .orphans
+            .push(key_id);
     }
 
     /// Takes one queued orphan host key id.
@@ -638,10 +642,7 @@ impl OrphanGuard<'_> {
 impl Drop for OrphanGuard<'_> {
     fn drop(&mut self) {
         if let Some(key_id) = self.key_id.take() {
-            // `Drop` has no caller to return an error to. The only error is a
-            // poisoned lock, which makes every registry call fail, so no
-            // later operation of this adapter succeeds either way.
-            let _ = self.registry.queue_orphan(key_id);
+            self.registry.queue_orphan(key_id);
         }
     }
 }
@@ -3565,14 +3566,43 @@ mod tests {
         assert!(registry.orphans().is_empty());
     }
 
+    /// A registry whose lock a panic poisoned still queues an orphan, so an
+    /// orphan guard dropped then loses no host key id, and every other
+    /// registry call still fails closed.
+    #[test]
+    fn a_poisoned_registry_still_queues_an_orphan() {
+        let registry = CallbackKeyRegistry::new();
+        let poisoner = std::thread::scope(|s| {
+            s.spawn(|| {
+                let _held = registry.slots.lock();
+                std::panic::resume_unwind(Box::new("poison the registry lock"));
+            })
+            .join()
+        });
+        assert!(poisoner.is_err());
+        assert!(registry.slots.is_poisoned());
+        registry.queue_orphan("9".to_owned());
+        let queued = registry
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .orphans
+            .clone();
+        assert_eq!(queued, vec!["9".to_owned()]);
+        assert!(matches!(
+            registry.pop_orphan(),
+            Err(PlatformError::CustodyError(_))
+        ));
+    }
+
     /// A sweep whose host destroy fails keeps the orphan queued and
     /// fails the generation before any mint; a host that no longer holds the
     /// key counts as destroyed.
     #[tokio::test]
     async fn a_failed_sweep_keeps_the_orphan_and_mints_nothing() {
         let registry = CallbackKeyRegistry::new();
-        registry.queue_orphan("7".to_owned()).unwrap();
-        registry.queue_orphan("8".to_owned()).unwrap();
+        registry.queue_orphan("7".to_owned());
+        registry.queue_orphan("8".to_owned());
         let result = generate_keypair(
             &registry,
             KeyType::Ed25519,

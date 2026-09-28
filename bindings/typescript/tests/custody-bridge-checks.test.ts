@@ -395,9 +395,10 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     await custody.destroyKey(first);
     expect(custody.isBound(alpha.keyId)).toBe(false);
     // The host still holds the pseudonym key; the adapter must not reach it.
+    // The pseudonym died with its identity (§9.10.4.A), so it is key-not-found.
     const calls = store.signCalls;
     const err = await custody.sign(alpha.keyId, DIGEST).catch((e: unknown) => e);
-    expect(mapBridgeError(err).code).toBe("SCP-IDENT-1055");
+    expect(mapBridgeError(err).code).toBe("SCP-CRYPTO-4006");
     expect(store.signCalls).toBe(calls);
     // A new identity's pseudonym reuses id "777" with a different point.
     const second = await custody.generateKeypair();

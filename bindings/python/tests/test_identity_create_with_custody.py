@@ -239,8 +239,8 @@ def test_destroying_an_identity_destroys_its_pseudonyms() -> None:
     pseudonym signing.
     """
     provider = _FakeKeychain()
-    identity = provider.generate_keypair("ed25519")
-    other = provider.generate_keypair("ed25519")
+    identity = provider.generate_keypair("ed25519", "identity")
+    other = provider.generate_keypair("ed25519", "identity")
     _, v1 = provider.derive_pseudonym(identity, b"ctx")
     _, v2 = provider.derive_rotatable_pseudonym(identity, b"ctx", 3)
     _, kept = provider.derive_pseudonym(other, b"ctx")
