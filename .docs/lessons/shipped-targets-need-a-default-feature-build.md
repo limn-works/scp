@@ -266,12 +266,19 @@ Three jobs each looked like they covered it and none did:
 - `.github/workflows/build-matrix.yml` runs `cargo build --release` without
   `--examples`, and only on a release tag or a `workflow_call`.
 - `.github/workflows/release.yml` runs `cargo clippy --workspace --all-targets` on
-  default features, but on `workflow_dispatch` — after the merge, not before it.
+  default features, on `workflow_dispatch` — after the merge, not before it. Its timing
+  is not the only gap: `--all-targets` includes every example, and across the whole
+  workspace it unifies dev-dependency features the way mechanism 1 describes, so
+  `scp-node/testing` is on and that command exits 0 on `DhtMode::Memory` in
+  `website.rs` whenever it runs.
 
 ## The trap in the obvious widening
 
 Widening the pull-request job to `cargo clippy --workspace --all-targets` on default
-features looks strictly better and fails today. Two targets need the `testing`
+features looks strictly better. It is not a substitute for the per-package examples
+gate, because its workspace-wide dev-dependency unification (mechanism 1) turns
+`scp-node/testing` on and leaves the check inert against `DhtMode::Memory`. It also
+fails today. Two targets need the `testing`
 feature without declaring it, and cargo aborts after the first, so measuring one at a
 time is what finds them all:
 
@@ -314,6 +321,9 @@ manifest.
 
 - Before writing that a job would have caught a break, name the job and read its trigger.
   A job gated on `push: tags:` or `workflow_dispatch` gates a release, not a pull request.
+  Then read its command's scope: a `--workspace` command that builds examples or tests
+  unifies dev-dependency features across members and can compile a testing-only item
+  whatever its trigger.
 - When a feature flag moves a construct out of a shipped build, grep the whole repository
   for the construct's name — examples, the `README.md` beside the example, operator
   guides, environment-variable tables, and the source of the crate that declares the flag.

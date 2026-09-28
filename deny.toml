@@ -114,7 +114,9 @@ ignore = [
     # lru: `LruCache::pop()` leaves dangling pointers when a key's `Drop` panics. Reported
     # against lru 0.12.5 (aws-sdk-s3, above) and lru 0.16.3, which mainline 6.0.1 (the
     # scp-dht DHT client) requires as `^0.16`; the advisory names lru >= 0.18.2 as
-    # patched, and every workspace crate that names lru directly resolves 0.18.2. The
+    # patched, and every workspace crate that names lru directly resolves 0.18.2; the
+    # `[bans]` entry for lru below fails the check if any other crate pulls in a lower
+    # version, because both IDs here are ignored for every lru version. The
     # keys both crates store (aws-sdk-s3's cache key, mainline's `Id` and
     # `SocketAddrV4`) have no panicking `Drop`, so the trigger cannot occur. A mainline
     # release that requires lru >= 0.18.2 clears the 0.16.3 copy. Re-check with
@@ -127,6 +129,13 @@ ignore = [
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
+# The two lru ignores above hold an advisory ID for every lru version in the graph.
+# This ban keeps them scoped to the transitive copies they justify: an lru below the
+# patched 0.18.2 fails the check unless aws-sdk-s3 or mainline is what depends on it,
+# so a workspace crate naming an unpatched lru directly is reported.
+deny = [
+    { crate = "lru:<0.18.2", wrappers = ["aws-sdk-s3", "mainline"], reason = "RUSTSEC-2026-0002 and RUSTSEC-2026-0253 are ignored only for these two dependents" },
+]
 
 # ── Sources ─────────────────────────────────────────────────────────────────
 [sources]

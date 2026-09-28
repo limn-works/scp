@@ -949,14 +949,6 @@ if grep -qF 'wasm-protocol job' "$FIXTURE16.harness/out.txt"; then
 else
     report "case 16 names the CI job that compiles for that target" 1 "the NOT CHECKED line names no job: $(tail -n 5 "$FIXTURE16.harness/out.txt")"
 fi
-# The same run compiled a crate, so it must also name the examples gate it did not run:
-# deleting that NOTES entry leaves a change under crates/*/examples/ reported green here
-# and red in the rust-clippy job.
-if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh over the example targets of scp-clock' "$FIXTURE16.harness/out.txt"; then
-    report "case 16 names the examples gate it did not run" 0 ""
-else
-    report "case 16 names the examples gate it did not run" 1 "the output holds no NOT CHECKED line for scripts/check-examples-compile.sh: $(tail -n 6 "$FIXTURE16.harness/out.txt")"
-fi
 if grep -qF -- '--target wasm32-unknown-unknown' "$FIXTURE16.harness/cargo.log"; then
     report "case 16 starts no wasm compile of its own" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE16.harness/cargo.log")"
 else
@@ -1147,6 +1139,48 @@ if grep -qF 'NOT CHECKED — the features a sibling manifest activates on scp-cl
     report "case 22 names the feature set it could not read" 0 ""
 else
     report "case 22 names the feature set it could not read" 1 "the output holds no NOT CHECKED line for the sibling feature set: $(tail -n 5 "$FIXTURE22.harness/out.txt")"
+fi
+
+# Case 22's metadata answer holds no package list, so the run cannot tell which compiled
+# package has an example target and names every one of them, saying why.
+if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh over the example targets of scp-clock (this run could not read their targets' "$FIXTURE22.harness/out.txt"; then
+    report "case 22 names the examples gate over every package when it cannot read targets" 0 ""
+else
+    report "case 22 names the examples gate over every package when it cannot read targets" 1 "the output holds no qualified NOT CHECKED line for scripts/check-examples-compile.sh: $(tail -n 6 "$FIXTURE22.harness/out.txt")"
+fi
+
+# ── Case 22b: the examples gate over the packages that have an example target ────────
+#
+# `scripts/check-examples-compile.sh` lints every `example` target, one at a time, with
+# clippy under `-D warnings`, which this runner does not run. The fixture changes two
+# packages and its metadata answer gives an example target to one of them, so the NOT
+# CHECKED line must name that package and not the other: a line naming a package with no
+# example target reports a gate that cannot fail on the change.
+#
+# The mutations it kills: deleting that NOTES entry leaves a change to an example reported
+# green here and red in the rust-clippy job; dropping the target filter names scp-clock.
+FIXTURE22B="$WORK/example-targets"
+build_fixture "$FIXTURE22B"
+fixture_commit "$FIXTURE22B" crates/scp-clock/src/lib.rs
+fixture_commit "$FIXTURE22B" crates/scp-transport/src/lib.rs
+HARNESS22B="$FIXTURE22B.harness"
+write_stubs "$HARNESS22B" "$PIN_CHANNEL" 0 0 ""
+cat > "$HARNESS22B/metadata.json" <<'JSON'
+{"version":1,"target_directory":"/stub-target-dir","packages":[
+ {"name":"scp-clock","dependencies":[],"targets":[{"name":"scp_clock","kind":["lib"]}]},
+ {"name":"scp-transport","dependencies":[],"targets":[{"name":"scp_transport","kind":["lib"]},{"name":"relay","kind":["example"]}]}
+]}
+JSON
+PATH="$HARNESS22B/bin:$PATH" bash "$FIXTURE22B/scripts/fix-round-check.sh" > "$HARNESS22B/out.txt" 2>&1
+if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh over the example targets of scp-transport:' "$HARNESS22B/out.txt"; then
+    report "case 22b names the examples gate over the package that has an example" 0 ""
+else
+    report "case 22b names the examples gate over the package that has an example" 1 "the output holds no NOT CHECKED line naming scp-transport alone: $(tail -n 6 "$HARNESS22B/out.txt")"
+fi
+if grep -F 'check-examples-compile.sh over the example targets of' "$HARNESS22B/out.txt" | grep -qF 'scp-clock'; then
+    report "case 22b names no package without an example target" 1 "$(grep -F 'check-examples-compile.sh' "$HARNESS22B/out.txt")"
+else
+    report "case 22b names no package without an example target" 0 ""
 fi
 
 # ── Case 23: the scripts/ lane against the suites CI runs over that directory ────────
