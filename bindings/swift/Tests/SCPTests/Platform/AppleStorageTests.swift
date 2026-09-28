@@ -337,18 +337,22 @@
         @Test("a prefix that carries a zero byte selects only the keys past it")
         func prefixCarryingAZeroByteSelectsOnlyItsKeys() async throws {
             // Both `listKeys` and `deletePrefix` bind the prefix as the lower
-            // bound and its successor `delta\u{0}p` as the upper bound. A
-            // method that binds the lower bound as a C string scans from
-            // `delta` and selects both keys, answering 2; one that binds the
-            // upper bound as a C string scans up to `delta` and selects none,
-            // answering 0. The correct answer is 1 for each method. These
-            // assertions count keys rather than compare the strings
-            // `listKeys` returns.
+            // bound and its successor as the upper bound; for `delta\u{0}o`
+            // the successor is `delta\u{0}p`. The key `delta` sorts below
+            // every key that starts with `delta\u{0}`. A method that binds
+            // the lower bound as a C string scans from `delta`, selects
+            // `delta` and `delta\u{0}one`, and answers 2 for `delta\u{0}o`
+            // and 3 for `delta\u{0}`. A method that binds the upper bound as
+            // a C string scans up to `delta` and selects no key, answering 0.
+            // The correct answers are 1 and 2. These assertions count keys
+            // rather than compare the strings `listKeys` returns.
             let fixture = try makeStorageFixture()
             defer { fixture.removeFiles() }
 
+            let below = "delta"
             let first = "delta\u{0}one"
             let second = "delta\u{0}two"
+            try await fixture.storage.set(key: below, value: Data([0x00]))
             try await fixture.storage.set(key: first, value: Data([0x01]))
             try await fixture.storage.set(key: second, value: Data([0x02]))
 
@@ -356,6 +360,7 @@
             #expect(try await fixture.storage.listKeys(prefix: "delta\u{0}").count == 2)
 
             #expect(try await fixture.storage.deletePrefix(prefix: "delta\u{0}o") == 1)
+            #expect(try await fixture.storage.exists(key: below) == true)
             #expect(try await fixture.storage.exists(key: first) == false)
             #expect(try await fixture.storage.exists(key: second) == true)
         }
@@ -416,10 +421,13 @@
     /// answers `nil`, the prefix is empty, and no length limit rejects an
     /// empty bind, so no case here reaches the bind in that branch.
     struct AppleStorageRejectedBindTests {
-        /// The length limit these cases request. SQLite raises a request
-        /// below its compiled minimum to that minimum, so each case reads the
-        /// limit `setLengthLimit(_:)` answers.
-        private static let requestedLimit: Int32 = 1
+        /// The length limit these cases request. Some SQLite releases raise a
+        /// request below a compiled minimum (30 bytes in SQLite 3.51) to that
+        /// minimum, and older releases apply any request as given, so a
+        /// request of 1 could answer 1 or 30. A request of 30 sits at that
+        /// minimum, and each case still reads the limit `setLengthLimit(_:)`
+        /// answers.
+        private static let requestedLimit: Int32 = 30
 
         /// A key one byte longer than `limit`.
         private static func overLimitKey(_ limit: Int32) -> String {
@@ -428,8 +436,11 @@
 
         /// A prefix `limit - 1` bytes long whose successor is `limit + 1`
         /// bytes long, so SQLite accepts the prefix's bind and rejects the
-        /// successor's.
+        /// successor's. Such a prefix needs `limit` of at least 2, and the
+        /// check runs before `String(repeating:count:)`, which traps on a
+        /// negative count.
         private static func prefixWithOverLimitSuccessor(_ limit: Int32) throws -> String {
+            try #require(limit >= 2)
             let prefix = String(repeating: "k", count: Int(limit) - 2) + "\u{7F}"
             let successor = try #require(AppleStorage.prefixSuccessor(prefix))
             try #require(prefix.utf8.count < Int(limit))

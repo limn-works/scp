@@ -403,6 +403,28 @@
             #expect(result == Data())
         }
 
+        // MARK: - Prefix binds carrying a zero byte
+
+        @Test("a prefix that carries a zero byte selects only the keys past it")
+        func prefixCarryingAZeroByteSelectsOnlyItsKeys() throws {
+            // `delta` sorts below every key that starts with `delta\u{0}`. A
+            // lower bound bound as a C string stops at the zero byte, scans
+            // from `delta`, and selects `delta` too; an upper bound bound as
+            // a C string scans up to `delta` and selects no key.
+            let storage = try InMemoryStorage()
+            try storage.set(key: "delta", value: Data([0x00]))
+            try storage.set(key: "delta\u{0}one", value: Data([0x01]))
+            try storage.set(key: "delta\u{0}two", value: Data([0x02]))
+
+            #expect(try storage.listKeys(prefix: "delta\u{0}o").count == 1)
+            #expect(try storage.listKeys(prefix: "delta\u{0}").count == 2)
+
+            #expect(try storage.deletePrefix(prefix: "delta\u{0}o") == 1)
+            #expect(try storage.exists(key: "delta") == true)
+            #expect(try storage.exists(key: "delta\u{0}one") == false)
+            #expect(try storage.exists(key: "delta\u{0}two") == true)
+        }
+
         // MARK: - prefixSuccessor unit tests
 
         @Test("prefixSuccessor increments last byte")

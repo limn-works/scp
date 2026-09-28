@@ -401,9 +401,10 @@
         /// Ask SQLite to cap every string and blob on this connection at
         /// `bytes`, and return the cap SQLite applied.
         ///
-        /// SQLite raises a request below its compiled minimum to that minimum
-        /// and lowers a request above its compiled maximum to that maximum, so
-        /// a caller reads the returned cap instead of assuming its request.
+        /// SQLite lowers a request above its compiled maximum to that maximum,
+        /// and some releases raise a request below a compiled minimum to that
+        /// minimum, so a caller reads the returned cap instead of assuming its
+        /// request.
         /// Once the cap is in force, `sqlite3_bind_text` and
         /// `sqlite3_bind_blob` answer `SQLITE_TOOBIG` for a value longer than
         /// the cap. `AppleStorageTests` calls this method to make SQLite reject
