@@ -3,6 +3,7 @@
 
 package works.limn.scp.stream
 
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
@@ -347,8 +348,15 @@ class StreamsTest {
                         subscribeEntered.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
                         "contextEvents did not reach its subscribe call",
                     )
-                    val stopping = launch(Dispatchers.Default) { factory.stopContextEvents(EVENT_CONTEXT_HANDLE) }
-                    withContext(Dispatchers.Default) { withTimeoutOrNull(STOP_WAIT_MS) { stopping.join() } }
+                    // UNDISPATCHED runs the stop on this thread up to its first suspension,
+                    // which is the held mutex inside withContext(NonCancellable), before launch
+                    // returns. The cancel below therefore lands on a stop that is already
+                    // waiting for the mutex, however slowly the runner schedules threads.
+                    val stopping =
+                        launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+                            factory.stopContextEvents(EVENT_CONTEXT_HANDLE)
+                        }
+                    assertTrue(stopping.isActive, "stopContextEvents returned while the subscribe held its mutex")
                     stopping.cancel()
 
                     releaseSubscribe.countDown()
@@ -380,8 +388,13 @@ class StreamsTest {
                         subscribeEntered.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
                         "incomingMessages did not reach its subscribe call",
                     )
-                    val stopping = launch(Dispatchers.Default) { factory.stopMessageStream(EVENT_CONTEXT_HANDLE) }
-                    withContext(Dispatchers.Default) { withTimeoutOrNull(STOP_WAIT_MS) { stopping.join() } }
+                    // UNDISPATCHED parks the stop on the held mutex before launch returns, for
+                    // the reason the event-side test above states.
+                    val stopping =
+                        launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+                            factory.stopMessageStream(EVENT_CONTEXT_HANDLE)
+                        }
+                    assertTrue(stopping.isActive, "stopMessageStream returned while the subscribe held its mutex")
                     stopping.cancel()
 
                     releaseSubscribe.countDown()
