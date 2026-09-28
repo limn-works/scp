@@ -123,7 +123,9 @@ class KeyCustodyProvider(Protocol):
         :meth:`derive_pseudonym` receives a 32-byte digest and returns the
         64-byte low-s P-256 ``r || s`` over it with no second hash (§9.5);
         the bridge verifies it strictly under the pseudonym point and rejects
-        anything else.
+        anything else, for a pseudonym key this adapter derived and still holds
+        bound; for a handle the adapter did not bind, the bridge returns the
+        host's bytes unchecked.
         """
         ...
 

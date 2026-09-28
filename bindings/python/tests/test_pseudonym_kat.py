@@ -115,9 +115,13 @@ def test_prehash_signature_is_low_s_and_64_bytes() -> None:
 def test_bridge_derives_vector_30_routing_id() -> None:
     """§25.19 Vector 30 ``rid_v1`` through the PyO3 bridge's pseudonym derivation."""
     core = pytest.importorskip("scp_sdk._scp_core")
-    hook = getattr(core, "testing_pseudonym_routing_id_from_seed", None)
-    if hook is None:
+    # A `testing` build exposes the fullstack methods (see test_e2e_fullstack.py);
+    # only a build without that feature may skip. In a `testing` build a missing
+    # hook is a failure, not a skip.
+    if not hasattr(core.SCP({"type": "in_memory"}), "fullstack_create_node"):
         pytest.skip("extension built without the `testing` feature")
+    hook = getattr(core, "testing_pseudonym_routing_id_from_seed", None)
+    assert hook is not None, "a `testing` build must export testing_pseudonym_routing_id_from_seed"
     vector = VECTORS[0]
     routing_id = hook(bytes.fromhex(vector["scalar"]), CONTEXT_ALPHA.decode())
     assert bytes(routing_id).hex() == vector["rid_v1"]
