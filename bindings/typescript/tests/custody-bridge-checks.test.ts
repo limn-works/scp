@@ -47,7 +47,6 @@ interface TestingCustody {
   derivePseudonym(identityKeyId: string, contextId: string): Promise<PseudonymResult>;
   sign(keyId: string, data: Buffer): Promise<Buffer>;
   destroyKey(keyId: string): Promise<void>;
-  isBound(keyId: string): boolean;
 }
 
 type TestingCustodyCtor = new (
@@ -344,17 +343,35 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
   });
 
   test("the adapter unbinds a pseudonym before the host's destroyKey runs", async () => {
+    // Observed through behaviour: a bound pseudonym id rejects a 5-byte input
+    // in `check_sign_input` before the host is called (SCP-CRYPTO-4060, no host
+    // `sign`); an unbound id passes the input to the host's `sign`.
     const store = new Store();
     const custody = adapter(store);
     const identity = await custody.generateKeypair();
     const pseudonym = await custody.derivePseudonym(identity, "ctx");
-    expect(custody.isBound(pseudonym.keyId)).toBe(true);
-    let boundDuringHostDestroy: boolean | undefined;
+    const short = Buffer.alloc(5);
+    const whileBound = await rejectionOf(() => custody.sign(pseudonym.keyId, short));
+    expect(whileBound.code).toBe("SCP-CRYPTO-4060");
+    expect(store.signCalls).toBe(0);
+
+    let duringHostDestroy: Promise<Buffer> | undefined;
     store.destroyProbe = (keyId) => {
-      boundDuringHostDestroy = custody.isBound(keyId);
+      duringHostDestroy = custody.sign(keyId, short);
+      // Hold the JS thread inside the host's destroyKey so the sign above
+      // passes the adapter's input check (on a tokio worker) before the host
+      // call returns.
+      const until = Date.now() + 200;
+      while (Date.now() < until) {
+        // spin
+      }
     };
     await custody.destroyKey(pseudonym.keyId);
-    expect(boundDuringHostDestroy).toBe(false);
+    expect(duringHostDestroy).toBeDefined();
+    const mapped = await rejectionOf(() => duringHostDestroy as Promise<Buffer>);
+    // Reached the host (already unbound), which by then had deleted the key.
+    expect(store.signCalls).toBe(1);
+    expect(mapped.code).toBe("SCP-CRYPTO-4006");
   });
 
   // §25.19 Vectors 30 and 31: each identity scalar, installed as the native

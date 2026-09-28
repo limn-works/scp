@@ -28,26 +28,18 @@ use scp_platform::traits::{KeyHandle, PseudonymKeypair};
 /// The bridge error code for a custody [`PlatformError`], one mapping for the
 /// `PyO3`, napi-rs and `UniFFI` bridges.
 ///
-/// [`PlatformError::KeyNotFound`] is
-/// [`CRYPTO_4006`](crate::error_codes::CRYPTO_4006), [`PlatformError::CustodyError`] is
-/// [`CRYPTO_4060`](crate::error_codes::CRYPTO_4060), and
+/// Defined as [`custody_failure_code`](crate::error_codes::custody_failure_code)
+/// of the error's [`CustodyFailure`](scp_crypto::CustodyFailure), so a
+/// [`PlatformError`] and a runtime-carried custody failure share one code
+/// table: [`PlatformError::KeyNotFound`] is
+/// [`CRYPTO_4006`](crate::error_codes::CRYPTO_4006),
 /// [`PlatformError::PseudonymRejected`] is
-/// [`IDENT_1055`](crate::error_codes::IDENT_1055), the code ADR-021's
-/// 2026-09-27 amendment gives a host pseudonym the bridge cannot bind. Every
-/// other variant keeps [`CRYPTO_4004`](crate::error_codes::CRYPTO_4004).
+/// [`IDENT_1055`](crate::error_codes::IDENT_1055) (the code ADR-021's
+/// 2026-09-27 amendment gives a host pseudonym the bridge cannot bind), and
+/// every other variant is [`CRYPTO_4060`](crate::error_codes::CRYPTO_4060).
 #[must_use]
-pub const fn platform_error_code(e: &PlatformError) -> &'static str {
-    use crate::error_codes as codes;
-    match e {
-        PlatformError::KeyNotFound => codes::CRYPTO_4006,
-        PlatformError::CustodyError(_) => codes::CRYPTO_4060,
-        PlatformError::PseudonymRejected(_) => codes::IDENT_1055,
-        PlatformError::WrongKeyType { .. }
-        | PlatformError::StorageError(_)
-        | PlatformError::AttestationError(_)
-        | PlatformError::PushError(_)
-        | PlatformError::Unsupported(_) => codes::CRYPTO_4004,
-    }
+pub fn platform_error_code(e: &PlatformError) -> &'static str {
+    crate::error_codes::custody_failure_code(&scp_crypto::CustodyFailure::from(e))
 }
 
 /// Maps a host custody callback's failure to a [`PlatformError`], one mapping
@@ -313,6 +305,23 @@ mod tests {
             platform_error_code(&PlatformError::PseudonymRejected("x".to_owned())),
             codes::IDENT_1055
         );
+        for other in [
+            PlatformError::WrongKeyType {
+                expected: scp_platform::traits::KeyType::Ed25519,
+                actual: scp_platform::traits::KeyType::X25519,
+            },
+            PlatformError::StorageError("x".to_owned()),
+            PlatformError::AttestationError("x".to_owned()),
+            PlatformError::PushError("x".to_owned()),
+            PlatformError::Unsupported("x"),
+        ] {
+            assert_eq!(
+                platform_error_code(&other),
+                codes::CRYPTO_4060,
+                "{other:?} is a custody failure, the same code a runtime-carried \
+                 CustodyFailure of it gets"
+            );
+        }
     }
 
     #[test]

@@ -655,14 +655,18 @@ async fn spawn_from_welcome_carries_a_destroyed_active_key_as_custody_key_not_fo
         true,
     )
     .await;
-    match result {
-        Err(crate::context::ContextError::Custody(failure)) => assert!(
-            failure.is_key_not_found(),
-            "a destroyed #active key is key-not-found, got {failure:?}"
-        ),
-        Err(other) => panic!("expected ContextError::Custody, got {other:?}"),
-        Ok(_) => panic!("a join under a destroyed #active key must fail"),
-    }
+    // `assert!` rather than `panic!`: `check-handler-no-panic.sh` reads file
+    // contents and cannot see this file's `#[cfg(test)]` gate (see the
+    // over-cap outlet test below).
+    let failure = match &result {
+        Err(crate::context::ContextError::Custody(failure)) => Some(failure),
+        _ => None,
+    };
+    assert!(
+        failure.is_some_and(scp_crypto::CustodyFailure::is_key_not_found),
+        "a join under a destroyed #active key must fail with ContextError::Custody key-not-found, got {:?}",
+        result.as_ref().err()
+    );
 }
 
 // ---------------------------------------------------------------------------

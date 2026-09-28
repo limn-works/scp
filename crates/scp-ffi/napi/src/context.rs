@@ -1404,10 +1404,9 @@ pub(crate) async fn context_join_from_welcome_on(
         Ok(handle) => handle,
         Err(e) => {
             crate::runtime::remove_context(bi, &sealed.context_id);
-            return Err(NapiError::from(ScpNapiError::Context {
-                message: format!("context_join_from_welcome failed: {e}"),
-                code: codes::CTX_2013.to_owned(),
-            }));
+            // Through `From<ContextError>`, so a typed custody failure keeps its
+            // code (a destroyed `#active` key is `SCP-CRYPTO-4006`).
+            return Err(NapiError::from(ScpNapiError::from(e)));
         }
     };
 
@@ -6051,6 +6050,50 @@ mod tests {
         assert!(
             !bi.core.has_known_context(&ctx_id),
             "no known-context discovery entry may leak after a failed join"
+        );
+    }
+
+    /// A join whose `#active` key custody no longer holds fails at the
+    /// runtime's invitation KEM agreement (the first step of the join) with a
+    /// typed custody failure, which the bridge reports as `SCP-CRYPTO-4006`
+    /// through `From<ContextError>` and still rolls its reversible state back.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_from_welcome_with_a_destroyed_active_key_is_crypto_4006() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let joiner_did = register_in_memory_joiner(&bi).await;
+        let (custody, active) = crate::runtime::with_identity(&bi, &joiner_did, |entry| {
+            Ok((entry.custody.clone(), entry.identity.active_signing_key))
+        })
+        .expect("the joiner is registered");
+        scp_platform::traits::KeyCustody::destroy_key(custody.as_ref(), &active)
+            .await
+            .expect("destroy_key should succeed");
+        let ctx_id = "b".repeat(64);
+        let sealed = super::NapiSealedInvitation {
+            context_id: ctx_id.clone(),
+            creator_did: "did:dht:z6MkNapiDestroyedActiveCreator".to_owned(),
+            enc: vec![0u8; 32],
+            ciphertext: b"bogus-bundle-ciphertext".to_vec(),
+        };
+        let Err(err) = super::context_join_from_welcome_on(
+            &bi,
+            joiner_did,
+            sealed,
+            "bogus-reservation-id".to_owned(),
+        )
+        .await
+        else {
+            panic!("a join under a destroyed #active key must fail");
+        };
+        assert!(
+            err.reason.contains(codes::CRYPTO_4006),
+            "expected CRYPTO_4006 for a destroyed #active key, got: {}",
+            err.reason
+        );
+        assert!(
+            crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_err(),
+            "FFI (UCAN) state must NOT survive a failed join"
         );
     }
 

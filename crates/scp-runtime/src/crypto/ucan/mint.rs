@@ -1370,6 +1370,79 @@ mod tests {
             .unwrap()
     }
 
+    /// A destroyed issuer key fails the mint with a typed key-not-found custody
+    /// failure, which every bridge reports as `SCP-CRYPTO-4006`.
+    #[tokio::test]
+    async fn mint_ucan_with_a_destroyed_issuer_key_is_custody_key_not_found() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        custody.destroy_key(&key_handle).await.unwrap();
+        let caps = vec!["messages:write".to_owned()];
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-abc123",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        };
+        let err = mint_ucan(&params, &custody, &scp_clock::SystemClock)
+            .await
+            .expect_err("a mint under a destroyed issuer key must fail");
+        assert!(
+            matches!(&err, UcanError::Custody(failure) if failure.is_key_not_found()),
+            "expected UcanError::Custody key-not-found, got {err:?}"
+        );
+    }
+
+    /// A destroyed delegator key fails the delegation with a typed
+    /// key-not-found custody failure, which every bridge reports as
+    /// `SCP-CRYPTO-4006`.
+    #[tokio::test]
+    async fn delegate_ucan_with_a_destroyed_delegator_key_is_custody_key_not_found() {
+        let (alice_custody, alice_key, alice_did) = setup_custody().await;
+        let (bob_custody, bob_key, bob_did) = setup_custody().await;
+        let caps = vec!["messages:read".to_owned()];
+        let root_token = mint_root_token(
+            &alice_custody,
+            &alice_key,
+            &alice_did,
+            &bob_did,
+            "ctx-1",
+            &caps,
+        )
+        .await;
+        bob_custody.destroy_key(&bob_key).await.unwrap();
+        let attenuated = vec![Attenuation {
+            with: "scp:ctx:ctx-1/messages:read".to_owned(),
+            can: "read".to_owned(),
+        }];
+        let delegate_params = DelegateParams {
+            parent_token: &root_token,
+            delegator_did: &bob_did,
+            delegator_key: &bob_key,
+            delegatee_did: "did:dht:z6MkCarol",
+            attenuated_capabilities: &attenuated,
+            lifetime_secs: 1800,
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        };
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
+            .await
+            .expect_err("a delegation under a destroyed delegator key must fail");
+        assert!(
+            matches!(&err, UcanError::Custody(failure) if failure.is_key_not_found()),
+            "expected UcanError::Custody key-not-found, got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn delegate_ucan_creates_valid_delegated_token() {
         // Alice creates a root token for Bob.

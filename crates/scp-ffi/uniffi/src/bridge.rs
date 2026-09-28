@@ -20534,6 +20534,82 @@ mod tests {
         }
     }
 
+    /// Creates a broadcast context, then destroys its creator's `#active` key
+    /// in custody.
+    #[cfg(feature = "testing")]
+    fn broadcast_context_with_destroyed_active_key(
+        rt: &tokio::runtime::Runtime,
+        scp: &Scp,
+    ) -> (Arc<Identity>, Arc<ContextHandle>) {
+        use scp_platform::traits::KeyCustody;
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            // Broadcast contexts require MemoryScope::Full (spec §5.14).
+            memory_scope: MemoryScope::Full,
+            ..encrypted_join_test_params()
+        };
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), params))
+            .expect("broadcast context_create should succeed");
+        let custody = identity
+            .in_memory_custody
+            .as_ref()
+            .expect("an in-memory identity retains its custody");
+        let key = identity
+            .core_id
+            .as_ref()
+            .expect("an in-memory identity retains its core identity")
+            .active_signing_key;
+        rt.block_on(custody.0.destroy_key(&key))
+            .expect("destroy_key should succeed");
+        (identity, handle)
+    }
+
+    /// A context creator whose `#active` key custody no longer holds fails
+    /// `ucan_mint` with `SCP-CRYPTO-4006`: the runtime carries the signing
+    /// failure as `UcanError::Custody`, and the bridge maps its kind.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ucan_mint_with_a_destroyed_signing_key_is_crypto_4006() {
+        let rt = runtime();
+        let scp = scp_test();
+        let (_identity, handle) = broadcast_context_with_destroyed_active_key(rt, &scp);
+        let err = rt
+            .block_on(scp.ucan_mint(
+                handle,
+                "did:dht:z6MkMember".to_owned(),
+                vec!["messages:write".to_owned()],
+                None,
+            ))
+            .expect_err("a mint under a destroyed signing key must fail");
+        match err {
+            ScpError::Crypto { code, .. } => assert_eq!(code, codes::CRYPTO_4006),
+            other => panic!("expected Crypto CRYPTO_4006, got: {other:?}"),
+        }
+    }
+
+    /// An identity whose `#active` key custody no longer holds fails
+    /// `event_log_checkpoint` with `SCP-CRYPTO-4006`: `KeyCustodySigner`
+    /// carries the signing failure as `EventLogError::Custody`, and the bridge
+    /// maps its kind.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn event_log_checkpoint_with_a_destroyed_signing_key_is_crypto_4006() {
+        let rt = runtime();
+        let scp = scp_test();
+        let (identity, handle) = broadcast_context_with_destroyed_active_key(rt, &scp);
+        let err = rt
+            .block_on(scp.event_log_checkpoint(handle, identity, 0))
+            .expect_err("a checkpoint under a destroyed signing key must fail");
+        match err {
+            ScpError::Crypto { code, .. } => assert_eq!(code, codes::CRYPTO_4006),
+            other => panic!("expected Crypto CRYPTO_4006, got: {other:?}"),
+        }
+    }
+
     /// `context_import` (re-home) registers a discovery `KnownContext`
     /// post-commit (parity with `context_create` / `context_join`), so an
     /// imported context is discoverable just like a created one.

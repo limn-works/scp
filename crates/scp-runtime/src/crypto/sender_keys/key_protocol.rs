@@ -549,6 +549,29 @@ mod tests {
     // SenderKeyEpochAdvance tests
     // -------------------------------------------------------------------
 
+    /// A destroyed signing key fails the epoch advance with a typed
+    /// key-not-found custody failure, which every bridge reports as
+    /// `SCP-CRYPTO-4006`.
+    #[tokio::test]
+    async fn epoch_advance_with_a_destroyed_key_is_custody_key_not_found() {
+        let (custody, signing_key) = setup().await;
+        custody.destroy_key(&signing_key).await.unwrap();
+        let err = publish_sender_key_epoch_advance(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            5,
+            SigningKeyId::Active,
+        )
+        .await
+        .expect_err("an epoch advance under a destroyed key must fail");
+        assert!(
+            matches!(&err, SenderKeyError::Custody(failure) if failure.is_key_not_found()),
+            "expected SenderKeyError::Custody key-not-found, got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn epoch_advance_creation_and_signature_verification() {
         let (custody, signing_key) = setup().await;

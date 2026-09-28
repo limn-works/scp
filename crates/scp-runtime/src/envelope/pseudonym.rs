@@ -116,6 +116,22 @@ mod tests {
     // v1 (non-rotatable) pseudonym tests
     // -----------------------------------------------------------------------
 
+    /// A destroyed identity key fails derivation with a typed key-not-found
+    /// custody failure, which every bridge reports as `SCP-CRYPTO-4006`.
+    #[tokio::test]
+    async fn derive_pseudonym_with_a_destroyed_key_is_custody_key_not_found() {
+        let custody = InMemoryKeyCustody::new();
+        let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        custody.destroy_key(&key_handle).await.unwrap();
+        let err = derive_pseudonym(&custody, &key_handle, b"test-context-1")
+            .await
+            .expect_err("derivation under a destroyed key must fail");
+        assert!(
+            matches!(&err, EnvelopeError::Custody(failure) if failure.is_key_not_found()),
+            "expected EnvelopeError::Custody key-not-found, got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn derive_pseudonym_is_deterministic() {
         let custody = InMemoryKeyCustody::new();

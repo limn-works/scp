@@ -715,6 +715,57 @@ mod tests {
         );
     }
 
+    /// An identity whose `#active` key custody no longer holds fails the
+    /// checkpoint with `SCP-CRYPTO-4006`: `KeyCustodySigner` carries the
+    /// signing failure as `EventLogError::Custody`, and the bridge maps its
+    /// kind.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn event_log_checkpoint_with_a_destroyed_signing_key_is_crypto_4006() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let (creator, handle) = crate::runtime().block_on(async {
+            let creator = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+            let params = serde_json::json!({
+                "mode": "broadcast",
+                "ceiling": ["messages:read"],
+                "memoryScope": "full",
+                "governance": "single_admin",
+            })
+            .to_string();
+            let handle = crate::context::context_create_on(&bi, &creator, params)
+                .await
+                .expect("context_create should succeed");
+            let custody = creator
+                .inner
+                .in_memory_custody
+                .as_ref()
+                .expect("an in-memory identity retains its custody");
+            let key = creator
+                .inner
+                .scp_identity
+                .as_ref()
+                .expect("an in-memory identity retains its identity state")
+                .active_signing_key;
+            scp_platform::traits::KeyCustody::destroy_key(custody.as_ref(), &key)
+                .await
+                .expect("destroy_key should succeed");
+            (creator, handle)
+        });
+
+        let Err(err) = event_log_checkpoint_on(&bi, &handle, &creator, 1.0) else {
+            panic!("a checkpoint under a destroyed signing key must fail")
+        };
+        assert!(
+            err.reason.contains(codes::CRYPTO_4006),
+            "expected SCP-CRYPTO-4006 for a destroyed signing key, got: {}",
+            err.reason
+        );
+    }
+
     #[test]
     fn decode_hex_hash_rejects_short_input() {
         // 62 hex chars (31 bytes) — too short.
