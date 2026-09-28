@@ -588,7 +588,7 @@ class AndroidKeyCustodyTest {
         @Test
         fun `exportSigningKeyBytes rejects a hardware handle with SCP-CRYPTO-4005 citing ADR-063`() {
             // The hardware branch throws before it reads Android Keystore, so a JVM test reaches it.
-            val hardwareHandle = KeyHandle(id = "tee-key", custodyType = CustodyType.HARDWARE)
+            val hardwareHandle = KeyHandle(id = "keystore-key", custodyType = CustodyType.HARDWARE)
             val exception = assertThrows<ScpException> {
                 custody.exportSigningKeyBytes(hardwareHandle)
             }
@@ -596,6 +596,9 @@ class AndroidKeyCustodyTest {
             val message = exception.message.orEmpty()
             assertTrue(message.contains("ADR-063's curve slice"), message)
             assertTrue(!message.contains("GitHub issue"), message)
+            // The adapter never reads KeyInfo.securityLevel, so the message may not claim a TEE.
+            assertTrue(message.contains("Android Keystore custody"), message)
+            assertTrue(!message.contains("TEE"), message)
         }
     }
 

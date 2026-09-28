@@ -8,7 +8,7 @@
 //                               (schema, LIKE escaping, ORDER BY, WITHOUT ROWID)
 //
 // The production AndroidStorage uses SQLCipher (net.zetetic:sqlcipher-android) with
-// TEE-derived encryption, which requires Android hardware. These tests exercise the
+// Keystore-derived encryption, which requires an Android runtime. These tests exercise the
 // same SQL statements against unencrypted JVM SQLite to verify correctness of the
 // query logic without Android runtime dependencies.
 //

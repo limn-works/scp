@@ -56,7 +56,9 @@ import kotlinx.coroutines.withContext
  * `{"data": {"scp": "1"}}`; [handleNotification] rejects a missing or wrong `scp` field and
  * accepts any other fields beside it.
  *
- * @param context Android application [Context], used for Firebase initialisation.
+ * @param context Android application [Context]. The class does not read it and does not
+ *   initialise Firebase: [register] calls `FirebaseMessaging.getInstance()`, which uses the
+ *   default FirebaseApp, so the caller must initialise Firebase before calling [register].
  *   Callers should pass the application context to avoid activity lifecycle leaks.
  *
  * ## Usage

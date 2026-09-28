@@ -3,7 +3,7 @@
 // IMPORTANT: These are IN-MEMORY-ONLY tests. All StorageProvider contract tests run
 // against InMemoryStorageProvider, NOT the real AndroidStorage implementation. The
 // following production behaviors are NOT exercised by these tests:
-//   - Android Keystore TEE key derivation (Bug #2: setRandomizedEncryptionRequired)
+//   - Android Keystore key derivation (Bug #2: setRandomizedEncryptionRequired)
 //   - SQLCipher SQL LIKE escaping with % and _ wildcards (Bug #4)
 //   - Non-atomic deletePrefix under concurrent access (Bug #5)
 //   - Passphrase ByteArray zeroing after database open (Bug #3)
@@ -23,7 +23,7 @@
 //    production class structure without requiring Android runtime dependencies.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
-// SCP-113 (Android Storage trait with TEE-backed SQLCipher).
+// SCP-113 (Android Storage trait with SQLCipher and a Keystore-derived key).
 
 package works.limn.scp.android.platform
 
@@ -444,7 +444,7 @@ class AndroidStorageTest {
     }
 
     // -------------------------------------------------------------------
-    // TEE key derivation verification (constants and structure)
+    // Keystore key derivation verification (constants and structure)
     // -------------------------------------------------------------------
 
     @Nested

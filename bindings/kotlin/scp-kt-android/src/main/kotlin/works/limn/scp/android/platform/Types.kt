@@ -40,10 +40,15 @@ enum class CustodyType {
     /** Key material is stored in memory only (testing adapter). */
     IN_MEMORY,
 
-    /** Key material is protected by a hardware security module (Android Keystore TEE). */
+    /**
+     * Key material is held by Android Keystore, which does not hand the private bytes to the
+     * app. [AndroidKeyCustody] reports this value for every Keystore key without reading
+     * `KeyInfo.securityLevel`, so the value does not show whether Keystore put the key in the
+     * TEE or, on a device whose KeyMint runs in software, in software.
+     */
     HARDWARE,
 
-    /** Key material is stored in software (Bouncy Castle) but not in a hardware security module. */
+    /** Key material is held by Bouncy Castle in the app process, not by Android Keystore. */
     SOFTWARE,
 }
 
@@ -64,7 +69,7 @@ data class KeyHandle(
  * Handle to a derived pseudonym keypair.
  *
  * Pseudonym keys are always software-managed regardless of whether the source
- * identity key is hardware-backed. See ADR-006 for the derivation algorithm.
+ * identity key is a Keystore key. See ADR-006 for the derivation algorithm.
  *
  * @property id Unique identifier for the pseudonym signing key.
  * @property custodyType Always [CustodyType.SOFTWARE] for derived pseudonym keys.
@@ -77,9 +82,10 @@ data class PseudonymKeyHandle(
 /**
  * Attestation that a key has been destroyed.
  *
- * For Android Keystore-backed keys, [method] is [DestructionMethod.HARDWARE] because
- * the key material resides in the TEE and deletion removes it from hardware. For
- * software-backed keys, [method] is [DestructionMethod.SOFTWARE_ONLY].
+ * For Android Keystore keys, [method] is [DestructionMethod.HARDWARE] because Keystore held
+ * the key and deleted it. [AndroidKeyCustody] does not read `KeyInfo.securityLevel`, so
+ * [DestructionMethod.HARDWARE] does not show whether the key sat in the TEE or in a software
+ * KeyMint. For Bouncy Castle keys, [method] is [DestructionMethod.SOFTWARE_ONLY].
  *
  * See section 9.15 of the SCP specification for key destruction requirements.
  *
@@ -100,7 +106,7 @@ enum class DestructionMethod {
     /** Key material was deleted from software storage (Bouncy Castle in-memory map). */
     SOFTWARE_ONLY,
 
-    /** Key material was destroyed by the hardware security module (Android Keystore TEE). */
+    /** Key material was deleted from Android Keystore (see [CustodyType.HARDWARE]). */
     HARDWARE,
 }
 
@@ -162,7 +168,9 @@ interface DeviceAttestationProvider {
      *   identifier, and ADR-027 acceptance criterion 7 requires the Android adapter not to read
      *   this parameter.
      * @return Platform-specific attestation token bytes.
-     * @throws ScpException if attestation fails.
+     * @throws ScpException if attestation fails. ADR-027 acceptance criterion 7 requires the
+     *   Android adapter to throw [ScpException] with code `SCP-ATTEST-9001` for every failure;
+     *   [AndroidDeviceAttestation] converts only some exception types (see its KDoc).
      */
     suspend fun attest(challenge: ByteArray, deviceId: ByteArray): ByteArray
 
@@ -174,7 +182,9 @@ interface DeviceAttestationProvider {
      *   ADR-027 require the caller to pass `A`, never the request bytes or
      *   their plain SHA-256. No Rust code calls this method yet.
      * @return Platform-specific assertion token bytes.
-     * @throws ScpException if assertion fails.
+     * @throws ScpException if assertion fails. ADR-027 acceptance criterion 7 requires the
+     *   Android adapter to throw [ScpException] with code `SCP-ATTEST-9001` for every failure;
+     *   [AndroidDeviceAttestation] converts only some exception types (see its KDoc).
      */
     suspend fun assertRequest(requestHash: ByteArray): ByteArray
 }
@@ -222,7 +232,7 @@ interface PushProvider {
  *
  * Abstracts key generation, signing, key agreement, and pseudonym derivation
  * behind a uniform interface. The Android implementation ([AndroidKeyCustody])
- * uses Android Keystore for TEE-backed Ed25519 on API 33+ and Bouncy Castle
+ * uses Android Keystore for Ed25519 on API 33+ and Bouncy Castle
  * for software fallback on API 26-32. ADR-027, as amended on 2026-09-10, requires a P-256
  * signing key in Keystore at every supported API level instead; no story tracks that move
  * yet.
@@ -254,7 +264,7 @@ interface KeyCustodyProvider {
     /**
      * Generate a new keypair of the specified type.
      *
-     * Ed25519 keys may be hardware-backed (Android Keystore TEE on API 33+).
+     * Ed25519 keys may be Keystore keys ([CustodyType.HARDWARE], API 33+).
      * X25519 wrapping keys are always software-managed (Bouncy Castle).
      *
      * @param keyType The type of key to generate.
@@ -370,17 +380,17 @@ interface KeyCustodyProvider {
      *
      * Required for governance vote signing, which needs the raw signing key
      * bytes. Software-backed keys can export their private material.
-     * Hardware-backed TEE keys are non-extractable and MUST throw an error
-     * with a clear message indicating that governance signing is not supported
-     * on hardware-backed keys. ADR-063's curve slice replaces raw-key export
+     * Keystore keys ([CustodyType.HARDWARE]) are non-extractable, so the method MUST throw
+     * for one, with a clear message indicating that governance signing is not supported
+     * on Keystore keys. ADR-063's curve slice replaces raw-key export
      * with a signer for governance signing.
      *
      * @param keyHandle Handle to an Ed25519 key.
      * @return 32-byte raw Ed25519 private key bytes.
      * @throws ScpException with code `SCP-CRYPTO-4001` if key not found.
      * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
-     * @throws ScpException with code `SCP-CRYPTO-4005` if key is hardware-backed
-     *   and cannot be exported (TEE keys are non-extractable).
+     * @throws ScpException with code `SCP-CRYPTO-4005` if key is a Keystore key
+     *   and cannot be exported (Keystore keys are non-extractable).
      */
     fun exportSigningKeyBytes(keyHandle: KeyHandle): ByteArray
 }
@@ -390,7 +400,8 @@ interface KeyCustodyProvider {
  *
  * Abstracts persistent, encrypted storage behind a uniform interface. The Android
  * implementation ([AndroidStorage]) uses SQLCipher with a 32-byte key derived from an
- * AES-256 key that Android Keystore holds in the TEE.
+ * AES-256 key that Android Keystore holds. The adapter does not read `KeyInfo.securityLevel`, so
+ * it does not know whether Keystore put that key in the TEE or in software.
  *
  * This interface declares the six methods of the UniFFI `StorageProvider` callback interface in
  * `crates/scp-ffi/uniffi/src/lib.rs` under the same names. The Rust `Storage` trait in

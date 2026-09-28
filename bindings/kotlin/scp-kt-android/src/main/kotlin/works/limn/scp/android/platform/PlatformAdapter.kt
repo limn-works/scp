@@ -21,13 +21,14 @@ import android.content.Context
  * accepts only the UniFFI-generated `uniffi.scp.KeyCustodyProvider`, which [keyCustody]
  * does not implement.
  *
- * @property keyCustody Android Keystore key management (TEE-backed Ed25519 on API 33+ today;
- *   ADR-027 requires P-256 at every supported API level, and no story tracks that move yet).
+ * @property keyCustody Android Keystore key management (Keystore-held Ed25519 on API 33+ today,
+ *   reported as [CustodyType.HARDWARE] without a `KeyInfo.securityLevel` check; ADR-027
+ *   requires P-256 at every supported API level, and no story tracks that move yet).
  * @property deviceAttestation Play Integrity device attestation, which requests a Classic
  *   token today; story SCP-111 tracks the Standard request ADR-027 requires.
  * @property push Firebase Cloud Messaging with opaque data-only payloads.
- * @property storage SQLCipher encrypted storage whose 32-byte key is derived from a TEE-held
- *   AES-256 key.
+ * @property storage SQLCipher encrypted storage whose 32-byte key is derived from a
+ *   Keystore-held AES-256 key.
  */
 data class AndroidPlatformAdapterImpl(
     val keyCustody: KeyCustodyProvider,
@@ -51,8 +52,9 @@ data class AndroidPlatformAdapterImpl(
  *
  * - [AndroidKeyCustody] requires context for EncryptedSharedPreferences access.
  * - [AndroidDeviceAttestation] requires context for Play Integrity API access.
- * - [AndroidPushProvider] requires context for FCM token retrieval.
- * - [AndroidStorage] requires context for database file and Keystore access.
+ * - [AndroidPushProvider] takes a context it does not read; FCM token retrieval goes through
+ *   `FirebaseMessaging.getInstance()`, and the caller initialises Firebase.
+ * - [AndroidStorage] requires context for the database file path and the SQLCipher open helper.
  *
  * See ADR-027 in `.docs/adrs/phase-6.md` for the full design rationale.
  */

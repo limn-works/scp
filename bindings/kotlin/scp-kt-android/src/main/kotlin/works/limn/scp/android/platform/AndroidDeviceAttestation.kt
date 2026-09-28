@@ -63,10 +63,13 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      * encoded JWT bytes. ADR-027 acceptance criterion 7 requires a Standard
      * token, prepared with the `cloudProjectNumber` of the package verifier's
      * `PlayIntegrityVerifier` entry, whose `requestHash` is the lowercase
-     * hexadecimal form of the binding digest `D`, and an adapter that does not
-     * read [deviceId]. This adapter meets none of the three. Story SCP-111
-     * tracks the Standard request and its `requestHash`; its acceptance
-     * criteria do not yet name the `cloudProjectNumber` or the [deviceId]
+     * hexadecimal form of the binding digest `D`, an adapter that does not
+     * read [deviceId], and an adapter that throws [ScpException] with code
+     * `SCP-ATTEST-9001` for every failure, because a UniFFI callback that
+     * throws any other exception panics the Rust caller. This adapter meets
+     * none of the four. Story SCP-111 tracks the Standard request and its
+     * `requestHash`; its acceptance criteria do not yet name the
+     * `cloudProjectNumber`, the [deviceId] requirement or the every-failure
      * requirement.
      *
      * @param challenge The 32-byte binding digest `D` of
@@ -78,7 +81,10 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      *   ADR-027 acceptance criterion 7 requires the adapter not to read this
      *   parameter.
      * @return Play Integrity token bytes (JWT, UTF-8 encoded).
-     * @throws ScpException if the Play Integrity API call fails.
+     * @throws ScpException with code `SCP-ATTEST-9001` if the Play Integrity
+     *   call throws an `ApiException`, a [SecurityException] or an
+     *   [IllegalStateException]. Any other exception from the call, and any
+     *   exception thrown before or after it, propagates unconverted.
      */
     override suspend fun attest(challenge: ByteArray, deviceId: ByteArray): ByteArray {
         val clientDataJSON = buildClientDataJSON(challenge, deviceId)
@@ -143,7 +149,11 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      *   ADR-027 require the caller to pass `A`, never the request bytes or
      *   their plain SHA-256. No Rust code calls this method yet.
      * @return Play Integrity token bytes (JWT, UTF-8 encoded).
-     * @throws ScpException if the Play Integrity API call fails.
+     * @throws ScpException with code `SCP-ATTEST-9001` if [attest] converts the
+     *   failure; [attest] converts only an `ApiException`, a [SecurityException]
+     *   or an [IllegalStateException] from the Play Integrity call, and any other
+     *   exception propagates unconverted. ADR-027 acceptance criterion 7 requires
+     *   every failure to throw [ScpException] with code `SCP-ATTEST-9001`.
      */
     override suspend fun assertRequest(requestHash: ByteArray): ByteArray {
         // Play Integrity does not have a per-request assertion flow equivalent

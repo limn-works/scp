@@ -12,9 +12,12 @@
 //! The Kotlin adapter ships an Ed25519 and X25519 scheme:
 //!
 //! - **Ed25519 on API 33+ (Android 13+):** Android Keystore natively supports
-//!   `EdDSA` with `Ed25519` parameter spec. Keys are TEE-backed -- the private
-//!   key bytes never leave the Trusted Execution Environment.
-//!   [`CustodyType::Hardware`] is reported.
+//!   `EdDSA` with `Ed25519` parameter spec. Keystore holds the key and does
+//!   not hand its private bytes to the app. [`CustodyType::Hardware`] is
+//!   reported for every Keystore key. The adapter does not read
+//!   `KeyInfo.securityLevel`, so on a device whose `KeyMint` runs in software
+//!   (an API 33 emulator, for one) the key is held in software and the adapter
+//!   still reports [`CustodyType::Hardware`].
 //!
 //! - **Ed25519 on API 26-32:** Bouncy Castle software Ed25519 fallback.
 //!   [`CustodyType::Software`] is reported.
@@ -29,10 +32,11 @@
 //! agreement key below it. The adapter has not moved to P-256, and no story
 //! tracks that move yet.
 //!
-//! # TEE vs StrongBox
+//! # `StrongBox`
 //!
-//! TEE is the default and only option. StrongBox is not used due to 10-100x
-//! latency penalty incompatible with SCP's frequent signing operations.
+//! The adapter does not request `StrongBox`, due to its 10-100x latency penalty
+//! incompatible with SCP's frequent signing operations; Keystore chooses where
+//! to put the key.
 //!
 //! See ADR-027 in `.docs/adrs/phase-6.md` for the full design rationale.
 
