@@ -27,7 +27,10 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -266,6 +269,39 @@ class ScpViewModelTest {
             assertEquals(listOf(1L, 2L), stubBindings.leaveCalledHandles)
         }
 
+    // onCleared's cleanup coroutine and the one a post-clear trackContext launches run
+    // `leave` in parallel on Dispatchers.IO. Without the lock around onCleanupFailure, the
+    // second failure enters the override while the first is still inside it.
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    fun `onCleanupFailure calls from parallel cleanup coroutines never overlap`() {
+        stubBindings.leaveAlwaysThrows = true
+        val ioBridge = CoroutineBridge(
+            nativeBindings = stubBindings,
+            ioDispatcher = Dispatchers.IO,
+            cpuDispatcher = Dispatchers.IO,
+        )
+        val viewModel = OverlapProbeViewModel()
+        viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = ioBridge))
+        viewModel.callOnCleared()
+        assertTrue(viewModel.firstEntered.await(5, TimeUnit.SECONDS), "first failure never arrived")
+
+        // The first override call is parked inside onCleanupFailure; this leave fails on
+        // another IO thread while it stays there.
+        viewModel.trackContext(TrackedContext(handle = 2L, identityHandle = 2L, bridge = ioBridge))
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (!stubBindings.leaveCalledHandles.contains(2L) && System.nanoTime() < deadline) {
+            Thread.sleep(5)
+        }
+        assertTrue(stubBindings.leaveCalledHandles.contains(2L), "second leave never ran")
+        Thread.sleep(OVERLAP_WINDOW_MS)
+        assertEquals(1, viewModel.entered.get(), "second call entered onCleanupFailure concurrently")
+
+        viewModel.releaseFirst.countDown()
+        assertTrue(viewModel.bothDone.await(5, TimeUnit.SECONDS), "second failure never arrived")
+        assertEquals(1, viewModel.maxInFlight.get())
+    }
+
     // A Java subclass of ScpViewModel calls `super()`, so a zero-argument JVM constructor is
     // part of this artifact's published surface. Adding a primary-constructor parameter
     // without a default removes it and fails this method.
@@ -280,6 +316,41 @@ class ScpViewModelTest {
         )
     }
 
+}
+
+private const val OVERLAP_WINDOW_MS = 200L
+
+/** Records how many [onCleanupFailure] calls run at once; parks the first until released. */
+private class OverlapProbeViewModel : ScpViewModel() {
+    val entered = AtomicInteger()
+    val maxInFlight = AtomicInteger()
+    val firstEntered = CountDownLatch(1)
+    val releaseFirst = CountDownLatch(1)
+    val bothDone = CountDownLatch(2)
+    private val inFlight = AtomicInteger()
+
+    override fun onCleanupFailure(context: TrackedContext, cause: Throwable) {
+        val now = inFlight.incrementAndGet()
+        maxInFlight.accumulateAndGet(now) { a, b -> maxOf(a, b) }
+        if (entered.incrementAndGet() == 1) {
+            firstEntered.countDown()
+            releaseFirst.await(5, TimeUnit.SECONDS)
+        }
+        inFlight.decrementAndGet()
+        bothDone.countDown()
+    }
+
+    fun callOnCleared() {
+        val store = ViewModelStore()
+        val self = this
+        val factory =
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T = self as T
+            }
+        ViewModelProvider(store, factory)[OverlapProbeViewModel::class.java]
+        store.clear()
+    }
 }
 
 /**
@@ -320,8 +391,12 @@ private class TestScpViewModel(
  */
 @Suppress("TooManyFunctions")
 internal class TestNativeBindings : NativeBindings {
-    val leaveCalledHandles = mutableListOf<Long>()
+    /** Synchronized because a test with a dispatching bridge calls `leave` from two threads. */
+    val leaveCalledHandles: MutableList<Long> = Collections.synchronizedList(mutableListOf())
     var leaveThrowsForHandle: Long? = null
+
+    /** When true, every leave throws, whatever its handle. */
+    @Volatile var leaveAlwaysThrows = false
 
     /**
      * Handle whose leave raises a cancellation the cleanup coroutine did not cause, as an
@@ -334,7 +409,7 @@ internal class TestNativeBindings : NativeBindings {
         if (contextHandle == leaveCancelsForHandle) {
             throw CancellationException("cleanup cancelled at handle $contextHandle")
         }
-        if (contextHandle == leaveThrowsForHandle) {
+        if (leaveAlwaysThrows || contextHandle == leaveThrowsForHandle) {
             throw ScpLeaveException("leave failed for handle $contextHandle")
         }
     }

@@ -16,6 +16,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * Resource handle for an active SCP context tracked by [ScpViewModel].
@@ -87,6 +89,12 @@ abstract class ScpViewModel : ViewModel() {
     // that dispatcher dispatches; an inline one runs every `leave` before [onCleared] returns.
     private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
 
+    // Serializes [onCleanupFailure] across every cleanup coroutine: [onCleared] launches one
+    // and each post-clear [trackContext] launches another, and with a dispatching bridge
+    // their `leave` calls fail on different threads at once. A [Mutex] suspends a waiting
+    // coroutine instead of blocking its thread, which may be an Android main thread.
+    private val cleanupFailureLock = Mutex()
+
     /**
      * Register a context for automatic cleanup on ViewModel clear.
      *
@@ -144,6 +152,9 @@ abstract class ScpViewModel : ViewModel() {
      *   inside `leave`, for example from an injected I/O dispatcher that rejected the task.
      * - An [onCleanupFailure] override that throws does not stop remaining `leave` calls
      *   either. Its throwable is logged at warning level and the loop continues.
+     * - Snapshot order binds this coroutine only. A context [trackContext] registers after
+     *   this call is left on a coroutine of its own, whose `leave` can run at the same time
+     *   as this one's on another thread. [onCleanupFailure] calls never overlap.
      *
      * What this method does not guarantee: that `leave` calls have finished. The cleanup
      * coroutine starts on the calling thread and, when the bridge's I/O dispatcher dispatches
@@ -183,7 +194,7 @@ abstract class ScpViewModel : ViewModel() {
                 val failure =
                     runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }
                         .exceptionOrNull() ?: continue
-                runCatching { onCleanupFailure(ctx, failure) }
+                cleanupFailureLock.withLock { runCatching { onCleanupFailure(ctx, failure) } }
                     .onFailure { overrideFailure ->
                         Log.w(
                             TAG,
@@ -211,11 +222,18 @@ abstract class ScpViewModel : ViewModel() {
      * [onCleared] keeps calling `leave` on remaining contexts after one fails.
      *
      * Runs inside a cleanup coroutine. When the bridge's I/O dispatcher dispatches (the default
-     * `Dispatchers.IO` does), that is on whichever thread the dispatcher resumed that coroutine
-     * on, after [onCleared] has already returned. A dispatcher that runs inline, such as
+     * `Dispatchers.IO` does), that is on whichever thread resumed that coroutine, after
+     * [onCleared] has already returned. A dispatcher that runs inline, such as
      * `Dispatchers.Unconfined`, runs it on the thread that called [onCleared] (an Android main
      * thread) before [onCleared] returns. Either way it must not block its thread, for a reason
      * `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` states.
+     *
+     * Calls never overlap, so an override may update unsynchronized state, although
+     * successive calls can run on different threads. [onCleared]'s coroutine and each
+     * coroutine that [trackContext] launches after clear can see `leave` fail at the same
+     * time; a [Mutex] makes each wait, suspended rather than blocking its thread, until the
+     * running call returns. Calls from one coroutine keep its order; calls from different
+     * coroutines have no defined order.
      *
      * A throw from an override does not propagate: [onCleared] catches it, logs it at warning
      * level, and still calls `leave` on every remaining context, so throwing here fails
