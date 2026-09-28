@@ -8,11 +8,14 @@ package works.limn.scp
 
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import works.limn.scp.bridge.BridgeException
@@ -342,6 +345,97 @@ class ServerTest {
             assertTrue(caller.isCancelled)
             assertEquals(listOf(relay.handleJson), stubBindings.relayShutdownHandles)
             assertTrue(relay.isShutdown)
+        }
+    }
+
+    // The Relay and Node KDoc examples tear down from a `finally` block under NonCancellable.
+    // These cases pin why: a cancelled owner reaches the `finally` block cancelled, and a bare
+    // shutdown() there throws at the bridge's withContext before the FFI teardown runs.
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `a relay shut down under NonCancellable in the finally block of a cancelled owner stops`() {
+        runTest(testDispatcher) {
+            val relay = Relay.startInMemory(serverBridge)
+            val owner =
+                launch {
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        withContext(NonCancellable) { relay.shutdown() }
+                    }
+                }
+            advanceUntilIdle()
+            owner.cancel()
+            advanceUntilIdle()
+            assertTrue(owner.isCancelled)
+            assertEquals(listOf(relay.handleJson), stubBindings.relayShutdownHandles)
+            assertTrue(relay.isShutdown)
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `a relay shut down bare in the finally block of a cancelled owner stays live`() {
+        runTest(testDispatcher) {
+            val relay = Relay.startInMemory(serverBridge)
+            val owner =
+                launch {
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        relay.shutdown()
+                    }
+                }
+            advanceUntilIdle()
+            owner.cancel()
+            advanceUntilIdle()
+            assertTrue(owner.isCancelled)
+            assertEquals(emptyList<String>(), stubBindings.relayShutdownHandles)
+            assertFalse(relay.isShutdown)
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `a node shut down under NonCancellable in the finally block of a cancelled owner stops`() {
+        runTest(testDispatcher) {
+            val node = createNode()
+            val owner =
+                launch {
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        withContext(NonCancellable) { node.shutdown() }
+                    }
+                }
+            advanceUntilIdle()
+            owner.cancel()
+            advanceUntilIdle()
+            assertTrue(owner.isCancelled)
+            assertEquals(listOf(node.handleJson), stubBindings.nodeShutdownHandles)
+            assertTrue(node.isShutdown)
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `a node shut down bare in the finally block of a cancelled owner stays live`() {
+        runTest(testDispatcher) {
+            val node = createNode()
+            val owner =
+                launch {
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        node.shutdown()
+                    }
+                }
+            advanceUntilIdle()
+            owner.cancel()
+            advanceUntilIdle()
+            assertTrue(owner.isCancelled)
+            assertEquals(emptyList<String>(), stubBindings.nodeShutdownHandles)
+            assertFalse(node.isShutdown)
         }
     }
 }

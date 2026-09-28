@@ -238,12 +238,17 @@ internal data class NodeInfo(
  * hit in its tests; an Android caller would block a main thread, which risks an
  * ANR. See `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
  *
+ * A `finally` block runs [shutdown] under `NonCancellable`: a `finally` block
+ * usually runs because its coroutine was cancelled, and in a cancelled coroutine
+ * the bridge's `withContext(ioDispatcher)` throws `CancellationException` before
+ * the FFI call starts, so a bare `relay.shutdown()` there tears nothing down.
+ *
  * ```kotlin
  * val relay = Relay.startInMemory(bridge)
  * try {
  *     println(relay.relayUrl)
  * } finally {
- *     relay.shutdown()
+ *     withContext(NonCancellable) { relay.shutdown() }
  * }
  * ```
  */
@@ -308,7 +313,10 @@ class Relay internal constructor(
  * [shutdown] is this type's only stop path, and it suspends, for a reason
  * [Relay] states in full: an earlier `close()` ran
  * `runBlocking(Dispatchers.Default) { shutdown() }`, which blocks a calling
- * thread on a coroutine whose dispatcher this type does not control.
+ * thread on a coroutine whose dispatcher this type does not control. A
+ * `finally` block runs [shutdown] under `NonCancellable`, for the reason [Relay]
+ * states: in a cancelled coroutine a bare `node.shutdown()` throws
+ * `CancellationException` before the FFI call starts and tears nothing down.
  *
  * ```kotlin
  * val node = Node.startInMemory(bridge)
@@ -316,7 +324,7 @@ class Relay internal constructor(
  *     println(node.relayUrl)
  *     println(node.did)
  * } finally {
- *     node.shutdown()
+ *     withContext(NonCancellable) { node.shutdown() }
  * }
  * ```
  */
