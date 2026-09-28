@@ -464,6 +464,20 @@ export interface PseudonymResult {
   keyId: string;
 }
 
+/** A custody key's stated type and public key, returned by {@link KeyCustodyProvider.getPublicKey}. */
+export interface CustodyPublicKey {
+  /** `"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`. */
+  keyType: string;
+  /** The public key in the exact encoding its type names. */
+  publicKey: Uint8Array;
+}
+
+/** The shape napi-rs marshals for a {@link CustodyPublicKey}: bytes as a number array. */
+interface NativeCustodyPublicKey {
+  keyType: string;
+  publicKey: number[];
+}
+
 /** The shape napi-rs marshals for a {@link PseudonymResult}: bytes as a number array. */
 interface NativePseudonymResult {
   publicKey: number[];
@@ -512,13 +526,18 @@ export interface KeyCustodyProvider {
    */
   sign(keyId: string, message: Uint8Array): Uint8Array;
   /**
-   * Return the public key of `keyId`: 32 bytes for Ed25519 and X25519, the
-   * 33-byte compressed SEC1 point for `"p256"` and for a pseudonym key
-   * (byte-identical to the point {@link derivePseudonym} returned), the
-   * 65-byte uncompressed SEC1 point for `"hpke-p256"`. Any other length is
-   * an error.
+   * Return the type and public key of `keyId`. `keyType` is the type the key
+   * was generated with (`"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`);
+   * a pseudonym key from {@link derivePseudonym} is `"p256"`. `publicKey` is
+   * 32 bytes for Ed25519 and X25519, the 33-byte compressed SEC1 point for
+   * `"p256"` (for a pseudonym, byte-identical to the point
+   * {@link derivePseudonym} returned), and the 65-byte uncompressed SEC1
+   * point for `"hpke-p256"`. The bridge registers the key under the stated
+   * type and rejects a length that does not match it. A provider that holds
+   * no key for `keyId` throws a `KeyNotFoundError` (or any object whose
+   * `code` is `"KEY_NOT_FOUND"`), which callers receive as key-not-found.
    */
-  getPublicKey(keyId: string): Uint8Array;
+  getPublicKey(keyId: string): CustodyPublicKey;
   /** Destroy key material for `keyId`; subsequent operations must fail. */
   destroyKey(keyId: string): void;
   /**
@@ -821,7 +840,10 @@ export class SCP {
       // array arg (not positional), so the two-value callbacks destructure it.
       sign: ([keyId, message]: [string, number[]]): number[] =>
         Array.from(provider.sign(keyId, Uint8Array.from(message))),
-      getPublicKey: (keyId: string): number[] => Array.from(provider.getPublicKey(keyId)),
+      getPublicKey: (keyId: string): NativeCustodyPublicKey => {
+        const { keyType, publicKey } = provider.getPublicKey(keyId);
+        return { keyType, publicKey: Array.from(publicKey) };
+      },
       destroyKey: (keyId: string): void => provider.destroyKey(keyId),
       dhAgree: ([keyId, peerPublic]: [string, number[]]): number[] =>
         Array.from(provider.dhAgree(keyId, Uint8Array.from(peerPublic))),

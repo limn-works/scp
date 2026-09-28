@@ -24,6 +24,8 @@ import hashlib
 
 import pytest
 
+from scp_sdk.errors import KeyNotFoundError
+
 from .pseudonym_recipe import (
     canonical_pseudonym_seed,
     canonical_rotatable_pseudonym_seed,
@@ -150,10 +152,12 @@ class _FakeKeychain:
             return p256_sign_prehash(self._pseudonyms[key_id], bytes(message))
         return ed25519_sign(self._seeds[key_id], bytes(message))
 
-    def get_public_key(self, key_id: str) -> bytes:
+    def get_public_key(self, key_id: str) -> tuple[str, bytes]:
         if key_id in self._pseudonyms:
-            return p256_compressed(self._pseudonyms[key_id])
-        return ed25519_publickey(self._seeds[key_id])
+            return "p256", p256_compressed(self._pseudonyms[key_id])
+        if key_id not in self._seeds:
+            raise KeyNotFoundError(f"unknown key id: {key_id}")
+        return "ed25519", ed25519_publickey(self._seeds[key_id])
 
     def destroy_key(self, key_id: str) -> None:
         self._seeds.pop(key_id, None)

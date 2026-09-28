@@ -133,14 +133,20 @@ class KeyCustodyProvider(Protocol):
         """
         ...
 
-    def get_public_key(self, key_id: str) -> bytes:
-        """Return the public key of ``key_id``.
+    def get_public_key(self, key_id: str) -> tuple[str, bytes]:
+        """Return ``(key_type, public_key)`` for ``key_id``.
 
-        32 bytes for Ed25519 and X25519; the 33-byte compressed SEC1 point
-        for ``"p256"`` and for a pseudonym key id (byte-identical to the
-        ``public_key`` :meth:`derive_pseudonym` returned for it); the 65-byte
-        uncompressed SEC1 point for ``"hpke-p256"``. Any other length is an
-        error.
+        ``key_type`` is the type the key was generated with (``"ed25519"``,
+        ``"x25519"``, ``"p256"`` or ``"hpke-p256"``); a pseudonym key id from
+        :meth:`derive_pseudonym` is ``"p256"``. ``public_key`` is 32 bytes for
+        Ed25519 and X25519, the 33-byte compressed SEC1 point for ``"p256"``
+        (for a pseudonym, byte-identical to the ``public_key``
+        :meth:`derive_pseudonym` returned for it), and the 65-byte
+        uncompressed SEC1 point for ``"hpke-p256"``. The bridge registers the
+        key under the stated type and rejects a length that does not match
+        it. A provider that holds no key for ``key_id`` raises
+        :class:`~scp_sdk.errors.KeyNotFoundError`, which callers receive as
+        key-not-found; any other exception is a custody error.
         """
         ...
 
