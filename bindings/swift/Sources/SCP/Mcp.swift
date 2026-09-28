@@ -31,8 +31,8 @@ public nonisolated struct McpToolDefinition: Sendable {
 
 /// The result of invoking an external MCP tool, wrapped with SCP provenance.
 ///
-/// Maintains the protocol's provenance-everywhere principle: even tool calls
-/// to external (non-SCP) MCP servers carry verifiable origin metadata.
+/// Maintains the protocol's provenance-everywhere principle: a tool call to
+/// any MCP server, an SCP node's or another, carries verifiable origin metadata.
 ///
 /// See ADR-015 in `.docs/adrs/phase-3.md`.
 public nonisolated struct McpToolResult: Sendable {
@@ -74,10 +74,10 @@ public nonisolated struct McpToolResult: Sendable {
 
 // MARK: - McpClientConfig
 
-/// Configuration for connecting to an external MCP server.
+/// Configuration for connecting to an MCP server.
 ///
-/// Specifies how to connect to an external (non-SCP) MCP server. Tool results
-/// from external servers are wrapped with SCP provenance metadata.
+/// Specifies how to connect to an MCP server, an SCP node's SSE server
+/// included. Tool results are wrapped with SCP provenance metadata.
 public nonisolated enum McpClientConfig: Sendable {
     /// Connect via stdio: spawn a subprocess and communicate over stdin/stdout.
     ///
@@ -101,9 +101,9 @@ public nonisolated enum McpClientConfig: Sendable {
 
 /// An MCP client for consuming external tools with SCP provenance.
 ///
-/// Connects to an external MCP server (non-SCP) via an ``SCP`` instance
-/// and wraps tool results with SCP provenance metadata. This maintains
-/// SCP's provenance-everywhere principle even for external tool calls.
+/// Connects to an MCP server, an SCP node's SSE server included, via an
+/// ``SCP`` instance and wraps tool results with SCP provenance metadata. This
+/// maintains SCP's provenance-everywhere principle for every tool call.
 ///
 /// ## Usage
 ///
