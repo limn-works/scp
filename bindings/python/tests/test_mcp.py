@@ -310,6 +310,18 @@ class TestScpMcpClientConnectValidation:
         with pytest.raises(McpError):
             await SCP.mcp_client_connect_sse(scp, "", None)
 
+    @pytest.mark.asyncio
+    async def test_sse_forwards_the_auth_token_to_the_native_bridge(self) -> None:
+        from scp_sdk.scp import SCP
+
+        scp = MagicMock()
+        scp._native = MagicMock()
+        scp._native.py_mcp_client_connect_sse.return_value = "mcp-client-1"
+        await SCP.mcp_client_connect_sse(scp, "http://127.0.0.1:9/sse", "tok-1")
+        scp._native.py_mcp_client_connect_sse.assert_called_once_with(
+            "http://127.0.0.1:9/sse", "tok-1"
+        )
+
 
 # -----------------------------------------------------------------------
 # Handle wrapper tests

@@ -4635,6 +4635,22 @@ fn mcp_client_registry(
     bi.mcp_client_registry().as_ref()
 }
 
+/// Runs an MCP client's blocking I/O on tokio's blocking pool, so a slow or
+/// silent server holds a blocking thread rather than an async worker that
+/// relay, actor and MCP-server tasks share. `code` names the operation in the
+/// error a failed task returns.
+async fn run_mcp_client_io<T: Send + 'static>(
+    code: &str,
+    io: impl FnOnce() -> Result<T, ScpError> + Send + 'static,
+) -> Result<T, ScpError> {
+    tokio::task::spawn_blocking(io)
+        .await
+        .map_err(|e| ScpError::Transport {
+            msg: format!("MCP client task failed: {e}"),
+            code: code.to_owned(),
+        })?
+}
+
 fn mcp_handle_id(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
 }
@@ -16517,7 +16533,6 @@ impl Scp {
     /// Per-instance equivalent of the free-function `mcp_client_connect_stdio`.
     ///
     /// Routes through the module-level MCP client registry.
-    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_client_connect_stdio(&self, command: Vec<String>) -> Result<String, ScpError> {
         if command.is_empty() {
             return Err(ScpError::Validation {
@@ -16526,18 +16541,23 @@ impl Scp {
             });
         }
 
-        let transport = McpStdioTransport::spawn(self.inner.core.mcp_allowlist(), &command)
-            .map_err(|e| ScpError::Transport {
-                msg: format!("failed to connect stdio MCP client: {e}"),
-                code: codes::TRANS_5015.to_owned(),
-            })?;
-
-        let mut client =
-            scp_mcp::client::McpClient::new(McpUniFFITransportWrapper::Stdio(transport));
-        client.initialize().map_err(|e| ScpError::Transport {
-            msg: format!("MCP initialize handshake failed: {e}"),
-            code: codes::TRANS_5016.to_owned(),
-        })?;
+        let bi = Arc::clone(&self.inner);
+        let client =
+            run_mcp_client_io(codes::TRANS_5016, move || {
+                let transport = McpStdioTransport::spawn(bi.core.mcp_allowlist(), &command)
+                    .map_err(|e| ScpError::Transport {
+                        msg: format!("failed to connect stdio MCP client: {e}"),
+                        code: codes::TRANS_5015.to_owned(),
+                    })?;
+                let mut client =
+                    scp_mcp::client::McpClient::new(McpUniFFITransportWrapper::Stdio(transport));
+                client.initialize().map_err(|e| ScpError::Transport {
+                    msg: format!("MCP initialize handshake failed: {e}"),
+                    code: codes::TRANS_5016.to_owned(),
+                })?;
+                Ok(client)
+            })
+            .await?;
 
         let handle_id = mcp_handle_id("mcp-client");
         mcp_client_registry(&self.inner).insert(
@@ -16557,7 +16577,6 @@ impl Scp {
     /// sent as `Authorization: Bearer <token>` on the `GET` and on every POST,
     /// or `None` for a server that runs no bearer check; an SCP SSE server
     /// always runs one (ADR-015).
-    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_client_connect_sse(
         &self,
         url: String,
@@ -16565,19 +16584,22 @@ impl Scp {
     ) -> Result<String, ScpError> {
         validate_relay_url(&url)?;
 
-        let transport =
-            scp_mcp::sse_client::SseClientTransport::connect(&url, auth_token.as_deref()).map_err(
-                |e| ScpError::Transport {
-                    msg: format!("failed to connect SSE client: {e}"),
-                    code: codes::TRANS_5018.to_owned(),
-                },
-            )?;
-
-        let mut client = scp_mcp::client::McpClient::new(McpUniFFITransportWrapper::Sse(transport));
-        client.initialize().map_err(|e| ScpError::Transport {
-            msg: format!("MCP initialize handshake failed: {e}"),
-            code: codes::TRANS_5018.to_owned(),
-        })?;
+        let client = run_mcp_client_io(codes::TRANS_5018, move || {
+            let transport =
+                scp_mcp::sse_client::SseClientTransport::connect(&url, auth_token.as_deref())
+                    .map_err(|e| ScpError::Transport {
+                        msg: format!("failed to connect SSE client: {e}"),
+                        code: codes::TRANS_5018.to_owned(),
+                    })?;
+            let mut client =
+                scp_mcp::client::McpClient::new(McpUniFFITransportWrapper::Sse(transport));
+            client.initialize().map_err(|e| ScpError::Transport {
+                msg: format!("MCP initialize handshake failed: {e}"),
+                code: codes::TRANS_5018.to_owned(),
+            })?;
+            Ok(client)
+        })
+        .await?;
 
         let handle_id = mcp_handle_id("mcp-client");
         mcp_client_registry(&self.inner).insert(
@@ -16612,29 +16634,31 @@ impl Scp {
     /// Per-instance equivalent of the free-function `mcp_client_list_tools`.
     ///
     /// Routes through the module-level MCP client registry.
-    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_client_list_tools(
         &self,
         handle: String,
     ) -> Result<Vec<McpOutletInfo>, ScpError> {
         validate_mcp_handle(&handle)?;
 
-        let entry = mcp_client_registry(&self.inner)
-            .get(&handle)
-            .ok_or_else(|| ScpError::Transport {
-                msg: format!("MCP client handle '{handle}' not found"),
-                code: codes::TRANS_5020.to_owned(),
+        let bi = Arc::clone(&self.inner);
+        let outlets = run_mcp_client_io(codes::TRANS_5022, move || {
+            let entry =
+                mcp_client_registry(&bi)
+                    .get(&handle)
+                    .ok_or_else(|| ScpError::Transport {
+                        msg: format!("MCP client handle '{handle}' not found"),
+                        code: codes::TRANS_5020.to_owned(),
+                    })?;
+            let client_guard = entry.client.lock().map_err(|e| ScpError::Transport {
+                msg: format!("client lock poisoned: {e}"),
+                code: codes::TRANS_5021.to_owned(),
             })?;
-
-        let client_guard = entry.client.lock().map_err(|e| ScpError::Transport {
-            msg: format!("client lock poisoned: {e}"),
-            code: codes::TRANS_5021.to_owned(),
-        })?;
-
-        let outlets = client_guard.list_tools().map_err(|e| ScpError::Transport {
-            msg: format!("tools/list failed: {e}"),
-            code: codes::TRANS_5022.to_owned(),
-        })?;
+            client_guard.list_tools().map_err(|e| ScpError::Transport {
+                msg: format!("tools/list failed: {e}"),
+                code: codes::TRANS_5022.to_owned(),
+            })
+        })
+        .await?;
 
         Ok(outlets
             .into_iter()
@@ -16650,7 +16674,6 @@ impl Scp {
     /// Per-instance equivalent of the free-function `mcp_client_invoke`.
     ///
     /// Routes through the module-level MCP client registry.
-    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_client_invoke(
         &self,
         handle: String,
@@ -16664,30 +16687,32 @@ impl Scp {
         validate_context_id(&context_id)?;
         validate_did(&invoker_did)?;
 
-        let entry = mcp_client_registry(&self.inner)
-            .get(&handle)
-            .ok_or_else(|| ScpError::Transport {
-                msg: format!("MCP client handle '{handle}' not found"),
-                code: codes::TRANS_5023.to_owned(),
+        let bi = Arc::clone(&self.inner);
+        let result = run_mcp_client_io(codes::TRANS_5025, move || {
+            let entry =
+                mcp_client_registry(&bi)
+                    .get(&handle)
+                    .ok_or_else(|| ScpError::Transport {
+                        msg: format!("MCP client handle '{handle}' not found"),
+                        code: codes::TRANS_5023.to_owned(),
+                    })?;
+            let input: serde_json::Value =
+                serde_json::from_str(&input_json).map_err(|e| ScpError::Validation {
+                    msg: format!("invalid input JSON: {e}"),
+                    code: codes::VALID_7021.to_owned(),
+                })?;
+            let client_guard = entry.client.lock().map_err(|e| ScpError::Transport {
+                msg: format!("client lock poisoned: {e}"),
+                code: codes::TRANS_5024.to_owned(),
             })?;
-
-        let input: serde_json::Value =
-            serde_json::from_str(&input_json).map_err(|e| ScpError::Validation {
-                msg: format!("invalid input JSON: {e}"),
-                code: codes::VALID_7021.to_owned(),
-            })?;
-
-        let client_guard = entry.client.lock().map_err(|e| ScpError::Transport {
-            msg: format!("client lock poisoned: {e}"),
-            code: codes::TRANS_5024.to_owned(),
-        })?;
-
-        let result = client_guard
-            .invoke(&outlet_name, input, &context_id, &invoker_did)
-            .map_err(|e| ScpError::Transport {
-                msg: format!("tools/call failed: {e}"),
-                code: codes::TRANS_5025.to_owned(),
-            })?;
+            client_guard
+                .invoke(&outlet_name, input, &context_id, &invoker_did)
+                .map_err(|e| ScpError::Transport {
+                    msg: format!("tools/call failed: {e}"),
+                    code: codes::TRANS_5025.to_owned(),
+                })
+        })
+        .await?;
 
         let content_json =
             serde_json::to_string(&result.content).unwrap_or_else(|_| "[]".to_owned());
@@ -22969,13 +22994,17 @@ mod tests {
 
     /// `mcp_client_connect_sse` sends the caller's token on its `GET`, so a
     /// Swift or Kotlin client passes the bearer check an SCP SSE server always
-    /// runs. The listener closes after reading the request head, so the
-    /// connect fails after the header has gone out.
-    #[tokio::test(flavor = "multi_thread")]
+    /// runs, and it waits for the server off the async worker. The listener
+    /// holds the connection silent until the timer branch has run, then
+    /// closes it, so the connect fails after the header has gone out. On this
+    /// single-threaded runtime a connect that blocked the worker would hold
+    /// the timer branch for the listener's five-second hold.
+    #[tokio::test]
     async fn mcp_client_connect_sse_sends_the_bearer_token() {
         use std::io::BufRead;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
             let (conn, _) = listener.accept().expect("accept GET");
             let mut reader = std::io::BufReader::new(conn);
@@ -22984,23 +23013,37 @@ mod tests {
                 let mut line = String::new();
                 let n = reader.read_line(&mut line).expect("read head");
                 if n == 0 || line == "\r\n" {
-                    return head;
+                    break;
                 }
                 head.push_str(&line);
             }
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            head
         });
-        let result = scp_test()
-            .mcp_client_connect_sse(
+        let scp = scp_test();
+        let started = std::time::Instant::now();
+        let (result, timer_done) = tokio::join!(
+            scp.mcp_client_connect_sse(
                 format!("http://127.0.0.1:{port}/sse"),
                 Some("tok-1".to_owned()),
-            )
-            .await;
+            ),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let timer_done = started.elapsed();
+                let _ = release_tx.send(());
+                timer_done
+            }
+        );
         let head = server.join().expect("server thread");
         assert!(
             head.contains("\r\nAuthorization: Bearer tok-1\r\n"),
             "the GET must carry the token, got: {head}"
         );
         assert!(result.is_err(), "the listener closed without a response");
+        assert!(
+            timer_done < std::time::Duration::from_secs(2),
+            "the connect must wait off the async worker, but the timer took {timer_done:?}"
+        );
     }
 
     /// `mcp_client_disconnect` must reject unknown handle.

@@ -152,6 +152,25 @@ pub(crate) struct McpClientEntry {
 // `bi.mcp_server_registry()` / `bi.mcp_client_registry()` against an
 // explicit `&NapiBridgeInstance`.
 
+/// Runs an MCP client's blocking I/O on tokio's blocking pool, so a slow or
+/// silent server holds a blocking thread rather than an async worker that
+/// the bridge's other tasks share. `code` names the operation in the error a
+/// failed task returns.
+async fn run_mcp_client_io<T: Send + 'static>(
+    code: &str,
+    io: impl FnOnce() -> Result<T, ScpNapiError> + Send + 'static,
+) -> napi::Result<T> {
+    tokio::task::spawn_blocking(io)
+        .await
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Transport {
+                message: format!("MCP client task failed: {e}"),
+                code: code.to_owned(),
+            })
+        })?
+        .map_err(napi::Error::from)
+}
+
 fn mcp_handle_id(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
 }
@@ -840,7 +859,6 @@ pub(crate) async fn mcp_server_stop_on(
 }
 
 /// Per-bridge-instance implementation of [`Scp::mcp_client_connect_stdio`](crate::scp::Scp::mcp_client_connect_stdio).
-#[allow(clippy::unused_async)]
 pub(crate) async fn mcp_client_connect_stdio_on(
     bi: &NapiBridgeInstance,
     command: Vec<String>,
@@ -860,13 +878,15 @@ pub(crate) async fn mcp_client_connect_stdio_on(
         })
     })?;
 
-    let mut client = McpClient::new(McpClientTransportWrapper::Stdio(transport));
-    client.initialize().map_err(|e| {
-        napi::Error::from(ScpNapiError::Transport {
+    let client = run_mcp_client_io(codes::TRANS_5016, move || {
+        let mut client = McpClient::new(McpClientTransportWrapper::Stdio(transport));
+        client.initialize().map_err(|e| ScpNapiError::Transport {
             message: format!("MCP initialize handshake failed: {e}"),
             code: codes::TRANS_5016.to_owned(),
-        })
-    })?;
+        })?;
+        Ok(client)
+    })
+    .await?;
 
     let handle_id = mcp_handle_id("mcp-client");
     let entry = McpClientEntry {
@@ -883,27 +903,27 @@ pub(crate) async fn mcp_client_connect_stdio_on(
 }
 
 /// Per-bridge-instance implementation of [`Scp::mcp_client_connect_sse`](crate::scp::Scp::mcp_client_connect_sse).
-#[allow(clippy::unused_async)]
 pub(crate) async fn mcp_client_connect_sse_on(
     bi: &NapiBridgeInstance,
     url: String,
     auth_token: Option<String>,
 ) -> napi::Result<NapiMcpClientHandle> {
-    let transport = scp_mcp::sse_client::SseClientTransport::connect(&url, auth_token.as_deref())
-        .map_err(|e| {
-        napi::Error::from(ScpNapiError::Transport {
-            message: format!("failed to connect SSE client: {e}"),
-            code: codes::TRANS_5018.to_owned(),
-        })
-    })?;
-
-    let mut client = McpClient::new(McpClientTransportWrapper::Sse(transport));
-    client.initialize().map_err(|e| {
-        napi::Error::from(ScpNapiError::Transport {
+    let client = run_mcp_client_io(codes::TRANS_5018, move || {
+        let transport =
+            scp_mcp::sse_client::SseClientTransport::connect(&url, auth_token.as_deref()).map_err(
+                |e| ScpNapiError::Transport {
+                    message: format!("failed to connect SSE client: {e}"),
+                    code: codes::TRANS_5018.to_owned(),
+                },
+            )?;
+        let mut client = McpClient::new(McpClientTransportWrapper::Sse(transport));
+        client.initialize().map_err(|e| ScpNapiError::Transport {
             message: format!("MCP initialize handshake failed: {e}"),
             code: codes::TRANS_5018.to_owned(),
-        })
-    })?;
+        })?;
+        Ok(client)
+    })
+    .await?;
 
     let handle_id = mcp_handle_id("mcp-client");
     let entry = McpClientEntry {
@@ -938,35 +958,32 @@ pub(crate) async fn mcp_client_disconnect_on(
 }
 
 /// Per-bridge-instance implementation of [`Scp::mcp_client_list_tools`](crate::scp::Scp::mcp_client_list_tools).
-#[allow(clippy::unused_async)]
 pub(crate) async fn mcp_client_list_tools_on(
     bi: &NapiBridgeInstance,
     handle: &NapiMcpClientHandle,
 ) -> napi::Result<Vec<NapiMcpToolInfo>> {
     crate::napi_check_handle!(&bi.core, handle);
-    let entry = bi
-        .mcp_client_registry()
-        .get(&handle.handle_id)
-        .ok_or_else(|| {
-            napi::Error::from(ScpNapiError::Transport {
-                message: format!("MCP client handle '{}' not found", handle.handle_id),
+    let registry = Arc::clone(bi.mcp_client_registry());
+    let handle_id = handle.handle_id.clone();
+    let outlets = run_mcp_client_io(codes::TRANS_5022, move || {
+        let entry = registry
+            .get(&handle_id)
+            .ok_or_else(|| ScpNapiError::Transport {
+                message: format!("MCP client handle '{handle_id}' not found"),
                 code: codes::TRANS_5020.to_owned(),
-            })
-        })?;
-
-    let client_guard = entry.client.lock().map_err(|e| {
-        napi::Error::from(ScpNapiError::Transport {
+            })?;
+        let client_guard = entry.client.lock().map_err(|e| ScpNapiError::Transport {
             message: format!("client lock poisoned: {e}"),
             code: codes::TRANS_5021.to_owned(),
-        })
-    })?;
-
-    let outlets = client_guard.list_tools().map_err(|e| {
-        napi::Error::from(ScpNapiError::Transport {
-            message: format!("tools/list failed: {e}"),
-            code: codes::TRANS_5022.to_owned(),
-        })
-    })?;
+        })?;
+        client_guard
+            .list_tools()
+            .map_err(|e| ScpNapiError::Transport {
+                message: format!("tools/list failed: {e}"),
+                code: codes::TRANS_5022.to_owned(),
+            })
+    })
+    .await?;
 
     Ok(outlets
         .into_iter()
@@ -980,8 +997,6 @@ pub(crate) async fn mcp_client_list_tools_on(
 }
 
 /// Per-bridge-instance implementation of [`Scp::mcp_client_invoke`](crate::scp::Scp::mcp_client_invoke).
-#[allow(clippy::unused_async)]
-#[allow(clippy::needless_pass_by_value)]
 pub(crate) async fn mcp_client_invoke_on(
     bi: &NapiBridgeInstance,
     handle: &NapiMcpClientHandle,
@@ -991,38 +1006,32 @@ pub(crate) async fn mcp_client_invoke_on(
     invoker_did: String,
 ) -> napi::Result<NapiMcpInvokeResult> {
     crate::napi_check_handle!(&bi.core, handle);
-    let entry = bi
-        .mcp_client_registry()
-        .get(&handle.handle_id)
-        .ok_or_else(|| {
-            napi::Error::from(ScpNapiError::Transport {
-                message: format!("MCP client handle '{}' not found", handle.handle_id),
+    let registry = Arc::clone(bi.mcp_client_registry());
+    let handle_id = handle.handle_id.clone();
+    let result = run_mcp_client_io(codes::TRANS_5025, move || {
+        let entry = registry
+            .get(&handle_id)
+            .ok_or_else(|| ScpNapiError::Transport {
+                message: format!("MCP client handle '{handle_id}' not found"),
                 code: codes::TRANS_5023.to_owned(),
-            })
-        })?;
-
-    let input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
-        napi::Error::from(ScpNapiError::Transport {
-            message: format!("invalid input JSON: {e}"),
-            code: codes::VALID_7021.to_owned(),
-        })
-    })?;
-
-    let client_guard = entry.client.lock().map_err(|e| {
-        napi::Error::from(ScpNapiError::Transport {
+            })?;
+        let input: serde_json::Value =
+            serde_json::from_str(&input_json).map_err(|e| ScpNapiError::Transport {
+                message: format!("invalid input JSON: {e}"),
+                code: codes::VALID_7021.to_owned(),
+            })?;
+        let client_guard = entry.client.lock().map_err(|e| ScpNapiError::Transport {
             message: format!("client lock poisoned: {e}"),
             code: codes::TRANS_5024.to_owned(),
-        })
-    })?;
-
-    let result = client_guard
-        .invoke(&outlet_name, input, &context_id, &invoker_did)
-        .map_err(|e| {
-            napi::Error::from(ScpNapiError::Transport {
+        })?;
+        client_guard
+            .invoke(&outlet_name, input, &context_id, &invoker_did)
+            .map_err(|e| ScpNapiError::Transport {
                 message: format!("tools/call failed: {e}"),
                 code: codes::TRANS_5025.to_owned(),
             })
-        })?;
+    })
+    .await?;
 
     let content_json = serde_json::to_string(&result.content).unwrap_or_else(|_| "[]".to_owned());
 
@@ -1180,21 +1189,20 @@ mod tests {
     use super::*;
     use crate::runtime::NapiBridgeInstance;
 
-    /// WU6: Two-instance regression test — disabling enforcement via the
-    /// public `mcp_disable_stdio_allowlist_on` entry point on one instance
-    /// MUST NOT leak into another. Drives the public surface so the test
-    /// catches a regression where the helper silently locks the wrong
-    /// mutex or fails to plumb `instance_id`.
     /// `mcp_client_connect_sse_on` sends the caller's token on its `GET`, so a
     /// TypeScript client passes the bearer check an SCP SSE server always
-    /// runs. The listener closes after reading the request head, so the
-    /// connect fails after the header has gone out.
+    /// runs, and it waits for the server off the async worker. The listener
+    /// holds the connection silent until the timer branch has run, then
+    /// closes it, so the connect fails after the header has gone out. On this
+    /// single-threaded runtime a connect that blocked the worker would hold
+    /// the timer branch for the listener's five-second hold.
     #[test]
     fn mcp_client_connect_sse_sends_the_bearer_token_napi() {
         use std::io::BufRead;
         let bi = NapiBridgeInstance::new_napi();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
             let (conn, _) = listener.accept().expect("accept GET");
             let mut reader = std::io::BufReader::new(conn);
@@ -1203,24 +1211,50 @@ mod tests {
                 let mut line = String::new();
                 let n = reader.read_line(&mut line).expect("read head");
                 if n == 0 || line == "\r\n" {
-                    return head;
+                    break;
                 }
                 head.push_str(&line);
             }
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            head
         });
-        let result = crate::runtime().block_on(mcp_client_connect_sse_on(
-            &bi,
-            format!("http://127.0.0.1:{port}/sse"),
-            Some("tok-1".to_owned()),
-        ));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let started = std::time::Instant::now();
+        let (result, timer_done) = runtime.block_on(async {
+            tokio::join!(
+                mcp_client_connect_sse_on(
+                    &bi,
+                    format!("http://127.0.0.1:{port}/sse"),
+                    Some("tok-1".to_owned()),
+                ),
+                async {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    let timer_done = started.elapsed();
+                    let _ = release_tx.send(());
+                    timer_done
+                }
+            )
+        });
         let head = server.join().expect("server thread");
         assert!(
             head.contains("\r\nAuthorization: Bearer tok-1\r\n"),
             "the GET must carry the token, got: {head}"
         );
         assert!(result.is_err(), "the listener closed without a response");
+        assert!(
+            timer_done < std::time::Duration::from_secs(2),
+            "the connect must wait off the async worker, but the timer took {timer_done:?}"
+        );
     }
 
+    /// WU6: Two-instance regression test — disabling enforcement via the
+    /// public `mcp_disable_stdio_allowlist_on` entry point on one instance
+    /// MUST NOT leak into another. Drives the public surface so the test
+    /// catches a regression where the helper silently locks the wrong
+    /// mutex or fails to plumb `instance_id`.
     #[test]
     fn allowlist_disable_does_not_leak_across_instances_napi() {
         let a = NapiBridgeInstance::new_napi();

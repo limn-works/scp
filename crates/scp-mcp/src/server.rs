@@ -499,6 +499,13 @@ pub struct McpServer<P: ContextProvider> {
     /// from those notifications when the roster changes. A `Mutex` because the
     /// pump holds `&self`.
     client_views: std::sync::Mutex<HashMap<ContextId, ContextView>>,
+    /// Whether this session's client has listed: `tools/list` or
+    /// `resources/list` read the served set. A context with no recorded view
+    /// then changed for the client (it joined the served set after the list,
+    /// or its view could not be read), while a client that never listed holds
+    /// no list any event could make stale. Atomic because the pump holds
+    /// `&self`.
+    client_listed: std::sync::atomic::AtomicBool,
     /// Whether a real runtime event source is wired to this server.
     ///
     /// Set only by `McpServer::wired_pair`, which is the *only* constructor
@@ -670,6 +677,7 @@ impl<P: ContextProvider> McpServer<P> {
             subscriptions: HashSet::new(),
             served_contexts: std::sync::Mutex::new(HashSet::new()),
             client_views: std::sync::Mutex::new(HashMap::new()),
+            client_listed: std::sync::atomic::AtomicBool::new(false),
             // Fail closed: no event source, no promises that need one.
             event_source_wired: false,
             pending_notifications: Vec::new(),
@@ -715,6 +723,7 @@ impl<P: ContextProvider> McpServer<P> {
             subscriptions: HashSet::new(),
             served_contexts: std::sync::Mutex::new(HashSet::new()),
             client_views: std::sync::Mutex::new(HashMap::new()),
+            client_listed: std::sync::atomic::AtomicBool::new(false),
             event_source_wired: true,
             pending_notifications: Vec::new(),
         };
@@ -1497,6 +1506,7 @@ impl<P: ContextProvider> McpServer<P> {
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        *self.client_listed.get_mut() = false;
     }
 
     /// Removes and returns the notifications that `tools/call` requests
@@ -1545,7 +1555,10 @@ impl<P: ContextProvider> McpServer<P> {
     /// removed the context. Another member's join, departure or revocation
     /// leaves the view unchanged and sends none of them, so a member denied
     /// `scp://{ctx}/members` cannot time roster changes through the tools
-    /// resource, whose only requirement is membership.
+    /// resource, whose only requirement is membership. With no view recorded,
+    /// a session whose client has not listed records the current view and
+    /// sends nothing, because it holds no list to re-read (see
+    /// [`Self::refresh_view`]).
     ///
     /// # Re-authorization on every emission
     ///
@@ -1700,6 +1713,8 @@ impl<P: ContextProvider> McpServer<P> {
     /// context is recorded then.
     fn record_served_contexts(&self) -> Result<Vec<ContextId>, String> {
         let active = self.provider.active_context_ids()?;
+        self.client_listed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.served_contexts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1754,23 +1769,31 @@ impl<P: ContextProvider> McpServer<P> {
     }
 
     /// Reads `context_id`'s current [`ContextView`], records it in
-    /// `client_views`, and returns whether it differs from the view recorded
-    /// before.
+    /// `client_views`, and returns whether the client must be told its view
+    /// changed.
     ///
-    /// Returns `true` when no view was recorded, and when the view cannot be
-    /// read. A failed read also forgets the recorded view, so the next event
-    /// compares against nothing and notifies again.
+    /// With a view recorded, that is whether the current view differs from
+    /// it. With none recorded, it is whether the client listed in this
+    /// session: a context it listed has a recorded view unless the context
+    /// joined the served set after that list or its view could not be read,
+    /// and a client that never listed holds no list to re-read, so the first
+    /// event of such a session records the view and stays silent. When the
+    /// view cannot be read, the change cannot be ruled out, so a client that
+    /// holds a view or a list is told; the recorded view is kept, so the next
+    /// readable event compares against what the client last saw rather than
+    /// against nothing.
     fn refresh_view(&self, served: &[ContextId], context_id: &str) -> bool {
         let current = self.context_view(served, context_id);
+        let listed = self.client_listed.load(std::sync::atomic::Ordering::SeqCst);
         let mut views = self
             .client_views
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(view) = current {
-            views.insert(context_id.to_owned(), view.clone()) != Some(view)
-        } else {
-            views.remove(context_id);
-            true
+        match current {
+            Some(view) => views
+                .insert(context_id.to_owned(), view.clone())
+                .map_or(listed, |recorded| recorded != view),
+            None => listed || views.contains_key(context_id),
         }
     }
 
@@ -3879,6 +3902,70 @@ mod tests {
                 .notifications_for_event("ctx_a", &members_and_tools_event())
                 .is_empty(),
             "an unchanged view must not produce the list-changed pair or a tools update"
+        );
+    }
+
+    /// With no view recorded, a session whose client never listed holds no
+    /// list to re-read, so another member's join stays silent, in the first
+    /// session and after `reset_session`. A client that listed is told when
+    /// a context joins its served set after that list.
+    #[test]
+    fn roster_change_before_any_list_is_silent() {
+        let mut provider = MockProvider::default();
+        for kind in [ResourceKind::Events, ResourceKind::Members] {
+            provider.denied_resources.push(("ctx_a".to_owned(), kind));
+        }
+        let mut server = subscribing_server(provider);
+        assert!(
+            server
+                .notifications_for_event("ctx_a", &members_and_tools_event())
+                .is_empty(),
+            "a client that never listed must not learn when the roster changed"
+        );
+
+        server.reset_session();
+        let init = make_request(METHOD_INITIALIZE, Some(init_params()));
+        assert!(server.handle_request(&init).unwrap().error.is_none());
+        assert!(
+            server
+                .notifications_for_event("ctx_a", &members_and_tools_event())
+                .is_empty(),
+            "a reconnect must not re-arm the roster timing signal"
+        );
+
+        let list = make_request(protocol::METHOD_TOOLS_LIST, None);
+        assert!(server.handle_request(&list).unwrap().error.is_none());
+        server.provider.contexts.push("ctx_new".to_owned());
+        assert!(
+            list_changed_pair_sent(
+                &server.notifications_for_event("ctx_new", &members_and_tools_event())
+            ),
+            "a context that joined the served set after the list must be announced"
+        );
+    }
+
+    /// A view that cannot be read is announced once, and the recorded view
+    /// stays: the next readable event compares against what the client last
+    /// saw, so an unchanged view is silent rather than announced again.
+    #[test]
+    fn unreadable_view_is_announced_once_and_keeps_the_recorded_view() {
+        let mut server = subscribing_server(MockProvider::default());
+        subscribe(&mut server, "scp://ctx_a/tools");
+
+        server.provider.unreadable.push("ctx_a".to_owned());
+        assert!(
+            list_changed_pair_sent(
+                &server.notifications_for_event("ctx_a", &members_and_tools_event())
+            ),
+            "a change that cannot be ruled out must be announced"
+        );
+
+        server.provider.unreadable.clear();
+        assert!(
+            server
+                .notifications_for_event("ctx_a", &members_and_tools_event())
+                .is_empty(),
+            "the view the client last saw is unchanged, so the next event is silent"
         );
     }
 

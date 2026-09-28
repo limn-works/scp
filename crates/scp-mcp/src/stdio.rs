@@ -145,25 +145,31 @@ pub const MAX_LINE_BYTES: u64 = 10 * 1024 * 1024;
 ///
 /// # Errors
 ///
-/// Returns an error when the read fails, or when the line reaches the limit
-/// before a newline.
+/// Returns an error when the read fails, when the line reaches the limit
+/// before a newline, or when the line is not UTF-8.
 pub fn read_line_bounded<R: std::io::BufRead>(
     reader: &mut R,
     buf: &mut String,
 ) -> Result<usize, String> {
     use std::io::{BufRead, Read};
-    // `Read::take` consumes `self`, but `Read` is implemented for `&mut R`
-    // so we pass `&mut *reader` which is `&mut R` — `take()` consumes the
-    // temporary reference, not the reader itself.
+    let mut raw = Vec::new();
+    // `Read` is implemented for `&mut R`, so `take` consumes the temporary
+    // reference, not the reader itself.
     let mut bounded = (&mut *reader).take(MAX_LINE_BYTES);
-    let n = BufRead::read_line(&mut bounded, buf).map_err(|e| format!("read error: {e}"))?;
-    // If we read exactly MAX_LINE_BYTES and there's no newline, the line
-    // was truncated — reject it rather than silently returning partial data.
-    if n as u64 == MAX_LINE_BYTES && !buf.ends_with('\n') {
+    // Raw bytes first, as in `read_loop_from`: a cap that falls inside a
+    // multibyte character must surface as the oversize line it is, not as a
+    // decoding error.
+    let n = BufRead::read_until(&mut bounded, b'\n', &mut raw)
+        .map_err(|e| format!("read error: {e}"))?;
+    // Exactly at the cap with no newline means the line was truncated; reject
+    // it rather than return partial data.
+    if n as u64 == MAX_LINE_BYTES && raw.last() != Some(&b'\n') {
         return Err(format!(
             "line exceeds {MAX_LINE_BYTES} byte limit — possible denial-of-service"
         ));
     }
+    let line = std::str::from_utf8(&raw).map_err(|e| format!("read error: {e}"))?;
+    buf.push_str(line);
     Ok(n)
 }
 
@@ -875,6 +881,27 @@ mod tests {
             output.is_empty(),
             "nothing may be dispatched from a truncated line"
         );
+    }
+
+    /// The blocking reader the stdio and SSE clients use checks the cap on raw
+    /// bytes too: a cap inside a multibyte character reports the over-long
+    /// line, not a UTF-8 decoding error.
+    #[test]
+    fn read_line_bounded_reports_line_too_long_when_the_cap_splits_a_character() {
+        let cap = usize::try_from(MAX_LINE_BYTES).expect("cap fits in usize on test targets");
+        let mut input = vec![b'x', b'x'];
+        while input.len() <= cap {
+            input.extend_from_slice("\u{20ac}".as_bytes());
+        }
+        let mut reader = std::io::Cursor::new(input);
+        let mut buf = String::new();
+        let err = read_line_bounded(&mut reader, &mut buf).expect_err("over-long line");
+        assert!(err.contains("byte limit"), "got: {err}");
+        assert!(buf.is_empty(), "no partial line may be returned");
+
+        let mut reader = std::io::Cursor::new("h\u{e9}\nrest".as_bytes().to_vec());
+        assert_eq!(read_line_bounded(&mut reader, &mut buf), Ok(4));
+        assert_eq!(buf, "h\u{e9}\n");
     }
 
     /// Drives the REAL `read_loop_from` and returns its result with everything

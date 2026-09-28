@@ -3050,13 +3050,19 @@ mod tests {
             Ok(())
         };
 
+        // The outlet and its handler are registered, so only the missing
+        // supervisor can refuse this call.
         let unsupervised = setup_unsupervised_context(&bi, creator, true);
+        register_sum_handler(&bi, &unsupervised);
         let provider = provider_for(&unsupervised);
         let args = serde_json::json!({"a": 1, "b": 2});
+        let refusal = provider
+            .run_outlet(&unsupervised, "calculator", args.clone(), authorize)
+            .expect_err("no supervisor must refuse the call")
+            .to_string();
         assert!(
-            provider
-                .run_outlet(&unsupervised, "calculator", args.clone(), authorize)
-                .is_err()
+            refusal.contains("ContextManager not yet attached"),
+            "the refusal must name the missing supervisor, got: {refusal}"
         );
         assert_eq!(asked.get(), 0, "no supervisor: the token must stay unspent");
         crate::runtime::remove_context(&bi, &unsupervised);
