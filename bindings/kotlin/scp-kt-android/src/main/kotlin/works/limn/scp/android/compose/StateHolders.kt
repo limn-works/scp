@@ -551,7 +551,7 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
  *   [coordinator] leaves composition, whether that is this mount or a later one, and skipped
  *   when this mount left [coordinator] before its [start] ran there, because that mount opened
  *   nothing and a mount on a replaced coordinator may still collect the subscription. It must be
- *   idempotent, because every mount under [key] has its own [onStop] run. Runs on
+ *   idempotent, because every mount under [key] whose [start] ran has its own [onStop] run. Runs on
  *   [coordinator]'s scope, which disposal does not cancel, so it may suspend for as long as
  *   it needs. Disposal returns without waiting for it, so
  *   `onStop` finishes only if a process outlives it.
