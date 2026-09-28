@@ -328,7 +328,7 @@ WebRTC library integration is platform-specific (webrtc-rs for native, browser W
 
 ## ADR-025: Apple Platform Adapter
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling and the passkey root custody ruling) and 2026-09-27 (the device-attestation binding and offline verification) — see the amendments below.
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling and the passkey root custody ruling) and 2026-09-27 (the device-attestation binding and offline verification, and the bind and byte-count requirements of `AppleStorage`) — see the amendments below.
 
 **Amendment (2026-09-10 — every SCP key is ECDSA on P-256, and root custody defaults to a passkey).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. `09-security-model.md` §9.7.4.1 item 4 states the passkey default. This ADR's Context named the Secure Enclave's P-256-only support as "the key constraint shaping this ADR" and called it "not a limitation the protocol can design around". That sentence inverted cause and effect: Apple fixed the hardware and SCP chose the curve. Three consequences for this ADR, each written into the text below. The Secure Enclave now holds SCP operational signing keys on Apple platforms, so the Rationale's "Why Keychain … not Secure Enclave" argument is withdrawn. Acceptance criterion 8, which forbade `AppleKeyCustody` from generating or using a Secure Enclave key for SCP signing, is inverted and restated. The root member is held by a passkey through Apple's passkey provider, so no Keychain generic-password item holds it.
 
@@ -541,12 +541,14 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
    - APNs registration uses the `.alert` notification category with `UNAuthorizationOptions.alert` only for system notification permission; the actual push payload remains silent.
 
 5. **`AppleStorage` — SQLCipher:**
-   - `store(key: String, value: Data)`: Writes `(key, value)` to the SQLCipher-encrypted SQLite database.
-   - `retrieve(key: String) -> Data?`: Returns stored data or nil.
+   - `set(key: String, value: Data)`: Writes `(key, value)` to the SQLCipher-encrypted SQLite database. (Amended 2026-09-27; this line previously read "`store(key: String, value: Data)`", a method name neither the UniFFI `StorageProvider` protocol nor `AppleStorage` uses.)
+   - `get(key: String) -> Data?`: Returns stored data or nil. (Amended 2026-09-27; this line previously read "`retrieve(key: String) -> Data?`", a method name neither the UniFFI `StorageProvider` protocol nor `AppleStorage` uses.)
    - `delete(key: String)`: Removes a key.
    - `listKeys(prefix: String) -> [String]`: Lists keys matching a prefix in lexicographic order.
    - `deletePrefix(prefix: String) -> UInt64`: Deletes all keys matching a prefix. Returns count deleted.
    - `exists(key: String) -> Bool`: Returns true if the key exists.
+   - Every one of the six methods above throws when SQLite rejects a parameter bind, and none of them reports a result computed from an unbound parameter. SQLite reports a rejected bind through a return code and leaves that parameter reading `NULL`, and a statement carrying `NULL` where a key belongs still steps to `SQLITE_DONE`: `delete` would then remove no row and return, `exists` would answer `false` for a key the database holds, and `get` would answer `nil` for it. Reading each bind's return code is what turns those three answers into a thrown `StorageError.databaseError`. (Amended 2026-09-27; criterion 5 stated no bind requirement before this bullet.)
+   - Every one of the six methods above binds each key and each prefix at that string's exact UTF-8 byte count, so two keys that differ only after a zero byte name two rows. A C string ends at its first zero byte, so a method that handed SQLite a C string pointer and a negative length would answer `set("a\0b", x)` by writing the one-byte key `a`, `set("a\0c", y)` would overwrite that same row, and `get("a\0b")` would then answer `y`. SQLite answers `SQLITE_OK` for that bind and steps that statement to `SQLITE_DONE`, so the return code the bullet above reads rejects nothing here, and the byte count is what separates those two keys. The same byte count also forbids a null pointer, which SQLite reads as a request to bind `NULL` while still answering `SQLITE_OK`. (Amended 2026-09-27; criterion 5 stated no byte-count requirement before this bullet.)
    - Database encryption: 32-byte key stored in Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. Passed to SQLCipher via `PRAGMA key` before any other operation on the connection.
    - iOS: database file has `NSFileProtectionCompleteUntilFirstUserAuthentication` attribute set before first open.
    - macOS: file protection not applicable; Keychain-protected encryption key provides the access control.
