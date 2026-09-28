@@ -104,7 +104,15 @@ class SCP internal constructor(
      * thread pool that does not happen-before the coroutine that invoked
      * [shutdown].
      */
-    private val isShutdown: AtomicBoolean = AtomicBoolean(false)
+    private val shutdownRecorded: AtomicBoolean = AtomicBoolean(false)
+
+    /**
+     * `true` once a [shutdown] call's FFI teardown has returned without throwing, the same
+     * contract as `Relay.isShutdown` and `Node.isShutdown`. Internal so that ScpShutdownTest
+     * can check that a failed teardown leaves it false and a cancelled caller still sets it.
+     */
+    internal val isShutdown: Boolean
+        get() = shutdownRecorded.get()
 
     /**
      * Constructs a fresh [SCP] with an explicit storage configuration.
@@ -195,7 +203,7 @@ class SCP internal constructor(
             // the finalizer warning, while a cancellation the bridge raises after a finished
             // teardown (its trailing ensureActive, or resuming a cancelled caller) cannot
             // leave a torn-down instance recorded as live.
-            isShutdown.set(true)
+            shutdownRecorded.set(true)
         }
     }
 
@@ -223,7 +231,7 @@ class SCP internal constructor(
      */
     @Suppress("ProtectedMemberInFinalClass", "Unused")
     protected fun finalize() {
-        if (!isShutdown.get()) {
+        if (!isShutdown) {
             Logger.getLogger("works.limn.scp.SCP").log(
                 Level.WARNING,
                 "SCP instance (id={0}) was garbage-collected without a shutdown() call. " +
