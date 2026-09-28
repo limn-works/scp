@@ -355,22 +355,53 @@ impl FfiBridgeProvider {
     ///
     /// Fails when the actor does not hold the context or cannot be asked, and,
     /// with no supervisor attached, when the bridge holds no copy of the
-    /// context; the caller then denies, because it cannot learn the current
-    /// role state. The message names whichever of the two held nothing.
+    /// context. The message for an absent context names whichever of the two
+    /// held nothing. [`Self::gate_role_state`] keeps those two failures apart
+    /// for the access gates.
     fn live_role_state(
         bi: &crate::runtime::PyBridgeInstance,
         context_id: &str,
     ) -> Result<scp_core::context::roles::ContextRoleState, String> {
-        Self::held_role_state(bi, context_id)?.ok_or_else(|| {
-            if bi.core.try_supervisor().is_some() {
-                format!("context '{context_id}' is not held by the supervisor")
-            } else {
-                format!(
-                    "context '{context_id}' is not held by this bridge, and no supervisor \
-                     is attached"
-                )
-            }
-        })
+        Self::held_role_state(bi, context_id)?
+            .ok_or_else(|| Self::absent_context_message(bi, context_id))
+    }
+
+    /// Reads `context_id`'s role state as [`Self::live_role_state`] does, for
+    /// an access gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccessRefusal::Denied`](scp_mcp::server::AccessRefusal::Denied)
+    /// when the actor (with no supervisor, the bridge) holds no such context:
+    /// the agent holds no grant in a context this instance does not hold, so
+    /// `tools/list` and `resources/list` omit it. Returns
+    /// [`AccessRefusal::Unreadable`](scp_mcp::server::AccessRefusal::Unreadable)
+    /// when the read itself failed, so a failed read never reaches the client
+    /// as a shorter list.
+    fn gate_role_state(
+        bi: &crate::runtime::PyBridgeInstance,
+        context_id: &str,
+    ) -> Result<scp_core::context::roles::ContextRoleState, scp_mcp::server::AccessRefusal> {
+        use scp_mcp::server::AccessRefusal;
+        match Self::held_role_state(bi, context_id) {
+            Ok(Some(role_state)) => Ok(role_state),
+            Ok(None) => Err(AccessRefusal::Denied(Self::absent_context_message(
+                bi, context_id,
+            ))),
+            Err(e) => Err(AccessRefusal::Unreadable(e)),
+        }
+    }
+
+    /// Names the holder that has no `context_id`: the supervisor when one is
+    /// attached, otherwise this bridge.
+    fn absent_context_message(bi: &crate::runtime::PyBridgeInstance, context_id: &str) -> String {
+        if bi.core.try_supervisor().is_some() {
+            format!("context '{context_id}' is not held by the supervisor")
+        } else {
+            format!(
+                "context '{context_id}' is not held by this bridge, and no supervisor is attached"
+            )
+        }
     }
 
     /// Reads `context_id`'s current role state from the source
@@ -673,11 +704,11 @@ impl ContextProvider for FfiBridgeProvider {
         use scp_mcp::server::AccessRefusal;
         // A dropped bridge instance, an unreadable role state, or a failed
         // read inside `outlet_grant` is a failed read, which `tools/list`
-        // reports as an error instead of omitting the context's tools. The
-        // role state comes from the actor, not the bridge copy.
+        // reports as an error instead of omitting the context's tools. A
+        // context the actor does not hold is a denial. The role state comes
+        // from the actor, not the bridge copy.
         let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
-        let role_state =
-            Self::live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;
+        let role_state = Self::gate_role_state(&bi, context_id)?;
         self.outlet_grant(&bi, &role_state, context_id, outlet_name, check)
     }
 
@@ -704,10 +735,10 @@ impl ContextProvider for FfiBridgeProvider {
         use scp_mcp::server::AccessRefusal;
         // A dropped bridge instance or an unreadable role state is a failed
         // read, which `resources/list` reports as an error instead of
-        // omitting the context's resources.
+        // omitting the context's resources. A context the actor does not hold
+        // is a denial, which `resources/list` omits.
         let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
-        let role_state =
-            Self::live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;
+        let role_state = Self::gate_role_state(&bi, context_id)?;
         let access = resource.check_access(&role_state, &self.agent_did, context_id);
         access.map_err(AccessRefusal::Denied)
     }
@@ -4455,10 +4486,11 @@ mod tests {
         assert!(
             matches!(
                 &denial,
-                scp_mcp::server::AccessRefusal::Unreadable(msg)
+                scp_mcp::server::AccessRefusal::Denied(msg)
                     if msg.contains("not held by this bridge, and no supervisor is attached")
             ),
-            "with no supervisor the denial must name the bridge, got: {denial}"
+            "with no supervisor an absent context is a denial naming the bridge, not a \
+             failed read, got: {denial}"
         );
         assert!(provider.context_members(&ctx_id).is_ok());
         assert!(
@@ -4493,9 +4525,26 @@ mod tests {
             assert!(
                 matches!(
                     &denial,
-                    scp_mcp::server::AccessRefusal::Unreadable(msg) if msg.contains("not held by the supervisor")
+                    scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("not held by the supervisor")
                 ),
-                "the {kind:?} denial must come from the actor query, got: {denial}"
+                "the {kind:?} refusal must be a denial from the actor query, so \
+                 `resources/list` omits the context instead of failing, got: {denial}"
+            );
+        }
+        for check in [
+            scp_mcp::server::CapabilityCheck::Probe,
+            scp_mcp::server::CapabilityCheck::Invoke,
+        ] {
+            let denial = provider
+                .validate_capability(&ctx_id, "any-outlet", check)
+                .expect_err("the bridge copy must not grant a tool the actor does not");
+            assert!(
+                matches!(
+                    &denial,
+                    scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("not held by the supervisor")
+                ),
+                "the {check:?} refusal must be a denial from the actor query, so \
+                 `tools/list` omits the context instead of failing, got: {denial}"
             );
         }
         assert!(provider.context_members(&ctx_id).is_err());
