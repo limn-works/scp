@@ -64,8 +64,10 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      * token, prepared with the `cloudProjectNumber` of the package verifier's
      * `PlayIntegrityVerifier` entry, whose `requestHash` is the lowercase
      * hexadecimal form of the binding digest `D`, and an adapter that does not
-     * read [deviceId]. This adapter meets none of the three; story SCP-111's
-     * acceptance criteria track each one.
+     * read [deviceId]. This adapter meets none of the three. Story SCP-111
+     * tracks the Standard request and its `requestHash`; its acceptance
+     * criteria do not yet name the `cloudProjectNumber` or the [deviceId]
+     * requirement.
      *
      * @param challenge The 32-byte binding digest `D` of
      *   `09-security-model.md` §9.3.1. ADR-025 and ADR-027 require the caller
@@ -132,8 +134,9 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      * Classic integrity token whose nonce is `Base64(SHA-256(clientDataJSON))`.
      * ADR-027 acceptance criterion 8 requires a Standard integrity token whose
      * `requestHash` is the lowercase hexadecimal form of `A`, requested
-     * without routing through [attest]; story SCP-111's acceptance criteria
-     * track both requirements.
+     * without routing through [attest]. Story SCP-111 tracks the Standard
+     * request; its acceptance criteria do not yet name the rule against
+     * routing through [attest].
      *
      * @param requestHash The 32-byte assertion digest `A` of
      *   `09-security-model.md` §9.3.1 over the request bytes. ADR-025 and
