@@ -4,7 +4,9 @@
 //!
 //! 1. **Full node** (default): Starts an [`ApplicationNode`] with DID identity,
 //!    relay, and HTTP server (`.well-known/scp` + WebSocket upgrade). Uses
-//!    persistent `SQLite` storage by default (`SQLCipher` encrypted).
+//!    persistent `SQLite` storage by default (`SQLCipher` encrypted), and asks
+//!    for a newly generated identity on every run, so a shipped build exits 1
+//!    with `NoPreRotationBackend`.
 //! 2. **Relay-only** (`--relay-only`): Runs a bare [`RelayServer`], identical
 //!    to the standalone `scp-relay` binary.
 //! 3. **Ephemeral** (`--ephemeral`): Runs a full node with all in-memory
@@ -501,7 +503,9 @@ fn validate_storage_path_or_exit(dir: &std::path::Path) {
     }
 }
 
-/// Runs the full node with persistent `SQLite` storage (production default).
+/// Runs the full node with persistent `SQLite` storage (the default mode). A
+/// shipped build exits 1 with `NoPreRotationBackend`, because the node asks for a
+/// newly generated identity on every run.
 async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // Parse the blob backend before anything below creates the storage
     // directory, the storage key, or a store, so a backend this build cannot

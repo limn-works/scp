@@ -1781,8 +1781,9 @@ mod tests {
         // out-of-band). `Disabled` is the fail-safe, non-disclosing direction and
         // must never be rejected; only `DhtMode::Production` discloses (M2). The
         // binary exposes this configuration as `SCP_NODE_DHT_MODE=disabled` under
-        // `--self-host`. The full relay node rejects that value and requires
-        // `production`, because it must publish its DID to be discoverable.
+        // `--self-host`. The full relay node rejects that value, because it must
+        // publish its DID to be discoverable; it accepts `production`, and
+        // `memory` in a `testing` build.
         let external_addr = SocketAddr::from(([198, 51, 100, 7], 32891));
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),

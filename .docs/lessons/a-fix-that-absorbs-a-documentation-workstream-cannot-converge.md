@@ -3,8 +3,13 @@
 A fix that made one example compile on a shipped build grew to 1,204 inserted lines
 across 37 files. Nineteen review rounds later the branch was still producing findings, and
 in the nineteenth round a reviewer falsified three claims that the two newest commits had
-added. Deleting every sentence about a subsystem the branch never modified ended the loop
-that fixing individual sentences could not.
+added. Deleting most of the sentences about subsystems the branch never modified ended the
+loop that fixing individual sentences could not. Three such passages stayed, because
+deleting each would put back a false sentence or leave a refusal unexplained: the rustdoc
+of `identity_execute_custody_migration` in `crates/scp-ffi/src/identity.rs`, which had said
+its backend succeeds; the operator guide's paragraph on why a shipped full node exits 1;
+and the reason in the `--ephemeral` refusal message. The rule below does not admit them;
+they are the exceptions this branch took.
 
 ## The Rule
 
@@ -32,8 +37,8 @@ cannot create an identity.
 That one sentence became thirty. Each round a reviewer found a surface where the same
 explanation was missing, or wrong, or scoped differently, and each fix added surfaces.
 The identity fail-closed behavior belongs to the ADR-062 severing workstream. This branch
-never modified it. It only described it — on ten bridge and SDK doc comments, four SDK
-methods, two operator guides, and an error-code registry.
+never modified it. At its widest the branch described it on ten bridge and SDK doc
+comments, four SDK methods, two operator guides, and an error-code registry.
 
 ## Universals about provenance are the specific trap
 

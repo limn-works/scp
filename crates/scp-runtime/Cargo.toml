@@ -236,9 +236,13 @@ required-features = ["testing"]
 name = "identity"
 # The example names `InMemoryDhtClient`, `InMemoryKeyCustody`, and
 # `InMemoryPreRotationCustody`, which a consumer reaches only through this crate's
-# `testing` feature, so a default-feature `cargo run --example identity` reports the
-# missing feature instead of unresolved imports. `check-examples-compile.sh`
-# names each target, so the declaration removes no target from that gate.
+# `testing` feature. Inside this workspace the declaration never refuses a build:
+# the `scp-testing` dev-dependency turns on `scp-runtime/testing`, and cargo unifies
+# that into every dev target, so `cargo run -p scp-runtime --example identity`
+# compiles and runs. Only a build of the published crate, which strips
+# dev-dependencies, reports the missing feature instead of unresolved imports.
+# `check-examples-compile.sh` names each target, so the declaration removes no
+# target from that gate.
 required-features = ["testing"]
 
 [[example]]
