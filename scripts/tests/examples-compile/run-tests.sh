@@ -9,12 +9,15 @@
 # there with real cargo, and asserts both the exit code and the FAIL or OK line that names
 # the outcome, so a case cannot pass on the wrong outcome.
 #
-# The last five cases pin the gate's invocation. `--all-features` or `--features testing` on
-# the clippy line turns `featuregated` green. `--examples` in place of `--example NAME` skips
-# a `required-features` target and exits 0, which turns `requiredfeatures` green. One
-# `cargo clippy --workspace --examples` unifies `helper`'s dev-dependency features into
-# `demo`, which turns `devdepunify` green. Iterating published files in place of targets
-# turns `excluded` red. An unquoted `for` loop splits `spaced` at its space and turns it red.
+# The last five cases pin the gate's invocation, and each mutation below makes its case fail.
+# `--all-features` or `--features testing` on the clippy line makes the gate exit 0 on
+# `featuregated`, which expects exit 1. `--examples` in place of `--example NAME` skips a
+# `required-features` target and makes the gate exit 0 on `requiredfeatures`, which expects
+# exit 1. One `cargo clippy --workspace --examples` unifies `helper`'s dev-dependency features
+# into `demo` and makes the gate exit 0 on `devdepunify`, which expects exit 1. Iterating
+# published files in place of targets drops `excluded`'s only target and makes the gate exit 1
+# on `excluded`, which expects exit 0. An unquoted `for` loop splits `spaced` at its space and
+# makes the gate exit 1 on `spaced`, which expects exit 0.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
