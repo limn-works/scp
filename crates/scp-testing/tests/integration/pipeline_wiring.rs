@@ -3226,10 +3226,58 @@ fn mcp_wiring_gate_rejects_a_receiver_not_from_the_bridge_instance() {
     ));
 }
 
+/// A wired `validate_resource_access`, as the resource-access gate accepts it.
+/// The resource-gate self-tests derive each regression from it.
+const RESOURCE_BRIDGE: &str = "fn validate_resource_access(&self, context_id: &str, resource: ResourceKind) \
+                  -> Result<(), AccessRefusal> {\n    use scp_mcp::server::AccessRefusal;\n    \
+                  let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;\n    \
+                  let role_state =\n        \
+                  Self::live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;\n    \
+                  let access = resource.check_access(&role_state, &self.agent_did, context_id);\n    \
+                  access.map_err(AccessRefusal::Denied)\n}\n\
+                  fn context_members(&self) {}\n";
+
+/// The resource-access gate must go red when the live read targets an instance
+/// other than the provider's own bridge instance (a stand-in `bi`, or `bi`
+/// rebound before the read), or when a statement runs before `bi` is bound.
+#[test]
+fn mcp_resource_gate_rejects_a_read_not_from_the_bridge_instance() {
+    let bridge = RESOURCE_BRIDGE;
+    assert!(answers_resource_access_from_live_role_state(
+        &production_code(bridge)
+    ));
+    // The live read survives, but `bi` is a stand-in instance, not the
+    // provider's own bridge instance.
+    let stand_in_instance = bridge.replace(
+        "let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;",
+        "let bi = detached.clone();",
+    );
+    assert!(!answers_resource_access_from_live_role_state(
+        &production_code(&stand_in_instance)
+    ));
+    // `bi` is bound from the bridge instance, then rebound to another
+    // instance before the live read.
+    let bi_rebound = bridge.replace(
+        "let role_state =\n",
+        "let bi = detached.clone();\n    let role_state =\n",
+    );
+    assert!(!answers_resource_access_from_live_role_state(
+        &production_code(&bi_rebound)
+    ));
+    // A statement before the `bi` binding answers `Ok(())` early.
+    let early_return = bridge.replace(
+        "use scp_mcp::server::AccessRefusal;",
+        "use scp_mcp::server::AccessRefusal;\n    return Ok(());",
+    );
+    assert!(!answers_resource_access_from_live_role_state(
+        &production_code(&early_return)
+    ));
+}
+
 /// The resource-access gate must go red when a comment names the capability
 /// check, a stand-in role state reaches the predicate (in place of the live
-/// read, chained onto it, or shadowing it), the predicate's verdict
-/// is discarded, or the checked pieces survive only in another function.
+/// read, chained onto it, or shadowing it), the predicate's verdict is
+/// discarded, or the checked pieces survive only in another function.
 #[test]
 fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
     let doc_only = "/// `Events` require `Capability::MessagesRead` per spec.\n\
@@ -3242,13 +3290,7 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
     // The bridge half of the resource gate: `validate_resource_access` must
     // read role state from the live source and pass THAT value to the shared
     // predicate, and return the predicate's verdict.
-    let bridge = "fn validate_resource_access(&self, context_id: &str, resource: ResourceKind) \
-                  -> Result<(), AccessRefusal> {\n    let bi = self.upgrade_bi()?;\n    \
-                  let role_state =\n        \
-                  Self::live_role_state(&bi, context_id).map_err(AccessRefusal::Unreadable)?;\n    \
-                  let access = resource.check_access(&role_state, &self.agent_did, context_id);\n    \
-                  access.map_err(AccessRefusal::Denied)\n}\n\
-                  fn context_members(&self) {}\n";
+    let bridge = RESOURCE_BRIDGE;
     assert!(answers_resource_access_from_live_role_state(
         &production_code(bridge)
     ));
@@ -3357,15 +3399,21 @@ fn fn_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
 
 /// Whether the production `validate_resource_access` in `code` reads the
 /// context's role state from the live source (PyO3 and NAPI `live_role_state`,
-/// UniFFI `role_state_of`), passes that value to `ResourceKind::check_access`,
-/// and returns that call's verdict as the function's tail expression.
+/// UniFFI `role_state_of`) of the provider's own bridge instance, passes that
+/// value to `ResourceKind::check_access`, and returns that call's verdict as
+/// the function's tail expression.
 ///
-/// The whole live-read statement is pinned, and it must be the statement right
-/// before the predicate call. So no later statement can rebind `role_state` to
-/// a stand-in, and no call chained onto the read (an `or_else`, an
-/// `unwrap_or_else`) can turn a failed read into a stand-in: each pinned read
-/// ends in `?`, which returns the failure as `AccessRefusal::Unreadable`.
+/// The whole body is pinned statement by statement: the `use` of
+/// `AccessRefusal`, then `bi` bound from `self.upgrade_bi()`, then the
+/// live-read statement, then the predicate call and its verdict. So no
+/// statement can bind `bi` to another instance or return before the check, no
+/// later statement can rebind `role_state` to a stand-in, and no call chained
+/// onto the read (an `or_else`, an `unwrap_or_else`) can turn a failed read
+/// into a stand-in: each pinned read ends in `?`, which returns the failure as
+/// `AccessRefusal::Unreadable`.
 fn answers_resource_access_from_live_role_state(code: &str) -> bool {
+    const BIND: &str = "use scp_mcp::server::AccessRefusal; \
+                        let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;";
     const TAIL: &str = "let access = resource.check_access(&role_state, &self.agent_did, \
                         context_id); access.map_err(AccessRefusal::Denied) }";
     const READS: [&str; 3] = [
@@ -3386,7 +3434,11 @@ fn answers_resource_access_from_live_role_state(code: &str) -> bool {
         READS.iter().any(|read| {
             before_tail
                 .strip_suffix(read)
-                .is_some_and(|rest| rest.ends_with(' '))
+                .and_then(|rest| rest.strip_suffix(' '))
+                .and_then(|rest| rest.strip_suffix(BIND))
+                .is_some_and(|signature| {
+                    signature.trim_end().ends_with('{') && signature.matches('{').count() == 1
+                })
         })
     })
 }
@@ -3458,9 +3510,10 @@ fn production_source(src: &str) -> &str {
 /// `scp_mcp::server::ResourceKind::check_access`, and each bridge's
 /// `validate_resource_access` passes it the role state that bridge read. This
 /// test pins the two parts the types cannot see: that each bridge feeds the
-/// predicate role state read from the live source rather than a stand-in, and
-/// that the predicate's `Self::Events | Self::Members =>` arm calls
-/// `member_has_capability` with `Capability::MessagesRead`. It does not check
+/// predicate role state read from the live source of its own bridge instance
+/// rather than a stand-in, and that the predicate's
+/// `Self::Events | Self::Members =>` arm calls `member_has_capability` with
+/// `Capability::MessagesRead`. It does not check
 /// how that arm uses the call's result, nor the `Tools` arm, which requires
 /// membership only; `scp-mcp`'s unit tests exercise the predicate's decisions.
 #[test]
@@ -3490,7 +3543,7 @@ fn mcp_resource_access_is_answered_from_real_role_state() {
         assert!(
             answers_resource_access_from_live_role_state(&production_code(src)),
             "{bridge}'s production `validate_resource_access` must read the context's \
-             role state from the live source and pass that value to \
+             role state from the live source of its own bridge instance and pass that value to \
              `ResourceKind::check_access`; a stand-in role state, a deleted predicate \
              call, or a call in some other function does not count"
         );
@@ -3503,8 +3556,8 @@ fn mcp_resource_access_is_answered_from_real_role_state() {
             .is_some_and(checks_messages_read),
         "`ResourceKind::check_access` must authorize the events/members resources, \
          in their own `Self::Events | Self::Members =>` arm, \
-         against the real capability catalogue (spec §5.3.1: `messages:read` is what \
-         lets an observer see content and membership) on its PRODUCTION path; a \
+         against the real capability catalogue (spec §5.5.1, Default Role Set: an observer, whose only \
+         permission is `messages:read`, can see all content and membership) on its PRODUCTION path; a \
          test-module occurrence does not count"
     );
 }

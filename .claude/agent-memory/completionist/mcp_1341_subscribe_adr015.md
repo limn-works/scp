@@ -1,6 +1,6 @@
 ---
 name: mcp-1341-subscribe-adr015
-description: Shipped state of MCP resources/subscribe backed by Supervisor events (#1341, Track G) — earlier findings are FIXED; only ADR-015 AC7 (dynamic tool list) and AC8 (Rust serve binary) remain genuinely open.
+description: Shipped state of MCP resources/subscribe backed by Supervisor events (#1341, Track G) — earlier findings are FIXED; ADR-015 AC5's remote-integration part (no TLS; the SSE client sends a token only to loopback), AC7 (dynamic tool list) and AC8 (Rust serve binary) remain genuinely open.
 metadata:
   type: project
 ---
@@ -29,7 +29,9 @@ and do nothing while `initialize` advertised `subscribe: true` (NAPI returned
   bridge reads the context's live role state and passes it to the one shared
   predicate, `ResourceKind::check_access` in `crates/scp-mcp/src/server.rs`,
   which requires `Capability::MessagesRead` for Events and Members (spec
-  §5.3.1) and membership alone for Tools. A member without `messages:read`
+  §5.5.1, Default Role Set: an observer, whose only permission is
+  `messages:read`, can see all content and membership) and membership alone
+  for Tools. A member without `messages:read`
   reading `scp://<ctx>/tools` is the rule, not a defect. Not "denied everywhere."
 - **The SSE pump is owned, not leaked.** `sse_router` is deleted; `router_with_pump`
   is crate-private, returns the pump `JoinHandle`, and `run_sse` holds it in
@@ -55,6 +57,15 @@ and do nothing while `initialize` advertised `subscribe: true` (NAPI returned
   deliberately not per-event auth-gated).
 
 ## Still genuinely OPEN (ADR-015 acceptance criteria, not regressions)
+- **AC5 — SSE transport, remote-integration part.** ADR-015 AC5 records this
+  part as unmet. Neither the SSE server nor any SDK's SSE client has TLS, every
+  SDK's SSE client refuses an `https://` URL, and given a token the client
+  refuses a URL whose host resolves to a non-loopback address. The server always
+  requires a bearer token, so an SDK client reaches an SCP SSE server only on
+  the same host. It stays open until ADR-015 records how a remote client reaches
+  the server with its token protected on the path and the server and every
+  SDK's SSE client implement that decision; SCP-049 lists the tracking issue in
+  `blockedByIssues`.
 - **AC7 — dynamic tool list.** On all three bridges `active_context_ids()`
   returns the configured contexts whose live role state names the agent, so a
   join or departure among the configured contexts changes the served set
