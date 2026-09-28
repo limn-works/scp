@@ -483,8 +483,9 @@ wide_list=""
 # `crates/` is absent because the compile, format and gate steps above read it, and the
 # Rust commands they still leave unrun are the same for every run, which is why items 1,
 # 2, 3 and 6 of the DOES-NOT-RUN list state them once rather than per changed file. The
-# reverse-dependency line and the wasm line below are the two that name the packages a
-# given run selected, so both are computed rather than listed here.
+# reverse-dependency line, the two scripts/check-examples-compile.sh lines and the wasm
+# line below are the four that name the packages a given run selected, so all four are
+# computed rather than listed here.
 UNRUN_LANES=(
     "bindings/python/|ruff and pytest, which the python-lint and python-test jobs of .github/workflows/ci.yml run"
     "bindings/typescript/|biome, tsc and bun test, which the typescript-check job of .github/workflows/ci.yml runs"
@@ -752,10 +753,15 @@ else
     done
 
     NOTES+=("the reverse dependencies of $crate_list: cargo check -p compiles the packages it names and none of their dependents, so a changed public signature compiles here and fails to compile its dependents in the rust-clippy job of .github/workflows/ci.yml")
-    # The examples gate compiles each `example` target against its package's whole
-    # dependency graph, so the note names each changed package that owns an example
-    # target or that one of those packages reaches through workspace dependencies of any
-    # kind. When cargo metadata cannot be read, it names every package compiled.
+    # scripts/check-examples-compile.sh makes two assertions, and each gets its own line.
+    # Assertion 2 runs `cargo package --list` on every workspace package, whether or not
+    # it has an example target, so its line names every package compiled. Assertion 1
+    # lints each `example` target, which compiles against the owning package's normal,
+    # build and dev dependencies and, below those, only normal and build dependencies,
+    # because cargo builds a dev-dependency for the package that declares it alone. Its
+    # line names each changed package that walk reaches. When cargo metadata cannot be
+    # read, it names every package compiled.
+    NOTES+=("scripts/check-examples-compile.sh assertion 2 over $crate_list: that gate runs cargo package --list -p on every workspace package, whether or not it has an example target, and fails when that command fails, as it does on a readme key naming a missing file, or when the package publishes an examples/*.rs file that no example target compiles, as autoexamples = false or a redirected path key leaves; the compile above never packages a crate, so either failure passes here and fails that gate in the rust-clippy job of .github/workflows/ci.yml")
     example_rc=0
     example_list=""
     if [[ $metadata_rc -ne 0 ]]; then
@@ -765,16 +771,17 @@ else
 import json, sys
 selected = set(sys.argv[1:])
 pkgs = json.load(sys.stdin)["packages"]
-deps = {p["name"]: {d["name"] for d in p.get("dependencies", [])} for p in pkgs}
-reached = set()
-todo = [p["name"] for p in pkgs
-    if any("example" in t.get("kind", []) for t in p.get("targets", []))]
+deps = {p["name"]: [(d["name"], d.get("kind")) for d in p.get("dependencies", [])]
+    for p in pkgs}
+reached = {p["name"] for p in pkgs
+    if any("example" in t.get("kind", []) for t in p.get("targets", []))}
+todo = [d for o in reached for d, _ in deps[o] if d in deps]
 while todo:
     n = todo.pop()
     if n in reached:
         continue
     reached.add(n)
-    todo.extend(d for d in deps.get(n, ()) if d in deps)
+    todo.extend(d for d, k in deps[n] if k != "dev" and d in deps)
 print(", ".join(sorted(selected & reached)))
 ' "${CRATES[@]}" 2>/dev/null) || example_rc=$?
     fi
@@ -782,7 +789,7 @@ print(", ".join(sorted(selected & reached)))
         example_list="$crate_list (this run could not read their targets out of cargo metadata, so some of them may have no example target)"
     fi
     if [[ -n $example_list ]]; then
-        NOTES+=("scripts/check-examples-compile.sh over the example targets that compile $example_list: the compile above runs cargo check, which reports no clippy lint, while that gate runs cargo clippy -- -D warnings on each example alone, in that one package's dev-target feature set and without the --features list the compile above passed, so an example with a clippy warning, or one that names an item behind a feature the compile above turned on, passes here and fails that gate in the rust-clippy job of .github/workflows/ci.yml")
+        NOTES+=("scripts/check-examples-compile.sh assertion 1 over the example targets that compile $example_list: the compile above runs cargo check, which reports no clippy lint, while that gate runs cargo clippy -- -D warnings on each example alone, in that one package's dev-target feature set and without the --features list the compile above passed, so an example with a clippy warning, or one that names an item behind a feature the compile above turned on, passes here and fails that gate in the rust-clippy job of .github/workflows/ci.yml")
     fi
 
     declare -a SELECTED_WASM=()
@@ -885,11 +892,22 @@ GATES_NOT_RUN=(
     # The toolchain precondition this script runs before any cargo command, above.
     scripts/check-resolved-rustc.sh
     # Runs `cargo clippy` over every example target in the workspace, one target at a
-    # time, so it compiles and takes the shared target directory's build lock, which the
-    # criterion above GATES excludes. The rust-clippy job of .github/workflows/ci.yml runs
-    # it on the pushed head.
+    # time, and `cargo package --list` over every workspace package, so it compiles and
+    # takes the shared target directory's build lock, which the criterion above GATES
+    # excludes. The rust-clippy job of .github/workflows/ci.yml runs it on the pushed head.
     scripts/check-examples-compile.sh
 )
+
+# scripts/check-examples-compile.sh is the one GATES_NOT_RUN entry this run never starts
+# (the other runs as the toolchain precondition), so a branch that edits it gets a line
+# saying the edited gate went unrun over this repository. The fixture suite the scripts/
+# lane names runs the gate over throwaway workspaces, never over this one.
+if [[ $changed_rc -eq 0 ]]; then
+    while IFS= read -r f; do
+        [[ $f == scripts/check-examples-compile.sh ]] || continue
+        NOTES+=("scripts/check-examples-compile.sh over this repository's workspace: this branch changed that gate, and this run never starts it, because it compiles and GATES_NOT_RUN lists it, so an edit that makes it reject a shipped crate's examples or published files passes here and fails the rust-clippy job of .github/workflows/ci.yml, which runs it over every workspace package")
+    done <<< "$CHANGED"
+fi
 
 # `scripts/check-workflow-compile-steps.py` imports PyYAML, which the standard library does
 # not carry, so an interpreter without it fails that gate for a missing library rather than
