@@ -88,8 +88,12 @@ public nonisolated enum McpClientConfig: Sendable {
 
     /// Connect via SSE: HTTP client with Server-Sent Events.
     ///
-    /// - Parameter url: The URL of the SSE endpoint.
-    case sse(url: String)
+    /// - Parameters:
+    ///   - url: The URL of the SSE endpoint.
+    ///   - authToken: The bearer token sent in an `Authorization` header on
+    ///     every request, or `nil` for a server that runs no bearer check. An
+    ///     SCP SSE server always runs one (ADR-015).
+    case sse(url: String, authToken: String?)
 }
 
 // MARK: - McpClient
@@ -155,8 +159,8 @@ public actor McpClient {
         case let .stdio(command, args):
             let handle = try await scp.mcpClientConnectStdio(command: [command] + args)
             return McpClient(scp: scp, handle: handle)
-        case let .sse(url):
-            let handle = try await scp.mcpClientConnectSse(url: url)
+        case let .sse(url, authToken):
+            let handle = try await scp.mcpClientConnectSse(url: url, authToken: authToken)
             return McpClient(scp: scp, handle: handle)
         }
     }

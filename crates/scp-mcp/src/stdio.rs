@@ -138,6 +138,35 @@ fn parse_incoming(line: &str) -> Result<Incoming, Box<JsonRpcResponse>> {
 /// while preventing unbounded allocation from a misbehaving peer.
 pub const MAX_LINE_BYTES: u64 = 10 * 1024 * 1024;
 
+/// Reads a line from a blocking `reader` into `buf`, bounded to [`MAX_LINE_BYTES`].
+///
+/// Returns the number of bytes read (0 on EOF), like
+/// [`std::io::BufRead::read_line`].
+///
+/// # Errors
+///
+/// Returns an error when the read fails, or when the line reaches the limit
+/// before a newline.
+pub fn read_line_bounded<R: std::io::BufRead>(
+    reader: &mut R,
+    buf: &mut String,
+) -> Result<usize, String> {
+    use std::io::{BufRead, Read};
+    // `Read::take` consumes `self`, but `Read` is implemented for `&mut R`
+    // so we pass `&mut *reader` which is `&mut R` — `take()` consumes the
+    // temporary reference, not the reader itself.
+    let mut bounded = (&mut *reader).take(MAX_LINE_BYTES);
+    let n = BufRead::read_line(&mut bounded, buf).map_err(|e| format!("read error: {e}"))?;
+    // If we read exactly MAX_LINE_BYTES and there's no newline, the line
+    // was truncated — reject it rather than silently returning partial data.
+    if n as u64 == MAX_LINE_BYTES && !buf.ends_with('\n') {
+        return Err(format!(
+            "line exceeds {MAX_LINE_BYTES} byte limit — possible denial-of-service"
+        ));
+    }
+    Ok(n)
+}
+
 /// Serializes writes to stdout so responses from the read loop and
 /// notifications from the event pump interleave as whole lines.
 #[derive(Clone)]

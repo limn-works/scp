@@ -4653,7 +4653,7 @@ use scp_mcp::stdio::MAX_LINE_BYTES as MCP_MAX_LINE_BYTES;
 /// Transport wrapper that delegates to either stdio or SSE.
 pub(crate) enum McpUniFFITransportWrapper {
     Stdio(McpStdioTransport),
-    Sse(McpSseTransport),
+    Sse(scp_mcp::sse_client::SseClientTransport),
 }
 
 impl scp_mcp::client::McpTransport for McpUniFFITransportWrapper {
@@ -4814,38 +4814,6 @@ impl Drop for McpStdioTransport {
             let _ = guard.child.kill();
             let _ = guard.child.wait();
         }
-    }
-}
-
-/// SSE MCP transport: communicates via HTTP with Server-Sent Events.
-///
-/// SSE transport is a placeholder — stdio is the primary transport for
-/// mobile clients. SSE methods return descriptive errors.
-pub(crate) struct McpSseTransport {
-    _url: String,
-}
-
-impl McpSseTransport {
-    fn connect(url: &str) -> Self {
-        Self {
-            _url: url.to_owned(),
-        }
-    }
-}
-
-impl scp_mcp::client::McpTransport for McpSseTransport {
-    fn send_request(
-        &self,
-        _request: &scp_mcp::protocol::JsonRpcRequest,
-    ) -> Result<scp_mcp::protocol::JsonRpcResponse, String> {
-        Err("SSE client transport not yet implemented for UniFFI — use stdio transport".to_owned())
-    }
-
-    fn send_notification(
-        &self,
-        _notification: &scp_mcp::protocol::JsonRpcNotification,
-    ) -> Result<(), String> {
-        Err("SSE client transport not yet implemented for UniFFI — use stdio transport".to_owned())
     }
 }
 
@@ -5058,10 +5026,14 @@ impl McpUniFfiBridgeProvider {
         // outlet's registered kind so the UCAN check selects the correct
         // split stem (SCP-OUT-014). Scope the DashMap Ref so the shard lock
         // is released before entering with_ucan_state (a different DashMap).
+        // The caller read `role_state` from the actor, so a context with no
+        // handle is one the actor holds with no outlet registered through this
+        // bridge (see `context_tools`): the outlet is unregistered, which is
+        // a denial and not a failed read.
         let outlet_kind_for_ucan = {
             let handle = context_handle_registry(bi).get(context_id).ok_or_else(|| {
-                AccessRefusal::Unreadable(format!(
-                    "context '{context_id}' not found in handle registry"
+                AccessRefusal::Denied(format!(
+                    "outlet '{outlet_name}' not registered in context '{context_id}'"
                 ))
             })?;
             bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
@@ -5195,13 +5167,21 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         context_id: &str,
     ) -> Result<Vec<scp_mcp::server::ContextOutletInfo>, String> {
         // Look up the ContextHandle from this provider's instance registry
-        // and read its outlet_registry. A dropped bridge or a context with no
-        // handle is an error, never an empty outlet registry.
+        // and read its outlet_registry. Outlets register only on a handle, and
+        // only this bridge's create and join paths register one, so a context
+        // the actor holds with no handle has no outlet registered through this
+        // bridge: its registry is empty. A dropped bridge, a failed role-state
+        // read, or a context the actor does not hold is an error.
         let bi = self.upgrade_bi()?;
         let registry = context_handle_registry(&bi);
-        let handle = registry.get(context_id).ok_or_else(|| {
-            format!("context '{context_id}' could not be read — no context handle")
-        })?;
+        let Some(handle) = registry.get(context_id) else {
+            return match Self::role_state_of(&bi, context_id)? {
+                Some(_) => Ok(Vec::new()),
+                None => Err(format!(
+                    "context '{context_id}' could not be read — no context handle"
+                )),
+            };
+        };
         let outlet_registry = handle
             .outlet_registry
             .lock()
@@ -16573,12 +16553,25 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `mcp_client_connect_sse`.
     ///
-    /// Routes through the module-level MCP client registry.
+    /// Routes through the module-level MCP client registry. `auth_token` is
+    /// sent as `Authorization: Bearer <token>` on the `GET` and on every POST,
+    /// or `None` for a server that runs no bearer check; an SCP SSE server
+    /// always runs one (ADR-015).
     #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
-    pub async fn mcp_client_connect_sse(&self, url: String) -> Result<String, ScpError> {
+    pub async fn mcp_client_connect_sse(
+        &self,
+        url: String,
+        auth_token: Option<String>,
+    ) -> Result<String, ScpError> {
         validate_relay_url(&url)?;
 
-        let transport = McpSseTransport::connect(&url);
+        let transport =
+            scp_mcp::sse_client::SseClientTransport::connect(&url, auth_token.as_deref()).map_err(
+                |e| ScpError::Transport {
+                    msg: format!("failed to connect SSE client: {e}"),
+                    code: codes::TRANS_5018.to_owned(),
+                },
+            )?;
 
         let mut client = scp_mcp::client::McpClient::new(McpUniFFITransportWrapper::Sse(transport));
         client.initialize().map_err(|e| ScpError::Transport {
@@ -22972,6 +22965,42 @@ mod tests {
             }
             other => panic!("expected ScpError::Validation, got {other:?}"),
         }
+    }
+
+    /// `mcp_client_connect_sse` sends the caller's token on its `GET`, so a
+    /// Swift or Kotlin client passes the bearer check an SCP SSE server always
+    /// runs. The listener closes after reading the request head, so the
+    /// connect fails after the header has gone out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mcp_client_connect_sse_sends_the_bearer_token() {
+        use std::io::BufRead;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().expect("accept GET");
+            let mut reader = std::io::BufReader::new(conn);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).expect("read head");
+                if n == 0 || line == "\r\n" {
+                    return head;
+                }
+                head.push_str(&line);
+            }
+        });
+        let result = scp_test()
+            .mcp_client_connect_sse(
+                format!("http://127.0.0.1:{port}/sse"),
+                Some("tok-1".to_owned()),
+            )
+            .await;
+        let head = server.join().expect("server thread");
+        assert!(
+            head.contains("\r\nAuthorization: Bearer tok-1\r\n"),
+            "the GET must carry the token, got: {head}"
+        );
+        assert!(result.is_err(), "the listener closed without a response");
     }
 
     /// `mcp_client_disconnect` must reject unknown handle.

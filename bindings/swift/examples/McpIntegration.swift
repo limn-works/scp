@@ -56,7 +56,7 @@ struct McpIntegration {
         //
         //   let client = try await McpClient.connect(
         //       scp: scp,
-        //       config: .sse(url: "http://localhost:8080/mcp")
+        //       config: .sse(url: "http://localhost:8080/mcp", authToken: nil)
         //   )
         //   let outlets = try await client.listTools()
         //

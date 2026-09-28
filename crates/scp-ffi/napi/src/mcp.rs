@@ -163,7 +163,7 @@ fn mcp_handle_id(prefix: &str) -> String {
 /// Transport wrapper that delegates to either stdio or SSE.
 pub(crate) enum McpClientTransportWrapper {
     Stdio(StdioMcpTransport),
-    Sse(SseMcpTransport),
+    Sse(scp_mcp::sse_client::SseClientTransport),
 }
 
 impl McpTransport for McpClientTransportWrapper {
@@ -306,29 +306,6 @@ impl Drop for StdioMcpTransport {
             let _ = guard.child.kill();
             let _ = guard.child.wait();
         }
-    }
-}
-
-/// SSE MCP transport: communicates via HTTP with Server-Sent Events.
-pub(crate) struct SseMcpTransport {
-    _url: String,
-}
-
-impl SseMcpTransport {
-    fn connect(url: &str) -> Self {
-        Self {
-            _url: url.to_owned(),
-        }
-    }
-}
-
-impl McpTransport for SseMcpTransport {
-    fn send_request(&self, _request: &JsonRpcRequest) -> Result<JsonRpcResponse, String> {
-        Err("SSE client transport not yet implemented for NAPI — use stdio transport".to_owned())
-    }
-
-    fn send_notification(&self, _notification: &JsonRpcNotification) -> Result<(), String> {
-        Err("SSE client transport not yet implemented for NAPI — use stdio transport".to_owned())
     }
 }
 
@@ -910,8 +887,15 @@ pub(crate) async fn mcp_client_connect_stdio_on(
 pub(crate) async fn mcp_client_connect_sse_on(
     bi: &NapiBridgeInstance,
     url: String,
+    auth_token: Option<String>,
 ) -> napi::Result<NapiMcpClientHandle> {
-    let transport = SseMcpTransport::connect(&url);
+    let transport = scp_mcp::sse_client::SseClientTransport::connect(&url, auth_token.as_deref())
+        .map_err(|e| {
+        napi::Error::from(ScpNapiError::Transport {
+            message: format!("failed to connect SSE client: {e}"),
+            code: codes::TRANS_5018.to_owned(),
+        })
+    })?;
 
     let mut client = McpClient::new(McpClientTransportWrapper::Sse(transport));
     client.initialize().map_err(|e| {
@@ -1201,6 +1185,42 @@ mod tests {
     /// MUST NOT leak into another. Drives the public surface so the test
     /// catches a regression where the helper silently locks the wrong
     /// mutex or fails to plumb `instance_id`.
+    /// `mcp_client_connect_sse_on` sends the caller's token on its `GET`, so a
+    /// TypeScript client passes the bearer check an SCP SSE server always
+    /// runs. The listener closes after reading the request head, so the
+    /// connect fails after the header has gone out.
+    #[test]
+    fn mcp_client_connect_sse_sends_the_bearer_token_napi() {
+        use std::io::BufRead;
+        let bi = NapiBridgeInstance::new_napi();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().expect("accept GET");
+            let mut reader = std::io::BufReader::new(conn);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).expect("read head");
+                if n == 0 || line == "\r\n" {
+                    return head;
+                }
+                head.push_str(&line);
+            }
+        });
+        let result = crate::runtime().block_on(mcp_client_connect_sse_on(
+            &bi,
+            format!("http://127.0.0.1:{port}/sse"),
+            Some("tok-1".to_owned()),
+        ));
+        let head = server.join().expect("server thread");
+        assert!(
+            head.contains("\r\nAuthorization: Bearer tok-1\r\n"),
+            "the GET must carry the token, got: {head}"
+        );
+        assert!(result.is_err(), "the listener closed without a response");
+    }
+
     #[test]
     fn allowlist_disable_does_not_leak_across_instances_napi() {
         let a = NapiBridgeInstance::new_napi();

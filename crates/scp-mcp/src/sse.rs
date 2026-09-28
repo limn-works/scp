@@ -582,7 +582,11 @@ async fn sse_handler<P: ContextProvider + 'static>(
     // newest claimant: the live session, or an admission still waiting for
     // the permit. A newer admission therefore cancels a waiting one, which
     // gives up, instead of cancelling a session that has already ended and
-    // then losing the permit to the older waiter.
+    // then losing the permit to the older waiter. The wait polls the
+    // cancellation first, and the admission checks it again under the lock
+    // that makes a session live, because the semaphore can hand the freed
+    // permit to the older waiter before the newer one cancels it: a cancelled
+    // admission then returns 409 and releases the permit to the newer one.
     let (free, evict) = {
         let mut current = state
             .session_evict
@@ -601,8 +605,9 @@ async fn sse_handler<P: ContextProvider + 'static>(
         tracing::info!("MCP SSE: evicting the live session for a new admission");
         let waited = tokio::time::timeout(EVICTION_WAIT, async {
             tokio::select! {
-                permit = Arc::clone(&state.session_slot).acquire_owned() => permit.ok(),
+                biased;
                 () = evict.cancelled() => None,
+                permit = Arc::clone(&state.session_slot).acquire_owned() => permit.ok(),
             }
         })
         .await;
@@ -638,6 +643,16 @@ async fn sse_handler<P: ContextProvider + 'static>(
     // is dispatched only if it names this admission.
     let session_id = mint_session_id();
     let mut server = state.server.lock().await;
+    if evict.is_cancelled() {
+        drop(server);
+        drop(permit);
+        tracing::warn!("MCP SSE: admission superseded before its session went live");
+        return (
+            StatusCode::CONFLICT,
+            "an MCP session is already active on this endpoint",
+        )
+            .into_response();
+    }
     server.reset_session();
     *state
         .live_session
@@ -1833,6 +1848,44 @@ mod tests {
             "the newest admission must win the slot"
         );
         drop(third);
+    }
+
+    /// An admission superseded after the freed permit reached it, but before
+    /// it ran again, gives up with 409 and hands the permit back, instead of
+    /// going live with a cancelled token and returning 200 for a stream that
+    /// ends at once. The test releases the permit to the parked admission and
+    /// cancels its token with no await in between, so both are ready when the
+    /// admission next runs.
+    #[tokio::test]
+    async fn admission_superseded_after_the_permit_reached_it_gives_up() {
+        let state = Arc::new(AppState {
+            server: Mutex::new(McpServer::new(MockProvider::default())),
+            notifier: McpNotifier::new(&test_config()),
+            retry_ms: DEFAULT_RETRY_MS,
+            session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            session_evict: std::sync::Mutex::new(CancellationToken::new()),
+            shutdown: CancellationToken::new(),
+            live_session: std::sync::Mutex::new(None),
+        });
+        let held = Arc::clone(&state.session_slot).try_acquire_owned().unwrap();
+        let waiter = tokio::spawn(sse_handler(State(Arc::clone(&state))));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        drop(held);
+        state.session_evict.lock().unwrap().cancel();
+
+        let status = waiter.await.unwrap().status();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            state.session_slot.available_permits(),
+            1,
+            "the superseded admission must hand the permit back"
+        );
+        assert!(
+            state.live_session.lock().unwrap().is_none(),
+            "the superseded admission must not go live"
+        );
     }
 
     /// Helper: send a request through the router and return the status code.

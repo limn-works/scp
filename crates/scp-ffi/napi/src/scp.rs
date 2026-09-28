@@ -4071,9 +4071,16 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `mcp_client_connect_sse`.
+    /// `auth_token` is sent as `Authorization: Bearer <token>` on the `GET`
+    /// and on every POST, or `None` for a server that runs no bearer check; an
+    /// SCP SSE server always runs one (ADR-015).
     #[napi(js_name = "mcpClientConnectSse")]
-    pub async fn mcp_client_connect_sse(&self, url: String) -> napi::Result<NapiMcpClientHandle> {
-        crate::mcp::mcp_client_connect_sse_on(&self.inner, url).await
+    pub async fn mcp_client_connect_sse(
+        &self,
+        url: String,
+        auth_token: Option<String>,
+    ) -> napi::Result<NapiMcpClientHandle> {
+        crate::mcp::mcp_client_connect_sse_on(&self.inner, url, auth_token).await
     }
 
     /// Per-instance equivalent of the free-function `mcp_client_disconnect`.

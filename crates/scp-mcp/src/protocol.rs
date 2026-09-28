@@ -239,8 +239,14 @@ pub const METHOD_RESOURCES_UPDATED: &str = "notifications/resources/updated";
 /// MCP notification: `notifications/tools/list_changed` -- tool list updated.
 pub const METHOD_TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
 
-/// MCP notification: `notifications/resources/list_changed` -- the set of
-/// resources the server exposes changed (a context was joined or left).
+/// MCP notification: `notifications/resources/list_changed` -- the resources
+/// this agent may read may have changed, so the client re-lists them.
+///
+/// The server sends it when the agent's served contexts, readable resource kinds or
+/// tool view changed, a `tools/call` that spent the agent's token included;
+/// when it cannot read which contexts it serves; and when the event pump
+/// lagged and resynchronizes. A join or leave is one such change, not the only
+/// one.
 pub const METHOD_RESOURCES_LIST_CHANGED: &str = "notifications/resources/list_changed";
 
 // ---------------------------------------------------------------------------

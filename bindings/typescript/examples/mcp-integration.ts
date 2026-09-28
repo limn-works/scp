@@ -55,8 +55,10 @@ async function main(): Promise<void> {
     console.log("MCP server running, exposing outlets");
 
     try {
-      // Or connect as an MCP client to a remote server.
-      const client = await scp.mcpClientConnectSse("http://localhost:8080/mcp");
+      // Or connect as an MCP client to a remote server via SSE. The remote
+      // server runs no bearer check; an SCP SSE server needs its token here
+      // instead of null.
+      const client = await scp.mcpClientConnectSse("http://localhost:8080/mcp", null);
       try {
         const outlets = await scp.mcpClientListTools(client);
         console.log(`Remote server offers ${outlets.length} outlet(s)`);
