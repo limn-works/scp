@@ -757,7 +757,13 @@ public extension AppleKeyCustody {
     /// - Returns: The raw public key bytes.
     /// - Throws: ``PlatformError/keyNotFound(_:)`` if the handle is unknown,
     ///   ``PlatformError/keychainError(_:)`` for Keychain failures,
-    ///   ``PlatformError/custodyError(_:)`` if CryptoKit rejects the key bytes.
+    ///   ``PlatformError/custodyError(_:)`` if the stored key type is unknown
+    ///   or CryptoKit rejects Ed25519 or X25519 key bytes. For a P-256
+    ///   pseudonym key whose public key is derived from the stored scalar,
+    ///   the shared Rust helper's error propagates unchanged:
+    ///   ``ScpError/Validation(msg:code:)`` with `SCP-VALID-7005` if the
+    ///   stored scalar is not 32 bytes, and ``ScpError/Crypto(msg:code:)``
+    ///   with `SCP-CRYPTO-4001` if the scalar is out of range.
     ///
     /// See ADR-025 Key custody and ADR-006 `public_key`.
     @concurrent
@@ -961,8 +967,13 @@ public extension AppleKeyCustody {
     ///   Ed25519 key, ``PlatformError/keyNotFound(_:)`` if the handle is
     ///   unknown, ``PlatformError/biometricAuthenticationFailed(_:)`` if
     ///   biometric gating is active and authentication fails,
-    ///   ``PlatformError/keychainError(_:)`` for Keychain failures,
-    ///   ``PlatformError/custodyError(_:)`` for key derivation failures.
+    ///   ``PlatformError/keychainError(_:)`` for Keychain failures. The
+    ///   shared Rust P-256 helper's error propagates unchanged:
+    ///   ``ScpError/Validation(msg:code:)`` with `SCP-VALID-7005` if the
+    ///   context seed or scalar is not 32 bytes, and
+    ///   ``ScpError/Crypto(msg:code:)`` with `SCP-CRYPTO-4001` if the scalar
+    ///   is out of range. Any other error surfaces as
+    ///   ``PlatformError/custodyError(_:)``.
     ///
     /// See spec §9.10.4.A and `derive_pseudonym_keypair` in
     /// `scp-crypto/src/pseudonym.rs` for the Rust reference.
@@ -1001,7 +1012,9 @@ public extension AppleKeyCustody {
     ///   - pseudonymEpoch: The rotation epoch, serialized as 8 big-endian bytes.
     /// - Returns: A ``PseudonymResult`` whose `publicKey` is the 33-byte
     ///   compressed P-256 point and whose `keyId` is the pseudonym key handle.
-    /// - Throws: The same errors as ``derivePseudonym(_:contextId:)``.
+    /// - Throws: The same errors as ``derivePseudonym(_:contextId:)``,
+    ///   including the P-256 helper's ``ScpError`` passed through unchanged
+    ///   with its code.
     @concurrent
     func deriveRotatablePseudonym(
         _ keyHandle: String,

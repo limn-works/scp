@@ -4,8 +4,8 @@ Pure-Python, stdlib-only reference implementation of the cross-platform
 per-context pseudonym recipe that every SCP custody backend MUST reproduce
 byte-for-byte (Rust ``crates/scp-crypto/src/pseudonym.rs`` plus the per-bridge
 custody callbacks; the TypeScript, Swift, and Kotlin SDKs implement the same
-recipe). It exists so the Python KAT and the Python custody test fixture share
-one canonical algorithm rather than re-deriving it (and risking drift) in each.
+recipe). It gives the Python custody test fixture the context seeds and the
+P-256 helper test an independent prehash signer, so neither re-derives them.
 
 The CI Python interpreter has neither PyNaCl nor ``cryptography`` installed, so
 HKDF/HMAC come from :mod:`hashlib`/:mod:`hmac` and P-256 is a compact affine
@@ -26,7 +26,10 @@ Recipe (matching the Rust core)::
         HKDF-Expand-SHA256(prk=seed, info=b"SCP-PSEUDONYM-P256-V1", L=48), "big")
         mod (n - 1) + 1
     public_key = SEC1-compressed(d * G)          # 33 bytes
-    routing_id = SHA-256(b"scp-pseudonym-routing-v1:" + public_key)
+
+This module computes the two seeds and signs with a given ``d``; ``d`` and
+``public_key`` come from the production helpers ``scp_sdk.p256_pseudonym_scalar``
+and ``scp_sdk.p256_public_key``.
 
 Until slice S12 the native identity key is Ed25519, so the ikm is its 32-byte
 private seed. A custody provider returns ``(public_key, key_id)`` as separate
@@ -44,7 +47,6 @@ import hmac
 PSEUDONYM_SECRET_SALT = b"scp-pseudonym-secret-v1"
 PSEUDONYM_V1_INFO = b"scp-pseudonym"
 PSEUDONYM_V2_INFO = b"scp-pseudonym-v2"
-PSEUDONYM_ROUTING_PREFIX = b"scp-pseudonym-routing-v1:"
 
 # ---------------------------------------------------------------------------
 # Minimal P-256 (SEC 2 secp256r1) — stdlib only, affine coordinates.
@@ -142,12 +144,6 @@ def hkdf_sha256(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
     return hkdf_expand_sha256(_hmac256(salt, ikm), info, length)
 
 
-def seed_to_scalar(label: bytes, seed: bytes) -> int:
-    """FIPS 186-5 A.2.1 seed-to-scalar (§9.10.4): 48 bytes, mod (n - 1), + 1."""
-    wide = int.from_bytes(hkdf_expand_sha256(seed, label, 48), "big")
-    return wide % (_N - 1) + 1
-
-
 # ---------------------------------------------------------------------------
 # Canonical pseudonym derivation.
 # ---------------------------------------------------------------------------
@@ -169,9 +165,3 @@ def canonical_rotatable_pseudonym_seed(
     """Return the v2 (rotatable) 32-byte context seed for a context + epoch."""
     data = bytes(context_id) + pseudonym_epoch.to_bytes(8, "big") + PSEUDONYM_V2_INFO
     return _hmac256(pseudonym_secret(ikm), data)
-
-
-def pseudonym_routing_id(public_key: bytes) -> bytes:
-    """Return the 32-byte §9.10.4 routing id of a 33-byte pseudonym point."""
-    assert len(public_key) == 33
-    return hashlib.sha256(PSEUDONYM_ROUTING_PREFIX + public_key).digest()

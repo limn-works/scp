@@ -1,8 +1,8 @@
 /**
  * Canonical software-custody pseudonym derivation (spec §9.10.4.A, §25.19).
  *
- * Test-only reference for the TypeScript KAT and the custody fixture, so both
- * share one recipe. HMAC/HKDF come from `node:crypto`; `d * G` comes from
+ * Test-only reference that gives the custody fixtures the context seeds and
+ * the P-256 helper tests an independent prehash signer. HMAC/HKDF come from `node:crypto`; `d * G` comes from
  * `createECDH("prime256v1")`; prehash ECDSA is RFC 6979 with BigInt modular
  * arithmetic, because node has no API that signs a digest without hashing it
  * again. Nothing here is constant-time.
@@ -12,7 +12,9 @@
  *   seed_v2 = HMAC-SHA256(secret, context_id || BE64(epoch) || "scp-pseudonym-v2")
  *   d = int(HKDF-Expand-SHA256(prk = seed, info = "SCP-PSEUDONYM-P256-V1", 48)) mod (n - 1) + 1
  *   public_key = SEC1-compressed(d * G)                     (33 bytes)
- *   routing_id = SHA-256("scp-pseudonym-routing-v1:" || public_key)
+ *
+ * `d` and `public_key` come from the production helpers `p256PseudonymScalar`
+ * and `p256PublicKey`; this module signs with a given `d`.
  */
 
 import * as crypto from "node:crypto";
@@ -22,7 +24,6 @@ export const P256_N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2
 const PSEUDONYM_SECRET_SALT = "scp-pseudonym-secret-v1";
 const PSEUDONYM_V1_INFO = "scp-pseudonym";
 const PSEUDONYM_V2_INFO = "scp-pseudonym-v2";
-const PSEUDONYM_ROUTING_PREFIX = "scp-pseudonym-routing-v1:";
 
 export function bytesToBigInt(bytes: Uint8Array): bigint {
   return bytes.length === 0 ? 0n : BigInt(`0x${Buffer.from(bytes).toString("hex")}`);
@@ -46,23 +47,6 @@ function modPow(base: bigint, exp: bigint, mod: bigint): bigint {
     e >>= 1n;
   }
   return result;
-}
-
-/** RFC 5869 HKDF-Expand with SHA-256. */
-export function hkdfExpandSha256(prk: Uint8Array, info: Uint8Array, length: number): Buffer {
-  const blocks: Buffer[] = [];
-  let block: Buffer = Buffer.alloc(0);
-  for (let counter = 1; blocks.length * 32 < length; counter++) {
-    block = hmac256(prk, Buffer.concat([block, Buffer.from(info), Buffer.from([counter])]));
-    blocks.push(block);
-  }
-  return Buffer.concat(blocks).subarray(0, length);
-}
-
-/** FIPS 186-5 A.2.1 seed-to-scalar (§9.10.4): 48 bytes, mod (n - 1), + 1. */
-export function seedToScalar(label: string, seed: Uint8Array): bigint {
-  const wide = bytesToBigInt(hkdfExpandSha256(seed, Buffer.from(label), 48));
-  return (wide % (P256_N - 1n)) + 1n;
 }
 
 function pointOf(d: bigint, format: "compressed" | "uncompressed"): Buffer {
@@ -129,14 +113,5 @@ export function pseudonymSeedV2(ikm: Uint8Array, contextId: Uint8Array, epoch: b
   return hmac256(
     pseudonymSecret(ikm),
     Buffer.concat([Buffer.from(contextId), be, Buffer.from(PSEUDONYM_V2_INFO)]),
-  );
-}
-
-/** The 32-byte §9.10.4 routing id of a 33-byte pseudonym point. */
-export function pseudonymRoutingId(publicKey: Uint8Array): Uint8Array {
-  if (publicKey.length !== 33)
-    throw new Error(`pseudonym point must be 33 bytes, got ${publicKey.length}`);
-  return new Uint8Array(
-    crypto.createHash("sha256").update(PSEUDONYM_ROUTING_PREFIX).update(publicKey).digest(),
   );
 }
