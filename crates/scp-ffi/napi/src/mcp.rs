@@ -281,6 +281,30 @@ fn mcp_handle_id(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
 }
 
+/// Registers `entry` under `handle_id` unless the instance has shut down.
+///
+/// A connect or serve awaits before it registers, so the instance's shutdown
+/// can clear the MCP registries while it runs. Shutdown sets the core flag
+/// before it clears them, so the flag read after the insert catches an insert
+/// that the clear missed; the entry is then removed and dropped, which kills a
+/// stdio server's process group or ends a server's transport task.
+fn register_unless_shut_down<E>(
+    bi: &NapiBridgeInstance,
+    registry: &dashmap::DashMap<String, E>,
+    handle_id: String,
+    entry: E,
+) -> Result<String, ScpNapiError> {
+    registry.insert(handle_id.clone(), entry);
+    if bi.core.is_shutdown() {
+        drop(registry.remove(&handle_id));
+        return Err(ScpNapiError::Transport {
+            message: "the SCP instance has shut down".to_owned(),
+            code: codes::TRANS_5001.to_owned(),
+        });
+    }
+    Ok(handle_id)
+}
+
 // ---------------------------------------------------------------------------
 // Transport implementations
 // ---------------------------------------------------------------------------
@@ -953,14 +977,18 @@ pub(crate) async fn mcp_server_create_on(
         }
     });
 
-    let handle_id = mcp_handle_id("mcp-server");
     let entry = McpServerEntry {
         shutdown_tx: Some(shutdown_tx),
         _task_handle: task_handle,
         stopped: false,
     };
 
-    bi.mcp_server_registry().insert(handle_id.clone(), entry);
+    let handle_id = register_unless_shut_down(
+        bi,
+        bi.mcp_server_registry(),
+        mcp_handle_id("mcp-server"),
+        entry,
+    )?;
     crate::increment_handle_count();
 
     Ok(NapiMcpServerHandle {
@@ -1039,10 +1067,12 @@ pub(crate) async fn mcp_client_connect_stdio_on(
     })
     .await?;
 
-    let handle_id = mcp_handle_id("mcp-client");
-    let entry = McpClientEntry::new(client, Some(server));
-
-    bi.mcp_client_registry().insert(handle_id.clone(), entry);
+    let handle_id = register_unless_shut_down(
+        bi,
+        bi.mcp_client_registry(),
+        mcp_handle_id("mcp-client"),
+        McpClientEntry::new(client, Some(server)),
+    )?;
     crate::increment_handle_count();
 
     Ok(NapiMcpClientHandle {
@@ -1078,10 +1108,12 @@ pub(crate) async fn mcp_client_connect_sse_on(
     })
     .await?;
 
-    let handle_id = mcp_handle_id("mcp-client");
-    let entry = McpClientEntry::new(client, None);
-
-    bi.mcp_client_registry().insert(handle_id.clone(), entry);
+    let handle_id = register_unless_shut_down(
+        bi,
+        bi.mcp_client_registry(),
+        mcp_handle_id("mcp-client"),
+        McpClientEntry::new(client, None),
+    )?;
     crate::increment_handle_count();
 
     Ok(NapiMcpClientHandle {
@@ -1404,6 +1436,91 @@ mod tests {
         assert!(
             !err.reason.contains(codes::TRANS_5018),
             "a bad URL is a validation error, not a transport error: {err}"
+        );
+    }
+
+    /// A stdio connect that completes after the instance shut down registers
+    /// nothing: it fails, and dropping its entry kills the server it spawned.
+    /// The shutdown runs first here; the check after the insert is the same
+    /// one that catches a shutdown landing mid-handshake.
+    #[cfg(unix)]
+    #[test]
+    fn a_stdio_connect_after_shutdown_registers_nothing_and_kills_its_server_napi() {
+        let bi = NapiBridgeInstance::new_napi();
+        bi.core
+            .mcp_allowlist()
+            .lock()
+            .expect("allowlist lock")
+            .configure(&["sh"])
+            .expect("allow sh");
+        let pid_file =
+            std::env::temp_dir().join(format!("{}.pid", mcp_handle_id("mcp-shutdown-connect")));
+        let script = format!(
+            "echo $$ > '{}'; read l; \
+            echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\",\
+            \"capabilities\":{{}},\"serverInfo\":{{\"name\":\"stub\"}}}}}}'; \
+            sleep 600; true",
+            pid_file.display()
+        );
+        bi.core.shutdown();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(mcp_client_connect_stdio_on(
+            &bi,
+            vec!["sh".to_owned(), "-c".to_owned(), script],
+        ));
+        let pid = std::fs::read_to_string(&pid_file).expect("the stub server wrote its pid");
+        let _ = std::fs::remove_file(&pid_file);
+
+        let Err(error) = result else {
+            panic!("a connect after shutdown must fail");
+        };
+        assert!(
+            error.reason.contains("shut down"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            bi.mcp_client_registry().is_empty(),
+            "a connect after shutdown must leave the registry empty"
+        );
+        let alive = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .expect("run kill -0");
+        assert!(
+            !alive.success(),
+            "the spawned server must be killed and reaped"
+        );
+    }
+
+    /// The server twin of
+    /// `a_stdio_connect_after_shutdown_registers_nothing_and_kills_its_server_napi`:
+    /// a serve that completes after the instance shut down fails and leaves
+    /// the server registry empty.
+    #[test]
+    fn a_serve_after_shutdown_registers_nothing_napi() {
+        let bi = Arc::new(NapiBridgeInstance::new_napi());
+        bi.core.shutdown();
+        let Err(error) = crate::runtime().block_on(mcp_server_create_on(
+            &bi,
+            NapiMcpServerConfig {
+                identity_did: AGENT_DID.to_owned(),
+                context_ids: vec![SUB_CTX.to_owned()],
+                transport: "sse".to_owned(),
+            },
+        )) else {
+            panic!("a serve after shutdown must fail");
+        };
+        assert!(
+            error.reason.contains("shut down"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            bi.mcp_server_registry().is_empty(),
+            "a serve after shutdown must leave the registry empty"
         );
     }
 
