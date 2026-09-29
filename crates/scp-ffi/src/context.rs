@@ -61,6 +61,13 @@ const fn context_state_str(state: &scp_core::context::ContextState) -> &'static 
 /// 'closed' state -- context must be 'active'". `code` is the operation's own
 /// code, and a context no supervisor actor serves is refused with it too.
 ///
+/// A poisoned context is the exception: it is refused with `SCP-CTX-2134`
+/// `ContextPoisoned`, never with `code`. ADR-049 §10 makes that code on the
+/// next per-context operation the authoritative poison signal a caller
+/// branches on for operator recovery. A crashed or mid-respawn actor already
+/// surfaces as `SCP-CTX-2135` `ActorCrashed` through
+/// [`crate::runtime::live_context_state`].
+///
 /// The state comes from [`crate::runtime::live_context_state`], which queries
 /// the context's supervisor actor. Reading
 /// [`PyContextHandle`]'s `state` string instead would admit an operation into a
@@ -77,6 +84,12 @@ fn require_active_context(
     if matches!(state, scp_core::context::ContextState::Active) {
         return Ok(());
     }
+    if matches!(state, scp_core::context::ContextState::Poisoned) {
+        return Err(crate::error::ScpPyError::from(
+            scp_core::context::ContextError::ContextPoisoned(context_id.to_owned()),
+        )
+        .into());
+    }
     let state_name = context_state_str(&state);
     Err(crate::error::ScpPyError::ContextError {
         message: format!(
@@ -85,6 +98,90 @@ fn require_active_context(
         code: code.to_owned(),
     }
     .into())
+}
+
+/// Prefixes a supervisor error a committed Welcome join met while reading its
+/// role state, keeping the error's code.
+///
+/// `context_join_from_welcome` returns this when the actor is busy, crashed or
+/// poisoned after `spawn_actor_from_welcome` committed. The prefix tells the
+/// caller the join is not undone: the context stays resident and the bridge's
+/// capability copy stays deny-all.
+fn committed_join_sync_error(err: crate::error::ScpPyError) -> crate::error::ScpPyError {
+    match err {
+        crate::error::ScpPyError::ContextError { message, code } => {
+            crate::error::ScpPyError::ContextError {
+                message: format!(
+                    "context_join_from_welcome committed the join, but the supervisor did \
+                     not answer the role-state read; the joined context stays resident and \
+                     this bridge's capability copy stays deny-all until a later role-state \
+                     sync: {message}"
+                ),
+                code,
+            }
+        }
+        other => other,
+    }
+}
+
+/// Installs a committed Welcome join's role state from the supervisor, and
+/// tears the join down when the supervisor no longer serves it.
+///
+/// BLACK-2JF-01 — post-irreversible-commit compensation. The read is
+/// `get_role_state_checked`, which keeps three outcomes apart:
+///   - `Ok(Some(_))`: install it. The install fails only if a concurrent
+///     close/leave removed the just-registered FFI state.
+///   - `Ok(None)`: the supervisor holds no actor, no poison flag and no
+///     respawn marker for the id, so a concurrent close/leave removed the
+///     actor in the window since the spawn returned.
+///   - `Err(_)`: the actor is busy or timed out, mid-respawn, or
+///     poisoned. The join is committed and the context still exists.
+///
+/// For the first two, returning `Err` without tearing the actor down
+/// would strand an orphaned actor for a join that never fully
+/// materialized at the bridge. Compensate with the COMPLETE teardown
+/// (`discard_joined_context`): it removes the actor handle AND destroys
+/// the resident MLS group AND deletes the durable Class-S snapshot the
+/// join persisted — a bare `despawn_actor` would leave the crypto group
+/// and snapshot behind, resurrecting the context on restart and blocking
+/// a fresh re-join. Then purge residual bridge state and surface the
+/// error.
+///
+/// The third must NOT discard: the single-use key package is consumed,
+/// so destroying the group would turn a transient miss into a permanent
+/// loss of membership. It surfaces the supervisor's code (a busy actor,
+/// `SCP-CTX-2135` or `SCP-CTX-2134`) and leaves the FFI state holding
+/// the deny-all precheck role state, so no UCAN, outlet or MCP check
+/// grants more than the empty ceiling until a later role-state sync.
+///
+/// # Errors
+///
+/// Returns the supervisor's error, prefixed by [`committed_join_sync_error`],
+/// for a busy, crashed or poisoned actor, and a `RuntimeError` after the
+/// teardown for the other two failures.
+fn install_joined_role_state(
+    bi: &crate::runtime::PyBridgeInstance,
+    rt: &tokio::runtime::Runtime,
+    sup: &scp_core::context::supervisor::Supervisor,
+    context_id: &str,
+) -> PyResult<()> {
+    let discard_reason = match rt.block_on(sup.get_role_state_checked(context_id)) {
+        Ok(Some(role_state)) => crate::runtime::install_role_state(bi, context_id, role_state)
+            .err()
+            .map(|e| e.to_string()),
+        Ok(None) => Some(format!(
+            "context '{context_id}' not found in supervisor after the join committed"
+        )),
+        Err(e) => {
+            return Err(committed_join_sync_error(crate::error::ScpPyError::from(e)).into());
+        }
+    };
+    if let Some(reason) = discard_reason {
+        rt.block_on(sup.discard_joined_context(context_id));
+        crate::runtime::remove_context(bi, context_id);
+        return Err(PyRuntimeError::new_err(reason));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -143,12 +240,12 @@ impl PyContextHandle {
     /// non-terminal state. An operation the bridge serves from its own state
     /// (UCAN mint, delegate and validate; outlet and MCP capability checks)
     /// does not read the supervisor and does not refuse such a context. Join,
-    /// leave, send, and receive refuse a poisoned context with the operation's
-    /// own code (`SCP-CTX-2013`, `SCP-CTX-2015`, `SCP-CTX-2019`,
-    /// `SCP-CTX-2021`), not `SCP-CTX-2134`, and surface a crashed or mid-respawn actor as
-    /// `SCP-CTX-2135` `ActorCrashed`. An operation the supervisor answers
-    /// without a bridge lifecycle gate returns `SCP-CTX-2134`
-    /// `ContextPoisoned`. Operator recovery from a poisoned context is
+    /// leave, send, and receive refuse a poisoned context with `SCP-CTX-2134`
+    /// `ContextPoisoned`, as every operation the supervisor answers does, and
+    /// surface a crashed or mid-respawn actor as `SCP-CTX-2135`
+    /// `ActorCrashed`. They refuse any other non-active state with the
+    /// operation's own code (`SCP-CTX-2013`, `SCP-CTX-2015`, `SCP-CTX-2019`,
+    /// `SCP-CTX-2021`). Operator recovery from a poisoned context is
     /// `clear_poison` / process restart, not an SDK call.
     #[getter]
     fn state(&self) -> PyResult<String> {
@@ -2951,7 +3048,7 @@ impl crate::scp::PyScp {
         // so the "detect a duplicate BEFORE consuming the single-use KeyPackage"
         // crash-safety is preserved regardless of the ceiling. The AUTHENTICATED
         // role state, ceiling included, is re-synced from the supervisor AFTER a
-        // successful spawn (see `sync_role_state_from_manager` below).
+        // successful spawn (see `install_role_state` below).
         //
         // Ordering matters for two reasons:
         //   1. `register_ffi_state` hard-errors on an already-registered context
@@ -3016,22 +3113,9 @@ impl crate::scp::PyScp {
         // just registered (and not removed on this success path), so the sync
         // targets a live entry.
         //
-        // BLACK-2JF-01 — post-irreversible-commit compensation: the sync fails
-        // ONLY if a concurrent close/leave removed the just-registered FFI state
-        // or the actor in the window since the spawn returned. Returning `Err`
-        // here without tearing the actor down would strand a live, orphaned
-        // actor for a join that never fully materialized at the bridge.
-        // Compensate with the COMPLETE teardown (`discard_joined_context`): it
-        // removes the actor handle AND destroys the resident MLS group AND
-        // deletes the durable Class-S snapshot the join persisted — a bare
-        // `despawn_actor` would leave the crypto group and snapshot behind,
-        // resurrecting the context on restart and blocking a fresh re-join.
-        // Then purge residual bridge state and surface the error.
-        if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &sealed.context_id) {
-            rt.block_on(sup.discard_joined_context(&sealed.context_id));
-            crate::runtime::remove_context(bi, &sealed.context_id);
-            return Err(PyRuntimeError::new_err(e.to_string()));
-        }
+        // BLACK-2JF-01 — post-irreversible-commit compensation: see
+        // `install_joined_role_state`.
+        install_joined_role_state(bi, rt, &sup, &sealed.context_id)?;
 
         // Runtime join committed. Register the context in the known-contexts
         // discovery registry so a Welcome-joined context is surfaced by
@@ -3898,7 +3982,7 @@ impl crate::scp::PyScp {
 
         rt.block_on(async move {
             use scp_core::context::actor::commands::{
-                ExecuteGovernanceActionPayload, GovernanceCommand, QueriesCommand,
+                ExecuteGovernanceActionPayload, GovernanceCommand,
             };
 
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3923,45 +4007,23 @@ impl crate::scp::PyScp {
                     PyRuntimeError::new_err(format!("governance execution failed: {e}"))
                 })?;
 
-            // Re-sync local role state cache from ContextManager after any
-            // governance action that may have modified roles/membership (#560).
-            //
-            // NOTE: Cannot call `sync_role_state_from_manager()` here because that
-            // function uses `rt.block_on()` and we are already inside `rt.block_on()`.
-            // Nested `block_on` panics with "Cannot start a runtime from within a
-            // runtime." Instead, dispatch the role-state query inline.
-            let (rs_tx, rs_rx) = tokio::sync::oneshot::channel();
-            let rs_cmd = QueriesCommand::GetRoleState {
-                context_id: context_id.clone(),
-                reply: rs_tx,
-            };
-            let role_state_lookup = match sup.dispatch_query(rs_cmd).await {
-                Ok(_) => rs_rx.await.ok().and_then(Result::ok).flatten(),
-                Err(_) => None,
-            };
-            match role_state_lookup {
-                Some(new_role_state) => {
-                    if let Err(e) = crate::runtime::with_ffi_state(bi, &context_id, |st| {
-                        st.role_state = new_role_state;
-                        Ok(())
-                    }) {
-                        tracing::warn!(
-                            context_id = %context_id,
-                            proposal_id = %proposal_id_log,
-                            error = %e,
-                            "failed to sync role state after governance action — \
-                             local capability checks may be stale"
-                        );
-                    }
-                }
-                None => {
-                    tracing::warn!(
-                        context_id = %context_id,
-                        proposal_id = %proposal_id_log,
-                        "failed to sync role state after governance action — \
-                         context not found in ContextManager"
-                    );
-                }
+            // Re-sync the bridge role state AND its UCAN/outlet ceiling copy
+            // from the supervisor after any governance action that may have
+            // modified roles, membership or the ceiling. A `ModifyCeiling`
+            // executes here, and writing only `role_state` would leave
+            // `ceiling_strings` granting a capability the ceiling removed.
+            // The async variant runs because this closure is already inside
+            // `rt.block_on`, where the sync wrapper's nested `block_on` panics.
+            if let Err(e) =
+                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    proposal_id = %proposal_id_log,
+                    error = %e,
+                    "failed to sync role state after governance action — \
+                     local capability checks may be stale"
+                );
             }
 
             use scp_core::context::state::GovernanceActionResult;
@@ -8125,6 +8187,150 @@ mod tests {
 
         scp.context_receive(&handle)
             .expect("receive must pass the gate for an active context");
+    }
+
+    /// The post-commit step of a Welcome join keeps apart the three answers
+    /// `get_role_state_checked` gives: it installs a served role state, tears
+    /// down a join the supervisor no longer serves, and keeps a join whose
+    /// actor is poisoned instead of destroying it.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn install_joined_role_state_discards_only_a_join_the_supervisor_does_not_serve() {
+        crate::init_runtime().ok();
+        let rt = crate::runtime().unwrap();
+        let creator = "did:dht:z6MkJoinedRoleState";
+        let setup = |prefix: &str, spawn: bool| {
+            let bi = __bi();
+            crate::runtime::init_context_manager_for_test(&bi);
+            let ctx_id = format!("{prefix}{}", "0".repeat(60));
+            if spawn {
+                crate::runtime::create_supervisor_context_for_test(
+                    &bi,
+                    &ctx_id,
+                    creator,
+                    &["messages:read".to_owned()],
+                );
+            }
+            crate::runtime::register_ffi_state(&bi, &ctx_id, creator, &[]).unwrap();
+            let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+            (bi, ctx_id, sup)
+        };
+        let ffi_ceiling = |bi: &crate::runtime::PyBridgeInstance, ctx_id: &str| {
+            crate::runtime::with_ffi_state(bi, ctx_id, |st| Ok(st.ceiling_strings.clone()))
+        };
+
+        // Served: the role state and the ceiling copy come from the supervisor.
+        let (bi, ctx_id, sup) = setup("7a01", true);
+        install_joined_role_state(&bi, rt, &sup, &ctx_id).expect("a served join installs");
+        assert!(ffi_ceiling(&bi, &ctx_id).unwrap().contains("messages:read"));
+        crate::runtime::remove_context(&bi, &ctx_id);
+
+        // Absent: the join is torn down and its bridge state removed.
+        let (bi, ctx_id, sup) = setup("7a02", false);
+        let err = install_joined_role_state(&bi, rt, &sup, &ctx_id).unwrap_err();
+        assert!(
+            err.to_string().contains("not found in supervisor"),
+            "got: {err}"
+        );
+        assert!(
+            ffi_ceiling(&bi, &ctx_id).is_err(),
+            "an absent join's bridge state must be removed"
+        );
+
+        // Poisoned: the join stays committed and its bridge copy stays deny-all.
+        let (bi, ctx_id, sup) = setup("7a03", true);
+        rt.block_on(sup.test_poison_context(&ctx_id));
+        let err = install_joined_role_state(&bi, rt, &sup, &ctx_id).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains(codes::CTX_2134) && text.contains("committed the join"),
+            "got: {text}"
+        );
+        assert!(
+            ffi_ceiling(&bi, &ctx_id)
+                .expect("a poisoned join keeps its bridge state")
+                .is_empty(),
+            "the bridge copy stays deny-all"
+        );
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// A committed Welcome join that meets a busy, crashed or poisoned actor
+    /// keeps the supervisor's code and says the join is not undone; an error
+    /// of another kind passes through unchanged.
+    #[test]
+    fn committed_join_sync_error_keeps_the_code_and_names_the_commit() {
+        let crashed = committed_join_sync_error(crate::error::ScpPyError::from(
+            scp_core::context::ContextError::ActorCrashed("ctx-1".to_owned()),
+        ));
+        match crashed {
+            crate::error::ScpPyError::ContextError { message, code } => {
+                assert_eq!(code, codes::CTX_2135);
+                assert!(message.contains("committed the join"), "got: {message}");
+            }
+            other => panic!("expected a ContextError, got {other:?}"),
+        }
+        let identity = crate::error::ScpPyError::IdentityError {
+            message: "unrelated".to_owned(),
+            code: "SCP-IDENT-1001".to_owned(),
+        };
+        match committed_join_sync_error(identity) {
+            crate::error::ScpPyError::IdentityError { message, code } => {
+                assert_eq!(
+                    (message.as_str(), code.as_str()),
+                    ("unrelated", "SCP-IDENT-1001")
+                );
+            }
+            other => panic!("expected the IdentityError unchanged, got {other:?}"),
+        }
+    }
+
+    /// Every lifecycle gate refuses a context the crash watchdog poisoned with
+    /// `SCP-CTX-2134` `ContextPoisoned`, the code ADR-049 §10 makes the
+    /// authoritative poison signal, and not with the gate's own code.
+    ///
+    /// The handle still reads `"active"`, so a gate reading that string admits
+    /// all four calls, and a gate that relabels `Poisoned` with its own code
+    /// fails the code assertion. `lifecycle_gates_refuse_a_context_the_supervisor_closed`
+    /// is the case that keeps the gate's own code for a non-poisoned state.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn lifecycle_gates_report_a_poisoned_context_as_context_poisoned() {
+        let creator = "did:dht:z6MkPoisonGateCreator";
+        let member = "did:dht:z6MkPoisonGateMember";
+        let (scp, handle) = lifecycle_fixture("a4", creator);
+        let sup = std::sync::Arc::clone(crate::runtime::supervisor(&scp.inner).unwrap());
+        crate::runtime()
+            .unwrap()
+            .block_on(sup.test_poison_context(&handle.context_id));
+
+        let join = scp
+            .context_join(&handle, member, None)
+            .expect_err("join must refuse a poisoned context");
+        let leave = scp
+            .context_leave(&handle, member)
+            .expect_err("leave must refuse a poisoned context");
+        let send = Python::with_gil(|py| {
+            let payload = pyo3::types::PyBytes::new(py, b"hello");
+            scp.context_send(&handle, creator, payload.as_any(), None)
+                .expect_err("send must refuse a poisoned context")
+        });
+        let receive = scp
+            .context_receive(&handle)
+            .err()
+            .expect("receive must refuse a poisoned context");
+        for (name, err, gate_code) in [
+            ("join", join, codes::CTX_2013),
+            ("leave", leave, codes::CTX_2015),
+            ("send", send, codes::CTX_2019),
+            ("receive", receive, codes::CTX_2021),
+        ] {
+            let text = err.to_string();
+            assert!(
+                text.contains(codes::CTX_2134) && !text.contains(gate_code),
+                "{name} reported: {text}"
+            );
+        }
     }
 
     // -------------------------------------------------------------------

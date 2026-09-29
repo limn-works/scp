@@ -1566,8 +1566,8 @@ pub fn register_ffi_state(
             // ceiling and the supervisor holds it empty. Substituting the
             // default here would grant eleven capabilities in that context.
             // `context_join_from_welcome` registers `&[]` before the join and
-            // `sync_role_state_from_manager` then writes the authenticated role
-            // state and ceiling.
+            // `install_role_state` then writes the authenticated role state
+            // and ceiling.
             //
             // Ceiling-entry grammar enforcement (spec §5.3.1.1) runs on each
             // entry BEFORE it is normalized into the UCAN ceiling string set.
@@ -1871,52 +1871,52 @@ pub fn remove_ffi_state(bi: &PyBridgeInstance, context_id: &str) {
 /// Must be called after any governance action that modifies role state
 /// (`ChangeRole`, `ModifyCeiling`, `AddMember`, `RemoveMember`, etc.) so that the
 /// FFI-side copy used by UCAN/outlet capability checks stays current.
-/// `context_join_from_welcome` also calls it after a successful spawn: the
-/// joiner registers its FFI state with an empty, deny-all ceiling as a
-/// reversible precheck, and this replaces the whole role state (ceiling, role
-/// definitions, the creator's admin grant, the joiner's member assignment) with
-/// the one the supervisor built from the ceiling AUTHENTICATED by the joined
-/// MLS group's signed context binding.
+///
+/// The read is `Supervisor::get_role_state_checked`, so a busy or timed-out
+/// actor, a crashed or mid-respawn context and a poisoned context each fail
+/// with their own `ContextError` code instead of reading as a context the
+/// supervisor does not serve.
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError` if the context manager is not initialized, the
-/// context is not registered in either the manager or the FFI state registry,
-/// or the tokio runtime is unavailable.
+/// Returns `ScpPyError` if the supervisor is not initialized, the supervisor
+/// serves no context for `context_id`, the supervisor could not answer the
+/// read, the FFI state registry holds no entry for `context_id`, or the tokio
+/// runtime is unavailable.
 pub fn sync_role_state_from_manager(
     bi: &PyBridgeInstance,
     context_id: &str,
 ) -> Result<(), ScpPyError> {
-    let sup = supervisor(bi)?;
     let rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
-    let new_role_state = rt.block_on(sup.get_role_state(context_id)).ok_or_else(|| {
-        ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
-    })?;
-    install_role_state(bi, context_id, new_role_state)
+    rt.block_on(sync_role_state_from_manager_async(bi, context_id))
 }
 
 /// Async-native variant of [`sync_role_state_from_manager`].
 ///
-/// Callers that are already executing inside `runtime().block_on(...)` (e.g.
-/// the governance proposal/approve/reject/withdraw flows in `context.rs`) MUST
-/// use this instead of the sync wrapper: the sync wrapper performs its own
-/// `block_on`, and a nested `block_on` on the multi-threaded runtime panics
-/// with "Cannot start a runtime from within a runtime". This helper awaits the
-/// supervisor role-state query directly so it composes inside an existing
-/// async context.
+/// Callers that are already executing inside `runtime().block_on(...)` (the
+/// governance propose, approve, reject, withdraw and execute flows in
+/// `context.rs`) MUST use this instead of the sync wrapper: the sync wrapper
+/// performs its own `block_on`, and a nested `block_on` on the multi-threaded
+/// runtime panics with "Cannot start a runtime from within a runtime". This
+/// helper awaits the supervisor role-state query directly so it composes
+/// inside an existing async context.
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError` if the supervisor is not initialized, the context is
-/// not registered in the supervisor, or the FFI state is missing.
+/// Returns every error [`sync_role_state_from_manager`] documents except the
+/// tokio runtime one.
 pub async fn sync_role_state_from_manager_async(
     bi: &PyBridgeInstance,
     context_id: &str,
 ) -> Result<(), ScpPyError> {
     let sup = supervisor(bi)?;
-    let new_role_state = sup.get_role_state(context_id).await.ok_or_else(|| {
-        ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
-    })?;
+    let new_role_state = sup
+        .get_role_state_checked(context_id)
+        .await
+        .map_err(ScpPyError::from)?
+        .ok_or_else(|| {
+            ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
+        })?;
     install_role_state(bi, context_id, new_role_state)
 }
 
@@ -1924,7 +1924,18 @@ pub async fn sync_role_state_from_manager_async(
 /// the context's `FfiBridgeState`, in the enforced UCAN capability-name form
 /// (`{resource}:{action}`) that [`register_ffi_state`] builds on the create
 /// path.
-fn install_role_state(
+///
+/// `context_join_from_welcome` calls it directly with the role state the
+/// supervisor built from the ceiling AUTHENTICATED by the joined MLS group's
+/// signed context binding, replacing the whole precheck role state (ceiling,
+/// role definitions, the creator's admin grant, the joiner's member
+/// assignment) it registered with an empty, deny-all ceiling.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` when the FFI state registry holds no
+/// entry for `context_id`.
+pub(crate) fn install_role_state(
     bi: &PyBridgeInstance,
     context_id: &str,
     role_state: ContextRoleState,
@@ -3123,6 +3134,97 @@ mod tests {
         );
         assert_eq!(role_ceiling_len, 0, "the role-state ceiling stays empty");
 
+        remove_context(bi, &ctx_id);
+    }
+
+    /// The governance flows' async re-sync narrows a stale UCAN/outlet ceiling
+    /// copy to the supervisor's ceiling, a `[]` deny-all ceiling included.
+    ///
+    /// Each bridge copy starts as the default ceiling, the state
+    /// `governance_execute` left behind a `ModifyCeiling` when it rewrote only
+    /// `role_state`. The precondition assertion is the case that must differ;
+    /// after the sync the two copies must agree.
+    #[test]
+    fn sync_role_state_from_manager_async_narrows_a_stale_ceiling_copy() {
+        crate::init_runtime().ok();
+        let default_strings: Vec<String> = scp_core::context::roles::default_ceiling()
+            .iter()
+            .map(|cap| cap.name().into_owned())
+            .collect();
+        for (prefix, supervisor_ceiling) in [
+            ("51c1", vec!["messages:read".to_owned()]),
+            ("51c2", Vec::new()),
+        ] {
+            let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+            let bi = &*bi_arc;
+            init_context_manager_for_test(bi);
+            let ctx_id = format!("{prefix}{}", "0".repeat(60));
+            let creator = "did:dht:z6MkCeilingResync";
+            create_supervisor_context_for_test(bi, &ctx_id, creator, &supervisor_ceiling);
+            register_ffi_state(bi, &ctx_id, creator, &default_strings).unwrap();
+            let before = with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
+            assert!(
+                before.contains("messages:write"),
+                "{prefix}: the stale copy must grant messages:write, got: {before:?}"
+            );
+
+            crate::runtime()
+                .unwrap()
+                .block_on(sync_role_state_from_manager_async(bi, &ctx_id))
+                .unwrap();
+
+            let (strings, expected) = with_ffi_state(bi, &ctx_id, |st| {
+                Ok((
+                    st.ceiling_strings.clone(),
+                    st.role_state.ceiling().to_ucan_string_set(),
+                ))
+            })
+            .unwrap();
+            assert_eq!(strings, expected, "{prefix}: the two copies must agree");
+            assert!(
+                !strings.contains("messages:write"),
+                "{prefix}: the narrowed copy must not grant messages:write, got: {strings:?}"
+            );
+            assert_eq!(
+                strings.is_empty(),
+                supervisor_ceiling.is_empty(),
+                "{prefix}: a `[]` supervisor ceiling leaves the copy deny-all, got: {strings:?}"
+            );
+            remove_context(bi, &ctx_id);
+        }
+    }
+
+    /// A poisoned context fails the sync with `SCP-CTX-2134`, not with the
+    /// "not found in supervisor" answer an absent context gets, and leaves the
+    /// bridge state as it was.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn sync_role_state_from_manager_reports_a_poisoned_context_as_poisoned() {
+        crate::init_runtime().ok();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
+        let ctx_id = format!("51c3{}", "0".repeat(60));
+        let creator = "did:dht:z6MkRoleSyncPoisoned";
+        create_supervisor_context_for_test(bi, &ctx_id, creator, &["messages:read".to_owned()]);
+        register_ffi_state(bi, &ctx_id, creator, &[]).unwrap();
+        let sup = Arc::clone(supervisor(bi).unwrap());
+        crate::runtime()
+            .unwrap()
+            .block_on(sup.test_poison_context(&ctx_id));
+
+        let err = sync_role_state_from_manager(bi, &ctx_id).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains(scp_ffi_common::error_codes::CTX_2134)
+                && !text.contains("not found in supervisor"),
+            "got: {text}"
+        );
+        let strings = with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
+        assert!(
+            strings.is_empty(),
+            "the bridge copy stays as registered, got: {strings:?}"
+        );
         remove_context(bi, &ctx_id);
     }
 
