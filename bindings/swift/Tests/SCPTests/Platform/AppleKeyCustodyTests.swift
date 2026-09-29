@@ -38,58 +38,6 @@
     @testable import SCP
     import Testing
 
-    // MARK: - §25.2 test-vector scalar
-
-    /// The §25.2 identity scalar of `seed`: FIPS 186-5 A.2.1 under the
-    /// test-vector label, `int(HKDF-Expand-SHA256(seed, "SCP-TEST-VECTOR-KEY-V1", 48))
-    /// mod (n - 1) + 1`, as 32 big-endian bytes. Test code, so no production
-    /// export takes a label.
-    private func testVectorScalar(seed: Data) -> Data {
-        let key = SymmetricKey(data: seed)
-        let info = Data("SCP-TEST-VECTOR-KEY-V1".utf8)
-        let block1 = Data(HMAC<SHA256>.authenticationCode(for: info + [1], using: key))
-        let block2 = Data(HMAC<SHA256>.authenticationCode(for: block1 + info + [2], using: key))
-        let wide = [UInt8](block1 + block2.prefix(16))
-        // n - 1, big-endian.
-        let modulus: [UInt8] = [
-            0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-            0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x50
-        ]
-        // Bitwise long division: remainder r (33 bytes, one spare for the shift).
-        var rem = [UInt8](repeating: 0, count: 33)
-        let mod33 = [0] + modulus
-        for byte in wide {
-            for bit in (0 ..< 8).reversed() {
-                var carry = (byte >> UInt8(bit)) & 1
-                for idx in (0 ..< 33).reversed() {
-                    let next = rem[idx] >> 7
-                    rem[idx] = (rem[idx] << 1) | carry
-                    carry = next
-                }
-                if !rem.lexicographicallyPrecedes(mod33) {
-                    var borrow = 0
-                    for idx in (0 ..< 33).reversed() {
-                        var diff = Int(rem[idx]) - Int(mod33[idx]) - borrow
-                        borrow = diff < 0 ? 1 : 0
-                        if diff < 0 {
-                            diff += 256
-                        }
-                        rem[idx] = UInt8(diff)
-                    }
-                }
-            }
-        }
-        // + 1 (cannot overflow: rem < n - 1).
-        for idx in (0 ..< 33).reversed() {
-            let (sum, overflow) = rem[idx].addingReportingOverflow(1)
-            rem[idx] = sum
-            if !overflow {
-                break
-            }
-        }
-        return Data(rem.suffix(32))
-    }
-
     // MARK: - Hex helper
 
     /// Decodes an even-length lowercase hex string into raw bytes.
@@ -716,27 +664,26 @@
             try await custody.destroyKey(handle)
         }
 
-        /// One §25.19 pseudonym vector: identity seed, identity scalar (the ikm),
-        /// and the v1 and v2 (epoch 1) points over "context-alpha".
+        /// One §25.19 pseudonym vector: identity scalar (the ikm) and the v1 and
+        /// v2 (epoch 1) points over "context-alpha".
         struct PseudonymVector {
-            let seed: Data
             let scalar: String
             let staticPoint: String
             let rotatedPoint: String
         }
 
-        /// §25.19 vectors 30 and 31. The identity seed maps to the ikm scalar via
-        /// the §25.2 label "SCP-TEST-VECTOR-KEY-V1" (`testVectorScalar`, test
-        /// code); every hex value is copied verbatim from the spec.
+        /// §25.19 vectors 30 and 31, every hex value copied verbatim from the
+        /// spec. The seed-to-scalar step under the §25.2 label
+        /// "SCP-TEST-VECTOR-KEY-V1" is pinned by `spec_25_19_vectors_30_31` in
+        /// `crates/scp-crypto/src/pseudonym.rs`, so this test installs the
+        /// scalar directly.
         static let pseudonymVectors: [PseudonymVector] = [
             PseudonymVector(
-                seed: Data(repeating: 0x01, count: 32),
                 scalar: "32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64",
                 staticPoint: "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72",
                 rotatedPoint: "0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479"
             ),
             PseudonymVector(
-                seed: Data([0x9D] + [UInt8](1 ... 31)),
                 scalar: "65d56a863d03d31ea15ade82f677058d5bbe53afedc6ff7d2b8846aa25a1bc2b",
                 staticPoint: "0239f7c3213f3567183fd2fcf7aec6c884bc70e0e694c42053284a4b5ebef4fe2d",
                 rotatedPoint: "037967cfe8d3111cdd72288ea3f444c15b710300323162fec63ca9036af73754e3"
@@ -751,7 +698,7 @@
         /// reference (`scp-crypto/src/pseudonym.rs`) across all SDKs.
         ///
         /// Both vectors use `context_id = "context-alpha"` (ASCII). For each
-        /// identity seed the test asserts:
+        /// identity scalar the test asserts:
         /// - v1 (`derivePseudonym`) public key equals the literal §25.19 hex.
         /// - v2 epoch 1 (`deriveRotatablePseudonym`) public key equals the
         ///   literal §25.19 hex.
@@ -765,10 +712,6 @@
                 let ikm = try hexToData(vector.scalar)
                 let v1Expected = try hexToData(vector.staticPoint)
                 let v2Expected = try hexToData(vector.rotatedPoint)
-                #expect(
-                    testVectorScalar(seed: vector.seed) == ikm,
-                    "seed-to-scalar must reproduce the §25.19 identity scalar"
-                )
 
                 // Store the ikm as the Ed25519 identity seed the derivation reads.
                 let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: ikm)

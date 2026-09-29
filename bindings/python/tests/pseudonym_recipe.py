@@ -9,9 +9,8 @@ P-256 helper test an independent prehash signer, so neither re-derives them.
 
 The CI Python interpreter has neither PyNaCl nor ``cryptography`` installed, so
 HKDF/HMAC come from :mod:`hashlib`/:mod:`hmac` and P-256 is a compact affine
-implementation. No native extension is required, so this module — and any test
-that imports it — runs under plain ``pytest``. It is test code: nothing here is
-constant-time.
+implementation. The module itself needs no native extension; the tests that
+import it do. It is test code: nothing here is constant-time.
 
 Recipe (matching the Rust core)::
 

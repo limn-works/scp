@@ -33,8 +33,6 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import java.math.BigInteger
 import java.security.MessageDigest
-import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
 import java.util.concurrent.ConcurrentHashMap
 
 /** Decodes lowercase hex. */
@@ -863,10 +861,10 @@ class AndroidKeyCustodyTest {
     //
     // Pins the software-custody P-256 pseudonym points for the §25.19 vectors 30
     // and 31 over context "context-alpha", proving the Kotlin adapter matches the
-    // cross-platform recipe (§9.10.4.A). The vectors map the identity seed to the
-    // ikm with seedToScalar("SCP-TEST-VECTOR-KEY-V1", seed), which this test computes
-    // itself (testVectorScalar); the adapter's ikm is its Ed25519 seed, so the test
-    // installs the spec scalar as that seed.
+    // cross-platform recipe (§9.10.4.A). The seed-to-scalar step under the §25.2
+    // label "SCP-TEST-VECTOR-KEY-V1" is pinned by spec_25_19_vectors_30_31 in
+    // crates/scp-crypto/src/pseudonym.rs; the adapter's ikm is its Ed25519 seed, so
+    // the test installs the literal spec scalar as that seed.
     //   pseudonym_secret = HKDF-SHA256(ikm, salt="scp-pseudonym-secret-v1")
     //   v1 seed          = HMAC-SHA256(secret, ctx || "scp-pseudonym")
     //   v2 seed          = HMAC-SHA256(secret, ctx || BE64(epoch) || "scp-pseudonym-v2")
@@ -880,7 +878,6 @@ class AndroidKeyCustodyTest {
         @Test
         fun `vector 30 static and rotatable pseudonyms match spec bytes`() {
             assertVectorMatches(
-                seed = ByteArray(32) { 0x01 },
                 expectedScalar = "32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64",
                 expectedV1 = "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72",
                 expectedV2Epoch1 = "0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479",
@@ -889,10 +886,7 @@ class AndroidKeyCustodyTest {
 
         @Test
         fun `vector 31 static and rotatable pseudonyms match spec bytes`() {
-            // seed = 0x9d, then 0x01, 0x02, ... 0x1f (31 ascending bytes after the lead).
-            val seed = ByteArray(32) { i -> if (i == 0) 0x9d.toByte() else i.toByte() }
             assertVectorMatches(
-                seed = seed,
                 expectedScalar = "65d56a863d03d31ea15ade82f677058d5bbe53afedc6ff7d2b8846aa25a1bc2b",
                 expectedV1 = "0239f7c3213f3567183fd2fcf7aec6c884bc70e0e694c42053284a4b5ebef4fe2d",
                 expectedV2Epoch1 = "037967cfe8d3111cdd72288ea3f444c15b710300323162fec63ca9036af73754e3",
@@ -900,19 +894,17 @@ class AndroidKeyCustodyTest {
         }
 
         /**
-         * Injects a fixed identity seed, then asserts that v1 [derivePseudonym] and v2
-         * [AndroidKeyCustody.deriveRotatablePseudonym] (epoch 1) over context "context-alpha"
-         * produce the spec-pinned public key bytes, and that v1 and v2 are distinct.
+         * Injects the spec identity scalar as the Ed25519 seed, then asserts that v1
+         * [derivePseudonym] and v2 [AndroidKeyCustody.deriveRotatablePseudonym] (epoch 1) over
+         * context "context-alpha" produce the spec-pinned public key bytes, and that v1 and v2
+         * are distinct.
          */
         private fun assertVectorMatches(
-            seed: ByteArray,
             expectedScalar: String,
             expectedV1: String,
             expectedV2Epoch1: String,
         ) {
-            val ikm = testVectorScalar(seed)
-            assertEquals(expectedScalar, ikm.toHexString())
-            val identityHandle = injectSoftwareEd25519(ikm)
+            val identityHandle = injectSoftwareEd25519(hex(expectedScalar))
             val contextAlpha = "context-alpha".toByteArray(Charsets.UTF_8)
 
             val v1Pseudonym = custody.derivePseudonym(identityHandle, contextAlpha)
@@ -948,22 +940,6 @@ class AndroidKeyCustodyTest {
             custody.publicKey(
                 KeyHandle(id = pseudonym.id, custodyType = pseudonym.custodyType),
             ).toHexString()
-
-        /**
-         * The §25.2 identity scalar of [seed]: FIPS 186-5 A.2.1 under the test-vector
-         * label, `int(HKDF-Expand-SHA256(seed, "SCP-TEST-VECTOR-KEY-V1", 48)) mod (n - 1) + 1`,
-         * as 32 big-endian bytes. Test code, so no production export takes a label.
-         */
-        private fun testVectorScalar(seed: ByteArray): ByteArray {
-            val mac = Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(seed, "HmacSHA256")) }
-            val info = "SCP-TEST-VECTOR-KEY-V1".toByteArray(Charsets.UTF_8)
-            val t1 = mac.doFinal(info + byteArrayOf(1))
-            val t2 = mac.doFinal(t1 + info + byteArrayOf(2))
-            val n = BigInteger("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", 16)
-            val d = BigInteger(1, t1 + t2.copyOfRange(0, 16)).mod(n - BigInteger.ONE) + BigInteger.ONE
-            val be = d.toByteArray().takeLast(32).toByteArray()
-            return ByteArray(32 - be.size) + be
-        }
 
         private fun ByteArray.toHexString(): String =
             joinToString("") { byte -> "%02x".format(byte) }

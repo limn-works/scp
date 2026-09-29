@@ -49,10 +49,10 @@ function modPow(base: bigint, exp: bigint, mod: bigint): bigint {
   return result;
 }
 
-function pointOf(d: bigint, format: "compressed" | "uncompressed"): Buffer {
+function pointOf(d: bigint): Buffer {
   const ecdh = crypto.createECDH("prime256v1");
   ecdh.setPrivateKey(bigIntTo32(d));
-  return ecdh.getPublicKey(null, format);
+  return ecdh.getPublicKey(null, "uncompressed");
 }
 
 /** RFC 6979 §3.2 nonce for P-256 with HMAC-SHA-256. */
@@ -79,7 +79,7 @@ export function p256SignPrehash(d: bigint, digest: Uint8Array): Uint8Array {
   if (digest.length !== 32) throw new Error(`prehash must be 32 bytes, got ${digest.length}`);
   const z = bytesToBigInt(digest);
   const k = rfc6979Nonce(d, digest);
-  const r = bytesToBigInt(pointOf(k, "uncompressed").subarray(1, 33)) % P256_N;
+  const r = bytesToBigInt(pointOf(k).subarray(1, 33)) % P256_N;
   let s = (modPow(k, P256_N - 2n, P256_N) * (z + r * d)) % P256_N;
   if (s > P256_N / 2n) s = P256_N - s;
   return new Uint8Array(Buffer.concat([bigIntTo32(r), bigIntTo32(s)]));
