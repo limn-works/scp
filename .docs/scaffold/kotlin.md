@@ -257,35 +257,26 @@ class Identity private constructor(
 
 A type whose teardown reaches the Rust engine exposes exactly one `suspend` teardown function and implements no `AutoCloseable` or `Closeable`, so no `use { }` block applies to it. `AutoCloseable.close()` is synchronous, so it could reach the engine only by blocking its calling thread, which never returns under an injected `StandardTestDispatcher` and risks an ANR on an Android main thread. `.docs/standards/sdk-common.md` §"Kotlin: why no `Closeable`" and ADR-028 (as amended, `.docs/adrs/phase-6.md`) state the rule; `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` records the observed deadlock and the ANR risk.
 
+`SCP` is the one Kotlin type whose teardown reaches the Rust engine today. `Relay` and `Node` follow the same rule, but no production class implements the `ServerBindings` interface they call (`.docs/standards/sdk-capability-matrix.json` marks every Server operation `"kotlin": false`), so their `shutdown()` reaches only the test source set's `StubServerBindings`.
+
 ```kotlin
-class Relay internal constructor(
-    private val bridge: ServerBridge,
-    // ...
+class SCP internal constructor(
+    private val inner: NativeScp,
 ) {
-    @Volatile
-    var isShutdown: Boolean = false
-        internal set
+    private val shutdownRecorded = AtomicBoolean(false)
 
     // The only stop path. It suspends on the bridge's injected ioDispatcher. A failed
-    // teardown propagates and leaves isShutdown false, so the relay still reads as live.
-    // ServerBridge.shutdownRelay sets the flag inside its bridge call, because withContext
-    // checks for cancellation as it returns: a flag set here after that call would stay false
-    // for a caller cancelled after a finished teardown. ServerTest's "every stop method on a
-    // lifecycle-owning type suspends" check skips every compiled `$lambda` body, so it catches
-    // no blocking call inside a lambda written here.
-    suspend fun shutdown() {
-        bridge.shutdownRelay(this)
-    }
-}
-
-class ServerBridge internal constructor(
-    private val bindings: ServerBindings,
-    private val bridge: CoroutineBridge,
-) {
-    internal suspend fun shutdownRelay(relay: Relay) = bridge.ffiCall {
-        bindings.relayShutdown(relay.handleJson)
-        // Reached only when the FFI call returns; an engine failure throws first.
-        relay.isShutdown = true
+    // teardown propagates and leaves the flag false, so the instance still reads as live.
+    // shutdown sets the flag inside the bridge block, because withContext checks for cancellation
+    // as it returns: a flag set after ffiCallSuspend returned would stay false for a caller
+    // cancelled after a finished teardown.
+    suspend fun shutdown(bridge: CoroutineBridge, timeout: Duration = 5.seconds) {
+        val millis = timeout.inWholeMilliseconds.coerceAtLeast(0).toULong()
+        bridge.ffiCallSuspend {
+            inner.shutdown(timeoutMillis = millis)
+            // Reached only when the FFI call returns; an engine failure throws first.
+            shutdownRecorded.set(true)
+        }
     }
 }
 
@@ -293,11 +284,11 @@ class ServerBridge internal constructor(
 // Run it under NonCancellable: a finally block usually runs because the coroutine was
 // cancelled, and in a cancelled coroutine the bridge's withContext(ioDispatcher) throws
 // CancellationException before the FFI call starts, so a bare shutdown() tears nothing down.
-val relay = Relay.startInMemory(bridge)
+val scp = withContext(Dispatchers.IO) { SCP.withStorage(config) }
 try {
-    println(relay.relayUrl)
+    scp.contextCreate(identity, params)
 } finally {
-    withContext(NonCancellable) { relay.shutdown() }
+    withContext(NonCancellable) { scp.shutdown(bridge) }
 }
 ```
 
