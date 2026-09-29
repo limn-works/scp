@@ -15,7 +15,7 @@
 //! See ADR-001 acceptance criteria 6 and 7.
 
 use openmls::prelude::*;
-use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
+use tls_codec::Serialize as TlsSerializeTrait;
 
 use crate::epoch_grace::EpochGraceStore;
 use crate::error::MlsError;
@@ -51,7 +51,7 @@ pub fn process_commit(
     let old_epoch = g.epoch().as_u64();
 
     // Deserialize the Commit bytes into an MlsMessageIn.
-    let message_in = MlsMessageIn::tls_deserialize(&mut &*commit_bytes)
+    let message_in = crate::wire::parse_mls_message_in(commit_bytes)
         .map_err(|e| MlsError::CommitProcessingFailed(format!("deserializing commit: {e}")))?;
 
     // Convert to a ProtocolMessage for processing.

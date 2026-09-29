@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use openmls::prelude::{KeyPackageBundle, KeyPackageIn, MlsMessageOut, ProtocolVersion};
+use openmls::prelude::{KeyPackageBundle, MlsMessageOut, ProtocolVersion};
 use scp_clock::Clock;
 use scp_event_log::{Event, EventType};
 use scp_mls::group::{
@@ -51,7 +51,7 @@ use scp_protocol::envelope::outer::{
 };
 use scp_relay_client::{ClientMessage, RelayMessage};
 use serde::{Deserialize, Serialize};
-use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
+use tls_codec::Serialize as TlsSerialize;
 use zeroize::Zeroizing;
 
 use crate::context::PerContextState;
@@ -577,7 +577,7 @@ impl ScpClient {
         let timestamp = self.clock.now_secs();
         let committer_did = self.signer.did().to_owned();
 
-        let key_package_in = KeyPackageIn::tls_deserialize(&mut &*key_package_bytes)
+        let key_package_in = scp_mls::wire::parse_key_package_in(key_package_bytes)
             .map_err(|e| ClientError::Codec(format!("deserializing key package: {e}")))?;
 
         // ADR-057 §9.16.1: read the joiner's published stable wrapping key from the
@@ -2072,7 +2072,7 @@ fn key_package_member_did(
     key_package_bytes: &[u8],
     clock: &dyn Clock,
 ) -> Result<String, ClientError> {
-    let key_package_in = KeyPackageIn::tls_deserialize(&mut &*key_package_bytes)
+    let key_package_in = scp_mls::wire::parse_key_package_in(key_package_bytes)
         .map_err(|e| ClientError::Codec(format!("deserializing key package: {e}")))?;
     // ADR-057 §Prereq-1: `key_package_in_did` re-validates the accepted
     // `Lifetime` against the hardened clock, so this naming path accepts exactly

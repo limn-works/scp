@@ -588,14 +588,14 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     // raw `scp-mls` group (a dev-dependency) — exactly the wire bytes a hostile or
     // out-of-scope committer could put on the wire — while BOB is a real
     // `ScpClient` whose `receive_message` is the unit under test.
-    use openmls::prelude::{BasicCredential, KeyPackageIn};
+    use openmls::prelude::BasicCredential;
     use scp_did::SigningKeyId;
     use scp_mls::group::{
         add_member, add_member_with_convergent_timestamp, create_group,
         generate_key_package_with_wrapping_key, remove_member,
     };
     use scp_mls::{ScpCredential, SignatureKeyPair};
-    use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
+    use tls_codec::Serialize as TlsSerialize;
 
     // The raw Alice group and Bob's client share a real-time base so every
     // KeyPackage `Lifetime` stays valid against openmls's internal (real) clock
@@ -617,7 +617,7 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
         .client
         .generate_key_package_for_join(CTX)
         .expect("Bob key package");
-    let bob_kp_in = KeyPackageIn::tls_deserialize(&mut &*bob_kp_bytes).expect("bob kp deserialize");
+    let bob_kp_in = scp_mls::wire::parse_key_package_in(&bob_kp_bytes).expect("bob kp deserialize");
     let add_bob = add_member(&mut alice_group, bob_kp_in, &SystemClock).expect("Alice adds Bob");
     let bob_welcome = add_bob
         .welcome
@@ -648,8 +648,8 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
             &SystemClock,
         )
         .expect("carol key package");
-    let carol_kp_in = KeyPackageIn::tls_deserialize(
-        &mut &*carol_bundle
+    let carol_kp_in = scp_mls::wire::parse_key_package_in(
+        &carol_bundle
             .key_package()
             .tls_serialize_detached()
             .expect("carol kp bytes"),

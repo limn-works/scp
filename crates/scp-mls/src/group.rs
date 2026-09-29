@@ -30,7 +30,7 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
 use scp_clock::Clock;
 use scp_protocol::context::ScpContextExtension;
-use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
+use tls_codec::Serialize as TlsSerializeTrait;
 
 /// The single ciphersuite used by all SCP MLS groups.
 ///
@@ -354,15 +354,55 @@ impl ScpMlsGroup {
         ))
     }
 
-    /// Reconstructs an `ScpMlsGroup` from its constituent parts.
+    /// Reconstructs an `ScpMlsGroup` from its constituent parts, checking
+    /// that the parts can be an SCP group.
     ///
-    /// Used by the native runtime's persistent provider to rebuild a live group
-    /// from a durable MLS crypto snapshot (the inverse of reading
-    /// [`inner`](Self::inner) / [`provider`](Self::provider) /
-    /// [`signer_key_pair`](Self::signer_key_pair)) after a restart (ADR-057).
-    /// The resulting group is active (`destroyed = false`).
+    /// Used by the snapshot restore, the native runtime's persistent provider
+    /// (ADR-057) and the Welcome join. The checks, in order: the group runs
+    /// [`SCP_CIPHERSUITE`], the signer passes [`check_p256_signer`], and the
+    /// signer's public key is the group's own leaf signature key (spec 09
+    /// §9.5). It then writes the signer to the provider's key store so
+    /// openmls can find it. The resulting group is active
+    /// (`destroyed = false`).
+    ///
+    /// # Errors
+    ///
+    /// [`MlsError::UnsupportedCiphersuite`] for another ciphersuite,
+    /// [`MlsError::InvalidSigner`] with the [`SignerDefect`] that failed, or
+    /// [`MlsError::StorageError`] if the signer cannot be stored.
+    pub fn from_parts(
+        group: MlsGroup,
+        provider: InMemoryMlsProvider,
+        signer: SignatureKeyPair,
+    ) -> Result<Self, MlsError> {
+        require_scp_ciphersuite(group.ciphersuite())?;
+        check_p256_signer(&signer)?;
+        let own_leaf = group
+            .own_leaf_node()
+            .ok_or(MlsError::InvalidSigner(SignerDefect::NoOwnLeaf))?;
+        if own_leaf.signature_key().as_slice() != signer.public() {
+            return Err(MlsError::InvalidSigner(SignerDefect::LeafKeyMismatch));
+        }
+        signer
+            .store(provider.storage())
+            .map_err(|e| MlsError::StorageError(format!("signer store failed: {e}")))?;
+        Ok(Self::assemble(group, provider, signer))
+    }
+
+    /// Builds an `ScpMlsGroup` without the [`from_parts`](Self::from_parts)
+    /// checks. Production code reaches it only through `from_parts`; tests use
+    /// it to build the negative fixtures the checks reject.
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
-    pub const fn from_parts(
+    pub const fn from_parts_unchecked(
+        group: MlsGroup,
+        provider: InMemoryMlsProvider,
+        signer: SignatureKeyPair,
+    ) -> Self {
+        Self::assemble(group, provider, signer)
+    }
+
+    const fn assemble(
         group: MlsGroup,
         provider: InMemoryMlsProvider,
         signer: SignatureKeyPair,
@@ -1322,7 +1362,7 @@ pub fn join_group_from_bytes(
     provider: InMemoryMlsProvider,
     signer: SignatureKeyPair,
 ) -> Result<ScpMlsGroup, MlsError> {
-    let welcome_in = MlsMessageIn::tls_deserialize(&mut &*welcome_bytes)
+    let welcome_in = crate::wire::parse_mls_message_in(welcome_bytes)
         .map_err(|e| MlsError::WelcomeProcessingFailed(format!("deserializing welcome: {e}")))?;
 
     // Extract the Welcome from the MlsMessageIn body.
@@ -1352,19 +1392,23 @@ pub fn join_group_from_bytes(
         .use_ratchet_tree_extension(true)
         .build();
 
-    let staged_welcome = StagedWelcome::new_from_welcome(&provider, &join_config, welcome, None)
-        .map_err(|e| MlsError::WelcomeProcessingFailed(e.to_string()))?;
+    // openmls decodes the peer's group secrets and GroupInfo and checks the
+    // confirmation tag inside these two calls, under `debug_assert!`s of its
+    // own and of tls_codec (openmls `creation.rs` "Confirmation tag
+    // mismatch"). In a build with debug assertions on, a hostile Welcome
+    // would panic there, so both run under `catch_unwind` and a panic becomes
+    // an error. Release builds compile the assertions out.
+    let joined = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        StagedWelcome::new_from_welcome(&provider, &join_config, welcome, None)
+            .map_err(|e| MlsError::WelcomeProcessingFailed(e.to_string()))?
+            .into_group(&provider)
+            .map_err(|e| MlsError::WelcomeProcessingFailed(e.to_string()))
+    }));
+    let group = joined.map_err(|_| {
+        MlsError::WelcomeProcessingFailed("openmls rejected the Welcome with a panic".to_string())
+    })??;
 
-    let group = staged_welcome
-        .into_group(&provider)
-        .map_err(|e| MlsError::WelcomeProcessingFailed(e.to_string()))?;
-
-    Ok(ScpMlsGroup {
-        group: Some(group),
-        provider,
-        signer: EagerDropSigner::new(signer),
-        destroyed: false,
-    })
+    ScpMlsGroup::from_parts(group, provider, signer)
 }
 
 #[cfg(test)]
@@ -1554,6 +1598,152 @@ mod tests {
                 encoded.len()
             );
         }
+        Ok(())
+    }
+
+    /// A Welcome into a ciphersuite-1 group, built with openmls directly
+    /// (SCP never creates such a group), and the joiner's provider and signer.
+    fn cs1_welcome()
+    -> Result<(Vec<u8>, InMemoryMlsProvider, SignatureKeyPair), Box<dyn std::error::Error>> {
+        let cs1 = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+        let member = |name: &str| -> Result<_, Box<dyn std::error::Error>> {
+            let provider = InMemoryMlsProvider::default();
+            let signer = SignatureKeyPair::new(cs1.signature_algorithm())?;
+            signer.store(provider.storage())?;
+            let credential_with_key = CredentialWithKey {
+                credential: BasicCredential::new(test_credential(name).to_bytes()?).into(),
+                signature_key: signer.to_public_vec().into(),
+            };
+            Ok((provider, signer, credential_with_key))
+        };
+        let (alice_provider, alice_signer, alice_cred) = member("alice")?;
+        let (bob_provider, bob_signer, bob_cred) = member("bob")?;
+        let config = MlsGroupCreateConfig::builder()
+            .ciphersuite(cs1)
+            .use_ratchet_tree_extension(true)
+            .build();
+        let mut alice = MlsGroup::new(&alice_provider, &alice_signer, &config, alice_cred)?;
+        let bob_kp = KeyPackage::builder().build(cs1, &bob_provider, &bob_signer, bob_cred)?;
+        let (_commit, welcome, _group_info) = alice.add_members(
+            &alice_provider,
+            &alice_signer,
+            core::slice::from_ref(bob_kp.key_package()),
+        )?;
+        Ok((welcome.tls_serialize_detached()?, bob_provider, bob_signer))
+    }
+
+    /// Joining a ciphersuite-1 group through a Welcome fails with the
+    /// ciphersuite error. Without the ciphersuite check in `from_parts`, the
+    /// Ed25519 signer check would fail instead and this test goes red.
+    #[test]
+    fn join_rejects_a_cs1_welcome() -> Result<(), Box<dyn std::error::Error>> {
+        let (welcome, provider, signer) = cs1_welcome()?;
+        let result = join_group_from_bytes(&welcome, provider, signer);
+        assert!(
+            matches!(
+                result,
+                Err(MlsError::UnsupportedCiphersuite {
+                    expected: 2,
+                    got: 1
+                })
+            ),
+            "got {:?}",
+            result.err()
+        );
+        Ok(())
+    }
+
+    /// Takes a freshly created group apart into the parts `from_parts` takes.
+    fn created_parts()
+    -> Result<(MlsGroup, InMemoryMlsProvider, SignatureKeyPair), Box<dyn std::error::Error>> {
+        let mut created = create_group(&test_credential("alice"), &SystemClock)?;
+        let signer = created.signer.take().ok_or("created group has no signer")?;
+        let group = created
+            .group
+            .take()
+            .ok_or("created group has no MlsGroup")?;
+        let provider = std::mem::take(&mut created.provider);
+        Ok((group, provider, signer))
+    }
+
+    /// `from_parts` rejects a valid P-256 signer that is not the key of the
+    /// group's own leaf, and accepts the group's own signer.
+    #[test]
+    fn from_parts_rejects_a_signer_that_is_not_the_leaf_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (group, provider, _own) = created_parts()?;
+        let foreign = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm())?;
+        let result = ScpMlsGroup::from_parts(group, provider, foreign);
+        assert!(
+            matches!(
+                result,
+                Err(MlsError::InvalidSigner(SignerDefect::LeafKeyMismatch))
+            ),
+            "got {:?}",
+            result.err()
+        );
+
+        let (group, provider, own) = created_parts()?;
+        ScpMlsGroup::from_parts(group, provider, own)?;
+        Ok(())
+    }
+
+    /// A Welcome that anyone holding Bob's published `KeyPackage` can build: its
+    /// group secrets are HPKE-sealed to Bob's init key (RFC 9420 §12.4.3.1,
+    /// `EncryptWithLabel(init_key, "Welcome", encrypted_group_info, ...)`), and
+    /// their plaintext opens with a variable-length header whose
+    /// length-of-length is 8 bytes. openmls decodes that plaintext inside
+    /// `StagedWelcome::new_from_welcome`, where `tls_codec` `debug_assert!`s on
+    /// the header.
+    #[cfg(debug_assertions)]
+    fn hostile_welcome(
+        key_package: &KeyPackage,
+        provider: &InMemoryMlsProvider,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        use openmls_traits::crypto::OpenMlsCrypto as _;
+        use tls_codec::VLBytes;
+
+        let encrypted_group_info = vec![0u8; 8];
+        let mut info = VLBytes::new(b"MLS 1.0 Welcome".to_vec()).tls_serialize_detached()?;
+        info.extend(VLBytes::new(encrypted_group_info.clone()).tls_serialize_detached()?);
+        let mut plaintext = vec![0xC0];
+        plaintext.extend_from_slice(&[0; 16]);
+        let sealed = provider.crypto().hpke_seal(
+            SCP_CIPHERSUITE.hpke_config(),
+            key_package.hpke_init_key().as_slice(),
+            &info,
+            &[],
+            &plaintext,
+        )?;
+        let secrets = EncryptedGroupSecrets::new(key_package.hash_ref(provider.crypto())?, sealed)
+            .tls_serialize_detached()?;
+
+        // MlsMessage { version = mls10, wire_format = welcome, Welcome { .. } }.
+        let mut welcome = vec![0, 1, 0, 3];
+        welcome.extend_from_slice(&u16::from(SCP_CIPHERSUITE).to_be_bytes());
+        welcome.extend(VLBytes::new(secrets).tls_serialize_detached()?);
+        welcome.extend(VLBytes::new(encrypted_group_info).tls_serialize_detached()?);
+        Ok(welcome)
+    }
+
+    /// A hostile Welcome from a non-member makes openmls panic in a build with
+    /// debug assertions on; the join returns an error instead. Removing the
+    /// `catch_unwind` around the Welcome processing makes this test panic.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn join_turns_an_openmls_panic_into_an_error() -> Result<(), Box<dyn std::error::Error>> {
+        let (bundle, signer, provider) =
+            generate_key_package(&test_credential("bob"), &SystemClock)?;
+        let welcome = hostile_welcome(bundle.key_package(), &provider)?;
+        let result = join_group_from_bytes(&welcome, provider, signer);
+        assert!(
+            matches!(
+                &result,
+                Err(MlsError::WelcomeProcessingFailed(m)) if m.contains("panic")
+            ),
+            "got {:?}",
+            result.err()
+        );
         Ok(())
     }
 

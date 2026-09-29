@@ -133,6 +133,12 @@ pub enum MlsError {
         now: u64,
     },
 
+    /// MLS wire bytes from a peer did not decode: a malformed `MlsMessage`,
+    /// `KeyPackage` or `Welcome`, including a length header the decoder
+    /// asserts against (see [`crate::wire`]).
+    #[error("MLS wire decoding failed: {0}")]
+    DeserializationFailed(String),
+
     /// Serializing or deserializing an [`crate::ScpMlsGroup`] state snapshot
     /// failed (the out-of-band persistence path used by the in-browser driver
     /// to snapshot the in-memory MLS provider to durable storage — ADR-057
@@ -235,4 +241,11 @@ pub enum SignerDefect {
     /// not `scalar·G`.
     #[error("key pair check failed: {0}")]
     KeyPair(scp_crypto::p256::P256Error),
+    /// The signer's public key is not the signature key of the group's own
+    /// leaf, so the group would sign with a key no member can verify.
+    #[error("signer public key is not the own leaf's signature key")]
+    LeafKeyMismatch,
+    /// The group has no own leaf to compare the signer against.
+    #[error("group has no own leaf")]
+    NoOwnLeaf,
 }

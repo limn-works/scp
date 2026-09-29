@@ -39,8 +39,8 @@ scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
 scp-relay-client = { path = "../scp-relay-client", version = "=0.1.0-beta.2" }
 
 # openmls is needed directly for the wire (de)serialization of KeyPackages and
-# MLS messages at the driver boundary (KeyPackageIn::tls_deserialize and
-# friends); scp-mls exposes its op surface in terms of these openmls types.
+# MLS messages at the driver boundary (decoding goes through `scp_mls::wire`);
+# scp-mls exposes its op surface in terms of these openmls types.
 # `js` is declared in the wasm32 section below, and `libcrux-provider` nowhere — see the
 # note on the same dependency in crates/scp-mls/Cargo.toml.
 openmls = { workspace = true }

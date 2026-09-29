@@ -2590,8 +2590,8 @@ impl PerContextState {
         bytes: &[u8],
         clock: &dyn Clock,
     ) -> Result<AddMemberOutput, ContextError> {
-        use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
-        use openmls::prelude::{KeyPackageIn, ProtocolVersion};
+        use openmls::prelude::ProtocolVersion;
+        use openmls::prelude::tls_codec::Serialize as _;
         use openmls_traits::OpenMlsProvider as _;
 
         // Pre-validate the key package to extract the wrapping key BEFORE the add
@@ -2604,7 +2604,7 @@ impl PerContextState {
         // (§9.5) is rejected before the add, rather than admitting the member
         // with no recorded wrapping key.
         let wrapping_key = {
-            let kp_in = KeyPackageIn::tls_deserialize(&mut &*bytes).map_err(|e| {
+            let kp_in = scp_mls::wire::parse_key_package_in(bytes).map_err(|e| {
                 ContextError::CryptoFailed(format!("key package deserialization: {e}"))
             })?;
             let provider_tmp = scp_mls::InMemoryMlsProvider::default();
@@ -2616,7 +2616,7 @@ impl PerContextState {
         };
 
         // Deserialize to KeyPackageIn for the actual add operation.
-        let kp_in = KeyPackageIn::tls_deserialize(&mut &*bytes)
+        let kp_in = scp_mls::wire::parse_key_package_in(bytes)
             .map_err(|e| ContextError::CryptoFailed(format!("key package deserialization: {e}")))?;
 
         let crypto = self.encrypted_crypto_mut()?;

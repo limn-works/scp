@@ -29,7 +29,7 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
+use tls_codec::Serialize as TlsSerializeTrait;
 use zeroize::Zeroizing;
 
 use super::backend::{
@@ -181,12 +181,11 @@ impl ProductionMlsBackend {
     /// Returns [`MlsError::WelcomeProcessingFailed`] if the public bytes do
     /// not deserialize / validate as an SCP `KeyPackage`.
     fn consumed_init_key_key(key_package_public_bytes: &[u8]) -> Result<String, MlsError> {
-        let kp_in =
-            KeyPackageIn::tls_deserialize(&mut &*key_package_public_bytes).map_err(|e| {
-                MlsError::WelcomeProcessingFailed(format!(
-                    "deserializing key package for init-key: {e}"
-                ))
-            })?;
+        let kp_in = scp_mls::wire::parse_key_package_in(key_package_public_bytes).map_err(|e| {
+            MlsError::WelcomeProcessingFailed(format!(
+                "deserializing key package for init-key: {e}"
+            ))
+        })?;
         let provider = new_provider();
         let validated = kp_in
             .validate(provider.crypto(), ProtocolVersion::Mls10)
@@ -353,7 +352,7 @@ impl MlsBackend for ProductionMlsBackend {
         // the existing `add_member` API which accepts a pre-deserialized KP;
         // the trait boundary takes raw bytes so callers do not need to
         // depend on OpenMLS types directly.
-        let kp = KeyPackageIn::tls_deserialize(&mut &*key_package_bytes)
+        let kp = scp_mls::wire::parse_key_package_in(&*key_package_bytes)
             .map_err(|e| MlsError::AddMemberFailed(format!("deserializing key package: {e}")))?;
 
         let result = group::add_member(group, kp, self.clock.as_ref())?;
@@ -462,7 +461,7 @@ impl MlsBackend for ProductionMlsBackend {
     ) -> Result<ValidatedKeyPackage, MlsError> {
         // Deserialize and validate against the SCP ciphersuite. This runs the
         // OpenMLS-side validation without holding any group state.
-        let kp_in = KeyPackageIn::tls_deserialize(&mut &*key_package_bytes)
+        let kp_in = scp_mls::wire::parse_key_package_in(&*key_package_bytes)
             .map_err(|e| MlsError::AddMemberFailed(format!("deserializing key package: {e}")))?;
 
         let provider = new_provider();
@@ -1041,7 +1040,7 @@ mod tests {
         assert_eq!(alice_grp.epoch().unwrap(), 1);
 
         // Re-deserialize to confirm the commit is TLS-valid.
-        let _reparsed = MlsMessageIn::tls_deserialize(&mut &*commit_bytes).unwrap();
+        let _reparsed = scp_mls::wire::parse_mls_message_in(&commit_bytes).unwrap();
     }
 
     #[tokio::test]

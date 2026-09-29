@@ -41,10 +41,11 @@
 //! # Restore checks
 //!
 //! A group restore runs `MlsGroup::load`, then
-//! [`require_scp_ciphersuite`](crate::group::require_scp_ciphersuite), then
-//! [`extract_p256_scalar`](crate::group::extract_p256_scalar) on the signer. A
-//! pending-join restore loads no group, so it runs only the signer check. No
-//! older snapshot is migrated (plan decision C1).
+//! [`ScpMlsGroup::from_parts`](crate::ScpMlsGroup::from_parts), which checks
+//! the ciphersuite, the signer, and that the signer is the own leaf's key. A
+//! pending-join restore loads no group, so it runs only
+//! [`check_p256_signer`](crate::group::check_p256_signer). No older snapshot
+//! is migrated.
 
 use openmls::prelude::{GroupId, MlsGroup};
 use openmls_basic_credential::SignatureKeyPair;
@@ -274,21 +275,16 @@ impl ScpMlsGroup {
                 )
             })?;
 
-        // Restore order (plan A2): load, then ciphersuite, then signer.
-        crate::group::require_scp_ciphersuite(mls_group.ciphersuite())?;
-        crate::group::extract_p256_scalar(&signer)?;
-
-        // A loaded group needs its signer in the provider key store so OpenMLS can
-        // find it.
-        signer
-            .store(provider.storage())
-            .map_err(|e| MlsError::Snapshot(format!("signer store failed: {e}")))?;
+        // Restore order: load, then `from_parts` checks the ciphersuite, the
+        // signer, and that the signer is the own leaf's key, and stores the
+        // signer in the provider key store.
+        let group = Self::from_parts(mls_group, provider, signer)?;
 
         // Belt-and-suspenders: clear any residual key bytes before drop (the dump's
         // own `Drop` is the backstop for every path, including early `?` above).
         snapshot.provider_signer.zeroize_secrets();
 
-        Ok(Self::from_parts(mls_group, provider, signer))
+        Ok(group)
     }
 }
 
@@ -406,7 +402,7 @@ pub fn restore_pending_join(
         .map_err(|e| MlsError::Snapshot(format!("pending snapshot deserialization: {e}")))?;
 
     let (provider, signer) = snapshot.provider_signer.rebuild()?;
-    crate::group::extract_p256_scalar(&signer)?;
+    crate::group::check_p256_signer(&signer)?;
     // Move the bindings out (leaving empties) so the returned strings are owned.
     let owner_did = std::mem::take(&mut snapshot.owner_did);
     let context_id = std::mem::take(&mut snapshot.context_id);
@@ -425,10 +421,10 @@ mod tests {
     use crate::ScpCredential;
     use crate::error::SignerDefect;
     use crate::group::{add_member, create_group, generate_key_package, join_group};
-    use openmls::prelude::KeyPackageIn;
+
     use scp_clock::SystemClock;
     use scp_did::SigningKeyId;
-    use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
+    use tls_codec::Serialize as TlsSerialize;
 
     const ALICE: &str = "did:key:z6MkAliceMlsSnapshotFixtureAAAAAAAAAAAAAAA";
     const BOB: &str = "did:key:z6MkBobMlsSnapshotFixtureBBBBBBBBBBBBBBBBBB";
@@ -467,8 +463,8 @@ mod tests {
         let mut alice = create_group(&credential(ALICE), &SystemClock).unwrap();
         let (bundle, bob_signer, bob_provider) =
             generate_key_package(&credential(BOB), &SystemClock).unwrap();
-        let kp_in = KeyPackageIn::tls_deserialize(
-            &mut &*bundle.key_package().tls_serialize_detached().unwrap(),
+        let kp_in = crate::wire::parse_key_package_in(
+            &bundle.key_package().tls_serialize_detached().unwrap(),
         )
         .unwrap();
         let add = add_member(&mut alice, kp_in, &SystemClock).unwrap();
@@ -520,8 +516,8 @@ mod tests {
 
         // Alice creates a group and adds Bob from his published key package.
         let mut alice = create_group(&credential(ALICE), &SystemClock).unwrap();
-        let kp_in = KeyPackageIn::tls_deserialize(
-            &mut &*bundle.key_package().tls_serialize_detached().unwrap(),
+        let kp_in = crate::wire::parse_key_package_in(
+            &bundle.key_package().tls_serialize_detached().unwrap(),
         )
         .unwrap();
         let add = add_member(&mut alice, kp_in, &SystemClock).unwrap();
@@ -561,7 +557,7 @@ mod tests {
             .use_ratchet_tree_extension(true)
             .build();
         let group = MlsGroup::new(&provider, &signer, &config, credential_with_key).unwrap();
-        ScpMlsGroup::from_parts(group, provider, signer)
+        ScpMlsGroup::from_parts_unchecked(group, provider, signer)
     }
 
     /// A P-256 signer whose public key is a valid point that is not
@@ -579,7 +575,7 @@ mod tests {
 
     /// T2(a): a snapshot of a ciphersuite-1 group fails closed on restore with
     /// `UnsupportedCiphersuite { expected: 2, got: 1 }`. The ciphersuite check
-    /// runs before the signer check (plan A2); without it the Ed25519 signer
+    /// runs before the signer check; without it the Ed25519 signer
     /// would surface as `InvalidSigner` instead, and this test fails.
     #[test]
     fn deserialize_state_rejects_cs1_group() {

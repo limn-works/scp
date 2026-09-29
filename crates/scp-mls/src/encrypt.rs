@@ -26,7 +26,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use openmls::prelude::*;
 use scp_clock::Clock;
-use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
+use tls_codec::Serialize as TlsSerializeTrait;
 
 use crate::convergent_timestamp::decode_convergent_timestamp_aad;
 use crate::error::MlsError;
@@ -152,7 +152,7 @@ pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, Ml
     }
 
     // Deserialize the ciphertext bytes into an MlsMessageIn.
-    let message_in = MlsMessageIn::tls_deserialize(&mut &*ciphertext)
+    let message_in = crate::wire::parse_mls_message_in(ciphertext)
         .map_err(|e| MlsError::DecryptionFailed(format!("deserializing ciphertext: {e}")))?;
 
     // Convert to a ProtocolMessage for processing.
@@ -258,7 +258,7 @@ pub fn decrypt_with_sender_did(
         return Err(MlsError::GroupDestroyed);
     }
 
-    let message_in = MlsMessageIn::tls_deserialize(&mut &*ciphertext)
+    let message_in = crate::wire::parse_mls_message_in(ciphertext)
         .map_err(|e| MlsError::DecryptionFailed(format!("deserializing ciphertext: {e}")))?;
 
     let protocol_message = message_in
@@ -643,7 +643,7 @@ pub fn decrypt_with_membership_changes(
         return Err(MlsError::GroupDestroyed);
     }
 
-    let message_in = MlsMessageIn::tls_deserialize(&mut &*ciphertext)
+    let message_in = crate::wire::parse_mls_message_in(ciphertext)
         .map_err(|e| MlsError::DecryptionFailed(format!("deserializing ciphertext: {e}")))?;
 
     let protocol_message = message_in

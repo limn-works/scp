@@ -19,7 +19,6 @@ use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
 
-use openmls::prelude::KeyPackageIn;
 use scp_core::crypto::mls::credential::ScpCredential;
 use scp_core::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
 use scp_core::crypto::sender_keys::{
@@ -44,7 +43,7 @@ use scp_testing::relay::behavior::SuppressionConfig;
 use scp_testing::relay::{BehaviorMode, InMemoryRelay};
 use scp_testing::transport::InMemoryTransport;
 use scp_transport::traits::{RoutingId, TransportAdapter, TransportEvent};
-use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
+use tls_codec::Serialize as TlsSerializeTrait;
 
 // -------------------------------------------------------------------------
 // The demo
@@ -178,7 +177,7 @@ async fn end_to_end_network_demo() {
         .key_package()
         .tls_serialize_detached()
         .unwrap();
-    let kp_in = KeyPackageIn::tls_deserialize(&mut kp_bytes.as_slice()).unwrap();
+    let kp_in = scp_core::crypto::mls::wire::parse_key_package_in(kp_bytes.as_slice()).unwrap();
     let add_result = add_member(&mut alice_group, kp_in, &scp_clock::SystemClock).unwrap();
     let mut bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
 

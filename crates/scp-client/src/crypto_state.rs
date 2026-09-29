@@ -895,7 +895,7 @@ impl ContextCryptoState {
 #[allow(clippy::panic)]
 mod tests {
     use super::*;
-    use openmls::prelude::KeyPackageIn;
+
     use scp_clock::SystemClock;
     use scp_did::SigningKeyId;
     use scp_mls::group::{
@@ -904,7 +904,7 @@ mod tests {
     };
     use scp_mls::{ScpCredential, SignatureKeyPair};
     use scp_protocol::context::pseudonym::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
-    use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
+    use tls_codec::Serialize as TlsSerialize;
 
     const CTX: &str = "ctx-crypto-state-unit";
     const ALICE: &str = "did:key:z6MkAliceCryptoStateUnitFixtureAAAAAAAAAAA";
@@ -927,7 +927,7 @@ mod tests {
         let (bundle, signer, provider): (_, SignatureKeyPair, _) =
             generate_key_package(&credential(BOB), &SystemClock).unwrap();
         let kp_bytes = bundle.key_package().tls_serialize_detached().unwrap();
-        let kp_in = KeyPackageIn::tls_deserialize(&mut &*kp_bytes).unwrap();
+        let kp_in = scp_mls::wire::parse_key_package_in(&kp_bytes).unwrap();
         let result = add_member(&mut alice.mls_group, kp_in, &SystemClock).unwrap();
 
         let bob_group = join_group(&result.welcome, provider, signer).unwrap();
@@ -978,8 +978,8 @@ mod tests {
         // Carol joins as an existing member.
         let (carol_bundle, carol_signer, carol_provider): (_, SignatureKeyPair, _) =
             generate_key_package(&credential(CAROL), &SystemClock).unwrap();
-        let carol_kp_in = KeyPackageIn::tls_deserialize(
-            &mut &*carol_bundle.key_package().tls_serialize_detached().unwrap(),
+        let carol_kp_in = scp_mls::wire::parse_key_package_in(
+            &carol_bundle.key_package().tls_serialize_detached().unwrap(),
         )
         .unwrap();
         let add_carol = add_member(&mut alice.mls_group, carol_kp_in, &SystemClock).unwrap();
@@ -995,8 +995,8 @@ mod tests {
         let (bob_bundle, _bob_signer, _bob_provider): (_, SignatureKeyPair, _) =
             generate_key_package_with_wrapping_key(&credential(BOB), Some(&bob_wk), &SystemClock)
                 .unwrap();
-        let bob_kp_in = KeyPackageIn::tls_deserialize(
-            &mut &*bob_bundle.key_package().tls_serialize_detached().unwrap(),
+        let bob_kp_in = scp_mls::wire::parse_key_package_in(
+            &bob_bundle.key_package().tls_serialize_detached().unwrap(),
         )
         .unwrap();
         // ADR-057: the add-Bob commit binds a convergent timestamp into its
@@ -1187,7 +1187,7 @@ mod tests {
         let (bundle, signer, provider): (_, SignatureKeyPair, _) =
             generate_key_package(&credential(BOB), &SystemClock).unwrap();
         let kp_bytes = bundle.key_package().tls_serialize_detached().unwrap();
-        let kp_in = KeyPackageIn::tls_deserialize(&mut &*kp_bytes).unwrap();
+        let kp_in = scp_mls::wire::parse_key_package_in(&kp_bytes).unwrap();
         let result = add_member(&mut alice.mls_group, kp_in, &SystemClock).unwrap();
         let bob_group = join_group(&result.welcome, provider, signer).unwrap();
         let mut bob = ContextCryptoState::from_group(CTX, bob_group);
@@ -1281,8 +1281,8 @@ mod tests {
         let (bundle, signer, provider): (_, SignatureKeyPair, _) =
             generate_key_package_with_wrapping_key(&credential(BOB), Some(&bob_wpub), &SystemClock)
                 .unwrap();
-        let kp_in = KeyPackageIn::tls_deserialize(
-            &mut &*bundle.key_package().tls_serialize_detached().unwrap(),
+        let kp_in = scp_mls::wire::parse_key_package_in(
+            &bundle.key_package().tls_serialize_detached().unwrap(),
         )
         .unwrap();
         let add = add_member(&mut alice.mls_group, kp_in, &SystemClock).unwrap();

@@ -104,7 +104,7 @@
 // KATs assert on fixed vectors; `expect`/`unwrap`/`panic` keep failures legible.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-use openmls::prelude::{KeyPackageIn, PrivateMessageIn, Welcome};
+use openmls::prelude::PrivateMessageIn;
 use scp_did::{DID, SigningKeyId};
 use scp_event_log::tree::{append_unsigned_event, event_count, leaf_hash, root};
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
@@ -461,7 +461,7 @@ fn assert_mls_wire_encoding_roundtrips() {
     // MlsMessage. `Welcome` derives both TLS directions, so it round-trips ungated.
     {
         let golden = from_hex(GOLDEN_MLS_WELCOME_HEX);
-        let welcome = Welcome::tls_deserialize(&mut &golden[..])
+        let welcome = scp_mls::wire::parse_welcome(&golden[..])
             .unwrap_or_else(|e| panic!("Welcome golden blob deserializes: {e}"));
         let reserialized = welcome
             .tls_serialize_detached()
@@ -478,7 +478,7 @@ fn assert_mls_wire_encoding_roundtrips() {
     // it directly (both TLS directions).
     {
         let golden = from_hex(GOLDEN_KEY_PACKAGE_HEX);
-        let kp_in = KeyPackageIn::tls_deserialize(&mut &golden[..])
+        let kp_in = scp_mls::wire::parse_key_package_in(&golden[..])
             .unwrap_or_else(|e| panic!("KeyPackage golden blob deserializes: {e}"));
         let reserialized = kp_in
             .tls_serialize_detached()

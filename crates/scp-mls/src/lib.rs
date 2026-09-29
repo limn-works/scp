@@ -56,6 +56,7 @@ pub mod keypackage_attestation;
 pub mod lifetime;
 pub mod ratchet;
 pub mod snapshot;
+pub mod wire;
 pub mod wrapping_extension;
 
 // Re-export primary public API types for convenience.

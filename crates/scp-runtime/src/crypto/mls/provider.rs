@@ -41,7 +41,6 @@ use openmls_traits::OpenMlsProvider;
 use scp_clock::Clock;
 use scp_did::SigningKeyId;
 use serde::{Deserialize, Serialize};
-use tls_codec::Deserialize as TlsDeserializeTrait;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::backend::MlsBackend;
@@ -820,7 +819,7 @@ impl NodeMlsFactory {
         // Deserialize the key package as KeyPackageIn (TLS format).
         // This matches add_member() which also uses KeyPackageIn, ensuring
         // both methods accept the same byte format (#1294).
-        let kp_in = KeyPackageIn::tls_deserialize(&mut &*bytes)
+        let kp_in = scp_mls::wire::parse_key_package_in(bytes)
             .map_err(|e| ContextError::InvalidKeyPackage(format!("TLS deserialization: {e}")))?;
 
         // Validate ciphersuite and signature.
@@ -1072,19 +1071,13 @@ impl NodeMlsFactory {
                 )
             })?;
 
-        // Restore checks, in order (spec 09 §9.5): the loaded group runs
-        // `SCP_CIPHERSUITE`, then the signer is a P-256 pair whose public key
-        // is scalar·G. SCP migrates no state from another suite, so either
-        // failure fails the restore closed.
-        scp_mls::require_scp_ciphersuite(mls_group.ciphersuite())
+        // `ScpMlsGroup::from_parts` runs the restore checks (spec 09 §9.5): the
+        // loaded group runs `SCP_CIPHERSUITE`, the signer is a P-256 pair whose
+        // public key is scalar·G, and that key is the own leaf's signature key.
+        // SCP migrates no state from another suite, so any failure fails the
+        // restore closed. It then stores the signer so OpenMLS can find it.
+        let scp_group = ScpMlsGroup::from_parts(mls_group, provider, signer)
             .map_err(|e| ContextError::CryptoFailed(format!("restored group: {e}")))?;
-        scp_mls::check_p256_signer(&signer)
-            .map_err(|e| ContextError::CryptoFailed(format!("restored signer: {e}")))?;
-
-        // Re-store the signer in the provider's key store so OpenMLS can find it.
-        signer
-            .store(provider.storage())
-            .map_err(|e| ContextError::CryptoFailed(format!("signer store failed: {e}")))?;
 
         // Reconstruct SenderKeyStore. drain() moves keys out and clears the
         // snapshot's copy.
@@ -1154,10 +1147,6 @@ impl NodeMlsFactory {
         // Reconstruct member wrapping keys.
         let member_wrapping_keys: HashMap<String, [u8; 65]> =
             snapshot.member_wrapping_keys.drain(..).collect();
-
-        // Rebuild the live group via `scp_mls::ScpMlsGroup`'s public restore
-        // constructor (the struct's fields are in another crate now; ADR-057).
-        let scp_group = ScpMlsGroup::from_parts(mls_group, provider, signer);
 
         // Take the local_sender_key and leave a zeroed placeholder. SenderKey
         // implements ZeroizeOnDrop, so the placeholder is cleaned when snapshot
@@ -2720,12 +2709,29 @@ mod tests {
         );
         snapshot.signer_bytes = rmp_serde::to_vec(&tampered).unwrap();
         let err = restore_error(&snapshot);
-        assert!(err.contains("restored signer"), "{err}");
+        assert!(err.contains("restored group: invalid MLS signer"), "{err}");
+    }
+
+    /// A snapshot whose signer is a valid P-256 pair but not the key of the
+    /// group's own leaf fails the restore closed: the group would sign with a
+    /// key no member can verify.
+    #[test]
+    fn build_restored_owned_rejects_signer_that_is_not_the_leaf_key() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        let mut snapshot = exported_snapshot(&provider, &ctx_id);
+        let foreign = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm()).unwrap();
+        snapshot.signer_bytes = rmp_serde::to_vec(&foreign).unwrap();
+        let err = restore_error(&snapshot);
+        assert!(
+            err.contains("signer public key is not the own leaf's signature key"),
+            "{err}"
+        );
     }
 
     /// T2(a): a snapshot of a ciphersuite-1 group (X25519 / Ed25519) fails
     /// the restore closed with the ciphersuite error, which runs before the
-    /// signer check (plan A2): without it the Ed25519 signer would surface as
+    /// signer check: without it the Ed25519 signer would surface as
     /// a signer error instead, and this test fails.
     #[test]
     fn build_restored_owned_rejects_cs1_group() {
@@ -2767,7 +2773,10 @@ mod tests {
         snapshot.signer_bytes = rmp_serde::to_vec(&signer).unwrap();
 
         let err = restore_error(&snapshot);
-        assert!(err.starts_with("restored group"), "{err}");
+        assert!(
+            err.starts_with("restored group: unsupported MLS ciphersuite"),
+            "{err}"
+        );
     }
 
     // -------------------------------------------------------------------

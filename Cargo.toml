@@ -320,16 +320,6 @@ await_holding_lock = "deny"
 [profile.dev]
 debug = "line-tables-only"
 
-# tls_codec 0.4 `debug_assert!`s that a variable-length vector header's
-# length-of-length is at most 2 (its `mls` feature) before returning
-# `InvalidVectorLength` for exactly that input. The header comes from the peer,
-# so with debug assertions on, a hostile KeyPackage, Welcome or commit panics a
-# dev or test build where a release build rejects it with an error. Turning the
-# assertion off for this one package gives every profile the release behavior;
-# the openmls assertions above stay on.
-[profile.dev.package.tls_codec]
-debug-assertions = false
-
 # ── Release profile ─────────────────────────────────────────────────────────
 # `debug-assertions = false` is the cargo release DEFAULT — this line changes no
 # behavior; it makes an otherwise-implicit invariant EXPLICIT and greppable.
