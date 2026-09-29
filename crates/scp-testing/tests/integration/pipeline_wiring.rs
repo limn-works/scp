@@ -3031,16 +3031,28 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
 /// "The Supervisor's receiver" is pinned by the `match` that binds it: its
 /// scrutinee is exactly `supervisor_of_bi`, the bridge's accessor for its own
 /// instance's Supervisor called on the parameter `bi`; its first arm is
-/// `Ok(supervisor) => supervisor.subscribe_events(),`; and it is the
-/// function's first statement, so no earlier statement rebinds `bi`.
+/// `Ok(supervisor) => supervisor.subscribe_events(),`; its only other arm is
+/// an `Err` arm whose value is `None`, so a Supervisor that cannot be reached
+/// yields no receiver rather than one nothing feeds; and it is the function's
+/// first statement, so no earlier statement rebinds `bi`.
 ///
 /// "That receiver" is pinned two ways: the `match` is the whole initializer of
-/// `context_events` (its closing `}` is followed by `;`, so no chained call
-/// replaces its value), and every other mention of `context_events` in the
-/// body is a read through `.is_none()` or the constructor argument, so no
-/// statement rebinds or shadows it between the `match` and the constructor.
+/// `context_events` (the `Err` arm is followed by the `match`'s closing `}`
+/// and `;`, so no chained call replaces its value), and every other mention of
+/// `context_events` in the body is a read through `.is_none()` or the
+/// constructor argument, so no statement rebinds or shadows it between the
+/// `match` and the constructor.
 fn serves_the_supervisor_event_source(code: &str, serve_fn: &str, supervisor_of_bi: &str) -> bool {
     const ARM: &str = "{ Ok(supervisor) => supervisor.subscribe_events(),";
+    // The arms allowed after `ARM`, each closing the `match` and ending the
+    // statement: with no Supervisor there is no receiver, so the arm's value is
+    // `None` (after, at most, the bridges' shared warning). Any other value is a
+    // receiver no Supervisor feeds, which would advertise
+    // `resources.subscribe: true` over a pump that never fires.
+    const ERR_ARMS: [&str; 2] = [
+        "Err(_) => None, };",
+        "Err(e) => { tracing::warn!(\"MCP server: no supervisor event source ({e})\"); None } };",
+    ];
     let bind = format!("let context_events = match {supervisor_of_bi} ");
     let bundle_wired = fn_body(code, "mcp_server_bundle").is_some_and(|body| {
         let bi_is_the_parameter = body
@@ -3051,20 +3063,11 @@ fn serves_the_supervisor_event_source(code: &str, serve_fn: &str, supervisor_of_
             let first_statement =
                 before.matches('{').count() == 1 && before.trim_end().ends_with('{');
             let rest = &body[at + bind.len()..];
-            if !first_statement || !rest.starts_with(ARM) {
-                return false;
-            }
-            let mut depth = 0usize;
-            rest.char_indices()
-                .find_map(|(i, c)| {
-                    match c {
-                        '{' => depth += 1,
-                        '}' => depth -= 1,
-                        _ => return None,
-                    }
-                    (depth == 0).then_some(i + 1)
+            first_statement
+                && rest.strip_prefix(ARM).is_some_and(|after_ok| {
+                    let after_ok = after_ok.trim_start();
+                    ERR_ARMS.iter().any(|err_arm| after_ok.starts_with(err_arm))
                 })
-                .is_some_and(|end| rest[end..].trim_start().starts_with(';'))
         });
         let mentions = body.matches("context_events").count();
         let reads = body.matches("context_events.is_none()").count();
@@ -3177,8 +3180,9 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
 
 /// The event-source gate must go red when the receiver comes from anything
 /// but the bridge instance's own Supervisor: a stand-in scrutinee, the
-/// accessor called on another instance, `bi` rebound before the `match`, or
-/// an `Ok` arm that ignores the Supervisor it matched.
+/// accessor called on another instance, `bi` rebound before the `match`, an
+/// `Ok` arm that ignores the Supervisor it matched, or an `Err` arm that yields
+/// a receiver when there is no Supervisor.
 #[test]
 fn mcp_wiring_gate_rejects_a_receiver_not_from_the_bridge_instance() {
     let wired = WIRED_BUNDLE;
@@ -3224,6 +3228,40 @@ fn mcp_wiring_gate_rejects_a_receiver_not_from_the_bridge_instance() {
         "serve",
         SUPERVISOR_OF_BI
     ));
+    // The bridges' shipped `Err` arm, which warns before yielding `None`, is
+    // accepted.
+    let warns_then_none = wired.replace(
+        "Err(_) => None,\n    };",
+        "Err(e) => {\n            \
+         tracing::warn!(\"MCP server: no supervisor event source ({e})\");\n            \
+         None\n        }\n    };",
+    );
+    assert!(serves_the_supervisor_event_source(
+        &production_code(&warns_then_none),
+        "serve",
+        SUPERVISOR_OF_BI
+    ));
+    // With no Supervisor, the `Err` arm yields a receiver from a channel it
+    // creates itself, whose sender is already dropped: subscriptions would be
+    // advertised over a pump nothing feeds. Both `Err` arm shapes go red.
+    let stand_in_err = wired.replace(
+        "Err(_) => None,",
+        "Err(_) => Some(tokio::sync::broadcast::channel(1).1),",
+    );
+    let stand_in_after_warning = warns_then_none.replace(
+        "\n            None\n        }",
+        "\n            Some(tokio::sync::broadcast::channel(1).1)\n        }",
+    );
+    for regression in [stand_in_err, stand_in_after_warning] {
+        assert!(
+            !serves_the_supervisor_event_source(
+                &production_code(&regression),
+                "serve",
+                SUPERVISOR_OF_BI
+            ),
+            "{regression}"
+        );
+    }
 }
 
 /// A wired `validate_resource_access`, as the resource-access gate accepts it.
@@ -3830,6 +3868,55 @@ fn answers_capability_from_live_role_state(code: &str) -> bool {
     })
 }
 
+/// Whether the production `validate_capability` in `code` (from
+/// [`production_code`]) is the SCP-048 stub whose whole body refuses every
+/// outlet as unsupported: after the signature's `{`, the only expression is
+/// `Err(scp_mcp::server::AccessRefusal::Unsupported(OUTLET_INVOCATION_UNAVAILABLE.to_owned()))`.
+fn refuses_every_capability_as_unsupported(code: &str) -> bool {
+    const REFUSAL: &str = "{ Err(scp_mcp::server::AccessRefusal::Unsupported( \
+                           OUTLET_INVOCATION_UNAVAILABLE.to_owned(), )) }";
+    fn_body(code, "validate_capability").is_some_and(|body| {
+        body.trim_end()
+            .strip_suffix(REFUSAL)
+            .is_some_and(|signature| !signature.contains('{'))
+    })
+}
+
+/// NAPI's `validate_capability` stub as rustfmt lays it out, as the stub gate
+/// accepts it.
+const UNSUPPORTED_CAPABILITY_STUB: &str = "fn validate_capability(\n    &self,\n    \
+                  _context_id: &str,\n    _outlet_name: &str,\n    \
+                  _check: scp_mcp::server::CapabilityCheck,\n) -> Result<(), \
+                  scp_mcp::server::AccessRefusal> {\n    // Stub — see SCP-048\n    \
+                  Err(scp_mcp::server::AccessRefusal::Unsupported(\n        \
+                  OUTLET_INVOCATION_UNAVAILABLE.to_owned(),\n    ))\n}\n\
+                  fn invoke_outlet(&self) {}\n";
+
+/// The stub gate must go red when NAPI's `validate_capability` grants, or runs
+/// any statement before its refusal, while `invoke_outlet` is still a stub.
+#[test]
+fn mcp_capability_stub_gate_rejects_a_grant() {
+    const REFUSAL: &str = "Err(scp_mcp::server::AccessRefusal::Unsupported(\n        \
+                           OUTLET_INVOCATION_UNAVAILABLE.to_owned(),\n    ))";
+    assert!(refuses_every_capability_as_unsupported(&production_code(
+        UNSUPPORTED_CAPABILITY_STUB
+    )));
+    let granted = UNSUPPORTED_CAPABILITY_STUB.replace(REFUSAL, "Ok(())");
+    let early_grant = UNSUPPORTED_CAPABILITY_STUB.replace(
+        "    // Stub — see SCP-048\n",
+        "    if _check.is_read() { return Ok(()); }\n",
+    );
+    let refusal_in_dead_block = UNSUPPORTED_CAPABILITY_STUB
+        .replace(REFUSAL, &format!("Ok(())\n}}\nfn unused() {{ {REFUSAL}"));
+    for regression in [granted, early_grant, refusal_in_dead_block] {
+        assert_ne!(regression, UNSUPPORTED_CAPABILITY_STUB);
+        assert!(
+            !refuses_every_capability_as_unsupported(&production_code(&regression)),
+            "{regression}"
+        );
+    }
+}
+
 /// Returns the production code of a Rust source file as one whitespace-collapsed
 /// line: everything before the trailing `#[cfg(test)] mod tests { ... }`, with
 /// every line that is only a comment (`//`, `///`, `//!`) removed.
@@ -3908,7 +3995,9 @@ fn production_source(src: &str) -> &str {
 /// `validate_capability` returns `outlet_grant`'s verdict on role state read
 /// through that same `gate_role_state` (NAPI's `validate_capability` is a stub
 /// against SCP-048, the MCP server tool listing and capability filtering
-/// story, and reports every outlet as unsupported). Third, the predicate's
+/// story, and this test pins its whole body to the refusal that reports every
+/// outlet as unsupported, so it cannot grant a tool its stubbed `invoke_outlet`
+/// would then fail). Third, the predicate's
 /// `Self::Events | Self::Members =>` arm calls `member_has_capability` with
 /// `Capability::MessagesRead`. It does not check
 /// how that arm uses the call's result, nor the `Tools` arm, which requires
@@ -3958,7 +4047,15 @@ fn mcp_resource_access_is_answered_from_real_role_state() {
              supervisor attached, the bridge's own copy or `Ok(None)`, and otherwise the bound \
              supervisor's `get_role_state_checked` answer; a stand-in role state does not count"
         );
-        if bridge != "NAPI" {
+        if bridge == "NAPI" {
+            assert!(
+                refuses_every_capability_as_unsupported(&code),
+                "NAPI's production `validate_capability` must stay the SCP-048 stub whose whole \
+                 body is `Err(AccessRefusal::Unsupported(OUTLET_INVOCATION_UNAVAILABLE))` while \
+                 its `invoke_outlet` is not implemented: any grant lists tools in `tools/list` \
+                 that every `tools/call` then fails"
+            );
+        } else {
             assert!(
                 answers_capability_from_live_role_state(&code),
                 "{bridge}'s production `validate_capability` must read the context's role state \
