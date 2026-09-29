@@ -535,6 +535,35 @@ impl TestingCallbackCustody {
         })
     }
 
+    /// Derives and binds the v2 (rotatable) pseudonym of `identity_key_id` in
+    /// `context_id` at `epoch` (§9.10.4.1).
+    ///
+    /// # Errors
+    ///
+    /// `SCP-VALID-7001` for an `epoch` that is negative or does not fit in a
+    /// `u64`; otherwise the adapter's custody error coded as production
+    /// derivation reports it (as for `derivePseudonym`).
+    #[napi(js_name = "deriveRotatablePseudonym")]
+    pub async fn derive_rotatable_pseudonym(
+        &self,
+        identity_key_id: String,
+        context_id: String,
+        epoch: napi::bindgen_prelude::BigInt,
+    ) -> napi::Result<crate::custody::NapiPseudonymResult> {
+        use scp_platform::KeyCustody;
+        let identity = testing_handle(&identity_key_id)?;
+        let epoch = crate::economy::amount_u64_from_bigint(&epoch, "epoch")?;
+        let pseudonym = self
+            .inner
+            .derive_rotatable_pseudonym(&identity, context_id.as_bytes(), epoch)
+            .await
+            .map_err(|e| napi::Error::from(crate::context::pseudonym_derivation_failed(&e)))?;
+        Ok(crate::custody::NapiPseudonymResult {
+            public_key: pseudonym.public_key().as_bytes().to_vec(),
+            key_id: pseudonym.key_handle().id().to_string(),
+        })
+    }
+
     /// Signs `data` with `key_id` through the adapter's checked `sign`.
     ///
     /// The adapter's `sign` future is polled once on the calling JS thread

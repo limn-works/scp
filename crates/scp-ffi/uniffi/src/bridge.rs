@@ -24891,6 +24891,49 @@ mod tests {
         assert_ne!(rotated.key_handle(), first.key_handle());
     }
 
+    /// The callback adapter hands the host the caller's context bytes and
+    /// epoch unchanged (§9.10.4, §9.10.4.1): the v1 and v2 routing ids are the
+    /// recipe's for exactly `(seed, "ctx-routing", None)` and
+    /// `(seed, "ctx-routing", Some(3))`.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn callback_custody_forwards_context_and_epoch_unchanged() {
+        let provider = ProdLikeCustody::new();
+        let keys = Arc::clone(&provider.keys);
+        let custody = CallbackKeyCustody::new(Box::new(provider));
+        let identity = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("identity key");
+        let seed = keys
+            .lock()
+            .expect("keystore mutex")
+            .get(&identity.id().to_string())
+            .expect("identity key is in the store")
+            .to_bytes();
+        let static_pseudonym = custody
+            .derive_pseudonym(&identity, b"ctx-routing")
+            .await
+            .expect("v1 derive");
+        assert_eq!(
+            *static_pseudonym.routing_id(),
+            recipe_routing_id(seed, b"ctx-routing", None)
+        );
+        let rotated = custody
+            .derive_rotatable_pseudonym(&identity, b"ctx-routing", 3)
+            .await
+            .expect("rotatable derive");
+        assert_eq!(
+            *rotated.routing_id(),
+            recipe_routing_id(seed, b"ctx-routing", Some(3))
+        );
+        assert_ne!(
+            *rotated.routing_id(),
+            recipe_routing_id(seed, b"ctx-routing", Some(4)),
+            "the routing id is epoch-scoped"
+        );
+    }
+
     /// B3: `destroy_key` unbinds the handle. A host that reuses key id 777
     /// for a second point is refused while the first is bound, and accepted
     /// once the first is destroyed.

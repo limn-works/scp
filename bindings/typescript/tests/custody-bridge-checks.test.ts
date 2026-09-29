@@ -11,6 +11,12 @@
  *   - `unbind` in `destroy_key`: a destroyed id can carry a new point, and
  *     the id is already unbound when the host's `destroyKey` runs.
  *
+ * The forwarding test fails if `derive_pseudonym` or
+ * `derive_rotatable_pseudonym` in `custody.rs`, or `derivePseudonym` or
+ * `deriveRotatablePseudonym` in `src/internal/custody-adapter.ts`, hands the
+ * host anything but the caller's context bytes and epoch, routes v2 to the v1
+ * callback, or returns anything but the host's point.
+ *
  * The host-failure tests fail if `hostCall` in
  * `src/internal/custody-adapter.ts` stops turning a host failure into a typed
  * rejection: a host throw (including a thrown value with no readable
@@ -38,6 +44,11 @@ import { bigIntTo32, bytesToBigInt, P256_N, pseudonymSeedV1 } from "./pseudonym-
 interface TestingCustody {
   generateKeypair(): Promise<string>;
   derivePseudonym(identityKeyId: string, contextId: string): Promise<PseudonymResult>;
+  deriveRotatablePseudonym(
+    identityKeyId: string,
+    contextId: string,
+    epoch: bigint,
+  ): Promise<PseudonymResult>;
   sign(keyId: string, data: Buffer): Promise<Buffer>;
   destroyKey(keyId: string): Promise<void>;
 }
@@ -221,6 +232,45 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     const pseudonym = await custody.derivePseudonym(identity, "ctx");
     const err = await custody.sign(pseudonym.keyId, DIGEST).catch((e: unknown) => e);
     expect(mapBridgeError(err).code).toBe("SCP-CRYPTO-4060");
+  });
+
+  test("the host receives the caller's context and epoch unchanged and the bridge returns its §25.19 Vector 30 points", async () => {
+    // §25.19 Vector 30 (`context_id` = "context-alpha", epoch 1): the context
+    // seeds and the points, copied verbatim from the spec.
+    const d1 = p256PseudonymScalar(
+      Buffer.from("47ea801c24e8a4d577f04837eca0674fbbf160127fa2d1a4bb1420150b0a048b", "hex"),
+    );
+    const d2 = p256PseudonymScalar(
+      Buffer.from("6ab63aa150992ff032f6963c31dc9f5a8bd4e9518516f9fbd3bea7bc07f64b38", "hex"),
+    );
+    const V1 = "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72";
+    const V2 = "0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479";
+    const store = new Store();
+    const received: unknown[][] = [];
+    const custody = adapterWith(store, {
+      derivePseudonym: (...args: unknown[]) => {
+        received.push(["v1", ...args]);
+        store.pseudonyms.set("101", d1);
+        return { publicKey: p256PublicKey(d1), keyId: "101" };
+      },
+      deriveRotatablePseudonym: (...args: unknown[]) => {
+        received.push(["v2", ...args]);
+        store.pseudonyms.set("202", d2);
+        return { publicKey: p256PublicKey(d2), keyId: "202" };
+      },
+    });
+    const identity = await custody.generateKeypair();
+    const v1 = await custody.derivePseudonym(identity, "context-alpha");
+    const v2 = await custody.deriveRotatablePseudonym(identity, "context-alpha", 1n);
+    const context = new Uint8Array(Buffer.from("context-alpha"));
+    expect(received).toEqual([
+      ["v1", identity, context],
+      ["v2", identity, context, 1n],
+    ]);
+    expect(Buffer.from(v1.publicKey).toString("hex")).toBe(V1);
+    expect(v1.keyId).toBe("101");
+    expect(Buffer.from(v2.publicKey).toString("hex")).toBe(V2);
+    expect(v2.keyId).toBe("202");
   });
 
   test("destroying a pseudonym unbinds its id", async () => {
