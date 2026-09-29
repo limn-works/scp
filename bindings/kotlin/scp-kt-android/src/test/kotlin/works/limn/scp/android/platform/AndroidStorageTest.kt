@@ -10,19 +10,23 @@
 //     SQLCipher under concurrent access
 //   - Zeroing of the passphrase ByteArray in the finally block after database open
 //
-// Instrumented tests on real devices are required to verify the full SQLCipher +
-// Android Keystore path. See ADR-027 for the testing strategy.
+// Only an instrumented test on a real device can run the SQLCipher and Android
+// Keystore path. No instrumented test for AndroidStorage exists, and ADR-027 (the
+// Android platform adapter) names no testing strategy for it.
 //
 // Test strategies:
 //
-// 1. **Contract tests**: Verify the StorageProvider interface contract using an
-//    InMemoryStorageProvider that mirrors the production AndroidStorage semantics
-//    (INSERT OR REPLACE, lexicographic ordering, prefix matching). These tests
-//    validate that any conforming StorageProvider implementation behaves correctly.
+// 1. **Contract tests**: Check the StorageProvider interface contract against
+//    InMemoryStorageProvider, which copies the AndroidStorage semantics (INSERT OR
+//    REPLACE, lexicographic ordering, prefix matching). These tests run no other
+//    StorageProvider implementation, so they show nothing about AndroidStorage.
 //
-// 2. **AndroidStorage verification tests**: Verify that AndroidStorage uses the
-//    correct Keystore alias, error codes, and constant values. These verify the
-//    production class structure without requiring Android runtime dependencies.
+// 2. **AndroidStorage constant and signature tests**: Assert the values of
+//    AndroidStorage's constants (Keystore alias, database and column names, error
+//    codes), that AndroidStorage implements StorageProvider, and the signatures of
+//    its constructor and getOrCreateStorageKey. No test calls AndroidStorage code, so
+//    none shows that AndroidStorage passes its alias to Keystore or throws the right
+//    error code.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
 // SCP-113 (Android Storage trait with TEE-backed SQLCipher; the adapter derives the SQLCipher
