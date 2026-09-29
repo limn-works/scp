@@ -116,13 +116,8 @@ import java.security.SecureRandom
  *
  * ## Compromise recovery
  *
- * Key rotation follows the 6-step recovery process from section 9.12:
- *   1. Generate new identity keypair via [generateKeypair]
- *   2. Publish new DID document with updated key material
- *   3. Re-join affected contexts with new identity
- *   4. Revoke UCAN delegations from compromised key
- *   5. Request admin role re-assignment in governed contexts
- *   6. Destroy compromised key via [destroyKey]
+ * `.docs/specs/09-security-model.md` §9.12 (Compromise Recovery Protocol) defines the recovery
+ * steps. This KDoc does not restate them.
  *
  * See ADR-027 for the full Android platform adapter design.
  *
@@ -288,7 +283,9 @@ class AndroidKeyCustody internal constructor(
      * removal reaches disk. The post-deletion check reads only [softwareKeys].
      *
      * After this call, operations with the same handle in the same process throw [ScpException]
-     * with code `SCP-CRYPTO-4001`, except [dhAgree], which throws `SCP-CRYPTO-4002`.
+     * with code `SCP-CRYPTO-4001`, with two exceptions: [dhAgree] throws `SCP-CRYPTO-4002`, and
+     * [exportSigningKeyBytes] on a Keystore handle ([CustodyType.HARDWARE]) throws
+     * `SCP-CRYPTO-4005`, because it refuses on [KeyHandle.custodyType] before any key lookup.
      * When the process dies before `apply()` writes the removal to disk, the next instance's
      * `restorePersistedEd25519Keys` reloads the seed and the key signs again, although this
      * call returned `confirmed = true`.
@@ -614,9 +611,12 @@ class AndroidKeyCustody internal constructor(
      *   only [KeyHandle.custodyType] and the stored key type, not where the handle came from.
      * @return 32-byte raw Ed25519 private key bytes.
      * @throws ScpException with code `SCP-CRYPTO-4003` if the key is not Ed25519.
-     * @throws ScpException with code `SCP-CRYPTO-4005` if the key is a Keystore key
-     *   (Keystore does not hand its private key bytes to the app).
-     * @throws ScpException with code `SCP-CRYPTO-4001` if the key is not found.
+     * @throws ScpException with code `SCP-CRYPTO-4005` if the handle is a Keystore handle
+     *   ([CustodyType.HARDWARE]), checked before any key lookup, so a destroyed or unknown
+     *   Keystore handle also gets this code (Keystore does not hand its private key bytes to
+     *   the app).
+     * @throws ScpException with code `SCP-CRYPTO-4001` if the handle is a software handle and
+     *   no software key is found under it.
      */
     override fun exportSigningKeyBytes(keyHandle: KeyHandle): ByteArray {
         if (keyHandle.custodyType == CustodyType.HARDWARE) {

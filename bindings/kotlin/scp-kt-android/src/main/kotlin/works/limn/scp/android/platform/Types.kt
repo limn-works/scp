@@ -143,8 +143,9 @@ enum class DestructionMethod {
  *   public key that is not 32 bytes long. [KeyCustodyProvider.dhAgree] raises it for a wrong
  *   key type only when the handle names a software Ed25519 key.
  * - `SCP-CRYPTO-4004`: Key destruction failed
- * - `SCP-CRYPTO-4005`: Signing key export refused, because the key is a Keystore key
- *   (thrown only by [KeyCustodyProvider.exportSigningKeyBytes]; retrying cannot succeed)
+ * - `SCP-CRYPTO-4005`: Signing key export refused, because the handle is a Keystore handle
+ *   (thrown only by [KeyCustodyProvider.exportSigningKeyBytes], from [KeyHandle.custodyType]
+ *   before any key lookup, so a destroyed Keystore handle also gets it; retrying cannot succeed)
  * - `SCP-TRANS-5001`: Push payload has no `scp` field
  * - `SCP-TRANS-5002`: Push payload `scp` field is not `"1"`
  * - `SCP-STORAGE-8001`: Storage key not found. Defined as `AndroidStorage.ERROR_KEY_NOT_FOUND`
@@ -332,7 +333,9 @@ interface KeyCustodyProvider {
      * Destroy key material associated with a handle.
      *
      * After this call, operations with the same handle in the same process throw [ScpException]
-     * with code `SCP-CRYPTO-4001`, except [dhAgree], which throws `SCP-CRYPTO-4002`.
+     * with code `SCP-CRYPTO-4001`, with two exceptions: [dhAgree] throws `SCP-CRYPTO-4002`, and
+     * [exportSigningKeyBytes] on a Keystore handle ([CustodyType.HARDWARE]) throws
+     * `SCP-CRYPTO-4005`, because it refuses on [KeyHandle.custodyType] before any key lookup.
      * [AndroidKeyCustody] removes a software Ed25519 key's persisted
      * seed with an asynchronous `apply()`, so a later process can restore the key when this
      * process dies before the removal reaches disk (see [DestructionAttestation.confirmed]).
@@ -436,10 +439,12 @@ interface KeyCustodyProvider {
      *
      * @param keyHandle Handle to an Ed25519 key.
      * @return 32-byte raw Ed25519 private key bytes.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if key not found.
+     * @throws ScpException with code `SCP-CRYPTO-4001` if the handle is a software handle
+     *   and no software key is found under it.
      * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
-     * @throws ScpException with code `SCP-CRYPTO-4005` if key is a Keystore key
-     *   and cannot be exported (Keystore keys are non-extractable).
+     * @throws ScpException with code `SCP-CRYPTO-4005` if the handle is a Keystore handle
+     *   ([CustodyType.HARDWARE]), checked before any key lookup, so a destroyed or unknown
+     *   Keystore handle also gets this code (Keystore keys are non-extractable).
      */
     fun exportSigningKeyBytes(keyHandle: KeyHandle): ByteArray
 }

@@ -448,8 +448,10 @@ class AndroidStorageTest {
     }
 
     // -------------------------------------------------------------------
-    // AndroidStorage structure and error-code verification. No test here runs
-    // Keystore key derivation; see the file header.
+    // AndroidStorage structure and error-code constant values. No test here runs
+    // Keystore key derivation or any AndroidStorage code that throws these codes,
+    // so none shows which code a failing AndroidStorage call throws; see the file
+    // header.
     // -------------------------------------------------------------------
 
     @Nested
@@ -486,7 +488,7 @@ class AndroidStorageTest {
         }
 
         @Test
-        fun `ScpException for key derivation failure carries correct error code`() {
+        fun `ScpException the test builds with ERROR_KEY_DERIVATION_FAILED carries SCP-STORAGE-8003`() {
             val exception = ScpException(
                 "Failed to derive storage encryption key: test",
                 AndroidStorage.ERROR_KEY_DERIVATION_FAILED
@@ -496,7 +498,7 @@ class AndroidStorageTest {
         }
 
         @Test
-        fun `ScpException for storage operation failure carries correct error code`() {
+        fun `ScpException the test builds with ERROR_STORAGE_OPERATION_FAILED carries SCP-STORAGE-8002`() {
             val exception = ScpException(
                 "Storage set operation failed",
                 AndroidStorage.ERROR_STORAGE_OPERATION_FAILED
