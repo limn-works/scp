@@ -30,6 +30,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -737,8 +739,14 @@ class ScpHotStreamRemountTest {
             assertTrue("the last mount's unmount launched no stop", stop != null)
             assertTrue("a held departure's Job completed before any stop ran", !held.isCompleted)
 
+            assertSame("the last departure did not get the held departure's Job", held, stop)
+
             val third = coordinator.mount("k")
-            assertEquals("a later mount did not capture the pending stop", stop, third.pendingStop)
+            // The captured stop is the launched coroutine, a different object from the Job
+            // unmount returned, which completes only once that coroutine has finished.
+            val pending = checkNotNull(third.pendingStop) { "a later mount did not capture the pending stop" }
+            val pendingDoneAtStop = AtomicBoolean(false)
+            held.invokeOnCompletion { pendingDoneAtStop.set(pending.isCompleted) }
 
             val stopsSeenByStart = AtomicInteger(-1)
             val starting =
@@ -753,6 +761,7 @@ class ScpHotStreamRemountTest {
             assertEquals("a later mount's start ran before the pending stop", 2, stopsSeenByStart.get())
             runBlocking { held.join() }
             assertEquals("a held departure's Job completed before its onStop ran", 2, stops.get())
+            assertTrue("unmount's Job completed before the stop a later mount captured", pendingDoneAtStop.get())
         } finally {
             dispatcherFree.countDown()
             executor.shutdown()
@@ -801,19 +810,26 @@ class ScpHotStreamRemountTest {
 
         val first = checkNotNull(coordinator.unmount(coordinator.startedMount("k")) { stopped += "first" })
         val secondMount = coordinator.mount("k")
-        assertEquals("a later mount did not capture the pending stop", first, secondMount.pendingStop)
+        val firstStop = checkNotNull(secondMount.pendingStop) { "a later mount did not capture the pending stop" }
         val second = checkNotNull(coordinator.unmount(secondMount) { stopped += "second" })
         val third = coordinator.mount("k")
-        assertEquals("a later mount did not capture the newest stop", second, third.pendingStop)
+        val secondStop = checkNotNull(third.pendingStop) { "a later mount did not capture the newest stop" }
+        assertNotSame("a later mount captured the older stop", firstStop, secondStop)
         val firstDoneAtSecond = AtomicBoolean(false)
-        second.invokeOnCompletion { firstDoneAtSecond.set(first.isCompleted) }
+        secondStop.invokeOnCompletion { firstDoneAtSecond.set(firstStop.isCompleted) }
+        val stopDoneAtFirst = AtomicBoolean(false)
+        first.invokeOnCompletion { stopDoneAtFirst.set(firstStop.isCompleted) }
+        val stopDoneAtSecond = AtomicBoolean(false)
+        second.invokeOnCompletion { stopDoneAtSecond.set(secondStop.isCompleted) }
 
         dispatcher.runNewestFirst()
 
         assertEquals("a mount that never started ran onStop", listOf("first"), stopped.toList())
         assertTrue("the later stop finished before the earlier one", firstDoneAtSecond.get())
-        assertTrue("the earlier stop did not finish", first.isCompleted)
-        assertTrue("the later stop did not finish", second.isCompleted)
+        assertTrue("the earlier stop did not finish", firstStop.isCompleted)
+        assertTrue("the later stop did not finish", secondStop.isCompleted)
+        assertTrue("the first departure's Job completed before its stop", first.isCompleted && stopDoneAtFirst.get())
+        assertTrue("the second departure's Job completed before its stop", second.isCompleted && stopDoneAtSecond.get())
     }
 
     /**

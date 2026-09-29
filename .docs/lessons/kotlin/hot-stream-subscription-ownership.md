@@ -68,7 +68,8 @@ subscription that a different caller had just opened.
   captures only the newest stop, and an older stop that reached its dispatcher last would
   otherwise release whatever that mount's start opened. For a departure it holds, `unmount`
   returns a `Job` that the next launched stop completes, and the last departure gets that same
-  `Job`.
+  `Job`. That `Job` is not the launched stop a later mount captures: it completes only after that
+  stop finishes, so a test compares the two by completion order, never by identity.
 - **Derive the key from the stream and the handle.** The coordinator counts and orders mounts
   per key only, while `HotStreamFactory` keys a subscription by context handle alone. A mount
   under `handle` and a mount under `"events" to handle` that both reach one `contextEvents`
