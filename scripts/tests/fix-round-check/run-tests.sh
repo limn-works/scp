@@ -116,11 +116,16 @@
 #     run that activates a narrower feature set than the merge gate resolves and prints
 #     `compile ok` says nothing about the modules it skipped.
 #
-#     Case 23 reads every `scripts/` program a job of `.github/workflows/ci.yml` starts,
-#     subtracts the runner's own GATES array, and asserts that the `scripts/` entry of
-#     UNRUN_LANES names every path that remains. The subtraction is the lane's own
-#     criterion: the lane discloses a command CI runs that no step of the run starts, and
-#     a path in GATES is a command the run does start. That entry is what a fix agent
+#     Case 23 reads every `scripts/` program a job of `.github/workflows/ci.yml` starts
+#     with `bash`, `python3`, `python3.12`, `python3.12 -m pytest` or a `./` path, on a
+#     one-line `run:` step or inside a `run: |` block, subtracts the runner's own GATES
+#     and GATES_NOT_RUN arrays, and asserts that the `scripts/` entry of UNRUN_LANES names
+#     every path that remains. The subtraction is the lane's own criterion: the lane
+#     discloses a command CI runs that no step of the run starts or names. A path in GATES
+#     is a command the run does start. A path in GATES_NOT_RUN is one the run either starts
+#     as its toolchain precondition or names in the header's DOES-NOT-RUN list, and case
+#     22d fails when an unstarted GATES_NOT_RUN path is missing from that list, so the
+#     GATES_NOT_RUN subtraction holds only while case 22d does. That entry is what a fix agent
 #     editing an enforcement gate acts on, and a suite absent from it is a red CI job the
 #     runner's output gave the agent no reason to expect. Two further assertions hold the
 #     case's two inputs non-empty, because an empty lane line matches no suite name and an
@@ -1334,9 +1339,9 @@ else
 fi
 # The two inputs the assertion above reads, each asserted non-empty, because an empty one
 # makes that assertion pass over nothing: an empty LANE_LINE matches no suite name, and an
-# empty suite list gives the loop no iteration. A renamed UNRUN_LANES array, a reworded
-# `run:` step in the workflow and a renamed GATES array each empty one of the two, and
-# each would otherwise leave this case green while reading no lane at all.
+# empty suite list gives the loop no iteration. A renamed UNRUN_LANES array empties the
+# first, and a reworded `run:` step in the workflow that the extractor no longer reads
+# empties the second; each would otherwise leave this case green while reading nothing.
 if [[ -n $LANE_LINE ]]; then
     report "case 23 found the scripts/ entry it reads" 0 ""
 else
@@ -1345,7 +1350,7 @@ fi
 if [[ $LANE_SUITE_COUNT -gt 0 ]]; then
     report "case 23 read a non-empty suite set out of .github/workflows/ci.yml" 0 ""
 else
-    report "case 23 read a non-empty suite set out of .github/workflows/ci.yml" 1 "subtracting the GATES array from the scripts/ programs .github/workflows/ci.yml starts left no path, so the assertion above iterated over nothing and could not fail"
+    report "case 23 read a non-empty suite set out of .github/workflows/ci.yml" 1 "subtracting the GATES and GATES_NOT_RUN arrays from the scripts/ programs .github/workflows/ci.yml starts left no path, so the assertion above iterated over nothing and could not fail"
 fi
 
 # ── Case 24: a caller-named run in a checkout that resolves no origin/main ───────────
@@ -1406,8 +1411,9 @@ fi
 #
 # The case reads both sides: every suite that qualifies has to appear in the entry, and
 # every suite the entry names has to qualify. It iterates LANE_SUITES, the set case 23
-# above reads out of `.github/workflows/ci.yml` and subtracts the GATES array from, so a
-# suite CI gains reaches this case too and a gate the run itself starts stays out of it —
+# above reads out of `.github/workflows/ci.yml` and subtracts the GATES and GATES_NOT_RUN
+# arrays from, so a suite CI gains reaches this case too and a gate the run itself starts
+# or names in its DOES-NOT-RUN list stays out of it —
 # the `.github/` entry names those three gates in its own trailing sentence, as programs
 # the run did start.
 #
