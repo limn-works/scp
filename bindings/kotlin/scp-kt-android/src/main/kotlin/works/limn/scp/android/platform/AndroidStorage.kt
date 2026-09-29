@@ -227,6 +227,11 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         }
     }
 
+    /**
+     * Returns keys matching [prefix], by SQL `LIKE`. SQLite's `LIKE` ignores ASCII letter
+     * case and no `PRAGMA case_sensitive_like` is set, so "ctx.a" also matches "ctx.Abc";
+     * the Rust SqliteStorage and AppleStorage prefix scans are case-sensitive.
+     */
     override fun listKeys(prefix: String): List<String> {
         try {
             val escaped = escapeLikePrefix(prefix)
@@ -250,6 +255,10 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         }
     }
 
+    /**
+     * Deletes keys matching [prefix], by the same case-insensitive SQL `LIKE` as
+     * [listKeys], so deletePrefix("ctx.a") also deletes "ctx.Abc".
+     */
     override fun deletePrefix(prefix: String): Long {
         try {
             val escaped = escapeLikePrefix(prefix)

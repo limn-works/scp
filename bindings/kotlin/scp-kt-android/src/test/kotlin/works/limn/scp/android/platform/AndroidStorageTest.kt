@@ -15,15 +15,25 @@
 // ADR-027 (the Android platform adapter) acceptance criterion 13 requires
 // `storage_conformance!()` against AndroidStorage and a SQLCipher test that opens
 // the raw database file and confirms it is unreadable without the
-// Keystore-derived key, on an API 33+ physical device or an API 33 emulator with
-// Play Store. No such test exists.
+// Keystore-derived key. Criterion 13 separately requires hardware tests to run on
+// an API 33+ physical device or an API 33 emulator with Play Store; it names no
+// device for the SQLCipher test. No such test exists.
 //
 // Test strategies:
 //
 // 1. **Contract tests**: Check the StorageProvider interface contract against
-//    InMemoryStorageProvider, which copies the AndroidStorage semantics (INSERT OR
-//    REPLACE, lexicographic ordering, prefix matching). These tests run no other
-//    StorageProvider implementation, so they show nothing about AndroidStorage.
+//    InMemoryStorageProvider. The double shares INSERT OR REPLACE with AndroidStorage,
+//    but its prefix matching and ordering differ from AndroidStorage's:
+//    - AndroidStorage matches a prefix with SQL `LIKE`, which SQLite matches without
+//      regard to ASCII letter case (no `PRAGMA case_sensitive_like` is set), so
+//      listKeys("ctx.a") also returns "ctx.Abc" and deletePrefix("ctx.a") also deletes
+//      it. The double's `startsWith` is case-sensitive, as are the Rust SqliteStorage
+//      and AppleStorage byte-range scans.
+//    - AndroidStorage orders keys by SQLite's BINARY collation over UTF-8 bytes; the
+//      double's TreeMap orders by UTF-16 code units. The two disagree when one key holds
+//      a character in U+E000..U+FFFF and another a supplementary-plane character.
+//    These tests run no other StorageProvider implementation, so they show nothing
+//    about AndroidStorage.
 //
 // 2. **AndroidStorage constant and signature tests**: Assert the values of
 //    AndroidStorage's constants (Keystore alias, database and column names, error
@@ -54,14 +64,17 @@ import kotlin.reflect.KFunction1
 /**
  * In-memory implementation of [StorageProvider] for contract testing.
  *
- * Mirrors the SQLCipher-backed production semantics: INSERT OR REPLACE on store,
- * lexicographic ordering on listKeys, and prefix-based matching. This implementation
- * validates the StorageProvider contract without requiring Android runtime dependencies.
+ * Shares INSERT OR REPLACE on store with AndroidStorage. Its prefix matching is
+ * case-sensitive `startsWith`, while AndroidStorage's SQL `LIKE` ignores ASCII letter
+ * case, and its ordering is by UTF-16 code units, while AndroidStorage's is by UTF-8
+ * bytes; the file header states both differences. This implementation checks the
+ * StorageProvider contract without Android runtime dependencies.
  */
 class InMemoryStorageProvider : StorageProvider {
 
-    // TreeMap provides natural lexicographic ordering, matching SQLCipher's
-    // ORDER BY key ASC behavior. TreeMap is not thread-safe, and the
+    // TreeMap orders keys by UTF-16 code units. SQLCipher's ORDER BY key ASC orders
+    // by UTF-8 bytes, which differs only for keys holding characters in U+E000..U+FFFF
+    // and supplementary-plane characters. TreeMap is not thread-safe, and the
     // StorageProvider contract requires concurrent callers not to interfere
     // (conformance case 12, concurrent_access), so every operation holds [lock].
     private val lock = Any()
