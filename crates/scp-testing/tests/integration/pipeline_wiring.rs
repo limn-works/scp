@@ -3322,13 +3322,15 @@ const HELD_READ: &str = "fn gate_role_state(bi: &Bi, context_id: &str) -> R {\n 
                   return Ok(\n            \
                   crate::runtime::with_context(bi, context_id, |rt| Ok(rt.role_state.clone())).ok(),\n        \
                   );\n    };\n    \
+                  let supervisor = Arc::clone(supervisor);\n    \
                   let id = context_id.to_owned();\n    \
                   block_on(async move { supervisor.get_role_state_checked(&id).await })\n}\n\
                   fn outlet_grant() {}\n";
 
 /// The source gate must go red when the role-state read returns a stand-in on
-/// either branch, reads something other than the bound supervisor, or reports
-/// a held context as absent.
+/// either branch, asks a receiver other than the supervisor it bound from
+/// `bi`, asks about an id other than its `context_id` parameter, or reports a
+/// held context as absent.
 #[test]
 fn mcp_role_state_gate_rejects_a_stand_in_below_gate_role_state() {
     assert!(reads_role_state_from_its_own_source(&production_code(
@@ -3340,9 +3342,25 @@ fn mcp_role_state_gate_rejects_a_stand_in_below_gate_role_state() {
          );",
         "return Ok(None);",
     );
+    let uniffi_form = uniffi_form
+        .replace("Some(supervisor)", "Some(sup)")
+        .replace(
+            "let supervisor = Arc::clone(supervisor);",
+            "let sup = Arc::clone(sup);",
+        )
+        .replace(
+            "{ supervisor.get_role_state_checked",
+            "{ sup.get_role_state_checked",
+        );
     assert!(reads_role_state_from_its_own_source(&production_code(
-        &uniffi_form.replace("Some(supervisor)", "Some(sup)")
+        &uniffi_form
     )));
+    // The UniFFI form binds `sup`, so a call on `supervisor` there asks a
+    // receiver the function never bound from `bi`.
+    let uniffi_wrong_receiver = uniffi_form.replace(
+        "{ sup.get_role_state_checked",
+        "{ supervisor.get_role_state_checked",
+    );
     let stand_in_first = HELD_READ.replace(
         "let id =",
         "return Ok(Some(ContextRoleState::default()));\n    let id =",
@@ -3368,6 +3386,26 @@ fn mcp_role_state_gate_rejects_a_stand_in_below_gate_role_state() {
         "match held_role_state(bi, context_id) {",
         "match cached_role_state(bi, context_id) {",
     );
+    let rebound_receiver = HELD_READ.replace(
+        "let supervisor = Arc::clone(supervisor);",
+        "let supervisor = Arc::clone(&other_instance_supervisor);",
+    );
+    let rebound_id = HELD_READ.replace(
+        "let id = context_id.to_owned();",
+        "let id = cached_context_id.clone();",
+    );
+    let shadowed_receiver = HELD_READ.replace(
+        "block_on(async move",
+        "let supervisor = other_instance_supervisor();\n    block_on(async move",
+    );
+    let shadowed_id = HELD_READ.replace(
+        "block_on(async move",
+        "let id: String = cached_context_id();\n    block_on(async move",
+    );
+    let other_receiver = HELD_READ.replace(
+        "{ supervisor.get_role_state_checked",
+        "{ other.supervisor.get_role_state_checked",
+    );
     for regression in [
         stand_in_first,
         no_supervisor_stand_in,
@@ -3376,6 +3414,12 @@ fn mcp_role_state_gate_rejects_a_stand_in_below_gate_role_state() {
         unwrapped,
         absent,
         unknown_read,
+        uniffi_wrong_receiver,
+        rebound_receiver,
+        rebound_id,
+        shadowed_receiver,
+        shadowed_id,
+        other_receiver,
     ] {
         assert!(
             !reads_role_state_from_its_own_source(&production_code(&regression)),
@@ -3700,17 +3744,34 @@ fn after_open_parens<const OPEN: usize>(text: &str) -> Option<&str> {
 /// NAPI, which keep one) or `Ok(None)` (on `UniFFI`, which keeps no copy);
 /// otherwise it asks the supervisor it bound with `get_role_state_checked`.
 ///
+/// The two statements right after that branch must be `let <name> =
+/// Arc::clone(<name>);` and `let id = context_id.to_owned();`, where `<name>`
+/// is the supervisor the branch bound from `bi.core.try_supervisor()`. The rest
+/// of the function must call `<name>.get_role_state_checked(&id).await` as the
+/// first expression of an `async move` block and must not rebind `<name>` or
+/// `id` with a `let`. A rebinding through a closure or pattern parameter is
+/// not checked.
+///
 /// Outside that no-supervisor branch the function must not contain `Some(`,
 /// `Ok(None)` or `default(`. Those three spellings are indicators of a stand-in
 /// role state or a held context reported absent; the gate does not prove the
 /// supervisor's answer is returned unaltered by some other spelling.
 fn reads_role_state_from_its_own_source(code: &str) -> bool {
-    const NO_SUPERVISOR: [&str; 3] = [
-        "letSome(supervisor)=bi.core.try_supervisor()else{returnOk(crate::runtime::\
-         with_context(bi,context_id,|rt|{Ok(rt.role_state.clone())}).ok());};",
-        "letSome(supervisor)=bi.core.try_supervisor()else{returnOk(crate::runtime::\
-         with_context(bi,context_id,|rt|Ok(rt.role_state.clone())).ok(),);};",
-        "letSome(sup)=bi.core.try_supervisor()else{returnOk(None);};",
+    const NO_SUPERVISOR: [(&str, &str); 3] = [
+        (
+            "letSome(supervisor)=bi.core.try_supervisor()else{returnOk(crate::runtime::\
+             with_context(bi,context_id,|rt|{Ok(rt.role_state.clone())}).ok());};",
+            "supervisor",
+        ),
+        (
+            "letSome(supervisor)=bi.core.try_supervisor()else{returnOk(crate::runtime::\
+             with_context(bi,context_id,|rt|Ok(rt.role_state.clone())).ok(),);};",
+            "supervisor",
+        ),
+        (
+            "letSome(sup)=bi.core.try_supervisor()else{returnOk(None);};",
+            "sup",
+        ),
     ];
     const STAND_INS: [&str; 3] = ["Some(", "Ok(None)", "default("];
     let Some(gate) = fn_body(code, "gate_role_state") else {
@@ -3722,12 +3783,27 @@ fn reads_role_state_from_its_own_source(code: &str) -> bool {
         .any(|(_, name)| {
             fn_body(code, name).is_some_and(|body| {
                 let body: String = body.split_whitespace().collect();
-                NO_SUPERVISOR.iter().any(|branch| {
+                NO_SUPERVISOR.iter().any(|(branch, receiver)| {
                     body.split_once(branch).is_some_and(|(before, after)| {
-                        after.contains(".get_role_state_checked(&id).await")
-                            && !STAND_INS
-                                .iter()
-                                .any(|s| before.contains(s) || after.contains(s))
+                        let bound = format!(
+                            "let{receiver}=Arc::clone({receiver});letid=context_id.to_owned();"
+                        );
+                        let call =
+                            format!("asyncmove{{{receiver}.get_role_state_checked(&id).await");
+                        let rebinds = [
+                            format!("let{receiver}="),
+                            format!("let{receiver}:"),
+                            format!("letmut{receiver}"),
+                            "letid=".to_owned(),
+                            "letid:".to_owned(),
+                            "letmutid".to_owned(),
+                        ];
+                        after.strip_prefix(bound.as_str()).is_some_and(|rest| {
+                            rest.contains(call.as_str())
+                                && !rebinds.iter().any(|r| rest.contains(r.as_str()))
+                        }) && !STAND_INS
+                            .iter()
+                            .any(|s| before.contains(s) || after.contains(s))
                     })
                 })
             })
