@@ -69,8 +69,9 @@ use crate::validate;
 struct StdioClientTransport {
     /// The spawned subprocess, kept apart from the pipes an in-flight call
     /// holds so a disconnect can stop it while a call waits on its stdout.
-    /// On Unix it leads its own process group. `py_mcp_client_disconnect`
-    /// or, at the latest, [`Drop`] kills that group and reaps the subprocess
+    /// On Unix it leads its own process group. Dropping the handle's
+    /// [`McpClientState`] or, at the latest, this transport's [`Drop`] kills
+    /// that group and reaps the subprocess
     /// through [`stop_stdio_server`], which empties the slot.
     child: Arc<Mutex<Option<Child>>>,
     /// The subprocess's stdin writer and stdout reader.
@@ -117,7 +118,12 @@ impl StdioClientTransport {
         // A launcher such as `npx` or `uvx` runs the real server as its own
         // child, which inherits the stdout pipe. The subprocess leads a new
         // process group so `stop_server_process` can kill that descendant
-        // too; killing the launcher alone would leave the pipe open.
+        // too; killing the launcher alone would leave the pipe open. That
+        // group is not the terminal's foreground group, so a Ctrl-C or hangup
+        // reaches the host and not the server. A host killed that way runs no
+        // destructor; the server then sees EOF on stdin, which the MCP stdio
+        // transport names as its shutdown signal, and a server that ignores
+        // that EOF outlives the host.
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut server, 0);
         let mut child = server
@@ -151,7 +157,7 @@ impl StdioClientTransport {
 /// Kills a stdio server's process group and reaps the server, once.
 ///
 /// The server leaves its slot under the slot's lock, so a later call (the
-/// transport's [`Drop`] after `py_mcp_client_disconnect`) finds the slot
+/// transport's [`Drop`] after the [`McpClientState`] drop) finds the slot
 /// empty and signals nothing. A second `stop_server_process` on the same
 /// reaped `Child` would not be safe: it decides whether to signal the group
 /// from a `waitid` on the raw pid, and once the server is reaped that pid can
@@ -1180,13 +1186,26 @@ pub(crate) struct McpClientState {
     url: Option<String>,
     /// The real MCP client, connected and initialized.
     client: Arc<Mutex<McpClient<ClientTransport, SystemTimestamp>>>,
-    /// A stdio client's subprocess, which `py_mcp_client_disconnect` kills
-    /// directly: an in-flight call's clone of `client` would otherwise keep
-    /// the subprocess alive, and a thread parked on its stdout, for as long
-    /// as the server stays silent. `None` for an SSE client: a disconnect
-    /// does not end an in-flight SSE call, which waits on a POST with no read
-    /// timeout until the server answers or closes the connection.
+    /// A stdio client's subprocess, which this state's [`Drop`] kills
+    /// directly, whether `py_mcp_client_disconnect` removes the state or
+    /// instance shutdown clears the registry: an in-flight call's clone of
+    /// `client` would otherwise keep the subprocess alive, and a thread parked
+    /// on its stdout, for as long as the server stays silent. `None` for an
+    /// SSE client: dropping the state does not end an in-flight SSE call,
+    /// which waits on a POST with no read timeout until the server answers or
+    /// closes the connection.
     stdio_server: Option<Arc<Mutex<Option<Child>>>>,
+}
+
+impl Drop for McpClientState {
+    fn drop(&mut self) {
+        // A stdio server, and every process in its process group, is dead
+        // once the state drops, even while a call on the handle is in flight;
+        // that call then fails on the closed stdout.
+        if let Some(server) = &self.stdio_server {
+            stop_stdio_server(server);
+        }
+    }
 }
 
 // Phase D (#1695): `server_registry()` / `client_registry()` default-bridge
@@ -1624,7 +1643,11 @@ impl crate::scp::PyScp {
 impl crate::scp::PyScp {
     #[pyo3(name = "py_mcp_client_connect_stdio")]
     #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for method arguments.
-    pub fn py_mcp_client_connect_stdio(&self, command: Vec<String>) -> PyResult<String> {
+    pub fn py_mcp_client_connect_stdio(
+        &self,
+        py: Python<'_>,
+        command: Vec<String>,
+    ) -> PyResult<String> {
         let bi = &*self.inner;
         if command.is_empty() {
             return Err(
@@ -1633,16 +1656,23 @@ impl crate::scp::PyScp {
         }
 
         // Spawn the subprocess and create the transport. Allowlist is
-        // per-instance (lives on `CoreFields::mcp_allowlist`).
-        let transport = StdioClientTransport::spawn(bi.core.mcp_allowlist(), &command)
-            .map_err(|e| ScpPyError::transport(format!("failed to connect stdio client: {e}")))?;
-        let server = transport.server_process();
+        // per-instance (lives on `CoreFields::mcp_allowlist`). The GIL is
+        // released for the spawn and the blocking handshake, so a silent
+        // server stalls only this thread.
+        let (client, server) = py.allow_threads(|| {
+            let transport = StdioClientTransport::spawn(bi.core.mcp_allowlist(), &command)
+                .map_err(|e| {
+                    ScpPyError::transport(format!("failed to connect stdio client: {e}"))
+                })?;
+            let server = transport.server_process();
 
-        // Create the MCP client and perform the initialize handshake.
-        let mut client = McpClient::new(ClientTransport::Stdio(transport));
-        client
-            .initialize()
-            .map_err(|e| ScpPyError::transport(format!("MCP initialize handshake failed: {e}")))?;
+            // Create the MCP client and perform the initialize handshake.
+            let mut client = McpClient::new(ClientTransport::Stdio(transport));
+            client.initialize().map_err(|e| {
+                ScpPyError::transport(format!("MCP initialize handshake failed: {e}"))
+            })?;
+            Ok::<_, ScpPyError>((client, server))
+        })?;
 
         let handle = generate_handle_id("mcp-client");
         let state = McpClientState {
@@ -1687,21 +1717,24 @@ impl crate::scp::PyScp {
     #[pyo3(name = "py_mcp_client_connect_sse", signature = (url, auth_token))]
     pub fn py_mcp_client_connect_sse(
         &self,
+        py: Python<'_>,
         url: &str,
         auth_token: Option<&str>,
     ) -> PyResult<String> {
         let bi = &*self.inner;
         validate::validate_relay_url(url)?;
 
-        // Connect to the SSE endpoint.
-        let transport = SseClientTransport::connect(url, auth_token)
-            .map_err(|e| ScpPyError::transport(format!("failed to connect SSE client: {e}")))?;
-
-        // Create the MCP client and perform the initialize handshake.
-        let mut client = McpClient::new(ClientTransport::Sse(transport));
-        client
-            .initialize()
-            .map_err(|e| ScpPyError::transport(format!("MCP initialize handshake failed: {e}")))?;
+        // Connect to the SSE endpoint and perform the initialize handshake
+        // with the GIL released, so a silent server stalls only this thread.
+        let client = py.allow_threads(|| {
+            let transport = SseClientTransport::connect(url, auth_token)
+                .map_err(|e| ScpPyError::transport(format!("failed to connect SSE client: {e}")))?;
+            let mut client = McpClient::new(ClientTransport::Sse(transport));
+            client.initialize().map_err(|e| {
+                ScpPyError::transport(format!("MCP initialize handshake failed: {e}"))
+            })?;
+            Ok::<_, ScpPyError>(client)
+        })?;
 
         let handle = generate_handle_id("mcp-client");
         let state = McpClientState {
@@ -1750,12 +1783,10 @@ impl crate::scp::PyScp {
 
         // A call in flight on this handle holds its own clone of
         // `state.client`, so dropping `state` does not drop the transport.
-        // Killing the stdio subprocess's process group here ends it now; the
-        // in-flight call then fails on the closed stdout and drops the last
-        // clone.
-        if let Some(server) = state.stdio_server {
-            stop_stdio_server(&server);
-        }
+        // The state's `Drop` kills the stdio subprocess's process group here;
+        // the in-flight call then fails on the closed stdout and drops the
+        // last clone.
+        drop(state);
 
         Ok(())
     }
@@ -1793,14 +1824,17 @@ impl crate::scp::PyScp {
         let client = Arc::clone(&entry.client);
         drop(entry); // Release the DashMap guard before blocking.
 
-        let outlets = {
+        // The GIL is released for the blocking request, so another Python
+        // thread can run, including a `py_mcp_client_disconnect` that ends
+        // this call against a silent stdio server.
+        let outlets = py.allow_threads(|| {
             let client_guard = client
                 .lock()
                 .map_err(|e| ScpPyError::transport(format!("client lock poisoned: {e}")))?;
             client_guard
                 .list_tools()
-                .map_err(|e| ScpPyError::transport(format!("tools/list failed: {e}")))?
-        };
+                .map_err(|e| ScpPyError::transport(format!("tools/list failed: {e}")))
+        })?;
 
         // Convert outlet definitions to JSON array for Python.
         let outlets_json: Vec<serde_json::Value> = outlets
@@ -1868,14 +1902,16 @@ impl crate::scp::PyScp {
         let input_json = py_dict_to_json(input)?;
 
         // Send the real tools/call request via the MCP client.
-        let result = {
+        // The GIL is released for the blocking request, as in
+        // `py_mcp_client_list_tools`.
+        let result = py.allow_threads(|| {
             let client_guard = client
                 .lock()
                 .map_err(|e| ScpPyError::transport(format!("client lock poisoned: {e}")))?;
             client_guard
                 .invoke(outlet_name, input_json, context_id, identity_did)
-                .map_err(|e| ScpPyError::transport(format!("tools/call failed: {e}")))?
-        };
+                .map_err(|e| ScpPyError::transport(format!("tools/call failed: {e}")))
+        })?;
 
         // Convert the McpToolResult to a Python dict.
         let content_json: Vec<serde_json::Value> = result
@@ -3342,8 +3378,14 @@ mod tests {
             }
             head
         });
-        let result =
-            scp.py_mcp_client_connect_sse(&format!("http://127.0.0.1:{port}/sse"), Some("tok-1"));
+        pyo3::prepare_freethreaded_python();
+        let result = Python::with_gil(|py| {
+            scp.py_mcp_client_connect_sse(
+                py,
+                &format!("http://127.0.0.1:{port}/sse"),
+                Some("tok-1"),
+            )
+        });
         let head = server.join().expect("server thread");
         assert!(
             head.contains("\r\nAuthorization: Bearer tok-1\r\n"),
@@ -3884,54 +3926,99 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// A `tools/list` in flight against a silent stdio server holds its own
-    /// clone of the client, so dropping the registry's copy does not drop the
-    /// transport. `py_mcp_client_disconnect` kills the server's process
-    /// group, and the in-flight call then ends on the closed stdout. The stub
-    /// answers `initialize`, then runs `sleep` as its own child, the way `npx`
-    /// runs the real server: the trailing `true` keeps `sh` from exec'ing it.
-    /// That grandchild holds the stdout pipe, so the in-flight call ends only
-    /// when the disconnect kills it as well as the direct child.
+    /// Connects `scp` through `py_mcp_client_connect_stdio` to a stub server
+    /// that answers `initialize` and then falls silent, and starts a
+    /// `py_mcp_client_list_tools` on it from a Python thread. The stub runs
+    /// `sleep` as its own child, the way `npx` runs the real server: the
+    /// trailing `true` keeps `sh` from exec'ing it. That grandchild holds the
+    /// stdout pipe, so the in-flight call ends only when its whole process
+    /// group is killed. Returns the handle, the server's slot, and a receiver
+    /// that yields whether the in-flight call failed.
     #[cfg(unix)]
-    #[test]
-    fn disconnect_kills_the_stdio_servers_process_group_under_an_in_flight_call() {
-        let scp = crate::scp::PyScp::new_in_memory_for_test();
-        let mut allowlist = allowlist::StdioAllowlist::new_with_defaults();
-        allowlist.configure(&["sh"]).expect("allow sh");
-        let allowlist = Mutex::new(allowlist);
+    fn start_call_on_a_silent_stdio_server(
+        scp: &crate::scp::PyScp,
+    ) -> (
+        String,
+        Arc<Mutex<Option<Child>>>,
+        std::sync::mpsc::Receiver<bool>,
+    ) {
+        pyo3::prepare_freethreaded_python();
+        scp.inner
+            .core
+            .mcp_allowlist()
+            .lock()
+            .expect("allowlist lock")
+            .configure(&["sh"])
+            .expect("allow sh");
         let script = "read l; \
             echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\
             \"capabilities\":{},\"serverInfo\":{\"name\":\"stub\"}}}'; \
             sleep 600; true";
-        let transport = StdioClientTransport::spawn(
-            &allowlist,
-            &["sh".to_owned(), "-c".to_owned(), script.to_owned()],
-        )
-        .expect("spawn stub server");
-        let server = transport.server_process();
-        let mut client = McpClient::new(ClientTransport::Stdio(transport));
-        client.initialize().expect("initialize against the stub");
-        let client = Arc::new(Mutex::new(client));
-        let handle = generate_handle_id("mcp-client");
-        client_registry_of(&scp.inner).insert(
-            handle.clone(),
-            McpClientState {
-                transport: "stdio".to_owned(),
-                command: None,
-                url: None,
-                client: Arc::clone(&client),
-                stdio_server: Some(Arc::clone(&server)),
-            },
-        );
+        let handle = Python::with_gil(|py| {
+            scp.py_mcp_client_connect_stdio(
+                py,
+                vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+            )
+        })
+        .expect("connect to the stub server");
+        let server = client_registry_of(&scp.inner)
+            .get(&handle)
+            .expect("registered handle")
+            .stdio_server
+            .clone()
+            .expect("a stdio client records its server");
 
+        let caller = crate::scp::PyScp {
+            inner: Arc::clone(&scp.inner),
+        };
+        let call_handle = handle.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let listed = client.lock().expect("client lock").list_tools();
-            let _ = done_tx.send(listed.is_err());
+            let failed =
+                Python::with_gil(|py| caller.py_mcp_client_list_tools(py, &call_handle).is_err());
+            let _ = done_tx.send(failed);
         });
         std::thread::sleep(std::time::Duration::from_millis(300));
-        scp.py_mcp_client_disconnect(&handle)
-            .expect("disconnect a known handle");
+        (handle, server, done_rx)
+    }
+
+    /// Runs `stop` on a Python thread of its own and waits for it to return.
+    /// The in-flight call releases the GIL, so `stop` gets it; a call that
+    /// held the GIL through its blocking read would leave `stop` waiting
+    /// here until the timeout.
+    #[cfg(unix)]
+    fn run_on_a_second_python_thread(stop: impl FnOnce(Python<'_>) + Send + 'static) {
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            Python::with_gil(stop);
+            let _ = stopped_tx.send(());
+        });
+        stopped_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect(
+                "the in-flight call must release the GIL so a second Python thread can stop it",
+            );
+    }
+
+    /// A `tools/list` in flight against a silent stdio server holds its own
+    /// clone of the client, so dropping the registry's copy does not drop the
+    /// transport. `py_mcp_client_disconnect`, called from a second Python
+    /// thread, kills the server's process group, and the in-flight call then
+    /// ends on the closed stdout.
+    #[cfg(unix)]
+    #[test]
+    fn disconnect_kills_the_stdio_servers_process_group_under_an_in_flight_call() {
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        let (handle, server, done_rx) = start_call_on_a_silent_stdio_server(&scp);
+
+        let disconnector = crate::scp::PyScp {
+            inner: Arc::clone(&scp.inner),
+        };
+        run_on_a_second_python_thread(move |_py| {
+            disconnector
+                .py_mcp_client_disconnect(&handle)
+                .expect("disconnect a known handle");
+        });
 
         assert!(
             server.lock().expect("server lock").is_none(),
@@ -3940,6 +4027,34 @@ mod tests {
         let failed = done_rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the in-flight call must end once disconnect kills the server's grandchild");
+        assert!(failed, "the killed stub server sent no tools/list response");
+    }
+
+    /// Instance shutdown clears the client registry while a `tools/list` is
+    /// in flight against a silent stdio server. Dropping the client state
+    /// kills the server's process group, as a disconnect does, and the
+    /// in-flight call then ends on the closed stdout.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_kills_the_stdio_servers_process_group_under_an_in_flight_call() {
+        crate::init_runtime().expect("tokio runtime for SCP.shutdown");
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        let (_handle, server, done_rx) = start_call_on_a_silent_stdio_server(&scp);
+
+        let owner = crate::scp::PyScp {
+            inner: Arc::clone(&scp.inner),
+        };
+        run_on_a_second_python_thread(move |py| {
+            owner.shutdown(py, 1_000).expect("shut the instance down");
+        });
+
+        assert!(
+            server.lock().expect("server lock").is_none(),
+            "shutdown must kill and reap the stdio server process"
+        );
+        let failed = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the in-flight call must end once shutdown kills the server's grandchild");
         assert!(failed, "the killed stub server sent no tools/list response");
     }
 
