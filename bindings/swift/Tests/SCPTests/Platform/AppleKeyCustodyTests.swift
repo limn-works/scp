@@ -388,9 +388,15 @@
             let second = try await custody.sign(pseudonym.keyId, data: digest)
             #expect(first == second, "software pseudonym signatures must be deterministic")
 
-            // A pseudonym key signs only a 32-byte digest.
-            await #expect(throws: PlatformError.self) {
+            // A pseudonym key signs only a 32-byte digest; the shared helper's
+            // `SCP-VALID-7005` reaches the caller unchanged, as in Kotlin.
+            do {
                 _ = try await custody.sign(pseudonym.keyId, data: Data("12 bytes....".utf8))
+                Issue.record("a 12-byte digest signed")
+            } catch let ScpError.Validation(_, code) {
+                #expect(code == "SCP-VALID-7005")
+            } catch {
+                Issue.record("expected ScpError.Validation, got \(error)")
             }
 
             // Cleanup

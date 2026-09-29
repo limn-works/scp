@@ -698,8 +698,12 @@ public extension AppleKeyCustody {
     ///   unknown, ``PlatformError/biometricAuthenticationFailed(_:)`` if
     ///   biometric gating is active and authentication fails,
     ///   ``PlatformError/keychainError(_:)`` for Keychain failures,
-    ///   ``PlatformError/custodyError(_:)`` if CryptoKit or the Rust P-256
-    ///   signer rejects the key bytes.
+    ///   ``PlatformError/custodyError(_:)`` if CryptoKit rejects Ed25519 key
+    ///   bytes. For a P-256 pseudonym key the shared Rust helper's error
+    ///   propagates unchanged: ``ScpError/Validation(msg:code:)`` with
+    ///   `SCP-VALID-7005` if `data` or the stored scalar is not 32 bytes, and
+    ///   ``ScpError/Crypto(msg:code:)`` with `SCP-CRYPTO-4001` if the scalar
+    ///   is out of range.
     ///
     /// See ADR-025 Key custody and ADR-006 `sign`.
     @concurrent
@@ -722,6 +726,10 @@ public extension AppleKeyCustody {
             return try signingKey.signature(for: data)
         } catch let platformErr as PlatformError {
             throw platformErr
+        } catch let scpErr as ScpError {
+            // The shared P-256 helper's typed error and code reach the caller
+            // unchanged, as in the Kotlin SDK.
+            throw scpErr
         } catch {
             throw PlatformError.custodyError(
                 "\(storedType == .p256Pseudonym ? "P-256 pseudonym" : "Ed25519") signing failed for handle "
