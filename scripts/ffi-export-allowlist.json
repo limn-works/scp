@@ -808,24 +808,6 @@
       "path": "crates/scp-ffi/uniffi/src/server.rs",
       "kind": "lifecycle",
       "reason": "Instance lifecycle (shutdown); not a parity operation."
-    },
-    {
-      "name": "p256_seed_to_scalar",
-      "path": "crates/scp-ffi/uniffi/src/p256_host.rs",
-      "kind": "bridge-specific",
-      "reason": "\u00a79.10.4 / SCP-307: the FIPS 186-5 A.2.1 seed-to-scalar reduction for Swift and Kotlin custody hosts, which hold pseudonym scalars themselves, so no host re-implements it. UniFFI-only by the binding model: the TypeScript and Python hosts sign through their own custody providers and the in-process Rust custody calls scp-crypto directly."
-    },
-    {
-      "name": "p256_public_key",
-      "path": "crates/scp-ffi/uniffi/src/p256_host.rs",
-      "kind": "bridge-specific",
-      "reason": "\u00a79.10.4 / SCP-307: the 33-byte compressed P-256 point of a host-held pseudonym scalar, for the Swift and Kotlin custody hosts. UniFFI-only by the binding model (see p256_seed_to_scalar)."
-    },
-    {
-      "name": "p256_sign_prehash_rfc6979",
-      "path": "crates/scp-ffi/uniffi/src/p256_host.rs",
-      "kind": "bridge-specific",
-      "reason": "\u00a79.5 / \u00a79.10.4 / SCP-307: RFC 6979 low-s prehash ECDSA for a host-held pseudonym scalar, so the Swift and Kotlin software signers meet \u00a79.5's deterministic-nonce rule without their own ECDSA. UniFFI-only by the binding model (see p256_seed_to_scalar)."
     }
   ],
   "napi": [

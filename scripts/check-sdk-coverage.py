@@ -110,6 +110,23 @@ SDK_EXTENSIONS: dict[str, str] = {
 # Do NOT "simplify" by deleting these entries: removing one re-opens a
 # fail-closed gap for that op.
 ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
+    # P-256 custody-host helpers are module-level free functions named without
+    # a domain prefix in every SDK.
+    ("Crypto", "p256_seed_to_scalar"): {
+        "python": ["p256_seed_to_scalar"],
+        "typescript": ["p256SeedToScalar"],
+        "swift": ["p256SeedToScalar"],
+    },
+    ("Crypto", "p256_public_key"): {
+        "python": ["p256_public_key"],
+        "typescript": ["p256PublicKey"],
+        "swift": ["p256PublicKey"],
+    },
+    ("Crypto", "p256_sign_prehash_rfc6979"): {
+        "python": ["p256_sign_prehash_rfc6979"],
+        "typescript": ["p256SignPrehashRfc6979"],
+        "swift": ["p256SignPrehashRfc6979"],
+    },
     # Identity attestations carry the "Link" infix across all SDKs.
     ("Identity", "create_attestation"): {
         "python": ["create_identity_link_attestation"],

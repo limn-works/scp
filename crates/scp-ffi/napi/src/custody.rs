@@ -229,16 +229,18 @@ fn host_value<R: HostOutcome>(
     method: &str,
     call: napi::Result<R>,
 ) -> Result<R::Value, PlatformError> {
-    host_value_with(method, call, scp_ffi_common::custody_parse::host_failure)
+    host_value_with(method, call, |code, message| {
+        scp_ffi_common::custody_parse::host_failure(method, code, message)
+    })
 }
 
 /// [`host_value`] with the host-reported failure mapped by `on_host_failure`
-/// (given `method`, the host's code and its message) in place of the shared
-/// custody mapping.
+/// (given the host's code and its message) in place of the shared custody
+/// mapping. `method` names the called host method in the bridge-side errors.
 fn host_value_with<R: HostOutcome>(
     method: &str,
     call: napi::Result<R>,
-    on_host_failure: fn(&str, Option<&str>, &str) -> PlatformError,
+    on_host_failure: impl FnOnce(Option<&str>, &str) -> PlatformError,
 ) -> Result<R::Value, PlatformError> {
     let outcome = call.map_err(|e| {
         PlatformError::CustodyError(format!("KeyCustodyProvider.{method} call failed: {e}"))
@@ -249,7 +251,6 @@ fn host_value_with<R: HostOutcome>(
             "KeyCustodyProvider.{method} reported success with no value"
         ))),
         Err((code, message)) => Err(on_host_failure(
-            method,
             code.as_deref(),
             message.as_deref().unwrap_or_default(),
         )),
@@ -410,12 +411,14 @@ impl NapiCallbackKeyCustody {
             &result.key_id,
         )?;
         let host_public_key = host_value_with(
-            method,
+            "get_public_key",
             self.tsfns
                 .get_public_key
                 .call_async(pseudonym.key_handle().id().to_string())
                 .await,
-            scp_ffi_common::custody_parse::pseudonym_lookup_failure,
+            |code, message| {
+                scp_ffi_common::custody_parse::pseudonym_lookup_failure(method, code, message)
+            },
         )
         .map_err(|e| scp_ffi_common::custody_parse::pseudonym_lookup_error(method, e))?;
         self.pseudonyms.bind(method, &pseudonym, &host_public_key)?;

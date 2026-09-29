@@ -285,19 +285,18 @@ impl PyKeyCustodyProvider {
     where
         T: for<'py> pyo3::FromPyObject<'py>,
     {
-        self.call_str_with(method_name, key_id, |code, message| {
-            scp_ffi_common::custody_parse::host_failure(method_name, code, message)
+        self.call_str_with(method_name, key_id, |py, e| {
+            Self::call_err(py, method_name, e)
         })
     }
 
-    /// [`Self::call_str`] with a raised exception mapped by `on_raise` (given
-    /// the exception's `code` attribute and its text) in place of the shared
-    /// custody mapping.
+    /// [`Self::call_str`] with a raised exception mapped by `on_raise` in
+    /// place of the shared custody mapping ([`Self::call_err`]).
     fn call_str_with<T>(
         &self,
         method_name: &str,
         key_id: &str,
-        on_raise: impl FnOnce(Option<&str>, &str) -> PlatformError,
+        on_raise: impl FnOnce(Python<'_>, &PyErr) -> PlatformError,
     ) -> Result<T, PlatformError>
     where
         T: for<'py> pyo3::FromPyObject<'py>,
@@ -307,7 +306,7 @@ impl PyKeyCustodyProvider {
                 .obj
                 .bind(py)
                 .call_method1(method_name, (key_id,))
-                .map_err(|e| on_raise(Self::exc_code(py, &e).as_deref(), &e.to_string()))?;
+                .map_err(|e| on_raise(py, &e))?;
             result
                 .extract::<T>()
                 .map_err(|e| Self::type_err(method_name, &e))
@@ -397,9 +396,18 @@ impl PyKeyCustodyProvider {
             .and_then(|c| c.extract::<String>().ok())
     }
 
+    /// A result that did not extract. A derive method's error names the
+    /// shape it must return, since a dict or a bare `bytes` is the usual
+    /// mistake.
     fn type_err(method_name: &str, e: &PyErr) -> PlatformError {
+        let expected = match method_name {
+            "derive_pseudonym" | "derive_rotatable_pseudonym" => {
+                " (expected PseudonymResult(public_key: bytes, key_id: str) or a (bytes, str) tuple)"
+            }
+            _ => "",
+        };
         PlatformError::CustodyError(format!(
-            "KeyCustodyProvider.{method_name} returned an unexpected type: {e}"
+            "KeyCustodyProvider.{method_name} returned an unexpected type{expected}: {e}"
         ))
     }
 }
@@ -451,10 +459,10 @@ impl FfiKeyCustody {
 ///   33-byte compressed point for a pseudonym key id.
 /// - `destroy_key(key_id: str) -> None`.
 /// - `dh_agree(key_id: str, peer_public: bytes) -> bytes` — 32 shared bytes.
-/// - `derive_pseudonym(key_id: str, context_id: bytes) -> tuple[bytes, str]` —
-///   `(public_key, key_id)`: the 33-byte compressed P-256 point and the key id
+/// - `derive_pseudonym(key_id: str, context_id: bytes) -> PseudonymResult` —
+///   `scp_sdk.PseudonymResult(public_key, key_id)` (any `(bytes, str)` tuple): the 33-byte compressed P-256 point and the key id
 ///   of its signing key, whose `get_public_key` must return the same point.
-/// - `derive_rotatable_pseudonym(key_id: str, context_id: bytes, pseudonym_epoch: int) -> tuple[bytes, str]`
+/// - `derive_rotatable_pseudonym(key_id: str, context_id: bytes, pseudonym_epoch: int) -> PseudonymResult`
 ///   — `(public_key, key_id)`, checked as above. The provider performs the canonical
 ///   v2 derivation (HMAC key is the private-derived `pseudonym_secret`, domain
 ///   `"scp-pseudonym-v2"`); the bridge does NOT synthesize the preimage.
@@ -502,8 +510,12 @@ impl PyCallbackKeyCustody {
             .call_str_with(
                 "get_public_key",
                 &pseudonym.key_handle().id().to_string(),
-                |code, message| {
-                    scp_ffi_common::custody_parse::pseudonym_lookup_failure(method, code, message)
+                |py, e| {
+                    scp_ffi_common::custody_parse::pseudonym_lookup_failure(
+                        method,
+                        PyKeyCustodyProvider::exc_code(py, e).as_deref(),
+                        &e.to_string(),
+                    )
                 },
             )
             .map_err(|e| scp_ffi_common::custody_parse::pseudonym_lookup_error(method, e))?;
@@ -739,7 +751,8 @@ pub(crate) mod test_fakes {
     /// `wrong_public_key`, `high_s`, `fixed_id` (every pseudonym gets id 777),
     /// or a `get_public_key` of a pseudonym key id that raises with
     /// `SCP-CRYPTO-4006` (`lookup_4006`) or `SCP-CRYPTO-4060` (`lookup_4060`),
-    /// or returns `None` (`lookup_none`).
+    /// or returns `None` (`lookup_none`), or a derive that returns a dict in
+    /// place of the `(public_key, key_id)` tuple (`dict`).
     const FAKE_PROVIDER_PY: &std::ffi::CStr = c"
 import hashlib, hmac
 
@@ -853,6 +866,8 @@ class FakeCustody:
                                  + bytes(context_id) + epoch_tag).digest()
             kid = str(int.from_bytes(tag[:8], 'big'))
         self._pseudonyms[kid] = seed_to_scalar(seed)
+        if self._fault == 'dict':
+            return {'public_key': compressed(self._pseudonyms[kid]), 'key_id': kid}
         return (compressed(self._pseudonyms[kid]), kid)
 
     def derive_pseudonym(self, key_id, context_id):
@@ -1276,6 +1291,35 @@ mod tests {
                 .await
                 .expect_err("high-s host signature"),
         );
+    }
+
+    /// A derive method that returns a dict fails as a custody error whose text
+    /// names the shape the provider must return.
+    #[tokio::test]
+    async fn ffi_custody_callback_derive_dict_names_expected_shape() {
+        let custody = FfiKeyCustody::Callback(fake_py_custody(Some("dict")));
+        let handle = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("key");
+        for err in [
+            custody
+                .derive_pseudonym(&handle, b"ctx")
+                .await
+                .expect_err("dict from derive_pseudonym"),
+            custody
+                .derive_rotatable_pseudonym(&handle, b"ctx", 0)
+                .await
+                .expect_err("dict from derive_rotatable_pseudonym"),
+        ] {
+            match &err {
+                PlatformError::CustodyError(m) => assert!(
+                    m.contains("PseudonymResult(public_key: bytes, key_id: str)"),
+                    "{m}"
+                ),
+                other => panic!("expected CustodyError, got {other:?}"),
+            }
+        }
     }
 
     /// ADR-021 2026-09-27: every failure of the `get_public_key(key_id)`

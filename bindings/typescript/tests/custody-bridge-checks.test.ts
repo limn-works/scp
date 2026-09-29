@@ -36,15 +36,11 @@ import { CryptoError, IdentityError, mapBridgeError } from "../src/errors";
 import { toNativeCustodyProvider } from "../src/internal/custody-adapter";
 import { loadNativeAddon } from "../src/internal/native";
 import type { KeyCustodyProvider, PseudonymResult } from "../src/scp";
-import {
-  bigIntTo32,
-  bytesToBigInt,
-  P256_N,
-  p256Compressed,
-  p256SignPrehash,
-  pseudonymScalar,
-  pseudonymSeedV1,
-} from "./pseudonym-recipe";
+import { p256PublicKey, p256SeedToScalar, p256SignPrehashRfc6979 } from "../src/scp";
+import { bigIntTo32, bytesToBigInt, P256_N, pseudonymSeedV1 } from "./pseudonym-recipe";
+
+/** The §9.10.4 label that maps a pseudonym context seed to its P-256 scalar. */
+const SCALAR_LABEL = new TextEncoder().encode("SCP-PSEUDONYM-P256-V1");
 
 interface TestingCustody {
   generateKeypair(): Promise<string>;
@@ -74,7 +70,8 @@ type Fault = "highS" | "fixedId" | "signThrows" | "sign4001" | "lookup4006" | "l
 /** The host's key store, with a count of `sign` calls that reach it. */
 class Store {
   seeds = new Map<string, Uint8Array>();
-  pseudonyms = new Map<string, bigint>();
+  /** Pseudonym key id -> its 32-byte P-256 scalar (§9.10.4). */
+  pseudonyms = new Map<string, Uint8Array>();
   /** Pseudonym key id -> the identity key id it was derived from. */
   pseudonymOwner = new Map<string, string>();
   next = 1;
@@ -102,7 +99,7 @@ class StoreKeychain implements KeyCustodyProvider {
     const d = this.store.pseudonyms.get(keyId);
     // The contract's key-not-found signal (`KeyCustodyProvider` in `src/scp.ts`).
     if (d === undefined) throw new CryptoError(`key not found: ${keyId}`, "SCP-CRYPTO-4006");
-    const sig = p256SignPrehash(d, message);
+    const sig = p256SignPrehashRfc6979(d, message);
     if (this.fault !== "highS") return sig;
     const s = bytesToBigInt(sig.subarray(32));
     return new Uint8Array(
@@ -116,7 +113,7 @@ class StoreKeychain implements KeyCustodyProvider {
       throw new CryptoError(`lookup lost ${keyId}`, "SCP-CRYPTO-4006");
     }
     if (d !== undefined && this.fault === "lookupThrows") throw new Error(`lookup lost ${keyId}`);
-    if (d !== undefined) return p256Compressed(d);
+    if (d !== undefined) return p256PublicKey(d);
     if (this.store.seeds.has(keyId)) return new Uint8Array(32);
     throw new Error(`unknown key id: ${keyId}`);
   }
@@ -141,7 +138,8 @@ class StoreKeychain implements KeyCustodyProvider {
   derivePseudonym(keyId: string, contextId: Uint8Array): PseudonymResult {
     const seed = this.store.seeds.get(keyId);
     if (seed === undefined) throw new Error(`unknown key id: ${keyId}`);
-    const d = pseudonymScalar(pseudonymSeedV1(seed, contextId));
+    // The host computes the context seed; the SDK helper maps it to the scalar.
+    const d = p256SeedToScalar(SCALAR_LABEL, pseudonymSeedV1(seed, contextId));
     // Deterministic per (identity, context), as the provider contract requires;
     // `fixedId` names every pseudonym "777" to reuse one id across contexts.
     const h = crypto.createHash("sha256").update(`${keyId}|`).update(contextId).digest();
@@ -149,7 +147,7 @@ class StoreKeychain implements KeyCustodyProvider {
       this.fault === "fixedId" ? "777" : (h.readBigUInt64BE(0) | (1n << 63n)).toString();
     this.store.pseudonyms.set(pseudonymId, d);
     this.store.pseudonymOwner.set(pseudonymId, keyId);
-    return { publicKey: p256Compressed(d), keyId: pseudonymId };
+    return { publicKey: p256PublicKey(d), keyId: pseudonymId };
   }
 
   deriveRotatablePseudonym(): PseudonymResult {
@@ -286,6 +284,30 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     const mapped = await rejectionOf(() => wrongType.derivePseudonym(identity, "ctx"));
     expect(mapped).toBeInstanceOf(IdentityError);
     expect(mapped.code).toBe("SCP-IDENT-1055");
+  });
+
+  test("a lookup that reports success with no value names get_public_key, not the derivation", async () => {
+    const store = new Store();
+    // The raw native record, so the bridge itself sees `{ ok: true }` with no value.
+    const record = toNativeCustodyProvider(new StoreKeychain(store));
+    const lookup = record.getPublicKey;
+    const Ctor = native.TestingCallbackCustody as TestingCustodyCtor;
+    // Typed loosely: `{ ok: true }` with no value is the misbehaviour under test.
+    const broken: Record<string, unknown> = {
+      ...record,
+      getPublicKey: (keyId: string) => (store.pseudonyms.has(keyId) ? { ok: true } : lookup(keyId)),
+    };
+    const custody = new Ctor(broken as ReturnType<typeof toNativeCustodyProvider>);
+    const identity = await custody.generateKeypair();
+    const mapped = await rejectionOf(() => custody.derivePseudonym(identity, "ctx"));
+    expect(mapped).toBeInstanceOf(IdentityError);
+    expect(mapped.code).toBe("SCP-IDENT-1055");
+    expect(mapped.message).toContain(
+      "KeyCustodyProvider.derive_pseudonym: get_public_key(key_id) failed",
+    );
+    expect(mapped.message).toContain(
+      "KeyCustodyProvider.get_public_key reported success with no value",
+    );
   });
 
   test("a host method that throws another error rejects with a custody error", async () => {

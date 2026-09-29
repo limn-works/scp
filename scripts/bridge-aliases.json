@@ -2909,6 +2909,48 @@
       "napi": [
         "participation_record"
       ]
+    },
+    {
+      "canonical": "p256_seed_to_scalar",
+      "category": "identity",
+      "pyo3": [
+        "py_p256_seed_to_scalar",
+        "p256_seed_to_scalar"
+      ],
+      "uniffi": [
+        "p256_seed_to_scalar"
+      ],
+      "napi": [
+        "p256_seed_to_scalar"
+      ]
+    },
+    {
+      "canonical": "p256_public_key",
+      "category": "identity",
+      "pyo3": [
+        "py_p256_public_key",
+        "p256_public_key"
+      ],
+      "uniffi": [
+        "p256_public_key"
+      ],
+      "napi": [
+        "p256_public_key"
+      ]
+    },
+    {
+      "canonical": "p256_sign_prehash_rfc6979",
+      "category": "identity",
+      "pyo3": [
+        "py_p256_sign_prehash_rfc6979",
+        "p256_sign_prehash_rfc6979"
+      ],
+      "uniffi": [
+        "p256_sign_prehash_rfc6979"
+      ],
+      "napi": [
+        "p256_sign_prehash_rfc6979"
+      ]
     }
   ],
   "exemptions": {

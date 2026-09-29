@@ -24,12 +24,17 @@ import hashlib
 
 import pytest
 
+from scp_sdk import (
+    PseudonymResult,
+    p256_public_key,
+    p256_seed_to_scalar,
+    p256_sign_prehash_rfc6979,
+)
+
 from .pseudonym_recipe import (
+    PSEUDONYM_SCALAR_LABEL,
     canonical_pseudonym_seed,
     canonical_rotatable_pseudonym_seed,
-    p256_compressed,
-    p256_sign_prehash,
-    pseudonym_scalar,
 )
 
 # ---------------------------------------------------------------------------
@@ -130,10 +135,13 @@ class _FakeKeychain:
     ``sign``, mirroring how a real keychain would behave.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, dict_result: bool = False) -> None:
+        # ``dict_result`` makes both derive methods return a dict in place of
+        # a :class:`PseudonymResult`, the shape mistake the bridge must name.
+        self._dict_result = dict_result
         self._seeds: dict[str, bytes] = {}
-        # Pseudonym key id -> P-256 private scalar (§9.10.4).
-        self._pseudonyms: dict[str, int] = {}
+        # Pseudonym key id -> 32-byte P-256 private scalar (§9.10.4).
+        self._pseudonyms: dict[str, bytes] = {}
         # Pseudonym key id -> the identity key id it was derived from, so
         # destroying the identity destroys its pseudonyms (§9.10.4.A).
         self._pseudonym_owner: dict[str, str] = {}
@@ -150,12 +158,12 @@ class _FakeKeychain:
     def sign(self, key_id: str, message: bytes) -> bytes:
         if key_id in self._pseudonyms:
             # A pseudonym key signs a 32-byte digest: 64-byte low-s r || s.
-            return p256_sign_prehash(self._pseudonyms[key_id], bytes(message))
+            return p256_sign_prehash_rfc6979(self._pseudonyms[key_id], bytes(message))
         return ed25519_sign(self._seeds[key_id], bytes(message))
 
     def get_public_key(self, key_id: str) -> bytes:
         if key_id in self._pseudonyms:
-            return p256_compressed(self._pseudonyms[key_id])
+            return p256_public_key(self._pseudonyms[key_id])
         return ed25519_publickey(self._seeds[key_id])
 
     def destroy_key(self, key_id: str) -> None:
@@ -186,13 +194,18 @@ class _FakeKeychain:
             h.update(epoch.to_bytes(8, "big"))
         return str(int.from_bytes(h.digest()[:8], "big") | (1 << 63))
 
-    def _register_pseudonym(self, owner: str, seed: bytes, kid: str) -> tuple[bytes, str]:
-        d = pseudonym_scalar(seed)
+    def _register_pseudonym(self, owner: str, seed: bytes, kid: str) -> PseudonymResult:
+        # The host computes the context seed; the SDK helper maps it to the
+        # scalar and the point.
+        d = p256_seed_to_scalar(PSEUDONYM_SCALAR_LABEL, seed)
         self._pseudonyms[kid] = d
         self._pseudonym_owner[kid] = owner
-        return p256_compressed(d), kid
+        result = PseudonymResult(public_key=p256_public_key(d), key_id=kid)
+        if self._dict_result:
+            return result._asdict()  # type: ignore[return-value]
+        return result
 
-    def derive_pseudonym(self, key_id: str, context_id: bytes) -> tuple[bytes, str]:
+    def derive_pseudonym(self, key_id: str, context_id: bytes) -> PseudonymResult:
         # Canonical v1 recipe (§9.10.4.A) over the Ed25519 identity seed (the
         # native interim ikm until S12). Registers the P-256 pseudonym key under
         # its deterministic id and returns ``(public_key (33), key_id)``.
@@ -204,7 +217,7 @@ class _FakeKeychain:
 
     def derive_rotatable_pseudonym(
         self, key_id: str, context_id: bytes, pseudonym_epoch: int
-    ) -> tuple[bytes, str]:
+    ) -> PseudonymResult:
         # Canonical v2 recipe (§9.10.4.A): HMAC(context_id || epoch_BE ||
         # "scp-pseudonym-v2"). Same return shape as the v1 path.
         seed = canonical_rotatable_pseudonym_seed(self._seeds[key_id], context_id, pseudonym_epoch)
@@ -230,6 +243,7 @@ def test_destroying_an_identity_destroys_its_pseudonyms() -> None:
     Covers the v1 and the v2 derivation, and leaves another identity's
     pseudonym signing.
     """
+    pytest.importorskip("scp_sdk._scp_core")
     provider = _FakeKeychain()
     identity = provider.generate_keypair("ed25519")
     other = provider.generate_keypair("ed25519")
@@ -291,3 +305,37 @@ async def test_identity_create_with_custody_rejects_incomplete_provider(scp) -> 
 
     with pytest.raises(_scp_core.ValidationError, match="missing the required method"):
         await scp.identity_create_with_custody(Incomplete())
+
+
+_ENCRYPTED_PARAMS = {"ceiling": ["messages:read"], "memory_scope": "ephemeral"}
+
+
+@pytest.mark.asyncio
+async def test_pseudonym_result_provider_derives_in_context_create(scp) -> None:
+    """A provider returning :class:`PseudonymResult` derives the pseudonym an
+    encrypted ``context_create`` needs, and the bridge binds it."""
+    provider = _FakeKeychain()
+    result = provider.derive_pseudonym(provider.generate_keypair("ed25519"), b"probe")
+    assert isinstance(result, PseudonymResult)
+    assert len(result.public_key) == 33
+
+    identity = await scp.identity_create_with_custody(provider)
+    before = set(provider._pseudonyms)
+    ctx = await scp.context_create(identity.did, _ENCRYPTED_PARAMS)
+
+    assert ctx.context_id
+    assert set(provider._pseudonyms) - before, "context_create never derived a pseudonym"
+
+
+@pytest.mark.asyncio
+async def test_dict_pseudonym_result_fails_naming_the_expected_shape(scp) -> None:
+    """A provider whose derive returns a dict fails, and the error text names
+    ``PseudonymResult(public_key: bytes, key_id: str)``."""
+    from scp_sdk import _scp_core
+
+    provider = _FakeKeychain(dict_result=True)
+    identity = await scp.identity_create_with_custody(provider)
+
+    expected = r"PseudonymResult\(public_key: bytes, key_id: str\)"
+    with pytest.raises(_scp_core.ScpError, match=expected):
+        await scp.context_create(identity.did, _ENCRYPTED_PARAMS)

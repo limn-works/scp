@@ -22,7 +22,8 @@ Recipe (matching the Rust core)::
     seed_v2 = HMAC-SHA256(
         pseudonym_secret,
         context_id + pseudonym_epoch.to_bytes(8, "big") + b"scp-pseudonym-v2")
-    d = int(HKDF-Expand-SHA256(prk=seed, info=b"SCP-PSEUDONYM-P256-V1", L=48))
+    d = int.from_bytes(
+        HKDF-Expand-SHA256(prk=seed, info=b"SCP-PSEUDONYM-P256-V1", L=48), "big")
         mod (n - 1) + 1
     public_key = SEC1-compressed(d * G)          # 33 bytes
     routing_id = SHA-256(b"scp-pseudonym-routing-v1:" + public_key)

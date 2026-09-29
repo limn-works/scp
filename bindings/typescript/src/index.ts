@@ -241,7 +241,7 @@ export type {
   ScpOptions,
   StorageConfig,
 } from "./scp";
-export { SCP } from "./scp";
+export { p256PublicKey, p256SeedToScalar, p256SignPrehashRfc6979, SCP } from "./scp";
 
 // ---------------------------------------------------------------------------
 // Errors

@@ -120,6 +120,10 @@ type NativeAddon = RawNativeAddon & {
   validateAgainstTemplate?: unknown;
   validateContextParams?: unknown;
   checkScopedCapability?: unknown;
+  // P-256 custody-host helpers (§9.10.4, §9.5), module-level free functions.
+  p256SeedToScalar?: unknown;
+  p256PublicKey?: unknown;
+  p256SignPrehashRfc6979?: unknown;
 };
 
 /**
@@ -515,7 +519,9 @@ export interface KeyCustodyProvider {
    * the P-256 prehash ECDSA `r || s` with low s (§9.5); the bridge rejects
    * any other length and any signature that fails strict verification, for a
    * pseudonym key this adapter derived and still holds bound; for a handle the
-   * adapter did not bind, the bridge returns the host's bytes unchecked.
+   * adapter did not bind, the bridge returns the host's bytes unchecked. A
+   * software host signs with {@link p256SignPrehashRfc6979} rather than its
+   * own ECDSA.
    */
   sign(keyId: string, message: Uint8Array): Uint8Array;
   /**
@@ -543,7 +549,10 @@ export interface KeyCustodyProvider {
    * re-deriving names one key rather than minting another. The pseudonym
    * dies with its identity (spec §9.10.4.A): `destroyKey(keyId)` destroys it,
    * and a derivation still in flight when `keyId` is destroyed fails with
-   * key-not-found and stores nothing.
+   * key-not-found and stores nothing. A host maps the §9.10.4 `context_seed`
+   * to the pseudonym key with {@link p256SeedToScalar} and computes
+   * `publicKey` with {@link p256PublicKey} rather than reducing and
+   * multiplying itself.
    */
   derivePseudonym(keyId: string, contextId: Uint8Array): PseudonymResult;
   /**
@@ -573,6 +582,69 @@ export interface KeyCustodyProvider {
   exportSigningKeyBytes(keyId: string): Uint8Array;
   /** Return `"hardware"`, `"software"`, or `"in_memory"`. */
   custodyType(keyId: string): string;
+}
+
+// ---------------------------------------------------------------------------
+// P-256 custody-host helpers
+// ---------------------------------------------------------------------------
+
+/** Calls the addon's P-256 host helper `name`, mapping its errors. */
+function p256HostCall(
+  name: "p256SeedToScalar" | "p256PublicKey" | "p256SignPrehashRfc6979",
+  ...args: Uint8Array[]
+): Uint8Array {
+  // NAPI Vec<u8> IN params map to number[] in JS; the Vec<u8> return is a
+  // Buffer, copied into a plain Uint8Array.
+  const fn = nativeFreeFn<(...a: number[][]) => Uint8Array>(name);
+  try {
+    return Uint8Array.from(fn(...args.map((a) => Array.from(a))));
+  } catch (err) {
+    throw mapBridgeError(err);
+  }
+}
+
+/**
+ * Maps a 32-byte seed to a P-256 private scalar in `[1, n − 1]` under `label`.
+ *
+ * FIPS 186-5 A.2.1, spec §9.10.4: `HKDF-Expand(seed, label, 48)` read as a
+ * big-endian integer, `mod (n − 1) + 1`, returned as 32 big-endian bytes. For
+ * a pseudonym the label is `"SCP-PSEUDONYM-P256-V1"` and the seed the §9.10.4
+ * `context_seed`. A {@link KeyCustodyProvider} host stores the result as the
+ * pseudonym key and passes it to {@link p256PublicKey} and
+ * {@link p256SignPrehashRfc6979}.
+ *
+ * The Rust side wipes its copies; the arrays the bridge copies through the JS
+ * boundary are not wiped, so the host wipes its own.
+ *
+ * @throws {ValidationError} `SCP-VALID-7005` when `seed` is not 32 bytes.
+ * @throws {CryptoError} `SCP-CRYPTO-4001` if the reduction fails.
+ */
+export function p256SeedToScalar(label: Uint8Array, seed: Uint8Array): Uint8Array {
+  return p256HostCall("p256SeedToScalar", label, seed);
+}
+
+/**
+ * Returns the 33-byte SEC1 compressed public key `d·G` of a 32-byte scalar.
+ *
+ * @throws {ValidationError} `SCP-VALID-7005` when `scalar` is not 32 bytes.
+ * @throws {CryptoError} `SCP-CRYPTO-4001` when it is zero or not below `n`.
+ */
+export function p256PublicKey(scalar: Uint8Array): Uint8Array {
+  return p256HostCall("p256PublicKey", scalar);
+}
+
+/**
+ * Signs a 32-byte digest with the scalar (spec §9.5): RFC 6979 deterministic
+ * nonce (`h1 = digest`), low-`s` normalized, returned as the 64-byte `r || s`
+ * that {@link KeyCustodyProvider.sign} returns for a pseudonym key id.
+ *
+ * @throws {ValidationError} `SCP-VALID-7005` when `scalar` or `digest` is not
+ *   32 bytes.
+ * @throws {CryptoError} `SCP-CRYPTO-4001` when the scalar is out of range or
+ *   signing fails.
+ */
+export function p256SignPrehashRfc6979(scalar: Uint8Array, digest: Uint8Array): Uint8Array {
+  return p256HostCall("p256SignPrehashRfc6979", scalar, digest);
 }
 
 // ---------------------------------------------------------------------------

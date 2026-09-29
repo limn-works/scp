@@ -14,6 +14,9 @@
 //!    deterministic nonces and returns the low-`s` `r || s` (§9.5), which the
 //!    bridge then verifies strictly.
 //!
+//! Each export wraps the function of the same name in
+//! `scp_ffi_common::p256_host`, which the `PyO3` and napi-rs exports wrap too.
+//!
 //! The scalar crosses the FFI boundary because the host is its custodian.
 //! Wiping is best-effort: the Rust side wipes the seed and scalar `Vec`s it is
 //! handed and its own copies (`Zeroizing`), but uniffi's lift and
@@ -21,26 +24,17 @@
 //! the scalar across the boundary, in either direction, and the returned
 //! scalar `Vec` is freed by uniffi unwiped. The host wipes its own arrays.
 
-use scp_crypto::p256::{P256SigningKey, seed_to_scalar, sign_prehash_rfc6979};
-use scp_ffi_common::error_codes as codes;
+use scp_ffi_common::p256_host::{self as shared, P256HostError};
 use zeroize::Zeroizing;
 
 use crate::bridge::ScpError;
 
-fn exact_32(what: &str, bytes: &[u8]) -> Result<Zeroizing<[u8; 32]>, ScpError> {
-    let array: [u8; 32] = bytes.try_into().map_err(|_| ScpError::Validation {
-        msg: format!("{what} must be 32 bytes, got {}", bytes.len()),
-        code: codes::VALID_7005.to_owned(),
-    })?;
-    Ok(Zeroizing::new(array))
-}
-
-fn signing_key(scalar: &[u8]) -> Result<P256SigningKey, ScpError> {
-    let scalar = exact_32("P-256 scalar", scalar)?;
-    P256SigningKey::from_scalar_bytes(&scalar).map_err(|e| ScpError::Crypto {
-        msg: format!("invalid P-256 scalar: {e}"),
-        code: codes::CRYPTO_4001.to_owned(),
-    })
+fn scp_error(e: P256HostError) -> ScpError {
+    let code = e.code().to_owned();
+    match e {
+        P256HostError::Validation(msg) => ScpError::Validation { msg, code },
+        P256HostError::Crypto(msg) => ScpError::Crypto { msg, code },
+    }
 }
 
 /// Maps a 32-byte seed to a P-256 private scalar in `[1, n − 1]` under `label`.
@@ -56,13 +50,8 @@ fn signing_key(scalar: &[u8]) -> Result<P256SigningKey, ScpError> {
 #[uniffi::export]
 pub fn p256_seed_to_scalar(label: Vec<u8>, seed: Vec<u8>) -> Result<Vec<u8>, ScpError> {
     let seed = Zeroizing::new(seed);
-    let seed = exact_32("seed", &seed)?;
-    let scalar = seed_to_scalar(&label, &seed).map_err(|e| ScpError::Crypto {
-        msg: format!("seed_to_scalar failed: {e}"),
-        code: codes::CRYPTO_4001.to_owned(),
-    })?;
-    let key = P256SigningKey::from_nonzero_scalar(scalar);
-    Ok(key.to_scalar_bytes().to_vec())
+    let scalar = shared::p256_seed_to_scalar(&label, &seed).map_err(scp_error)?;
+    Ok(scalar.to_vec())
 }
 
 /// The 33-byte SEC1 compressed public key `d·G` of a 32-byte scalar.
@@ -74,7 +63,9 @@ pub fn p256_seed_to_scalar(label: Vec<u8>, seed: Vec<u8>) -> Result<Vec<u8>, Scp
 #[uniffi::export]
 pub fn p256_public_key(scalar: Vec<u8>) -> Result<Vec<u8>, ScpError> {
     let scalar = Zeroizing::new(scalar);
-    Ok(signing_key(&scalar)?.public_key().to_compressed().to_vec())
+    Ok(shared::p256_public_key(&scalar)
+        .map_err(scp_error)?
+        .to_vec())
 }
 
 /// Signs a 32-byte digest with the scalar: RFC 6979 deterministic nonce
@@ -88,20 +79,9 @@ pub fn p256_public_key(scalar: Vec<u8>) -> Result<Vec<u8>, ScpError> {
 #[uniffi::export]
 pub fn p256_sign_prehash_rfc6979(scalar: Vec<u8>, digest: Vec<u8>) -> Result<Vec<u8>, ScpError> {
     let scalar = Zeroizing::new(scalar);
-    let key = signing_key(&scalar)?;
-    let digest: [u8; 32] = digest
-        .as_slice()
-        .try_into()
-        .map_err(|_| ScpError::Validation {
-            msg: format!("digest must be 32 bytes, got {}", digest.len()),
-            code: codes::VALID_7005.to_owned(),
-        })?;
-    sign_prehash_rfc6979(&key, &digest)
-        .map(|sig| sig.to_vec())
-        .map_err(|e| ScpError::Crypto {
-            msg: format!("P-256 signing failed: {e}"),
-            code: codes::CRYPTO_4001.to_owned(),
-        })
+    Ok(shared::p256_sign_prehash_rfc6979(&scalar, &digest)
+        .map_err(scp_error)?
+        .to_vec())
 }
 
 #[cfg(test)]

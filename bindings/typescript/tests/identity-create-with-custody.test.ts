@@ -21,14 +21,11 @@ import * as crypto from "node:crypto";
 
 import { CryptoError, ScpError } from "../src/errors";
 import type { KeyCustodyProvider, PseudonymResult } from "../src/scp";
-import { SCP } from "../src/scp";
-import {
-  p256Compressed,
-  p256SignPrehash,
-  pseudonymScalar,
-  pseudonymSeedV1,
-  pseudonymSeedV2,
-} from "./pseudonym-recipe";
+import { p256PublicKey, p256SeedToScalar, p256SignPrehashRfc6979, SCP } from "../src/scp";
+import { pseudonymSeedV1, pseudonymSeedV2 } from "./pseudonym-recipe";
+
+/** The §9.10.4 label that maps a pseudonym context seed to its P-256 scalar. */
+const SCALAR_LABEL = new TextEncoder().encode("SCP-PSEUDONYM-P256-V1");
 
 // ---------------------------------------------------------------------------
 // Probe: is the NAPI-backed SCP class available in this environment?
@@ -53,8 +50,8 @@ type PseudonymFault = "legacy32" | "wrongPublicKey" | "deriveKeyNotFound";
 
 class CryptoKeychain implements KeyCustodyProvider {
   #seeds = new Map<string, Uint8Array>();
-  // Pseudonym key ids → P-256 private scalar (§9.10.4.A).
-  #pseudonyms = new Map<string, bigint>();
+  // Pseudonym key ids → 32-byte P-256 private scalar (§9.10.4.A).
+  #pseudonyms = new Map<string, Uint8Array>();
   // Pseudonym key id -> the identity key id it was derived from, so destroying
   // the identity destroys its pseudonyms (§9.10.4.A).
   #pseudonymOwner = new Map<string, string>();
@@ -93,14 +90,14 @@ class CryptoKeychain implements KeyCustodyProvider {
 
   sign(keyId: string, message: Uint8Array): Uint8Array {
     const d = this.#pseudonyms.get(keyId);
-    if (d !== undefined) return p256SignPrehash(d, message);
+    if (d !== undefined) return p256SignPrehashRfc6979(d, message);
     return new Uint8Array(crypto.sign(null, Buffer.from(message), this.#keyObject(keyId)));
   }
 
   getPublicKey(keyId: string): Uint8Array {
     const d = this.#pseudonyms.get(keyId);
     if (d !== undefined) {
-      const point = p256Compressed(d);
+      const point = p256PublicKey(d);
       // A host whose handle answers with a different point than its derivation.
       if (this.#fault === "wrongPublicKey") point[0] = point[0] === 0x02 ? 0x03 : 0x02;
       return point;
@@ -159,10 +156,11 @@ class CryptoKeychain implements KeyCustodyProvider {
   // Register the §9.10.4.A P-256 pseudonym of a context seed under `keyId`.
   // Native software custody keys the recipe on the Ed25519 identity seed.
   #registerPseudonym(owner: string, contextSeed: Uint8Array, keyId: string): PseudonymResult {
-    const d = pseudonymScalar(contextSeed);
+    // The host computes the context seed; the SDK helper maps it to the scalar.
+    const d = p256SeedToScalar(SCALAR_LABEL, contextSeed);
     this.#pseudonyms.set(keyId, d);
     this.#pseudonymOwner.set(keyId, owner);
-    const point = p256Compressed(d);
+    const point = p256PublicKey(d);
     // A host still on the retired 32-byte Ed25519 pseudonym shape.
     const publicKey = this.#fault === "legacy32" ? point.subarray(1) : point;
     return { publicKey, keyId };

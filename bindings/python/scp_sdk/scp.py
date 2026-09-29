@@ -49,6 +49,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Literal,
+    NamedTuple,
     Protocol,
     TypeAlias,
     TypedDict,
@@ -85,11 +86,29 @@ __all__ = [
     "InviteMemberOutcome",
     "KeyCustodyProvider",
     "McpAllowlistState",
+    "PseudonymResult",
     "Sealed",
     "SealedInvitation",
     "SqliteStorage",
     "StorageConfig",
+    "p256_public_key",
+    "p256_seed_to_scalar",
+    "p256_sign_prehash_rfc6979",
 ]
+
+
+class PseudonymResult(NamedTuple):
+    """A pseudonym a :class:`KeyCustodyProvider` derived (``09-security-model.md`` §9.10.4).
+
+    Returned by :meth:`KeyCustodyProvider.derive_pseudonym` and
+    :meth:`KeyCustodyProvider.derive_rotatable_pseudonym`. Being a tuple, it
+    is also accepted wherever a ``(public_key, key_id)`` pair is.
+    """
+
+    public_key: bytes
+    """The 33-byte SEC1 compressed P-256 public key."""
+    key_id: str
+    """The numeric id of the pseudonym key, usable with ``sign`` and ``get_public_key``."""
 
 
 @runtime_checkable
@@ -140,7 +159,8 @@ class KeyCustodyProvider(Protocol):
         the bridge verifies it strictly under the pseudonym point and rejects
         anything else, for a pseudonym key this adapter derived and still holds
         bound; for a handle the adapter did not bind, the bridge returns the
-        host's bytes unchecked.
+        host's bytes unchecked. A software host signs with
+        :func:`scp_sdk.p256_sign_prehash_rfc6979` rather than its own ECDSA.
         """
         ...
 
@@ -166,11 +186,12 @@ class KeyCustodyProvider(Protocol):
         """Return the 32-byte X25519 shared secret with ``peer_public``."""
         ...
 
-    def derive_pseudonym(self, key_id: str, context_id: bytes) -> tuple[bytes, str]:
+    def derive_pseudonym(self, key_id: str, context_id: bytes) -> PseudonymResult:
         """Derive a context-scoped P-256 pseudonym keypair (v1, static; §9.10.4).
 
-        Returns ``(public_key, key_id)``: the 33-byte SEC1 compressed P-256
-        pseudonym point and the numeric id of its signing key. The bridge
+        Returns a :class:`PseudonymResult` ``(public_key, key_id)``: the
+        33-byte SEC1 compressed P-256 pseudonym point and the numeric id of
+        its signing key. The bridge
         rejects (``SCP-IDENT-1055``) a point that is not a valid compressed
         P-256 point, and a key id whose :meth:`get_public_key` raises or
         differs from it.
@@ -189,18 +210,24 @@ class KeyCustodyProvider(Protocol):
             pseudonym_secret = HKDF-SHA256(
                 ikm=ikm, salt=b"scp-pseudonym-secret-v1", info=b"", length=32)
             seed = HMAC-SHA256(pseudonym_secret, context_id + b"scp-pseudonym")
-            d = int(HKDF-Expand-SHA256(
-                prk=seed, info=b"SCP-PSEUDONYM-P256-V1", length=48)) % (n - 1) + 1
+            d = int.from_bytes(HKDF-Expand-SHA256(
+                prk=seed, info=b"SCP-PSEUDONYM-P256-V1", length=48),
+                "big") % (n - 1) + 1
             public_key = SEC1_compressed(d * G)
+
+        A host maps ``seed`` to ``d`` with :func:`scp_sdk.p256_seed_to_scalar`
+        (``d.to_bytes(32, "big")``) and computes ``public_key`` with
+        :func:`scp_sdk.p256_public_key` rather than reducing and multiplying
+        itself.
         """
         ...
 
     def derive_rotatable_pseudonym(
         self, key_id: str, context_id: bytes, pseudonym_epoch: int
-    ) -> tuple[bytes, str]:
+    ) -> PseudonymResult:
         """Derive a rotatable, epoch-scoped P-256 pseudonym keypair (v2).
 
-        Returns ``(public_key, key_id)``, checked as for
+        Returns a :class:`PseudonymResult` ``(public_key, key_id)``, checked as for
         :meth:`derive_pseudonym`; the same ``(key_id, context_id,
         pseudonym_epoch)`` MUST return the same pseudonym key id, and it dies
         with its identity as for :meth:`derive_pseudonym` (§9.10.4.A). Including
@@ -384,6 +411,61 @@ def _native_mod() -> Any:
             code="SCP-UNKNOWN-0001",
         ) from exc
     return _scp_core
+
+
+def _p256_host_call(name: str, *args: bytes) -> bytes:
+    """Call the ``_scp_core`` P-256 host helper ``name``, mapping its errors."""
+    fn = getattr(_native_mod(), name)
+    try:
+        return bytes(fn(*args))
+    except Exception as exc:
+        raise _coded_bridge_error(exc) from exc
+
+
+def p256_seed_to_scalar(label: bytes, seed: bytes) -> bytes:
+    """Map a 32-byte seed to a P-256 private scalar in ``[1, n - 1]`` under ``label``.
+
+    FIPS 186-5 A.2.1, ``09-security-model.md`` §9.10.4:
+    ``int.from_bytes(HKDF-Expand(seed, label, 48), "big") % (n - 1) + 1``,
+    returned as 32 big-endian bytes. For a pseudonym the label is
+    ``b"SCP-PSEUDONYM-P256-V1"`` and the seed the §9.10.4 ``context_seed``.
+    A :class:`KeyCustodyProvider` host stores the result as the pseudonym
+    key and passes it to :func:`p256_public_key` and
+    :func:`p256_sign_prehash_rfc6979`.
+
+    The Rust side wipes its copies; Python ``bytes`` are never wiped.
+
+    Raises:
+        ValidationError: ``SCP-VALID-7005`` when ``seed`` is not 32 bytes.
+        CryptoError: ``SCP-CRYPTO-4001`` if the reduction fails.
+    """
+    return _p256_host_call("p256_seed_to_scalar", label, seed)
+
+
+def p256_public_key(scalar: bytes) -> bytes:
+    """Return the 33-byte SEC1 compressed public key ``d * G`` of a 32-byte scalar.
+
+    Raises:
+        ValidationError: ``SCP-VALID-7005`` when ``scalar`` is not 32 bytes.
+        CryptoError: ``SCP-CRYPTO-4001`` when it is zero or not below ``n``.
+    """
+    return _p256_host_call("p256_public_key", scalar)
+
+
+def p256_sign_prehash_rfc6979(scalar: bytes, digest: bytes) -> bytes:
+    """Sign a 32-byte digest with the scalar (§9.5).
+
+    RFC 6979 deterministic nonce (``h1 = digest``), low-``s`` normalized,
+    returned as the 64-byte ``r || s``: what :meth:`KeyCustodyProvider.sign`
+    returns for a pseudonym key id.
+
+    Raises:
+        ValidationError: ``SCP-VALID-7005`` when ``scalar`` or ``digest`` is
+            not 32 bytes.
+        CryptoError: ``SCP-CRYPTO-4001`` when the scalar is out of range or
+            signing fails.
+    """
+    return _p256_host_call("p256_sign_prehash_rfc6979", scalar, digest)
 
 
 def _native_cls() -> Any:
