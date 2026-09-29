@@ -21,6 +21,7 @@ Requires the native extension built with ``testing``::
 from __future__ import annotations
 
 import hashlib
+from typing import Literal
 
 import pytest
 
@@ -134,10 +135,20 @@ class _FakeKeychain:
     ``sign``, mirroring how a real keychain would behave.
     """
 
-    def __init__(self, *, dict_result: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        dict_result: bool = False,
+        fault: Literal["legacy32", "wrong_public_key"] | None = None,
+    ) -> None:
         # ``dict_result`` makes both derive methods return a dict in place of
         # a :class:`PseudonymResult`, the shape mistake the bridge must name.
         self._dict_result = dict_result
+        # ``fault`` makes the host return a pseudonym the bridge must reject
+        # (§9.10.4): ``legacy32`` the retired 32-byte Ed25519 shape,
+        # ``wrong_public_key`` a ``get_public_key`` answer that disagrees with
+        # the point the derivation returned.
+        self._fault = fault
         self._seeds: dict[str, bytes] = {}
         # Pseudonym key id -> 32-byte P-256 private scalar (§9.10.4).
         self._pseudonyms: dict[str, bytes] = {}
@@ -159,7 +170,10 @@ class _FakeKeychain:
 
     def get_public_key(self, key_id: str) -> bytes:
         if key_id in self._pseudonyms:
-            return p256_public_key(self._pseudonyms[key_id])
+            point = bytearray(p256_public_key(self._pseudonyms[key_id]))
+            if self._fault == "wrong_public_key":
+                point[0] = 0x03 if point[0] == 0x02 else 0x02
+            return bytes(point)
         return ed25519_publickey(self._seeds[key_id])
 
     def destroy_key(self, key_id: str) -> None:
@@ -189,7 +203,10 @@ class _FakeKeychain:
         # scalar and the point.
         d = p256_pseudonym_scalar(seed)
         self._pseudonyms[kid] = d
-        result = PseudonymResult(public_key=p256_public_key(d), key_id=kid)
+        point = p256_public_key(d)
+        if self._fault == "legacy32":
+            point = point[1:]
+        result = PseudonymResult(public_key=point, key_id=kid)
         if self._dict_result:
             return result._asdict()  # type: ignore[return-value]
         return result
@@ -273,8 +290,9 @@ _ENCRYPTED_PARAMS = {"ceiling": ["messages:read"], "memory_scope": "ephemeral"}
 
 @pytest.mark.asyncio
 async def test_pseudonym_result_provider_derives_in_context_create(scp) -> None:
-    """A provider returning :class:`PseudonymResult` derives the pseudonym an
-    encrypted ``context_create`` needs, and the bridge binds it."""
+    """An encrypted ``context_create`` succeeds with a provider returning
+    :class:`PseudonymResult`, and it drives that provider to derive a new
+    pseudonym key."""
     provider = _FakeKeychain()
     identity = await scp.identity_create_with_custody(provider)
     before = set(provider._pseudonyms)
@@ -282,6 +300,24 @@ async def test_pseudonym_result_provider_derives_in_context_create(scp) -> None:
 
     assert ctx.context_id
     assert set(provider._pseudonyms) - before, "context_create never derived a pseudonym"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["legacy32", "wrong_public_key"])
+async def test_untrusted_host_pseudonym_fails_context_create_with_ident_1055(
+    scp, fault: Literal["legacy32", "wrong_public_key"]
+) -> None:
+    """§9.10.4: the bridge fails closed with ``SCP-IDENT-1055`` on a host
+    pseudonym it cannot trust: a retired 32-byte key (``legacy32``), or a key
+    id whose ``get_public_key`` disagrees with the point the derivation
+    returned (``wrong_public_key``)."""
+    from scp_sdk import _scp_core
+
+    provider = _FakeKeychain(fault=fault)
+    identity = await scp.identity_create_with_custody(provider)
+    with pytest.raises(_scp_core.ScpError) as excinfo:
+        await scp.context_create(identity.did, _ENCRYPTED_PARAMS)
+    assert str(excinfo.value).startswith("[SCP-IDENT-1055]"), excinfo.value
 
 
 @pytest.mark.asyncio

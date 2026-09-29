@@ -1289,6 +1289,55 @@ mod tests {
         );
     }
 
+    /// §25.19 Vector 30 through production software custody. Until S12 the
+    /// §9.10.4.A ikm is the Ed25519 seed, so the vector's identity scalar is
+    /// imported as that seed; the v1 and v2 (`epoch` = 1) points and routing
+    /// ids on `context-alpha` must equal the spec's literal bytes. Keying the
+    /// derivation on the public key, or dropping a recipe step, fails this.
+    #[tokio::test]
+    async fn derive_pseudonym_reproduces_spec_25_19_vector_30() {
+        fn h(s: &str) -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        }
+        let dir = TempDir::new().unwrap();
+        let custody = make_custody(&dir, "pw");
+        let scalar: [u8; 32] =
+            h("32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64")
+                .try_into()
+                .unwrap();
+        let identity = custody
+            .import_ed25519_signing_key(&Zeroizing::new(scalar))
+            .await
+            .unwrap();
+        let ctx = b"context-alpha";
+
+        let v1 = custody.derive_pseudonym(&identity, ctx).await.unwrap();
+        assert_eq!(
+            v1.public_key().as_bytes(),
+            h("0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72").as_slice()
+        );
+        assert_eq!(
+            v1.routing_id().as_slice(),
+            h("b7faa05dea2cef1b7aff6a48fa5b7b9ffe217b25f3152d78d597bb9078e98307").as_slice()
+        );
+
+        let v2 = custody
+            .derive_rotatable_pseudonym(&identity, ctx, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            v2.public_key().as_bytes(),
+            h("0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479").as_slice()
+        );
+        assert_eq!(
+            v2.routing_id().as_slice(),
+            h("b19754a5e88c993683f99e48646ba518cba80dec0693f920c5671263650b6ae9").as_slice()
+        );
+    }
+
     #[tokio::test]
     async fn derive_pseudonym_key_can_sign() {
         let dir = TempDir::new().unwrap();

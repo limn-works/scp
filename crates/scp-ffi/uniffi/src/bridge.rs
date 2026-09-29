@@ -24650,51 +24650,6 @@ mod tests {
         );
     }
 
-    /// §25.19 Vectors 30 and 31 through the bridge's production member
-    /// pseudonym path: with the vector's identity scalar as the host's
-    /// identity key (the §9.10.4.A software ikm), the routing id the bridge
-    /// returns for "context-alpha" is the spec's v1 routing id, compared as
-    /// the spec's hex, not recomputed.
-    #[cfg(feature = "testing")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn member_pseudonym_reproduces_spec_25_19_v1_routing_ids() {
-        const VECTORS: [(&str, &str); 2] = [
-            (
-                "32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64",
-                "b7faa05dea2cef1b7aff6a48fa5b7b9ffe217b25f3152d78d597bb9078e98307",
-            ),
-            (
-                "65d56a863d03d31ea15ade82f677058d5bbe53afedc6ff7d2b8846aa25a1bc2b",
-                "cab5ff45d21b6d0425fa7657e89fc68514965cbb4ca2b9549f4ccf430d581e7c",
-            ),
-        ];
-        for (identity_scalar, routing_id) in VECTORS {
-            let provider = ProdLikeCustody::new();
-            let keys = Arc::clone(&provider.keys);
-            let identity = scp_test()
-                .identity_create_with_custody(Box::new(provider))
-                .await
-                .expect("identity_create_with_custody");
-            let handle = identity
-                .core_id
-                .as_ref()
-                .expect("callback identity retains its core id")
-                .identity_key;
-            let scalar: [u8; 32] = hex::decode(identity_scalar)
-                .expect("hex")
-                .try_into()
-                .expect("32 bytes");
-            keys.lock().expect("keystore mutex").insert(
-                handle.id().to_string(),
-                ed25519_dalek::SigningKey::from_bytes(&scalar),
-            );
-            let derived = derive_member_pseudonym_required(&identity, "context-alpha")
-                .await
-                .expect("pseudonym derives");
-            assert_eq!(hex::encode(derived), routing_id);
-        }
-    }
-
     /// §9.10.4.A: a host that reports key-not-found (`SCP-CRYPTO-4006`) while
     /// deriving the creator's pseudonym fails the production `context_create`
     /// with `SCP-CRYPTO-4006`, not a pseudonym-derivation identity code.
