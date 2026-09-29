@@ -1,6 +1,6 @@
 /**
  * MCP integration: expose SCP outlets via an MCP JSON-RPC server, then
- * connect as an MCP client to a remote server.
+ * connect as an MCP client to an MCP server on this machine.
  *
  * Post-Phase-4 (ADR-048): all bridge operations route through an
  * explicit `SCP` instance. The free-function shims (`serveMcp`,
@@ -55,13 +55,14 @@ async function main(): Promise<void> {
     console.log("MCP server running, exposing outlets");
 
     try {
-      // Or connect as an MCP client to a remote server via SSE. The remote
-      // server runs no bearer check; an SCP SSE server needs its token here
-      // instead of null.
+      // Or connect as an MCP client to an MCP server on this machine via SSE.
+      // This server runs no bearer check; an SCP SSE server needs its token
+      // here instead of null. The transport has no TLS, so a token is sent
+      // only to a loopback host.
       const client = await scp.mcpClientConnectSse("http://localhost:8080/mcp", null);
       try {
         const outlets = await scp.mcpClientListTools(client);
-        console.log(`Remote server offers ${outlets.length} outlet(s)`);
+        console.log(`The server offers ${outlets.length} outlet(s)`);
 
         const result = await scp.mcpClientInvoke(
           client,
