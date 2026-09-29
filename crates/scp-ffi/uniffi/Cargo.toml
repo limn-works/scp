@@ -93,6 +93,13 @@ rand = { workspace = true }
 zeroize = { workspace = true }
 z-base-32 = { workspace = true }
 
+# A stdio MCP server's stdin is a Unix socket whose writes cannot raise
+# SIGPIPE (`SO_NOSIGPIPE` on Apple, `MSG_NOSIGNAL` elsewhere): a Swift app
+# loading this library keeps SIGPIPE's default action, so a write to a dead
+# server would otherwise terminate the app.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", default-features = false, features = ["std", "net"] }
+
 [dev-dependencies]
 # The MCP subscription tests build a wired server with
 # `McpServer::with_event_source`, public only under `scp-mcp/testing`.
@@ -116,6 +123,11 @@ tempfile = "3"
 # `full` enables statements + items; `visit` provides the `Visit` trait used
 # to walk the bridge source without substring matching (PR #1690 retro).
 syn = { version = "2", features = ["full", "visit", "extra-traits"] }
+
+# The SIGPIPE test restores SIGPIPE's default action in a child test process,
+# as a Swift app has it; the test harness ignores SIGPIPE.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 [[test]]
 name = "e2e_bridge"

@@ -4637,7 +4637,8 @@ impl Drop for McpClientEntry {
     fn drop(&mut self) {
         // A stdio server, and every process in its process group, is dead
         // once the entry drops, even while a call on the handle is in flight;
-        // that call then fails on the closed stdout.
+        // that call then fails on the closed stdout, and a call queued behind
+        // it fails with `EPIPE` on the closed stdin (see [`ServerStdin`]).
         if let Some(server) = &self.stdio_server {
             stop_stdio_server(server);
         }
@@ -4748,8 +4749,53 @@ pub(crate) struct McpStdioTransport {
 }
 
 struct McpStdioTransportInner {
-    stdin: std::process::ChildStdin,
+    stdin: ServerStdin,
     reader: std::io::BufReader<std::process::ChildStdout>,
+}
+
+/// The write end of a stdio server's stdin. On Unix it is a socket whose
+/// writes cannot raise SIGPIPE, so a write to a server that is dead (killed
+/// by a disconnect while the call waited behind another, or exited on its
+/// own) fails with `EPIPE` instead: SIGPIPE's default action, which a Swift
+/// app loading this library keeps, terminates the whole host. A pipe offers
+/// no per-descriptor way to suppress the signal on Linux, and a socket does.
+struct ServerStdin(
+    #[cfg(unix)] std::os::unix::net::UnixStream,
+    #[cfg(not(unix))] std::process::ChildStdin,
+);
+
+impl ServerStdin {
+    /// Makes the server's stdin: the end this transport writes, and the
+    /// `Stdio` that becomes the server's descriptor 0.
+    #[cfg(unix)]
+    fn new() -> Result<(Self, std::process::Stdio), String> {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair()
+            .map_err(|e| format!("failed to create the server's stdin socket: {e}"))?;
+        #[cfg(target_vendor = "apple")]
+        rustix::net::sockopt::set_socket_nosigpipe(&ours, true)
+            .map_err(|e| format!("failed to set SO_NOSIGPIPE on the server's stdin: {e}"))?;
+        Ok((
+            Self(ours),
+            std::process::Stdio::from(std::os::fd::OwnedFd::from(theirs)),
+        ))
+    }
+}
+
+impl std::io::Write for ServerStdin {
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        rustix::net::send(&self.0, buf, rustix::net::SendFlags::NOSIGNAL)
+            .map_err(std::io::Error::from)
+    }
+
+    #[cfg(any(not(unix), target_vendor = "apple"))]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
 }
 
 impl McpStdioTransport {
@@ -4773,10 +4819,14 @@ impl McpStdioTransport {
             guard.validate_command(cmd).map_err(|e| e.to_string())?
         };
 
+        #[cfg(unix)]
+        let (stdin, server_stdin) = ServerStdin::new()?;
+        #[cfg(not(unix))]
+        let server_stdin = Stdio::piped();
         let mut command = Command::new(&basename);
         command
             .args(args)
-            .stdin(Stdio::piped())
+            .stdin(server_stdin)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         // The server leads its own process group, so the group kill in
@@ -4794,8 +4844,13 @@ impl McpStdioTransport {
         let mut child = command
             .spawn()
             .map_err(|e| format!("failed to spawn '{basename}': {e}"))?;
+        // The server's end of its stdin socket lives in `command`; dropping
+        // it leaves the server as the socket's only reader, so a write fails
+        // once the server is gone.
+        drop(command);
 
-        let stdin = child.stdin.take().ok_or("failed to capture child stdin")?;
+        #[cfg(not(unix))]
+        let stdin = ServerStdin(child.stdin.take().ok_or("failed to capture child stdin")?);
         let stdout = child
             .stdout
             .take()
@@ -16697,7 +16752,8 @@ impl Scp {
     /// Routes through the module-level MCP client registry. Dropping the
     /// entry stops a stdio client's server, so its process group, which holds
     /// the processes the server started, is dead when this returns, even while a call on the handle is in
-    /// flight; that call then fails on the closed stdout. A disconnect does
+    /// flight; that call then fails on the closed stdout, and a call queued
+    /// behind it fails on the closed stdin without raising SIGPIPE. A disconnect does
     /// not end a call in flight on an SSE client: that call waits until the
     /// server answers its POST or closes the connection.
     #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
@@ -23347,6 +23403,101 @@ mod tests {
                 "the second call ran after the server was killed"
             );
         });
+    }
+
+    /// A request or notification written to a stdio server that is gone
+    /// returns an error and raises no SIGPIPE, whether a disconnect killed
+    /// the server (the call queued behind an in-flight one) or the server
+    /// exited on its own. The test harness ignores SIGPIPE, which would hide
+    /// the signal, so the scenario runs in a child test process that restores
+    /// SIGPIPE's default action, as a Swift app has it, and the parent
+    /// asserts the child exited cleanly rather than by a signal.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_to_a_dead_stdio_server_raises_no_sigpipe() {
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "SCP_UNIFFI_SIGPIPE_TEST_CHILD";
+        const NAME: &str = "bridge::tests::a_write_to_a_dead_stdio_server_raises_no_sigpipe";
+        if std::env::var_os(CHILD).is_some() {
+            // SAFETY: `signal` with `SIG_DFL` installs no handler; this child
+            // process runs only this test.
+            let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+            assert_ne!(previous, libc::SIG_ERR, "restore SIGPIPE's default action");
+            write_to_dead_stdio_servers();
+            return;
+        }
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .expect("run the child test process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            output.status.signal(),
+            None,
+            "a write to a dead stdio server killed the host by signal; child stdout:\n{stdout}"
+        );
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the child test process must run and pass the scenario: {:?}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The child half of `a_write_to_a_dead_stdio_server_raises_no_sigpipe`.
+    #[cfg(unix)]
+    fn write_to_dead_stdio_servers() {
+        use scp_mcp::client::McpTransport as _;
+        let mut allowlist = scp_mcp::allowlist::StdioAllowlist::new_with_defaults();
+        allowlist.configure(&["sh"]).expect("allow sh");
+        let allowlist = std::sync::Mutex::new(allowlist);
+        let request = scp_mcp::protocol::JsonRpcRequest {
+            jsonrpc: "2.0".to_owned(),
+            method: "tools/list".to_owned(),
+            params: None,
+            id: scp_mcp::protocol::RequestId::Number(1),
+        };
+        let notification =
+            scp_mcp::protocol::JsonRpcNotification::new("notifications/initialized", None);
+
+        let killed = McpStdioTransport::spawn(
+            &allowlist,
+            &["sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()],
+        )
+        .expect("spawn a silent server");
+        stop_stdio_server(&killed.server_process());
+        assert!(
+            killed.send_request(&request).is_err(),
+            "a request to a killed server must fail"
+        );
+        assert!(
+            killed.send_notification(&notification).is_err(),
+            "a notification to a killed server must fail"
+        );
+
+        let exited = McpStdioTransport::spawn(
+            &allowlist,
+            &["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()],
+        )
+        .expect("spawn a server that exits");
+        exited
+            .server_process()
+            .lock()
+            .expect("server lock")
+            .as_mut()
+            .expect("the server is in its slot")
+            .wait()
+            .expect("wait for the server to exit");
+        assert!(
+            exited.send_notification(&notification).is_err(),
+            "a notification to an exited server must fail"
+        );
+        assert!(
+            exited.send_request(&request).is_err(),
+            "a request to an exited server must fail"
+        );
     }
 
     /// `mcp_client_disconnect` must reject unknown handle.
