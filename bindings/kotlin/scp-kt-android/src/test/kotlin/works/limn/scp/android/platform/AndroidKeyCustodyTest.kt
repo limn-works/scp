@@ -567,7 +567,10 @@ class AndroidKeyCustodyTest {
             val pseudonym = custody.derivePseudonym(identityHandle, "ctx".toByteArray())
             val handle = KeyHandle(id = pseudonym.id, custodyType = pseudonym.custodyType)
             assertTrue(custody.destroyKey(handle).confirmed)
-            assertThrows<ScpException> { custody.publicKey(handle) }
+            val publicKeyError = assertThrows<ScpException> { custody.publicKey(handle) }
+            assertEquals("SCP-CRYPTO-4006", publicKeyError.code)
+            val signError = assertThrows<ScpException> { custody.sign(handle, ByteArray(32) { 1 }) }
+            assertEquals("SCP-CRYPTO-4006", signError.code)
         }
 
         @Test
