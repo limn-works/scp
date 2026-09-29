@@ -127,8 +127,9 @@ impl NatStrategy for FailingNatStrategy {
 /// Uses in-memory backends and the default `TlsMode::SelfSigned` (the same
 /// self-signed certificate [`SucceedingTlsProvider`] produces on a `Domain`
 /// reach). The config opts into `DhtMode::Production` (M2 accepts `Disabled`
-/// for every `Reach`, `Domain` included; advisory — nothing is published with
-/// the in-memory DHT client). Drive it with `Node::start_for_testing(test_node_config()).await`.
+/// for every `Reach`, `Domain` included), which makes `Node::start` publish
+/// through the in-memory `did_method` and fail the start if that publish fails.
+/// Drive it with `Node::start_for_testing(test_node_config()).await`.
 #[must_use]
 pub fn test_node_config() -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
     let custody = Arc::new(InMemoryKeyCustody::new());
