@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # Cases for scripts/check-examples-compile.sh.
 #
-# THE CRITERION: the gate exits 1 when an example target fails to compile or lint, when a
-# cfg predicate other than a platform key sits in an example target's source or in a `.rs`
-# file under `examples/`, when a published `examples/*.rs` is no example target's source, when `cargo package --list`
+# THE CRITERION: the gate exits 1 when an example target fails to compile or lint, when an
+# example target's source or a `.rs` file under `examples/` holds a construct the gate's
+# source scan rejects, when a published `examples/*.rs` is no example target's source, when `cargo package --list`
 # fails, or when it checked no example target; and it exits 0 on a workspace with none of
 # those. Each case builds a workspace in `mktemp -d` (one crate, or two where a case needs a
 # dev-dependency edge between members or a defect in the second package), copies the real
 # gate into its `scripts/`, runs it there with real cargo, and asserts both the exit code and the FAIL or OK line that names
 # the outcome, so a case cannot pass on the wrong outcome.
 #
-# The five cases from `featuregated` to `spaced` and the last two pin the gate's invocation,
-# and each mutation below makes its case fail.
+# The five cases from `featuregated` to `spaced`, `secondbroken` and `secondorphan` pin the
+# gate's invocation, the cases from `cfgbody` to `platformcfg` pin its source scan, and each
+# mutation below makes its case fail.
 # `--all-features` or `--features testing` on the clippy line makes the gate exit 0 on
 # `featuregated`, which expects exit 1. `--examples` in place of `--example NAME` skips a
 # `required-features` target and makes the gate exit 0 on `requiredfeatures`, which expects
@@ -21,10 +22,14 @@
 # on `excluded`, which expects exit 0. An unquoted `for` loop splits `spaced` at its space and
 # makes the gate exit 1 on `spaced`, which expects exit 0. Ending the package loop after its
 # first package makes the gate exit 0 on `secondbroken` and `secondorphan`, which expect exit 1.
-# Dropping the cfg scan makes the gate exit 0 on `cfgbody` and `cfghelper`, which expect exit
-# 1: `cfgbody` compiles because its feature-gated `main` vanishes. Scanning string literals or
-# comments, or rejecting a platform key, makes the gate exit 1 on `platformcfg`, which
-# expects exit 0.
+# Dropping the source scan makes the gate exit 0 on every case from `cfgbody` to
+# `macrorules`, which expect exit 1: each fixture compiles on default features. Accepting a
+# platform predicate false on the host makes the gate exit 0 on `falsecfg`, accepting an
+# empty `any()` does the same on `emptyany`, ending a block comment at its first `*/` does
+# the same on `nestedcomment`, and dropping the `include`, `#[path]` or `macro_rules` rule
+# does the same on `include`, `pathmod` or `macrorules`. Scanning string literals or
+# comments, rejecting a platform predicate true on the host, or rejecting `include_str!`
+# makes the gate exit 1 on `platformcfg`, which expects exit 0.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -153,17 +158,55 @@ expect "second package publishes an orphan" "$ws" 1 "FAIL: zeta publishes 'examp
 ws="$(new_ws cfgbody $'[features]\ntesting = []')"
 printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
 printf '#[cfg(\n    feature = "testing"\n)]\nfn main() { demo::t(); }\n#[cfg(not(feature = "testing"))]\nfn main() {}\n' > "$ws/demo/examples/good.rs"
-expect "example body behind a feature cfg" "$ws" 1 "FAIL: demo example 'good' gates code on a non-platform cfg predicate"
+expect "example body behind a feature cfg" "$ws" 1 "FAIL: demo example 'good' holds a construct that can remove code"
 
 ws="$(new_ws cfghelper)"
 mkdir -p "$ws/demo/examples/support"
 printf '#[cfg_attr(test, allow(dead_code))]\npub fn h() {}\n' > "$ws/demo/examples/support/mod.rs"
-expect "helper module under examples/ with a cfg_attr predicate" "$ws" 1 "FAIL: demo 'examples/support/mod.rs' gates code on a non-platform cfg predicate"
+expect "helper module under examples/ with a cfg_attr predicate" "$ws" 1 "FAIL: demo 'examples/support/mod.rs' holds a construct that can remove code"
+
+# The same dodge on a platform key: the body sits under a predicate false on every host
+# this suite runs on (it needs a unix host, as the gate does).
+ws="$(new_ws falsecfg $'[features]\ntesting = []')"
+printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+printf '#[cfg(not(unix))]\nfn main() { demo::t(); }\n#[cfg(unix)]\nfn main() {}\n' > "$ws/demo/examples/good.rs"
+expect "example body behind a platform predicate false on the host" "$ws" 1 "      cfg(not(unix))"
+
+ws="$(new_ws emptyany $'[features]\ntesting = []')"
+printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+printf '#[cfg(any())]\nfn main() { demo::t(); }\n#[cfg(not(any()))]\nfn main() {}\n' > "$ws/demo/examples/good.rs"
+expect "example body behind an empty any()" "$ws" 1 "      cfg(any())"
+
+# Block comments nest. A scanner that ends one at its first `*/` reads the rest of line 1 as
+# the start of a string literal that runs to line 6, and so never sees the feature cfg.
+ws="$(new_ws nestedcomment $'[features]\ntesting = []')"
+printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+printf '/* /* */ " */\n#[cfg(feature = "testing")]\nfn main() { demo::t(); }\n#[cfg(not(feature = "testing"))]\nfn main() {}\n// "\n' > "$ws/demo/examples/good.rs"
+expect "feature cfg after a nested block comment" "$ws" 1 '      cfg(feature = "testing")'
+
+# The next three hide the gated body in a file the scan does not open, or build the cfg
+# attribute from an ident the scan does not read.
+ws="$(new_ws include $'[features]\ntesting = []')"
+printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+printf '#[cfg(feature = "testing")]\nfn main() { demo::t(); }\n#[cfg(not(feature = "testing"))]\nfn main() {}\n' > "$ws/demo/src/body.inc"
+echo 'include!("../src/body.inc");' > "$ws/demo/examples/good.rs"
+expect "example that includes a file outside examples/" "$ws" 1 "      include!"
+
+ws="$(new_ws pathmod $'[features]\ntesting = []')"
+printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+printf '#[cfg(feature = "testing")]\npub fn run() { demo::t(); }\n#[cfg(not(feature = "testing"))]\npub fn run() {}\n' > "$ws/demo/examples/body.inc"
+printf '#[path = "body.inc"]\nmod body;\nfn main() { body::run(); }\n' > "$ws/demo/examples/good.rs"
+expect "example module read through #[path]" "$ws" 1 "      #[path]"
+
+ws="$(new_ws macrorules $'[features]\ntesting = []')"
+printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+printf 'macro_rules! gate {\n    ($k:ident) => {\n        #[$k(feature = "testing")]\n        fn main() { demo::t(); }\n        #[$k(not(feature = "testing"))]\n        fn main() {}\n    };\n}\ngate!(cfg);\n' > "$ws/demo/examples/good.rs"
+expect "cfg attribute built by a local macro" "$ws" 1 "      macro_rules!"
 
 ws="$(new_ws platformcfg)"
 cat > "$ws/demo/examples/good.rs" <<'RS'
 // #[cfg(feature = "testing")] in a comment is not a predicate.
-/* nor cfg(test) in a block comment */
+/* nor cfg(test) in a /* nested */ block comment, nor include!("x.rs") */
 fn main() {
     let s = "#[cfg(feature = \"testing\")]";
     let c = '"';
@@ -171,16 +214,15 @@ fn main() {
     {
         let _ = (s, c);
     }
-    #[cfg(not(any(unix, target_os = "windows")))]
+    #[cfg(not(any(windows, target_os = "windows",)))]
     {
         let _ = (s, c);
     }
-    let _ = cfg!(all(target_family = "unix", target_pointer_width = "64"));
-    #[cfg(windows)]
-    let _ = (s, c);
+    let _ = cfg!(all(target_family = "unix", not(windows)));
+    let _ = (include_str!("good.rs"), r#"cfg(windows) "include" macro_rules"#);
 }
 RS
-expect "platform predicates, and cfg text in strings and comments" "$ws" 0 "OK: 1 example target(s) compile"
+expect "platform predicates true on the host, and scan text in strings and comments" "$ws" 0 "OK: 1 example target(s) compile"
 
 echo "$PASSED passed, $FAILED failed"
 [ "$FAILED" -eq 0 ]

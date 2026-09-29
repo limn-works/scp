@@ -1057,8 +1057,8 @@ jobs:
           # udp/coap alongside ring-backed quic/http3), so a single combined
           # invocation covers all four.
           cargo clippy -p scp-transport --features quic,http3,udp,coap --all-targets -- -D warnings
-          # Asserts two things: every example target compiles with no cfg
-          # predicate but a platform key in its example source, and every
+          # Asserts two things: every example target compiles and its example
+          # source holds no construct the script's source scan rejects, and every
           # published examples/*.rs is some target's source. The script header
           # states what the check cannot prove; do not restate it here.
           bash scripts/check-examples-compile.sh

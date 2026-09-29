@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Two assertions about example targets:
 #
-#   1. Every example target in the workspace compiles, lint-clean, and no cfg
-#      predicate other than a platform key removes source from that compile.
+#   1. Every example target in the workspace compiles, lint-clean, and its example
+#      sources hold none of the constructs the source scan below rejects.
 #   2. Every published `examples/*.rs` file IS the source of an example target.
 #
 # Assertion 2 joins on PATH, never on target name. A `[[example]] path = …` key can
@@ -60,34 +60,46 @@
 # list carries `scp-node?/testing`. Measured: the workspace-wide form exits 0 on
 # the `DhtMode::Memory` defect; this loop exits 1.
 #
-# WHY ASSERTION 1 READS CFG PREDICATES. A target whose body sits behind
+# WHY ASSERTION 1 READS THE SOURCE. A target whose body sits behind
 # `#[cfg(feature = "testing")] fn main() { ... }`, next to an empty
 # `#[cfg(not(feature = "testing"))] fn main() {}`, compiles to nothing on the feature set
-# the loop builds, and a compile alone counts it as checked. So every `cfg(`, `cfg_attr(`
-# and `cfg!(` predicate in a target's source file, and in every `.rs` file under the
-# package's `examples/`, published or not, may name only a platform key (`unix`,
-# `windows`, `target_*`) under `not`, `any` or `all`, and no empty `any()` or `all()`.
-# Cases `cfgbody`, `cfghelper` and `platformcfg` pin this.
+# the loop builds, and a compile alone counts it as checked. So the scan reads each target's
+# source file and every `.rs` file under the package's `examples/`, published or not, and
+# fails on any of these:
+#   - A `cfg(` or `cfg!(` predicate that names anything but a platform key (`unix`,
+#     `windows`, `target_*`) under `not`, `any` or `all`, or that is false on the host
+#     running this gate, as `rustc --print cfg` reports it. A false platform predicate
+#     removes code as a feature key does: `#[cfg(not(unix))]` on the Linux CI runner.
+#     An empty `any()` or `all()` fails too.
+#   - `cfg_attr`, `#[path]`, `include` and `macro_rules`. `cfg_attr` can carry a `path`
+#     key, `#[path]` and `include!` bring in a file the scan never opens, and a local macro
+#     can build a `cfg` attribute from an ident or drop its input tokens. No example in the
+#     workspace uses any of the four.
+#   - A block comment or string literal the scan cannot close. Block comments nest, as
+#     rustc reads them, and an unclosed one fails the scan instead of desynchronizing it.
+# String literals and comments are blanked first, so neither hides a predicate from the
+# scan nor fakes one into it. Cases `cfgbody` to `macrorules` pin this, and case
+# `platformcfg` pins what passes.
 #
-# TWO RESIDUAL LIMITS:
-#   - Code rustc discards before type-checking by another route: a platform predicate
-#     false on the CI host (`cfg(windows)`, `all(unix, windows)`), a macro that drops its
-#     input tokens, or a `#[path]` module outside `examples/`. Lesson row 9b; no human has
-#     ruled it acceptable.
-#   - Beyond the dev-dependency closure stated above (lesson row 4b) and the discard
-#     routes just named (lesson row 9b), every remaining bypass edits the crate's BUILD
-#     CONFIGURATION: its `build.rs`, a manifest key, or `.cargo/config.toml` rustflags.
-#     That is the criterion. It is not "write access to the crate": every defect
-#     this gate catches, including the `DhtMode::Memory` edit above, is written by
-#     someone with that access, so write access separates nothing. A source edit to an
-#     example or to the lib is this gate's subject and never an exemption. `build.rs` is an instance of the
-#     criterion that needs no manifest key, and one hypothesis stays unmeasured: that a build
-#     script printing `cargo::rustc-cfg=feature="testing"` makes `DhtMode::Memory`
-#     exist for every target of the package. Two attempts to reproduce it made the
-#     gate exit 1 instead, because the injected cfg desynchronized the lib from its
-#     dependency features. Review covers build-configuration edits. No hook guards
-#     this script either. AGENTS.md lists it among the enforcement
-#     files a human must approve weakening, and review enforces that rule.
+# RESIDUAL LIMITS. These are the bypasses known to the gate's authors, not a proof that
+# no other exists:
+#   - The dev-dependency closure stated above (lesson row 4b).
+#   - Code outside `examples/` that an example calls or expands (lesson row 9c): a lib
+#     item compiled only under a feature key beside an empty default twin, or a lib or
+#     dependency macro (`#[tokio::main]` is one) that drops or feature-gates its input.
+#     The scan reads example sources only. No human has ruled this acceptable.
+#   - An edit to the crate's BUILD CONFIGURATION: its `build.rs`, a manifest key, or
+#     `.cargo/config.toml` rustflags. "Write access to the crate" is not the criterion:
+#     every defect this gate catches, including the `DhtMode::Memory` edit above, is
+#     written by someone with that access, so write access separates nothing. A source
+#     edit to an example is this gate's subject and never an exemption. `build.rs` is an
+#     instance of the criterion that needs no manifest key, and one hypothesis stays
+#     unmeasured: that a build script printing `cargo::rustc-cfg=feature="testing"` makes
+#     `DhtMode::Memory` exist for every target of the package. Two attempts to reproduce
+#     it made the gate exit 1 instead, because the injected cfg desynchronized the lib
+#     from its dependency features. Review covers build-configuration edits.
+# No hook guards this script. AGENTS.md lists it among the enforcement files a human must
+# approve weakening, and review enforces that rule.
 #
 # See .docs/lessons/shipped-targets-need-a-default-feature-build.md.
 set -euo pipefail
@@ -97,35 +109,65 @@ cd "$(dirname "$0")/.."
 status=0
 checked=0
 
-# cfg_scan FILE LABEL: fail when FILE holds a cfg predicate naming anything but a
-# platform key. String literals and comments are blanked first, so neither hides one
-# from the scan nor fakes one into it.
+# cfg_scan FILE LABEL: fail when FILE holds a construct the header's source rules reject.
+# Each hit prints on its own line.
+HOST_CFG="$(rustc --print cfg </dev/null)" || { echo "FAIL: 'rustc --print cfg' failed." >&2; exit 1; }
 IFS= read -r -d '' CFG_SCAN <<'PL' || true
 local $/; $_ = <STDIN>;
-s{(r(\#*)".*?"\2|b?"(?:[^"\\]|\\.)*"|b?'(?:[^'\\]|\\.)')|//[^\n]*|/\*.*?\*/}{defined $1 ? '""' : ' '}gse;
-my %ok = map { $_ => 1 } qw(not any all unix windows target_os target_family target_arch
+my @str;
+my %plat = map { $_ => 1 } qw(unix windows target_os target_family target_arch
   target_pointer_width target_endian target_env target_vendor);
-while (/\bcfg(_attr)?\s*!?\s*\(/g) {
-  my ($attr, $d, $p, $i) = ($1, 1, '', pos);
+my %host = map { $_ => 1 } split /\n/, $ENV{HOST_CFG};
+s{(b?r(\#*)"(.*?)"\2|b?"((?:[^"\\]|\\.)*)"|b?'(?:[^'\\]|\\.)')|//[^\n]*|(/\*(?:[^/*]++|/(?!\*)|\*(?!/)|(?5))*+\*/)}{
+  !defined $1 ? ' ' : $1 =~ /^b?'/ ? '0' : do { push @str, defined $3 ? $3 : $4; qq{"$#str"} }
+}gse;
+print "unbalanced block comment\n" if m{/\*};
+print "unbalanced string literal\n" if s/"\d+"//gr =~ /"/;
+print "include!\n" if /\binclude\b/;
+print "macro_rules!\n" if /\bmacro_rules\b/;
+print "#[path]\n" if /#\s*!?\s*\[\s*path\b/;
+print "cfg_attr\n" if /\bcfg_attr\b/;
+sub ev {
+  my $t = shift; my $k = shift @$t;
+  return undef unless defined $k && $k =~ /^[A-Za-z_]/;
+  if (@$t && $t->[0] eq '(') {
+    return undef unless $k =~ /^(?:not|any|all)$/;
+    shift @$t; my @v;
+    while (@$t && $t->[0] ne ')') {
+      my $x = ev($t); return undef unless defined $x; push @v, $x;
+      last unless @$t && $t->[0] eq ','; shift @$t;
+    }
+    return undef unless @$t && shift(@$t) eq ')';
+    return undef if $k eq 'not' ? @v != 1 : !@v;
+    return $k eq 'not' ? !$v[0] : $k eq 'any' ? (grep { $_ } @v) > 0 : !(grep { !$_ } @v);
+  }
+  return undef unless $plat{$k};
+  return $host{$k} ? 1 : 0 unless @$t && $t->[0] eq '=';
+  shift @$t; my $s = shift @$t;
+  return undef unless defined $s && $s =~ /^"(\d+)"$/;
+  return $host{qq{$k="$str[$1]"}} ? 1 : 0;
+}
+while (/\bcfg\s*!?\s*\(/g) {
+  my ($d, $p, $i) = (1, '', pos);
   for (; $i < length && $d; $i++) {
     my $c = substr($_, $i, 1);
     $d++ if $c eq '('; $d-- if $c eq ')';
-    last if $attr && $d == 1 && $c eq ',';
     $p .= $c if $d;
   }
-  my $bad = grep { !$ok{$_} } $p =~ /\b([A-Za-z_]\w*)\b/g;
-  $bad++ if $p =~ /\b(?:any|all)\s*\(\s*\)/;
-  (my $s = $p) =~ s/\s+/ /g;
-  print "cfg($s)\n" if $bad;
+  my @t = $p =~ /\G\s*([A-Za-z_]\w*|"\d+"|[(),=])/gc;
+  my $v = substr($p, pos($p) // 0) =~ /^\s*$/ ? ev(\@t) : undef;
+  next if $v && !@t;
+  (my $s = $p) =~ s/"(\d+)"/"$str[$1]"/g; $s =~ s/\s+/ /g;
+  print "cfg($s)\n";
 }
 PL
 cfg_scan() {
   local hits
-  if ! hits="$(perl -e "$CFG_SCAN" <"$1")"; then
-    echo "FAIL: could not scan $2 for cfg predicates." >&2; status=1; return
+  if ! hits="$(HOST_CFG="$HOST_CFG" perl -e "$CFG_SCAN" <"$1")"; then
+    echo "FAIL: could not scan $2." >&2; status=1; return
   fi
   [ -n "$hits" ] || return 0
-  echo "FAIL: $2 gates code on a non-platform cfg predicate, which removes it from this compile:" >&2
+  echo "FAIL: $2 holds a construct that can remove code from this compile:" >&2
   printf '      %s\n' "$hits" >&2
   status=1
 }
