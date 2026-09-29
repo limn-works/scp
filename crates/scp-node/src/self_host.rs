@@ -1335,8 +1335,9 @@ where
             tracing::info!(
                 "DhtMode::Disabled — DHT layer off: the DID document is NOT published (no address \
                  disclosed, fail-closed on publish) and the DHT resolution arm returns Ok(None). \
-                 DID resolution composes the relay layer around the off DHT arm (the fail-safe \
-                 default; set DhtMode::Production to host publicly)"
+                 The relay layer is a NoOpRelayQuerier until SCP-RELAYRES-006, so resolution \
+                 answers from the cache alone (the fail-safe default; set DhtMode::Production \
+                 to host publicly)"
             );
             let did_method = build_disabled_did_method(cache);
             let key_resolver = build_shared_cache_key_resolver(
@@ -1983,9 +1984,12 @@ pub fn build_memory_did_method(
 /// disclosed) and resolve contributes an honest `Ok(None)` — never a fabricated
 /// or in-memory answer (ADR-062 §Decision 1, A2). The method shares the node's
 /// [`DidCache`] with the co-located resolver but carries no signer (it never
-/// publishes). DID resolution still runs: the
-/// [`DualLayerResolver`](scp_identity::DualLayerResolver) composes the
-/// relay layer around the off DHT arm.
+/// publishes). The [`DualLayerResolver`](scp_identity::DualLayerResolver)
+/// composes the relay layer around the off DHT arm, but the relay layer
+/// `host_site` wires is a
+/// [`NoOpRelayQuerier`](scp_identity::resolver::NoOpRelayQuerier) that also
+/// answers `Ok(None)` until SCP-RELAYRES-006, so resolution answers from the
+/// cache alone.
 #[must_use]
 pub fn build_disabled_did_method(
     cache: Arc<DidCache>,
