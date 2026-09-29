@@ -368,11 +368,22 @@ impl SupervisorHandle {
             .cloned()
     }
 
-    /// Read-only lifecycle-state probe for `context_id`. Returns `None`
-    /// if no per-context actor is registered (close / TTL does not
+    /// Read-only lifecycle-state probe for `context_id`. Close does not
     /// despawn the actor, so `Some(state)` reflects the live lifecycle
-    /// state — `Active` / `Creating` vs a terminal state — and `None`
-    /// means the actor genuinely does not exist).
+    /// state — `Active` / `Creating` vs a terminal state such as `Closed` —
+    /// and a context the crash watchdog poisoned reads `Some(Poisoned)`
+    /// (ADR-049 §10). A TTL expiry does despawn the actor once its cleanup
+    /// completes and the `Expired` state is durable, so a context whose
+    /// expiry completed reads `None`. While an incomplete expiry is retrying,
+    /// the actor stays registered and reads `Some(Expired)`.
+    ///
+    /// `None` does not mean the context is absent. It covers an id no actor
+    /// serves and also an actor this call could not reach: a busy or
+    /// timed-out actor, and a context mid-respawn or past a failed respawn.
+    /// Read `None` only as "no live `Active` context". A caller whose
+    /// decision turns on absence calls
+    /// [`Supervisor::read_context_state_checked`](crate::context::supervisor::supervisor::Supervisor::read_context_state_checked),
+    /// which reports the unreachable cases as `ActorBusy` and `ActorCrashed`.
     ///
     /// Capability-reduced surface over
     /// [`Supervisor::read_context_state`](crate::context::supervisor::supervisor::Supervisor::read_context_state):
@@ -700,6 +711,17 @@ impl SupervisorHandle {
     /// `actor/handlers/`.
     pub(in crate::context) async fn despawn_actor(&self, context_id: &str) -> bool {
         self.supervisor.despawn_actor(context_id).await
+    }
+
+    /// Despawn the actor an import is replacing, and mark the gap until the
+    /// replacement registers (ADR-049 §10). See
+    /// [`Supervisor::despawn_for_replace`](crate::context::supervisor::Supervisor::despawn_for_replace).
+    ///
+    /// # Visibility
+    ///
+    /// `pub(in crate::context)` — reachable by the lifecycle import path only.
+    pub(in crate::context) async fn despawn_for_replace(&self, context_id: &str) -> bool {
+        self.supervisor.despawn_for_replace(context_id).await
     }
 
     /// Whether the context is poisoned (ADR-049 §10) — its actor exceeded
