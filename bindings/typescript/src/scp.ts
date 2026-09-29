@@ -121,7 +121,7 @@ type NativeAddon = RawNativeAddon & {
   validateContextParams?: unknown;
   checkScopedCapability?: unknown;
   // P-256 custody-host helpers (§9.10.4, §9.5), module-level free functions.
-  p256SeedToScalar?: unknown;
+  p256PseudonymScalar?: unknown;
   p256PublicKey?: unknown;
   p256SignPrehashRfc6979?: unknown;
 };
@@ -550,7 +550,7 @@ export interface KeyCustodyProvider {
    * dies with its identity (spec §9.10.4.A): `destroyKey(keyId)` destroys it,
    * and a derivation still in flight when `keyId` is destroyed fails with
    * key-not-found and stores nothing. A host maps the §9.10.4 `context_seed`
-   * to the pseudonym key with {@link p256SeedToScalar} and computes
+   * to the pseudonym key with {@link p256PseudonymScalar} and computes
    * `publicKey` with {@link p256PublicKey} rather than reducing and
    * multiplying itself.
    */
@@ -590,7 +590,7 @@ export interface KeyCustodyProvider {
 
 /** Calls the addon's P-256 host helper `name`, mapping its errors. */
 function p256HostCall(
-  name: "p256SeedToScalar" | "p256PublicKey" | "p256SignPrehashRfc6979",
+  name: "p256PseudonymScalar" | "p256PublicKey" | "p256SignPrehashRfc6979",
   ...args: Uint8Array[]
 ): Uint8Array {
   // NAPI Vec<u8> IN params map to number[] in JS; the Vec<u8> return is a
@@ -604,23 +604,24 @@ function p256HostCall(
 }
 
 /**
- * Maps a 32-byte seed to a P-256 private scalar in `[1, n − 1]` under `label`.
+ * Maps a 32-byte §9.10.4 `context_seed` (v1 or v2) to its P-256 pseudonym
+ * scalar in `[1, n − 1]`.
  *
- * FIPS 186-5 A.2.1, spec §9.10.4: `HKDF-Expand(seed, label, 48)` read as a
- * big-endian integer, `mod (n − 1) + 1`, returned as 32 big-endian bytes. For
- * a pseudonym the label is `"SCP-PSEUDONYM-P256-V1"` and the seed the §9.10.4
- * `context_seed`. A {@link KeyCustodyProvider} host stores the result as the
- * pseudonym key and passes it to {@link p256PublicKey} and
- * {@link p256SignPrehashRfc6979}.
+ * FIPS 186-5 A.2.1, spec §9.10.4:
+ * `HKDF-Expand(context_seed, "SCP-PSEUDONYM-P256-V1", 48)` read as a
+ * big-endian integer, `mod (n − 1) + 1`, returned as 32 big-endian bytes. The
+ * label is fixed inside the helper, so no host passes it. A
+ * {@link KeyCustodyProvider} host stores the result as the pseudonym key and
+ * passes it to {@link p256PublicKey} and {@link p256SignPrehashRfc6979}.
  *
  * The Rust side wipes its copies; the arrays the bridge copies through the JS
  * boundary are not wiped, so the host wipes its own.
  *
- * @throws {ValidationError} `SCP-VALID-7005` when `seed` is not 32 bytes.
+ * @throws {ValidationError} `SCP-VALID-7005` when `contextSeed` is not 32 bytes.
  * @throws {CryptoError} `SCP-CRYPTO-4001` if the reduction fails.
  */
-export function p256SeedToScalar(label: Uint8Array, seed: Uint8Array): Uint8Array {
-  return p256HostCall("p256SeedToScalar", label, seed);
+export function p256PseudonymScalar(contextSeed: Uint8Array): Uint8Array {
+  return p256HostCall("p256PseudonymScalar", contextSeed);
 }
 
 /**

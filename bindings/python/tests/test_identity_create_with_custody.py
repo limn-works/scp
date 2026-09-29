@@ -26,13 +26,12 @@ import pytest
 
 from scp_sdk import (
     PseudonymResult,
+    p256_pseudonym_scalar,
     p256_public_key,
-    p256_seed_to_scalar,
     p256_sign_prehash_rfc6979,
 )
 
 from .pseudonym_recipe import (
-    PSEUDONYM_SCALAR_LABEL,
     canonical_pseudonym_seed,
     canonical_rotatable_pseudonym_seed,
 )
@@ -197,7 +196,7 @@ class _FakeKeychain:
     def _register_pseudonym(self, owner: str, seed: bytes, kid: str) -> PseudonymResult:
         # The host computes the context seed; the SDK helper maps it to the
         # scalar and the point.
-        d = p256_seed_to_scalar(PSEUDONYM_SCALAR_LABEL, seed)
+        d = p256_pseudonym_scalar(seed)
         self._pseudonyms[kid] = d
         self._pseudonym_owner[kid] = owner
         result = PseudonymResult(public_key=p256_public_key(d), key_id=kid)
@@ -337,5 +336,26 @@ async def test_dict_pseudonym_result_fails_naming_the_expected_shape(scp) -> Non
     identity = await scp.identity_create_with_custody(provider)
 
     expected = r"PseudonymResult\(public_key: bytes, key_id: str\)"
-    with pytest.raises(_scp_core.ScpError, match=expected):
+    with pytest.raises(_scp_core.ScpError, match=expected) as excinfo:
         await scp.context_create(identity.did, _ENCRYPTED_PARAMS)
+    assert str(excinfo.value).startswith("[SCP-CRYPTO-4060]"), excinfo.value
+
+
+@pytest.mark.asyncio
+async def test_coroutine_derive_fails_with_custody_error(scp) -> None:
+    """A provider whose derive is an ``async def`` returns a coroutine, which is
+    the wrong type: the operation fails with ``SCP-CRYPTO-4060``, not
+    ``SCP-IDENT-1055``."""
+    from scp_sdk import _scp_core
+
+    class _AsyncDerive(_FakeKeychain):
+        async def derive_pseudonym(  # type: ignore[override]
+            self, key_id: str, context_id: bytes
+        ) -> PseudonymResult:
+            return super().derive_pseudonym(key_id, context_id)
+
+    provider = _AsyncDerive()
+    identity = await scp.identity_create_with_custody(provider)
+    with pytest.raises(_scp_core.ScpError, match="coroutine") as excinfo:
+        await scp.context_create(identity.did, _ENCRYPTED_PARAMS)
+    assert str(excinfo.value).startswith("[SCP-CRYPTO-4060]"), excinfo.value

@@ -1,10 +1,11 @@
 /**
- * The SDK's P-256 custody-host helpers (`p256SeedToScalar`, `p256PublicKey`,
+ * The SDK's P-256 custody-host helpers (`p256PseudonymScalar`, `p256PublicKey`,
  * `p256SignPrehashRfc6979`, exported from the package root) against pinned
  * outputs:
  *   - spec §25.19 Vectors 30 and 31: each `context_seed_v1` and
- *     `context_seed_v2` maps through `p256SeedToScalar` and `p256PublicKey` to
- *     the spec's v1 and v2 points;
+ *     `context_seed_v2` maps through `p256PseudonymScalar` (whose
+ *     `SCP-PSEUDONYM-P256-V1` label is fixed inside the helper) and
+ *     `p256PublicKey` to the spec's v1 and v2 points;
  *   - RFC 6979 A.2.5 (P-256, SHA-256, "sample"): the RFC's `r`, and the low-s
  *     form of the RFC's `s` (the two sum to `n`, §9.5);
  *   - the independent recipe in `./pseudonym-recipe`, which signs the same
@@ -18,20 +19,19 @@ import { describe, expect, test } from "bun:test";
 import * as crypto from "node:crypto";
 
 import { CryptoError, type ScpError, ValidationError } from "../src/errors";
-import { p256PublicKey, p256SeedToScalar, p256SignPrehashRfc6979 } from "../src/index";
+import { p256PseudonymScalar, p256PublicKey, p256SignPrehashRfc6979 } from "../src/index";
 import { loadNativeAddon } from "../src/internal/native";
 import { bytesToBigInt, P256_N, p256SignPrehash } from "./pseudonym-recipe";
 
 let skipReason = "";
 try {
-  if (typeof loadNativeAddon().p256SeedToScalar !== "function") {
+  if (typeof loadNativeAddon().p256PseudonymScalar !== "function") {
     skipReason = "native addon predates the P-256 host helpers";
   }
 } catch (e: unknown) {
   skipReason = `native addon not available: ${e instanceof Error ? e.message : String(e)}`;
 }
 
-const LABEL = new TextEncoder().encode("SCP-PSEUDONYM-P256-V1");
 const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
 const unhex = (s: string) => new Uint8Array(Buffer.from(s, "hex"));
 
@@ -56,10 +56,10 @@ const VECTORS = [
 describe.skipIf(skipReason !== "")(`P-256 host helpers ${skipReason}`, () => {
   for (const v of VECTORS) {
     test(`${v.name}: context seeds map to the spec's v1 and v2 points`, () => {
-      const d1 = p256SeedToScalar(LABEL, unhex(v.seedV1));
+      const d1 = p256PseudonymScalar(unhex(v.seedV1));
       expect(d1.length).toBe(32);
       expect(hex(p256PublicKey(d1))).toBe(v.v1);
-      expect(hex(p256PublicKey(p256SeedToScalar(LABEL, unhex(v.seedV2))))).toBe(v.v2);
+      expect(hex(p256PublicKey(p256PseudonymScalar(unhex(v.seedV2))))).toBe(v.v2);
     });
   }
 
@@ -77,8 +77,7 @@ describe.skipIf(skipReason !== "")(`P-256 host helpers ${skipReason}`, () => {
   });
 
   test("signatures equal the independent recipe's for the same scalar and digest", () => {
-    const d = p256SeedToScalar(
-      LABEL,
+    const d = p256PseudonymScalar(
       unhex("47ea801c24e8a4d577f04837eca0674fbbf160127fa2d1a4bb1420150b0a048b"),
     );
     for (let i = 0; i < 8; i++) {
@@ -104,11 +103,7 @@ describe.skipIf(skipReason !== "")(`P-256 host helpers ${skipReason}`, () => {
       expect(caught).toBeInstanceOf(cls);
       expect((caught as ScpError).code).toBe(code);
     };
-    expectCode(
-      () => p256SeedToScalar(LABEL, new Uint8Array(31)),
-      ValidationError,
-      "SCP-VALID-7005",
-    );
+    expectCode(() => p256PseudonymScalar(new Uint8Array(31)), ValidationError, "SCP-VALID-7005");
     expectCode(() => p256PublicKey(new Uint8Array(33).fill(1)), ValidationError, "SCP-VALID-7005");
     expectCode(() => p256PublicKey(new Uint8Array(32)), CryptoError, "SCP-CRYPTO-4001");
     expectCode(() => p256PublicKey(new Uint8Array(32).fill(0xff)), CryptoError, "SCP-CRYPTO-4001");

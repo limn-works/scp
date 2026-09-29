@@ -36,11 +36,8 @@ import { CryptoError, IdentityError, mapBridgeError } from "../src/errors";
 import { toNativeCustodyProvider } from "../src/internal/custody-adapter";
 import { loadNativeAddon } from "../src/internal/native";
 import type { KeyCustodyProvider, PseudonymResult } from "../src/scp";
-import { p256PublicKey, p256SeedToScalar, p256SignPrehashRfc6979 } from "../src/scp";
+import { p256PseudonymScalar, p256PublicKey, p256SignPrehashRfc6979 } from "../src/scp";
 import { bigIntTo32, bytesToBigInt, P256_N, pseudonymSeedV1 } from "./pseudonym-recipe";
-
-/** The §9.10.4 label that maps a pseudonym context seed to its P-256 scalar. */
-const SCALAR_LABEL = new TextEncoder().encode("SCP-PSEUDONYM-P256-V1");
 
 interface TestingCustody {
   generateKeypair(): Promise<string>;
@@ -139,7 +136,7 @@ class StoreKeychain implements KeyCustodyProvider {
     const seed = this.store.seeds.get(keyId);
     if (seed === undefined) throw new Error(`unknown key id: ${keyId}`);
     // The host computes the context seed; the SDK helper maps it to the scalar.
-    const d = p256SeedToScalar(SCALAR_LABEL, pseudonymSeedV1(seed, contextId));
+    const d = p256PseudonymScalar(pseudonymSeedV1(seed, contextId));
     // Deterministic per (identity, context), as the provider contract requires;
     // `fixedId` names every pseudonym "777" to reuse one id across contexts.
     const h = crypto.createHash("sha256").update(`${keyId}|`).update(contextId).digest();

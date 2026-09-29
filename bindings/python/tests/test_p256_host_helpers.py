@@ -1,6 +1,6 @@
 """The SDK's P-256 custody-host helpers against pinned outputs.
 
-``scp_sdk.p256_seed_to_scalar``, ``scp_sdk.p256_public_key`` and
+``scp_sdk.p256_pseudonym_scalar``, ``scp_sdk.p256_public_key`` and
 ``scp_sdk.p256_sign_prehash_rfc6979``:
 
 - spec §25.19 Vectors 30 and 31: each ``context_seed_v1`` and
@@ -25,14 +25,13 @@ pytest.importorskip("scp_sdk._scp_core")
 from scp_sdk import (
     CryptoError,
     ValidationError,
+    p256_pseudonym_scalar,
     p256_public_key,
-    p256_seed_to_scalar,
     p256_sign_prehash_rfc6979,
 )
 
 from .pseudonym_recipe import p256_sign_prehash
 
-LABEL = b"SCP-PSEUDONYM-P256-V1"
 N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
 
 # §25.19 values, copied verbatim from the spec.
@@ -60,10 +59,10 @@ VECTORS = [
 def test_context_seeds_map_to_spec_points(
     name: str, seed_v1: str, v1: str, seed_v2: str, v2: str
 ) -> None:
-    d1 = p256_seed_to_scalar(LABEL, bytes.fromhex(seed_v1))
+    d1 = p256_pseudonym_scalar(bytes.fromhex(seed_v1))
     assert isinstance(d1, bytes) and len(d1) == 32
     assert p256_public_key(d1).hex() == v1
-    assert p256_public_key(p256_seed_to_scalar(LABEL, bytes.fromhex(seed_v2))).hex() == v2
+    assert p256_public_key(p256_pseudonym_scalar(bytes.fromhex(seed_v2))).hex() == v2
 
 
 def test_rfc6979_a25_signature_is_low_s() -> None:
@@ -78,7 +77,7 @@ def test_rfc6979_a25_signature_is_low_s() -> None:
 
 
 def test_signatures_equal_the_independent_recipe() -> None:
-    d = p256_seed_to_scalar(LABEL, bytes.fromhex(VECTORS[0][1]))
+    d = p256_pseudonym_scalar(bytes.fromhex(VECTORS[0][1]))
     for i in range(8):
         digest = hashlib.sha256(b"msg-%d" % i).digest()
         assert p256_sign_prehash_rfc6979(d, digest) == p256_sign_prehash(
@@ -89,7 +88,7 @@ def test_signatures_equal_the_independent_recipe() -> None:
 @pytest.mark.parametrize(
     ("call", "error", "code"),
     [
-        (lambda: p256_seed_to_scalar(LABEL, bytes(31)), ValidationError, "SCP-VALID-7005"),
+        (lambda: p256_pseudonym_scalar(bytes(31)), ValidationError, "SCP-VALID-7005"),
         (lambda: p256_public_key(b"\x01" * 33), ValidationError, "SCP-VALID-7005"),
         (lambda: p256_public_key(bytes(32)), CryptoError, "SCP-CRYPTO-4001"),
         (lambda: p256_public_key(b"\xff" * 32), CryptoError, "SCP-CRYPTO-4001"),

@@ -1441,7 +1441,7 @@ fn discovery_and_provenance_coverage() {
 // `economy_adjust_relay_price`.
 //
 // Subsequently RAISED 109 -> 112 by the three P-256 custody-host helpers
-// (`p256_seed_to_scalar` / `p256_public_key` / `p256_sign_prehash_rfc6979`,
+// (`p256_pseudonym_scalar` / `p256_public_key` / `p256_sign_prehash_rfc6979`,
 // §9.10.4 and §9.5): one implementation in `scp_ffi_common::p256_host`, first
 // exported by UniFFI alone and now by PyO3 and NAPI too, so their
 // `ffi-export-allowlist.json` bridge-specific entries are gone. Pure coverage

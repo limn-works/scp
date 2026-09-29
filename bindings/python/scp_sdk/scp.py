@@ -91,8 +91,8 @@ __all__ = [
     "SealedInvitation",
     "SqliteStorage",
     "StorageConfig",
+    "p256_pseudonym_scalar",
     "p256_public_key",
-    "p256_seed_to_scalar",
     "p256_sign_prehash_rfc6979",
 ]
 
@@ -101,8 +101,7 @@ class PseudonymResult(NamedTuple):
     """A pseudonym a :class:`KeyCustodyProvider` derived (``09-security-model.md`` §9.10.4).
 
     Returned by :meth:`KeyCustodyProvider.derive_pseudonym` and
-    :meth:`KeyCustodyProvider.derive_rotatable_pseudonym`. Being a tuple, it
-    is also accepted wherever a ``(public_key, key_id)`` pair is.
+    :meth:`KeyCustodyProvider.derive_rotatable_pseudonym`.
     """
 
     public_key: bytes
@@ -129,6 +128,13 @@ class KeyCustodyProvider(Protocol):
     Key identifiers are opaque, numeric-string handles your implementation
     assigns in :meth:`generate_keypair` and maps internally to real key
     material. Byte values are passed and returned as ``bytes``.
+
+    Every method is a plain ``def``. A method that returns a coroutine (an
+    ``async def``), or a value of the wrong type (for :meth:`derive_pseudonym`,
+    a ``dict``, bare ``bytes`` or a tuple whose items have the wrong types),
+    fails the operation with the custody error ``SCP-CRYPTO-4060``;
+    ``SCP-IDENT-1055`` covers only a well-typed :class:`PseudonymResult` the
+    bridge cannot bind.
 
     A method reports failure by raising. Raise an exception whose ``code`` is
     ``"SCP-CRYPTO-4006"`` (key not found), such as
@@ -215,7 +221,7 @@ class KeyCustodyProvider(Protocol):
                 "big") % (n - 1) + 1
             public_key = SEC1_compressed(d * G)
 
-        A host maps ``seed`` to ``d`` with :func:`scp_sdk.p256_seed_to_scalar`
+        A host maps ``seed`` to ``d`` with :func:`scp_sdk.p256_pseudonym_scalar`
         (``d.to_bytes(32, "big")``) and computes ``public_key`` with
         :func:`scp_sdk.p256_public_key` rather than reducing and multiplying
         itself.
@@ -422,24 +428,24 @@ def _p256_host_call(name: str, *args: bytes) -> bytes:
         raise _coded_bridge_error(exc) from exc
 
 
-def p256_seed_to_scalar(label: bytes, seed: bytes) -> bytes:
-    """Map a 32-byte seed to a P-256 private scalar in ``[1, n - 1]`` under ``label``.
+def p256_pseudonym_scalar(context_seed: bytes) -> bytes:
+    """Map a 32-byte §9.10.4 ``context_seed`` to its P-256 pseudonym scalar in ``[1, n - 1]``.
 
     FIPS 186-5 A.2.1, ``09-security-model.md`` §9.10.4:
-    ``int.from_bytes(HKDF-Expand(seed, label, 48), "big") % (n - 1) + 1``,
-    returned as 32 big-endian bytes. For a pseudonym the label is
-    ``b"SCP-PSEUDONYM-P256-V1"`` and the seed the §9.10.4 ``context_seed``.
-    A :class:`KeyCustodyProvider` host stores the result as the pseudonym
-    key and passes it to :func:`p256_public_key` and
+    ``int.from_bytes(HKDF-Expand(context_seed, b"SCP-PSEUDONYM-P256-V1", 48),
+    "big") % (n - 1) + 1``, returned as 32 big-endian bytes. The label is fixed
+    inside the helper, so no host passes it. The seed is the v1 or v2
+    ``context_seed``. A :class:`KeyCustodyProvider` host stores the result as
+    the pseudonym key and passes it to :func:`p256_public_key` and
     :func:`p256_sign_prehash_rfc6979`.
 
     The Rust side wipes its copies; Python ``bytes`` are never wiped.
 
     Raises:
-        ValidationError: ``SCP-VALID-7005`` when ``seed`` is not 32 bytes.
+        ValidationError: ``SCP-VALID-7005`` when ``context_seed`` is not 32 bytes.
         CryptoError: ``SCP-CRYPTO-4001`` if the reduction fails.
     """
-    return _p256_host_call("p256_seed_to_scalar", label, seed)
+    return _p256_host_call("p256_pseudonym_scalar", context_seed)
 
 
 def p256_public_key(scalar: bytes) -> bytes:

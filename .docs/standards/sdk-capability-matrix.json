@@ -1820,14 +1820,14 @@
           }
         },
         {
-          "name": "p256_seed_to_scalar",
+          "name": "p256_pseudonym_scalar",
           "python": true,
           "typescript": true,
           "kotlin": false,
           "swift": true,
-          "notes": "Custody-host helper (§9.10.4, FIPS 186-5 A.2.1): maps a 32-byte context_seed to the P-256 pseudonym scalar under a label, so no host re-implements the reduction. One implementation in scp_ffi_common::p256_host, exported by PyO3, napi-rs and UniFFI.",
+          "notes": "Custody-host helper (§9.10.4, FIPS 186-5 A.2.1): maps a 32-byte context_seed to the P-256 pseudonym scalar under the SCP-PSEUDONYM-P256-V1 label fixed inside the helper, so no host re-implements the reduction or passes the label. One implementation in scp_ffi_common::p256_host, exported by PyO3, napi-rs and UniFFI.",
           "exemptions": {
-            "kotlin": "Kotlin hosts call the UniFFI-generated uniffi.scp.p256SeedToScalar directly (scp-kt-android's P256Pseudonym wraps it); the generated Kotlin is built, not committed, so the scanned scp-kt sources hold no symbol for it."
+            "kotlin": "Kotlin hosts call the UniFFI-generated uniffi.scp.p256PseudonymScalar directly (scp-kt-android's P256Pseudonym wraps it); the generated Kotlin is built, not committed, so the scanned scp-kt sources hold no symbol for it."
           }
         },
         {

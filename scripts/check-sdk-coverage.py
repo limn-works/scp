@@ -112,10 +112,10 @@ SDK_EXTENSIONS: dict[str, str] = {
 ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     # P-256 custody-host helpers are module-level free functions named without
     # a domain prefix in every SDK.
-    ("Crypto", "p256_seed_to_scalar"): {
-        "python": ["p256_seed_to_scalar"],
-        "typescript": ["p256SeedToScalar"],
-        "swift": ["p256SeedToScalar"],
+    ("Crypto", "p256_pseudonym_scalar"): {
+        "python": ["p256_pseudonym_scalar"],
+        "typescript": ["p256PseudonymScalar"],
+        "swift": ["p256PseudonymScalar"],
     },
     ("Crypto", "p256_public_key"): {
         "python": ["p256_public_key"],

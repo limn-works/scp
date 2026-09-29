@@ -6,8 +6,9 @@
 //! its `pseudonym_secret`, which on hardware custody never leaves the secure
 //! boundary, §9.10.4.A), then:
 //!
-//! 1. [`p256_seed_to_scalar`] maps the seed to the scalar (FIPS 186-5 A.2.1,
-//!    constant-time `crypto-bigint` reduction in `scp-crypto`);
+//! 1. [`p256_pseudonym_scalar`] maps the seed to the scalar under the fixed
+//!    `SCP-PSEUDONYM-P256-V1` label (FIPS 186-5 A.2.1, constant-time
+//!    `crypto-bigint` reduction in `scp-crypto`), so no host passes the label;
 //! 2. [`p256_public_key`] gives the 33-byte compressed point it returns from
 //!    `derive_pseudonym` and `get_public_key`;
 //! 3. [`p256_sign_prehash_rfc6979`] signs a 32-byte digest with RFC 6979
@@ -24,11 +25,12 @@
 //! wipes the buffers it owns.
 
 use scp_crypto::p256::{P256SigningKey, seed_to_scalar, sign_prehash_rfc6979};
+use scp_crypto::pseudonym::PSEUDONYM_SCALAR_LABEL;
 use zeroize::Zeroizing;
 
 use crate::error_codes as codes;
 
-/// A rejected [`p256_seed_to_scalar`], [`p256_public_key`] or
+/// A rejected [`p256_pseudonym_scalar`], [`p256_public_key`] or
 /// [`p256_sign_prehash_rfc6979`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum P256HostError {
@@ -79,23 +81,23 @@ fn signing_key(scalar: &[u8]) -> Result<P256SigningKey, P256HostError> {
         .map_err(|e| P256HostError::Crypto(format!("invalid P-256 scalar: {e}")))
 }
 
-/// Maps a 32-byte seed to a P-256 private scalar in `[1, n − 1]` under `label`.
+/// Maps a 32-byte §9.10.4 `context_seed` (v1 or v2) to its P-256 pseudonym
+/// scalar in `[1, n − 1]`.
 ///
-/// FIPS 186-5 A.2.1, §9.10.4: `HKDF-Expand(seed, label, 48) mod (n − 1) + 1`.
-/// Returns the 32-byte big-endian scalar. For a pseudonym the label is
-/// `"SCP-PSEUDONYM-P256-V1"` and the seed the §9.10.4 `context_seed`.
+/// FIPS 186-5 A.2.1, §9.10.4:
+/// `HKDF-Expand(context_seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n − 1) + 1`.
+/// The label is fixed here ([`PSEUDONYM_SCALAR_LABEL`]), so a host cannot
+/// derive a pseudonym under a mistyped one. Returns the 32-byte big-endian
+/// scalar.
 ///
 /// # Errors
 ///
-/// [`P256HostError::Validation`] when `seed` is not 32 bytes;
+/// [`P256HostError::Validation`] when `context_seed` is not 32 bytes;
 /// [`P256HostError::Crypto`] if the reduction fails (unreachable for a
 /// 32-byte seed).
-pub fn p256_seed_to_scalar(
-    label: &[u8],
-    seed: &[u8],
-) -> Result<Zeroizing<[u8; 32]>, P256HostError> {
-    let seed = exact_32("seed", seed)?;
-    let scalar = seed_to_scalar(label, &seed)
+pub fn p256_pseudonym_scalar(context_seed: &[u8]) -> Result<Zeroizing<[u8; 32]>, P256HostError> {
+    let seed = exact_32("context_seed", context_seed)?;
+    let scalar = seed_to_scalar(PSEUDONYM_SCALAR_LABEL, &seed)
         .map_err(|e| P256HostError::Crypto(format!("seed_to_scalar failed: {e}")))?;
     Ok(P256SigningKey::from_nonzero_scalar(scalar).to_scalar_bytes())
 }
@@ -175,9 +177,9 @@ mod tests {
     }
 
     /// §25.19 Vectors 30 and 31: each spec `context_seed_v1` maps through the
-    /// reduction to the spec's v1 point.
+    /// fixed-label reduction to the spec's v1 point.
     #[test]
-    fn seed_to_scalar_reproduces_vectors_30_and_31_v1_points() {
+    fn pseudonym_scalar_reproduces_vectors_30_and_31_v1_points() {
         for (seed, point) in [
             (
                 "47ea801c24e8a4d577f04837eca0674fbbf160127fa2d1a4bb1420150b0a048b",
@@ -188,7 +190,7 @@ mod tests {
                 "0239f7c3213f3567183fd2fcf7aec6c884bc70e0e694c42053284a4b5ebef4fe2d",
             ),
         ] {
-            let scalar = p256_seed_to_scalar(b"SCP-PSEUDONYM-P256-V1", &h(seed)).expect("scalar");
+            let scalar = p256_pseudonym_scalar(&h(seed)).expect("scalar");
             assert_eq!(
                 hex::encode(p256_public_key(scalar.as_slice()).expect("point")),
                 point
@@ -198,7 +200,7 @@ mod tests {
 
     #[test]
     fn malformed_input_is_rejected_with_its_code() {
-        let err = p256_seed_to_scalar(b"L", &[0; 31]).expect_err("31-byte seed");
+        let err = p256_pseudonym_scalar(&[0; 31]).expect_err("31-byte seed");
         assert!(matches!(err, P256HostError::Validation(_)), "{err:?}");
         assert_eq!(err.code(), "SCP-VALID-7005");
         let err = p256_public_key(&[0; 32]).expect_err("zero scalar");

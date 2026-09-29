@@ -14822,8 +14822,8 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      * bridge verifies it strictly and rejects anything else, for a pseudonym
      * key this adapter derived and still holds bound; for a handle the adapter
      * did not bind, the bridge returns the host's bytes unchecked. A software host
-     * signs with [`crate::p256_host::p256_sign_prehash_rfc6979`] rather than
-     * its own ECDSA.
+     * signs with the `p256_sign_prehash_rfc6979` export
+     * (`p256SignPrehashRfc6979` in Swift and Kotlin) rather than its own ECDSA.
      */
     func sign(keyId: String, message: Data) async throws  -> Data
     
@@ -14880,8 +14880,10 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      * non-numeric key id, and a key id whose `get_public_key` fails or does
      * not return the same 33 bytes. `sign` on that key id receives a 32-byte digest and
      * must return a 64-byte low-`s` `r || s` that verifies under the point.
-     * A host maps the seed with [`crate::p256_host::p256_seed_to_scalar`]
-     * rather than reducing it itself.
+     * A host maps the seed to `d` with the `p256_pseudonym_scalar` export
+     * (`p256PseudonymScalar` in Swift and Kotlin) and computes the point with
+     * the `p256_public_key` export (`p256PublicKey`) rather than reducing and
+     * multiplying itself.
      *
      * The pseudonym dies with its identity (`09-security-model.md`
      * §9.10.4.A): `destroy_key` on `key_id` destroys it, and a derivation
@@ -17402,6 +17404,27 @@ public func metadataRecordToJson(contextId: String, sequence: UInt64, signerDid:
 })
 }
 /**
+ * Maps a 32-byte §9.10.4 `context_seed` (v1 or v2) to its P-256 pseudonym
+ * scalar in `[1, n − 1]`.
+ *
+ * FIPS 186-5 A.2.1, §9.10.4:
+ * `HKDF-Expand(context_seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n − 1) + 1`,
+ * with the label fixed inside the helper. Returns the 32-byte big-endian
+ * scalar.
+ *
+ * # Errors
+ *
+ * `SCP-VALID-7005` when `context_seed` is not 32 bytes; `SCP-CRYPTO-4001` if
+ * the reduction fails (unreachable for a 32-byte seed).
+ */
+public func p256PseudonymScalar(contextSeed: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_p256_pseudonym_scalar(
+        FfiConverterData.lower(contextSeed),$0
+    )
+})
+}
+/**
  * The 33-byte SEC1 compressed public key `d·G` of a 32-byte scalar.
  *
  * # Errors
@@ -17413,26 +17436,6 @@ public func p256PublicKey(scalar: Data)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_func_p256_public_key(
         FfiConverterData.lower(scalar),$0
-    )
-})
-}
-/**
- * Maps a 32-byte seed to a P-256 private scalar in `[1, n − 1]` under `label`.
- *
- * FIPS 186-5 A.2.1, §9.10.4: `HKDF-Expand(seed, label, 48) mod (n − 1) + 1`.
- * Returns the 32-byte big-endian scalar. For a pseudonym the label is
- * `"SCP-PSEUDONYM-P256-V1"` and the seed the §9.10.4 `context_seed`.
- *
- * # Errors
- *
- * `SCP-VALID-7005` when `seed` is not 32 bytes; `SCP-CRYPTO-4001` if the
- * reduction fails (unreachable for a 32-byte seed).
- */
-public func p256SeedToScalar(label: Data, seed: Data)throws  -> Data  {
-    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_p256_seed_to_scalar(
-        FfiConverterData.lower(label),
-        FfiConverterData.lower(seed),$0
     )
 })
 }
@@ -17843,10 +17846,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_metadata_record_to_json() != 58960) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_p256_public_key() != 39495) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_p256_pseudonym_scalar() != 7172) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_p256_seed_to_scalar() != 31098) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_p256_public_key() != 39495) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_p256_sign_prehash_rfc6979() != 49215) {
@@ -18536,7 +18539,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_assert_request() != 3156) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 34161) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 13127) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 51576) {
@@ -18551,7 +18554,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_dh_agree() != 52565) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 26992) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 28586) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 41285) {

@@ -346,7 +346,7 @@ class AndroidKeyCustody internal constructor(
      *      `pseudonym_secret` is the identity key's §9.10.4.A secret (see [contextSeed]).
      *   2. `d = HKDF-Expand-SHA256(prk = seed, info = "SCP-PSEUDONYM-P256-V1", 48)
      *      mod (n - 1) + 1` (FIPS 186-5 A.2.1), computed by the Rust `scp-crypto`
-     *      reduction through the `p256SeedToScalar` export.
+     *      reduction through the `p256PseudonymScalar` export.
      *   3. The public key is the 33-byte compressed point `d * G`.
      *
      * **Software keys (API 26-32, [CustodyType.SOFTWARE]):** `pseudonym_secret =

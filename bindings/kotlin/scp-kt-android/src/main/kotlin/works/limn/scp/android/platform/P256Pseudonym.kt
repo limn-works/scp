@@ -7,8 +7,8 @@
 
 package works.limn.scp.android.platform
 
+import uniffi.scp.p256PseudonymScalar
 import uniffi.scp.p256PublicKey
-import uniffi.scp.p256SeedToScalar
 import uniffi.scp.p256SignPrehashRfc6979
 import java.nio.ByteBuffer
 import java.security.MessageDigest
@@ -22,13 +22,11 @@ import uniffi.scp.ScpException as BridgeException
  *   public_key = SEC1-compressed(d * G)   (33 bytes)
  */
 internal object P256Pseudonym {
-    /** HKDF-Expand label that turns a context seed into the pseudonym scalar. */
-    const val SCALAR_LABEL = "SCP-PSEUDONYM-P256-V1"
-
     private const val DIGEST_SIZE = 32
 
     /**
-     * Maps a 32-byte context seed to its pseudonym scalar, stores the scalar in [keys]
+     * Maps a 32-byte context seed to its pseudonym scalar (the `SCP-PSEUDONYM-P256-V1`
+     * label is fixed inside the Rust helper), stores the scalar in [keys]
      * under [pseudonymId] as a pseudonym of [identityId], and zeroizes the seed.
      */
     fun register(
@@ -38,7 +36,7 @@ internal object P256Pseudonym {
         contextSeed: ByteArray,
     ): PseudonymKeyHandle {
         val scalar = try {
-            bridged { p256SeedToScalar(SCALAR_LABEL.toByteArray(Charsets.UTF_8), contextSeed) }
+            bridged { p256PseudonymScalar(contextSeed) }
         } finally {
             contextSeed.fill(0)
         }

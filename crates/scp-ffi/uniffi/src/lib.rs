@@ -369,8 +369,8 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// bridge verifies it strictly and rejects anything else, for a pseudonym
     /// key this adapter derived and still holds bound; for a handle the adapter
     /// did not bind, the bridge returns the host's bytes unchecked. A software host
-    /// signs with [`crate::p256_host::p256_sign_prehash_rfc6979`] rather than
-    /// its own ECDSA.
+    /// signs with the `p256_sign_prehash_rfc6979` export
+    /// (`p256SignPrehashRfc6979` in Swift and Kotlin) rather than its own ECDSA.
     async fn sign(&self, key_id: String, message: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 
     /// Return the public key bytes for `key_id`: 32 bytes for an Ed25519 or
@@ -417,8 +417,10 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// non-numeric key id, and a key id whose `get_public_key` fails or does
     /// not return the same 33 bytes. `sign` on that key id receives a 32-byte digest and
     /// must return a 64-byte low-`s` `r || s` that verifies under the point.
-    /// A host maps the seed with [`crate::p256_host::p256_seed_to_scalar`]
-    /// rather than reducing it itself.
+    /// A host maps the seed to `d` with the `p256_pseudonym_scalar` export
+    /// (`p256PseudonymScalar` in Swift and Kotlin) and computes the point with
+    /// the `p256_public_key` export (`p256PublicKey`) rather than reducing and
+    /// multiplying itself.
     ///
     /// The pseudonym dies with its identity (`09-security-model.md`
     /// §9.10.4.A): `destroy_key` on `key_id` destroys it, and a derivation

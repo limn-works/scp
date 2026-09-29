@@ -10,12 +10,10 @@
 import Foundation
 
 enum P256Pseudonym {
-    /// HKDF-Expand label that turns a context seed into the pseudonym scalar.
-    static let scalarLabel = "SCP-PSEUDONYM-P256-V1"
-
-    /// The 32-byte pseudonym scalar of a 32-byte §9.10.4 context seed.
+    /// The 32-byte pseudonym scalar of a 32-byte §9.10.4 context seed; the
+    /// `SCP-PSEUDONYM-P256-V1` label is fixed inside the Rust helper.
     static func scalar(contextSeed: Data) throws -> Data {
-        try p256SeedToScalar(label: Data(scalarLabel.utf8), seed: contextSeed)
+        try p256PseudonymScalar(contextSeed: contextSeed)
     }
 
     /// The 33-byte compressed public point of a pseudonym scalar.

@@ -2911,17 +2911,17 @@
       ]
     },
     {
-      "canonical": "p256_seed_to_scalar",
+      "canonical": "p256_pseudonym_scalar",
       "category": "identity",
       "pyo3": [
-        "py_p256_seed_to_scalar",
-        "p256_seed_to_scalar"
+        "py_p256_pseudonym_scalar",
+        "p256_pseudonym_scalar"
       ],
       "uniffi": [
-        "p256_seed_to_scalar"
+        "p256_pseudonym_scalar"
       ],
       "napi": [
-        "p256_seed_to_scalar"
+        "p256_pseudonym_scalar"
       ]
     },
     {

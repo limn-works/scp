@@ -21,11 +21,8 @@ import * as crypto from "node:crypto";
 
 import { CryptoError, ScpError } from "../src/errors";
 import type { KeyCustodyProvider, PseudonymResult } from "../src/scp";
-import { p256PublicKey, p256SeedToScalar, p256SignPrehashRfc6979, SCP } from "../src/scp";
+import { p256PseudonymScalar, p256PublicKey, p256SignPrehashRfc6979, SCP } from "../src/scp";
 import { pseudonymSeedV1, pseudonymSeedV2 } from "./pseudonym-recipe";
-
-/** The §9.10.4 label that maps a pseudonym context seed to its P-256 scalar. */
-const SCALAR_LABEL = new TextEncoder().encode("SCP-PSEUDONYM-P256-V1");
 
 // ---------------------------------------------------------------------------
 // Probe: is the NAPI-backed SCP class available in this environment?
@@ -157,7 +154,7 @@ class CryptoKeychain implements KeyCustodyProvider {
   // Native software custody keys the recipe on the Ed25519 identity seed.
   #registerPseudonym(owner: string, contextSeed: Uint8Array, keyId: string): PseudonymResult {
     // The host computes the context seed; the SDK helper maps it to the scalar.
-    const d = p256SeedToScalar(SCALAR_LABEL, contextSeed);
+    const d = p256PseudonymScalar(contextSeed);
     this.#pseudonyms.set(keyId, d);
     this.#pseudonymOwner.set(keyId, owner);
     const point = p256PublicKey(d);

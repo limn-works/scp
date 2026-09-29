@@ -6,8 +6,8 @@
 //! its `pseudonym_secret`, which on hardware custody never leaves the secure
 //! boundary, §9.10.4.A), then:
 //!
-//! 1. [`p256_seed_to_scalar`] maps the seed to the scalar (FIPS 186-5 A.2.1,
-//!    constant-time `crypto-bigint` reduction in `scp-crypto`);
+//! 1. [`p256_pseudonym_scalar`] maps the seed to the scalar under the fixed
+//!    `SCP-PSEUDONYM-P256-V1` label (FIPS 186-5 A.2.1, constant-time `crypto-bigint` reduction in `scp-crypto`);
 //! 2. [`p256_public_key`] gives the 33-byte compressed point it returns from
 //!    `derive_pseudonym` and `get_public_key`;
 //! 3. [`p256_sign_prehash_rfc6979`] signs a 32-byte digest with RFC 6979
@@ -37,20 +37,22 @@ fn scp_error(e: P256HostError) -> ScpError {
     }
 }
 
-/// Maps a 32-byte seed to a P-256 private scalar in `[1, n − 1]` under `label`.
+/// Maps a 32-byte §9.10.4 `context_seed` (v1 or v2) to its P-256 pseudonym
+/// scalar in `[1, n − 1]`.
 ///
-/// FIPS 186-5 A.2.1, §9.10.4: `HKDF-Expand(seed, label, 48) mod (n − 1) + 1`.
-/// Returns the 32-byte big-endian scalar. For a pseudonym the label is
-/// `"SCP-PSEUDONYM-P256-V1"` and the seed the §9.10.4 `context_seed`.
+/// FIPS 186-5 A.2.1, §9.10.4:
+/// `HKDF-Expand(context_seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n − 1) + 1`,
+/// with the label fixed inside the helper. Returns the 32-byte big-endian
+/// scalar.
 ///
 /// # Errors
 ///
-/// `SCP-VALID-7005` when `seed` is not 32 bytes; `SCP-CRYPTO-4001` if the
-/// reduction fails (unreachable for a 32-byte seed).
+/// `SCP-VALID-7005` when `context_seed` is not 32 bytes; `SCP-CRYPTO-4001` if
+/// the reduction fails (unreachable for a 32-byte seed).
 #[uniffi::export]
-pub fn p256_seed_to_scalar(label: Vec<u8>, seed: Vec<u8>) -> Result<Vec<u8>, ScpError> {
-    let seed = Zeroizing::new(seed);
-    let scalar = shared::p256_seed_to_scalar(&label, &seed).map_err(scp_error)?;
+pub fn p256_pseudonym_scalar(context_seed: Vec<u8>) -> Result<Vec<u8>, ScpError> {
+    let context_seed = Zeroizing::new(context_seed);
+    let scalar = shared::p256_pseudonym_scalar(&context_seed).map_err(scp_error)?;
     Ok(scalar.to_vec())
 }
 
@@ -137,9 +139,9 @@ mod tests {
     /// §25.19 Vector 30: the spec's `context_seed_v1` maps through the
     /// exported reduction to the spec's v1 point.
     #[test]
-    fn seed_export_reproduces_vector_30_v1_point() {
+    fn pseudonym_scalar_export_reproduces_vector_30_v1_point() {
         let seed = h("47ea801c24e8a4d577f04837eca0674fbbf160127fa2d1a4bb1420150b0a048b");
-        let scalar = p256_seed_to_scalar(b"SCP-PSEUDONYM-P256-V1".to_vec(), seed).expect("scalar");
+        let scalar = p256_pseudonym_scalar(seed).expect("scalar");
         assert_eq!(
             hex::encode(p256_public_key(scalar).expect("point")),
             "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72"
@@ -148,7 +150,7 @@ mod tests {
 
     #[test]
     fn exports_reject_malformed_input() {
-        let err = p256_seed_to_scalar(b"L".to_vec(), vec![0; 31]).expect_err("31-byte seed");
+        let err = p256_pseudonym_scalar(vec![0; 31]).expect_err("31-byte seed");
         assert!(matches!(err, ScpError::Validation { .. }), "{err:?}");
         let err = p256_public_key(vec![0; 32]).expect_err("zero scalar");
         assert!(matches!(err, ScpError::Crypto { .. }), "{err:?}");

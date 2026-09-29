@@ -27,25 +27,26 @@ fn py_error(e: P256HostError) -> PyErr {
     })
 }
 
-/// Maps a 32-byte seed to a P-256 private scalar in `[1, n − 1]` under `label`.
+/// Maps a 32-byte §9.10.4 `context_seed` (v1 or v2) to its P-256 pseudonym
+/// scalar in `[1, n − 1]`.
 ///
-/// FIPS 186-5 A.2.1, §9.10.4: `HKDF-Expand(seed, label, 48) mod (n − 1) + 1`.
-/// Returns the 32-byte big-endian scalar. For a pseudonym the label is
-/// `b"SCP-PSEUDONYM-P256-V1"` and the seed the §9.10.4 `context_seed`.
+/// FIPS 186-5 A.2.1, §9.10.4:
+/// `HKDF-Expand(context_seed, b"SCP-PSEUDONYM-P256-V1", 48) mod (n − 1) + 1`,
+/// with the label fixed inside the helper. Returns the 32-byte big-endian
+/// scalar.
 ///
 /// # Errors
 ///
-/// `SCP-VALID-7005` when `seed` is not 32 bytes; `SCP-CRYPTO-4001` if the
-/// reduction fails (unreachable for a 32-byte seed).
+/// `SCP-VALID-7005` when `context_seed` is not 32 bytes; `SCP-CRYPTO-4001` if
+/// the reduction fails (unreachable for a 32-byte seed).
 #[pyfunction]
-#[pyo3(name = "p256_seed_to_scalar")]
-pub fn py_p256_seed_to_scalar(
+#[pyo3(name = "p256_pseudonym_scalar")]
+pub fn py_p256_pseudonym_scalar(
     py: Python<'_>,
-    label: Vec<u8>,
-    seed: Vec<u8>,
+    context_seed: Vec<u8>,
 ) -> PyResult<Bound<'_, PyBytes>> {
-    let seed = Zeroizing::new(seed);
-    let scalar = shared::p256_seed_to_scalar(&label, &seed).map_err(py_error)?;
+    let context_seed = Zeroizing::new(context_seed);
+    let scalar = shared::p256_pseudonym_scalar(&context_seed).map_err(py_error)?;
     Ok(PyBytes::new(py, scalar.as_slice()))
 }
 
@@ -89,7 +90,7 @@ pub fn py_p256_sign_prehash_rfc6979(
 ///
 /// Returns a `PyErr` if a function cannot be added to the module.
 pub fn register_p256_host(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(py_p256_seed_to_scalar, m)?)?;
+    m.add_function(wrap_pyfunction!(py_p256_pseudonym_scalar, m)?)?;
     m.add_function(wrap_pyfunction!(py_p256_public_key, m)?)?;
     m.add_function(wrap_pyfunction!(py_p256_sign_prehash_rfc6979, m)?)?;
     Ok(())
