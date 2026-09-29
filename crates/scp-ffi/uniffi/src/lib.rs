@@ -560,9 +560,11 @@ pub trait DeviceAttestationProvider: Send + Sync {
     ///
     /// `challenge` — Apple: the 32-byte binding digest `D` of
     ///   `09-security-model.md` §9.3.1, which the Swift adapter hands App
-    ///   Attest as `clientDataHash` unchanged and rejects with
-    ///   `SCP-ATTEST-9026` when it is not 32 bytes (ADR-025 acceptance
-    ///   criterion 3). Android: ADR-027, the Android platform adapter, states
+    ///   Attest as `clientDataHash` unchanged. When App Attest is supported,
+    ///   the adapter rejects a `challenge` that is not 32 bytes with
+    ///   `SCP-ATTEST-9026` (ADR-025 acceptance criterion 3); when it is not
+    ///   supported, the adapter throws `SCP-ATTEST-9019` before it reads the
+    ///   length. Android: ADR-027, the Android platform adapter, states
     ///   what it binds.
     /// `device_id` — stable identifier for this device instance. The Swift
     ///   adapter does not read it.
@@ -579,9 +581,11 @@ pub trait DeviceAttestationProvider: Send + Sync {
     ///   `09-security-model.md` §9.3.1 over the caller's request bytes `m`,
     ///   never `SHA-256(m)` and never `m` itself. The domain separator keeps
     ///   every `A` distinct from every attestation binding digest `D`. The
-    ///   Swift adapter hands `A` to App Attest as `clientDataHash` unchanged
-    ///   and rejects it with `SCP-ATTEST-9026` when it is not 32 bytes
-    ///   (ADR-025 acceptance criterion 3).
+    ///   Swift adapter hands `A` to App Attest as `clientDataHash` unchanged.
+    ///   When App Attest is supported, the adapter rejects an `A` that is not
+    ///   32 bytes with `SCP-ATTEST-9026` (ADR-025 acceptance criterion 3);
+    ///   when it is not supported, the adapter throws `SCP-ATTEST-9019`
+    ///   before it reads the length.
     ///
     /// Returns the platform assertion object bytes (Apple: CBOR assertion;
     /// Android: integrity verdict).

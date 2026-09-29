@@ -828,7 +828,8 @@ pub trait PreRotationCustody: Send + Sync {
 /// the keri workstream (ADR-025, the Apple platform adapter, in
 /// `.docs/adrs/phase-5.md`). §9.3.1 of `.docs/specs/09-security-model.md`
 /// states how a reader verifies an Apple App Attest attestation object, and
-/// story SCP-316 implements that reader. OQ-22 of
+/// story SCP-316, still pending, specifies that reader; no code verifies a
+/// device attestation yet. OQ-22 of
 /// `.docs/specs/27-attestations.md` keeps open which of the two traits is
 /// normative.
 pub trait DeviceAttestation: Send + Sync {

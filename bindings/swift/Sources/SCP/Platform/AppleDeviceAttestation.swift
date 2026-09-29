@@ -104,10 +104,10 @@
     ///    unchanged. ADR-025 has the Rust core pass the assertion digest `A`
     ///    of §9.3.1 as `requestHash`.
     ///
-    /// The adapter hashes nothing. It rejects a `challenge` or a
-    /// `requestHash` that is not 32 bytes with `SCP-ATTEST-9026`, which
-    /// `AttestationError.invalidChallenge` maps to, and otherwise hands it to
-    /// App Attest as it arrived.
+    /// The adapter hashes nothing. When App Attest is supported, it rejects a
+    /// `challenge` or a `requestHash` that is not 32 bytes with
+    /// `SCP-ATTEST-9026`, which `AttestationError.invalidChallenge` maps to,
+    /// and otherwise hands it to App Attest as it arrived.
     ///
     /// ## Unavailable service (simulator, or a device without App Attest)
     ///
