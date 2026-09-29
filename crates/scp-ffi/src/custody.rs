@@ -676,12 +676,12 @@ impl KeyCustody for PyCallbackKeyCustody {
         let p = &self.provider;
         scp_ffi_common::callback_custody::derive_pseudonym(
             &self.registry,
-            "derive_pseudonym",
             key,
             context_id,
             None,
             |key_id| std::future::ready(p.call_str_bytes("derive_pseudonym", &key_id, context_id)),
             |key_id| p.host_public_key(&key_id),
+            |key_id| std::future::ready(p.call_str_void("destroy_key", &key_id)),
         )
         .await
     }
@@ -706,7 +706,6 @@ impl KeyCustody for PyCallbackKeyCustody {
         let p = &self.provider;
         scp_ffi_common::callback_custody::derive_pseudonym(
             &self.registry,
-            "derive_rotatable_pseudonym",
             key,
             context_id,
             Some(pseudonym_epoch),
@@ -719,6 +718,7 @@ impl KeyCustody for PyCallbackKeyCustody {
                 ))
             },
             |key_id| p.host_public_key(&key_id),
+            |key_id| std::future::ready(p.call_str_void("destroy_key", &key_id)),
         )
         .await
     }
@@ -1032,7 +1032,13 @@ class FakeCustody:
         if key_id not in self._seeds:
             raise HostError('key not found: ' + key_id, 'SCP-CRYPTO-4006')
         seed = hmac.new(self._seeds[key_id], bytes(context_id), hashlib.sha256).digest()
-        return self._register(key_id, seed, context_id, b'v1')
+        derived = self._register(key_id, seed, context_id, b'v1')
+        # Called with (identity key id, derived key id) after the host holds
+        # the derived key and before this host call returns.
+        derive_probe = getattr(self, 'derive_probe', None)
+        if derive_probe is not None:
+            derive_probe(key_id, derived[1])
+        return derived
 
     def derive_rotatable_pseudonym(self, key_id, context_id, pseudonym_epoch):
         # Canonical v2 preimage: context_id || BE64(epoch) || 'scp-pseudonym-v2'.
@@ -1743,6 +1749,96 @@ mod tests {
             *bound_during_host_destroy.lock().expect("probe mutex"),
             Some(false),
             "the host's destroy_key ran while the handle was still live"
+        );
+    }
+
+    /// §9.10.4.A: an identity destroy that completes while its pseudonym
+    /// derive is inside the host's `derive_pseudonym` leaves no key on the
+    /// host, which keeps every key it is not told to destroy. The derive is
+    /// key-not-found, the host received a destroy for the derived id, and a
+    /// sign on that id is key-not-found. Without the adapter's destroy the
+    /// host keeps the derived key, which the sign resolves and uses.
+    #[tokio::test]
+    async fn ffi_custody_callback_derive_racing_identity_destroy_leaves_no_host_key() {
+        use pyo3::types::{PyCFunction, PyDict, PyTuple};
+        use std::future::Future as _;
+        let (adapter, host) = super::test_fakes::fake_py_custody_and_host(None);
+        let custody = std::sync::Arc::new(adapter);
+        let identity = custody
+            .generate_identity_keypair()
+            .await
+            .expect("identity key");
+        let destroyed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let derived = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let (probe_adapter, probe_derived) = (std::sync::Arc::downgrade(&custody), derived.clone());
+        let probe_destroyed = destroyed.clone();
+        Python::with_gil(|py| {
+            let derive_probe = PyCFunction::new_closure(
+                py,
+                None,
+                None,
+                move |args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>| {
+                    let (_source, derived_id): (String, String) = args.extract()?;
+                    *probe_derived.lock().expect("probe mutex") = Some(derived_id);
+                    let custody = probe_adapter
+                        .upgrade()
+                        .expect("adapter is alive during derive");
+                    // Every host call here is synchronous, so the identity
+                    // destroy completes on its first poll.
+                    let mut destroy = std::pin::pin!(custody.destroy_key(&identity));
+                    let polled = destroy
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+                    assert!(
+                        matches!(polled, std::task::Poll::Ready(Ok(()))),
+                        "the identity destroy completes inside the host derive"
+                    );
+                    PyResult::Ok(())
+                },
+            )
+            .expect("derive probe");
+            let destroy_probe = PyCFunction::new_closure(
+                py,
+                None,
+                None,
+                move |args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>| {
+                    let (key_id,): (String,) = args.extract()?;
+                    probe_destroyed.lock().expect("probe mutex").push(key_id);
+                    PyResult::Ok(())
+                },
+            )
+            .expect("destroy probe");
+            let host = host.bind(py);
+            host.setattr("derive_probe", derive_probe)
+                .expect("set derive probe");
+            host.setattr("probe", destroy_probe)
+                .expect("set destroy probe");
+        });
+
+        let result = custody.derive_pseudonym(&identity, b"ctx").await;
+        assert!(
+            matches!(result, Err(PlatformError::KeyNotFound)),
+            "{result:?}"
+        );
+        let derived_id = derived
+            .lock()
+            .expect("probe mutex")
+            .clone()
+            .expect("the host derived");
+        assert_eq!(
+            *destroyed.lock().expect("probe mutex"),
+            vec![identity.id().to_string(), derived_id.clone()],
+            "the host received a destroy for the derived id"
+        );
+        let signed = custody
+            .sign(
+                &KeyHandle::new(derived_id.parse().expect("numeric key id")),
+                &[0x42u8; 32],
+            )
+            .await;
+        assert!(
+            matches!(signed, Err(PlatformError::KeyNotFound)),
+            "{signed:?}"
         );
     }
 

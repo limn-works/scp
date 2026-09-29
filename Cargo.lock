@@ -5124,7 +5124,6 @@ dependencies = [
  "hex",
  "hkdf 0.12.4",
  "hmac 0.12.1",
- "p256",
  "rand 0.8.8",
  "rmp-serde",
  "rusqlite",

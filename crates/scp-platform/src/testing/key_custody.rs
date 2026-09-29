@@ -1250,18 +1250,16 @@ mod tests {
     /// raw signature and verifies strictly.
     #[tokio::test]
     async fn p256_sign_normalises_a_pinned_high_s_signature() {
-        use p256::ecdsa::signature::hazmat::PrehashSigner;
         let seed = [7u8; 32];
         let mut scalar = [0u8; 32];
         rand::rngs::StdRng::from_seed(seed).fill_bytes(&mut scalar);
-        let raw_signer = p256::ecdsa::SigningKey::from_slice(&scalar).unwrap();
+        let raw_signer = P256SigningKey::from_scalar_bytes(&scalar).unwrap();
 
         let digest = [HIGH_S_DIGEST_BYTE; 32];
-        let raw: p256::ecdsa::Signature = raw_signer.sign_prehash(&digest).unwrap();
-        assert!(
-            raw.normalize_s().is_some(),
-            "the pinned digest's raw RFC 6979 s must be high"
-        );
+        let raw =
+            scp_crypto::p256::sign_prehash_rfc6979_unnormalized(&raw_signer, &digest).unwrap();
+        let low = scp_crypto::p256::normalize_low_s(&raw).unwrap();
+        assert_ne!(raw, low, "the pinned digest's raw RFC 6979 s must be high");
 
         let custody = InMemoryKeyCustody::from_seed_bytes(seed);
         let handle = custody
@@ -1271,11 +1269,8 @@ mod tests {
         let pk = P256PublicKey::from_sec1(custody.public_key(&handle).await.unwrap().as_bytes())
             .unwrap();
         let sig = custody.sign(&handle, &digest).await.unwrap();
-        assert_ne!(sig.as_bytes(), raw.to_bytes().as_slice());
-        assert_eq!(
-            sig.as_bytes(),
-            raw.normalize_s().unwrap().to_bytes().as_slice()
-        );
+        assert_ne!(sig.as_bytes(), raw.as_slice());
+        assert_eq!(sig.as_bytes(), low.as_slice());
         verify_prehash_strict(&pk, &digest, sig.as_bytes()).unwrap();
     }
 

@@ -10,10 +10,14 @@
  *     shorter input never reaches the host;
  *   - `p256_host_signature`: a high-s host signature comes out as the low-s
  *     form;
- *   - `begin_destroy` and `end_destroy`: a destroyed id can carry a new point,
- *     and the id is no longer live when the host's `destroyKey` runs;
+ *   - `begin_destroy` and `end_destroy`: the id is no longer live when the
+ *     host's `destroyKey` runs, and a host that breaks the no-reuse contract
+ *     by giving a destroyed id a new point has that point bound;
  *   - `retire_pseudonyms_of`: destroying an identity retires its pseudonyms,
- *     so they sign nothing and a host may reuse their ids.
+ *     so they sign nothing, and a host that breaks the no-reuse contract by
+ *     handing their ids to new pseudonyms has those bound afresh;
+ *   - `derive_pseudonym`: a derive racing its identity's destroy is
+ *     key-not-found and destroys the host key it derived (§9.10.4.A).
  *
  * The host-failure tests fail if `hostCall` in
  * `src/internal/custody-adapter.ts` stops turning a host failure into a typed
@@ -83,6 +87,18 @@ class Store {
   signCalls = 0;
   /** Called with the key id at the start of the host's `destroyKey`. */
   destroyProbe?: (keyId: string) => void;
+  /** Every key id the host's `destroyKey` received, in order. */
+  destroyed: string[] = [];
+  /**
+   * Whether destroying an identity also drops its pseudonyms. A host that
+   * keeps every key it is not told to destroy sets this false.
+   */
+  cascadeDestroy = true;
+  /**
+   * Called with (identity key id, derived key id) inside the host's
+   * `derivePseudonym`, after the host holds the derived key.
+   */
+  deriveProbe?: (sourceKeyId: string, derivedKeyId: string) => void;
 }
 
 class StoreKeychain implements KeyCustodyProvider {
@@ -126,15 +142,18 @@ class StoreKeychain implements KeyCustodyProvider {
         role: this.store.roles.get(keyId) ?? "missing",
       };
     }
-    throw new Error(`unknown key id: ${keyId}`);
+    // The contract's key-not-found signal.
+    throw new CryptoError(`unknown key id: ${keyId}`, "SCP-CRYPTO-4006");
   }
 
   destroyKey(keyId: string): void {
     this.store.destroyProbe?.(keyId);
+    this.store.destroyed.push(keyId);
     this.store.seeds.delete(keyId);
     this.store.roles.delete(keyId);
     this.store.pseudonyms.delete(keyId);
     this.store.pseudonymOwner.delete(keyId);
+    if (!this.store.cascadeDestroy) return;
     // A pseudonym dies with its identity (§9.10.4.A).
     for (const [kid, owner] of [...this.store.pseudonymOwner]) {
       if (owner !== keyId) continue;
@@ -158,6 +177,7 @@ class StoreKeychain implements KeyCustodyProvider {
       this.fault === "fixedId" ? "777" : (h.readBigUInt64BE(0) | (1n << 63n)).toString();
     this.store.pseudonyms.set(pseudonymId, d);
     this.store.pseudonymOwner.set(pseudonymId, keyId);
+    this.store.deriveProbe?.(keyId, pseudonymId);
     return { publicKey: p256Compressed(d), keyId: pseudonymId };
   }
 
@@ -399,6 +419,46 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     const err = await (duringHostDestroy as Promise<unknown>);
     expect(mapBridgeError(err).code).toBe("SCP-CRYPTO-4006");
     expect(store.signCalls).toBe(signsBefore);
+  });
+
+  test("a derive racing its identity's destroy leaves no host key", async () => {
+    // §9.10.4.A: a derivation in flight when its identity is destroyed is
+    // key-not-found and stores nothing, on the host included. The identity
+    // destroy starts inside the host's derivePseudonym; the testing
+    // `destroyKey` retires the identity on the JS thread before it returns,
+    // so the adapter's bind finds the identity gone. The host keeps every key
+    // it is not told to destroy, so without the adapter's destroy of the
+    // derived id the host keeps it, and the sign below resolves and uses it.
+    const store = new Store();
+    store.cascadeDestroy = false;
+    const custody = adapter(store);
+    const identity = await custody.generateKeypair();
+    let derivedId: string | undefined;
+    let identityDestroy: Promise<unknown> | undefined;
+    store.deriveProbe = (_source, id) => {
+      derivedId = id;
+      // Settle the result into a value at once, so a rejection is never
+      // unhandled; the promise below never rejects.
+      identityDestroy = custody.destroyKey(identity).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+    };
+    const err = await custody.derivePseudonym(identity, "ctx").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(mapBridgeError(err).code).toBe("SCP-CRYPTO-4006");
+    expect(await identityDestroy).toBeUndefined();
+    expect(derivedId).toBeDefined();
+    const id = derivedId as string;
+    expect(store.destroyed).toContain(id);
+    expect(store.pseudonyms.has(id)).toBe(false);
+    const signed = await custody.sign(id, DIGEST).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(mapBridgeError(signed).code).toBe("SCP-CRYPTO-4006");
   });
 
   test("destroying an identity retires its pseudonyms", async () => {

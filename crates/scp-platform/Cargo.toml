@@ -103,8 +103,9 @@ fs2 = { version = "0.4", optional = true }
 
 [dev-dependencies]
 # Test-only: raw (un-normalised) RFC 6979 ECDSA, to pin a digest whose raw `s`
-# is high so the low-s normalisation test cannot pass by luck.
-p256 = { workspace = true }
+# is high so the low-s normalisation test cannot pass by luck. P-256 arithmetic
+# stays in scp-crypto; `deny.toml` bans a direct `p256` dependency here.
+scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2", features = ["testing"] }
 scp-testing = { path = "../scp-testing" }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

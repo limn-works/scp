@@ -106,6 +106,31 @@ ignore = [
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
+# P-256 arithmetic stays inside scp-crypto (`scp_crypto::p256`, including the
+# scalar multiplication behind `ecdh_p256`): no other workspace crate may depend
+# on the curve crates, normal or dev. `wrappers` lists every crate allowed to
+# depend on each one directly; the rest are the upstream crates that need them.
+# The clippy `disallowed-types` bans on the P-256 point and scalar types are the
+# second layer; this one also catches a type the compiler infers.
+deny = [
+    { crate = "p256", wrappers = [
+        "scp-crypto",
+        "hpke-rs-rust-crypto",
+        "openmls_basic_credential",
+        "openmls_rust_crypto",
+    ], reason = "P-256 arithmetic stays in scp-crypto" },
+    { crate = "elliptic-curve", wrappers = [
+        "ecdsa",
+        "k256",
+        "p256",
+        "p384",
+        "primeorder",
+    ], reason = "P-256 arithmetic stays in scp-crypto" },
+    { crate = "primeorder", wrappers = [
+        "p256",
+        "p384",
+    ], reason = "P-256 arithmetic stays in scp-crypto" },
+]
 
 # ── Sources ─────────────────────────────────────────────────────────────────
 [sources]

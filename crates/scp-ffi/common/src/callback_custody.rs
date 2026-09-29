@@ -290,14 +290,27 @@ struct Slots {
 
 impl Slots {
     /// Whether host key id `key_id` names a `Live` or `Destroying` slot. An
-    /// id that does not parse as a `u64` names no slot.
+    /// id [`parse_handle`](crate::custody_parse::parse_handle) refuses
+    /// (non-numeric, or a non-canonical form such as `"07"` or `"+7"`) names
+    /// no slot: the registry holds only ids that parse, and each under its
+    /// one canonical spelling.
     fn names_held_key(&self, key_id: &str) -> bool {
-        key_id.parse::<u64>().is_ok_and(|id| {
+        crate::custody_parse::parse_handle("names_held_key", key_id).is_ok_and(|handle| {
             matches!(
-                self.map.get(&id),
+                self.map.get(&handle.id()),
                 Some(Slot::Live(_) | Slot::Destroying { .. })
             )
         })
+    }
+
+    /// Whether slot `id` is a live identity holding `key`: the source a
+    /// pseudonym derivation resolved, not yet destroyed and not handed to
+    /// another key.
+    fn is_live_identity(&self, id: u64, key: &RegisteredKey) -> bool {
+        matches!(
+            self.map.get(&id),
+            Some(Slot::Live(identity)) if identity.role == KeyRole::Identity && identity.key == *key
+        )
     }
 }
 
@@ -324,10 +337,11 @@ impl CallbackKeyRegistry {
         })
     }
 
-    /// Records a key `generate_keypair` minted. It may replace a
-    /// `Destroying`, `Abandoned` or `Destroyed` slot, because a host may hand
-    /// a freed id to a new key; the destroy in flight then leaves the new
-    /// entry alone. When the replaced slot is an identity mid-destroy, its
+    /// Records a key `generate_keypair` minted. The host contract forbids
+    /// handing a freed id to a new key; a host that breaks it may name a
+    /// `Destroying`, `Abandoned` or `Destroyed` slot, which this replaces,
+    /// and the destroy in flight then leaves the new entry alone. When the
+    /// replaced slot is an identity mid-destroy, its
     /// pseudonyms are retired first (§9.15), because the destroy that would
     /// retire them no longer owns the slot and the new key must own none of
     /// them.
@@ -404,8 +418,9 @@ impl CallbackKeyRegistry {
     /// so an id already bound to the same key for the same `role` (source,
     /// context and epoch) is accepted; so is an id this adapter resolved as
     /// an operational key with the same public key, which the derivation now
-    /// identifies, and a `Destroyed` id, which the host has handed to the
-    /// new pseudonym (as [`Self::register`] accepts for a minted key). Any
+    /// identifies, and a `Destroyed` id, which a host breaking the no-reuse
+    /// contract has handed to the new pseudonym (tolerated as
+    /// [`Self::register`] tolerates it for a minted key). Any
     /// other occupant is rejected: a minted key, an identity, another key, or
     /// the same key for another source, context or epoch.
     ///
@@ -429,12 +444,10 @@ impl CallbackKeyRegistry {
         source_key: &RegisteredKey,
     ) -> Result<(), PlatformError> {
         let mut slots = self.lock()?;
-        if let KeyRole::Pseudonym { source, .. } = &role {
-            match slots.map.get(source) {
-                Some(Slot::Live(identity))
-                    if identity.role == KeyRole::Identity && identity.key == *source_key => {}
-                _ => return Err(PlatformError::KeyNotFound),
-            }
+        if let KeyRole::Pseudonym { source, .. } = &role
+            && !slots.is_live_identity(*source, source_key)
+        {
+            return Err(PlatformError::KeyNotFound);
         }
         match slots.map.get(&handle.id()) {
             Some(Slot::Live(existing)) if existing.key == key && existing.role == role => {
@@ -660,6 +673,17 @@ impl CallbackKeyRegistry {
     /// [`PlatformError::CustodyError`] if the registry lock is poisoned.
     fn names_held_key(&self, key_id: &str) -> Result<bool, PlatformError> {
         Ok(self.lock()?.names_held_key(key_id))
+    }
+
+    /// Whether slot `id` is a live identity holding `key`, read under the
+    /// registry lock ([`CallbackKeyRegistry::bind_pseudonym`] applies the
+    /// same test to a pseudonym's source).
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::CustodyError`] if the registry lock is poisoned.
+    fn is_live_identity(&self, id: u64, key: &RegisteredKey) -> Result<bool, PlatformError> {
+        Ok(self.lock()?.is_live_identity(id, key))
     }
 
     /// The host key ids queued for [`sweep_orphans`].
@@ -1035,28 +1059,76 @@ where
             orphan.disarm();
             Ok(handle)
         }
-        Err(e) => match registry.names_held_key(&key_id) {
-            // The id names a key this adapter holds: destroy nothing.
-            Ok(true) => {
-                orphan.disarm();
-                Err(e)
-            }
-            // The guard stays armed: the id is queued, and destroyed only
-            // once the registry can say it names no held key.
-            Err(poisoned) => Err(PlatformError::CustodyError(format!(
-                "{e}; the rejected host key was not destroyed and is queued: {poisoned}"
-            ))),
-            Ok(false) => match host_destroy(key_id).await {
-                Ok(()) => {
-                    orphan.disarm();
-                    Err(e)
+        Err(e) => {
+            // The guard's queueing now belongs to the destroy below.
+            orphan.disarm();
+            match destroy_refused_key(registry, key_id, &host_destroy).await {
+                Ok(()) => Err(e),
+                Err(RefusedKeyQueued::RegistryPoisoned(poisoned)) => {
+                    Err(PlatformError::CustodyError(format!(
+                        "{e}; the rejected host key was not destroyed and is queued: {poisoned}"
+                    )))
                 }
-                // The guard stays armed: the id is queued for the next sweep.
-                Err(destroy_err) => Err(PlatformError::CustodyError(format!(
-                    "{e}; destroying the rejected host key also failed, and it is queued for \
-                     the next generation to destroy: {destroy_err}"
-                ))),
-            },
+                Err(RefusedKeyQueued::DestroyFailed(destroy_err)) => {
+                    Err(PlatformError::CustodyError(format!(
+                        "{e}; destroying the rejected host key also failed, and it is queued \
+                         for the next generation to destroy: {destroy_err}"
+                    )))
+                }
+            }
+        }
+    }
+}
+
+/// Why [`destroy_refused_key`] left a host key queued for [`sweep_orphans`]
+/// instead of destroying it.
+#[derive(Debug)]
+enum RefusedKeyQueued {
+    /// The registry lock is poisoned, so it cannot say whether the id names
+    /// a held key; nothing is destroyed.
+    RegistryPoisoned(PlatformError),
+    /// The host's destroy failed.
+    DestroyFailed(PlatformError),
+}
+
+/// Destroys host key `key_id`, which the host handed a flow that refused it,
+/// unless the id names a key this adapter holds (`Live` or `Destroying`):
+/// a host that reused a held id must not lose the held key to the refusal.
+///
+/// Until the host confirms the destroy, the id sits under an armed
+/// [`OrphanGuard`], so a failed destroy, a poisoned registry, or a dropped
+/// future leaves it queued for [`sweep_orphans`]. A host that reports the
+/// key as [`PlatformError::KeyNotFound`] no longer holds it.
+///
+/// # Errors
+///
+/// [`RefusedKeyQueued`] when the id stays queued.
+async fn destroy_refused_key<D, DF>(
+    registry: &CallbackKeyRegistry,
+    key_id: String,
+    host_destroy: &D,
+) -> Result<(), RefusedKeyQueued>
+where
+    D: Fn(String) -> DF + Sync,
+    DF: Future<Output = Result<(), PlatformError>>,
+{
+    let mut orphan = OrphanGuard {
+        registry,
+        key_id: Some(key_id.clone()),
+    };
+    match registry.names_held_key(&key_id) {
+        // The id names a key this adapter holds: destroy nothing.
+        Ok(true) => {
+            orphan.disarm();
+            Ok(())
+        }
+        Err(poisoned) => Err(RefusedKeyQueued::RegistryPoisoned(poisoned)),
+        Ok(false) => match host_destroy(key_id).await {
+            Ok(()) | Err(PlatformError::KeyNotFound) => {
+                orphan.disarm();
+                Ok(())
+            }
+            Err(e) => Err(RefusedKeyQueued::DestroyFailed(e)),
         },
     }
 }
@@ -1325,27 +1397,47 @@ where
 /// handle is then bound as a [`KeyRole::Pseudonym`] of `(key, context_id,
 /// epoch)` ([`CallbackKeyRegistry::bind_pseudonym`]).
 ///
+/// A derivation in flight when its identity is destroyed fails with
+/// key-not-found and stores nothing (§9.10.4.A), on the host included: when
+/// the `get_public_key(key_id)` confirmation fails or the bind runs and the
+/// source is no longer a live identity holding the key the derive resolved,
+/// the adapter destroys the derived host key through `host_destroy`
+/// ([`destroy_refused_key`]: never an id the registry holds, and queued for
+/// [`sweep_orphans`] if the destroy fails or is dropped) before it returns
+/// [`PlatformError::KeyNotFound`]. A failed confirmation while the source
+/// is still that live identity refuses the pseudonym (ADR-021).
+///
 /// # Errors
 ///
-/// [`PlatformError::WrongKeyType`] for `key`, or as in [`resolve`]; any host
-/// error; [`PlatformError::PseudonymRejected`] (reported as `SCP-IDENT-1055`)
-/// for a malformed pseudonym, a malformed `get_public_key(key_id)` answer, a
-/// point or role that answer does not confirm, or a refused bind.
-pub async fn derive_pseudonym<H, HF, P, PF>(
+/// [`PlatformError::WrongKeyType`] for `key`, or as in [`resolve`]; any
+/// `host_derive` error; [`PlatformError::KeyNotFound`] for a derive that
+/// raced its identity's destroy; [`PlatformError::PseudonymRejected`]
+/// (reported as `SCP-IDENT-1055`) for a malformed pseudonym, a failed or
+/// malformed `get_public_key(key_id)` answer, a point or role that answer
+/// does not confirm, or a refused bind; [`PlatformError::CustodyError`] if
+/// the registry lock is poisoned.
+pub async fn derive_pseudonym<H, HF, P, PF, D, DF>(
     registry: &CallbackKeyRegistry,
-    method: &str,
     key: &KeyHandle,
     context_id: &[u8],
     epoch: Option<u64>,
     host_derive: H,
     host_get_public_key: P,
+    host_destroy: D,
 ) -> Result<PseudonymKeypair, PlatformError>
 where
     H: FnOnce(String) -> HF,
     HF: Future<Output = Result<(Vec<u8>, String), PlatformError>>,
     P: Fn(String) -> PF + Sync,
     PF: Future<Output = Result<HostPublicKey, PlatformError>>,
+    D: Fn(String) -> DF + Sync,
+    DF: Future<Output = Result<(), PlatformError>>,
 {
+    let method = if epoch.is_some() {
+        "derive_rotatable_pseudonym"
+    } else {
+        "derive_pseudonym"
+    };
     let source = resolve(registry, key, &host_get_public_key).await?.0;
     let source_key = source.key.clone();
     if source.role != KeyRole::Identity {
@@ -1362,7 +1454,20 @@ where
         RegisteredKey::P256Signing(P256PublicKey::from_sec1(&public_key).map_err(|e| {
             PlatformError::PseudonymRejected(format!("KeyCustodyProvider.{method}: {e}"))
         })?);
-    let answer = host_get_public_key(key_id).await?;
+    let answer = match host_get_public_key(key_id).await {
+        Ok(answer) => answer,
+        // A failed confirmation refuses the pseudonym (ADR-021), unless the
+        // identity was destroyed while the host derived (§9.10.4.A).
+        Err(e) => {
+            return Err(if registry.is_live_identity(key.id(), &source_key)? {
+                PlatformError::PseudonymRejected(format!(
+                    "KeyCustodyProvider.{method}: get_public_key(key_id) failed: {e}"
+                ))
+            } else {
+                refuse_raced_derive(registry, &pseudonym, &host_destroy).await
+            });
+        }
+    };
     // A malformed answer about the pseudonym key refuses the pseudonym.
     let rejected = |e| match e {
         PlatformError::CustodyError(msg) => PlatformError::PseudonymRejected(msg),
@@ -1381,7 +1486,7 @@ where
              pseudonym point"
         )));
     }
-    registry.bind_pseudonym(
+    match registry.bind_pseudonym(
         method,
         *pseudonym.key_handle(),
         derived,
@@ -1391,8 +1496,41 @@ where
             epoch,
         },
         &source_key,
-    )?;
-    Ok(pseudonym)
+    ) {
+        Ok(()) => Ok(pseudonym),
+        // The source identity was destroyed (or its id handed to another
+        // key) while the host derived, or the derived id is mid-destroy. A
+        // held id is left alone; any other is the host key this derive made.
+        Err(PlatformError::KeyNotFound) => {
+            Err(refuse_raced_derive(registry, &pseudonym, &host_destroy).await)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The error a derivation that raced its identity's destroy returns, after
+/// destroying the host key it derived ([`destroy_refused_key`]): key-not-found
+/// (§9.10.4.A), also when the destroy failed and left the key queued for the
+/// sweep; the poisoned-lock error if the registry lock is poisoned.
+async fn refuse_raced_derive<D, DF>(
+    registry: &CallbackKeyRegistry,
+    pseudonym: &PseudonymKeypair,
+    host_destroy: &D,
+) -> PlatformError
+where
+    D: Fn(String) -> DF + Sync,
+    DF: Future<Output = Result<(), PlatformError>>,
+{
+    match destroy_refused_key(
+        registry,
+        pseudonym.key_handle().id().to_string(),
+        host_destroy,
+    )
+    .await
+    {
+        Ok(()) | Err(RefusedKeyQueued::DestroyFailed(_)) => PlatformError::KeyNotFound,
+        Err(RefusedKeyQueued::RegistryPoisoned(poisoned)) => poisoned,
+    }
 }
 
 /// A software host for bridge tests: Ed25519, P-256 signing and HPKE P-256
@@ -2060,7 +2198,6 @@ mod tests {
         let confirm = p256_answer(key);
         let derived = derive_pseudonym(
             &registry,
-            "derive_pseudonym",
             &KeyHandle::new(1),
             b"ctx",
             None,
@@ -2075,6 +2212,7 @@ mod tests {
                     Ok(confirm)
                 }
             },
+            no_destroy,
         )
         .await
         .unwrap();
@@ -2524,7 +2662,6 @@ mod tests {
         let (point, id) = (returned.0, returned.1.to_owned());
         derive_pseudonym(
             registry,
-            "derive_rotatable_pseudonym",
             &KeyHandle::new(source),
             context,
             epoch,
@@ -2536,6 +2673,7 @@ mod tests {
                 let confirm = confirm.clone();
                 async move { Ok(confirm) }
             },
+            no_destroy,
         )
         .await
     }
@@ -2598,12 +2736,12 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let resolved = derive_pseudonym(
             &registry,
-            "derive_pseudonym",
             &KeyHandle::new(5),
             b"ctx",
             None,
             |_| async { panic!("no derivation from a resolved key") },
             lookup(&answer("ed25519", &e.to_bytes()), &calls),
+            no_destroy,
         )
         .await;
         assert!(matches!(
@@ -2923,7 +3061,9 @@ mod tests {
     }
 
     /// A derive whose host call returns after its identity was destroyed
-    /// binds nothing: the source check is repeated under the bind's lock.
+    /// binds nothing (the source check is repeated under the bind's lock)
+    /// and destroys the host key it derived. Dropping that destroy fails the
+    /// host-destroy assertion.
     #[tokio::test]
     async fn a_derive_racing_its_identity_destroy_binds_nothing() {
         let registry = CallbackKeyRegistry::new();
@@ -2935,9 +3075,10 @@ mod tests {
         );
         let key = p256(0xE9);
         let point = key.public_key().to_compressed().to_vec();
+        let destroyed = Log::default();
+        let destroyed = &destroyed;
         let result = derive_pseudonym(
             &registry,
-            "derive_pseudonym",
             &KeyHandle::new(1),
             b"ctx",
             None,
@@ -2953,13 +3094,25 @@ mod tests {
                 let answer = p256_answer(&key);
                 async move { Ok(answer) }
             },
+            |id| async move {
+                destroyed.lock().unwrap().push(id);
+                Ok(())
+            },
         )
         .await;
         assert!(matches!(result, Err(PlatformError::KeyNotFound)));
         assert!(registry.get(&KeyHandle::new(20)).unwrap().is_none());
+        // §9.10.4.A: the derive stores nothing, on the host included.
+        assert_eq!(*destroyed.lock().unwrap(), vec!["20".to_owned()]);
+        assert!(registry.orphans().is_empty());
     }
 
     type Log = std::sync::Mutex<Vec<String>>;
+
+    /// A host destroy a test expects never to be called.
+    fn no_destroy(_: String) -> std::future::Ready<Result<(), PlatformError>> {
+        panic!("unexpected host destroy")
+    }
 
     async fn generate_with(
         registry: &CallbackKeyRegistry,
@@ -3355,7 +3508,8 @@ mod tests {
 
     /// J3: a derive from identity 1 (key A) whose host call returns after id
     /// 1 was destroyed and handed to identity key B fails with
-    /// `KeyNotFound`, and the id it returned is not bound.
+    /// `KeyNotFound`, the id it returned is not bound, and the host key
+    /// behind that id is destroyed.
     #[tokio::test]
     async fn a_derive_racing_an_identity_id_reuse_binds_nothing() {
         let registry = CallbackKeyRegistry::new();
@@ -3369,9 +3523,10 @@ mod tests {
         let replacement = RegisteredKey::Ed25519(ed(0xFA).verifying_key());
         let key = p256(0xFB);
         let point = key.public_key().to_compressed().to_vec();
+        let destroyed = Log::default();
+        let destroyed = &destroyed;
         let result = derive_pseudonym(
             &registry,
-            "derive_pseudonym",
             &identity,
             b"ctx",
             None,
@@ -3390,6 +3545,10 @@ mod tests {
                 let answer = p256_answer(&key);
                 async move { Ok(answer) }
             },
+            |id| async move {
+                destroyed.lock().unwrap().push(id);
+                Ok(())
+            },
         )
         .await;
         assert!(
@@ -3398,6 +3557,7 @@ mod tests {
         );
         assert!(registry.get(&KeyHandle::new(20)).unwrap().is_none());
         assert_eq!(registry.get(&identity).unwrap().unwrap().key, replacement);
+        assert_eq!(*destroyed.lock().unwrap(), vec!["20".to_owned()]);
     }
 
     /// The software host through the flows: every type generates with the
@@ -3431,12 +3591,12 @@ mod tests {
         assert_eq!(sig.as_bytes().len(), 64);
         let pseudonym = derive_pseudonym(
             &registry,
-            "derive_rotatable_pseudonym",
             &identity,
             b"ctx",
             Some(2),
             |id| async move { host.derive_pseudonym(&id, b"ctx", Some(2)) },
             gpk,
+            no_destroy,
         )
         .await
         .unwrap();
@@ -3501,12 +3661,12 @@ mod tests {
         let gpk = |id: String| async move { host.get_public_key(&id) };
         let pseudonym = derive_pseudonym(
             &registry,
-            "derive_pseudonym",
             &identity,
             b"ctx",
             None,
             |id| async move { host.derive_pseudonym(&id, b"ctx", None) },
             gpk,
+            no_destroy,
         )
         .await
         .unwrap();
@@ -3533,12 +3693,12 @@ mod tests {
         let registry = CallbackKeyRegistry::new();
         let result = derive_pseudonym(
             &registry,
-            "derive_pseudonym",
             &operational,
             b"ctx",
             None,
             |id| async move { host.derive_pseudonym(&id, b"ctx", None) },
             |id: String| async move { host.get_public_key(&id) },
+            no_destroy,
         )
         .await;
         assert!(
@@ -3590,12 +3750,12 @@ mod tests {
         };
         let result = derive_pseudonym(
             &registry,
-            "derive_pseudonym",
             &identity,
             b"ctx",
             None,
             |id| async move { host.derive_pseudonym(&id, b"ctx", None) },
             promoting,
+            no_destroy,
         )
         .await;
         assert!(
@@ -3857,5 +4017,313 @@ mod tests {
         .await;
         assert!(matches!(result, Err(PlatformError::CustodyError(_))));
         assert_eq!(registry.orphans(), vec!["not-a-number".to_owned()]);
+    }
+
+    /// A generation handed a non-canonical spelling (`"0N"`) of an id the
+    /// registry holds live names no held key, because the registry holds
+    /// only canonical ids: the refused key is destroyed by exactly that
+    /// string, and nothing is queued. Parsing the id loosely (`"07"` as 7)
+    /// spares the host key and fails this.
+    #[tokio::test]
+    async fn a_non_canonical_spelling_of_a_live_id_is_destroyed() {
+        let valid = p256(0x41);
+        let e = ed(0x42);
+        for n in [1u64, 7] {
+            let registry = CallbackKeyRegistry::new();
+            let destroyed = Log::default();
+            let canonical = n.to_string();
+            generate_with(
+                &registry,
+                KeyType::P256Signing,
+                &canonical,
+                Ok(p256_answer(&valid)),
+                &destroyed,
+            )
+            .await
+            .unwrap();
+            let padded = format!("0{n}");
+            let refused = generate_with(
+                &registry,
+                KeyType::Ed25519,
+                &padded,
+                Ok(ed_answer(&e)),
+                &destroyed,
+            )
+            .await;
+            assert!(
+                matches!(refused, Err(PlatformError::CustodyError(_))),
+                "{refused:?}"
+            );
+            assert_eq!(*destroyed.lock().unwrap(), vec![padded.clone()]);
+            assert!(registry.orphans().is_empty(), "{padded}: not queued");
+            assert!(registry.is_live(&KeyHandle::new(n)));
+        }
+    }
+
+    /// A queued non-canonical id (`"07"`) names no held key while slot 7 is
+    /// live, so the sweep destroys it. Parsing the id loosely drops it from
+    /// the queue without a host call and fails this.
+    #[tokio::test]
+    async fn a_sweep_destroys_a_non_canonical_spelling_of_a_live_id() {
+        let registry = CallbackKeyRegistry::new();
+        registry
+            .register(
+                KeyHandle::new(7),
+                RegisteredEntry::minted(
+                    RegisteredKey::P256Signing(p256(0x43).public_key()),
+                    KeyRole::Operational,
+                ),
+            )
+            .unwrap();
+        registry.queue_orphan("07".to_owned());
+        let destroyed = Log::default();
+        let destroyed = &destroyed;
+        sweep_orphans(&registry, &|id: String| async move {
+            destroyed.lock().unwrap().push(id);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(*destroyed.lock().unwrap(), vec!["07".to_owned()]);
+        assert!(registry.orphans().is_empty());
+        assert!(registry.is_live(&KeyHandle::new(7)));
+    }
+
+    /// A derive racing its identity's destroy, through the software host,
+    /// which keeps every key it is not told to destroy: the identity destroy
+    /// completes while the derive is inside the host's derive call. The
+    /// derive is key-not-found, the host received a destroy for the derived
+    /// id and no longer holds it, and a sign on that id is key-not-found.
+    /// Dropping the adapter's destroy leaves the host key, which a later
+    /// sign resolves and uses; this fails.
+    #[tokio::test]
+    async fn a_derive_racing_its_identity_destroy_leaves_no_host_key() {
+        let host = fake_host::FakeHost::default();
+        let host = &host;
+        let registry = CallbackKeyRegistry::new();
+        let registry = &registry;
+        let gpk = |id: String| async move { host.get_public_key(&id) };
+        let host_destroy = |id: String| async move { host.destroy_key(&id) };
+        let identity = generate_keypair(
+            registry,
+            KeyType::Ed25519,
+            KeyRole::Identity,
+            |t, r| async move { host.generate_keypair(t, r) },
+            gpk,
+            host_destroy,
+        )
+        .await
+        .unwrap();
+        let derived_id = std::sync::Mutex::new(None::<String>);
+        let derived_id = &derived_id;
+        let result = derive_pseudonym(
+            registry,
+            &identity,
+            b"ctx",
+            None,
+            |id| async move {
+                let derived = host.derive_pseudonym(&id, b"ctx", None)?;
+                *derived_id.lock().unwrap() = Some(derived.1.clone());
+                destroy_key(registry, &identity, host_destroy).await?;
+                Ok(derived)
+            },
+            gpk,
+            host_destroy,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(PlatformError::KeyNotFound)),
+            "{result:?}"
+        );
+        let derived_id = derived_id.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            host.calls("destroy_key"),
+            2,
+            "the identity and the derived key"
+        );
+        assert!(
+            !host.holds(&derived_id),
+            "the derived host key is destroyed"
+        );
+        assert!(registry.orphans().is_empty());
+        let signed = sign(
+            registry,
+            &KeyHandle::new(derived_id.parse().unwrap()),
+            &[0x42; 32],
+            |id, data| async move { host.sign(&id, &data) },
+            gpk,
+        )
+        .await;
+        assert!(
+            matches!(signed, Err(PlatformError::KeyNotFound)),
+            "{signed:?}"
+        );
+    }
+
+    /// A derive racing its identity's destroy whose host destroy of the
+    /// derived key fails is still key-not-found, and the key is queued for
+    /// the sweep.
+    #[tokio::test]
+    async fn a_raced_derive_whose_destroy_fails_queues_the_key() {
+        let registry = CallbackKeyRegistry::new();
+        live(
+            &registry,
+            1,
+            RegisteredKey::Ed25519(ed(0xE8).verifying_key()),
+            KeyRole::Identity,
+        );
+        let key = p256(0xE9);
+        let point = key.public_key().to_compressed().to_vec();
+        let result = derive_pseudonym(
+            &registry,
+            &KeyHandle::new(1),
+            b"ctx",
+            None,
+            |_| {
+                let token = registry.begin_destroy(&KeyHandle::new(1));
+                let ended = token.and_then(|t| registry.end_destroy(&KeyHandle::new(1), t, true));
+                async move {
+                    ended?;
+                    Ok((point, "20".to_owned()))
+                }
+            },
+            |_| {
+                let answer = p256_answer(&key);
+                async move { Ok(answer) }
+            },
+            |_| async { Err(PlatformError::CustodyError("host busy".into())) },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(PlatformError::KeyNotFound)),
+            "{result:?}"
+        );
+        assert_eq!(registry.orphans(), vec!["20".to_owned()]);
+    }
+
+    /// A raced derive whose returned id names a key the registry holds live
+    /// destroys nothing: the held key is not the raced derive's to destroy.
+    #[tokio::test]
+    async fn a_raced_derive_never_destroys_a_held_id() {
+        let registry = CallbackKeyRegistry::new();
+        live(
+            &registry,
+            1,
+            RegisteredKey::Ed25519(ed(0xE8).verifying_key()),
+            KeyRole::Identity,
+        );
+        let held = p256(0xEA);
+        live(
+            &registry,
+            20,
+            RegisteredKey::P256Signing(held.public_key()),
+            KeyRole::Operational,
+        );
+        let key = p256(0xE9);
+        let point = key.public_key().to_compressed().to_vec();
+        let result = derive_pseudonym(
+            &registry,
+            &KeyHandle::new(1),
+            b"ctx",
+            None,
+            |_| {
+                let token = registry.begin_destroy(&KeyHandle::new(1));
+                let ended = token.and_then(|t| registry.end_destroy(&KeyHandle::new(1), t, true));
+                async move {
+                    ended?;
+                    Ok((point, "20".to_owned()))
+                }
+            },
+            |_| {
+                let answer = p256_answer(&key);
+                async move { Ok(answer) }
+            },
+            no_destroy,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(PlatformError::KeyNotFound)),
+            "{result:?}"
+        );
+        assert!(registry.orphans().is_empty());
+        assert!(registry.is_live(&KeyHandle::new(20)));
+    }
+
+    /// A failed `get_public_key(key_id)` confirmation while the source is
+    /// still the live identity refuses the pseudonym (ADR-021) with the
+    /// host's message, binds nothing, and destroys nothing. Passing the host
+    /// error through fails this.
+    #[tokio::test]
+    async fn a_failed_confirmation_refuses_the_pseudonym() {
+        let registry = CallbackKeyRegistry::new();
+        live(
+            &registry,
+            1,
+            RegisteredKey::Ed25519(ed(0xE8).verifying_key()),
+            KeyRole::Identity,
+        );
+        let point = p256(0xE9).public_key().to_compressed().to_vec();
+        let result = derive_pseudonym(
+            &registry,
+            &KeyHandle::new(1),
+            b"ctx",
+            None,
+            |_| async move { Ok((point, "20".to_owned())) },
+            |_| async { Err(PlatformError::CustodyError("keystore locked".into())) },
+            no_destroy,
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(PlatformError::PseudonymRejected(msg)) if msg.contains("keystore locked")),
+            "{result:?}"
+        );
+        assert!(!registry.is_live(&KeyHandle::new(20)));
+        assert!(registry.orphans().is_empty());
+    }
+
+    /// A failed `get_public_key(key_id)` confirmation after the source
+    /// identity was destroyed while the host answered is key-not-found
+    /// (§9.10.4.A), and the adapter destroys the derived host key. Refusing
+    /// every failed confirmation as a rejected pseudonym fails this.
+    #[tokio::test]
+    async fn a_failed_confirmation_after_the_identity_destroy_is_key_not_found() {
+        let registry = CallbackKeyRegistry::new();
+        let registry = &registry;
+        live(
+            registry,
+            1,
+            RegisteredKey::Ed25519(ed(0xE8).verifying_key()),
+            KeyRole::Identity,
+        );
+        let point = p256(0xE9).public_key().to_compressed().to_vec();
+        let destroyed = Log::default();
+        let destroyed = &destroyed;
+        let result = derive_pseudonym(
+            registry,
+            &KeyHandle::new(1),
+            b"ctx",
+            None,
+            |_| async move { Ok((point, "20".to_owned())) },
+            |_| {
+                let token = registry.begin_destroy(&KeyHandle::new(1));
+                let ended = token.and_then(|t| registry.end_destroy(&KeyHandle::new(1), t, true));
+                async move {
+                    ended?;
+                    Err(PlatformError::CustodyError("keystore locked".into()))
+                }
+            },
+            |id: String| async move {
+                destroyed.lock().unwrap().push(id);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(PlatformError::KeyNotFound)),
+            "{result:?}"
+        );
+        assert_eq!(*destroyed.lock().unwrap(), vec!["20".to_owned()]);
+        assert!(registry.orphans().is_empty());
+        assert!(!registry.is_live(&KeyHandle::new(20)));
     }
 }

@@ -851,7 +851,6 @@ impl KeyCustody for CallbackKeyCustody {
         let p = &*self.provider;
         scp_ffi_common::callback_custody::derive_pseudonym(
             &self.registry,
-            "derive_pseudonym",
             key,
             context_id,
             None,
@@ -862,6 +861,7 @@ impl KeyCustody for CallbackKeyCustody {
                     .map_err(host_err("derive_pseudonym"))
             },
             |key_id| host_public_key(p, key_id),
+            |key_id| async move { p.destroy_key(key_id).await.map_err(host_err("destroy_key")) },
         )
         .await
     }
@@ -883,7 +883,6 @@ impl KeyCustody for CallbackKeyCustody {
         let p = &*self.provider;
         scp_ffi_common::callback_custody::derive_pseudonym(
             &self.registry,
-            "derive_rotatable_pseudonym",
             key,
             context_id,
             Some(pseudonym_epoch),
@@ -894,6 +893,7 @@ impl KeyCustody for CallbackKeyCustody {
                     .map_err(host_err("derive_rotatable_pseudonym"))
             },
             |key_id| host_public_key(p, key_id),
+            |key_id| async move { p.destroy_key(key_id).await.map_err(host_err("destroy_key")) },
         )
         .await
     }
@@ -24819,12 +24819,19 @@ mod tests {
         /// Called with the key id at the start of `destroy_key`, before the
         /// host forgets the key.
         destroy_probe: Option<DestroyProbe>,
+        /// Called with (identity key id, derived key id) inside
+        /// `derive_pseudonym`, after the host holds the derived key and before
+        /// the host call returns.
+        derive_probe: Option<DeriveProbe>,
         /// The role each key id was minted in, as `get_public_key` reports it.
         roles: std::sync::Mutex<std::collections::HashMap<String, String>>,
     }
 
     /// A callback run inside the host's `destroy_key`.
     type DestroyProbe = Box<dyn Fn(&str) + Send + Sync>;
+
+    /// A callback run inside the host's `derive_pseudonym`.
+    type DeriveProbe = Box<dyn Fn(&str, &str) + Send + Sync>;
 
     /// One way a host's pseudonym path can misbehave.
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24857,6 +24864,7 @@ mod tests {
                 fault,
                 sign_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 destroy_probe: None,
+                derive_probe: None,
                 roles: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         }
@@ -25068,7 +25076,11 @@ mod tests {
             key_id: String,
             context_id: Vec<u8>,
         ) -> Result<crate::PseudonymResult, ScpError> {
-            self.mint_pseudonym(&key_id, &context_id, None)
+            let derived = self.mint_pseudonym(&key_id, &context_id, None)?;
+            if let Some(probe) = &self.derive_probe {
+                probe(&key_id, &derived.key_id);
+            }
+            Ok(derived)
         }
 
         async fn derive_rotatable_pseudonym(
@@ -25516,6 +25528,85 @@ mod tests {
             *bound_during_host_destroy.lock().expect("probe mutex"),
             Some(false),
             "the host's destroy_key ran while the handle was still live"
+        );
+    }
+
+    /// §9.10.4.A: an identity destroy that completes while its pseudonym
+    /// derive is inside the host's `derive_pseudonym` leaves no key on the
+    /// host, which keeps every key it is not told to destroy. The derive is
+    /// key-not-found, the host received a destroy for the derived id, and a
+    /// sign on that id is key-not-found. Without the adapter's destroy the
+    /// host keeps the derived key, which the sign resolves and uses.
+    #[tokio::test]
+    async fn a_derive_racing_its_identity_destroy_leaves_no_host_key() {
+        use std::future::Future as _;
+        type Cell = std::sync::OnceLock<std::sync::Weak<CallbackKeyCustody>>;
+        let adapter = Arc::new(Cell::new());
+        let identity_cell = Arc::new(std::sync::OnceLock::<KeyHandle>::new());
+        let destroyed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let derived = Arc::new(std::sync::Mutex::new(None::<String>));
+        let mut host = ProdLikeCustody::new();
+        let probe_destroyed = destroyed.clone();
+        host.destroy_probe = Some(Box::new(move |key_id: &str| {
+            probe_destroyed
+                .lock()
+                .expect("probe mutex")
+                .push(key_id.to_owned());
+        }));
+        let (probe_adapter, probe_identity, probe_derived) =
+            (adapter.clone(), identity_cell.clone(), derived.clone());
+        host.derive_probe = Some(Box::new(move |_source: &str, derived_id: &str| {
+            *probe_derived.lock().expect("probe mutex") = Some(derived_id.to_owned());
+            let custody = probe_adapter
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .expect("adapter is alive during derive");
+            let identity = probe_identity.get().expect("identity set");
+            // The test host never suspends, so the identity destroy
+            // completes on its first poll.
+            let mut destroy = std::pin::pin!(custody.destroy_key(identity));
+            let polled = destroy
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+            assert!(
+                matches!(polled, std::task::Poll::Ready(Ok(()))),
+                "the identity destroy completes inside the host derive"
+            );
+        }));
+        let custody = Arc::new(CallbackKeyCustody::new(Box::new(host)));
+        adapter
+            .set(Arc::downgrade(&custody))
+            .expect("cell set once");
+        let identity = custody
+            .generate_identity_keypair()
+            .await
+            .expect("identity key");
+        identity_cell.set(identity).expect("identity set once");
+
+        let result = custody.derive_pseudonym(&identity, b"ctx").await;
+        assert!(
+            matches!(result, Err(PlatformError::KeyNotFound)),
+            "{result:?}"
+        );
+        let derived_id = derived
+            .lock()
+            .expect("probe mutex")
+            .clone()
+            .expect("the host derived");
+        assert_eq!(
+            *destroyed.lock().expect("probe mutex"),
+            vec![identity.id().to_string(), derived_id.clone()],
+            "the host received a destroy for the derived id"
+        );
+        let signed = custody
+            .sign(
+                &KeyHandle::new(derived_id.parse().expect("numeric key id")),
+                &[0x42u8; 32],
+            )
+            .await;
+        assert!(
+            matches!(signed, Err(PlatformError::KeyNotFound)),
+            "{signed:?}"
         );
     }
 

@@ -743,12 +743,12 @@ impl<H: JsCustodyHost> KeyCustody for CallbackAdapter<H> {
         let h = &self.host;
         flow::derive_pseudonym(
             &self.registry,
-            "derive_pseudonym",
             key,
             context_id,
             None,
             |key_id| h.derive_pseudonym(key_id, context_id.to_vec()),
             |key_id| h.get_public_key(key_id),
+            |key_id| h.destroy_key(key_id),
         )
         .await
     }
@@ -771,12 +771,12 @@ impl<H: JsCustodyHost> KeyCustody for CallbackAdapter<H> {
         let h = &self.host;
         flow::derive_pseudonym(
             &self.registry,
-            "derive_rotatable_pseudonym",
             key,
             context_id,
             Some(pseudonym_epoch),
             |key_id| h.derive_rotatable_pseudonym(key_id, context_id.to_vec(), pseudonym_epoch),
             |key_id| h.get_public_key(key_id),
+            |key_id| h.destroy_key(key_id),
         )
         .await
     }
