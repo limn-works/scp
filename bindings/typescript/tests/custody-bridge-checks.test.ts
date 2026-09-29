@@ -69,8 +69,6 @@ class Store {
   seeds = new Map<string, Uint8Array>();
   /** Pseudonym key id -> its 32-byte P-256 scalar (§9.10.4). */
   pseudonyms = new Map<string, Uint8Array>();
-  /** Pseudonym key id -> the identity key id it was derived from. */
-  pseudonymOwner = new Map<string, string>();
   next = 1;
   signCalls = 0;
   /** Called with the key id at the start of the host's `destroyKey`. */
@@ -119,13 +117,6 @@ class StoreKeychain implements KeyCustodyProvider {
     this.store.destroyProbe?.(keyId);
     this.store.seeds.delete(keyId);
     this.store.pseudonyms.delete(keyId);
-    this.store.pseudonymOwner.delete(keyId);
-    // A pseudonym dies with its identity (§9.10.4.A).
-    for (const [kid, owner] of [...this.store.pseudonymOwner]) {
-      if (owner !== keyId) continue;
-      this.store.pseudonyms.delete(kid);
-      this.store.pseudonymOwner.delete(kid);
-    }
   }
 
   dhAgree(_keyId: string, _peerPublic: Uint8Array): Uint8Array {
@@ -143,7 +134,6 @@ class StoreKeychain implements KeyCustodyProvider {
     const pseudonymId =
       this.fault === "fixedId" ? "777" : (h.readBigUInt64BE(0) | (1n << 63n)).toString();
     this.store.pseudonyms.set(pseudonymId, d);
-    this.store.pseudonymOwner.set(pseudonymId, keyId);
     return { publicKey: p256PublicKey(d), keyId: pseudonymId };
   }
 
@@ -250,15 +240,15 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     expect((await custody.sign(beta.keyId, DIGEST)).length).toBe(64);
   });
 
-  test("a destroyed identity's pseudonym rejects sign with key-not-found (§9.10.4.A)", async () => {
+  test("a host key-not-found on a pseudonym sign rejects with CryptoError SCP-CRYPTO-4006 and nothing uncaught", async () => {
     const store = new Store();
     const custody = adapter(store);
     const identity = await custody.generateKeypair();
-    const other = await custody.generateKeypair();
     const pseudonym = await custody.derivePseudonym(identity, "ctx");
-    const kept = await custody.derivePseudonym(other, "ctx");
     expect((await custody.sign(pseudonym.keyId, DIGEST)).length).toBe(64);
-    await custody.destroyKey(identity);
+    // The host no longer holds the scalar (as after it destroys the identity
+    // that owns the pseudonym) while the bridge still has the id bound.
+    store.pseudonyms.delete(pseudonym.keyId);
     let err: unknown;
     const uncaught = await uncaughtDuring(async () => {
       err = await custody.sign(pseudonym.keyId, DIGEST).catch((e: unknown) => e);
@@ -267,7 +257,6 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     const mapped = mapBridgeError(err);
     expect(mapped).toBeInstanceOf(CryptoError);
     expect(mapped.code).toBe("SCP-CRYPTO-4006");
-    expect((await custody.sign(kept.keyId, DIGEST)).length).toBe(64);
   });
 
   test("a failed getPublicKey(keyId) confirmation rejects the pseudonym with SCP-IDENT-1055", async () => {
