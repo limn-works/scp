@@ -493,9 +493,9 @@ pub struct McpServer<P: ContextProvider> {
     client_capabilities: Option<ClientCapabilities>,
     /// Active resource subscriptions (URIs).
     subscriptions: HashSet<String>,
-    /// Contexts that a `tools/list` or `resources/list` response, or a pump
-    /// evaluation, found served, and whose removal the client has not yet
-    /// been told about.
+    /// Contexts that a `tools/list`, `resources/list` or successful
+    /// `resources/subscribe` response, or a pump evaluation, found served, and
+    /// whose removal the client has not yet been told about.
     ///
     /// [`Self::notifications_for_event`] reads it when an event arrives for a
     /// context that `active_context_ids()` no longer returns. Every bridge
@@ -1427,6 +1427,15 @@ impl<P: ContextProvider> McpServer<P> {
         }
 
         self.subscriptions.insert(params.uri);
+        // A successful subscribe tells the client the context is served, as a
+        // list response does, so the event that later removes the context
+        // must announce the removal. Without this entry, a client that
+        // subscribed without listing would keep a filtered subscription and
+        // never learn that it stopped delivering.
+        self.served_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(context_id.clone());
         // The subscribe response carries neither list, so it overwrites no
         // recorded half, and it records a view only in a session that has not
         // listed. There the client holds no cached list that can go stale, and
@@ -1531,7 +1540,7 @@ impl<P: ContextProvider> McpServer<P> {
     /// asked for.
     ///
     /// `served_contexts` and `client_views` are cleared too: they record which
-    /// contexts sit in *this* client's cached lists, so a context the previous
+    /// contexts *this* client was told about, so a context the previous
     /// client listed must not produce a removal notice for a client that never
     /// listed it.
     ///
@@ -1624,16 +1633,17 @@ impl<P: ContextProvider> McpServer<P> {
     ///
     /// Events for contexts this server does not serve produce no notifications,
     /// with one exception. When a membership or lifecycle event arrives for a
-    /// context that a list response or an earlier event found served and
-    /// `active_context_ids()` no longer returns, that event is the one that
-    /// removed the context. The server then sends the
+    /// context that a list or subscribe response or an earlier event found
+    /// served and `active_context_ids()` no longer returns, that event is the
+    /// one that removed the context. The server then sends the
     /// `tools/list_changed` + `resources/list_changed` pair once, so the
-    /// client drops the context from its cached lists.
+    /// client drops the context from its cached lists and learns that a
+    /// subscription on it has stopped delivering.
     ///
     /// When `active_context_ids()` fails, the server forgets no context and
-    /// sends only that pair, and only for a context a list response or an
-    /// earlier event found served, so the client's re-list surfaces the
-    /// failure.
+    /// sends only that pair, and only for a context a list or subscribe
+    /// response or an earlier event found served, so the client's re-list
+    /// surfaces the failure.
     #[must_use]
     pub fn notifications_for_event(
         &self,
@@ -4476,6 +4486,45 @@ mod tests {
                     .iter()
                     .any(|n| n.method == protocol::METHOD_RESOURCES_LIST_CHANGED),
             "got: {notifs:?}"
+        );
+    }
+
+    /// A successful subscribe tells the client the context is served, so a
+    /// client that subscribed without ever listing is told when the context
+    /// is removed, and learns its filtered subscription stopped delivering.
+    /// `Expired` stands for every event in the membership and lifecycle
+    /// class, which includes the agent's own `MemberLeft`.
+    #[test]
+    fn removal_event_after_subscribe_without_list_emits_list_changed_pair() {
+        let mut server = subscribing_server(MockProvider::default());
+        subscribe(&mut server, "scp://ctx_a/members");
+        server.provider.contexts.retain(|c| c != "ctx_a");
+
+        let notifs = server.notifications_for_event("ctx_a", &members_and_tools_event());
+        let methods: Vec<&str> = notifs.iter().map(|n| n.method.as_str()).collect();
+        assert_eq!(
+            methods,
+            vec![
+                protocol::METHOD_TOOLS_LIST_CHANGED,
+                protocol::METHOD_RESOURCES_LIST_CHANGED
+            ],
+            "a subscribed but never-listed context was removed: the client must \
+             be told, and no resources/updated may name the removed context"
+        );
+        assert!(
+            !server
+                .client_views
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key("ctx_a"),
+            "the removal must drop the view the subscribe recorded"
+        );
+        assert!(
+            server
+                .notifications_for_event("ctx_a", &members_and_tools_event())
+                .is_empty(),
+            "after announcing the removal once, events on the removed context \
+             must stay silent"
         );
     }
 
