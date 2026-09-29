@@ -330,6 +330,31 @@
             #expect(msg?.contains("isSupported") == true)
         }
 
+        /// The supported-device side of this order is pinned by the SCP-ATTEST-9026
+        /// tests over `RecordingAppAttestService`, whose `isSupported` is true.
+        @Test("attest throws SCP-ATTEST-9019, not SCP-ATTEST-9026, for a wrong-length challenge when App Attest is unavailable")
+        func attestUnsupportedPrecedesLengthCheck() async {
+            for length in [0, 31, 33] {
+                let harness = makeAdapter(ScriptedAppAttestService(supported: false))
+                let msg = await expectCode("SCP-ATTEST-9019", from: "attest (\(length) bytes)") { () async throws(ScpError) -> Data in
+                    try await harness.adapter.attest(challenge: Data(repeating: 0x01, count: length), deviceId: deviceId)
+                }
+                #expect(msg?.contains("isSupported") == true)
+                #expect(harness.defaults.string(forKey: keyIdDefaultsKey) == nil)
+            }
+        }
+
+        @Test("assertRequest throws SCP-ATTEST-9019, not SCP-ATTEST-9026, for a wrong-length requestHash when App Attest is unavailable")
+        func assertRequestUnsupportedPrecedesLengthCheck() async {
+            for length in [0, 31, 33] {
+                let harness = makeAdapter(ScriptedAppAttestService(supported: false), storedKeyId: scriptedKeyId)
+                let msg = await expectCode("SCP-ATTEST-9019", from: "assertRequest (\(length) bytes)") { () async throws(ScpError) -> Data in
+                    try await harness.adapter.assertRequest(requestHash: Data(repeating: 0xAB, count: length))
+                }
+                #expect(msg?.contains("isSupported") == true)
+            }
+        }
+
         @Test("every AttestationError case maps to its own SCP-ATTEST code")
         func everyCaseHasItsOwnCode() {
             let cases: [AttestationError] = [
