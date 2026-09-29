@@ -2791,13 +2791,17 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | `"scp-private-state-v1"` | HKDF info prefix | Private state routing ID derivation — full info is `"scp-private-state-v1" \|\| did_string` | §3.7 |
 | `"scp-bridge-credential-v1"` | HKDF info | Bridge credential encryption key derivation | §12 |
 | `"scp-participation-statement-v1"` | HKDF info | Context-specific participation signing key derivation | §7.3 |
+| `"scp-pseudonym-secret-v1"` | HKDF salt (the label bytes themselves, not their hash) | `pseudonym_secret` derivation — `HKDF-SHA256(ikm = p256_private_scalar, salt = "scp-pseudonym-secret-v1", info = "", len = 32)`; native software custody passes the Ed25519 identity seed as `ikm` until S12 (§9.10.4.A interim) | §9.10.4.A |
+| `"SCP-PSEUDONYM-P256-V1"` | HKDF-Expand info | Pseudonym seed-to-scalar step (FIPS 186-5 A.2.1), for v1 and v2 alike — `scalar_input = HKDF-Expand-SHA256(context_seed, "SCP-PSEUDONYM-P256-V1", 48)`, then `d = (int(scalar_input) mod (n - 1)) + 1` | §9.10.4 (v1), §9.10.4.1 (v2) |
 
-**HMAC domain separators** — used in HMAC-SHA-256 for pseudonym key derivation:
+**HMAC domain separators** — each is the last field of the HMAC-SHA-256 message that yields the pseudonym `context_seed`:
 
-| Label | Used For | Construction | Spec Reference |
-|-------|----------|--------------|----------------|
-| `"scp-pseudonym"` | Pseudonym v1 (non-rotatable, epoch 0) | `HMAC-SHA-256(identity_key_material, context_id \|\| "scp-pseudonym")` | §9.2 |
-| `"scp-pseudonym-v2"` | Pseudonym v2 (rotatable, epoch > 0) | `HMAC-SHA-256(identity_key_material, context_id \|\| epoch_BE \|\| "scp-pseudonym-v2")` | §9.2 |
+| Label | Type | Used For | Construction | Spec Reference |
+|-------|------|----------|--------------|----------------|
+| `"scp-pseudonym"` | HMAC message domain suffix | Pseudonym v1 (static; used by every context that does not opt into rotation) | `HMAC-SHA256(identity_key_material, context_id \|\| "scp-pseudonym")`, where `identity_key_material` is the 32-byte `pseudonym_secret` | §9.10.4 |
+| `"scp-pseudonym-v2"` | HMAC message domain suffix | Pseudonym v2 (rotatable; derived at every rotation epoch, epoch 0 included, and v2 epoch 0 differs from v1) | `HMAC-SHA256(pseudonym_secret, context_id \|\| epoch_BE \|\| "scp-pseudonym-v2")`, where `epoch_BE` is the 64-bit big-endian pseudonym rotation epoch | §9.10.4.1 |
+
+Both seeds go through the `"SCP-PSEUDONYM-P256-V1"` seed-to-scalar step above. The routing-id prefix `"scp-pseudonym-routing-v1:"` that hashes the resulting 33-byte pseudonym public key is a SHA-256 domain separator, registered in §9.18.2.
 
 **MLS exporter labels** — used in RFC 9420 `MLS-Exporter` for key export:
 
