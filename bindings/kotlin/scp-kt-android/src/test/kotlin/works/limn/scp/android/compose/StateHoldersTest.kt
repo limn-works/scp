@@ -1126,7 +1126,8 @@ class ScpHotStreamRemountTest {
             val gate = CompletableDeferred<Unit>()
             val starting =
                 rowScope.launch {
-                    coordinator.startMounted(row) {
+                    // Typed, so `shared` is not coerced to the Unit that `launch` expects.
+                    coordinator.startMounted<Any>(row) {
                         entered.countDown()
                         gate.await()
                         shared
