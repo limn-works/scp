@@ -93,13 +93,16 @@ private class InMemorySharedPreferences : SharedPreferences {
 }
 
 /**
- * Unit tests for [AndroidKeyCustody] software fallback path.
+ * Unit tests for [AndroidKeyCustody]: the software fallback path, plus the one Keystore-handle
+ * check a JVM test reaches.
  *
  * Android Keystore is not available in JVM unit tests. These tests verify:
  * - Software Ed25519 key generation, signing, and public key extraction
  * - Software X25519 key generation and DH agreement
  * - Pseudonym derivation determinism
- * - Key destruction
+ * - Key destruction, and the error codes a destroyed handle yields
+ * - Signing-key export, including its rejection of a [CustodyType.HARDWARE] handle, which
+ *   throws before it reads Keystore
  * - Error handling (key not found, wrong key type)
  * - Ed25519 key persistence to EncryptedSharedPreferences
  *
@@ -359,6 +362,23 @@ class AndroidKeyCustodyTest {
                 custody.publicKey(handle)
             }
             assertEquals("SCP-CRYPTO-4001", exception.code)
+        }
+
+        @Test
+        fun `destroyKey makes subsequent dhAgree fail with SCP-CRYPTO-4002 or 4003 for a wrong-length peer`() {
+            val handle = custody.generateKeypair(KeyType.X25519)
+            custody.destroyKey(handle)
+
+            val destroyed = assertThrows<ScpException> {
+                custody.dhAgree(handle, ByteArray(32))
+            }
+            assertEquals("SCP-CRYPTO-4002", destroyed.code)
+
+            // dhAgree checks the peer key's length before it looks up the handle.
+            val wrongLength = assertThrows<ScpException> {
+                custody.dhAgree(handle, ByteArray(31))
+            }
+            assertEquals("SCP-CRYPTO-4003", wrongLength.code)
         }
 
         @Test

@@ -25,7 +25,10 @@
 //   derives every pseudonym secret of that key from its signature over the public string
 //   "scp-pseudonym-secret-v1". A caller that signs that string derives every pseudonym private
 //   key of the identity. ADR-027 acceptance criterion 6 forbids this construction.
-// No other path returns a software private key, and no path returns an X25519 private key.
+// No other public method returns a software private key, and no public method returns an
+// X25519 private key. The softwareKeys map is not behind that boundary: it is `internal`, so
+// any code in this module reads every software key pair, X25519 included, and Kotlin compiles
+// it to a public JVM getter with a mangled name that Java code in an app can call.
 // No code passes this class to the Rust engine.
 //
 // Software Ed25519 keys that generateKeypair creates (API 26-32 fallback) are persisted to
@@ -171,6 +174,10 @@ class AndroidKeyCustody internal constructor(
      * Ed25519 keys that [generateKeypair] creates are additionally written to [encryptedPrefs]
      * with `apply()`, so they survive process death once the queued write reaches disk.
      * Derived pseudonym keys and X25519 wrapping keys are held in memory only.
+     *
+     * The map is `internal`, not `private`, because the unit tests read it. Kotlin compiles an
+     * `internal` property to a public JVM getter with a mangled name, so Java code in an app can
+     * read every private key in this map.
      */
     internal val softwareKeys = ConcurrentHashMap<String, AsymmetricCipherKeyPair>()
 
@@ -290,9 +297,11 @@ class AndroidKeyCustody internal constructor(
      * post-deletion check reads only [softwareKeys].
      *
      * After this call, operations with the same handle in the same process throw [ScpException]
-     * with code `SCP-CRYPTO-4001`, with two exceptions: [dhAgree] throws `SCP-CRYPTO-4002`, and
-     * [exportSigningKeyBytes] on a Keystore handle ([CustodyType.HARDWARE]) throws
-     * `SCP-CRYPTO-4005`, because it refuses on [KeyHandle.custodyType] before any key lookup.
+     * with code `SCP-CRYPTO-4001`, with two exceptions: [dhAgree] throws `SCP-CRYPTO-4002`, or
+     * `SCP-CRYPTO-4003` when its peer key is not 32 bytes, because it checks the peer key's
+     * length before any key lookup; and [exportSigningKeyBytes] on a Keystore handle
+     * ([CustodyType.HARDWARE]) throws `SCP-CRYPTO-4005`, because it refuses on
+     * [KeyHandle.custodyType] before any key lookup.
      * When the process dies before `apply()` writes the removal to disk, the next instance's
      * `restorePersistedEd25519Keys` reloads the seed and the key signs again, although this
      * call returned `confirmed = true`.
@@ -315,9 +324,10 @@ class AndroidKeyCustody internal constructor(
      * Performs X25519 Diffie-Hellman key agreement.
      *
      * X25519 wrapping keys are always software-managed (Bouncy Castle); this class does not use
-     * the X25519 key agreement Android Keystore offers from API 33. The private key never
-     * leaves the [AndroidKeyCustody] boundary -- the scalar multiplication happens inside this
-     * method.
+     * the X25519 key agreement Android Keystore offers from API 33. The scalar multiplication
+     * happens inside this method, and no public method of this class returns the X25519 private
+     * key. The `internal` [softwareKeys] map still holds it, readable by any code in this module
+     * and by Java code through the map's mangled public JVM getter.
      *
      * @param keyHandle Handle to an X25519 key from [generateKeypair].
      * @param peerPublic 32-byte X25519 public key of the peer.
