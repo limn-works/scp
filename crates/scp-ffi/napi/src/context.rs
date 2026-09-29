@@ -976,12 +976,9 @@ pub(crate) async fn context_join_on(
         })
         .transpose()?;
 
-    // Ensure the Supervisor is initialized — context_join is a valid
-    // first operation (e.g. a device joining a context without creating one).
-    // init_supervisor is idempotent (OnceLock — first call wins). #1073
-    // Passes the joiner DID to NodeMlsFactory for real MLS encryption (#1294).
-    crate::runtime::init_supervisor(bi, &identity_did);
-
+    // No `init_supervisor` call here: the lifecycle gate above already refused
+    // with SCP-CTX-2000 unless this instance holds a supervisor, so join is
+    // never the operation that attaches one.
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
 
     // Generate a real MLS key package for the joining member (#1294).
@@ -5593,13 +5590,12 @@ mod tests {
     #[cfg(feature = "testing")]
     use scp_core::context::membership::KeyPackage;
     use scp_core::context::params::Capability;
-    // The feature-gated economy tests reference `codes::` directly (no
-    // `use super::*`); the ungated export tests reach `codes` through their
-    // in-fn `use super::*` glob (re-exporting the file-level alias). Gate the
-    // alias to its sole direct consumers so the ungated build does not see an
-    // unused import.
+    // The feature-gated economy tests and the ungated
+    // `parse_context_params_rejects_a_non_object_params_json` reference
+    // `codes::` directly (no `use super::*`), so the alias stays ungated; the
+    // ungated export tests reach `codes` through their in-fn `use super::*`
+    // glob.
     use scp_did::DID;
-    #[cfg(feature = "testing")]
     use scp_ffi_common::error_codes as codes;
     use std::sync::Arc;
 

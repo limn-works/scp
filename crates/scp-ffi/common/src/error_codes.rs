@@ -538,7 +538,9 @@ pub const CTX_2096: &str = "SCP-CTX-2096";
 /// Context actor busy: the supervisor holds an actor for the context, but the
 /// actor did not answer (a saturated mailbox or a reply timeout, ADR-049 §10).
 ///
-/// Retryable, unlike `CTX_2134` and `CTX_2135`.
+/// Retryable: the actor is live and a later call can reach it. `CTX_2135`
+/// is retryable only while a respawn runs, and `CTX_2134` is not retryable
+/// until an operator clears the poison or the process restarts.
 ///
 /// Maps from `ContextError::ActorBusy`.
 pub const CTX_2130: &str = "SCP-CTX-2130";
@@ -549,11 +551,14 @@ pub const CTX_2130: &str = "SCP-CTX-2130";
 ///
 /// Maps from `ContextError::ContextPoisoned`.
 pub const CTX_2134: &str = "SCP-CTX-2134";
-/// Context actor crashed and could not be respawned (ADR-049 §10).
+/// Context actor crashed and has not been respawned (ADR-049 §10).
 ///
-/// Typically a lost or corrupt persisted snapshot. Distinct from `CTX_2134`:
-/// the crash budget was not necessarily exhausted; the respawn itself was
-/// impossible.
+/// Covers two states. While the watchdog's respawn runs, the context is
+/// mid-respawn and a retry can succeed once the respawn finishes. After a
+/// failed respawn below the budget (typically a lost or corrupt persisted
+/// snapshot), nothing retries the respawn, so the code persists until
+/// operator recovery or a restart. Distinct from `CTX_2134`: the crash budget
+/// was not necessarily exhausted.
 ///
 /// Maps from `ContextError::ActorCrashed`.
 pub const CTX_2135: &str = "SCP-CTX-2135";

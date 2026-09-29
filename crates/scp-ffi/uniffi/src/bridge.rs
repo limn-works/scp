@@ -1381,6 +1381,15 @@ impl From<scp_core::context::ContextError> for ScpError {
                 msg: format!("{e}"),
                 code: codes::CTX_2096.to_owned(),
             },
+            // ADR-049 §10: the supervisor holds an actor for the context, but
+            // the actor did not answer (saturated mailbox or a reply timeout).
+            // Dedicated SCP-CTX-2130 instead of CTX_2001 so a Swift / Kotlin
+            // caller can retry a busy actor rather than treat it as a
+            // permanent failure.
+            CE::ActorBusy(_) => Self::Context {
+                msg: format!("{e}"),
+                code: codes::CTX_2130.to_owned(),
+            },
             // ADR-049 §10: actor poisoned (exceeded the respawn budget).
             // Dedicated SCP-CTX-2134 instead of the CTX_2001 catch-all so a
             // Swift / Kotlin caller can detect "dormant, needs operator
@@ -23459,6 +23468,15 @@ mod tests {
             ScpError::Context { code, .. } => code,
             other => panic!("expected ScpError::Context, got {other:?}"),
         }
+    }
+
+    /// ADR-049 §10: an actor that does not answer must surface the dedicated
+    /// retryable SCP-CTX-2130 code, NOT the catch-all SCP-CTX-2001, so the
+    /// Swift and Kotlin SDKs see the same code as the NAPI and `PyO3` bridges.
+    #[test]
+    fn actor_busy_surfaces_ctx_2130() {
+        let err: ScpError = scp_core::context::ContextError::ActorBusy("ctx-1".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2130);
     }
 
     /// ADR-049 §10: a poisoned context must surface the dedicated
