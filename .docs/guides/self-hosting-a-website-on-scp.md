@@ -408,7 +408,7 @@ home line doesn't have. Honest, not fixable from here.
   (SCP-RELAYRES-006) lands. `HostSiteConfig::defaults` in
   `crates/scp-node/src/self_host.rs` sets `dht: DhtMode::Disabled`. The example
   command above now builds without `testing` and exits 1 on every run, because
-  the example gives `Node::start` an empty storage directory and, on a build
+  the example gives `Node::start` a storage directory that holds no identity and, on a build
   without `testing`, its identity-creation (`Generate`) path returns
   `NoPreRotationBackend` whatever custody or storage the caller supplies. A `testing` build
   is not a way to run it: it mints the identity through the test-harness

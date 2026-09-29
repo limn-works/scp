@@ -12,7 +12,7 @@ runs this example without a test-harness stand-in.** `cargo run -p scp-node
 --example website` compiles, then exits 1 on every run. `host_site` asks for
 `IdentitySource::Persisted`, which `Node::start` resolves by loading the stored
 identity or, when the directory holds none, creating one on its `Generate`
-path. The example gives it a new, empty directory on every run, so every run
+path. The example gives `host_site` a new, empty directory on every run, so every run
 takes `Generate`. On a build without `scp-node`'s `testing` feature that path
 returns `NoPreRotationBackend` whatever custody or storage is supplied: it
 takes no `PreRotationCustody` input, so it fails closed rather than mint a
