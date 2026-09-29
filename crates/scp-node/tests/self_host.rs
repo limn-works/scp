@@ -1065,7 +1065,8 @@ async fn build_self_host_node_over_dir(dir: &std::path::Path) -> ApplicationNode
 
     // The production `--self-host` identity wiring: `IdentitySource::Persisted`
     // load-or-creates from the root storage so the DID is stable across
-    // restarts. `NatTraversal` (publishing) → `DhtMode::Production` (M2).
+    // restarts. The node opts into `DhtMode::Production` (M2 accepts
+    // `Disabled` for every `Reach`, `NatTraversal` included).
     Node::start(NodeConfig {
         nat: NatSlot::Custom(Arc::new(FixedTierNatStrategy)),
         dht: DhtMode::Production,

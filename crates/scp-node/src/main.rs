@@ -138,7 +138,9 @@ fn parse_cli_from(
 /// each select a run mode, and [`main`] dispatches on the first one it finds.
 /// Without this check a second mode flag is silently ignored: a shipped binary
 /// given `--self-host --ephemeral` would run a DHT-publishing self-host node
-/// instead of refusing `--ephemeral`. Two mode flags therefore fail closed.
+/// instead of refusing `--ephemeral`. Two mode flags therefore fail closed
+/// (`.docs/prds/self-host-binary.json` SHB-001, the exactly-one-run-mode
+/// acceptance criterion).
 fn conflicting_modes(config: &CliConfig) -> Option<String> {
     let selected: Vec<&str> = [
         (config.relay_only, "--relay-only"),
@@ -1471,7 +1473,8 @@ mod tests {
 
     /// Two run-mode selections fail closed instead of one silently winning:
     /// `--ephemeral` beside `--self-host`, the `SCP_NODE_SELF_HOST` fallback,
-    /// or `--relay-only` is refused, as is `--relay-only` beside self-host.
+    /// or `--relay-only` is refused, as is `--relay-only` beside self-host
+    /// (SHB-001, the exactly-one-run-mode acceptance criterion).
     #[test]
     fn two_run_modes_are_refused() {
         for (args, env_self_host, named) in [

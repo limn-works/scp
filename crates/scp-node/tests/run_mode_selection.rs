@@ -1,6 +1,8 @@
 //! The `scp-node` binary refuses two run modes at once, before it probes or
 //! starts anything. `conflicting_modes` holds the rule; this test proves that
-//! `main` calls it ahead of the `--health` probe and the mode dispatch.
+//! `main` calls it ahead of the `--health` probe and the mode dispatch
+//! (`.docs/prds/self-host-binary.json` SHB-001, the exactly-one-run-mode
+//! acceptance criterion).
 
 #![allow(clippy::expect_used, clippy::panic)]
 

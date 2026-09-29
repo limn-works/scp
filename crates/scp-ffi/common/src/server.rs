@@ -391,9 +391,11 @@ pub async fn start_node_in_memory(
         Some(id) => {
             // Migrated to the ADR-052 flat-config front door (Phase B-P2).
             // The dropped explicit `SelfSignedTlsProvider::new("localhost")` is
-            // reproduced by the default `TlsMode::SelfSigned`. `Domain` is a
-            // publishing reach, so M2 requires `DhtMode::Production` (advisory
-            // in P1 — the in-memory DHT client publishes nothing).
+            // reproduced by the default `TlsMode::SelfSigned`. This node opts
+            // into `DhtMode::Production` (M2 accepts `Disabled` for every
+            // `Reach`, `Domain` included), which makes `Node::start` publish
+            // through the caller's `did_method` and fail the start if that
+            // publish fails.
             //
             // Constructed via a PRODUCTION `Node::start` (spec §17.5: FFI
             // bridges must not rely on an `allow_unencrypted_storage` escape
@@ -611,9 +613,10 @@ where
     // Build the node via the ADR-052 flat-config front door (Phase B-P2). The
     // two identity arms differ only in their `IdentitySource`; the dropped
     // explicit `SelfSignedTlsProvider::new("localhost")` is reproduced by the
-    // default `TlsMode::SelfSigned`. `Domain` is a publishing reach, so M2
-    // requires `DhtMode::Production`, which makes `Node::start` publish through
-    // `did_method` and fail the start if that publish fails. Each arm moves
+    // default `TlsMode::SelfSigned`. This node opts into `DhtMode::Production`
+    // (M2 accepts `Disabled` for every `Reach`, `Domain` included), which makes
+    // `Node::start` publish through `did_method` and fail the start if that
+    // publish fails. Each arm moves
     // `storage` into its own config, so both arms build a config separately.
     let node = if let Some(id) = identity {
         Node::start(NodeConfig {

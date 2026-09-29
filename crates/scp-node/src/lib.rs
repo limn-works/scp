@@ -1676,10 +1676,10 @@ impl
         // Migrated to the ADR-052 flat-config front door (Phase B-P2). The
         // dropped `.tls_provider(SelfSignedTlsProvider::new("localhost"))` is
         // reproduced by the default `TlsMode::SelfSigned`, which installs a
-        // byte-identical self-signed provider for the `Domain` reach. `Domain`
-        // is a publishing reach, so M2 requires `DhtMode::Production`, which
-        // makes `Node::start` publish through `did_method` and fail the start
-        // if that publish fails.
+        // byte-identical self-signed provider for the `Domain` reach. This
+        // node opts into `DhtMode::Production` (M2 accepts `Disabled` for every
+        // `Reach`, `Domain` included), which makes `Node::start` publish
+        // through `did_method` and fail the start if that publish fails.
         //
         // Storage goes through a production `Node::start` front door: an
         // ephemeral `InMemoryStorage` is wrapped in `EncryptingAdapter` under a
@@ -4067,8 +4067,9 @@ mod tests {
 
     /// Builds a domain-mode `NodeConfig` for `test.example.com` with a
     /// succeeding self-signed TLS provider and a fresh generated identity.
-    /// `Reach::Domain` is a publishing reach, so `DhtMode::Production` is set
-    /// (M2); the in-memory `TestDidDht` publishes nothing offline.
+    /// The config opts into `DhtMode::Production` (M2 accepts `Disabled` for
+    /// every `Reach`, `Reach::Domain` included); the in-memory `TestDidDht`
+    /// publishes nothing offline.
     fn domain_config() -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
@@ -4480,8 +4481,9 @@ mod tests {
     }
 
     /// Builds a no-domain (`Reach::NatTraversal`) `NodeConfig` whose NAT probe
-    /// is a `MockNatStrategy` returning `tier` (no real STUN). `NatTraversal` is a
-    /// publishing reach → `DhtMode::Production` (M2).
+    /// is a `MockNatStrategy` returning `tier` (no real STUN). The config opts
+    /// into `DhtMode::Production` (M2 accepts `Disabled` for every `Reach`,
+    /// `NatTraversal` included).
     fn no_domain_config(
         tier: ReachabilityTier,
     ) -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
