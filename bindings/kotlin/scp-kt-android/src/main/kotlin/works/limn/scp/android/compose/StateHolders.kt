@@ -684,8 +684,10 @@ class ScpHotStreams(
  * [HotStreamFactory.contextEvents] and released through [HotStreamFactory.stopContextEvents]
  * when the last mount of that stream leaves composition.
  *
- * @return Compose [State] holding the [SharedFlow], or `null` until the subscription opens, and
- *   for good once [hotStreams] is closed or its scope is cancelled.
+ * @return Compose [State] holding the [SharedFlow], or `null` until the subscription opens. A
+ *   mount that starts after [hotStreams] is closed or its scope is cancelled has its start
+ *   refused, and its [State] stays `null`. A mount that already holds a [SharedFlow] keeps it;
+ *   once [ScpHotStreams.close] runs, that flow receives nothing further.
  */
 @Composable
 fun rememberContextEvents(
@@ -704,8 +706,10 @@ fun rememberContextEvents(
  * [HotStreamFactory.incomingMessages] and released through [HotStreamFactory.stopMessageStream]
  * when the last mount of that stream leaves composition.
  *
- * @return Compose [State] holding the [SharedFlow], or `null` until the subscription opens, and
- *   for good once [hotStreams] is closed or its scope is cancelled.
+ * @return Compose [State] holding the [SharedFlow], or `null` until the subscription opens. A
+ *   mount that starts after [hotStreams] is closed or its scope is cancelled has its start
+ *   refused, and its [State] stays `null`. A mount that already holds a [SharedFlow] keeps it;
+ *   once [ScpHotStreams.close] runs, that flow receives nothing further.
  */
 @Composable
 fun rememberIncomingMessages(
