@@ -2106,48 +2106,36 @@ pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_
 }
 
 /// Attaches a supervisor to `bi` if none is attached, then creates `context_id`
-/// inside it under `creator_did` with `ceiling` as the capability ceiling.
+/// inside it under `creator_did` with `default_ceiling()` as the capability
+/// ceiling.
 ///
 /// [`register_test_context`] alone registers the bridge's UCAN state; it does
 /// NOT create the context inside a supervisor, so every lifecycle gate refuses
 /// a context a test only registered. Tests call this to give the context the
-/// actor a real `context_create` would have spawned. It mirrors the `PyO3`
-/// reference bridge's `create_supervisor_context_for_test`.
+/// actor a real `context_create` would have spawned.
 ///
-/// `ceiling` entries take the colon form the TypeScript surface accepts
-/// (`"outlet:register"`, `"messages:write"`). An empty slice creates the context
-/// with `default_ceiling()`.
+/// Gated on `testing` as well as `test`: its only callers are `testing`-gated
+/// tests, and the production test lane (`--features server`) must compile it
+/// out rather than warn that it is unused.
 ///
 /// # Panics
 ///
-/// Panics when a `ceiling` entry fails the §5.4.2.1 capability parser, when no
-/// supervisor can be attached, or when `create_context` rejects the request —
-/// each one is a broken test fixture rather than a condition under test.
-#[cfg(test)]
-#[allow(clippy::expect_used, clippy::panic)] // A broken test fixture panics; production paths keep the deny.
+/// Panics when no supervisor can be attached or when `create_context` rejects
+/// the request: either one is a broken test fixture rather than a condition
+/// under test.
+#[cfg(all(test, feature = "testing"))]
+#[allow(clippy::expect_used)] // A broken test fixture panics; production paths keep the deny.
 pub(crate) async fn create_supervisor_context_for_test(
     bi: &NapiBridgeInstance,
     context_id: &str,
     creator_did: &str,
-    ceiling: &[&str],
 ) {
     init_supervisor_for_test_on(bi);
-    let capabilities: Vec<scp_core::context::roles::Capability> = if ceiling.is_empty() {
-        scp_core::context::roles::default_ceiling()
+    let params = scp_core::context::ContextParams {
+        ceiling: scp_core::context::roles::default_ceiling()
             .iter()
             .cloned()
-            .collect()
-    } else {
-        ceiling
-            .iter()
-            .map(|entry| {
-                scp_core::context::roles::Capability::new(entry)
-                    .unwrap_or_else(|| panic!("test ceiling entry {entry:?} must parse"))
-            })
-            .collect()
-    };
-    let params = scp_core::context::ContextParams {
-        ceiling: capabilities,
+            .collect(),
         ..scp_core::context::ContextParams::default()
     };
     let sup = Arc::clone(supervisor(bi).expect("test supervisor must be attached"));

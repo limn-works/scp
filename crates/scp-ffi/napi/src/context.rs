@@ -6745,7 +6745,7 @@ mod tests {
             ("unreachable", "SCP-CTX-2130"),
         ] {
             let ctx_id = format!("napi-gate-{fault}-{}", uuid::Uuid::new_v4());
-            crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator, &[]).await;
+            crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator).await;
             crate::runtime::register_test_context(&bi, &ctx_id, creator);
             let handle = active_handle_for(&bi, &ctx_id, creator);
             match fault {
