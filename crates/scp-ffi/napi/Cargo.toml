@@ -58,7 +58,7 @@ hex = { workspace = true }
 sha2 = { workspace = true }
 rmp-serde = { workspace = true }
 ed25519-dalek = { workspace = true }
-tls_codec = "0.4"
+tls_codec = "0.5"
 scp-core = { path = "../../scp-core" }
 scp-media = { path = "../../scp-media" }
 scp-clock = { path = "../../scp-clock" }

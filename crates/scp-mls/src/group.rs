@@ -16,13 +16,13 @@
 //! All groups use `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` — no
 //! ciphersuite negotiation. See ADR-001 for the rationale.
 
-use std::ops::Deref;
-
 use crate::InMemoryMlsProvider;
 use crate::convergent_timestamp::encode_convergent_timestamp_aad;
 use crate::credential::ScpCredential;
 use crate::error::MlsError;
-use crate::lifetime::{key_package_lifetime, validate_key_package_lifetime};
+use crate::lifetime::{
+    key_package_lifetime, validate_key_package_lifetime, validate_tree_leaf_lifetimes,
+};
 use openmls::group::GroupContext;
 use openmls::messages::group_info::GroupInfo;
 use openmls::prelude::*;
@@ -44,71 +44,11 @@ use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTra
 /// and simplifies the implementation. See ADR-001 for the rationale.
 pub const SCP_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
-// ---------------------------------------------------------------------------
-// EagerDropSigner — defense-in-depth wrapper for upstream SignatureKeyPair
-// ---------------------------------------------------------------------------
-
-/// Wrapper around `openmls_basic_credential::SignatureKeyPair` that documents
-/// the zeroization gap and ensures eager drop semantics.
-///
-/// `SignatureKeyPair` stores its Ed25519 private key in a plain `Vec<u8>` and
-/// does not implement `Zeroize` or `ZeroizeOnDrop`. The `private` field is not
-/// publicly accessible (only available behind the `test-utils` feature), so
-/// we cannot zeroize it from outside the crate without `unsafe` code.
-///
-/// Using `unsafe` to reach into the struct's private field was considered and
-/// rejected: `#[repr(Rust)]` provides no field ordering guarantee, so
-/// calculating field offsets is undefined behavior. Writing through a shared
-/// reference also violates aliasing rules under Stacked/Tree Borrows.
-/// See issue #601 and the security review on PR #764.
-///
-/// This wrapper provides:
-/// 1. **Documentation of the gap** — future upstream support for `Zeroize` on
-///    `SignatureKeyPair` would close this.
-/// 2. **Eager drop via [`EagerDropSigner::take`]** — `destroy_group` uses
-///    `take()` to drop the key material as early as possible.
-/// 3. **Centralized ownership** — all `SignatureKeyPair` storage in
-///    `ScpMlsGroup` goes through this type.
-///
-/// **Upstream limitation:** Full zeroization requires `openmls_basic_credential`
-/// to implement `Zeroize` on `SignatureKeyPair`. See issue #82.
-pub struct EagerDropSigner(Option<SignatureKeyPair>);
-
-impl EagerDropSigner {
-    /// Wraps a `SignatureKeyPair` in an eager-drop wrapper.
-    #[must_use]
-    pub const fn new(inner: SignatureKeyPair) -> Self {
-        Self(Some(inner))
-    }
-
-    /// Returns a reference to the inner `SignatureKeyPair`, or `None` after
-    /// destruction.
-    #[must_use]
-    pub const fn as_ref(&self) -> Option<&SignatureKeyPair> {
-        self.0.as_ref()
-    }
-
-    /// Takes the inner `SignatureKeyPair` out, leaving `None`. Used by
-    /// `destroy_group` for eager cleanup, and by the runtime's persistent
-    /// provider when consuming a pending-join signer (ADR-057).
-    #[must_use = "the taken signing key should be used or explicitly dropped"]
-    pub const fn take(&mut self) -> Option<SignatureKeyPair> {
-        self.0.take()
-    }
-}
-
-impl Deref for EagerDropSigner {
-    type Target = Option<SignatureKeyPair>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
 /// Recovers the 32-byte Ed25519 private **seed** from an MLS `SignatureKeyPair`
 /// (ADR-057 Option A pseudonym derivation).
 ///
-/// `openmls_basic_credential::SignatureKeyPair` stores the ED25519 private key as
+/// `openmls_basic_credential::SignatureKeyPair` stores the ED25519 private key,
+/// in a zeroize-on-drop `tls_codec::SecretVLBytes`, as
 /// `ed25519_dalek::SigningKey::to_bytes()` — the 32-byte RFC-8032 seed (see its
 /// `SignatureKeyPair::new` ED25519 arm), exactly the form
 /// [`ed25519_dalek::SigningKey::from_bytes`] consumes. Its `private()` accessor
@@ -129,10 +69,11 @@ fn extract_ed25519_seed(
     use zeroize::Zeroize as _;
 
     // Only the private seed is read back; `public` / `signature_scheme` are
-    // ignored (serde skips unknown fields for a struct by default). `private` is
-    // a plain `Vec<u8>` on the upstream type (no `serde_bytes`), so it round-trips
-    // through `rmp_serde` as a positional u8 sequence into this `Vec<u8>` — match
-    // that shape exactly.
+    // ignored (serde skips unknown fields for a struct by default). The upstream
+    // `private` field is a `SecretVLBytes` that serializes through
+    // `secret_bytes_as_vec` as a bare byte sequence (no `serde_bytes`), so it
+    // round-trips through `rmp_serde` as a positional u8 sequence into this
+    // `Vec<u8>` — match that shape exactly.
     #[derive(serde::Deserialize)]
     struct Ed25519SeedExtract {
         private: Vec<u8>,
@@ -194,13 +135,12 @@ pub struct ScpMlsGroup {
     pub(crate) group: Option<MlsGroup>,
     /// The MLS provider (crypto + storage) for this group.
     pub(crate) provider: InMemoryMlsProvider,
-    /// The local member's Ed25519 signing key pair, wrapped in
-    /// [`EagerDropSigner`] for eager release on [`destroy_group`]: the private
-    /// key `Vec<u8>` is FREED, not zeroized (`OpenMLS` `SignatureKeyPair` has no
-    /// `Zeroize`; upstream issue #82), just earlier than a bare drop would.
-    /// Inner `Option` is `None` after [`destroy_group`] drops the
-    /// private key material.
-    pub(crate) signer: EagerDropSigner,
+    /// The local member's Ed25519 signing key pair. `None` after
+    /// [`destroy_group`] drops it. The private key is a
+    /// `tls_codec::SecretVLBytes`, which zeroizes on drop, so taking the signer
+    /// out wipes the key material at destruction rather than when the wrapper
+    /// is dropped.
+    pub(crate) signer: Option<SignatureKeyPair>,
     /// Whether the group has been destroyed.
     pub(crate) destroyed: bool,
 }
@@ -234,8 +174,8 @@ impl ScpMlsGroup {
     /// # Errors
     ///
     /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed
-    /// (the signer is taken on destruction for eager release: freed, not
-    /// zeroized, since `SignatureKeyPair` has no `Zeroize`; upstream issue #82).
+    /// (destruction takes and drops the signer, and the signer zeroizes its
+    /// private key on drop).
     pub fn signer_key_pair(&self) -> Result<&SignatureKeyPair, MlsError> {
         self.signer.as_ref().ok_or(MlsError::GroupDestroyed)
     }
@@ -301,7 +241,7 @@ impl ScpMlsGroup {
         Self {
             group: Some(group),
             provider,
-            signer: EagerDropSigner::new(signer),
+            signer: Some(signer),
             destroyed: false,
         }
     }
@@ -609,9 +549,10 @@ fn create_group_inner(
     // Create the MLS group with the creator as the sole member. The creator's
     // own `LeafNode` `Lifetime` was routed through the injected `Clock` via the
     // `.lifetime(...)` call on the create-config builder above (ADR-057
-    // §Prereq-1). The residual openmls-internal-clock exposure is confined to
-    // the *receive* side (Welcome tree-leaf validation), which openmls does not
-    // expose for bracketing — see the module docs in `crate::lifetime`.
+    // §Prereq-1). On the receive side, `join_group_from_bytes` brackets every
+    // KeyPackage-sourced Welcome tree leaf against the injected clock, and
+    // openmls's internal `Lifetime::validate` also runs on those leaves — see the
+    // module docs in `crate::lifetime`.
     let group = MlsGroup::new(
         &provider,
         &signer,
@@ -623,7 +564,7 @@ fn create_group_inner(
     Ok(ScpMlsGroup {
         group: Some(group),
         provider,
-        signer: EagerDropSigner::new(signer),
+        signer: Some(signer),
         destroyed: false,
     })
 }
@@ -659,7 +600,7 @@ pub struct AddMemberResult {
 /// * `key_package` - The new member's pre-published `KeyPackage`, signed by
 ///   their Ed25519 key and containing their SCP credential.
 /// * `clock` - The injected hardened [`Clock`]. After openmls validates the
-///   key package (which runs its own un-injectable internal `Lifetime::is_valid`
+///   key package (which runs its own un-injectable internal `Lifetime::validate`
 ///   against openmls's clock), the accepted `Lifetime` is *additionally*
 ///   re-validated against this hardened clock — and checked for the RFC 9420
 ///   maximum-range bound openmls never applies (ADR-057 §Prereq-1).
@@ -689,7 +630,7 @@ pub fn add_member(
         .map_err(|e| MlsError::AddMemberFailed(format!("key package validation: {e}")))?;
 
     // SECURITY (ADR-057 §Prereq-1): openmls's `validate` above runs its own
-    // internal `Lifetime::is_valid` against openmls's (wasm: unhardened) clock.
+    // internal `Lifetime::validate` against openmls's (wasm: unhardened) clock.
     // Re-validate the accepted `Lifetime` against the injected hardened clock,
     // and enforce the RFC 9420 maximum-range bound openmls's `validate` never
     // applies. This is additive hardening — it never replaces openmls's check.
@@ -997,7 +938,7 @@ pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
     // leaving `None`, and the taken value is dropped at the end of the
     // statement. This releases:
     //   - MlsGroup: tree secrets, epoch key schedules, ratchet state
-    //   - SignatureKeyPair: Ed25519 private key (Vec<u8>)
+    //   - SignatureKeyPair: Ed25519 private key, zeroized on drop by `SecretVLBytes`
     drop(group.group.take());
     drop(group.signer.take());
 
@@ -1208,14 +1149,13 @@ fn generate_key_package_inner(
     // `build()`, so the published freshness bounds are governed by the same
     // clock as the rest of the client. Without this call `build()` falls back to
     // `Lifetime::default()` → `Lifetime::new()`, which reads openmls's INTERNAL
-    // clock — under the wasm `js` feature `fluvio_wasm_timer::SystemTime`, an
-    // attacker-overridable `Date.now()`. Generation is now fully routed; the
-    // only residual openmls-internal-clock read is the *receive* side
-    // (`Lifetime::is_valid` on Welcome tree-leaf validation), which openmls does
-    // not expose for bracketing. add_member / key_package_in_did / the
-    // staged-commit Add paths re-validate accepted `Lifetime`s against the
-    // injected clock; the Welcome-leaf residual is tracked upstream (see
-    // `crate::lifetime` module docs).
+    // clock — under the wasm `js` feature `web_time::SystemTime`, an
+    // attacker-overridable `Date.now()`. Generation is fully routed. On the
+    // receive side, add_member / key_package_in_did / the staged-commit Add
+    // paths re-validate accepted `Lifetime`s against the injected clock, and
+    // `join_group_from_bytes` brackets every KeyPackage-sourced Welcome tree
+    // leaf against it; openmls's internal `Lifetime::validate` also runs on each
+    // of those paths (see `crate::lifetime` module docs).
     let key_package_bundle = builder
         .key_package_lifetime(key_package_lifetime(clock))
         .build(SCP_CIPHERSUITE, &provider, &signer, credential_with_key)
@@ -1237,6 +1177,9 @@ fn generate_key_package_inner(
 /// * `provider` - The MLS provider that holds the new member's key material
 ///   (from [`generate_key_package`]).
 /// * `signer` - The new member's signing key pair (from [`generate_key_package`]).
+/// * `clock` - The injected hardened [`Clock`]. Every KeyPackage-sourced leaf
+///   of the joined tree is validated against it before the group is adopted
+///   (see [`join_group_from_bytes`]).
 ///
 /// # Returns
 ///
@@ -1246,15 +1189,18 @@ fn generate_key_package_inner(
 ///
 /// Returns [`MlsError::WelcomeProcessingFailed`] if the Welcome message
 /// cannot be processed.
+/// Returns [`MlsError::KeyPackageLifetimeInvalid`] if a KeyPackage-sourced tree
+/// leaf's `Lifetime` fails validation against `clock`.
 pub fn join_group(
     welcome: &MlsMessageOut,
     provider: InMemoryMlsProvider,
     signer: SignatureKeyPair,
+    clock: &dyn Clock,
 ) -> Result<ScpMlsGroup, MlsError> {
     let serialized = welcome
         .tls_serialize_detached()
         .map_err(|e| MlsError::WelcomeProcessingFailed(format!("serializing welcome: {e}")))?;
-    join_group_from_bytes(&serialized, provider, signer)
+    join_group_from_bytes(&serialized, provider, signer, clock)
 }
 
 /// Joins a group from TLS-serialized Welcome bytes.
@@ -1269,6 +1215,11 @@ pub fn join_group(
 /// * `provider` - The MLS provider holding the key package's private state
 ///   (from [`generate_key_package`]).
 /// * `signer` - The new member's signing key pair (from [`generate_key_package`]).
+/// * `clock` - The injected hardened [`Clock`]. After `StagedWelcome::into_group`
+///   and before the group is wrapped, every leaf of the joined tree whose source
+///   is `LeafNodeSource::KeyPackage` is validated against it, together with the
+///   RFC 9420 maximum-range bound (ADR-057 §Prereq-1). `Update`- and
+///   `Commit`-sourced leaves carry no `Lifetime` and are skipped.
 ///
 /// # Returns
 ///
@@ -1278,10 +1229,14 @@ pub fn join_group(
 ///
 /// Returns [`MlsError::WelcomeProcessingFailed`] if the Welcome message
 /// cannot be deserialized or processed.
+/// Returns [`MlsError::KeyPackageLifetimeInvalid`] if a KeyPackage-sourced tree
+/// leaf's `Lifetime` is expired, not yet valid, or over-long under `clock`; the
+/// joined group is dropped and never adopted.
 pub fn join_group_from_bytes(
     welcome_bytes: &[u8],
     provider: InMemoryMlsProvider,
     signer: SignatureKeyPair,
+    clock: &dyn Clock,
 ) -> Result<ScpMlsGroup, MlsError> {
     let welcome_in = MlsMessageIn::tls_deserialize(&mut &*welcome_bytes)
         .map_err(|e| MlsError::WelcomeProcessingFailed(format!("deserializing welcome: {e}")))?;
@@ -1320,10 +1275,18 @@ pub fn join_group_from_bytes(
         .into_group(&provider)
         .map_err(|e| MlsError::WelcomeProcessingFailed(e.to_string()))?;
 
+    // SECURITY (ADR-057 §Prereq-1): openmls validated each KeyPackage-sourced
+    // tree leaf's `Lifetime` inside `new_from_welcome` against its own clock
+    // (wasm: `web_time`'s `Date.now()`). Re-validate every such leaf against the
+    // injected hardened clock, with the RFC 9420 maximum-range bound, before the
+    // group is adopted. On failure the `MlsGroup` and the provider it wrote into
+    // are dropped here and the caller never receives a group.
+    validate_tree_leaf_lifetimes(&group, clock)?;
+
     Ok(ScpMlsGroup {
         group: Some(group),
         provider,
-        signer: EagerDropSigner::new(signer),
+        signer: Some(signer),
         destroyed: false,
     })
 }
@@ -1521,7 +1484,8 @@ mod tests {
         let result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
 
         // Bob joins using the Welcome message.
-        let bob_group = join_group(&result.welcome, bob_provider, bob_signer).unwrap();
+        let bob_group =
+            join_group(&result.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
 
         // Both Alice and Bob should see 2 members.
         let alice_members = alice_group.members().unwrap();
@@ -1671,7 +1635,7 @@ mod tests {
     // ADR-057 §Prereq-1: KeyPackage Lifetime routed through the injected Clock
     // -----------------------------------------------------------------------
     //
-    // Test-clock realism: openmls's un-injectable internal `is_valid`/`Lifetime::new`
+    // Test-clock realism: openmls's un-injectable internal `validate`/`Lifetime::new`
     // still run against the REAL system clock at every openmls generation/validation
     // site, so injected TestClocks must sit within the real-clock acceptance window.
     // We seed from `SystemClock.now_secs()` and apply small relative offsets.
@@ -1728,8 +1692,8 @@ mod tests {
         // the exact `key_package_lifetime` helper already asserted directly in
         // the two generate_key_package tests above and in the `crate::lifetime`
         // unit tests, so re-reading the own leaf here would only duplicate that.
-        // (The un-bracketable residual is the *joining peers'* leaves, which — un-
-        // like the own leaf — a joined `MlsGroup` exposes no public way to reach.)
+        // The joining peers' leaves are bracketed by `join_group_from_bytes`
+        // (see the `join_*_under_injected_clock` tests below).
         let now = SystemClock.now_secs();
         let clock = scp_clock::TestClock::new(now);
         let group = create_group(&test_credential("carol"), &clock).unwrap();
@@ -1845,5 +1809,142 @@ mod tests {
             matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }),
             "add_member must reject an over-long-range KP openmls would accept, got {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-057 §Prereq-1: Welcome tree-leaf lifetimes bracketed on join
+    // -----------------------------------------------------------------------
+    //
+    // Every clock is seeded from `SystemClock.now_secs()` so openmls's own
+    // real-clock `Lifetime::validate` on the tree leaves passes and only SCP's
+    // injected-clock check can reject.
+
+    /// Alice's group holding Carol, whose leaf expires at `real_now + 600`,
+    /// with Bob then added through a `KeyPackage` minted at `real_now`. Returns
+    /// the Welcome and Bob's join material.
+    ///
+    /// Carol is the member whose leaf carries a `Lifetime` into Bob's tree:
+    /// openmls's `add_members` commits with an `UpdatePath`, which turns Alice's
+    /// own leaf `Commit`-sourced, while Carol never commits, so her leaf keeps
+    /// `LeafNodeSource::KeyPackage`.
+    #[allow(clippy::unwrap_used)]
+    fn welcome_with_carol_leaf_expiring_soon(
+        real_now: u64,
+    ) -> (MlsMessageOut, SignatureKeyPair, InMemoryMlsProvider) {
+        use crate::lifetime::KEY_PACKAGE_LIFETIME_SECS;
+        let now_clock = scp_clock::TestClock::new(real_now);
+        let mut alice = create_group(&test_credential("alice"), &now_clock).unwrap();
+        let (carol_bundle, _carol_signer, _carol_provider) = generate_key_package(
+            &test_credential("carol"),
+            &scp_clock::TestClock::new(real_now - KEY_PACKAGE_LIFETIME_SECS + 600),
+        )
+        .unwrap();
+        add_member(
+            &mut alice,
+            carol_bundle.key_package().clone().into(),
+            &now_clock,
+        )
+        .unwrap();
+        let (bob_bundle, bob_signer, bob_provider) =
+            generate_key_package(&test_credential("bob"), &now_clock).unwrap();
+        let add = add_member(
+            &mut alice,
+            bob_bundle.key_package().clone().into(),
+            &now_clock,
+        )
+        .unwrap();
+        (add.welcome, bob_signer, bob_provider)
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
+    fn join_rejects_welcome_whose_tree_leaf_is_expired_under_injected_clock() {
+        let real_now = SystemClock.now_secs();
+        let (welcome, bob_signer, bob_provider) = welcome_with_carol_leaf_expiring_soon(real_now);
+        let bob_clock = scp_clock::TestClock::new(real_now + 1200);
+        let err = join_group(&welcome, bob_provider, bob_signer, &bob_clock)
+            .err()
+            .expect("join must reject a Welcome whose tree holds an expired leaf");
+        match err {
+            MlsError::KeyPackageLifetimeInvalid { not_after, now, .. } => {
+                // `not_after == real_now + 600` names Carol's leaf; Bob's own
+                // leaf expires at `real_now + KEY_PACKAGE_LIFETIME_SECS`.
+                assert_eq!(not_after, real_now + 600, "the rejected leaf is Carol's");
+                assert_eq!(now, real_now + 1200, "validated against the injected clock");
+            }
+            other => panic!("expected KeyPackageLifetimeInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn join_accepts_welcome_whose_tree_leaves_are_valid_under_injected_clock() {
+        let real_now = SystemClock.now_secs();
+        let (welcome, bob_signer, bob_provider) = welcome_with_carol_leaf_expiring_soon(real_now);
+        let bob_clock = scp_clock::TestClock::new(real_now);
+        let bob = join_group(&welcome, bob_provider, bob_signer, &bob_clock).unwrap();
+        assert_eq!(bob.members().unwrap().len(), 3);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
+    fn join_rejects_welcome_whose_tree_leaf_exceeds_max_lifetime_range() {
+        use crate::lifetime::KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS;
+        let real_now = SystemClock.now_secs();
+
+        // Carol's KeyPackage carries a temporally valid but over-long Lifetime,
+        // which openmls accepts (its `validate` never checks the range). SCP's
+        // `add_member` would reject it, so Alice adds Carol through openmls
+        // directly, as a non-SCP member of the group could.
+        let carol_provider = InMemoryMlsProvider::default();
+        let carol_signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm()).unwrap();
+        carol_signer.store(carol_provider.storage()).unwrap();
+        let cwk = CredentialWithKey {
+            credential: BasicCredential::new(test_credential("carol").to_bytes().unwrap()).into(),
+            signature_key: carol_signer.to_public_vec().into(),
+        };
+        let over_long_not_after = real_now + KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS + 3600;
+        let carol_bundle = KeyPackage::builder()
+            .key_package_lifetime(Lifetime::init(real_now - 3600, over_long_not_after))
+            .build(SCP_CIPHERSUITE, &carol_provider, &carol_signer, cwk)
+            .unwrap();
+
+        let mut alice = create_group(&test_credential("alice"), &SystemClock).unwrap();
+        {
+            let signer = alice.signer.as_ref().unwrap();
+            let g = alice.group.as_mut().unwrap();
+            g.add_members(
+                &alice.provider,
+                signer,
+                &[carol_bundle.key_package().clone()],
+            )
+            .unwrap();
+            g.merge_pending_commit(&alice.provider).unwrap();
+        }
+
+        let (bob_bundle, bob_signer, bob_provider) =
+            generate_key_package(&test_credential("bob"), &SystemClock).unwrap();
+        let add = add_member(
+            &mut alice,
+            bob_bundle.key_package().clone().into(),
+            &SystemClock,
+        )
+        .unwrap();
+
+        let err = join_group(
+            &add.welcome,
+            bob_provider,
+            bob_signer,
+            &scp_clock::TestClock::new(real_now),
+        )
+        .err()
+        .expect("join must reject a Welcome whose tree holds an over-long leaf Lifetime");
+        match err {
+            MlsError::KeyPackageLifetimeInvalid { not_after, .. } => assert_eq!(
+                not_after, over_long_not_after,
+                "the rejected leaf is Carol's over-long one"
+            ),
+            other => panic!("expected KeyPackageLifetimeInvalid, got {other:?}"),
+        }
     }
 }

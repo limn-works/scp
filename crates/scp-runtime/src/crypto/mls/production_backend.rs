@@ -473,7 +473,7 @@ impl MlsBackend for ProductionMlsBackend {
             .map_err(|e| MlsError::AddMemberFailed(format!("key package validation: {e}")))?;
 
         // SECURITY (ADR-057 §Prereq-1): openmls's `validate` above runs its own
-        // internal `Lifetime::is_valid` against openmls's (wasm: unhardened)
+        // internal `Lifetime::validate` against openmls's (wasm: unhardened)
         // clock. Re-validate the accepted `Lifetime` against the injected
         // hardened clock (threaded in as `clock`, not read from backend state —
         // SCP-CRYPTOMOVE-000c) and enforce the RFC 9420 max-range bound
@@ -642,7 +642,8 @@ impl MlsBackend for ProductionMlsBackend {
         }
 
         let (signer, provider) = signer_and_provider_from_wrapper(wrapper)?;
-        let group = group::join_group_from_bytes(welcome_bytes, provider, signer)?;
+        let group =
+            group::join_group_from_bytes(welcome_bytes, provider, signer, self.clock.as_ref())?;
 
         // Join succeeded and the marker key is bound to the consumed init key —
         // durably record it BEFORE returning, so a replay (even on a different
@@ -836,6 +837,93 @@ mod tests {
             replay_count, 1,
             "exactly one concurrent join must be rejected as a single-use replay \
              (res1={t1}, res2={t2})"
+        );
+    }
+
+    /// ADR-057 §Prereq-1 wiring: `join_from_welcome` brackets the Welcome's
+    /// tree-leaf lifetimes against the backend's injected clock. A Welcome whose
+    /// tree holds a leaf that expired under that clock is rejected with
+    /// `KeyPackageLifetimeInvalid`, and the durable consumed-init-key set records
+    /// nothing, so the `KeyPackage` is not burned by the rejected join.
+    #[tokio::test]
+    async fn join_from_welcome_rejects_expired_tree_leaf_and_records_no_consumed_key() {
+        use scp_clock::TestClock;
+        use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_SECS;
+
+        let real_now = SystemClock.now_secs();
+        let store: Arc<dyn OpenMlsStorageAdapter> = Arc::new(SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ));
+        let joiner = ProductionMlsBackend::new(Arc::new(TestClock::new(real_now + 1200)));
+        joiner.set_consumed_init_key_store(Arc::clone(&store));
+
+        // Bob's KeyPackage, minted by the joiner backend.
+        let bob_gen = joiner
+            .generate_key_package(&test_credential("bob-expired-leaf"), None)
+            .await
+            .unwrap();
+
+        // Carol's leaf expires at `real_now + 600`: valid under the real clock
+        // openmls reads, expired under the joiner's clock. Carol never commits,
+        // so her leaf keeps its KeyPackage `Lifetime` into Bob's tree; Alice's
+        // own leaf turns `Commit`-sourced when her add commits with a path.
+        let mut alice =
+            group::create_group(&test_credential("alice-expired-leaf"), &SystemClock).unwrap();
+        let (carol_bundle, _carol_signer, _carol_provider) = group::generate_key_package(
+            &test_credential("carol-expired-leaf"),
+            &TestClock::new(real_now - KEY_PACKAGE_LIFETIME_SECS + 600),
+        )
+        .unwrap();
+        group::add_member(
+            &mut alice,
+            carol_bundle.key_package().clone().into(),
+            &SystemClock,
+        )
+        .unwrap();
+        let added = ProductionMlsBackend::new(Arc::new(SystemClock))
+            .add_member_raw(&mut alice, &bob_gen.key_package_bytes)
+            .await
+            .unwrap();
+
+        let err = joiner
+            .join_from_welcome(
+                &added.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .err()
+            .expect("the join must reject a Welcome whose tree holds an expired leaf");
+        match err {
+            MlsError::KeyPackageLifetimeInvalid { not_after, now, .. } => {
+                assert_eq!(not_after, real_now + 600, "the rejected leaf is Carol's");
+                assert_eq!(now, real_now + 1200, "validated against the backend clock");
+            }
+            other => panic!("expected KeyPackageLifetimeInvalid, got {other:?}"),
+        }
+
+        let consumed_key =
+            ProductionMlsBackend::consumed_init_key_key(&bob_gen.key_package_bytes).unwrap();
+        assert!(
+            store.retrieve(&consumed_key).await.unwrap().is_none(),
+            "a rejected join must not record the init key as consumed"
+        );
+
+        // Control: the same Welcome joins under a real-now clock over the same
+        // store, and that join does record the init key.
+        let control = ProductionMlsBackend::new(Arc::new(SystemClock));
+        control.set_consumed_init_key_store(Arc::clone(&store));
+        control
+            .join_from_welcome(
+                &added.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store.retrieve(&consumed_key).await.unwrap().is_some(),
+            "an accepted join records the init key under the same store key"
         );
     }
 
@@ -1034,7 +1122,7 @@ mod tests {
         use scp_mls::KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS;
 
         // Mint the KeyPackage at the REAL present (backend clock is `SystemClock`)
-        // so openmls's un-injectable internal `is_valid` accepts it; the injected
+        // so openmls's un-injectable internal `validate` accepts it; the injected
         // `clock` param is what drives the SCP hardened re-check below.
         let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
         let cred = test_credential("carol-stateless");

@@ -145,48 +145,27 @@ pub fn extract_own_wrapping_key(
 /// Extracts the `scp_wrapping_key` from a member's `LeafNode`, identified by
 /// their DID in the SCP credential.
 ///
-/// For the local member, reads `own_leaf_node()` directly which provides full
-/// access to the `LeafNode` extensions. For a REMOTE member this returns
-/// [`MlsError::MemberNotFound`]: openmls 0.8.1 exposes no public way to reach
-/// another member's `LeafNode` from a joined group (the `RatchetTree` returned
-/// by `export_ratchet_tree()` has no public node iterator, `full_leaves()` lives
-/// on the `pub(crate)` `TreeSync`, and `members()` yields a `Member` without
-/// extensions — see ADR-057 and the notes in [`crate::lifetime`]). Remote
-/// members' stable wrapping keys are therefore NOT read from the tree; they are
-/// only ever needed for the proactive/offline PUSH path (§9.16.1), where the
-/// key holder caches them from the added `KeyPackage` at `add_member` time. The
-/// canonical new-member key exchange is the PULL protocol (§9.16.2), which
-/// carries a fresh ephemeral wrapping key inline in each `SenderKeyRequest` and
-/// needs no stable-key lookup at all.
+/// Works for the local member and for every remote member: the member's leaf
+/// index comes from [`find_leaf_index_by_did`], and its `LeafNode` from
+/// `MlsGroup::public_group().leaf(index)` (public since openmls 0.9.0).
 ///
 /// # Errors
 ///
 /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
-/// Returns [`MlsError::MemberNotFound`] if `target_did` is not the local member
-///   (remote members' extensions are not accessible via openmls's public API,
-///   per the note above).
+/// Returns [`MlsError::MemberNotFound`] if no member carries `target_did`, or
+///   the member's leaf is absent from the tree.
 /// Returns [`MlsError::ExtensionError`] if the extension data is malformed.
 pub fn extract_member_wrapping_key(
     group: &crate::group::ScpMlsGroup,
     target_did: &str,
 ) -> Result<Option<[u8; X25519_PUBLIC_KEY_SIZE]>, MlsError> {
     let g = group.inner()?;
-
-    // Check if target is the local member — we can access own leaf node.
-    if let Some(own_leaf) = g.own_leaf_node()
-        && let Ok(basic) = BasicCredential::try_from(own_leaf.credential().clone())
-        && let Ok(cred) = crate::credential::ScpCredential::from_bytes(basic.identity())
-        && cred.did == target_did
-    {
-        return extract_wrapping_key(own_leaf.extensions());
-    }
-
-    // Remote members' `LeafNode` extensions are not accessible through openmls
-    // 0.8.1's public API (ADR-057; see this function's doc comment). A joiner
-    // does not need remote stable wrapping keys: it exchanges sender keys via
-    // the pull protocol (§9.16.2), which carries a fresh ephemeral wrapping key
-    // inline in each `SenderKeyRequest`.
-    Err(MlsError::MemberNotFound(u32::MAX))
+    let idx = find_leaf_index_by_did(g, target_did)?;
+    let leaf = g
+        .public_group()
+        .leaf(idx)
+        .ok_or_else(|| MlsError::MemberNotFound(idx.u32()))?;
+    extract_wrapping_key(leaf.extensions())
 }
 
 /// Finds a member's leaf index by their DID in the SCP credential.
@@ -334,7 +313,8 @@ mod tests {
             crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
 
         let bob_group =
-            crate::group::join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+            crate::group::join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock)
+                .unwrap();
 
         // Bob's own wrapping key should be present after joining.
         let bob_extracted = extract_own_wrapping_key(&bob_group).unwrap();
@@ -343,6 +323,57 @@ mod tests {
             Some(bob_wrapping),
             "Bob's own leaf node must contain scp_wrapping_key after joining"
         );
+    }
+
+    /// Each member reads the other's stable wrapping key from the tree, and a
+    /// DID that is not a member yields `MemberNotFound`.
+    #[test]
+    fn extract_member_wrapping_key_reads_remote_member_key() {
+        let alice_cred = test_credential("alice");
+        let alice_wrapping = [0xA1_u8; 32];
+        let mut alice_group = crate::group::create_group_with_wrapping_key(
+            &alice_cred,
+            Some(&alice_wrapping),
+            &SystemClock,
+        )
+        .unwrap();
+
+        let bob_cred = test_credential("bob");
+        let bob_wrapping = [0xB2_u8; 32];
+        let (bob_kp, bob_signer, bob_provider) =
+            crate::group::generate_key_package_with_wrapping_key(
+                &bob_cred,
+                Some(&bob_wrapping),
+                &SystemClock,
+            )
+            .unwrap();
+        let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
+        let add_result =
+            crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
+        let bob_group =
+            crate::group::join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock)
+                .unwrap();
+
+        assert_eq!(
+            extract_member_wrapping_key(&alice_group, &bob_cred.did).unwrap(),
+            Some(bob_wrapping),
+            "Alice must read Bob's wrapping key from the tree"
+        );
+        assert_eq!(
+            extract_member_wrapping_key(&bob_group, &alice_cred.did).unwrap(),
+            Some(alice_wrapping),
+            "Bob must read Alice's wrapping key from the tree"
+        );
+        assert_eq!(
+            extract_member_wrapping_key(&alice_group, &alice_cred.did).unwrap(),
+            Some(alice_wrapping),
+            "the local member's own key is read through the same path"
+        );
+        let carol_cred = test_credential("carol");
+        assert!(matches!(
+            extract_member_wrapping_key(&alice_group, &carol_cred.did),
+            Err(MlsError::MemberNotFound(_))
+        ));
     }
 
     /// AC: advance MLS epoch via Commit -> extract LeafNode -> scp_wrapping_key
@@ -373,7 +404,8 @@ mod tests {
             crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
 
         let mut bob_group =
-            crate::group::join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+            crate::group::join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock)
+                .unwrap();
 
         // Alice performs an update WITH her wrapping key to preserve it.
         let commit =

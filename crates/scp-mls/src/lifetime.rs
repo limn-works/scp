@@ -6,9 +6,9 @@
 //! `openmls` mints and validates `KeyPackage` [`Lifetime`]s from *its own*
 //! internal clock. [`Lifetime::new`](openmls::prelude::Lifetime) and
 //! [`Lifetime::default`](openmls::prelude::Lifetime) read `SystemTime::now()`;
-//! [`Lifetime::is_valid`](openmls::prelude::Lifetime) re-reads the same clock at
+//! [`Lifetime::validate`](openmls::prelude::Lifetime) re-reads the same clock at
 //! validation time. Under the `openmls` `js` feature (the wasm build) that
-//! `SystemTime` is `fluvio_wasm_timer::SystemTime`, which reads a *live,
+//! `SystemTime` is `web_time::SystemTime` (openmls 0.9.0), which reads a *live,
 //! un-captured* `Date.now()` — a **second, unhardened clock**, distinct from the
 //! SCP-layer hardened [`Clock`](scp_clock::Clock) injected through the rest of
 //! the client, and fully attacker-overridable in-tab. Left as-is, a hostile
@@ -17,7 +17,7 @@
 //! confidentiality — group secrets stay sound — but it defeats `KeyPackage`
 //! freshness/expiry as a defense.
 //!
-//! `openmls` 0.8 exposes **no** clock-injection seam on `Lifetime`. The
+//! `openmls` 0.9.0 exposes **no** clock-injection seam on `Lifetime`. The
 //! real seam the cryptographer review identified is
 //! [`Lifetime::init`](openmls::prelude::Lifetime) — a pure constructor that
 //! takes caller-supplied `not_before`/`not_after` bounds and bypasses the
@@ -30,40 +30,42 @@
 //!   [`validate_key_package_lifetime`], which re-checks temporal validity
 //!   against the injected [`Clock`](scp_clock::Clock) wherever openmls exposes
 //!   the accepted `Lifetime` (post-`validate` on `KeyPackageIn`, pre-merge on
-//!   staged-commit Add proposals), and additionally enforces the RFC 9420
+//!   staged-commit Add proposals, and on Welcome tree leaves post-`into_group`
+//!   and pre-adoption), and additionally enforces the RFC 9420
 //!   maximum-total-range bound that openmls's own `validate` path never checks.
 //!
-//! # Residual: openmls's un-injectable internal check still runs
+//! # openmls's internal check still runs, and SCP brackets it
 //!
-//! openmls's own `Lifetime::is_valid` (called inside `KeyPackageIn::validate`
-//! and the Welcome tree-leaf validation) is **not** injectable and still runs
-//! against openmls's internal clock (the real wall clock natively; the
-//! attacker-overridable `Date.now()` on wasm). The SCP checks in this module
-//! sit *in addition to* that internal check — they never replace or weaken it.
-//! The remaining residual — openmls validating Welcome tree leaves against its
-//! own clock — is tracked upstream. It is not bracketable, but not because the
-//! accessor is private: `LeafNode::life_time()` is `pub(crate)`, yet
-//! `leaf_node_source()` is public and its public `LeafNodeSource::KeyPackage`
-//! variant carries the `Lifetime`. The real blocker is that a joined `MlsGroup`
-//! exposes no public way to reach another member's `LeafNode` (`members()` /
-//! `member_at()` yield a `Member` with no lifetime; `export_ratchet_tree()`'s
-//! `RatchetTree` has no public node iterator; `public_group()` is `pub(crate)`;
-//! only `own_leaf_node()` is public — and that leaf is SCP-minted, so bracketing
-//! it is possible but pointless). See the `SECURITY (ADR-057 §Prereq-1)` notes
-//! in [`crate::group`] and the browser surface's `time.rs`.
+//! openmls's own `Lifetime::validate` still runs inside `KeyPackageIn::validate`
+//! and inside Welcome tree-leaf validation, against openmls's internal clock
+//! (the real wall clock natively; the attacker-overridable `Date.now()` through
+//! `web_time` on wasm), because openmls 0.9.0 has no time-provider seam. SCP
+//! brackets both paths against the injected clock, in addition to that internal
+//! check and never in place of it:
+//!
+//! - `KeyPackageIn::validate`: [`crate::group::add_member`],
+//!   [`crate::group::key_package_in_did`], and the staged-commit Add
+//!   proposals in [`crate::encrypt::decrypt_with_sender_did`] and
+//!   [`crate::encrypt::decrypt_with_membership_changes`].
+//! - Welcome tree leaves: `validate_tree_leaf_lifetimes`, called by
+//!   [`crate::group::join_group_from_bytes`] after `StagedWelcome::into_group`
+//!   and before it builds the `ScpMlsGroup`. openmls 0.9.0 makes
+//!   `MlsGroup::public_group()` public, so every leaf of the joined tree and its
+//!   `LeafNodeSource::KeyPackage(Lifetime)` is reachable.
 //!
 //! # Test-clock realism constraint (IMPORTANT)
 //!
-//! Because openmls's un-injectable internal `is_valid`/`Lifetime::new` still
+//! Because openmls's un-injectable internal `validate`/`Lifetime::new` still
 //! runs against the **real** system clock at every openmls validation/generation
-//! site, an injected [`Clock`](scp_clock::Clock) used in a test must sit within
+//! site — including every KeyPackage-sourced leaf of a Welcome's tree — an injected [`Clock`](scp_clock::Clock) used in a test must sit within
 //! `(real_now - KEY_PACKAGE_LIFETIME_SECS, real_now + KEY_PACKAGE_LIFETIME_MARGIN_SECS)`
 //! of the real clock — otherwise a `KeyPackage` minted from the injected clock is
 //! rejected by openmls's *own* internal validation before this module's check
 //! ever runs. Seed test clocks from `SystemClock.now_secs()` and apply small
 //! relative offsets; do not use absolute fixed epochs far from the real present.
 
-use openmls::prelude::Lifetime;
+use openmls::prelude::{Lifetime, MlsGroup};
+use openmls::treesync::LeafNodeSource;
 use scp_clock::Clock;
 
 use crate::error::MlsError;
@@ -121,12 +123,12 @@ pub fn key_package_lifetime(clock: &dyn Clock) -> Lifetime {
 /// Validates a `KeyPackage` [`Lifetime`] against the injected
 /// [`Clock`](scp_clock::Clock).
 ///
-/// This is SCP's hardened counterpart to openmls's `Lifetime::is_valid`, which
+/// This is SCP's hardened counterpart to openmls's `Lifetime::validate`, which
 /// reads openmls's un-injectable internal clock. It performs two checks:
 ///
-/// 1. **Temporal validity** — mirrors openmls's `is_valid` *exactly* (strict
-///    inequalities): `not_before < now && now < not_after`, with `now` read from
-///    the injected clock.
+/// 1. **Temporal validity** — the bounds of openmls 0.9.0
+///    `Lifetime::validate_with_time`: `not_before <= now && now < not_after`,
+///    with `now` read from the injected clock.
 /// 2. **Maximum range** — enforces the RFC 9420 bound that openmls's own
 ///    `validate` path never applies: `not_after - not_before <=
 ///    KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS`. A legitimately-signed `Lifetime`
@@ -148,8 +150,9 @@ pub fn validate_key_package_lifetime(
     let not_before = lifetime.not_before();
     let not_after = lifetime.not_after();
 
-    // Mirror openmls `Lifetime::is_valid` exactly: strict `<` on both bounds.
-    let temporally_valid = not_before < now && now < not_after;
+    // The bounds of openmls 0.9.0 `Lifetime::validate_with_time`, which rejects
+    // `not_after <= now` (expired) and `not_before > now` (not yet valid).
+    let temporally_valid = not_before <= now && now < not_after;
 
     // RFC 9420 (ValSem / openmls annotations #32) maximum-range bound. openmls
     // exposes `has_acceptable_range` but does NOT call it in `validate`, so we
@@ -166,6 +169,35 @@ pub fn validate_key_package_lifetime(
             now,
         })
     }
+}
+
+/// Validates the `Lifetime` of every KeyPackage-sourced leaf in a joined
+/// group's tree against the injected [`Clock`](scp_clock::Clock), through
+/// [`validate_key_package_lifetime`] (ADR-057 §Prereq-1).
+///
+/// `MlsGroup::members()` yields every non-blank leaf, the joiner's own included.
+/// A leaf whose source is `LeafNodeSource::Update` or `LeafNodeSource::Commit`
+/// carries no `Lifetime` (RFC 9420 §7.2) and is skipped.
+///
+/// # Errors
+///
+/// Returns [`MlsError::KeyPackageLifetimeInvalid`] for the first leaf whose
+/// `Lifetime` fails the temporal or maximum-range check, and
+/// [`MlsError::MemberNotFound`] if a member index has no leaf in the tree.
+pub(crate) fn validate_tree_leaf_lifetimes(
+    group: &MlsGroup,
+    clock: &dyn Clock,
+) -> Result<(), MlsError> {
+    let public = group.public_group();
+    for member in group.members() {
+        let leaf = public
+            .leaf(member.index)
+            .ok_or_else(|| MlsError::MemberNotFound(member.index.u32()))?;
+        if let LeafNodeSource::KeyPackage(lifetime) = leaf.leaf_node_source() {
+            validate_key_package_lifetime(lifetime, clock)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -223,13 +255,36 @@ mod tests {
 
     #[test]
     fn validate_rejects_over_long_range_that_openmls_would_accept() {
-        // Temporally valid (not_before < now < not_after) but the total range
-        // exceeds the max — openmls's own is_valid would accept this, our check
+        // Temporally valid (not_before <= now < not_after) but the total range
+        // exceeds the max — openmls's own validate would accept this, our check
         // rejects it.
         let now = 10_000_000u64;
         let clock = TestClock::new(now);
         let lt = Lifetime::init(now - 10, now + KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS + 10);
         let err = validate_key_package_lifetime(&lt, &clock).unwrap_err();
+        assert!(matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }));
+    }
+
+    #[test]
+    fn validate_accepts_now_equal_to_not_before() {
+        let now = 10_000_000u64;
+        let lt = Lifetime::init(now, now + 100);
+        assert!(validate_key_package_lifetime(&lt, &TestClock::new(now)).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_now_equal_to_not_after() {
+        let now = 10_000_000u64;
+        let lt = Lifetime::init(now - 100, now);
+        let err = validate_key_package_lifetime(&lt, &TestClock::new(now)).unwrap_err();
+        assert!(matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }));
+    }
+
+    #[test]
+    fn validate_rejects_now_one_second_before_not_before() {
+        let not_before = 10_000_000u64;
+        let lt = Lifetime::init(not_before, not_before + 100);
+        let err = validate_key_package_lifetime(&lt, &TestClock::new(not_before - 1)).unwrap_err();
         assert!(matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }));
     }
 

@@ -32,13 +32,11 @@
 //! The native runtime has its own crypto-state snapshot
 //! (`MlsCryptoSnapshot` in `scp-runtime/src/crypto/mls/provider.rs`) with a
 //! **different, flat byte layout** — it folds provider storage, signer, sender
-//! keys, wrapping keypair, and sequence counters into one struct, and its wire
-//! form is pinned by committed legacy KAT fixtures. This crate's snapshots
-//! deliberately keep their own, smaller byte format (group state + signer, or
-//! pending material + signer): they are not byte-compatible with the runtime's,
-//! and are not meant to be. A future refactor MUST NOT "unify" the two formats
-//! on the assumption they are the same shape — they are not, and the runtime's
-//! is fixture-locked.
+//! keys, wrapping keypair, and sequence counters into one struct. This crate's
+//! snapshots deliberately keep their own, smaller byte format (group state +
+//! signer, or pending material + signer): they are not byte-compatible with the
+//! runtime's, and are not meant to be. A future refactor MUST NOT "unify" the
+//! two formats on the assumption they are the same shape — they are not.
 
 use openmls::prelude::{GroupId, MlsGroup};
 use openmls_basic_credential::SignatureKeyPair;
@@ -455,7 +453,7 @@ mod tests {
         )
         .unwrap();
         let add = add_member(&mut alice, kp_in, &SystemClock).unwrap();
-        let bob = join_group(&add.welcome, bob_provider, bob_signer).unwrap();
+        let bob = join_group(&add.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
 
         // Snapshot Bob, then restore into a fresh group.
         let blob = bob.serialize_state().unwrap();
@@ -510,7 +508,13 @@ mod tests {
         let add = add_member(&mut alice, kp_in, &SystemClock).unwrap();
 
         // The RESTORED pending pair must process the Welcome into a live group.
-        let bob = join_group(&add.welcome, restored_provider, restored_signer).unwrap();
+        let bob = join_group(
+            &add.welcome,
+            restored_provider,
+            restored_signer,
+            &SystemClock,
+        )
+        .unwrap();
         assert_eq!(
             bob.epoch().unwrap(),
             alice.epoch().unwrap(),

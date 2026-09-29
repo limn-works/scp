@@ -237,7 +237,8 @@ pub struct ScpClient {
     routing_index: HashMap<[u8; 32], String>,
     /// Observability counter: inbound frames dropped as **self-echoes** — this
     /// member's own publish delivered back by the relay (which has no publisher
-    /// exclusion) and rejected by openmls as `CannotDecryptOwnMessage`. In-memory
+    /// exclusion), which openmls returns as `OwnPrivateMessage` and scp-mls
+    /// rejects as `MlsError::CannotDecryptOwnMessage`. In-memory
     /// only; read via [`Self::dropped_frame_counts`]. Expected to be non-zero in
     /// normal operation (every announcement self-echoes once).
     dropped_self_echo: u64,
@@ -737,7 +738,12 @@ impl ScpClient {
         // `join_group_from_bytes` is the wire-path variant: it deserializes the
         // Welcome (as `MlsMessageIn`) internally, so the driver never has to
         // name the inbound MLS message type.
-        let mls_group = join_group_from_bytes(welcome_bytes, pending.provider, pending.signer)?;
+        let mls_group = join_group_from_bytes(
+            welcome_bytes,
+            pending.provider,
+            pending.signer,
+            self.clock.as_ref(),
+        )?;
         let crypto = ContextCryptoState::from_group_with_wrapping(
             context_id,
             mls_group,
