@@ -82,7 +82,13 @@ subscription that a different caller had just opened.
   departure whose `start` returned the same object as an earlier held one's (compared by
   identity; `HotStreamFactory` hands every caller of one subscription one `SharedFlow`) adds
   nothing to the held list, so that list stays bounded by the number of distinct subscriptions
-  under the key, not by how many list rows scrolled past a long-lived mount. Discarding an early
+  under the key, not by how many list rows scrolled past a long-lived mount. A `start` that
+  began runs to completion under `NonCancellable` even when its mount leaves meanwhile: a start
+  that disposal cancelled returned nothing to compare, so each row that left while its start
+  waited on `HotStreamFactory`'s mutex kept one more `onStop` for good. A mount whose `start`
+  threw keeps its `onStop`, because that start may have opened what it did not return, so the
+  bound adds one entry per start that threw and one for the start running under the key's
+  mutex. Discarding an early
   mount's `onStop` whose `start` returned a different object instead leaks a subscription
   whenever two different streams share a key, such as a `contextEvents` and an
   `incomingMessages` stream both keyed by one context handle.
@@ -135,7 +141,9 @@ show one context handle during a transition each count only their own mounts.
   subscription stays live. `crosswise coordinator moves under one key do not wait on each other`
   moves two mounts in opposite directions and asserts that the second one starts.
   `departures beside a live mount hold one onStop per subscription` churns a hundred mounts
-  past a live one and asserts the held list's size, and `a cancelled coordinator scope logs its
+  past a live one and asserts the held list's size, `departures while their start is suspended
+  hold one onStop per subscription` cancels each departing row's start while it is suspended and
+  asserts the same bound, and `a cancelled coordinator scope logs its
   skipped onStop and refuses later starts` asserts the log line, the exceptional Job, and the
   refused start.
 

@@ -11,6 +11,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.ui.test.junit4.createComposeRule
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -23,6 +24,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -1102,6 +1104,51 @@ class ScpHotStreamRemountTest {
         assertEquals("a held onStop ran while a mount stayed live", 0, stops.get())
         runBlocking { checkNotNull(coordinator.unmount(header) { stops.incrementAndGet() }).join() }
         assertEquals("the key's stop did not run one onStop per subscription", 2, stops.get())
+    }
+
+    /**
+     * A mount that leaves beside a live mount while its `start` is suspended, and whose start
+     * coroutine is then cancelled as `rememberScpHotStream`'s disposal cancels it, still records
+     * what that `start` returned, so its held `onStop` collapses with the others of that
+     * subscription. A start that cancellation interrupted would leave its mount's `onStop` with
+     * nothing to compare, and the held list would grow by one per such departure.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `departures while their start is suspended hold one onStop per subscription`() {
+        val coordinator = ScpHotStreamCoordinator(newCoordinatorScope())
+        val shared = Any()
+        val header = coordinator.startedMount("k", shared)
+        val rowScope = newCoordinatorScope()
+        val stops = AtomicInteger(0)
+        repeat(ROW_CHURN) {
+            val row = coordinator.mount("k")
+            val entered = CountDownLatch(1)
+            val gate = CompletableDeferred<Unit>()
+            val starting =
+                rowScope.launch {
+                    coordinator.startMounted(row) {
+                        entered.countDown()
+                        gate.await()
+                        shared
+                    }
+                }
+            assertTrue("a row's start never ran", entered.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+            coordinator.unmount(row) { stops.incrementAndGet() }
+            starting.cancel()
+            gate.complete(Unit)
+            runBlocking { starting.join() }
+            assertEquals(
+                "a start cancelled after its mount left did not record what it returned",
+                ScpHotStreamCoordinator.Started(shared),
+                row.phase.get(),
+            )
+        }
+
+        // One entry per distinct object, plus the newest row's, which was running when it left.
+        assertEquals("held onStop lambdas grew with departures", 2, header.state.heldStops.size)
+        assertEquals("a held onStop ran while a mount stayed live", 0, stops.get())
+        runBlocking { checkNotNull(coordinator.unmount(header) { stops.incrementAndGet() }).join() }
+        assertEquals("the key's stop did not run one onStop per subscription", 1, stops.get())
     }
 
     /**

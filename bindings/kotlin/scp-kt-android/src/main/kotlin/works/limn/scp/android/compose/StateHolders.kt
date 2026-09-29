@@ -17,6 +17,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
@@ -28,6 +29,7 @@ import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -289,9 +291,13 @@ private fun <R> rememberCollectedState(
  * takes the key's mutex opened nothing, and its `start` never runs afterwards. Two mounts whose
  * `start` returned one same object (compared by identity) hold one subscription, so this class
  * keeps and runs one `onStop` for that object; a registry such as `HotStreamFactory` returns one
- * [SharedFlow] instance for every caller of one subscription. The `onStop` lambdas held for a key
- * are therefore bounded by the number of distinct objects its mounts' `start` returned, not by
- * how many mounts entered and left while another mount stayed composed.
+ * [SharedFlow] instance for every caller of one subscription. A `start` that began runs to
+ * completion even when its mount leaves meanwhile, so what it returned is compared too. A mount
+ * whose `start` threw keeps its own `onStop`, because that `start` may have opened a
+ * subscription it did not return. The `onStop` lambdas held for a key are therefore bounded by
+ * the number of distinct objects its mounts' `start` returned, plus one per `start` that threw
+ * and one for the `start` running under the key's mutex, not by how many mounts entered and left
+ * while another mount stayed composed.
  *
  * Each stop joins the stop launched before it under that key before it takes
  * that key's mutex, and [startMounted] joins the stop its mount captured before it runs a
@@ -397,7 +403,12 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
      * Join the stop [mount] captured, then run [start] under that key's mutex and return what
      * [start] returned.
      *
-     * A caller cancelling this call releases that mutex, so a stop waiting on it proceeds.
+     * A caller cancelling this call while it waits for that stop or that mutex ends it there,
+     * and its `start` never runs. Once [start] runs, it runs to completion under
+     * [NonCancellable], so a mount that leaves while its `start` is suspended still records what
+     * that `start` returned, and a stop compares that object against the other held departures'
+     * instead of keeping one more `onStop` for a subscription it cannot identify. This call then
+     * releases the mutex and throws the caller's [CancellationException].
      *
      * @throws ScpHotStreamCoordinatorClosedException when this coordinator's scope is cancelled,
      *   checked under the mutex, because no stop could release what [start] opened.
@@ -419,7 +430,7 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
             if (!mount.phase.compareAndSet(MountPhase.NOT_STARTED, MountPhase.STARTING)) {
                 throw CancellationException("mount left before its start ran")
             }
-            start().also { mount.phase.set(Started(it)) }
+            withContext(NonCancellable) { start().also { mount.phase.set(Started(it)) } }
         }
     }
 
@@ -506,7 +517,7 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
 
     /**
      * [stops] without each entry whose mount's `start` returned an object an earlier entry's
-     * `start` returned, in order. An entry whose `start` has not returned is kept.
+     * `start` returned, in order. An entry whose `start` threw, or is still running, is kept.
      */
     private fun distinctStarts(stops: List<HeldStop>): List<HeldStop> {
         val seen = HashSet<Started>()
@@ -546,7 +557,8 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
      *   removed. Guarded by this object's monitor.
      * @property heldStops `onStop` lambdas of mounts that [unmount] removed while another mount
      *   under this key stayed live and whose `start` ran, in departure order, at most one per
-     *   object those mounts' `start` returned. The stop that the last live mount's departure
+     *   object those mounts' `start` returned, plus each whose `start` threw or was still
+     *   running when [unmount] last compacted this list. The stop that the last live mount's departure
      *   launches runs them. Guarded by this object's monitor.
      * @property lastStop Job of the stop [unmount] launched most recently for this key, or
      *   `null` when it has launched none since this state was created. The next stop [unmount]
@@ -633,8 +645,9 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
  * @param start Suspend factory lambda that creates the [SharedFlow]. Called once each time this
  *   mount begins under a ([key], [coordinator]) pair, so a change of either one calls it again,
  *   and not at all when the mount leaves before [start] runs. Runs in a coroutine scoped to the
- *   Composable. It returns one same [SharedFlow] instance to every mount of one subscription, as
- *   `HotStreamFactory` does, because [coordinator] runs one [onStop] per instance it saw.
+ *   Composable, but once it begins, disposal does not cancel it: it runs to completion, so
+ *   [coordinator] learns what it returned. It returns one same [SharedFlow] instance to every
+ *   mount of one subscription, as `HotStreamFactory` does, because [coordinator] runs one [onStop] per instance it saw.
  * @param onStop Suspend cleanup lambda that releases the subscription [start] returned, and
  *   nothing else. [coordinator] runs it once the last live mount under [key] on [coordinator]
  *   leaves composition, whether that is this mount or a later one. It skips it when this mount
@@ -723,7 +736,8 @@ fun <T> rememberScpHotStream(
             // (holding onStop for that stop otherwise), and records that stop's Job before it
             // returns, so a start that a later mount begins under this same key joins that job
             // instead of racing it. It drops onStop when this mount's start never ran there.
-            // Cancelling `scope` afterwards cancels only this mount's start, never that stop.
+            // Cancelling `scope` afterwards cancels this mount's start only while it waits to
+            // run (a start already running finishes), and never that stop.
             val ownStop = slot.close()?.let { coordinator.unmount(it, onStop) }
             swappedOutStops.set(pendingSwapStops + listOfNotNull(ownStop?.let { coordinator to it }))
             scope.cancel()
