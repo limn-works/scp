@@ -75,11 +75,16 @@ timeout rather than as a named failing test.
 One revision of `onCleared()` appended `cleanupJob.invokeOnCompletion { cleanupScope.cancel() }`
 after dispatching, and another called `cleanupJob.complete()`. Neither frees anything: a
 `SupervisorJob` whose children have all completed holds no thread, no handle, and no memory, and
-`Dispatchers.Unconfined` owns no thread to shut down. Both do turn every later
-`cleanupScope.launch` into a silent no-op, because a child launched under a cancelled or completed
-job is cancelled before it runs, so a context that `trackContext` registers after `onCleared`
-never gets its `leave`. Android clears a view model once, so `trackContext` itself launches that
-`leave` once `onCleared` has run, the way `ViewModel.addCloseable` closes a resource added after
+`Dispatchers.Unconfined` owns no thread to shut down. Both do make every later
+`cleanupScope.launch` start its child already cancelled. `launchLeave` starts that child with
+`CoroutineStart.UNDISPATCHED`, which runs a coroutine's body even when its job is already
+cancelled, so the child's loop still runs. Each `leave` then enters the bridge's
+`withContext(ioDispatcher)`, which throws `CancellationException` on entry because the job is
+cancelled, before the FFI call starts. The loop catches that exception and, when no other
+cleanup coroutine holds the failure lock, hands it to `onCleanupFailure`, whose default body logs
+a warning. A context that `trackContext` registers after `onCleared` therefore never gets its
+`leave`, and it produces a leave-failure warning carrying a `CancellationException`. Android
+clears a view model once, so `trackContext` itself launches that `leave` once `onCleared` has run, the way `ViewModel.addCloseable` closes a resource added after
 clear. `ScpViewModelTest.a context tracked after onCleared is left without a second onCleared`
 fails if either call returns.
 

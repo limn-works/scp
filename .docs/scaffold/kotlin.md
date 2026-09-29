@@ -14,8 +14,8 @@ bindings/kotlin/
     build.gradle.kts             # SDK module build
     src/
       main/kotlin/works/limn/scp/
-        Identity.kt              # Identity class
-        Context.kt               # Context class, Membership
+        Identity.kt              # IdentityAdvancedBridge and the data classes its operations return
+        Context.kt               # Context class (superseded: ADR-048 removed it; no Context.kt ships)
         Tools.kt                 # ToolDefinition, TestVector data classes
         Trust.kt                 # evaluateTrust(), TrustEvaluation
         EventLog.kt              # EventLog class, Event, Proof, Checkpoint
@@ -89,7 +89,7 @@ UniFFI generates:
 
 ### Async bridging
 
-UniFFI supports Kotlin coroutines via `uniffi-kotlin-multiplatform`. This SDK wraps blocking FFI calls in an injected `ioDispatcher` (`CoroutineBridge.ioDispatcher`, which defaults to `Dispatchers.IO`) to avoid depending on the multiplatform plugin until it stabilizes. A test injects a `StandardTestDispatcher` there, so no call, and no subscription release, may name `Dispatchers.IO` directly:
+UniFFI supports Kotlin coroutines via `uniffi-kotlin-multiplatform`. This SDK wraps blocking FFI calls in an injected `ioDispatcher` (`CoroutineBridge.ioDispatcher`, which defaults to `Dispatchers.IO`) to avoid depending on the multiplatform plugin until it stabilizes. A test injects a `StandardTestDispatcher` there, so no call, and no subscription release, may name `Dispatchers.IO` directly. The `Context` class below is superseded: ADR-048 removed `Context` from the Kotlin surface, so no `Context.kt` ships and the sketch binds no code. It still shows the injected `ioDispatcher` and the `callbackFlow` subscription release that `bindings/kotlin/AGENTS.md` §Coroutines and streams requires of every shipped stream; a context is a handle that `CoroutineBridge.context` operates on.
 
 ```kotlin
 class Context internal constructor(
@@ -213,6 +213,8 @@ class ValidationException(message: String, code: String) : ScpException(message,
 ```
 
 ## Identity Class
+
+Superseded. `scp-kt` ships no `Identity` class, so this sketch binds no code; the shipped `Identity.kt` holds `IdentityAdvancedBridge` and the data classes its operations return.
 
 ```kotlin
 class Identity private constructor(
