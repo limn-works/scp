@@ -103,8 +103,8 @@ composition thread on Android is a main thread, where blocking risks an ANR rega
 
 That comment also named a real constraint: launching `onStop` on whichever scope disposal then
 cancels races cancellation against `onStop`, and `onStop` may never run. A second scope settles
-both — disposal launches `onStop` on a scope it never cancels, then cancels its subscription scope
-and returns. `rememberScpContext`'s KDoc example teaches callers that same shape, because that
+both — disposal hands `onStop` to its coordinator, which runs it on a scope disposal never
+cancels, then disposal cancels its subscription scope and returns. `rememberScpContext`'s KDoc example teaches callers that same shape, because that
 example previously showed `runBlocking(Dispatchers.IO) { bridge.context.leave(...) }` inside a
 disposal callback.
 
