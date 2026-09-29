@@ -18,7 +18,6 @@
 pub mod bridge_state;
 pub mod error_codes;
 pub mod outlet_id;
-/// P-256 host helpers the three bridges export (§9.10.4, §9.5).
 pub mod p256_host;
 pub mod ucan_errors;
 pub mod validate;

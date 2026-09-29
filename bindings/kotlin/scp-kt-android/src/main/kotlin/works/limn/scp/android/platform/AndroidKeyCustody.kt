@@ -223,6 +223,8 @@ class AndroidKeyCustody internal constructor(
      * @return 64-byte signature.
      * @throws ScpException with code `SCP-CRYPTO-4006` if the key is not found.
      * @throws ScpException with code `SCP-CRYPTO-4003` if the key is not Ed25519.
+     * @throws ScpException with code `SCP-VALID-7005` if a pseudonym handle is given
+     *   anything but a 32-byte digest.
      */
     override fun sign(keyHandle: KeyHandle, data: ByteArray): ByteArray {
         pseudonymKeys.withScalar(keyHandle.id) { P256Pseudonym.signPrehash(it, data) }?.let { return it }

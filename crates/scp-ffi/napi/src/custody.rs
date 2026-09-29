@@ -55,10 +55,19 @@ use crate::identity::OpaqueInMemoryKeyCustody;
 /// `Promise`) — keystore reads are fast and the bridge awaits the dispatch via
 /// [`ThreadsafeFunction::call_async`]. Private key material never crosses into
 /// Rust ownership (ADR-006): the consumer owns the secrets and returns only
-/// public bytes / opaque key-id strings.
+/// public bytes and key-id strings.
+///
+/// Every key id the host returns is the canonical decimal form of a `u64`, as
+/// `String(n)` writes it for a `bigint` `n`: ASCII digits only, with no sign,
+/// no leading zero (`"0"` itself is allowed) and no whitespace
+/// ([`parse_handle`](scp_ffi_common::custody_parse::parse_handle)). Any other
+/// id is rejected: from `generateKeypair` with the custody error
+/// `SCP-CRYPTO-4060`, and from `derivePseudonym` or `deriveRotatablePseudonym`
+/// with `SCP-IDENT-1055`.
 #[napi(object, object_to_js = false)]
 pub struct NapiKeyCustodyProvider {
-    /// `(keyType: string) => string` — generate a keypair, return its id.
+    /// `(keyType: string) => string` — generate a keypair, return its id, a
+    /// canonical decimal `u64` string (`SCP-CRYPTO-4060` otherwise).
     #[napi(
         ts_type = "(keyType: string) => { ok: boolean; value?: string; code?: string; message?: string }"
     )]
@@ -88,20 +97,34 @@ pub struct NapiKeyCustodyProvider {
     pub dh_agree: Function<'static, (String, Vec<u8>), HostBytesResult>,
     /// `(keyId: string, contextId: Uint8Array) => { publicKey, keyId }` —
     /// the §9.10.4 v1 pseudonym: `publicKey` is the 33-byte compressed P-256
-    /// point and `keyId` the numeric handle of the pseudonym key. The bridge
-    /// requires `getPublicKey(keyId)` to return the same 33 bytes. The same
-    /// (`keyId`, `contextId`) MUST return the same pseudonym `keyId` on every
-    /// call, so re-deriving names one key rather than minting another.
+    /// point and `keyId` the id of the pseudonym key, a canonical decimal
+    /// `u64` string. The bridge requires `getPublicKey(keyId)` to return the
+    /// same 33 bytes and rejects any other result with `SCP-IDENT-1055`. The
+    /// same (`keyId`, `contextId`) MUST return the same pseudonym `keyId` on
+    /// every call, so re-deriving names one key rather than minting another.
+    ///
+    /// Canonical recipe (§9.10.4, §9.10.4.A; `ikm` is the identity private key
+    /// material, the 32-byte Ed25519 seed until slice S12):
+    ///   1. `pseudonym_secret = HKDF-SHA256(ikm, salt="scp-pseudonym-secret-v1", info="", L=32)`
+    ///   2. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
+    ///   3. `d = p256PseudonymScalar(seed)` and `publicKey = p256PublicKey(d)`.
+    ///
+    /// The HMAC key is the 32-byte `pseudonym_secret`, never the public key:
+    /// public key bytes would be a membership-enumeration oracle (§9.10.4.A).
     #[napi(
         ts_type = "(args: [string, number[]]) => { ok: boolean; value?: { publicKey: number[]; keyId: string }; code?: string; message?: string }"
     )]
     pub derive_pseudonym: Function<'static, (String, Vec<u8>), HostPseudonymResult>,
     /// `(keyId: string, contextId: Uint8Array, pseudonymEpoch: bigint) => { publicKey, keyId }`
-    /// — the §9.10.4 rotatable v2 pseudonym, same return shape as
-    /// `derivePseudonym`; the same (`keyId`, `contextId`, `pseudonymEpoch`)
-    /// MUST return the same pseudonym `keyId`. The provider performs the canonical derivation
-    /// (HMAC key is the private-derived `pseudonym_secret`, domain
-    /// `"scp-pseudonym-v2"`); the bridge does NOT synthesize the preimage.
+    /// — the §9.10.4.1 rotatable v2 pseudonym, same return shape and checks
+    /// as `derivePseudonym`; the same (`keyId`, `contextId`,
+    /// `pseudonymEpoch`) MUST return the same pseudonym `keyId`. The provider
+    /// performs the canonical derivation, steps 1 and 3 of `derivePseudonym`
+    /// with step 2 replaced by
+    ///   `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonymEpoch) || "scp-pseudonym-v2")`
+    /// where `BE64` is the 8-byte big-endian epoch; the HMAC key is the
+    /// `pseudonym_secret`, never the public key. The bridge does NOT
+    /// synthesize the preimage.
     #[napi(
         ts_type = "(args: [string, number[], bigint]) => { ok: boolean; value?: { publicKey: number[]; keyId: string }; code?: string; message?: string }"
     )]
@@ -124,7 +147,7 @@ pub struct NapiKeyCustodyProvider {
 pub struct NapiPseudonymResult {
     /// 33-byte SEC1 compressed P-256 public key.
     pub public_key: Vec<u8>,
-    /// Numeric key id of the pseudonym key, as a decimal string.
+    /// Key id of the pseudonym key: a canonical decimal `u64` string.
     pub key_id: String,
 }
 

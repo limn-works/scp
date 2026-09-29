@@ -541,7 +541,26 @@ class AndroidKeyCustodyTest {
             val exception = assertThrows<ScpException> {
                 custody.sign(handle, ByteArray(12))
             }
-            assertEquals("SCP-CRYPTO-4003", exception.code)
+            assertEquals("SCP-VALID-7005", exception.code)
+        }
+
+        /**
+         * A wrong-length digest is `SCP-VALID-7005` and an out-of-range scalar
+         * `SCP-CRYPTO-4001`: the codes of the shared Rust helper.
+         */
+        @Test
+        fun `signPrehash reports the shared helper codes`() {
+            val scalar = ByteArray(32) { 1 }
+            for (size in listOf(0, 12, 31, 33)) {
+                val exception = assertThrows<ScpException> {
+                    P256Pseudonym.signPrehash(scalar, ByteArray(size))
+                }
+                assertEquals("SCP-VALID-7005", exception.code, "digest of $size bytes")
+            }
+            val outOfRange = assertThrows<ScpException> {
+                P256Pseudonym.signPrehash(ByteArray(32), ByteArray(32))
+            }
+            assertEquals("SCP-CRYPTO-4001", outOfRange.code)
         }
 
         @Test

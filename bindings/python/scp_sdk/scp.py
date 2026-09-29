@@ -107,7 +107,10 @@ class PseudonymResult(NamedTuple):
     public_key: bytes
     """The 33-byte SEC1 compressed P-256 public key."""
     key_id: str
-    """The numeric id of the pseudonym key, usable with ``sign`` and ``get_public_key``."""
+    """The id of the pseudonym key, usable with ``sign`` and ``get_public_key``.
+
+    A canonical decimal ``u64`` string (see :class:`KeyCustodyProvider`).
+    """
 
 
 @runtime_checkable
@@ -125,9 +128,16 @@ class KeyCustodyProvider(Protocol):
     the GIL while orchestrating, then re-acquires it per call), so a method
     body may block on a keystore without stalling the asyncio event loop.
 
-    Key identifiers are opaque, numeric-string handles your implementation
-    assigns in :meth:`generate_keypair` and maps internally to real key
-    material. Byte values are passed and returned as ``bytes``.
+    Key identifiers are handles your implementation assigns in
+    :meth:`generate_keypair` and :meth:`derive_pseudonym` and maps internally
+    to real key material. Each is the canonical decimal form of an unsigned
+    64-bit integer, as ``str(n)`` writes it for an ``int`` ``n`` in
+    ``[0, 2**64 - 1]``: ASCII digits only, with no sign, no leading zero
+    (``"0"`` itself is allowed) and no whitespace. The bridge rejects any other
+    id (``"007"``, ``"+7"``, ``" 7"``, a UUID): from :meth:`generate_keypair`
+    with the custody error ``SCP-CRYPTO-4060``, and from
+    :meth:`derive_pseudonym` or :meth:`derive_rotatable_pseudonym` with
+    ``SCP-IDENT-1055``. Byte values are passed and returned as ``bytes``.
 
     Every method is a plain ``def``. A method that returns a coroutine (an
     ``async def``), or a value of the wrong type (for :meth:`derive_pseudonym`,
@@ -153,7 +163,11 @@ class KeyCustodyProvider(Protocol):
     """
 
     def generate_keypair(self, key_type: str) -> str:
-        """Generate a keypair (``"ed25519"`` or ``"x25519"``); return its id."""
+        """Generate a keypair (``"ed25519"`` or ``"x25519"``); return its id.
+
+        The id is a canonical decimal ``u64`` string (``SCP-CRYPTO-4060``
+        otherwise).
+        """
         ...
 
     def sign(self, key_id: str, message: bytes) -> bytes:
@@ -196,11 +210,11 @@ class KeyCustodyProvider(Protocol):
         """Derive a context-scoped P-256 pseudonym keypair (v1, static; §9.10.4).
 
         Returns a :class:`PseudonymResult` ``(public_key, key_id)``: the
-        33-byte SEC1 compressed P-256 pseudonym point and the numeric id of
-        its signing key. The bridge
-        rejects (``SCP-IDENT-1055``) a point that is not a valid compressed
-        P-256 point, and a key id whose :meth:`get_public_key` raises or
-        differs from it.
+        33-byte SEC1 compressed P-256 pseudonym point and the id of its
+        signing key. The bridge rejects (``SCP-IDENT-1055``) a point that is
+        not a valid compressed P-256 point, a key id that is not a canonical
+        decimal ``u64`` string, and a key id whose :meth:`get_public_key`
+        raises or differs from it.
         The same ``(key_id, context_id)`` MUST return the same pseudonym key
         id on every call, so re-deriving names one key rather than minting
         another.

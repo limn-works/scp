@@ -23,12 +23,12 @@ enum P256Pseudonym {
 
     /// Signs a 32-byte digest without hashing it again: RFC 6979 nonce,
     /// 64-byte `r || s` with low s (§9.5).
+    ///
+    /// - Throws: ``ScpError/Validation(msg:code:)`` with `SCP-VALID-7005` if
+    ///   `digest` or `scalar` is not 32 bytes, and ``ScpError/Crypto(msg:code:)``
+    ///   with `SCP-CRYPTO-4001` if the scalar is out of range: the Rust
+    ///   helper's checks and codes, which every binding shares.
     static func signPrehash(scalar: Data, digest: Data) throws -> Data {
-        guard digest.count == 32 else {
-            throw PlatformError.custodyError(
-                "P-256 pseudonym keys sign only a 32-byte digest, got \(digest.count) bytes"
-            )
-        }
-        return try p256SignPrehashRfc6979(scalar: scalar, digest: digest)
+        try p256SignPrehashRfc6979(scalar: scalar, digest: digest)
     }
 }

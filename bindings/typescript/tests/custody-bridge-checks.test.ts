@@ -169,7 +169,10 @@ function adapter(store: Store, fault?: Fault): TestingCustody {
  * A provider over `store` whose `overrides` replace some methods, typed
  * loosely so a test can return what a misbehaving host returns.
  */
-function adapterWith(store: Store, overrides: Record<string, () => unknown>): TestingCustody {
+function adapterWith(
+  store: Store,
+  overrides: Record<string, (...args: unknown[]) => unknown>,
+): TestingCustody {
   const Ctor = native.TestingCallbackCustody as TestingCustodyCtor;
   const provider = Object.assign(new StoreKeychain(store), overrides) as KeyCustodyProvider;
   return new Ctor(toNativeCustodyProvider(provider));
@@ -281,6 +284,30 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     const mapped = await rejectionOf(() => wrongType.derivePseudonym(identity, "ctx"));
     expect(mapped).toBeInstanceOf(IdentityError);
     expect(mapped.code).toBe("SCP-IDENT-1055");
+  });
+
+  test("a non-canonical key id is SCP-CRYPTO-4060 from generateKeypair and SCP-IDENT-1055 from derivePseudonym", async () => {
+    const generated = adapterWith(new Store(), { generateKeypair: () => "007" });
+    const onGenerate = await rejectionOf(() => generated.generateKeypair());
+    expect(onGenerate).toBeInstanceOf(CryptoError);
+    expect(onGenerate.code).toBe("SCP-CRYPTO-4060");
+    expect(onGenerate.message).toContain("non-canonical key_id");
+
+    const store = new Store();
+    const host = new StoreKeychain(store);
+    const derived = adapterWith(store, {
+      derivePseudonym: (...args: unknown[]) => {
+        const [keyId, contextId] = args as [string, Uint8Array];
+        const result = host.derivePseudonym(keyId, contextId);
+        store.pseudonyms.set("007", store.pseudonyms.get(result.keyId) as Uint8Array);
+        return { publicKey: result.publicKey, keyId: "007" };
+      },
+    });
+    const identity = await derived.generateKeypair();
+    const onDerive = await rejectionOf(() => derived.derivePseudonym(identity, "ctx"));
+    expect(onDerive).toBeInstanceOf(IdentityError);
+    expect(onDerive.code).toBe("SCP-IDENT-1055");
+    expect(onDerive.message).toContain("non-canonical key_id");
   });
 
   test("a lookup that reports success with no value names get_public_key, not the derivation", async () => {

@@ -453,6 +453,31 @@
             #expect(publicKey.isValidSignature(ecdsa, for: SHA256.hash(data: Data("sample".utf8))))
         }
 
+        /// A wrong-length digest is `SCP-VALID-7005` and an out-of-range
+        /// scalar `SCP-CRYPTO-4001`: the codes of the shared Rust helper.
+        @Test("signPrehash reports the shared helper codes")
+        func pseudonymSignerReportsSharedCodes() throws {
+            let scalar = Data(repeating: 1, count: 32)
+            for size in [0, 12, 31, 33] {
+                do {
+                    _ = try P256Pseudonym.signPrehash(scalar: scalar, digest: Data(count: size))
+                    Issue.record("a \(size)-byte digest signed")
+                } catch let ScpError.Validation(_, code) {
+                    #expect(code == "SCP-VALID-7005", "digest of \(size) bytes")
+                } catch {
+                    Issue.record("expected ScpError.Validation, got \(error)")
+                }
+            }
+            do {
+                _ = try P256Pseudonym.signPrehash(scalar: Data(count: 32), digest: Data(count: 32))
+                Issue.record("a zero scalar signed")
+            } catch let ScpError.Crypto(_, code) {
+                #expect(code == "SCP-CRYPTO-4001")
+            } catch {
+                Issue.record("expected ScpError.Crypto, got \(error)")
+            }
+        }
+
         // MARK: - custodyType
 
         @Test("custodyType returns 'software' for all keys")

@@ -322,7 +322,8 @@ pub trait MessageListener: Send + Sync {
 pub struct PseudonymResult {
     /// The 33-byte SEC1 compressed P-256 pseudonym public key.
     pub public_key: Vec<u8>,
-    /// The key id of the pseudonym's signing key in the host's custody.
+    /// The key id of the pseudonym's signing key in the host's custody: a
+    /// canonical decimal `u64` string (see [`KeyCustodyProvider`]).
     pub key_id: String,
 }
 
@@ -346,6 +347,14 @@ pub struct PseudonymResult {
 /// `SCP-IDENT-1037`, which `scpid_sign` reports for any custody failure (spec
 /// §3.11.4). Throw only
 /// [`ScpError`]: `UniFFI` 0.29 panics on any other error a callback throws.
+///
+/// Every key id the host returns is the canonical decimal form of a `u64`, as
+/// `String(n)` (Swift, `UInt64`) or `n.toString()` (Kotlin, `ULong`) writes it:
+/// ASCII digits only, with no sign, no leading zero (`"0"` itself is allowed)
+/// and no whitespace. The bridge rejects any other id (`"007"`, `"+7"`,
+/// `" 7"`, a UUID): from `generate_keypair` with the custody error
+/// `SCP-CRYPTO-4060`, and from `derive_pseudonym` or
+/// `derive_rotatable_pseudonym` with `SCP-IDENT-1055`.
 ///
 /// # SAFETY: Thread execution context
 ///
@@ -386,7 +395,9 @@ pub trait KeyCustodyProvider: Send + Sync {
 
     /// Generate a new keypair. `key_type` is `"ed25519"` or `"x25519"`.
     ///
-    /// Returns an opaque key identifier string.
+    /// Returns the new key's id, a canonical decimal `u64` string (see
+    /// [`KeyCustodyProvider`]); the bridge rejects any other id with
+    /// `SCP-CRYPTO-4060`.
     async fn generate_keypair(&self, key_type: String) -> Result<String, ScpError>;
 
     /// Perform X25519 Diffie-Hellman key agreement.
@@ -400,23 +411,27 @@ pub trait KeyCustodyProvider: Send + Sync {
 
     /// Derive a deterministic, context-scoped P-256 pseudonym keypair (§9.10.4).
     ///
-    /// The derivation runs inside the host's custody. Algorithm:
+    /// The derivation runs inside the host's custody. Canonical recipe
+    /// (§9.10.4, §9.10.4.A; every software host MUST produce identical bytes;
+    /// `ikm` is the identity private key material, the 32-byte Ed25519 seed
+    /// until slice S12):
     ///   1. `pseudonym_secret = HKDF-SHA256(ikm, salt="scp-pseudonym-secret-v1", info="", L=32)`
     ///   2. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
-    ///   3. `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`; the public key
-    ///      is the 33-byte SEC1 compressed point `d·G`.
+    ///   3. `d = p256PseudonymScalar(seed)` and `public_key = p256PublicKey(d)`,
+    ///      the 33-byte SEC1 compressed point `d·G`.
     ///
     /// The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key —
-    /// public key bytes would be a membership-enumeration oracle (§9.10.4).
+    /// public key bytes would be a membership-enumeration oracle (§9.10.4.A).
     /// Routing fields carry `SHA-256("scp-pseudonym-routing-v1:" || point)`,
     /// which the Rust side computes from the returned point.
     ///
     /// Returns the pseudonym's 33-byte compressed point and the key id of its
     /// signing key as a [`PseudonymResult`]. The bridge rejects (fail closed,
     /// `SCP-IDENT-1055`) a point that is not a valid compressed P-256 point, a
-    /// non-numeric key id, and a key id whose `get_public_key` fails or does
-    /// not return the same 33 bytes. `sign` on that key id receives a 32-byte digest and
-    /// must return a 64-byte low-`s` `r || s` that verifies under the point.
+    /// key id that is not a canonical decimal `u64` string, and a key id whose
+    /// `get_public_key` fails or does not return the same 33 bytes. `sign` on
+    /// that key id receives a 32-byte digest and must return a 64-byte low-`s`
+    /// `r || s` that verifies under the point.
     /// A host maps the seed to `d` with the `p256_pseudonym_scalar` export
     /// (`p256PseudonymScalar` in Swift and Kotlin) and computes the point with
     /// the `p256_public_key` export (`p256PublicKey`) rather than reducing and
@@ -439,11 +454,12 @@ pub trait KeyCustodyProvider: Send + Sync {
 
     /// Derive a rotatable (epoch-versioned) per-context pseudonym keypair.
     ///
-    /// Canonical recipe (spec §9.10.4.A / §9.10.4.1): the HMAC key is the
-    /// private-derived `pseudonym_secret` (HKDF over the identity private seed),
-    /// NEVER the public key.
-    /// `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2")`;
-    /// `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`. Returns a
+    /// Canonical recipe (§9.10.4.1): steps 1 and 3 of `derive_pseudonym`, with
+    /// step 2 replaced by
+    ///   `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2")`
+    /// where `BE64` is the 8-byte big-endian epoch, then
+    /// `d = p256PseudonymScalar(seed)` and `public_key = p256PublicKey(d)`.
+    /// The HMAC key is the `pseudonym_secret`, NEVER the public key. Returns a
     /// [`PseudonymResult`], checked exactly as for `derive_pseudonym`.
     ///
     /// The same (`key_id`, `context_id`, `pseudonym_epoch`) MUST return the

@@ -22,8 +22,6 @@ import uniffi.scp.ScpException as BridgeException
  *   public_key = SEC1-compressed(d * G)   (33 bytes)
  */
 internal object P256Pseudonym {
-    private const val DIGEST_SIZE = 32
-
     /**
      * Maps a 32-byte context seed to its pseudonym scalar (the `SCP-PSEUDONYM-P256-V1`
      * label is fixed inside the Rust helper), stores the scalar in [keys]
@@ -68,17 +66,12 @@ internal object P256Pseudonym {
      * Signs a 32-byte digest without hashing it again, with the RFC 6979 nonce, and
      * returns the 64-byte low-s `r || s` (§9.5).
      *
-     * @throws ScpException with code `SCP-CRYPTO-4003` if [digest] is not 32 bytes.
+     * @throws ScpException with code `SCP-VALID-7005` if [digest] or [scalar] is not
+     *   32 bytes, and `SCP-CRYPTO-4001` if the scalar is out of range: the Rust helper's
+     *   checks and codes, which every binding shares.
      */
-    fun signPrehash(scalar: ByteArray, digest: ByteArray): ByteArray {
-        if (digest.size != DIGEST_SIZE) {
-            throw ScpException(
-                "P-256 pseudonym keys sign only a 32-byte digest, got ${digest.size} bytes",
-                "SCP-CRYPTO-4003",
-            )
-        }
-        return bridged { p256SignPrehashRfc6979(scalar, digest) }
-    }
+    fun signPrehash(scalar: ByteArray, digest: ByteArray): ByteArray =
+        bridged { p256SignPrehashRfc6979(scalar, digest) }
 
     /** Maps a bridge error to this package's [ScpException], keeping its code. */
     private inline fun <T> bridged(call: () -> T): T = try {

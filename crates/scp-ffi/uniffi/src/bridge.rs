@@ -1779,7 +1779,7 @@ impl From<scp_transport::TransportError> for ScpError {
 }
 
 impl ScpError {
-    /// A custody [`PlatformError`](scp_platform::PlatformError) carrying `msg`,
+    /// A custody [`PlatformError`] carrying `msg`,
     /// coded by
     /// [`platform_error_code`](scp_ffi_common::custody_parse::platform_error_code):
     /// every bridge path reports key-not-found as `SCP-CRYPTO-4006`, any other
@@ -6475,7 +6475,7 @@ fn export_signing_key(handle: &ContextHandle) -> Result<KeyHandle, ScpError> {
 /// `in_memory_custody`, matching the resolution order of every other
 /// key-bearing `UniFFI` path.
 ///
-/// Returns the custody's [`PlatformError`](scp_platform::PlatformError), which
+/// Returns the custody's [`PlatformError`], which
 /// `export_context` carries as `ContextError::Custody` so the caller sees
 /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` otherwise. It
 /// validates that the returned signature is exactly 64 bytes (Ed25519), so a
@@ -24358,6 +24358,10 @@ mod tests {
         /// `get_public_key(key_id)` of a pseudonym key id fails with the generic
         /// `SCP-CRYPTO-4060`.
         LookupFails4060,
+        /// `generate_keypair` returns the non-canonical key id `"007"`.
+        NonCanonicalKeypairId,
+        /// `derive_pseudonym` returns the non-canonical key id `"007"`.
+        NonCanonicalPseudonymId,
     }
 
     impl ProdLikeCustody {
@@ -24438,6 +24442,8 @@ mod tests {
             let public_key = pseudonym.public_key().to_compressed().to_vec();
             let id = if self.fault == PseudonymFault::FixedId {
                 "777".to_owned()
+            } else if self.fault == PseudonymFault::NonCanonicalPseudonymId {
+                "007".to_owned()
             } else {
                 Self::pseudonym_key_id(key_id, context_id, epoch)
             };
@@ -24536,10 +24542,13 @@ mod tests {
             let mut seed = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut seed);
             let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-            let id = self
-                .next
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                .to_string();
+            let id = if self.fault == PseudonymFault::NonCanonicalKeypairId {
+                "007".to_owned()
+            } else {
+                self.next
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    .to_string()
+            };
             self.keys
                 .lock()
                 .expect("keystore mutex")
@@ -24748,6 +24757,41 @@ mod tests {
                 }
                 other => panic!("expected IDENT_1055, got {other:?}"),
             }
+        }
+    }
+
+    /// A key id must be the canonical decimal form of a `u64`: `"007"` from
+    /// `generate_keypair` fails the identity create with the custody error
+    /// `SCP-CRYPTO-4060`.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_canonical_generated_key_id_is_crypto_4060() {
+        let provider = ProdLikeCustody::with_fault(PseudonymFault::NonCanonicalKeypairId);
+        match scp_test()
+            .identity_create_with_custody(Box::new(provider))
+            .await
+        {
+            Err(ScpError::Crypto { code, msg }) => {
+                assert_eq!(code, codes::CRYPTO_4060);
+                assert!(msg.contains("non-canonical key_id"), "{msg}");
+            }
+            Err(other) => panic!("expected CRYPTO_4060, got {other:?}"),
+            Ok(_) => panic!("a non-canonical key id created an identity"),
+        }
+    }
+
+    /// A pseudonym key id must be the canonical decimal form of a `u64`:
+    /// `"007"` from `derive_pseudonym` is rejected with `SCP-IDENT-1055`.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_canonical_pseudonym_key_id_is_ident_1055() {
+        let (identity, _) = prod_like_identity(PseudonymFault::NonCanonicalPseudonymId).await;
+        match derive_member_pseudonym_required(&identity, "ctx").await {
+            Err(ScpError::Identity { code, msg }) => {
+                assert_eq!(code, codes::IDENT_1055);
+                assert!(msg.contains("non-canonical key_id"), "{msg}");
+            }
+            other => panic!("expected IDENT_1055, got {other:?}"),
         }
     }
 

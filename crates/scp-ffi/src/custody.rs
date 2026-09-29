@@ -451,7 +451,10 @@ impl FfiKeyCustody {
 /// Concrete [`KeyCustody`] adapter delegating to a [`PyKeyCustodyProvider`].
 ///
 /// The provider returns:
-/// - `generate_keypair(key_type: str) -> str` — a numeric key-id string.
+/// - `generate_keypair(key_type: str) -> str` — a key id: the canonical
+///   decimal form of a `u64`, as `str(n)` writes it (no sign, no leading zero,
+///   no whitespace), which [`parse_handle`](scp_ffi_common::custody_parse::parse_handle)
+///   enforces (`SCP-CRYPTO-4060` otherwise).
 /// - `sign(key_id: str, message: bytes) -> bytes` — a 64-byte Ed25519 sig, or
 ///   for a pseudonym key id a 64-byte low-`s` P-256 `r || s` over a 32-byte
 ///   digest, which the adapter verifies strictly under the bound point.
@@ -460,11 +463,14 @@ impl FfiKeyCustody {
 /// - `destroy_key(key_id: str) -> None`.
 /// - `dh_agree(key_id: str, peer_public: bytes) -> bytes` — 32 shared bytes.
 /// - `derive_pseudonym(key_id: str, context_id: bytes) -> PseudonymResult` —
-///   `scp_sdk.PseudonymResult(public_key, key_id)` (any `(bytes, str)` tuple): the 33-byte compressed P-256 point and the key id
-///   of its signing key, whose `get_public_key` must return the same point.
-/// - `derive_rotatable_pseudonym(key_id: str, context_id: bytes, pseudonym_epoch: int) -> PseudonymResult`
-///   — `(public_key, key_id)`, checked as above. The provider performs the canonical
-///   v2 derivation (HMAC key is the private-derived `pseudonym_secret`, domain
+///   `scp_sdk.PseudonymResult(public_key, key_id)` (any `(bytes, str)`
+///   tuple): the 33-byte compressed P-256 point and the canonical decimal
+///   key id of its signing key, whose `get_public_key` must return the same
+///   point (`SCP-IDENT-1055` otherwise).
+/// - `derive_rotatable_pseudonym(key_id: str, context_id: bytes,
+///   pseudonym_epoch: int) -> PseudonymResult` — `(public_key, key_id)`,
+///   checked as above. The provider performs the canonical v2 derivation (HMAC
+///   key is the private-derived `pseudonym_secret`, domain
 ///   `"scp-pseudonym-v2"`); the bridge does NOT synthesize the preimage.
 /// - `export_signing_key_bytes(key_id: str) -> bytes` — 32 private seed bytes.
 /// - `custody_type(key_id: str) -> str` — `"hardware"` / `"software"` /
@@ -818,7 +824,7 @@ class FakeCustody:
         self._fault = fault
 
     def generate_keypair(self, key_type):
-        kid = str(self._next)
+        kid = '007' if self._fault == 'noncanonical_keypair' else str(self._next)
         self._next += 1
         self._seeds[kid] = hashlib.sha256(kid.encode()).digest()
         return kid
@@ -861,6 +867,8 @@ class FakeCustody:
             return (hashlib.sha256(seed).digest(), key_id)
         if self._fault == 'fixed_id':
             kid = '777'
+        elif self._fault == 'noncanonical_pseudonym':
+            kid = '007'
         else:
             tag = hashlib.sha256(b'fake-pseudonym-key-id' + key_id.encode() + b'|'
                                  + bytes(context_id) + epoch_tag).digest()
@@ -1351,6 +1359,45 @@ mod tests {
                 }
                 other => panic!("{fault}: expected IDENT_1055, got {other:?}"),
             }
+        }
+    }
+
+    /// A key id must be the canonical decimal form of a `u64`: `"007"` from
+    /// `generate_keypair` is the custody error `SCP-CRYPTO-4060`, and from
+    /// `derive_pseudonym` a rejected pseudonym, `SCP-IDENT-1055`.
+    #[tokio::test]
+    async fn ffi_custody_callback_non_canonical_key_ids_are_rejected() {
+        use scp_ffi_common::error_codes as codes;
+        let custody = FfiKeyCustody::Callback(fake_py_custody(Some("noncanonical_keypair")));
+        let err = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect_err("\"007\" from generate_keypair");
+        assert_custody_error(&err);
+        match crate::error::ScpPyError::from(err) {
+            crate::error::ScpPyError::CryptoError { code, message } => {
+                assert_eq!(code, codes::CRYPTO_4060);
+                assert!(message.contains("non-canonical key_id"), "{message}");
+            }
+            other => panic!("expected CRYPTO_4060, got {other:?}"),
+        }
+
+        let custody = FfiKeyCustody::Callback(fake_py_custody(Some("noncanonical_pseudonym")));
+        let handle = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("key");
+        let err = custody
+            .derive_pseudonym(&handle, b"ctx")
+            .await
+            .expect_err("\"007\" from derive_pseudonym");
+        assert_pseudonym_rejected(&err);
+        match crate::error::ScpPyError::from(err) {
+            crate::error::ScpPyError::IdentityError { code, message } => {
+                assert_eq!(code, codes::IDENT_1055);
+                assert!(message.contains("non-canonical key_id"), "{message}");
+            }
+            other => panic!("expected IDENT_1055, got {other:?}"),
         }
     }
 

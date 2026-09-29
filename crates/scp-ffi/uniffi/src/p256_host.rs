@@ -7,7 +7,8 @@
 //! boundary, §9.10.4.A), then:
 //!
 //! 1. [`p256_pseudonym_scalar`] maps the seed to the scalar under the fixed
-//!    `SCP-PSEUDONYM-P256-V1` label (FIPS 186-5 A.2.1, constant-time `crypto-bigint` reduction in `scp-crypto`);
+//!    `SCP-PSEUDONYM-P256-V1` label (FIPS 186-5 A.2.1, constant-time
+//!    `crypto-bigint` reduction in `scp-crypto`);
 //! 2. [`p256_public_key`] gives the 33-byte compressed point it returns from
 //!    `derive_pseudonym` and `get_public_key`;
 //! 3. [`p256_sign_prehash_rfc6979`] signs a 32-byte digest with RFC 6979
@@ -148,15 +149,40 @@ mod tests {
         );
     }
 
+    /// Each export reports the shared code for its failure class: a wrong
+    /// length is `SCP-VALID-7005`, an out-of-range scalar `SCP-CRYPTO-4001`.
     #[test]
     fn exports_reject_malformed_input() {
+        use scp_ffi_common::error_codes as codes;
         let err = p256_pseudonym_scalar(vec![0; 31]).expect_err("31-byte seed");
-        assert!(matches!(err, ScpError::Validation { .. }), "{err:?}");
+        assert!(
+            matches!(&err, ScpError::Validation { code, .. } if code == codes::VALID_7005),
+            "{err:?}"
+        );
         let err = p256_public_key(vec![0; 32]).expect_err("zero scalar");
-        assert!(matches!(err, ScpError::Crypto { .. }), "{err:?}");
+        assert!(
+            matches!(&err, ScpError::Crypto { code, .. } if code == codes::CRYPTO_4001),
+            "{err:?}"
+        );
         let err = p256_public_key(vec![0xff; 32]).expect_err("scalar ≥ n");
-        assert!(matches!(err, ScpError::Crypto { .. }), "{err:?}");
+        assert!(
+            matches!(&err, ScpError::Crypto { code, .. } if code == codes::CRYPTO_4001),
+            "{err:?}"
+        );
+        let err = p256_public_key(vec![1; 31]).expect_err("31-byte scalar");
+        assert!(
+            matches!(&err, ScpError::Validation { code, .. } if code == codes::VALID_7005),
+            "{err:?}"
+        );
         let err = p256_sign_prehash_rfc6979(vec![1; 32], vec![0; 12]).expect_err("12-byte digest");
-        assert!(matches!(err, ScpError::Validation { .. }), "{err:?}");
+        assert!(
+            matches!(&err, ScpError::Validation { code, .. } if code == codes::VALID_7005),
+            "{err:?}"
+        );
+        let err = p256_sign_prehash_rfc6979(vec![0; 32], vec![0; 32]).expect_err("zero scalar");
+        assert!(
+            matches!(&err, ScpError::Crypto { code, .. } if code == codes::CRYPTO_4001),
+            "{err:?}"
+        );
     }
 }
