@@ -128,17 +128,16 @@
         /// or ``registrationDidFail(_:)``. After consumption it is set back to `nil`.
         private var tokenContinuation: CheckedContinuation<Data, Error>?
 
-        /// Asks the platform to start APNs registration. ``register()`` calls it
-        /// on the main actor before it suspends.
+        /// Asks the platform to start APNs registration. ``register()`` schedules
+        /// it on the main actor and then suspends without waiting for it to run,
+        /// so the call can run after ``hasPendingRegistration`` becomes `true`.
         private let requestRemoteNotifications: @MainActor @Sendable () -> Void
 
         /// The wake signal ``handleNotification(payload:)`` returns for every
         /// payload it accepts: the UTF-8 bytes of `{"aps":{"content-available":1}}`.
         ///
         /// The method returns this constant, not the received bytes, because
-        /// bytes that parse to the permitted object can still carry
-        /// relay-chosen content, such as trailing whitespace or a duplicate key
-        /// that the parser collapses into one.
+        /// accepted bytes can still carry whitespace the relay chose.
         static let wakeSignal = Data(#"{"aps":{"content-available":1}}"#.utf8)
 
         /// `true` while a ``register()`` call is suspended waiting for
@@ -195,7 +194,8 @@
                 throw PushError.registrationAlreadyInProgress
             }
 
-            // Trigger registration on the main thread before suspending.
+            // Schedule registration on the main actor. The main actor runs it
+            // whenever it gets to it, which can be after this call suspends.
             let request = requestRemoteNotifications
             Task { @MainActor in
                 request()
@@ -239,7 +239,8 @@
         ///
         /// Validates that `payload` is the strictly opaque `{"aps": {"content-available": 1}}`
         /// format required by §10.7. Any additional field in the payload — at the top level
-        /// or nested inside `aps` — is rejected with ``PushError/opaquePayloadViolation``.
+        /// or nested inside `aps`, including one carried by a repeated key — is rejected
+        /// with ``PushError/opaquePayloadViolation``.
         ///
         /// When the payload is valid, the method returns ``wakeSignal``, a fixed byte
         /// string, and never the received bytes, so a caller receives no byte the relay
@@ -254,7 +255,8 @@
         ///   - ``PushError/invalidPayload(_:)`` if the bytes cannot be parsed as JSON or the
         ///     top-level structure is not a dictionary.
         ///   - ``PushError/opaquePayloadViolation(_:)`` if the payload contains any field
-        ///     other than `aps.content-available`.
+        ///     other than `aps.content-available`, repeats a key, or differs from
+        ///     `{"aps":{"content-available":1}}` by anything but JSON whitespace.
         public func handleNotification(payload: Data) throws -> Data {
             try validateOpaquePayload(payload)
             return Self.wakeSignal
@@ -321,6 +323,15 @@
         /// 3. The `aps` value is a JSON object with **exactly one** key:
         ///    `"content-available"`.
         /// 4. The `content-available` value is the integer `1`.
+        /// 5. The payload bytes, with JSON whitespace (space, tab, line feed,
+        ///    carriage return) removed, equal ``wakeSignal``.
+        ///
+        /// Rules 2 to 4 read the dictionary `JSONSerialization` builds, and
+        /// `JSONSerialization` keeps one value for a key the object repeats, so
+        /// a second `aps` or `content-available` member carrying a context ID
+        /// passes them. Rule 5 reads the received bytes and rejects that
+        /// payload, along with any other encoding of the permitted object, such
+        /// as an escaped key or `1.0`.
         ///
         /// - Parameter payload: Raw JSON bytes to validate.
         /// - Throws: ``PushError/invalidPayload(_:)`` or ``PushError/opaquePayloadViolation(_:)``.
@@ -381,6 +392,14 @@
             else {
                 throw PushError.opaquePayloadViolation(
                     "\"content-available\" must be integer 1 (not boolean true, a fraction, or other value), got \(contentAvailable)"
+                )
+            }
+
+            // Rule 5: the received bytes, whitespace removed, are the permitted payload.
+            let jsonWhitespace: Set<UInt8> = [0x20, 0x09, 0x0A, 0x0D]
+            guard Data(payload.filter { !jsonWhitespace.contains($0) }) == Self.wakeSignal else {
+                throw PushError.opaquePayloadViolation(
+                    "payload bytes differ from {\"aps\":{\"content-available\":1}} by more than whitespace: a key repeats or a token is not in canonical form"
                 )
             }
         }

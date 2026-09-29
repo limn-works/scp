@@ -92,17 +92,54 @@
             #expect(signal == Data(#"{"aps":{"content-available":1}}"#.utf8))
         }
 
-        @Test("handleNotification returns the fixed wake signal for bytes that repeat the aps key")
-        func handleNotificationDiscardsDuplicateKeyBytes() async throws {
-            // `JSONSerialization` keeps one value for a key the object repeats,
-            // so these bytes parse to the one payload §10.7 permits while
-            // carrying a second `aps` member the relay chose.
+        @Test("handleNotification accepts the permitted payload with whitespace between its tokens")
+        func handleNotificationAcceptsWhitespaceBetweenTokens() async throws {
+            // JSON whitespace may sit between any two tokens, so the byte
+            // comparison must remove it before comparing.
+            let provider = ApplePushProvider()
+            let bytes = Data("{ \"aps\" :\t{\r\n  \"content-available\" : 1\n}\n}".utf8)
+
+            let signal = try await provider.handleNotification(payload: bytes)
+            #expect(signal == Data(#"{"aps":{"content-available":1}}"#.utf8))
+        }
+
+        @Test("handleNotification rejects a repeated aps key whose second value carries a context ID")
+        func handleNotificationRejectsDuplicateApsCarryingContextId() async throws {
+            // `JSONSerialization` keeps the first value for a key the object
+            // repeats, so these bytes parse to the one payload §10.7 permits
+            // while carrying a context ID in the second `aps` member.
+            let provider = ApplePushProvider()
+            let bytes = Data(#"{"aps":{"content-available":1},"aps":{"contextId":"ctx-42","content-available":1}}"#.utf8)
+            let parsed = try JSONSerialization.jsonObject(with: bytes) as? [String: [String: Int]]
+            #expect(parsed == ["aps": ["content-available": 1]])
+
+            await expectRejection(provider, bytes, .opaquePayloadViolation)
+        }
+
+        @Test("handleNotification rejects a repeated content-available key")
+        func handleNotificationRejectsDuplicateContentAvailable() async {
+            let provider = ApplePushProvider()
+            let bytes = Data(#"{"aps":{"content-available":1,"content-available":"ctx-42"}}"#.utf8)
+
+            await expectRejection(provider, bytes, .opaquePayloadViolation)
+        }
+
+        @Test("handleNotification rejects a repeated aps key whose values match")
+        func handleNotificationRejectsDuplicateApsKey() async {
             let provider = ApplePushProvider()
             let bytes = Data(#"{"aps":{"content-available":1},"aps":{"content-available":1}}"#.utf8)
 
-            let signal = try await provider.handleNotification(payload: bytes)
-            #expect(signal != bytes)
-            #expect(signal == Data(#"{"aps":{"content-available":1}}"#.utf8))
+            await expectRejection(provider, bytes, .opaquePayloadViolation)
+        }
+
+        @Test("handleNotification rejects an escaped key that decodes to aps")
+        func handleNotificationRejectsEscapedKey() async throws {
+            let provider = ApplePushProvider()
+            let bytes = Data(#"{"\u0061ps":{"content-available":1}}"#.utf8)
+            let parsed = try JSONSerialization.jsonObject(with: bytes) as? [String: [String: Int]]
+            #expect(parsed == ["aps": ["content-available": 1]])
+
+            await expectRejection(provider, bytes, .opaquePayloadViolation)
         }
 
         @Test("handleNotification rejects a second top-level field")
