@@ -24,7 +24,7 @@
 // 2. **AndroidStorage constant and signature tests**: Assert the values of
 //    AndroidStorage's constants (Keystore alias, database and column names, error
 //    codes), that AndroidStorage implements StorageProvider, and the signatures of
-//    its constructor and getOrCreateStorageKey. No test calls AndroidStorage code, so
+//    its constructor and getOrCreateStorageKey. No test in this file calls AndroidStorage code, so
 //    none shows that AndroidStorage passes its alias to Keystore or throws the right
 //    error code.
 //

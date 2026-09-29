@@ -71,7 +71,8 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      *   5. an adapter that throws [ScpException] with code `SCP-ATTEST-9001`
      *      for every failure, because a UniFFI callback that throws any other
      *      exception panics the Rust caller.
-     * Story SCP-111's acceptance criteria track all five.
+     * The reopen note of story SCP-111, which stands in progress, names all
+     * five.
      *
      * @param challenge The 32-byte binding digest `D` of
      *   `09-security-model.md` §9.3.1. ADR-025 and ADR-027 require the caller
@@ -141,9 +142,8 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      * Classic integrity token whose nonce is `Base64(SHA-256(clientDataJSON))`.
      * ADR-027 acceptance criterion 8 requires a Standard integrity token whose
      * `requestHash` is the lowercase hexadecimal form of `A`, requested
-     * without routing through [attest]. Story SCP-111's acceptance criteria
-     * track the Standard request and the rule against routing through
-     * [attest].
+     * without routing through [attest]. The reopen note of story SCP-111 names
+     * the Classic request and the routing through [attest].
      *
      * @param requestHash The 32-byte assertion digest `A` of
      *   `09-security-model.md` §9.3.1 over the request bytes. ADR-025 and
