@@ -38,7 +38,7 @@
         /// bytes, so it is not the binding digest `D` or the assertion digest
         /// `A` of `09-security-model.md` §9.3.1 that App Attest takes as
         /// `clientDataHash`.
-        case invalidChallenge(String)
+        case invalidClientDataHash(String)
     }
 
     extension AttestationError {
@@ -53,7 +53,7 @@
             case .keyNotFound:
                 .Identity(msg: "no App Attest key ID is stored; call attest first", code: "SCP-ATTEST-9020")
             case let .internalError(msg): .Identity(msg: msg, code: "SCP-ATTEST-9025")
-            case let .invalidChallenge(msg): .Identity(msg: msg, code: "SCP-ATTEST-9026")
+            case let .invalidClientDataHash(msg): .Identity(msg: msg, code: "SCP-ATTEST-9026")
             }
         }
 
@@ -106,7 +106,7 @@
     ///
     /// The adapter hashes nothing. When App Attest is supported, it rejects a
     /// `challenge` or a `requestHash` that is not 32 bytes with
-    /// `SCP-ATTEST-9026`, which `AttestationError.invalidChallenge` maps to,
+    /// `SCP-ATTEST-9026`, which `AttestationError.invalidClientDataHash` maps to,
     /// and otherwise hands it to App Attest as it arrived.
     ///
     /// ## Unavailable service (simulator, or a device without App Attest)
@@ -205,7 +205,7 @@
         ///
         /// - Throws: `ScpError.Identity` carrying `SCP-ATTEST-9019` for
         ///   `AttestationError.unsupported`, `SCP-ATTEST-9026` for
-        ///   `AttestationError.invalidChallenge`, `SCP-ATTEST-9001` for
+        ///   `AttestationError.invalidClientDataHash`, `SCP-ATTEST-9001` for
         ///   `AttestationError.serviceError`, or `SCP-ATTEST-9025` for
         ///   `AttestationError.internalError`, in the cases
         ///   `attestReportingAttestationError(challenge:deviceId:)` lists.
@@ -223,7 +223,7 @@
         ///
         /// - Throws: `ScpError.Identity` carrying `SCP-ATTEST-9019` for
         ///   `AttestationError.unsupported`, `SCP-ATTEST-9026` for
-        ///   `AttestationError.invalidChallenge`, `SCP-ATTEST-9020` for
+        ///   `AttestationError.invalidClientDataHash`, `SCP-ATTEST-9020` for
         ///   `AttestationError.keyNotFound`, `SCP-ATTEST-9001` for
         ///   `AttestationError.serviceError`, or `SCP-ATTEST-9025` for
         ///   `AttestationError.internalError`, in the cases
@@ -263,7 +263,7 @@
         /// - Throws: `AttestationError.unsupported` when
         ///   `DCAppAttestService.isSupported` is `false`, or when `generateKey`
         ///   or `attestKey` answers with `DCError.featureUnsupported`.
-        ///   `AttestationError.invalidChallenge` when App Attest is supported
+        ///   `AttestationError.invalidClientDataHash` when App Attest is supported
         ///   and `challenge` is not 32 bytes; this method then generates no
         ///   key and calls no App Attest method.
         ///   `AttestationError.serviceError` when `generateKey` or `attestKey`
@@ -281,7 +281,7 @@
                 )
             }
             guard challenge.count == 32 else {
-                throw AttestationError.invalidChallenge(
+                throw AttestationError.invalidClientDataHash(
                     "the attestation challenge is \(challenge.count) bytes; App Attest takes the "
                         + "32-byte binding digest D of 09-security-model.md §9.3.1 as clientDataHash"
                 )
@@ -333,7 +333,7 @@
         /// - Throws: `AttestationError.unsupported` when
         ///   `DCAppAttestService.isSupported` is `false`, or when
         ///   `generateAssertion` answers with `DCError.featureUnsupported`.
-        ///   `AttestationError.invalidChallenge` when App Attest is supported
+        ///   `AttestationError.invalidClientDataHash` when App Attest is supported
         ///   and `requestHash` is not 32 bytes; this method then calls no App
         ///   Attest method.
         ///   `AttestationError.keyNotFound` when no key ID is stored, because
@@ -352,7 +352,7 @@
                 )
             }
             guard requestHash.count == 32 else {
-                throw AttestationError.invalidChallenge(
+                throw AttestationError.invalidClientDataHash(
                     "the assertion request hash is \(requestHash.count) bytes; App Attest takes the "
                         + "32-byte assertion digest A of 09-security-model.md §9.3.1 as clientDataHash"
                 )

@@ -358,7 +358,7 @@
         @Test("every AttestationError case maps to its own SCP-ATTEST code")
         func everyCaseHasItsOwnCode() {
             let cases: [AttestationError] = [
-                .serviceError("m"), .unsupported("m"), .keyNotFound, .internalError("m"), .invalidChallenge("m")
+                .serviceError("m"), .unsupported("m"), .keyNotFound, .internalError("m"), .invalidClientDataHash("m")
             ]
             let codes = cases.compactMap { error -> String? in
                 guard case let .Identity(_, code) = error.scpError else { return nil }
