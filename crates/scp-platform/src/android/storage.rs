@@ -1,11 +1,14 @@
 //! `SQLCipher` storage adapter for Android.
 //!
 //! The Kotlin class `AndroidStorage` in
-//! `bindings/kotlin/scp-kt-android/.../AndroidStorage.kt` implements the
-//! Kotlin `StorageProvider` interface in `Types.kt`, not [`Storage`]
-//! (ADR-021); the [`super`] module docs list where the two differ. No code
-//! injects the Kotlin adapter into the Rust engine yet. This module documents
-//! the Rust-side contract and re-exports the trait type for Android builds.
+//! `bindings/kotlin/scp-kt-android/.../AndroidStorage.kt` implements the Kotlin
+//! `StorageProvider` interface in `Types.kt`, not [`Storage`]; the [`super`] module
+//! docs list where the two differ. ADR-021 and ADR-027 require the class to
+//! implement the `UniFFI` `StorageProvider` callback interface and to be injected
+//! into the Rust engine. The class does neither, and no code injects it into
+//! the Rust engine. Story SCP-113 stays in progress while the class fails its
+//! trait criterion. This module documents the Rust-side contract and
+//! re-exports the trait type for Android builds.
 //!
 //! # Encryption Architecture (ADR-027)
 //!

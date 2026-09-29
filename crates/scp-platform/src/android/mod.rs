@@ -2,9 +2,15 @@
 //!
 //! This module declares the four Android platform adapter modules. The
 //! adapters themselves are Kotlin classes in `bindings/kotlin/scp-kt-android/`.
-//! Each Kotlin class implements a Kotlin interface in `Types.kt`, not a trait
-//! in [`crate::traits`] (ADR-021, ADR-027). No Kotlin interface matches both
-//! the Rust trait and the `UniFFI` callback interface in
+//! ADR-021 (the `UniFFI` bridge) and ADR-027 (the Android platform adapter)
+//! require each Kotlin class to implement the `UniFFI` callback interface for
+//! its capability and to be injected into the Rust engine. No shipped class
+//! does either. Each Kotlin class implements a Kotlin interface in `Types.kt`,
+//! and no code injects any of them into the Rust engine. Stories SCP-110 to
+//! SCP-113 of `.docs/prds/main.json` stay in progress while their adapters
+//! fail their trait criteria, and story SCP-214 tracks injecting a
+//! key-custody provider into the Rust engine. No Kotlin interface matches both
+//! the Rust trait in [`crate::traits`] and the `UniFFI` callback interface in
 //! `crates/scp-ffi/uniffi/src/lib.rs` for its capability:
 //!
 //! - `DeviceAttestationProvider` restates the `UniFFI` callback interface of

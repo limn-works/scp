@@ -2,7 +2,10 @@
 //
 // Assembles all four Android platform providers (KeyCustody, DeviceAttestation,
 // PushProvider, Storage) into a single adapter object. No code in the Kotlin SDKs calls
-// the factory, and no code passes the adapter to the Rust engine.
+// the factory, and no code passes the adapter to the Rust engine. ADR-027 requires the Kotlin
+// SDK's `SCP.create()` to call the factory and inject the four providers into the Rust engine
+// as UniFFI callback interfaces (ADR-021, the UniFFI bridge), so the shipped factory diverges
+// from both ADRs; story SCP-214 tracks injecting a key custody provider.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer).
 

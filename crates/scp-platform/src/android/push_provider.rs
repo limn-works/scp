@@ -1,11 +1,14 @@
 //! Firebase Cloud Messaging push adapter for Android.
 //!
 //! The Kotlin class `AndroidPushProvider` in
-//! `bindings/kotlin/scp-kt-android/.../AndroidPushProvider.kt` implements the
-//! Kotlin `PushProvider` interface in `Types.kt`, not [`Push`] (ADR-021); the
-//! [`super`] module docs list where the two differ. No code injects the Kotlin
-//! adapter into the Rust engine yet. This module documents the Rust-side
-//! contract and re-exports the trait types for Android builds.
+//! `bindings/kotlin/scp-kt-android/.../AndroidPushProvider.kt` implements the Kotlin
+//! `PushProvider` interface in `Types.kt`, not [`Push`]; the [`super`] module
+//! docs list where the two differ. ADR-021 and ADR-027 require the class to
+//! implement the `UniFFI` `PushProvider` callback interface and to be injected
+//! into the Rust engine. The class does neither, and no code injects it into
+//! the Rust engine. Story SCP-112 stays in progress while the class fails its
+//! trait criterion. This module documents the Rust-side contract and
+//! re-exports the trait types for Android builds.
 //!
 //! # FCM Payload Opacity (ADR-027, section 10.7)
 //!
