@@ -120,9 +120,10 @@ class KeyCustodyProvider(Protocol):
     ``SCP-CRYPTO-4060`` carrying that code and the exception text. Every SDK
     operation that calls the provider reports these two codes, including the
     pseudonym derivation inside ``context_create`` and the identity key reads
-    and signatures of identity operations; the one exception is
+    and signatures of identity operations. There are two exceptions:
     ``SCP-IDENT-1055``, reported when the bridge rejects the pseudonym a
-    :meth:`derive_pseudonym` call returned.
+    :meth:`derive_pseudonym` call returned, and ``SCP-IDENT-1037``, which
+    ``scpid_sign`` reports for any custody failure (spec §3.11.4).
     """
 
     def generate_keypair(self, key_type: str, role: str) -> str:

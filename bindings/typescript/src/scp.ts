@@ -498,9 +498,10 @@ export interface CustodyPublicKey {
  * the custody error `SCP-CRYPTO-4060` carrying the thrown code and message.
  * Every SDK operation that calls the provider reports these two codes,
  * including the pseudonym derivation inside `createContext` and the identity
- * key reads and signatures of identity operations; the one exception is
+ * key reads and signatures of identity operations. There are two exceptions:
  * `SCP-IDENT-1055`, reported when the bridge rejects the pseudonym a
- * {@link derivePseudonym} call returned.
+ * {@link derivePseudonym} call returned, and `SCP-IDENT-1037`, which
+ * `scpidSign` reports for any custody failure (spec §3.11.4).
  *
  * Every callback must be synchronous and return the type its signature names.
  * A callback that returns a Promise or other thenable, or a value of the wrong

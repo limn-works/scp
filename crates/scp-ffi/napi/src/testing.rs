@@ -590,18 +590,6 @@ impl TestingCallbackCustody {
         Ok(Buffer::from(signature.as_bytes().to_vec()))
     }
 
-    /// Whether the adapter's registry holds `key_id` live. A host
-    /// `destroyKey` calls it to prove the adapter retires the handle
-    /// (`Destroying`) before the host call.
-    ///
-    /// # Errors
-    ///
-    /// `SCP-CRYPTO-4060` if `key_id` is not a numeric key id.
-    #[napi(js_name = "isBound")]
-    pub fn is_bound(&self, key_id: String) -> napi::Result<bool> {
-        Ok(self.inner.registry.is_live(&testing_handle(&key_id)?))
-    }
-
     /// Destroys `key_id` through the adapter, which retires the handle before
     /// the host call.
     ///

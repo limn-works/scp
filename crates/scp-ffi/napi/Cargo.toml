@@ -59,6 +59,9 @@ sha2 = { workspace = true }
 rmp-serde = { workspace = true }
 ed25519-dalek = { workspace = true }
 tls_codec = "0.4"
+# `CustodyFailure`, the typed custody error the runtime carries to the bridge;
+# tests also recompute P-256 pseudonym points and signatures.
+scp-crypto = { path = "../../scp-crypto" }
 scp-core = { path = "../../scp-core" }
 scp-media = { path = "../../scp-media" }
 scp-clock = { path = "../../scp-clock" }
@@ -99,9 +102,6 @@ scp-ffi-common = { path = "../common", features = ["testing", "custody"] }
 # non-testing feature list.
 scp-dht = { path = "../../scp-dht", features = ["testing"] }
 tempfile = "3"
-# The P-256 flow test verifies adapter output against scp-crypto directly, and
-# the routing-id tests recompute the §9.10.4 pseudonym independently.
-scp-crypto = { path = "../../scp-crypto" }
 # Provides weak C stubs for napi runtime symbols so the test binary
 # can link without a Node.js runtime. Kept as a dev-dependency so
 # the cdylib build NEVER sees these stubs (if they leaked into the

@@ -511,12 +511,7 @@ pub(crate) async fn ucan_mint_on(
     // await directly without spawning a separate task.
     let token = mint_ucan(&params, custody.as_ref(), &scp_clock::SystemClock)
         .await
-        .map_err(|e| {
-            napi::Error::from(ScpNapiError::Permission {
-                message: format!("UCAN minting failed: {e}"),
-                code: scp_ffi_common::ucan_errors::ucan_error_code(&e).to_owned(),
-            })
-        })?;
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let data = NapiUcanTokenData {
         token_id: token.payload.nnc.clone(),
@@ -1655,6 +1650,58 @@ mod tests {
         assert!(
             reason.contains("SCP-IDENT-1017"),
             "expected SCP-IDENT-1017, got: {reason}"
+        );
+    }
+
+    /// A context creator whose signing key custody no longer holds fails the
+    /// mint with `SCP-CRYPTO-4006`: the runtime carries the signing failure as
+    /// `UcanError::Custody`, and the bridge maps its kind.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_mint_with_a_destroyed_signing_key_is_crypto_4006() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let creator = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let params = serde_json::json!({
+            "mode": "broadcast",
+            "ceiling": ["messages:write"],
+            "memoryScope": "full",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = crate::context::context_create_on(&bi, &creator, params)
+            .await
+            .expect("context_create should succeed");
+        let custody = handle
+            .in_memory_custody
+            .as_ref()
+            .expect("an in-memory identity retains its custody on the handle");
+        let key = handle
+            .signing_key
+            .expect("the handle retains the signing key");
+        scp_platform::traits::KeyCustody::destroy_key(custody.as_ref(), &key)
+            .await
+            .expect("destroy_key should succeed");
+
+        let Err(err) = ucan_mint_on(
+            &bi,
+            &handle,
+            "did:dht:z6MkMember".to_owned(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        else {
+            panic!("a mint under a destroyed signing key must fail")
+        };
+        assert!(
+            err.reason
+                .contains(scp_ffi_common::error_codes::CRYPTO_4006),
+            "expected SCP-CRYPTO-4006 for a destroyed signing key, got: {}",
+            err.reason
         );
     }
 

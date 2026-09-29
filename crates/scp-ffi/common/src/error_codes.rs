@@ -251,11 +251,18 @@ pub const IDENT_1053: &str = "SCP-IDENT-1053";
 // when deriving the caller's per-member routing pseudonym from custody-held
 // identity key material. Encrypted / pseudonymous contexts hard-fail on
 // derivation error; broadcast contexts (spec §5.14) skip derivation entirely.
+// A custody failure during derivation is not a pseudonym error: it carries
+// CRYPTO_4006 (key not found) or CRYPTO_4060 (any other custody failure).
 // -----------------------------------------------------------------------
 
 /// Pseudonym derivation: identity missing core key material.
 pub const IDENT_1054: &str = "SCP-IDENT-1054";
-/// Pseudonym derivation failed (custody/KDF error).
+/// A host-derived pseudonym the bridge rejects.
+///
+/// The bridge rejects a malformed key id or point, a `get_public_key(key_id)`
+/// that returns a different point, or a key id already bound to another point
+/// (ADR-021 2026-09-27 amendment). Custody failures during derivation carry
+/// [`CRYPTO_4006`] or [`CRYPTO_4060`].
 pub const IDENT_1055: &str = "SCP-IDENT-1055";
 /// Pseudonym derivation: no custody provider available.
 pub const IDENT_1056: &str = "SCP-IDENT-1056";
@@ -1284,3 +1291,17 @@ pub const SAGA_13065: &str = "SCP-SAGA-13065";
 /// Saga `Busy` terminal — the participant context set overlapped an in-flight
 /// saga (per-participant-context-set gating, §5.15.4).
 pub const SAGA_13066: &str = "SCP-SAGA-13066";
+
+/// The bridge error code for a runtime [`CustodyFailure`](scp_crypto::CustodyFailure).
+///
+/// One mapping for the `PyO3`, napi-rs and `UniFFI` bridges: key-not-found is
+/// [`CRYPTO_4006`], a rejected host pseudonym is [`IDENT_1055`], and any other
+/// custody failure is [`CRYPTO_4060`].
+#[must_use]
+pub const fn custody_failure_code(e: &scp_crypto::CustodyFailure) -> &'static str {
+    match e.kind {
+        scp_crypto::CustodyFailureKind::KeyNotFound => CRYPTO_4006,
+        scp_crypto::CustodyFailureKind::PseudonymRejected => IDENT_1055,
+        scp_crypto::CustodyFailureKind::Failed => CRYPTO_4060,
+    }
+}

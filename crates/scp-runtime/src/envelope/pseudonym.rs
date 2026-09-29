@@ -57,8 +57,8 @@ use scp_protocol::envelope::EnvelopeError;
 ///
 /// # Errors
 ///
-/// Returns [`EnvelopeError::PseudonymDerivationFailed`] if the underlying
-/// key custody operation fails (e.g., key handle not found, wrong key type).
+/// Returns [`EnvelopeError::Custody`] if the underlying key custody operation
+/// fails (e.g., key handle not found, wrong key type).
 pub async fn derive_pseudonym(
     key_custody: &impl KeyCustody,
     identity_key_handle: &KeyHandle,
@@ -67,7 +67,7 @@ pub async fn derive_pseudonym(
     key_custody
         .derive_pseudonym(identity_key_handle, context_id)
         .await
-        .map_err(|e| EnvelopeError::PseudonymDerivationFailed(e.to_string()))
+        .map_err(|e| EnvelopeError::Custody(e.into()))
 }
 
 /// Derives a rotatable, epoch-scoped pseudonym keypair (v2).
@@ -90,8 +90,8 @@ pub async fn derive_pseudonym(
 ///
 /// # Errors
 ///
-/// Returns [`EnvelopeError::PseudonymDerivationFailed`] if the underlying
-/// key custody operation fails (e.g., key handle not found, wrong key type).
+/// Returns [`EnvelopeError::Custody`] if the underlying key custody operation
+/// fails (e.g., key handle not found, wrong key type).
 pub async fn derive_rotatable_pseudonym(
     key_custody: &impl KeyCustody,
     identity_key_handle: &KeyHandle,
@@ -101,7 +101,7 @@ pub async fn derive_rotatable_pseudonym(
     key_custody
         .derive_rotatable_pseudonym(identity_key_handle, context_id, pseudonym_epoch)
         .await
-        .map_err(|e| EnvelopeError::PseudonymDerivationFailed(e.to_string()))
+        .map_err(|e| EnvelopeError::Custody(e.into()))
 }
 
 #[cfg(test)]
@@ -114,6 +114,22 @@ mod tests {
     // -----------------------------------------------------------------------
     // v1 (non-rotatable) pseudonym tests
     // -----------------------------------------------------------------------
+
+    /// A destroyed identity key fails derivation with a typed key-not-found
+    /// custody failure, which every bridge reports as `SCP-CRYPTO-4006`.
+    #[tokio::test]
+    async fn derive_pseudonym_with_a_destroyed_key_is_custody_key_not_found() {
+        let custody = InMemoryKeyCustody::new();
+        let key_handle = custody.generate_identity_keypair().await.unwrap();
+        custody.destroy_key(&key_handle).await.unwrap();
+        let err = derive_pseudonym(&custody, &key_handle, b"test-context-1")
+            .await
+            .expect_err("derivation under a destroyed key must fail");
+        assert!(
+            matches!(&err, EnvelopeError::Custody(failure) if failure.is_key_not_found()),
+            "expected EnvelopeError::Custody key-not-found, got {err:?}"
+        );
+    }
 
     #[tokio::test]
     async fn derive_pseudonym_is_deterministic() {

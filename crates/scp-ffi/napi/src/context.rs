@@ -1424,10 +1424,9 @@ pub(crate) async fn context_join_from_welcome_on(
         Ok(handle) => handle,
         Err(e) => {
             crate::runtime::remove_context(bi, &sealed.context_id);
-            return Err(NapiError::from(ScpNapiError::Context {
-                message: format!("context_join_from_welcome failed: {e}"),
-                code: codes::CTX_2013.to_owned(),
-            }));
+            // Through `From<ContextError>`, so a typed custody failure keeps its
+            // code (a destroyed `#active` key is `SCP-CRYPTO-4006`).
+            return Err(NapiError::from(ScpNapiError::from(e)));
         }
     };
 
@@ -1822,9 +1821,17 @@ pub(crate) async fn context_send_on(
         scp_core::envelope::create_inner_envelope(&params, custody.as_ref(), &signing_key)
             .await
             .map_err(|e| {
-                NapiError::from(ScpNapiError::Crypto {
-                    message: format!("inner envelope signing failed: {e}"),
-                    code: codes::CRYPTO_4001.to_owned(),
+                NapiError::from(match &e {
+                    scp_core::envelope::EnvelopeError::Custody(failure) => {
+                        ScpNapiError::custody_failure(
+                            format!("inner envelope signing failed: {e}"),
+                            failure,
+                        )
+                    }
+                    _ => ScpNapiError::Crypto {
+                        message: format!("inner envelope signing failed: {e}"),
+                        code: codes::CRYPTO_4001.to_owned(),
+                    },
                 })
             })?;
     }
@@ -2922,11 +2929,7 @@ pub(crate) async fn broadcast_publish_on(
     };
     sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
         .await
-        .map_err(|e| {
-            napi::Error::from_reason(format!(
-                "supervisor dispatch_broadcast_command_with_custody failed: {e}"
-            ))
-        })?;
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     rx.await
         .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -3068,11 +3071,7 @@ pub(crate) async fn broadcast_publish_asset_on(
     };
     sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
         .await
-        .map_err(|e| {
-            napi::Error::from_reason(format!(
-                "supervisor dispatch_broadcast_command_with_custody failed: {e}"
-            ))
-        })?;
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     let envelope = rx
         .await
         .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
@@ -3202,11 +3201,7 @@ pub(crate) async fn broadcast_publish_assets_on(
         };
         sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
             .await
-            .map_err(|e| {
-                napi::Error::from_reason(format!(
-                    "supervisor dispatch_broadcast_command_with_custody failed: {e}"
-                ))
-            })?;
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         let envelope = rx
             .await
             .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
@@ -6078,6 +6073,50 @@ mod tests {
         );
     }
 
+    /// A join whose `#active` key custody no longer holds fails at the
+    /// runtime's invitation KEM agreement (the first step of the join) with a
+    /// typed custody failure, which the bridge reports as `SCP-CRYPTO-4006`
+    /// through `From<ContextError>` and still rolls its reversible state back.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_from_welcome_with_a_destroyed_active_key_is_crypto_4006() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let joiner_did = register_in_memory_joiner(&bi).await;
+        let (custody, active) = crate::runtime::with_identity(&bi, &joiner_did, |entry| {
+            Ok((entry.custody.clone(), entry.identity.active_signing_key))
+        })
+        .expect("the joiner is registered");
+        scp_platform::traits::KeyCustody::destroy_key(custody.as_ref(), &active)
+            .await
+            .expect("destroy_key should succeed");
+        let ctx_id = "b".repeat(64);
+        let sealed = super::NapiSealedInvitation {
+            context_id: ctx_id.clone(),
+            creator_did: "did:dht:z6MkNapiDestroyedActiveCreator".to_owned(),
+            enc: vec![0u8; 32],
+            ciphertext: b"bogus-bundle-ciphertext".to_vec(),
+        };
+        let Err(err) = super::context_join_from_welcome_on(
+            &bi,
+            joiner_did,
+            sealed,
+            "bogus-reservation-id".to_owned(),
+        )
+        .await
+        else {
+            panic!("a join under a destroyed #active key must fail");
+        };
+        assert!(
+            err.reason.contains(codes::CRYPTO_4006),
+            "expected CRYPTO_4006 for a destroyed #active key, got: {}",
+            err.reason
+        );
+        assert!(
+            crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_err(),
+            "FFI (UCAN) state must NOT survive a failed join"
+        );
+    }
+
     /// ADR-049 Phase 2J (orphaned-success fix): a pre-existing (`Occupied`)
     /// FFI-state entry fails `context_join_from_welcome` at the
     /// `register_ffi_state` precheck — which runs BEFORE `spawn_actor_from_welcome`
@@ -7277,6 +7316,49 @@ mod tests {
         );
     }
 
+    /// A custody that no longer holds the exporter's `#active` key fails the
+    /// export with `SCP-CRYPTO-4006`: the runtime carries the custody failure
+    /// as a typed value, and the bridge maps its kind to the code. Reverting
+    /// the runtime to a text error would report a context code instead.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_export_with_a_destroyed_signing_key_is_crypto_4006() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let params_json = serde_json::json!({
+            "ceiling": ["messages:read", "context:close"],
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = super::context_create_on(&bi, &identity, params_json)
+            .await
+            .expect("context_create should succeed");
+        let custody = handle
+            .in_memory_custody
+            .as_ref()
+            .expect("an in-memory identity retains its custody on the handle");
+        let key = handle
+            .signing_key
+            .expect("the handle retains the signing key");
+        scp_platform::traits::KeyCustody::destroy_key(custody.as_ref(), &key)
+            .await
+            .expect("destroy_key should succeed");
+
+        let err = super::context_export_on(&bi, &handle)
+            .await
+            .expect_err("export with a destroyed signing key must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(codes::CRYPTO_4006),
+            "expected CRYPTO_4006 for a destroyed export key, got: {msg}"
+        );
+    }
+
     /// Confirms the export signature is genuinely verified on import: flipping a
     /// byte inside the serialized export (which lands in the signed snapshot
     /// region) MUST cause `context_import_on` to fail. This proves the signature
@@ -7611,6 +7693,52 @@ mod tests {
             }
             other => panic!("expected CRYPTO_4006, got {other:?}"),
         }
+    }
+
+    /// A broadcast author whose `#active` key the custody no longer holds
+    /// fails the publish with `SCP-CRYPTO-4006`: the supervisor carries the
+    /// signing failure as `ContextError::Custody`, and the bridge maps its kind.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_publish_with_a_destroyed_signing_key_is_crypto_4006() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let creator = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let params = serde_json::json!({
+            "mode": "broadcast",
+            "ceiling": ["messages:read"],
+            "memoryScope": "full",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = super::context_create_on(&bi, &creator, params)
+            .await
+            .expect("broadcast context_create should succeed");
+        let custody = handle
+            .in_memory_custody
+            .as_ref()
+            .expect("an in-memory identity retains its custody on the handle");
+        let key = handle
+            .signing_key
+            .expect("the handle retains the signing key");
+        scp_platform::traits::KeyCustody::destroy_key(custody.as_ref(), &key)
+            .await
+            .expect("destroy_key should succeed");
+
+        let Err(err) =
+            super::broadcast_publish_on(&bi, &handle, creator.inner.did.clone(), b"hi".to_vec())
+                .await
+        else {
+            panic!("broadcast publish with a destroyed signing key must fail")
+        };
+        assert!(
+            err.reason.contains(codes::CRYPTO_4006),
+            "expected CRYPTO_4006 for a destroyed broadcast key, got: {}",
+            err.reason
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
