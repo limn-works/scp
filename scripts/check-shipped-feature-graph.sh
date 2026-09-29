@@ -140,7 +140,7 @@ cd "$REPO_ROOT"
 # a future dependency edge pull plaintext key-per-file storage back into a
 # shipped graph with no gate failure to announce it.
 #
-# TEN ROWS NAME A FEATURE A ROOT PACKAGE ACTIVATES THROUGH ITS OWN `[features]`
+# ELEVEN ROWS NAME A FEATURE A ROOT PACKAGE ACTIVATES THROUGH ITS OWN `[features]`
 # TABLE. `cargo tree -e features` renders no feature EDGE for any of them (see
 # "TWO RENDERINGS" in the header), so this gate could not observe one until it
 # began reading the per-package resolved-feature rendering. Their classification:
@@ -158,16 +158,19 @@ cd "$REPO_ROOT"
 #   - `scp-ffi/extension-module` — `["pyo3/extension-module"]`, which tells pyo3
 #     to leave the Python symbols to the interpreter that loads the cdylib. It
 #     activates no SCP-crate feature and no dependency edge.
-#   - `scp-ffi/vendored-openssl` — `["scp-platform/vendored-openssl"]`, which adds
-#     `rusqlite/bundled-sqlcipher-vendored-openssl` and compiles the same
+#   - `scp-ffi/vendored-openssl` — `["scp-platform/vendored-openssl"]`, the
+#     wheel-only feature that forwards to the platform crate.
+#   - `scp-platform/vendored-openssl` — what `scp-ffi/vendored-openssl`
+#     activates on the platform crate. It is
+#     `["rusqlite?/bundled-sqlcipher-vendored-openssl"]`, which compiles the same
 #     SQLCipher against an OpenSSL this build produces instead of one the host
-#     supplies. `scp-platform/vendored-openssl` carries its own row below.
+#     supplies, and activates nothing when `rusqlite` is not already enabled.
 #   - `scp-client-wasm/default` — an EMPTY feature list. Cargo reports `default`
 #     as enabled on that default member and it activates nothing.
 # The `scp-ffi|--features extension-module,vendored-openssl` ARTIFACTS entry, the
 # PyPI wheel's configuration read from `[tool.maturin]`, resolves the two
 # `scp-ffi` rows above that no other entry reaches.
-# None of the ten forwards a `testing` edge or an `allow_unencrypted_storage`
+# None of the eleven forwards a `testing` edge or an `allow_unencrypted_storage`
 # edge. The reader reports cargo's RESOLVED list, so every feature a `default`
 # row expands to appears as its own row and meets this ⊆ check on its own —
 # permitting a `default` row therefore admits nothing beyond that row.
