@@ -1383,11 +1383,13 @@ jobs:
   # The wheel adds the features `[tool.maturin] features` in
   # `bindings/python/pyproject.toml` names (`extension-module`,
   # `vendored-openssl`), and `vendored-openssl` compiles OpenSSL from source
-  # through openssl-src. A third step builds the library with exactly that list,
-  # read from the file, so a PR that breaks the OpenSSL or SQLCipher source build
-  # fails here instead of in the release run. It covers the Linux x86_64 host
-  # build only; the manylinux_2_28 container, the universal2 macOS build, and the
-  # Windows NASM build still run only in `build-matrix.yml`.
+  # through openssl-src for a Linux or Windows target and activates nothing for an
+  # Apple target, whose SQLCipher keeps CommonCrypto. A third step checks that
+  # split with `cargo tree` for each wheel target, and a fourth builds the library
+  # with exactly that list, read from the file, so a PR that breaks the OpenSSL or
+  # SQLCipher source build fails here instead of in the release run. The build
+  # covers the Linux x86_64 host only; the manylinux_2_28 container, the universal2
+  # macOS build, and the Windows NASM build still run only in `build-matrix.yml`.
   #
   # This job carried a "build-only" note claiming a pyo3 test suite assumes
   # in-memory custody and does not compile in prod config. Measured on this tree,
@@ -1455,6 +1457,29 @@ jobs:
           # than 0 if a feature flip selects zero tests.
           cargo nextest run --no-tests=fail -p scp-ffi --features server --lib \
             -E 'test(identity_create_fails_closed_without_pre_rotation_backend) + test(verify_device_attestation_fails_closed)'
+      - name: Check the PyPI wheel's features vendor OpenSSL on non-Apple targets only
+        run: |
+          # `crates/scp-platform/Cargo.toml` declares the libsqlite3-sys edge that
+          # `vendored-openssl` sets for non-Apple targets only, because
+          # libsqlite3-sys 0.30.1 checks `bundled-sqlcipher-vendored-openssl` before
+          # the Apple branch that selects CommonCrypto. For each wheel target this
+          # resolves the wheel's feature list, requires the vendored feature on the
+          # Linux and Windows targets, and on the Apple targets requires
+          # `bundled-sqlcipher` (proof that the tree rendered) without the vendored one.
+          FEATURES="$(python3 -c 'import tomllib; print(",".join(tomllib.load(open("bindings/python/pyproject.toml", "rb"))["tool"]["maturin"]["features"]))')"
+          VENDORED='libsqlite3-sys feature "bundled-sqlcipher-vendored-openssl"'
+          BUNDLED='libsqlite3-sys feature "bundled-sqlcipher"'
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc aarch64-apple-darwin x86_64-apple-darwin; do
+            TREE="$(cargo tree -p scp-ffi --features "${FEATURES}" -e features --target "${target}" -i libsqlite3-sys)"
+            case "${target}" in
+              *-apple-darwin)
+                grep -qF "${BUNDLED}" <<<"${TREE}" || { echo "${target}: no SQLCipher in the resolved tree"; exit 1; }
+                if grep -qF "${VENDORED}" <<<"${TREE}"; then echo "${target}: the wheel vendors OpenSSL and drops CommonCrypto"; exit 1; fi ;;
+              *)
+                grep -qF "${VENDORED}" <<<"${TREE}" || { echo "${target}: the wheel does not vendor OpenSSL"; exit 1; } ;;
+            esac
+            echo "${target}: OK"
+          done
       - name: Build pyo3 bridge with the PyPI wheel's features (vendored OpenSSL)
         run: |
           # The feature list comes from the file maturin reads, so this step builds

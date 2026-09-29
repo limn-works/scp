@@ -162,9 +162,11 @@ cd "$REPO_ROOT"
 #     wheel-only feature that forwards to the platform crate.
 #   - `scp-platform/vendored-openssl` — what `scp-ffi/vendored-openssl`
 #     activates on the platform crate. It is
-#     `["rusqlite?/bundled-sqlcipher-vendored-openssl"]`, which compiles the same
-#     SQLCipher against an OpenSSL this build produces instead of one the host
-#     supplies, and activates nothing when `rusqlite` is not already enabled.
+#     `["libsqlite3-sys?/bundled-sqlcipher-vendored-openssl"]`, on an edge the
+#     crate declares for non-Apple targets only. For a Linux or Windows target it
+#     compiles the same SQLCipher against an OpenSSL this build produces instead
+#     of the host's libcrypto; for an Apple target it activates nothing and
+#     SQLCipher keeps CommonCrypto; and it activates nothing when `sqlite` is off.
 #   - `scp-client-wasm/default` — an EMPTY feature list. Cargo reports `default`
 #     as enabled on that default member and it activates nothing.
 # The `scp-ffi|--features extension-module,vendored-openssl` ARTIFACTS entry, the
@@ -269,11 +271,12 @@ EOF
 # unless ARTIFACTS carries the exact configuration that table selects. Today
 # that table selects `extension-module`, a pyo3-only feature that changes no
 # SCP-crate edge, and `vendored-openssl`, which reaches
-# `scp-platform/vendored-openssl` and from there adds
-# `rusqlite/bundled-sqlcipher-vendored-openssl`. Neither nullifies a security
-# property: the first selects a Python linkage, and the second compiles the same
-# SQLCipher against an OpenSSL this build produced instead of one the host
-# supplies. The `scp-ffi|--features extension-module,vendored-openssl` entry
+# `scp-platform/vendored-openssl` and from there, on a non-Apple target, adds
+# `libsqlite3-sys/bundled-sqlcipher-vendored-openssl`. Neither nullifies a
+# security property: the first selects a Python linkage, and the second compiles
+# the same SQLCipher against an OpenSSL this build produced instead of the host's
+# libcrypto on Linux and Windows, and leaves CommonCrypto in place on an Apple
+# target. The `scp-ffi|--features extension-module,vendored-openssl` entry
 # below is the wheel's configuration.
 #
 # uniffi-bindgen (the third workspace `[[bin]]`, in `crates/scp-ffi/uniffi`) is

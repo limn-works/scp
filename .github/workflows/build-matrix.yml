@@ -139,8 +139,14 @@ jobs:
   #     each leg builds one wheel per CPython minor that the classifiers in
   #     bindings/python/pyproject.toml name, 3.10-3.13; a platform with no
   #     wheel falls back to the sdist. The sdist builds with the same
-  #     `vendored-openssl` feature, so installing it compiles OpenSSL;
-  #     bindings/python/README.md §Requirements lists what that build needs.
+  #     `vendored-openssl` feature, so installing it on Linux or Windows
+  #     compiles OpenSSL; bindings/python/README.md §Requirements lists what
+  #     that build needs.
+  #   - `vendored-openssl` compiles OpenSSL into SQLCipher on the Linux and
+  #     Windows legs only. On the universal2 leg it activates nothing, and
+  #     SQLCipher keeps CommonCrypto: crates/scp-platform/Cargo.toml declares
+  #     the edge the feature sets for non-Apple targets only. Job
+  #     rust-build-pyo3-production in ci.yml checks that split with `cargo tree`.
   #   - manylinux 2_28, not 2014: CentOS 7 (EOL) can build neither
   #     ring (glibc >= 2.18, newer gcc) nor vendored OpenSSL.
   #   - x86_64 2_28 container ships a minimal perl that openssl-src's

@@ -6,7 +6,7 @@ Python conventions, toolchain, and CI for the SCP Python SDK. References `sdk-co
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| Python | 3.12+ | Minimum supported version (for PEP 695 type parameter syntax, `type X` statements, `ParamSpec`). `match` (3.10), `X \| Y` union syntax (3.10) are available but 3.12 is the floor for type parameter syntax. |
+| Python | 3.10+ | Minimum supported version, the `requires-python` floor in `bindings/python/pyproject.toml`; the published wheels cover CPython 3.10-3.13. `match` and `X \| Y` union syntax (3.10) are available. PEP 695 type parameter syntax and `type X` statements (3.12) are not: write type aliases as `X: TypeAlias = ...`. ruff (`target-version = "py310"`) and mypy (`python_version = "3.10"`) reject syntax and names newer than 3.10. |
 | maturin | latest | Build tool for PyO3 Rust extension |
 | ruff | latest | Linter + formatter (replaces flake8, isort, black) |
 | mypy | latest | Static type checker (`--strict` mode) |
@@ -239,7 +239,9 @@ maturin builds binary wheels with the Rust extension embedded. Users install wit
 
 | Platform | Architecture | Wheel tag |
 |----------|-------------|-----------|
-| Linux | x86_64 | manylinux2014_x86_64 |
-| Linux | aarch64 | manylinux2014_aarch64 |
+| Linux | x86_64 | manylinux_2_28_x86_64 |
+| Linux | aarch64 | manylinux_2_28_aarch64 |
 | macOS | universal2 | macosx_11_0_universal2 |
 | Windows | x86_64 | win_amd64 |
+
+The Linux wheels need glibc 2.28 or newer. The Linux and Windows wheels embed an OpenSSL compiled from source (`scp-ffi/vendored-openssl`) that SQLCipher uses; the macOS wheel's SQLCipher uses CommonCrypto from the OS. On a platform with no matching wheel, pip falls back to the sdist, which compiles the extension on the installing machine; `bindings/python/README.md` §Requirements lists the tools that build needs.

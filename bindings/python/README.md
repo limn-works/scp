@@ -46,7 +46,7 @@ asyncio.run(main())
 
 - A Python version inside the `requires-python` range that `pyproject.toml` declares
 - Nothing else when a wheel exists for your platform: wheels are pre-built for CPython 3.10-3.13 on Linux x86_64 and aarch64 with glibc 2.28 or newer, macOS 11 or newer, and Windows x86_64
-- A build from source compiles OpenSSL, both when pip falls back to the source distribution because no wheel matches and when you run `maturin develop` in `bindings/python`: it needs a Rust toolchain and a full perl, plus make on Linux and macOS. On Windows, NASM is optional: with it on PATH OpenSSL builds its assembly routines, and without it the build configures OpenSSL with `no-asm`
+- A build from source needs a Rust toolchain. This holds both when pip falls back to the source distribution because no wheel matches and when you run `maturin develop` in `bindings/python`. On Linux and Windows the build also compiles OpenSSL, which needs a full perl, plus make on Linux. On Windows, NASM is optional: with it on PATH OpenSSL builds its assembly routines, and without it the build configures OpenSSL with `no-asm`. On macOS the build compiles no OpenSSL, because SQLCipher uses CommonCrypto from the OS
 
 ## API Reference
 

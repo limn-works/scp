@@ -19,11 +19,12 @@ default = ["server"]
 # but incompatible with test binaries. Maturin passes this explicitly.
 # cargo test runs WITHOUT it, so auto-initialize can embed Python.
 extension-module = ["pyo3/extension-module"]
-# Compile OpenSSL from source into SQLCipher instead of taking its crypto from
-# the build host. The PyPI wheel selects this feature through `[tool.maturin]
-# features` in `bindings/python/pyproject.toml`. The `vendored-openssl` comment in
-# `crates/scp-platform/Cargo.toml` says why every other shipped artifact leaves it
-# off.
+# On a non-Apple target, compile OpenSSL from source into SQLCipher instead of
+# linking the build host's libcrypto; on an Apple target SQLCipher keeps
+# CommonCrypto and this feature changes nothing. The PyPI wheel selects this
+# feature through `[tool.maturin] features` in `bindings/python/pyproject.toml`.
+# The `vendored-openssl` comment in `crates/scp-platform/Cargo.toml` says how the
+# Apple exclusion works and why the relay and node binaries leave it off.
 vendored-openssl = ["scp-platform/vendored-openssl"]
 # Shared relay/node startup code. Pulls in scp-node.
 server = ["scp-ffi-common/server", "dep:scp-node"]

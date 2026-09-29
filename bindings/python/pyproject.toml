@@ -45,18 +45,18 @@ markers = [
   "parity: cross-bridge runtime parity test (ADR-046)",
 ]
 
+# ruff and mypy target the `requires-python` floor, 3.10, so they reject syntax and
+# standard-library names that the cp310 and cp311 wheels cannot import, such as
+# the PEP 695 `type` statement and type parameters, and never rewrite code into them.
 [tool.ruff]
-target-version = "py312"
+target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "RUF"]
-# UP040/UP047: PEP 695 `type` statement and type params require Python 3.12+; we support 3.10+.
-# The `X: TypeAlias = ...` annotation is the only type-alias form legal on 3.10/3.11.
-ignore = ["UP040", "UP047"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.10"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
@@ -64,9 +64,11 @@ warn_unused_configs = true
 [tool.maturin]
 # Features of `scp-ffi`, the package `manifest-path` below names. `extension-module`
 # forwards `pyo3/extension-module`. `vendored-openssl` forwards
-# `scp-platform/vendored-openssl`, which compiles OpenSSL from source into
-# SQLCipher, because a `pip install` of the wheel runs no linker and the wheel
-# installs onto a machine whose OpenSSL the build never saw.
+# `scp-platform/vendored-openssl`, which on a Linux or Windows target compiles
+# OpenSSL from source into SQLCipher, because a `pip install` of the wheel runs no
+# linker and the wheel installs onto a machine whose OpenSSL the build never saw.
+# On a macOS target, the universal2 wheel and a macOS install from the sdist
+# alike, it changes nothing and SQLCipher keeps CommonCrypto from the OS.
 features = ["extension-module", "vendored-openssl"]
 manifest-path = "../../crates/scp-ffi/Cargo.toml"
 module-name = "scp_sdk._scp_core"
