@@ -1992,7 +1992,7 @@ mod tests {
         // not the slower AEAD-failure path. A valid 65-byte `enc` point and a
         // dummy wrapping secret are supplied to prove the gate is reached purely
         // on length, independent of any key agreement.
-        let enc = crate::crypto::hpke::p256::test_point(0);
+        let enc = scp_crypto::p256::testing::valid_uncompressed_point(0);
         let wrapping_secret = [7u8; 32];
 
         for bad_len in [47usize, 49usize] {

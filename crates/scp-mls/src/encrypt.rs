@@ -1195,7 +1195,7 @@ mod tests {
         // ADR-057 sender-key distribution: Carol's KeyPackage must publish an
         // scp_wrapping_key leaf extension, or the fail-closed add-extraction in
         // decrypt_with_membership_changes rejects the add pre-merge (INVARIANT 3).
-        let carol_wk = crate::wrapping_extension::test_wrapping_point(0xCC);
+        let carol_wk = scp_crypto::p256::testing::valid_uncompressed_point(0xCC);
         let (carol_kp_bundle, _carol_signer, _carol_provider) =
             generate_key_package_with_wrapping_key(&carol_cred, Some(&carol_wk), &SystemClock)
                 .unwrap();
@@ -1255,7 +1255,7 @@ mod tests {
         let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
 
         let bob_cred = test_credential("bob");
-        let bob_wk = crate::wrapping_extension::test_wrapping_point(0xBB);
+        let bob_wk = scp_crypto::p256::testing::valid_uncompressed_point(0xBB);
         let (bob_kp_bundle, bob_signer, bob_provider) =
             generate_key_package_with_wrapping_key(&bob_cred, Some(&bob_wk), &SystemClock).unwrap();
         let add_bob = add_member(
@@ -1323,7 +1323,7 @@ mod tests {
         let (carol_kp_bundle, _carol_signer, _carol_provider) =
             generate_key_package_with_wrapping_key(
                 &carol_cred,
-                Some(&crate::wrapping_extension::test_wrapping_point(0xCC)),
+                Some(&scp_crypto::p256::testing::valid_uncompressed_point(0xCC)),
                 &SystemClock,
             )
             .unwrap();
@@ -1613,7 +1613,7 @@ mod tests {
         // wrapping-key check that precedes it (both are pre-merge).
         let (carol_kp_bundle, _s, _p) = generate_key_package_with_wrapping_key(
             &carol_cred,
-            Some(&crate::wrapping_extension::test_wrapping_point(0xCC)),
+            Some(&scp_crypto::p256::testing::valid_uncompressed_point(0xCC)),
             &SystemClock,
         )
         .unwrap();

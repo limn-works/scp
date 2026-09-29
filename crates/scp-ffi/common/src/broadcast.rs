@@ -83,16 +83,15 @@ impl std::error::Error for WrappingPubkeyError {}
 /// 65, and [`WrappingPubkeyError::InvalidPoint`] for a 65-byte value that is
 /// not a valid uncompressed P-256 point.
 pub fn parse_wrapping_pubkey(bytes: &[u8]) -> Result<[u8; 65], WrappingPubkeyError> {
-    if bytes.len() != WRAPPING_PUBKEY_LEN {
-        return Err(WrappingPubkeyError::InvalidLength {
-            actual: bytes.len(),
-        });
-    }
-    scp_protocol::crypto::hpke::p256::validate_uncompressed_point(bytes).map_err(|e| {
-        WrappingPubkeyError::InvalidPoint {
-            detail: e.to_string(),
+    match scp_crypto::p256::P256PublicKey::from_uncompressed(bytes) {
+        Ok(point) => Ok(point.to_uncompressed()),
+        Err(scp_crypto::p256::P256Error::InvalidUncompressedLength(actual)) => {
+            Err(WrappingPubkeyError::InvalidLength { actual })
         }
-    })
+        Err(e) => Err(WrappingPubkeyError::InvalidPoint {
+            detail: e.to_string(),
+        }),
+    }
 }
 
 /// Builds and JSON-serializes a [`SealedBroadcastKey`] from a broadcast
@@ -193,12 +192,7 @@ pub fn open_sealed_broadcast_key(
         serde_json::from_str(sealed_json).map_err(|e| OpenSealedKeyError::InvalidJson {
             detail: e.to_string(),
         })?;
-    let secret: [u8; WRAPPING_SECRET_LEN] =
-        wrapping_secret
-            .try_into()
-            .map_err(|_| OpenSealedKeyError::InvalidSecretLength {
-                actual: wrapping_secret.len(),
-            })?;
+    let secret = wrapping_secret_array(wrapping_secret)?;
     let key = open_broadcast_key(
         &sealed.ct,
         &sealed.enc,
@@ -213,6 +207,21 @@ pub fn open_sealed_broadcast_key(
     Ok(key.as_bytes().to_vec())
 }
 
+/// Copies the caller's wrapping scalar into a [`Zeroizing`](zeroize::Zeroizing) array, so the one
+/// copy this module makes is wiped when it drops.
+fn wrapping_secret_array(
+    wrapping_secret: &[u8],
+) -> Result<zeroize::Zeroizing<[u8; WRAPPING_SECRET_LEN]>, OpenSealedKeyError> {
+    let mut secret = zeroize::Zeroizing::new([0u8; WRAPPING_SECRET_LEN]);
+    if wrapping_secret.len() != WRAPPING_SECRET_LEN {
+        return Err(OpenSealedKeyError::InvalidSecretLength {
+            actual: wrapping_secret.len(),
+        });
+    }
+    secret.copy_from_slice(wrapping_secret);
+    Ok(secret)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -221,6 +230,21 @@ mod tests {
         generate_broadcast_key, seal_broadcast_key_to_subscriber,
     };
     use scp_core::crypto::sender_keys::generate_wrapping_keypair;
+
+    /// Compile-time check: the copied wrapping scalar is `Zeroizing`, so a
+    /// plain-array return type stops this module compiling.
+    #[test]
+    fn wrapping_secret_copy_is_zeroizing() {
+        fn zeroizing(x: &zeroize::Zeroizing<[u8; 32]>) -> [u8; 32] {
+            **x
+        }
+        let secret = wrapping_secret_array(&[9; 32]).unwrap();
+        assert_eq!(zeroizing(&secret), [9; 32]);
+        assert!(matches!(
+            wrapping_secret_array(&[9; 31]),
+            Err(OpenSealedKeyError::InvalidSecretLength { actual: 31 })
+        ));
+    }
 
     const CTX: &str = "ctx-broadcast-common-test";
     const AUTHOR: &str = "did:dht:z6MkBroadcastAuthorCommonTest";

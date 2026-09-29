@@ -129,6 +129,11 @@ pub fn require_scp_ciphersuite(ciphersuite: Ciphersuite) -> Result<(), MlsError>
     }
 }
 
+/// Capacity of the one buffer [`extract_p256_scalar`] encodes a signer into.
+/// The named `MessagePack` encoding of a P-256 `SignatureKeyPair` is under 300
+/// bytes, so the buffer never reallocates.
+const SIGNER_ENCODING_CAPACITY: usize = 512;
+
 /// Reads and checks the 32-byte P-256 private scalar of an MLS
 /// `SignatureKeyPair`.
 ///
@@ -154,7 +159,7 @@ pub fn require_scp_ciphersuite(ciphersuite: Ciphersuite) -> Result<(), MlsError>
 /// # Errors
 ///
 /// [`MlsError::InvalidSigner`] with the [`SignerDefect`] that failed.
-pub fn extract_p256_scalar(
+pub(crate) fn extract_p256_scalar(
     signer: &SignatureKeyPair,
 ) -> Result<zeroize::Zeroizing<[u8; 32]>, MlsError> {
     use zeroize::Zeroize as _;
@@ -176,10 +181,21 @@ pub fn extract_p256_scalar(
         }));
     }
 
-    let mut serialized = rmp_serde::to_vec_named(signer)
+    // Encode into one buffer allocated up front: a growing `Vec` frees each
+    // outgrown buffer, holding part of the scalar, without wiping it. The
+    // named encoding of a P-256 pair is under 300 bytes.
+    let mut serialized = zeroize::Zeroizing::new(Vec::with_capacity(SIGNER_ENCODING_CAPACITY));
+    rmp_serde::encode::write_named(&mut *serialized, signer)
         .map_err(|e| MlsError::InvalidSigner(SignerDefect::Unreadable(e.to_string())))?;
+    if serialized.capacity() != SIGNER_ENCODING_CAPACITY {
+        // The buffer reallocated, so an unwiped fragment may already be in
+        // freed memory; refuse rather than report a clean extraction.
+        return Err(MlsError::InvalidSigner(SignerDefect::Unreadable(format!(
+            "signer encoding outgrew its {SIGNER_ENCODING_CAPACITY}-byte buffer"
+        ))));
+    }
     let extract: Result<P256ScalarExtract, _> = rmp_serde::from_slice(&serialized);
-    serialized.zeroize();
+    drop(serialized);
     let mut extract =
         extract.map_err(|e| MlsError::InvalidSigner(SignerDefect::Unreadable(e.to_string())))?;
 
@@ -187,6 +203,20 @@ pub fn extract_p256_scalar(
     extract.private.zeroize();
     extract.public.zeroize();
     outcome
+}
+
+/// Checks that `signer` is a P-256 pair SCP can sign with.
+///
+/// The pair must use the `SCP_CIPHERSUITE` signature scheme, a 32-byte scalar
+/// in `[1, n)`, and a 65-byte public key equal to `scalar·G`. Every site
+/// outside this crate that restores or accepts a signer calls this; the scalar
+/// never leaves the crate.
+///
+/// # Errors
+///
+/// [`MlsError::InvalidSigner`] with the [`SignerDefect`] that failed.
+pub fn check_p256_signer(signer: &SignatureKeyPair) -> Result<(), MlsError> {
+    extract_p256_scalar(signer).map(drop)
 }
 
 /// The length and key-pair checks of [`extract_p256_scalar`], split out so
@@ -1504,6 +1534,39 @@ mod tests {
         );
         let valid = SignatureKeyPair::from_raw(p256, scalar.to_vec(), public);
         assert_eq!(*extract_p256_scalar(&valid)?, *scalar);
+        Ok(())
+    }
+
+    /// The named encoding of a signer `SignatureKeyPair::new` generates for
+    /// the cs2 scheme fits the one preallocated buffer, so extraction never
+    /// reallocates a buffer holding the scalar. Shrinking
+    /// `SIGNER_ENCODING_CAPACITY` below the encoding makes extraction fail.
+    #[test]
+    fn production_signer_encoding_fits_the_extraction_buffer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..16 {
+            let signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm())?;
+            assert_eq!(extract_p256_scalar(&signer)?.len(), 32);
+            let encoded = zeroize::Zeroizing::new(rmp_serde::to_vec_named(&signer)?);
+            assert!(
+                encoded.len() <= SIGNER_ENCODING_CAPACITY,
+                "encoding is {} bytes",
+                encoded.len()
+            );
+        }
+        Ok(())
+    }
+
+    /// `check_p256_signer` rejects an Ed25519 signer and accepts a P-256 one.
+    #[test]
+    fn check_p256_signer_accepts_only_p256() -> Result<(), Box<dyn std::error::Error>> {
+        let ed = SignatureKeyPair::new(SignatureScheme::ED25519)?;
+        assert!(matches!(
+            check_p256_signer(&ed),
+            Err(MlsError::InvalidSigner(SignerDefect::WrongScheme { .. }))
+        ));
+        let p256 = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm())?;
+        check_p256_signer(&p256)?;
         Ok(())
     }
 

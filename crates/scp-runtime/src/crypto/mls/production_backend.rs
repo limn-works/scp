@@ -297,10 +297,9 @@ fn signer_and_provider_from_wrapper(
 ) -> Result<(SignatureKeyPair, InMemoryMlsProvider), MlsError> {
     let signer: SignatureKeyPair = rmp_serde::from_slice(&wrapper.signer_bytes)
         .map_err(|e| MlsError::StorageError(format!("signer deserialization: {e}")))?;
-    // C19(c): the restored signer must be a P-256 pair whose public key is
-    // scalar·G before OpenMLS signs anything with it (no group is loaded
-    // yet, so the ciphersuite check runs when the Welcome is processed).
-    group::extract_p256_scalar(&signer)?;
+    // The restored signer must be a P-256 pair whose public key is scalar·G
+    // before OpenMLS signs anything with it (spec 09 §9.5).
+    group::check_p256_signer(&signer)?;
 
     let provider = new_provider();
     {
@@ -796,14 +795,6 @@ mod tests {
         restore_signer(&valid).expect("a valid P-256 pair restores");
     }
 
-    /// A valid 65-byte DHKEM(P-256) wrapping point, distinct per `tag`.
-    fn wrap_point(tag: u8) -> [u8; 65] {
-        scp_crypto::p256::P256SigningKey::from_seed(b"production-backend-test", &[tag; 32])
-            .unwrap()
-            .public_key()
-            .to_uncompressed()
-    }
-
     fn test_credential(name: &str) -> ScpCredential {
         ScpCredential::new(format!("did:dht:z6Mk{name}"), None, SigningKeyId::Active).unwrap()
     }
@@ -918,7 +909,7 @@ mod tests {
     async fn create_group_with_wrapping_key_propagates_extension() {
         let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
         let cred = test_credential("alice-wrap");
-        let wrap_pub = wrap_point(0x11);
+        let wrap_pub = scp_crypto::p256::testing::valid_uncompressed_point(0x11);
 
         let grp = backend.create_group(&cred, Some(&wrap_pub)).await.unwrap();
 
@@ -1040,7 +1031,7 @@ mod tests {
 
         let alice_cred = test_credential("alice-adv");
         let mut alice_grp = backend.create_group(&alice_cred, None).await.unwrap();
-        let wrap_pub = wrap_point(0x22);
+        let wrap_pub = scp_crypto::p256::testing::valid_uncompressed_point(0x22);
 
         let commit_bytes = backend
             .advance_epoch(&mut alice_grp, &wrap_pub)
@@ -1131,7 +1122,7 @@ mod tests {
         // subsequent `advance_epoch` call MUST agree on the wrapping
         // extension being present. We pass the same `wrap_pub` to
         // `create_group`, `generate_key_package`, and `advance_epoch`.
-        let wrap_pub = wrap_point(0x42);
+        let wrap_pub = scp_crypto::p256::testing::valid_uncompressed_point(0x42);
 
         let alice_cred = test_credential("alice-pc");
         let bob_cred = test_credential("bob-pc");
@@ -1251,7 +1242,7 @@ mod tests {
 
         // Creator side: a context group carrying the 0xFF02 extension.
         let alice_cred = test_credential("alice-ctx");
-        let alice_wrap = wrap_point(0xA1);
+        let alice_wrap = scp_crypto::p256::testing::valid_uncompressed_point(0xA1);
         let ctx_ext = sample_context_extension("ctx:prod-join");
         let mut alice_group = group::create_group_with_context(
             &alice_cred,
@@ -1264,7 +1255,7 @@ mod tests {
         // Joiner side: KP via the PRODUCTION generate_key_package path WITH a
         // wrapping key — now declares 0xFF01 + 0xFF02.
         let bob_cred = test_credential("bob-ctx");
-        let bob_wrap = wrap_point(0xB2);
+        let bob_wrap = scp_crypto::p256::testing::valid_uncompressed_point(0xB2);
         let bob_gen = backend
             .generate_key_package(&bob_cred, Some(&bob_wrap))
             .await
@@ -1320,7 +1311,7 @@ mod tests {
         let backend = joinable_backend();
 
         let alice_cred = test_credential("alice-ctx-neg");
-        let alice_wrap = wrap_point(0xA3);
+        let alice_wrap = scp_crypto::p256::testing::valid_uncompressed_point(0xA3);
         let ctx_ext = sample_context_extension("ctx:prod-neg");
         let mut alice_group = group::create_group_with_context(
             &alice_cred,

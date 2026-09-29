@@ -259,15 +259,12 @@ impl ValidatedEnc {
 /// [`HpkeError::InvalidKey`] if `enc` is not 65 bytes, is not led by `0x04`,
 /// is not on the curve, or is the point at infinity.
 pub fn validate_enc(enc: &[u8]) -> Result<ValidatedEnc, HpkeError> {
-    let bytes: [u8; ENC_LEN] = enc.try_into().map_err(|_| {
-        HpkeError::InvalidKey(format!(
-            "P-256 HPKE enc must be {ENC_LEN} bytes, got {}",
-            enc.len()
-        ))
-    })?;
-    let point = P256PublicKey::from_sec1(&bytes)
+    let point = P256PublicKey::from_uncompressed(enc)
         .map_err(|e| HpkeError::InvalidKey(format!("P-256 HPKE enc: {e}")))?;
-    Ok(ValidatedEnc { bytes, point })
+    Ok(ValidatedEnc {
+        bytes: point.to_uncompressed(),
+        point,
+    })
 }
 
 /// §9.5 point validation of any 65-byte wire key in the DHKEM(P-256) form: an
@@ -283,16 +280,6 @@ pub fn validate_enc(enc: &[u8]) -> Result<ValidatedEnc, HpkeError> {
 /// is not on the curve, or is the point at infinity.
 pub fn validate_uncompressed_point(bytes: &[u8]) -> Result<[u8; PUBLIC_KEY_LEN], HpkeError> {
     validate_enc(bytes).map(|v| *v.as_bytes())
-}
-
-/// A valid 65-byte uncompressed P-256 point, distinct per `tag`, for unit-test
-/// fixtures that need a wire key but not its scalar.
-#[cfg(test)]
-pub(crate) fn test_point(tag: u8) -> [u8; PUBLIC_KEY_LEN] {
-    let Ok(key) = P256SigningKey::from_seed(b"scp-protocol-test-point", &[tag; 32]) else {
-        unreachable!("a fixed 32-byte seed derives a valid P-256 scalar");
-    };
-    key.public_key().to_uncompressed()
 }
 
 /// HPKE open paths for P-256 recipient keys held inside a `KeyCustody`

@@ -62,6 +62,10 @@ pub enum P256Error {
     /// A SEC1 point encoding was neither 33 nor 65 bytes long.
     #[error("P-256 point encoding must be 33 or 65 bytes, got {0}")]
     InvalidPointLength(usize),
+    /// An uncompressed SEC1 point encoding (the HPKE and MLS wire key form)
+    /// was not exactly 65 bytes long.
+    #[error("P-256 uncompressed point must be 65 bytes, got {0} bytes")]
+    InvalidUncompressedLength(usize),
     /// A SEC1 point encoding carried a leading byte its length does not allow
     /// (33 bytes need `0x02`/`0x03`, 65 bytes need `0x04`).
     #[error("P-256 point encoding of {len} bytes has invalid leading byte {prefix:#04x}")]
@@ -147,6 +151,29 @@ impl P256PublicKey {
         PublicKey::from_sec1_bytes(bytes)
             .map(Self)
             .map_err(|_| P256Error::PointNotOnCurve)
+    }
+
+    /// Parses and validates a 65-byte uncompressed SEC1 point, the wire form of
+    /// every HPKE `enc` and DHKEM(P-256) public key (RFC 9180 §7.1.1) and of
+    /// every MLS leaf key (RFC 9420 §5.1.2): `0x04 ‖ x ‖ y`, on the curve, not
+    /// the point at infinity (§9.5 point validation).
+    ///
+    /// This is SCP's one parser of a peer-supplied uncompressed point; every
+    /// wire-key check calls it and maps the error into its own type.
+    ///
+    /// # Errors
+    ///
+    /// - [`P256Error::InvalidUncompressedLength`] for any length other than 65.
+    /// - [`P256Error::InvalidPointPrefix`] for a 65-byte value not led by `0x04`.
+    /// - [`P256Error::PointNotOnCurve`] when the coordinates fail the curve
+    ///   equation.
+    pub fn from_uncompressed(bytes: &[u8]) -> Result<Self, P256Error> {
+        if bytes.len() != UNCOMPRESSED_POINT_LEN {
+            return Err(P256Error::InvalidUncompressedLength(bytes.len()));
+        }
+        // At 65 bytes `from_sec1` admits only the `0x04` prefix, so the length
+        // check above is the whole difference from the general SEC1 parser.
+        Self::from_sec1(bytes)
     }
 
     /// The 33-byte SEC1 compressed form: the §9.5 signature-verification key
@@ -574,6 +601,26 @@ impl core::fmt::Debug for Hex<'_> {
     }
 }
 
+/// Test fixtures shared by every crate that needs a valid P-256 wire point.
+///
+/// Compiled only under `cfg(test)` or the `testing` feature, which only
+/// dev-dependencies enable, so no shipped build carries it.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use super::{P256SigningKey, UNCOMPRESSED_POINT_LEN};
+
+    /// A valid 65-byte uncompressed P-256 point (`0x04 ‖ x ‖ y`, on the
+    /// curve), distinct per `seed`, for fixtures that need a wire key but not
+    /// its scalar.
+    #[must_use]
+    pub fn valid_uncompressed_point(seed: u8) -> [u8; UNCOMPRESSED_POINT_LEN] {
+        let Ok(key) = P256SigningKey::from_seed(b"scp-crypto-test-point", &[seed; 32]) else {
+            unreachable!("a fixed 32-byte seed derives a valid P-256 scalar");
+        };
+        key.public_key().to_uncompressed()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -581,6 +628,68 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+
+    /// §9.5 point validation of the uncompressed wire form: one row per
+    /// rejection class, with the valid point as the positive control. The
+    /// length error names the received length.
+    #[test]
+    fn from_uncompressed_accepts_only_a_65_byte_on_curve_0x04_point() {
+        let valid = testing::valid_uncompressed_point(1);
+        let parsed = P256PublicKey::from_uncompressed(&valid).unwrap();
+        assert_eq!(parsed.to_uncompressed(), valid);
+
+        let mut compressed_prefix = valid;
+        compressed_prefix[0] = 0x02;
+        let mut off_curve = valid;
+        off_curve[64] ^= 0x01;
+        let rows: [(&str, Vec<u8>, P256Error); 5] = [
+            (
+                "64 bytes",
+                valid[..64].to_vec(),
+                P256Error::InvalidUncompressedLength(64),
+            ),
+            (
+                "66 bytes",
+                [&valid[..], &[0][..]].concat(),
+                P256Error::InvalidUncompressedLength(66),
+            ),
+            (
+                "0x02 prefix",
+                compressed_prefix.to_vec(),
+                P256Error::InvalidPointPrefix {
+                    len: 65,
+                    prefix: 0x02,
+                },
+            ),
+            ("off curve", off_curve.to_vec(), P256Error::PointNotOnCurve),
+            (
+                "all zeros",
+                vec![0u8; 65],
+                P256Error::InvalidPointPrefix {
+                    len: 65,
+                    prefix: 0x00,
+                },
+            ),
+        ];
+        for (name, bytes, expected) in rows {
+            assert_eq!(
+                P256PublicKey::from_uncompressed(&bytes),
+                Err(expected),
+                "{name}"
+            );
+        }
+        assert!(
+            P256Error::InvalidUncompressedLength(32)
+                .to_string()
+                .contains("got 32 bytes")
+        );
+        // A 33-byte compressed point is valid SEC1 but not the wire form.
+        let compressed = parsed.to_compressed();
+        assert_eq!(
+            P256PublicKey::from_uncompressed(&compressed),
+            Err(P256Error::InvalidUncompressedLength(33))
+        );
+    }
 
     fn h<const N: usize>(s: &str) -> [u8; N] {
         hex::decode(s).unwrap().try_into().unwrap()

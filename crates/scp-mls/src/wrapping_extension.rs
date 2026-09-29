@@ -209,25 +209,13 @@ pub fn find_leaf_index_by_did(
     Err(MlsError::MemberNotFound(u32::MAX))
 }
 
-/// A valid 65-byte uncompressed P-256 point, distinct per `tag`, for tests
-/// across this crate.
-#[cfg(test)]
-pub(crate) fn test_wrapping_point(tag: u8) -> [u8; P256_WRAPPING_KEY_SIZE] {
-    let Ok(key) =
-        scp_crypto::p256::P256SigningKey::from_seed(b"scp-mls-test-wrapping-key", &[tag; 32])
-    else {
-        unreachable!("a fixed 32-byte seed derives a valid P-256 scalar");
-    };
-    key.public_key().to_uncompressed()
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 mod tests {
     use super::*;
     use scp_clock::SystemClock;
 
-    use super::test_wrapping_point as point;
+    use scp_crypto::p256::testing::valid_uncompressed_point as point;
 
     fn extensions_with(payload: Vec<u8>) -> Extensions<LeafNode> {
         Extensions::<LeafNode>::single(Extension::Unknown(

@@ -1636,7 +1636,7 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
-            wrapping_pubkey: crate::crypto::hpke::p256::test_point(0),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0),
             nonce: [0u8; REQUEST_NONCE_SIZE],
             timestamp: now,
             signature: [0u8; 64],
@@ -1654,7 +1654,7 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
-            wrapping_pubkey: crate::crypto::hpke::p256::test_point(0),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0),
             nonce: [0u8; REQUEST_NONCE_SIZE],
             timestamp: now,
             signature: [0u8; 64],
@@ -1675,7 +1675,7 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
-            wrapping_pubkey: crate::crypto::hpke::p256::test_point(0),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0),
             nonce: [0u8; REQUEST_NONCE_SIZE],
             // Timestamp far ahead of "now".
             timestamp: now + REQUEST_FRESHNESS_SECS + 10_000,
@@ -2088,7 +2088,7 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             sender_did: "did:dht:alice".to_owned(),
             epoch: 7,
-            wrapping_pubkey: crate::crypto::hpke::p256::test_point(0x11),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0x11),
             nonce: [0x22; REQUEST_NONCE_SIZE],
             timestamp: 1_700_000_000,
             signature: [0x33; 64],
@@ -2110,7 +2110,7 @@ mod tests {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 3,
             hpke_sealed_key: [0x44; 48],
-            ephemeral_pubkey: crate::crypto::hpke::p256::test_point(0x55),
+            ephemeral_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0x55),
             request_nonce: [0x66; REQUEST_NONCE_SIZE],
         };
         let bytes = rmp_serde::to_vec_named(&response).unwrap();
@@ -2175,7 +2175,7 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
-            wrapping_pubkey: crate::crypto::hpke::p256::test_point(0xBB),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0xBB),
             nonce: [0xCC; REQUEST_NONCE_SIZE],
             timestamp: 1_700_000_000,
             signature: [0xDD; 64],
@@ -2199,7 +2199,7 @@ mod tests {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 2,
             hpke_sealed_key: [0xEE; 48],
-            ephemeral_pubkey: crate::crypto::hpke::p256::test_point(0xFF),
+            ephemeral_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0xFF),
             request_nonce: [0x11; REQUEST_NONCE_SIZE],
         };
         let msg = SenderKeyDistributionMessage::KeyResponse(response);
@@ -2250,7 +2250,7 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
-            wrapping_pubkey: crate::crypto::hpke::p256::test_point(0),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0),
             nonce: [0; REQUEST_NONCE_SIZE],
             timestamp: 0,
             signature: [0; 64],
@@ -2259,7 +2259,7 @@ mod tests {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
             hpke_sealed_key: [0; 48],
-            ephemeral_pubkey: crate::crypto::hpke::p256::test_point(0),
+            ephemeral_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0),
             request_nonce: [0; REQUEST_NONCE_SIZE],
         });
         let block = SenderKeyDistributionMessage::BlockNotification(BlockNotification {
@@ -2404,7 +2404,7 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             sender_did: "did:dht:alice".to_owned(),
             epoch: 7,
-            wrapping_pubkey: crate::crypto::hpke::p256::test_point(0x11),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0x11),
             nonce: [0x22; REQUEST_NONCE_SIZE],
             timestamp: 1_700_000_000,
             signature: [0x33; 64],
@@ -2429,7 +2429,7 @@ mod tests {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 3,
             hpke_sealed_key: [0x44; 48],
-            ephemeral_pubkey: crate::crypto::hpke::p256::test_point(0x55),
+            ephemeral_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0x55),
             request_nonce: [0x66; REQUEST_NONCE_SIZE],
         };
         let mut map: serde_json::Map<String, serde_json::Value> =

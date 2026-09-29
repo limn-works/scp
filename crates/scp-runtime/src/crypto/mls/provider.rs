@@ -1072,13 +1072,13 @@ impl NodeMlsFactory {
                 )
             })?;
 
-        // Restore checks, in order (C19(c); 09 §9.5): the loaded group runs
+        // Restore checks, in order (spec 09 §9.5): the loaded group runs
         // `SCP_CIPHERSUITE`, then the signer is a P-256 pair whose public key
-        // is scalar·G. SCP migrates no state from another suite (C1), so
-        // either failure fails the restore closed.
+        // is scalar·G. SCP migrates no state from another suite, so either
+        // failure fails the restore closed.
         scp_mls::require_scp_ciphersuite(mls_group.ciphersuite())
             .map_err(|e| ContextError::CryptoFailed(format!("restored group: {e}")))?;
-        scp_mls::extract_p256_scalar(&signer)
+        scp_mls::check_p256_signer(&signer)
             .map_err(|e| ContextError::CryptoFailed(format!("restored signer: {e}")))?;
 
         // Re-store the signer in the provider's key store so OpenMLS can find it.
@@ -1296,15 +1296,6 @@ mod tests {
     use tls_codec::Serialize as TlsSerializeTrait;
 
     const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
-
-    /// A fixed, valid 65-byte DHKEM(P-256) wrapping point for fixtures that
-    /// record a remote member's wrapping key.
-    fn fixed_wrapping_point() -> [u8; 65] {
-        scp_crypto::p256::P256SigningKey::from_seed(b"scp-runtime-provider-test", &[0xAA; 32])
-            .unwrap()
-            .public_key()
-            .to_uncompressed()
-    }
 
     /// Test helper: encrypt a message using the old `encrypt_message` path
     /// (sender key + MLS encrypt). Used by provider-level tests that test
@@ -1885,9 +1876,10 @@ mod tests {
             state
                 .sender_key_store
                 .set_unchecked(&ctx_id_hex, bob, generate_sender_key());
-            state
-                .member_wrapping_keys
-                .insert(bob.to_owned(), fixed_wrapping_point());
+            state.member_wrapping_keys.insert(
+                bob.to_owned(),
+                scp_crypto::p256::testing::valid_uncompressed_point(0xAA),
+            );
             state.sender_key_epoch = 42;
         }
 
@@ -2008,9 +2000,10 @@ mod tests {
             state
                 .sender_key_store
                 .set_unchecked(&ctx_id_hex, bob, generate_sender_key());
-            state
-                .member_wrapping_keys
-                .insert(bob.to_owned(), fixed_wrapping_point());
+            state.member_wrapping_keys.insert(
+                bob.to_owned(),
+                scp_crypto::p256::testing::valid_uncompressed_point(0xAA),
+            );
         }
 
         // Capture originals for comparison (bytes, so no Clone dependence).
@@ -2073,7 +2066,7 @@ mod tests {
         assert_eq!(owned_bob, Some(orig_bob_key));
         assert_eq!(
             owned.member_wrapping_keys.get(bob).copied(),
-            Some(fixed_wrapping_point())
+            Some(scp_crypto::p256::testing::valid_uncompressed_point(0xAA))
         );
         assert!(owned.pending_distributions.is_empty());
         assert_eq!(
@@ -2694,7 +2687,7 @@ mod tests {
         let provider = make_provider();
         let ctx_id = make_context_id();
         let mut snapshot = exported_snapshot(&provider, &ctx_id);
-        snapshot.wrapping_public_key = fixed_wrapping_point();
+        snapshot.wrapping_public_key = scp_crypto::p256::testing::valid_uncompressed_point(0xAA);
         let err = restore_error(&snapshot);
         assert!(err.contains("restored wrapping keypair"), "{err}");
     }

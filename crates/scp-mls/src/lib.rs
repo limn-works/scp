@@ -84,8 +84,8 @@ pub use context_extension::{
 };
 pub use group::{
     AddMemberResult, RemoveMemberResult, SCP_CIPHERSUITE, ScpMlsGroup, add_member,
-    add_member_with_convergent_timestamp, create_group, create_group_with_context,
-    create_group_with_wrapping_key, destroy_group, extract_p256_scalar, generate_key_package,
+    add_member_with_convergent_timestamp, check_p256_signer, create_group,
+    create_group_with_context, create_group_with_wrapping_key, destroy_group, generate_key_package,
     generate_key_package_with_context_params, generate_key_package_with_wrapping_key, join_group,
     key_package_in_did, key_package_in_wrapping_key, remove_member, require_scp_ciphersuite,
 };

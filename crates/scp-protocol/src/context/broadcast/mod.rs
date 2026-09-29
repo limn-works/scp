@@ -2814,7 +2814,7 @@ mod tests {
                 "ctx-gated-1",
                 "did:example:bob",
                 &bob_key,
-                crate::crypto::hpke::p256::test_point(7),
+                scp_crypto::p256::testing::valid_uncompressed_point(7),
                 2000,
                 Some(ucan.clone()),
             );
@@ -3223,7 +3223,7 @@ mod tests {
             ctx.handle_key_request(
                 "did:example:sole-author",
                 "did:example:sub1",
-                &crate::crypto::hpke::p256::test_point(0)
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
             ),
             KeyRequestDecision::Deny { .. }
         ));
@@ -3256,7 +3256,7 @@ mod tests {
             ctx.handle_key_request(
                 "did:example:alice",
                 "did:example:sub1",
-                &crate::crypto::hpke::p256::test_point(0)
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
             ),
             KeyRequestDecision::Grant { .. }
         ));
@@ -3268,7 +3268,7 @@ mod tests {
             ctx.handle_key_request(
                 "did:example:alice",
                 "did:example:sub1",
-                &crate::crypto::hpke::p256::test_point(0)
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
             ),
             KeyRequestDecision::Deny { .. }
         ));
@@ -3337,7 +3337,7 @@ mod tests {
         let alice_decision = ctx.handle_key_request(
             "did:example:alice",
             "did:example:sub1",
-            &crate::crypto::hpke::p256::test_point(0),
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
         );
         assert!(matches!(alice_decision, KeyRequestDecision::Grant { .. }));
 
@@ -3349,7 +3349,7 @@ mod tests {
         let bob_decision = ctx.handle_key_request(
             "did:example:bob",
             "did:example:sub1",
-            &crate::crypto::hpke::p256::test_point(0),
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
         );
         assert!(matches!(bob_decision, KeyRequestDecision::Deny { .. }));
 
@@ -4028,7 +4028,7 @@ mod tests {
         let decision = ctx.handle_key_request(
             "did:example:alice",
             "did:example:dave",
-            &crate::crypto::hpke::p256::test_point(0),
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
         );
         assert!(
             !matches!(decision, KeyRequestDecision::Deny { .. }),
@@ -4326,7 +4326,7 @@ mod tests {
         let decision = ctx.handle_key_request(
             "did:example:alice",
             "did:example:dave",
-            &crate::crypto::hpke::p256::test_point(0),
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
         );
         assert!(
             matches!(decision, KeyRequestDecision::Deny { .. }),
@@ -4342,7 +4342,7 @@ mod tests {
         let decision = ctx.handle_key_request(
             "did:example:alice",
             "did:example:unknown",
-            &crate::crypto::hpke::p256::test_point(0),
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
         );
         assert!(
             matches!(decision, KeyRequestDecision::Deny { .. }),
@@ -4358,7 +4358,7 @@ mod tests {
         let decision = ctx.handle_key_request(
             "did:example:unknown",
             "did:example:bob",
-            &crate::crypto::hpke::p256::test_point(0),
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
         );
         assert!(
             matches!(decision, KeyRequestDecision::Deny { .. }),
@@ -4376,7 +4376,7 @@ mod tests {
         let decision = ctx.handle_key_request(
             "did:example:alice",
             "did:example:carol",
-            &crate::crypto::hpke::p256::test_point(0),
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
         );
         assert!(
             matches!(decision, KeyRequestDecision::Grant { .. }),
@@ -4453,7 +4453,7 @@ mod tests {
                 ctx.handle_key_request(
                     "did:example:alice",
                     "did:example:evil",
-                    &crate::crypto::hpke::p256::test_point(0)
+                    &scp_crypto::p256::testing::valid_uncompressed_point(0)
                 ),
                 KeyRequestDecision::Deny { .. }
             ),
@@ -4507,7 +4507,7 @@ mod tests {
         let decision = ctx.handle_key_request(
             "did:example:alice",
             "did:example:bob",
-            &crate::crypto::hpke::p256::test_point(0),
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
         );
         match decision {
             KeyRequestDecision::Grant { epoch, .. } => {
@@ -4541,7 +4541,7 @@ mod tests {
         let decision = ctx.handle_key_request(
             "did:example:alice",
             "did:example:bob",
-            &crate::crypto::hpke::p256::test_point(0),
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
         );
         assert!(
             matches!(decision, KeyRequestDecision::Deny { .. }),
@@ -4776,7 +4776,7 @@ mod tests {
         let denied = ctx.handle_key_request(
             "did:example:alice",
             "did:example:bob",
-            &crate::crypto::hpke::p256::test_point(0),
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
         );
         assert!(matches!(denied, KeyRequestDecision::Deny { .. }));
 
@@ -4824,7 +4824,7 @@ mod tests {
         let decision = ctx.handle_key_request(
             "did:example:alice",
             "did:example:sub1",
-            &crate::crypto::hpke::p256::test_point(0),
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
         );
         assert!(matches!(decision, KeyRequestDecision::Grant { .. }));
 
@@ -4853,7 +4853,7 @@ mod tests {
             ctx.handle_key_request(
                 "did:example:alice",
                 "did:example:sub1",
-                &crate::crypto::hpke::p256::test_point(0)
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
             ),
             KeyRequestDecision::Grant { .. }
         ));
@@ -4861,7 +4861,7 @@ mod tests {
             ctx.handle_key_request(
                 "did:example:alice",
                 "did:example:sub3",
-                &crate::crypto::hpke::p256::test_point(0)
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
             ),
             KeyRequestDecision::Grant { .. }
         ));
@@ -4871,7 +4871,7 @@ mod tests {
             ctx.handle_key_request(
                 "did:example:alice",
                 "did:example:sub2",
-                &crate::crypto::hpke::p256::test_point(0)
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
             ),
             KeyRequestDecision::Deny { .. }
         ));
@@ -5662,7 +5662,7 @@ mod tests {
             ctx.handle_key_request(
                 "did:example:alice",
                 "did:example:sub1",
-                &crate::crypto::hpke::p256::test_point(0)
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
             ),
             KeyRequestDecision::Grant { .. }
         ));
@@ -5670,7 +5670,7 @@ mod tests {
             ctx.handle_key_request(
                 "did:example:bob",
                 "did:example:sub1",
-                &crate::crypto::hpke::p256::test_point(0)
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
             ),
             KeyRequestDecision::Grant { .. }
         ));
@@ -5678,7 +5678,7 @@ mod tests {
             ctx.handle_key_request(
                 "did:example:carol",
                 "did:example:sub1",
-                &crate::crypto::hpke::p256::test_point(0)
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
             ),
             KeyRequestDecision::Grant { .. }
         ));
@@ -5692,7 +5692,7 @@ mod tests {
             ctx.handle_key_request(
                 "did:example:alice",
                 "did:example:sub1",
-                &crate::crypto::hpke::p256::test_point(0)
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
             ),
             KeyRequestDecision::Deny { .. }
         ));
@@ -5700,7 +5700,7 @@ mod tests {
             ctx.handle_key_request(
                 "did:example:bob",
                 "did:example:sub1",
-                &crate::crypto::hpke::p256::test_point(0)
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
             ),
             KeyRequestDecision::Deny { .. }
         ));
@@ -5708,7 +5708,7 @@ mod tests {
             ctx.handle_key_request(
                 "did:example:carol",
                 "did:example:sub1",
-                &crate::crypto::hpke::p256::test_point(0)
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
             ),
             KeyRequestDecision::Deny { .. }
         ));
@@ -5718,7 +5718,7 @@ mod tests {
             ctx.handle_key_request(
                 "did:example:alice",
                 "did:example:sub2",
-                &crate::crypto::hpke::p256::test_point(0)
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
             ),
             KeyRequestDecision::Grant { .. }
         ));
@@ -5726,7 +5726,7 @@ mod tests {
             ctx.handle_key_request(
                 "did:example:bob",
                 "did:example:sub2",
-                &crate::crypto::hpke::p256::test_point(0)
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
             ),
             KeyRequestDecision::Grant { .. }
         ));
@@ -5734,7 +5734,7 @@ mod tests {
             ctx.handle_key_request(
                 "did:example:carol",
                 "did:example:sub2",
-                &crate::crypto::hpke::p256::test_point(0)
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
             ),
             KeyRequestDecision::Grant { .. }
         ));
@@ -5758,7 +5758,7 @@ mod tests {
             ctx.handle_key_request(
                 "did:example:alice",
                 "did:example:sub1",
-                &crate::crypto::hpke::p256::test_point(0)
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
             ),
             KeyRequestDecision::Grant { .. }
         ));
@@ -5860,7 +5860,7 @@ mod tests {
             .insert(did_str.to_owned(), verifying_key.to_bytes());
 
         // A deterministic, valid DHKEM(P-256) wrapping key for testing.
-        let wrapping_pubkey = crate::crypto::hpke::p256::test_point(seed[0]);
+        let wrapping_pubkey = scp_crypto::p256::testing::valid_uncompressed_point(seed[0]);
 
         (signing_key, wrapping_pubkey)
     }
@@ -5873,7 +5873,7 @@ mod tests {
     fn subscriber_registration_struct_has_required_fields() {
         let reg = SubscriberRegistration {
             subscriber_did: DID("did:example:test".to_owned()),
-            wrapping_pubkey: crate::crypto::hpke::p256::test_point(0).to_vec(),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0).to_vec(),
             ucan: None,
             timestamp: 1_700_000_000,
             signature: vec![0u8; 64],
@@ -5888,7 +5888,7 @@ mod tests {
     #[test]
     fn subscriber_registration_signing_input_is_deterministic() {
         let did = DID("did:example:sub".to_owned());
-        let pubkey = crate::crypto::hpke::p256::test_point(42);
+        let pubkey = scp_crypto::p256::testing::valid_uncompressed_point(42);
         let ts = 1_700_000_000u64;
 
         let input1 = SubscriberRegistration::signing_input("ctx-1", &did, &pubkey, ts);
@@ -6083,7 +6083,7 @@ mod tests {
         // uncompressed P-256 point (05 §5.14.3 `HpkeP256PublicKey`, 09 §9.5)
         // is rejected: 16 bytes, 32 bytes (X25519-sized), a compressed-form
         // prefix, and an off-curve point.
-        let good = crate::crypto::hpke::p256::test_point(1);
+        let good = scp_crypto::p256::testing::valid_uncompressed_point(1);
         let mut compressed_prefix = good;
         compressed_prefix[0] = 0x02;
         let mut off_curve = good;
@@ -6380,7 +6380,7 @@ mod tests {
     fn subscriber_registration_serde_roundtrip() {
         let reg = SubscriberRegistration {
             subscriber_did: DID("did:example:test".to_owned()),
-            wrapping_pubkey: crate::crypto::hpke::p256::test_point(42).to_vec(),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(42).to_vec(),
             ucan: None,
             timestamp: 1_700_000_000,
             signature: vec![0xAA; 64],
@@ -6399,7 +6399,7 @@ mod tests {
     fn subscriber_registration_msgpack_roundtrip() {
         let reg = SubscriberRegistration {
             subscriber_did: DID("did:example:msgpack-test".to_owned()),
-            wrapping_pubkey: crate::crypto::hpke::p256::test_point(77).to_vec(),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(77).to_vec(),
             ucan: None,
             timestamp: 1_700_000_000,
             signature: vec![0xBB; 64],

@@ -576,15 +576,6 @@ mod tests {
     use scp_protocol::crypto::access_keys::generate_access_key;
     use scp_protocol::crypto::sender_keys::NonceDedup;
 
-    /// A valid 65-byte uncompressed P-256 point, distinct per `tag`, for
-    /// fixtures that need a wire key but not its scalar.
-    fn point(tag: u8) -> [u8; hpke::PUBLIC_KEY_LEN] {
-        scp_crypto::p256::P256SigningKey::from_seed(b"scp-runtime-access-key-test", &[tag; 32])
-            .unwrap()
-            .public_key()
-            .to_uncompressed()
-    }
-
     /// A requester whose custody no longer holds the signing key fails the
     /// access-key request with the typed custody failure, so a caller sees
     /// key-not-found as `SCP-CRYPTO-4006`.
@@ -702,7 +693,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:alice".to_owned(),
             context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: point(0).to_vec(),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0).to_vec(),
             nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_700_000_000,
             signature: vec![0u8; 64],
@@ -722,7 +713,7 @@ mod tests {
             member_did: "did:dht:alice".to_owned(),
             epoch: 5,
             hpke_sealed_key: [0x11; 48],
-            ephemeral_pubkey: point(0).to_vec(),
+            ephemeral_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0).to_vec(),
         };
         let json = serde_json::to_string(&response).unwrap();
         let deserialized: AccessKeyResponse = serde_json::from_str(&json).unwrap();
@@ -736,7 +727,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:bob".to_owned(),
             context_id: "ctx-2".to_owned(),
-            wrapping_pubkey: point(42).to_vec(),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(42).to_vec(),
             nonce: [0xAA; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_700_000_000,
             signature: vec![7u8; 64],
@@ -755,7 +746,7 @@ mod tests {
             member_did: "did:dht:bob".to_owned(),
             epoch: 10,
             hpke_sealed_key: [0x55; 48],
-            ephemeral_pubkey: point(99).to_vec(),
+            ephemeral_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(99).to_vec(),
         };
         let bytes = rmp_serde::to_vec(&response).unwrap();
         let deserialized: AccessKeyResponse = rmp_serde::from_slice(&bytes).unwrap();
@@ -956,7 +947,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:alice".to_owned(),
             context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: point(0).to_vec(),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0).to_vec(),
             nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_000_000,
             signature: vec![0u8; 64],
@@ -969,7 +960,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:alice".to_owned(),
             context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: point(0).to_vec(),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0).to_vec(),
             nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_000_000,
             signature: vec![0u8; 64],
@@ -983,7 +974,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:alice".to_owned(),
             context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: point(0).to_vec(),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0).to_vec(),
             nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_000_000,
             signature: vec![0u8; 64],
@@ -998,7 +989,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:alice".to_owned(),
             context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: point(0).to_vec(),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0).to_vec(),
             nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             // Timestamp more than 30s ahead of "now".
             timestamp: 1_000_031,
@@ -1015,7 +1006,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:alice".to_owned(),
             context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: point(0).to_vec(),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0).to_vec(),
             nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_000_025,
             signature: vec![0u8; 64],
@@ -1052,7 +1043,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:bob".to_owned(),
             context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: point(0).to_vec(),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0).to_vec(),
             nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_000_000,
             signature: vec![0u8; 64],
@@ -1084,7 +1075,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:bob".to_owned(),
             context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: point(0).to_vec(),
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0).to_vec(),
             nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_000_000,
             signature: vec![0u8; 64],
@@ -1111,11 +1102,14 @@ mod tests {
         // The wrapping key is validated (§9.5: 65 bytes, `0x04`, on the curve)
         // before the request is hashed for its signature check, so each of
         // these is rejected as an invalid wrapping key, not a bad signature.
-        let mut wrong_prefix = point(3);
+        let mut wrong_prefix = scp_crypto::p256::testing::valid_uncompressed_point(3);
         wrong_prefix[0] = 0x02;
         for (case, wrapping_pubkey) in [
             ("16 bytes", vec![0u8; 16]),
-            ("32 bytes", point(3)[1..33].to_vec()),
+            (
+                "32 bytes",
+                scp_crypto::p256::testing::valid_uncompressed_point(3)[1..33].to_vec(),
+            ),
             ("0x02 prefix", wrong_prefix.to_vec()),
             (
                 "off curve",
@@ -1303,10 +1297,22 @@ mod tests {
         let nonce_a = [0xAAu8; ACCESS_KEY_NONCE_SIZE];
         let nonce_b = [0xBBu8; ACCESS_KEY_NONCE_SIZE];
 
-        let hash_a =
-            compute_request_hash("ctx-1", "did:dht:bob", 100, &point(0), &nonce_a).unwrap();
-        let hash_b =
-            compute_request_hash("ctx-1", "did:dht:bob", 100, &point(0), &nonce_b).unwrap();
+        let hash_a = compute_request_hash(
+            "ctx-1",
+            "did:dht:bob",
+            100,
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
+            &nonce_a,
+        )
+        .unwrap();
+        let hash_b = compute_request_hash(
+            "ctx-1",
+            "did:dht:bob",
+            100,
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
+            &nonce_b,
+        )
+        .unwrap();
 
         assert_ne!(hash_a, hash_b);
     }
@@ -1323,7 +1329,7 @@ mod tests {
         let context_id = "ctx-spec";
         let requester_did = "did:dht:requester";
         let timestamp = 1_700_000_000_u64;
-        let wrapping_pubkey = point(5);
+        let wrapping_pubkey = scp_crypto::p256::testing::valid_uncompressed_point(5);
         let nonce = [0x5Au8; ACCESS_KEY_NONCE_SIZE];
 
         let mut preimage = Vec::new();

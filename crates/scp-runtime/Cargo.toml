@@ -92,6 +92,8 @@ arc-swap = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]
+# The shared valid-P-256-point test fixture (`scp_crypto::p256::testing`).
+scp-crypto = { path = "../scp-crypto", features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # The discovery test modules construct `InMemoryDhtClient` (now gated behind
 # `scp-dht/testing`); activate it for this crate's own test build (ADR-062
