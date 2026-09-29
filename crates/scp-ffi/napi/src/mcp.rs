@@ -18,6 +18,7 @@
 use scp_ffi_common::error_codes as codes;
 use std::io::{BufReader, Write};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use napi_derive::napi;
@@ -151,10 +152,77 @@ pub(crate) struct McpClientEntry {
     /// in flight against a silent SSE server holds its blocking thread until
     /// the server answers or closes the connection.
     pub(crate) stdio_server: Option<Arc<Mutex<Option<std::process::Child>>>>,
+    /// Set by the entry's `Drop`. A call reads it after it takes the client's
+    /// lock, so a call queued behind an in-flight one fails once the handle
+    /// is disconnected instead of sending a request over a transport the
+    /// disconnect left open (an SSE client's connection outlives the entry).
+    closed: Arc<AtomicBool>,
+}
+
+impl McpClientEntry {
+    fn new(
+        client: McpClient<McpClientTransportWrapper>,
+        stdio_server: Option<Arc<Mutex<Option<std::process::Child>>>>,
+    ) -> Self {
+        Self {
+            client: Arc::new(tokio::sync::Mutex::new(client)),
+            stdio_server,
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+/// A client cloned out of the registry, with its entry's closed flag.
+struct LiveMcpClient {
+    client: Arc<tokio::sync::Mutex<McpClient<McpClientTransportWrapper>>>,
+    closed: Arc<AtomicBool>,
+}
+
+impl LiveMcpClient {
+    /// Clones the handle's client out of the registry, so the shard guard
+    /// drops before the call's I/O and the call holds neither the registry
+    /// nor its entry.
+    fn checkout(
+        bi: &NapiBridgeInstance,
+        handle_id: &str,
+        code: &str,
+    ) -> Result<Self, ScpNapiError> {
+        bi.mcp_client_registry()
+            .get(handle_id)
+            .map(|entry| Self {
+                client: Arc::clone(&entry.client),
+                closed: Arc::clone(&entry.closed),
+            })
+            .ok_or_else(|| ScpNapiError::Transport {
+                message: format!("MCP client handle '{handle_id}' not found"),
+                code: code.to_owned(),
+            })
+    }
+
+    /// Takes the client's lock as a future, before the call enters the
+    /// blocking pool (see `McpClientEntry::client`), and refuses the call
+    /// when the handle was disconnected while it waited.
+    async fn lock(
+        self,
+        handle_id: &str,
+        code: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<McpClient<McpClientTransportWrapper>>, ScpNapiError>
+    {
+        let guard = self.client.lock_owned().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(ScpNapiError::Transport {
+                message: format!("MCP client handle '{handle_id}' was disconnected"),
+                code: code.to_owned(),
+            });
+        }
+        Ok(guard)
+    }
 }
 
 impl Drop for McpClientEntry {
     fn drop(&mut self) {
+        // A call queued on the handle's lock fails once it gets the lock.
+        self.closed.store(true, Ordering::Release);
         // A stdio server, and every process in its process group, is dead
         // once the entry drops, even while a call on the handle is in flight;
         // that call then fails on the closed stdout.
@@ -969,10 +1037,7 @@ pub(crate) async fn mcp_client_connect_stdio_on(
     .await?;
 
     let handle_id = mcp_handle_id("mcp-client");
-    let entry = McpClientEntry {
-        client: Arc::new(tokio::sync::Mutex::new(client)),
-        stdio_server: Some(server),
-    };
+    let entry = McpClientEntry::new(client, Some(server));
 
     bi.mcp_client_registry().insert(handle_id.clone(), entry);
     crate::increment_handle_count();
@@ -1011,10 +1076,7 @@ pub(crate) async fn mcp_client_connect_sse_on(
     .await?;
 
     let handle_id = mcp_handle_id("mcp-client");
-    let entry = McpClientEntry {
-        client: Arc::new(tokio::sync::Mutex::new(client)),
-        stdio_server: None,
-    };
+    let entry = McpClientEntry::new(client, None);
 
     bi.mcp_client_registry().insert(handle_id.clone(), entry);
     crate::increment_handle_count();
@@ -1040,7 +1102,8 @@ pub(crate) async fn mcp_client_disconnect_on(
         .into());
     };
     // Dropping the entry kills a stdio server and its process group before
-    // this returns, even while a call on the handle is in flight.
+    // this returns, even while a call on the handle is in flight, and makes
+    // every call still queued on the handle's lock fail without sending.
     drop(entry);
     Ok(())
 }
@@ -1051,19 +1114,9 @@ pub(crate) async fn mcp_client_list_tools_on(
     handle: &NapiMcpClientHandle,
 ) -> napi::Result<Vec<NapiMcpToolInfo>> {
     crate::napi_check_handle!(&bi.core, handle);
-    // Clone the client out so the shard guard drops before the I/O, and the
-    // call holds neither the registry nor its entry. The client's lock is
-    // taken before the call enters the blocking pool (see
-    // `McpClientEntry::client`).
-    let client = bi
-        .mcp_client_registry()
-        .get(&handle.handle_id)
-        .map(|entry| Arc::clone(&entry.client))
-        .ok_or_else(|| ScpNapiError::Transport {
-            message: format!("MCP client handle '{}' not found", handle.handle_id),
-            code: codes::TRANS_5020.to_owned(),
-        })?;
-    let client_guard = client.lock_owned().await;
+    let client_guard = LiveMcpClient::checkout(bi, &handle.handle_id, codes::TRANS_5020)?
+        .lock(&handle.handle_id, codes::TRANS_5020)
+        .await?;
     let outlets = run_mcp_client_io(codes::TRANS_5022, move || {
         client_guard
             .list_tools()
@@ -1095,24 +1148,13 @@ pub(crate) async fn mcp_client_invoke_on(
     invoker_did: String,
 ) -> napi::Result<NapiMcpInvokeResult> {
     crate::napi_check_handle!(&bi.core, handle);
-    // Clone the client out so the shard guard drops before the I/O, and the
-    // call holds neither the registry nor its entry. The client's lock is
-    // taken before the call enters the blocking pool (see
-    // `McpClientEntry::client`).
-    let client = bi
-        .mcp_client_registry()
-        .get(&handle.handle_id)
-        .map(|entry| Arc::clone(&entry.client))
-        .ok_or_else(|| ScpNapiError::Transport {
-            message: format!("MCP client handle '{}' not found", handle.handle_id),
-            code: codes::TRANS_5023.to_owned(),
-        })?;
+    let client = LiveMcpClient::checkout(bi, &handle.handle_id, codes::TRANS_5023)?;
     let input: serde_json::Value =
         serde_json::from_str(&input_json).map_err(|e| ScpNapiError::Transport {
             message: format!("invalid input JSON: {e}"),
             code: codes::VALID_7021.to_owned(),
         })?;
-    let client_guard = client.lock_owned().await;
+    let client_guard = client.lock(&handle.handle_id, codes::TRANS_5023).await?;
     let result = run_mcp_client_io(codes::TRANS_5025, move || {
         client_guard
             .invoke(&outlet_name, input, &context_id, &invoker_did)
@@ -1417,10 +1459,7 @@ mod tests {
         let handle_id = mcp_handle_id("mcp-client");
         bi.mcp_client_registry().insert(
             handle_id.clone(),
-            McpClientEntry {
-                client: Arc::new(tokio::sync::Mutex::new(client)),
-                stdio_server: Some(Arc::clone(&server)),
-            },
+            McpClientEntry::new(client, Some(Arc::clone(&server))),
         );
         crate::increment_handle_count();
         let handle = NapiMcpClientHandle {
@@ -1504,10 +1543,7 @@ mod tests {
         let handle_id = mcp_handle_id("mcp-client");
         bi.mcp_client_registry().insert(
             handle_id.clone(),
-            McpClientEntry {
-                client: Arc::new(tokio::sync::Mutex::new(client)),
-                stdio_server: Some(Arc::clone(&server)),
-            },
+            McpClientEntry::new(client, Some(Arc::clone(&server))),
         );
         crate::increment_handle_count();
         let handle = NapiMcpClientHandle {
@@ -1567,6 +1603,88 @@ mod tests {
         assert!(
             second.is_err(),
             "the second call ran after the server was killed"
+        );
+    }
+
+    /// A call queued behind an in-flight one sends nothing once the handle is
+    /// disconnected, though the transport is still open. The entry carries no
+    /// server process, as an SSE client's does not, so the disconnect leaves
+    /// the stub server answering: the in-flight `tools/list` gets its answer,
+    /// and the stub would answer the queued one too had the queued call sent
+    /// it.
+    #[test]
+    fn a_call_queued_at_disconnect_sends_no_request_napi() {
+        let bi = NapiBridgeInstance::new_napi();
+        let mut allowlist = scp_mcp::allowlist::StdioAllowlist::new_with_defaults();
+        allowlist.configure(&["sh"]).expect("allow sh");
+        let allowlist = Mutex::new(allowlist);
+        let script = "read l; \
+            echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\
+            \"capabilities\":{},\"serverInfo\":{\"name\":\"stub\"}}}'; \
+            read l; read l; sleep 1; \
+            echo '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}'; \
+            read l; \
+            echo '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[]}}'; \
+            sleep 30 & wait";
+        let transport = StdioMcpTransport::spawn(
+            &allowlist,
+            &["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+        )
+        .expect("spawn stub server");
+        let server = transport.server_process();
+        let mut client = McpClient::new(McpClientTransportWrapper::Stdio(transport));
+        client.initialize().expect("initialize the stub server");
+        let handle_id = mcp_handle_id("mcp-client");
+        bi.mcp_client_registry()
+            .insert(handle_id.clone(), McpClientEntry::new(client, None));
+        crate::increment_handle_count();
+        let handle = NapiMcpClientHandle {
+            handle_id,
+            instance_id: bi.instance_id(),
+        };
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let short = std::time::Duration::from_millis(300);
+        let joined = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(
+                    mcp_client_list_tools_on(&bi, &handle),
+                    async {
+                        tokio::time::sleep(short).await;
+                        mcp_client_list_tools_on(&bi, &handle).await
+                    },
+                    async {
+                        tokio::time::sleep(short * 2).await;
+                        mcp_client_disconnect_on(&bi, &handle)
+                            .await
+                            .expect("disconnect a known handle");
+                    }
+                )
+            })
+            .await
+        });
+        stop_stdio_server(&server);
+        if joined.is_err() {
+            runtime.shutdown_background();
+        }
+        let (first, second, ()) = joined.expect("both calls must end");
+        if let Err(e) = &first {
+            panic!(
+                "the in-flight call must get the open transport's answer: {}",
+                e.reason
+            );
+        }
+        let Err(err) = second else {
+            panic!("the queued call sent tools/list after the disconnect");
+        };
+        assert!(
+            err.reason.contains("was disconnected"),
+            "the queued call must fail as disconnected, got: {}",
+            err.reason
         );
     }
 
@@ -1830,10 +1948,63 @@ mod tests {
     /// `tools/list` must not name a tool that `tools/call` cannot run. The
     /// NAPI `invoke_outlet` is not implemented, so the context creator,
     /// who holds the admin role, sees an empty tool list and a `tools/call`
-    /// refused at the capability check.
+    /// refused at the capability check. The context holds a registered
+    /// outlet, so the empty list comes from the capability filter, not from
+    /// an empty registry.
     #[test]
     fn napi_mcp_lists_no_tool_it_cannot_invoke() {
-        let (_bi, mut server) = napi_mcp_fixture();
+        use scp_mcp::server::ContextProvider as _;
+
+        let (bi, mut server) = napi_mcp_fixture();
+        crate::runtime::with_context(&bi, SUB_CTX, |rt| {
+            let registration = scp_core::context::outlets::OutletRegistration {
+                outlet_id: "send_message".to_owned(),
+                kind: scp_core::context::outlets::OutletKind::default(),
+                name: "Send message".to_owned(),
+                description: "Posts a message to the context".to_owned(),
+                schema: scp_core::context::outlets::OutletSchema {
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"to": {"type": "string"}, "body": {"type": "string"}},
+                        "required": ["to", "body"]
+                    }),
+                    output_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"id": {"type": "string"}, "sent_at": {"type": "number"}}
+                    }),
+                    aggregate_schema: None,
+                },
+                implementation_hash: [0xAA; 32],
+                test_vectors: vec![],
+                operator_did: AGENT_DID.into(),
+                cost: None,
+                message_catalog: Vec::new(),
+                registered_at: 0,
+                signature: Vec::new(),
+            };
+            scp_core::context::outlets::register_outlet(
+                &mut rt.outlet_registry,
+                &rt.role_state,
+                registration,
+                AGENT_DID,
+            )
+            .expect("the context creator registers an outlet");
+            Ok(())
+        })
+        .expect("SUB_CTX has UCAN state");
+        let provider = McpNapiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: AGENT_DID.to_owned(),
+            context_ids: vec![SUB_CTX.to_owned()],
+        };
+        assert_eq!(
+            provider
+                .context_tools(SUB_CTX)
+                .expect("read the outlets")
+                .len(),
+            1,
+            "the listing below must filter a registered outlet"
+        );
         let _ = initialize_and_read_subscribe_flag(&mut server);
 
         let listed = server
