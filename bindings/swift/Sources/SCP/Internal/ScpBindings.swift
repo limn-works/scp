@@ -2886,11 +2886,13 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * Routes through the module-level MCP client registry. Dropping the
      * entry stops a stdio client's server, so its process group, which holds
-     * the processes the server started, is dead when this returns, even while a call on the handle is in
-     * flight; that call then fails on the closed stdout, and a call queued
-     * behind it fails on the closed stdin without raising SIGPIPE. A disconnect does
-     * not end a call in flight on an SSE client: that call waits until the
-     * server answers its POST or closes the connection.
+     * the processes the server started, is dead when this returns, even
+     * while a call on the handle is in flight; that call then fails on the
+     * closed stdout. A call queued behind the in-flight one, on a stdio or
+     * an SSE client, fails as disconnected once it takes the client's lock
+     * and sends nothing. A disconnect does not end a call in flight on an
+     * SSE client: that call waits until the server answers its POST or
+     * closes the connection.
      */
     func mcpClientDisconnect(handle: String) async throws 
     
@@ -5924,11 +5926,13 @@ open func mcpClientConnectStdio(command: [String])async throws  -> String  {
      *
      * Routes through the module-level MCP client registry. Dropping the
      * entry stops a stdio client's server, so its process group, which holds
-     * the processes the server started, is dead when this returns, even while a call on the handle is in
-     * flight; that call then fails on the closed stdout, and a call queued
-     * behind it fails on the closed stdin without raising SIGPIPE. A disconnect does
-     * not end a call in flight on an SSE client: that call waits until the
-     * server answers its POST or closes the connection.
+     * the processes the server started, is dead when this returns, even
+     * while a call on the handle is in flight; that call then fails on the
+     * closed stdout. A call queued behind the in-flight one, on a stdio or
+     * an SSE client, fails as disconnected once it takes the client's lock
+     * and sends nothing. A disconnect does not end a call in flight on an
+     * SSE client: that call waits until the server answers its POST or
+     * closes the connection.
      */
 open func mcpClientDisconnect(handle: String)async throws   {
     return
@@ -18085,7 +18089,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_stdio() != 2953) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_disconnect() != 30036) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_disconnect() != 64476) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_invoke() != 16053) {
