@@ -589,11 +589,6 @@ mod tests {
     use scp_crypto::pseudonym::{PSEUDONYM_SCALAR_LABEL, derive_pseudonym_secret};
     use sha2::Sha256;
 
-    /// C1/C2: only an identity key derives. An operational Ed25519 key, and
-    /// a derived pseudonym key, are refused with `WrongKeyType` and mint
-    /// nothing; the operational key still signs, so the refusal is its role.
-    /// The identity key draws the same 32 RNG bytes as an Ed25519
-    /// `generate_keypair` (ADR-046), and an import is an identity.
     /// A destroy removes the pseudonyms seeded under the destroyed key's id
     /// for every key type, not only Ed25519, so a non-Ed25519 identity
     /// cannot leave a live pseudonym behind (§9.10.4.A).
@@ -640,6 +635,11 @@ mod tests {
         }
     }
 
+    /// C1/C2: only an identity key derives. An operational Ed25519 key, and
+    /// a derived pseudonym key, are refused with `WrongKeyType` and mint
+    /// nothing; the operational key still signs, so the refusal is its role.
+    /// The identity key draws the same 32 RNG bytes as an Ed25519
+    /// `generate_keypair` (ADR-046), and an import is an identity.
     #[tokio::test]
     async fn only_identity_keys_derive() {
         let custody = InMemoryKeyCustody::from_seed_bytes([7u8; 32]);

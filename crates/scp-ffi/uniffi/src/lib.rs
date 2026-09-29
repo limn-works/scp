@@ -424,7 +424,10 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// from [`Self::get_public_key`] for the key's lifetime; the bridge
     /// refuses and destroys a key whose reported role differs.
     ///
-    /// Returns an opaque key identifier string.
+    /// Returns an opaque key identifier string. A host never reuses a key
+    /// id: the id returned here, or by a pseudonym derivation, names no other
+    /// key on the host for the host's lifetime, even after that key is
+    /// destroyed.
     async fn generate_keypair(&self, key_type: String, role: String) -> Result<String, ScpError>;
 
     /// Perform Diffie-Hellman key agreement.

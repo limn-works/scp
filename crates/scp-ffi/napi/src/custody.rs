@@ -64,7 +64,9 @@ pub struct NapiKeyCustodyProvider {
     /// `"hpke-p256"`; `role` is `"identity"` (the only pseudonym-derivation
     /// source) or `"operational"`. The host records `role` and reports it from
     /// `getPublicKey` for the key's lifetime; the bridge refuses and destroys
-    /// a key whose reported role differs.
+    /// a key whose reported role differs. The host never reuses a key id: an
+    /// id it returns here, or from a pseudonym derivation, names no other key
+    /// for the host's lifetime, even after that key is destroyed.
     #[napi(
         ts_type = "(args: [string, string]) => { ok: boolean; value?: string; code?: string; message?: string }"
     )]

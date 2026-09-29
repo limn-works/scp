@@ -14975,7 +14975,10 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      * from [`Self::get_public_key`] for the key's lifetime; the bridge
      * refuses and destroys a key whose reported role differs.
      *
-     * Returns an opaque key identifier string.
+     * Returns an opaque key identifier string. A host never reuses a key
+     * id: the id returned here, or by a pseudonym derivation, names no other
+     * key on the host for the host's lifetime, even after that key is
+     * destroyed.
      */
     func generateKeypair(keyType: String, role: String) async throws  -> String
     
@@ -18679,7 +18682,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_destroy_key() != 41195) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_generate_keypair() != 43280) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_generate_keypair() != 61586) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_dh_agree() != 46704) {

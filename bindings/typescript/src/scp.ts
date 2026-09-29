@@ -521,7 +521,9 @@ export interface KeyCustodyProvider {
    * for HPKE). `role` is `"identity"` (the only source a pseudonym derives
    * from) or `"operational"`. Record `role` and report it from
    * {@link getPublicKey} for the key's lifetime; the bridge refuses and
-   * destroys a key whose reported role differs.
+   * destroys a key whose reported role differs. Never reuse a key id: an id
+   * returned here, or from {@link derivePseudonym}, names no other key for
+   * the provider's lifetime, even after that key is destroyed.
    */
   generateKeypair(keyType: string, role: string): string;
   /**

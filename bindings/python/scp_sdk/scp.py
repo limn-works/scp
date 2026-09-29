@@ -134,7 +134,9 @@ class KeyCustodyProvider(Protocol):
         ``"identity"`` (the only source a pseudonym derives from) or
         ``"operational"``. Record ``role`` and report it from
         :meth:`get_public_key` for the key's lifetime; the bridge refuses and
-        destroys a key whose reported role differs.
+        destroys a key whose reported role differs. Never reuse a key id: an
+        id returned here, or from :meth:`derive_pseudonym`, names no other key
+        for the provider's lifetime, even after that key is destroyed.
         """
         ...
 

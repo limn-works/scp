@@ -462,7 +462,9 @@ impl FfiKeyCustody {
 ///   `"hpke-p256"`, and `role` is `"identity"` (the only pseudonym-derivation
 ///   source) or `"operational"`. The host records `role` and reports it from
 ///   `get_public_key` for the key's lifetime; the bridge refuses and destroys
-///   a key whose reported role differs.
+///   a key whose reported role differs. The host never reuses a key id: an
+///   id it returns here, or from a pseudonym derivation, names no other key
+///   for the host's lifetime, even after that key is destroyed.
 /// - `sign(key_id: str, message: bytes) -> bytes` — a 64-byte Ed25519 sig;
 ///   for a `"p256"` key or a pseudonym key id, `message` is the 32-byte
 ///   digest and the result is raw `r ‖ s` or DER, which the bridge normalises

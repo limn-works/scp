@@ -20,11 +20,14 @@
 //!   `get_public_key` the same way in every entry point, and binds in the role
 //!   the host's answer states: [`KeyRole::Identity`] when the host reports
 //!   `"identity"`, [`KeyRole::Operational`] when it reports `"operational"`.
-//! - A host key minted by a `generate_keypair` future the caller dropped
-//!   before the handle was registered is queued, and the next generation
-//!   destroys it on the host first ([`sweep_orphans`]). The queue lives in
-//!   this registry, so a process that exits before its next generation
-//!   leaves the queued key on the host.
+//! - From the moment the host returns a key id until the handle is
+//!   registered or the host key destroyed, a `generate_keypair` future the
+//!   caller drops leaves that id queued, and the next generation destroys it
+//!   on the host first ([`sweep_orphans`]). The queue lives in this
+//!   registry, so a process that exits before its next generation leaves the
+//!   queued key on the host. A host never reuses a key id; a sweep still
+//!   skips a queued id that names a key the registry holds live or is
+//!   destroying.
 //! - Every host signature is verified: an Ed25519 signature strictly over the
 //!   data under the registered verifying key, a P-256 signature through
 //!   [`p256_host_signature`].
@@ -613,9 +616,32 @@ impl CallbackKeyRegistry {
             .push(key_id);
     }
 
-    /// Takes one queued orphan host key id.
+    /// Takes one queued orphan host key id to destroy.
+    ///
+    /// Under the same lock, it drops without returning any queued id that
+    /// names a `Live` or `Destroying` slot: a host that handed the id to a new
+    /// key has already freed the orphan, and destroying the id would destroy
+    /// the live key. The host contract forbids reusing a key id; this check
+    /// keeps a host that breaks it from turning a sweep into a destroy of a
+    /// key this adapter holds. It reads the registry at pop time only, so it
+    /// cannot see a registration that lands while the sweep's host destroy is
+    /// in flight.
     fn pop_orphan(&self) -> Result<Option<String>, PlatformError> {
-        Ok(self.lock()?.orphans.pop())
+        let mut slots = self.lock()?;
+        while let Some(key_id) = slots.orphans.pop() {
+            let names_held_key = key_id.parse::<u64>().is_ok_and(|id| {
+                matches!(
+                    slots.map.get(&id),
+                    Some(Slot::Live(_) | Slot::Destroying { .. })
+                )
+            });
+            if !names_held_key {
+                drop(slots);
+                return Ok(Some(key_id));
+            }
+        }
+        drop(slots);
+        Ok(None)
     }
 
     /// The host key ids queued for [`sweep_orphans`].
@@ -1005,6 +1031,9 @@ where
 /// A key the host reports as [`PlatformError::KeyNotFound`] is already gone.
 /// Each id leaves the queue only under an armed guard, so a sweep dropped
 /// mid-destroy re-queues the id it was destroying and leaves the rest queued.
+/// A queued id that names a `Live` or `Destroying` slot when it is taken is
+/// dropped without a host call (`CallbackKeyRegistry::pop_orphan`), so a host
+/// that reused the id loses no live key to the sweep.
 ///
 /// # Errors
 ///
@@ -2920,10 +2949,9 @@ mod tests {
     }
 
     /// Every generation the adapter refuses destroys the host key it was
-    /// handed: a non-numeric id, a malformed public key, a failing fetch, an
-    /// answer stating another type (F3), and (B2) an id the registry holds
-    /// live. An accepted key is not destroyed, and may take over a
-    /// destroyed id.
+    /// handed, and a destroyed key leaves no orphan queued: a non-numeric id,
+    /// a malformed public key, a failing fetch, an answer stating another
+    /// type (F3) or role (M2).
     #[tokio::test]
     async fn refused_generation_destroys_the_host_key() {
         type Case = (KeyType, &'static str, Result<HostPublicKey, PlatformError>);
@@ -2984,8 +3012,20 @@ mod tests {
             );
             assert_eq!(*destroyed.lock().unwrap(), vec![key_id.to_owned()]);
             assert!(registry.slots.lock().unwrap().map.is_empty(), "{key_id}");
+            assert!(
+                registry.orphans().is_empty(),
+                "{key_id}: destroyed, not queued"
+            );
         }
+    }
 
+    /// (B2) A generation handed an id the registry holds live is refused and
+    /// the host key destroyed, not queued; an accepted key is not destroyed,
+    /// and may take over a destroyed id.
+    #[tokio::test]
+    async fn a_live_id_is_refused_and_a_destroyed_id_is_reusable() {
+        let valid = p256(5);
+        let e = ed(6);
         let registry = CallbackKeyRegistry::new();
         let destroyed = Log::default();
         let handle = generate_with(
@@ -3011,6 +3051,7 @@ mod tests {
         .await;
         assert!(matches!(again, Err(PlatformError::CustodyError(_))));
         assert_eq!(*destroyed.lock().unwrap(), vec!["21".to_owned()]);
+        assert!(registry.orphans().is_empty(), "destroyed, not queued");
         assert_eq!(
             registry.get(&handle).unwrap().unwrap().key,
             RegisteredKey::P256Signing(valid.public_key())
@@ -3663,6 +3704,54 @@ mod tests {
         .await
         .unwrap();
         assert!(registry.orphans().is_empty());
+    }
+
+    /// A sweep never destroys a queued id that names a key the registry
+    /// holds live or is destroying: a host that reused the id for a later
+    /// key has freed the orphan, and destroying the id would destroy the
+    /// held key. A queued id naming no held slot is still destroyed.
+    #[tokio::test]
+    async fn a_sweep_spares_a_queued_id_the_host_reused() {
+        let registry = CallbackKeyRegistry::new();
+        let valid = p256(0x31);
+        for id in ["7", "8", "9", "not-a-number"] {
+            registry.queue_orphan(id.to_owned());
+        }
+        // A later generation registered reused id "7" live.
+        registry
+            .register(
+                KeyHandle::new(7),
+                RegisteredEntry::minted(
+                    RegisteredKey::P256Signing(valid.public_key()),
+                    KeyRole::Operational,
+                ),
+            )
+            .unwrap();
+        // Reused id "9" is live, and a destroy of it is in flight.
+        registry
+            .register(
+                KeyHandle::new(9),
+                RegisteredEntry::minted(
+                    RegisteredKey::P256Signing(valid.public_key()),
+                    KeyRole::Operational,
+                ),
+            )
+            .unwrap();
+        registry.begin_destroy(&KeyHandle::new(9)).unwrap();
+
+        let destroyed = Log::default();
+        let destroyed = &destroyed;
+        sweep_orphans(&registry, &|id: String| async move {
+            destroyed.lock().unwrap().push(id);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let mut swept = destroyed.lock().unwrap().clone();
+        swept.sort();
+        assert_eq!(swept, vec!["8".to_owned(), "not-a-number".to_owned()]);
+        assert!(registry.orphans().is_empty());
+        assert!(registry.is_live(&KeyHandle::new(7)));
     }
 
     /// A rejected key whose destroy fails is queued for the next sweep.
