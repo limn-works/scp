@@ -40,6 +40,7 @@
 use scp_ffi_common::error_codes as codes;
 use std::io::{BufReader, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
@@ -156,21 +157,22 @@ impl StdioClientTransport {
 
 /// Kills a stdio server's process group and reaps the server, once.
 ///
-/// The server leaves its slot under the slot's lock, so a later call (the
+/// The server leaves its slot under the slot's lock, and
+/// `stop_server_process` consumes the `Child`, so a later call (the
 /// transport's [`Drop`] after the [`McpClientState`] drop) finds the slot
-/// empty and signals nothing. A second `stop_server_process` on the same
-/// reaped `Child` would not be safe: it decides whether to signal the group
-/// from a `waitid` on the raw pid, and once the server is reaped that pid can
-/// belong to another child of this process, such as a second stdio server
-/// leading its own group. The lock is held until the server is reaped, so a
-/// disconnect returns only after the server is gone even when the drop runs
+/// empty and signals nothing. A second stop of the same reaped server would
+/// not be safe: the stop decides whether to signal the group from a `waitid`
+/// on the raw pid, and once the server is reaped that pid can belong to
+/// another child of this process, such as a second stdio server leading its
+/// own group. The lock is held until the server is reaped, so a disconnect
+/// returns only after the server is gone even when the drop runs
 /// concurrently.
 fn stop_stdio_server(slot: &Mutex<Option<Child>>) {
     let mut slot = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(child) = slot.take() {
-        scp_mcp::stdio::stop_server_process(&Mutex::new(child));
+        scp_mcp::stdio::stop_server_process(child);
     }
 }
 
@@ -1195,10 +1197,99 @@ pub(crate) struct McpClientState {
     /// which waits on a POST with no read timeout until the server answers or
     /// closes the connection.
     stdio_server: Option<Arc<Mutex<Option<Child>>>>,
+    /// Set by the state's [`Drop`]. A call reads it after it takes the
+    /// client's lock, so a call queued behind an in-flight one fails once the
+    /// handle is disconnected instead of sending a request over a transport
+    /// the disconnect left open (an SSE client's connection outlives the
+    /// state).
+    closed: Arc<AtomicBool>,
+}
+
+impl McpClientState {
+    fn new(
+        transport: &str,
+        command: Option<Vec<String>>,
+        url: Option<String>,
+        client: McpClient<ClientTransport, SystemTimestamp>,
+        stdio_server: Option<Arc<Mutex<Option<Child>>>>,
+    ) -> Self {
+        Self {
+            transport: transport.to_owned(),
+            command,
+            url,
+            client: Arc::new(Mutex::new(client)),
+            stdio_server,
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+/// A client cloned out of the registry, with its state's closed flag.
+struct LiveMcpClient {
+    client: Arc<Mutex<McpClient<ClientTransport, SystemTimestamp>>>,
+    closed: Arc<AtomicBool>,
+}
+
+impl LiveMcpClient {
+    /// Clones the handle's client out of the registry, so the shard guard
+    /// drops before the call blocks.
+    fn checkout(bi: &crate::runtime::PyBridgeInstance, handle: &str) -> Result<Self, ScpPyError> {
+        client_registry_of(bi)
+            .get(handle)
+            .map(|entry| Self {
+                client: Arc::clone(&entry.client),
+                closed: Arc::clone(&entry.closed),
+            })
+            .ok_or_else(|| ScpPyError::transport(format!("MCP client handle '{handle}' not found")))
+    }
+
+    /// Takes the client's lock, and refuses the call when the handle was
+    /// disconnected while it waited.
+    fn lock(
+        &self,
+        handle: &str,
+    ) -> Result<std::sync::MutexGuard<'_, McpClient<ClientTransport, SystemTimestamp>>, ScpPyError>
+    {
+        let guard = self
+            .client
+            .lock()
+            .map_err(|e| ScpPyError::transport(format!("client lock poisoned: {e}")))?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(ScpPyError::transport(format!(
+                "MCP client handle '{handle}' was disconnected"
+            )));
+        }
+        Ok(guard)
+    }
+}
+
+/// Registers `state` under `handle` unless the instance has shut down.
+///
+/// A connect or serve releases the GIL, so `SCP.shutdown` can clear the
+/// registries while it runs. Shutdown sets the core flag before it clears
+/// them, so the flag read after the insert catches an insert that the clear
+/// missed; the state is then removed and dropped, which kills a stdio
+/// server's process group or ends a server's transport task.
+fn register_unless_shut_down<S>(
+    bi: &crate::runtime::PyBridgeInstance,
+    registry: &DashMap<String, S>,
+    handle: String,
+    state: S,
+) -> Result<String, ScpPyError> {
+    registry.insert(handle.clone(), state);
+    if bi.core.is_shutdown() {
+        drop(registry.remove(&handle));
+        return Err(ScpPyError::transport(
+            "the SCP instance has shut down".to_owned(),
+        ));
+    }
+    Ok(handle)
 }
 
 impl Drop for McpClientState {
     fn drop(&mut self) {
+        // A call queued on the handle's lock fails once it gets the lock.
+        self.closed.store(true, Ordering::Release);
         // A stdio server, and every process in its process group, is dead
         // once the state drops, even while a call on the handle is in flight;
         // that call then fails on the closed stdout.
@@ -1305,7 +1396,8 @@ fn generate_handle_id(prefix: &str) -> String {
 ///
 /// # Errors
 ///
-/// Raises `TransportError` if the server fails to start.
+/// Raises `TransportError` if the server fails to start or the instance
+/// shuts down before the server is registered.
 ///
 /// See ADR-015: MCP server with context namespace mapping.
 #[pymethods]
@@ -1458,9 +1550,12 @@ impl crate::scp::PyScp {
             task_handle: Some(task_handle),
         };
 
-        server_registry_of(bi).insert(handle.clone(), state);
-
-        Ok(handle)
+        Ok(register_unless_shut_down(
+            bi,
+            server_registry_of(bi),
+            handle,
+            state,
+        )?)
     }
 }
 
@@ -1637,8 +1732,9 @@ impl crate::scp::PyScp {
 ///
 /// # Errors
 ///
-/// Raises `TransportError` if the subprocess fails to start or the
-/// MCP initialize handshake fails.
+/// Raises `TransportError` if the subprocess fails to start, the MCP
+/// initialize handshake fails, or the instance shuts down before the client
+/// is registered, in which case the subprocess is killed.
 #[pymethods]
 impl crate::scp::PyScp {
     #[pyo3(name = "py_mcp_client_connect_stdio")]
@@ -1675,18 +1771,13 @@ impl crate::scp::PyScp {
         })?;
 
         let handle = generate_handle_id("mcp-client");
-        let state = McpClientState {
-            transport: "stdio".to_owned(),
-            command: Some(command),
-            url: None,
-
-            client: Arc::new(Mutex::new(client)),
-            stdio_server: Some(server),
-        };
-
-        client_registry_of(bi).insert(handle.clone(), state);
-
-        Ok(handle)
+        let state = McpClientState::new("stdio", Some(command), None, client, Some(server));
+        Ok(register_unless_shut_down(
+            bi,
+            client_registry_of(bi),
+            handle,
+            state,
+        )?)
     }
 }
 
@@ -1711,7 +1802,8 @@ impl crate::scp::PyScp {
 /// # Errors
 ///
 /// Raises `TransportError` if the token is malformed, or if the connection
-/// or MCP handshake fails, including when the server refuses the token.
+/// or MCP handshake fails, including when the server refuses the token, or
+/// if the instance shuts down before the client is registered.
 #[pymethods]
 impl crate::scp::PyScp {
     #[pyo3(name = "py_mcp_client_connect_sse", signature = (url, auth_token))]
@@ -1737,18 +1829,13 @@ impl crate::scp::PyScp {
         })?;
 
         let handle = generate_handle_id("mcp-client");
-        let state = McpClientState {
-            transport: "sse".to_owned(),
-            command: None,
-            url: Some(url.to_owned()),
-
-            client: Arc::new(Mutex::new(client)),
-            stdio_server: None,
-        };
-
-        client_registry_of(bi).insert(handle.clone(), state);
-
-        Ok(handle)
+        let state = McpClientState::new("sse", None, Some(url.to_owned()), client, None);
+        Ok(register_unless_shut_down(
+            bi,
+            client_registry_of(bi),
+            handle,
+            state,
+        )?)
     }
 }
 
@@ -1761,7 +1848,9 @@ impl crate::scp::PyScp {
 /// on the closed stdout. For SSE clients, a disconnect does not end an
 /// in-flight call: the call waits on a POST with no read timeout until the
 /// server answers or closes the connection, and the transport's
-/// connections close when that last call on the handle ends.
+/// connections close when that last call on the handle ends. A call queued
+/// behind an in-flight one, on either transport, fails as disconnected once
+/// it gets the client and sends nothing.
 ///
 /// # Arguments
 ///
@@ -1816,21 +1905,14 @@ impl crate::scp::PyScp {
     pub fn py_mcp_client_list_tools(&self, py: Python<'_>, handle: &str) -> PyResult<PyObject> {
         let bi = &*self.inner;
         validate::validate_mcp_handle(handle)?;
-        let entry = client_registry_of(bi).get(handle).ok_or_else(|| {
-            ScpPyError::transport(format!("MCP client handle '{handle}' not found"))
-        })?;
-
         // Send the real tools/list request via the MCP client.
-        let client = Arc::clone(&entry.client);
-        drop(entry); // Release the DashMap guard before blocking.
+        let client = LiveMcpClient::checkout(bi, handle)?;
 
         // The GIL is released for the blocking request, so another Python
         // thread can run, including a `py_mcp_client_disconnect` that ends
         // this call against a silent stdio server.
         let outlets = py.allow_threads(|| {
-            let client_guard = client
-                .lock()
-                .map_err(|e| ScpPyError::transport(format!("client lock poisoned: {e}")))?;
+            let client_guard = client.lock(handle)?;
             client_guard
                 .list_tools()
                 .map_err(|e| ScpPyError::transport(format!("tools/list failed: {e}")))
@@ -1891,12 +1973,7 @@ impl crate::scp::PyScp {
         validate::validate_outlet_name(outlet_name)?;
         validate::validate_context_id(context_id)?;
         validate::validate_did(identity_did)?;
-        let entry = client_registry_of(bi).get(handle).ok_or_else(|| {
-            ScpPyError::transport(format!("MCP client handle '{handle}' not found"))
-        })?;
-
-        let client = Arc::clone(&entry.client);
-        drop(entry); // Release the DashMap guard before Python object access.
+        let client = LiveMcpClient::checkout(bi, handle)?;
 
         // Convert input to JSON.
         let input_json = py_dict_to_json(input)?;
@@ -1905,9 +1982,7 @@ impl crate::scp::PyScp {
         // The GIL is released for the blocking request, as in
         // `py_mcp_client_list_tools`.
         let result = py.allow_threads(|| {
-            let client_guard = client
-                .lock()
-                .map_err(|e| ScpPyError::transport(format!("client lock poisoned: {e}")))?;
+            let client_guard = client.lock(handle)?;
             client_guard
                 .invoke(outlet_name, input_json, context_id, identity_did)
                 .map_err(|e| ScpPyError::transport(format!("tools/call failed: {e}")))
@@ -4115,6 +4190,143 @@ mod tests {
         );
         stop_stdio_server(&slot);
         assert!(slot.lock().expect("slot lock").is_none());
+    }
+
+    /// A call queued behind an in-flight one sends nothing once the handle is
+    /// disconnected, though the transport is still open. The state carries no
+    /// server process, as an SSE client's does not, so the disconnect leaves
+    /// the stub server answering: the in-flight `tools/list` gets its answer,
+    /// and the stub would answer the queued one too had the queued call sent
+    /// it.
+    #[cfg(unix)]
+    #[test]
+    fn a_call_queued_at_disconnect_sends_no_request() {
+        pyo3::prepare_freethreaded_python();
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        scp.inner
+            .core
+            .mcp_allowlist()
+            .lock()
+            .expect("allowlist lock")
+            .configure(&["sh"])
+            .expect("allow sh");
+        let script = "read l; \
+            echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\
+            \"capabilities\":{},\"serverInfo\":{\"name\":\"stub\"}}}'; \
+            read l; read l; sleep 1; \
+            echo '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}'; \
+            read l; \
+            echo '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[]}}'; \
+            sleep 30 & wait";
+        let transport = StdioClientTransport::spawn(
+            scp.inner.core.mcp_allowlist(),
+            &["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+        )
+        .expect("spawn stub server");
+        let server = transport.server_process();
+        let mut client = McpClient::new(ClientTransport::Stdio(transport));
+        client.initialize().expect("initialize the stub server");
+        let handle = generate_handle_id("mcp-client");
+        client_registry_of(&scp.inner).insert(
+            handle.clone(),
+            McpClientState::new("stdio", None, None, client, None),
+        );
+
+        let call_after = |delay_ms: u64| {
+            let caller = crate::scp::PyScp {
+                inner: Arc::clone(&scp.inner),
+            };
+            let handle = handle.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                let error = Python::with_gil(|py| {
+                    caller
+                        .py_mcp_client_list_tools(py, &handle)
+                        .err()
+                        .map(|e| e.to_string())
+                });
+                let _ = tx.send(error);
+            });
+            rx
+        };
+        let first = call_after(0);
+        let second = call_after(300);
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        scp.py_mcp_client_disconnect(&handle)
+            .expect("disconnect a known handle");
+
+        let timeout = std::time::Duration::from_secs(10);
+        let first = first
+            .recv_timeout(timeout)
+            .expect("the in-flight call must end");
+        let second = second
+            .recv_timeout(timeout)
+            .expect("the queued call must end");
+        stop_stdio_server(&server);
+        assert!(
+            first.is_none(),
+            "the in-flight call must get the open transport's answer: {first:?}"
+        );
+        let error = second.expect("the queued call sent tools/list after the disconnect");
+        assert!(
+            error.contains("was disconnected"),
+            "the queued call must fail as disconnected, got: {error}"
+        );
+    }
+
+    /// A stdio connect that completes after `SCP.shutdown` cleared the client
+    /// registry registers nothing: it fails, and dropping its state kills the
+    /// server it spawned. The shutdown runs first here; the check after the
+    /// insert is the same one that catches a shutdown landing mid-handshake.
+    #[cfg(unix)]
+    #[test]
+    fn a_stdio_connect_after_shutdown_registers_nothing_and_kills_its_server() {
+        crate::init_runtime().expect("tokio runtime for SCP.shutdown");
+        pyo3::prepare_freethreaded_python();
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        scp.inner
+            .core
+            .mcp_allowlist()
+            .lock()
+            .expect("allowlist lock")
+            .configure(&["sh"])
+            .expect("allow sh");
+        let pid_file = std::env::temp_dir().join(format!(
+            "{}.pid",
+            generate_handle_id("mcp-shutdown-connect")
+        ));
+        let script = format!(
+            "echo $$ > '{}'; read l; \
+            echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\",\
+            \"capabilities\":{{}},\"serverInfo\":{{\"name\":\"stub\"}}}}}}'; \
+            sleep 600; true",
+            pid_file.display()
+        );
+        let result = Python::with_gil(|py| {
+            scp.shutdown(py, 1_000).expect("shut the instance down");
+            scp.py_mcp_client_connect_stdio(py, vec!["sh".to_owned(), "-c".to_owned(), script])
+        });
+        let pid = std::fs::read_to_string(&pid_file).expect("the stub server wrote its pid");
+        let _ = std::fs::remove_file(&pid_file);
+
+        let error = result
+            .expect_err("a connect after shutdown must fail")
+            .to_string();
+        assert!(error.contains("shut down"), "unexpected error: {error}");
+        assert!(
+            client_registry_of(&scp.inner).is_empty(),
+            "a connect after shutdown must leave the registry empty"
+        );
+        let alive = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .expect("run kill -0");
+        assert!(
+            !alive.success(),
+            "the spawned server must be killed and reaped"
+        );
     }
 
     /// WU6: Two-instance regression test — disabling enforcement via the
