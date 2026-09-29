@@ -2884,7 +2884,12 @@ public protocol ScpProtocol: AnyObject, Sendable {
     /**
      * Per-instance equivalent of the free-function `mcp_client_disconnect`.
      *
-     * Routes through the module-level MCP client registry.
+     * Routes through the module-level MCP client registry. Dropping the
+     * entry stops a stdio client's server, so its process group, which holds
+     * the processes the server started, is dead when this returns, even while a call on the handle is in
+     * flight; that call then fails on the closed stdout. A disconnect does
+     * not end a call in flight on an SSE client: that call waits until the
+     * server answers its POST or closes the connection.
      */
     func mcpClientDisconnect(handle: String) async throws 
     
@@ -5916,7 +5921,12 @@ open func mcpClientConnectStdio(command: [String])async throws  -> String  {
     /**
      * Per-instance equivalent of the free-function `mcp_client_disconnect`.
      *
-     * Routes through the module-level MCP client registry.
+     * Routes through the module-level MCP client registry. Dropping the
+     * entry stops a stdio client's server, so its process group, which holds
+     * the processes the server started, is dead when this returns, even while a call on the handle is in
+     * flight; that call then fails on the closed stdout. A disconnect does
+     * not end a call in flight on an SSE client: that call waits until the
+     * server answers its POST or closes the connection.
      */
 open func mcpClientDisconnect(handle: String)async throws   {
     return
@@ -18067,13 +18077,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_is_local_did() != 10856) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_sse() != 38639) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_sse() != 24394) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_stdio() != 2953) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_disconnect() != 63976) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_disconnect() != 44175) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_invoke() != 16053) {
