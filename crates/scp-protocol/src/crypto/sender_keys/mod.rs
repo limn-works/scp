@@ -180,9 +180,9 @@ pub enum SenderKeyError {
     #[error("HPKE decryption failed: {0}")]
     HpkeDecryptionFailed(String),
 
-    /// A key custody operation failed.
-    #[error("key custody error: {0}")]
-    KeyCustodyError(String),
+    /// Custody returned a wrapping (X25519) public key that is not 32 bytes.
+    #[error("malformed wrapping public key: {0}")]
+    MalformedWrappingPublicKey(String),
 
     /// A sender key request was replayed (duplicate nonce within the expiry window).
     #[error("replayed request: duplicate nonce detected")]

@@ -140,7 +140,7 @@ pub async fn request_sender_key(
         .map_err(|e| SenderKeyError::Custody(e.into()))?;
 
     let wrap_bytes: [u8; 32] = wrapping_pubkey.into_bytes().try_into().map_err(|_| {
-        SenderKeyError::KeyCustodyError("X25519 public key must be 32 bytes".into())
+        SenderKeyError::MalformedWrappingPublicKey("X25519 public key must be 32 bytes".into())
     })?;
     let sig_bytes: [u8; 64] = signature
         .into_bytes()
@@ -328,7 +328,7 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
 /// # Errors
 ///
 /// Returns [`SenderKeyError::Custody`] if the DH agreement or public-key
-/// lookup fails in custody, and [`SenderKeyError::KeyCustodyError`] if the
+/// lookup fails in custody, and [`SenderKeyError::MalformedWrappingPublicKey`] if the
 /// custody returns a wrapping public key that is not 32 bytes. Returns [`SenderKeyError::HpkeDecryptionFailed`]
 /// if HPKE open fails (wrong key/`info`/`aad`, tampered `enc`/`ct`) or the
 /// recovered plaintext is not exactly 32 bytes.
@@ -355,7 +355,9 @@ pub async fn open_sender_key_response(
         .await
         .map_err(|e| SenderKeyError::Custody(e.into()))?;
     let pk_rm_bytes: [u8; 32] = pk_rm.as_bytes().try_into().map_err(|_| {
-        SenderKeyError::KeyCustodyError("wrapping public key must be 32 bytes".to_owned())
+        SenderKeyError::MalformedWrappingPublicKey(
+            "wrapping public key must be 32 bytes".to_owned(),
+        )
     })?;
 
     // Build context-bound info and AAD (§9.16.2) using response fields.
@@ -515,6 +517,7 @@ mod tests {
     use scp_platform::traits::{KeyCustody, KeyType};
 
     use super::*;
+    use crate::crypto::key_loss_custody::{KeyLoss, KeyLossCustody};
     use scp_protocol::crypto::sender_keys::key_protocol_verify::{
         BLOCK_NOTIFICATION_FRESHNESS_MS, REQUEST_FRESHNESS_SECS,
     };
@@ -569,6 +572,150 @@ mod tests {
         assert!(
             matches!(&err, SenderKeyError::Custody(failure) if failure.is_key_not_found()),
             "expected SenderKeyError::Custody key-not-found, got {err:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Custody key-not-found: one test per custody call. Each asserts the
+    // typed failure every bridge reports as `SCP-CRYPTO-4006`.
+    // -------------------------------------------------------------------
+
+    fn assert_key_not_found<T: std::fmt::Debug>(result: Result<T, SenderKeyError>, step: &str) {
+        let err = result.expect_err(step);
+        assert!(
+            matches!(&err, SenderKeyError::Custody(failure) if failure.is_key_not_found()),
+            "{step}: expected SenderKeyError::Custody key-not-found, got {err:?}"
+        );
+    }
+
+    async fn request_with(
+        custody: &impl KeyCustody,
+        signing_key: &KeyHandle,
+    ) -> Result<SenderKeyRequestResult, SenderKeyError> {
+        request_sender_key(
+            custody,
+            signing_key,
+            "did:dht:bob",
+            "did:dht:alice",
+            1,
+            &scp_clock::SystemClock,
+        )
+        .await
+    }
+
+    /// A response whose `enc` is a valid X25519 public key, so `open` reaches
+    /// both custody calls. The sealed key is never opened by these tests.
+    fn response_with_valid_enc() -> SenderKeyResponse {
+        let secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        SenderKeyResponse {
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 1,
+            hpke_sealed_key: [0u8; 48],
+            ephemeral_pubkey: x25519_dalek::PublicKey::from(&secret).to_bytes(),
+            request_nonce: [0u8; REQUEST_NONCE_SIZE],
+        }
+    }
+
+    #[tokio::test]
+    async fn request_sender_key_wrapping_key_generation_is_custody_key_not_found() {
+        let custody = KeyLossCustody::new(KeyLoss::OnGenerate);
+        let signing_key = custody
+            .inner
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        assert_key_not_found(
+            request_with(&custody, &signing_key).await,
+            "wrapping key generation",
+        );
+    }
+
+    #[tokio::test]
+    async fn request_sender_key_wrapping_public_key_is_custody_key_not_found() {
+        let custody = KeyLossCustody::new(KeyLoss::AfterGenerate);
+        let signing_key = custody
+            .inner
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        assert_key_not_found(
+            request_with(&custody, &signing_key).await,
+            "wrapping public key read",
+        );
+    }
+
+    #[tokio::test]
+    async fn request_sender_key_with_a_destroyed_signing_key_is_custody_key_not_found() {
+        let (custody, signing_key) = setup().await;
+        custody.destroy_key(&signing_key).await.unwrap();
+        assert_key_not_found(
+            request_with(&custody, &signing_key).await,
+            "request signing",
+        );
+    }
+
+    #[tokio::test]
+    async fn open_sender_key_response_with_a_destroyed_wrapping_key_is_custody_key_not_found() {
+        let custody = InMemoryKeyCustody::new();
+        let wrapping_key = custody.generate_keypair(KeyType::X25519).await.unwrap();
+        custody.destroy_key(&wrapping_key).await.unwrap();
+        assert_key_not_found(
+            open_sender_key_response(&custody, &wrapping_key, "ctx-1", &response_with_valid_enc())
+                .await,
+            "DH agreement",
+        );
+    }
+
+    #[tokio::test]
+    async fn open_sender_key_response_wrapping_public_key_is_custody_key_not_found() {
+        let custody = KeyLossCustody::new(KeyLoss::AfterDhAgree);
+        let wrapping_key = custody.generate_keypair(KeyType::X25519).await.unwrap();
+        assert_key_not_found(
+            open_sender_key_response(&custody, &wrapping_key, "ctx-1", &response_with_valid_enc())
+                .await,
+            "wrapping public key read after DH agreement",
+        );
+    }
+
+    #[tokio::test]
+    async fn send_block_notification_with_a_destroyed_key_is_custody_key_not_found() {
+        let (custody, signing_key) = setup().await;
+        custody.destroy_key(&signing_key).await.unwrap();
+        assert_key_not_found(
+            send_block_notification(
+                &custody,
+                &signing_key,
+                "ctx-1",
+                "did:dht:alice",
+                "did:dht:dave",
+                SigningKeyId::Active,
+                &scp_clock::SystemClock,
+            )
+            .await,
+            "block notification signing",
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_sender_key_for_block_with_a_destroyed_key_is_custody_key_not_found() {
+        let (custody, signing_key) = setup().await;
+        custody.destroy_key(&signing_key).await.unwrap();
+        let mut block_list = HashSet::new();
+        assert_key_not_found(
+            rotate_sender_key_for_block(
+                &custody,
+                &signing_key,
+                &RotateForBlockParams {
+                    context_id: "ctx-1",
+                    sender_did: "did:dht:alice",
+                    current_epoch: 3,
+                    blocked_did: "did:dht:dave",
+                    signer_key_ref: SigningKeyId::Active,
+                },
+                &mut block_list,
+            )
+            .await,
+            "epoch advance signing during block rotation",
         );
     }
 

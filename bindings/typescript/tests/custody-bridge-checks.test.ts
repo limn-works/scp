@@ -374,7 +374,10 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
   test("the adapter retires a pseudonym before the host's destroyKey runs", async () => {
     // Observed through behaviour: a sign issued while the host's destroyKey
     // runs finds the handle retired (Destroying) and fails key-not-found
-    // (SCP-CRYPTO-4006) without reaching the host's `sign`.
+    // (SCP-CRYPTO-4006) without reaching the host's `sign`. The testing `sign`
+    // polls the adapter once on the JS thread before it returns, and that
+    // poll reads the registry, so a `sign` issued inside the host's
+    // `destroyKey` sees the registry as it stands during that host call.
     const store = new Store();
     const custody = adapter(store);
     const identity = await custody.generateKeypair();
@@ -384,18 +387,12 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
 
     let duringHostDestroy: Promise<unknown> | undefined;
     store.destroyProbe = (keyId) => {
-      // Settle the rejection into a value at once, so it is never unhandled.
+      // Settle the result into a value at once, so a rejection is never
+      // unhandled; the promise below never rejects.
       duringHostDestroy = custody.sign(keyId, DIGEST).then(
         () => undefined,
         (e: unknown) => e,
       );
-      // Hold the JS thread inside the host's destroyKey so the sign above
-      // reaches the adapter's registry (on a tokio worker) before the host
-      // call returns.
-      const until = Date.now() + 200;
-      while (Date.now() < until) {
-        // spin
-      }
     };
     await custody.destroyKey(pseudonym.keyId);
     expect(duringHostDestroy).toBeDefined();

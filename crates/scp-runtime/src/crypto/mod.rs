@@ -12,3 +12,5 @@ pub mod ucan;
 
 #[cfg(test)]
 mod agent_binding_tests;
+#[cfg(test)]
+pub(crate) mod key_loss_custody;
