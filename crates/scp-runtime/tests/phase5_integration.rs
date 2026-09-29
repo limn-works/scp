@@ -676,12 +676,14 @@ async fn platform_push_notifications() {
     assert!(!token.as_bytes().is_empty());
 
     // -- Handle notification --
+    // §10.7 forbids a context ID in a push payload, so the wake signal must
+    // not carry the one this payload holds.
     let payload = b"new-message-ctx-123";
     let wake = push
         .handle_notification(payload)
         .await
         .expect("notification handling");
-    assert_eq!(wake.payload, payload);
+    assert_eq!(wake.payload, br#"{"aps":{"content-available":1}}"#);
 }
 
 #[tokio::test]

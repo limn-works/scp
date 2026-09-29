@@ -5,7 +5,9 @@
 //! specification (ADR-006):
 //!
 //! 1. `register_returns_token` — `register()` returns a non-empty push token
-//! 2. `handle_notification_produces_event` — `handle_notification(payload)` returns a wake signal
+//! 2. `handle_notification_produces_event` — `handle_notification(payload)` returns a
+//!    non-empty wake signal that does not carry the payload bytes (§10.7 forbids
+//!    push metadata from reaching the caller)
 //!
 //! See ADR-006 in `.docs/adrs/phase-1.md` for the platform adapter design.
 
@@ -62,11 +64,19 @@ macro_rules! push_conformance {
                     .await
                     .expect("handle_notification should succeed");
 
-                // The wake signal should contain the original payload (or a
-                // processed version of it). At minimum it should be non-empty.
+                // §10.7 forbids a context ID, a sender identifier, and any
+                // other metadata in a push payload, so an adapter returns a
+                // fixed wake signal and never echoes the payload bytes.
                 assert!(
                     !wake_signal.payload.is_empty(),
                     "wake signal payload should not be empty"
+                );
+                assert!(
+                    !wake_signal
+                        .payload
+                        .windows(payload.len())
+                        .any(|window| window == payload),
+                    "wake signal carries the notification payload bytes"
                 );
             }
         }

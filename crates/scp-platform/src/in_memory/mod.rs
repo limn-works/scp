@@ -10,7 +10,8 @@
 //!   cannot present a false guarantee, it simply has no state (it fails
 //!   **closed**, not open).
 //! - [`InMemoryPush`] — an in-memory [`Push`](crate::traits::Push) backend
-//!   that mints synthetic tokens and passes payloads through as wake signals.
+//!   that mints synthetic tokens and returns one fixed wake signal that
+//!   carries no byte of the notification payload.
 //!
 //! Because they destroy no guarantee, spec §17.17 governs them as
 //! durability-only arms: they MAY be compiled into any build and selected

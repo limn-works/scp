@@ -1,22 +1,29 @@
-//! In-memory [`Push`] implementation for testing.
+//! Durability-only in-memory [`Push`] implementation (ADR-062 §0).
 //!
-//! Returns synthetic push tokens (UUIDs) and passes notification payloads
-//! through as wake signals. See ADR-006 in `.docs/adrs/phase-1.md`.
+//! Returns synthetic push tokens (UUIDs) and a fixed wake signal for every
+//! notification payload. See ADR-006 in `.docs/adrs/phase-1.md`.
 
 use uuid::Uuid;
 
 use crate::error::PlatformError;
 use crate::traits::{Push, PushToken, WakeSignal};
 
-/// In-memory implementation of [`Push`] for testing and development.
+/// Durability-only in-memory implementation of [`Push`].
 ///
-/// Produces synthetic push tokens using UUID v4 and passes notification
-/// payloads through directly as wake signals. For Phase 1 testing, push is
-/// not actively exercised (processes use direct relay subscriptions), but
-/// this adapter satisfies the trait requirements.
+/// Produces synthetic push tokens using UUID v4. `handle_notification`
+/// returns `WAKE_SIGNAL` for every payload and never the received bytes,
+/// because §10.7 of the infrastructure spec forbids a context ID, a sender
+/// identifier, and any other metadata in a push payload: a wake signal built
+/// from the received bytes would hand whatever metadata a relay put there to
+/// the caller.
 ///
 /// See ADR-006 in `.docs/adrs/phase-1.md`.
 pub struct InMemoryPush;
+
+/// The wake signal [`InMemoryPush`] returns for every notification: the UTF-8
+/// bytes of `{"aps":{"content-available":1}}`, the one push payload §10.7
+/// permits.
+const WAKE_SIGNAL: &[u8] = br#"{"aps":{"content-available":1}}"#;
 
 impl InMemoryPush {
     /// Creates a new in-memory push adapter.
@@ -45,10 +52,9 @@ impl Push for InMemoryPush {
 
     fn handle_notification(
         &self,
-        payload: &[u8],
+        _payload: &[u8],
     ) -> impl Future<Output = Result<WakeSignal, PlatformError>> + Send {
-        let payload = payload.to_vec();
-        async move { Ok(WakeSignal::new(payload)) }
+        async move { Ok(WakeSignal::new(WAKE_SIGNAL.to_vec())) }
     }
 }
 
@@ -76,18 +82,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_notification_passes_through_payload() {
+    async fn handle_notification_returns_fixed_wake_signal() {
         let push = InMemoryPush::new();
-        let payload = b"wake up, new messages";
+        let payload = br#"{"aps":{"content-available":1}}"#;
         let signal = push.handle_notification(payload).await.unwrap();
-        assert_eq!(signal.payload, payload);
+        assert_eq!(signal.payload, br#"{"aps":{"content-available":1}}"#);
+    }
+
+    #[tokio::test]
+    async fn handle_notification_drops_payload_metadata() {
+        // A payload carrying a context ID breaks §10.7; the wake signal must
+        // not carry any of it to the caller.
+        let push = InMemoryPush::new();
+        let payload = br#"{"aps":{"content-available":1},"contextId":"ctx-42"}"#;
+        let signal = push.handle_notification(payload).await.unwrap();
+        assert_eq!(signal.payload, WAKE_SIGNAL);
+        assert!(
+            !signal.payload.windows(6).any(|w| w == b"ctx-42"),
+            "wake signal carries the payload's context ID"
+        );
     }
 
     #[tokio::test]
     async fn handle_notification_empty_payload() {
         let push = InMemoryPush::new();
         let signal = push.handle_notification(b"").await.unwrap();
-        assert!(signal.payload.is_empty());
+        assert_eq!(signal.payload, WAKE_SIGNAL);
     }
 
     #[tokio::test]
@@ -95,6 +115,6 @@ mod tests {
         let push = InMemoryPush::new();
         let payload = vec![0xAB; 4096];
         let signal = push.handle_notification(&payload).await.unwrap();
-        assert_eq!(signal.payload, payload);
+        assert_eq!(signal.payload, WAKE_SIGNAL);
     }
 }
