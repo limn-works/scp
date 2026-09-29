@@ -81,8 +81,9 @@ A single multi-threaded tokio runtime (`RUNTIME`, an `OnceLock<Runtime>` in
 # features, manifest path); this crate carries none, so maturin run here builds a
 # top-level `_scp_core` without `extension-module`. That table selects
 # `vendored-openssl`, so on Linux and Windows the build compiles OpenSSL (macOS
-# uses CommonCrypto unless OPENSSL_DIR is set); bindings/python/README.md
-# §Requirements lists the tools that build needs and the variables that change it.
+# uses CommonCrypto unless OPENSSL_DIR, or both OPENSSL_LIB_DIR and
+# OPENSSL_INCLUDE_DIR, is set); bindings/python/README.md §Requirements lists
+# the tools that build needs and the variables that change it.
 (cd bindings/python && maturin develop --release)
 
 # Type-check only (no Python linkage)
