@@ -67,9 +67,11 @@ import javax.crypto.spec.GCMParameterSpec
  *
  * ## Thread safety
  *
- * SQLCipher's [SQLiteDatabase] is thread-safe for concurrent reads and serialized writes.
- * The [db] property uses lazy initialization with the default `SYNCHRONIZED` mode,
- * ensuring the database is opened exactly once.
+ * SQLCipher's [SQLiteDatabase] is safe to call from several threads. [ScpDatabaseHelper]
+ * disables write-ahead logging, so the connection pool holds one connection and reads and
+ * writes both run one at a time on it. The [db] property uses lazy initialization with the
+ * default `SYNCHRONIZED` mode, so it keeps the first successful open and every later access
+ * reuses that database.
  *
  * ## Errors
  *

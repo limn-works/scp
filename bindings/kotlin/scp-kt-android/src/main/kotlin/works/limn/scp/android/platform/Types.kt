@@ -135,11 +135,13 @@ enum class DestructionMethod {
  * SCP-specific exception with structured error codes.
  *
  * Error codes follow the pattern `SCP-{DOMAIN}-{NUMBER}`:
- * - `SCP-CRYPTO-4001`: Key not found (a software or Keystore lookup, any key type,
- *   X25519 included)
- * - `SCP-CRYPTO-4002`: X25519 key not found by [KeyCustodyProvider.dhAgree]
+ * - `SCP-CRYPTO-4001`: Key not found by any method other than [KeyCustodyProvider.dhAgree]
+ *   (a software or Keystore lookup, any key type, X25519 included)
+ * - `SCP-CRYPTO-4002`: [KeyCustodyProvider.dhAgree] found no software key under the handle: a
+ *   destroyed or unknown handle, or a Keystore Ed25519 handle
  * - `SCP-CRYPTO-4003`: Wrong key type for operation, or a [KeyCustodyProvider.dhAgree] peer
- *   public key that is not 32 bytes long
+ *   public key that is not 32 bytes long. [KeyCustodyProvider.dhAgree] raises it for a wrong
+ *   key type only when the handle names a software Ed25519 key.
  * - `SCP-CRYPTO-4004`: Key destruction failed
  * - `SCP-CRYPTO-4005`: Signing key export refused, because the key is a Keystore key
  *   (thrown only by [KeyCustodyProvider.exportSigningKeyBytes]; retrying cannot succeed)
@@ -330,7 +332,8 @@ interface KeyCustodyProvider {
      * Destroy key material associated with a handle.
      *
      * After this call, operations with the same handle in the same process throw [ScpException]
-     * with code `SCP-CRYPTO-4001`. [AndroidKeyCustody] removes a software Ed25519 key's persisted
+     * with code `SCP-CRYPTO-4001`, except [dhAgree], which throws `SCP-CRYPTO-4002`.
+     * [AndroidKeyCustody] removes a software Ed25519 key's persisted
      * seed with an asynchronous `apply()`, so a later process can restore the key when this
      * process dies before the removal reaches disk (see [DestructionAttestation.confirmed]).
      *
@@ -351,9 +354,10 @@ interface KeyCustodyProvider {
      * @param keyHandle Handle to an X25519 key.
      * @param peerPublic 32-byte X25519 public key of the peer.
      * @return 32-byte X25519 shared secret.
-     * @throws ScpException with code `SCP-CRYPTO-4002` if X25519 key not found.
+     * @throws ScpException with code `SCP-CRYPTO-4002` if no software key sits under
+     *   [keyHandle]: a destroyed or unknown handle, or a Keystore Ed25519 handle.
      * @throws ScpException with code `SCP-CRYPTO-4003` if [peerPublic] is not 32 bytes long or
-     *   [keyHandle] names an Ed25519 key.
+     *   [keyHandle] names a software Ed25519 key.
      */
     fun dhAgree(keyHandle: KeyHandle, peerPublic: ByteArray): ByteArray
 

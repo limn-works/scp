@@ -23,8 +23,8 @@
 //!   [`CustodyType::Software`] is reported.
 //!
 //! - **X25519 (all API levels):** Always software-managed via Bouncy Castle.
-//!   Android Keystore does not support X25519. [`CustodyType::Software`] is
-//!   reported.
+//!   The adapter does not use the X25519 key agreement Android Keystore offers
+//!   from API 33. [`CustodyType::Software`] is reported.
 //!
 //! ADR-027, as amended on 2026-09-10, requires a different scheme: an EC
 //! P-256 signing key in Keystore at every supported API level, and P-256 key
