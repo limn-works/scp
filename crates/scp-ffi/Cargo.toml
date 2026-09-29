@@ -20,9 +20,11 @@ default = ["server"]
 # cargo test runs WITHOUT it, so auto-initialize can embed Python.
 extension-module = ["pyo3/extension-module"]
 # On a non-Apple target, compile OpenSSL from source into SQLCipher instead of
-# linking the build host's libcrypto; on an Apple target SQLCipher keeps
-# CommonCrypto and this feature changes nothing. The PyPI wheel selects this
-# feature through `[tool.maturin] features` in `bindings/python/pyproject.toml`.
+# linking the build host's libcrypto; on an Apple target this feature changes
+# nothing, and SQLCipher uses CommonCrypto unless OPENSSL_DIR (or both
+# OPENSSL_LIB_DIR and OPENSSL_INCLUDE_DIR) is set in the build environment. The
+# PyPI wheel selects this feature through `[tool.maturin] features` in
+# `bindings/python/pyproject.toml`.
 # The `vendored-openssl` comment in `crates/scp-platform/Cargo.toml` says how the
 # Apple exclusion works and why the relay and node binaries leave it off.
 vendored-openssl = ["scp-platform/vendored-openssl"]

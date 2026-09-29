@@ -66,7 +66,12 @@ mcp = []  # MCP server dependencies (if any beyond stdlib)
 [tool.maturin]
 python-source = "."
 module-name = "scp_sdk._scp_core"
-features = ["pyo3/extension-module"]
+# Features of `scp-ffi`, the package `manifest-path` names. `extension-module`
+# forwards `pyo3/extension-module`; `vendored-openssl` compiles OpenSSL into the
+# Linux and Windows wheels' SQLCipher (the comment on this table in
+# `bindings/python/pyproject.toml` says why and what a macOS build uses).
+features = ["extension-module", "vendored-openssl"]
+manifest-path = "../../crates/scp-ffi/Cargo.toml"
 
 [tool.ruff]
 target-version = "py310"

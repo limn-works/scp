@@ -165,8 +165,9 @@ cd "$REPO_ROOT"
 #     `["libsqlite3-sys?/bundled-sqlcipher-vendored-openssl"]`, on an edge the
 #     crate declares for non-Apple targets only. For a Linux or Windows target it
 #     compiles the same SQLCipher against an OpenSSL this build produces instead
-#     of the host's libcrypto; for an Apple target it activates nothing and
-#     SQLCipher keeps CommonCrypto; and it activates nothing when `sqlite` is off.
+#     of the host's libcrypto; for an Apple target it activates nothing, so
+#     SQLCipher stays on CommonCrypto unless OPENSSL_DIR (or OPENSSL_LIB_DIR plus
+#     OPENSSL_INCLUDE_DIR) is set; and it activates nothing when `sqlite` is off.
 #   - `scp-client-wasm/default` — an EMPTY feature list. Cargo reports `default`
 #     as enabled on that default member and it activates nothing.
 # The `scp-ffi|--features extension-module,vendored-openssl` ARTIFACTS entry, the
@@ -275,9 +276,9 @@ EOF
 # `libsqlite3-sys/bundled-sqlcipher-vendored-openssl`. Neither nullifies a
 # security property: the first selects a Python linkage, and the second compiles
 # the same SQLCipher against an OpenSSL this build produced instead of the host's
-# libcrypto on Linux and Windows, and leaves CommonCrypto in place on an Apple
-# target. The `scp-ffi|--features extension-module,vendored-openssl` entry
-# below is the wheel's configuration.
+# libcrypto on Linux and Windows, and activates nothing on an Apple target. The
+# `scp-ffi|--features extension-module,vendored-openssl` entry below is the
+# wheel's configuration.
 #
 # uniffi-bindgen (the third workspace `[[bin]]`, in `crates/scp-ffi/uniffi`) is
 # deliberately NOT a separate ARTIFACTS entry: it is a build-time code-generation

@@ -68,7 +68,11 @@ warn_unused_configs = true
 # OpenSSL from source into SQLCipher, because a `pip install` of the wheel runs no
 # linker and the wheel installs onto a machine whose OpenSSL the build never saw.
 # On a macOS target, the universal2 wheel and a macOS install from the sdist
-# alike, it changes nothing and SQLCipher keeps CommonCrypto from the OS.
+# alike, it changes nothing: SQLCipher uses CommonCrypto from the OS unless the
+# build environment sets OPENSSL_DIR (or both OPENSSL_LIB_DIR and
+# OPENSSL_INCLUDE_DIR), in which case libsqlite3-sys links that OpenSSL's
+# libcrypto dynamically. On Linux and Windows, OPENSSL_NO_VENDOR set to anything
+# but `0` makes openssl-sys skip the source build and link the host's OpenSSL.
 features = ["extension-module", "vendored-openssl"]
 manifest-path = "../../crates/scp-ffi/Cargo.toml"
 module-name = "scp_sdk._scp_core"
