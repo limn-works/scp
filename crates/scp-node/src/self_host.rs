@@ -881,9 +881,12 @@ pub struct HostSiteReady {
 ///
 /// See the example at `crates/scp-node/examples/website.rs` and the guide
 /// `.docs/guides/self-hosting-a-website-on-scp.md`. Until a production
-/// `PreRotationCustody` backend exists, the example exits 1 with
-/// `IdentityError::NoPreRotationBackend` on every build without the `testing`
-/// feature, and a `testing` build runs it only through the test-harness
+/// `PreRotationCustody` backend exists, [`host_site`] and [`host_site_until`]
+/// fail on every build without the `testing` feature whenever the resolved
+/// `storage_path` directory holds no persisted identity, a first deployment
+/// included: they return [`HostSiteError::NodeBuild`] wrapping
+/// `IdentityError::NoPreRotationBackend`, and the example exits 1 with it. A
+/// `testing` build creates the identity only through the test-harness
 /// `InMemoryPreRotationCustody` stand-in.
 pub struct HostSiteConfig {
     // --- Required (irreducible; no whole-struct Default — M4) ---
@@ -1178,9 +1181,11 @@ fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool
 /// public-hosting distinction), the example at
 /// `crates/scp-node/examples/website.rs`, and the guide
 /// `.docs/guides/self-hosting-a-website-on-scp.md`. Until a production
-/// `PreRotationCustody` backend exists, the example exits 1 with
-/// `IdentityError::NoPreRotationBackend` on every build without the `testing`
-/// feature, and a `testing` build runs it only through the test-harness
+/// `PreRotationCustody` backend exists, this function fails on every build
+/// without the `testing` feature whenever the resolved `storage_path`
+/// directory holds no persisted identity, a first deployment included (see
+/// `# Errors`), and the example exits 1 with that error. A `testing` build
+/// creates the identity only through the test-harness
 /// `InMemoryPreRotationCustody` stand-in.
 ///
 /// The default [`DhtMode::Disabled`] publishes nothing to the network (fail-safe).
@@ -1200,6 +1205,12 @@ fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool
 /// path/key resolution,
 /// storage/custody/blob open, DID method construction, node build, asset load,
 /// TLS config, deploy, or serve. Returns `Ok(())` on clean shutdown.
+///
+/// On every build without the `testing` feature, returns
+/// [`HostSiteError::NodeBuild`] wrapping `IdentityError::NoPreRotationBackend`
+/// whenever the resolved `storage_path` directory holds no persisted
+/// identity, because no production `PreRotationCustody` backend exists to
+/// create one.
 pub async fn host_site(config: HostSiteConfig) -> Result<(), HostSiteError> {
     host_site_until(config, async {
         scp_transport::startup::shutdown_signal().await;
