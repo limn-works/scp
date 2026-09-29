@@ -175,8 +175,8 @@ pub fn read_line_bounded<R: std::io::BufRead>(
 
 /// Kills a stdio MCP server's process group and reaps the server process.
 ///
-/// Each bridge's stdio client keeps the server's [`std::process::Child`]
-/// behind its own mutex, apart from the pipes an in-flight call holds, so a
+/// Each bridge's stdio client keeps the server's [`std::process::Child`] in
+/// its own slot, apart from the pipes an in-flight call holds, so a
 /// disconnect stops the server at once instead of when the in-flight call
 /// releases the client. Each bridge spawns the server as the leader of its
 /// own process group, and a launcher such as `npx` or `uvx` runs the real
@@ -184,23 +184,23 @@ pub fn read_line_bounded<R: std::io::BufRead>(
 /// (not OpenBSD or Redox, which lack `waitid`) the whole group gets
 /// `SIGKILL`, which closes every holder of that stdout, and the in-flight
 /// [`read_response`] then fails on EOF. The group is signalled only while a
-/// `waitid` peek finds an unreaped child under the leader's pid. Call it at
-/// most once per `Child`: once a call has reaped the leader, the pid is free,
-/// a later child of this process can take it and lead its own group, and a
-/// second call's peek would find that child and kill its whole group. A
-/// caller that can reach the stop twice (a disconnect, then the transport's
-/// drop) keeps the `Child` in an `Option` slot and takes it out under the
-/// slot's lock, so the second path finds nothing to stop. Elsewhere only the
-/// direct child is killed, and a process it started keeps the pipe open. A
-/// poisoned lock still yields the child, because a leaked server outlives
-/// every caller.
-pub fn stop_server_process(child: &std::sync::Mutex<std::process::Child>) {
-    let mut child = child
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+/// `waitid` peek finds an unreaped child under the leader's pid, so the stop
+/// must run at most once per `Child`: once a call has reaped the leader, the
+/// pid is free, a later child of this process can take it and lead its own
+/// group, and a second call's peek would find that child and kill its whole
+/// group. The function takes the `Child` by value, so a second call on the
+/// same `Child` is a use-after-move compile error. Elsewhere only the direct
+/// child is killed, and a process it started keeps the pipe open.
+///
+/// ```compile_fail,E0382
+/// let child = std::process::Command::new("true").spawn().expect("spawn");
+/// scp_mcp::stdio::stop_server_process(child);
+/// scp_mcp::stdio::stop_server_process(child);
+/// ```
+pub fn stop_server_process(mut child: std::process::Child) {
     // A `NOWAIT` peek reports the unreaped leader without reaping it. It
     // cannot tell a reaped leader from a later child reusing its pid, which
-    // is why this function runs at most once per `Child`.
+    // is why this function consumes the `Child`.
     #[cfg(all(unix, not(any(target_os = "openbsd", target_os = "redox"))))]
     {
         use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
@@ -1088,9 +1088,7 @@ mod tests {
             let mut sink = Vec::new();
             let _ = tx.send(std::io::Read::read_to_end(&mut stdout, &mut sink).map(|_| ()));
         });
-        let child = std::sync::Mutex::new(child);
-
-        stop_server_process(&child);
+        stop_server_process(child);
         rx.recv_timeout(std::time::Duration::from_secs(10))
             .expect("the group kill must close every holder of the stdout pipe")
             .expect("read to EOF");
