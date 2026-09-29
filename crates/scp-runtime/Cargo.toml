@@ -239,8 +239,9 @@ name = "identity"
 # `testing` feature. Inside this workspace the declaration never refuses a build:
 # the `scp-testing` dev-dependency turns on `scp-runtime/testing`, and cargo unifies
 # that into every dev target, so `cargo run -p scp-runtime --example identity`
-# compiles and runs. Only a build of the published crate, which strips
-# dev-dependencies, reports the missing feature instead of unresolved imports.
+# compiles and runs. Only a build of the published crate, which strips path-only
+# dev-dependencies such as `scp-testing`, reports the missing feature instead of
+# unresolved imports.
 # `check-examples-compile.sh` names each target, so the declaration removes no
 # target from that gate.
 required-features = ["testing"]

@@ -42,10 +42,12 @@ of them reopens a bypass this repository has already measured:
    A body under `#[cfg(feature = "testing")] fn main()`, beside an empty
    `#[cfg(not(feature = "testing"))] fn main() {}`, compiles to nothing on the feature set
    the lint call builds, and the target still counts as checked (row 9a). The script reads
-   each target's source and every `.rs` file under the package's `examples/`, after
-   blanking string literals and comments, with block comments nested as rustc nests them.
-   It fails on a `cfg(` or `cfg!(` predicate that names anything but `not`, `any`, `all`,
-   `unix`, `windows` and the `target_*` keys, or that is false on the host running the
+   each target's source and every `.rs` file under the package's `examples/`, following
+   symbolic links as rustc follows them when it resolves `mod`, after blanking string
+   literals and comments, with block comments nested as rustc nests them. It fails on a
+   `cfg(` or `cfg!(` predicate that names anything but `not`, `any`, `all`, `unix`,
+   `windows`, `target_os`, `target_family`, `target_arch`, `target_pointer_width`,
+   `target_endian`, `target_env` and `target_vendor`, or that is false on the host running the
    gate (row 9b), and on `cfg_attr`, `#[path]`, `include` and `macro_rules`, and on a block
    comment or string literal it cannot close.
 
@@ -158,8 +160,8 @@ target, so a `required-features` declaration no longer removes one from the coun
 
 A later round restored the declaration on different ground. The revert measured the
 build inside the workspace, where the dev-dependency back-edge turns `testing` on. A
-consumer of the published crate has no dev-dependencies, so on default features the file
-fails with unresolved imports, and the declaration makes cargo name the missing
+consumer of the published crate has none of its path-only dev-dependencies, `scp-testing`
+among them, so on default features the file fails with unresolved imports, and the declaration makes cargo name the missing
 feature instead. All four of `scp-runtime`'s examples now carry it, and the gate still
 compiles each of them.
 

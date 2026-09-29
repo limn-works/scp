@@ -64,10 +64,13 @@
 # `#[cfg(feature = "testing")] fn main() { ... }`, next to an empty
 # `#[cfg(not(feature = "testing"))] fn main() {}`, compiles to nothing on the feature set
 # the loop builds, and a compile alone counts it as checked. So the scan reads each target's
-# source file and every `.rs` file under the package's `examples/`, published or not, and
-# fails on any of these:
-#   - A `cfg(` or `cfg!(` predicate that names anything but a platform key (`unix`,
-#     `windows`, `target_*`) under `not`, `any` or `all`, or that is false on the host
+# source file and every `.rs` file under the package's `examples/`, published or not, with
+# symbolic links followed as rustc follows them when it resolves `mod`, and fails on any of
+# these:
+#   - A `cfg(` or `cfg!(` predicate that names anything but one of nine platform keys
+#     (`unix`, `windows`, `target_os`, `target_family`, `target_arch`,
+#     `target_pointer_width`, `target_endian`, `target_env`, `target_vendor`) under `not`,
+#     `any` or `all`, or that is false on the host
 #     running this gate, as `rustc --print cfg` reports it. A false platform predicate
 #     removes code as a feature key does: `#[cfg(not(unix))]` on the Linux CI runner.
 #     An empty `any()` or `all()` fails too.
@@ -225,10 +228,11 @@ EOF
   fi
 
   # Every .rs file on disk under examples/, published or not, helper modules included.
+  # -L follows a symlinked file or directory, as rustc does when it resolves `mod`.
   if [ -d "$pkgdir/examples" ]; then
     while IFS= read -r file; do
       cfg_scan "$file" "$pkg '${file#"$pkgdir"/}'"
-    done < <(find "$pkgdir/examples" -type f -name '*.rs' | sort)
+    done < <(find -L "$pkgdir/examples" -type f -name '*.rs' | sort)
   fi
 
   [ -n "$TGT_TSV" ] || continue

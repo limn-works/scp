@@ -26,8 +26,9 @@
 # `macrorules`, which expect exit 1: each fixture compiles on default features. Accepting a
 # platform predicate false on the host makes the gate exit 0 on `falsecfg`, accepting an
 # empty `any()` does the same on `emptyany`, ending a block comment at its first `*/` does
-# the same on `nestedcomment`, and dropping the `include`, `#[path]` or `macro_rules` rule
-# does the same on `include`, `pathmod` or `macrorules`. Scanning string literals or
+# the same on `nestedcomment`, dropping the `include`, `#[path]` or `macro_rules` rule
+# does the same on `include`, `pathmod` or `macrorules`, and listing `examples/` without
+# following symbolic links does the same on `symlinkmod` and `symlinkdir`. Scanning string literals or
 # comments, rejecting a platform predicate true on the host, or rejecting `include_str!`
 # makes the gate exit 1 on `platformcfg`, which expects exit 0.
 set -euo pipefail
@@ -164,6 +165,24 @@ ws="$(new_ws cfghelper)"
 mkdir -p "$ws/demo/examples/support"
 printf '#[cfg_attr(test, allow(dead_code))]\npub fn h() {}\n' > "$ws/demo/examples/support/mod.rs"
 expect "helper module under examples/ with a cfg_attr predicate" "$ws" 1 "FAIL: demo 'examples/support/mod.rs' holds a construct that can remove code"
+
+# A helper module reached through a symbolic link: rustc follows the link when it resolves
+# `mod support;`, so the scan must too, whether the link is the file or its directory.
+ws="$(new_ws symlinkmod $'[features]\ntesting = []')"
+printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+printf '#[cfg(feature = "testing")]\npub fn run() { demo::t(); }\n#[cfg(not(feature = "testing"))]\npub fn run() {}\n' > "$ws/demo/src/body.rs"
+mkdir -p "$ws/demo/examples/support"
+ln -s ../../src/body.rs "$ws/demo/examples/support/mod.rs"
+printf 'mod support;\nfn main() { support::run(); }\n' > "$ws/demo/examples/good.rs"
+expect "helper module that is a symbolic link" "$ws" 1 "FAIL: demo 'examples/support/mod.rs' holds a construct that can remove code"
+
+ws="$(new_ws symlinkdir $'[features]\ntesting = []')"
+printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+mkdir -p "$ws/demo/support"
+printf '#[cfg(feature = "testing")]\npub fn run() { demo::t(); }\n#[cfg(not(feature = "testing"))]\npub fn run() {}\n' > "$ws/demo/support/mod.rs"
+ln -s ../support "$ws/demo/examples/support"
+printf 'mod support;\nfn main() { support::run(); }\n' > "$ws/demo/examples/good.rs"
+expect "helper module under a symbolically linked directory" "$ws" 1 "FAIL: demo 'examples/support/mod.rs' holds a construct that can remove code"
 
 # The same dodge on a platform key: the body sits under a predicate false on every host
 # this suite runs on (it needs a unix host, as the gate does).
