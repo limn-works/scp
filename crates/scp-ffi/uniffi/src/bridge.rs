@@ -4748,6 +4748,32 @@ fn mcp_server_registry(
     bi.mcp_server_registry().as_ref()
 }
 
+/// Registers `entry` under `handle` unless the instance has shut down.
+///
+/// `shutdown` can clear the registries on another thread while a connect
+/// awaits its handshake or a create spawns its server task, before either
+/// inserts its entry. Shutdown sets the core flag before it clears
+/// them, so the flag read after the insert catches an insert that the clear
+/// missed; the entry is then removed and dropped, which kills a stdio
+/// server's process group or drops a server's shutdown sender.
+fn register_mcp_unless_shut_down<E>(
+    bi: &crate::runtime::UniffiBridgeInstance,
+    registry: &dashmap::DashMap<String, E>,
+    handle: String,
+    entry: E,
+) -> Result<String, ScpError> {
+    registry.insert(handle.clone(), entry);
+    if bi.core.is_shutdown() {
+        drop(registry.remove(&handle));
+        return Err(ScpError::Transport {
+            msg: "the SCP instance has shut down".to_owned(),
+            code: codes::TRANS_5001.to_owned(),
+        });
+    }
+    increment_handle_count();
+    Ok(handle)
+}
+
 /// Returns a reference to this `UniffiBridgeInstance`'s MCP client registry.
 fn mcp_client_registry(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
@@ -16686,18 +16712,16 @@ impl Scp {
             }
         });
 
-        let handle_id = mcp_handle_id("mcp-server");
-        mcp_server_registry(&self.inner).insert(
-            handle_id.clone(),
+        register_mcp_unless_shut_down(
+            &self.inner,
+            mcp_server_registry(&self.inner),
+            mcp_handle_id("mcp-server"),
             McpServerEntry {
                 shutdown_tx: Some(shutdown_tx),
                 _task_handle: task_handle,
                 stopped: false,
             },
-        );
-        increment_handle_count();
-
-        Ok(handle_id)
+        )
     }
 
     /// Per-instance equivalent of the free-function `mcp_server_stop`.
@@ -16760,12 +16784,12 @@ impl Scp {
             })
             .await?;
 
-        let handle_id = mcp_handle_id("mcp-client");
-        mcp_client_registry(&self.inner)
-            .insert(handle_id.clone(), McpClientEntry::new(client, Some(server)));
-        increment_handle_count();
-
-        Ok(handle_id)
+        register_mcp_unless_shut_down(
+            &self.inner,
+            mcp_client_registry(&self.inner),
+            mcp_handle_id("mcp-client"),
+            McpClientEntry::new(client, Some(server)),
+        )
     }
 
     /// Per-instance equivalent of the free-function `mcp_client_connect_sse`.
@@ -16799,12 +16823,12 @@ impl Scp {
         })
         .await?;
 
-        let handle_id = mcp_handle_id("mcp-client");
-        mcp_client_registry(&self.inner)
-            .insert(handle_id.clone(), McpClientEntry::new(client, None));
-        increment_handle_count();
-
-        Ok(handle_id)
+        register_mcp_unless_shut_down(
+            &self.inner,
+            mcp_client_registry(&self.inner),
+            mcp_handle_id("mcp-client"),
+            McpClientEntry::new(client, None),
+        )
     }
 
     /// Per-instance equivalent of the free-function `mcp_client_disconnect`.
@@ -16843,7 +16867,7 @@ impl Scp {
         validate_mcp_handle(&handle)?;
 
         let client = LiveMcpClient::checkout(&self.inner, &handle, codes::TRANS_5020)?;
-        let client_guard = client.lock(&handle, codes::TRANS_5020).await?;
+        let client_guard = client.lock(&handle, codes::TRANS_5021).await?;
         let outlets = run_mcp_client_io(codes::TRANS_5022, move || {
             client_guard.list_tools().map_err(|e| ScpError::Transport {
                 msg: format!("tools/list failed: {e}"),
@@ -16885,7 +16909,7 @@ impl Scp {
                 msg: format!("invalid input JSON: {e}"),
                 code: codes::VALID_7021.to_owned(),
             })?;
-        let client_guard = client.lock(&handle, codes::TRANS_5023).await?;
+        let client_guard = client.lock(&handle, codes::TRANS_5024).await?;
         let result = run_mcp_client_io(codes::TRANS_5025, move || {
             client_guard
                 .invoke(&outlet_name, input, &context_id, &invoker_did)
@@ -23015,6 +23039,83 @@ mod tests {
         assert!(result.is_err(), "invalid transport mode should be rejected");
     }
 
+    /// A server created once the instance has shut down is refused and left
+    /// out of the registry, whose clear at shutdown has already run.
+    #[tokio::test]
+    async fn an_mcp_server_created_after_shutdown_registers_nothing() {
+        let scp = scp_test();
+        scp.shutdown(1_000).await.expect("shut the instance down");
+        let config = McpServerConfig {
+            identity_did: "did:dht:z6MkTestUser".to_owned(),
+            context_ids: vec!["ctx-1".to_owned()],
+            transport: "stdio".to_owned(),
+            ucan_token: None,
+            proof_tokens: None,
+        };
+
+        let err = scp
+            .mcp_server_create(config)
+            .await
+            .expect_err("a server created after shutdown must be refused");
+        assert!(
+            err.to_string().contains("shut down"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            mcp_server_registry(&scp.inner).is_empty(),
+            "a server created after shutdown must leave the registry empty"
+        );
+    }
+
+    /// A stdio connect whose handshake ends after shutdown registers no
+    /// client, and dropping the refused entry kills the server it spawned.
+    #[tokio::test]
+    async fn a_stdio_connect_after_shutdown_registers_nothing_and_kills_its_server() {
+        let scp = scp_test();
+        scp.inner
+            .core
+            .mcp_allowlist()
+            .lock()
+            .expect("allowlist lock")
+            .configure(&["sh"])
+            .expect("allow sh");
+        let pid_file =
+            std::env::temp_dir().join(format!("{}.pid", mcp_handle_id("mcp-shutdown-connect")));
+        let script = format!(
+            "echo $$ > '{}'; read l; \
+            echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\",\
+            \"capabilities\":{{}},\"serverInfo\":{{\"name\":\"stub\"}}}}}}'; \
+            sleep 600; true",
+            pid_file.display()
+        );
+        scp.shutdown(1_000).await.expect("shut the instance down");
+
+        let result = scp
+            .mcp_client_connect_stdio(vec!["sh".to_owned(), "-c".to_owned(), script])
+            .await;
+        let pid = std::fs::read_to_string(&pid_file).expect("the stub server wrote its pid");
+        let _ = std::fs::remove_file(&pid_file);
+
+        let err = result.expect_err("a connect after shutdown must fail");
+        assert!(
+            err.to_string().contains("shut down"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            mcp_client_registry(&scp.inner).is_empty(),
+            "a connect after shutdown must leave the registry empty"
+        );
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run kill -0");
+        assert!(
+            !alive.success(),
+            "the spawned server must be killed and reaped"
+        );
+    }
+
     /// With no `Supervisor` attached, the production `mcp_server_create` still
     /// returns a server handle, and that server serves no context: the
     /// provider it builds reads role state from the actor, so `resources/list`
@@ -23381,9 +23482,28 @@ mod tests {
     /// server process, as an SSE client's does not, so the disconnect leaves
     /// the stub server answering: the in-flight `tools/list` gets its answer,
     /// and the stub would answer the queued one too had the queued call sent
-    /// it.
+    /// it. The refusal carries the queued operation's disconnected code,
+    /// not the code for an unknown handle.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_call_queued_at_disconnect_sends_no_request() {
+    async fn a_list_tools_queued_at_disconnect_sends_no_request() {
+        call_queued_at_disconnect_sends_no_request(QueuedCall::ListTools).await;
+    }
+
+    /// The `tools/call` twin of
+    /// [`a_list_tools_queued_at_disconnect_sends_no_request`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_invoke_queued_at_disconnect_sends_no_request() {
+        call_queued_at_disconnect_sends_no_request(QueuedCall::Invoke).await;
+    }
+
+    /// The call [`call_queued_at_disconnect_sends_no_request`] queues.
+    #[derive(Clone, Copy)]
+    enum QueuedCall {
+        ListTools,
+        Invoke,
+    }
+
+    async fn call_queued_at_disconnect_sends_no_request(queued: QueuedCall) {
         let scp = scp_test();
         let mut allowlist = scp_mcp::allowlist::StdioAllowlist::new_with_defaults();
         allowlist.configure(&["sh"]).expect("allow sh");
@@ -23414,7 +23534,21 @@ mod tests {
                 scp.mcp_client_list_tools(handle.clone()),
                 async {
                     tokio::time::sleep(short).await;
-                    scp.mcp_client_list_tools(handle.clone()).await
+                    match queued {
+                        QueuedCall::ListTools => {
+                            scp.mcp_client_list_tools(handle.clone()).await.map(drop)
+                        }
+                        QueuedCall::Invoke => scp
+                            .mcp_client_invoke(
+                                handle.clone(),
+                                "test-outlet".to_owned(),
+                                "{}".to_owned(),
+                                "ctx-test".to_owned(),
+                                "did:dht:z6MkTestUser".to_owned(),
+                            )
+                            .await
+                            .map(drop),
+                    }
                 },
                 async {
                     tokio::time::sleep(short * 2).await;
@@ -23431,12 +23565,22 @@ mod tests {
             panic!("the in-flight call must get the open transport's answer: {e}");
         }
         let Err(err) = second else {
-            panic!("the queued call sent tools/list after the disconnect");
+            panic!("the queued call sent its request after the disconnect");
         };
-        assert!(
-            err.to_string().contains("was disconnected"),
-            "the queued call must fail as disconnected, got: {err}"
-        );
+        let expected = match queued {
+            QueuedCall::ListTools => codes::TRANS_5021,
+            QueuedCall::Invoke => codes::TRANS_5024,
+        };
+        match &err {
+            ScpError::Transport { msg, code } => {
+                assert!(
+                    msg.contains("was disconnected"),
+                    "the queued call must fail as disconnected, got: {msg}"
+                );
+                assert_eq!(code, expected, "the queued call's refusal code");
+            }
+            other => panic!("the queued call must fail as disconnected, got: {other:?}"),
+        }
     }
 
     /// A call queued behind one that a silent server stalls waits on the

@@ -743,17 +743,21 @@ pub const TRANS_5016: &str = "SCP-TRANS-5016";
 pub const TRANS_5018: &str = "SCP-TRANS-5018";
 /// Transport proof error.
 pub const TRANS_5019: &str = "SCP-TRANS-5019";
-/// Transport webhook error.
+/// MCP client `tools/list`: no client is registered under the handle.
 pub const TRANS_5020: &str = "SCP-TRANS-5020";
-/// Transport webhook register error.
+/// MCP client `tools/list`: the handle was disconnected while the call
+/// waited for the client's lock, so the call sent no request.
 pub const TRANS_5021: &str = "SCP-TRANS-5021";
-/// Transport webhook unregister error.
+/// MCP client `tools/list`: the request failed on the transport, the server
+/// answered with an error, or the task running the call failed.
 pub const TRANS_5022: &str = "SCP-TRANS-5022";
-/// Transport webhook list error.
+/// MCP client `tools/call`: no client is registered under the handle.
 pub const TRANS_5023: &str = "SCP-TRANS-5023";
-/// Transport webhook fire error.
+/// MCP client `tools/call`: the handle was disconnected while the call
+/// waited for the client's lock, so the call sent no request.
 pub const TRANS_5024: &str = "SCP-TRANS-5024";
-/// Transport webhook test error.
+/// MCP client `tools/call`: the request failed on the transport, the server
+/// answered with an error, or the task running the call failed.
 pub const TRANS_5025: &str = "SCP-TRANS-5025";
 /// Transport relay configured error.
 pub const TRANS_5030: &str = "SCP-TRANS-5030";
