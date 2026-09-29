@@ -1487,11 +1487,13 @@ pub(crate) async fn context_join_from_welcome_on(
     // just registered (and not removed on this success path), so the sync targets
     // a live entry.
     //
-    // BLACK-2JF-01 — post-irreversible-commit compensation: the sync fails ONLY
-    // if a concurrent close/leave removed the just-registered FFI state in the
-    // window since the spawn returned. A close/leave does NOT despawn the runtime
-    // actor, so returning `Err` here without tearing the actor down would strand a
-    // live, orphaned actor for a join that never fully materialized at the bridge.
+    // BLACK-2JF-01 — post-irreversible-commit compensation: the sync fails in
+    // two cases: a concurrent close/leave removed the just-registered FFI state
+    // in the window since the spawn returned, or an entry of the authenticated
+    // ceiling fails the §5.3.1.1 grammar (VALID_7000). In both cases the runtime
+    // actor is live (a close/leave does NOT despawn it), so returning `Err` here
+    // without tearing the actor down would strand a live, orphaned actor for a
+    // join that never fully materialized at the bridge.
     // Compensate with the COMPLETE teardown (`discard_joined_context`): it removes
     // the actor handle AND destroys the resident MLS group AND deletes the durable
     // Class-S snapshot the join persisted — a bare `despawn_actor` would leave the
@@ -6751,7 +6753,7 @@ mod tests {
     ///
     /// In every case the handle's cached string reads "active" and the gate
     /// reads the supervisor: a poisoned context reads `Some(Poisoned)` and
-    /// refuses with the operation's code, a context mid-respawn or past a
+    /// refuses with `ContextPoisoned` (`SCP-CTX-2134`), a context mid-respawn or past a
     /// failed respawn reads `ActorCrashed` (`SCP-CTX-2135`), and an actor whose
     /// mailbox does not answer reads `ActorBusy` (`SCP-CTX-2130`). Each row
     /// asserts the bracketed typed code the TypeScript SDK parses, not a
@@ -6767,12 +6769,11 @@ mod tests {
         let creator = "did:key:z6MkNapiGateFaultCreator";
         let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
 
-        // `None` means the refusal carries the operation's own code.
-        for (fault, supervisor_code) in [
-            ("poisoned", None),
-            ("mid_respawn", Some(codes::CTX_2135)),
-            ("respawn_failed", Some(codes::CTX_2135)),
-            ("unreachable", Some(codes::CTX_2130)),
+        for (fault, expected) in [
+            ("poisoned", codes::CTX_2134),
+            ("mid_respawn", codes::CTX_2135),
+            ("respawn_failed", codes::CTX_2135),
+            ("unreachable", codes::CTX_2130),
         ] {
             let ctx_id = format!("napi-gate-{fault}-{}", uuid::Uuid::new_v4());
             crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator).await;
@@ -6799,25 +6800,17 @@ mod tests {
             let Err(subscribe) = super::subscribe_admission(&bi, &handle).await else {
                 panic!("subscribe must refuse a {fault} context");
             };
-            for (call, op_code, err) in [
-                ("join", codes::CTX_2013, join),
-                ("leave", codes::CTX_2015, leave),
-                ("send", codes::CTX_2019, send),
-                ("subscribe", codes::CTX_2021, subscribe),
+            for (call, err) in [
+                ("join", join),
+                ("leave", leave),
+                ("send", send),
+                ("subscribe", subscribe),
             ] {
-                let expected = supervisor_code.unwrap_or(op_code);
                 assert!(
                     err.reason.starts_with(&format!("[{expected}] ")),
                     "{call} on a {fault} context must carry typed code {expected}, got: {}",
                     err.reason
                 );
-                if supervisor_code.is_none() {
-                    assert!(
-                        err.reason.contains("'poisoned' state"),
-                        "{call} on a poisoned context must name the state, got: {}",
-                        err.reason
-                    );
-                }
             }
             assert!(
                 !handle

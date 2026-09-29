@@ -1968,13 +1968,19 @@ pub async fn read_live_context_state(
 /// Fails closed: a context no actor serves refuses the operation. `mk_err`
 /// wraps the refusal message in the error variant and the error code the
 /// calling operation reports, so a lifecycle refusal keeps whichever
-/// [`ScpNapiError`] variant that operation already returned.
+/// [`ScpNapiError`] variant that operation already returned. A poisoned
+/// context is the exception: it refuses with `ContextPoisoned`
+/// (`SCP-CTX-2134`), the code ADR-049 §10 names as the consumer's signal to
+/// start operator recovery.
 ///
 /// # Errors
 ///
-/// Returns whatever `mk_err` builds when the supervisor reports any state other
-/// than `Active` and when no actor serves `context_id`, and
-/// [`ScpNapiError::Context`] when the supervisor query itself fails.
+/// Returns [`ScpNapiError::Context`] with `SCP-CTX-2134` when the supervisor
+/// reports `Poisoned`; whatever `mk_err` builds when it reports any other state
+/// than `Active` and when no actor serves `context_id`; and the supervisor's
+/// own error (`SCP-CTX-2130` busy, `SCP-CTX-2135` crashed or mid-respawn) when
+/// the supervisor query itself fails, or `SCP-CTX-2000` when this bridge has no
+/// supervisor.
 pub async fn require_active_context<F>(
     bi: &NapiBridgeInstance,
     context_id: &str,
@@ -1986,6 +1992,13 @@ where
 {
     match read_live_context_state(bi, context_id).await? {
         Some(scp_core::context::ContextState::Active) => Ok(()),
+        // ADR-049 §10: a caller detects a poisoned context by the
+        // `SCP-CTX-2134` code on its next per-context operation, not by
+        // polling `state()`, so the gate surfaces `ContextPoisoned` rather
+        // than the operation's own non-active code.
+        Some(scp_core::context::ContextState::Poisoned) => Err(ScpNapiError::from(
+            scp_core::context::ContextError::ContextPoisoned(context_id.to_owned()),
+        )),
         Some(other) => Err(mk_err(format!(
             "cannot {verb} in '{}' state -- context must be active",
             context_state_str(&other)
