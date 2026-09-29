@@ -5,7 +5,7 @@ across 37 files. Nineteen review rounds later the branch was still producing fin
 in the nineteenth round a reviewer falsified three claims that the two newest commits had
 added. Deleting most of the sentences about subsystems the branch never modified ended the
 loop that fixing individual sentences could not. Outside the example the branch fixed
-(`crates/scp-node/examples/website.rs` and its `README.md`), eleven passages stayed that
+(`crates/scp-node/examples/website.rs` and its `README.md`), ten passages stayed that
 explain a fail-closed backend the branch never modified: `NoPreRotationBackend` on identity
 creation, or the unconfigured custody-migration backend. Each stayed because it replaced a
 false sentence: either a claim that a backend succeeds, or a documented command that exits 1
@@ -17,8 +17,7 @@ with no reason given, which reads as a promise that the command works:
   `run_full_node_persistent`, and the reason in the `--ephemeral` refusal message.
 - `docs/guides/relay-operations.md`: the Identity cell of the full-node row in the modes
   table, the comment on the full-node command below it, the identity bullet in §6, and the
-  Production deployment and Development deployment paragraphs on why a shipped full node
-  exits 1.
+  Production deployment paragraph on why a shipped full node exits 1.
 - `.docs/guides/deploying-an-scp-website.md`: the opening paragraph on why each recipe
   fails on a shipped build.
 - `.docs/guides/self-hosting-a-website-on-scp.md`: the parenthetical in the `host_site`

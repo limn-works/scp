@@ -308,10 +308,8 @@ The call to `run_full_node_ephemeral` and the `"memory"` match arm
 capability injection, keeps the in-memory DHT client and the in-memory key custody out
 of every released build.
 
-Do not run the full node (no mode flag) for development. A shipped binary logs
-`no production pre-rotation custody backend available` and exits 1 on every run, for
-the reason given under Production deployment. `SCP_NODE_DHT_MODE` defaults to `production`, so a `--features testing`
-build of the full node with the variable unset publishes the host's address to the
+`SCP_NODE_DHT_MODE` defaults to `production`, so a `--features testing` build of the
+full node (no mode flag) with the variable unset publishes the host's address to the
 global Mainline DHT, a location disclosure, even under `SCP_NODE_DOMAIN=localhost`.
 
 ### Programmatic usage (Rust SDK)
