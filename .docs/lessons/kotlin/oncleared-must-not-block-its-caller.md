@@ -80,9 +80,9 @@ after dispatching, and another called `cleanupJob.complete()`. Neither frees any
 `CoroutineStart.UNDISPATCHED`, which runs a coroutine's body even when its job is already
 cancelled, so the child's loop still runs. Each `leave` then enters the bridge's
 `withContext(ioDispatcher)`, which throws `CancellationException` on entry because the job is
-cancelled, before the FFI call starts. The loop catches that exception and, when no other
-cleanup coroutine holds the failure lock, hands it to `onCleanupFailure`, whose default body logs
-a warning. A context that `trackContext` registers after `onCleared` therefore never gets its
+cancelled, before the FFI call starts. The loop catches that exception and hands it to
+`onCleanupFailure`, after any `onCleanupFailure` call another cleanup coroutine is running
+returns; the default body logs a warning. A context that `trackContext` registers after `onCleared` therefore never gets its
 `leave`, and it produces a leave-failure warning carrying a `CancellationException`. Android
 clears a view model once, so `trackContext` itself launches that `leave` once `onCleared` has run, the way `ViewModel.addCloseable` closes a resource added after
 clear. `ScpViewModelTest.a context tracked after onCleared is left without a second onCleared`
