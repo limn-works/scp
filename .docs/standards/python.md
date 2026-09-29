@@ -212,10 +212,13 @@ pytest bindings/python/tests/ -v --asyncio-mode=auto
 maturin build --release
 
 # Build wheels for all platforms (CI: the python-wheels job in
-# .github/workflows/build-matrix.yml, one wheel per CPython minor per target)
-maturin build --release --target x86_64-unknown-linux-gnu -i python3.10 python3.11 python3.12 python3.13
-maturin build --release --target aarch64-unknown-linux-gnu -i python3.10 python3.11 python3.12 python3.13
-maturin build --release --target universal2-apple-darwin -i python3.10 python3.11 python3.12 python3.13
+# .github/workflows/build-matrix.yml, one wheel per CPython minor per target).
+# The flags and variable below give each wheel the tag the Platform Wheels table
+# names: CI builds the Linux wheels inside the manylinux_2_28 container, and
+# MACOSX_DEPLOYMENT_TARGET sets the macOS floor in the universal2 tag.
+maturin build --release --target x86_64-unknown-linux-gnu --compatibility manylinux_2_28 -i python3.10 python3.11 python3.12 python3.13
+maturin build --release --target aarch64-unknown-linux-gnu --compatibility manylinux_2_28 -i python3.10 python3.11 python3.12 python3.13
+MACOSX_DEPLOYMENT_TARGET=11.0 maturin build --release --target universal2-apple-darwin -i python3.10 python3.11 python3.12 python3.13
 maturin build --release --target x86_64-pc-windows-msvc -i python3.10 python3.11 python3.12 python3.13
 ```
 
