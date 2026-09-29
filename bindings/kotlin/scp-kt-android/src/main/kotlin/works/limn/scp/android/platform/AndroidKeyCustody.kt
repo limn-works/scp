@@ -38,7 +38,7 @@
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
 // ADR-025 (Apple Platform Adapter — parallel reference), section 9.12 (Compromise Recovery),
-// section 9.15 (Key Destruction Verification).
+// section 9.15 (Ephemeral Key Destruction Verification).
 
 package works.limn.scp.android.platform
 
@@ -284,9 +284,10 @@ class AndroidKeyCustody internal constructor(
      * For Keystore keys ([CustodyType.HARDWARE]): deletes the entry from Android Keystore and performs
      * a re-fetch to confirm deletion (section 9.15 key destruction verification).
      *
-     * For software-backed keys: removes the entry from the [softwareKeys] map and removes a
-     * software Ed25519 key's seed from [encryptedPrefs] with `apply()`, which returns before the
-     * removal reaches disk. The post-deletion check reads only [softwareKeys].
+     * For software-backed keys: removes the entry from the [softwareKeys] map and removes the
+     * seed of a software Ed25519 key that [generateKeypair] creates (API 26-32) from
+     * [encryptedPrefs] with `apply()`, which returns before the removal reaches disk. The
+     * post-deletion check reads only [softwareKeys].
      *
      * After this call, operations with the same handle in the same process throw [ScpException]
      * with code `SCP-CRYPTO-4001`, with two exceptions: [dhAgree] throws `SCP-CRYPTO-4002`, and
@@ -898,12 +899,13 @@ internal class SoftwareKeyOps(
     }
 
     /**
-     * Destroys a software-backed key by removing it from both the in-memory map
-     * and [encryptedPrefs].
+     * Destroys a software-backed key by removing it from the in-memory map and removing its
+     * seed entry from [encryptedPrefs], which only an Ed25519 key that [generateEd25519]
+     * created has; for a derived pseudonym key or an X25519 key the removal is a no-op.
      *
-     * Returns [DestructionMethod.SOFTWARE_ONLY] because the key material was stored
-     * in software (Bouncy Castle in-memory + EncryptedSharedPreferences) without
-     * hardware protection. The `apply()` call queues the [encryptedPrefs] removal and returns
+     * Returns [DestructionMethod.SOFTWARE_ONLY] because the key material was held in software
+     * (the Bouncy Castle in-memory map, plus EncryptedSharedPreferences for a generated Ed25519
+     * key) without hardware protection. The `apply()` call queues the [encryptedPrefs] removal and returns
      * before the removal reaches disk, and the verification reads only [softwareKeys], so
      * `confirmed = true` does not show that the persisted seed is gone.
      */
@@ -911,7 +913,7 @@ internal class SoftwareKeyOps(
         val removed = softwareKeys.remove(keyHandle.id)
         softwareKeyTypes.remove(keyHandle.id)
 
-        // Remove from EncryptedSharedPreferences (no-op if not an Ed25519 identity key)
+        // Remove from EncryptedSharedPreferences (no-op unless generateEd25519 persisted the key)
         val prefsKey = "$PREFS_KEY_PREFIX${keyHandle.id}"
         encryptedPrefs.edit().remove(prefsKey).apply()
 

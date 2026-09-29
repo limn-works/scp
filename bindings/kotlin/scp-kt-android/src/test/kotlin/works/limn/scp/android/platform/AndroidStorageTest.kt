@@ -55,9 +55,8 @@ import kotlin.reflect.KFunction1
  * In-memory implementation of [StorageProvider] for contract testing.
  *
  * Mirrors the SQLCipher-backed production semantics: INSERT OR REPLACE on store,
- * lexicographic ordering on listKeys, prefix-based matching, and cursor-style
- * retrieval. This implementation validates the StorageProvider contract without
- * requiring Android runtime dependencies.
+ * lexicographic ordering on listKeys, and prefix-based matching. This implementation
+ * validates the StorageProvider contract without requiring Android runtime dependencies.
  */
 class InMemoryStorageProvider : StorageProvider {
 

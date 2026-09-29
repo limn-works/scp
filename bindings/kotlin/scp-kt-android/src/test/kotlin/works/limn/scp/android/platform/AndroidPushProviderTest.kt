@@ -164,15 +164,18 @@ class AndroidPushProviderTest {
     }
 
     // -----------------------------------------------------------------------
-    // Payload with extra fields — still valid per FCM data message format
+    // Payload with extra fields — current behaviour, not the contract
     // -----------------------------------------------------------------------
 
     @Test
-    fun `payload with scp field and extra fields still returns Pull`() {
-        // As long as "scp" == "1", the handler accepts a payload with other
-        // fields. §10.7 puts the opacity requirement on the push sender;
-        // handleNotification checks only the wake signal field and does not
-        // enforce opacity.
+    fun `handleNotification accepts extra fields that ADR-027 AC10 forbids`() {
+        // handleNotification checks only the "scp" field, so a payload with
+        // other fields returns Pull. §10.7 says a push payload MUST contain a
+        // wake signal and nothing else, and ADR-027 acceptance criterion 10
+        // forbids any other content in the payload; SCP-112 records the
+        // criterion "FCM payload format is opaque" as unmet. This test pins
+        // the current behaviour only: the SCP-112 fix rejects this payload
+        // and inverts this assertion.
         val payload = mapOf("scp" to "1", "extra" to "ignored")
         val signal = provider.handleNotification(payload)
         assertEquals(WakeSignal.PULL, signal)

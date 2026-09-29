@@ -71,7 +71,9 @@ enum class CustodyType {
  *
  * @property id Unique identifier for the key. For Android Keystore keys, this maps to
  *   alias `scp.key.$id`. For software keys, this maps to a [ConcurrentHashMap] entry and,
- *   for a software Ed25519 key, also to the EncryptedSharedPreferences entry `scp.ed25519.$id`.
+ *   for a software Ed25519 key that [KeyCustodyProvider.generateKeypair] creates (API 26-32),
+ *   also to the EncryptedSharedPreferences entry `scp.ed25519.$id`. A derived pseudonym key
+ *   is also a software Ed25519 key, and it has no EncryptedSharedPreferences entry.
  * @property custodyType Where the key material is stored ([CustodyType.HARDWARE] for Keystore,
  *   [CustodyType.SOFTWARE] for Bouncy Castle fallback).
  */
@@ -112,8 +114,9 @@ data class PseudonymKeyHandle(
  *   key, the check asks Keystore whether it still holds the alias. For a software key, the check
  *   reads the in-memory map right after removing the id from it, so it fails only when another
  *   call inserts the same id between the removal and the check, and [AndroidKeyCustody] inserts
- *   only fresh random UUIDs. It does not read the EncryptedSharedPreferences entry that holds a
- *   software Ed25519 key's seed. [AndroidKeyCustody] removes that entry with
+ *   only fresh random UUIDs. It does not read the EncryptedSharedPreferences entry that holds
+ *   the seed of a software Ed25519 key that [KeyCustodyProvider.generateKeypair] creates
+ *   (API 26-32). [AndroidKeyCustody] removes that entry with
  *   `apply()`, which returns before the removal reaches disk, so `confirmed` is `true` while the
  *   seed can still be on disk. When the process dies before the write lands, the next
  *   [AndroidKeyCustody] instance restores the seed at startup and the key signs again.
@@ -131,7 +134,8 @@ data class DestructionAttestation(
 enum class DestructionMethod {
     /**
      * Key material was deleted from software storage: the Bouncy Castle in-memory map and,
-     * for a software Ed25519 key, its EncryptedSharedPreferences entry. [AndroidKeyCustody]
+     * for a software Ed25519 key that [KeyCustodyProvider.generateKeypair] creates
+     * (API 26-32), its EncryptedSharedPreferences entry. [AndroidKeyCustody]
      * removes that entry with `apply()`, which writes the removal to disk asynchronously.
      */
     SOFTWARE_ONLY,
@@ -371,9 +375,10 @@ interface KeyCustodyProvider {
      * with code `SCP-CRYPTO-4001`, with two exceptions: [dhAgree] throws `SCP-CRYPTO-4002`, and
      * [exportSigningKeyBytes] on a Keystore handle ([CustodyType.HARDWARE]) throws
      * `SCP-CRYPTO-4005`, because it refuses on [KeyHandle.custodyType] before any key lookup.
-     * [AndroidKeyCustody] removes a software Ed25519 key's persisted
-     * seed with an asynchronous `apply()`, so a later process can restore the key when this
-     * process dies before the removal reaches disk (see [DestructionAttestation.confirmed]).
+     * [AndroidKeyCustody] removes the persisted seed of a software Ed25519 key that
+     * [generateKeypair] creates (API 26-32) with an asynchronous `apply()`, so a later process
+     * can restore the key when this process dies before the removal reaches disk (see
+     * [DestructionAttestation.confirmed]).
      *
      * @param keyHandle Handle to destroy.
      * @return A [DestructionAttestation] naming the destruction method, with
