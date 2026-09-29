@@ -22,9 +22,10 @@
 // calls `handleNotification(payload:)` yet, so nothing performs that pull today.
 // Apple learns only that the device received a notification at a specific time.
 //
-// `handleNotification(payload:)` **enforces** this invariant on receipt: payloads
-// containing any field other than `aps.content-available` are rejected with
-// ``PushError/opaquePayloadViolation``.
+// `handleNotification(payload:)` **enforces** this invariant on receipt: a JSON
+// object whose bytes differ from `{"aps":{"content-available":1}}` by anything but
+// whitespace between tokens is rejected with ``PushError/opaquePayloadViolation``.
+// ADR-025 criterion 4 names this payload for APNs.
 //
 // ## Token Registration Lifecycle
 //
@@ -237,10 +238,12 @@
 
         /// Handle an incoming APNs silent push notification.
         ///
-        /// Validates that `payload` is the strictly opaque `{"aps": {"content-available": 1}}`
-        /// format required by §10.7. Any additional field in the payload — at the top level
-        /// or nested inside `aps`, including one carried by a repeated key — is rejected
-        /// with ``PushError/opaquePayloadViolation``.
+        /// Validates that `payload` is the opaque `{"aps": {"content-available": 1}}` payload
+        /// ADR-025 criterion 4 names for APNs, which meets the §10.7 rule that a push
+        /// payload carries no context ID, sender identifier, or other metadata. Any
+        /// additional field in the payload — at the top level or nested inside `aps`,
+        /// including one carried by a repeated key — is rejected with
+        /// ``PushError/opaquePayloadViolation``.
         ///
         /// When the payload is valid, the method returns ``wakeSignal``, a fixed byte
         /// string, and never the received bytes, so a caller receives no byte the relay
@@ -254,9 +257,10 @@
         /// - Throws:
         ///   - ``PushError/invalidPayload(_:)`` if the bytes cannot be parsed as JSON or the
         ///     top-level structure is not a dictionary.
-        ///   - ``PushError/opaquePayloadViolation(_:)`` if the payload contains any field
-        ///     other than `aps.content-available`, repeats a key, or differs from
-        ///     `{"aps":{"content-available":1}}` by anything but JSON whitespace.
+        ///   - ``PushError/opaquePayloadViolation(_:)`` if the payload exceeds 4096 bytes,
+        ///     or is a JSON object whose bytes differ from `{"aps":{"content-available":1}}`
+        ///     by anything but JSON whitespace between tokens: any other field, a repeated
+        ///     key, or any `content-available` value other than the token `1`.
         public func handleNotification(payload: Data) throws -> Data {
             try validateOpaquePayload(payload)
             return Self.wakeSignal
@@ -317,26 +321,37 @@
         /// {"aps": {"content-available": 1}}
         /// ```
         ///
-        /// Validation rules (all must pass):
-        /// 1. The payload parses as a JSON object.
-        /// 2. The top-level object has **exactly one** key: `"aps"`.
-        /// 3. The `aps` value is a JSON object with **exactly one** key:
-        ///    `"content-available"`.
-        /// 4. The `content-available` value is the integer `1`.
-        /// 5. The payload bytes, with JSON whitespace (space, tab, line feed,
-        ///    carriage return) removed, equal ``wakeSignal``.
+        /// Validation rules, in the order they run:
+        /// 1. The payload is at most 4096 bytes, the APNs maximum.
+        /// 2. The payload parses as JSON, and its root is a JSON object.
+        /// 3. The payload bytes, with JSON whitespace (space, tab, line feed,
+        ///    carriage return) removed outside string literals, equal
+        ///    ``wakeSignal``.
         ///
-        /// Rules 2 to 4 read the dictionary `JSONSerialization` builds, and
-        /// `JSONSerialization` keeps one value for a key the object repeats, so
-        /// a second `aps` or `content-available` member carrying a context ID
-        /// passes them. Rule 5 reads the received bytes and rejects that
-        /// payload, along with any other encoding of the permitted object, such
-        /// as an escaped key or `1.0`.
+        /// Rule 3 alone decides which payload is accepted. It reads the received
+        /// bytes, not the dictionary `JSONSerialization` builds, because
+        /// `JSONSerialization` keeps one value for a key the object repeats: a
+        /// second `aps` or `content-available` member carrying a context ID
+        /// parses to the permitted object. Rule 3 rejects that payload, and any
+        /// other field, a boolean, a fraction such as `1.0` or `1.5`, an escaped
+        /// key, or any value other than the token `1`, because none of them
+        /// reduces to ``wakeSignal``. Rule 3 keeps whitespace inside a string
+        /// literal, so the key `"a ps"` stays distinct from `"aps"`. It finds
+        /// string literals by toggling on each `"` byte; an escaped quote would
+        /// throw that count off, but its backslash is never removed and
+        /// ``wakeSignal`` holds no backslash, so such a payload never matches.
+        ///
+        /// Every payload rule 3 accepts is ``wakeSignal`` with whitespace
+        /// between its tokens, which is a JSON object, so rule 2 rejects no
+        /// payload rule 3 would accept. Rule 2 decides only which error a
+        /// caller receives: ``PushError/invalidPayload(_:)`` for bytes that are
+        /// not a JSON object, ``PushError/opaquePayloadViolation(_:)`` for a
+        /// JSON object other than the permitted one.
         ///
         /// - Parameter payload: Raw JSON bytes to validate.
         /// - Throws: ``PushError/invalidPayload(_:)`` or ``PushError/opaquePayloadViolation(_:)``.
         private func validateOpaquePayload(_ payload: Data) throws {
-            // APNs payload limit is 4 KB for standard push; reject oversized payloads early.
+            // Rule 1: APNs payload limit is 4 KB for standard push; reject oversized payloads early.
             let maxPayloadBytes = 4096
             guard payload.count <= maxPayloadBytes else {
                 throw PushError.opaquePayloadViolation(
@@ -344,62 +359,32 @@
                 )
             }
 
-            // Deserialise JSON.
+            // Rule 2: the bytes are a JSON object.
             let json: Any
             do {
                 json = try JSONSerialization.jsonObject(with: payload, options: [])
             } catch {
                 throw PushError.invalidPayload(error.localizedDescription)
             }
-
-            guard let topLevel = json as? [String: Any] else {
+            guard json is [String: Any] else {
                 throw PushError.invalidPayload("payload root is not a JSON object")
             }
 
-            // Rule 2: exactly one top-level key — "aps".
-            guard topLevel.count == 1, let aps = topLevel["aps"] else {
-                let keys = topLevel.keys.sorted().joined(separator: ", ")
-                throw PushError.opaquePayloadViolation(
-                    "top-level object must contain only \"aps\" but found: [\(keys)]"
-                )
+            // Rule 3: the received bytes, whitespace outside string literals
+            // removed, are the permitted payload.
+            var stripped = Data(capacity: payload.count)
+            var inString = false
+            for byte in payload {
+                if byte == 0x22 {
+                    inString.toggle()
+                } else if !inString, byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D {
+                    continue
+                }
+                stripped.append(byte)
             }
-
-            guard let apsDict = aps as? [String: Any] else {
-                throw PushError.opaquePayloadViolation("\"aps\" value is not a JSON object")
-            }
-
-            // Rule 3: exactly one key inside "aps" — "content-available".
-            guard apsDict.count == 1, let contentAvailable = apsDict["content-available"] else {
-                let keys = apsDict.keys.sorted().joined(separator: ", ")
+            guard stripped == Self.wakeSignal else {
                 throw PushError.opaquePayloadViolation(
-                    "\"aps\" object must contain only \"content-available\" but found: [\(keys)]"
-                )
-            }
-
-            // Rule 4: content-available must be the integer 1 (not boolean true).
-            // JSONSerialization bridges both JSON numbers and JSON booleans to NSNumber.
-            // __NSCFBoolean is a NSNumber subclass; NSNumber(boolValue: true).int64Value == 1,
-            // so int64Value alone incorrectly accepts boolean true.
-            // CFGetTypeID disambiguates: CFBooleanGetTypeID() ≠ CFNumberGetTypeID().
-            // A JSON fraction such as 1.5 is a floating-point CFNumber whose
-            // int64Value truncates to 1, so CFNumberIsFloatType rejects it before
-            // int64Value is read.
-            guard
-                let number = contentAvailable as? NSNumber,
-                CFGetTypeID(number) == CFNumberGetTypeID(),
-                !CFNumberIsFloatType(number),
-                number.int64Value == 1
-            else {
-                throw PushError.opaquePayloadViolation(
-                    "\"content-available\" must be integer 1 (not boolean true, a fraction, or other value), got \(contentAvailable)"
-                )
-            }
-
-            // Rule 5: the received bytes, whitespace removed, are the permitted payload.
-            let jsonWhitespace: Set<UInt8> = [0x20, 0x09, 0x0A, 0x0D]
-            guard Data(payload.filter { !jsonWhitespace.contains($0) }) == Self.wakeSignal else {
-                throw PushError.opaquePayloadViolation(
-                    "payload bytes differ from {\"aps\":{\"content-available\":1}} by more than whitespace: a key repeats or a token is not in canonical form"
+                    "payload bytes differ from {\"aps\":{\"content-available\":1}} by more than whitespace between tokens"
                 )
             }
         }

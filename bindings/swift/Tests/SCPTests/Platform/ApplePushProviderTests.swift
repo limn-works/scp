@@ -4,18 +4,23 @@
 // `.docs/adrs/phase-5.md` states what `handleNotification(payload:)` accepts:
 // "The relay MUST send only `{"aps": {"content-available": 1}}` payloads. The
 // adapter enforces opacity on receipt." The same criterion requires the adapter
-// to throw "for a payload containing any field other than
-// `aps.content-available`, for a `content-available` value other than the
-// integer 1, and for bytes that are not a JSON object". §10.7, notifications
-// and push, of `.docs/specs/10-infrastructure-and-self-hosting.md` is where
-// that requirement comes from: a payload carrying a context ID, a sender
-// identifier, or a message count would hand Apple metadata the protocol keeps
-// encrypted.
+// to throw for a payload above 4 KB, "for a payload containing any field
+// other than `aps.content-available`, for a `content-available` value other
+// than the integer 1, for bytes that are not a JSON object", and for bytes that
+// differ from the permitted payload by more than JSON whitespace. §10.7,
+// notifications and push, of `.docs/specs/10-infrastructure-and-self-hosting.md`
+// is where the opacity requirement comes from: a push payload carries no
+// context ID, no sender identifier, and no metadata of any kind.
 //
-// Each case below names the field it added, the value it changed, or the shape
-// it broke, and requires the `PushError` case `handleNotification(payload:)`
-// throws for that payload: `invalidPayload` for bytes that are not a JSON
-// object, `opaquePayloadViolation` for every other rejection.
+// The adapter runs three rules: a 4 KB size cap, a JSON-object parse, and a
+// byte comparison with the permitted payload after whitespace outside string
+// literals is removed. The byte comparison alone decides which JSON object is
+// accepted, so each rejection case below that builds a JSON object turns green
+// only while that comparison runs. The parse only picks the error case: each
+// case requires the `PushError` case `handleNotification(payload:)` throws,
+// `invalidPayload` for bytes that are not a JSON object and
+// `opaquePayloadViolation` for every other rejection, so deleting the parse
+// turns the two `invalidPayload` cases red.
 //
 // `register()` reaches APNs through the shared application, and a `swift test`
 // host holds no APNs entitlement and receives no device token. The callback
@@ -35,7 +40,7 @@
         try JSONSerialization.data(withJSONObject: object, options: [])
     }
 
-    /// The one payload §10.7 permits.
+    /// The APNs payload ADR-025 criterion 4 permits.
     private func opaquePayload() throws -> Data {
         try payload(["aps": ["content-available": 1]])
     }
@@ -82,7 +87,8 @@
         @Test("handleNotification returns the fixed wake signal, not relay bytes that parse to it")
         func handleNotificationDiscardsAcceptedPayloadBytes() async throws {
             // Trailing whitespace is legal JSON, so these bytes parse to the one
-            // payload §10.7 permits while carrying 100 bytes the relay chose.
+            // payload ADR-025 criterion 4 permits while carrying 100 bytes the
+            // relay chose.
             // Returning the received bytes would hand those bytes to the caller.
             let provider = ApplePushProvider()
             let bytes = try opaquePayload() + Data(String(repeating: " ", count: 100).utf8)
@@ -106,8 +112,9 @@
         @Test("handleNotification rejects a repeated aps key whose second value carries a context ID")
         func handleNotificationRejectsDuplicateApsCarryingContextId() async throws {
             // `JSONSerialization` keeps the first value for a key the object
-            // repeats, so these bytes parse to the one payload §10.7 permits
-            // while carrying a context ID in the second `aps` member.
+            // repeats, so these bytes parse to the one payload ADR-025
+            // criterion 4 permits while carrying a context ID in the second
+            // `aps` member.
             let provider = ApplePushProvider()
             let bytes = Data(#"{"aps":{"content-available":1},"aps":{"contextId":"ctx-42","content-available":1}}"#.utf8)
             let parsed = try JSONSerialization.jsonObject(with: bytes) as? [String: [String: Int]]
@@ -138,6 +145,26 @@
             let bytes = Data(#"{"\u0061ps":{"content-available":1}}"#.utf8)
             let parsed = try JSONSerialization.jsonObject(with: bytes) as? [String: [String: Int]]
             #expect(parsed == ["aps": ["content-available": 1]])
+
+            await expectRejection(provider, bytes, .opaquePayloadViolation)
+        }
+
+        @Test("handleNotification rejects a space inside the aps key")
+        func handleNotificationRejectsSpaceInsideApsKey() async throws {
+            // Removing every space would turn `"a ps"` into `"aps"`, so the
+            // byte comparison must keep whitespace inside a string literal.
+            let provider = ApplePushProvider()
+            let bytes = Data(#"{"a ps":{"content-available":1}}"#.utf8)
+            let parsed = try JSONSerialization.jsonObject(with: bytes) as? [String: [String: Int]]
+            #expect(parsed == ["a ps": ["content-available": 1]])
+
+            await expectRejection(provider, bytes, .opaquePayloadViolation)
+        }
+
+        @Test("handleNotification rejects a space inside the content-available key")
+        func handleNotificationRejectsSpaceInsideContentAvailableKey() async {
+            let provider = ApplePushProvider()
+            let bytes = Data(#"{"aps":{"content- available":1}}"#.utf8)
 
             await expectRejection(provider, bytes, .opaquePayloadViolation)
         }
@@ -183,8 +210,8 @@
         func handleNotificationRejectsBooleanContentAvailable() async throws {
             // `JSONSerialization` bridges a JSON boolean and a JSON number to
             // one `NSNumber` class, and `NSNumber(value: true).intValue` reads
-            // 1, so an implementation comparing `intValue` alone would accept
-            // this payload.
+            // 1, so a check on the parsed value would need a type test; the
+            // byte comparison rejects the token `true` without one.
             let provider = ApplePushProvider()
             let bytes = try payload(["aps": ["content-available": true]])
 
@@ -201,9 +228,9 @@
 
         @Test("handleNotification rejects a fractional content-available whose integer part is 1")
         func handleNotificationRejectsFractionalContentAvailable() async {
-            // `NSNumber.intValue` truncates 1.5 to 1, so an implementation that
-            // checks the CFNumber type and `intValue` alone would accept this
-            // payload.
+            // `NSNumber.intValue` truncates 1.5 to 1, so a check on the parsed
+            // value would need a float test; the byte comparison rejects the
+            // token `1.5` without one.
             let provider = ApplePushProvider()
             let bytes = Data(#"{"aps":{"content-available":1.5}}"#.utf8)
 
@@ -233,7 +260,7 @@
             //
             // Trailing whitespace is legal JSON, so these bytes break no rule
             // but the size rule: without the size guard they parse as the one
-            // payload §10.7 permits and the call accepts them.
+            // payload ADR-025 criterion 4 permits and the call accepts them.
             let provider = ApplePushProvider()
             let bytes = try opaquePayload() + Data(String(repeating: " ", count: 5000).utf8)
             #expect(bytes.count > 4096)

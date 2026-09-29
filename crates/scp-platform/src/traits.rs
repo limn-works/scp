@@ -297,12 +297,15 @@ impl PushToken {
 /// payload and copies no byte of the received payload. See ADR-006.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeSignal {
-    /// The raw notification payload that triggered this wake signal.
+    /// The bytes the [`Push`] implementation chose as the wake signal. They
+    /// must carry no content from the notification payload (§10.7).
     pub payload: Vec<u8>,
 }
 
 impl WakeSignal {
-    /// Creates a new wake signal from a notification payload.
+    /// Creates a wake signal holding `payload`, the bytes the [`Push`]
+    /// implementation chose to return. The caller passes bytes that carry no
+    /// content from the received notification (§10.7).
     #[must_use]
     pub const fn new(payload: Vec<u8>) -> Self {
         Self { payload }
@@ -841,8 +844,8 @@ pub trait DeviceAttestation: Send + Sync {
 /// Push notification trait.
 ///
 /// Abstracts platform-specific push notification registration and handling
-/// (APNs, FCM). The testing implementation returns synthetic tokens and passes
-/// payloads through as wake signals. See ADR-006.
+/// (APNs, FCM). The in-memory implementation returns synthetic tokens and one
+/// fixed wake signal for every payload. See ADR-006.
 pub trait Push: Send + Sync {
     /// Register for push notifications and return a platform-specific token.
     ///
