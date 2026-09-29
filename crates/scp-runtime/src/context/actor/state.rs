@@ -1715,22 +1715,6 @@ fn hex_encode_context_id(id: &[u8; 32]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// WrappingKeyPair — per-identity DHKEM(P-256) keypair held by the supervisor
-// ---------------------------------------------------------------------------
-
-/// DHKEM(P-256) wrapping keypair (§9.16.1) held in the supervisor's per-identity map
-/// (`DashMap<DID, ArcSwap<WrappingKeyPair>>`). Secret bytes are wrapped
-/// in `Zeroizing` so rotation zeros the prior keypair when the last
-/// `Arc<WrappingKeyPair>` drops.
-#[derive(Debug)]
-pub struct WrappingKeyPair {
-    /// 65-byte uncompressed P-256 public point.
-    pub public: [u8; 65],
-    /// 32-byte P-256 secret scalar. Zeroized on drop.
-    pub secret: Zeroizing<[u8; 32]>,
-}
-
-// ---------------------------------------------------------------------------
 // Per-context crypto orchestration + state-management (ADR-049 PR-7 Prep A)
 // ---------------------------------------------------------------------------
 //
@@ -3087,8 +3071,8 @@ impl PerContextState {
     /// Exports the per-context crypto state as an opaque, restore-compatible
     /// byte blob, verbatim from the former provider `export_crypto_state`. The
     /// two floor collections are caller-sourced (authoritative Class-M
-    /// registry); the DHKEM(P-256) wrapping keypair enters as parameters
-    /// (node-resident). The send-side sequence counter is read from
+    /// registry); the DHKEM(P-256) wrapping scalar enters as a parameter
+    /// (node-resident; its public point is derived on restore). The send-side sequence counter is read from
     /// [`PerContextState::send_tracker`] (the actor's home for the provider's
     /// former `send_sequence`).
     ///
@@ -3104,7 +3088,6 @@ impl PerContextState {
         &self,
         sender_key_epochs: Vec<(String, u64)>,
         recv_sequence_floors: Vec<(String, ReceiveFloor)>,
-        wrapping_public_key: [u8; 65],
         wrapping_secret_key: &[u8],
     ) -> Result<Vec<u8>, ContextError> {
         let ContextModeState::Encrypted(crypto) = &self.mode else {
@@ -3178,7 +3161,6 @@ impl PerContextState {
                 .collect(),
             signer_bytes: std::mem::take(&mut signer_bytes),
             group_id,
-            wrapping_public_key,
             wrapping_secret_key: wrapping_secret_key.to_vec(),
         };
 
@@ -3842,18 +3824,6 @@ mod tests {
         let t = RecvSequenceTracker::new();
         let did = DID("did:example:eve".to_owned());
         assert_eq!(t.last_seen(&did), 0);
-    }
-
-    #[test]
-    fn wrapping_keypair_secret_is_zeroizing() {
-        // `Zeroizing` drop zeros the byte buffer; we assert the type-level
-        // contract by constructing one and reading the public bytes.
-        let (public, secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
-        let kp = WrappingKeyPair { public, secret };
-        assert_eq!(kp.public, public);
-        // Zeroization on drop is asserted by `Zeroizing`'s own tests; we
-        // assert here only that the field compiles under `Zeroizing<[u8;32]>`.
-        drop(kp);
     }
 
     /// ADR-049 §9 PR2a: the Class-S sub-struct mirror snapshot/restore is a
@@ -4825,7 +4795,7 @@ mod crypto_ops_golden {
         let (alice_p, alice_a, _bob_p, _bob_a, ctx) = setup();
         // Use Alice's provider wrapping keypair so the actor export embeds the
         // SAME node-resident wrapping material a restore needs.
-        let (wpub, wsec) = alice_p.wrapping_keypair_snapshot();
+        let (_, wsec) = alice_p.wrapping_keypair_snapshot();
 
         // Capture the ORIGINAL group-context extension + local epoch off the live
         // actor (export is non-destructive) as the golden restore target.
@@ -4833,7 +4803,7 @@ mod crypto_ops_golden {
         let orig_epoch = alice_a.local_sender_key_epoch();
 
         let blob_a = alice_a
-            .export_crypto_state(Vec::new(), Vec::new(), wpub, &*wsec)
+            .export_crypto_state(Vec::new(), Vec::new(), &*wsec)
             .unwrap();
         assert!(!blob_a.is_empty());
 
@@ -4862,18 +4832,18 @@ mod crypto_ops_golden {
     #[test]
     fn golden_destroy_mls_group_empties_export() {
         let (alice_p, mut alice_a, _bob_p, _bob_a, _ctx) = setup();
-        let (wpub, wsec) = alice_p.wrapping_keypair_snapshot();
+        let (_, wsec) = alice_p.wrapping_keypair_snapshot();
 
         assert!(
             !alice_a
-                .export_crypto_state(Vec::new(), Vec::new(), wpub, &*wsec)
+                .export_crypto_state(Vec::new(), Vec::new(), &*wsec)
                 .unwrap()
                 .is_empty()
         );
         alice_a.destroy_mls_group().unwrap();
         assert!(
             alice_a
-                .export_crypto_state(Vec::new(), Vec::new(), wpub, &*wsec)
+                .export_crypto_state(Vec::new(), Vec::new(), &*wsec)
                 .unwrap()
                 .is_empty(),
             "destroy_mls_group makes export return empty (the group map entry is \

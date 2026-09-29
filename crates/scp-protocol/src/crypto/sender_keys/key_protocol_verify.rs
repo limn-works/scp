@@ -43,7 +43,7 @@ use scp_did::SigningKeyId;
 ///
 /// Returns `(public_key, secret_key)`: the 65-byte uncompressed P-256 point
 /// and the 32-byte big-endian scalar, wiped on drop. The secret key should be
-/// persisted via `ProtocolRepository::store_wrapping_keypair` and the public
+/// persisted via `ProtocolRepository::store_wrapping_key` and the public
 /// key included in the `LeafNode` extension via `make_wrapping_key_extension`.
 ///
 /// See spec §9.16.1.

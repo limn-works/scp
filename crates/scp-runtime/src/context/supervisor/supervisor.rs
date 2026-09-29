@@ -48,7 +48,6 @@ use crate::context::actor::commands::{
 };
 use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::outcome::Outcome;
-use crate::context::actor::state::WrappingKeyPair;
 use crate::context::actor::{BoundedReplyError, bounded_reply_await};
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use crate::context::outlets::stream::{OriginAdmissionTracker, StreamAdmissionTracker};
@@ -57,6 +56,7 @@ use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::context::supervisor::saga_journal::{
     JournalEntry, SagaId, SagaJournal, SagaState, SagaTerminalState,
 };
+use crate::crypto::wrapping::WrappingKeyPair;
 use crate::economy::adapter::PaymentAdapterDyn;
 use scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt;
 use serde::{Deserialize, Serialize};
@@ -2530,7 +2530,7 @@ impl Supervisor {
     ) -> Option<Arc<Vec<u8>>> {
         self.wrapping_keys.get(did).map(|entry| {
             let pair = entry.value().load_full();
-            Arc::new(pair.public.to_vec())
+            Arc::new(pair.public().to_vec())
         })
     }
 
@@ -2556,7 +2556,7 @@ impl Supervisor {
     ) -> Option<Arc<zeroize::Zeroizing<Vec<u8>>>> {
         self.wrapping_keys.get(did).map(|entry| {
             let pair = entry.value().load_full();
-            Arc::new(zeroize::Zeroizing::new(pair.secret.to_vec()))
+            Arc::new(zeroize::Zeroizing::new(pair.secret().to_vec()))
         })
     }
 
@@ -2565,7 +2565,7 @@ impl Supervisor {
     /// [`Self::with_providers`] observes empty per-identity state.
     /// Wrapping-key secrets zeroize on drop via the
     /// `Zeroizing<[u8;32]>` field on
-    /// [`WrappingKeyPair`](crate::context::actor::state::WrappingKeyPair).
+    /// [`WrappingKeyPair`](crate::crypto::wrapping::WrappingKeyPair).
     /// Phase 1 fix-up of ADR-049 (post-review-round-1).
     pub(crate) fn clear_wrapping_keys(&self) {
         self.wrapping_keys.clear();
@@ -2592,18 +2592,9 @@ impl Supervisor {
         secret: zeroize::Zeroizing<Vec<u8>>,
     ) -> Result<(), ContextError> {
         let _guard = self.write_lock.lock().await;
-        // Convert from runtime-API `Vec<u8>` to the per-identity
-        // [`crate::context::actor::state::WrappingKeyPair`] shape (a 65-byte
-        // point and a 32-byte scalar behind `Zeroizing`). The point is
-        // validated (§9.5) and the pair checked to match (C19(c)) before the
-        // slot changes, so a malformed or mismatched pair fails loudly instead
-        // of publishing a key this node cannot open.
-        let public_arr = scp_protocol::crypto::hpke::p256::validate_uncompressed_point(&public)
-            .map_err(|e| {
-                ContextError::InvalidState(format!(
-                    "Supervisor::set_wrapping_keys — wrapping public key: {e}"
-                ))
-            })?;
+        // The pair is rebuilt from the scalar and its derived point compared
+        // with the supplied one, so a malformed or mismatched pair fails
+        // loudly instead of publishing a key this node cannot open.
         let secret_arr: zeroize::Zeroizing<[u8; 32]> =
             zeroize::Zeroizing::new(secret.as_slice().try_into().map_err(|_| {
                 ContextError::InvalidState(format!(
@@ -2611,15 +2602,16 @@ impl Supervisor {
                     secret.len(),
                 ))
             })?);
-        scp_crypto::p256::check_keypair(&secret_arr, &public_arr).map_err(|e| {
+        let pair = WrappingKeyPair::from_secret(secret_arr).map_err(|e| {
             ContextError::InvalidState(format!(
-                "Supervisor::set_wrapping_keys — wrapping keypair: {e}"
+                "Supervisor::set_wrapping_keys — wrapping secret key: {e}"
             ))
         })?;
-        let pair = WrappingKeyPair {
-            public: public_arr,
-            secret: secret_arr,
-        };
+        if pair.public().as_slice() != public.as_slice() {
+            return Err(ContextError::InvalidState(
+                "Supervisor::set_wrapping_keys — wrapping public key is not secret · G".to_owned(),
+            ));
+        }
         match self.wrapping_keys.get(&did) {
             Some(entry) => entry.value().store(Arc::new(pair)),
             None => {
@@ -2766,7 +2758,7 @@ impl Supervisor {
         let wrapping_pubkey = self
             .wrapping_keys
             .get(identity)
-            .map(|entry| entry.value().load_full().public);
+            .map(|entry| *entry.value().load().public());
 
         Ok(
             crate::context::supervisor::key_package_actor::KeyPackageStoreDeps {
@@ -14445,8 +14437,7 @@ impl Supervisor {
                     // `build_snapshot_for_persist` (step 4) will persist. The P-256
                     // wrapping keypair is node-level and enters as params from the
                     // RETAINED `deps.crypto.wrapping_keypair()` accessor.
-                    let (welcome_wrapping_public, welcome_wrapping_secret) =
-                        deps.crypto.wrapping_keypair();
+                    let (_, welcome_wrapping_secret) = deps.crypto.wrapping_keypair();
                     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the crypto move relocated
                     // `export_crypto_state` onto the actor `state`, so the former
                     // provider `arm_export_failure_once` seam no longer sits on
@@ -14467,7 +14458,6 @@ impl Supervisor {
                                 deps.supervisor.export_sender_key_epochs(&context_id_bytes),
                                 deps.supervisor
                                     .export_recv_sequence_floors(&context_id_bytes),
-                                welcome_wrapping_public,
                                 &*welcome_wrapping_secret,
                             ),
                         )
@@ -16892,7 +16882,7 @@ mod tests {
     }
 
     /// Each malformed or mismatched pair surfaces as `InvalidState` and
-    /// registers nothing (§9.5, C19(c)): a 32-byte (X25519-length) public
+    /// registers nothing (§9.5): a 32-byte (X25519-length) public
     /// key, a `0x02`-prefixed point, an off-curve point, a 16-byte secret,
     /// and a valid point paired with another key's scalar.
     #[tokio::test]
@@ -17252,9 +17242,9 @@ mod tests {
         sender_key_epochs: Vec<(String, u64)>,
         recv_sequence_floors: Vec<(String, scp_protocol::context::builder::ReceiveFloor)>,
     ) -> Result<Vec<u8>, ContextError> {
-        let (wpub, wsec) = crypto.wrapping_keypair_snapshot();
+        let (_, wsec) = crypto.wrapping_keypair_snapshot();
         let state = take_into_actor(crypto, ctx, ext);
-        state.export_crypto_state(sender_key_epochs, recv_sequence_floors, wpub, &*wsec)
+        state.export_crypto_state(sender_key_epochs, recv_sequence_floors, &*wsec)
     }
 
     /// Build a `Supervisor` around an EXISTING crypto provider `Arc` — used by the

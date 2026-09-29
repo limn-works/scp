@@ -46,6 +46,7 @@ use zeroize::{Zeroize, Zeroizing};
 use super::backend::MlsBackend;
 use super::production_backend::ProductionMlsBackend;
 use crate::crypto::hpke_backend::{HpkeBackend, ProductionHpkeBackend};
+use crate::crypto::wrapping::WrappingKeyPair;
 use scp_mls::credential::ScpCredential;
 use scp_mls::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
 use scp_mls::validate_key_package_lifetime;
@@ -54,7 +55,6 @@ use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::builder::ReceiveFloor;
 use scp_protocol::crypto::sender_keys::{
     NonceDedup, SenderKey, SenderKeyDistributionMessage, SenderKeyStore, generate_sender_key,
-    generate_wrapping_keypair,
 };
 
 // ---------------------------------------------------------------------------
@@ -168,18 +168,11 @@ pub(crate) struct MlsCryptoSnapshot {
     /// defense-in-depth at the sender-key layer.
     #[serde(default)]
     pub(crate) recv_sequence_tracker: Vec<(String, u64, u64)>,
-    /// The provider-level DHKEM(P-256) wrapping public key (§9.16.1): the
-    /// 65-byte uncompressed point. Persisted so remote members' HPKE-sealed
-    /// sender key responses can still be decrypted after a restart. Without
-    /// this, the restored provider would generate a fresh keypair whose public
-    /// key doesn't match the one published in the MLS tree's `LeafNode`
-    /// extension. Required: a snapshot without it fails to decode.
-    #[serde(with = "scp_protocol::serde_util::serde_pubkey_65")]
-    pub(crate) wrapping_public_key: [u8; 65],
-    /// The provider-level DHKEM(P-256) wrapping secret scalar (§9.16.1).
-    /// Wrapped in a `Vec<u8>` for serde compatibility; restore requires 32
-    /// bytes whose `scalar·G` is `wrapping_public_key`, re-wrapped in
-    /// [`Zeroizing`].
+    /// The provider-level DHKEM(P-256) wrapping secret scalar (§9.16.1), the
+    /// only persisted half: restore derives the public point from it, so a
+    /// restored provider keeps publishing the key its remote members sealed
+    /// sender keys to. Wrapped in a `Vec<u8>` for serde compatibility; restore
+    /// requires a 32-byte scalar in `[1, n − 1]`, re-wrapped in [`Zeroizing`].
     pub(crate) wrapping_secret_key: Vec<u8>,
 }
 
@@ -216,7 +209,6 @@ impl std::fmt::Debug for MlsCryptoSnapshot {
             )
             .field("signer_bytes", &"[REDACTED]")
             .field("group_id", &format_args!("[{} bytes]", self.group_id.len()))
-            .field("wrapping_public_key", &"[REDACTED]")
             .field("wrapping_secret_key", &"[REDACTED]")
             .finish()
     }
@@ -423,21 +415,6 @@ pub struct RestoredFloors {
 
 /// Production `ContextCryptoProvider` backed by `OpenMLS`.
 ///
-/// Node-resident DHKEM(P-256) wrapping keypair (§9.16.1), held as one unit so the
-/// public and secret halves rotate and are read atomically (ADR-049 PR-7
-/// hardening H3). Stored behind a single [`ArcSwap`] on [`NodeMlsFactory`].
-struct WrappingKeypair {
-    /// DHKEM(P-256) wrapping public key for sender key HPKE (§9.16.1): the
-    /// 65-byte uncompressed point published in the MLS `LeafNode`
-    /// `scp_wrapping_key` extension.
-    public: [u8; 65],
-    /// P-256 wrapping secret scalar for sender key HPKE (§9.16.1). Used to open
-    /// HPKE-sealed sender key responses. Wrapped in [`Zeroizing`] so the prior
-    /// key material is zeroized when the last `Arc` to this pair drops (i.e. on
-    /// rotation, when the `ArcSwap` slot is replaced).
-    secret: Zeroizing<[u8; 32]>,
-}
-
 /// Manages per-context MLS groups and sender keys. Thread-safe via internal
 /// `Mutex`-protected maps.
 ///
@@ -456,7 +433,7 @@ struct WrappingKeypair {
 /// # Wrapping-keypair atomicity (ADR-049 PR-7 hardening H3)
 ///
 /// The node-resident DHKEM(P-256) wrapping keypair is stored as a SINGLE
-/// [`WrappingKeypair`] behind ONE [`ArcSwap`], so the public and secret halves
+/// [`WrappingKeyPair`] behind ONE [`ArcSwap`], so the public and secret halves
 /// rotate and are read as one unit. A prior design held the two halves in two
 /// separate `ArcSwap` slots; a reader that loaded the public half and then the
 /// secret half across two `.load()` calls could observe a torn pair (public of
@@ -503,7 +480,7 @@ pub struct NodeMlsFactory {
     /// public half published in the MLS `LeafNode` `scp_wrapping_key` extension,
     /// secret half used to open HPKE-sealed sender key responses.
     ///
-    /// Held as a SINGLE [`WrappingKeypair`] behind ONE [`ArcSwap`] (ADR-049 PR-7
+    /// Held as a SINGLE [`WrappingKeyPair`] behind ONE [`ArcSwap`] (ADR-049 PR-7
     /// hardening H3) so the pair rotates and is read atomically — the
     /// snapshot-restore path (which takes `&self`) replaces both halves in one
     /// `.store()`, and every reader loads both halves from one `.load()`,
@@ -511,7 +488,7 @@ pub struct NodeMlsFactory {
     /// key material is zeroized when the last `Arc` to the pair drops. Reader
     /// discipline (load → use → drop within the same poll) is enforced at every
     /// callsite — no callsite stores the loaded `Arc` in a struct field.
-    wrapping_keypair: ArcSwap<WrappingKeypair>,
+    wrapping_keypair: ArcSwap<WrappingKeyPair>,
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -564,16 +541,12 @@ impl NodeMlsFactory {
         hpke_backend: Arc<dyn HpkeBackend>,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        let (wrapping_public_key, wrapping_secret_key) = generate_wrapping_keypair();
         Self {
             local_did,
             clock,
             mls_backend,
             hpke_backend,
-            wrapping_keypair: ArcSwap::from_pointee(WrappingKeypair {
-                public: wrapping_public_key,
-                secret: wrapping_secret_key,
-            }),
+            wrapping_keypair: ArcSwap::from_pointee(WrappingKeyPair::generate()),
         }
     }
 
@@ -692,9 +665,9 @@ impl NodeMlsFactory {
         context_extension: &scp_protocol::context::ScpContextExtension,
     ) -> Result<OwnedMlsCryptoState, ContextCreationError> {
         let credential = self.make_credential()?;
-        // Load through ArcSwap; the guard is dropped as `.public` is `Copy`ed
-        // into the stack array (load → copy → drop within the poll).
-        let wrapping_pk = self.wrapping_keypair.load().public;
+        // Load through ArcSwap; the guard is dropped as the public point is
+        // copied into the stack array (load → copy → drop within the poll).
+        let wrapping_pk = *self.wrapping_keypair.load().public();
         let mls_group = group::create_group_with_context(
             &credential,
             &wrapping_pk,
@@ -766,7 +739,7 @@ impl NodeMlsFactory {
     #[cfg(any(test, feature = "testing"))]
     pub fn create_bare_group_owned(&self) -> Result<OwnedMlsCryptoState, ContextCreationError> {
         let credential = self.make_credential()?;
-        let wrapping_pk = self.wrapping_keypair.load().public;
+        let wrapping_pk = *self.wrapping_keypair.load().public();
         let mls_group = group::create_group_with_wrapping_key(
             &credential,
             Some(&wrapping_pk),
@@ -918,7 +891,7 @@ impl NodeMlsFactory {
                 let sender_key = crate::crypto::sender_keys::key_protocol::hpke_open_sender_key(
                     &response.hpke_sealed_key,
                     &response.ephemeral_pubkey,
-                    &wrapping_keypair_guard.secret,
+                    wrapping_keypair_guard.secret(),
                     &ctx_id_hex,
                     &response.sender_did,
                     response.epoch,
@@ -991,7 +964,7 @@ impl NodeMlsFactory {
     #[must_use]
     pub(crate) fn wrapping_keypair(&self) -> ([u8; 65], zeroize::Zeroizing<[u8; 32]>) {
         let guard = self.wrapping_keypair.load();
-        (guard.public, zeroize::Zeroizing::new(*guard.secret))
+        (*guard.public(), guard.secret().clone())
     }
 
     /// Reconstructs the per-context MLS crypto MATERIAL from a persisted
@@ -1192,10 +1165,10 @@ impl NodeMlsFactory {
         // prior two-store window where one slot could be observed rotated
         // while the other lagged.
         //
-        // C19(c): the pair is restored only when the secret is a 32-byte P-256
-        // scalar whose public point is the persisted public key; anything else
-        // fails the restore closed before the slot changes. The public key's
-        // 65-byte length was checked on decode.
+        // Only the scalar is persisted; the public point is derived from it,
+        // so a restored pair cannot disagree with itself. A secret that is not
+        // a 32-byte scalar in `[1, n − 1]` fails the restore closed before the
+        // slot changes.
         //
         // SECURITY: the intermediate secret is `Zeroizing` from the copy on, so
         // it is zeroed on drop even on the `?` returns below.
@@ -1211,12 +1184,10 @@ impl NodeMlsFactory {
                     ))
                 })?,
         );
-        scp_crypto::p256::check_keypair(&secret, &snapshot.wrapping_public_key)
-            .map_err(|e| ContextError::CryptoFailed(format!("restored wrapping keypair: {e}")))?;
-        self.wrapping_keypair.store(Arc::new(WrappingKeypair {
-            public: snapshot.wrapping_public_key,
-            secret,
-        }));
+        let pair = WrappingKeyPair::from_secret(secret).map_err(|e| {
+            ContextError::CryptoFailed(format!("restored wrapping secret key: {e}"))
+        })?;
+        self.wrapping_keypair.store(Arc::new(pair));
 
         // SECURITY: Zeroize the wrapping secret key bytes remaining in the
         // snapshot. The key has been copied into the Zeroizing<[u8; 32]> guard
@@ -1351,9 +1322,9 @@ mod tests {
         sender_key_epochs: Vec<(String, u64)>,
         recv_sequence_floors: Vec<(String, ReceiveFloor)>,
     ) -> Result<Vec<u8>, ContextError> {
-        let (wpub, wsec) = provider.wrapping_keypair();
+        let (_, wsec) = provider.wrapping_keypair();
         let state = take_into_actor(provider, ctx);
-        state.export_crypto_state(sender_key_epochs, recv_sequence_floors, wpub, &*wsec)
+        state.export_crypto_state(sender_key_epochs, recv_sequence_floors, &*wsec)
     }
 
     /// #2148 (ADR-049 birth-into-actor): birth an owned context onto a throwaway
@@ -1369,11 +1340,11 @@ mod tests {
         recv_sequence_floors: Vec<(String, ReceiveFloor)>,
         mutate: impl FnOnce(&mut crate::context::actor::ContextCryptoState),
     ) -> Vec<u8> {
-        let (wpub, wsec) = provider.wrapping_keypair();
+        let (_, wsec) = provider.wrapping_keypair();
         let mut state = take_into_actor(provider, ctx);
         mutate(actor_crypto_mut(&mut state));
         state
-            .export_crypto_state(sender_key_epochs, recv_sequence_floors, wpub, &*wsec)
+            .export_crypto_state(sender_key_epochs, recv_sequence_floors, &*wsec)
             .expect("export seeded actor crypto")
     }
 
@@ -1746,7 +1717,7 @@ mod tests {
         let extracted = scp_mls::wrapping_extension::extract_own_wrapping_key(group).unwrap();
         assert_eq!(
             extracted,
-            Some(provider.wrapping_keypair.load().public),
+            Some(*provider.wrapping_keypair.load().public()),
             "own leaf node must contain provider's wrapping public key"
         );
     }
@@ -1787,7 +1758,7 @@ mod tests {
         let ctx_id = make_context_id();
 
         let ctx_hex = hex::encode(ctx_id);
-        let bob_wrapping_pk = bob_provider.wrapping_keypair.load().public;
+        let bob_wrapping_pk = *bob_provider.wrapping_keypair.load().public();
         let (sealed_vec, ephemeral_pub) =
             crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
                 &[42u8; 32],
@@ -1830,9 +1801,9 @@ mod tests {
         let unknown_ctx = [0xFFu8; 32];
         let state =
             PerContextState::new_for_test_encrypted(unknown_ctx, 0, DID::from(TEST_DID.to_owned()));
-        let (wpub, wsec) = make_provider().wrapping_keypair();
+        let (_, wsec) = make_provider().wrapping_keypair();
         let exported = state
-            .export_crypto_state(Vec::new(), Vec::new(), wpub, &*wsec)
+            .export_crypto_state(Vec::new(), Vec::new(), &*wsec)
             .unwrap();
         assert!(
             exported.is_empty(),
@@ -1888,9 +1859,9 @@ mod tests {
         };
 
         // Export crypto state through the actor seam.
-        let (wpub, wsec) = provider.wrapping_keypair();
+        let (_, wsec) = provider.wrapping_keypair();
         let exported = actor
-            .export_crypto_state(Vec::new(), Vec::new(), wpub, &*wsec)
+            .export_crypto_state(Vec::new(), Vec::new(), &*wsec)
             .unwrap();
         assert!(!exported.is_empty(), "exported state should be non-empty");
 
@@ -2023,7 +1994,7 @@ mod tests {
 
         // Export with BOTH floor axes populated: per-sender epoch (bob, 5) and
         // intra-epoch recv floor ReceiveFloor { epoch: 5, sequence: 3 }.
-        let (wpub, wsec) = provider.wrapping_keypair();
+        let (_, wsec) = provider.wrapping_keypair();
         let exported = actor
             .export_crypto_state(
                 vec![(bob.to_owned(), 5)],
@@ -2034,7 +2005,6 @@ mod tests {
                         sequence: 3,
                     },
                 )],
-                wpub,
                 &*wsec,
             )
             .unwrap();
@@ -2506,11 +2476,11 @@ mod tests {
         let provider = make_provider();
         let ctx_id = make_context_id();
 
-        let (wpub, wsec) = provider.wrapping_keypair();
+        let (_, wsec) = provider.wrapping_keypair();
         let mut actor = take_into_actor(&provider, &ctx_id);
         assert!(
             !actor
-                .export_crypto_state(Vec::new(), Vec::new(), wpub, &*wsec)
+                .export_crypto_state(Vec::new(), Vec::new(), &*wsec)
                 .unwrap()
                 .is_empty(),
             "live group must export non-empty state"
@@ -2520,7 +2490,7 @@ mod tests {
 
         // After destroy, export should return empty (no MLS group).
         let exported = actor
-            .export_crypto_state(Vec::new(), Vec::new(), wpub, &*wsec)
+            .export_crypto_state(Vec::new(), Vec::new(), &*wsec)
             .unwrap();
         assert!(
             exported.is_empty(),
@@ -2574,9 +2544,9 @@ mod tests {
             .expect("group present")
             .epoch()
             .unwrap();
-        let (wpub, wsec) = provider.wrapping_keypair();
+        let (_, wsec) = provider.wrapping_keypair();
         let exported = actor
-            .export_crypto_state(Vec::new(), Vec::new(), wpub, &*wsec)
+            .export_crypto_state(Vec::new(), Vec::new(), &*wsec)
             .unwrap();
 
         let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
@@ -2597,8 +2567,8 @@ mod tests {
         let ctx_id = make_context_id();
 
         // Capture the original wrapping keypair.
-        let original_public = provider.wrapping_keypair.load().public;
-        let original_secret: [u8; 32] = *provider.wrapping_keypair.load().secret;
+        let original_public = *provider.wrapping_keypair.load().public();
+        let original_secret: [u8; 32] = **provider.wrapping_keypair.load().secret();
 
         // Sanity: the keypair should not be all zeros.
         assert_ne!(
@@ -2616,7 +2586,7 @@ mod tests {
 
         // Create a fresh provider (simulates restart — gets a NEW random keypair).
         let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let fresh_public = provider2.wrapping_keypair.load().public;
+        let fresh_public = *provider2.wrapping_keypair.load().public();
         assert_ne!(
             fresh_public, original_public,
             "fresh provider should have a DIFFERENT wrapping public key"
@@ -2629,8 +2599,8 @@ mod tests {
         let _ = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
 
         // After restore, the wrapping keypair must match the ORIGINAL, not the fresh one.
-        let restored_public = provider2.wrapping_keypair.load().public;
-        let restored_secret: [u8; 32] = *provider2.wrapping_keypair.load().secret;
+        let restored_public = *provider2.wrapping_keypair.load().public();
+        let restored_secret: [u8; 32] = **provider2.wrapping_keypair.load().secret();
 
         assert_eq!(
             restored_public, original_public,
@@ -2655,33 +2625,61 @@ mod tests {
     fn restore_error(snapshot: &MlsCryptoSnapshot) -> String {
         let bytes = rmp_serde::to_vec_named(snapshot).unwrap();
         let fresh = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let before = fresh.wrapping_keypair.load().public;
+        let before = *fresh.wrapping_keypair.load().public();
         let err = match fresh.build_restored_owned(&make_context_id(), &bytes) {
             Err(ContextError::CryptoFailed(m)) => m,
             Err(other) => panic!("expected CryptoFailed, got {other:?}"),
             Ok(_) => panic!("tampered snapshot must not restore"),
         };
         assert_eq!(
-            fresh.wrapping_keypair.load().public,
+            *fresh.wrapping_keypair.load().public(),
             before,
             "a refused restore must not replace the wrapping keypair"
         );
         err
     }
 
-    /// T7 / C19(c): a snapshot whose persisted wrapping public key is a valid
-    /// P-256 point that is not `secret · G` fails the restore closed.
+    /// A persisted wrapping scalar outside `[1, n − 1]` (zero, or the group
+    /// order `n`) fails the restore closed instead of deriving a point.
     #[test]
-    fn build_restored_owned_rejects_mismatched_wrapping_pair() {
+    fn build_restored_owned_rejects_out_of_range_wrapping_secret() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        let n = hex::decode("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")
+            .unwrap();
+        for (case, secret) in [("zero", vec![0u8; 32]), ("n", n)] {
+            let mut snapshot = exported_snapshot(&provider, &ctx_id);
+            snapshot.wrapping_secret_key = secret;
+            let err = restore_error(&snapshot);
+            assert!(
+                err.contains("restored wrapping secret key"),
+                "{case}: {err}"
+            );
+        }
+    }
+
+    /// Restore derives the published wrapping point from the persisted scalar:
+    /// a snapshot carrying scalar `1` restores a provider whose public key is
+    /// the P-256 base point `G`.
+    #[test]
+    fn build_restored_owned_derives_the_wrapping_point_from_the_scalar() {
         let provider = make_provider();
         let ctx_id = make_context_id();
         let mut snapshot = exported_snapshot(&provider, &ctx_id);
-        snapshot.wrapping_public_key = scp_crypto::p256::testing::valid_uncompressed_point(0xAA);
-        let err = restore_error(&snapshot);
-        assert!(err.contains("restored wrapping keypair"), "{err}");
+        let mut one = vec![0u8; 32];
+        one[31] = 1;
+        snapshot.wrapping_secret_key = one;
+        let bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
+        let fresh = make_provider();
+        let _restored = fresh.build_restored_owned(&ctx_id, &bytes).unwrap();
+        assert_eq!(
+            hex::encode(fresh.wrapping_keypair.load().public()),
+            "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296\
+             4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+        );
     }
 
-    /// C19(c): a persisted wrapping secret that is not 32 bytes fails the
+    /// A persisted wrapping secret that is not 32 bytes fails the
     /// restore closed rather than keeping a freshly generated pair.
     #[test]
     fn build_restored_owned_rejects_wrong_length_wrapping_secret() {

@@ -476,7 +476,7 @@ impl SupervisorHandle {
         self.supervisor
             .wrapping_keys
             .get(did)
-            .map(|entry| entry.value().load_full().public)
+            .map(|entry| *entry.value().load().public())
     }
 
     /// Look up this identity's `KeyPackageStoreActor` handle. Returns
@@ -965,13 +965,12 @@ const fn _assert_send_sync() {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::context::actor::state::WrappingKeyPair;
     use crate::context::supervisor::key_package_actor::KeyPackageStoreActor;
     use crate::context::supervisor::saga_journal::{ProtocolRepositorySagaJournal, SagaJournal};
     use crate::context::supervisor::supervisor::SupervisorConfig;
+    use crate::crypto::wrapping::WrappingKeyPair;
     use arc_swap::ArcSwap;
     use scp_platform::in_memory::InMemoryStorage;
-    use zeroize::Zeroizing;
 
     struct TestPersistence;
     #[async_trait::async_trait]
@@ -1045,11 +1044,8 @@ mod tests {
     async fn my_wrapping_public_key_reads_registered_value() {
         let (sup, handle) = test_handle();
         let did = DID("did:example:alice".to_owned());
-        let (public, secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
-        let kp = WrappingKeyPair {
-            public,
-            secret: Zeroizing::new(*secret),
-        };
+        let kp = WrappingKeyPair::generate();
+        let public = *kp.public();
         sup.wrapping_keys
             .insert(did.clone(), ArcSwap::new(Arc::new(kp)));
         let token = OwnedIdentityDid::issue_for_actor(did);

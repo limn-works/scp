@@ -2539,11 +2539,10 @@ pub fn build_snapshot_for_persist(
     // on the actor's `state` (was the provider); the P-256 wrapping keypair enters
     // as params from the retained `deps.crypto.wrapping_keypair()`, and the send
     // sequence is read from `state.send_tracker` inside the twin.
-    let (wrapping_public_key, wrapping_secret_key) = deps.crypto.wrapping_keypair();
+    let (_, wrapping_secret_key) = deps.crypto.wrapping_keypair();
     match state.export_crypto_state(
         deps.supervisor.export_sender_key_epochs(&ctx_id_bytes),
         deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes),
-        wrapping_public_key,
         &*wrapping_secret_key,
     ) {
         Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
