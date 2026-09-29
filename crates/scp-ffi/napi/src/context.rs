@@ -339,6 +339,10 @@ impl NapiContextHandle {
     /// Creates a minimal active handle stamped with the given bridge
     /// instance's id. Suitable for testing bridge functions that only need
     /// UCAN state (set up via `ensure_registered`).
+    ///
+    /// The handle carries `default_ceiling()`, the ceiling `context_create`
+    /// resolves an omitted declaration to, because `ensure_registered` keeps
+    /// an empty ceiling empty (deny-all).
     pub(crate) fn test_active_on(
         bi: &Arc<NapiBridgeInstance>,
         context_id: String,
@@ -351,7 +355,10 @@ impl NapiContextHandle {
             state: std::sync::Mutex::new(ContextState::Active),
             creator_did,
             mode: "Encrypted".to_owned(),
-            ceiling: vec![],
+            ceiling: scp_core::context::roles::default_ceiling()
+                .iter()
+                .map(scp_core::context::roles::Capability::ucan_capability_name)
+                .collect(),
             ceiling_policy: "immutable".to_owned(),
             ttl_seconds: None,
             promotion_policy: None,
@@ -582,7 +589,8 @@ fn default_ceiling_strings() -> Vec<String> {
 /// # Errors
 ///
 /// Returns `ScpNapiError::Validation` (`SCP-VALID-7000`) if the JSON is
-/// malformed or the parameters fail the common builder's validation.
+/// malformed, is not an object, or the parameters fail the common builder's
+/// validation.
 fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> {
     let params: serde_json::Value = serde_json::from_str(params_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
@@ -592,6 +600,19 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
             code: codes::VALID_7000.to_owned(),
         })
     })?;
+    // Every field below indexes `params` by key, and serde_json's index reads
+    // `Null` for any key of a non-object value, so an array, string, number,
+    // bool, or `null` would otherwise build a context from the defaults of
+    // every field, including the full default ceiling, that the caller never
+    // declared.
+    if !params.is_object() {
+        return Err(NapiError::from(ScpNapiError::Validation {
+            message: format!(
+                "params_json must be a JSON object of context parameters, got {params}"
+            ),
+            code: codes::VALID_7000.to_owned(),
+        }));
+    }
 
     let mode_str = params["mode"].as_str().unwrap_or("Encrypted").to_owned();
     // ceiling: string[] (default: `default_ceiling()`).
@@ -1407,13 +1428,19 @@ pub(crate) async fn context_join_from_welcome_on(
     // any pre-existing entry untouched (never roll back state we did not create).
     //
     // FLAG-1: the caller no longer supplies a ceiling, so register with the
-    // DEFAULT ceiling (`&[]`). The Occupied dedup is keyed on `context_id`, so
-    // the "detect a duplicate BEFORE consuming the single-use KeyPackage"
-    // crash-safety is preserved regardless of the ceiling. The AUTHENTICATED
-    // ceiling is re-synced from the joined handle's signed params AFTER a
-    // successful spawn (see `sync_ceiling_from_params` below).
-    crate::runtime::register_ffi_state(bi, &sealed.context_id, &sealed.creator_did, &[])
-        .map_err(NapiError::from)?;
+    // DEFAULT ceiling, passed explicitly because `register_ffi_state` keeps an
+    // empty ceiling empty (deny-all). The Occupied dedup is keyed on
+    // `context_id`, so the "detect a duplicate BEFORE consuming the single-use
+    // KeyPackage" crash-safety is preserved regardless of the ceiling. The
+    // AUTHENTICATED ceiling is re-synced from the joined handle's signed params
+    // AFTER a successful spawn (see `sync_ceiling_from_params` below).
+    crate::runtime::register_ffi_state(
+        bi,
+        &sealed.context_id,
+        &sealed.creator_did,
+        &default_ceiling_strings(),
+    )
+    .map_err(NapiError::from)?;
     // Insert the joiner as a member of the freshly-registered role state. On the
     // (practically unreachable) failure of this insert into state we just
     // created, roll it back so a failed join leaves nothing behind.
@@ -6726,10 +6753,12 @@ mod tests {
     /// reads the supervisor: a poisoned context reads `Some(Poisoned)` and
     /// refuses with the operation's code, a context mid-respawn or past a
     /// failed respawn reads `ActorCrashed` (`SCP-CTX-2135`), and an actor whose
-    /// mailbox does not answer reads `ActorBusy` (`SCP-CTX-2130`). A gate that
-    /// folded a failed read into `None` would report "no live supervisor
-    /// state" for the last three, and a gate that read the cached string
-    /// would admit all four.
+    /// mailbox does not answer reads `ActorBusy` (`SCP-CTX-2130`). Each row
+    /// asserts the bracketed typed code the TypeScript SDK parses, not a
+    /// message substring, so a mapping that delivered the `SCP-CTX-2001`
+    /// catch-all fails the row. A gate that folded a failed read into `None`
+    /// would report "no live supervisor state" for the last three, and a gate
+    /// that read the cached string would admit all four.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lifecycle_gates_refuse_a_poisoned_crashed_or_unreachable_actor() {
@@ -6738,11 +6767,12 @@ mod tests {
         let creator = "did:key:z6MkNapiGateFaultCreator";
         let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
 
-        for (fault, expected) in [
-            ("poisoned", "'poisoned' state"),
-            ("mid_respawn", codes::CTX_2135),
-            ("respawn_failed", codes::CTX_2135),
-            ("unreachable", "SCP-CTX-2130"),
+        // `None` means the refusal carries the operation's own code.
+        for (fault, supervisor_code) in [
+            ("poisoned", None),
+            ("mid_respawn", Some(codes::CTX_2135)),
+            ("respawn_failed", Some(codes::CTX_2135)),
+            ("unreachable", Some(codes::CTX_2130)),
         ] {
             let ctx_id = format!("napi-gate-{fault}-{}", uuid::Uuid::new_v4());
             crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator).await;
@@ -6769,16 +6799,25 @@ mod tests {
             let Err(subscribe) = super::subscribe_admission(&bi, &handle).await else {
                 panic!("subscribe must refuse a {fault} context");
             };
-            for (call, err) in [
-                ("join", join),
-                ("leave", leave),
-                ("send", send),
-                ("subscribe", subscribe),
+            for (call, op_code, err) in [
+                ("join", codes::CTX_2013, join),
+                ("leave", codes::CTX_2015, leave),
+                ("send", codes::CTX_2019, send),
+                ("subscribe", codes::CTX_2021, subscribe),
             ] {
+                let expected = supervisor_code.unwrap_or(op_code);
                 assert!(
-                    err.to_string().contains(expected),
-                    "{call} on a {fault} context must report {expected:?}, got: {err}"
+                    err.reason.starts_with(&format!("[{expected}] ")),
+                    "{call} on a {fault} context must carry typed code {expected}, got: {}",
+                    err.reason
                 );
+                if supervisor_code.is_none() {
+                    assert!(
+                        err.reason.contains("'poisoned' state"),
+                        "{call} on a poisoned context must name the state, got: {}",
+                        err.reason
+                    );
+                }
             }
             assert!(
                 !handle
@@ -6888,6 +6927,41 @@ mod tests {
             err.to_string().contains("ceiling entries must be"),
             "parser reported: {err}"
         );
+    }
+
+    /// A top-level `params_json` that is not a JSON object rejects with
+    /// `SCP-VALID-7000` instead of building a context from every field's
+    /// default, while an empty object parses to those defaults.
+    ///
+    /// `serde_json`'s index reads `Null` for every key of a non-object value, so
+    /// without the object check an array, a double-encoded string, a number, a
+    /// bool, or `null` would create an Encrypted context with the full default
+    /// ceiling.
+    #[test]
+    fn parse_context_params_rejects_a_non_object_params_json() {
+        for params_json in [
+            "null",
+            "42",
+            "true",
+            r#"["messages:write"]"#,
+            r#""{\"ceiling\":[]}""#,
+        ] {
+            let err = super::parse_context_params(params_json)
+                .err()
+                .unwrap_or_else(|| panic!("{params_json} must not parse"));
+            assert!(
+                err.reason.starts_with(&format!("[{}] ", codes::VALID_7000)),
+                "{params_json} must reject with {}, got: {}",
+                codes::VALID_7000,
+                err.reason
+            );
+            assert!(
+                err.reason.contains("must be a JSON object"),
+                "{params_json} must be rejected by the object check, got: {}",
+                err.reason
+            );
+        }
+        assert_eq!(parsed_ceiling_names("{}"), default_ceiling_names());
     }
 
     /// A rejected direct-execute leaves context membership/role state unchanged
@@ -7830,6 +7904,8 @@ mod tests {
         let core_handle = test_dispatch_create_context(&bi, &ctx_id, params, creator.clone()).await;
 
         // Build a handle with NO retained custody — the externally-loaded shape.
+        // Balances the decrement `NapiContextHandle`'s `Drop` runs.
+        crate::increment_handle_count();
         let handle = NapiContextHandle {
             context_id: ctx_id.clone(),
             state: std::sync::Mutex::new(ContextState::Active),

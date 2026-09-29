@@ -535,6 +535,13 @@ pub const CTX_2095: &str = "SCP-CTX-2095";
 ///
 /// Maps from `ContextError::NotPseudonymousContext`.
 pub const CTX_2096: &str = "SCP-CTX-2096";
+/// Context actor busy: the supervisor holds an actor for the context, but the
+/// actor did not answer (a saturated mailbox or a reply timeout, ADR-049 §10).
+///
+/// Retryable, unlike `CTX_2134` and `CTX_2135`.
+///
+/// Maps from `ContextError::ActorBusy`.
+pub const CTX_2130: &str = "SCP-CTX-2130";
 /// Context poisoned: its actor exceeded the respawn budget (ADR-049 §10).
 ///
 /// No longer respawned; the context is dormant until an operator clears the
