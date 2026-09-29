@@ -62,17 +62,19 @@
 # TWO RESIDUAL LIMITS, both structural, neither worth another mechanism:
 #   - A target whose body sits behind `#[cfg(...)]` is counted and compiles to
 #     nothing. `checked` counts targets, not lines, so coverage is an upper bound.
-#   - Every remaining bypass needs write access to the crate under test. That is
-#     the criterion, and it is wider than "edits the manifest": `crates/NAME/build.rs`
-#     needs no manifest key at all, and a build script that prints
-#     `cargo::rustc-cfg=feature="testing"` makes `DhtMode::Memory` exist for every
-#     target of the package. `.cargo/config.toml` rustflags is the same class.
-#     (A later attempt to reproduce that build script made the gate exit 1 instead,
-#     because the injected cfg desynchronized the lib from its dependency features.
-#     The criterion does not rest on the exit code either way: a writer of the crate
-#     controls what its targets compile against.) Defending a gate
-#     against a writer of its own subject is unbounded, so review covers it. No
-#     hook guards this script either. AGENTS.md lists it among the enforcement
+#   - Beyond the dev-dependency closure stated above (lesson row 4b), every remaining
+#     bypass edits the crate's BUILD CONFIGURATION: its `build.rs`, a manifest key, or
+#     `.cargo/config.toml` rustflags. That is the criterion. It is
+#     not "write access to the crate": every defect this gate catches, including the
+#     `DhtMode::Memory` edit above, is written by someone with that access, so write
+#     access separates nothing. A source edit to an example or to the lib is this
+#     gate's subject and never an exemption. `build.rs` is an instance of the
+#     criterion that needs no manifest key, and one hypothesis stays unmeasured: that a build
+#     script printing `cargo::rustc-cfg=feature="testing"` makes `DhtMode::Memory`
+#     exist for every target of the package. Two attempts to reproduce it made the
+#     gate exit 1 instead, because the injected cfg desynchronized the lib from its
+#     dependency features. Review covers build-configuration edits. No hook guards
+#     this script either. AGENTS.md lists it among the enforcement
 #     files a human must approve weakening, and review enforces that rule.
 #
 # See .docs/lessons/shipped-targets-need-a-default-feature-build.md.
@@ -100,10 +102,14 @@ while IFS=$'\t' read -r pkg pkgdir; do
       | @tsv
     ')"
 
+  # Every cargo call in this loop reads /dev/null, not the heredoc feeding the loop,
+  # so no subprocess can drain the package list and end the loop after one package.
+  # Cases `secondbroken` and `secondorphan` pin that every package is checked.
+  #
   # Never swallow this exit code: `cargo package --list` fails (101) on a manifest
   # error such as a `readme` naming a missing file, and treating that as "no
   # published examples" would drop the crate from assertion 2 in silence.
-  if ! RAW="$(cargo package --list -p "$pkg" --allow-dirty 2>&1)"; then
+  if ! RAW="$(cargo package --list -p "$pkg" --allow-dirty 2>&1 </dev/null)"; then
     # Unconditional. Gating this on the package having targets inverts it: an
     # `autoexamples = false` crate has none, which is exactly the state where a
     # published example file cannot be seen, so silence there is the failure mode
@@ -136,7 +142,7 @@ EOF
     [ -n "$name" ] || continue
     checked=$((checked + 1))
     echo "── $pkg::$name  ($src)"
-    if ! cargo clippy -p "$pkg" --example "$name" -- -D warnings; then
+    if ! cargo clippy -p "$pkg" --example "$name" -- -D warnings </dev/null; then
       echo "FAIL: $pkg example '$name' does not compile." >&2
       status=1
     fi

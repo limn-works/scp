@@ -5,11 +5,12 @@
 # published `examples/*.rs` is no example target's source, when `cargo package --list`
 # fails, or when it checked no example target; and it exits 0 on a workspace with none of
 # those. Each case builds a workspace in `mktemp -d` (one crate, or two where a case needs a
-# dev-dependency edge between members), copies the real gate into its `scripts/`, runs it
-# there with real cargo, and asserts both the exit code and the FAIL or OK line that names
+# dev-dependency edge between members or a defect in the second package), copies the real
+# gate into its `scripts/`, runs it there with real cargo, and asserts both the exit code and the FAIL or OK line that names
 # the outcome, so a case cannot pass on the wrong outcome.
 #
-# The last five cases pin the gate's invocation, and each mutation below makes its case fail.
+# The five cases from `featuregated` to `spaced` and the last two pin the gate's invocation,
+# and each mutation below makes its case fail.
 # `--all-features` or `--features testing` on the clippy line makes the gate exit 0 on
 # `featuregated`, which expects exit 1. `--examples` in place of `--example NAME` skips a
 # `required-features` target and makes the gate exit 0 on `requiredfeatures`, which expects
@@ -17,7 +18,8 @@
 # into `demo` and makes the gate exit 0 on `devdepunify`, which expects exit 1. Iterating
 # published files in place of targets drops `excluded`'s only target and makes the gate exit 1
 # on `excluded`, which expects exit 0. An unquoted `for` loop splits `spaced` at its space and
-# makes the gate exit 1 on `spaced`, which expects exit 0.
+# makes the gate exit 1 on `spaced`, which expects exit 0. Ending the package loop after its
+# first package makes the gate exit 0 on `secondbroken` and `secondorphan`, which expect exit 1.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -39,6 +41,17 @@ new_ws() {
     echo 'pub fn f() {}' > "$ws/demo/src/lib.rs"
     echo 'fn main() {}' > "$ws/demo/examples/good.rs"
     echo "$ws"
+}
+
+# add_member WS NAME [EXTRA_MANIFEST_LINES]: a second package NAME with one clean example
+# `ex`, listed after `demo`. NAME sorts after `demo` too, so `cargo metadata` lists it second
+# whether it orders packages by member list or by name.
+add_member() {
+    mkdir -p "$1/$2/src" "$1/$2/examples"
+    printf '[workspace]\nmembers = ["demo", "%s"]\nresolver = "2"\n' "$2" > "$1/Cargo.toml"
+    printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\nlicense = "MIT"\ndescription = "fixture"\n%s\n' "$2" "${3:-}" > "$1/$2/Cargo.toml"
+    echo 'pub fn g() {}' > "$1/$2/src/lib.rs"
+    echo 'fn main() {}' > "$1/$2/examples/ex.rs"
 }
 
 # expect NAME WS WANT_EXIT WANT_LINE
@@ -115,6 +128,19 @@ expect "target whose file is excluded from publication" "$ws" 0 "OK: 1 example t
 ws="$(new_ws spaced $'[[example]]\nname = "spaced"\npath = "examples/has space.rs"')"
 echo 'fn main() {}' > "$ws/demo/examples/has space.rs"
 expect "example file whose name contains a space" "$ws" 0 "OK: 2 example target(s) compile"
+
+# Two cases put the only defect in the package `cargo metadata` lists second, so a gate
+# whose package loop stops after its first iteration (a `break`, or a command in the loop
+# body that drains the heredoc on stdin) exits 0 on both and turns them red.
+ws="$(new_ws secondbroken)"
+add_member "$ws" zeta
+echo 'fn main() { undefined_fn(); }' > "$ws/zeta/examples/ex.rs"
+expect "second package's example does not compile" "$ws" 1 "FAIL: zeta example 'ex' does not compile."
+
+ws="$(new_ws secondorphan)"
+add_member "$ws" zeta $'autoexamples = false\n[[example]]\nname = "ex"\npath = "examples/ex.rs"'
+echo 'fn main() {}' > "$ws/zeta/examples/orphan.rs"
+expect "second package publishes an orphan" "$ws" 1 "FAIL: zeta publishes 'examples/orphan.rs'"
 
 echo "$PASSED passed, $FAILED failed"
 [ "$FAILED" -eq 0 ]

@@ -39,10 +39,16 @@ of them reopens a bypass this repository has already measured:
    fail. Collapsing the loop to one `--examples` call per package keeps mechanisms 1
    to 5 and reopens row 3.
 
-Row 8 is answered by none of them, and deliberately so: a `build.rs` can inject any cfg
-into every target of its own package. The criterion for what this gate cannot defend
-against is **write access to the crate under test**, not "edits the manifest" — an earlier
-draft wrote the narrower indicator as the contract, which is the failure `.docs/standards/concrete-prose.md`
+Row 8 is answered by none of them, and deliberately so. Beyond the dev-dependency closure
+(row 4b), the criterion for what this gate cannot defend against is **an edit to the crate's
+build configuration**: its `build.rs`, a manifest key, or `.cargo/config.toml` rustflags. It
+is not "write access to the crate under test". Every defect the gate catches, the
+`DhtMode::Memory` edit to `examples/website.rs` included, is written by someone with that
+access, so write access separates no bypass from any defect, and a later editor could cite it
+to exempt any example. A source edit to an example or to the lib is the gate's subject and
+never an exemption. "Edits the manifest" is too narrow in the other direction, because
+`build.rs` needs no manifest key; an earlier draft wrote that narrower indicator as the
+contract, which is the failure `.docs/standards/concrete-prose.md`
 §Contracts and indicators names after Caulfield.
 
 ## Eight rounds, ten measured bypasses, and which ones the gate closes
@@ -72,9 +78,9 @@ request does not close the plan item's "default features" contract until a human
 Row 8 (a `build.rs` injecting a cfg) is not demonstrated. Two attempts to reproduce it
 made the gate exit 1, because the injected cfg desynchronizes the lib from its dependency
 features and the lib itself stops compiling. It stays in the table as an untested
-hypothesis rather than a measured bypass. The residual limit does not rest on it: a writer
-of the crate under test controls what its targets compile against, which is the criterion,
-and `build.rs` is one instance of that access rather than the reason for it.
+hypothesis rather than a measured bypass. The residual limit does not rest on it: an edit to
+the crate's build configuration is the criterion, and `build.rs` is one instance of it rather
+than the reason for it.
 
 Counting these was itself a source of error. Five earlier drafts of this paragraph
 asserted a total, described a table column, or claimed a coverage that the table three
@@ -95,7 +101,7 @@ above name their rows: a bare total drifts from the table, and an enumeration do
 | 6c | filename containing a space | unquoted `for` word-split past both checks |
 | 7a | `examples/website/main.rs` directory layout | cargo auto-discovers it and publishes it; the enumerating regex matched only the flat form |
 | 7b | `autoexamples = false` + a `cargo package --list` failure | the failure branch was gated on the crate having targets, which that key empties |
-| 8 | `crates/scp-node/build.rs` printing `cargo::rustc-cfg=feature="testing"` | cargo auto-discovers `build.rs` with no manifest key, and the cfg reaches every target of the package |
+| 8 | `crates/scp-node/build.rs` printing `cargo::rustc-cfg=feature="testing"` | hypothesis, unmeasured: cargo auto-discovers `build.rs` with no manifest key, so the cfg might reach every target of the package; two reproduction attempts made the gate exit 1 instead |
 
 7a needed no manifest edit and no adversary. Cargo auto-discovers both
 `examples/NAME.rs` and `examples/NAME/main.rs`; the check's regex encoded only the
