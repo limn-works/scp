@@ -23,7 +23,9 @@ const SSE_CLOSED: &str = "SSE connection is closed; connect a new transport";
 /// Holds the `GET` stream open for the session and sends each message as a
 /// POST on a fresh connection. A POST the server answers outside 2xx fails
 /// the call. A request returns the first JSON-RPC response on the stream whose
-/// `id` is the request's, and skips every other response.
+/// `id` is the request's, and skips every other response, every notification,
+/// and every server-initiated request (a line carrying `method`), whatever its
+/// `id`.
 pub struct SseClientTransport {
     /// The SSE endpoint URL (e.g., `http://localhost:3000/sse`).
     _url: String,
@@ -354,8 +356,16 @@ impl McpTransport for SseClientTransport {
             let trimmed = line.trim();
             if trimmed.starts_with("data:") {
                 let data = trimmed.strip_prefix("data:").unwrap_or("").trim();
-                // Try to parse as a JSON-RPC response.
-                if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(data)
+                // A notification has no id, and a server-initiated request
+                // carries a method; `JsonRpcResponse` would accept the
+                // request's shape, so skip it before deserializing.
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+                    continue;
+                };
+                if value.get("id").is_none() || value.get("method").is_some() {
+                    continue;
+                }
+                if let Ok(response) = serde_json::from_value::<JsonRpcResponse>(value)
                     && response.id == request.id
                 {
                     return Ok(response);
@@ -723,6 +733,36 @@ mod tests {
             .send_request(&request(5))
             .expect("a backlog must not fail a call the server ran");
         assert_eq!(response.id, crate::protocol::RequestId::Number(5));
+        drop(server.join().expect("server thread"));
+    }
+
+    /// A server-initiated request (`ping`) under the call's own id is not the
+    /// call's response: the call skips it and returns the response behind it.
+    #[test]
+    fn sse_client_skips_a_server_request_under_its_own_id() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (_, mut sse) = accept_sse(&listener);
+            let (mut conn, _) = listener.accept().expect("accept request POST");
+            read_request(&conn);
+            sse.write_all(
+                b"event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\r\n\r\n\
+                  event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\r\n\r\n",
+            )
+            .expect("write events");
+            conn.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("answer request POST");
+            sse
+        });
+
+        let transport =
+            SseClientTransport::connect(&format!("http://127.0.0.1:{port}/sse"), Some("tok-1"))
+                .expect("connect");
+        let response = transport.send_request(&request(1)).expect("request");
+        assert_eq!(response.id, crate::protocol::RequestId::Number(1));
+        assert_eq!(response.result, Some(serde_json::json!({"ok": true})));
+        assert!(response.error.is_none());
         drop(server.join().expect("server thread"));
     }
 
