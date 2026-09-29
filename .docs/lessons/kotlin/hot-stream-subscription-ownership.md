@@ -66,19 +66,21 @@ subscription that a different caller had just opened.
   the stop launched before it under that key before it takes that key's mutex, because a mount
   captures only the newest stop, and an older stop that reached its dispatcher last would
   otherwise release whatever that mount's start opened. For a departure it holds, `unmount`
-  returns a `Job` that the next launched stop completes, so a mount that moves to another
-  coordinator while a second mount under that key stays on the first one starts only after the
-  first coordinator releases the subscription both mounts shared. `rememberScpHotStream` keeps
-  every such `Job` that has not completed, each paired with the coordinator that returned it,
-  across any number of coordinator changes, and a start joins every one a different coordinator
-  returned. A mount that waits on another coordinator's Job is counted on its new coordinator
-  only once that wait ends: counted while waiting, it made its new coordinator hold the `onStop`
-  of a mount moving the other way, and two crosswise moves then each waited on a Job only the
-  other's departure completed.
+  returns a `Job` that the next launched stop completes.
+- **Change a mount's coordinator only together with its registry.** Two coordinators cannot
+  order each other's lambdas. When two coordinators reach one `HotStreamFactory`, the old
+  coordinator's stop releases the one subscription that factory keeps under a context handle
+  once the old coordinator's own last mount under that key leaves, and every mount collecting
+  that subscription through the new coordinator loses it (defect 4). An earlier shape made the
+  moving mount's start wait for the old coordinator's stop. That wait protected the moving mount
+  alone: a third mount already live on the new coordinator still lost its subscription, silently.
+  So `rememberScpHotStream` does no cross-coordinator waiting, and its `coordinator` parameter
+  states that a coordinator changes only together with the registry it orders, such as a new
+  factory with its own new coordinator. Each factory keeps its own Rust subscriptions, so the old
+  coordinator's stop and the new coordinator's start then touch different subscriptions.
 - **Run one `onStop` per subscription a started mount opened.** `startMounted` and `unmount`
   race to claim a mount with one compare-and-set; when `unmount` wins, that mount's `start`
-  never runs and its `onStop` is dropped, because it opened nothing and a mount still live on a
-  replaced coordinator may collect the subscription that `onStop` would release. A held
+  never runs and its `onStop` is dropped, because it opened nothing. A held
   departure whose `start` returned the same object as an earlier held one's (compared by
   identity; `HotStreamFactory` hands every caller of one subscription one `SharedFlow`) adds
   nothing to the held list, so that list stays bounded by the number of distinct subscriptions
@@ -130,24 +132,16 @@ show one context handle during a transition each count only their own mounts.
   and that their shared subscription is still live. `a stop runs after every stop launched before
   it under that key` launches two stops on a dispatcher that runs its queued tasks newest first,
   and asserts that the earlier stop completes before the later one and that the second mount,
-  which leaves before its `start` runs, has no `onStop` run for it, and `a coordinator swap next to a
-  live mount starts only after the old coordinator stops the key` asserts that a moved mount
-  opens a fresh subscription only after its old coordinator released the shared one. `two
-  coordinator changes under one key start only after the first swapped-out stop` holds the first
-  swapped-out `onStop` on a latch across a second change, `a moved mount that leaves before it
-  starts releases nothing a live mount collects` removes a moved mount while its old coordinator
-  still holds its `onStop`, and `a mount that moves away and back next to a live mount starts
-  again and releases nothing` returns a moved mount to its first coordinator; each asserts which
-  subscription stays live. `crosswise coordinator moves under one key do not wait on each other`
-  moves two mounts in opposite directions and asserts that the second one starts.
+  which leaves before its `start` runs, has no `onStop` run for it. `a coordinator change with its
+  registry under one same key opens a subscription on the new registry` changes a mount's
+  coordinator and registry together while the old `onStop` is held on a latch, and asserts that
+  the new registry's subscription and the returned `State` arrive before that stop runs.
   `departures beside a live mount hold one onStop per subscription` churns a hundred mounts
   past a live one and asserts the held list's size, `departures while their start is suspended
   hold one onStop per subscription` cancels each departing row's start while it is suspended and
   asserts the same bound, and `a cancelled coordinator scope logs its
   skipped onStop and refuses later starts` asserts the log line, the exceptional Job, and the
-  refused start. `ScpHotStreamSwappedOutStopTest` in that same file asserts that two held
-  departures from one coordinator get back one same Job and that the list a composable carries
-  across coordinator changes keeps that Job once.
+  refused start.
 
 ## Anti-patterns
 
