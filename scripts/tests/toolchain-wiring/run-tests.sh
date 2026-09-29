@@ -65,7 +65,8 @@
 #     comparison passes a mise-dispatched compiler that answers with the pinned version. Check 4 fails closed
 #     when the pin is absent, when the pin names no channel, and when
 #     `scripts/check-resolved-rustc.sh` is absent. Every other case in this file runs with a
-#     compiler that agrees with the pin, so each one also proves check 4 stays silent then.
+#     compiler that agrees with the pin, and each of those that expects exit 0 proves check
+#     4 stays silent then, because `run_case` fails it on any FAIL line.
 #     One state has no case: `rustc` absent from PATH, which a canned repository cannot
 #     produce without also taking `bash`, `sed`, and `grep` off PATH.
 #   * Check 5 fails when `.mise.toml` lets a mise older than 2026.9.15 run, which it does
@@ -74,15 +75,19 @@
 #     names a manager other than bun. It also fails on three spellings mise accepts but
 #     `scripts/setup-toolchain.sh` cannot read: a `{ hard = ... }` table, a trailing
 #     comment, and no spaces around `=`. It passes a floor above 2026.9.15 whose month has
-#     two digits, which a string comparison would order below 2026.9.15. Every case except
-#     the "policy-*" ones, the absent `.mise.toml`, and the malformed one writes both
-#     settings, so each of those proves check 5 stays silent then.
+#     two digits, which a string comparison would order below 2026.9.15. It fails closed,
+#     with its own message, on an absent `.mise.toml` and on one tomllib rejects. Every case
+#     except the "policy-*" ones, the absent `.mise.toml`, and the malformed one writes both
+#     settings, and `run_case` fails any of those whose output carries a check 5 finding,
+#     so each one proves check 5 stays silent then, whatever else the case expects.
 #   * `scripts/setup-toolchain.sh` reads the floor check 5 requires: it rejects a mise
 #     below the plain-string floor, compares a two-digit month as an integer, rejects the
 #     table spelling and a `min_version` inside a table, and reports an absent
 #     `.mise.toml`, a failing `mise --version`, and an unreadable version, each with its
-#     own message instead of dying silently under `set -e`. Each case stops before the
-#     script's first mise call past `mise --version`.
+#     own message instead of dying silently under `set -e`. Each of those cases stops before
+#     the script's first mise call past `mise --version`. Two cases accept a mise at exactly
+#     the floor and one whose two-digit month orders it above the floor, and prove the
+#     script prints no rejection and runs past the check.
 #
 # HOW EACH CASE IS BUILT. `run_case` makes a temporary directory, writes the gate and
 # `scripts/check-resolved-rustc.sh` into `scripts/`, runs `git init` so the gate's
@@ -353,6 +358,15 @@ YAML
 # check-3 case can fail only through check 3.
 MISE_POLICY_HEAD='min_version = "2026.9.15"\n\n'
 MISE_POLICY_TAIL='\n[settings.npm]\npackage_manager = "bun"\n'
+# Every check 5 finding holds one of these phrases, and no other check prints any of them:
+# each program finding names `min_version` or `settings.npm.package_manager`, and the
+# fail-closed branches name the floor and the package manager.
+CHECK5_PHRASES=(
+    "min_version"
+    "settings.npm.package_manager"
+    "mise version floor and npm package manager"
+    "mise refuses to run below"
+)
 
 emit_mise() {
     case "$MISE_SOURCE" in
@@ -570,6 +584,20 @@ run_case() {
         echo "FAIL [$name]: output contains a FAIL line, and the case expects none" >&2
         ok=0
     fi
+    # Every mise producer sets MISE_SOURCE, and every source outside these three writes
+    # both settings check 5 requires, so check 5 must stay silent however the case fails.
+    local check5_phrase
+    case $MISE_SOURCE in
+        absent | malformed | policy-*) ;;
+        *)
+            for check5_phrase in "${CHECK5_PHRASES[@]}"; do
+                if grep -Fq -- "$check5_phrase" <<< "$output"; then
+                    echo "FAIL [$name]: output carries a check 5 finding ($check5_phrase), and the case's .mise.toml sets both values check 5 requires" >&2
+                    ok=0
+                fi
+            done
+            ;;
+    esac
     if [[ $actual_exit -ne $want_exit ]]; then
         echo "FAIL [$name]: gate exited $actual_exit, expected $want_exit" >&2
         ok=0
@@ -927,6 +955,15 @@ run_case "mise-config-absent" 1 \
     ".mise.toml does not exist" routing_ok mise_absent
 
 # ── Check 5: mise refuses to run below 2026.9.15, and installs npm tools through bun ───
+
+# Check 3 fails on the same two documents, so these cases require check 5's own message:
+# each goes red if check 5 skips an absent or unparseable `.mise.toml` rather than
+# reporting it.
+mise_source_case malformed "mise-config-is-not-a-toml-document-for-check-5" 1 \
+    "is not a TOML document tomllib accepts, so the gate cannot check its mise version floor"
+run_case "mise-config-absent-for-check-5" 1 \
+    "does not exist, so the gate cannot check that mise refuses to run below 2026.9.15" \
+    routing_ok mise_absent
 
 mise_source_case policy-min-version-absent "mise-declares-no-min-version" 1 \
     "declares no top-level min_version"
@@ -1441,21 +1478,33 @@ COPY_RESOLVED_RUSTC="yes"
 SETUP="$REPO_ROOT/scripts/setup-toolchain.sh"
 
 # setup_case <name> <.mise.toml text|""> <body of the canned mise> <required substring>
+#            [forbidden substring]
 #
-# Every case expects exit 1: each state stops the script before its first mise call past
-# `mise --version`, so no case installs anything. An empty `.mise.toml` text writes no file.
+# Every case expects exit 1 and runs `--check`, which installs nothing. A rejecting state
+# stops the script before its first mise call past `mise --version`. An accepted mise runs
+# on, and the canned `mise`, `brew`, `rustc`, and `cargo` answer every later call with an
+# error, so the script counts its missing tools and exits 1 without reading this machine's
+# toolchain. An empty `.mise.toml` text writes no file.
 setup_case() {
-    local name=$1 mise_toml=$2 mise_body=$3 want_msg=$4 root output actual_exit ok=1
+    local name=$1 mise_toml=$2 mise_body=$3 want_msg=$4 forbid_msg=${5:-}
+    local root output actual_exit ok=1 stub
     root="$TMP_PARENT/setup-$name"
     mkdir -p "$root/scripts" "$root/stub-bin"
     cp "$SETUP" "$root/scripts/"
     [[ -n $mise_toml ]] && printf '%b' "$mise_toml" > "$root/.mise.toml"
     printf '#!/usr/bin/env bash\n%s\n' "$mise_body" > "$root/stub-bin/mise"
-    chmod +x "$root/stub-bin/mise"
+    for stub in brew rustc cargo; do
+        printf '#!/usr/bin/env bash\nexit 97\n' > "$root/stub-bin/$stub"
+    done
+    chmod +x "$root/stub-bin/"*
     output=$(PATH="$root/stub-bin:$PATH" bash "$root/scripts/setup-toolchain.sh" --check 2>&1)
     actual_exit=$?
     if ! grep -Fq -- "$want_msg" <<< "$output"; then
         echo "FAIL [setup-$name]: output missing required substring: $want_msg" >&2
+        ok=0
+    fi
+    if [[ -n $forbid_msg ]] && grep -Fq -- "$forbid_msg" <<< "$output"; then
+        echo "FAIL [setup-$name]: output contains forbidden substring: $forbid_msg" >&2
         ok=0
     fi
     if [[ $actual_exit -ne 1 ]]; then
@@ -1493,6 +1542,19 @@ setup_case "reports-a-failing-mise-version" "$setup_policy" 'exit 3' \
     "'mise --version' exited with an error"
 setup_case "reports-an-unreadable-mise-version" "$setup_policy" 'echo "garbage"' \
     "'mise --version' printed 'garbage'"
+
+# A mise at or above the floor passes the check, and the script runs on to its next mise
+# call, which the canned mise fails. A comparator that rejected every version would print
+# the rejection and exit before "java not installed via mise".
+setup_case "accepts-a-mise-at-the-floor" "$setup_policy" \
+    '[[ ${1:-} == --version ]] && echo "2026.9.15 macos-arm64" && exit 0; exit 97' \
+    "mise 2026.9.15 is at least 2026.9.15" "is older than"
+setup_case "accepts-a-mise-whose-two-digit-month-is-above-the-floor" "$setup_policy" \
+    '[[ ${1:-} == --version ]] && echo "2026.10.1 macos-arm64" && exit 0; exit 97' \
+    "mise 2026.10.1 is at least 2026.9.15" "is older than"
+setup_case "runs-past-the-floor-check-after-accepting" "$setup_policy" \
+    '[[ ${1:-} == --version ]] && echo "2026.9.15 macos-arm64" && exit 0; exit 97' \
+    "java not installed via mise" "is older than"
 
 echo ""
 echo "toolchain-wiring cases: $passed passed, $failed failed"

@@ -246,8 +246,8 @@
 # manager, and a setting in one developer's `~/.config/mise/config.toml` reaches no other
 # checkout.
 #
-# HOW THE GATE ASKS. It parses `.mise.toml` with the TOML parser check 3 uses and reads
-# two keys:
+# HOW THE GATE ASKS. It parses `.mise.toml` with the TOML parser check 3 uses, reads two
+# keys, and checks the spelling of one:
 #
 #   * `min_version` at the top level. mise treats a string value as a hard floor and exits
 #     with an error when its own version is older, and treats `{ hard = "..." }` the same
