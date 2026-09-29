@@ -730,9 +730,12 @@ pub const CRYPTO_4058: &str = "SCP-CRYPTO-4058";
 /// `UniFFI` HPKE error.
 pub const CRYPTO_4059: &str = "SCP-CRYPTO-4059";
 /// Key custody error: a key custody provider, or a host's custody callback,
-/// failed for a reason other than key-not-found ([`CRYPTO_4006`]).
+/// failed for a reason other than key-not-found ([`CRYPTO_4006`]) or a
+/// rejected host pseudonym ([`IDENT_1055`]).
 ///
-/// Every native bridge reports `PlatformError::CustodyError` with this code.
+/// Every native bridge reports every `PlatformError` variant with this code
+/// except `KeyNotFound` ([`CRYPTO_4006`]) and `PseudonymRejected`
+/// ([`IDENT_1055`]).
 pub const CRYPTO_4060: &str = "SCP-CRYPTO-4060";
 
 // -------------------------------------------------------------------------

@@ -345,7 +345,10 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
   test("the adapter unbinds a pseudonym before the host's destroyKey runs", async () => {
     // Observed through behaviour: a bound pseudonym id rejects a 5-byte input
     // in `check_sign_input` before the host is called (SCP-CRYPTO-4060, no host
-    // `sign`); an unbound id passes the input to the host's `sign`.
+    // `sign`); an unbound id passes the input to the host's `sign`. The testing
+    // `sign` runs that check on the JS thread before it returns, so a `sign`
+    // issued inside the host's `destroyKey` reads the binding table as it
+    // stands during that host call.
     const store = new Store();
     const custody = adapter(store);
     const identity = await custody.generateKeypair();
@@ -358,13 +361,6 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     let duringHostDestroy: Promise<Buffer> | undefined;
     store.destroyProbe = (keyId) => {
       duringHostDestroy = custody.sign(keyId, short);
-      // Hold the JS thread inside the host's destroyKey so the sign above
-      // passes the adapter's input check (on a tokio worker) before the host
-      // call returns.
-      const until = Date.now() + 200;
-      while (Date.now() < until) {
-        // spin
-      }
     };
     await custody.destroyKey(pseudonym.keyId);
     expect(duringHostDestroy).toBeDefined();
