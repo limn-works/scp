@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run-tests.sh — exercise all five checks in `scripts/check-toolchain-wiring.sh` against
-# canned repositories.
+# canned repositories, and the mise version check in `scripts/setup-toolchain.sh`.
 #
 # WHAT THIS TESTS.
 #   * Check 1 fails when a file Docker builds from a `rust` base image does not carry the
@@ -71,10 +71,18 @@
 #   * Check 5 fails when `.mise.toml` lets a mise older than 2026.9.15 run, which it does
 #     when `min_version` is absent, a soft floor only, lower than 2026.9.15, or not
 #     dot-separated integers, and fails when `settings.npm.package_manager` is absent or
-#     names a manager other than bun. It passes a `{ hard = ... }` table and a floor above
-#     2026.9.15 whose month has two digits, which a string comparison would order below
-#     2026.9.15. Every other case writes both settings, so each one also proves check 5
-#     stays silent then.
+#     names a manager other than bun. It also fails on three spellings mise accepts but
+#     `scripts/setup-toolchain.sh` cannot read: a `{ hard = ... }` table, a trailing
+#     comment, and no spaces around `=`. It passes a floor above 2026.9.15 whose month has
+#     two digits, which a string comparison would order below 2026.9.15. Every case except
+#     the "policy-*" ones, the absent `.mise.toml`, and the malformed one writes both
+#     settings, so each of those proves check 5 stays silent then.
+#   * `scripts/setup-toolchain.sh` reads the floor check 5 requires: it rejects a mise
+#     below the plain-string floor, compares a two-digit month as an integer, rejects the
+#     table spelling and a `min_version` inside a table, and reports an absent
+#     `.mise.toml`, a failing `mise --version`, and an unreadable version, each with its
+#     own message instead of dying silently under `set -e`. Each case stops before the
+#     script's first mise call past `mise --version`.
 #
 # HOW EACH CASE IS BUILT. `run_case` makes a temporary directory, writes the gate and
 # `scripts/check-resolved-rustc.sh` into `scripts/`, runs `git init` so the gate's
@@ -381,6 +389,14 @@ emit_mise_body() {
             ;;
         policy-min-version-hard-table)
             printf 'min_version = { hard = "2026.9.15", soft = "2026.9.20" }\n\n[tools]\nbun = "1.3.9"\n'
+            printf '%b' "$MISE_POLICY_TAIL"
+            ;;
+        policy-min-version-trailing-comment)
+            printf 'min_version = "2026.9.15" # floor\n\n[tools]\nbun = "1.3.9"\n'
+            printf '%b' "$MISE_POLICY_TAIL"
+            ;;
+        policy-min-version-no-spaces)
+            printf 'min_version="2026.9.15"\n\n[tools]\nbun = "1.3.9"\n'
             printf '%b' "$MISE_POLICY_TAIL"
             ;;
         policy-min-version-two-digit-month)
@@ -920,7 +936,13 @@ mise_source_case policy-min-version-lower "mise-min-version-below-the-floor" 1 \
     "which is lower than 2026.9.15"
 mise_source_case policy-min-version-not-numeric "mise-min-version-not-dot-separated-integers" 1 \
     "which is not dot-separated integers"
-mise_source_case policy-min-version-hard-table "mise-min-version-as-a-hard-table" 0 ""
+setup_cannot_read="but scripts/setup-toolchain.sh reads the floor only from a line of exactly"
+mise_source_case policy-min-version-hard-table "mise-min-version-as-a-hard-table" 1 \
+    "$setup_cannot_read"
+mise_source_case policy-min-version-trailing-comment "mise-min-version-with-a-trailing-comment" 1 \
+    "$setup_cannot_read"
+mise_source_case policy-min-version-no-spaces "mise-min-version-without-spaces" 1 \
+    "$setup_cannot_read"
 mise_source_case policy-min-version-two-digit-month "mise-min-version-above-the-floor-with-a-two-digit-month" 0 ""
 mise_source_case policy-npm-manager-absent "mise-sets-no-npm-package-manager" 1 \
     "sets settings.npm.package_manager to None, not 'bun'"
@@ -1413,6 +1435,64 @@ COPY_RESOLVED_RUSTC="no"
 run_case "resolved-rustc-check-absent" 1 \
     "scripts/check-resolved-rustc.sh does not exist" routing_ok mise_ok
 COPY_RESOLVED_RUSTC="yes"
+
+# ── scripts/setup-toolchain.sh reads the floor check 5 requires ────────────────────────
+
+SETUP="$REPO_ROOT/scripts/setup-toolchain.sh"
+
+# setup_case <name> <.mise.toml text|""> <body of the canned mise> <required substring>
+#
+# Every case expects exit 1: each state stops the script before its first mise call past
+# `mise --version`, so no case installs anything. An empty `.mise.toml` text writes no file.
+setup_case() {
+    local name=$1 mise_toml=$2 mise_body=$3 want_msg=$4 root output actual_exit ok=1
+    root="$TMP_PARENT/setup-$name"
+    mkdir -p "$root/scripts" "$root/stub-bin"
+    cp "$SETUP" "$root/scripts/"
+    [[ -n $mise_toml ]] && printf '%b' "$mise_toml" > "$root/.mise.toml"
+    printf '#!/usr/bin/env bash\n%s\n' "$mise_body" > "$root/stub-bin/mise"
+    chmod +x "$root/stub-bin/mise"
+    output=$(PATH="$root/stub-bin:$PATH" bash "$root/scripts/setup-toolchain.sh" --check 2>&1)
+    actual_exit=$?
+    if ! grep -Fq -- "$want_msg" <<< "$output"; then
+        echo "FAIL [setup-$name]: output missing required substring: $want_msg" >&2
+        ok=0
+    fi
+    if [[ $actual_exit -ne 1 ]]; then
+        echo "FAIL [setup-$name]: setup-toolchain.sh exited $actual_exit, expected 1" >&2
+        ok=0
+    fi
+    if [[ $ok -eq 1 ]]; then
+        echo "PASS [setup-$name]: exit=$actual_exit"
+        passed=$((passed + 1))
+    else
+        echo "---- output begin ----" >&2
+        echo "$output" >&2
+        echo "---- output end ----" >&2
+        failed=$((failed + 1))
+    fi
+}
+
+setup_policy="${MISE_POLICY_HEAD}[tools]\nbun = \"1.3.9\"\n${MISE_POLICY_TAIL}"
+setup_no_floor="has no line of exactly 'min_version = \"<version>\"' above its first table header"
+
+setup_case "rejects-a-mise-below-the-floor" "$setup_policy" 'echo "2026.2.22 macos-arm64"' \
+    "mise 2026.2.22 is older than 2026.9.15"
+setup_case "compares-a-two-digit-month-as-an-integer" \
+    'min_version = "2026.10.1"\n\n[tools]\nbun = "1.3.9"\n' 'echo "2026.9.15 macos-arm64"' \
+    "mise 2026.9.15 is older than 2026.10.1"
+setup_case "rejects-a-hard-table" \
+    'min_version = { hard = "2026.9.15" }\n\n[tools]\nbun = "1.3.9"\n' 'echo "2026.9.15 macos-arm64"' \
+    "$setup_no_floor"
+setup_case "ignores-a-min-version-inside-a-table" \
+    '[tools]\nmin_version = "2026.9.15"\n' 'echo "2026.9.15 macos-arm64"' \
+    "$setup_no_floor"
+setup_case "reports-an-absent-mise-config" "" 'echo "2026.9.15 macos-arm64"' \
+    ".mise.toml does not exist, so this script cannot read the mise version floor"
+setup_case "reports-a-failing-mise-version" "$setup_policy" 'exit 3' \
+    "'mise --version' exited with an error"
+setup_case "reports-an-unreadable-mise-version" "$setup_policy" 'echo "garbage"' \
+    "'mise --version' printed 'garbage'"
 
 echo ""
 echo "toolchain-wiring cases: $passed passed, $failed failed"

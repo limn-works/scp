@@ -96,16 +96,31 @@ version_at_least() {
   return 0
 }
 
-# The floor comes from `.mise.toml`, so this script and mise read one value. The script
-# exits instead of counting a failure, because every step below runs mise, and a mise
-# below the floor is the release that re-enters itself through its `npm` shim.
+# The floor comes from `.mise.toml`, so this script and mise read one value. No TOML
+# parser exists before mise installs Python, so the sed takes the line of exactly
+# `min_version = "..."` above the first line starting with `[`, and check 5 of
+# `scripts/check-toolchain-wiring.sh` fails on any `.mise.toml` whose floor this sed does
+# not read. The script exits instead of counting a failure, because every step below runs
+# mise, and a mise below the floor is the release that re-enters itself through its `npm`
+# shim. Each command substitution below sits in an `if` condition, so a failing sed or
+# `mise --version` reaches its message instead of ending the script through `set -e`.
 if command -v mise &>/dev/null; then
-  MISE_FLOOR="$(sed -n 's/^min_version = "\([0-9.]*\)"$/\1/p' "$REPO_ROOT/.mise.toml")"
-  MISE_HAVE="$(mise --version 2>/dev/null | awk '{print $1}')"
-  if [[ -z "$MISE_FLOOR" ]]; then
-    red "  ✗ .mise.toml sets no min_version string, so this script cannot check the mise version"
+  if [[ ! -f "$REPO_ROOT/.mise.toml" ]]; then
+    red "  ✗ $REPO_ROOT/.mise.toml does not exist, so this script cannot read the mise version floor"
     exit 1
-  elif [[ ! "$MISE_HAVE" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+  fi
+  if ! MISE_FLOOR="$(sed -n '/^\[/q; s/^min_version = "\([0-9.]*\)"$/\1/p' "$REPO_ROOT/.mise.toml")" \
+    || [[ -z "$MISE_FLOOR" ]]; then
+    red "  ✗ .mise.toml has no line of exactly 'min_version = \"<version>\"' above its first table header, so this script cannot read the mise version floor"
+    exit 1
+  fi
+  # mise's own stderr stays on the terminal, so a mise that refuses `--version` shows why.
+  if ! MISE_VERSION_OUTPUT="$(mise --version)"; then
+    red "  ✗ 'mise --version' exited with an error, so this script cannot compare the mise version against $MISE_FLOOR"
+    exit 1
+  fi
+  MISE_HAVE="$(awk '{print $1; exit}' <<< "$MISE_VERSION_OUTPUT")"
+  if [[ ! "$MISE_HAVE" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
     red "  ✗ 'mise --version' printed '$MISE_HAVE', which is not a version this script can compare against $MISE_FLOOR"
     exit 1
   elif ! version_at_least "$MISE_HAVE" "$MISE_FLOOR"; then

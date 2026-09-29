@@ -255,6 +255,12 @@
 #     without a `hard` key. The gate compares the floor's dot-separated integers against
 #     2026.9.15 and fails when the floor is absent, soft, lower, or not dot-separated
 #     integers.
+#   * the spelling of that floor. `scripts/setup-toolchain.sh` has no TOML parser before
+#     mise installs Python, so it reads the floor with a sed that takes the line of exactly
+#     `min_version = "..."` above the first line starting with `[`. The gate runs the same
+#     match and fails unless it yields the floor tomllib read, so a `{ hard = ... }` table,
+#     a trailing comment, or other spacing, each of which mise accepts, fails here instead
+#     of making `scripts/setup-toolchain.sh` exit 1 on every developer's machine.
 #   * `package_manager` in the `settings.npm` table. The gate fails unless it reads "bun".
 #
 # Check 5 reads a file, so it establishes what that file demands and nothing about the
@@ -758,16 +764,29 @@ MISE_MIN_VERSION_FLOOR="2026.9.15"
 # line and nothing when both settings hold. A document no TOML parser accepts exits 2 with
 # the parser's message.
 read -r -d '' MISE_POLICY_PROGRAM <<'PYTHON' || true
+import re
 import sys
 import tomllib
 
 path, floor_text = sys.argv[1], sys.argv[2]
 try:
     with open(path, "rb") as handle:
-        document = tomllib.load(handle)
-except (OSError, tomllib.TOMLDecodeError) as error:
+        text = handle.read().decode("utf-8")
+    document = tomllib.loads(text)
+except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
     print(error, file=sys.stderr)
     sys.exit(2)
+
+# The floor scripts/setup-toolchain.sh reads: its sed stops at the first line that starts
+# with "[" and takes the one line of exactly `min_version = "<digits and dots>"`.
+setup_floor = None
+for line in text.split("\n"):
+    if line.startswith("["):
+        break
+    match = re.fullmatch(r'min_version = "([0-9.]*)"', line)
+    if match:
+        setup_floor = match.group(1)
+        break
 
 
 def parse(text):
@@ -787,13 +806,15 @@ elif isinstance(declared, str):
 elif isinstance(declared, dict) and isinstance(declared.get("hard"), str):
     hard = declared["hard"]
 else:
-    print(f"{path} sets min_version to {declared!r}, which gives mise no hard floor: mise only warns on a soft floor and keeps running. Write 'min_version = \"{floor_text}\"' or 'min_version = {{ hard = \"{floor_text}\" }}'.")
+    print(f"{path} sets min_version to {declared!r}, which gives mise no hard floor: mise only warns on a soft floor and keeps running. Write 'min_version = \"{floor_text}\"'.")
 if hard is not None:
     parsed = parse(hard)
     if parsed is None:
         print(f"{path} sets the min_version hard floor to {hard!r}, which is not dot-separated integers, so the gate cannot compare it against {floor_text}.")
     elif parsed < floor:
         print(f"{path} sets the min_version hard floor to {hard}, which is lower than {floor_text}. mise 2026.2.22 resolves the 'npm:@napi-rs/cli = latest' entry by running 'npm view', which re-enters mise through the npm shim until the process table fills. Raise the floor to {floor_text} or later.")
+    elif setup_floor != hard:
+        print(f"{path} sets the min_version hard floor to {hard}, but scripts/setup-toolchain.sh reads the floor only from a line of exactly 'min_version = \"{hard}\"' above the first table header, and it finds {'no such line' if setup_floor is None else 'the floor ' + setup_floor}, so it exits 1 on every run or compares against the wrong floor. Write 'min_version = \"{hard}\"' on one line, with no table, comment, or other spacing.")
 
 settings = document.get("settings")
 npm = settings.get("npm") if isinstance(settings, dict) else None
