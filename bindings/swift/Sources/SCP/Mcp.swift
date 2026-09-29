@@ -2,11 +2,11 @@ import Foundation
 
 // MARK: - McpToolDefinition
 
-/// An MCP tool definition as reported by an external MCP server.
+/// An MCP tool definition as reported by an MCP server.
 ///
 /// Represents a tool available through the Model Context Protocol. When
 /// consumed via SCP, tool results are wrapped with provenance metadata
-/// recording the external source, invoking agent, and context.
+/// recording the MCP server the tool came from, the invoking agent, and the context.
 ///
 /// See ADR-015 in `.docs/adrs/phase-3.md`.
 public nonisolated struct McpToolDefinition: Sendable {
@@ -29,7 +29,7 @@ public nonisolated struct McpToolDefinition: Sendable {
 
 // MARK: - McpToolResult
 
-/// The result of invoking an external MCP tool, wrapped with SCP provenance.
+/// The result of invoking an MCP tool, wrapped with SCP provenance.
 ///
 /// Maintains the protocol's provenance-everywhere principle: a tool call to
 /// any MCP server, an SCP node's or another, carries verifiable origin metadata.
@@ -99,7 +99,7 @@ public nonisolated enum McpClientConfig: Sendable {
 
 // MARK: - McpClient
 
-/// An MCP client for consuming external tools with SCP provenance.
+/// An MCP client that calls an MCP server's tools and records SCP provenance.
 ///
 /// Connects to an MCP server, an SCP node's SSE server included, via an
 /// ``SCP`` instance and wraps tool results with SCP provenance metadata. This
@@ -143,7 +143,7 @@ public actor McpClient {
 
     // MARK: - Factory
 
-    /// Connects to an external MCP server and completes the MCP handshake.
+    /// Connects to an MCP server, an SCP node's SSE server included, and completes the MCP handshake.
     ///
     /// - Parameters:
     ///   - scp: The owning ``SCP`` instance whose MCP client registry
@@ -168,7 +168,7 @@ public actor McpClient {
 
     // MARK: - Tool Listing
 
-    /// Lists available tools from the external MCP server.
+    /// Lists available tools from the connected MCP server.
     ///
     /// Sends a `tools/list` JSON-RPC request and returns the tool definitions.
     ///
@@ -188,14 +188,14 @@ public actor McpClient {
 
     // MARK: - Tool Invocation
 
-    /// Invokes an external tool and wraps the result with SCP provenance.
+    /// Invokes a tool on the connected MCP server and wraps the result with SCP provenance.
     ///
-    /// Sends a `tools/call` JSON-RPC request to the external MCP server, then
-    /// wraps the result with provenance metadata recording the external tool
+    /// Sends a `tools/call` JSON-RPC request to the connected MCP server, then
+    /// wraps the result with provenance metadata recording the tool
     /// source, the invoking agent's DID, the SCP context, and the timestamp.
     ///
     /// - Parameters:
-    ///   - tool: The name of the external tool to invoke.
+    ///   - tool: The name of the tool to invoke.
     ///   - input: The tool's input as serialized JSON data.
     ///   - contextId: The SCP context ID for provenance tracking.
     ///   - invokerDid: The DID of the agent invoking the tool.
