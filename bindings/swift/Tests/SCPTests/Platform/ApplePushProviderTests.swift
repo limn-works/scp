@@ -14,9 +14,12 @@
 //
 // The adapter runs three rules: a 4 KB size cap, a JSON-object parse, and a
 // byte comparison with the permitted payload after whitespace outside string
-// literals is removed. The byte comparison alone decides which JSON object is
-// accepted, so each rejection case below that builds a JSON object turns green
-// only while that comparison runs. The parse only picks the error case: each
+// literals is removed. The byte comparison decides which JSON object of at
+// most 4096 bytes is accepted, so each rejection case below that builds a JSON
+// object of at most 4096 bytes turns green only while that comparison runs. The
+// size cap also rejects a JSON object the comparison accepts, the permitted
+// payload padded past 4096 bytes with whitespace, so the oversized case turns
+// green only while the size cap runs. The parse only picks the error case: each
 // case requires the `PushError` case `handleNotification(payload:)` throws,
 // `invalidPayload` for bytes that are not a JSON object and
 // `opaquePayloadViolation` for every other rejection, so deleting the parse

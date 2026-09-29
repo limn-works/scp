@@ -6,11 +6,13 @@
 //!
 //! 1. `register_returns_token` — `register()` returns a non-empty push token
 //! 2. `handle_notification_produces_event` — [`check_fixed_wake_signal`]:
-//!    `handle_notification` accepts the APNs payload ADR-025 criterion 4 names
-//!    and returns a non-empty wake signal, and for three other payloads (a JSON
-//!    context ID and sender, a context ID in plain bytes, and the permitted
-//!    payload with trailing whitespace a relay chose) it either returns an
-//!    error or returns a signal byte-identical to the first. The fixed signal is this suite's reading of §10.7's opacity rule
+//!    `handle_notification` accepts at least one of [`PERMITTED_PAYLOADS`], the
+//!    wake payloads the platform artifacts name, and returns a non-empty wake
+//!    signal for it. Every other payload the adapter accepts, whether another
+//!    permitted payload, a permitted payload with trailing whitespace a relay
+//!    chose, or one of [`METADATA_PAYLOADS`], yields a signal byte-identical
+//!    to that first one; the adapter may reject any of them instead. The fixed
+//!    signal is this suite's reading of §10.7's opacity rule
 //!    (`.docs/specs/10-infrastructure-and-self-hosting.md`: a push payload
 //!    carries "no context ID, no sender identifier, no message preview, no
 //!    metadata of any kind"): a signal that varied with the payload would hand
@@ -21,42 +23,59 @@
 
 use scp_platform::Push;
 
-/// The APNs push payload ADR-025 criterion 4 names; every adapter accepts it.
-pub const PERMITTED_PAYLOAD: &[u8] = br#"{"aps":{"content-available":1}}"#;
-
-/// Payloads other than [`PERMITTED_PAYLOAD`].
+/// The wake payloads the platform artifacts name. Each adapter accepts the one
+/// its platform uses and may reject the others:
 ///
-/// Two carry metadata §10.7 forbids, and the third is the permitted payload
-/// with trailing whitespace a relay chose. An adapter rejects each one or returns the signal it returns for
-/// [`PERMITTED_PAYLOAD`].
-pub const OTHER_PAYLOADS: [&[u8]; 3] = [
-    br#"{"aps":{"content-available":1},"contextId":"ctx-42","sender":"relay-7"}"#,
-    b"new-message-ctx-123",
-    b"{\"aps\":{\"content-available\":1}}   ",
+/// - `{"aps":{"content-available":1}}`: the APNs payload of ADR-025 criterion
+///   4 (`.docs/adrs/phase-5.md`).
+/// - `{"data": {"scp": "1"}}`: the FCM payload of ADR-027
+///   (`.docs/adrs/phase-6.md`).
+/// - `{ "scp": 1 }`: the relay push payload of spec §10.7.1 step 5.
+pub const PERMITTED_PAYLOADS: [&[u8]; 3] = [
+    br#"{"aps":{"content-available":1}}"#,
+    br#"{"data": {"scp": "1"}}"#,
+    br#"{ "scp": 1 }"#,
 ];
 
-/// Asserts that `push` returns one fixed, non-empty wake signal: the signal for
-/// [`PERMITTED_PAYLOAD`], and for each of [`OTHER_PAYLOADS`] either an error
-/// or a byte-identical signal.
+/// Payloads carrying metadata §10.7 forbids: a JSON context ID and sender next
+/// to the APNs wake field, and a context ID in plain bytes. An adapter rejects
+/// each one or returns its fixed signal.
+pub const METADATA_PAYLOADS: [&[u8]; 2] = [
+    br#"{"aps":{"content-available":1},"contextId":"ctx-42","sender":"relay-7"}"#,
+    b"new-message-ctx-123",
+];
+
+/// Asserts that `push` returns one fixed, non-empty wake signal: it accepts at
+/// least one of [`PERMITTED_PAYLOADS`], and every payload it accepts among
+/// [`PERMITTED_PAYLOADS`], each of them with three trailing spaces, and
+/// [`METADATA_PAYLOADS`] yields a signal byte-identical to the signal for the
+/// first permitted payload it accepts.
 ///
 /// # Panics
 ///
-/// Panics when `push` rejects [`PERMITTED_PAYLOAD`], returns an empty signal,
-/// or returns a signal for another payload that differs from the signal for
-/// [`PERMITTED_PAYLOAD`].
+/// Panics when `push` rejects every one of [`PERMITTED_PAYLOADS`], returns an
+/// empty signal, or returns two different signals.
 pub async fn check_fixed_wake_signal<P: Push>(push: &P) {
-    let result = push.handle_notification(PERMITTED_PAYLOAD).await;
-    assert!(
-        result.is_ok(),
-        "handle_notification rejected the permitted payload: {:?}",
-        result.as_ref().err()
-    );
-    let Ok(fixed) = result else { return };
+    let mut fixed = None;
+    for payload in PERMITTED_PAYLOADS {
+        if let Ok(signal) = push.handle_notification(payload).await {
+            fixed = Some(signal);
+            break;
+        }
+    }
+    let Some(fixed) = fixed else {
+        panic!("handle_notification rejected every permitted payload");
+    };
     assert!(
         !fixed.payload.is_empty(),
         "wake signal payload should not be empty"
     );
-    for payload in OTHER_PAYLOADS {
+    let padded = PERMITTED_PAYLOADS.map(|p| [p, b"   ".as_slice()].concat());
+    let others = PERMITTED_PAYLOADS
+        .into_iter()
+        .chain(padded.iter().map(Vec::as_slice))
+        .chain(METADATA_PAYLOADS);
+    for payload in others {
         if let Ok(signal) = push.handle_notification(payload).await {
             assert_eq!(
                 signal, fixed,
@@ -129,10 +148,10 @@ mod tests {
 
     use super::*;
 
-    /// A strict adapter: rejects every payload but the permitted one.
-    struct RejectingPush;
+    /// A strict adapter: rejects every payload but the one it holds.
+    struct StrictPush(&'static [u8]);
 
-    impl Push for RejectingPush {
+    impl Push for StrictPush {
         fn register(&self) -> impl Future<Output = Result<PushToken, PlatformError>> + Send {
             async { Ok(PushToken::new(b"token".to_vec())) }
         }
@@ -141,7 +160,7 @@ mod tests {
             &self,
             payload: &[u8],
         ) -> impl Future<Output = Result<WakeSignal, PlatformError>> + Send {
-            let accepted = payload == PERMITTED_PAYLOAD;
+            let accepted = payload == self.0;
             async move {
                 if accepted {
                     Ok(WakeSignal::new(b"wake".to_vec()))
@@ -183,7 +202,7 @@ mod tests {
             &self,
             payload: &[u8],
         ) -> impl Future<Output = Result<WakeSignal, PlatformError>> + Send {
-            let result = if payload.trim_ascii_end() == PERMITTED_PAYLOAD {
+            let result = if payload.trim_ascii_end() == PERMITTED_PAYLOADS[0] {
                 Ok(WakeSignal::new(payload.to_vec()))
             } else {
                 Err(PlatformError::PushError("opaque payload violation".into()))
@@ -206,8 +225,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_adapter_rejecting_metadata_payloads() {
-        check_fixed_wake_signal(&RejectingPush).await;
+    async fn accepts_strict_adapter_for_each_platform_payload() {
+        // An APNs, an FCM, and a §10.7.1 adapter each reject every payload
+        // but their own, and each passes.
+        for payload in PERMITTED_PAYLOADS {
+            check_fixed_wake_signal(&StrictPush(payload)).await;
+        }
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "rejected every permitted payload")]
+    async fn rejects_adapter_accepting_only_metadata_payload() {
+        check_fixed_wake_signal(&StrictPush(METADATA_PAYLOADS[1])).await;
     }
 
     #[tokio::test]
@@ -242,7 +271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "rejected the permitted payload")]
+    #[should_panic(expected = "rejected every permitted payload")]
     async fn rejects_adapter_refusing_permitted_payload() {
         struct RefusingPush;
         impl Push for RefusingPush {

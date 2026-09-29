@@ -328,7 +328,10 @@
         ///    carriage return) removed outside string literals, equal
         ///    ``wakeSignal``.
         ///
-        /// Rule 3 alone decides which payload is accepted. It reads the received
+        /// Rules 1 and 3 together decide which payload is accepted: rule 3
+        /// decides among payloads of at most 4096 bytes, and rule 1 rejects a
+        /// payload rule 3 would accept when whitespace between its tokens takes
+        /// it past 4096 bytes. Rule 3 reads the received
         /// bytes, not the dictionary `JSONSerialization` builds, because
         /// `JSONSerialization` keeps one value for a key the object repeats: a
         /// second `aps` or `content-available` member carrying a context ID

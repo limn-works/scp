@@ -85,10 +85,18 @@ mod tests {
 
     #[tokio::test]
     async fn handle_notification_returns_fixed_wake_signal() {
+        // Neither payload equals WAKE_SIGNAL, so an adapter that returned the
+        // received bytes would fail the second assertion.
         let push = InMemoryPush::new();
-        let payload = br#"{"aps":{"content-available":1}}"#;
-        let signal = push.handle_notification(payload).await.unwrap();
-        assert_eq!(signal.payload, br#"{"aps":{"content-available":1}}"#);
+        let payloads: [&[u8]; 2] = [
+            br#"{ "aps" : { "content-available" : 1 } }"#,
+            br#"{ "scp": 1 }"#,
+        ];
+        for payload in payloads {
+            assert_ne!(payload, WAKE_SIGNAL);
+            let signal = push.handle_notification(payload).await.unwrap();
+            assert_eq!(signal.payload, WAKE_SIGNAL);
+        }
     }
 
     #[tokio::test]
