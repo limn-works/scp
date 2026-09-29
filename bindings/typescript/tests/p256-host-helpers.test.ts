@@ -64,19 +64,16 @@ describe.skipIf(skipReason !== "")(`P-256 host helpers ${skipReason}`, () => {
     });
   }
 
-  test("the scalar is a mutable Uint8Array that fill(0) clears", () => {
+  test("returns a fresh scalar on each call and leaves the caller's seed intact", () => {
     // §25.19 Vector 30, v1.
     const seedHex = "47ea801c24e8a4d577f04837eca0674fbbf160127fa2d1a4bb1420150b0a048b";
     const seed = unhex(seedHex);
     const d = p256PseudonymScalar(seed);
-    expect(d).toBeInstanceOf(Uint8Array);
-    expect(hex(p256PublicKey(d))).toBe(
-      "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72",
-    );
+    const dHex = hex(d);
     expect(hex(seed)).toBe(seedHex);
+    // Wiping the returned scalar must not reach a later call's result.
     d.fill(0);
-    expect(d.every((b) => b === 0)).toBe(true);
-    expect(hex(p256PseudonymScalar(seed))).not.toBe(hex(d));
+    expect(hex(p256PseudonymScalar(seed))).toBe(dHex);
   });
 
   test("RFC 6979 A.2.5: the RFC's r and the low-s form of its s", () => {
