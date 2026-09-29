@@ -521,6 +521,30 @@ async fn run_join_with(
     Result<crate::context::ContextHandle, crate::context::ContextError>,
     Joined,
 ) {
+    run_join_with_active_key(
+        seed,
+        persistence,
+        committed,
+        request_params,
+        request_ctx_id,
+        false,
+    )
+    .await
+}
+
+/// [`run_join_with`], and when `destroy_active` is set, Bob's custody destroys
+/// his `#active` key after the bundle is sealed to it and before the spawn.
+async fn run_join_with_active_key(
+    seed: u8,
+    persistence: Option<Box<dyn ContextPersistence>>,
+    committed: Option<ContextParams>,
+    request_params: ContextParams,
+    request_ctx_id: Option<String>,
+    destroy_active: bool,
+) -> (
+    Result<crate::context::ContextHandle, crate::context::ContextError>,
+    Joined,
+) {
     let bob = DID::from(BOB_DID);
     let group_ctx_id = ctx_hex(seed);
     let group_ctx_bytes = context_id_to_bytes(&group_ctx_id);
@@ -576,6 +600,12 @@ async fn run_join_with(
         &DID::from(ALICE_DID),
         reservation_id,
     );
+    if destroy_active {
+        bob_custody
+            .destroy_key(&bob_handle)
+            .await
+            .expect("bob's custody destroys his #active key");
+    }
 
     let result = sup
         .spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)
@@ -609,6 +639,34 @@ async fn join_bob(
         None,
     )
     .await
+}
+
+/// A joiner whose `#active` key its custody no longer holds fails the
+/// invitation KEM agreement with the typed custody failure, so every bridge
+/// reports key-not-found as `SCP-CRYPTO-4006` rather than a crypto text error.
+#[tokio::test]
+async fn spawn_from_welcome_carries_a_destroyed_active_key_as_custody_key_not_found() {
+    let (result, _j) = run_join_with_active_key(
+        0x5e,
+        None,
+        Some(joiner_params()),
+        joiner_params(),
+        None,
+        true,
+    )
+    .await;
+    // `assert!` rather than `panic!`: `check-handler-no-panic.sh` reads file
+    // contents and cannot see this file's `#[cfg(test)]` gate (see the
+    // over-cap outlet test below).
+    let failure = match &result {
+        Err(crate::context::ContextError::Custody(failure)) => Some(failure),
+        _ => None,
+    };
+    assert!(
+        failure.is_some_and(scp_crypto::CustodyFailure::is_key_not_found),
+        "a join under a destroyed #active key must fail with ContextError::Custody key-not-found, got {:?}",
+        result.as_ref().err()
+    );
 }
 
 // ---------------------------------------------------------------------------

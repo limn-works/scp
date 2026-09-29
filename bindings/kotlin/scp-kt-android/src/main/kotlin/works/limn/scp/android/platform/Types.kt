@@ -17,7 +17,7 @@ package works.limn.scp.android.platform
  * X25519 keys are used for key agreement (HPKE wrapping keys).
  */
 enum class KeyType {
-    /** Ed25519 signing key (identity keys, active signing keys, pseudonym keys). */
+    /** Ed25519 signing key (identity keys, active signing keys). */
     ED25519,
 
     /** X25519 key agreement key (HPKE wrapping keys). */
@@ -103,8 +103,7 @@ enum class DestructionMethod {
  * SCP-specific exception with structured error codes.
  *
  * Error codes follow the pattern `SCP-{DOMAIN}-{NUMBER}`:
- * - `SCP-CRYPTO-4001`: Ed25519 key not found
- * - `SCP-CRYPTO-4002`: X25519 key not found
+ * - `SCP-CRYPTO-4006`: Key not found (the handle is unknown or its key was destroyed)
  * - `SCP-CRYPTO-4003`: Wrong key type for operation
  * - `SCP-CRYPTO-4004`: Key destruction failed
  * - `SCP-CRYPTO-4005`: Cryptographic operation failed
@@ -199,8 +198,10 @@ interface PushProvider {
  * uses Android Keystore for TEE-backed Ed25519 on API 33+ and Bouncy Castle
  * for software fallback on API 26-32.
  *
- * This interface mirrors the Rust `KeyCustody` trait in `scp-platform/src/traits.rs`
- * and the UniFFI `KeyCustodyProvider` callback interface in `scp-ffi/uniffi/src/bridge.rs`.
+ * This interface mirrors the Rust `KeyCustody` trait in `scp-platform/src/traits.rs`.
+ * It is NOT the `scp-ffi-uniffi` `KeyCustodyProvider` callback protocol (u64 key ids,
+ * `derivePseudonym` returning a `PseudonymResult`): no in-tree Kotlin host implements
+ * the bridge protocol yet; S0 PR8 conforms [AndroidKeyCustody] to it.
  *
  * See ADR-006 for the platform abstraction design and ADR-027 for the Android adapter.
  */
@@ -218,24 +219,29 @@ interface KeyCustodyProvider {
     fun generateKeypair(keyType: KeyType): KeyHandle
 
     /**
-     * Sign data with an Ed25519 key.
+     * Sign data with an Ed25519 identity key or a P-256 pseudonym key.
      *
-     * @param keyHandle Handle to an Ed25519 key.
-     * @param data The bytes to sign.
-     * @return 64-byte Ed25519 signature.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if key not found.
-     * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
+     * @param keyHandle Handle to an Ed25519 key, or a pseudonym handle from
+     *   [derivePseudonym] / [deriveRotatablePseudonym].
+     * @param data For an Ed25519 key, the message. For a pseudonym key, a 32-byte digest,
+     *   signed without a second hash (§9.5).
+     * @return 64 bytes: an Ed25519 signature, or for a pseudonym key the P-256 ECDSA
+     *   `r || s` with low s (§9.5).
+     * @throws ScpException with code `SCP-CRYPTO-4006` if key not found.
+     * @throws ScpException with code `SCP-CRYPTO-4003` if key is X25519, or a pseudonym
+     *   key is given data that is not 32 bytes.
      */
     fun sign(keyHandle: KeyHandle, data: ByteArray): ByteArray
 
     /**
      * Return the raw public key bytes for a handle.
      *
-     * Works for both Ed25519 (32 bytes) and X25519 (32 bytes) key handles.
+     * Ed25519 and X25519 keys return 32 bytes; a P-256 pseudonym key returns its
+     * 33-byte SEC1 compressed point (§9.10.4).
      *
      * @param keyHandle Handle to any key type.
-     * @return Raw public key bytes (32 bytes).
-     * @throws ScpException with code `SCP-CRYPTO-4001` if key not found.
+     * @return Raw public key bytes: 32, or 33 for a pseudonym key.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if key not found.
      */
     fun publicKey(keyHandle: KeyHandle): ByteArray
 
@@ -243,11 +249,16 @@ interface KeyCustodyProvider {
      * Destroy key material associated with a handle.
      *
      * After this call, all subsequent operations with the same handle will
-     * throw [ScpException] with code `SCP-CRYPTO-4001`.
+     * throw [ScpException] with code `SCP-CRYPTO-4006`.
+     *
+     * Destroying an identity destroys every v1 and v2 pseudonym key derived
+     * from it, and a derivation still in flight when its identity is destroyed
+     * fails with key-not-found (`SCP-CRYPTO-4006`) and stores nothing
+     * (`09-security-model.md` §9.10.4.A).
      *
      * @param keyHandle Handle to destroy.
      * @return A [DestructionAttestation] confirming the destruction.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if the handle is already invalid.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if the handle is already invalid.
      * @throws ScpException with code `SCP-CRYPTO-4004` if destruction cannot be confirmed.
      */
     fun destroyKey(keyHandle: KeyHandle): DestructionAttestation
@@ -261,7 +272,7 @@ interface KeyCustodyProvider {
      * @param keyHandle Handle to an X25519 key.
      * @param peerPublic 32-byte X25519 public key of the peer.
      * @return 32-byte X25519 shared secret.
-     * @throws ScpException with code `SCP-CRYPTO-4002` if X25519 key not found.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if X25519 key not found.
      */
     fun dhAgree(keyHandle: KeyHandle, peerPublic: ByteArray): ByteArray
 
@@ -272,17 +283,25 @@ interface KeyCustodyProvider {
      * `pseudonym_secret`, NEVER the public key (public-key keying would be a
      * membership-enumeration oracle):
      *   1. `seed = HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")`
-     *   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`  // RFC-8032 seed
+     *   2. `d = HKDF-Expand-SHA256(seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n - 1) + 1`;
+     *      the pseudonym key is P-256 `d`, public key the 33-byte compressed `d * G`.
+     *      [sign] on its handle takes a 32-byte digest and returns 64-byte low-s
+     *      `r || s` with an RFC 6979 nonce (§9.5).
      *
      * Software custody: `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
      * salt="scp-pseudonym-secret-v1")` — cross-platform deterministic. Hardware
      * custody: a device-local secret inside the secure boundary — device-local
      * by design (not identical across devices).
      *
+     * The pseudonym dies with its identity (`09-security-model.md` §9.10.4.A):
+     * destroying the identity destroys every v1 and v2 pseudonym key derived
+     * from it, and a derivation still in flight when its identity is destroyed
+     * fails with key-not-found (`SCP-CRYPTO-4006`) and stores nothing.
+     *
      * @param keyHandle Handle to the identity Ed25519 key.
      * @param contextId Raw context ID bytes.
      * @return A [PseudonymKeyHandle] to the derived signing key.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if key not found.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if key not found.
      * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
      */
     fun derivePseudonym(keyHandle: KeyHandle, contextId: ByteArray): PseudonymKeyHandle
@@ -296,7 +315,10 @@ interface KeyCustodyProvider {
      * §9.10.4.A). The HMAC key is the private-derived `pseudonym_secret`, NEVER the
      * public key (public-key keying would be a membership-enumeration oracle):
      *   1. `seed = HMAC-SHA256(pseudonym_secret, contextId || BE64(epoch) || "scp-pseudonym-v2")`
-     *   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`  // RFC-8032 seed
+     *   2. `d = HKDF-Expand-SHA256(seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n - 1) + 1`;
+     *      the pseudonym key is P-256 `d`, public key the 33-byte compressed `d * G`.
+     *      [sign] on its handle takes a 32-byte digest and returns 64-byte low-s
+     *      `r || s` with an RFC 6979 nonce (§9.5).
      *
      * The `"scp-pseudonym-v2"` domain separator differs from v1's `"scp-pseudonym"`,
      * so v2 at any epoch never collides with the v1 [derivePseudonym] output.
@@ -306,11 +328,16 @@ interface KeyCustodyProvider {
      * custody: a device-local secret inside the secure boundary — device-local
      * by design (not identical across devices).
      *
+     * The pseudonym dies with its identity (`09-security-model.md` §9.10.4.A):
+     * destroying the identity destroys every v1 and v2 pseudonym key derived
+     * from it, and a derivation still in flight when its identity is destroyed
+     * fails with key-not-found (`SCP-CRYPTO-4006`) and stores nothing.
+     *
      * @param keyHandle Handle to the identity Ed25519 key.
      * @param contextId Raw context ID bytes.
      * @param pseudonymEpoch Rotation epoch counter, mixed in as a big-endian u64.
      * @return A [PseudonymKeyHandle] to the derived signing key.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if key not found.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if key not found.
      * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
      */
     fun deriveRotatablePseudonym(
@@ -330,7 +357,7 @@ interface KeyCustodyProvider {
      *
      * @param keyHandle Handle to an Ed25519 key.
      * @return 32-byte raw Ed25519 private key bytes.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if key not found.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if key not found.
      * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
      * @throws ScpException with code `SCP-CRYPTO-4005` if key is hardware-backed
      *   and cannot be exported (TEE keys are non-extractable).

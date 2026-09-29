@@ -191,6 +191,13 @@ impl From<scp_identity::IdentityError> for ScpNapiError {
         use scp_identity::IdentityError as IE;
         use scp_platform::PreRotationCustodyError as PE;
 
+        // A custody failure keeps its custody code (key-not-found is
+        // SCP-CRYPTO-4006), not the generic identity code.
+        let e = match e {
+            IE::Platform(pe) => return Self::from(pe),
+            other => other,
+        };
+
         if let IE::PreRotation(pre_err) = &e {
             let code = match pre_err {
                 PE::HandleNotFound => codes::IDENT_1047,
@@ -252,6 +259,7 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
     fn from(e: scp_core::context::ContextError) -> Self {
         use scp_core::context::ContextError as CE;
         match &e {
+            CE::Custody(failure) => Self::custody_failure(format!("{e}"), failure),
             // Surface the canonical rate-limit code on the typed
             // envelope so TypeScript callers can check `.code`
             // instead of string-matching `SCP-ECON-12090` inside
@@ -493,6 +501,9 @@ impl From<scp_core::crypto::mls::error::MlsError> for ScpNapiError {
 
 impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpNapiError {
     fn from(e: scp_core::crypto::sender_keys::SenderKeyError) -> Self {
+        if let scp_core::crypto::sender_keys::SenderKeyError::Custody(failure) = &e {
+            return Self::custody_failure(format!("sender key operation failed: {e}"), failure);
+        }
         Self::Crypto {
             message: format!(
                 "sender key operation failed: {e} — verify key material and encryption parameters"
@@ -504,6 +515,9 @@ impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpNapiError {
 
 impl From<scp_core::crypto::ucan::UcanError> for ScpNapiError {
     fn from(e: scp_core::crypto::ucan::UcanError) -> Self {
+        if let scp_core::crypto::ucan::UcanError::Custody(failure) = &e {
+            return Self::custody_failure(format!("UCAN signing failed: {e}"), failure);
+        }
         // Canonical UCAN→error-code mapping — see `scp-ffi/src/error.rs`
         // for the full rationale. All bridges route through the shared
         // `scp_ffi_common::ucan_errors` module.
@@ -519,6 +533,9 @@ impl From<scp_core::crypto::ucan::UcanError> for ScpNapiError {
 
 impl From<scp_core::envelope::EnvelopeError> for ScpNapiError {
     fn from(e: scp_core::envelope::EnvelopeError) -> Self {
+        if let scp_core::envelope::EnvelopeError::Custody(failure) = &e {
+            return Self::custody_failure(format!("envelope operation failed: {e}"), failure);
+        }
         Self::Crypto {
             message: format!(
                 "envelope operation failed: {e} — check payload size, signing keys, and encryption state"
@@ -530,6 +547,9 @@ impl From<scp_core::envelope::EnvelopeError> for ScpNapiError {
 
 impl From<scp_event_log::EventLogError> for ScpNapiError {
     fn from(e: scp_event_log::EventLogError) -> Self {
+        if let scp_event_log::EventLogError::Custody(failure) = &e {
+            return Self::custody_failure(format!("event log operation failed: {e}"), failure);
+        }
         Self::Context {
             message: format!(
                 "event log operation failed: {e} — verify log integrity and sequence numbers"
@@ -610,14 +630,45 @@ impl From<scp_core::bridge::shadow::ShadowError> for ScpNapiError {
     }
 }
 
+impl ScpNapiError {
+    /// A custody [`PlatformError`](scp_platform::PlatformError) carrying
+    /// `message`, coded by
+    /// [`platform_error_code`](scp_ffi_common::custody_parse::platform_error_code):
+    /// every bridge path reports key-not-found as `SCP-CRYPTO-4006`, any other
+    /// custody failure as `SCP-CRYPTO-4060`, and a rejected host pseudonym as
+    /// `SCP-IDENT-1055`.
+    pub(crate) fn custody(message: String, e: &scp_platform::PlatformError) -> Self {
+        let code = scp_ffi_common::custody_parse::platform_error_code(e).to_owned();
+        if matches!(e, scp_platform::PlatformError::PseudonymRejected(_)) {
+            Self::Identity { message, code }
+        } else {
+            Self::Crypto { message, code }
+        }
+    }
+}
+
+impl ScpNapiError {
+    /// A custody failure the runtime carried as a typed
+    /// [`CustodyFailure`](scp_crypto::CustodyFailure), coded by
+    /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code):
+    /// key-not-found is `SCP-CRYPTO-4006`, a rejected host pseudonym
+    /// `SCP-IDENT-1055`, and any other custody failure `SCP-CRYPTO-4060`.
+    pub(crate) fn custody_failure(message: String, e: &scp_crypto::CustodyFailure) -> Self {
+        let code = scp_ffi_common::error_codes::custody_failure_code(e).to_owned();
+        if matches!(e.kind, scp_crypto::CustodyFailureKind::PseudonymRejected) {
+            Self::Identity { message, code }
+        } else {
+            Self::Crypto { message, code }
+        }
+    }
+}
+
 impl From<scp_platform::PlatformError> for ScpNapiError {
     fn from(e: scp_platform::PlatformError) -> Self {
-        Self::Crypto {
-            message: format!(
-                "platform key operation failed: {e} — check key custody configuration"
-            ),
-            code: codes::CRYPTO_4004.to_owned(),
-        }
+        Self::custody(
+            format!("platform key operation failed: {e} — check key custody configuration"),
+            &e,
+        )
     }
 }
 
@@ -698,6 +749,66 @@ mod tests {
             ScpNapiError::Identity { code, .. } => code,
             other => panic!("expected ScpNapiError::Identity, got {other:?}"),
         }
+    }
+
+    /// Every runtime error that carries a custody failure reaches the caller
+    /// with the custody code: key-not-found as `SCP-CRYPTO-4006`, any other
+    /// custody failure as `SCP-CRYPTO-4060`, a rejected host pseudonym as
+    /// `SCP-IDENT-1055`. Broadcast publish signing and join key agreement
+    /// arrive as `ContextError::Custody`.
+    #[test]
+    fn custody_failures_carry_the_custody_codes_in_every_carrier() {
+        use scp_crypto::{CustodyFailure, CustodyFailureKind as K};
+        fn failure(kind: K) -> CustodyFailure {
+            CustodyFailure {
+                kind,
+                detail: "custody detail".to_owned(),
+            }
+        }
+        fn crypto_code(e: ScpNapiError) -> String {
+            match e {
+                ScpNapiError::Crypto { code, .. } => code,
+                other => panic!("expected a crypto error, got {other:?}"),
+            }
+        }
+        fn identity_code(e: ScpNapiError) -> String {
+            match e {
+                ScpNapiError::Identity { code, .. } => code,
+                other => panic!("expected an identity error, got {other:?}"),
+            }
+        }
+        use scp_core::context::ContextError;
+        assert_eq!(
+            crypto_code(ContextError::Custody(failure(K::KeyNotFound)).into()),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            crypto_code(ContextError::Custody(failure(K::Failed)).into()),
+            codes::CRYPTO_4060
+        );
+        assert_eq!(
+            identity_code(ContextError::Custody(failure(K::PseudonymRejected)).into()),
+            codes::IDENT_1055
+        );
+        assert_eq!(
+            crypto_code(
+                scp_core::crypto::sender_keys::SenderKeyError::Custody(failure(K::KeyNotFound))
+                    .into()
+            ),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            crypto_code(scp_core::crypto::ucan::UcanError::Custody(failure(K::KeyNotFound)).into()),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            crypto_code(scp_core::envelope::EnvelopeError::Custody(failure(K::KeyNotFound)).into()),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            crypto_code(scp_event_log::EventLogError::Custody(failure(K::Failed)).into()),
+            codes::CRYPTO_4060
+        );
     }
 
     #[test]

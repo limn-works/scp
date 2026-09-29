@@ -1,8 +1,9 @@
 // AndroidKeyCustodyTest.kt — Unit tests for AndroidKeyCustody (SCP-110)
 //
 // These tests exercise the software fallback path (Bouncy Castle) since Android Keystore
-// is not available in JVM unit tests. The Keystore path (API 33+, CustodyType.HARDWARE)
-// requires an Android device or emulator and is tested via instrumented tests.
+// is not available in JVM unit tests. AndroidKeyCustodyPseudonymLifecycleTest runs the
+// Keystore path (API 33+, CustodyType.HARDWARE) against a fake KeystoreKeys; no on-device
+// test of the real Keystore exists yet.
 //
 // Uses InMemorySharedPreferences to inject a test double for EncryptedSharedPreferences,
 // allowing verification of Ed25519 key persistence without the Android framework (#119).
@@ -14,6 +15,10 @@ package works.limn.scp.android.platform
 
 import android.content.SharedPreferences
 import org.bouncycastle.crypto.AsymmetricCipherKeyPair
+import org.bouncycastle.crypto.ec.CustomNamedCurves
+import org.bouncycastle.crypto.params.ECDomainParameters
+import org.bouncycastle.crypto.params.ECPublicKeyParameters
+import org.bouncycastle.crypto.signers.ECDSASigner
 import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
 import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
 import org.bouncycastle.crypto.signers.Ed25519Signer
@@ -26,7 +31,13 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import java.math.BigInteger
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
+
+/** Decodes lowercase hex. */
+private fun hex(text: String): ByteArray =
+    ByteArray(text.length / 2) { text.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
 
 /**
  * In-memory [SharedPreferences] test double for [AndroidKeyCustody] persistence tests.
@@ -35,7 +46,7 @@ import java.util.concurrent.ConcurrentHashMap
  * [getAll], [getString], [edit] with [putString], [remove], and [apply]/[commit].
  * All other SharedPreferences methods throw [UnsupportedOperationException].
  */
-private class InMemorySharedPreferences : SharedPreferences {
+internal class InMemorySharedPreferences : SharedPreferences {
     private val store = ConcurrentHashMap<String, Any?>()
 
     override fun getAll(): MutableMap<String, *> = store.toMutableMap()
@@ -221,12 +232,12 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `sign throws SCP-CRYPTO-4001 for missing key`() {
+        fun `sign throws SCP-CRYPTO-4006 for missing key`() {
             val fakeHandle = KeyHandle(id = "nonexistent-key", custodyType = CustodyType.SOFTWARE)
             val exception = assertThrows<ScpException> {
                 custody.sign(fakeHandle, "data".toByteArray())
             }
-            assertEquals("SCP-CRYPTO-4001", exception.code)
+            assertEquals("SCP-CRYPTO-4006", exception.code)
         }
 
         @Test
@@ -278,12 +289,12 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `publicKey throws SCP-CRYPTO-4001 for missing key`() {
+        fun `publicKey throws SCP-CRYPTO-4006 for missing key`() {
             val fakeHandle = KeyHandle(id = "nonexistent-key", custodyType = CustodyType.SOFTWARE)
             val exception = assertThrows<ScpException> {
                 custody.publicKey(fakeHandle)
             }
-            assertEquals("SCP-CRYPTO-4001", exception.code)
+            assertEquals("SCP-CRYPTO-4006", exception.code)
         }
 
         @Test
@@ -338,45 +349,45 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `destroyKey makes subsequent sign fail with SCP-CRYPTO-4001`() {
+        fun `destroyKey makes subsequent sign fail with SCP-CRYPTO-4006`() {
             val handle = custody.generateKeypair(KeyType.ED25519)
             custody.destroyKey(handle)
 
             val exception = assertThrows<ScpException> {
                 custody.sign(handle, "data".toByteArray())
             }
-            assertEquals("SCP-CRYPTO-4001", exception.code)
+            assertEquals("SCP-CRYPTO-4006", exception.code)
         }
 
         @Test
-        fun `destroyKey makes subsequent publicKey fail with SCP-CRYPTO-4001`() {
+        fun `destroyKey makes subsequent publicKey fail with SCP-CRYPTO-4006`() {
             val handle = custody.generateKeypair(KeyType.ED25519)
             custody.destroyKey(handle)
 
             val exception = assertThrows<ScpException> {
                 custody.publicKey(handle)
             }
-            assertEquals("SCP-CRYPTO-4001", exception.code)
+            assertEquals("SCP-CRYPTO-4006", exception.code)
         }
 
         @Test
-        fun `destroyKey throws SCP-CRYPTO-4001 for already-destroyed key`() {
+        fun `destroyKey throws SCP-CRYPTO-4006 for already-destroyed key`() {
             val handle = custody.generateKeypair(KeyType.ED25519)
             custody.destroyKey(handle)
 
             val exception = assertThrows<ScpException> {
                 custody.destroyKey(handle)
             }
-            assertEquals("SCP-CRYPTO-4001", exception.code)
+            assertEquals("SCP-CRYPTO-4006", exception.code)
         }
 
         @Test
-        fun `destroyKey throws SCP-CRYPTO-4001 for nonexistent key`() {
+        fun `destroyKey throws SCP-CRYPTO-4006 for nonexistent key`() {
             val fakeHandle = KeyHandle(id = "nonexistent-key", custodyType = CustodyType.SOFTWARE)
             val exception = assertThrows<ScpException> {
                 custody.destroyKey(fakeHandle)
             }
-            assertEquals("SCP-CRYPTO-4001", exception.code)
+            assertEquals("SCP-CRYPTO-4006", exception.code)
         }
     }
 
@@ -429,12 +440,12 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `dhAgree throws SCP-CRYPTO-4002 for missing key`() {
+        fun `dhAgree throws SCP-CRYPTO-4006 for missing key`() {
             val fakeHandle = KeyHandle(id = "nonexistent-key", custodyType = CustodyType.SOFTWARE)
             val exception = assertThrows<ScpException> {
                 custody.dhAgree(fakeHandle, ByteArray(32))
             }
-            assertEquals("SCP-CRYPTO-4002", exception.code)
+            assertEquals("SCP-CRYPTO-4006", exception.code)
         }
 
         @Test
@@ -479,17 +490,87 @@ class AndroidKeyCustodyTest {
                 id = pseudonym.id,
                 custodyType = pseudonym.custodyType,
             )
-            val data = "pseudonym signed message".toByteArray(Charsets.UTF_8)
-            val signature = custody.sign(pseudonymKeyHandle, data)
-            assertEquals(64, signature.size)
-
-            // Verify signature
+            // §9.5: the host signs a 32-byte digest as P-256 ECDSA, 64-byte r || s, low s.
+            val curve = CustomNamedCurves.getByName("secp256r1")
+            val domain = ECDomainParameters(curve.curve, curve.g, curve.n, curve.h)
             val pubKeyBytes = custody.publicKey(pseudonymKeyHandle)
-            val pubKeyParams = Ed25519PublicKeyParameters(pubKeyBytes, 0)
-            val verifier = Ed25519Signer()
-            verifier.init(false, pubKeyParams)
-            verifier.update(data, 0, data.size)
-            assertTrue(verifier.verifySignature(signature))
+            assertEquals(33, pubKeyBytes.size)
+            val verifier = ECDSASigner()
+            verifier.init(false, ECPublicKeyParameters(curve.curve.decodePoint(pubKeyBytes), domain))
+            for (i in 0 until 16) {
+                val digest = MessageDigest.getInstance("SHA-256").digest(byteArrayOf(i.toByte()))
+                val signature = custody.sign(pseudonymKeyHandle, digest)
+                assertEquals(64, signature.size)
+                val r = BigInteger(1, signature.copyOfRange(0, 32))
+                val sVal = BigInteger(1, signature.copyOfRange(32, 64))
+                assertTrue(sVal <= curve.n.shiftRight(1), "s must be low (§9.5)")
+                assertTrue(verifier.verifySignature(digest, r, sVal))
+                // RFC 6979: the same digest signs to the same bytes.
+                assertArrayEquals(signature, custody.sign(pseudonymKeyHandle, digest))
+            }
+        }
+
+        /**
+         * RFC 6979 A.2.5 (P-256, SHA-256, message "sample"): the pseudonym signer reproduces
+         * the RFC's r, so it draws the RFC 6979 nonce, and returns the low-s form of the
+         * RFC's (high) s, the two summing to n. No Kotlin code normalizes s; the Rust
+         * `p256SignPrehashRfc6979` export does.
+         */
+        @Test
+        fun `pseudonym signer reproduces RFC 6979 A_2_5 with low s`() {
+            val x = hex("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721")
+            val digest = MessageDigest.getInstance("SHA-256").digest("sample".toByteArray(Charsets.UTF_8))
+            val signature = P256Pseudonym.signPrehash(x, digest)
+            assertEquals(
+                "efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716",
+                signature.copyOfRange(0, 32).joinToString("") { "%02x".format(it) },
+            )
+            val n = CustomNamedCurves.getByName("secp256r1").n
+            val rfcS = BigInteger("f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8", 16)
+            assertEquals(n, BigInteger(1, signature.copyOfRange(32, 64)).add(rfcS))
+            assertArrayEquals(signature, P256Pseudonym.signPrehash(x, digest))
+        }
+
+        @Test
+        fun `pseudonym sign rejects a non-32-byte input`() {
+            val identityHandle = custody.generateKeypair(KeyType.ED25519)
+            val pseudonym = custody.derivePseudonym(identityHandle, "ctx".toByteArray())
+            val handle = KeyHandle(id = pseudonym.id, custodyType = pseudonym.custodyType)
+            val exception = assertThrows<ScpException> {
+                custody.sign(handle, ByteArray(12))
+            }
+            assertEquals("SCP-VALID-7005", exception.code)
+        }
+
+        /**
+         * A wrong-length digest is `SCP-VALID-7005` and an out-of-range scalar
+         * `SCP-CRYPTO-4001`: the codes of the shared Rust helper.
+         */
+        @Test
+        fun `signPrehash reports the shared helper codes`() {
+            val scalar = ByteArray(32) { 1 }
+            for (size in listOf(0, 12, 31, 33)) {
+                val exception = assertThrows<ScpException> {
+                    P256Pseudonym.signPrehash(scalar, ByteArray(size))
+                }
+                assertEquals("SCP-VALID-7005", exception.code, "digest of $size bytes")
+            }
+            val outOfRange = assertThrows<ScpException> {
+                P256Pseudonym.signPrehash(ByteArray(32), ByteArray(32))
+            }
+            assertEquals("SCP-CRYPTO-4001", outOfRange.code)
+        }
+
+        @Test
+        fun `destroyKey removes a pseudonym key`() {
+            val identityHandle = custody.generateKeypair(KeyType.ED25519)
+            val pseudonym = custody.derivePseudonym(identityHandle, "ctx".toByteArray())
+            val handle = KeyHandle(id = pseudonym.id, custodyType = pseudonym.custodyType)
+            assertTrue(custody.destroyKey(handle).confirmed)
+            val publicKeyError = assertThrows<ScpException> { custody.publicKey(handle) }
+            assertEquals("SCP-CRYPTO-4006", publicKeyError.code)
+            val signError = assertThrows<ScpException> { custody.sign(handle, ByteArray(32) { 1 }) }
+            assertEquals("SCP-CRYPTO-4006", signError.code)
         }
 
         @Test
@@ -506,6 +587,9 @@ class AndroidKeyCustodyTest {
             val pubKey1 = custody.publicKey(pubKey1Handle)
             val pubKey2 = custody.publicKey(pubKey2Handle)
             assertArrayEquals(pubKey1, pubKey2)
+            // One handle per (identity, context): re-deriving reuses the id.
+            assertEquals(pseudonym1.id, pseudonym2.id)
+            assertEquals(1, custody.pseudonymKeys.size)
         }
 
         @Test
@@ -545,12 +629,12 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `derivePseudonym throws SCP-CRYPTO-4001 for missing identity key`() {
+        fun `derivePseudonym throws SCP-CRYPTO-4006 for missing identity key`() {
             val fakeHandle = KeyHandle(id = "nonexistent-key", custodyType = CustodyType.SOFTWARE)
             val exception = assertThrows<ScpException> {
                 custody.derivePseudonym(fakeHandle, "ctx".toByteArray())
             }
-            assertEquals("SCP-CRYPTO-4001", exception.code)
+            assertEquals("SCP-CRYPTO-4006", exception.code)
         }
 
         @Test
@@ -563,7 +647,7 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `derivePseudonym public key is 32 bytes`() {
+        fun `derivePseudonym public key is a 33-byte compressed P-256 point`() {
             val identityHandle = custody.generateKeypair(KeyType.ED25519)
             val pseudonym = custody.derivePseudonym(
                 identityHandle,
@@ -572,7 +656,8 @@ class AndroidKeyCustodyTest {
             val pubKey = custody.publicKey(
                 KeyHandle(id = pseudonym.id, custodyType = pseudonym.custodyType),
             )
-            assertEquals(32, pubKey.size)
+            assertEquals(33, pubKey.size)
+            assertTrue(pubKey[0] == 0x02.toByte() || pubKey[0] == 0x03.toByte())
         }
     }
 
@@ -585,8 +670,8 @@ class AndroidKeyCustodyTest {
 
         @Test
         fun `ScpException carries correct error code`() {
-            val exception = ScpException("test message", "SCP-CRYPTO-4001")
-            assertEquals("SCP-CRYPTO-4001", exception.code)
+            val exception = ScpException("test message", "SCP-CRYPTO-4006")
+            assertEquals("SCP-CRYPTO-4006", exception.code)
             assertEquals("test message", exception.message)
         }
 
@@ -767,25 +852,27 @@ class AndroidKeyCustodyTest {
                 "test-ctx".toByteArray(Charsets.UTF_8),
             )
 
-            // Only the identity key should be persisted, not the pseudonym
-            val identityPrefsKey = "scp.ed25519.${identityHandle.id}"
-            val pseudonymPrefsKey = "scp.ed25519.${pseudonym.id}"
-            assertTrue(prefs.contains(identityPrefsKey))
-            assertTrue(!prefs.contains(pseudonymPrefsKey))
+            // Only the identity key is persisted; no prefs key names the pseudonym.
+            assertTrue(prefs.contains("scp.ed25519.${identityHandle.id}"))
+            val leaked = prefs.all.keys.filter { it.contains(pseudonym.id) }
+            assertTrue(leaked.isEmpty(), "pseudonym persisted under $leaked")
         }
     }
 
     // -------------------------------------------------------------------
     // Known-answer tests for pseudonym derivation (spec §25.19)
     //
-    // Pins the software-custody Ed25519 pseudonym public key bytes for fixed
-    // identity seeds and context "context-alpha", proving the Kotlin adapter
-    // matches the cross-platform recipe shared with the Rust core and the other
-    // SDK bindings:
-    //   pseudonym_secret = HKDF-SHA256(seed, salt="scp-pseudonym-secret-v1")
+    // Pins the software-custody P-256 pseudonym points for the §25.19 vectors 30
+    // and 31 over context "context-alpha", proving the Kotlin adapter matches the
+    // cross-platform recipe (§9.10.4.A). The seed-to-scalar step under the §25.2
+    // label "SCP-TEST-VECTOR-KEY-V1" is pinned by spec_25_19_vectors_30_31 in
+    // crates/scp-crypto/src/pseudonym.rs; the adapter's ikm is its Ed25519 seed, so
+    // the test installs the literal spec scalar as that seed.
+    //   pseudonym_secret = HKDF-SHA256(ikm, salt="scp-pseudonym-secret-v1")
     //   v1 seed          = HMAC-SHA256(secret, ctx || "scp-pseudonym")
     //   v2 seed          = HMAC-SHA256(secret, ctx || BE64(epoch) || "scp-pseudonym-v2")
-    //   pseudonym_pubkey = Ed25519_keygen(seed[0..32]).public_key
+    //   d                = HKDF-Expand(seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n-1) + 1
+    //   pseudonym_pubkey = SEC1-compressed(d * G)
     // -------------------------------------------------------------------
 
     @Nested
@@ -794,34 +881,33 @@ class AndroidKeyCustodyTest {
         @Test
         fun `vector 30 static and rotatable pseudonyms match spec bytes`() {
             assertVectorMatches(
-                seed = ByteArray(32) { 0x01 },
-                expectedV1 = "fddc04882a48aa39888f6dbec622f9c5aa6f06b2e40820a69a2e0e89b5f09ac2",
-                expectedV2Epoch1 = "43e50a947c4b2be44f871e309c7edc64afaf4207b9a589c9b01f61c01158090f",
+                expectedScalar = "32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64",
+                expectedV1 = "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72",
+                expectedV2Epoch1 = "0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479",
             )
         }
 
         @Test
         fun `vector 31 static and rotatable pseudonyms match spec bytes`() {
-            // seed = 0x9d, then 0x01, 0x02, ... 0x1f (31 ascending bytes after the lead).
-            val seed = ByteArray(32) { i -> if (i == 0) 0x9d.toByte() else i.toByte() }
             assertVectorMatches(
-                seed = seed,
-                expectedV1 = "ff6e2e909a008318f97bb2c26c1d787ceb9aa2996f746766335e10ba7e2213cc",
-                expectedV2Epoch1 = "edd47319719e2350d1db9488e0189f2405267d7dc243489cfd9aa6f3ac3fc639",
+                expectedScalar = "65d56a863d03d31ea15ade82f677058d5bbe53afedc6ff7d2b8846aa25a1bc2b",
+                expectedV1 = "0239f7c3213f3567183fd2fcf7aec6c884bc70e0e694c42053284a4b5ebef4fe2d",
+                expectedV2Epoch1 = "037967cfe8d3111cdd72288ea3f444c15b710300323162fec63ca9036af73754e3",
             )
         }
 
         /**
-         * Injects a fixed identity seed, then asserts that v1 [derivePseudonym] and v2
-         * [AndroidKeyCustody.deriveRotatablePseudonym] (epoch 1) over context "context-alpha"
-         * produce the spec-pinned public key bytes, and that v1 and v2 are distinct.
+         * Injects the spec identity scalar as the Ed25519 seed, then asserts that v1
+         * [derivePseudonym] and v2 [AndroidKeyCustody.deriveRotatablePseudonym] (epoch 1) over
+         * context "context-alpha" produce the spec-pinned public key bytes, and that v1 and v2
+         * are distinct.
          */
         private fun assertVectorMatches(
-            seed: ByteArray,
+            expectedScalar: String,
             expectedV1: String,
             expectedV2Epoch1: String,
         ) {
-            val identityHandle = injectSoftwareEd25519(seed)
+            val identityHandle = injectSoftwareEd25519(hex(expectedScalar))
             val contextAlpha = "context-alpha".toByteArray(Charsets.UTF_8)
 
             val v1Pseudonym = custody.derivePseudonym(identityHandle, contextAlpha)

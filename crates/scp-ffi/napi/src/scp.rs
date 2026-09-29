@@ -447,9 +447,9 @@ impl Scp {
                     .map_or_else(InMemoryKeyCustody::new, |seed| {
                         InMemoryKeyCustody::from_seed_bytes(**seed)
                     });
-                let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+                let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
                     crate::identity::OpaqueInMemoryKeyCustody(in_memory),
-                ));
+                )));
                 let pre_rotation_custody =
                     Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
                 let dht = crate::identity::shared_did_method()?;
@@ -575,9 +575,9 @@ impl Scp {
             "in_memory" => {
                 use scp_platform::testing::InMemoryKeyCustody;
 
-                let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+                let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
                     crate::identity::OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
-                ));
+                )));
                 let pre_rotation_custody =
                     Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
                 let dht = crate::identity::shared_did_method()?;
@@ -991,10 +991,10 @@ impl Scp {
             rt.block_on(custody.sign(&key_handle, &built.canonical_bytes))
         })
         .map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("Ed25519 signing failed: {e}"),
-                code: codes::IDENT_1041.to_owned(),
-            })
+            NapiError::from(ScpNapiError::custody(
+                format!("link attestation signing failed: {e}"),
+                &e,
+            ))
         })?;
         attestation.signature = sig.as_bytes().to_vec();
 
@@ -5061,9 +5061,9 @@ mod concurrency_cap_tests {
             .build()
             .unwrap();
 
-        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
             OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
-        ));
+        )));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         let dht = scp_identity::DidDht::with_client(Arc::new(scp_dht::InMemoryDhtClient::new()));

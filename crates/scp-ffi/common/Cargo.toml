@@ -34,7 +34,8 @@ testing = [
 ]
 # Shared callback-custody byte/string parsing helpers (custody_parse module).
 # Requires only scp-platform for the typed return values (KeyHandle,
-# PseudonymKeypair, PublicKey, PlatformError). Deliberately NOT folded into
+# PseudonymKeypair, PublicKey, PlatformError); scp-crypto, for the P-256
+# point and strict signature checks on host pseudonym returns. Deliberately NOT folded into
 # `resolvers`: these are pure byte/string ops far lighter than the resolver
 # stack.
 custody = ["dep:scp-platform"]
@@ -87,6 +88,9 @@ scp-transport = { path = "../../scp-transport", features = ["redb-blob"], option
 # feature added here that its allowlist omits (ADR-062 §Decision 6).
 scp-node = { path = "../../scp-node", optional = true }
 scp-platform = { path = "../../scp-platform", features = ["encrypting", "sqlite", "in-memory-storage"], optional = true }
+# Unconditional: `error_codes::custody_failure_code` and `ucan_errors` read the
+# `CustodyFailure` the runtime carries, and `custody_parse` uses the P-256 point.
+scp-crypto = { path = "../../scp-crypto" }
 async-trait = { workspace = true, optional = true }
 dashmap = { workspace = true }
 zeroize = { workspace = true }

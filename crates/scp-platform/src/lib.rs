@@ -73,6 +73,14 @@ pub mod testing;
 pub mod kdf;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+// The in-memory pseudonym keys of the software custodies, compiled exactly
+// when one of them is (`file`, `testing`, `sqlite` with `software_platform`).
+#[cfg(any(
+    feature = "file",
+    feature = "testing",
+    all(feature = "sqlite", feature = "software_platform")
+))]
+pub(crate) mod pseudonym_keys;
 // Versioned storage envelope + spec §17.3 key conventions. The single source of
 // the `StoredValue` format and `identity/{did}/document` key convention shared
 // by `scp-runtime`'s `ProtocolRepository` and `scp-identity`'s `Identity::create`

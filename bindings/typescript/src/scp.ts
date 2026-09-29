@@ -43,6 +43,7 @@ import type { PaymentReceiptVerificationResult } from "./economy";
 import { ContextError, mapBridgeError, mapSagaError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
 import { type BridgeContextHandle, getBridge, toCapabilityValidation } from "./internal/bridge";
+import { toNativeCustodyProvider } from "./internal/custody-adapter";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
 import { assertTestEnvironment } from "./internal/test-guard";
 import type { StreamingSagaNative, StreamingSagaOptions } from "./outlets";
@@ -119,6 +120,10 @@ type NativeAddon = RawNativeAddon & {
   validateAgainstTemplate?: unknown;
   validateContextParams?: unknown;
   checkScopedCapability?: unknown;
+  // P-256 custody-host helpers (§9.10.4, §9.5), module-level free functions.
+  p256PseudonymScalar?: unknown;
+  p256PublicKey?: unknown;
+  p256SignPrehashRfc6979?: unknown;
 };
 
 /**
@@ -258,6 +263,35 @@ export function __clampShutdownMillisForTests(timeoutSecs: number): number {
     return MAX_MILLIS;
   }
   return Math.round(timeoutSecs * 1000);
+}
+
+/**
+ * Passes `args` to the native P-256 helper `fn` and returns its result as
+ * the one `Uint8Array` the host owns.
+ *
+ * NAPI `Vec<u8>` parameters and returns are `number[]` in JS. The
+ * `number[]` copies of the arguments, and the `number[]` result once it is
+ * copied into the returned `Uint8Array`, are wiped with `fill(0)`.
+ *
+ * @internal
+ */
+export function __p256HostInvokeForTests(
+  fn: (...a: number[][]) => number[],
+  args: readonly Uint8Array[],
+): Uint8Array {
+  const raw = args.map((a) => Array.from(a));
+  let out: number[] | undefined;
+  try {
+    out = fn(...raw);
+    return Uint8Array.from(out);
+  } catch (err) {
+    throw mapBridgeError(err);
+  } finally {
+    for (const r of raw) {
+      r.fill(0);
+    }
+    out?.fill(0);
+  }
 }
 
 /**
@@ -456,6 +490,17 @@ export interface KeyPackageReservation {
   readonly keyPackagePublic: Uint8Array;
 }
 
+/** A pseudonym a {@link KeyCustodyProvider} derived (spec §9.10.4). */
+export interface PseudonymResult {
+  /** The 33-byte SEC1 compressed P-256 public key. */
+  publicKey: Uint8Array;
+  /**
+   * The id of the pseudonym key, usable with `sign` and `getPublicKey`: a
+   * canonical decimal `u64` string (see {@link KeyCustodyProvider}).
+   */
+  keyId: string;
+}
+
 /**
  * Caller-supplied custody backend for {@link SCP.identityCreateWithCustody}.
  *
@@ -467,43 +512,123 @@ export interface KeyPackageReservation {
  * protocol so all SDKs share an identical contract.
  *
  * Callbacks are invoked synchronously from the native bridge (marshalled onto
- * the Node.js event loop). Key identifiers are opaque, numeric-string handles
- * your implementation assigns in {@link generateKeypair}. Byte values are
- * passed and returned as `Uint8Array`.
+ * the Node.js event loop). Byte values are passed and returned as `Uint8Array`.
+ *
+ * Key identifiers are handles your implementation assigns in
+ * {@link generateKeypair} and {@link derivePseudonym}. Each is the canonical
+ * decimal form of an unsigned 64-bit integer, as `String(n)` writes it for a
+ * `bigint` `n` in `[0, 2^64 - 1]`: ASCII digits only, with no sign, no leading
+ * zero (`"0"` itself is allowed) and no whitespace. The bridge rejects any
+ * other id (`"007"`, `"+7"`, `" 7"`, a UUID): from `generateKeypair` with the
+ * custody error `SCP-CRYPTO-4060`, and from `derivePseudonym` or
+ * `deriveRotatablePseudonym` with `SCP-IDENT-1055`.
+ *
+ * A callback reports failure by throwing. Throw an error whose `code` is
+ * `"SCP-CRYPTO-4006"` (key not found), such as
+ * `new CryptoError(msg, "SCP-CRYPTO-4006")`, for a key id that was destroyed or
+ * never existed; the SDK call then rejects with a `CryptoError` carrying that
+ * code. Any other throw, whatever its code or value, rejects the SDK call with
+ * the custody error `SCP-CRYPTO-4060` carrying the thrown code and message.
+ * Every SDK operation that calls the provider reports these two codes,
+ * including the pseudonym derivation inside `createContext` and the identity
+ * key reads and signatures of identity operations. There are two exceptions:
+ * `SCP-IDENT-1055`, reported when the bridge rejects the pseudonym a
+ * {@link derivePseudonym} call returned (including when `getPublicKey` on its
+ * key id throws, whatever the code), and `SCP-IDENT-1037`, which
+ * `scpidSign` reports for any custody failure (spec §3.11.4).
+ *
+ * Every callback must be synchronous and return the type its signature names.
+ * A callback that returns a Promise or other thenable, or a value of the wrong
+ * type, fails the SDK call with `SCP-CRYPTO-4060`; the SDK attaches a handler
+ * to a returned thenable, so its rejection is swallowed. No throw, returned
+ * value or rejected thenable reaches the process as an uncaught exception or
+ * an unhandled rejection.
  *
  * Only available on the NAPI (Node.js / Bun) backend — the SDK requires the
  * native addon (ADR-048). The browser tier (`@limn-works/scp-ts-wasm`, ADR-057)
  * runs the full protocol in-tab and does not use this native custody callback.
  */
 export interface KeyCustodyProvider {
-  /** Generate a keypair (`"ed25519"` or `"x25519"`); return its opaque id. */
+  /**
+   * Generate a keypair (`"ed25519"` or `"x25519"`); return its id, a
+   * canonical decimal `u64` string (`SCP-CRYPTO-4060` otherwise).
+   */
   generateKeypair(keyType: string): string;
-  /** Return the 64-byte Ed25519 signature of `message` under `keyId`. */
+  /**
+   * Return the 64-byte signature of `message` under `keyId`. For an identity
+   * key this is Ed25519. For a pseudonym key returned by
+   * {@link derivePseudonym} `message` is a 32-byte digest and the result is
+   * the P-256 prehash ECDSA `r || s` with low s (§9.5); the bridge rejects
+   * any other length and any signature that fails strict verification, for a
+   * pseudonym key this adapter derived and still holds bound; for a handle the
+   * adapter did not bind, the bridge returns the host's bytes unchecked. A
+   * software host signs with {@link p256SignPrehashRfc6979} rather than its
+   * own ECDSA.
+   */
   sign(keyId: string, message: Uint8Array): Uint8Array;
-  /** Return the 32 public-key bytes for `keyId`. */
+  /**
+   * Return the public key for `keyId`: 32 Ed25519 bytes for an identity key,
+   * the 33-byte compressed P-256 point for a pseudonym key.
+   */
   getPublicKey(keyId: string): Uint8Array;
-  /** Destroy key material for `keyId`; subsequent operations must fail. */
+  /**
+   * Destroy key material for `keyId`; subsequent operations must fail.
+   * Destroying an identity key also destroys its `pseudonym_secret` and every
+   * v1 and v2 pseudonym key derived from it, so each such pseudonym `keyId`
+   * then fails too (spec §9.10.4.A).
+   */
   destroyKey(keyId: string): void;
   /** Return the 32-byte X25519 shared secret with `peerPublic`. */
   dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array;
   /**
-   * Derive a context-scoped pseudonym keypair. Returns
-   * `publicKey(32) || keyIdUtf8` — the 32-byte pseudonym public key
-   * concatenated with the UTF-8 numeric id of the derived signing key.
+   * Derive the context-scoped P-256 pseudonym of identity key `keyId`
+   * (spec §9.10.4, §9.10.4.A). `publicKey` is the 33-byte compressed point
+   * and `keyId` the id of the new pseudonym key, a canonical decimal `u64`
+   * string (`SCP-IDENT-1055` otherwise). The bridge requires
+   * `getPublicKey(keyId)` to return the same 33 bytes, and fails the
+   * operation with `SCP-IDENT-1055` otherwise, including when that
+   * `getPublicKey` call fails with any code. The same (`keyId`,
+   * `contextId`) MUST return the same pseudonym `keyId` on every call, so
+   * re-deriving names one key rather than minting another. The pseudonym
+   * dies with its identity (spec §9.10.4.A): `destroyKey(keyId)` destroys it,
+   * and a derivation still in flight when `keyId` is destroyed fails with
+   * key-not-found (`SCP-CRYPTO-4006`) and stores nothing.
+   *
+   * Canonical recipe (spec §9.10.4, §9.10.4.A; every software host MUST
+   * produce identical bytes; `ikm` is the identity private key material, the
+   * 32-byte Ed25519 seed until slice S12):
+   *   1. `pseudonym_secret = HKDF-SHA256(ikm, salt="scp-pseudonym-secret-v1", info="", L=32)`
+   *   2. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
+   *   3. `d = p256PseudonymScalar(seed)` and `publicKey = p256PublicKey(d)`.
+   *
+   * The HMAC key is the 32-byte `pseudonym_secret`, never the public key:
+   * public key bytes would be a membership-enumeration oracle (§9.10.4.A).
+   * A host maps `seed` to `d` with {@link p256PseudonymScalar} and computes
+   * `publicKey` with {@link p256PublicKey} rather than reducing and
+   * multiplying itself.
    */
-  derivePseudonym(keyId: string, contextId: Uint8Array): Uint8Array;
+  derivePseudonym(keyId: string, contextId: Uint8Array): PseudonymResult;
   /**
-   * Derive a rotatable (epoch-versioned) context-scoped pseudonym keypair.
-   * Identical layout to {@link derivePseudonym} — returns
-   * `publicKey(32) || keyIdUtf8` — but the derivation mixes the big-endian
-   * 64-bit `pseudonymEpoch` and a distinct domain separator so rotating the
-   * epoch yields an unlinkable new keypair (spec §9.10.4.A).
+   * Derive a rotatable (epoch-versioned) context-scoped pseudonym (spec
+   * §9.10.4.1). Same contract and checks as {@link derivePseudonym}; the same
+   * (`keyId`, `contextId`, `pseudonymEpoch`) MUST return the same pseudonym
+   * `keyId` on every call, and it dies with its identity as for
+   * {@link derivePseudonym}.
+   *
+   * Canonical recipe: steps 1 and 3 of {@link derivePseudonym}, with step 2
+   * replaced by
+   *   `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonymEpoch) || "scp-pseudonym-v2")`
+   * where `BE64` is the 8-byte big-endian epoch. The `"scp-pseudonym-v2"`
+   * separator differs from the v1 `"scp-pseudonym"`, so epoch 0 yields a
+   * pseudonym distinct from the static v1 one, and rotating the epoch yields
+   * an unlinkable new keypair. The HMAC key is the `pseudonym_secret`, never
+   * the public key.
    */
   deriveRotatablePseudonym(
     keyId: string,
     contextId: Uint8Array,
     pseudonymEpoch: bigint,
-  ): Uint8Array;
+  ): PseudonymResult;
   /**
    * Return the 32 raw Ed25519 private-seed bytes for `keyId`.
    *
@@ -517,6 +642,66 @@ export interface KeyCustodyProvider {
   exportSigningKeyBytes(keyId: string): Uint8Array;
   /** Return `"hardware"`, `"software"`, or `"in_memory"`. */
   custodyType(keyId: string): string;
+}
+
+// ---------------------------------------------------------------------------
+// P-256 custody-host helpers
+// ---------------------------------------------------------------------------
+
+/** Calls the addon's P-256 host helper `name`, mapping its errors. */
+function p256HostCall(
+  name: "p256PseudonymScalar" | "p256PublicKey" | "p256SignPrehashRfc6979",
+  ...args: Uint8Array[]
+): Uint8Array {
+  return __p256HostInvokeForTests(nativeFreeFn<(...a: number[][]) => number[]>(name), args);
+}
+
+/**
+ * Maps a 32-byte §9.10.4 `context_seed` (v1 or v2) to its P-256 pseudonym
+ * scalar in `[1, n − 1]`.
+ *
+ * FIPS 186-5 A.2.1, spec §9.10.4:
+ * `HKDF-Expand(context_seed, "SCP-PSEUDONYM-P256-V1", 48)` read as a
+ * big-endian integer, `mod (n − 1) + 1`, returned as 32 big-endian bytes. The
+ * label is fixed inside the helper, so no host passes it. A
+ * {@link KeyCustodyProvider} host stores the result as the pseudonym key and
+ * passes it to {@link p256PublicKey} and {@link p256SignPrehashRfc6979}.
+ *
+ * The Rust side and the SDK wipe their own copies of the seed and the
+ * scalar. The SDK returns the scalar as one mutable `Uint8Array` that no
+ * other SDK code holds; the host wipes it with `fill(0)` when it destroys the
+ * key, and wipes the seed it passed in. The transfer buffers napi-rs copies
+ * across the JS boundary cannot be reached from JS and are not wiped.
+ *
+ * @throws {ValidationError} `SCP-VALID-7005` when `contextSeed` is not 32 bytes.
+ * @throws {CryptoError} `SCP-CRYPTO-4001` if the reduction fails.
+ */
+export function p256PseudonymScalar(contextSeed: Uint8Array): Uint8Array {
+  return p256HostCall("p256PseudonymScalar", contextSeed);
+}
+
+/**
+ * Returns the 33-byte SEC1 compressed public key `d·G` of a 32-byte scalar.
+ *
+ * @throws {ValidationError} `SCP-VALID-7005` when `scalar` is not 32 bytes.
+ * @throws {CryptoError} `SCP-CRYPTO-4001` when it is zero or not below `n`.
+ */
+export function p256PublicKey(scalar: Uint8Array): Uint8Array {
+  return p256HostCall("p256PublicKey", scalar);
+}
+
+/**
+ * Signs a 32-byte digest with the scalar (spec §9.5): RFC 6979 deterministic
+ * nonce (`h1 = digest`), low-`s` normalized, returned as the 64-byte `r || s`
+ * that {@link KeyCustodyProvider.sign} returns for a pseudonym key id.
+ *
+ * @throws {ValidationError} `SCP-VALID-7005` when `scalar` or `digest` is not
+ *   32 bytes.
+ * @throws {CryptoError} `SCP-CRYPTO-4001` when the scalar is out of range or
+ *   signing fails.
+ */
+export function p256SignPrehashRfc6979(scalar: Uint8Array, digest: Uint8Array): Uint8Array {
+  return p256HostCall("p256SignPrehashRfc6979", scalar, digest);
 }
 
 // ---------------------------------------------------------------------------
@@ -760,56 +945,7 @@ export class SCP {
         );
       }
     }
-    // NAPI marshals each provider method as a ThreadsafeFunction WITHOUT
-    // preserving `this`, and Rust `Vec<u8>` crosses the wire as a JS
-    // `Array<number>` (not `Uint8Array`). The adapter below (a) closes over
-    // `provider` in each arrow so `this` is bound, and (b) converts byte args
-    // inbound (`Array<number>` → `Uint8Array`) and byte returns outbound
-    // (`Uint8Array` → `Array<number>`). Methods with no byte payload
-    // (`generateKeypair`, `destroyKey`, `custodyType`) pass through unchanged.
-    // Additionally, napi-rs delivers a multi-element Rust tuple
-    // (`(String, Vec<u8>)`) to the JS callback as a SINGLE `[keyId, bytes]`
-    // array argument — not as two positional args — so the tuple callbacks
-    // (`sign`, `dhAgree`, `derivePseudonym`) accept one array and destructure
-    // it. Single-value callbacks receive their positional argument normally.
-    const adapter = {
-      generateKeypair: (keyType: string): string => provider.generateKeypair(keyType),
-      // napi-rs delivers a `(String, Vec<u8>)` tuple as a single `[keyId, bytes]`
-      // array arg (not positional), so the two-value callbacks destructure it.
-      sign: ([keyId, message]: [string, number[]]): number[] =>
-        Array.from(provider.sign(keyId, Uint8Array.from(message))),
-      getPublicKey: (keyId: string): number[] => Array.from(provider.getPublicKey(keyId)),
-      destroyKey: (keyId: string): void => provider.destroyKey(keyId),
-      dhAgree: ([keyId, peerPublic]: [string, number[]]): number[] =>
-        Array.from(provider.dhAgree(keyId, Uint8Array.from(peerPublic))),
-      derivePseudonym: ([keyId, contextId]: [string, number[]]): number[] =>
-        Array.from(provider.derivePseudonym(keyId, Uint8Array.from(contextId))),
-      // The Rust `(String, Vec<u8>, u64)` tuple likewise arrives as a single
-      // `[keyId, contextId, epoch]` array; the `u64` epoch crosses as a JS
-      // `bigint` (the field's declared `ts_type`).
-      deriveRotatablePseudonym: ([keyId, contextId, epoch]: [string, number[], bigint]): number[] =>
-        Array.from(provider.deriveRotatablePseudonym(keyId, Uint8Array.from(contextId), epoch)),
-      // A sign-only / hardware / secure-enclave custody throws here to signal it
-      // cannot export raw private-key bytes (ADR-006). Translate that into the
-      // native error channel by returning an empty array (the Rust bridge's
-      // 32-byte check then yields `Err`): §9.10.4 best-effort paths — e.g. the
-      // post-create / post-import `PseudonymAnnouncement`, which signs via the
-      // exported key — skip gracefully, while required callers surface a custody
-      // error. Returning a value rather than re-throwing keeps the provider's
-      // synchronous exception from leaking into the host's unhandled-exception
-      // tracking (which would spuriously fail tests) while preserving the
-      // fail-closed contract. Signing itself never uses this path — it goes
-      // through `KeyCustody::sign` — so sign-only custody can still produce a
-      // signed export.
-      exportSigningKeyBytes: (keyId: string): number[] => {
-        try {
-          return Array.from(provider.exportSigningKeyBytes(keyId));
-        } catch {
-          return [];
-        }
-      },
-      custodyType: (keyId: string): string => provider.custodyType(keyId),
-    };
+    const adapter = toNativeCustodyProvider(provider);
     try {
       const raw = await (
         this.#native.identityCreateWithCustody as (p: typeof adapter) => Promise<unknown>

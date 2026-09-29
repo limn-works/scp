@@ -1140,6 +1140,42 @@
       "path": "crates/scp-ffi/napi/src/ucan.rs",
       "kind": "getter",
       "reason": "Getter for a UCAN token id on a result type."
+    },
+    {
+      "name": "new",
+      "path": "crates/scp-ffi/napi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the napi callback adapter so TypeScript tests reach its \u00a79.5/\u00a79.10.4 pseudonym checks (32-byte input, strict low-s verification, destroy-time unbinding). Not a protocol operation."
+    },
+    {
+      "name": "generate_keypair",
+      "path": "crates/scp-ffi/napi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the napi callback adapter so TypeScript tests reach its \u00a79.5/\u00a79.10.4 pseudonym checks (32-byte input, strict low-s verification, destroy-time unbinding). Not a protocol operation."
+    },
+    {
+      "name": "derive_pseudonym",
+      "path": "crates/scp-ffi/napi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the napi callback adapter so TypeScript tests reach its \u00a79.5/\u00a79.10.4 pseudonym checks (32-byte input, strict low-s verification, destroy-time unbinding). Not a protocol operation."
+    },
+    {
+      "name": "derive_rotatable_pseudonym",
+      "path": "crates/scp-ffi/napi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the napi callback adapter so TypeScript tests reach its §9.5/§9.10.4 pseudonym checks (32-byte input, strict low-s verification, destroy-time unbinding). Not a protocol operation."
+    },
+    {
+      "name": "sign",
+      "path": "crates/scp-ffi/napi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the napi callback adapter so TypeScript tests reach its \u00a79.5/\u00a79.10.4 pseudonym checks (32-byte input, strict low-s verification, destroy-time unbinding). Not a protocol operation."
+    },
+    {
+      "name": "destroy_key",
+      "path": "crates/scp-ffi/napi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the napi callback adapter so TypeScript tests reach its \u00a79.5/\u00a79.10.4 pseudonym checks (32-byte input, strict low-s verification, destroy-time unbinding). Not a protocol operation."
     }
   ],
   "pending_registration": {

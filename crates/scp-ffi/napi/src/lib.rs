@@ -132,6 +132,7 @@ pub mod mcp;
 pub mod media;
 pub mod outlet_stream;
 pub mod outlets;
+pub mod p256_host;
 pub mod provenance;
 pub mod runtime;
 pub mod scp;

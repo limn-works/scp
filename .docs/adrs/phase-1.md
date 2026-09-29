@@ -866,9 +866,11 @@ pub enum TransportEvent {
 
 ## ADR-006: Platform Abstraction (In-Memory Testing Adapter)
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-09-27 (SCP-307, the Android hardware pseudonym secret).
 
 **Amendment (2026-09-10 — the `KeyCustody` key types are both P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The `KeyType` enum this ADR defines named one variant per curve and now names both by purpose: `P256Signing` and `P256Agreement`. Every method contract below reads the same way afterwards — `sign` rejects an agreement-only handle, `dh_agree` rejects a signing-only handle — because the split was always a purpose split and the curve names hid that. The pseudonym derivation gains the seed-to-scalar step of §9.10.4 of the security-model spec, because P-256 has no analogue of the seed expansion RFC 8032 fixed for the superseded curve. This ADR's adapter is the in-memory testing one, so no custody claim changes.
+
+**Amendment (2026-09-27 — SCP-307, the Android hardware pseudonym secret).** On Android hardware custody (Keystore, API 33 and above), `pseudonym_secret` is a 256-bit Keystore HMAC-SHA256 key that `generate_keypair` creates beside the identity key. The HMAC that yields the §9.10.4 context seed runs inside Keystore, so the secret never leaves it. Nothing is derived from a signature: the example `SHA-256(TEE_sign("scp-pseudonym-secret-v1"))` in acceptance criterion 1 below is withdrawn, because a hardware signer draws its own nonce and would yield a different secret on every call (§9.10.4.A). A Keystore identity key generated before this secret existed has none, and deriving a pseudonym from it fails with `SCP-CRYPTO-4006`.
 
 ### Context
 

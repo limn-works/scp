@@ -310,7 +310,7 @@ struct KatSigner(SigningKey);
 
 #[async_trait::async_trait]
 impl EventLogSigner for KatSigner {
-    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
+    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, scp_crypto::CustodyFailure> {
         Ok(self.0.sign(message).to_bytes().to_vec())
     }
 }

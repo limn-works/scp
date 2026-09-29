@@ -1589,7 +1589,10 @@ fn resolve_verifying_key(
         let public_key = rt
             .block_on(async move { custody.public_key(&handle).await })
             .map_err(|e| {
-                crate::error::ScpPyError::context(format!("failed to resolve verifying key: {e}"))
+                crate::error::ScpPyError::custody(
+                    format!("failed to resolve verifying key: {e}"),
+                    &e,
+                )
             })?;
         // 32-byte length + canonical-point decode: the shared conversion tail
         // in scp-ffi-common, identical across all FFI bridges. A `None`
@@ -1654,7 +1657,7 @@ fn resolve_creator_verifying_key(
 /// IMPORT path: in each case a real pseudonym is REQUIRED for a usable
 /// encrypted context. Custody / derivation failure is a hard error carrying the
 /// canonical pseudonym-derivation identity codes (1054 missing key material,
-/// 1055 derivation failed, 1057 wrong key length) — never a silent
+/// 1055 derivation failed or invalid P-256 point) — never a silent
 /// zero-pseudonym fallback, which would reintroduce the relay-correlation
 /// vector by leaving the routing axis degraded. On import the exporter's
 /// pseudonym is local-instance state with no meaning to the importer, so it is
@@ -1669,7 +1672,7 @@ fn derive_member_pseudonym(
     bi: &crate::runtime::PyBridgeInstance,
     importer_did: &str,
     context_id: &str,
-) -> PyResult<[u8; 32]> {
+) -> Result<[u8; 32], crate::error::ScpPyError> {
     crate::runtime::with_identity(bi, importer_did, |entry| {
         let rt = crate::runtime().map_err(|e| {
             crate::error::ScpPyError::identity_with_code(
@@ -1677,27 +1680,7 @@ fn derive_member_pseudonym(
                 codes::IDENT_1055,
             )
         })?;
-        let pseudonym = rt.block_on(async {
-            entry
-                .custody
-                .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
-                .await
-        });
-        let pk = pseudonym
-            .map_err(|e| {
-                crate::error::ScpPyError::identity_with_code(
-                    format!("pseudonym derivation failed: {e}"),
-                    codes::IDENT_1055,
-                )
-            })?
-            .public_key;
-        let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
-            crate::error::ScpPyError::identity_with_code(
-                "pseudonym public key must be 32 bytes",
-                codes::IDENT_1057,
-            )
-        })?;
-        Ok(bytes)
+        pseudonym_routing_id_on(rt, &entry.custody, entry.identity.identity_key, context_id)
     })
     .map_err(|e| {
         // A registry miss surfaces `with_identity`'s generic SCP-IDENT-1001;
@@ -1705,7 +1688,7 @@ fn derive_member_pseudonym(
         // (SCP-IDENT-1054) so a caller switching on `.code` gets the same code
         // for the same failure across bridges. Errors raised inside the closure
         // already carry specific codes and pass through unchanged.
-        let mapped = match e {
+        match e {
             crate::error::ScpPyError::IdentityError { message, code }
                 if code == codes::IDENT_1001 =>
             {
@@ -1715,9 +1698,33 @@ fn derive_member_pseudonym(
                 )
             }
             other => other,
-        };
-        PyErr::from(mapped)
+        }
     })
+}
+
+/// Derives the §9.10.4 routing id of `identity_key`'s pseudonym in
+/// `context_id` over `custody`: the derivation step every member-pseudonym
+/// path shares. A failure carries its custody code: key-not-found →
+/// SCP-CRYPTO-4006 (§9.10.4.A), a host pseudonym the bridge cannot bind →
+/// SCP-IDENT-1055, any other custody failure → SCP-CRYPTO-4060.
+pub(crate) fn pseudonym_routing_id_on(
+    rt: &tokio::runtime::Runtime,
+    custody: &crate::custody::FfiKeyCustody,
+    identity_key: scp_platform::KeyHandle,
+    context_id: &str,
+) -> Result<[u8; 32], crate::error::ScpPyError> {
+    let pseudonym = rt.block_on(async {
+        custody
+            .derive_pseudonym(&identity_key, context_id.as_bytes())
+            .await
+    });
+    // §9.10.4: the routing axis carries the 32-byte routing id of the
+    // 33-byte P-256 pseudonym. `PseudonymKeypair::new` already rejected a
+    // malformed host-returned point, which surfaces here as SCP-IDENT-1055.
+    let pseudonym = pseudonym.map_err(|e| {
+        crate::error::ScpPyError::custody(format!("pseudonym derivation failed: {e}"), &e)
+    })?;
+    Ok(*pseudonym.routing_id())
 }
 
 /// Bridge-level local-custody gate for the bare-`DID` join-side bootstraps
@@ -2568,7 +2575,7 @@ impl crate::scp::PyScp {
             // reserved `[0u8; 32]` sentinel — peers reject any announce of a
             // reserved value, so the joiner becomes permanently unaddressable
             // with no error surfaced. Propagate the canonical identity codes
-            // (1054/1055/1057) at the same granularity as create/import.
+            // (1054/1055) at the same granularity as create/import.
             // BROADCAST contexts soft-fail to `None`: they carry no per-member
             // pseudonym (spec §5.14) and the runtime ignores the value.
             let local_pseudonym: Option<[u8; 32]> = if join_is_broadcast {
@@ -2919,9 +2926,10 @@ impl crate::scp::PyScp {
                 Ok(handle) => handle,
                 Err(e) => {
                     crate::runtime::remove_context(bi, &sealed.context_id);
-                    return Err(PyRuntimeError::new_err(format!(
-                        "context_join_from_welcome failed: {e}"
-                    )));
+                    // Through `From<ContextError>`, so a typed custody failure
+                    // keeps its code (a destroyed `#active` key is
+                    // `SCP-CRYPTO-4006`).
+                    return Err(PyErr::from(crate::error::ScpPyError::from(e)));
                 }
             };
 
@@ -3656,7 +3664,7 @@ impl crate::scp::PyScp {
                     }),
                 )
             })
-            .map_err(|e| PyRuntimeError::new_err(format!("context export failed: {e}")))?;
+            .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))?;
 
         scp_core::context::export_import::serialize_export(&export)
             .map_err(|e| PyRuntimeError::new_err(format!("export serialization failed: {e}")))
@@ -5016,18 +5024,12 @@ impl crate::scp::PyScp {
                 };
                 sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
                     .await
-                    .map_err(|e| {
-                        crate::error::ScpPyError::context(format!(
-                            "supervisor dispatch_broadcast_command_with_custody failed: {e}"
-                        ))
-                    })?;
+                    .map_err(crate::error::ScpPyError::from)?;
                 rx.await
                     .map_err(|e| {
                         crate::error::ScpPyError::context(format!("shim reply dropped: {e}"))
                     })?
-                    .map_err(|e| {
-                        crate::error::ScpPyError::context(format!("broadcast publish failed: {e}"))
-                    })?;
+                    .map_err(crate::error::ScpPyError::from)?;
                 Ok(())
             })
         })
@@ -5133,21 +5135,13 @@ impl crate::scp::PyScp {
                 };
                 sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
                     .await
-                    .map_err(|e| {
-                        crate::error::ScpPyError::context(format!(
-                            "supervisor dispatch_broadcast_command_with_custody failed: {e}"
-                        ))
-                    })?;
+                    .map_err(crate::error::ScpPyError::from)?;
                 let envelope = rx
                     .await
                     .map_err(|e| {
                         crate::error::ScpPyError::context(format!("shim reply dropped: {e}"))
                     })?
-                    .map_err(|e| {
-                        crate::error::ScpPyError::context(format!(
-                            "broadcast publish asset failed: {e}"
-                        ))
-                    })?;
+                    .map_err(crate::error::ScpPyError::from)?;
 
                 // Compute blob_id as SHA-256 of the serialized envelope.
                 let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
@@ -5276,21 +5270,13 @@ impl crate::scp::PyScp {
                     };
                     sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
                         .await
-                        .map_err(|e| {
-                            crate::error::ScpPyError::context(format!(
-                                "supervisor dispatch_broadcast_command_with_custody failed: {e}"
-                            ))
-                        })?;
+                        .map_err(crate::error::ScpPyError::from)?;
                     let envelope = rx
                         .await
                         .map_err(|e| {
                             crate::error::ScpPyError::context(format!("shim reply dropped: {e}"))
                         })?
-                        .map_err(|e| {
-                            crate::error::ScpPyError::context(format!(
-                                "broadcast publish asset failed: {e}"
-                            ))
-                        })?;
+                        .map_err(crate::error::ScpPyError::from)?;
 
                     let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
                         crate::error::ScpPyError::context(format!(
@@ -6267,11 +6253,317 @@ mod tests {
         let bi = __bi();
         let err = derive_member_pseudonym(&bi, "did:dht:z6MkNoSuchIdentity", "ctx-encrypted")
             .expect_err("encrypted derivation without key material must hard-fail");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("SCP-IDENT-1054"),
-            "expected missing-key-material code SCP-IDENT-1054, got: {msg}"
+        assert_identity_code(err, codes::IDENT_1054);
+    }
+
+    /// Asserts that `err` is an identity error carrying `code`; tests assert
+    /// the typed code, never the message text.
+    fn assert_identity_code(err: crate::error::ScpPyError, code: &str) {
+        match err {
+            crate::error::ScpPyError::IdentityError { code: got, .. } => assert_eq!(got, code),
+            other => panic!("expected identity error {code}, got {other:?}"),
+        }
+    }
+
+    /// Registers `did` with callback custody over the fake Python provider,
+    /// its identity key freshly generated there. Returns the identity key id.
+    #[cfg(feature = "testing")]
+    fn register_fake_callback_identity(
+        bi: &crate::runtime::PyBridgeInstance,
+        did: &str,
+        fault: Option<&str>,
+    ) -> u64 {
+        use scp_platform::KeyCustody as _;
+        crate::init_runtime().expect("init the SCP tokio runtime");
+        let custody = std::sync::Arc::new(crate::custody::FfiKeyCustody::Callback(
+            crate::custody::test_fakes::fake_py_custody(fault),
+        ));
+        let identity_key = crate::runtime()
+            .unwrap()
+            .block_on(custody.generate_keypair(scp_platform::KeyType::Ed25519))
+            .unwrap();
+        crate::runtime::register_identity(
+            bi,
+            did,
+            crate::runtime::IdentityEntry {
+                identity: scp_identity::ScpIdentity {
+                    did: did.to_owned(),
+                    identity_key,
+                    active_signing_key: identity_key,
+                    agent_signing_key: None,
+                    pre_rotation_commitment: [0u8; 32],
+                },
+                custody,
+                document: scp_did::DidDocument {
+                    context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+                    id: did.to_owned(),
+                    verification_method: vec![],
+                    authentication: vec![],
+                    assertion_method: vec![],
+                    also_known_as: vec![],
+                    service: vec![],
+                },
+                identity_link_attestations: Vec::new(),
+                pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+                pre_rotation_custody: std::sync::Arc::new(
+                    scp_platform::testing::InMemoryPreRotationCustody::new(),
+                ),
+            },
         );
+        identity_key.id()
+    }
+
+    /// The bridge helper returns the §9.10.4 routing id of the host's P-256
+    /// point, `SHA-256("scp-pseudonym-routing-v1:" || point)`, not the point.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn member_pseudonym_is_the_routing_id_of_the_host_point() {
+        let bi = __bi();
+        let did = "did:dht:z6MkPseudonymRoutingValue";
+        let key_id = register_fake_callback_identity(&bi, did, None);
+        let routing_id = derive_member_pseudonym(&bi, did, "ctx-routing").expect("derives");
+        let point = crate::custody::test_fakes::fake_pseudonym_point(
+            &crate::custody::test_fakes::fake_context_seed(key_id, b"ctx-routing", None),
+        );
+        assert_eq!(
+            routing_id,
+            scp_crypto::pseudonym::pseudonym_routing_id(&point)
+        );
+    }
+
+    /// A host still returning a 32-byte (Ed25519-era) pseudonym key fails with
+    /// SCP-IDENT-1055, and for that reason: the point length.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn legacy_host_pseudonym_is_ident_1055_on_point_length() {
+        let bi = __bi();
+        let did = "did:dht:z6MkPseudonymLegacyHost";
+        register_fake_callback_identity(&bi, did, Some("legacy32"));
+        let err = derive_member_pseudonym(&bi, did, "ctx").expect_err("legacy host key rejected");
+        assert_identity_code(err, codes::IDENT_1055);
+    }
+
+    /// A host whose `get_public_key(key_id)` disagrees with the point it
+    /// returned fails with SCP-IDENT-1055.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn host_public_key_mismatch_is_ident_1055() {
+        let bi = __bi();
+        let did = "did:dht:z6MkPseudonymWrongPublicKey";
+        register_fake_callback_identity(&bi, did, Some("wrong_public_key"));
+        let err =
+            derive_member_pseudonym(&bi, did, "ctx").expect_err("mismatched host key rejected");
+        assert_identity_code(err, codes::IDENT_1055);
+    }
+
+    /// §9.10.4.A: a host that reports key-not-found (`SCP-CRYPTO-4006`) while
+    /// deriving the creator's pseudonym fails the production `context_create`
+    /// with `SCP-CRYPTO-4006`, not a pseudonym-derivation identity code.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn context_create_surfaces_host_key_not_found_as_crypto_4006() {
+        use scp_platform::KeyCustody as _;
+        crate::init_runtime().ok();
+        let bi_arc = __bi();
+        let did = "did:dht:z6MkPseudonymHostKeyNotFound";
+        let key_id = register_fake_callback_identity(&bi_arc, did, None);
+        let custody =
+            crate::runtime::with_identity(&bi_arc, did, |entry| Ok(entry.custody.clone()))
+                .expect("registered identity");
+        crate::runtime()
+            .expect("runtime")
+            .block_on(custody.destroy_key(&scp_platform::KeyHandle::new(key_id)))
+            .expect("host destroys the identity key");
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi_arc),
+        };
+        let err = Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("mode", "encrypted").unwrap();
+            scp.context_create(did, &dict)
+                .expect_err("derivation under a destroyed key must fail")
+                .to_string()
+        });
+        assert!(
+            err.contains("SCP-CRYPTO-4006"),
+            "expected key-not-found SCP-CRYPTO-4006, got: {err}"
+        );
+    }
+
+    /// A custody that no longer holds the exporter's `#active` key fails the
+    /// export with `SCP-CRYPTO-4006`: the runtime carries the custody failure
+    /// as a typed value, and the bridge maps its kind to the code. Reverting
+    /// the runtime to a text error would report a context code instead.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn context_export_with_a_destroyed_signing_key_is_crypto_4006() {
+        use scp_platform::KeyCustody as _;
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = Arc::clone(&scp.inner);
+            let creator_identity = scp.identity_create(py, "in_memory", None).unwrap();
+            let creator = creator_identity.did().to_owned();
+            let ctx_id = format!("export-key-not-found-{}", uuid::Uuid::new_v4());
+            crate::runtime::register_context(&bi, &ctx_id, &creator, &[]).unwrap();
+            let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+            let rt = crate::runtime().unwrap();
+            rt.block_on(sup.create_context(
+                ctx_id.clone(),
+                scp_core::context::ContextParams::default(),
+                scp_did::DID(creator.clone()),
+                None,
+            ))
+            .unwrap();
+            let (custody, key) = crate::runtime::with_identity(&bi, &creator, |entry| {
+                Ok((
+                    Arc::clone(&entry.custody),
+                    entry.identity.active_signing_key,
+                ))
+            })
+            .expect("registered identity");
+            rt.block_on(custody.destroy_key(&key))
+                .expect("destroy_key should succeed");
+
+            let err = scp
+                .context_export(py, &ctx_id)
+                .expect_err("export with a destroyed signing key must fail")
+                .to_string();
+            assert!(
+                err.contains("SCP-CRYPTO-4006"),
+                "expected key-not-found SCP-CRYPTO-4006, got: {err}"
+            );
+        });
+    }
+
+    /// A broadcast author whose `#active` key the custody no longer holds
+    /// fails the publish with `SCP-CRYPTO-4006`: the supervisor carries the
+    /// signing failure as `ContextError::Custody`, and the bridge maps its kind.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn broadcast_publish_with_a_destroyed_signing_key_is_crypto_4006() {
+        use scp_platform::KeyCustody as _;
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = Arc::clone(&scp.inner);
+            let creator_identity = scp.identity_create(py, "in_memory", None).unwrap();
+            let creator = creator_identity.did().to_owned();
+            let dict = PyDict::new(py);
+            dict.set_item("mode", "broadcast").unwrap();
+            // Broadcast contexts require MemoryScope::Full (spec §5.14).
+            dict.set_item("memory_scope", "full").unwrap();
+            let handle = scp
+                .context_create(&creator, &dict)
+                .expect("broadcast context_create should succeed");
+            let (custody, key) = crate::runtime::with_identity(&bi, &creator, |entry| {
+                Ok((
+                    Arc::clone(&entry.custody),
+                    entry.identity.active_signing_key,
+                ))
+            })
+            .expect("registered identity");
+            crate::runtime()
+                .unwrap()
+                .block_on(custody.destroy_key(&key))
+                .expect("destroy_key should succeed");
+
+            let err = scp
+                .broadcast_publish(&handle, &creator, b"hi".to_vec())
+                .expect_err("broadcast publish with a destroyed signing key must fail")
+                .to_string();
+            assert!(
+                err.contains("SCP-CRYPTO-4006"),
+                "expected key-not-found SCP-CRYPTO-4006, got: {err}"
+            );
+        });
+    }
+
+    /// Creates a broadcast context, then destroys its creator's `#active` key
+    /// in custody. Returns the bridge, the creator DID and the context id.
+    #[cfg(feature = "testing")]
+    fn broadcast_context_with_destroyed_active_key(
+        py: Python<'_>,
+        scp: &crate::scp::PyScp,
+    ) -> (Arc<crate::runtime::PyBridgeInstance>, String, String) {
+        use scp_platform::KeyCustody as _;
+        let bi = Arc::clone(&scp.inner);
+        let creator = scp
+            .identity_create(py, "in_memory", None)
+            .unwrap()
+            .did()
+            .to_owned();
+        let dict = PyDict::new(py);
+        dict.set_item("mode", "broadcast").unwrap();
+        dict.set_item("memory_scope", "full").unwrap();
+        dict.set_item("ceiling", vec!["messages:write"]).unwrap();
+        let handle = scp
+            .context_create(&creator, &dict)
+            .expect("broadcast context_create should succeed");
+        let (custody, key) = crate::runtime::with_identity(&bi, &creator, |entry| {
+            Ok((
+                Arc::clone(&entry.custody),
+                entry.identity.active_signing_key,
+            ))
+        })
+        .expect("registered identity");
+        crate::runtime()
+            .unwrap()
+            .block_on(custody.destroy_key(&key))
+            .expect("destroy_key should succeed");
+        (bi, creator, handle.context_id)
+    }
+
+    /// A context creator whose `#active` key custody no longer holds fails
+    /// `ucan_mint` with `SCP-CRYPTO-4006`: the runtime carries the signing
+    /// failure as `UcanError::Custody`, and the bridge maps its kind.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ucan_mint_with_a_destroyed_signing_key_is_crypto_4006() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let (_bi, _creator, context_id) = broadcast_context_with_destroyed_active_key(py, &scp);
+            let err = scp
+                .ucan_mint(
+                    &context_id,
+                    "did:dht:z6MkMember",
+                    vec!["messages:write".to_owned()],
+                    None,
+                )
+                .expect_err("a mint under a destroyed signing key must fail")
+                .to_string();
+            assert!(
+                err.contains("SCP-CRYPTO-4006"),
+                "expected key-not-found SCP-CRYPTO-4006, got: {err}"
+            );
+        });
+    }
+
+    /// An identity whose `#active` key custody no longer holds fails
+    /// `event_log_checkpoint` with `SCP-CRYPTO-4006`: `KeyCustodySigner`
+    /// carries the signing failure as `EventLogError::Custody`, and the bridge
+    /// maps its kind.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn event_log_checkpoint_with_a_destroyed_signing_key_is_crypto_4006() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let (_bi, creator, context_id) = broadcast_context_with_destroyed_active_key(py, &scp);
+            let err = scp
+                .event_log_checkpoint(&context_id, &creator, 0)
+                .expect_err("a checkpoint under a destroyed signing key must fail")
+                .to_string();
+            assert!(
+                err.contains("SCP-CRYPTO-4006"),
+                "expected key-not-found SCP-CRYPTO-4006, got: {err}"
+            );
+        });
     }
 
     /// Builds an active `PyContextHandle` for the given mode, driving the real
@@ -6617,6 +6909,55 @@ mod tests {
             assert_eq!(
                 stats.known_contexts, 0,
                 "no known-context discovery entry may leak after a failed join"
+            );
+        });
+    }
+
+    /// A join whose `#active` key custody no longer holds fails at the
+    /// runtime's invitation KEM agreement (the first step of the join) with a
+    /// typed custody failure, which the bridge reports as `SCP-CRYPTO-4006`
+    /// through `From<ContextError>` and still rolls its reversible state back.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn join_from_welcome_with_a_destroyed_active_key_is_crypto_4006() {
+        use scp_platform::KeyCustody as _;
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = Arc::clone(&scp.inner);
+            let joiner = scp.identity_create(py, "in_memory", None).unwrap();
+            let joiner_did = joiner.did().to_owned();
+            let (custody, active) = crate::runtime::with_identity(&bi, &joiner_did, |entry| {
+                Ok((
+                    Arc::clone(&entry.custody),
+                    entry.identity.active_signing_key,
+                ))
+            })
+            .expect("registered identity");
+            crate::runtime()
+                .unwrap()
+                .block_on(custody.destroy_key(&active))
+                .expect("destroy_key should succeed");
+
+            let ctx_id = "b".repeat(64);
+            let sealed = __sealed(
+                &ctx_id,
+                "did:dht:z6MkDestroyedActiveCreator",
+                vec![0u8; 32],
+                b"bogus-bundle-ciphertext".to_vec(),
+            );
+            let err = scp
+                .context_join_from_welcome(joiner_did, sealed, "bogus-reservation-id".to_owned())
+                .expect_err("a join under a destroyed #active key must fail")
+                .to_string();
+            assert!(
+                err.contains("SCP-CRYPTO-4006"),
+                "expected key-not-found SCP-CRYPTO-4006, got: {err}"
+            );
+            assert!(
+                crate::runtime::with_ffi_state(&bi, &ctx_id, |_| Ok(())).is_err(),
+                "FFI state must NOT survive a failed join"
             );
         });
     }

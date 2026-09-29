@@ -477,8 +477,12 @@ async fn publish_to_resolver_dht_for<C: KeyCustody + Send + Sync>(
 /// Custody resolution order: platform/software callback custody first, then
 /// (only in `testing` builds) the retained in-memory custody.
 /// Failures carry the cross-bridge contract codes: missing key material →
-/// `IDENT_1054`, derivation failure → `IDENT_1055`, custody unavailable in
-/// this build → `IDENT_1056`, wrong public-key length → `IDENT_1057`.
+/// `IDENT_1054`, custody unavailable in this build → `IDENT_1056`, and a
+/// custody derivation failure → its custody code ([`ScpError::custody`]):
+/// key-not-found → `CRYPTO_4006` (§9.10.4.A), any other custody failure →
+/// `CRYPTO_4060`. A host pseudonym whose point is not a valid 33-byte P-256
+/// point, or whose `get_public_key(key_id)` fails or differs from it, fails in
+/// `CallbackKeyCustody::bind_pseudonym` → `IDENT_1055`.
 ///
 /// Callers gate this themselves: `context_create`/`context_join` skip it for
 /// broadcast contexts (soft `None`, spec §5.14), while `context_import` calls
@@ -500,10 +504,7 @@ async fn derive_member_pseudonym_required(
     let pseudonym = if let Some(ref cb) = identity.callback_custody {
         cb.derive_pseudonym(&identity_key, context_id.as_bytes())
             .await
-            .map_err(|e| ScpError::Identity {
-                msg: format!("pseudonym derivation failed: {e}"),
-                code: codes::IDENT_1055.to_owned(),
-            })?
+            .map_err(|e| ScpError::custody(format!("pseudonym derivation failed: {e}"), &e))?
     } else {
         #[cfg(feature = "testing")]
         {
@@ -519,10 +520,7 @@ async fn derive_member_pseudonym_required(
             imc.0
                 .derive_pseudonym(&identity_key, context_id.as_bytes())
                 .await
-                .map_err(|e| ScpError::Identity {
-                    msg: format!("pseudonym derivation failed: {e}"),
-                    code: codes::IDENT_1055.to_owned(),
-                })?
+                .map_err(|e| ScpError::custody(format!("pseudonym derivation failed: {e}"), &e))?
         }
         #[cfg(not(feature = "testing"))]
         {
@@ -534,14 +532,10 @@ async fn derive_member_pseudonym_required(
             });
         }
     };
-    pseudonym
-        .public_key
-        .as_bytes()
-        .try_into()
-        .map_err(|_| ScpError::Identity {
-            msg: "pseudonym public key must be 32 bytes".to_owned(),
-            code: codes::IDENT_1057.to_owned(),
-        })
+    // §9.10.4: the routing axis carries the 32-byte routing id of the 33-byte
+    // P-256 pseudonym. `parse_pseudonym` already rejected a malformed
+    // host-returned point, which surfaced above as IDENT_1055.
+    Ok(*pseudonym.routing_id())
 }
 
 /// Best-effort §9.10.4 pseudonym announcement (`UniFFI`).
@@ -692,13 +686,57 @@ fn resolve_context_custody(handle: &ContextHandle) -> Option<Arc<UniffiKeyCustod
 /// is `dyn`-dispatched via `Box<dyn KeyCustodyProvider>`).
 pub(crate) struct CallbackKeyCustody {
     provider: Box<dyn crate::KeyCustodyProvider>,
+    /// Pseudonym handles this adapter derived, each bound to its host point.
+    pseudonyms: scp_ffi_common::custody_parse::PseudonymBindings,
 }
 
 impl CallbackKeyCustody {
     /// Creates a new adapter wrapping the given callback provider.
     pub(crate) fn new(provider: Box<dyn crate::KeyCustodyProvider>) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            pseudonyms: scp_ffi_common::custody_parse::PseudonymBindings::default(),
+        }
     }
+
+    /// Validates a host pseudonym return and binds its key id to the point
+    /// after the host's `get_public_key(key_id)` reports the same 33 bytes.
+    ///
+    /// A failed `get_public_key(key_id)` call, with any code (`SCP-CRYPTO-4006`
+    /// too), is [`PlatformError::PseudonymRejected`] (`SCP-IDENT-1055`) with the
+    /// host's code and message kept (ADR-021 2026-09-27 amendment).
+    async fn bind_pseudonym(
+        &self,
+        method: &str,
+        result: crate::PseudonymResult,
+    ) -> Result<PseudonymKeypair, PlatformError> {
+        let pseudonym = scp_ffi_common::custody_parse::parse_pseudonym(
+            method,
+            &result.public_key,
+            &result.key_id,
+        )?;
+        let host_public_key = self
+            .provider
+            .get_public_key(pseudonym.key_handle().id().to_string())
+            .await
+            .map_err(|e| {
+                scp_ffi_common::custody_parse::pseudonym_lookup_failure(
+                    method,
+                    Some(e.code()),
+                    &e.to_string(),
+                )
+            })?;
+        self.pseudonyms.bind(method, &pseudonym, &host_public_key)?;
+        Ok(pseudonym)
+    }
+}
+
+/// Maps a host custody callback's [`ScpError`] through the shared
+/// host-failure mapping: `SCP-CRYPTO-4006` is [`PlatformError::KeyNotFound`],
+/// and any other code is [`PlatformError::CustodyError`] carrying the host's
+/// code and message.
+fn host_err(method: &str, e: &ScpError) -> PlatformError {
+    scp_ffi_common::custody_parse::host_failure(method, Some(e.code()), &e.to_string())
 }
 
 impl fmt::Debug for CallbackKeyCustody {
@@ -721,18 +759,24 @@ impl KeyCustody for CallbackKeyCustody {
             .provider
             .generate_keypair(type_str)
             .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            .map_err(|e| host_err("generate_keypair", &e))?;
         // Parse the returned key_id string as a u64 handle identifier via the
         // shared helper (unifies the error text with the PyO3/napi bridges).
         scp_ffi_common::custody_parse::parse_handle("generate_keypair", &key_id)
     }
 
     async fn sign(&self, key: &KeyHandle, data: &[u8]) -> Result<Signature, PlatformError> {
+        let pseudonym = self.pseudonyms.check_sign_input(key, data)?;
         let sig_bytes = self
             .provider
             .sign(key.id().to_string(), data.to_vec())
             .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            .map_err(|e| host_err("sign", &e))?;
+        if let Some((point, digest)) = pseudonym {
+            scp_ffi_common::custody_parse::PseudonymBindings::check_signature(
+                &point, &digest, &sig_bytes,
+            )?;
+        }
         Ok(Signature::new(sig_bytes))
     }
 
@@ -741,15 +785,19 @@ impl KeyCustody for CallbackKeyCustody {
             .provider
             .get_public_key(key.id().to_string())
             .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            .map_err(|e| host_err("get_public_key", &e))?;
         Ok(PublicKey::new(pk_bytes))
     }
 
     async fn destroy_key(&self, key: &KeyHandle) -> Result<(), PlatformError> {
-        self.provider
-            .destroy_key(key.id().to_string())
+        self.pseudonyms
+            .destroy_unbound(key, async {
+                self.provider
+                    .destroy_key(key.id().to_string())
+                    .await
+                    .map_err(|e| host_err("destroy_key", &e))
+            })
             .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))
     }
 
     async fn dh_agree(
@@ -761,7 +809,7 @@ impl KeyCustody for CallbackKeyCustody {
             .provider
             .dh_agree(key.id().to_string(), peer_public.to_vec())
             .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            .map_err(|e| host_err("dh_agree", &e))?;
         Ok(SharedSecret::new(scp_ffi_common::custody_parse::expect_32(
             "dh_agree", &shared,
         )?))
@@ -772,14 +820,12 @@ impl KeyCustody for CallbackKeyCustody {
         key: &KeyHandle,
         context_id: &[u8],
     ) -> Result<PseudonymKeypair, PlatformError> {
-        let result_bytes = self
+        let result = self
             .provider
             .derive_pseudonym(key.id().to_string(), context_id.to_vec())
             .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
-        // The callback returns concatenated [public_key_bytes (32) || key_id_utf8].
-        // Unpack via the shared helper (unifies error text with PyO3/napi).
-        scp_ffi_common::custody_parse::unpack_pseudonym("derive_pseudonym", &result_bytes)
+            .map_err(|e| host_err("derive_pseudonym", &e))?;
+        self.bind_pseudonym("derive_pseudonym", result).await
     }
 
     async fn derive_rotatable_pseudonym(
@@ -790,19 +836,19 @@ impl KeyCustody for CallbackKeyCustody {
     ) -> Result<PseudonymKeypair, PlatformError> {
         // Canonical v2 recipe (spec §9.10.4.A / §9.10.4.1): the provider performs
         // the rotatable derivation itself — seed = HMAC-SHA256(pseudonym_secret,
-        // context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2"); keypair =
-        // Ed25519_keygen(seed[0..32]). The epoch is threaded through to the
+        // context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2"); d =
+        // seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed), returned as the 33-byte
+        // compressed P-256 point. The epoch is threaded through to the
         // provider rather than synthesized into the context_id bridge-side, so
         // the v1 platform adapter does not re-append its own "scp-pseudonym"
         // domain separator (which would corrupt the v2 domain).
-        let result_bytes = self
+        let result = self
             .provider
             .derive_rotatable_pseudonym(key.id().to_string(), context_id.to_vec(), pseudonym_epoch)
             .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
-
-        // Unpack via the shared helper (unifies error text with PyO3/napi).
-        scp_ffi_common::custody_parse::unpack_pseudonym("derive_rotatable_pseudonym", &result_bytes)
+            .map_err(|e| host_err("derive_rotatable_pseudonym", &e))?;
+        self.bind_pseudonym("derive_rotatable_pseudonym", result)
+            .await
     }
 
     async fn ed25519_to_x25519_agree(
@@ -816,7 +862,7 @@ impl KeyCustody for CallbackKeyCustody {
             .provider
             .dh_agree(ed25519_handle.id().to_string(), peer_x25519_public.to_vec())
             .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            .map_err(|e| host_err("dh_agree", &e))?;
         Ok(SharedSecret::new(scp_ffi_common::custody_parse::expect_32(
             "ed25519_to_x25519_agree",
             &shared,
@@ -921,7 +967,7 @@ impl CallbackKeyCustody {
             .provider
             .export_signing_key_bytes(handle.id().to_string())
             .await
-            .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
+            .map_err(|e| host_err("export_signing_key_bytes", &e))?;
         // Private seed material: wrap the parsed 32-byte array in `Zeroizing`
         // so the intermediate seed buffer is wiped on drop, matching the PyO3
         // and NAPI callback custody paths (ADR-006).
@@ -1243,6 +1289,25 @@ pub enum ScpError {
     },
 }
 
+impl ScpError {
+    /// The error's `SCP-{CATEGORY}-{NUMBER}` code.
+    #[must_use]
+    pub(crate) fn code(&self) -> &str {
+        match self {
+            Self::Identity { code, .. }
+            | Self::Context { code, .. }
+            | Self::Permission { code, .. }
+            | Self::Crypto { code, .. }
+            | Self::Transport { code, .. }
+            | Self::Outlet { code, .. }
+            | Self::Validation { code, .. }
+            | Self::SagaAborted { code, .. }
+            | Self::SagaNeedsRepair { code, .. }
+            | Self::SagaBusy { code, .. } => code,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // From<scp-core error types> for ScpError
 // ---------------------------------------------------------------------------
@@ -1272,6 +1337,13 @@ impl From<scp_identity::IdentityError> for ScpError {
     fn from(e: scp_identity::IdentityError) -> Self {
         use scp_identity::IdentityError as IE;
         use scp_platform::PreRotationCustodyError as PE;
+
+        // A custody failure keeps its custody code (key-not-found is
+        // SCP-CRYPTO-4006), not the generic identity code.
+        let e = match e {
+            IE::Platform(pe) => return Self::from(pe),
+            other => other,
+        };
 
         if let IE::PreRotation(pre_err) = &e {
             let code = match pre_err {
@@ -1333,6 +1405,7 @@ impl From<scp_core::context::ContextError> for ScpError {
     fn from(e: scp_core::context::ContextError) -> Self {
         use scp_core::context::ContextError as CE;
         match &e {
+            CE::Custody(failure) => Self::custody_failure(format!("{e}"), failure),
             // Surface the canonical rate-limit code on the typed
             // envelope so Swift / Kotlin callers can detect
             // rate-limit rejection without string-matching on the
@@ -1567,6 +1640,9 @@ impl From<scp_core::crypto::mls::error::MlsError> for ScpError {
 
 impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpError {
     fn from(e: scp_core::crypto::sender_keys::SenderKeyError) -> Self {
+        if let scp_core::crypto::sender_keys::SenderKeyError::Custody(failure) = &e {
+            return Self::custody_failure(format!("sender key operation failed: {e}"), failure);
+        }
         Self::Crypto {
             msg: format!(
                 "sender key operation failed: {e} — verify key material and encryption parameters"
@@ -1578,6 +1654,9 @@ impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpError {
 
 impl From<scp_core::crypto::ucan::UcanError> for ScpError {
     fn from(e: scp_core::crypto::ucan::UcanError) -> Self {
+        if let scp_core::crypto::ucan::UcanError::Custody(failure) = &e {
+            return Self::custody_failure(format!("UCAN signing failed: {e}"), failure);
+        }
         // Canonical UCAN→error-code mapping — see `scp-ffi/src/error.rs`
         // for the full rationale. All bridges route through the shared
         // `scp_ffi_common::ucan_errors` module.
@@ -1591,6 +1670,9 @@ impl From<scp_core::crypto::ucan::UcanError> for ScpError {
 
 impl From<scp_core::envelope::EnvelopeError> for ScpError {
     fn from(e: scp_core::envelope::EnvelopeError) -> Self {
+        if let scp_core::envelope::EnvelopeError::Custody(failure) = &e {
+            return Self::custody_failure(format!("envelope operation failed: {e}"), failure);
+        }
         Self::Crypto {
             msg: format!(
                 "envelope operation failed: {e} — check payload size, signing keys, and encryption state"
@@ -1602,6 +1684,9 @@ impl From<scp_core::envelope::EnvelopeError> for ScpError {
 
 impl From<scp_event_log::EventLogError> for ScpError {
     fn from(e: scp_event_log::EventLogError) -> Self {
+        if let scp_event_log::EventLogError::Custody(failure) = &e {
+            return Self::custody_failure(format!("event log operation failed: {e}"), failure);
+        }
         Self::Context {
             msg: format!(
                 "event log operation failed: {e} — verify log integrity and sequence numbers"
@@ -1693,12 +1778,45 @@ impl From<scp_transport::TransportError> for ScpError {
     }
 }
 
+impl ScpError {
+    /// A custody [`PlatformError`] carrying `msg`,
+    /// coded by
+    /// [`platform_error_code`](scp_ffi_common::custody_parse::platform_error_code):
+    /// every bridge path reports key-not-found as `SCP-CRYPTO-4006`, any other
+    /// custody failure as `SCP-CRYPTO-4060`, and a rejected host pseudonym as
+    /// `SCP-IDENT-1055`.
+    pub(crate) fn custody(msg: String, e: &scp_platform::PlatformError) -> Self {
+        let code = scp_ffi_common::custody_parse::platform_error_code(e).to_owned();
+        if matches!(e, scp_platform::PlatformError::PseudonymRejected(_)) {
+            Self::Identity { msg, code }
+        } else {
+            Self::Crypto { msg, code }
+        }
+    }
+}
+
+impl ScpError {
+    /// A custody failure the runtime carried as a typed
+    /// [`CustodyFailure`](scp_crypto::CustodyFailure), coded by
+    /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code):
+    /// key-not-found is `SCP-CRYPTO-4006`, a rejected host pseudonym
+    /// `SCP-IDENT-1055`, and any other custody failure `SCP-CRYPTO-4060`.
+    pub(crate) fn custody_failure(msg: String, e: &scp_crypto::CustodyFailure) -> Self {
+        let code = scp_ffi_common::error_codes::custody_failure_code(e).to_owned();
+        if matches!(e.kind, scp_crypto::CustodyFailureKind::PseudonymRejected) {
+            Self::Identity { msg, code }
+        } else {
+            Self::Crypto { msg, code }
+        }
+    }
+}
+
 impl From<scp_platform::PlatformError> for ScpError {
     fn from(e: scp_platform::PlatformError) -> Self {
-        Self::Crypto {
-            msg: format!("platform key operation failed: {e} — check key custody configuration"),
-            code: codes::CRYPTO_4004.to_owned(),
-        }
+        Self::custody(
+            format!("platform key operation failed: {e} — check key custody configuration"),
+            &e,
+        )
     }
 }
 
@@ -4228,10 +4346,7 @@ async fn identity_create_link_attestation_impl(
             msg: format!("tokio join error: {e}"),
             code: codes::IDENT_1041.to_owned(),
         })?
-        .map_err(|e| ScpError::Identity {
-            msg: format!("Ed25519 signing failed: {e}"),
-            code: codes::IDENT_1041.to_owned(),
-        })?;
+        .map_err(|e| ScpError::custody(format!("link attestation signing failed: {e}"), &e))?;
     attestation.signature = sig.as_bytes().to_vec();
 
     // Store custody for later verification lookups. Shared with
@@ -5807,9 +5922,17 @@ async fn event_log_checkpoint_impl(
                                 &signer,
                             )
                             .await
-                            .map_err(|e| ScpError::Context {
-                                msg: format!("checkpoint generation failed: {e}"),
-                                code: codes::CTX_2027.to_owned(),
+                            .map_err(|e| match &e {
+                                scp_event_log::EventLogError::Custody(failure) => {
+                                    ScpError::custody_failure(
+                                        format!("checkpoint generation failed: {e}"),
+                                        failure,
+                                    )
+                                }
+                                _ => ScpError::Context {
+                                    msg: format!("checkpoint generation failed: {e}"),
+                                    code: codes::CTX_2027.to_owned(),
+                                },
                             })
                         })
                     })
@@ -5932,9 +6055,17 @@ async fn event_log_checkpoint_by_did_impl(
                                 &signer,
                             )
                             .await
-                            .map_err(|e| ScpError::Context {
-                                msg: format!("checkpoint generation failed: {e}"),
-                                code: codes::CTX_2027.to_owned(),
+                            .map_err(|e| match &e {
+                                scp_event_log::EventLogError::Custody(failure) => {
+                                    ScpError::custody_failure(
+                                        format!("checkpoint generation failed: {e}"),
+                                        failure,
+                                    )
+                                }
+                                _ => ScpError::Context {
+                                    msg: format!("checkpoint generation failed: {e}"),
+                                    code: codes::CTX_2027.to_owned(),
+                                },
                             })
                         })
                     })
@@ -6299,6 +6430,32 @@ pub(crate) async fn enforce_caller_principal_binding(
     Ok(())
 }
 
+/// Resolves the context-export signing key handle, failing closed with
+/// `ScpError::Context` (CTX-2040) when the handle carries no signing-key
+/// handle or no custody provider. `context_export` calls it before
+/// `export_context`, so [`sign_export_snapshot_via_custody`] runs only with a
+/// key and a custody present, and its error is the custody's own.
+fn export_signing_key(handle: &ContextHandle) -> Result<KeyHandle, ScpError> {
+    let key_handle = handle.signing_key.ok_or_else(|| ScpError::Context {
+        msg: "no signing key on context handle — context export \
+                  requires an identity with an active signing key"
+            .to_owned(),
+        code: codes::CTX_2040.to_owned(),
+    })?;
+    let has_custody = handle.callback_custody.is_some();
+    #[cfg(feature = "testing")]
+    let has_custody = has_custody || handle.in_memory_custody.is_some();
+    if !has_custody {
+        return Err(ScpError::Context {
+            msg: "no custody provider on context handle — context export \
+                      requires an identity created with custody"
+                .to_owned(),
+            code: codes::CTX_2040.to_owned(),
+        });
+    }
+    Ok(key_handle)
+}
+
 /// Signs the §23.16.8 context-export snapshot digest via the exporter
 /// identity's [`KeyCustody::sign`] — delegating to whichever backend backs the
 /// handle (platform/software callback custody OR in-memory custody) — instead
@@ -6318,73 +6475,45 @@ pub(crate) async fn enforce_caller_principal_binding(
 /// `in_memory_custody`, matching the resolution order of every other
 /// key-bearing `UniFFI` path.
 ///
-/// Fail-closed: returns `ScpError::Context` (CTX-2040) when no signing-key
-/// handle or custody provider is present, and validates that the returned
-/// signature is exactly 64 bytes (Ed25519) — so a misbehaving custody can
-/// never yield an under-length signature that would later fail verification
-/// in a confusing place. The caller (`context_export`) never emits an
-/// unsigned export on any error path.
+/// Returns the custody's [`PlatformError`], which
+/// `export_context` carries as `ContextError::Custody` so the caller sees
+/// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` otherwise. It
+/// validates that the returned signature is exactly 64 bytes (Ed25519), so a
+/// misbehaving custody can never yield an under-length signature that would
+/// later fail verification in a confusing place. The caller
+/// (`context_export`) never emits an unsigned export on any error path.
 async fn sign_export_snapshot_via_custody(
     handle: &ContextHandle,
+    key_handle: &KeyHandle,
     hash: &[u8; 32],
-) -> Result<[u8; 64], ScpError> {
-    let key_handle = handle.signing_key.ok_or_else(|| ScpError::Context {
-        msg: "no signing key on context handle — context export \
-                  requires an identity with an active signing key"
-            .to_owned(),
-        code: codes::CTX_2040.to_owned(),
-    })?;
-
+) -> Result<[u8; 64], scp_platform::PlatformError> {
     let signature = if let Some(ref cb) = handle.callback_custody {
-        cb.sign(&key_handle, hash)
-            .await
-            .map_err(|e| ScpError::Context {
-                msg: format!("platform custody failed to sign context export snapshot: {e}"),
-                code: codes::CTX_2040.to_owned(),
-            })?
+        cb.sign(key_handle, hash).await?
     } else {
         #[cfg(feature = "testing")]
         {
             if let Some(ref imc) = handle.in_memory_custody {
-                imc.0
-                    .sign(&key_handle, hash)
-                    .await
-                    .map_err(|e| ScpError::Context {
-                        msg: format!(
-                            "in-memory custody failed to sign context export snapshot: {e}"
-                        ),
-                        code: codes::CTX_2040.to_owned(),
-                    })?
+                imc.0.sign(key_handle, hash).await?
             } else {
-                return Err(ScpError::Context {
-                    msg: "no custody provider on context handle — context export \
-                              requires an identity created with custody"
-                        .to_owned(),
-                    code: codes::CTX_2040.to_owned(),
-                });
+                return Err(scp_platform::PlatformError::CustodyError(
+                    "no custody provider on context handle".to_owned(),
+                ));
             }
         }
         #[cfg(not(feature = "testing"))]
         {
-            return Err(ScpError::Context {
-                msg: "no custody provider on context handle — context export \
-                          requires an identity created with custody"
-                    .to_owned(),
-                code: codes::CTX_2040.to_owned(),
-            });
+            return Err(scp_platform::PlatformError::CustodyError(
+                "no custody provider on context handle".to_owned(),
+            ));
         }
     };
 
-    let bytes: [u8; 64] = signature
-        .as_bytes()
-        .try_into()
-        .map_err(|_| ScpError::Context {
-            msg: format!(
-                "custody sign returned {} bytes, expected 64 (Ed25519) for context export snapshot",
-                signature.as_bytes().len()
-            ),
-            code: codes::CTX_2040.to_owned(),
-        })?;
+    let bytes: [u8; 64] = signature.as_bytes().try_into().map_err(|_| {
+        scp_platform::PlatformError::CustodyError(format!(
+            "custody sign returned {} bytes, expected 64 (Ed25519) for context export snapshot",
+            signature.as_bytes().len()
+        ))
+    })?;
     Ok(bytes)
 }
 
@@ -10255,7 +10384,7 @@ impl Scp {
                 // produces a silently unusable context — the member cannot send
                 // app-data on a pseudonymous routing axis), carrying granular
                 // codes (missing material → 1054, derivation failure → 1055,
-                // wrong length → 1057, custody unavailable → 1056) that match the
+                // custody unavailable → 1056) that match the
                 // PyO3 reference. BROADCAST contexts soft-fail to `None` (no
                 // per-member pseudonym, spec §5.14 — the runtime ignores it).
                 let create_is_broadcast = matches!(
@@ -10987,7 +11116,7 @@ impl Scp {
                 // announce of a reserved value, so the joiner becomes
                 // permanently unaddressable with no error surfaced. Carry the
                 // granular codes (missing material → 1054, derivation failure →
-                // 1055, wrong length → 1057, custody unavailable → 1056) at
+                // 1055, custody unavailable → 1056) at
                 // create/import granularity. BROADCAST contexts soft-fail to
                 // `None` (no per-member pseudonym, spec §5.14 — the runtime
                 // ignores it). Branch on the joined context's mode.
@@ -11341,9 +11470,17 @@ impl Scp {
                             &core_id.active_signing_key,
                         )
                         .await
-                        .map_err(|e| ScpError::Crypto {
-                            msg: format!("inner envelope signing failed: {e}"),
-                            code: codes::CRYPTO_4001.to_owned(),
+                        .map_err(|e| match &e {
+                            scp_core::envelope::EnvelopeError::Custody(failure) => {
+                                ScpError::custody_failure(
+                                    format!("inner envelope signing failed: {e}"),
+                                    failure,
+                                )
+                            }
+                            _ => ScpError::Crypto {
+                                msg: format!("inner envelope signing failed: {e}"),
+                                code: codes::CRYPTO_4001.to_owned(),
+                            },
                         })?;
                     } else {
                         #[cfg(feature = "testing")]
@@ -11354,9 +11491,17 @@ impl Scp {
                                 &core_id.active_signing_key,
                             )
                             .await
-                            .map_err(|e| ScpError::Crypto {
-                                msg: format!("inner envelope signing failed: {e}"),
-                                code: codes::CRYPTO_4001.to_owned(),
+                            .map_err(|e| match &e {
+                                scp_core::envelope::EnvelopeError::Custody(failure) => {
+                                    ScpError::custody_failure(
+                                        format!("inner envelope signing failed: {e}"),
+                                        failure,
+                                    )
+                                }
+                                _ => ScpError::Crypto {
+                                    msg: format!("inner envelope signing failed: {e}"),
+                                    code: codes::CRYPTO_4001.to_owned(),
+                                },
                             })?;
                         }
                     }
@@ -19000,13 +19145,18 @@ impl Scp {
                 // (`new_multi_thread`), so a runtime handle is always present
                 // and `block_in_place` is legal here.
                 let rt = tokio::runtime::Handle::current();
+                let key_handle = export_signing_key(&handle)?;
                 let export = manager
                     .export_context(
                         &ctx_id,
                         scp_did::DID::from(creator_did),
                         |hash: &[u8; 32]| {
                             tokio::task::block_in_place(|| {
-                                rt.block_on(sign_export_snapshot_via_custody(&handle, hash))
+                                rt.block_on(sign_export_snapshot_via_custody(
+                                    &handle,
+                                    &key_handle,
+                                    hash,
+                                ))
                             })
                         },
                     )
@@ -19114,7 +19264,7 @@ impl Scp {
                 // derive it UNCONDITIONALLY, exactly like the PyO3 reference
                 // bridge. Custody / derivation failure is a hard error carrying
                 // granular codes (missing material → 1054, derivation failure →
-                // 1055, wrong length → 1057), never a silent zero-pseudonym
+                // 1055), never a silent zero-pseudonym
                 // fallback and never a `[0u8; 32]` sentinel for broadcast (which
                 // would make the member permanently unaddressable).
                 let local_pseudonym: [u8; 32] =
@@ -19274,6 +19424,66 @@ mod tests {
         crate::scp::Scp::new_in_memory_for_test()
     }
 
+    /// Every runtime error that carries a custody failure reaches the caller
+    /// with the custody code: key-not-found as `SCP-CRYPTO-4006`, any other
+    /// custody failure as `SCP-CRYPTO-4060`, a rejected host pseudonym as
+    /// `SCP-IDENT-1055`. Broadcast publish signing and join key agreement
+    /// arrive as `ContextError::Custody`.
+    #[test]
+    fn custody_failures_carry_the_custody_codes_in_every_carrier() {
+        use scp_crypto::{CustodyFailure, CustodyFailureKind as K};
+        fn failure(kind: K) -> CustodyFailure {
+            CustodyFailure {
+                kind,
+                detail: "custody detail".to_owned(),
+            }
+        }
+        fn crypto_code(e: ScpError) -> String {
+            match e {
+                ScpError::Crypto { code, .. } => code,
+                other => panic!("expected a crypto error, got {other:?}"),
+            }
+        }
+        fn identity_code(e: ScpError) -> String {
+            match e {
+                ScpError::Identity { code, .. } => code,
+                other => panic!("expected an identity error, got {other:?}"),
+            }
+        }
+        use scp_core::context::ContextError;
+        assert_eq!(
+            crypto_code(ContextError::Custody(failure(K::KeyNotFound)).into()),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            crypto_code(ContextError::Custody(failure(K::Failed)).into()),
+            codes::CRYPTO_4060
+        );
+        assert_eq!(
+            identity_code(ContextError::Custody(failure(K::PseudonymRejected)).into()),
+            codes::IDENT_1055
+        );
+        assert_eq!(
+            crypto_code(
+                scp_core::crypto::sender_keys::SenderKeyError::Custody(failure(K::KeyNotFound))
+                    .into()
+            ),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            crypto_code(scp_core::crypto::ucan::UcanError::Custody(failure(K::KeyNotFound)).into()),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            crypto_code(scp_core::envelope::EnvelopeError::Custody(failure(K::KeyNotFound)).into()),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            crypto_code(scp_event_log::EventLogError::Custody(failure(K::Failed)).into()),
+            codes::CRYPTO_4060
+        );
+    }
+
     /// A `KeyCustodyProvider` whose every method returns an error, used to prove
     /// that `identity_create_with_custody` declines BEFORE it calls the provider.
     /// A shipped build must reject the create at the pre-rotation check, so a
@@ -19327,7 +19537,7 @@ mod tests {
             &self,
             _key_id: String,
             _context_id: Vec<u8>,
-        ) -> Result<Vec<u8>, ScpError> {
+        ) -> Result<crate::PseudonymResult, ScpError> {
             Err(Self::refuse("derive_pseudonym"))
         }
 
@@ -20255,6 +20465,159 @@ mod tests {
             entry.routing_id, [0u8; 32],
             "encrypted join routing id must be a real derived pseudonym"
         );
+    }
+
+    /// A custody that no longer holds the exporter's `#active` key fails the
+    /// export with `SCP-CRYPTO-4006`: the runtime carries the custody failure
+    /// as a typed value, and the bridge maps its kind to the code. Reverting
+    /// the runtime to a text error would report a context code instead.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn context_export_with_a_destroyed_signing_key_is_crypto_4006() {
+        use scp_platform::traits::KeyCustody;
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let custody = handle
+            .in_memory_custody
+            .as_ref()
+            .expect("an in-memory identity retains its custody on the handle");
+        let key = handle
+            .signing_key
+            .expect("the handle retains the signing key");
+        rt.block_on(custody.0.destroy_key(&key))
+            .expect("destroy_key should succeed");
+
+        let err = rt
+            .block_on(scp.context_export(Arc::clone(&handle)))
+            .expect_err("export with a destroyed signing key must fail");
+        match err {
+            ScpError::Crypto { code, .. } => assert_eq!(code, codes::CRYPTO_4006),
+            other => panic!("expected Crypto CRYPTO_4006, got: {other:?}"),
+        }
+    }
+
+    /// A broadcast author whose `#active` key the custody no longer holds
+    /// fails the publish with `SCP-CRYPTO-4006`: the supervisor carries the
+    /// signing failure as `ContextError::Custody`, and the bridge maps its kind.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn broadcast_publish_with_a_destroyed_signing_key_is_crypto_4006() {
+        use scp_platform::traits::KeyCustody;
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            // Broadcast contexts require MemoryScope::Full (spec §5.14).
+            memory_scope: MemoryScope::Full,
+            ..encrypted_join_test_params()
+        };
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), params))
+            .expect("broadcast context_create should succeed");
+        let custody = identity
+            .in_memory_custody
+            .as_ref()
+            .expect("an in-memory identity retains its custody");
+        let key = identity
+            .core_id
+            .as_ref()
+            .expect("an in-memory identity retains its core identity")
+            .active_signing_key;
+        rt.block_on(custody.0.destroy_key(&key))
+            .expect("destroy_key should succeed");
+
+        let err = rt
+            .block_on(scp.broadcast_publish(handle, Arc::clone(&identity), b"hi".to_vec()))
+            .expect_err("broadcast publish with a destroyed signing key must fail");
+        match err {
+            ScpError::Crypto { code, .. } => assert_eq!(code, codes::CRYPTO_4006),
+            other => panic!("expected Crypto CRYPTO_4006, got: {other:?}"),
+        }
+    }
+
+    /// Creates a broadcast context, then destroys its creator's `#active` key
+    /// in custody.
+    #[cfg(feature = "testing")]
+    fn broadcast_context_with_destroyed_active_key(
+        rt: &tokio::runtime::Runtime,
+        scp: &Scp,
+    ) -> (Arc<Identity>, Arc<ContextHandle>) {
+        use scp_platform::traits::KeyCustody;
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            // Broadcast contexts require MemoryScope::Full (spec §5.14).
+            memory_scope: MemoryScope::Full,
+            ..encrypted_join_test_params()
+        };
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), params))
+            .expect("broadcast context_create should succeed");
+        let custody = identity
+            .in_memory_custody
+            .as_ref()
+            .expect("an in-memory identity retains its custody");
+        let key = identity
+            .core_id
+            .as_ref()
+            .expect("an in-memory identity retains its core identity")
+            .active_signing_key;
+        rt.block_on(custody.0.destroy_key(&key))
+            .expect("destroy_key should succeed");
+        (identity, handle)
+    }
+
+    /// A context creator whose `#active` key custody no longer holds fails
+    /// `ucan_mint` with `SCP-CRYPTO-4006`: the runtime carries the signing
+    /// failure as `UcanError::Custody`, and the bridge maps its kind.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ucan_mint_with_a_destroyed_signing_key_is_crypto_4006() {
+        let rt = runtime();
+        let scp = scp_test();
+        let (_identity, handle) = broadcast_context_with_destroyed_active_key(rt, &scp);
+        let err = rt
+            .block_on(scp.ucan_mint(
+                handle,
+                "did:dht:z6MkMember".to_owned(),
+                vec!["messages:write".to_owned()],
+                None,
+            ))
+            .expect_err("a mint under a destroyed signing key must fail");
+        match err {
+            ScpError::Crypto { code, .. } => assert_eq!(code, codes::CRYPTO_4006),
+            other => panic!("expected Crypto CRYPTO_4006, got: {other:?}"),
+        }
+    }
+
+    /// An identity whose `#active` key custody no longer holds fails
+    /// `event_log_checkpoint` with `SCP-CRYPTO-4006`: `KeyCustodySigner`
+    /// carries the signing failure as `EventLogError::Custody`, and the bridge
+    /// maps its kind.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn event_log_checkpoint_with_a_destroyed_signing_key_is_crypto_4006() {
+        let rt = runtime();
+        let scp = scp_test();
+        let (identity, handle) = broadcast_context_with_destroyed_active_key(rt, &scp);
+        let err = rt
+            .block_on(scp.event_log_checkpoint(handle, identity, 0))
+            .expect_err("a checkpoint under a destroyed signing key must fail");
+        match err {
+            ScpError::Crypto { code, .. } => assert_eq!(code, codes::CRYPTO_4006),
+            other => panic!("expected Crypto CRYPTO_4006, got: {other:?}"),
+        }
     }
 
     /// `context_import` (re-home) registers a discovery `KnownContext`
@@ -21327,7 +21690,7 @@ mod tests {
             &self,
             _key_id: String,
             _context_id: Vec<u8>,
-        ) -> Result<Vec<u8>, ScpError> {
+        ) -> Result<crate::PseudonymResult, ScpError> {
             Err(ScpError::Context {
                 msg: "derive_pseudonym not supported by SignOnlyCustody".to_owned(),
                 code: codes::CTX_2050.to_owned(),
@@ -21397,7 +21760,9 @@ mod tests {
         // The §23.16.8 digest is opaque to the signer — any 32-byte hash works
         // to prove the signing path.
         let hash = [0x42u8; 32];
-        let signature = super::sign_export_snapshot_via_custody(&handle, &hash)
+        let key_handle =
+            super::export_signing_key(&handle).expect("the handle carries a key and a custody");
+        let signature = super::sign_export_snapshot_via_custody(&handle, &key_handle, &hash)
             .await
             .expect("sign-only custody must produce a context-export signature");
 
@@ -21410,14 +21775,13 @@ mod tests {
             .expect("signature must verify against the sign-only custody public key");
     }
 
-    /// `sign_export_snapshot_via_custody` must fail closed when the handle
-    /// carries no signing-key handle — never returning a bogus signature.
+    /// `export_signing_key` must fail closed when the handle carries no
+    /// signing-key handle, so no export is signed.
     #[tokio::test]
     async fn export_snapshot_signing_fails_closed_without_signing_key() {
         let scp = scp_test();
         let handle = test_handle_for(&scp); // signing_key: None, no custody
-        let hash = [0u8; 32];
-        let result = super::sign_export_snapshot_via_custody(&handle, &hash).await;
+        let result = super::export_signing_key(&handle);
         let err = result.expect_err("missing signing key must be rejected");
         match err {
             ScpError::Context { ref code, .. } => assert_eq!(code, codes::CTX_2040),
@@ -23951,18 +24315,94 @@ mod tests {
     /// supports every required protocol method so `identity_create_with_custody`
     /// (which runs `DidDht::create`) and `scpid_sign` (which signs + exposes the
     /// public key) both work. Signatures are real, so a signed SCPID response
-    /// verifies against the exposed public key.
+    /// verifies against the exposed public key. Pseudonyms follow the §9.10.4
+    /// P-256 recipe over the identity seed; `fault` makes the pseudonym path
+    /// misbehave in one specific way so a test can reach each bridge rejection.
+    ///
+    /// Pseudonym key ids are deterministic per (identity key id, context,
+    /// epoch), as the `KeyCustodyProvider` contract requires, so deriving the
+    /// same pseudonym twice returns the same id.
     struct ProdLikeCustody {
-        keys: std::sync::Mutex<std::collections::HashMap<String, ed25519_dalek::SigningKey>>,
+        keys: Arc<std::sync::Mutex<std::collections::HashMap<String, ed25519_dalek::SigningKey>>>,
+        pseudonyms:
+            std::sync::Mutex<std::collections::HashMap<String, scp_crypto::p256::P256SigningKey>>,
         next: std::sync::atomic::AtomicU64,
+        fault: PseudonymFault,
+        /// Called with the key id at the start of `destroy_key`, before the
+        /// host forgets the key.
+        destroy_probe: Option<DestroyProbe>,
+        /// Counts every host `sign` call, so a test can show an input never
+        /// reached the host.
+        sign_calls: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    /// A callback run inside the host's `destroy_key`.
+    type DestroyProbe = Box<dyn Fn(&str) + Send + Sync>;
+
+    /// One way a host's pseudonym path can misbehave.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PseudonymFault {
+        None,
+        /// `derive_pseudonym` returns the 32-byte Ed25519 key of a legacy host.
+        Legacy32,
+        /// `get_public_key(key_id)` reports a point other than the derived one.
+        WrongPublicKey,
+        /// `sign` returns the high-`s` form of a valid signature.
+        HighS,
+        /// Every pseudonym gets key id 777, whatever its context: a host that
+        /// reuses one id for two different points.
+        FixedId,
+        /// `sign` fails with the generic `SCP-CRYPTO-4001`, which is not the
+        /// key-not-found code.
+        SignFails4001,
+        /// `get_public_key(key_id)` of a pseudonym key id fails with the
+        /// key-not-found code `SCP-CRYPTO-4006`.
+        LookupFails4006,
+        /// `get_public_key(key_id)` of a pseudonym key id fails with the generic
+        /// `SCP-CRYPTO-4060`.
+        LookupFails4060,
+        /// `generate_keypair` returns the non-canonical key id `"007"`.
+        NonCanonicalKeypairId,
+        /// `derive_pseudonym` returns the non-canonical key id `"007"`.
+        NonCanonicalPseudonymId,
     }
 
     impl ProdLikeCustody {
         fn new() -> Self {
+            Self::with_fault(PseudonymFault::None)
+        }
+
+        fn with_fault(fault: PseudonymFault) -> Self {
             Self {
-                keys: std::sync::Mutex::new(std::collections::HashMap::new()),
+                keys: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                pseudonyms: std::sync::Mutex::new(std::collections::HashMap::new()),
                 next: std::sync::atomic::AtomicU64::new(1),
+                fault,
+                destroy_probe: None,
+                sign_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             }
+        }
+
+        /// The deterministic u64 key id of the pseudonym for (identity key id,
+        /// context, epoch): the first 8 bytes of a domain-separated SHA-256.
+        fn pseudonym_key_id(key_id: &str, context_id: &[u8], epoch: Option<u64>) -> String {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(b"prod-like-pseudonym-key-id");
+            hasher.update((key_id.len() as u64).to_be_bytes());
+            hasher.update(key_id.as_bytes());
+            hasher.update((context_id.len() as u64).to_be_bytes());
+            hasher.update(context_id);
+            match epoch {
+                None => hasher.update([0u8]),
+                Some(e) => {
+                    hasher.update([1u8]);
+                    hasher.update(e.to_be_bytes());
+                }
+            }
+            let digest = hasher.finalize();
+            let mut id = [0u8; 8];
+            id.copy_from_slice(&digest[..8]);
+            u64::from_be_bytes(id).to_string()
         }
 
         fn key_for(&self, key_id: &str) -> Result<ed25519_dalek::SigningKey, ScpError> {
@@ -23971,27 +24411,128 @@ mod tests {
                 .expect("keystore mutex")
                 .get(key_id)
                 .cloned()
-                .ok_or_else(|| ScpError::Identity {
+                // The contract's key-not-found signal (`KeyCustodyProvider` in `lib.rs`).
+                .ok_or_else(|| ScpError::Crypto {
                     msg: format!("unknown key_id {key_id}"),
-                    code: codes::IDENT_1010.to_owned(),
+                    code: codes::CRYPTO_4006.to_owned(),
                 })
         }
+
+        fn pseudonym_for(&self, key_id: &str) -> Option<scp_crypto::p256::P256SigningKey> {
+            self.pseudonyms
+                .lock()
+                .expect("pseudonym mutex")
+                .get(key_id)
+                .cloned()
+        }
+
+        fn mint_pseudonym(
+            &self,
+            key_id: &str,
+            context_id: &[u8],
+            epoch: Option<u64>,
+        ) -> Result<crate::PseudonymResult, ScpError> {
+            let sk = self.key_for(key_id)?;
+            if self.fault == PseudonymFault::Legacy32 {
+                return Ok(crate::PseudonymResult {
+                    public_key: sk.verifying_key().to_bytes().to_vec(),
+                    key_id: key_id.to_owned(),
+                });
+            }
+            let ikm = zeroize::Zeroizing::new(sk.to_bytes());
+            let pseudonym =
+                scp_crypto::pseudonym::derive_pseudonym_keypair(&ikm, context_id, epoch)
+                    .expect("seed_to_scalar is total");
+            let public_key = pseudonym.public_key().to_compressed().to_vec();
+            let id = if self.fault == PseudonymFault::FixedId {
+                "777".to_owned()
+            } else if self.fault == PseudonymFault::NonCanonicalPseudonymId {
+                "007".to_owned()
+            } else {
+                Self::pseudonym_key_id(key_id, context_id, epoch)
+            };
+            self.pseudonyms
+                .lock()
+                .expect("pseudonym mutex")
+                .insert(id.clone(), pseudonym);
+            Ok(crate::PseudonymResult {
+                public_key,
+                key_id: id,
+            })
+        }
+    }
+
+    /// The §9.10.4 routing id the recipe yields for `seed` in `context_id`.
+    #[cfg(feature = "testing")]
+    fn recipe_routing_id(seed: [u8; 32], context_id: &[u8], epoch: Option<u64>) -> [u8; 32] {
+        let ikm = zeroize::Zeroizing::new(seed);
+        let point = scp_crypto::pseudonym::derive_pseudonym_keypair(&ikm, context_id, epoch)
+            .expect("seed_to_scalar is total")
+            .public_key()
+            .to_compressed();
+        scp_crypto::pseudonym::pseudonym_routing_id(&point)
     }
 
     #[async_trait::async_trait]
     impl crate::KeyCustodyProvider for ProdLikeCustody {
         async fn sign(&self, key_id: String, message: Vec<u8>) -> Result<Vec<u8>, ScpError> {
+            self.sign_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fault == PseudonymFault::SignFails4001 {
+                return Err(ScpError::Crypto {
+                    msg: "hsm offline".to_owned(),
+                    code: codes::CRYPTO_4001.to_owned(),
+                });
+            }
+            if let Some(pseudonym) = self.pseudonym_for(&key_id) {
+                // Signs input of any length (a non-digest is hashed first), so
+                // only the bridge's own check can reject a non-digest input.
+                let digest: [u8; 32] = <[u8; 32]>::try_from(message.as_slice())
+                    .unwrap_or_else(|_| sha2::Sha256::digest(&message).into());
+                let mut sig = scp_crypto::p256::sign_prehash_rfc6979(&pseudonym, &digest)
+                    .expect("RFC 6979 signing");
+                if self.fault == PseudonymFault::HighS {
+                    high_s(&mut sig);
+                }
+                return Ok(sig.to_vec());
+            }
             use ed25519_dalek::Signer;
             let sk = self.key_for(&key_id)?;
             Ok(sk.sign(&message).to_bytes().to_vec())
         }
 
         async fn get_public_key(&self, key_id: String) -> Result<Vec<u8>, ScpError> {
+            if let Some(pseudonym) = self.pseudonym_for(&key_id) {
+                let code = match self.fault {
+                    PseudonymFault::LookupFails4006 => Some(codes::CRYPTO_4006),
+                    PseudonymFault::LookupFails4060 => Some(codes::CRYPTO_4060),
+                    _ => None,
+                };
+                if let Some(code) = code {
+                    return Err(ScpError::Crypto {
+                        msg: format!("host lookup of {key_id} failed"),
+                        code: code.to_owned(),
+                    });
+                }
+                let mut point = pseudonym.public_key().to_compressed();
+                if self.fault == PseudonymFault::WrongPublicKey {
+                    // The other point with the same x: still valid, not the one derived.
+                    point[0] ^= 0x01;
+                }
+                return Ok(point.to_vec());
+            }
             let sk = self.key_for(&key_id)?;
             Ok(sk.verifying_key().to_bytes().to_vec())
         }
 
         async fn destroy_key(&self, key_id: String) -> Result<(), ScpError> {
+            if let Some(probe) = &self.destroy_probe {
+                probe(&key_id);
+            }
+            self.pseudonyms
+                .lock()
+                .expect("pseudonym mutex")
+                .remove(&key_id);
             self.keys.lock().expect("keystore mutex").remove(&key_id);
             Ok(())
         }
@@ -24003,10 +24544,13 @@ mod tests {
             let mut seed = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut seed);
             let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-            let id = self
-                .next
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                .to_string();
+            let id = if self.fault == PseudonymFault::NonCanonicalKeypairId {
+                "007".to_owned()
+            } else {
+                self.next
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    .to_string()
+            };
             self.keys
                 .lock()
                 .expect("keystore mutex")
@@ -24028,31 +24572,447 @@ mod tests {
             &self,
             key_id: String,
             context_id: Vec<u8>,
-        ) -> Result<Vec<u8>, ScpError> {
-            // Mint a derived key, return `[pubkey(32) || derived_key_id_utf8]`.
-            let sk = self.key_for(&key_id)?;
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(sk.to_bytes());
-            hasher.update(&context_id);
-            let derived_seed: [u8; 32] = hasher.finalize().into();
-            let derived = ed25519_dalek::SigningKey::from_bytes(&derived_seed);
-            let derived_pub = derived.verifying_key().to_bytes();
-            let id = self
-                .next
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                .to_string();
-            self.keys
-                .lock()
-                .expect("keystore mutex")
-                .insert(id.clone(), derived);
-            let mut out = derived_pub.to_vec();
-            out.extend_from_slice(id.as_bytes());
-            Ok(out)
+        ) -> Result<crate::PseudonymResult, ScpError> {
+            self.mint_pseudonym(&key_id, &context_id, None)
+        }
+
+        async fn derive_rotatable_pseudonym(
+            &self,
+            key_id: String,
+            context_id: Vec<u8>,
+            pseudonym_epoch: u64,
+        ) -> Result<crate::PseudonymResult, ScpError> {
+            self.mint_pseudonym(&key_id, &context_id, Some(pseudonym_epoch))
         }
 
         fn custody_type(&self, _key_id: String) -> String {
             "hardware".to_owned()
         }
+    }
+
+    /// Replaces the `s` of a raw P-256 signature with `n − s`: the same
+    /// signature in high-`s` form.
+    fn high_s(sig: &mut [u8; 64]) {
+        const N: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2,
+            0xfc, 0x63, 0x25, 0x51,
+        ];
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let mut d = i16::from(N[i]) - i16::from(sig[32 + i]) - borrow;
+            borrow = i16::from(d < 0);
+            if d < 0 {
+                d += 256;
+            }
+            sig[32 + i] = u8::try_from(d).expect("byte");
+        }
+    }
+
+    /// Mints a callback-custody identity and returns it with its identity seed.
+    #[cfg(feature = "testing")]
+    async fn prod_like_identity(fault: PseudonymFault) -> (Arc<Identity>, [u8; 32]) {
+        let provider = ProdLikeCustody::with_fault(fault);
+        let keys = Arc::clone(&provider.keys);
+        let identity = scp_test()
+            .identity_create_with_custody(Box::new(provider))
+            .await
+            .expect("identity_create_with_custody");
+        let handle = identity
+            .core_id
+            .as_ref()
+            .expect("callback identity retains its core id")
+            .identity_key;
+        let seed = keys
+            .lock()
+            .expect("keystore mutex")
+            .get(&handle.id().to_string())
+            .expect("identity key is in the store")
+            .to_bytes();
+        (identity, seed)
+    }
+
+    /// The bridge helper returns the §9.10.4 routing id of the host's P-256
+    /// pseudonym: `SHA-256("scp-pseudonym-routing-v1:" || point)` of the point
+    /// the recipe yields for the identity seed, not the point itself.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn member_pseudonym_is_the_recipe_routing_id() {
+        let (identity, seed) = prod_like_identity(PseudonymFault::None).await;
+        let routing_id = derive_member_pseudonym_required(&identity, "ctx-routing")
+            .await
+            .expect("pseudonym derives");
+        assert_eq!(routing_id, recipe_routing_id(seed, b"ctx-routing", None));
+        assert_ne!(
+            routing_id,
+            recipe_routing_id(seed, b"ctx-other", None),
+            "the routing id is context-scoped"
+        );
+    }
+
+    /// §9.10.4.A: a host that reports key-not-found (`SCP-CRYPTO-4006`) while
+    /// deriving the creator's pseudonym fails the production `context_create`
+    /// with `SCP-CRYPTO-4006`, not a pseudonym-derivation identity code.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn context_create_surfaces_host_key_not_found_as_crypto_4006() {
+        let rt = runtime();
+        let scp = scp_test();
+        let provider = ProdLikeCustody::with_fault(PseudonymFault::None);
+        let keys = Arc::clone(&provider.keys);
+        let identity = rt
+            .block_on(scp.identity_create_with_custody(Box::new(provider)))
+            .expect("identity_create_with_custody");
+        // The host loses every key, so it answers the derivation with 4006.
+        keys.lock().expect("keystore mutex").clear();
+        match rt.block_on(scp.context_create(identity, encrypted_join_test_params())) {
+            Err(ScpError::Crypto { code, .. }) => assert_eq!(code, codes::CRYPTO_4006),
+            Err(other) => panic!("expected CRYPTO_4006, got {other:?}"),
+            Ok(_) => panic!("context_create succeeded without the creator's key"),
+        }
+    }
+
+    /// A host still returning a 32-byte Ed25519 pseudonym key fails closed with
+    /// SCP-IDENT-1055, on the point length.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_32_byte_host_pseudonym_is_ident_1055() {
+        let (identity, _) = prod_like_identity(PseudonymFault::Legacy32).await;
+        match derive_member_pseudonym_required(&identity, "ctx").await {
+            Err(ScpError::Identity { code, .. }) => assert_eq!(code, codes::IDENT_1055),
+            other => panic!("expected IDENT_1055, got {other:?}"),
+        }
+    }
+
+    /// A host whose `get_public_key(key_id)` disagrees with the returned point
+    /// fails closed with SCP-IDENT-1055.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_public_key_mismatch_is_ident_1055() {
+        let (identity, _) = prod_like_identity(PseudonymFault::WrongPublicKey).await;
+        match derive_member_pseudonym_required(&identity, "ctx").await {
+            Err(ScpError::Identity { code, .. }) => assert_eq!(code, codes::IDENT_1055),
+            other => panic!("expected IDENT_1055, got {other:?}"),
+        }
+    }
+
+    /// ADR-021 2026-09-27: a failed `get_public_key(key_id)` confirmation call
+    /// rejects the pseudonym with SCP-IDENT-1055, whether the host's code is
+    /// key-not-found (`SCP-CRYPTO-4006`) or generic, and keeps the host's text.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_public_key_lookup_failure_is_ident_1055() {
+        for fault in [
+            PseudonymFault::LookupFails4006,
+            PseudonymFault::LookupFails4060,
+        ] {
+            let (identity, _) = prod_like_identity(fault).await;
+            match derive_member_pseudonym_required(&identity, "ctx").await {
+                Err(ScpError::Identity { code, msg }) => {
+                    assert_eq!(code, codes::IDENT_1055);
+                    assert!(msg.contains("host lookup of"), "{msg}");
+                }
+                other => panic!("expected IDENT_1055, got {other:?}"),
+            }
+        }
+    }
+
+    /// A key id must be the canonical decimal form of a `u64`: `"007"` from
+    /// `generate_keypair` fails the identity create with the custody error
+    /// `SCP-CRYPTO-4060`.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_canonical_generated_key_id_is_crypto_4060() {
+        let provider = ProdLikeCustody::with_fault(PseudonymFault::NonCanonicalKeypairId);
+        match scp_test()
+            .identity_create_with_custody(Box::new(provider))
+            .await
+        {
+            Err(ScpError::Crypto { code, msg }) => {
+                assert_eq!(code, codes::CRYPTO_4060);
+                assert!(msg.contains("non-canonical key_id"), "{msg}");
+            }
+            Err(other) => panic!("expected CRYPTO_4060, got {other:?}"),
+            Ok(_) => panic!("a non-canonical key id created an identity"),
+        }
+    }
+
+    /// A pseudonym key id must be the canonical decimal form of a `u64`:
+    /// `"007"` from `derive_pseudonym` is rejected with `SCP-IDENT-1055`.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_canonical_pseudonym_key_id_is_ident_1055() {
+        let (identity, _) = prod_like_identity(PseudonymFault::NonCanonicalPseudonymId).await;
+        match derive_member_pseudonym_required(&identity, "ctx").await {
+            Err(ScpError::Identity { code, msg }) => {
+                assert_eq!(code, codes::IDENT_1055);
+                assert!(msg.contains("non-canonical key_id"), "{msg}");
+            }
+            other => panic!("expected IDENT_1055, got {other:?}"),
+        }
+    }
+
+    /// Callback `sign` on a pseudonym handle takes a 32-byte digest and returns
+    /// a strict signature under the bound point; a 12-byte input and a host
+    /// high-`s` signature both fail closed.
+    #[tokio::test]
+    async fn callback_pseudonym_sign_is_strict() {
+        let host = ProdLikeCustody::new();
+        let sign_calls = Arc::clone(&host.sign_calls);
+        let custody = CallbackKeyCustody::new(Box::new(host));
+        let identity = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("identity key");
+        let pseudonym = custody
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect("derive");
+        let point = scp_crypto::p256::P256PublicKey::from_sec1(pseudonym.public_key().as_bytes())
+            .expect("point");
+        let digest = [0x42u8; 32];
+        let sig = custody
+            .sign(pseudonym.key_handle(), &digest)
+            .await
+            .expect("sign digest");
+        scp_crypto::p256::verify_prehash_strict(&point, &digest, sig.as_bytes())
+            .expect("strict signature under the bound point");
+        let before = sign_calls.load(std::sync::atomic::Ordering::SeqCst);
+        let err = custody
+            .sign(pseudonym.key_handle(), b"twelve bytes")
+            .await
+            .expect_err("12-byte input");
+        assert!(matches!(err, PlatformError::CustodyError(_)), "{err:?}");
+        assert_eq!(
+            sign_calls.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "a 12-byte input reached the host"
+        );
+        // Identity (non-pseudonym) handles still sign arbitrary messages.
+        custody
+            .sign(&identity, b"twelve bytes")
+            .await
+            .expect("identity sign");
+
+        let custody =
+            CallbackKeyCustody::new(Box::new(ProdLikeCustody::with_fault(PseudonymFault::HighS)));
+        let identity = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("identity key");
+        let pseudonym = custody
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect("derive");
+        let err = custody
+            .sign(pseudonym.key_handle(), &digest)
+            .await
+            .expect_err("high-s host signature");
+        assert!(matches!(err, PlatformError::CustodyError(_)), "{err:?}");
+    }
+
+    /// A host failure carrying `SCP-CRYPTO-4006` is key-not-found, and one
+    /// carrying the generic `SCP-CRYPTO-4001` is a custody error; the bridge
+    /// reports them as `SCP-CRYPTO-4006` and `SCP-CRYPTO-4060`.
+    #[tokio::test]
+    async fn callback_host_failure_codes_map_to_typed_errors() {
+        let custody = CallbackKeyCustody::new(Box::new(ProdLikeCustody::new()));
+        let identity = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("identity key");
+        let pseudonym = custody
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect("derive");
+        custody
+            .destroy_key(pseudonym.key_handle())
+            .await
+            .expect("destroy pseudonym");
+        let err = custody
+            .sign(pseudonym.key_handle(), &[0x42u8; 32])
+            .await
+            .expect_err("destroyed key");
+        assert!(matches!(err, PlatformError::KeyNotFound), "{err:?}");
+        match ScpError::from(err) {
+            ScpError::Crypto { code, .. } => assert_eq!(code, codes::CRYPTO_4006),
+            other => panic!("expected CRYPTO_4006, got {other:?}"),
+        }
+
+        let custody = CallbackKeyCustody::new(Box::new(ProdLikeCustody::with_fault(
+            PseudonymFault::SignFails4001,
+        )));
+        let identity = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("identity key");
+        let err = custody
+            .sign(&identity, b"message")
+            .await
+            .expect_err("host 4001");
+        match &err {
+            PlatformError::CustodyError(m) => {
+                assert!(
+                    m.contains(codes::CRYPTO_4001) && m.contains("hsm offline"),
+                    "{m}"
+                );
+            }
+            other => panic!("4001 must be a custody error, got {other:?}"),
+        }
+        match ScpError::from(err) {
+            ScpError::Crypto { code, .. } => assert_eq!(code, codes::CRYPTO_4060),
+            other => panic!("expected CRYPTO_4060, got {other:?}"),
+        }
+    }
+
+    /// B1: a host that returns the same key id for the same (identity,
+    /// context) re-binds cleanly; both derives yield the same routing id.
+    #[tokio::test]
+    async fn rederiving_a_pseudonym_reuses_its_key_id() {
+        let custody = CallbackKeyCustody::new(Box::new(ProdLikeCustody::new()));
+        let identity = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("identity key");
+        let first = custody
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect("first derive");
+        let second = custody
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect("second derive re-binds");
+        assert_eq!(first.key_handle(), second.key_handle());
+        assert_eq!(first.routing_id(), second.routing_id());
+        let rotated = custody
+            .derive_rotatable_pseudonym(&identity, b"ctx", 3)
+            .await
+            .expect("rotatable derive");
+        assert_ne!(rotated.key_handle(), first.key_handle());
+    }
+
+    /// The callback adapter hands the host the caller's context bytes and
+    /// epoch unchanged (§9.10.4, §9.10.4.1): the v1 and v2 routing ids are the
+    /// recipe's for exactly `(seed, "ctx-routing", None)` and
+    /// `(seed, "ctx-routing", Some(3))`.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn callback_custody_forwards_context_and_epoch_unchanged() {
+        let provider = ProdLikeCustody::new();
+        let keys = Arc::clone(&provider.keys);
+        let custody = CallbackKeyCustody::new(Box::new(provider));
+        let identity = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("identity key");
+        let seed = keys
+            .lock()
+            .expect("keystore mutex")
+            .get(&identity.id().to_string())
+            .expect("identity key is in the store")
+            .to_bytes();
+        let static_pseudonym = custody
+            .derive_pseudonym(&identity, b"ctx-routing")
+            .await
+            .expect("v1 derive");
+        assert_eq!(
+            *static_pseudonym.routing_id(),
+            recipe_routing_id(seed, b"ctx-routing", None)
+        );
+        let rotated = custody
+            .derive_rotatable_pseudonym(&identity, b"ctx-routing", 3)
+            .await
+            .expect("rotatable derive");
+        assert_eq!(
+            *rotated.routing_id(),
+            recipe_routing_id(seed, b"ctx-routing", Some(3))
+        );
+        assert_ne!(
+            *rotated.routing_id(),
+            recipe_routing_id(seed, b"ctx-routing", Some(4)),
+            "the routing id is epoch-scoped"
+        );
+    }
+
+    /// B3: `destroy_key` unbinds the handle. A host that reuses key id 777
+    /// for a second point is refused while the first is bound, and accepted
+    /// once the first is destroyed.
+    #[tokio::test]
+    async fn destroy_unbinds_a_pseudonym_handle() {
+        let custody = CallbackKeyCustody::new(Box::new(ProdLikeCustody::with_fault(
+            PseudonymFault::FixedId,
+        )));
+        let identity = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("identity key");
+        let first = custody
+            .derive_pseudonym(&identity, b"ctx-a")
+            .await
+            .expect("first derive");
+        assert_eq!(first.key_handle().id(), 777);
+        let err = custody
+            .derive_pseudonym(&identity, b"ctx-b")
+            .await
+            .expect_err("id 777 is bound to ctx-a's point");
+        assert!(
+            matches!(err, PlatformError::PseudonymRejected(_)),
+            "{err:?}"
+        );
+        custody
+            .destroy_key(first.key_handle())
+            .await
+            .expect("destroy");
+        let second = custody
+            .derive_pseudonym(&identity, b"ctx-b")
+            .await
+            .expect("re-derive under the freed id");
+        assert_eq!(second.key_handle().id(), 777);
+        assert_ne!(second.public_key(), first.public_key());
+    }
+
+    /// The adapter unbinds a pseudonym handle before it calls the host's
+    /// `destroy_key`: a probe inside the host's `destroy_key` reads the
+    /// adapter's bindings and finds the handle already unbound. Calling the
+    /// host first leaves the handle bound during that call, and this fails.
+    #[tokio::test]
+    async fn destroy_unbinds_before_the_host_call() {
+        type Cell = std::sync::OnceLock<std::sync::Weak<CallbackKeyCustody>>;
+        let adapter = Arc::new(Cell::new());
+        let bound_during_host_destroy = Arc::new(std::sync::Mutex::new(None::<bool>));
+        let mut host = ProdLikeCustody::new();
+        let (probe_adapter, probe_seen) = (adapter.clone(), bound_during_host_destroy.clone());
+        host.destroy_probe = Some(Box::new(move |key_id: &str| {
+            let custody = probe_adapter
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .expect("adapter is alive during destroy");
+            let handle = KeyHandle::new(key_id.parse().expect("numeric key id"));
+            *probe_seen.lock().expect("probe mutex") = Some(custody.pseudonyms.is_bound(&handle));
+        }));
+        let custody = Arc::new(CallbackKeyCustody::new(Box::new(host)));
+        adapter
+            .set(Arc::downgrade(&custody))
+            .expect("cell set once");
+
+        let identity = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("identity key");
+        let pseudonym = custody
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect("derive");
+        assert!(custody.pseudonyms.is_bound(pseudonym.key_handle()));
+        custody
+            .destroy_key(pseudonym.key_handle())
+            .await
+            .expect("destroy");
+        assert_eq!(
+            *bound_during_host_destroy.lock().expect("probe mutex"),
+            Some(false),
+            "the host's destroy_key ran while the handle was still bound"
+        );
     }
 
     /// `identity_create_with_custody` must register the callback identity in the

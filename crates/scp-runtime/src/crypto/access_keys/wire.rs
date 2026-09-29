@@ -143,9 +143,9 @@ pub struct AccessKeyRequestResult {
 ///
 /// # Errors
 ///
-/// Returns [`AccessKeyError::SigningFailed`] if signing fails.
+/// Returns [`AccessKeyError::Custody`] if key generation, the public-key
+/// lookup or signing fails in custody.
 /// Returns [`AccessKeyError::SerializationFailed`] if serialization fails.
-/// Returns [`AccessKeyError::KeyCustodyError`] if key generation fails.
 pub async fn request_access_key(
     key_custody: &impl KeyCustody,
     signing_key: &KeyHandle,
@@ -157,12 +157,12 @@ pub async fn request_access_key(
     let wrapping_key_handle = key_custody
         .generate_keypair(KeyType::X25519)
         .await
-        .map_err(|e| AccessKeyError::KeyCustodyError(e.to_string()))?;
+        .map_err(|e| AccessKeyError::Custody(e.into()))?;
 
     let wrapping_pubkey = key_custody
         .public_key(&wrapping_key_handle)
         .await
-        .map_err(|e| AccessKeyError::KeyCustodyError(e.to_string()))?;
+        .map_err(|e| AccessKeyError::Custody(e.into()))?;
 
     let timestamp = clock.now_secs();
 
@@ -182,7 +182,7 @@ pub async fn request_access_key(
     let signature = key_custody
         .sign(signing_key, &hash)
         .await
-        .map_err(|e| AccessKeyError::SigningFailed(e.to_string()))?;
+        .map_err(|e| AccessKeyError::Custody(e.into()))?;
 
     let request = AccessKeyRequest {
         requester_did: requester_did.to_owned(),
@@ -366,8 +366,9 @@ pub fn handle_access_key_request(
 ///
 /// # Errors
 ///
-/// Returns [`AccessKeyError::KeyCustodyError`] if the DH agreement or
-/// public-key lookup fails. Returns [`AccessKeyError::HpkeDecryptionFailed`]
+/// Returns [`AccessKeyError::Custody`] if the DH agreement or public-key
+/// lookup fails in custody, and [`AccessKeyError::MalformedWrappingPublicKey`] if the
+/// custody returns a wrapping public key that is not 32 bytes. Returns [`AccessKeyError::HpkeDecryptionFailed`]
 /// if HPKE open fails or the recovered plaintext is not exactly 32 bytes.
 pub async fn open_access_key_response(
     key_custody: &impl KeyCustody,
@@ -390,16 +391,18 @@ pub async fn open_access_key_response(
     let dh = key_custody
         .dh_agree(wrapping_key_handle, &enc)
         .await
-        .map_err(|e| AccessKeyError::KeyCustodyError(e.to_string()))?;
+        .map_err(|e| AccessKeyError::Custody(e.into()))?;
     let dh_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*dh.as_bytes());
 
     // Fetch pkRm for the same handle (kem_context = enc || pkRm).
     let pk_rm = key_custody
         .public_key(wrapping_key_handle)
         .await
-        .map_err(|e| AccessKeyError::KeyCustodyError(e.to_string()))?;
+        .map_err(|e| AccessKeyError::Custody(e.into()))?;
     let pk_rm_bytes: [u8; 32] = pk_rm.as_bytes().try_into().map_err(|_| {
-        AccessKeyError::KeyCustodyError("wrapping public key must be 32 bytes".to_owned())
+        AccessKeyError::MalformedWrappingPublicKey(
+            "wrapping public key must be 32 bytes".to_owned(),
+        )
     })?;
 
     // Build context-bound info and AAD (§9.17.1).
@@ -552,8 +555,117 @@ mod tests {
     use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
 
     use super::*;
+    use crate::crypto::key_loss_custody::{KeyLoss, KeyLossCustody};
     use scp_protocol::crypto::access_keys::generate_access_key;
     use scp_protocol::crypto::sender_keys::NonceDedup;
+
+    /// A requester whose custody no longer holds the signing key fails the
+    /// access-key request with the typed custody failure, so a caller sees
+    /// key-not-found as `SCP-CRYPTO-4006`.
+    #[tokio::test]
+    async fn request_access_key_carries_a_destroyed_signing_key_as_key_not_found() {
+        use scp_platform::testing::InMemoryKeyCustody;
+        let custody = InMemoryKeyCustody::new();
+        let signing_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        custody.destroy_key(&signing_key).await.unwrap();
+        let err = request_access_key(
+            &custody,
+            &signing_key,
+            "did:dht:alice",
+            "ctx-1",
+            &scp_clock::SystemClock,
+        )
+        .await
+        .expect_err("signing under a destroyed key must fail");
+        assert!(
+            matches!(&err, AccessKeyError::Custody(failure) if failure.is_key_not_found()),
+            "a destroyed signing key is a key-not-found custody failure, got {err:?}"
+        );
+    }
+
+    fn assert_key_not_found<T: std::fmt::Debug>(result: Result<T, AccessKeyError>, step: &str) {
+        let err = result.expect_err(step);
+        assert!(
+            matches!(&err, AccessKeyError::Custody(failure) if failure.is_key_not_found()),
+            "{step}: expected AccessKeyError::Custody key-not-found, got {err:?}"
+        );
+    }
+
+    async fn request_with(
+        custody: &impl KeyCustody,
+        signing_key: &KeyHandle,
+    ) -> Result<AccessKeyRequestResult, AccessKeyError> {
+        request_access_key(
+            custody,
+            signing_key,
+            "did:dht:alice",
+            "ctx-1",
+            &scp_clock::SystemClock,
+        )
+        .await
+    }
+
+    /// A response whose `enc` is a valid X25519 public key, so `open` reaches
+    /// both custody calls. The sealed key is never opened by these tests.
+    fn response_with_valid_enc() -> AccessKeyResponse {
+        let secret = StaticSecret::random_from_rng(OsRng);
+        AccessKeyResponse {
+            context_id: "ctx-1".to_owned(),
+            member_did: "did:dht:alice".to_owned(),
+            epoch: 1,
+            hpke_sealed_key: [0u8; 48],
+            ephemeral_pubkey: X25519Pub::from(&secret).to_bytes().to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_access_key_wrapping_key_generation_is_custody_key_not_found() {
+        let custody = KeyLossCustody::new(KeyLoss::OnGenerate);
+        let signing_key = custody
+            .inner
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        assert_key_not_found(
+            request_with(&custody, &signing_key).await,
+            "wrapping key generation",
+        );
+    }
+
+    #[tokio::test]
+    async fn request_access_key_wrapping_public_key_is_custody_key_not_found() {
+        let custody = KeyLossCustody::new(KeyLoss::AfterGenerate);
+        let signing_key = custody
+            .inner
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        assert_key_not_found(
+            request_with(&custody, &signing_key).await,
+            "wrapping public key read",
+        );
+    }
+
+    #[tokio::test]
+    async fn open_access_key_response_with_a_destroyed_wrapping_key_is_custody_key_not_found() {
+        let custody = scp_platform::testing::InMemoryKeyCustody::new();
+        let wrapping_key = custody.generate_keypair(KeyType::X25519).await.unwrap();
+        custody.destroy_key(&wrapping_key).await.unwrap();
+        assert_key_not_found(
+            open_access_key_response(&custody, &wrapping_key, &response_with_valid_enc()).await,
+            "DH agreement",
+        );
+    }
+
+    #[tokio::test]
+    async fn open_access_key_response_wrapping_public_key_is_custody_key_not_found() {
+        let custody = KeyLossCustody::new(KeyLoss::AfterDhAgree);
+        let wrapping_key = custody.generate_keypair(KeyType::X25519).await.unwrap();
+        assert_key_not_found(
+            open_access_key_response(&custody, &wrapping_key, &response_with_valid_enc()).await,
+            "wrapping public key read after DH agreement",
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Wire type serialization tests

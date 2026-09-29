@@ -25,8 +25,9 @@ use scp_protocol::crypto::ucan::UcanError;
 
 /// Maps a [`UcanError`] to its canonical SCP error code string.
 ///
-/// Every current variant maps to [`codes::PERM_3001`] ("generic UCAN
-/// validation failure"). The exhaustive `match` is deliberate — any
+/// Every validation variant maps to [`codes::PERM_3001`] ("generic UCAN
+/// validation failure"); [`UcanError::Custody`], a key custody failure while
+/// signing, maps through [`codes::custody_failure_code`]. The exhaustive `match` is deliberate — any
 /// new variant added to [`UcanError`] in `scp-protocol` becomes a
 /// compile error here until a classification decision is made and the
 /// match arm is added. A blanket `_ => PERM_3001` catch-all would
@@ -96,6 +97,10 @@ pub const fn ucan_error_code(err: &UcanError) -> &'static str {
 
         // Capability URI parsing.
         UcanError::InvalidCapabilityUri(_) => codes::PERM_3001,
+
+        // A key custody call failed while signing the token: the custody
+        // code, not a UCAN validation code.
+        UcanError::Custody(failure) => codes::custody_failure_code(failure),
     }
 }
 
@@ -178,5 +183,25 @@ mod tests {
                 "variant {variant:?} did not return PERM_3001",
             );
         }
+    }
+
+    /// A custody failure while signing a token carries the custody code, so a
+    /// caller sees key-not-found as `SCP-CRYPTO-4006`, not `SCP-PERM-3001`.
+    #[test]
+    fn custody_failure_routes_to_the_custody_code() {
+        let failure = |kind| {
+            UcanError::Custody(scp_crypto::CustodyFailure {
+                kind,
+                detail: "x".to_owned(),
+            })
+        };
+        assert_eq!(
+            ucan_error_code(&failure(scp_crypto::CustodyFailureKind::KeyNotFound)),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            ucan_error_code(&failure(scp_crypto::CustodyFailureKind::Failed)),
+            codes::CRYPTO_4060
+        );
     }
 }

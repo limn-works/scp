@@ -236,11 +236,12 @@ export type {
   ContextReconnectResult,
   KeyCustodyProvider,
   KeyPackageReservation,
+  PseudonymResult,
   ReconnectReport,
   ScpOptions,
   StorageConfig,
 } from "./scp";
-export { SCP } from "./scp";
+export { p256PseudonymScalar, p256PublicKey, p256SignPrehashRfc6979, SCP } from "./scp";
 
 // ---------------------------------------------------------------------------
 // Errors

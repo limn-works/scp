@@ -111,7 +111,7 @@ impl Deref for EagerDropSigner {
 /// `openmls_basic_credential::SignatureKeyPair` stores the ED25519 private key as
 /// `ed25519_dalek::SigningKey::to_bytes()` — the 32-byte RFC-8032 seed (see its
 /// `SignatureKeyPair::new` ED25519 arm), exactly the form
-/// [`ed25519_dalek::SigningKey::from_bytes`] consumes. Its `private()` accessor
+/// `ed25519_dalek::SigningKey::from_bytes` consumes. Its `private()` accessor
 /// is `test-utils`-gated (unavailable in a shipped build), so this production
 /// path recovers the seed through the type's own `serde` derive — the identical
 /// name-tagged `MessagePack` form `ProviderSignerDump` already serializes the
@@ -240,8 +240,9 @@ impl ScpMlsGroup {
         self.signer.as_ref().ok_or(MlsError::GroupDestroyed)
     }
 
-    /// Derives this member's per-context **pseudonym public key** (32 bytes) over
-    /// the wasm-held MLS `SignatureKeyPair` (ADR-057 Option A, §9.10.4.A interim
+    /// Derives this member's per-context **pseudonym routing id** (32 bytes,
+    /// §9.10.4: `SHA-256("scp-pseudonym-routing-v1:" || P-256 pseudonym point)`)
+    /// over the wasm-held MLS `SignatureKeyPair` (ADR-057 Option A, §9.10.4.A interim
     /// deviation).
     ///
     /// The browser has no identity key inside wasm; the only wasm-held Ed25519 key
@@ -256,8 +257,8 @@ impl ScpMlsGroup {
     /// pending the #1980 key-to-WebCrypto move that unifies the key boundary.
     ///
     /// The private seed NEVER leaves this method: it is extracted, fed to the
-    /// derivation, and dropped (zeroized) here. Only the resulting public
-    /// pseudonym (a routing address, not a secret) is returned.
+    /// derivation as the 32-byte ikm, and dropped (zeroized) here. Only the
+    /// resulting routing id (a routing address, not a secret) is returned.
     ///
     /// `context_id` is the raw context-id bytes. This derives the **v1 (static)**
     /// pseudonym — the only form the transport slice wires today; v2 epoch-scoped
@@ -274,15 +275,19 @@ impl ScpMlsGroup {
     /// groups are Ed25519-only per [`SCP_CIPHERSUITE`]).
     pub fn derive_pseudonym(&self, context_id: &[u8]) -> Result<[u8; 32], MlsError> {
         let signer = self.signer_key_pair()?;
-        let seed = extract_ed25519_seed(signer)?;
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        // The MLS signer is still Ed25519 in S0, so its 32-byte seed is the
+        // ikm; when the ciphersuite moves to P-256 the ikm becomes the MLS
+        // P-256 scalar, with the same recipe.
+        let ikm = extract_ed25519_seed(signer)?;
         // v1 (static) derivation. The epoch is fixed to `None` internally rather
         // than exposed as an always-`None` parameter — v2 epoch-scoped (rotatable)
         // pseudonyms (§9.10.4.1) are not yet driven by the transport slice, and the
         // shared recipe gains the epoch when rotation is wired.
-        let pseudonym =
-            scp_crypto::pseudonym::derive_pseudonym_keypair(&signing_key, context_id, None);
-        Ok(pseudonym.verifying_key().to_bytes())
+        let pseudonym = scp_crypto::pseudonym::derive_pseudonym_keypair(&ikm, context_id, None)
+            .map_err(|e| MlsError::PseudonymDerivationFailed(e.to_string()))?;
+        Ok(scp_crypto::pseudonym::pseudonym_routing_id(
+            &pseudonym.public_key().to_compressed(),
+        ))
     }
 
     /// Reconstructs an `ScpMlsGroup` from its constituent parts.
@@ -1364,10 +1369,15 @@ mod tests {
         let signer = group.signer_key_pair().unwrap();
         // SCP MLS signer is Ed25519 → a 32-byte seed.
         let seed: [u8; 32] = signer.private().try_into().unwrap();
-        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-        let expected = scp_crypto::pseudonym::derive_pseudonym_keypair(&sk, context_id, None)
-            .verifying_key()
-            .to_bytes();
+        let point = scp_crypto::pseudonym::derive_pseudonym_keypair(
+            &zeroize::Zeroizing::new(seed),
+            context_id,
+            None,
+        )
+        .unwrap()
+        .public_key()
+        .to_compressed();
+        let expected = scp_crypto::pseudonym::pseudonym_routing_id(&point);
 
         assert_eq!(
             via_method, expected,

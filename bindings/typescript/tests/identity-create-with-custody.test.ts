@@ -19,8 +19,10 @@
 import { describe, expect, test } from "bun:test";
 import * as crypto from "node:crypto";
 
-import type { KeyCustodyProvider } from "../src/scp";
-import { SCP } from "../src/scp";
+import { CryptoError, ScpError } from "../src/errors";
+import type { KeyCustodyProvider, PseudonymResult } from "../src/scp";
+import { p256PseudonymScalar, p256PublicKey, p256SignPrehashRfc6979, SCP } from "../src/scp";
+import { pseudonymSeedV1, pseudonymSeedV2 } from "./pseudonym-recipe";
 
 // ---------------------------------------------------------------------------
 // Probe: is the NAPI-backed SCP class available in this environment?
@@ -40,9 +42,19 @@ try {
 // Real-Ed25519 custody provider backed by node:crypto
 // ---------------------------------------------------------------------------
 
+/** A host fault the fixture can inject into its pseudonym results. */
+type PseudonymFault = "legacy32" | "wrongPublicKey" | "deriveKeyNotFound";
+
 class CryptoKeychain implements KeyCustodyProvider {
   #seeds = new Map<string, Uint8Array>();
+  // Pseudonym key ids → 32-byte P-256 private scalar (§9.10.4.A).
+  #pseudonyms = new Map<string, Uint8Array>();
   #next = 1;
+  readonly #fault: PseudonymFault | undefined;
+
+  constructor(fault?: PseudonymFault) {
+    this.#fault = fault;
+  }
 
   generateKeypair(_keyType: string): string {
     const { privateKey } = crypto.generateKeyPairSync("ed25519");
@@ -71,10 +83,19 @@ class CryptoKeychain implements KeyCustodyProvider {
   }
 
   sign(keyId: string, message: Uint8Array): Uint8Array {
+    const d = this.#pseudonyms.get(keyId);
+    if (d !== undefined) return p256SignPrehashRfc6979(d, message);
     return new Uint8Array(crypto.sign(null, Buffer.from(message), this.#keyObject(keyId)));
   }
 
   getPublicKey(keyId: string): Uint8Array {
+    const d = this.#pseudonyms.get(keyId);
+    if (d !== undefined) {
+      const point = p256PublicKey(d);
+      // A host whose handle answers with a different point than its derivation.
+      if (this.#fault === "wrongPublicKey") point[0] = point[0] === 0x02 ? 0x03 : 0x02;
+      return point;
+    }
     const pub = crypto.createPublicKey(this.#keyObject(keyId));
     const jwk = pub.export({ format: "jwk" }) as { x: string };
     return new Uint8Array(Buffer.from(jwk.x, "base64url"));
@@ -82,6 +103,7 @@ class CryptoKeychain implements KeyCustodyProvider {
 
   destroyKey(keyId: string): void {
     this.#seeds.delete(keyId);
+    this.#pseudonyms.delete(keyId);
   }
 
   dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array {
@@ -94,60 +116,62 @@ class CryptoKeychain implements KeyCustodyProvider {
     return new Uint8Array(h.digest());
   }
 
-  // Canonical per-context pseudonym secret (spec §9.10.4.A / §25.19):
-  //   pseudonym_secret = HKDF-SHA256(ikm = seed, salt = "scp-pseudonym-secret-v1",
-  //                                  info = "", len = 32)
-  #pseudonymSecret(keyId: string): Buffer {
+  #identitySeed(keyId: string): Uint8Array {
     const seed = this.#seeds.get(keyId);
     if (seed === undefined) throw new Error(`unknown key id: ${keyId}`);
-    return Buffer.from(
-      crypto.hkdfSync(
-        "sha256",
-        Buffer.from(seed),
-        Buffer.from("scp-pseudonym-secret-v1"),
-        Buffer.alloc(0),
-        32,
-      ),
+    return seed;
+  }
+
+  // The pseudonym key id for (identity, context, epoch): the provider contract
+  // requires the same inputs to name the same key. The top bit keeps it clear
+  // of the small sequential identity ids.
+  static #pseudonymKeyId(identity: string, contextId: Uint8Array, epoch?: bigint): string {
+    const h = crypto.createHash("sha256");
+    const identityBytes = Buffer.from(identity, "utf8");
+    const lengths = Buffer.alloc(8);
+    lengths.writeUInt32BE(identityBytes.length, 0);
+    lengths.writeUInt32BE(contextId.length, 4);
+    h.update("fake-keychain-pseudonym-id").update(lengths).update(identityBytes).update(contextId);
+    if (epoch !== undefined) {
+      const be = Buffer.alloc(8);
+      be.writeBigUInt64BE(epoch);
+      h.update(be);
+    }
+    return (h.digest().readBigUInt64BE(0) | (1n << 63n)).toString();
+  }
+
+  // Register the §9.10.4.A P-256 pseudonym of a context seed under `keyId`.
+  // Native software custody keys the recipe on the Ed25519 identity seed.
+  #registerPseudonym(contextSeed: Uint8Array, keyId: string): PseudonymResult {
+    // The host computes the context seed; the SDK helper maps it to the scalar.
+    const d = p256PseudonymScalar(contextSeed);
+    this.#pseudonyms.set(keyId, d);
+    const point = p256PublicKey(d);
+    // A host still on the retired 32-byte Ed25519 pseudonym shape.
+    const publicKey = this.#fault === "legacy32" ? point.subarray(1) : point;
+    return { publicKey, keyId };
+  }
+
+  derivePseudonym(keyId: string, contextId: Uint8Array): PseudonymResult {
+    // A host whose key is gone reports the contract's key-not-found code.
+    if (this.#fault === "deriveKeyNotFound") {
+      throw new CryptoError(`key not found: ${keyId}`, "SCP-CRYPTO-4006");
+    }
+    return this.#registerPseudonym(
+      pseudonymSeedV1(this.#identitySeed(keyId), contextId),
+      CryptoKeychain.#pseudonymKeyId(keyId, contextId),
     );
-  }
-
-  // Register a derived 32-byte context seed as a fresh signing key and return
-  // `publicKey(32) || keyIdUtf8` — the wire layout the native bridge unpacks.
-  #pseudonymFromContextSeed(contextSeed: Buffer): Uint8Array {
-    const pubJwk = crypto
-      .createPublicKey(this.#keyObjectFromSeed(contextSeed))
-      .export({ format: "jwk" }) as { x: string };
-    const pub = Buffer.from(pubJwk.x, "base64url");
-    const kid = String(this.#next++);
-    this.#seeds.set(kid, new Uint8Array(contextSeed));
-    return new Uint8Array(Buffer.concat([pub, Buffer.from(kid, "utf-8")]));
-  }
-
-  derivePseudonym(keyId: string, contextId: Uint8Array): Uint8Array {
-    // v1 (static): context_seed = HMAC-SHA256(secret, context_id || "scp-pseudonym")
-    const data = Buffer.concat([Buffer.from(contextId), Buffer.from("scp-pseudonym")]);
-    const contextSeed = crypto
-      .createHmac("sha256", this.#pseudonymSecret(keyId))
-      .update(data)
-      .digest();
-    return this.#pseudonymFromContextSeed(contextSeed);
   }
 
   deriveRotatablePseudonym(
     keyId: string,
     contextId: Uint8Array,
     pseudonymEpoch: bigint,
-  ): Uint8Array {
-    // v2 (rotatable): context_seed = HMAC-SHA256(
-    //   secret, context_id || BE64(epoch) || "scp-pseudonym-v2")
-    const be = Buffer.alloc(8);
-    be.writeBigUInt64BE(pseudonymEpoch);
-    const data = Buffer.concat([Buffer.from(contextId), be, Buffer.from("scp-pseudonym-v2")]);
-    const contextSeed = crypto
-      .createHmac("sha256", this.#pseudonymSecret(keyId))
-      .update(data)
-      .digest();
-    return this.#pseudonymFromContextSeed(contextSeed);
+  ): PseudonymResult {
+    return this.#registerPseudonym(
+      pseudonymSeedV2(this.#identitySeed(keyId), contextId, pseudonymEpoch),
+      CryptoKeychain.#pseudonymKeyId(keyId, contextId, pseudonymEpoch),
+    );
   }
 
   exportSigningKeyBytes(keyId: string): Uint8Array {
@@ -192,6 +216,55 @@ if (!scpAvailable) {
         await scp.shutdown(1000).catch(() => {});
       }
     });
+
+    // §9.10.4.A: a host that reports key-not-found while deriving fails the
+    // production context create with that code, not a derivation identity code.
+    test("an encrypted context create fails with SCP-CRYPTO-4006 when the host reports key-not-found", async () => {
+      const scp = new SCP({ storage: { type: "in_memory" } });
+      try {
+        const identity = await scp.identityCreateWithCustody(
+          new CryptoKeychain("deriveKeyNotFound"),
+        );
+        let caught: unknown;
+        try {
+          await scp.contextCreate(
+            identity,
+            JSON.stringify({ ceiling: ["messages:read"], memoryScope: "ephemeral" }),
+          );
+        } catch (err) {
+          caught = err;
+        }
+        expect(caught).toBeInstanceOf(ScpError);
+        expect((caught as ScpError).code).toBe("SCP-CRYPTO-4006");
+      } finally {
+        await scp.shutdown(1000).catch(() => {});
+      }
+    });
+
+    // §9.10.4: the bridge fails closed on a host pseudonym it cannot trust —
+    // a retired 32-byte key, or a key id whose getPublicKey disagrees with the
+    // point the derivation returned — with SCP-IDENT-1055.
+    for (const fault of ["legacy32", "wrongPublicKey"] as const) {
+      test(`an encrypted context create fails with SCP-IDENT-1055 on host fault ${fault}`, async () => {
+        const scp = new SCP({ storage: { type: "in_memory" } });
+        try {
+          const identity = await scp.identityCreateWithCustody(new CryptoKeychain(fault));
+          let caught: unknown;
+          try {
+            await scp.contextCreate(
+              identity,
+              JSON.stringify({ ceiling: ["messages:read"], memoryScope: "ephemeral" }),
+            );
+          } catch (err) {
+            caught = err;
+          }
+          expect(caught).toBeInstanceOf(ScpError);
+          expect((caught as ScpError).code).toBe("SCP-IDENT-1055");
+        } finally {
+          await scp.shutdown(1000).catch(() => {});
+        }
+      });
+    }
 
     test("rejects a provider missing required methods", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });

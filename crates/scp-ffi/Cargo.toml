@@ -56,6 +56,9 @@ async-trait = { workspace = true }
 pyo3 = { version = "0.24.1", features = ["experimental-async", "multiple-pymethods"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+# `CustodyFailure`, the typed custody error the runtime carries to the bridge;
+# tests also recompute P-256 pseudonym points and signatures.
+scp-crypto = { path = "../scp-crypto" }
 scp-core = { path = "../scp-core" }
 scp-identity = { path = "../scp-identity" }
 # The real Mainline DHT backend (PkarrDhtClient) is compiled unconditionally —

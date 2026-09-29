@@ -159,6 +159,11 @@ pub enum SenderKeyError {
     #[error("signing failed: {0}")]
     SigningFailed(String),
 
+    /// A key custody call failed (`KeyCustody`). The bridges report
+    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` otherwise.
+    #[error(transparent)]
+    Custody(#[from] scp_crypto::CustodyFailure),
+
     /// Ed25519 signature verification failed due to malformed input.
     #[error("verification failed: {0}")]
     VerificationFailed(String),
@@ -175,9 +180,9 @@ pub enum SenderKeyError {
     #[error("HPKE decryption failed: {0}")]
     HpkeDecryptionFailed(String),
 
-    /// A key custody operation failed.
-    #[error("key custody error: {0}")]
-    KeyCustodyError(String),
+    /// Custody returned a wrapping (X25519) public key that is not 32 bytes.
+    #[error("malformed wrapping public key: {0}")]
+    MalformedWrappingPublicKey(String),
 
     /// A sender key request was replayed (duplicate nonce within the expiry window).
     #[error("replayed request: duplicate nonce detected")]

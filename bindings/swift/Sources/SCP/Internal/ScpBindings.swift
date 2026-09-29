@@ -1360,6 +1360,9 @@ public protocol NodeHandleProtocol: AnyObject, Sendable {
     /**
      * Returns the WebSocket URL clients should connect to for this node's
      * relay (e.g., `ws://127.0.0.1:12345/scp/v1`).
+     *
+     * Read live per call from the node's relay-URL slot, so it reflects a NAT
+     * tier change that re-pointed the node's endpoint.
      */
     func relayUrl()  -> String
     
@@ -1580,6 +1583,9 @@ open func relayPort() -> UInt16  {
     /**
      * Returns the WebSocket URL clients should connect to for this node's
      * relay (e.g., `ws://127.0.0.1:12345/scp/v1`).
+     *
+     * Read live per call from the node's relay-URL slot, so it reflects a NAT
+     * tier change that re-pointed the node's endpoint.
      */
 open func relayUrl() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -1969,6 +1975,11 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function `address_resolve`.
+     *
+     * Returns a JSON object with two keys: `resolutions` holds the
+     * `AddressResolution` objects sorted by trust level, and
+     * `unavailable_layers` names each layer this build could not query,
+     * with the reason.
      */
     func addressResolve(ownerDid: String, address: String, knownContextsJson: String?) throws  -> String
     
@@ -2440,7 +2451,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Per-instance equivalent of the free-function `economy_verify_payment_receipts`.
      *
      * Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
-     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the
+     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`](scp_core::context::actor::commands::EconomyCommand::VerifyPaymentReceipts) to the
      * supervisor, returning a JSON `{"all_valid": <bool>, "results": [...]}`
      * document with one entry per receipt. Mirrors the `PyO3` reference bridge
      * exactly. Maximum 10,000 receipts per call.
@@ -3631,13 +3642,17 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Signs each delegation with `delegator_did`'s own key, read from this
+     * instance's identity custody registry. A `delegator_did` that this
+     * instance has not registered returns `SCP-IDENT-1001`.
      */
     func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid: String, parentToken: String, capabilities: [String]) async throws  -> UcanToken
     
     /**
      * Diagnostic, read-only evaluation of a UCAN token.
      *
-     * Counterpart to [`SCP::ucan_validate`]: runs the same 11-step ADR-016
+     * Counterpart to [`Scp::ucan_validate`](crate::scp::Scp::ucan_validate): runs the same 11-step ADR-016
      * pipeline via `evaluate_ucan` but returns a structured
      * [`CapabilityValidationRecord`] (six booleans) instead of failing at the
      * first error, and never records the token's nonce (read-only probe).
@@ -3897,6 +3912,11 @@ open func addCheckpointCosignature(handle: ContextHandle, checkpointJson: String
     
     /**
      * Per-instance equivalent of the free-function `address_resolve`.
+     *
+     * Returns a JSON object with two keys: `resolutions` holds the
+     * `AddressResolution` objects sorted by trust level, and
+     * `unavailable_layers` names each layer this build could not query,
+     * with the reason.
      */
 open func addressResolve(ownerDid: String, address: String, knownContextsJson: String?)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
@@ -4995,7 +5015,7 @@ open func economyBudgetRemaining(contextId: String, did: String)throws  -> UInt6
      * Per-instance equivalent of the free-function `economy_verify_payment_receipts`.
      *
      * Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
-     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the
+     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`](scp_core::context::actor::commands::EconomyCommand::VerifyPaymentReceipts) to the
      * supervisor, returning a JSON `{"all_valid": <bool>, "results": [...]}`
      * document with one entry per receipt. Mirrors the `PyO3` reference bridge
      * exactly. Maximum 10,000 receipts per call.
@@ -7469,6 +7489,10 @@ open func trustVerifyResponse(challengeJson: String, responseJson: String)throws
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Signs each delegation with `delegator_did`'s own key, read from this
+     * instance's identity custody registry. A `delegator_did` that this
+     * instance has not registered returns `SCP-IDENT-1001`.
      */
 open func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid: String, parentToken: String, capabilities: [String])async throws  -> UcanToken  {
     return
@@ -7490,7 +7514,7 @@ open func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid
     /**
      * Diagnostic, read-only evaluation of a UCAN token.
      *
-     * Counterpart to [`SCP::ucan_validate`]: runs the same 11-step ADR-016
+     * Counterpart to [`Scp::ucan_validate`](crate::scp::Scp::ucan_validate): runs the same 11-step ADR-016
      * pipeline via `evaluate_ucan` but returns a structured
      * [`CapabilityValidationRecord`] (six booleans) instead of failing at the
      * first error, and never records the token's nonce (read-only probe).
@@ -11461,6 +11485,95 @@ public func FfiConverterTypeProof_lower(_ value: Proof) -> RustBuffer {
 
 
 /**
+ * A host-derived §9.10.4 pseudonym, returned by
+ * [`KeyCustodyProvider::derive_pseudonym`] and
+ * [`KeyCustodyProvider::derive_rotatable_pseudonym`].
+ */
+public struct PseudonymResult {
+    /**
+     * The 33-byte SEC1 compressed P-256 pseudonym public key.
+     */
+    public var publicKey: Data
+    /**
+     * The key id of the pseudonym's signing key in the host's custody: a
+     * canonical decimal `u64` string (see [`KeyCustodyProvider`]).
+     */
+    public var keyId: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The 33-byte SEC1 compressed P-256 pseudonym public key.
+         */publicKey: Data, 
+        /**
+         * The key id of the pseudonym's signing key in the host's custody: a
+         * canonical decimal `u64` string (see [`KeyCustodyProvider`]).
+         */keyId: String) {
+        self.publicKey = publicKey
+        self.keyId = keyId
+    }
+}
+
+#if compiler(>=6)
+extension PseudonymResult: Sendable {}
+#endif
+
+
+extension PseudonymResult: Equatable, Hashable {
+    public static func ==(lhs: PseudonymResult, rhs: PseudonymResult) -> Bool {
+        if lhs.publicKey != rhs.publicKey {
+            return false
+        }
+        if lhs.keyId != rhs.keyId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(publicKey)
+        hasher.combine(keyId)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePseudonymResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PseudonymResult {
+        return
+            try PseudonymResult(
+                publicKey: FfiConverterData.read(from: &buf), 
+                keyId: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PseudonymResult, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.publicKey, into: &buf)
+        FfiConverterString.write(value.keyId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePseudonymResult_lift(_ buf: RustBuffer) throws -> PseudonymResult {
+    return try FfiConverterTypePseudonymResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePseudonymResult_lower(_ value: PseudonymResult) -> RustBuffer {
+    return FfiConverterTypePseudonymResult.lower(value)
+}
+
+
+/**
  * Result of publishing an asset to a broadcast context (SCP-290, SCP-292).
  */
 public struct PublishResult {
@@ -14229,10 +14342,10 @@ extension SourceType: Equatable, Hashable {}
  * an invalid state, so there is exactly one happy path per variant. This
  * mirrors the `PyO3` bridge's `SqliteKeyMaterial`.
  *
- * - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`] directly (raw-key
+ * - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`](scp_platform::sqlite::SqliteStorage::new) directly (raw-key
  * mode; the existing, unchanged path).
  * - [`SqliteKeyMaterial::Passphrase`] feeds
- * [`SqliteStorage::with_passphrase`], which derives the `SQLCipher` PRAGMA
+ * [`SqliteStorage::with_passphrase`](scp_platform::sqlite::SqliteStorage::with_passphrase), which derives the `SQLCipher` PRAGMA
  * key from the passphrase via the shared Argon2id parameterization with a
  * persisted per-database salt sidecar.
  *
@@ -14669,10 +14782,32 @@ public func FfiConverterCallbackInterfaceDeviceAttestationProvider_lower(_ v: De
 /**
  * Callback for platform cryptographic key management.
  *
- * Swift SDK: Secure Enclave / Keychain.
- * Kotlin SDK: Android Keystore.
+ * Implemented by host code and injected into the Rust engine. No in-tree
+ * Swift or Kotlin host implements this protocol yet: `AppleKeyCustody` and
+ * `AndroidKeyCustody` implement their SDKs' own custody interfaces (UUID or
+ * hex key ids, no [`PseudonymResult`]), and S0 PR8 conforms them to it.
  *
- * Implemented by Swift/Kotlin code and injected into the Rust engine.
+ * A method reports failure by returning an [`ScpError`]. Return one whose
+ * code is `SCP-CRYPTO-4006` (key not found) for a key id that was destroyed or
+ * never existed; the bridge reports it as key-not-found. Any other error,
+ * whatever its code, becomes the custody error `SCP-CRYPTO-4060` carrying the
+ * host's code and message. Every SDK operation that calls the provider
+ * reports these two codes, including the pseudonym derivation inside
+ * `context_create` and the identity key reads and signatures of identity
+ * operations. There are two exceptions: `SCP-IDENT-1055`, reported when the
+ * bridge rejects the pseudonym a `derive_pseudonym` call returned (including
+ * when `get_public_key` on its key id throws, whatever the code), and
+ * `SCP-IDENT-1037`, which `scpid_sign` reports for any custody failure (spec
+ * §3.11.4). Throw only
+ * [`ScpError`]: `UniFFI` 0.29 panics on any other error a callback throws.
+ *
+ * Every key id the host returns is the canonical decimal form of a `u64`, as
+ * `String(n)` (Swift, `UInt64`) or `n.toString()` (Kotlin, `ULong`) writes it:
+ * ASCII digits only, with no sign, no leading zero (`"0"` itself is allowed)
+ * and no whitespace. The bridge rejects any other id (`"007"`, `"+7"`,
+ * `" 7"`, a UUID): from `generate_keypair` with the custody error
+ * `SCP-CRYPTO-4060`, and from `derive_pseudonym` or
+ * `derive_rotatable_pseudonym` with `SCP-IDENT-1055`.
  *
  * # SAFETY: Thread execution context
  *
@@ -14689,26 +14824,40 @@ public func FfiConverterCallbackInterfaceDeviceAttestationProvider_lower(_ v: De
 public protocol KeyCustodyProvider: AnyObject, Sendable {
     
     /**
-     * Sign `message` bytes with the Ed25519 key identified by `key_id`.
+     * Sign `message` bytes with the key identified by `key_id`.
      *
-     * Returns the raw 64-byte Ed25519 signature.
+     * For an Ed25519 key, returns the raw 64-byte Ed25519 signature. For a
+     * pseudonym key id from `derive_pseudonym`, `message` is a 32-byte digest
+     * and the return is the 64-byte low-`s` P-256 `r || s` (§9.5); the
+     * bridge verifies it strictly and rejects anything else, for a pseudonym
+     * key this adapter derived and still holds bound; for a handle the adapter
+     * did not bind, the bridge returns the host's bytes unchecked. A software host
+     * signs with the `p256_sign_prehash_rfc6979` export
+     * (`p256SignPrehashRfc6979` in Swift and Kotlin) rather than its own ECDSA.
      */
     func sign(keyId: String, message: Data) async throws  -> Data
     
     /**
-     * Return the Ed25519 public key bytes (32 bytes) for `key_id`.
+     * Return the public key bytes for `key_id`: 32 bytes for an Ed25519 or
+     * X25519 key, the 33-byte compressed point for a pseudonym key.
      */
     func getPublicKey(keyId: String) async throws  -> Data
     
     /**
      * Destroy key material for `key_id`. Subsequent operations must fail.
+     *
+     * Destroying an identity key also destroys its `pseudonym_secret` and
+     * every v1 and v2 pseudonym key derived from it, so each such pseudonym
+     * key id then fails too (`09-security-model.md` §9.10.4.A).
      */
     func destroyKey(keyId: String) async throws 
     
     /**
      * Generate a new keypair. `key_type` is `"ed25519"` or `"x25519"`.
      *
-     * Returns an opaque key identifier string.
+     * Returns the new key's id, a canonical decimal `u64` string (see
+     * [`KeyCustodyProvider`]); the bridge rejects any other id with
+     * `SCP-CRYPTO-4060`.
      */
     func generateKeypair(keyType: String) async throws  -> String
     
@@ -14724,36 +14873,62 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
     func dhAgree(keyId: String, peerPublic: Data) async throws  -> Data
     
     /**
-     * Derive a deterministic, context-scoped Ed25519 pseudonym keypair.
+     * Derive a deterministic, context-scoped P-256 pseudonym keypair (§9.10.4).
      *
-     * The actual derivation runs inside the injected platform `KeyCustody`
-     * callback (Swift Keychain/Secure Enclave, Kotlin Keystore). Algorithm:
-     * 1. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
-     * 2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`  // seed is an RFC-8032 Ed25519 seed
+     * The derivation runs inside the host's custody. Canonical recipe
+     * (§9.10.4, §9.10.4.A; every software host MUST produce identical bytes;
+     * `ikm` is the identity private key material, the 32-byte Ed25519 seed
+     * until slice S12):
+     * 1. `pseudonym_secret = HKDF-SHA256(ikm, salt="scp-pseudonym-secret-v1", info="", L=32)`
+     * 2. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
+     * 3. `d = p256PseudonymScalar(seed)` and `public_key = p256PublicKey(d)`,
+     * the 33-byte SEC1 compressed point `d·G`.
      *
      * The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key —
      * public key bytes would be a membership-enumeration oracle (§9.10.4.A).
-     * For software custody, `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
-     * salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic
-     * (§25.19 vectors). For hardware custody (Secure Enclave, Keystore TEE) the
-     * private key is non-exportable, so `pseudonym_secret` is a device-local value
-     * computed inside the secure boundary, and those pseudonyms are device-local
-     * by design.
+     * Routing fields carry `SHA-256("scp-pseudonym-routing-v1:" || point)`,
+     * which the Rust side computes from the returned point.
      *
-     * Returns a two-element list: `[pseudonym_public_key_bytes (32), key_id (string as UTF-8)]`.
-     * The bridge unpacks this into a `PseudonymKeypair`.
+     * Returns the pseudonym's 33-byte compressed point and the key id of its
+     * signing key as a [`PseudonymResult`]. The bridge rejects (fail closed,
+     * `SCP-IDENT-1055`) a point that is not a valid compressed P-256 point, a
+     * key id that is not a canonical decimal `u64` string, and a key id whose
+     * `get_public_key` fails or does not return the same 33 bytes. `sign` on
+     * that key id receives a 32-byte digest and must return a 64-byte low-`s`
+     * `r || s` that verifies under the point.
+     * A host maps the seed to `d` with the `p256_pseudonym_scalar` export
+     * (`p256PseudonymScalar` in Swift and Kotlin) and computes the point with
+     * the `p256_public_key` export (`p256PublicKey`) rather than reducing and
+     * multiplying itself.
+     *
+     * The pseudonym dies with its identity (`09-security-model.md`
+     * §9.10.4.A): `destroy_key` on `key_id` destroys it, and a derivation
+     * still in flight when `key_id` is destroyed fails with key-not-found
+     * (`SCP-CRYPTO-4006`) and stores nothing.
+     *
+     * The same (`key_id`, `context_id`) MUST return the same pseudonym key id
+     * on every call, so re-deriving names one key rather than minting another;
+     * the bridge's per-key-id point bindings grow with the distinct ids a
+     * host returns.
      */
-    func derivePseudonym(keyId: String, contextId: Data) async throws  -> Data
+    func derivePseudonym(keyId: String, contextId: Data) async throws  -> PseudonymResult
     
     /**
      * Derive a rotatable (epoch-versioned) per-context pseudonym keypair.
      *
-     * Canonical recipe (spec §9.10.4.A / §9.10.4.1): the HMAC key is the
-     * private-derived `pseudonym_secret` (HKDF over the Ed25519 private seed),
-     * NEVER the public key.
-     * `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2")`;
-     * `keypair = Ed25519_keygen(seed[0..32])` (RFC-8032 seed). Returns
-     * `[pseudonym_public_key_bytes (32) || key_id_utf8]`.
+     * Canonical recipe (§9.10.4.1): steps 1 and 3 of `derive_pseudonym`, with
+     * step 2 replaced by
+     * `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2")`
+     * where `BE64` is the 8-byte big-endian epoch, then
+     * `d = p256PseudonymScalar(seed)` and `public_key = p256PublicKey(d)`.
+     * The HMAC key is the `pseudonym_secret`, NEVER the public key. Returns a
+     * [`PseudonymResult`], checked exactly as for `derive_pseudonym`.
+     *
+     * The same (`key_id`, `context_id`, `pseudonym_epoch`) MUST return the
+     * same pseudonym key id on every call, as for `derive_pseudonym`.
+     * Destroying `key_id` destroys this pseudonym, and an in-flight
+     * derivation fails and stores nothing, as for `derive_pseudonym`
+     * (`09-security-model.md` §9.10.4.A).
      *
      * The `pseudonym_epoch` is passed through to the provider so it performs
      * the canonical v2 derivation itself. Bridges MUST NOT synthesize a
@@ -14764,9 +14939,9 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      * # Default
      *
      * Rust-side providers that do not rotate return `ScpError::Context`
-     * (SCP-CTX-2050) indicating the method is not implemented. Platform SDK
-     * adapters (Swift `AppleKeyCustody`, Kotlin `AndroidKeyCustody`) override
-     * this with real implementations.
+     * (SCP-CTX-2050) indicating the method is not implemented. A host that
+     * rotates overrides it; no in-tree Swift or Kotlin host implements this
+     * protocol yet (S0 PR8).
      *
      * **Note:** `UniFFI` callback interfaces require foreign implementations to
      * define all methods. The generated Swift protocol / Kotlin interface will
@@ -14774,10 +14949,14 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      *
      * # Errors
      *
-     * Returns `ScpError` if the key is not found, is not an Ed25519 key, or the
-     * provider does not support rotatable pseudonyms.
+     * The host returns an `ScpError` with `SCP-CRYPTO-4006` when `key_id` was
+     * destroyed or never existed, and the caller receives key-not-found
+     * (`SCP-CRYPTO-4006`). Any other host error, including the Rust default's
+     * `SCP-CTX-2050`, reaches the caller as the custody error `SCP-CRYPTO-4060`
+     * carrying the host's code and message. A returned result the bridge
+     * rejects is `SCP-IDENT-1055`, as for `derive_pseudonym`.
      */
-    func deriveRotatablePseudonym(keyId: String, contextId: Data, pseudonymEpoch: UInt64) async throws  -> Data
+    func deriveRotatablePseudonym(keyId: String, contextId: Data, pseudonymEpoch: UInt64) async throws  -> PseudonymResult
     
     /**
      * Export the raw Ed25519 private key bytes (32 bytes) for `key_id`.
@@ -14789,8 +14968,8 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      * # Default
      *
      * Returns `ScpError::Context` (SCP-CTX-2050) indicating the method is not
-     * implemented. Platform SDKs (Swift `AppleKeyCustody`, Kotlin
-     * `AndroidKeyCustody`) override this with real implementations. Third-party
+     * implemented. A host that needs it overrides it (no in-tree Swift or
+     * Kotlin host implements this protocol yet, S0 PR8). Third-party
      * `KeyCustodyProvider` implementations that do not need governance vote
      * signing may rely on the default until they add support.
      *
@@ -14800,8 +14979,12 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      *
      * # Errors
      *
-     * Returns `ScpError` if the key is not found, not exportable, or not
-     * an Ed25519 key.
+     * The host returns an `ScpError` with `SCP-CRYPTO-4006` when `key_id` was
+     * destroyed or never existed, and the caller receives key-not-found
+     * (`SCP-CRYPTO-4006`). Any other host error, including the Rust default's
+     * `SCP-CTX-2050` and a key that is not exportable or not Ed25519, reaches
+     * the caller as the custody error `SCP-CRYPTO-4060` carrying the host's
+     * code and message.
      */
     func exportSigningKeyBytes(keyId: String) async throws  -> Data
     
@@ -15049,7 +15232,7 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
             uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
         ) in
             let makeCall = {
-                () async throws -> Data in
+                () async throws -> PseudonymResult in
                 guard let uniffiObj = try? FfiConverterCallbackInterfaceKeyCustodyProvider.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
@@ -15059,11 +15242,11 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
                 )
             }
 
-            let uniffiHandleSuccess = { (returnValue: Data) in
+            let uniffiHandleSuccess = { (returnValue: PseudonymResult) in
                 uniffiFutureCallback(
                     uniffiCallbackData,
                     UniffiForeignFutureStructRustBuffer(
-                        returnValue: FfiConverterData.lower(returnValue),
+                        returnValue: FfiConverterTypePseudonymResult_lower(returnValue),
                         callStatus: RustCallStatus()
                     )
                 )
@@ -15095,7 +15278,7 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
             uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
         ) in
             let makeCall = {
-                () async throws -> Data in
+                () async throws -> PseudonymResult in
                 guard let uniffiObj = try? FfiConverterCallbackInterfaceKeyCustodyProvider.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
@@ -15106,11 +15289,11 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
                 )
             }
 
-            let uniffiHandleSuccess = { (returnValue: Data) in
+            let uniffiHandleSuccess = { (returnValue: PseudonymResult) in
                 uniffiFutureCallback(
                     uniffiCallbackData,
                     UniffiForeignFutureStructRustBuffer(
-                        returnValue: FfiConverterData.lower(returnValue),
+                        returnValue: FfiConverterTypePseudonymResult_lower(returnValue),
                         callStatus: RustCallStatus()
                     )
                 )
@@ -17246,6 +17429,60 @@ public func metadataRecordToJson(contextId: String, sequence: UInt64, signerDid:
 })
 }
 /**
+ * Maps a 32-byte §9.10.4 `context_seed` (v1 or v2) to its P-256 pseudonym
+ * scalar in `[1, n − 1]`.
+ *
+ * FIPS 186-5 A.2.1, §9.10.4:
+ * `HKDF-Expand(context_seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n − 1) + 1`,
+ * with the label fixed inside the helper. Returns the 32-byte big-endian
+ * scalar.
+ *
+ * # Errors
+ *
+ * `SCP-VALID-7005` when `context_seed` is not 32 bytes; `SCP-CRYPTO-4001` if
+ * the reduction fails (unreachable for a 32-byte seed).
+ */
+public func p256PseudonymScalar(contextSeed: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_p256_pseudonym_scalar(
+        FfiConverterData.lower(contextSeed),$0
+    )
+})
+}
+/**
+ * The 33-byte SEC1 compressed public key `d·G` of a 32-byte scalar.
+ *
+ * # Errors
+ *
+ * `SCP-VALID-7005` when `scalar` is not 32 bytes; `SCP-CRYPTO-4001` when it
+ * is zero or not below `n`.
+ */
+public func p256PublicKey(scalar: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_p256_public_key(
+        FfiConverterData.lower(scalar),$0
+    )
+})
+}
+/**
+ * Signs a 32-byte digest with the scalar: RFC 6979 deterministic nonce
+ * (`h1 = digest`), low-`s` normalized, returned as the 64-byte `r || s`
+ * (§9.5).
+ *
+ * # Errors
+ *
+ * `SCP-VALID-7005` when `scalar` or `digest` is not 32 bytes;
+ * `SCP-CRYPTO-4001` when the scalar is out of range or signing fails.
+ */
+public func p256SignPrehashRfc6979(scalar: Data, digest: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_p256_sign_prehash_rfc6979(
+        FfiConverterData.lower(scalar),
+        FfiConverterData.lower(digest),$0
+    )
+})
+}
+/**
  * Checks whether the provenance chain depth is within the allowed limit.
  */
 public func provenanceCheckChainDepth(chainDepth: UInt8, maxDepth: UInt8?) -> Bool  {
@@ -17634,6 +17871,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_metadata_record_to_json() != 58960) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_p256_pseudonym_scalar() != 7172) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_p256_public_key() != 39495) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_p256_sign_prehash_rfc6979() != 49215) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_provenance_check_chain_depth() != 15774) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -17748,7 +17994,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_relay_port() != 32247) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_relay_url() != 19628) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_relay_url() != 35261) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_rollback_deploy() != 34442) {
@@ -17784,7 +18030,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_add_checkpoint_cosignature() != 48565) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_address_resolve() != 64098) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_address_resolve() != 23956) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_aggregate_trust_input() != 37504) {
@@ -17934,7 +18180,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_budget_remaining() != 32105) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_verify_payment_receipts() != 16710) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_verify_payment_receipts() != 40702) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_evaluate_invitation() != 11385) {
@@ -18255,10 +18501,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_response() != 16753) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 51192) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 59265) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_evaluate() != 33478) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_evaluate() != 17617) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_mint() != 2465) {
@@ -18315,31 +18561,31 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 4506) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_assert_request() != 17302) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_assert_request() != 3156) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 52852) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 13127) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 604) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 51576) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_destroy_key() != 15699) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_destroy_key() != 41195) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_generate_keypair() != 22511) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_generate_keypair() != 65380) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_dh_agree() != 52565) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 38646) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 49611) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 25367) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 17282) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 55617) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 60571) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_custody_type() != 30807) {
