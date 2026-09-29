@@ -187,9 +187,11 @@ abstract class ScpViewModel : ViewModel() {
      * nothing. Cancelling it would instead start every later [cleanupScope] launch already
      * cancelled. [launchLeave] starts undispatched, so that coroutine still runs, but each
      * `leave` then throws [CancellationException] from the bridge's `withContext` before its
-     * FFI call, and that exception reaches [onCleanupFailure] when no other cleanup coroutine
-     * holds the failure lock. A context that [trackContext] registers after [onCleared] would
-     * then never be left.
+     * FFI call. That exception reaches [onCleanupFailure] only when [cleanupFailureLock] is
+     * free: a cancelled coroutine that finds the lock held gets a [CancellationException] from
+     * `Mutex.lock` instead of waiting, and its loop ends with no [onCleanupFailure] call and
+     * no `leave` for its remaining contexts. A context that [trackContext] registers after
+     * [onCleared] would then never be left.
      */
     override fun onCleared() {
         super.onCleared()
