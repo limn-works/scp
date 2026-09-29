@@ -4620,14 +4620,48 @@ pub(crate) struct McpClientEntry {
     /// parked thread.
     pub(crate) client:
         Arc<tokio::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>>,
-    /// A stdio client's server process, which `mcp_client_disconnect` kills
-    /// directly: an in-flight call's clone of `client` would otherwise keep
-    /// the process alive, and a blocking thread parked on its stdout, for as
-    /// long as the server stays silent. `None` for an SSE client: its POST
-    /// read has no timeout, and a disconnect has no handle that ends it, so
-    /// the one call in flight against a silent SSE server holds its blocking
-    /// thread until the server answers or closes the connection.
-    pub(crate) stdio_server: Option<Arc<std::sync::Mutex<std::process::Child>>>,
+    /// A stdio client's server process, which the entry's `Drop` stops
+    /// through [`stop_stdio_server`], so every path that drops the entry (a
+    /// disconnect, the registry clear at instance shutdown, the instance's
+    /// drop) kills the server: an in-flight call's clone of `client` would
+    /// otherwise keep the process alive, and a blocking thread parked on its
+    /// stdout, for as long as the server stays silent. `None` for an SSE
+    /// client: its POST read has no timeout, and a disconnect has no handle
+    /// that ends it, so the one call in flight against a silent SSE server
+    /// holds its blocking thread until the server answers or closes the
+    /// connection.
+    pub(crate) stdio_server: Option<Arc<std::sync::Mutex<Option<std::process::Child>>>>,
+}
+
+impl Drop for McpClientEntry {
+    fn drop(&mut self) {
+        // A stdio server, and every process in its process group, is dead
+        // once the entry drops, even while a call on the handle is in flight;
+        // that call then fails on the closed stdout.
+        if let Some(server) = &self.stdio_server {
+            stop_stdio_server(server);
+        }
+    }
+}
+
+/// Kills a stdio server's process group and reaps the server, once.
+///
+/// The server leaves its slot under the slot's lock, so a later call (the
+/// transport's `Drop` after the entry's) finds the slot empty and signals
+/// nothing. A second `stop_server_process` on the same reaped `Child` would
+/// not be safe: it decides whether to signal the group from a `waitid` on the
+/// raw pid, and once the server is reaped that pid can belong to another
+/// child of this process, such as a second stdio server leading its own
+/// group. The lock is held until the server is reaped, so a disconnect
+/// returns only after the server is gone even when the transport's drop runs
+/// concurrently.
+fn stop_stdio_server(slot: &std::sync::Mutex<Option<std::process::Child>>) {
+    let mut slot = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(child) = slot.take() {
+        scp_mcp::stdio::stop_server_process(&std::sync::Mutex::new(child));
+    }
 }
 
 /// Returns a reference to this `UniffiBridgeInstance`'s MCP server registry.
@@ -4707,8 +4741,9 @@ impl scp_mcp::client::McpTransport for McpUniFFITransportWrapper {
 /// Stdio MCP transport: communicates with a subprocess via stdin/stdout.
 pub(crate) struct McpStdioTransport {
     /// The server process, apart from the pipes an in-flight call holds, so
-    /// a disconnect can stop it while a call waits on its stdout.
-    child: Arc<std::sync::Mutex<std::process::Child>>,
+    /// a disconnect can stop it while a call waits on its stdout. The slot
+    /// is emptied by the one [`stop_stdio_server`] call that kills it.
+    child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
     inner: std::sync::Mutex<McpStdioTransportInner>,
 }
 
@@ -4748,7 +4783,12 @@ impl McpStdioTransport {
         // `stop_server_process` also reaches the processes it starts: a
         // package runner (`npx`, `uvx`) starts the real server as a child
         // that inherits the stdout pipe, and an in-flight call ends only
-        // once every holder of that pipe is dead.
+        // once every holder of that pipe is dead. That group is not the
+        // terminal's foreground group, so a Ctrl-C or hangup reaches the host
+        // and not the server. A host killed that way runs no destructor; the
+        // server then sees EOF on stdin, which the MCP stdio transport names
+        // as its shutdown signal, and a server that ignores that EOF outlives
+        // the host.
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
         let mut child = command
@@ -4763,13 +4803,13 @@ impl McpStdioTransport {
         let reader = std::io::BufReader::new(stdout);
 
         Ok(Self {
-            child: Arc::new(std::sync::Mutex::new(child)),
+            child: Arc::new(std::sync::Mutex::new(Some(child))),
             inner: std::sync::Mutex::new(McpStdioTransportInner { stdin, reader }),
         })
     }
 
     /// The server process, for [`McpClientEntry::stdio_server`].
-    fn server_process(&self) -> Arc<std::sync::Mutex<std::process::Child>> {
+    fn server_process(&self) -> Arc<std::sync::Mutex<Option<std::process::Child>>> {
         Arc::clone(&self.child)
     }
 }
@@ -4837,7 +4877,7 @@ impl scp_mcp::client::McpTransport for McpStdioTransport {
 
 impl Drop for McpStdioTransport {
     fn drop(&mut self) {
-        scp_mcp::stdio::stop_server_process(&self.child);
+        stop_stdio_server(&self.child);
     }
 }
 
@@ -16654,9 +16694,9 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `mcp_client_disconnect`.
     ///
-    /// Routes through the module-level MCP client registry. A stdio client's
-    /// server process group, which holds the processes the server started,
-    /// is dead when this returns, even while a call on the handle is in
+    /// Routes through the module-level MCP client registry. Dropping the
+    /// entry stops a stdio client's server, so its process group, which holds
+    /// the processes the server started, is dead when this returns, even while a call on the handle is in
     /// flight; that call then fails on the closed stdout. A disconnect does
     /// not end a call in flight on an SSE client: that call waits until the
     /// server answers its POST or closes the connection.
@@ -16670,9 +16710,7 @@ impl Scp {
                 code: codes::TRANS_5019.to_owned(),
             });
         };
-        if let Some(server) = entry.stdio_server {
-            scp_mcp::stdio::stop_server_process(&server);
-        }
+        drop(entry);
 
         Ok(())
     }
@@ -23103,14 +23141,38 @@ mod tests {
     /// A `tools/list` in flight against a silent stdio server holds a blocking
     /// thread and its own clone of the client, not the registry shard, so a
     /// disconnect of the same handle returns at once, and it kills the server
-    /// process group, so the in-flight call ends on the closed stdout. The
-    /// stub server writes a notification before its `initialize` response,
-    /// which the client reads past, then starts a `sleep` in the background
-    /// and waits on it. The `sleep` inherits the stdout pipe, as the real
-    /// server a package runner (`npx`, `uvx`) starts does, so the call ends
-    /// only if the disconnect kills the server's descendants too.
+    /// process group, so the in-flight call ends on the closed stdout.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_client_disconnect_does_not_wait_on_an_in_flight_call() {
+        in_flight_call_ends_on(Teardown::Disconnect).await;
+    }
+
+    /// The instance-shutdown twin of
+    /// `mcp_client_disconnect_does_not_wait_on_an_in_flight_call`: the
+    /// shutdown clears the client registry while a `tools/list` is in flight,
+    /// and the cleared entry's drop kills the server process group, though
+    /// the in-flight call still holds its clone of the client.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_client_registry_clear_on_shutdown_kills_an_in_flight_server() {
+        in_flight_call_ends_on(Teardown::Shutdown).await;
+    }
+
+    /// How [`in_flight_call_ends_on`] removes the client entry.
+    #[derive(Clone, Copy)]
+    enum Teardown {
+        Disconnect,
+        Shutdown,
+    }
+
+    /// Runs a `tools/list` against a silent stub server and removes the
+    /// client entry mid-call through `teardown`. The stub server writes a
+    /// notification before its `initialize` response, which the client reads
+    /// past, then starts a `sleep` in the background and waits on it. The
+    /// `sleep` inherits the stdout pipe, as the real server a package runner
+    /// (`npx`, `uvx`) starts does, so the call ends only if the teardown kills
+    /// the server's descendants too. The server's slot is empty afterwards,
+    /// so the transport's later drop signals no pid.
+    async fn in_flight_call_ends_on(teardown: Teardown) {
         let scp = scp_test();
         let mut allowlist = scp_mcp::allowlist::StdioAllowlist::new_with_defaults();
         allowlist.configure(&["sh"]).expect("allow sh");
@@ -23144,9 +23206,13 @@ mod tests {
             tokio::join!(scp.mcp_client_list_tools(handle.clone()), async {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 let started = std::time::Instant::now();
-                scp.mcp_client_disconnect(handle.clone())
-                    .await
-                    .expect("disconnect a known handle");
+                match teardown {
+                    Teardown::Disconnect => scp
+                        .mcp_client_disconnect(handle.clone())
+                        .await
+                        .expect("disconnect a known handle"),
+                    Teardown::Shutdown => scp.shutdown(1_000).await.expect("shut down"),
+                }
                 started.elapsed()
             })
         })
@@ -23154,27 +23220,47 @@ mod tests {
         if joined.is_err() {
             // Free the parked blocking thread, or the runtime's shutdown
             // waits on it for the stub's whole sleep.
-            scp_mcp::stdio::stop_server_process(&server);
+            stop_stdio_server(&server);
         }
-        let (listed, disconnect_took) =
-            joined.expect("the in-flight call must end once disconnect kills the server's group");
+        let (listed, teardown_took) =
+            joined.expect("the in-flight call must end once the teardown kills the server's group");
+        if matches!(teardown, Teardown::Disconnect) {
+            assert!(
+                teardown_took < std::time::Duration::from_secs(1),
+                "disconnect waited {teardown_took:?} on the in-flight call"
+            );
+        }
         assert!(
-            disconnect_took < std::time::Duration::from_secs(1),
-            "disconnect waited {disconnect_took:?} on the in-flight call"
+            mcp_client_registry(&scp.inner).get(&handle).is_none(),
+            "the teardown must remove the client entry"
         );
         assert!(
-            server
-                .lock()
-                .expect("server lock")
-                .try_wait()
-                .expect("query the server process")
-                .is_some(),
-            "disconnect must kill the stdio server process"
+            server.lock().expect("server lock").is_none(),
+            "the entry's drop must stop the stdio server and empty its slot"
         );
         assert!(
             listed.is_err(),
             "the killed stub server sent no tools/list response"
         );
+    }
+
+    /// A stop takes the server out of its slot, so a second stop (the
+    /// transport's drop after the entry's) finds nothing to signal and never
+    /// peeks a pid the kernel may have handed to another child.
+    #[test]
+    fn stop_stdio_server_stops_the_server_once() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let slot = std::sync::Mutex::new(Some(child));
+        stop_stdio_server(&slot);
+        assert!(
+            slot.lock().expect("slot lock").is_none(),
+            "a stop must empty the slot"
+        );
+        stop_stdio_server(&slot);
+        assert!(slot.lock().expect("slot lock").is_none());
     }
 
     /// A call queued behind one that a silent server stalls waits on the
@@ -23244,7 +23330,7 @@ mod tests {
             })
             .await;
             if joined.is_err() {
-                scp_mcp::stdio::stop_server_process(&server);
+                stop_stdio_server(&server);
             }
             let (first, second, probe) =
                 joined.expect("both calls must end once disconnect kills the server");
