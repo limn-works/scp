@@ -20,6 +20,10 @@
  * and never reach the process as an uncaught exception or an unhandled
  * rejection.
  *
+ * A failed `getPublicKey(keyId)` confirmation call inside a pseudonym bind
+ * (a host error with any code, key-not-found included, or a wrongly typed
+ * return) rejects the derivation with `SCP-IDENT-1055` (ADR-021 2026-09-27).
+ *
  * It also runs the §25.19 Vector 30 and 31 identity scalars through the
  * bridge's production pseudonym derivation and compares each v1 routing id to
  * the spec.
@@ -28,7 +32,7 @@
 import { describe, expect, test } from "bun:test";
 import * as crypto from "node:crypto";
 
-import { CryptoError, mapBridgeError } from "../src/errors";
+import { CryptoError, IdentityError, mapBridgeError } from "../src/errors";
 import { toNativeCustodyProvider } from "../src/internal/custody-adapter";
 import { loadNativeAddon } from "../src/internal/native";
 import type { KeyCustodyProvider, PseudonymResult } from "../src/scp";
@@ -65,7 +69,7 @@ try {
 }
 
 /** A host fault the store injects into pseudonym signing or key ids. */
-type Fault = "highS" | "fixedId" | "signThrows" | "sign4001";
+type Fault = "highS" | "fixedId" | "signThrows" | "sign4001" | "lookup4006" | "lookupThrows";
 
 /** The host's key store, with a count of `sign` calls that reach it. */
 class Store {
@@ -108,6 +112,10 @@ class StoreKeychain implements KeyCustodyProvider {
 
   getPublicKey(keyId: string): Uint8Array {
     const d = this.store.pseudonyms.get(keyId);
+    if (d !== undefined && this.fault === "lookup4006") {
+      throw new CryptoError(`lookup lost ${keyId}`, "SCP-CRYPTO-4006");
+    }
+    if (d !== undefined && this.fault === "lookupThrows") throw new Error(`lookup lost ${keyId}`);
     if (d !== undefined) return p256Compressed(d);
     if (this.store.seeds.has(keyId)) return new Uint8Array(32);
     throw new Error(`unknown key id: ${keyId}`);
@@ -262,6 +270,22 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     expect(mapped).toBeInstanceOf(CryptoError);
     expect(mapped.code).toBe("SCP-CRYPTO-4006");
     expect((await custody.sign(kept.keyId, DIGEST)).length).toBe(64);
+  });
+
+  test("a failed getPublicKey(keyId) confirmation rejects the pseudonym with SCP-IDENT-1055", async () => {
+    for (const fault of ["lookup4006", "lookupThrows"] as const) {
+      const custody = adapter(new Store(), fault);
+      const identity = await custody.generateKeypair();
+      const mapped = await rejectionOf(() => custody.derivePseudonym(identity, "ctx"));
+      expect(mapped).toBeInstanceOf(IdentityError);
+      expect(mapped.code).toBe("SCP-IDENT-1055");
+      expect(mapped.message).toContain("lookup lost");
+    }
+    const wrongType = adapterWith(new Store(), { getPublicKey: () => 42 });
+    const identity = await wrongType.generateKeypair();
+    const mapped = await rejectionOf(() => wrongType.derivePseudonym(identity, "ctx"));
+    expect(mapped).toBeInstanceOf(IdentityError);
+    expect(mapped.code).toBe("SCP-IDENT-1055");
   });
 
   test("a host method that throws another error rejects with a custody error", async () => {

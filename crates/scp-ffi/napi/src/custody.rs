@@ -229,6 +229,17 @@ fn host_value<R: HostOutcome>(
     method: &str,
     call: napi::Result<R>,
 ) -> Result<R::Value, PlatformError> {
+    host_value_with(method, call, scp_ffi_common::custody_parse::host_failure)
+}
+
+/// [`host_value`] with the host-reported failure mapped by `on_host_failure`
+/// (given `method`, the host's code and its message) in place of the shared
+/// custody mapping.
+fn host_value_with<R: HostOutcome>(
+    method: &str,
+    call: napi::Result<R>,
+    on_host_failure: fn(&str, Option<&str>, &str) -> PlatformError,
+) -> Result<R::Value, PlatformError> {
     let outcome = call.map_err(|e| {
         PlatformError::CustodyError(format!("KeyCustodyProvider.{method} call failed: {e}"))
     })?;
@@ -237,7 +248,7 @@ fn host_value<R: HostOutcome>(
         Ok(None) => Err(PlatformError::CustodyError(format!(
             "KeyCustodyProvider.{method} reported success with no value"
         ))),
-        Err((code, message)) => Err(scp_ffi_common::custody_parse::host_failure(
+        Err((code, message)) => Err(on_host_failure(
             method,
             code.as_deref(),
             message.as_deref().unwrap_or_default(),
@@ -383,7 +394,11 @@ impl NapiCallbackKeyCustody {
     ///
     /// # Errors
     ///
-    /// Returns [`PlatformError::CustodyError`] on any of those failures.
+    /// Returns [`PlatformError::PseudonymRejected`] (`SCP-IDENT-1055`) on any
+    /// of those failures, including a failed `getPublicKey(keyId)` call: a
+    /// host failure with any code (`SCP-CRYPTO-4006` too), a failure result
+    /// with no value, or a call the bridge could not complete (ADR-021
+    /// 2026-09-27 amendment). The host's message stays in the text.
     async fn bind_pseudonym(
         &self,
         method: &str,
@@ -394,13 +409,15 @@ impl NapiCallbackKeyCustody {
             &result.public_key,
             &result.key_id,
         )?;
-        let host_public_key = host_value(
-            "get_public_key",
+        let host_public_key = host_value_with(
+            method,
             self.tsfns
                 .get_public_key
                 .call_async(pseudonym.key_handle().id().to_string())
                 .await,
-        )?;
+            scp_ffi_common::custody_parse::pseudonym_lookup_failure,
+        )
+        .map_err(|e| scp_ffi_common::custody_parse::pseudonym_lookup_error(method, e))?;
         self.pseudonyms.bind(method, &pseudonym, &host_public_key)?;
         Ok(pseudonym)
     }

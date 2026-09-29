@@ -60,6 +60,39 @@ pub fn host_failure(method: &str, code: Option<&str>, message: &str) -> Platform
     ))
 }
 
+/// Maps a host failure of a pseudonym bind's `get_public_key(key_id)` call to
+/// [`PlatformError::PseudonymRejected`], one mapping for the three bridges.
+///
+/// ADR-021's 2026-09-27 amendment binds a host pseudonym only when
+/// `get_public_key(key_id)` returns the derived 33 bytes and otherwise fails
+/// with `SCP-IDENT-1055`; a failed call is one of those otherwise cases, so a
+/// `SCP-CRYPTO-4006` from the host is a rejected pseudonym here, not
+/// [`PlatformError::KeyNotFound`]. The host's code and message stay in the text.
+/// `method` is the derive method whose result is being bound.
+#[must_use]
+pub fn pseudonym_lookup_failure(method: &str, code: Option<&str>, message: &str) -> PlatformError {
+    let code = code.map(|c| format!(" ({c})")).unwrap_or_default();
+    PlatformError::PseudonymRejected(format!(
+        "KeyCustodyProvider.{method}: get_public_key(key_id) failed{code}: {message}"
+    ))
+}
+
+/// Maps a bridge-side failure of a pseudonym bind's `get_public_key(key_id)`
+/// call to [`PlatformError::PseudonymRejected`].
+///
+/// Covers a call the bridge could not complete, a host success with no value,
+/// and a wrongly typed value; the original text is kept. An error that is
+/// already a rejected pseudonym passes through unchanged.
+#[must_use]
+pub fn pseudonym_lookup_error(method: &str, e: PlatformError) -> PlatformError {
+    match e {
+        PlatformError::PseudonymRejected(_) => e,
+        other => PlatformError::PseudonymRejected(format!(
+            "KeyCustodyProvider.{method}: get_public_key(key_id) failed: {other}"
+        )),
+    }
+}
+
 /// Parses a numeric key-id string (as returned by a `KeyCustodyProvider`) into
 /// a [`KeyHandle`].
 ///
@@ -287,6 +320,30 @@ mod tests {
                 }
                 other => panic!("{code:?} must be a custody error, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn pseudonym_lookup_failure_rejects_every_host_code_with_its_text() {
+        use crate::error_codes as codes;
+        for code in [Some(codes::CRYPTO_4006), Some(codes::CRYPTO_4060), None] {
+            match pseudonym_lookup_failure("derive_pseudonym", code, "no such key") {
+                PlatformError::PseudonymRejected(m) => {
+                    assert!(m.contains("get_public_key(key_id) failed"), "{m}");
+                    assert!(m.contains("no such key"), "{m}");
+                    if let Some(c) = code {
+                        assert!(m.contains(c), "{m}");
+                    }
+                }
+                other => panic!("{code:?} must be a rejected pseudonym, got {other:?}"),
+            }
+        }
+        match pseudonym_lookup_error(
+            "derive_pseudonym",
+            PlatformError::CustodyError("call failed".to_owned()),
+        ) {
+            PlatformError::PseudonymRejected(m) => assert!(m.contains("call failed"), "{m}"),
+            other => panic!("must be a rejected pseudonym, got {other:?}"),
         }
     }
 

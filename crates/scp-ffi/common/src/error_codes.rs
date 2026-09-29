@@ -260,9 +260,9 @@ pub const IDENT_1054: &str = "SCP-IDENT-1054";
 /// A host-derived pseudonym the bridge rejects.
 ///
 /// The bridge rejects a malformed key id or point, a `get_public_key(key_id)`
-/// that returns a different point, or a key id already bound to another point
-/// (ADR-021 2026-09-27 amendment). Custody failures during derivation carry
-/// [`CRYPTO_4006`] or [`CRYPTO_4060`].
+/// that fails with any code or returns a different point, or a key id already
+/// bound to another point (ADR-021 2026-09-27 amendment). Custody failures of
+/// the derive call itself carry [`CRYPTO_4006`] or [`CRYPTO_4060`].
 pub const IDENT_1055: &str = "SCP-IDENT-1055";
 /// Pseudonym derivation: no custody provider available.
 pub const IDENT_1056: &str = "SCP-IDENT-1056";

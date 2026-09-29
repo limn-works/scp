@@ -285,12 +285,29 @@ impl PyKeyCustodyProvider {
     where
         T: for<'py> pyo3::FromPyObject<'py>,
     {
+        self.call_str_with(method_name, key_id, |code, message| {
+            scp_ffi_common::custody_parse::host_failure(method_name, code, message)
+        })
+    }
+
+    /// [`Self::call_str`] with a raised exception mapped by `on_raise` (given
+    /// the exception's `code` attribute and its text) in place of the shared
+    /// custody mapping.
+    fn call_str_with<T>(
+        &self,
+        method_name: &str,
+        key_id: &str,
+        on_raise: impl FnOnce(Option<&str>, &str) -> PlatformError,
+    ) -> Result<T, PlatformError>
+    where
+        T: for<'py> pyo3::FromPyObject<'py>,
+    {
         Python::with_gil(|py| {
             let result = self
                 .obj
                 .bind(py)
                 .call_method1(method_name, (key_id,))
-                .map_err(|e| Self::call_err(py, method_name, &e))?;
+                .map_err(|e| on_raise(Self::exc_code(py, &e).as_deref(), &e.to_string()))?;
             result
                 .extract::<T>()
                 .map_err(|e| Self::type_err(method_name, &e))
@@ -365,12 +382,19 @@ impl PyKeyCustodyProvider {
     /// exception whose `code` attribute is `SCP-CRYPTO-4006` is key-not-found,
     /// and any other exception is a custody error carrying its code and text.
     fn call_err(py: Python<'_>, method_name: &str, e: &PyErr) -> PlatformError {
-        let code = e
-            .value(py)
+        scp_ffi_common::custody_parse::host_failure(
+            method_name,
+            Self::exc_code(py, e).as_deref(),
+            &e.to_string(),
+        )
+    }
+
+    /// The raised exception's `code` attribute, when it is a string.
+    fn exc_code(py: Python<'_>, e: &PyErr) -> Option<String> {
+        e.value(py)
             .getattr("code")
             .ok()
-            .and_then(|c| c.extract::<String>().ok());
-        scp_ffi_common::custody_parse::host_failure(method_name, code.as_deref(), &e.to_string())
+            .and_then(|c| c.extract::<String>().ok())
     }
 
     fn type_err(method_name: &str, e: &PyErr) -> PlatformError {
@@ -461,6 +485,11 @@ impl PyCallbackKeyCustody {
 
     /// Validates a host `(public_key, key_id)` pseudonym return and binds the
     /// key id to the point once `get_public_key(key_id)` reports the same bytes.
+    ///
+    /// Every failure of that `get_public_key(key_id)` call, whether a raised
+    /// exception with any `code` (`SCP-CRYPTO-4006` too) or a value that is not
+    /// `bytes`, is [`PlatformError::PseudonymRejected`] (`SCP-IDENT-1055`) with
+    /// the host's text kept (ADR-021 2026-09-27 amendment).
     fn bind_pseudonym(
         &self,
         method: &str,
@@ -470,7 +499,14 @@ impl PyCallbackKeyCustody {
             scp_ffi_common::custody_parse::parse_pseudonym(method, &public_key, &key_id)?;
         let host_public_key: Vec<u8> = self
             .provider
-            .call_str("get_public_key", &pseudonym.key_handle().id().to_string())?;
+            .call_str_with(
+                "get_public_key",
+                &pseudonym.key_handle().id().to_string(),
+                |code, message| {
+                    scp_ffi_common::custody_parse::pseudonym_lookup_failure(method, code, message)
+                },
+            )
+            .map_err(|e| scp_ffi_common::custody_parse::pseudonym_lookup_error(method, e))?;
         self.pseudonyms.bind(method, &pseudonym, &host_public_key)?;
         Ok(pseudonym)
     }
@@ -700,7 +736,10 @@ pub(crate) mod test_fakes {
     /// a compact affine P-256. Pseudonym key ids are deterministic per
     /// (identity key id, context, epoch), as the provider contract requires.
     /// `fault` makes the pseudonym path misbehave in one named way: `legacy32`,
-    /// `wrong_public_key`, `high_s`, or `fixed_id` (every pseudonym gets id 777).
+    /// `wrong_public_key`, `high_s`, `fixed_id` (every pseudonym gets id 777),
+    /// or a `get_public_key` of a pseudonym key id that raises with
+    /// `SCP-CRYPTO-4006` (`lookup_4006`) or `SCP-CRYPTO-4060` (`lookup_4060`),
+    /// or returns `None` (`lookup_none`).
     const FAKE_PROVIDER_PY: &std::ffi::CStr = c"
 import hashlib, hmac
 
@@ -782,6 +821,12 @@ class FakeCustody:
 
     def get_public_key(self, key_id):
         if key_id in self._pseudonyms:
+            if self._fault == 'lookup_4006':
+                raise HostError('lookup lost ' + key_id, 'SCP-CRYPTO-4006')
+            if self._fault == 'lookup_4060':
+                raise HostError('lookup lost ' + key_id, 'SCP-CRYPTO-4060')
+            if self._fault == 'lookup_none':
+                return None
             point = compressed(self._pseudonyms[key_id])
             if self._fault == 'wrong_public_key':
                 point = bytes([point[0] ^ 1]) + point[1:]
@@ -1231,6 +1276,38 @@ mod tests {
                 .await
                 .expect_err("high-s host signature"),
         );
+    }
+
+    /// ADR-021 2026-09-27: every failure of the `get_public_key(key_id)`
+    /// confirmation call, including a raise with the key-not-found code, rejects
+    /// the pseudonym with `SCP-IDENT-1055` and keeps the host's message.
+    #[tokio::test]
+    async fn ffi_custody_callback_pseudonym_lookup_failure_is_ident_1055() {
+        use scp_ffi_common::error_codes as codes;
+        for fault in ["lookup_4006", "lookup_4060", "lookup_none"] {
+            let custody = FfiKeyCustody::Callback(fake_py_custody(Some(fault)));
+            let handle = custody
+                .generate_keypair(KeyType::Ed25519)
+                .await
+                .expect("key");
+            let err = custody
+                .derive_pseudonym(&handle, b"ctx")
+                .await
+                .expect_err(fault);
+            match &err {
+                PlatformError::PseudonymRejected(m) => assert!(
+                    fault == "lookup_none" || m.contains("lookup lost"),
+                    "{fault}: {m}"
+                ),
+                other => panic!("{fault}: expected PseudonymRejected, got {other:?}"),
+            }
+            match crate::error::ScpPyError::from(err) {
+                crate::error::ScpPyError::IdentityError { code, .. } => {
+                    assert_eq!(code, codes::IDENT_1055, "{fault}");
+                }
+                other => panic!("{fault}: expected IDENT_1055, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]

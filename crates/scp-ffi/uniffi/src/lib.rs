@@ -413,8 +413,8 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// Returns the pseudonym's 33-byte compressed point and the key id of its
     /// signing key as a [`PseudonymResult`]. The bridge rejects (fail closed,
     /// `SCP-IDENT-1055`) a point that is not a valid compressed P-256 point, a
-    /// non-numeric key id, and a key id whose `get_public_key` does not return
-    /// the same 33 bytes. `sign` on that key id receives a 32-byte digest and
+    /// non-numeric key id, and a key id whose `get_public_key` fails or does
+    /// not return the same 33 bytes. `sign` on that key id receives a 32-byte digest and
     /// must return a 64-byte low-`s` `r || s` that verifies under the point.
     /// A host maps the seed with [`crate::p256_host::p256_seed_to_scalar`]
     /// rather than reducing it itself.

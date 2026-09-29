@@ -481,7 +481,7 @@ async fn publish_to_resolver_dht_for<C: KeyCustody + Send + Sync>(
 /// custody derivation failure → its custody code ([`ScpError::custody`]):
 /// key-not-found → `CRYPTO_4006` (§9.10.4.A), any other custody failure →
 /// `CRYPTO_4060`. A host pseudonym whose point is not a valid 33-byte P-256
-/// point, or whose `get_public_key(key_id)` differs from it, fails in
+/// point, or whose `get_public_key(key_id)` fails or differs from it, fails in
 /// `CallbackKeyCustody::bind_pseudonym` → `IDENT_1055`.
 ///
 /// Callers gate this themselves: `context_create`/`context_join` skip it for
@@ -701,6 +701,10 @@ impl CallbackKeyCustody {
 
     /// Validates a host pseudonym return and binds its key id to the point
     /// after the host's `get_public_key(key_id)` reports the same 33 bytes.
+    ///
+    /// A failed `get_public_key(key_id)` call, with any code (`SCP-CRYPTO-4006`
+    /// too), is [`PlatformError::PseudonymRejected`] (`SCP-IDENT-1055`) with the
+    /// host's code and message kept (ADR-021 2026-09-27 amendment).
     async fn bind_pseudonym(
         &self,
         method: &str,
@@ -715,7 +719,13 @@ impl CallbackKeyCustody {
             .provider
             .get_public_key(pseudonym.key_handle().id().to_string())
             .await
-            .map_err(|e| host_err(method, &e))?;
+            .map_err(|e| {
+                scp_ffi_common::custody_parse::pseudonym_lookup_failure(
+                    method,
+                    Some(e.code()),
+                    &e.to_string(),
+                )
+            })?;
         self.pseudonyms.bind(method, &pseudonym, &host_public_key)?;
         Ok(pseudonym)
     }
@@ -24342,6 +24352,12 @@ mod tests {
         /// `sign` fails with the generic `SCP-CRYPTO-4001`, which is not the
         /// key-not-found code.
         SignFails4001,
+        /// `get_public_key(key_id)` of a pseudonym key id fails with the
+        /// key-not-found code `SCP-CRYPTO-4006`.
+        LookupFails4006,
+        /// `get_public_key(key_id)` of a pseudonym key id fails with the generic
+        /// `SCP-CRYPTO-4060`.
+        LookupFails4060,
     }
 
     impl ProdLikeCustody {
@@ -24479,6 +24495,17 @@ mod tests {
 
         async fn get_public_key(&self, key_id: String) -> Result<Vec<u8>, ScpError> {
             if let Some(pseudonym) = self.pseudonym_for(&key_id) {
+                let code = match self.fault {
+                    PseudonymFault::LookupFails4006 => Some(codes::CRYPTO_4006),
+                    PseudonymFault::LookupFails4060 => Some(codes::CRYPTO_4060),
+                    _ => None,
+                };
+                if let Some(code) = code {
+                    return Err(ScpError::Crypto {
+                        msg: format!("host lookup of {key_id} failed"),
+                        code: code.to_owned(),
+                    });
+                }
                 let mut point = pseudonym.public_key().to_compressed();
                 if self.fault == PseudonymFault::WrongPublicKey {
                     // The other point with the same x: still valid, not the one derived.
@@ -24700,6 +24727,27 @@ mod tests {
         match derive_member_pseudonym_required(&identity, "ctx").await {
             Err(ScpError::Identity { code, .. }) => assert_eq!(code, codes::IDENT_1055),
             other => panic!("expected IDENT_1055, got {other:?}"),
+        }
+    }
+
+    /// ADR-021 2026-09-27: a failed `get_public_key(key_id)` confirmation call
+    /// rejects the pseudonym with SCP-IDENT-1055, whether the host's code is
+    /// key-not-found (`SCP-CRYPTO-4006`) or generic, and keeps the host's text.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_public_key_lookup_failure_is_ident_1055() {
+        for fault in [
+            PseudonymFault::LookupFails4006,
+            PseudonymFault::LookupFails4060,
+        ] {
+            let (identity, _) = prod_like_identity(fault).await;
+            match derive_member_pseudonym_required(&identity, "ctx").await {
+                Err(ScpError::Identity { code, msg }) => {
+                    assert_eq!(code, codes::IDENT_1055);
+                    assert!(msg.contains("host lookup of"), "{msg}");
+                }
+                other => panic!("expected IDENT_1055, got {other:?}"),
+            }
         }
     }
 

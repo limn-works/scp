@@ -121,8 +121,10 @@ class KeyCustodyProvider(Protocol):
     pseudonym derivation inside ``context_create`` and the identity key reads
     and signatures of identity operations. There are two exceptions:
     ``SCP-IDENT-1055``, reported when the bridge rejects the pseudonym a
-    :meth:`derive_pseudonym` call returned, and ``SCP-IDENT-1037``, which
-    ``scpid_sign`` reports for any custody failure (spec §3.11.4).
+    :meth:`derive_pseudonym` call returned (including when
+    :meth:`get_public_key` on its key id raises, whatever the ``code``), and
+    ``SCP-IDENT-1037``, which ``scpid_sign`` reports for any custody failure
+    (spec §3.11.4).
     """
 
     def generate_keypair(self, key_type: str) -> str:
@@ -170,7 +172,8 @@ class KeyCustodyProvider(Protocol):
         Returns ``(public_key, key_id)``: the 33-byte SEC1 compressed P-256
         pseudonym point and the numeric id of its signing key. The bridge
         rejects (``SCP-IDENT-1055``) a point that is not a valid compressed
-        P-256 point, and a key id whose :meth:`get_public_key` differs from it.
+        P-256 point, and a key id whose :meth:`get_public_key` raises or
+        differs from it.
         The same ``(key_id, context_id)`` MUST return the same pseudonym key
         id on every call, so re-deriving names one key rather than minting
         another.

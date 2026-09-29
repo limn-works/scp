@@ -490,7 +490,8 @@ export interface PseudonymResult {
  * including the pseudonym derivation inside `createContext` and the identity
  * key reads and signatures of identity operations. There are two exceptions:
  * `SCP-IDENT-1055`, reported when the bridge rejects the pseudonym a
- * {@link derivePseudonym} call returned, and `SCP-IDENT-1037`, which
+ * {@link derivePseudonym} call returned (including when `getPublicKey` on its
+ * key id throws, whatever the code), and `SCP-IDENT-1037`, which
  * `scpidSign` reports for any custody failure (spec §3.11.4).
  *
  * Every callback must be synchronous and return the type its signature names.
@@ -536,7 +537,8 @@ export interface KeyCustodyProvider {
    * (spec §9.10.4.A). `publicKey` is the 33-byte compressed point and `keyId`
    * the numeric id of the new pseudonym key. The bridge requires
    * `getPublicKey(keyId)` to return the same 33 bytes, and fails the
-   * operation with `SCP-IDENT-1055` otherwise. The same (`keyId`,
+   * operation with `SCP-IDENT-1055` otherwise, including when that
+   * `getPublicKey` call fails with any code. The same (`keyId`,
    * `contextId`) MUST return the same pseudonym `keyId` on every call, so
    * re-deriving names one key rather than minting another. The pseudonym
    * dies with its identity (spec §9.10.4.A): `destroyKey(keyId)` destroys it,

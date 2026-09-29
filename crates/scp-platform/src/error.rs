@@ -48,7 +48,7 @@ pub enum PlatformError {
 
     /// A bridge rejected a pseudonym that a host custody provider derived
     /// (spec §9.10.4): the returned key id or point is malformed,
-    /// `get_public_key(key_id)` reports a different point, or the key id is
+    /// `get_public_key(key_id)` fails or reports a different point, or the key id is
     /// already bound to another pseudonym point.
     #[error("pseudonym rejected: {0}")]
     PseudonymRejected(String),
