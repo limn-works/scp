@@ -109,6 +109,12 @@ import java.security.SecureRandom
  * 10-100x slower than TEE operations — latency that would visibly degrade SCP protocol participation
  * where every send operation requires a signature. See ADR-027 for the full rationale.
  *
+ * ## Errors
+ *
+ * This class converts no exception to [ScpException]. Each method throws [ScpException] only for
+ * the codes its KDoc names, and every other failure escapes as the original throwable. The
+ * KDoc of [KeyCustodyProvider] lists the Keystore and JCA exceptions each method can let escape.
+ *
  * ## Thread safety
  *
  * Android Keystore operations are thread-safe. The [softwareKeys] map is a
@@ -291,7 +297,8 @@ class AndroidKeyCustody internal constructor(
      * call returned `confirmed = true`.
      *
      * @param keyHandle Handle to destroy.
-     * @return [DestructionAttestation] confirming the destruction method and verification.
+     * @return [DestructionAttestation] naming the destruction method, with `confirmed` always
+     *   `true`: a failed post-deletion check throws `SCP-CRYPTO-4004` instead.
      * @throws ScpException with code `SCP-CRYPTO-4001` if the handle is already invalid.
      * @throws ScpException with code `SCP-CRYPTO-4004` if destruction cannot be confirmed.
      */
@@ -463,9 +470,10 @@ class AndroidKeyCustody internal constructor(
      * The `"scp-pseudonym-v2"` separator differs from v1's `"scp-pseudonym"`, so a v2
      * pseudonym at any epoch never collides with the v1 [derivePseudonym] output.
      *
-     * Matches the Rust `derive_rotatable_pseudonym()` in `scp-crypto/src/pseudonym.rs`
-     * (and the file/sqlite custody backends) so software-custody pseudonyms are identical
-     * across platforms. The hardware (Keystore) path is device-local by design.
+     * Matches the Rust `derive_pseudonym_keypair()` with `epoch = Some(pseudonymEpoch)` in
+     * `scp-crypto/src/pseudonym.rs` (and the file/sqlite custody backends, which call it) so
+     * software-custody pseudonyms are identical across platforms. The hardware (Keystore) path
+     * is device-local by design.
      *
      * @param keyHandle Handle to the identity Ed25519 key (source for derivation).
      * @param contextId Raw context ID bytes.

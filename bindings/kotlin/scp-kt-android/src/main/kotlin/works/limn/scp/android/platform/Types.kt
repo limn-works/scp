@@ -105,10 +105,15 @@ data class PseudonymKeyHandle(
  * See section 9.15 of the SCP specification for key destruction requirements.
  *
  * @property method The mechanism by which key material was destroyed.
- * @property confirmed `true` when the post-deletion check found no key under the handle's id.
- *   For a Keystore key, [AndroidKeyCustody] checks that Keystore no longer holds the alias. For
- *   a software key, it checks only its in-memory map, not the EncryptedSharedPreferences entry
- *   that holds a software Ed25519 key's seed. [AndroidKeyCustody] removes that entry with
+ * @property confirmed Always `true` in an attestation [AndroidKeyCustody] returns. After
+ *   deleting, [AndroidKeyCustody] checks that no key sits under the handle's id and throws
+ *   [ScpException] with code `SCP-CRYPTO-4004` when one does, so it never returns `false`, and
+ *   the field says no more than that [KeyCustodyProvider.destroyKey] returned. For a Keystore
+ *   key, the check asks Keystore whether it still holds the alias. For a software key, the check
+ *   reads the in-memory map right after removing the id from it, so it fails only when another
+ *   call inserts the same id between the removal and the check, and [AndroidKeyCustody] inserts
+ *   only fresh random UUIDs. It does not read the EncryptedSharedPreferences entry that holds a
+ *   software Ed25519 key's seed. [AndroidKeyCustody] removes that entry with
  *   `apply()`, which returns before the removal reaches disk, so `confirmed` is `true` while the
  *   seed can still be on disk. When the process dies before the write lands, the next
  *   [AndroidKeyCustody] instance restores the seed at startup and the key signs again.
@@ -296,6 +301,30 @@ interface PushProvider {
  * - Synchrony: its methods are synchronous. Every method of both Rust declarations is `async`
  *   except `custody_type`, which is synchronous in both.
  *
+ * [AndroidKeyCustody] converts no exception to [ScpException]. Each method throws [ScpException]
+ * only for the codes its `@throws` lines name, and every other failure escapes as the original
+ * throwable, so a `catch (e: ScpException)` does not catch it. The Keystore path, which an
+ * Ed25519 [generateKeypair] takes on API 33+ and each other method below takes for a
+ * [CustodyType.HARDWARE] handle, can let these escape:
+ *
+ * - [generateKeypair]: `KeyPairGenerator.getInstance` throws `NoSuchAlgorithmException` or
+ *   `NoSuchProviderException`, `initialize` throws `InvalidAlgorithmParameterException`, and
+ *   `generateKeyPair` throws `ProviderException` when Keystore fails to generate the key.
+ * - [sign], [derivePseudonym] and [deriveRotatablePseudonym], which sign through Keystore to
+ *   derive the pseudonym secret: `KeyStore.getInstance` throws `KeyStoreException`,
+ *   `KeyStore.load` throws `IOException`, `NoSuchAlgorithmException` or `CertificateException`,
+ *   `KeyStore.getEntry` throws `KeyStoreException`, `NoSuchAlgorithmException` or
+ *   `UnrecoverableEntryException`, `Signature.getInstance` throws `NoSuchAlgorithmException`,
+ *   `Signature.initSign` throws `InvalidKeyException`, and `Signature.sign` throws
+ *   `SignatureException`.
+ * - [publicKey]: the same `KeyStore.getInstance`, `KeyStore.load` and `KeyStore.getEntry`
+ *   exceptions, and `IllegalStateException` when the encoded public key is not the 44-byte
+ *   X.509 Ed25519 SubjectPublicKeyInfo.
+ * - [destroyKey]: the same `KeyStore.getInstance` and `KeyStore.load` exceptions, and
+ *   `KeyStoreException` from `containsAlias` and `deleteEntry`.
+ *
+ * [dhAgree] and [exportSigningKeyBytes] do not reach Keystore.
+ *
  * See ADR-006 for the platform abstraction design and ADR-027 for the Android adapter.
  */
 interface KeyCustodyProvider {
@@ -305,9 +334,11 @@ interface KeyCustodyProvider {
      * Ed25519 keys may be Keystore keys ([CustodyType.HARDWARE], API 33+).
      * X25519 wrapping keys are always software-managed (Bouncy Castle).
      *
+     * [AndroidKeyCustody] throws no [ScpException] from this method. A Keystore failure escapes
+     * as the original exception, listed in the interface KDoc.
+     *
      * @param keyType The type of key to generate.
      * @return An opaque [KeyHandle] referencing the generated key.
-     * @throws ScpException if key generation fails.
      */
     fun generateKeypair(keyType: KeyType): KeyHandle
 
@@ -345,8 +376,9 @@ interface KeyCustodyProvider {
      * process dies before the removal reaches disk (see [DestructionAttestation.confirmed]).
      *
      * @param keyHandle Handle to destroy.
-     * @return A [DestructionAttestation] naming the destruction method and the result of the
-     *   post-deletion check.
+     * @return A [DestructionAttestation] naming the destruction method, with
+     *   [DestructionAttestation.confirmed] always `true`: a failed post-deletion check throws
+     *   `SCP-CRYPTO-4004` instead.
      * @throws ScpException with code `SCP-CRYPTO-4001` if the handle is already invalid.
      * @throws ScpException with code `SCP-CRYPTO-4004` if destruction cannot be confirmed.
      */
