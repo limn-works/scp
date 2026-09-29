@@ -288,6 +288,19 @@ struct Slots {
     orphans: Vec<String>,
 }
 
+impl Slots {
+    /// Whether host key id `key_id` names a `Live` or `Destroying` slot. An
+    /// id that does not parse as a `u64` names no slot.
+    fn names_held_key(&self, key_id: &str) -> bool {
+        key_id.parse::<u64>().is_ok_and(|id| {
+            matches!(
+                self.map.get(&id),
+                Some(Slot::Live(_) | Slot::Destroying { .. })
+            )
+        })
+    }
+}
+
 /// Handle → slot for the handles one adapter instance has seen.
 ///
 /// Every destroyed id stays as a tombstone for the adapter's lifetime, so
@@ -629,19 +642,24 @@ impl CallbackKeyRegistry {
     fn pop_orphan(&self) -> Result<Option<String>, PlatformError> {
         let mut slots = self.lock()?;
         while let Some(key_id) = slots.orphans.pop() {
-            let names_held_key = key_id.parse::<u64>().is_ok_and(|id| {
-                matches!(
-                    slots.map.get(&id),
-                    Some(Slot::Live(_) | Slot::Destroying { .. })
-                )
-            });
-            if !names_held_key {
+            if !slots.names_held_key(&key_id) {
                 drop(slots);
                 return Ok(Some(key_id));
             }
         }
         drop(slots);
         Ok(None)
+    }
+
+    /// Whether host key id `key_id` names a `Live` or `Destroying` slot, read
+    /// under the registry lock: a key this adapter holds, whose id a host
+    /// destroy must not be issued for on behalf of another key.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::CustodyError`] if the registry lock is poisoned.
+    fn names_held_key(&self, key_id: &str) -> Result<bool, PlatformError> {
+        Ok(self.lock()?.names_held_key(key_id))
     }
 
     /// The host key ids queued for [`sweep_orphans`].
@@ -946,7 +964,12 @@ pub fn x25519_peer(peer_public: &[u8]) -> Result<[u8; 32], PlatformError> {
 /// numeric, the host's answer is refused, or the registry refuses the id (it
 /// is live), the new host key is destroyed before the error is returned; a
 /// destroy that also fails is appended to the error, and the key id is
-/// queued for the next sweep.
+/// queued for the next sweep. A refused id that names a `Live` or
+/// `Destroying` slot, read under the registry lock, is never destroyed or
+/// queued: it names a key this adapter holds, so destroying it would destroy
+/// that key, and the refusal is returned alone. On a poisoned registry lock
+/// the id is queued, not destroyed, and the sweep then fails closed on the
+/// same poison.
 ///
 /// From the moment the host returns a key id until the handle is registered
 /// or the host key destroyed, an armed guard holds the id: a caller that
@@ -1012,16 +1035,28 @@ where
             orphan.disarm();
             Ok(handle)
         }
-        Err(e) => match host_destroy(key_id).await {
-            Ok(()) => {
+        Err(e) => match registry.names_held_key(&key_id) {
+            // The id names a key this adapter holds: destroy nothing.
+            Ok(true) => {
                 orphan.disarm();
                 Err(e)
             }
-            // The guard stays armed: the id is queued for the next sweep.
-            Err(destroy_err) => Err(PlatformError::CustodyError(format!(
-                "{e}; destroying the rejected host key also failed, and it is queued for \
-                 the next generation to destroy: {destroy_err}"
+            // The guard stays armed: the id is queued, and destroyed only
+            // once the registry can say it names no held key.
+            Err(poisoned) => Err(PlatformError::CustodyError(format!(
+                "{e}; the rejected host key was not destroyed and is queued: {poisoned}"
             ))),
+            Ok(false) => match host_destroy(key_id).await {
+                Ok(()) => {
+                    orphan.disarm();
+                    Err(e)
+                }
+                // The guard stays armed: the id is queued for the next sweep.
+                Err(destroy_err) => Err(PlatformError::CustodyError(format!(
+                    "{e}; destroying the rejected host key also failed, and it is queued for \
+                     the next generation to destroy: {destroy_err}"
+                ))),
+            },
         },
     }
 }
@@ -3019,9 +3054,9 @@ mod tests {
         }
     }
 
-    /// (B2) A generation handed an id the registry holds live is refused and
-    /// the host key destroyed, not queued; an accepted key is not destroyed,
-    /// and may take over a destroyed id.
+    /// (B2) A generation handed an id the registry holds live is refused,
+    /// and nothing is destroyed or queued, because the id names the held key;
+    /// an accepted key is not destroyed, and may take over a destroyed id.
     #[tokio::test]
     async fn a_live_id_is_refused_and_a_destroyed_id_is_reusable() {
         let valid = p256(5);
@@ -3040,7 +3075,7 @@ mod tests {
         assert_eq!(handle.id(), 21);
         assert!(destroyed.lock().unwrap().is_empty());
 
-        // B2: a live id is refused, and the host key destroyed.
+        // B2: a live id is refused, and the held key is not destroyed.
         let again = generate_with(
             &registry,
             KeyType::Ed25519,
@@ -3050,8 +3085,8 @@ mod tests {
         )
         .await;
         assert!(matches!(again, Err(PlatformError::CustodyError(_))));
-        assert_eq!(*destroyed.lock().unwrap(), vec!["21".to_owned()]);
-        assert!(registry.orphans().is_empty(), "destroyed, not queued");
+        assert!(destroyed.lock().unwrap().is_empty(), "the held key is kept");
+        assert!(registry.orphans().is_empty(), "not queued");
         assert_eq!(
             registry.get(&handle).unwrap().unwrap().key,
             RegisteredKey::P256Signing(valid.public_key())
@@ -3704,6 +3739,59 @@ mod tests {
         .await
         .unwrap();
         assert!(registry.orphans().is_empty());
+    }
+
+    /// A host that hands a new generation the id of a key the registry holds
+    /// live gets the typed refusal, and the adapter issues no host destroy
+    /// for that id: the held key stays on the host and still signs.
+    #[tokio::test]
+    async fn a_refused_reused_id_does_not_destroy_the_held_key() {
+        let host = fake_host::FakeHost::default();
+        let host = &host;
+        let registry = CallbackKeyRegistry::new();
+        let gpk = |id: String| async move { host.get_public_key(&id) };
+        let held = generate_keypair(
+            &registry,
+            KeyType::Ed25519,
+            KeyRole::Operational,
+            |t, r| async move { host.generate_keypair(t, r) },
+            gpk,
+            |id| async move { host.destroy_key(&id) },
+        )
+        .await
+        .unwrap();
+        let held_id = held.id().to_string();
+        let destroys = Log::default();
+        let destroys = &destroys;
+        let reused = generate_keypair(
+            &registry,
+            KeyType::Ed25519,
+            KeyRole::Operational,
+            |_, _| async move { Ok(held_id) },
+            gpk,
+            |id| async move {
+                destroys.lock().unwrap().push(id.clone());
+                host.destroy_key(&id)
+            },
+        )
+        .await;
+        assert!(
+            matches!(reused, Err(PlatformError::CustodyError(_))),
+            "{reused:?}"
+        );
+        assert!(destroys.lock().unwrap().is_empty(), "no host destroy");
+        assert!(host.holds(&held.id().to_string()));
+        assert!(registry.orphans().is_empty());
+        let sig = sign(
+            &registry,
+            &held,
+            b"still mine",
+            |id, data| async move { host.sign(&id, &data) },
+            gpk,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sig.as_bytes().len(), 64);
     }
 
     /// A sweep never destroys a queued id that names a key the registry
