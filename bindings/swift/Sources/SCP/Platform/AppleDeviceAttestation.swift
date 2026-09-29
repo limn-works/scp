@@ -129,12 +129,26 @@
     ///
     /// ## Thread safety
     ///
-    /// `AppleDeviceAttestation` is `final` and conforms to `Sendable`. Internal
-    /// mutable state (`generationTask`, `UserDefaults`) is protected by `NSLock`.
+    /// `AppleDeviceAttestation` is `final` and conforms to `Sendable`. Its
+    /// `UserDefaults` reads and writes are protected by `NSLock`.
+    /// `callSerializer`, an actor, runs the App Attest calls of every `attest`
+    /// and `assertRequest`, key generation included, one call at a time in
+    /// arrival order. Each call therefore reads the stored key ID after every
+    /// preceding call finished writing it, and concurrent `attest` calls on a
+    /// device with no stored key generate one key. `attest` and
+    /// `assertRequest` check `isSupported` and the 32-byte length before they
+    /// queue a call, so a call either check rejects waits for no other call.
     /// `attestKey` and `generateAssertion` bridge to structured concurrency
     /// through `withCheckedContinuation` and return Apple's answer as a
     /// `Result`; `generateKey` bridges through
     /// `withCheckedThrowingContinuation`.
+    ///
+    /// The lock and the serializer belong to the `UserDefaults` object that
+    /// holds the key ID, not to one instance: `AppAttestKeyStateGuard`
+    /// attaches one pair to that object, and every instance over that object
+    /// takes that pair. `init()` reads `UserDefaults.standard`, which every
+    /// instance in the process shares, so two instances built with `init()`
+    /// run their App Attest calls in one order.
     ///
     /// See ADR-025 and the UniFFI `DeviceAttestationProvider` callback
     /// interface in `crates/scp-ffi/uniffi/src/lib.rs`, which this class
@@ -144,14 +158,18 @@
         // UniFFI `DeviceAttestationProvider` callback interface, whose Rust trait
         // requires `Send + Sync` (Rust) → `Sendable` (Swift). No Rust code holds or
         // calls that callback yet, so nothing injects this class into the Rust engine. Internal mutable
-        // state (`generationTask`, `UserDefaults`) is protected by `lock`; no reference
+        // state (`UserDefaults`) is protected by `lock`; no reference
         // semantics escape across the FFI boundary. This is the same exception as
         // `MessageListenerAdapter`. See .docs/standards/swift.md §Sendable — UniFFI exception.
 
         private let service: DCAppAttestService
         private let defaults: UserDefaults
         private let lock: NSLock
-        private var generationTask: Task<String, Error>?
+
+        /// Runs one App Attest call at a time, so each call reads the stored
+        /// key ID after every preceding call finished writing it, and
+        /// concurrent `attest` calls generate one key.
+        private let callSerializer: AppAttestCallSerializer
 
         /// The value of `DCAppAttestService.isSupported`, and nothing more.
         ///
@@ -175,17 +193,30 @@
         public init() {
             service = DCAppAttestService.shared
             defaults = UserDefaults.standard
-            lock = NSLock()
+            let keyStateGuard = AppAttestKeyStateGuard.guarding(defaults)
+            lock = keyStateGuard.lock
+            callSerializer = keyStateGuard.callSerializer
         }
 
         /// Testing initializer that accepts injected dependencies.
         ///
         /// Used in unit tests to supply a mock `DCAppAttestService` subclass and
-        /// an in-memory `UserDefaults` suite.
+        /// an in-memory `UserDefaults` suite. Every adapter built over one
+        /// `defaults` object shares one lock and one serializer, as every
+        /// adapter `init()` builds does.
         init(service: DCAppAttestService, defaults: UserDefaults) {
             self.service = service
             self.defaults = defaults
-            lock = NSLock()
+            let keyStateGuard = AppAttestKeyStateGuard.guarding(defaults)
+            lock = keyStateGuard.lock
+            callSerializer = keyStateGuard.callSerializer
+        }
+
+        /// Report whether this adapter and `other` share one lock and one
+        /// serializer, which every two adapters over one `UserDefaults` object
+        /// do.
+        func sharesKeyState(with other: AppleDeviceAttestation) -> Bool {
+            lock === other.lock && callSerializer === other.callSerializer
         }
 
         // MARK: - DeviceAttestationProvider
@@ -287,25 +318,31 @@
                 )
             }
 
-            let keyId: String
-            do {
-                keyId = try await resolveKeyId()
-            } catch let error as AttestationError {
-                throw error
-            } catch {
-                throw AttestationError.serviceError(error.localizedDescription)
-            }
+            // The two checks above run before the call is queued, so a call
+            // they reject waits for no other call. The key ID is read inside
+            // the serialized body, so it follows every write a preceding call
+            // made, and concurrent first calls generate one key.
+            let outcome = await callSerializer.run { [self] () -> Result<Data, AttestationError> in
+                let keyId: String
+                do {
+                    keyId = try await resolveKeyId()
+                } catch let error as AttestationError {
+                    return .failure(error)
+                } catch {
+                    return .failure(.serviceError(error.localizedDescription))
+                }
 
-            let outcome: Result<Data, AttestationError> = await withCheckedContinuation { continuation in
-                service.attestKey(keyId, clientDataHash: challenge) { attestation, error in
-                    if let error {
-                        continuation.resume(returning: .failure(.fromAppAttest(error, call: "attestKey")))
-                    } else if let attestation {
-                        continuation.resume(returning: .success(attestation))
-                    } else {
-                        continuation.resume(returning: .failure(.internalError(
-                            "attestKey returned neither attestation nor error"
-                        )))
+                return await withCheckedContinuation { continuation in
+                    service.attestKey(keyId, clientDataHash: challenge) { attestation, error in
+                        if let error {
+                            continuation.resume(returning: .failure(.fromAppAttest(error, call: "attestKey")))
+                        } else if let attestation {
+                            continuation.resume(returning: .success(attestation))
+                        } else {
+                            continuation.resume(returning: .failure(.internalError(
+                                "attestKey returned neither attestation nor error"
+                            )))
+                        }
                     }
                 }
             }
@@ -358,20 +395,24 @@
                 )
             }
 
-            guard let keyId = loadKeyId() else {
-                throw AttestationError.keyNotFound
-            }
+            // The key ID is read inside the serialized body for the reason
+            // `attestReportingAttestationError(challenge:deviceId:)` states.
+            let outcome = await callSerializer.run { [self] () -> Result<Data, AttestationError> in
+                guard let keyId = loadKeyId() else {
+                    return .failure(.keyNotFound)
+                }
 
-            let outcome: Result<Data, AttestationError> = await withCheckedContinuation { continuation in
-                service.generateAssertion(keyId, clientDataHash: requestHash) { assertion, error in
-                    if let error {
-                        continuation.resume(returning: .failure(.fromAppAttest(error, call: "generateAssertion")))
-                    } else if let assertion {
-                        continuation.resume(returning: .success(assertion))
-                    } else {
-                        continuation.resume(returning: .failure(.internalError(
-                            "generateAssertion returned neither assertion nor error"
-                        )))
+                return await withCheckedContinuation { continuation in
+                    service.generateAssertion(keyId, clientDataHash: requestHash) { assertion, error in
+                        if let error {
+                            continuation.resume(returning: .failure(.fromAppAttest(error, call: "generateAssertion")))
+                        } else if let assertion {
+                            continuation.resume(returning: .success(assertion))
+                        } else {
+                            continuation.resume(returning: .failure(.internalError(
+                                "generateAssertion returned neither assertion nor error"
+                            )))
+                        }
                     }
                 }
             }
@@ -382,51 +423,23 @@
 
         /// Retrieve the stored App Attest key ID, or generate and store a new one.
         ///
-        /// Uses a task-coalescing pattern to prevent TOCTOU races: if concurrent
-        /// callers both find no key in `UserDefaults`, only one key generation
-        /// task is started; all callers await the same task result. This prevents
-        /// multiple Secure Enclave keys from being generated on concurrent first
-        /// calls to `attest(challenge:deviceId:)`.
+        /// A caller reaches this method through `callSerializer`, which is what
+        /// makes concurrent callers that find no stored key ID generate one key
+        /// rather than one each: the second caller reads the key ID only after
+        /// the first caller stored it. `loadKeyId()` reads `UserDefaults` under
+        /// `lock` on every call, and this adapter caches no key ID.
         ///
         /// - Returns: An App Attest key ID string suitable for use in
         ///   `attestKey(_:clientDataHash:)` and `generateAssertion(_:clientDataHash:)`.
         /// - Throws: `AttestationError.unsupported` if `generateKey` answers
         ///   `DCError.featureUnsupported`, `AttestationError.serviceError` if it
-        ///   answers any other error.
+        ///   answers any other error, `AttestationError.internalError` if it
+        ///   answers neither a key ID nor an error.
         private func resolveKeyId() async throws -> String {
-            // Phase 1: synchronous check under lock. Returns either the existing
-            // key ID string, an in-flight Task to await, or nil meaning we must
-            // start a new task.
-            enum Outcome {
-                case existing(String)
-                case coalesce(Task<String, Error>)
-                case startNew
+            if let stored = loadKeyId() {
+                return stored
             }
-            let outcome: Outcome = lock.withLock {
-                if let existing = defaults.string(forKey: StorageKey.appAttestKeyId) {
-                    return .existing(existing)
-                }
-                if let ongoing = generationTask {
-                    return .coalesce(ongoing)
-                }
-                return .startNew
-            }
-
-            switch outcome {
-            case let .existing(keyId):
-                return keyId
-            case let .coalesce(task):
-                return try await task.value
-            case .startNew:
-                // The caller's frame holds `self` across `await task.value`, so
-                // a strong capture keeps no reference alive past that await.
-                let task = Task<String, Error> {
-                    try await self.generateAndStoreKey()
-                }
-                lock.withLock { generationTask = task }
-                defer { lock.withLock { generationTask = nil } }
-                return try await task.value
-            }
+            return try await generateAndStoreKey()
         }
 
         /// Generate a new App Attest key and persist its ID.
@@ -437,7 +450,8 @@
         /// - Returns: The newly generated App Attest key ID.
         /// - Throws: `AttestationError.unsupported` if the service call answers
         ///   `DCError.featureUnsupported`, `AttestationError.serviceError` if it
-        ///   answers any other error.
+        ///   answers any other error, `AttestationError.internalError` if it
+        ///   answers neither a key ID nor an error.
         private func generateAndStoreKey() async throws -> String {
             let keyId: String = try await withCheckedThrowingContinuation { continuation in
                 service.generateKey { keyId, error in
@@ -479,6 +493,80 @@
             lock.lock()
             defer { lock.unlock() }
             defaults.set(keyId, forKey: StorageKey.appAttestKeyId)
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // App Attest key-state guard
+    // ---------------------------------------------------------------------------
+
+    /// The lock and the call serializer that order every App Attest call over
+    /// one `UserDefaults` object.
+    ///
+    /// The stored key ID lives in that object, so two adapters over it race
+    /// unless they share one order. `guarding(_:)` keeps the pair as an
+    /// Objective-C associated object of that `UserDefaults` object, so the
+    /// pair lives exactly as long as that object and no Swift global holds it.
+    private final class AppAttestKeyStateGuard {
+        let lock = NSLock()
+        let callSerializer = AppAttestCallSerializer()
+
+        /// Return the pair attached to `defaults`, attaching a new pair first
+        /// when `defaults` carries none.
+        ///
+        /// `objc_sync_enter` on `defaults` makes the read and the attach one
+        /// step, so two adapters built at once over one object take one pair.
+        static func guarding(_ defaults: UserDefaults) -> AppAttestKeyStateGuard {
+            // The class metadata address is unique in the process and never
+            // moves, which makes it a stable association key.
+            let key = unsafeBitCast(AppAttestKeyStateGuard.self, to: UnsafeRawPointer.self)
+            objc_sync_enter(defaults)
+            defer { objc_sync_exit(defaults) }
+            if let existing = objc_getAssociatedObject(defaults, key) as? AppAttestKeyStateGuard {
+                return existing
+            }
+            let created = AppAttestKeyStateGuard()
+            objc_setAssociatedObject(defaults, key, created, .OBJC_ASSOCIATION_RETAIN)
+            return created
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // App Attest call serialization
+    // ---------------------------------------------------------------------------
+
+    /// Runs App Attest calls one at a time, in arrival order.
+    ///
+    /// **Why serialization, rather than a lock around the key-ID read:**
+    /// `generateKey` answers through a completion handler, so a lock cannot be
+    /// held from the read that finds no stored key ID to the write that stores
+    /// the generated one. Two first `attest` calls that each held the lock only
+    /// for the read would both find no key ID and generate one key each.
+    /// Running each call's whole body, from the key-ID read through Apple's
+    /// answer, before the next body starts makes each read follow every
+    /// preceding call's write.
+    ///
+    /// `run(_:)` chains each caller's work onto whatever work this serializer
+    /// last accepted, and it publishes that chaining inside actor isolation, so
+    /// two callers that arrive together take distinct positions in one order
+    /// rather than both reading an empty tail.
+    private actor AppAttestCallSerializer {
+        /// Work this serializer last accepted, which the next caller waits for.
+        private var tail: Task<Void, Never>?
+
+        /// Run `body` after every call this serializer already accepted, and
+        /// return what `body` returned.
+        ///
+        /// - Parameter body: One App Attest call, together with the key-ID
+        ///   read and write it makes.
+        func run<Outcome: Sendable>(_ body: @Sendable @escaping () async -> Outcome) async -> Outcome {
+            let predecessor = tail
+            let work = Task<Outcome, Never> {
+                await predecessor?.value
+                return await body()
+            }
+            tail = Task { _ = await work.value }
+            return await work.value
         }
     }
 
