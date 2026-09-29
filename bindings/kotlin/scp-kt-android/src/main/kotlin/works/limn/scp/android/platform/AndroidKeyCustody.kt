@@ -17,6 +17,10 @@
 //   holds in software: a generateKeypair key on API 26-32, and every derived pseudonym key,
 //   including a pseudonym derived from a Keystore identity key whose own seed the method
 //   refuses to export. It accepts any Ed25519 id in softwareKeys, not only a generateKeypair handle.
+//   ADR-027 acceptance criterion 14 (private key isolation) says the Rust engine receives only
+//   signatures and public keys, never private key material. The UniFFI KeyCustodyProvider
+//   callback declares export_signing_key_bytes, which carries this seed to Rust, so this method
+//   diverges from criterion 14.
 // - sign signs any caller-supplied bytes with a hardware identity key, and derivePseudonymSecret
 //   derives every pseudonym secret of that key from its signature over the public string
 //   "scp-pseudonym-secret-v1". A caller that signs that string derives every pseudonym private
@@ -145,7 +149,7 @@ class AndroidKeyCustody internal constructor(
     )
 
     // -----------------------------------------------------------------------
-    // Software key storage — used for API 26-32 Ed25519 and all X25519 keys
+    // Software key storage — API 26-32 Ed25519 keys, derived pseudonym keys, and X25519 keys
     // -----------------------------------------------------------------------
 
     /**
@@ -154,12 +158,15 @@ class AndroidKeyCustody internal constructor(
      * Key: UUID string (same as [KeyHandle.id]).
      * Value: Bouncy Castle asymmetric key pair (Ed25519 or X25519).
      *
-     * This map is only used for keys that cannot be stored in Android Keystore:
-     * - Ed25519 keys on API 26-32 (no Keystore EdDSA support)
+     * This map holds three kinds of key:
+     * - Ed25519 keys that [generateKeypair] creates on API 26-32 (no Keystore EdDSA support)
+     * - Ed25519 pseudonym keys that [derivePseudonym] and [deriveRotatablePseudonym] store, at
+     *   every API level and for a Keystore identity key too
      * - X25519 keys on all API levels (no Keystore X25519 support)
      *
-     * Ed25519 identity keys are additionally backed by [encryptedPrefs] so they
-     * survive process death. X25519 wrapping keys are ephemeral.
+     * Ed25519 keys that [generateKeypair] creates are additionally backed by [encryptedPrefs] so
+     * they survive process death. Derived pseudonym keys and X25519 wrapping keys are held in
+     * memory only.
      */
     internal val softwareKeys = ConcurrentHashMap<String, AsymmetricCipherKeyPair>()
 
@@ -273,10 +280,14 @@ class AndroidKeyCustody internal constructor(
      * For Keystore keys ([CustodyType.HARDWARE]): deletes the entry from Android Keystore and performs
      * a re-fetch to confirm deletion (section 9.15 key destruction verification).
      *
-     * For software-backed keys: removes the entry from the [softwareKeys] map.
+     * For software-backed keys: removes the entry from the [softwareKeys] map and removes a
+     * software Ed25519 key's seed from [encryptedPrefs] with `apply()`, which returns before the
+     * removal reaches disk. The post-deletion check reads only [softwareKeys].
      *
-     * After this call, all subsequent operations with the same handle will throw
-     * [ScpException] with code `SCP-CRYPTO-4001`.
+     * After this call, operations with the same handle in the same process throw [ScpException]
+     * with code `SCP-CRYPTO-4001`. When the process dies before `apply()` writes the removal to
+     * disk, the next instance's `restorePersistedEd25519Keys` reloads the seed and the key signs
+     * again, although this call returned `confirmed = true`.
      *
      * @param keyHandle Handle to destroy.
      * @return [DestructionAttestation] confirming the destruction method and verification.
@@ -302,6 +313,8 @@ class AndroidKeyCustody internal constructor(
      * @param peerPublic 32-byte X25519 public key of the peer.
      * @return 32-byte X25519 shared secret.
      * @throws ScpException with code `SCP-CRYPTO-4002` if the X25519 key is not found.
+     * @throws ScpException with code `SCP-CRYPTO-4003` if [peerPublic] is not 32 bytes long or
+     *   [keyHandle] names an Ed25519 key.
      */
     override fun dhAgree(keyHandle: KeyHandle, peerPublic: ByteArray): ByteArray {
         if (peerPublic.size != 32) {
@@ -574,15 +587,19 @@ class AndroidKeyCustody internal constructor(
      *
      * For software-backed keys ([CustodyType.SOFTWARE]): extracts the 32-byte seed from
      * the Bouncy Castle [Ed25519PrivateKeyParameters] and returns a copy. That covers a
-     * [generateKeypair] key on API 26-32 and every key [derivePseudonym] stores, including
-     * a pseudonym derived from a Keystore identity key.
+     * [generateKeypair] key on API 26-32 and every key [derivePseudonym] and
+     * [deriveRotatablePseudonym] store, including a pseudonym derived from a Keystore identity
+     * key.
      *
      * For Keystore keys ([CustodyType.HARDWARE]): throws an error because Keystore does
      * not hand the private key bytes to the app, so a Keystore key cannot sign a governance vote through
      * this adapter. ADR-063's curve slice requires every core function that takes a raw
      * signing key to take a signer instead, and every key-export accessor to leave the
      * custody adapters. That slice has not landed, so this accessor still exports the seed
-     * of a software key.
+     * of a software key. ADR-027 acceptance criterion 14 (private key isolation) already says
+     * the Rust engine receives only signatures and public keys, never private key material,
+     * and the UniFFI `KeyCustodyProvider` callback's `export_signing_key_bytes` carries this
+     * seed to Rust, so this method diverges from criterion 14 today.
      *
      * @param keyHandle Handle naming any Ed25519 key held in software: one [generateKeypair]
      *   returned, or a [KeyHandle] built from a [PseudonymKeyHandle.id]. The method checks
@@ -869,7 +886,9 @@ internal class SoftwareKeyOps(
      *
      * Returns [DestructionMethod.SOFTWARE_ONLY] because the key material was stored
      * in software (Bouncy Castle in-memory + EncryptedSharedPreferences) without
-     * hardware protection.
+     * hardware protection. The `apply()` call queues the [encryptedPrefs] removal and returns
+     * before the removal reaches disk, and the verification reads only [softwareKeys], so
+     * `confirmed = true` does not show that the persisted seed is gone.
      */
     fun destroy(keyHandle: KeyHandle): DestructionAttestation {
         val removed = softwareKeys.remove(keyHandle.id)

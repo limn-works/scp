@@ -1,7 +1,8 @@
 // AndroidStorage.kt — StorageProvider implementation for Android (ADR-027)
 //
-// Encrypted key-value storage using SQLCipher. The database encryption key is a
-// 32-byte value derived from a Keystore-held AES-256 key. Keystore does not hand
+// Encrypted key-value storage using SQLCipher. The adapter opens the database with a
+// 32-byte SQLCipher passphrase derived from a Keystore-held AES-256 key, and SQLCipher
+// derives the database encryption key from that passphrase. Keystore does not hand
 // the AES key to the app; the key encrypts a fixed 22-byte label via AES-GCM with a
 // fixed IV, and the first 32 of the 38 output bytes (the 22 ciphertext bytes and the
 // first 10 bytes of the 16-byte GCM tag) are the SQLCipher passphrase. The adapter
@@ -43,7 +44,8 @@ import javax.crypto.spec.GCMParameterSpec
  *
  * ## Encryption architecture
  *
- * The database encryption key is derived from a Keystore-held key:
+ * SQLCipher derives the database encryption key from a passphrase, and the adapter derives
+ * that passphrase from a Keystore-held key:
  *
  * 1. Android Keystore holds an AES-256-GCM key (alias: `scp.storage.key`). The key is
  *    generated on first use and persists across app restarts. The adapter does not read
@@ -53,7 +55,8 @@ import javax.crypto.spec.GCMParameterSpec
  *    AES-GCM with a fixed 12-byte zero IV. The fixed IV makes the 38-byte output (22 bytes
  *    of ciphertext followed by the 16-byte GCM tag) deterministic.
  * 3. The first 32 bytes of that output (the ciphertext and the first 10 bytes of the tag)
- *    are the SQLCipher passphrase, which SQLCipher uses for full-database encryption.
+ *    are the SQLCipher passphrase. SQLCipher derives the database encryption key from that
+ *    passphrase and encrypts the whole database with the derived key.
  *
  * Keystore does not hand the AES key bytes to the app. The derived passphrase is not
  * persisted to disk in plaintext, but key material stays in process memory: SQLCipher keeps
@@ -67,6 +70,19 @@ import javax.crypto.spec.GCMParameterSpec
  * SQLCipher's [SQLiteDatabase] is thread-safe for concurrent reads and serialized writes.
  * The [db] property uses lazy initialization with the default `SYNCHRONIZED` mode,
  * ensuring the database is opened exactly once.
+ *
+ * ## Errors
+ *
+ * The [db] property opens the database on the first access, and each [StorageProvider]
+ * method reads [db] inside its `try` block. Until one open succeeds, every method call
+ * retries the open, because a failed `lazy` initializer caches nothing. A failed open reaches
+ * the caller in one of three forms:
+ * - `SCP-STORAGE-8003` when [getOrCreateStorageKey] catches a `GeneralSecurityException`.
+ * - `SCP-STORAGE-8002` when opening the database throws an `android.database.SQLException`
+ *   or an `IllegalStateException`.
+ * - the original non-[ScpException] throwable for every other failure, for example the
+ *   `UnsatisfiedLinkError` from `System.loadLibrary("sqlcipher")` or the `IOException` from
+ *   `KeyStore.load`.
  *
  * ## Key ID
  *
@@ -90,7 +106,8 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         val encryptionKey = getOrCreateStorageKey()
         try {
             // The passphrase is passed as byte[] to the SQLiteOpenHelper constructor.
-            // SQLCipher 4.6+ uses the constructor-supplied key for encryption.
+            // SQLCipher 4.6+ derives the database encryption key from the constructor-supplied
+            // passphrase.
             // The returned ByteArray (encryptionKey) is zeroed in the finally block; the
             // intermediate copies inside getOrCreateStorageKey are not.
             // The real protection is Keystore-held key derivation — the passphrase
@@ -298,7 +315,7 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         /** Android Keystore provider name. */
         private const val KEYSTORE_PROVIDER = "AndroidKeyStore"
 
-        /** Alias for the Keystore-held AES-256 storage encryption key. */
+        /** Alias for the Keystore-held AES-256 key that derives the SQLCipher passphrase. */
         internal const val KEY_ALIAS = "scp.storage.key"
 
         /** AES key size in bits. */
@@ -343,7 +360,7 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         /** Error code: storage operation failed. */
         internal const val ERROR_STORAGE_OPERATION_FAILED = "SCP-STORAGE-8002"
 
-        /** Error code: storage encryption key derivation failed. */
+        /** Error code: the Keystore key or the SQLCipher passphrase derivation failed. */
         internal const val ERROR_KEY_DERIVATION_FAILED = "SCP-STORAGE-8003"
     }
 }

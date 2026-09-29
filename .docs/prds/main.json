@@ -6262,7 +6262,7 @@
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidKeyCustody.kt"
       ],
-      "description": "Implement the KeyCustody platform trait for Android Keystore. Android Keystore provides TEE-backed key custody; Ed25519 support requires API 33+ (Android 13+). StrongBox is available but dramatically slower than TEE-backed operations. Must decide minimum API level (API 33+ for Ed25519 Keystore, or software fallback for older devices) and TEE vs StrongBox policy (performance vs security tradeoff). Mirrors the Apple adapter structure from ADR-025. Emulator Keystore behavior differs from hardware — test on physical devices.\n\nStatus reopened 2026-09-28: ADR-027, as amended on 2026-09-10, requires an EC P-256 signing key in Keystore at every supported API level, P-256 key agreement in Keystore from API 31 with a Bouncy Castle software P-256 agreement key below it, and (acceptance criterion 6) a hardware `pseudonym_secret` that is a 32-byte symmetric key generated inside the TEE, never `SHA-256` over a signature. The shipped adapter generates Ed25519 and X25519 keys and derives the hardware pseudonym secret from a signature. It reports every Keystore key as `CustodyType.HARDWARE` without reading `KeyInfo.securityLevel`, so \"TEE-backed key operations used exclusively\" is unmet, and `AndroidKeyCustody` implements the Kotlin `KeyCustodyProvider` interface, not the Rust `KeyCustody` trait. This story tracks the move to P-256 and the TEE-generated pseudonym secret.",
+      "description": "Implement the KeyCustody platform trait for Android Keystore. ADR-027, the Android platform adapter, as amended on 2026-09-10, sets the API levels and curve: the SDK minimum is API 26, every signing key is an EC P-256 key in Android Keystore at every supported API level, and P-256 key agreement uses Keystore from API 31 and a Bouncy Castle software key below API 31. ADR-027 also excludes StrongBox, because StrongBox operations run 10-100x slower than TEE-backed operations and SCP signs frequently. Mirrors the Apple adapter structure from ADR-025. Emulator Keystore behavior differs from hardware — test on physical devices.\n\nStatus reopened 2026-09-28: ADR-027, as amended on 2026-09-10, requires an EC P-256 signing key in Keystore at every supported API level, P-256 key agreement in Keystore from API 31 with a Bouncy Castle software P-256 agreement key below it, and (acceptance criterion 6) a hardware `pseudonym_secret` that is a 32-byte symmetric key generated inside the TEE, never `SHA-256` over a signature. The shipped adapter generates Ed25519 and X25519 keys and derives the hardware pseudonym secret from a signature. It reports every Keystore key as `CustodyType.HARDWARE` without reading `KeyInfo.securityLevel`, so \"TEE-backed key operations used exclusively\" is unmet, and `AndroidKeyCustody` implements the Kotlin `KeyCustodyProvider` interface, not the Rust `KeyCustody` trait. This story tracks the move to P-256 and the TEE-generated pseudonym secret.",
       "acceptanceCriteria": [
         "KeyCustody trait implemented for Android Keystore matching the same platform trait signatures as ADR-025",
         "P-256 signing key generation uses Android Keystore at every supported API level, and P-256 key agreement uses Android Keystore from API 31 and a Bouncy Castle software key on API 26-30 (ADR-027 acceptance criteria 1 and 5)",
@@ -6274,10 +6274,10 @@
       ],
       "actionItems": [
         "Define Android-specific KeyCustody implementation struct",
-        "Implement Ed25519 key generation via Android Keystore (API 33+)",
-        "Implement software fallback key generation for API < 33",
+        "Implement P-256 signing key generation via Android Keystore at every supported API level",
+        "Implement P-256 key agreement via Android Keystore from API 31, and with a Bouncy Castle software P-256 key on API 26-30",
         "Implement TEE-backed signing and verification operations",
-        "Add StrongBox policy configuration (opt-in, document performance tradeoff)",
+        "Generate each hardware identity key's pseudonym_secret as a 32-byte symmetric key inside the TEE (ADR-027 acceptance criterion 6)",
         "Implement key destruction with attestation per §9.15",
         "Implement compromise recovery key rotation per §9.12",
         "Test on physical Android device — emulator Keystore behavior differs from hardware"
@@ -6298,7 +6298,7 @@
         "stubADR": true,
         "note": "ADR not yet fully written — story derived from expected approach and known constraints",
         "expectedDecisions": {
-          "minimumApiLevel": "API 33+ for Ed25519 Keystore, or software fallback for older devices",
+          "minimumApiLevel": "Decided by ADR-027 as amended on 2026-09-10: API 26 SDK minimum, P-256 signing in Keystore at every supported API level, Keystore P-256 key agreement from API 31",
           "teeVsStrongBox": "StrongBox excluded — 10-100x latency penalty is incompatible with SCP's per-message signing. TEE is the only option (ADR-027)"
         },
         "references": [

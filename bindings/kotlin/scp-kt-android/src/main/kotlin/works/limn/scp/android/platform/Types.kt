@@ -101,7 +101,13 @@ data class PseudonymKeyHandle(
  * See section 9.15 of the SCP specification for key destruction requirements.
  *
  * @property method The mechanism by which key material was destroyed.
- * @property confirmed `true` when the post-deletion verification confirmed the key is gone.
+ * @property confirmed `true` when the post-deletion check found no key under the handle's id.
+ *   For a Keystore key, [AndroidKeyCustody] checks that Keystore no longer holds the alias. For
+ *   a software key, it checks only its in-memory map, not the EncryptedSharedPreferences entry
+ *   that holds a software Ed25519 key's seed. [AndroidKeyCustody] removes that entry with
+ *   `apply()`, which returns before the removal reaches disk, so `confirmed` is `true` while the
+ *   seed can still be on disk. When the process dies before the write lands, the next
+ *   [AndroidKeyCustody] instance restores the seed at startup and the key signs again.
  */
 data class DestructionAttestation(
     val method: DestructionMethod,
@@ -132,7 +138,8 @@ enum class DestructionMethod {
  * - `SCP-CRYPTO-4001`: Key not found (a software or Keystore lookup, any key type,
  *   X25519 included)
  * - `SCP-CRYPTO-4002`: X25519 key not found by [KeyCustodyProvider.dhAgree]
- * - `SCP-CRYPTO-4003`: Wrong key type for operation
+ * - `SCP-CRYPTO-4003`: Wrong key type for operation, or a [KeyCustodyProvider.dhAgree] peer
+ *   public key that is not 32 bytes long
  * - `SCP-CRYPTO-4004`: Key destruction failed
  * - `SCP-CRYPTO-4005`: Signing key export refused, because the key is a Keystore key
  *   (thrown only by [KeyCustodyProvider.exportSigningKeyBytes]; retrying cannot succeed)
@@ -141,7 +148,7 @@ enum class DestructionMethod {
  * - `SCP-STORAGE-8001`: Storage key not found. Defined as `AndroidStorage.ERROR_KEY_NOT_FOUND`
  *   but thrown by no adapter: a missing key makes [StorageProvider.get] return `null`
  * - `SCP-STORAGE-8002`: Storage operation failed
- * - `SCP-STORAGE-8003`: Storage encryption key derivation failed
+ * - `SCP-STORAGE-8003`: The Keystore key or the SQLCipher passphrase derivation failed
  * - `SCP-ATTEST-9001`: Play Integrity attestation failed
  *
  * @property code Structured SCP error code.
@@ -322,11 +329,14 @@ interface KeyCustodyProvider {
     /**
      * Destroy key material associated with a handle.
      *
-     * After this call, all subsequent operations with the same handle will
-     * throw [ScpException] with code `SCP-CRYPTO-4001`.
+     * After this call, operations with the same handle in the same process throw [ScpException]
+     * with code `SCP-CRYPTO-4001`. [AndroidKeyCustody] removes a software Ed25519 key's persisted
+     * seed with an asynchronous `apply()`, so a later process can restore the key when this
+     * process dies before the removal reaches disk (see [DestructionAttestation.confirmed]).
      *
      * @param keyHandle Handle to destroy.
-     * @return A [DestructionAttestation] confirming the destruction.
+     * @return A [DestructionAttestation] naming the destruction method and the result of the
+     *   post-deletion check.
      * @throws ScpException with code `SCP-CRYPTO-4001` if the handle is already invalid.
      * @throws ScpException with code `SCP-CRYPTO-4004` if destruction cannot be confirmed.
      */
@@ -342,6 +352,8 @@ interface KeyCustodyProvider {
      * @param peerPublic 32-byte X25519 public key of the peer.
      * @return 32-byte X25519 shared secret.
      * @throws ScpException with code `SCP-CRYPTO-4002` if X25519 key not found.
+     * @throws ScpException with code `SCP-CRYPTO-4003` if [peerPublic] is not 32 bytes long or
+     *   [keyHandle] names an Ed25519 key.
      */
     fun dhAgree(keyHandle: KeyHandle, peerPublic: ByteArray): ByteArray
 
@@ -443,6 +455,13 @@ interface KeyCustodyProvider {
  * `get` as `store` and `retrieve`. The methods of this interface are synchronous, while every
  * method of both Rust declarations is `async`.
  *
+ * [AndroidStorage] opens its database on the first method call and retries the open on every
+ * call until one succeeds. Each method therefore also throws `SCP-STORAGE-8003` when the
+ * Keystore key or the passphrase derivation fails, and throws the original non-[ScpException]
+ * throwable for an open failure [AndroidStorage] does not catch, for example the
+ * `UnsatisfiedLinkError` from loading the SQLCipher library or the `IOException` from
+ * `KeyStore.load`. The class KDoc of [AndroidStorage] lists each case.
+ *
  * All keys are UTF-8 strings. Values are opaque byte arrays. Keys are unique — storing
  * a value with an existing key replaces the previous value.
  *
@@ -457,6 +476,8 @@ interface StorageProvider {
      * @param key The storage key (UTF-8 string).
      * @param data The value to store (opaque bytes).
      * @throws ScpException with code `SCP-STORAGE-8002` if the store operation fails.
+     * @throws ScpException with code `SCP-STORAGE-8003` if [AndroidStorage] cannot open its
+     *   database because the Keystore key or the passphrase derivation fails.
      */
     fun set(key: String, data: ByteArray)
 
@@ -468,6 +489,8 @@ interface StorageProvider {
      * @param key The storage key to look up.
      * @return The stored bytes, or `null` if the key does not exist.
      * @throws ScpException with code `SCP-STORAGE-8002` if the read operation fails.
+     * @throws ScpException with code `SCP-STORAGE-8003` if [AndroidStorage] cannot open its
+     *   database because the Keystore key or the passphrase derivation fails.
      */
     fun get(key: String): ByteArray?
 
@@ -478,6 +501,8 @@ interface StorageProvider {
      *
      * @param key The storage key to delete.
      * @throws ScpException with code `SCP-STORAGE-8002` if the delete operation fails.
+     * @throws ScpException with code `SCP-STORAGE-8003` if [AndroidStorage] cannot open its
+     *   database because the Keystore key or the passphrase derivation fails.
      */
     fun delete(key: String)
 
@@ -490,6 +515,8 @@ interface StorageProvider {
      * @param prefix The key prefix to match. Use `""` for all keys.
      * @return Keys matching the prefix, sorted in ascending lexicographic order.
      * @throws ScpException with code `SCP-STORAGE-8002` if the list operation fails.
+     * @throws ScpException with code `SCP-STORAGE-8003` if [AndroidStorage] cannot open its
+     *   database because the Keystore key or the passphrase derivation fails.
      */
     fun listKeys(prefix: String): List<String>
 
@@ -499,6 +526,8 @@ interface StorageProvider {
      * @param prefix The key prefix to match.
      * @return The number of keys deleted.
      * @throws ScpException with code `SCP-STORAGE-8002` if the delete operation fails.
+     * @throws ScpException with code `SCP-STORAGE-8003` if [AndroidStorage] cannot open its
+     *   database because the Keystore key or the passphrase derivation fails.
      */
     fun deletePrefix(prefix: String): Long
 
@@ -508,6 +537,8 @@ interface StorageProvider {
      * @param key The storage key to check.
      * @return `true` if the key exists, `false` otherwise.
      * @throws ScpException with code `SCP-STORAGE-8002` if the check operation fails.
+     * @throws ScpException with code `SCP-STORAGE-8003` if [AndroidStorage] cannot open its
+     *   database because the Keystore key or the passphrase derivation fails.
      */
     fun exists(key: String): Boolean
 }
