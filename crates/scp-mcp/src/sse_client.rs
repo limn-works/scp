@@ -9,7 +9,9 @@
 //! (ADR-015 in `.docs/adrs/phase-3.md`).
 
 use std::io::{BufReader, Write};
-use std::sync::Mutex;
+use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::client::McpTransport;
 use crate::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
@@ -36,6 +38,51 @@ pub struct SseClientTransport {
     auth_header: String,
     /// TCP stream for reading SSE events, protected by a mutex.
     sse_reader: Mutex<Option<BufReader<std::net::TcpStream>>>,
+    /// The state an [`SseCloser`] shares with this transport.
+    close: Arc<SseCloseState>,
+}
+
+/// The state an [`SseCloser`] shares with its transport: the closed flag and
+/// the sockets a blocked call reads from.
+struct SseCloseState {
+    /// Set by [`SseCloser::close`]; a transport sends nothing once it is set.
+    closed: AtomicBool,
+    /// A clone of the `GET` stream's socket, shut down on close.
+    sse_stream: TcpStream,
+    /// A clone of each POST socket whose status line a call is waiting on,
+    /// under the key [`SseCloseState::next_post`] gave it.
+    in_flight: Mutex<Vec<(u64, TcpStream)>>,
+    /// The key the next in-flight POST is stored under.
+    next_post: AtomicU64,
+}
+
+/// Closes an [`SseClientTransport`] from another thread.
+///
+/// A call blocked on the POST's status line, whose connection has no read
+/// timeout, or on the `GET` stream is otherwise unreachable: the transport's
+/// sockets live inside the call. [`SseCloser::close`] shuts down every such
+/// socket, so the blocked read returns at once and the call fails with
+/// [`SSE_CLOSED`], and every later call fails with [`SSE_CLOSED`] before it
+/// sends a POST.
+#[derive(Clone)]
+pub struct SseCloser(Arc<SseCloseState>);
+
+impl SseCloser {
+    /// Closes the transport: marks it closed, then shuts down the socket of
+    /// every POST a call is waiting on and the `GET` stream's socket.
+    pub fn close(&self) {
+        self.0.closed.store(true, Ordering::SeqCst);
+        let in_flight = match self.0.in_flight.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        // A socket the peer already closed fails `shutdown`; nothing is left
+        // to wake then.
+        for (_, stream) in in_flight {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        let _ = self.0.sse_stream.shutdown(Shutdown::Both);
+    }
 }
 
 /// Reads the status code from an HTTP status line such as `HTTP/1.1 200 OK`;
@@ -144,6 +191,9 @@ impl SseClientTransport {
             .flush()
             .map_err(|e| format!("failed to flush GET request: {e}"))?;
 
+        let sse_stream = stream
+            .try_clone()
+            .map_err(|e| format!("failed to clone stream: {e}"))?;
         let mut reader = BufReader::new(stream);
 
         // Read the HTTP status line and validate.
@@ -211,7 +261,20 @@ impl SseClientTransport {
             post_url,
             auth_header,
             sse_reader: Mutex::new(Some(reader)),
+            close: Arc::new(SseCloseState {
+                closed: AtomicBool::new(false),
+                sse_stream,
+                in_flight: Mutex::new(Vec::new()),
+                next_post: AtomicU64::new(0),
+            }),
         })
+    }
+
+    /// Returns a closer that ends this transport from another thread, waking
+    /// any call blocked on the server (see [`SseCloser`]).
+    #[must_use]
+    pub fn closer(&self) -> SseCloser {
+        SseCloser(Arc::clone(&self.close))
     }
 
     /// Opens a connection to the session's POST URL and writes one JSON-RPC
@@ -257,14 +320,19 @@ impl SseClientTransport {
         Ok(stream)
     }
 
-    /// Fails once a call has seen the stream close. The server ended that
+    /// Fails once an [`SseCloser`] closed the transport, or once a call has
+    /// seen the stream close. A closed stream means the server ended the
     /// session (a newer `GET`, a lagged stream, a shutdown), so no POST is
     /// sent under it.
     ///
     /// # Errors
     ///
-    /// Returns [`SSE_CLOSED`] when the stream has closed.
+    /// Returns [`SSE_CLOSED`] when the transport was closed or the stream has
+    /// closed.
     fn ensure_open(&self) -> Result<(), String> {
+        if self.close.closed.load(Ordering::SeqCst) {
+            return Err(SSE_CLOSED.to_owned());
+        }
         let closed = self
             .sse_reader
             .lock()
@@ -277,19 +345,26 @@ impl SseClientTransport {
     }
 
     /// POSTs one JSON-RPC message to the session's POST URL and reads the
-    /// answer's status line.
+    /// answer's status line. While it waits, the POST's socket is registered
+    /// with the transport's [`SseCloser`], whose `close` ends the wait.
     ///
     /// # Errors
     ///
-    /// Returns an error when the connection or write fails, or when the server
-    /// answers outside 2xx: 401 when its bearer check refuses the token, 409
-    /// when a newer `GET` took the session over, 400 or 413 for a refused body.
+    /// Returns [`SSE_CLOSED`] when an [`SseCloser`] closed the transport
+    /// before or during the wait. Returns an error when the connection or
+    /// write fails, or when the server answers outside 2xx: 401 when its
+    /// bearer check refuses the token, 409 when a newer `GET` took the session
+    /// over, 400 or 413 for a refused body.
     fn post(&self, body: &str) -> Result<(), String> {
         let stream = self.send_post(body)?;
-
+        let key = self.register_post(&stream)?;
         let mut status_line = String::new();
-        let n = read_line_bounded(&mut BufReader::new(&stream), &mut status_line)
-            .map_err(|e| format!("failed to read POST status line: {e}"))?;
+        let read = read_line_bounded(&mut BufReader::new(&stream), &mut status_line);
+        self.unregister_post(key);
+        if self.close.closed.load(Ordering::SeqCst) {
+            return Err(SSE_CLOSED.to_owned());
+        }
+        let n = read.map_err(|e| format!("failed to read POST status line: {e}"))?;
         if n == 0 {
             return Err("connection closed before the POST's HTTP status line".to_owned());
         }
@@ -301,6 +376,43 @@ impl SseClientTransport {
             ));
         }
         Ok(())
+    }
+
+    /// Registers a clone of a POST's socket for [`SseCloser::close`] and
+    /// returns its key. The closed flag is read under the registry's lock,
+    /// which `close` takes after setting it, so a POST registered after a
+    /// close sees the flag and a POST registered before it is shut down.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SSE_CLOSED`] when the transport was closed, and an error
+    /// when the socket cannot be cloned or the registry's lock is poisoned.
+    fn register_post(&self, stream: &TcpStream) -> Result<u64, String> {
+        let clone = stream
+            .try_clone()
+            .map_err(|e| format!("failed to clone POST stream: {e}"))?;
+        let mut in_flight = self
+            .close
+            .in_flight
+            .lock()
+            .map_err(|e| format!("SSE in-flight lock poisoned: {e}"))?;
+        if self.close.closed.load(Ordering::SeqCst) {
+            return Err(SSE_CLOSED.to_owned());
+        }
+        let key = self.close.next_post.fetch_add(1, Ordering::Relaxed);
+        in_flight.push((key, clone));
+        drop(in_flight);
+        Ok(key)
+    }
+
+    /// Removes the POST socket registered under `key`; a close may already
+    /// have taken it.
+    fn unregister_post(&self, key: u64) {
+        let mut in_flight = match self.close.in_flight.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        in_flight.retain(|(k, _)| *k != key);
     }
 }
 
@@ -321,7 +433,9 @@ impl McpTransport for SseClientTransport {
     /// Returns an error when the stream has closed, before any POST, when the
     /// POST fails, when a read fails or times out, and when the stream closes
     /// during the wait. A closed stream stays closed: the server has ended
-    /// the session, and the caller connects a new transport.
+    /// the session, and the caller connects a new transport. Returns
+    /// [`SSE_CLOSED`] when an [`SseCloser`] closed the transport before or
+    /// during the call.
     #[allow(clippy::significant_drop_tightening)] // sse_reader MutexGuard is borrowed by reader across the entire loop.
     fn send_request(&self, request: &JsonRpcRequest) -> Result<JsonRpcResponse, String> {
         let body = serde_json::to_string(request)
@@ -344,8 +458,12 @@ impl McpTransport for SseClientTransport {
         // shift every later reply by one.
         loop {
             let mut line = String::new();
-            let n = read_line_bounded(reader, &mut line)
-                .map_err(|e| format!("failed to read SSE event: {e}"))?;
+            let read = read_line_bounded(reader, &mut line);
+            if self.close.closed.load(Ordering::SeqCst) {
+                *sse_reader = None;
+                return Err(SSE_CLOSED.to_owned());
+            }
+            let n = read.map_err(|e| format!("failed to read SSE event: {e}"))?;
             if n == 0 {
                 *sse_reader = None;
                 return Err(
@@ -804,6 +922,97 @@ mod tests {
             listener.accept().is_err(),
             "no POST may reach the server after the stream closed"
         );
+    }
+
+    /// A closer ends a call whose POST the server accepted and never answers:
+    /// the POST's connection has no read timeout, so nothing else would. The
+    /// call fails with the closed error within a second, and a later call
+    /// fails before it sends a POST.
+    #[test]
+    fn sse_closer_ends_a_call_waiting_on_a_silent_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (_, sse) = accept_sse(&listener);
+            let (conn, _) = listener.accept().expect("accept request POST");
+            read_request(&conn);
+            accepted_tx.send(()).expect("signal accepted POST");
+            listener.set_nonblocking(true).expect("nonblocking");
+            (listener, sse, conn)
+        });
+
+        let transport =
+            SseClientTransport::connect(&format!("http://127.0.0.1:{port}/sse"), Some("tok-1"))
+                .expect("connect");
+        let closer = transport.closer();
+        let closing = std::thread::spawn(move || {
+            accepted_rx.recv().expect("POST accepted");
+            let closed_at = std::time::Instant::now();
+            closer.close();
+            closed_at
+        });
+        let err = transport
+            .send_request(&request(1))
+            .expect_err("a closed transport must end the call");
+        let ended_at = std::time::Instant::now();
+        let closed_at = closing.join().expect("closing thread");
+        assert_eq!(err, SSE_CLOSED);
+        assert!(
+            ended_at.duration_since(closed_at) < std::time::Duration::from_secs(1),
+            "close must end the blocked call at once"
+        );
+        let (listener, _sse, _conn) = server.join().expect("server thread");
+        let err = transport
+            .send_notification(&JsonRpcNotification::new("notifications/initialized", None))
+            .expect_err("a closed transport must fail");
+        assert_eq!(err, SSE_CLOSED);
+        assert!(
+            listener.accept().is_err(),
+            "no POST may reach the server after close"
+        );
+    }
+
+    /// A closer ends a call whose POST the server answered but whose response
+    /// never arrives on the stream, before the stream's 30-second read
+    /// timeout would.
+    #[test]
+    fn sse_closer_ends_a_call_waiting_on_the_stream() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (answered_tx, answered_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (_, sse) = accept_sse(&listener);
+            let (mut conn, _) = listener.accept().expect("accept request POST");
+            read_request(&conn);
+            conn.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("answer request POST");
+            answered_tx.send(()).expect("signal answered POST");
+            sse
+        });
+
+        let transport =
+            SseClientTransport::connect(&format!("http://127.0.0.1:{port}/sse"), Some("tok-1"))
+                .expect("connect");
+        let closer = transport.closer();
+        let closing = std::thread::spawn(move || {
+            answered_rx.recv().expect("POST answered");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let closed_at = std::time::Instant::now();
+            closer.close();
+            closed_at
+        });
+        let err = transport
+            .send_request(&request(1))
+            .expect_err("a closed transport must end the call");
+        let ended_at = std::time::Instant::now();
+        let closed_at = closing.join().expect("closing thread");
+        assert_eq!(err, SSE_CLOSED);
+        assert!(
+            ended_at.duration_since(closed_at) < std::time::Duration::from_secs(1),
+            "close must end the blocked stream read at once"
+        );
+        drop(server.join().expect("server thread"));
     }
 
     /// A token that could inject a header line, or an empty one, is refused

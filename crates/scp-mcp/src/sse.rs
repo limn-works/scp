@@ -2356,6 +2356,107 @@ mod tests {
         drop(second);
     }
 
+    /// Shared state around `server` with the session slot free and no live
+    /// session, as `run_sse` builds it before any client attaches.
+    fn unattached_state(server: McpServer<MockProvider>) -> Arc<AppState<MockProvider>> {
+        Arc::new(AppState {
+            server: Mutex::new(server),
+            notifier: McpNotifier::new(&test_config()),
+            retry_ms: DEFAULT_RETRY_MS,
+            session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            session_evict: std::sync::Mutex::new(CancellationToken::new()),
+            shutdown: CancellationToken::new(),
+            live_session: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// A session's disconnect clears its handshake and subscriptions before
+    /// the slot frees, with no new admission involved: `SessionGuard::drop`'s
+    /// reset task holds the permit until `reset_session` has run, so once the
+    /// slot is free the server is uninitialized with zero subscriptions.
+    #[tokio::test]
+    async fn dropped_session_is_reset_before_its_slot_frees() {
+        let (_event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
+        let (server, _pump) = McpServer::with_event_source(MockProvider::default(), event_rx);
+        let state = unattached_state(server);
+
+        let first = sse_handler(State(Arc::clone(&state))).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let (first_id, first) = session_id_of(first).await;
+        for body in [
+            initialize_body(1),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": crate::protocol::METHOD_RESOURCES_SUBSCRIBE,
+                "params": { "uri": "scp://ctx_a/events" },
+                "id": 2
+            }),
+        ] {
+            let status = message_handler(
+                State(Arc::clone(&state)),
+                session(&first_id),
+                body.to_string(),
+            )
+            .await
+            .into_response()
+            .status();
+            assert_eq!(status, StatusCode::ACCEPTED);
+        }
+        {
+            let server = state.server.lock().await;
+            assert!(server.is_initialized());
+            assert_eq!(server.subscription_count(), 1);
+        }
+
+        drop(first);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while state.session_slot.available_permits() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session slot never freed after the session dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let server = state.server.lock().await;
+        assert!(
+            !server.is_initialized(),
+            "a dropped session left its handshake behind"
+        );
+        assert_eq!(
+            server.subscription_count(),
+            0,
+            "a dropped session left its subscriptions behind"
+        );
+    }
+
+    /// Admission starts every session from a clean slate on its own, whatever
+    /// state the server holds when the client attaches: a new client never
+    /// inherits a handshake or a subscription it did not make.
+    #[tokio::test]
+    async fn admission_resets_a_server_holding_prior_session_state() {
+        let (_event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
+        let (server, _pump) = subscribed_server("scp://ctx_a/events", event_rx);
+        assert!(server.is_initialized());
+        assert_eq!(server.subscription_count(), 1);
+        let state = unattached_state(server);
+
+        let second = sse_handler(State(Arc::clone(&state))).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        {
+            let server = state.server.lock().await;
+            assert!(
+                !server.is_initialized(),
+                "a new admission inherited a prior handshake"
+            );
+            assert_eq!(
+                server.subscription_count(),
+                0,
+                "a new admission inherited prior subscriptions"
+            );
+        }
+        drop(second);
+    }
+
     // -- No cross-session replay (leak regression) ----------------------------
 
     /// A newly admitted session must receive NOTHING from a prior session,
