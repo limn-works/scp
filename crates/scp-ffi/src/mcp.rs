@@ -3926,22 +3926,27 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Yields an in-flight call's error message once it ends, or `None` if
+    /// it succeeded.
+    #[cfg(unix)]
+    type CallOutcome = std::sync::mpsc::Receiver<Option<String>>;
+
     /// Connects `scp` through `py_mcp_client_connect_stdio` to a stub server
     /// that answers `initialize` and then falls silent, and starts a
     /// `py_mcp_client_list_tools` on it from a Python thread. The stub runs
     /// `sleep` as its own child, the way `npx` runs the real server: the
     /// trailing `true` keeps `sh` from exec'ing it. That grandchild holds the
     /// stdout pipe, so the in-flight call ends only when its whole process
-    /// group is killed. Returns the handle, the server's slot, and a receiver
-    /// that yields whether the in-flight call failed.
+    /// group is killed. Returns only once the call holds the client's lock,
+    /// which it takes after cloning `client` out of the registry and keeps
+    /// through the blocking read, so the caller's teardown always meets a
+    /// call in flight. Returns the handle, the server's slot, and a receiver
+    /// that yields the in-flight call's error message, or `None` if it
+    /// succeeded.
     #[cfg(unix)]
     fn start_call_on_a_silent_stdio_server(
         scp: &crate::scp::PyScp,
-    ) -> (
-        String,
-        Arc<Mutex<Option<Child>>>,
-        std::sync::mpsc::Receiver<bool>,
-    ) {
+    ) -> (String, Arc<Mutex<Option<Child>>>, CallOutcome) {
         pyo3::prepare_freethreaded_python();
         scp.inner
             .core
@@ -3961,12 +3966,18 @@ mod tests {
             )
         })
         .expect("connect to the stub server");
-        let server = client_registry_of(&scp.inner)
-            .get(&handle)
-            .expect("registered handle")
-            .stdio_server
-            .clone()
-            .expect("a stdio client records its server");
+        let (server, probe) = {
+            let entry = client_registry_of(&scp.inner)
+                .get(&handle)
+                .expect("registered handle");
+            (
+                entry
+                    .stdio_server
+                    .clone()
+                    .expect("a stdio client records its server"),
+                Arc::clone(&entry.client),
+            )
+        };
 
         let caller = crate::scp::PyScp {
             inner: Arc::clone(&scp.inner),
@@ -3974,12 +3985,38 @@ mod tests {
         let call_handle = handle.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let failed =
-                Python::with_gil(|py| caller.py_mcp_client_list_tools(py, &call_handle).is_err());
-            let _ = done_tx.send(failed);
+            let error = Python::with_gil(|py| {
+                caller
+                    .py_mcp_client_list_tools(py, &call_handle)
+                    .err()
+                    .map(|e| e.to_string())
+            });
+            let _ = done_tx.send(error);
         });
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Nothing but the call locks the client once connect has returned,
+        // so a failed `try_lock` means the call is inside `list_tools`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while probe.try_lock().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the tools/list call never took the client's lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(probe);
         (handle, server, done_rx)
+    }
+
+    /// Asserts that the in-flight call failed on its `tools/list` request,
+    /// which only a call that reached the transport can do; a call that lost
+    /// the race to the teardown fails on the missing handle instead.
+    #[cfg(unix)]
+    fn assert_failed_in_tools_list(error: Option<String>) {
+        let error = error.expect("the killed stub server sent no tools/list response");
+        assert!(
+            error.contains("tools/list failed"),
+            "the call must fail on its in-flight request, not on the handle lookup: {error}"
+        );
     }
 
     /// Runs `stop` on a Python thread of its own and waits for it to return.
@@ -4024,10 +4061,10 @@ mod tests {
             server.lock().expect("server lock").is_none(),
             "disconnect must kill and reap the stdio server process"
         );
-        let failed = done_rx
+        let error = done_rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the in-flight call must end once disconnect kills the server's grandchild");
-        assert!(failed, "the killed stub server sent no tools/list response");
+        assert_failed_in_tools_list(error);
     }
 
     /// Instance shutdown clears the client registry while a `tools/list` is
@@ -4052,10 +4089,10 @@ mod tests {
             server.lock().expect("server lock").is_none(),
             "shutdown must kill and reap the stdio server process"
         );
-        let failed = done_rx
+        let error = done_rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the in-flight call must end once shutdown kills the server's grandchild");
-        assert!(failed, "the killed stub server sent no tools/list response");
+        assert_failed_in_tools_list(error);
     }
 
     /// `stop_stdio_server` reaps the server and empties its slot, so the
