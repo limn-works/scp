@@ -1,4 +1,5 @@
-// AndroidStorageTest.kt — Unit tests for AndroidStorage (SCP-113)
+// AndroidStorageTest.kt — StorageProvider contract tests against InMemoryStorageProvider,
+// and tests of AndroidStorage's constants and signatures (SCP-113)
 //
 // IMPORTANT: These are IN-MEMORY-ONLY tests. All StorageProvider contract tests run
 // against InMemoryStorageProvider, NOT the real AndroidStorage implementation. The
@@ -468,7 +469,7 @@ class AndroidStorageTest {
         }
 
         @Test
-        fun `getOrCreateStorageKey is accessible for integration testing`() {
+        fun `getOrCreateStorageKey takes no argument and returns ByteArray`() {
             // Verify the method exists on the production class with the signature
             // `AndroidStorage.() -> ByteArray` (calling it throws without Android
             // Keystore). The method is `internal`, so the Kotlin compiler mangles its
@@ -548,7 +549,7 @@ class AndroidStorageTest {
 
         @Test
         fun `store value of exactly 32 bytes round-trips`() {
-            // 32 bytes is the SQLCipher passphrase length — ensure no special handling
+            // InMemoryStorageProvider stores a 32-byte value like a value of any other length.
             val key = "exact32"
             val value = ByteArray(32) { it.toByte() }
             storage.set(key, value)
@@ -556,8 +557,8 @@ class AndroidStorageTest {
         }
 
         @Test
-        fun `concurrent stores to different keys do not interfere`() {
-            // Sequential simulation of concurrent access pattern
+        fun `sequential stores to 100 distinct keys each read back their own value`() {
+            // One thread stores the 100 keys in turn, so this test runs no concurrent access.
             val keys = (1..100).map { "concurrent.$it" }
             keys.forEach { storage.set(it, it.toByteArray()) }
             keys.forEach { key ->
