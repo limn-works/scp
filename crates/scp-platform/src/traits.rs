@@ -289,9 +289,12 @@ impl PushToken {
 ///
 /// Indicates that the application should wake up and process pending messages.
 /// §10.7 of the infrastructure spec forbids a context ID, a sender identifier,
-/// and a message count in a push payload, so a wake signal names no context.
-/// `InMemoryPush`, the one implementation of [`Push`], copies the received
-/// payload into the wake signal unchanged. See ADR-006.
+/// and any other metadata in a push payload. `WakeSignal` does not enforce that
+/// rule: it carries whatever bytes it is constructed from. `InMemoryPush`, the
+/// one implementation of [`Push`] and a test adapter behind the
+/// `in-memory-push` feature, copies the received payload into the wake signal
+/// unchanged, so a payload that breaks §10.7 yields a wake signal that carries
+/// the forbidden metadata. See ADR-006.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeSignal {
     /// The raw notification payload that triggered this wake signal.

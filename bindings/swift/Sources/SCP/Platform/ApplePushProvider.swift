@@ -367,12 +367,12 @@
 
             // Rule 4: content-available must be the integer 1 (not boolean true).
             // JSONSerialization bridges both JSON numbers and JSON booleans to NSNumber.
-            // __NSCFBoolean is a NSNumber subclass; NSNumber(boolValue: true).intValue == 1,
-            // so intValue alone incorrectly accepts boolean true.
+            // __NSCFBoolean is a NSNumber subclass; NSNumber(boolValue: true).int64Value == 1,
+            // so int64Value alone incorrectly accepts boolean true.
             // CFGetTypeID disambiguates: CFBooleanGetTypeID() ≠ CFNumberGetTypeID().
             // A JSON fraction such as 1.5 is a floating-point CFNumber whose
-            // intValue truncates to 1, so CFNumberIsFloatType rejects it before
-            // intValue is read.
+            // int64Value truncates to 1, so CFNumberIsFloatType rejects it before
+            // int64Value is read.
             guard
                 let number = contentAvailable as? NSNumber,
                 CFGetTypeID(number) == CFNumberGetTypeID(),
