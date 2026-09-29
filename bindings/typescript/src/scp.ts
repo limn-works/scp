@@ -465,6 +465,16 @@ export interface PseudonymResult {
   keyId: string;
 }
 
+/** A custody key's stated type and public key, returned by {@link KeyCustodyProvider.getPublicKey}. */
+export interface CustodyPublicKey {
+  /** `"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`. */
+  keyType: string;
+  /** The public key in the exact encoding its type names. */
+  publicKey: Uint8Array;
+  /** `"identity"` or `"operational"`: the role the key was minted in. */
+  role: string;
+}
+
 /**
  * Caller-supplied custody backend for {@link SCP.identityCreateWithCustody}.
  *
@@ -505,23 +515,49 @@ export interface PseudonymResult {
  * runs the full protocol in-tab and does not use this native custody callback.
  */
 export interface KeyCustodyProvider {
-  /** Generate a keypair (`"ed25519"` or `"x25519"`); return its opaque id. */
-  generateKeypair(keyType: string): string;
   /**
-   * Return the 64-byte signature of `message` under `keyId`. For an identity
-   * key this is Ed25519. For a pseudonym key returned by
-   * {@link derivePseudonym} `message` is a 32-byte digest and the result is
-   * the P-256 prehash ECDSA `r || s` with low s (§9.5); the bridge rejects
-   * any other length and any signature that fails strict verification, for a
-   * pseudonym key this adapter derived and still holds bound; for a handle the
-   * adapter did not bind, the bridge returns the host's bytes unchecked.
+   * Generate a keypair and return its opaque id. `keyType` is `"ed25519"`,
+   * `"x25519"`, `"p256"` (ECDSA P-256 signing) or `"hpke-p256"` (P-256 ECDH
+   * for HPKE). `role` is `"identity"` (the only source a pseudonym derives
+   * from) or `"operational"`. Record `role` and report it from
+   * {@link getPublicKey} for the key's lifetime; the bridge refuses and
+   * destroys a key whose reported role differs. Never reuse a key id: an id
+   * returned here, or from {@link derivePseudonym}, names no other key for
+   * the provider's lifetime, even after that key is destroyed.
+   */
+  generateKeypair(keyType: string, role: string): string;
+  /**
+   * Sign `message` under `keyId`. An Ed25519 key returns the 64-byte
+   * signature. A `"p256"` key, or a pseudonym key returned by
+   * {@link derivePseudonym}, receives a 32-byte digest (§9.5.1, no second
+   * hash) and returns raw `r || s` (64 bytes) or DER; the bridge normalises
+   * it to low-s and verifies it strictly against the key's public key, and
+   * any mismatch is an error. A software implementation MUST derive the
+   * ECDSA nonce by RFC 6979 with SHA-256; a hardware keystore may use a
+   * random nonce.
    */
   sign(keyId: string, message: Uint8Array): Uint8Array;
   /**
-   * Return the public key for `keyId`: 32 Ed25519 bytes for an identity key,
-   * the 33-byte compressed P-256 point for a pseudonym key.
+   * Return the type and public key of `keyId`. `keyType` is the type the key
+   * was generated with (`"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`);
+   * a pseudonym key from {@link derivePseudonym} is `"p256"`. `publicKey` is
+   * 32 bytes for Ed25519 and X25519, the 33-byte compressed SEC1 point for
+   * `"p256"` (for a pseudonym, byte-identical to the point
+   * {@link derivePseudonym} returned), and the 65-byte uncompressed SEC1
+   * point for `"hpke-p256"`. The bridge registers the key under the stated
+   * type and rejects a length that does not match it. A provider that holds
+   * no key for `keyId` throws a `KeyNotFoundError` (or any error whose `code`
+   * is `"SCP-CRYPTO-4006"`), which callers receive as key-not-found.
+   *
+   * `role` is the role {@link generateKeypair} minted the key in, reported in
+   * every session; a pseudonym key is `"operational"`. A key id the bridge
+   * has not seen binds as an identity only when `role` is `"identity"`, so an
+   * identity from an earlier session can still derive pseudonyms. The bridge
+   * cannot check this answer: a provider that reports `"identity"` for a key
+   * it minted as `"operational"` lets that key derive pseudonyms, and that is
+   * outside the native core's control.
    */
-  getPublicKey(keyId: string): Uint8Array;
+  getPublicKey(keyId: string): CustodyPublicKey;
   /**
    * Destroy key material for `keyId`; subsequent operations must fail.
    * Destroying an identity key also destroys its `pseudonym_secret` and every
@@ -529,7 +565,12 @@ export interface KeyCustodyProvider {
    * then fails too (spec §9.10.4.A).
    */
   destroyKey(keyId: string): void;
-  /** Return the 32-byte X25519 shared secret with `peerPublic`. */
+  /**
+   * Return the 32-byte shared secret with `peerPublic`. An X25519 key
+   * receives a 32-byte peer key; an `"hpke-p256"` key receives the 65-byte
+   * uncompressed SEC1 peer point, already validated on the curve, and
+   * returns the ECDH x-coordinate.
+   */
   dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array;
   /**
    * Derive the context-scoped P-256 pseudonym of identity key `keyId`

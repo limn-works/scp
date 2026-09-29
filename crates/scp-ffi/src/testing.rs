@@ -606,8 +606,12 @@ pub fn testing_pseudonym_routing_id_from_seed(
             })
         })?);
     let rt = crate::runtime()?;
+    use scp_platform::KeyCustody;
     let in_memory = scp_platform::testing::InMemoryKeyCustody::new();
-    let identity_key = rt.block_on(in_memory.import_ed25519_key(&seed));
+    // The identity role (§9.10.4.A): only an identity key derives.
+    let identity_key = rt
+        .block_on(in_memory.import_ed25519_signing_key(&seed))
+        .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))?;
     let custody = crate::custody::FfiKeyCustody::InMemory(in_memory);
     crate::context::pseudonym_routing_id_on(rt, &custody, identity_key, context_id)
         .map(|id| id.to_vec())

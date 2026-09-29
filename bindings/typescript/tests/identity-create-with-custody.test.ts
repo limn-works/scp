@@ -19,8 +19,8 @@
 import { describe, expect, test } from "bun:test";
 import * as crypto from "node:crypto";
 
-import { CryptoError, ScpError } from "../src/errors";
-import type { KeyCustodyProvider, PseudonymResult } from "../src/scp";
+import { CryptoError, KeyNotFoundError, ScpError } from "../src/errors";
+import type { CustodyPublicKey, KeyCustodyProvider, PseudonymResult } from "../src/scp";
 import { SCP } from "../src/scp";
 import {
   p256Compressed,
@@ -58,6 +58,8 @@ class CryptoKeychain implements KeyCustodyProvider {
   // Pseudonym key id -> the identity key id it was derived from, so destroying
   // the identity destroys its pseudonyms (§9.10.4.A).
   #pseudonymOwner = new Map<string, string>();
+  // Key id -> the role generateKeypair minted it in.
+  #roles = new Map<string, string>();
   #next = 1;
   readonly #fault: PseudonymFault | undefined;
 
@@ -65,10 +67,11 @@ class CryptoKeychain implements KeyCustodyProvider {
     this.#fault = fault;
   }
 
-  generateKeypair(_keyType: string): string {
+  generateKeypair(_keyType: string, role: string): string {
     const { privateKey } = crypto.generateKeyPairSync("ed25519");
     const jwk = privateKey.export({ format: "jwk" }) as { d: string };
     const kid = String(this.#next++);
+    this.#roles.set(kid, role);
     this.#seeds.set(kid, new Uint8Array(Buffer.from(jwk.d, "base64url")));
     return kid;
   }
@@ -87,7 +90,7 @@ class CryptoKeychain implements KeyCustodyProvider {
 
   #keyObject(keyId: string): crypto.KeyObject {
     const seed = this.#seeds.get(keyId);
-    if (seed === undefined) throw new Error(`unknown key id: ${keyId}`);
+    if (seed === undefined) throw new KeyNotFoundError(`unknown key id: ${keyId}`);
     return this.#keyObjectFromSeed(seed);
   }
 
@@ -97,21 +100,26 @@ class CryptoKeychain implements KeyCustodyProvider {
     return new Uint8Array(crypto.sign(null, Buffer.from(message), this.#keyObject(keyId)));
   }
 
-  getPublicKey(keyId: string): Uint8Array {
+  getPublicKey(keyId: string): CustodyPublicKey {
     const d = this.#pseudonyms.get(keyId);
     if (d !== undefined) {
       const point = p256Compressed(d);
       // A host whose handle answers with a different point than its derivation.
       if (this.#fault === "wrongPublicKey") point[0] = point[0] === 0x02 ? 0x03 : 0x02;
-      return point;
+      return { keyType: "p256", publicKey: point, role: "operational" };
     }
     const pub = crypto.createPublicKey(this.#keyObject(keyId));
     const jwk = pub.export({ format: "jwk" }) as { x: string };
-    return new Uint8Array(Buffer.from(jwk.x, "base64url"));
+    return {
+      keyType: "ed25519",
+      publicKey: new Uint8Array(Buffer.from(jwk.x, "base64url")),
+      role: this.#roles.get(keyId) ?? "missing",
+    };
   }
 
   destroyKey(keyId: string): void {
     this.#seeds.delete(keyId);
+    this.#roles.delete(keyId);
     this.#pseudonyms.delete(keyId);
     this.#pseudonymOwner.delete(keyId);
     // A pseudonym dies with its identity (§9.10.4.A).
@@ -134,7 +142,7 @@ class CryptoKeychain implements KeyCustodyProvider {
 
   #identitySeed(keyId: string): Uint8Array {
     const seed = this.#seeds.get(keyId);
-    if (seed === undefined) throw new Error(`unknown key id: ${keyId}`);
+    if (seed === undefined) throw new KeyNotFoundError(`unknown key id: ${keyId}`);
     return seed;
   }
 
@@ -220,8 +228,8 @@ class SignOnlyKeychain extends CryptoKeychain {
 describe("CryptoKeychain pseudonym lifecycle", () => {
   test("destroying an identity destroys its v1 and v2 pseudonyms (§9.10.4.A)", () => {
     const keychain = new CryptoKeychain();
-    const identity = keychain.generateKeypair("ed25519");
-    const other = keychain.generateKeypair("ed25519");
+    const identity = keychain.generateKeypair("ed25519", "identity");
+    const other = keychain.generateKeypair("ed25519", "identity");
     const ctx = new TextEncoder().encode("ctx");
     const v1 = keychain.derivePseudonym(identity, ctx).keyId;
     const v2 = keychain.deriveRotatablePseudonym(identity, ctx, 3n).keyId;

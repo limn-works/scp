@@ -1,6 +1,6 @@
 //! `SQLCipher`-backed key-custody conformance tests.
 //!
-//! Expands `key_custody_conformance!()` — 4 tests for
+//! Expands `key_custody_conformance!()` — 10 tests for
 //! `scp_platform::KeyCustody` — against `SqliteKeyCustody`. ADR-006
 //! (`.docs/adrs/phase-1.md`, platform abstraction) requires every adapter, not
 //! only its in-memory reference, to satisfy one contract; spec §16.15.1 of

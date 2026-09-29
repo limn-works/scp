@@ -100,10 +100,8 @@ pub mod tests {
         custody: &C,
     ) -> Result<(), crate::error::PlatformError> {
         use crate::error::PlatformError;
-        use crate::traits::KeyType;
-
-        let identity = custody.generate_keypair(KeyType::Ed25519).await?;
-        let other = custody.generate_keypair(KeyType::Ed25519).await?;
+        let identity = custody.generate_identity_keypair().await?;
+        let other = custody.generate_identity_keypair().await?;
 
         let v1 = custody.derive_pseudonym(&identity, b"ctx-a").await?;
         let v2 = custody

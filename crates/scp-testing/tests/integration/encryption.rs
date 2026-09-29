@@ -671,7 +671,7 @@ async fn pseudonym_derivation() {
         __s[..8].copy_from_slice(&(15u64).to_le_bytes());
         __s
     });
-    let identity_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+    let identity_key = custody.generate_identity_keypair().await.unwrap();
 
     let ctx_a = b"context-alpha";
     let ctx_b = b"context-beta";

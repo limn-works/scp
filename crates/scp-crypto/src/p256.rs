@@ -284,6 +284,29 @@ pub fn sign_prehash_rfc6979(
     Ok(signature_to_raw(&signature))
 }
 
+/// Signs a 32-byte digest with RFC 6979 deterministic nonces, as
+/// [`sign_prehash_rfc6979`] does, and returns the raw signature before
+/// low-`s` normalisation, so its `s` may be high.
+///
+/// Test support only: a test that must prove a low-`s` normalisation ran
+/// pins an input whose raw `s` is high. Every §9.5.1 signer uses
+/// [`sign_prehash_rfc6979`].
+///
+/// # Errors
+///
+/// [`P256Error::SigningFailed`] if the nonce yields `r = 0` or `s = 0`.
+#[cfg(any(test, feature = "testing"))]
+pub fn sign_prehash_rfc6979_unnormalized(
+    key: &P256SigningKey,
+    digest: &[u8; 32],
+) -> Result<[u8; SIGNATURE_LEN], P256Error> {
+    let signature: Signature = key
+        .0
+        .sign_prehash(digest)
+        .map_err(|_| P256Error::SigningFailed)?;
+    Ok(signature_to_raw(&signature))
+}
+
 /// Verifies a §9.5.1 signature: exactly 64 bytes, `r` and `s` in `[1, n − 1]`,
 /// `s ≤ n/2`, and a valid ECDSA equation over `digest` with no second hash.
 ///
@@ -570,6 +593,28 @@ mod tests {
         sig[..32].copy_from_slice(&r.to_repr());
         sig[32..].copy_from_slice(&s_bytes);
         (key.public_key(), sig)
+    }
+
+    /// The unnormalised signer returns the raw RFC 6979 signature: over
+    /// many digests it returns both low and high `s`, it always verifies
+    /// leniently, and its low-`s` form is [`sign_prehash_rfc6979`]'s output.
+    #[test]
+    fn unnormalized_rfc6979_is_the_raw_signature() {
+        let key = P256SigningKey::from_scalar_bytes(&[7; 32]).unwrap();
+        let (mut low, mut high) = (0, 0);
+        for b in 0..=u8::MAX {
+            let digest = [b; 32];
+            let raw = sign_prehash_rfc6979_unnormalized(&key, &digest).unwrap();
+            verify_prehash_lenient(&key.public_key(), &digest, &raw).unwrap();
+            let normalized = sign_prehash_rfc6979(&key, &digest).unwrap();
+            assert_eq!(normalize_low_s(&raw).unwrap(), normalized);
+            if raw == normalized {
+                low += 1;
+            } else {
+                high += 1;
+            }
+        }
+        assert!(low > 0 && high > 0, "low {low}, high {high}");
     }
 
     /// The §9.5 boundary: `s = (n − 1)/2` is low and passes strict

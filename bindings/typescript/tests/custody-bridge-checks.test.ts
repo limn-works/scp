@@ -3,13 +3,21 @@
  * driven through the SDK's production custody record
  * (`toNativeCustodyProvider`) and the napi `TestingCallbackCustody` hook.
  *
- * Each test fails if the check it names is removed from
- * `crates/scp-ffi/napi/src/custody.rs`:
- *   - `check_sign_input`: a pseudonym key signs only a 32-byte digest, and a
+ * Each test fails if the check it names is removed from the adapter
+ * (`crates/scp-ffi/napi/src/custody.rs` over `CallbackKeyRegistry` in
+ * `crates/scp-ffi/common/src/callback_custody.rs`):
+ *   - `p256_digest`: a pseudonym key signs only a 32-byte digest, and a
  *     shorter input never reaches the host;
- *   - `check_signature`: a high-s host signature is rejected;
- *   - `unbind` in `destroy_key`: a destroyed id can carry a new point, and
- *     the id is already unbound when the host's `destroyKey` runs.
+ *   - `p256_host_signature`: a high-s host signature comes out as the low-s
+ *     form;
+ *   - `begin_destroy` and `end_destroy`: the id is no longer live when the
+ *     host's `destroyKey` runs, and a host that breaks the no-reuse contract
+ *     by giving a destroyed id a new point has that point bound;
+ *   - `retire_pseudonyms_of`: destroying an identity retires its pseudonyms,
+ *     so they sign nothing, and a host that breaks the no-reuse contract by
+ *     handing their ids to new pseudonyms has those bound afresh;
+ *   - `derive_pseudonym`: a derive racing its identity's destroy is
+ *     key-not-found and destroys the host key it derived (§9.10.4.A).
  *
  * The host-failure tests fail if `hostCall` in
  * `src/internal/custody-adapter.ts` stops turning a host failure into a typed
@@ -31,7 +39,7 @@ import * as crypto from "node:crypto";
 import { CryptoError, mapBridgeError } from "../src/errors";
 import { toNativeCustodyProvider } from "../src/internal/custody-adapter";
 import { loadNativeAddon } from "../src/internal/native";
-import type { KeyCustodyProvider, PseudonymResult } from "../src/scp";
+import type { CustodyPublicKey, KeyCustodyProvider, PseudonymResult } from "../src/scp";
 import {
   bigIntTo32,
   bytesToBigInt,
@@ -73,10 +81,24 @@ class Store {
   pseudonyms = new Map<string, bigint>();
   /** Pseudonym key id -> the identity key id it was derived from. */
   pseudonymOwner = new Map<string, string>();
+  /** Key id -> the role `generateKeypair` minted it in. */
+  roles = new Map<string, string>();
   next = 1;
   signCalls = 0;
   /** Called with the key id at the start of the host's `destroyKey`. */
   destroyProbe?: (keyId: string) => void;
+  /** Every key id the host's `destroyKey` received, in order. */
+  destroyed: string[] = [];
+  /**
+   * Whether destroying an identity also drops its pseudonyms. A host that
+   * keeps every key it is not told to destroy sets this false.
+   */
+  cascadeDestroy = true;
+  /**
+   * Called with (identity key id, derived key id) inside the host's
+   * `derivePseudonym`, after the host holds the derived key.
+   */
+  deriveProbe?: (sourceKeyId: string, derivedKeyId: string) => void;
 }
 
 class StoreKeychain implements KeyCustodyProvider {
@@ -85,9 +107,10 @@ class StoreKeychain implements KeyCustodyProvider {
     readonly fault?: Fault,
   ) {}
 
-  generateKeypair(_keyType: string): string {
+  generateKeypair(_keyType: string, role: string): string {
     const kid = String(this.store.next++);
     this.store.seeds.set(kid, new Uint8Array(crypto.randomBytes(32)));
+    this.store.roles.set(kid, role);
     return kid;
   }
 
@@ -106,18 +129,31 @@ class StoreKeychain implements KeyCustodyProvider {
     );
   }
 
-  getPublicKey(keyId: string): Uint8Array {
+  getPublicKey(keyId: string): CustodyPublicKey {
     const d = this.store.pseudonyms.get(keyId);
-    if (d !== undefined) return p256Compressed(d);
-    if (this.store.seeds.has(keyId)) return new Uint8Array(32);
-    throw new Error(`unknown key id: ${keyId}`);
+    if (d !== undefined) {
+      return { keyType: "p256", publicKey: p256Compressed(d), role: "operational" };
+    }
+    const seed = this.store.seeds.get(keyId);
+    if (seed !== undefined) {
+      return {
+        keyType: "ed25519",
+        publicKey: ed25519Public(seed),
+        role: this.store.roles.get(keyId) ?? "missing",
+      };
+    }
+    // The contract's key-not-found signal.
+    throw new CryptoError(`unknown key id: ${keyId}`, "SCP-CRYPTO-4006");
   }
 
   destroyKey(keyId: string): void {
     this.store.destroyProbe?.(keyId);
+    this.store.destroyed.push(keyId);
     this.store.seeds.delete(keyId);
+    this.store.roles.delete(keyId);
     this.store.pseudonyms.delete(keyId);
     this.store.pseudonymOwner.delete(keyId);
+    if (!this.store.cascadeDestroy) return;
     // A pseudonym dies with its identity (§9.10.4.A).
     for (const [kid, owner] of [...this.store.pseudonymOwner]) {
       if (owner !== keyId) continue;
@@ -141,6 +177,7 @@ class StoreKeychain implements KeyCustodyProvider {
       this.fault === "fixedId" ? "777" : (h.readBigUInt64BE(0) | (1n << 63n)).toString();
     this.store.pseudonyms.set(pseudonymId, d);
     this.store.pseudonymOwner.set(pseudonymId, keyId);
+    this.store.deriveProbe?.(keyId, pseudonymId);
     return { publicKey: p256Compressed(d), keyId: pseudonymId };
   }
 
@@ -155,6 +192,14 @@ class StoreKeychain implements KeyCustodyProvider {
   custodyType(_keyId: string): string {
     return "software";
   }
+}
+
+/** The Ed25519 public key of a 32-byte seed, through a PKCS#8 import. */
+function ed25519Public(seed: Uint8Array): Uint8Array {
+  const pkcs8 = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]);
+  const key = crypto.createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" });
+  const spki = crypto.createPublicKey(key).export({ format: "der", type: "spki" });
+  return new Uint8Array(spki.subarray(spki.length - 32));
 }
 
 function adapter(store: Store, fault?: Fault): TestingCustody {
@@ -222,13 +267,17 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     expect(store.signCalls).toBe(calls);
   });
 
-  test("a high-s host signature is rejected", async () => {
+  test("a high-s host signature comes out as the low-s form", async () => {
     const store = new Store();
     const custody = adapter(store, "highS");
     const identity = await custody.generateKeypair();
     const pseudonym = await custody.derivePseudonym(identity, "ctx");
-    const err = await custody.sign(pseudonym.keyId, DIGEST).catch((e: unknown) => e);
-    expect(mapBridgeError(err).code).toBe("SCP-CRYPTO-4060");
+    const sig = await custody.sign(pseudonym.keyId, DIGEST);
+    expect(sig.length).toBe(64);
+    expect(bytesToBigInt(sig.subarray(32)) <= P256_N / 2n).toBe(true);
+    const d = store.pseudonyms.get(pseudonym.keyId);
+    if (d === undefined) throw new Error("pseudonym missing from the store");
+    expect(Buffer.from(sig).equals(Buffer.from(p256SignPrehash(d, DIGEST)))).toBe(true);
   });
 
   test("destroying a pseudonym unbinds its id", async () => {
@@ -342,36 +391,98 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     }
   });
 
-  test("the adapter unbinds a pseudonym before the host's destroyKey runs", async () => {
-    // Observed through behaviour: a bound pseudonym id rejects a 5-byte input
-    // in `check_sign_input` before the host is called (SCP-CRYPTO-4060, no host
-    // `sign`); an unbound id passes the input to the host's `sign`. The testing
-    // `sign` runs that check on the JS thread before it returns, so a `sign`
-    // issued inside the host's `destroyKey` reads the binding table as it
-    // stands during that host call.
+  test("the adapter retires a pseudonym before the host's destroyKey runs", async () => {
+    // Observed through behaviour: a sign issued while the host's destroyKey
+    // runs finds the handle retired (Destroying) and fails key-not-found
+    // (SCP-CRYPTO-4006) without reaching the host's `sign`. The testing `sign`
+    // polls the adapter once on the JS thread before it returns, and that
+    // poll reads the registry, so a `sign` issued inside the host's
+    // `destroyKey` sees the registry as it stands during that host call.
     const store = new Store();
     const custody = adapter(store);
     const identity = await custody.generateKeypair();
     const pseudonym = await custody.derivePseudonym(identity, "ctx");
-    const short = Buffer.alloc(5);
-    const whileBound = await rejectionOf(() => custody.sign(pseudonym.keyId, short));
-    expect(whileBound.code).toBe("SCP-CRYPTO-4060");
-    expect(store.signCalls).toBe(0);
+    expect((await custody.sign(pseudonym.keyId, DIGEST)).length).toBe(64);
+    const signsBefore = store.signCalls;
 
-    let duringHostDestroy: Promise<Buffer> | undefined;
+    let duringHostDestroy: Promise<unknown> | undefined;
     store.destroyProbe = (keyId) => {
-      duringHostDestroy = custody.sign(keyId, short);
-      // Marks it handled now: its rejection can land before `rejectionOf`
-      // attaches, which bun would report as unhandled. `rejectionOf` still
-      // reads the rejection from the same promise.
-      duringHostDestroy.catch(() => undefined);
+      // Settle the result into a value at once, so a rejection is never
+      // unhandled; the promise below never rejects.
+      duringHostDestroy = custody.sign(keyId, DIGEST).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
     };
     await custody.destroyKey(pseudonym.keyId);
     expect(duringHostDestroy).toBeDefined();
-    const mapped = await rejectionOf(() => duringHostDestroy as Promise<Buffer>);
-    // Reached the host (already unbound), which by then had deleted the key.
-    expect(store.signCalls).toBe(1);
-    expect(mapped.code).toBe("SCP-CRYPTO-4006");
+    const err = await (duringHostDestroy as Promise<unknown>);
+    expect(mapBridgeError(err).code).toBe("SCP-CRYPTO-4006");
+    expect(store.signCalls).toBe(signsBefore);
+  });
+
+  test("a derive racing its identity's destroy leaves no host key", async () => {
+    // §9.10.4.A: a derivation in flight when its identity is destroyed is
+    // key-not-found and stores nothing, on the host included. The identity
+    // destroy starts inside the host's derivePseudonym; the testing
+    // `destroyKey` retires the identity on the JS thread before it returns,
+    // so the adapter's bind finds the identity gone. The host keeps every key
+    // it is not told to destroy, so without the adapter's destroy of the
+    // derived id the host keeps it, and the sign below resolves and uses it.
+    const store = new Store();
+    store.cascadeDestroy = false;
+    const custody = adapter(store);
+    const identity = await custody.generateKeypair();
+    let derivedId: string | undefined;
+    let identityDestroy: Promise<unknown> | undefined;
+    store.deriveProbe = (_source, id) => {
+      derivedId = id;
+      // Settle the result into a value at once, so a rejection is never
+      // unhandled; the promise below never rejects.
+      identityDestroy = custody.destroyKey(identity).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+    };
+    const err = await custody.derivePseudonym(identity, "ctx").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(mapBridgeError(err).code).toBe("SCP-CRYPTO-4006");
+    expect(await identityDestroy).toBeUndefined();
+    expect(derivedId).toBeDefined();
+    const id = derivedId as string;
+    expect(store.destroyed).toContain(id);
+    expect(store.pseudonyms.has(id)).toBe(false);
+    const signed = await custody.sign(id, DIGEST).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(mapBridgeError(signed).code).toBe("SCP-CRYPTO-4006");
+  });
+
+  test("destroying an identity retires its pseudonyms", async () => {
+    const store = new Store();
+    const custody = adapter(store, "fixedId");
+    const first = await custody.generateKeypair();
+    const alpha = await custody.derivePseudonym(first, "alpha");
+    // Bound: the adapter rejects a 5-byte input before calling the host.
+    const whileBound = await rejectionOf(() => custody.sign(alpha.keyId, Buffer.alloc(5)));
+    expect(whileBound.code).toBe("SCP-CRYPTO-4060");
+    expect(store.signCalls).toBe(0);
+    await custody.destroyKey(first);
+    // The host still holds the pseudonym key; the adapter must not reach it.
+    // The pseudonym died with its identity (§9.10.4.A), so it is key-not-found.
+    const calls = store.signCalls;
+    const err = await custody.sign(alpha.keyId, DIGEST).catch((e: unknown) => e);
+    expect(mapBridgeError(err).code).toBe("SCP-CRYPTO-4006");
+    expect(store.signCalls).toBe(calls);
+    // A new identity's pseudonym reuses id "777" with a different point.
+    const second = await custody.generateKeypair();
+    const beta = await custody.derivePseudonym(second, "beta");
+    expect(beta.keyId).toBe(alpha.keyId);
+    expect(Buffer.from(beta.publicKey).equals(Buffer.from(alpha.publicKey))).toBe(false);
+    expect((await custody.sign(beta.keyId, DIGEST)).length).toBe(64);
   });
 
   // §25.19 Vectors 30 and 31: each identity scalar, installed as the native

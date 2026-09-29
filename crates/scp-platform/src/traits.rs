@@ -24,8 +24,8 @@ use crate::error::PlatformError;
 
 /// The type of cryptographic key managed by a [`KeyHandle`].
 ///
-/// See ADR-006 for usage: Ed25519 keys are used for identity and signing,
-/// X25519 keys are used for key agreement (HPKE wrapping keys).
+/// See ADR-006 for usage. The P-256 types are the SCP key suite (ADR-063);
+/// Ed25519 and X25519 remain until every consumer has moved to P-256.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum KeyType {
     /// Ed25519 signing key (identity keys, active signing keys). Pseudonym keys
@@ -33,6 +33,13 @@ pub enum KeyType {
     Ed25519,
     /// X25519 key agreement key (HPKE wrapping keys).
     X25519,
+    /// P-256 ECDSA signing key. Signs a 32-byte digest (prehash) and returns
+    /// the 64-byte low-`s` `r ‖ s`; its public key is the 33-byte compressed
+    /// SEC1 point. Pseudonym handles are this type.
+    P256Signing,
+    /// P-256 key-agreement key (HPKE `DHKEM(P-256, HKDF-SHA256)`). Its public
+    /// key is the 65-byte uncompressed SEC1 point; it only performs ECDH.
+    HpkeP256,
 }
 
 /// Opaque handle to a cryptographic key managed by a [`KeyCustody`] implementation.
@@ -120,7 +127,8 @@ impl PreRotationKeyHandle {
 
 /// A public key extracted from a [`KeyHandle`].
 ///
-/// Contains the raw public key bytes — Ed25519 (32 bytes) or X25519 (32 bytes).
+/// Contains the raw public key bytes — Ed25519 or X25519 (32 bytes), P-256
+/// signing (33-byte compressed SEC1), or HPKE P-256 (65-byte uncompressed SEC1).
 /// The interpretation depends on the [`KeyType`] of the originating handle.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PublicKey(Vec<u8>);
@@ -378,19 +386,46 @@ pub trait KeyCustody: Send + Sync {
         key_type: KeyType,
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send;
 
-    /// Sign data with an Ed25519 key, or a 32-byte digest with a P-256
-    /// pseudonym key ([`PseudonymKeypair::key_handle`]).
+    /// Generate the identity key (`#0`) of a new identity: an Ed25519 key in
+    /// the identity role.
     ///
-    /// For a pseudonym key, `data` is the digest itself (prehash, §9.5.1) and
-    /// the result is the 64-byte low-`s` `r ‖ s`.
+    /// A key's role is fixed when custody first holds it. Only an identity
+    /// key may be the source of [`derive_pseudonym`](Self::derive_pseudonym)
+    /// and [`derive_rotatable_pseudonym`](Self::derive_rotatable_pseudonym)
+    /// (§9.10.4.A). A key from [`generate_keypair`](Self::generate_keypair)
+    /// is operational, and a derived pseudonym key is a pseudonym; neither
+    /// ever derives. [`import_ed25519_signing_key`](Self::import_ed25519_signing_key)
+    /// installs the new identity key of a migrated identity, so it also
+    /// holds its key in the identity role.
+    ///
+    /// Software backends draw exactly as `generate_keypair(KeyType::Ed25519)`
+    /// does, so the ADR-046 byte parity holds whichever of the two mints the
+    /// identity key.
+    ///
+    /// # Errors
+    ///
+    /// As [`generate_keypair`](Self::generate_keypair). A backend that holds
+    /// no identity keys returns [`PlatformError::Unsupported`].
+    fn generate_identity_keypair(
+        &self,
+    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send;
+
+    /// Sign data with an Ed25519 key, or a 32-byte digest with a
+    /// [`KeyType::P256Signing`] key (including a pseudonym handle,
+    /// [`PseudonymKeypair::key_handle`]).
+    ///
+    /// For a P-256 key, `data` is the digest itself (prehash, §9.5.1) and the
+    /// result is the 64-byte low-`s` `r ‖ s`. Software backends use RFC 6979
+    /// nonces; a hardware signer may use random nonces, so callers must not
+    /// rely on P-256 signatures being deterministic.
     ///
     /// # Errors
     ///
     /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
-    /// Returns [`PlatformError::WrongKeyType`] if the handle refers to an
-    /// X25519 key.
-    /// Returns [`PlatformError::CustodyError`] if a pseudonym key is given
-    /// `data` that is not 32 bytes.
+    /// Returns [`PlatformError::WrongKeyType`] if the handle refers to a
+    /// key-agreement key ([`KeyType::X25519`] or [`KeyType::HpkeP256`]).
+    /// Returns [`PlatformError::CustodyError`] if a P-256 key is given `data`
+    /// that is not 32 bytes.
     fn sign(
         &self,
         key: &KeyHandle,
@@ -399,8 +434,9 @@ pub trait KeyCustody: Send + Sync {
 
     /// Return the public key for a handle.
     ///
-    /// Works for Ed25519 and X25519 key handles (32 bytes) and P-256 pseudonym
-    /// handles (33-byte compressed point).
+    /// Ed25519 and X25519 handles return 32 bytes, [`KeyType::P256Signing`]
+    /// handles (pseudonyms included) the 33-byte compressed SEC1 point, and
+    /// [`KeyType::HpkeP256`] handles the 65-byte uncompressed SEC1 point.
     ///
     /// # Errors
     ///
@@ -428,7 +464,14 @@ pub trait KeyCustody: Send + Sync {
         key: &KeyHandle,
     ) -> impl Future<Output = Result<(), PlatformError>> + Send;
 
-    /// Perform X25519 Diffie-Hellman key agreement.
+    /// Perform Diffie-Hellman key agreement. The handle's key type selects
+    /// the curve.
+    ///
+    /// - [`KeyType::X25519`]: `peer_public` is the 32-byte X25519 key.
+    /// - [`KeyType::HpkeP256`]: `peer_public` is exactly the 65-byte
+    ///   uncompressed SEC1 point (`0x04 || x || y`, RFC 9180 §7.1.1
+    ///   `SerializePublicKey`), on the curve and not the identity; a
+    ///   compressed point is rejected. The result is the ECDH x-coordinate.
     ///
     /// Returns the 32-byte shared secret. The private key never leaves the
     /// custody boundary — the scalar multiplication happens inside the adapter.
@@ -436,12 +479,14 @@ pub trait KeyCustody: Send + Sync {
     /// # Errors
     ///
     /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
-    /// Returns [`PlatformError::WrongKeyType`] if the handle refers to an
-    /// Ed25519 key.
+    /// Returns [`PlatformError::WrongKeyType`] if the handle refers to a
+    /// signing key ([`KeyType::Ed25519`] or [`KeyType::P256Signing`]).
+    /// Returns [`PlatformError::CustodyError`] if `peer_public` is malformed
+    /// for the handle's curve.
     fn dh_agree(
         &self,
         key: &KeyHandle,
-        peer_public: &[u8; 32],
+        peer_public: &[u8],
     ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send;
 
     /// Derive a deterministic, context-scoped pseudonym keypair (v1, non-rotatable).
@@ -477,8 +522,12 @@ pub trait KeyCustody: Send + Sync {
     /// # Errors
     ///
     /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
-    /// Returns [`PlatformError::WrongKeyType`] if the handle refers to an
-    /// X25519 key.
+    /// Returns [`PlatformError::WrongKeyType`] (with `expected`
+    /// [`KeyType::Ed25519`]) if the handle is not an identity key
+    /// ([`generate_identity_keypair`](Self::generate_identity_keypair)): an
+    /// operational or pseudonym key of any type, Ed25519 included, and every
+    /// non-Ed25519 key. Until S12 (§9.10.4.A native interim) the identity key
+    /// is Ed25519.
     fn derive_pseudonym(
         &self,
         key: &KeyHandle,
@@ -513,8 +562,12 @@ pub trait KeyCustody: Send + Sync {
     /// # Errors
     ///
     /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
-    /// Returns [`PlatformError::WrongKeyType`] if the handle refers to an
-    /// X25519 key.
+    /// Returns [`PlatformError::WrongKeyType`] (with `expected`
+    /// [`KeyType::Ed25519`]) if the handle is not an identity key
+    /// ([`generate_identity_keypair`](Self::generate_identity_keypair)): an
+    /// operational or pseudonym key of any type, Ed25519 included, and every
+    /// non-Ed25519 key. Until S12 (§9.10.4.A native interim) the identity key
+    /// is Ed25519.
     fn derive_rotatable_pseudonym(
         &self,
         key: &KeyHandle,
@@ -1057,36 +1110,177 @@ impl<T: Storage> Storage for std::sync::Arc<T> {
 }
 
 // ---------------------------------------------------------------------------
-// X25519 key agreement helper (software_platform only)
+// Software key helpers (software_platform only)
 // ---------------------------------------------------------------------------
 
-/// Signs a 32-byte digest with a software P-256 pseudonym key: the shared
-/// [`KeyCustody::sign`] path of every software backend for pseudonym handles.
+/// Signs a 32-byte digest with a software P-256 key: the shared
+/// [`KeyCustody::sign`] path of every software backend for
+/// [`KeyType::P256Signing`] handles, pseudonyms included.
 ///
 /// # Errors
 ///
 /// [`PlatformError::CustodyError`] when `data` is not 32 bytes, or when
 /// signing fails.
-// Compiled exactly when a caller is: `file.rs`, `testing/key_custody.rs`, and
-// `sqlite/key_custody.rs` (which needs `software_platform` too).
-#[cfg(any(
-    feature = "file",
-    feature = "testing",
-    all(feature = "sqlite", feature = "software_platform")
+#[cfg(all(
+    feature = "software_platform",
+    any(feature = "file", feature = "sqlite", feature = "testing")
 ))]
-pub(crate) fn sign_pseudonym_digest(
+pub(crate) fn sign_p256_digest(
     key: &scp_crypto::p256::P256SigningKey,
     data: &[u8],
 ) -> Result<Signature, PlatformError> {
     let digest: &[u8; 32] = data.try_into().map_err(|_| {
         PlatformError::CustodyError(format!(
-            "a P-256 pseudonym key signs a 32-byte digest, got {} bytes",
+            "a P-256 signing key signs a 32-byte digest, got {} bytes",
             data.len()
         ))
     })?;
     scp_crypto::p256::sign_prehash_rfc6979(key, digest)
         .map(|sig| Signature::new(sig.to_vec()))
-        .map_err(|e| PlatformError::CustodyError(format!("pseudonym signing: {e}")))
+        .map_err(|e| PlatformError::CustodyError(format!("P-256 signing: {e}")))
+}
+
+/// Parses the peer public key of a [`KeyType::HpkeP256`] key agreement.
+///
+/// The peer must be exactly the 65-byte uncompressed SEC1 point
+/// `0x04 || x || y` (RFC 9180 §7.1.1), on the curve and not the identity.
+/// Every backend and bridge uses this one check.
+///
+/// # Errors
+///
+/// [`PlatformError::CustodyError`] on any other length, a prefix other than
+/// `0x04`, an off-curve point, or the identity.
+pub fn hpke_p256_peer(
+    peer_public: &[u8],
+) -> Result<scp_crypto::p256::P256PublicKey, PlatformError> {
+    use scp_crypto::p256::UNCOMPRESSED_POINT_LEN;
+    if peer_public.len() != UNCOMPRESSED_POINT_LEN || peer_public[0] != 0x04 {
+        return Err(PlatformError::CustodyError(format!(
+            "an HPKE P-256 peer public key is the {UNCOMPRESSED_POINT_LEN}-byte uncompressed \
+             point (0x04 || x || y), got {} bytes",
+            peer_public.len()
+        )));
+    }
+    scp_crypto::p256::P256PublicKey::from_sec1(peer_public)
+        .map_err(|e| PlatformError::CustodyError(format!("P-256 peer public key: {e}")))
+}
+
+/// Performs ECDH between a software [`KeyType::HpkeP256`] key and a peer
+/// that passes [`hpke_p256_peer`]: the shared [`KeyCustody::dh_agree`] path
+/// of every software backend.
+///
+/// # Errors
+///
+/// [`PlatformError::CustodyError`] when `peer_public` fails
+/// [`hpke_p256_peer`].
+#[cfg(all(
+    feature = "software_platform",
+    any(feature = "file", feature = "sqlite", feature = "testing")
+))]
+pub(crate) fn p256_dh_agree(
+    key: &scp_crypto::p256::P256SigningKey,
+    peer_public: &[u8],
+) -> Result<SharedSecret, PlatformError> {
+    let peer = hpke_p256_peer(peer_public)?;
+    let shared = scp_crypto::p256::ecdh_p256(key, &peer);
+    Ok(SharedSecret::new(*shared))
+}
+
+/// Requires a 32-byte X25519 peer public key: the shared length check of every
+/// software backend's [`KeyCustody::dh_agree`] for [`KeyType::X25519`].
+///
+/// # Errors
+///
+/// [`PlatformError::CustodyError`] when `peer_public` is not 32 bytes.
+#[cfg(all(
+    feature = "software_platform",
+    any(feature = "file", feature = "sqlite", feature = "testing")
+))]
+pub(crate) fn x25519_peer(peer_public: &[u8]) -> Result<[u8; 32], PlatformError> {
+    peer_public.try_into().map_err(|_| {
+        PlatformError::CustodyError(format!(
+            "an X25519 peer public key is 32 bytes, got {}",
+            peer_public.len()
+        ))
+    })
+}
+
+/// Rebuilds a persisted P-256 key from its 32-byte scalar, rejecting zero and
+/// values `>= n`.
+///
+/// # Errors
+///
+/// [`PlatformError::StorageError`] when the stored scalar is not a valid
+/// P-256 private key.
+#[cfg(all(
+    feature = "software_platform",
+    any(feature = "file", feature = "sqlite")
+))]
+pub(crate) fn p256_key_from_stored(
+    scalar: &[u8; 32],
+) -> Result<scp_crypto::p256::P256SigningKey, PlatformError> {
+    scp_crypto::p256::P256SigningKey::from_scalar_bytes(scalar).map_err(|e| {
+        PlatformError::StorageError(format!("stored P-256 scalar is not a valid key: {e}"))
+    })
+}
+
+/// Generates a fresh P-256 scalar from the OS RNG by rejection sampling, for
+/// the persistent software backends.
+///
+/// # Errors
+///
+/// [`PlatformError::CustodyError`] when 8 consecutive draws are all invalid
+/// scalars (probability below 2^-256; a broken RNG, never bad luck).
+#[cfg(all(
+    feature = "software_platform",
+    any(feature = "file", feature = "sqlite")
+))]
+pub(crate) fn generate_p256_os_rng() -> Result<scp_crypto::p256::P256SigningKey, PlatformError> {
+    use rand::RngCore as _;
+    for _ in 0..8 {
+        let mut scalar = zeroize::Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(scalar.as_mut());
+        if let Ok(key) = scp_crypto::p256::P256SigningKey::from_scalar_bytes(&scalar) {
+            return Ok(key);
+        }
+    }
+    Err(PlatformError::CustodyError(
+        "OS RNG produced no valid P-256 scalar in 8 draws".into(),
+    ))
+}
+
+/// The pseudonym-derivation source check shared by the software backends:
+/// the source must be an identity key
+/// ([`KeyCustody::generate_identity_keypair`]), and until S12 (§9.10.4.A
+/// native interim) an Ed25519 one.
+///
+/// # Errors
+///
+/// [`PlatformError::WrongKeyType`] with `expected` [`KeyType::Ed25519`] for
+/// a source that is not an identity key (its role, whatever its type), or
+/// that is not Ed25519.
+#[cfg(all(
+    feature = "software_platform",
+    any(feature = "file", feature = "sqlite", feature = "testing")
+))]
+pub(crate) const fn require_derive_source(
+    is_identity: bool,
+    key_type: KeyType,
+) -> Result<(), PlatformError> {
+    if !is_identity {
+        return Err(PlatformError::WrongKeyType {
+            expected: KeyType::Ed25519,
+            actual: key_type,
+        });
+    }
+    // Until S12 (§9.10.4.A native interim): the identity key is Ed25519.
+    if !matches!(key_type, KeyType::Ed25519) {
+        return Err(PlatformError::WrongKeyType {
+            expected: KeyType::Ed25519,
+            actual: key_type,
+        });
+    }
+    Ok(())
 }
 
 /// Performs X25519 key agreement using an Ed25519 signing key via birational conversion.

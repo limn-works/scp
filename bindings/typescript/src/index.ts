@@ -234,6 +234,7 @@ export { Node, Relay } from "./server";
 
 export type {
   ContextReconnectResult,
+  CustodyPublicKey,
   KeyCustodyProvider,
   KeyPackageReservation,
   PseudonymResult,
@@ -255,6 +256,7 @@ export {
   GovernanceError,
   IdentityError,
   InvalidGrant,
+  KeyNotFoundError,
   McpError,
   mapBridgeError,
   mapSagaError,

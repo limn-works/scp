@@ -1115,7 +1115,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ) -> Result<(ScpIdentity, DidDocument, PreRotationKeyHandle), IdentityError> {
         // Step 1: Operational keypairs (#0, #active, #agent).
         let identity_key = key_custody
-            .generate_keypair(KeyType::Ed25519)
+            .generate_identity_keypair()
             .await
             .map_err(IdentityError::Platform)?;
 
@@ -2055,7 +2055,7 @@ impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
             // Step 1: Generate the operational keypairs in `key_custody`
             // (Identity Key #0, Active Signing Key #active).
             let identity_key = key_custody
-                .generate_keypair(KeyType::Ed25519)
+                .generate_identity_keypair()
                 .await
                 .map_err(IdentityError::Platform)?;
 

@@ -326,6 +326,22 @@ pub struct PseudonymResult {
     pub key_id: String,
 }
 
+/// A host key's stated type and public key, returned by
+/// [`KeyCustodyProvider::get_public_key`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CustodyPublicKey {
+    /// `"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`.
+    pub key_type: String,
+    /// The public key in that type's one encoding: 32 bytes (Ed25519,
+    /// X25519), the 33-byte compressed SEC1 point (`"p256"`), or the 65-byte
+    /// uncompressed SEC1 point (`"hpke-p256"`).
+    pub public_key: Vec<u8>,
+    /// `"identity"` or `"operational"`: the role
+    /// [`KeyCustodyProvider::generate_keypair`] minted the key in. A pseudonym
+    /// key is `"operational"`.
+    pub role: String,
+}
+
 /// Callback for platform cryptographic key management.
 ///
 /// Implemented by host code and injected into the Rust engine. No in-tree
@@ -362,19 +378,37 @@ pub struct PseudonymResult {
 pub trait KeyCustodyProvider: Send + Sync {
     /// Sign `message` bytes with the key identified by `key_id`.
     ///
-    /// For an Ed25519 key, returns the raw 64-byte Ed25519 signature. For a
-    /// pseudonym key id from `derive_pseudonym`, `message` is a 32-byte digest
-    /// and the return is the 64-byte low-`s` P-256 `r || s` (§9.5); the
-    /// bridge verifies it strictly and rejects anything else, for a pseudonym
-    /// key this adapter derived and still holds bound; for a handle the adapter
-    /// did not bind, the bridge returns the host's bytes unchecked. A software host
-    /// signs with [`crate::p256_host::p256_sign_prehash_rfc6979`] rather than
-    /// its own ECDSA.
+    /// For an Ed25519 key, returns the raw 64-byte signature. For a `"p256"`
+    /// key or a pseudonym key id from `derive_pseudonym`, `message` is a
+    /// 32-byte prehash (§9.5.1, no second hash) and the result is raw
+    /// `r || s` (64 bytes) or DER (`SecKeyCreateSignature` /
+    /// `java.security.Signature` output); the bridge normalises it to low-s
+    /// and verifies it strictly against the key's registered public key, and
+    /// any mismatch is an error. A software host MUST derive the ECDSA nonce
+    /// by RFC 6979 with SHA-256; a hardware host (Secure Enclave,
+    /// `StrongBox`/TEE) may use a random nonce.
     async fn sign(&self, key_id: String, message: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 
-    /// Return the public key bytes for `key_id`: 32 bytes for an Ed25519 or
-    /// X25519 key, the 33-byte compressed point for a pseudonym key.
-    async fn get_public_key(&self, key_id: String) -> Result<Vec<u8>, ScpError>;
+    /// Return the type and public key of `key_id` as a [`CustodyPublicKey`].
+    ///
+    /// The bridge types the key by `key_type` alone and requires exactly that
+    /// type's length: 32 bytes (`"ed25519"`, `"x25519"`), the 33-byte
+    /// compressed SEC1 point (`"p256"`, and a pseudonym key id, whose point is
+    /// byte-identical to the one `derive_pseudonym` returned), or the 65-byte
+    /// uncompressed SEC1 point (`"hpke-p256"`). An unknown type, a length that
+    /// does not match the stated type, or an invalid point is an error, and
+    /// the bridge binds nothing. The bridge asks this for every key id it has
+    /// not yet registered, whichever operation names it first.
+    ///
+    /// `role` is the role `generate_keypair` minted the key in, recorded by
+    /// the host for the key's lifetime and reported across sessions; a
+    /// pseudonym key is `"operational"`. A key id the bridge has not seen
+    /// binds as an identity only when `role` is `"identity"`, so an identity
+    /// from an earlier session can still derive pseudonyms. Any other role
+    /// string is an error. The bridge cannot check the host's word: a host
+    /// that reports `"identity"` for a key it minted as `"operational"` lets
+    /// that key derive pseudonyms, which is outside Rust's control.
+    async fn get_public_key(&self, key_id: String) -> Result<CustodyPublicKey, ScpError>;
 
     /// Destroy key material for `key_id`. Subsequent operations must fail.
     ///
@@ -383,15 +417,25 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// key id then fails too (`09-security-model.md` §9.10.4.A).
     async fn destroy_key(&self, key_id: String) -> Result<(), ScpError>;
 
-    /// Generate a new keypair. `key_type` is `"ed25519"` or `"x25519"`.
+    /// Generate a new keypair. `key_type` is `"ed25519"`, `"x25519"`,
+    /// `"p256"` (ECDSA P-256 signing) or `"hpke-p256"` (P-256 ECDH for HPKE).
+    /// `role` is `"identity"` (an identity key, the only pseudonym-derivation
+    /// source) or `"operational"`. The host records `role` and reports it
+    /// from [`Self::get_public_key`] for the key's lifetime; the bridge
+    /// refuses and destroys a key whose reported role differs.
     ///
-    /// Returns an opaque key identifier string.
-    async fn generate_keypair(&self, key_type: String) -> Result<String, ScpError>;
+    /// Returns an opaque key identifier string. A host never reuses a key
+    /// id: the id returned here, or by a pseudonym derivation, names no other
+    /// key on the host for the host's lifetime, even after that key is
+    /// destroyed.
+    async fn generate_keypair(&self, key_type: String, role: String) -> Result<String, ScpError>;
 
-    /// Perform X25519 Diffie-Hellman key agreement.
+    /// Perform Diffie-Hellman key agreement.
     ///
-    /// `key_id` — the X25519 key handle.
-    /// `peer_public` — 32-byte peer X25519 public key.
+    /// `key_id` — the X25519 or `"hpke-p256"` key handle.
+    /// `peer_public` — the 32-byte peer X25519 public key, or for
+    /// `"hpke-p256"` the 65-byte uncompressed SEC1 peer point (validated
+    /// on-curve by the bridge before this call).
     ///
     /// Returns the 32-byte shared secret. The private key never leaves the
     /// custody boundary.

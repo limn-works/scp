@@ -511,8 +511,20 @@ async fn announce_pseudonym_best_effort(
     .ok() else {
         return;
     };
-    let Ok(sk) = custody.export_ed25519_signing_key(&key_handle).await else {
-        return;
+    // Best effort by design (see the UniFFI bridge's
+    // `announce_pseudonym_best_effort`): peers recover on the next explicit
+    // announcement, and a sign-only custody must still create and join. A
+    // failure is logged, never discarded silently.
+    let sk = match custody.export_ed25519_signing_key(&key_handle).await {
+        Ok(sk) => sk,
+        Err(e) => {
+            tracing::warn!(
+                context_id,
+                error = %e,
+                "pseudonym announcement skipped: the active signing key cannot be exported"
+            );
+            return;
+        }
     };
     use scp_core::context::actor::commands::{
         MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
@@ -527,8 +539,16 @@ async fn announce_pseudonym_best_effort(
         }),
         reply: tx,
     };
-    if sup.dispatch_command(context_id, cmd).await.is_ok() {
-        let _ = rx.await;
+    match sup.dispatch_command(context_id, cmd).await {
+        Ok(_) => {
+            if rx.await.is_err() {
+                tracing::warn!(
+                    context_id,
+                    "pseudonym announcement: the context dropped its reply"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(context_id, error = %e, "pseudonym announcement not dispatched"),
     }
 }
 
@@ -7627,7 +7647,7 @@ mod tests {
             InMemoryKeyCustody::new(),
         )));
         let handle = custody
-            .generate_keypair(scp_platform::KeyType::Ed25519)
+            .generate_identity_keypair()
             .await
             .expect("generate identity key");
         let seed = zeroize::Zeroizing::new(

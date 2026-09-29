@@ -62,6 +62,15 @@ mod wasm_impl {
         /// Signs `data` with the key identified by `key_id`, returning the
         /// signature bytes. The private key never leaves JS/WebCrypto.
         ///
+        /// For a `"p256"` key, `data` is the 32-byte digest and the result is
+        /// either the 64-byte raw `r ‖ s` or DER. No Rust caller exists yet:
+        /// whoever wires one MUST route it through
+        /// `scp_ffi_common::callback_custody::sign` (with
+        /// `callback_custody::generate_keypair` for key creation), which
+        /// converts DER, normalises to low-`s`, verifies strictly and rejects
+        /// every malformed return; calling this binding directly skips all of
+        /// that.
+        ///
         /// `data` is passed **by value** (an owned `Vec<u8>`), so wasm-bindgen
         /// marshals it as a JS-owned `Uint8Array` copy detached from wasm linear
         /// memory — NOT a `subarray` view into it (which `&[u8]` would produce).
@@ -82,14 +91,17 @@ mod wasm_impl {
         #[wasm_bindgen(method, catch, js_name = "sign")]
         fn sign(this: &JsKeyCustody, key_id: &str, data: Vec<u8>) -> Result<Vec<u8>, JsValue>;
 
-        /// Returns the raw public key bytes for `key_id`. Throws if absent.
+        /// Returns the raw public key bytes for `key_id`: 32 bytes for
+        /// `"ed25519"` / `"x25519"`, the 33-byte compressed SEC1 point for
+        /// `"p256"`, the 65-byte uncompressed SEC1 point for `"hpke-p256"`.
+        /// Throws if absent.
         ///
         /// SEAM: see [`JsKeyCustody::sign`].
         #[wasm_bindgen(method, catch, js_name = "getPublicKey")]
         fn get_public_key(this: &JsKeyCustody, key_id: &str) -> Result<Vec<u8>, JsValue>;
 
-        /// Generates a keypair of type `key_type` (`"ed25519"` / `"x25519"`)
-        /// and returns its opaque `key_id`.
+        /// Generates a keypair of type `key_type` (`"ed25519"`, `"x25519"`,
+        /// `"p256"` or `"hpke-p256"`) and returns its opaque `key_id`.
         ///
         /// SEAM: see [`JsKeyCustody::sign`].
         #[wasm_bindgen(method, catch, js_name = "generateKeypair")]
@@ -102,8 +114,12 @@ mod wasm_impl {
         #[wasm_bindgen(method, catch, js_name = "destroyKey")]
         fn destroy_key(this: &JsKeyCustody, key_id: &str) -> Result<(), JsValue>;
 
-        /// Performs X25519 DH agreement against `peer_public`, returning the
-        /// 32-byte shared secret.
+        /// Performs DH agreement against `peer_public`, returning the 32-byte
+        /// shared secret: X25519 for an `"x25519"` key (32-byte peer), P-256
+        /// ECDH for an `"hpke-p256"` key (65-byte uncompressed SEC1 peer). No
+        /// Rust caller exists yet: whoever wires one MUST route it through
+        /// `scp_ffi_common::callback_custody::dh_agree`, which validates the
+        /// peer point and the 32-byte result.
         ///
         /// `peer_public` is passed **by value** (an owned `Vec<u8>`) for the same
         /// owned-copy-detached-from-wasm-memory reason as [`JsKeyCustody::sign`] —

@@ -57,6 +57,10 @@ impl KeyCustody for KeyLossCustody {
         }
     }
 
+    async fn generate_identity_keypair(&self) -> Result<KeyHandle, PlatformError> {
+        self.inner.generate_identity_keypair().await
+    }
+
     async fn sign(&self, key: &KeyHandle, data: &[u8]) -> Result<Signature, PlatformError> {
         self.inner.sign(key, data).await
     }
@@ -72,7 +76,7 @@ impl KeyCustody for KeyLossCustody {
     async fn dh_agree(
         &self,
         key: &KeyHandle,
-        peer_public: &[u8; 32],
+        peer_public: &[u8],
     ) -> Result<SharedSecret, PlatformError> {
         let shared = self.inner.dh_agree(key, peer_public).await?;
         if matches!(self.loss, KeyLoss::AfterDhAgree) {

@@ -1,5 +1,10 @@
 # Clippy configuration for scp-runtime.
 #
+# Clippy reads only the nearest configuration file, so this file repeats the
+# workspace `.clippy.toml` P-256 entries (the `disallowed-methods` list, and
+# the `ecdh`, point and scalar entries at the head of `disallowed-types`); see
+# that file.
+#
 # The actor-per-context refactor (ADR-049) moves per-context state onto
 # an actor. Actor-owned state is serialized by the actor's command loop
 # and needs no synchronization primitive. Shared state that does exist
@@ -43,7 +48,30 @@
 # read-path invariant as the Mutex ban. Sanctioned exceptions (should any
 # arise) carry an `#[allow(clippy::disallowed_types, reason = "…")]`.
 disallowed-types = [
+    { path = "elliptic_curve::ecdh::SharedSecret", reason = "P-256 ECDH runs only in scp_crypto::p256::ecdh_p256, whose P256PublicKey peer has passed 09-security-model.md §9.5 point validation. Call that function.", allow-invalid = true },
+    { path = "p256::ecdh::SharedSecret", reason = "P-256 ECDH runs only in scp_crypto::p256::ecdh_p256, whose P256PublicKey peer has passed 09-security-model.md §9.5 point validation. Call that function.", allow-invalid = true },
+    { path = "elliptic_curve::ecdh::EphemeralSecret", reason = "P-256 ECDH runs only in scp_crypto::p256::ecdh_p256, whose P256PublicKey peer has passed 09-security-model.md §9.5 point validation. Call that function.", allow-invalid = true },
+    { path = "p256::ecdh::EphemeralSecret", reason = "P-256 ECDH runs only in scp_crypto::p256::ecdh_p256, whose P256PublicKey peer has passed 09-security-model.md §9.5 point validation. Call that function.", allow-invalid = true },
+    { path = "p256::ProjectivePoint", reason = "P-256 scalar multiplication runs only in scp_crypto (p256::ecdh_p256 for a peer point, whose P256PublicKey has passed 09-security-model.md §9.5 point validation). Call scp_crypto; do not name P-256 point or scalar types.", allow-invalid = true },
+    { path = "p256::AffinePoint", reason = "P-256 scalar multiplication runs only in scp_crypto (p256::ecdh_p256 for a peer point, whose P256PublicKey has passed 09-security-model.md §9.5 point validation). Call scp_crypto; do not name P-256 point or scalar types.", allow-invalid = true },
+    { path = "p256::Scalar", reason = "P-256 scalar multiplication runs only in scp_crypto (p256::ecdh_p256 for a peer point, whose P256PublicKey has passed 09-security-model.md §9.5 point validation). Call scp_crypto; do not name P-256 point or scalar types.", allow-invalid = true },
+    { path = "p256::NonZeroScalar", reason = "P-256 scalar multiplication runs only in scp_crypto (p256::ecdh_p256 for a peer point, whose P256PublicKey has passed 09-security-model.md §9.5 point validation). Call scp_crypto; do not name P-256 point or scalar types.", allow-invalid = true },
+    { path = "primeorder::ProjectivePoint", reason = "P-256 scalar multiplication runs only in scp_crypto (p256::ecdh_p256 for a peer point, whose P256PublicKey has passed 09-security-model.md §9.5 point validation). Call scp_crypto; do not name P-256 point or scalar types.", allow-invalid = true },
+    { path = "primeorder::AffinePoint", reason = "P-256 scalar multiplication runs only in scp_crypto (p256::ecdh_p256 for a peer point, whose P256PublicKey has passed 09-security-model.md §9.5 point validation). Call scp_crypto; do not name P-256 point or scalar types.", allow-invalid = true },
+    { path = "elliptic_curve::ProjectivePoint", reason = "P-256 scalar multiplication runs only in scp_crypto (p256::ecdh_p256 for a peer point, whose P256PublicKey has passed 09-security-model.md §9.5 point validation). Call scp_crypto; do not name P-256 point or scalar types.", allow-invalid = true },
+    { path = "elliptic_curve::point::ProjectivePoint", reason = "P-256 scalar multiplication runs only in scp_crypto (p256::ecdh_p256 for a peer point, whose P256PublicKey has passed 09-security-model.md §9.5 point validation). Call scp_crypto; do not name P-256 point or scalar types.", allow-invalid = true },
+    { path = "elliptic_curve::AffinePoint", reason = "P-256 scalar multiplication runs only in scp_crypto (p256::ecdh_p256 for a peer point, whose P256PublicKey has passed 09-security-model.md §9.5 point validation). Call scp_crypto; do not name P-256 point or scalar types.", allow-invalid = true },
+    { path = "elliptic_curve::point::AffinePoint", reason = "P-256 scalar multiplication runs only in scp_crypto (p256::ecdh_p256 for a peer point, whose P256PublicKey has passed 09-security-model.md §9.5 point validation). Call scp_crypto; do not name P-256 point or scalar types.", allow-invalid = true },
+    { path = "elliptic_curve::Scalar", reason = "P-256 scalar multiplication runs only in scp_crypto (p256::ecdh_p256 for a peer point, whose P256PublicKey has passed 09-security-model.md §9.5 point validation). Call scp_crypto; do not name P-256 point or scalar types.", allow-invalid = true },
+    { path = "elliptic_curve::scalar::Scalar", reason = "P-256 scalar multiplication runs only in scp_crypto (p256::ecdh_p256 for a peer point, whose P256PublicKey has passed 09-security-model.md §9.5 point validation). Call scp_crypto; do not name P-256 point or scalar types.", allow-invalid = true },
+    { path = "elliptic_curve::NonZeroScalar", reason = "P-256 scalar multiplication runs only in scp_crypto (p256::ecdh_p256 for a peer point, whose P256PublicKey has passed 09-security-model.md §9.5 point validation). Call scp_crypto; do not name P-256 point or scalar types.", allow-invalid = true },
+    { path = "elliptic_curve::scalar::NonZeroScalar", reason = "P-256 scalar multiplication runs only in scp_crypto (p256::ecdh_p256 for a peer point, whose P256PublicKey has passed 09-security-model.md §9.5 point validation). Call scp_crypto; do not name P-256 point or scalar types.", allow-invalid = true },
     { path = "std::sync::Mutex", reason = "Use tokio::sync::Mutex in runtime async code; actor-owned state needs no Mutex. See ADR-049." },
     { path = "tokio::sync::Mutex", reason = "ADR-049 §Decision 12: forbidden on read paths. Use ArcSwap+write_lock, OnceLock/AtomicU64/DashMap, or the actor-owned &mut PerContextState. Sanctioned exceptions carry an #[allow(clippy::disallowed_types, reason = \"ADR-049 §Decision 12 allow-list: …\")]." },
     { path = "tokio::sync::RwLock", reason = "ADR-049 §Decision 12: forbidden on read paths. Use ArcSwap+write_lock, OnceLock/AtomicU64/DashMap, or the actor-owned &mut PerContextState. Sanctioned exceptions carry an #[allow(clippy::disallowed_types, reason = \"ADR-049 §Decision 12 allow-list: …\")]." },
+]
+disallowed-methods = [
+    { path = "elliptic_curve::ecdh::diffie_hellman", reason = "P-256 ECDH runs only in scp_crypto::p256::ecdh_p256, whose P256PublicKey peer has passed 09-security-model.md §9.5 point validation. Call that function.", allow-invalid = true },
+    { path = "p256::ecdh::diffie_hellman", reason = "P-256 ECDH runs only in scp_crypto::p256::ecdh_p256, whose P256PublicKey peer has passed 09-security-model.md §9.5 point validation. Call that function.", allow-invalid = true },
+    { path = "elliptic_curve::ecdh::EphemeralSecret::diffie_hellman", reason = "P-256 ECDH runs only in scp_crypto::p256::ecdh_p256, whose P256PublicKey peer has passed 09-security-model.md §9.5 point validation. Call that function.", allow-invalid = true },
 ]

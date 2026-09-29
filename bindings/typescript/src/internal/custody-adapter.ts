@@ -3,7 +3,14 @@
 // it to the bridge; the bridge-check tests drive the same record through the
 // napi `TestingCallbackCustody` hook.
 
-import type { KeyCustodyProvider, PseudonymResult } from "../scp";
+import type { CustodyPublicKey, KeyCustodyProvider, PseudonymResult } from "../scp";
+
+/** The shape napi-rs marshals for a `CustodyPublicKey`: bytes as a number array. */
+export interface NativeCustodyPublicKey {
+  keyType: string;
+  publicKey: number[];
+  role: string;
+}
 
 /** The shape napi-rs marshals for a {@link PseudonymResult}: bytes as a number array. */
 export interface NativePseudonymResult {
@@ -108,6 +115,22 @@ function asBytes(method: string): (raw: unknown) => number[] {
   };
 }
 
+function asPublicKey(method: string): (raw: unknown) => NativeCustodyPublicKey {
+  return (raw) => {
+    const result = raw as Partial<CustodyPublicKey> | null;
+    if (
+      typeof raw !== "object" ||
+      result === null ||
+      typeof result.keyType !== "string" ||
+      !(result.publicKey instanceof Uint8Array) ||
+      typeof result.role !== "string"
+    ) {
+      throw wrongType(method, "a { keyType: string, publicKey: Uint8Array, role: string } result");
+    }
+    return { keyType: result.keyType, publicKey: Array.from(result.publicKey), role: result.role };
+  };
+}
+
 function asPseudonym(method: string): (raw: unknown) => NativePseudonymResult {
   return (raw) => {
     const result = raw as Partial<PseudonymResult> | null;
@@ -138,19 +161,20 @@ export function toNativeCustodyProvider(provider: KeyCustodyProvider) {
   // wrongly typed return each reach Rust as a structured failure. napi-rs delivers a multi-element Rust tuple
   // (`(String, Vec<u8>)`) to the JS callback as a SINGLE `[keyId, bytes]`
   // array argument, not as two positional args, so the tuple callbacks
-  // (`sign`, `dhAgree`, `derivePseudonym`, `deriveRotatablePseudonym`) accept
+  // (`generateKeypair`, `sign`, `dhAgree`, `derivePseudonym`,
+  // `deriveRotatablePseudonym`) accept
   // one array and destructure it.
   return {
-    generateKeypair: (keyType: string): NativeHostResult<string> =>
+    generateKeypair: ([keyType, role]: [string, string]): NativeHostResult<string> =>
       hostCall(
         "generateKeypair",
-        () => provider.generateKeypair(keyType),
+        () => provider.generateKeypair(keyType, role),
         asString("generateKeypair"),
       ),
     sign: ([keyId, message]: [string, number[]]): NativeHostResult<number[]> =>
       hostCall("sign", () => provider.sign(keyId, Uint8Array.from(message)), asBytes("sign")),
-    getPublicKey: (keyId: string): NativeHostResult<number[]> =>
-      hostCall("getPublicKey", () => provider.getPublicKey(keyId), asBytes("getPublicKey")),
+    getPublicKey: (keyId: string): NativeHostResult<NativeCustodyPublicKey> =>
+      hostCall("getPublicKey", () => provider.getPublicKey(keyId), asPublicKey("getPublicKey")),
     // `destroyKey` returns nothing the bridge reads, so any non-thenable
     // return (a `Map.delete` boolean, say) is accepted.
     destroyKey: (keyId: string): NativeHostResult<undefined> =>

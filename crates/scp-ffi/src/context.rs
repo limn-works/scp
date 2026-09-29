@@ -6280,7 +6280,7 @@ mod tests {
         ));
         let identity_key = crate::runtime()
             .unwrap()
-            .block_on(custody.generate_keypair(scp_platform::KeyType::Ed25519))
+            .block_on(custody.generate_identity_keypair())
             .unwrap();
         crate::runtime::register_identity(
             bi,
@@ -8567,8 +8567,9 @@ from _scp_core_export_signer import ed25519_sign, ed25519_public_key
 class SignOnlyCustody:
     def __init__(self, key_id):
         self._key_id = str(key_id)
+        self.export_calls = 0
 
-    def generate_keypair(self, key_type):
+    def generate_keypair(self, key_type, role):
         return self._key_id
 
     def sign(self, key_id, message):
@@ -8577,7 +8578,8 @@ class SignOnlyCustody:
         return ed25519_sign(str(key_id), bytes(message))
 
     def get_public_key(self, key_id):
-        return ed25519_public_key(str(key_id))
+        # The provider's single key is the identity the test wires.
+        return ('ed25519', ed25519_public_key(str(key_id)), 'identity')
 
     def destroy_key(self, key_id):
         return None
@@ -8594,6 +8596,7 @@ class SignOnlyCustody:
     def export_signing_key_bytes(self, key_id):
         # The defining property: raw private-key export is REFUSED. A correct
         # context export must never call this path.
+        self.export_calls += 1
         raise RuntimeError('sign-only custody refuses raw key export')
 
     def custody_type(self, key_id):
@@ -8617,7 +8620,8 @@ class SignOnlyCustody:
     /// key using a process-local REAL Ed25519 signer (the private key lives only
     /// in Rust, never surfaced to Python — exactly like a keychain), but its
     /// `export_signing_key_bytes` RAISES. Returns the signer's verifying key so
-    /// the caller can verify the resulting export signature.
+    /// the caller can verify the resulting export signature, the custody, and
+    /// the provider object so the caller can read its `export_calls`.
     #[cfg(feature = "testing")]
     fn install_sign_only_custody(
         py: Python<'_>,
@@ -8626,6 +8630,7 @@ class SignOnlyCustody:
     ) -> (
         ed25519_dalek::VerifyingKey,
         std::sync::Arc<crate::custody::FfiKeyCustody>,
+        Py<PyAny>,
     ) {
         use pyo3::types::PyModule;
 
@@ -8687,7 +8692,11 @@ class SignOnlyCustody:
             .unwrap()
             .call1((active_handle_id,))
             .unwrap();
+        let host = obj.clone().unbind();
         let provider = crate::custody::PyKeyCustodyProvider::new(py, obj.unbind()).unwrap();
+        // The adapter resolves the identity's existing active handle through
+        // the provider's structured `get_public_key` on first use, as it does
+        // any handle it did not mint; no adoption step is needed.
         let sign_only_custody = Arc::new(crate::custody::FfiKeyCustody::Callback(
             crate::custody::PyCallbackKeyCustody::new(provider),
         ));
@@ -8698,7 +8707,7 @@ class SignOnlyCustody:
         })
         .unwrap();
 
-        (signer_pk, sign_only_custody)
+        (signer_pk, sign_only_custody, host)
     }
 
     #[test]
@@ -8718,7 +8727,7 @@ class SignOnlyCustody:
             let creator_identity = scp.identity_create(py, "in_memory", None).unwrap();
             let creator = creator_identity.did().to_owned();
 
-            let (signer_pk, sign_only_custody) = install_sign_only_custody(py, &bi, &creator);
+            let (signer_pk, sign_only_custody, host) = install_sign_only_custody(py, &bi, &creator);
 
             // Sanity: the swapped custody REFUSES raw key export but CAN sign.
             let rt = crate::runtime().unwrap();
@@ -8727,11 +8736,20 @@ class SignOnlyCustody:
             })
             .unwrap();
             let handle = scp_platform::KeyHandle::new(active_handle_id);
-            assert!(
-                rt.block_on(sign_only_custody.export_ed25519_signing_key(&handle))
-                    .is_err(),
-                "sign-only custody must refuse raw private-key export"
-            );
+            // F1: the refusal is the host's own, reached after the adapter
+            // resolved the handle as Ed25519; a host that exported would
+            // return Ok.
+            match rt.block_on(sign_only_custody.export_ed25519_signing_key(&handle)) {
+                Err(scp_platform::error::PlatformError::CustodyError(_)) => {}
+                other => panic!("expected the host's export refusal, got {other:?}"),
+            }
+            let export_calls = |py| {
+                host.bind(py)
+                    .getattr("export_calls")
+                    .and_then(|n| n.extract::<usize>())
+                    .unwrap()
+            };
+            assert_eq!(export_calls(py), 1, "the export reached the host");
             assert!(
                 rt.block_on(sign_only_custody.sign(&handle, b"probe"))
                     .is_ok(),
@@ -8756,6 +8774,11 @@ class SignOnlyCustody:
             let exported = scp.context_export(py, &ctx_id).expect(
                 "context export must succeed under sign-only custody (signing via \
                  KeyCustody::sign, never raw key export)",
+            );
+            assert_eq!(
+                export_calls(py),
+                1,
+                "the context export never asks for the raw key"
             );
 
             // The produced §23.16.8 signature must verify against the public key

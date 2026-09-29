@@ -480,8 +480,13 @@ pub async fn testing_pseudonym_routing_id_from_seed(
                 code: codes::VALID_7005.to_owned(),
             })
         })?);
+    use scp_platform::KeyCustody;
     let in_memory = scp_platform::testing::InMemoryKeyCustody::new();
-    let identity_key = in_memory.import_ed25519_key(&seed).await;
+    // The identity role (§9.10.4.A): only an identity key derives.
+    let identity_key = in_memory
+        .import_ed25519_signing_key(&seed)
+        .await
+        .map_err(custody_err)?;
     let custody = crate::custody::NapiKeyCustody::InMemory(Box::new(
         crate::identity::OpaqueInMemoryKeyCustody(in_memory),
     ));
@@ -537,7 +542,7 @@ impl TestingCallbackCustody {
     pub async fn generate_keypair(&self) -> napi::Result<String> {
         use scp_platform::KeyCustody;
         self.inner
-            .generate_keypair(scp_platform::KeyType::Ed25519)
+            .generate_identity_keypair()
             .await
             .map(|h| h.id().to_string())
             .map_err(custody_err)
@@ -611,16 +616,39 @@ impl TestingCallbackCustody {
         })
     }
 
-    /// Destroys `key_id` through the adapter (which unbinds a pseudonym).
+    /// Destroys `key_id` through the adapter, which retires the handle before
+    /// the host call.
+    ///
+    /// The adapter's `destroy_key` future is polled once on the calling JS
+    /// thread before the returned promise is spawned, so the handle is
+    /// retired before this call returns. A test that calls `destroyKey` from
+    /// inside a host callback therefore retires the handle while that host
+    /// callback runs, with no timing window.
     ///
     /// # Errors
     ///
     /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` for any other
     /// custody error, as production reports them.
-    #[napi(js_name = "destroyKey")]
-    pub async fn destroy_key(&self, key_id: String) -> napi::Result<()> {
+    #[napi(js_name = "destroyKey", ts_return_type = "Promise<void>")]
+    pub fn destroy_key<'env>(
+        &self,
+        env: &'env napi::Env,
+        key_id: String,
+    ) -> napi::Result<napi::bindgen_prelude::PromiseRaw<'env, ()>> {
         use scp_platform::KeyCustody;
+        use std::future::Future;
         let key = testing_handle(&key_id)?;
-        self.inner.destroy_key(&key).await.map_err(custody_err)
+        let inner = std::sync::Arc::clone(&self.inner);
+        let mut destroying =
+            Box::pin(async move { inner.destroy_key(&key).await.map_err(custody_err) });
+        let first = destroying
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+        env.spawn_future(async move {
+            match first {
+                std::task::Poll::Ready(result) => result,
+                std::task::Poll::Pending => destroying.await,
+            }
+        })
     }
 }
