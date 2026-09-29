@@ -21,6 +21,7 @@ import * as crypto from "node:crypto";
 import { CryptoError, type ScpError, ValidationError } from "../src/errors";
 import { p256PseudonymScalar, p256PublicKey, p256SignPrehashRfc6979 } from "../src/index";
 import { loadNativeAddon } from "../src/internal/native";
+import { __p256HostInvokeForTests } from "../src/scp";
 import { bytesToBigInt, P256_N, p256SignPrehash } from "./pseudonym-recipe";
 
 let skipReason = "";
@@ -62,6 +63,21 @@ describe.skipIf(skipReason !== "")(`P-256 host helpers ${skipReason}`, () => {
       expect(hex(p256PublicKey(p256PseudonymScalar(unhex(v.seedV2))))).toBe(v.v2);
     });
   }
+
+  test("the scalar is a mutable Uint8Array that fill(0) clears", () => {
+    // §25.19 Vector 30, v1.
+    const seedHex = "47ea801c24e8a4d577f04837eca0674fbbf160127fa2d1a4bb1420150b0a048b";
+    const seed = unhex(seedHex);
+    const d = p256PseudonymScalar(seed);
+    expect(d).toBeInstanceOf(Uint8Array);
+    expect(hex(p256PublicKey(d))).toBe(
+      "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72",
+    );
+    expect(hex(seed)).toBe(seedHex);
+    d.fill(0);
+    expect(d.every((b) => b === 0)).toBe(true);
+    expect(hex(p256PseudonymScalar(seed))).not.toBe(hex(d));
+  });
 
   test("RFC 6979 A.2.5: the RFC's r and the low-s form of its s", () => {
     const x = unhex("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
@@ -112,5 +128,56 @@ describe.skipIf(skipReason !== "")(`P-256 host helpers ${skipReason}`, () => {
       ValidationError,
       "SCP-VALID-7005",
     );
+  });
+});
+
+describe("P-256 host call wiping (stubbed native function)", () => {
+  const seed = new Uint8Array(32).fill(0x11);
+  const digest = new Uint8Array(32).fill(0x22);
+
+  test("wipes the argument copies it passed and returns a native Uint8Array uncopied", () => {
+    let passed: number[][] = [];
+    let valuesAtCall: number[][] = [];
+    const native = new Uint8Array(32).fill(0x33);
+    const out = __p256HostInvokeForTests(
+      (...a) => {
+        passed = a;
+        valuesAtCall = a.map((r) => r.slice());
+        return native;
+      },
+      [seed, digest],
+    );
+    expect(out).toBe(native);
+    expect(valuesAtCall).toEqual([Array.from(seed), Array.from(digest)]);
+    expect(passed.length).toBe(2);
+    for (const r of passed) {
+      expect(r).toEqual(new Array<number>(32).fill(0));
+    }
+    expect(seed.every((b) => b === 0x11)).toBe(true);
+  });
+
+  test("copies a number[] result into the returned Uint8Array, then wipes the number[]", () => {
+    const result = new Array<number>(32).fill(0x44);
+    const out = __p256HostInvokeForTests(() => result, [seed]);
+    expect(out).toBeInstanceOf(Uint8Array);
+    expect(Array.from(out)).toEqual(new Array<number>(32).fill(0x44));
+    expect(result).toEqual(new Array<number>(32).fill(0));
+  });
+
+  test("wipes the argument copies when the native function throws", () => {
+    let passed: number[][] = [];
+    expect(() =>
+      __p256HostInvokeForTests(
+        (...a) => {
+          passed = a;
+          throw new Error("boom");
+        },
+        [seed, digest],
+      ),
+    ).toThrow();
+    expect(passed.length).toBe(2);
+    for (const r of passed) {
+      expect(r).toEqual(new Array<number>(32).fill(0));
+    }
   });
 });

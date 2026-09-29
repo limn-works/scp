@@ -17,6 +17,7 @@ Skips when the native extension is not built.
 from __future__ import annotations
 
 import hashlib
+import sys
 
 import pytest
 
@@ -65,18 +66,35 @@ def test_context_seeds_map_to_spec_points(
     assert p256_public_key(p256_pseudonym_scalar(bytes.fromhex(seed_v2))).hex() == v2
 
 
-def test_scalar_is_a_wipeable_bytearray_and_bytearray_inputs_are_accepted() -> None:
-    # The host wipes the scalar when it destroys the key, so it must be a
-    # mutable bytearray, and bytearray seeds and scalars must be accepted.
+def test_native_scalar_is_a_bytearray_and_bytearray_inputs_are_accepted() -> None:
+    # The host wipes the scalar when it destroys the key, so the native
+    # helper returns a mutable bytearray, and bytearray seeds and scalars are
+    # accepted.
+    from scp_sdk import _scp_core
+
     seed = bytearray.fromhex(VECTORS[0][1])
+    assert type(_scp_core.p256_pseudonym_scalar(seed)) is bytearray
     d = p256_pseudonym_scalar(seed)
-    assert type(d) is bytearray
     assert d == p256_pseudonym_scalar(bytes(seed))
     assert p256_public_key(d).hex() == VECTORS[0][2]
     digest = hashlib.sha256(b"wipe").digest()
     assert p256_sign_prehash_rfc6979(d, digest) == p256_sign_prehash_rfc6979(bytes(d), digest)
-    d[:] = bytes(len(d))
-    assert d == bytearray(32)
+
+
+def test_wrapper_returns_the_native_scalar_object_uncopied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A wrapper copy would leave a second copy of the scalar that the host's
+    # wipe of the returned array cannot reach.
+    sentinel = bytearray(32)
+
+    class _Native:
+        @staticmethod
+        def p256_pseudonym_scalar(seed: bytes | bytearray) -> bytearray:
+            return sentinel
+
+    monkeypatch.setattr(sys.modules["scp_sdk.scp"], "_native_mod", lambda: _Native)
+    assert p256_pseudonym_scalar(bytes(32)) is sentinel
 
 
 def test_rfc6979_a25_signature_is_low_s() -> None:

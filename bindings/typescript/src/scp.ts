@@ -624,13 +624,41 @@ function p256HostCall(
   name: "p256PseudonymScalar" | "p256PublicKey" | "p256SignPrehashRfc6979",
   ...args: Uint8Array[]
 ): Uint8Array {
-  // NAPI Vec<u8> IN params map to number[] in JS; the Vec<u8> return is a
-  // Buffer, copied into a plain Uint8Array.
-  const fn = nativeFreeFn<(...a: number[][]) => Uint8Array>(name);
+  return __p256HostInvokeForTests(
+    nativeFreeFn<(...a: number[][]) => number[] | Uint8Array>(name),
+    args,
+  );
+}
+
+/**
+ * Passes `args` to the native P-256 helper `fn` and returns its result as
+ * the one `Uint8Array` the host owns.
+ *
+ * NAPI `Vec<u8>` parameters and returns are `number[]` in JS. The
+ * `number[]` copies of the arguments, and a `number[]` result once it is
+ * copied into the returned `Uint8Array`, are wiped with `fill(0)`; a
+ * `Uint8Array` result is returned as is, uncopied.
+ *
+ * @internal
+ */
+export function __p256HostInvokeForTests(
+  fn: (...a: number[][]) => number[] | Uint8Array,
+  args: readonly Uint8Array[],
+): Uint8Array {
+  const raw = args.map((a) => Array.from(a));
+  let out: number[] | Uint8Array | undefined;
   try {
-    return Uint8Array.from(fn(...args.map((a) => Array.from(a))));
+    out = fn(...raw);
+    return out instanceof Uint8Array ? out : Uint8Array.from(out);
   } catch (err) {
     throw mapBridgeError(err);
+  } finally {
+    for (const r of raw) {
+      r.fill(0);
+    }
+    if (Array.isArray(out)) {
+      out.fill(0);
+    }
   }
 }
 
@@ -645,8 +673,11 @@ function p256HostCall(
  * {@link KeyCustodyProvider} host stores the result as the pseudonym key and
  * passes it to {@link p256PublicKey} and {@link p256SignPrehashRfc6979}.
  *
- * The Rust side wipes its copies; the arrays the bridge copies through the JS
- * boundary are not wiped, so the host wipes its own.
+ * The Rust side and the SDK wipe their own copies of the seed and the
+ * scalar. The SDK returns the scalar as one mutable `Uint8Array` that no
+ * other SDK code holds; the host wipes it with `fill(0)` when it destroys the
+ * key, and wipes the seed it passed in. The transfer buffers napi-rs copies
+ * across the JS boundary cannot be reached from JS and are not wiped.
  *
  * @throws {ValidationError} `SCP-VALID-7005` when `contextSeed` is not 32 bytes.
  * @throws {CryptoError} `SCP-CRYPTO-4001` if the reduction fails.
