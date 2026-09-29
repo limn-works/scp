@@ -35,12 +35,13 @@ async def main() -> None:
         server = await scp.mcp_serve(identity.did, [ctx.context_id], "stdio")
         print("MCP server running")
 
-        # Or connect as an MCP client to an external server via SSE.
-        # The external server runs no bearer check; an SCP SSE server needs
-        # its token here instead of None.
+        # Or connect as an MCP client to an MCP server on this machine via SSE.
+        # This server runs no bearer check; an SCP SSE server needs its token
+        # here instead of None. The transport has no TLS, so a token is sent
+        # only to a loopback host.
         client = await scp.mcp_client_connect_sse("http://localhost:8080/mcp", None)
         outlets = await scp.mcp_client_list_tools(client)
-        print(f"Remote server offers {len(outlets)} outlet(s)")
+        print(f"The SSE server offers {len(outlets)} outlet(s)")
 
         result = await scp.mcp_client_invoke(
             client,
