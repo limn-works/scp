@@ -4017,7 +4017,9 @@ mod tests {
 
     #[test]
     fn unsubscribed_resource_produces_no_resources_updated() {
-        let server = subscribing_server(MockProvider::default());
+        let mut server = subscribing_server(MockProvider::default());
+        let list = make_request(protocol::METHOD_TOOLS_LIST, None);
+        assert!(server.handle_request(&list).unwrap().error.is_none());
 
         // With nothing subscribed, an events-only change is entirely silent.
         assert!(
@@ -4026,15 +4028,23 @@ mod tests {
                 .is_empty()
         );
 
-        // A membership change still emits the list-changed notifications
-        // (capability-gated, not subscription-gated) but no
+        // The listed client's view changes: it loses a built-in tool. A
+        // membership event then emits the list-changed pair (gated on the
+        // client having listed, not on a subscription) but no
         // `resources/updated`, because no resource is subscribed.
+        server
+            .provider
+            .denied_capabilities
+            .push(("ctx_a".to_owned(), BUILTIN_TOOLS[0].tool_name().to_owned()));
         let notifs = server.notifications_for_event("ctx_a", &members_and_tools_event());
-        assert!(
-            notifs
-                .iter()
-                .all(|n| n.method != protocol::METHOD_RESOURCES_UPDATED),
-            "no resources/updated may be emitted without a subscription: {notifs:?}"
+        let methods: Vec<&str> = notifs.iter().map(|n| n.method.as_str()).collect();
+        assert_eq!(
+            methods,
+            vec![
+                protocol::METHOD_TOOLS_LIST_CHANGED,
+                protocol::METHOD_RESOURCES_LIST_CHANGED,
+            ],
+            "the view change is announced and no resources/updated is sent without a subscription"
         );
     }
 

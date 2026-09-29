@@ -246,17 +246,19 @@ pub const METHOD_TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
 /// this agent may read may have changed, so the client re-lists them.
 ///
 /// The server compares the agent's served contexts, readable resource kinds and
-/// tool view after each `tools/call` and after each runtime `ContextEvent` in
-/// the membership, capability and lifecycle class (a join, a departure, a read
-/// or write revocation or restoration, a capability suspension, an executed
-/// governance action, a ceiling change, a consequence, a migration start, a
-/// tombstone, a close, an expiry). It sends this notice when that comparison
-/// finds a change, a `tools/call` that spent the agent's token included; when
-/// it cannot read which contexts it serves; and when the event pump lagged and
-/// resynchronizes. A join or leave is one such change, not the only one. Any
-/// other `ContextEvent` (a block, an access-key revocation or restoration, a
-/// message, a data-plane event) runs no comparison, so it sends this notice
-/// only when the server cannot read which contexts it serves.
+/// tool view after each `tools/call` that reaches the outlet invocation (a call
+/// refused earlier changes nothing, so it runs no comparison) and after each
+/// runtime `ContextEvent` in the membership, capability and lifecycle class
+/// (a join, a departure, a read or write revocation or restoration, a
+/// capability suspension, an executed governance action, a ceiling change, a
+/// consequence, a migration start, a tombstone, a close, an expiry). It sends
+/// this notice when that comparison finds a change, a `tools/call` that spent
+/// the agent's token included; when it cannot read which contexts it serves;
+/// and when the event pump lagged and resynchronizes. A join or leave is one
+/// such change, not the only one. Any other `ContextEvent` (a block, an
+/// access-key revocation or restoration, a message, a data-plane event) runs
+/// no comparison, so it sends this notice only when the server cannot read
+/// which contexts it serves.
 ///
 /// A change that no compared `ContextEvent` reports and no `tools/call` causes
 /// sends no notice: the agent token reaching its expiry, its nonce passing the
