@@ -14793,7 +14793,8 @@ public func FfiConverterCallbackInterfaceDeviceAttestationProvider_lower(_ v: De
  * reports these two codes, including the pseudonym derivation inside
  * `context_create` and the identity key reads and signatures of identity
  * operations. There are two exceptions: `SCP-IDENT-1055`, reported when the
- * bridge rejects the pseudonym a `derive_pseudonym` call returned, and
+ * bridge rejects the pseudonym a `derive_pseudonym` call returned (including
+ * when `get_public_key` on its key id throws, whatever the code), and
  * `SCP-IDENT-1037`, which `scpid_sign` reports for any custody failure (spec
  * §3.11.4). Throw only
  * [`ScpError`]: `UniFFI` 0.29 panics on any other error a callback throws.
@@ -18550,7 +18551,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_dh_agree() != 52565) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 36664) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 26992) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 41285) {
