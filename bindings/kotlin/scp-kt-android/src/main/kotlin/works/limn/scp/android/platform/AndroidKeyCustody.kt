@@ -13,13 +13,16 @@
 // software, and it reports CustodyType.HARDWARE for every Keystore key. This class performs all signing
 // and DH itself and returns signatures and shared secrets. Two paths hand a caller a software
 // private key or the material that derives one:
-// - exportSigningKeyBytes returns a software Ed25519 key's 32-byte private seed.
+// - exportSigningKeyBytes returns the 32-byte private seed of any Ed25519 key this class
+//   holds in software: a generateKeypair key on API 26-32, and every derived pseudonym key,
+//   including a pseudonym derived from a Keystore identity key whose own seed the method
+//   refuses to export. It accepts any Ed25519 id in softwareKeys, not only a generateKeypair handle.
 // - sign signs any caller-supplied bytes with a hardware identity key, and derivePseudonymSecret
 //   derives every pseudonym secret of that key from its signature over the public string
 //   "scp-pseudonym-secret-v1". A caller that signs that string derives every pseudonym private
 //   key of the identity. ADR-027 acceptance criterion 6 forbids this construction.
-// No other path returns a software private key (Ed25519 on API 26-32, a derived pseudonym key,
-// or an X25519 key). No code passes this class to the Rust engine.
+// No other path returns a software private key, and no path returns an X25519 private key.
+// No code passes this class to the Rust engine.
 //
 // Software Ed25519 keys that generateKeypair creates (API 26-32 fallback) are persisted to
 // EncryptedSharedPreferences (Jetpack Security) so they survive process death. Without this,
@@ -570,7 +573,9 @@ class AndroidKeyCustody internal constructor(
      * Exports the raw 32-byte Ed25519 private key bytes for governance vote signing.
      *
      * For software-backed keys ([CustodyType.SOFTWARE]): extracts the 32-byte seed from
-     * the Bouncy Castle [Ed25519PrivateKeyParameters] and returns a copy.
+     * the Bouncy Castle [Ed25519PrivateKeyParameters] and returns a copy. That covers a
+     * [generateKeypair] key on API 26-32 and every key [derivePseudonym] stores, including
+     * a pseudonym derived from a Keystore identity key.
      *
      * For Keystore keys ([CustodyType.HARDWARE]): throws an error because Keystore does
      * not hand the private key bytes to the app, so a Keystore key cannot sign a governance vote through
@@ -579,7 +584,9 @@ class AndroidKeyCustody internal constructor(
      * custody adapters. That slice has not landed, so this accessor still exports the seed
      * of a software key.
      *
-     * @param keyHandle Handle returned by [generateKeypair] for an Ed25519 key.
+     * @param keyHandle Handle naming any Ed25519 key held in software: one [generateKeypair]
+     *   returned, or a [KeyHandle] built from a [PseudonymKeyHandle.id]. The method checks
+     *   only [KeyHandle.custodyType] and the stored key type, not where the handle came from.
      * @return 32-byte raw Ed25519 private key bytes.
      * @throws ScpException with code `SCP-CRYPTO-4003` if the key is not Ed25519.
      * @throws ScpException with code `SCP-CRYPTO-4005` if the key is a Keystore key

@@ -26,7 +26,8 @@
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
 // SCP-113 (Android Storage trait with TEE-backed SQLCipher; the adapter derives the SQLCipher
-// key from a Keystore-held AES-256 key and does not check that Keystore put it in the TEE).
+// passphrase from a Keystore-held AES-256 key and does not check that Keystore put the AES key
+// in the TEE).
 
 package works.limn.scp.android.platform
 
@@ -447,11 +448,12 @@ class AndroidStorageTest {
     }
 
     // -------------------------------------------------------------------
-    // Keystore key derivation verification (constants and structure)
+    // AndroidStorage structure and error-code verification. No test here runs
+    // Keystore key derivation; see the file header.
     // -------------------------------------------------------------------
 
     @Nested
-    inner class KeystoreKeyDerivation {
+    inner class AndroidStorageStructure {
 
         @Test
         fun `AndroidStorage class exists and implements StorageProvider`() {

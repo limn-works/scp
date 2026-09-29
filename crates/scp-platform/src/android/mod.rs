@@ -62,8 +62,9 @@
 //! - [`push_provider`] — Firebase Cloud Messaging; checks only the `scp` wake
 //!   field of a data-only payload and does not enforce the opaque payload
 //!   §10.7 of the infrastructure spec defines.
-//! - [`storage`] — `SQLCipher` encrypted storage whose 32-byte key is derived
-//!   from a Keystore-held AES-256 key.
+//! - [`storage`] — `SQLCipher` encrypted storage whose 32-byte passphrase is
+//!   derived from a Keystore-held AES-256 key; `SQLCipher` derives the database
+//!   key from that passphrase.
 //!
 //! # Conditional Compilation
 //!

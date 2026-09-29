@@ -56,10 +56,11 @@ import javax.crypto.spec.GCMParameterSpec
  *    are the SQLCipher passphrase, which SQLCipher uses for full-database encryption.
  *
  * Keystore does not hand the AES key bytes to the app. The derived passphrase is not
- * persisted to disk in plaintext, but it stays in process memory: SQLCipher keeps the key
- * in native memory for as long as the database is open, and the adapter zeroes only the
- * returned passphrase array after open, not the 38-byte `doFinal` output or the list
- * `take` builds from it, which stay on the JVM heap until garbage collection.
+ * persisted to disk in plaintext, but key material stays in process memory: SQLCipher keeps
+ * the database key it derives from the passphrase in native memory for as long as the
+ * database is open, and the adapter zeroes only the returned passphrase array after open,
+ * not the 38-byte `doFinal` output or the list `take` builds from it, which stay on the
+ * JVM heap until garbage collection.
  *
  * ## Thread safety
  *
@@ -333,7 +334,10 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         /** Value column name. */
         internal const val COLUMN_VALUE = "value"
 
-        /** Error code: storage key not found. */
+        /**
+         * Error code: storage key not found. No code path throws it: a missing key makes
+         * [AndroidStorage.get] return `null`.
+         */
         internal const val ERROR_KEY_NOT_FOUND = "SCP-STORAGE-8001"
 
         /** Error code: storage operation failed. */

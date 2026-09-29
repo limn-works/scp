@@ -34,11 +34,15 @@ enum class KeyType {
  * and how it is protected.
  *
  * See ADR-006 for the custody model. [AndroidKeyCustody] reports [HARDWARE] for a
- * Keystore key and [SOFTWARE] for a Bouncy Castle key; the testing adapter reports
- * [IN_MEMORY].
+ * Keystore key and [SOFTWARE] for a Bouncy Castle key. No Android adapter reports
+ * [IN_MEMORY]; the value matches the custody type of ADR-006's in-memory testing
+ * adapter, which is Rust code and reports the Rust `CustodyType`.
  */
 enum class CustodyType {
-    /** Key material is stored in memory only (testing adapter). */
+    /**
+     * Key material is stored in memory only. No Android adapter reports this value; it
+     * matches the Rust in-memory testing adapter of ADR-006.
+     */
     IN_MEMORY,
 
     /**
@@ -125,15 +129,17 @@ enum class DestructionMethod {
  * SCP-specific exception with structured error codes.
  *
  * Error codes follow the pattern `SCP-{DOMAIN}-{NUMBER}`:
- * - `SCP-CRYPTO-4001`: Ed25519 key not found
- * - `SCP-CRYPTO-4002`: X25519 key not found
+ * - `SCP-CRYPTO-4001`: Key not found (a software or Keystore lookup, any key type,
+ *   X25519 included)
+ * - `SCP-CRYPTO-4002`: X25519 key not found by [KeyCustodyProvider.dhAgree]
  * - `SCP-CRYPTO-4003`: Wrong key type for operation
  * - `SCP-CRYPTO-4004`: Key destruction failed
  * - `SCP-CRYPTO-4005`: Signing key export refused, because the key is a Keystore key
  *   (thrown only by [KeyCustodyProvider.exportSigningKeyBytes]; retrying cannot succeed)
  * - `SCP-TRANS-5001`: Push payload has no `scp` field
  * - `SCP-TRANS-5002`: Push payload `scp` field is not `"1"`
- * - `SCP-STORAGE-8001`: Storage key not found
+ * - `SCP-STORAGE-8001`: Storage key not found. Defined as `AndroidStorage.ERROR_KEY_NOT_FOUND`
+ *   but thrown by no adapter: a missing key makes [StorageProvider.get] return `null`
  * - `SCP-STORAGE-8002`: Storage operation failed
  * - `SCP-STORAGE-8003`: Storage encryption key derivation failed
  * - `SCP-ATTEST-9001`: Play Integrity attestation failed
@@ -426,9 +432,10 @@ interface KeyCustodyProvider {
  * Platform trait for encrypted key-value storage.
  *
  * Abstracts persistent, encrypted storage behind a uniform interface. The Android
- * implementation ([AndroidStorage]) uses SQLCipher with a 32-byte key derived from an
- * AES-256 key that Android Keystore holds. The adapter does not read `KeyInfo.securityLevel`, so
- * it does not know whether Keystore put that key in the TEE or in software.
+ * implementation ([AndroidStorage]) uses SQLCipher with a 32-byte passphrase derived from an
+ * AES-256 key that Android Keystore holds; SQLCipher derives the database key from that
+ * passphrase. The adapter does not read `KeyInfo.securityLevel`, so it does not know whether
+ * Keystore put the AES key in the TEE or in software.
  *
  * This interface declares the six methods of the UniFFI `StorageProvider` callback interface in
  * `crates/scp-ffi/uniffi/src/lib.rs` under the same names. The Rust `Storage` trait in

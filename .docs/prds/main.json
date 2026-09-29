@@ -6422,7 +6422,7 @@
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidStorage.kt"
       ],
-      "description": "Implement the Storage platform trait for Android with TEE-backed key derivation for SQLCipher database encryption. The database encryption key must be derived using TEE-backed key derivation, not stored in plaintext. Mirrors ADR-025 Apple adapter storage structure.\n\nStatus reopened 2026-09-28: the shipped adapter derives the SQLCipher key from a Keystore AES-256 key but never reads `KeyInfo.securityLevel`, so it does not show that the key is TEE-backed, and the unit tests run against the test-only `InMemoryStorageProvider`, not SQLCipher. The criteria \"SQLCipher database encryption key derived via TEE-backed key derivation\" and \"Unit tests verify encrypted storage round-trip\" are unmet. `AndroidStorage` implements the Kotlin `StorageProvider` interface, not the Rust `Storage` trait, so the criterion \"Storage trait implemented for Android matching ADR-025 trait signatures\" is unmet as well.",
+      "description": "Implement the Storage platform trait for Android with TEE-backed key derivation for SQLCipher database encryption. The database encryption key must be derived using TEE-backed key derivation, not stored in plaintext. Mirrors ADR-025 Apple adapter storage structure.\n\nStatus reopened 2026-09-28: the shipped adapter derives the SQLCipher passphrase from a Keystore AES-256 key but never reads `KeyInfo.securityLevel`, so it does not show that the key is TEE-backed, and no unit test opens a SQLCipher database: of the 46 JVM tests, 31 run against the test-only `InMemoryStorageProvider` and 15 check `AndroidStorage` constants, type and error codes. The criteria \"SQLCipher database encryption key derived via TEE-backed key derivation\" and \"Unit tests verify encrypted storage round-trip\" are unmet. `AndroidStorage` implements the Kotlin `StorageProvider` interface, not the Rust `Storage` trait, so the criterion \"Storage trait implemented for Android matching ADR-025 trait signatures\" is unmet as well.",
       "acceptanceCriteria": [
         "Storage trait implemented for Android matching ADR-025 trait signatures",
         "SQLCipher database encryption key derived via TEE-backed key derivation",
@@ -6461,7 +6461,7 @@
           "ADR-025 — Apple adapter as parallel reference"
         ]
       },
-      "result": "AndroidStorage.kt implemented. The SQLCipher key is derived from an AES-256 key held by Android Keystore; the adapter does not read `KeyInfo.securityLevel`, so it does not know whether the key sits in the TEE or in software. `AndroidStorageTest.kt` holds 46 JVM unit tests, which run against the test-only `InMemoryStorageProvider`, not against SQLCipher."
+      "result": "AndroidStorage.kt implemented. The SQLCipher passphrase is derived from an AES-256 key held by Android Keystore, and SQLCipher derives the database key from that passphrase; the adapter does not read `KeyInfo.securityLevel`, so it does not know whether the AES key sits in the TEE or in software. `AndroidStorageTest.kt` holds 46 JVM unit tests: 31 run against the test-only `InMemoryStorageProvider`, 10 assert `AndroidStorage` constants, and 5 check `AndroidStorage`'s type and constructor by reflection or build an `ScpException` from its error-code constants. None opens a SQLCipher database."
     },
     {
       "id": "SCP-114",

@@ -28,8 +28,8 @@ import android.content.Context
  *   token today; story SCP-111 tracks the Standard request ADR-027 requires.
  * @property push Firebase Cloud Messaging; checks only the `scp` wake field of a data-only
  *   payload and does not enforce the opaque payload §10.7 defines.
- * @property storage SQLCipher encrypted storage whose 32-byte key is derived from a
- *   Keystore-held AES-256 key.
+ * @property storage SQLCipher encrypted storage whose 32-byte passphrase is derived from a
+ *   Keystore-held AES-256 key; SQLCipher derives the database key from that passphrase.
  */
 data class AndroidPlatformAdapterImpl(
     val keyCustody: KeyCustodyProvider,
