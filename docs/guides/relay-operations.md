@@ -155,6 +155,13 @@ OPTIONS:
     --relay-only            Run as a bare relay server (no identity, no HTTP)
     --ephemeral             Use in-memory storage for all subsystems (testing builds only;
                             a shipped binary exits 1)
+    --self-host             Host a static site entirely on SCP (no DNS name required);
+                            opens an inbound port to the public internet. Also set
+                            by SCP_NODE_SELF_HOST=1. See
+                            .docs/guides/self-hosting-a-website-on-scp.md
+    --site-dir <PATH>       Directory of static files to host in --self-host mode
+                            (must contain index.html; default: embedded site).
+                            Also set by SCP_NODE_SITE_DIR
     --storage-path <PATH>   SQLite database directory
     --health                TCP health probe (exit 0/1)
     --help, -h              Show help
