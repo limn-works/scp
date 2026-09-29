@@ -2,10 +2,10 @@
 /**
  * Guard: the `@limn-works/scp-ts-wasm` wasm build is `--release`-only.
  *
- * ADR-057 Prerequisite 4 (reframed): the fail-closed-on-tampered-ciphertext
- * guarantee rests on the shipped wasm being a `--release` build (openmls's
- * decrypt `debug_assert!` compiled out → typed `Err`, not a tab-abort). A
- * `wasm-pack build --dev` re-arms that assert.
+ * ADR-057 Prerequisite 4: the shipped wasm is a `--release` build, the
+ * configuration `fuzz_mls_decrypt -O` fuzzes to show a tampered ciphertext
+ * yields a typed `Err`, not a tab-abort. A `wasm-pack build --dev` turns debug
+ * assertions on, a configuration that fuzzing does not cover.
  *
  * This is a POSITIVE, BOUNDED invariant, asserted against the SAME argv the
  * build actually runs (imported from wasm-build.ts, not a text regex that could

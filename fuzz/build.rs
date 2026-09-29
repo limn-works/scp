@@ -14,13 +14,11 @@
 //! because `cargo check` passes no `-Z` flag, so without this script a broken directory
 //! override would reach `main` reporting a green check.
 //!
-//! WHAT IT COMPARES. `fuzz/rust-toolchain.toml` names a dated nightly, and rustc's version
-//! string carries the commit date rather than the channel date — `nightly-2026-05-03`
-//! reports `1.97.0-nightly (20de910db 2026-05-02)` — so the two dates do not match by
-//! construction and this script does not compare them. It compares the release channel:
-//! when the file names a nightly, the compiler must be a nightly. A different nightly
-//! fails later, loudly, at openmls 0.8.1's prelude (E0365), which is the condition
-//! `fuzz/rust-toolchain.toml` records.
+//! WHAT IT COMPARES. `fuzz/rust-toolchain.toml` names the undated `nightly` channel, and
+//! rustc's version string carries a commit date rather than a channel name — for example
+//! `1.99.0-nightly (d453bdd8f 2026-08-14)` — so this script does not compare dates. It
+//! compares the release channel: when the file names a nightly, the compiler must be a
+//! nightly.
 
 use std::path::Path;
 use std::process::Command;
