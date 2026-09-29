@@ -697,17 +697,21 @@ mod tests {
         }
     }
 
-    /// §25.26 Vectors 41 and 42: the RFC 6979 signer, keyed with §25.2's
-    /// reference scalar (the root-set member 0 of the vector identity),
-    /// reproduces each vector's 64-byte signature exactly.
-    ///
-    /// Vector 41 (raw form) signs the preimage digest `D`. Vector 42 (`WebAuthn`
-    /// assertion form) signs `SHA-256(authenticatorData || SHA-256(clientDataJSON))`,
-    /// which this test rebuilds from the vector's own bytes: the challenge
-    /// `"SCP-KEY-EVENT-V1:" || D`, its unpadded base64url form inside
-    /// `clientDataJSON`, and `authenticatorData = SHA-256("ctx.network") || 0x05 || BE32(0)`.
-    #[test]
-    fn spec_25_26_vectors_41_42_signatures() {
+    /// §25.26 Vectors 41 and 42 intermediates, rebuilt in test code from the
+    /// vector's own bytes. Vector 42's challenge is `"SCP-KEY-EVENT-V1:" || D`,
+    /// carried unpadded base64url inside `clientDataJSON`, and its
+    /// `authenticatorData` is `SHA-256("ctx.network") || 0x05 || BE32(0)`.
+    struct Spec2526 {
+        preimage_41: Vec<u8>,
+        digest_41: [u8; 32],
+        digest_42: [u8; 32],
+        challenge_b64url: String,
+        client_data_json: String,
+        client_data_hash: [u8; 32],
+        digest_assertion: [u8; 32],
+    }
+
+    fn spec_25_26() -> Spec2526 {
         const PREIMAGE_41: &str = "5343502d4b454c2d4556454e542d56313a010000000000000000000000000000\
              0000000000000000000000000000000000000000000000000000000000000000\
              0000000000000000000000000000000000000000000000000000000000000100\
@@ -747,6 +751,77 @@ mod tests {
             out
         }
 
+        let preimage_41 = unhex(PREIMAGE_41);
+        let digest_41 = sha256(&[&preimage_41]);
+        // Vector 42's preimage differs from Vector 41's only in the
+        // signature-form list's entry, byte 100.
+        let mut preimage_42 = preimage_41.clone();
+        preimage_42[100] = 0x02;
+        let digest_42 = sha256(&[&preimage_42]);
+        let challenge = [b"SCP-KEY-EVENT-V1:".as_slice(), &digest_42].concat();
+        let challenge_b64url = b64url(&challenge);
+        let client_data_json = format!(
+            "{{\"type\":\"webauthn.get\",\"challenge\":\"{challenge_b64url}\",\
+             \"origin\":\"https://ctx.network\",\"crossOrigin\":false}}"
+        );
+        let client_data_hash = sha256(&[client_data_json.as_bytes()]);
+        let authenticator_data =
+            [sha256(&[b"ctx.network"]).as_slice(), &[0x05, 0, 0, 0, 0]].concat();
+        let digest_assertion = sha256(&[&authenticator_data, &client_data_hash]);
+        Spec2526 {
+            preimage_41,
+            digest_41,
+            digest_42,
+            challenge_b64url,
+            client_data_json,
+            client_data_hash,
+            digest_assertion,
+        }
+    }
+
+    /// Checks that the §25.26 Vector 41 and 42 text is self-consistent: the
+    /// intermediates rebuilt in test code (`spec_25_26`) equal the literals the
+    /// spec prints. No production code runs here; it guards the vector text
+    /// and the test's rebuild, which `spec_25_26_vectors_41_42_signatures`
+    /// feeds to the production signer.
+    #[test]
+    fn spec_25_26_vector_intermediates_are_consistent() {
+        let v = spec_25_26();
+        assert_eq!(v.preimage_41.len(), 364);
+        assert_eq!(v.preimage_41[100], 0x01);
+        assert_eq!(
+            hex::encode(v.digest_41),
+            "d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7"
+        );
+        assert_eq!(
+            hex::encode(v.digest_42),
+            "9a41b0fdb978014730ab7d8d56b9a77745b4ff4824affc096bbd923d14a569a6"
+        );
+        assert_eq!(
+            v.challenge_b64url,
+            "U0NQLUtFWS1FVkVOVC1WMTqaQbD9uXgBRzCrfY1Wuad3RbT_SCSv_AlrvZI9FKVppg"
+        );
+        assert_eq!(v.client_data_json.len(), 155);
+        assert_eq!(
+            hex::encode(v.client_data_hash),
+            "0b33b76a4ecb79e15753a17147ac39f6964ae20523e7e001c258e67d2562c236"
+        );
+        assert_eq!(
+            hex::encode(v.digest_assertion),
+            "1f63ea5226c20ce261b3243ad941ef8834b0678cf4681b2f914963b0bffe4d6b"
+        );
+    }
+
+    /// §25.26 Vectors 41 and 42: the RFC 6979 signer, keyed with §25.2's
+    /// reference scalar (the root-set member 0 of the vector identity),
+    /// reproduces each vector's 64-byte signature exactly, and each verifies
+    /// strictly. Vector 41 (raw form) signs the preimage digest `D`; Vector 42
+    /// (`WebAuthn` assertion form) signs
+    /// `SHA-256(authenticatorData || SHA-256(clientDataJSON))`, both from
+    /// `spec_25_26`.
+    #[test]
+    fn spec_25_26_vectors_41_42_signatures() {
+        let v = spec_25_26();
         let key = P256SigningKey::from_seed(
             b"SCP-TEST-VECTOR-KEY-V1",
             &h("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"),
@@ -754,65 +829,23 @@ mod tests {
         .unwrap();
         let public_key = key.public_key();
 
-        // Vector 41: raw form, the signature is over D.
-        let preimage_41 = unhex(PREIMAGE_41);
-        assert_eq!(preimage_41.len(), 364);
-        let digest_41 = sha256(&[&preimage_41]);
-        assert_eq!(
-            hex::encode(digest_41),
-            "d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7"
-        );
-        let signature_41 = sign_prehash_rfc6979(&key, &digest_41).unwrap();
+        let signature_41 = sign_prehash_rfc6979(&key, &v.digest_41).unwrap();
         assert_eq!(
             hex::encode(signature_41),
             "274e7cf73b6807ec53619491a1cc094a5fa2a649b4a04a043965597c7faa5e96\
              7e7b499be2e9750521b4bfec6fa65bfdd14c8e5c940bb60884d040da9d1e70a0"
                 .replace(char::is_whitespace, "")
         );
-        verify_prehash_strict(&public_key, &digest_41, &signature_41).unwrap();
+        verify_prehash_strict(&public_key, &v.digest_41, &signature_41).unwrap();
 
-        // Vector 42: WebAuthn assertion form.
-        // Vector 42's preimage differs from Vector 41's only in the
-        // signature-form list's entry, byte 100.
-        let mut preimage_42 = preimage_41;
-        assert_eq!(preimage_42[100], 0x01);
-        preimage_42[100] = 0x02;
-        let digest_42 = sha256(&[&preimage_42]);
-        assert_eq!(
-            hex::encode(digest_42),
-            "9a41b0fdb978014730ab7d8d56b9a77745b4ff4824affc096bbd923d14a569a6"
-        );
-        let challenge = [b"SCP-KEY-EVENT-V1:".as_slice(), &digest_42].concat();
-        assert_eq!(
-            b64url(&challenge),
-            "U0NQLUtFWS1FVkVOVC1WMTqaQbD9uXgBRzCrfY1Wuad3RbT_SCSv_AlrvZI9FKVppg"
-        );
-        let client_data_json = format!(
-            "{{\"type\":\"webauthn.get\",\"challenge\":\"{}\",\
-             \"origin\":\"https://ctx.network\",\"crossOrigin\":false}}",
-            b64url(&challenge)
-        );
-        assert_eq!(client_data_json.len(), 155);
-        let client_data_hash = sha256(&[client_data_json.as_bytes()]);
-        assert_eq!(
-            hex::encode(client_data_hash),
-            "0b33b76a4ecb79e15753a17147ac39f6964ae20523e7e001c258e67d2562c236"
-        );
-        let authenticator_data =
-            [sha256(&[b"ctx.network"]).as_slice(), &[0x05, 0, 0, 0, 0]].concat();
-        let digest_assertion = sha256(&[&authenticator_data, &client_data_hash]);
-        assert_eq!(
-            hex::encode(digest_assertion),
-            "1f63ea5226c20ce261b3243ad941ef8834b0678cf4681b2f914963b0bffe4d6b"
-        );
-        let signature_42 = sign_prehash_rfc6979(&key, &digest_assertion).unwrap();
+        let signature_42 = sign_prehash_rfc6979(&key, &v.digest_assertion).unwrap();
         assert_eq!(
             hex::encode(signature_42),
             "6aee5c6f9b367f8a886fb996c2f08d77fefcddee6399f1b928cf1110cef786d0\
              315de3e854e0669d355b4968b5c2bc8075a5630e3c980844049ebcbf9716c424"
                 .replace(char::is_whitespace, "")
         );
-        verify_prehash_strict(&public_key, &digest_assertion, &signature_42).unwrap();
+        verify_prehash_strict(&public_key, &v.digest_assertion, &signature_42).unwrap();
     }
 
     #[test]

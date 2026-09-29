@@ -433,16 +433,20 @@ def _native_mod() -> Any:
     return _scp_core
 
 
-def _p256_host_call(name: str, *args: bytes) -> bytes:
-    """Call the ``_scp_core`` P-256 host helper ``name``, mapping its errors."""
+def _p256_host_call(name: str, *args: bytes | bytearray) -> Any:
+    """Call the ``_scp_core`` P-256 host helper ``name``, mapping its errors.
+
+    Returns the native result without a copy, so the ``bytearray`` scalar the
+    host wipes is the only copy Python holds.
+    """
     fn = getattr(_native_mod(), name)
     try:
-        return bytes(fn(*args))
+        return fn(*args)
     except Exception as exc:
         raise _coded_bridge_error(exc) from exc
 
 
-def p256_pseudonym_scalar(context_seed: bytes) -> bytes:
+def p256_pseudonym_scalar(context_seed: bytes | bytearray) -> bytearray:
     """Map a 32-byte §9.10.4 ``context_seed`` to its P-256 pseudonym scalar in ``[1, n - 1]``.
 
     FIPS 186-5 A.2.1, ``09-security-model.md`` §9.10.4:
@@ -453,7 +457,10 @@ def p256_pseudonym_scalar(context_seed: bytes) -> bytes:
     the pseudonym key and passes it to :func:`p256_public_key` and
     :func:`p256_sign_prehash_rfc6979`.
 
-    The Rust side wipes its copies; Python ``bytes`` are never wiped.
+    Returns a ``bytearray`` so the host can wipe the scalar: when it destroys
+    the key it clears the array in place (``d[:] = bytes(len(d))``) before
+    dropping it. The Rust side wipes its own copies. A host that must wipe the
+    seed passes it as a ``bytearray`` and clears it after the call.
 
     Raises:
         ValidationError: ``SCP-VALID-7005`` when ``context_seed`` is not 32 bytes.
@@ -462,7 +469,7 @@ def p256_pseudonym_scalar(context_seed: bytes) -> bytes:
     return _p256_host_call("p256_pseudonym_scalar", context_seed)
 
 
-def p256_public_key(scalar: bytes) -> bytes:
+def p256_public_key(scalar: bytes | bytearray) -> bytes:
     """Return the 33-byte SEC1 compressed public key ``d * G`` of a 32-byte scalar.
 
     Raises:
@@ -472,7 +479,7 @@ def p256_public_key(scalar: bytes) -> bytes:
     return _p256_host_call("p256_public_key", scalar)
 
 
-def p256_sign_prehash_rfc6979(scalar: bytes, digest: bytes) -> bytes:
+def p256_sign_prehash_rfc6979(scalar: bytes | bytearray, digest: bytes) -> bytes:
     """Sign a 32-byte digest with the scalar (§9.5).
 
     RFC 6979 deterministic nonce (``h1 = digest``), low-``s`` normalized,

@@ -9,11 +9,13 @@
 //!
 //! Wiping is best-effort: the Rust side wipes the seed and scalar `Vec`s it
 //! extracts and its own copies (`Zeroizing`), and builds each returned
-//! `bytes` straight from the wiped buffer. Python `bytes` are immutable and
-//! never wiped; a host that must wipe passes a `bytearray` and clears it.
+//! object straight from the wiped buffer. `p256_pseudonym_scalar` returns the
+//! scalar as a `bytearray`, the one secret a host keeps, so the host can wipe
+//! it when it destroys the key. The inputs accept `bytes` or `bytearray`; a
+//! host that must wipe an input passes a `bytearray` and clears it.
 
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyByteArray, PyBytes};
 use scp_ffi_common::p256_host::{self as shared, P256HostError};
 use zeroize::Zeroizing;
 
@@ -33,7 +35,7 @@ fn py_error(e: P256HostError) -> PyErr {
 /// FIPS 186-5 A.2.1, §9.10.4:
 /// `HKDF-Expand(context_seed, b"SCP-PSEUDONYM-P256-V1", 48) mod (n − 1) + 1`,
 /// with the label fixed inside the helper. Returns the 32-byte big-endian
-/// scalar.
+/// scalar as a `bytearray`, which the host wipes when it destroys the key.
 ///
 /// # Errors
 ///
@@ -44,10 +46,10 @@ fn py_error(e: P256HostError) -> PyErr {
 pub fn py_p256_pseudonym_scalar(
     py: Python<'_>,
     context_seed: Vec<u8>,
-) -> PyResult<Bound<'_, PyBytes>> {
+) -> PyResult<Bound<'_, PyByteArray>> {
     let context_seed = Zeroizing::new(context_seed);
     let scalar = shared::p256_pseudonym_scalar(&context_seed).map_err(py_error)?;
-    Ok(PyBytes::new(py, scalar.as_slice()))
+    Ok(PyByteArray::new(py, scalar.as_slice()))
 }
 
 /// The 33-byte SEC1 compressed public key `d·G` of a 32-byte scalar.

@@ -60,9 +60,23 @@ def test_context_seeds_map_to_spec_points(
     name: str, seed_v1: str, v1: str, seed_v2: str, v2: str
 ) -> None:
     d1 = p256_pseudonym_scalar(bytes.fromhex(seed_v1))
-    assert isinstance(d1, bytes) and len(d1) == 32
+    assert len(d1) == 32
     assert p256_public_key(d1).hex() == v1
     assert p256_public_key(p256_pseudonym_scalar(bytes.fromhex(seed_v2))).hex() == v2
+
+
+def test_scalar_is_a_wipeable_bytearray_and_bytearray_inputs_are_accepted() -> None:
+    # The host wipes the scalar when it destroys the key, so it must be a
+    # mutable bytearray, and bytearray seeds and scalars must be accepted.
+    seed = bytearray.fromhex(VECTORS[0][1])
+    d = p256_pseudonym_scalar(seed)
+    assert type(d) is bytearray
+    assert d == p256_pseudonym_scalar(bytes(seed))
+    assert p256_public_key(d).hex() == VECTORS[0][2]
+    digest = hashlib.sha256(b"wipe").digest()
+    assert p256_sign_prehash_rfc6979(d, digest) == p256_sign_prehash_rfc6979(bytes(d), digest)
+    d[:] = bytes(len(d))
+    assert d == bytearray(32)
 
 
 def test_rfc6979_a25_signature_is_low_s() -> None:

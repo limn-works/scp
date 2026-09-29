@@ -487,8 +487,12 @@ pub trait KeyCustodyProvider: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns `ScpError` if the key is not found, is not an Ed25519 key, or the
-    /// provider does not support rotatable pseudonyms.
+    /// The host returns an `ScpError` with `SCP-CRYPTO-4006` when `key_id` was
+    /// destroyed or never existed, and the caller receives key-not-found
+    /// (`SCP-CRYPTO-4006`). Any other host error, including the Rust default's
+    /// `SCP-CTX-2050`, reaches the caller as the custody error `SCP-CRYPTO-4060`
+    /// carrying the host's code and message. A returned result the bridge
+    /// rejects is `SCP-IDENT-1055`, as for `derive_pseudonym`.
     async fn derive_rotatable_pseudonym(
         &self,
         key_id: String,
@@ -522,8 +526,12 @@ pub trait KeyCustodyProvider: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns `ScpError` if the key is not found, not exportable, or not
-    /// an Ed25519 key.
+    /// The host returns an `ScpError` with `SCP-CRYPTO-4006` when `key_id` was
+    /// destroyed or never existed, and the caller receives key-not-found
+    /// (`SCP-CRYPTO-4006`). Any other host error, including the Rust default's
+    /// `SCP-CTX-2050` and a key that is not exportable or not Ed25519, reaches
+    /// the caller as the custody error `SCP-CRYPTO-4060` carrying the host's
+    /// code and message.
     async fn export_signing_key_bytes(&self, key_id: String) -> Result<Vec<u8>, ScpError> {
         let _ = key_id;
         Err(ScpError::Context {

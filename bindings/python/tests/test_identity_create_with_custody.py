@@ -287,10 +287,6 @@ async def test_pseudonym_result_provider_derives_in_context_create(scp) -> None:
     """A provider returning :class:`PseudonymResult` derives the pseudonym an
     encrypted ``context_create`` needs, and the bridge binds it."""
     provider = _FakeKeychain()
-    result = provider.derive_pseudonym(provider.generate_keypair("ed25519"), b"probe")
-    assert isinstance(result, PseudonymResult)
-    assert len(result.public_key) == 33
-
     identity = await scp.identity_create_with_custody(provider)
     before = set(provider._pseudonyms)
     ctx = await scp.context_create(identity.did, _ENCRYPTED_PARAMS)

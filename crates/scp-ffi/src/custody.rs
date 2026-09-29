@@ -822,6 +822,7 @@ class FakeCustody:
         self._pseudonyms = {}
         self._next = 1
         self._fault = fault
+        self.sign_calls = 0
 
     def generate_keypair(self, key_type):
         kid = '007' if self._fault == 'noncanonical_keypair' else str(self._next)
@@ -830,6 +831,7 @@ class FakeCustody:
         return kid
 
     def sign(self, key_id, message):
+        self.sign_calls += 1
         if self._fault == 'sign_4001':
             raise HostError('hsm offline', 'SCP-CRYPTO-4001')
         if key_id not in self._pseudonyms and key_id not in self._seeds:
@@ -1130,7 +1132,8 @@ mod tests {
     /// before the host is called.
     #[tokio::test]
     async fn ffi_custody_callback_pseudonym_sign_requires_digest() {
-        let custody = fake_callback_custody();
+        let (callback, host) = super::test_fakes::fake_py_custody_and_host(None);
+        let custody = FfiKeyCustody::Callback(callback);
         let handle = custody
             .generate_keypair(KeyType::Ed25519)
             .await
@@ -1139,12 +1142,21 @@ mod tests {
             .derive_pseudonym(&handle, b"ctx")
             .await
             .expect("derive");
+        let sign_calls = || {
+            Python::with_gil(|py| {
+                host.getattr(py, "sign_calls")
+                    .and_then(|n| n.extract::<u64>(py))
+                    .expect("sign_calls")
+            })
+        };
+        let before = sign_calls();
         assert_custody_error(
             &custody
                 .sign(pseudo.key_handle(), b"as pseudonym")
                 .await
                 .expect_err("12-byte input"),
         );
+        assert_eq!(sign_calls(), before, "a 12-byte input reached the host");
     }
 
     /// B1: deriving the same pseudonym twice returns the same key id, which

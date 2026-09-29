@@ -24331,6 +24331,9 @@ mod tests {
         /// Called with the key id at the start of `destroy_key`, before the
         /// host forgets the key.
         destroy_probe: Option<DestroyProbe>,
+        /// Counts every host `sign` call, so a test can show an input never
+        /// reached the host.
+        sign_calls: Arc<std::sync::atomic::AtomicU64>,
     }
 
     /// A callback run inside the host's `destroy_key`.
@@ -24376,6 +24379,7 @@ mod tests {
                 next: std::sync::atomic::AtomicU64::new(1),
                 fault,
                 destroy_probe: None,
+                sign_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             }
         }
 
@@ -24472,6 +24476,8 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::KeyCustodyProvider for ProdLikeCustody {
         async fn sign(&self, key_id: String, message: Vec<u8>) -> Result<Vec<u8>, ScpError> {
+            self.sign_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.fault == PseudonymFault::SignFails4001 {
                 return Err(ScpError::Crypto {
                     msg: "hsm offline".to_owned(),
@@ -24479,14 +24485,10 @@ mod tests {
                 });
             }
             if let Some(pseudonym) = self.pseudonym_for(&key_id) {
-                let digest: [u8; 32] =
-                    message
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| ScpError::Identity {
-                            msg: "pseudonym keys sign 32-byte digests".to_owned(),
-                            code: codes::IDENT_1010.to_owned(),
-                        })?;
+                // Signs input of any length (a non-digest is hashed first), so
+                // only the bridge's own check can reject a non-digest input.
+                let digest: [u8; 32] = <[u8; 32]>::try_from(message.as_slice())
+                    .unwrap_or_else(|_| sha2::Sha256::digest(&message).into());
                 let mut sig = scp_crypto::p256::sign_prehash_rfc6979(&pseudonym, &digest)
                     .expect("RFC 6979 signing");
                 if self.fault == PseudonymFault::HighS {
@@ -24800,7 +24802,9 @@ mod tests {
     /// high-`s` signature both fail closed.
     #[tokio::test]
     async fn callback_pseudonym_sign_is_strict() {
-        let custody = CallbackKeyCustody::new(Box::new(ProdLikeCustody::new()));
+        let host = ProdLikeCustody::new();
+        let sign_calls = Arc::clone(&host.sign_calls);
+        let custody = CallbackKeyCustody::new(Box::new(host));
         let identity = custody
             .generate_keypair(KeyType::Ed25519)
             .await
@@ -24818,11 +24822,17 @@ mod tests {
             .expect("sign digest");
         scp_crypto::p256::verify_prehash_strict(&point, &digest, sig.as_bytes())
             .expect("strict signature under the bound point");
+        let before = sign_calls.load(std::sync::atomic::Ordering::SeqCst);
         let err = custody
             .sign(pseudonym.key_handle(), b"twelve bytes")
             .await
             .expect_err("12-byte input");
         assert!(matches!(err, PlatformError::CustodyError(_)), "{err:?}");
+        assert_eq!(
+            sign_calls.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "a 12-byte input reached the host"
+        );
         // Identity (non-pseudonym) handles still sign arbitrary messages.
         custody
             .sign(&identity, b"twelve bytes")

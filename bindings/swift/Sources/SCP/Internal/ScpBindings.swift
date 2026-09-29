@@ -14949,8 +14949,12 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      *
      * # Errors
      *
-     * Returns `ScpError` if the key is not found, is not an Ed25519 key, or the
-     * provider does not support rotatable pseudonyms.
+     * The host returns an `ScpError` with `SCP-CRYPTO-4006` when `key_id` was
+     * destroyed or never existed, and the caller receives key-not-found
+     * (`SCP-CRYPTO-4006`). Any other host error, including the Rust default's
+     * `SCP-CTX-2050`, reaches the caller as the custody error `SCP-CRYPTO-4060`
+     * carrying the host's code and message. A returned result the bridge
+     * rejects is `SCP-IDENT-1055`, as for `derive_pseudonym`.
      */
     func deriveRotatablePseudonym(keyId: String, contextId: Data, pseudonymEpoch: UInt64) async throws  -> PseudonymResult
     
@@ -14975,8 +14979,12 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      *
      * # Errors
      *
-     * Returns `ScpError` if the key is not found, not exportable, or not
-     * an Ed25519 key.
+     * The host returns an `ScpError` with `SCP-CRYPTO-4006` when `key_id` was
+     * destroyed or never existed, and the caller receives key-not-found
+     * (`SCP-CRYPTO-4006`). Any other host error, including the Rust default's
+     * `SCP-CTX-2050` and a key that is not exportable or not Ed25519, reaches
+     * the caller as the custody error `SCP-CRYPTO-4060` carrying the host's
+     * code and message.
      */
     func exportSigningKeyBytes(keyId: String) async throws  -> Data
     
@@ -18574,10 +18582,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 49611) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 9321) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 17282) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 44263) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 60571) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_custody_type() != 30807) {

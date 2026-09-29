@@ -61,6 +61,15 @@
         return data
     }
 
+    /// Records an issue unless `error` is `.keyNotFound`, the case a missing
+    /// or destroyed key must report.
+    private func expectKeyNotFound(_ error: PlatformError?) {
+        guard case .keyNotFound = error else {
+            Issue.record("expected keyNotFound, got \(String(describing: error))")
+            return
+        }
+    }
+
     // MARK: - AppleKeyCustody Tests
 
     struct AppleKeyCustodyTests {
@@ -119,9 +128,9 @@
         func signDestroyedKey() async throws {
             let handle = try await custody.generateKeypair(keyType: "ed25519")
             try await custody.destroyKey(handle)
-            await #expect(throws: PlatformError.self) {
+            expectKeyNotFound(await #expect(throws: PlatformError.self) {
                 _ = try await custody.sign(handle, data: Data("test".utf8))
-            }
+            })
         }
 
         @Test("Ed25519 signature verifies with CryptoKit")
@@ -165,9 +174,9 @@
         func publicKeyDestroyedHandle() async throws {
             let handle = try await custody.generateKeypair(keyType: "ed25519")
             try await custody.destroyKey(handle)
-            await #expect(throws: PlatformError.self) {
+            expectKeyNotFound(await #expect(throws: PlatformError.self) {
                 _ = try await custody.publicKey(handle)
-            }
+            })
         }
 
         @Test("publicKey reads from metadata cache without accessing key material")
@@ -217,16 +226,16 @@
             let handle = try await custody.generateKeypair(keyType: "ed25519")
             try await custody.destroyKey(handle)
 
-            // All operations should now fail
-            await #expect(throws: PlatformError.self) {
+            // All operations should now fail with keyNotFound.
+            expectKeyNotFound(await #expect(throws: PlatformError.self) {
                 _ = try await custody.sign(handle, data: Data("test".utf8))
-            }
-            await #expect(throws: PlatformError.self) {
+            })
+            expectKeyNotFound(await #expect(throws: PlatformError.self) {
                 _ = try await custody.publicKey(handle)
-            }
-            await #expect(throws: PlatformError.self) {
+            })
+            expectKeyNotFound(await #expect(throws: PlatformError.self) {
                 _ = try await custody.destroyKey(handle)
-            }
+            })
         }
 
         // MARK: - dhAgree
