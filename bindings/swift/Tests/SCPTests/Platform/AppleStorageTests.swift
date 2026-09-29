@@ -42,7 +42,9 @@
 //    receives the 32-byte key through `PRAGMA key` before any other operation on
 //    the connection, and plain SQLite ignores that pragma without an error.
 //    `AppleStorage.open(at:encryptionKey:cipherVersion:)` throws for a
-//    connection that reports no SQLCipher version, and an open that throws
+//    connection that reports no SQLCipher version, and it asks right after
+//    `PRAGMA key`, so that rejected open writes no page to the database file
+//    and a later SQLCipher open of the same path succeeds. An open that throws
 //    after `sqlite3_open` leaves no descriptor on the database file.
 //
 // See ADR-025 in `.docs/adrs/phase-5.md`, and §17.11 and §17.13 of the
@@ -338,6 +340,38 @@
 
             #expect(try AppleStorage.readKeys(from: stmt) == ["a", "b"])
         }
+
+        /// `sqlCipherVersion(db:)` reads its rows through the same loop, and
+        /// an error that named a key there would send an operator to the `kv`
+        /// table for a failed version probe.
+        @Test("a scan's error names what the scanned column holds")
+        func scanErrorNamesItsColumn() throws {
+            let connection = try makeBareConnection()
+            defer { sqlite3_close_v2(connection) }
+
+            func expectNullRowError(
+                naming column: String,
+                _ readRows: (OpaquePointer?) throws -> [String]
+            ) {
+                var stmt: OpaquePointer?
+                defer { sqlite3_finalize(stmt) }
+                let sql = "SELECT column1 FROM (VALUES ('a'), (NULL))"
+                #expect(sqlite3_prepare_v2(connection, sql, -1, &stmt, nil) == SQLITE_OK)
+                do {
+                    _ = try readRows(stmt)
+                    Issue.record("the \(column) scan returned rows past a NULL column")
+                } catch let StorageError.databaseError(message) {
+                    #expect(message.hasPrefix("a \(column) row read NULL"), "\(message)")
+                } catch {
+                    Issue.record("caught \(error), which is not StorageError.databaseError")
+                }
+            }
+
+            expectNullRowError(naming: "key") { try AppleStorage.readKeys(from: $0) }
+            expectNullRowError(naming: "cipher_version") {
+                try AppleStorage.readTextColumn(from: $0, naming: "cipher_version")
+            }
+        }
     }
 
     // MARK: - Round-trip tests
@@ -627,6 +661,61 @@
                 openDescriptors(naming: fileURL.lastPathComponent).isEmpty,
                 "a failed open left a descriptor on the database file"
             )
+        }
+
+        @Test("an open rejected for its cipher_version writes no page, and a later open of that path succeeds")
+        func rejectedOpenWritesNoPage() async throws {
+            // `PRAGMA journal_mode = WAL` writes page 1 of a new database, and
+            // plain SQLite writes it in the clear, which SQLCipher then refuses
+            // to open under the key. Moving the version check after that
+            // pragma leaves a page in this file, and this case fails. The
+            // second open is the one a corrected build makes at the same path.
+            let fileURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("scp-storage-test-\(UUID().uuidString).db")
+            defer {
+                for suffix in ["", "-wal", "-shm"] {
+                    try? FileManager.default.removeItem(atPath: fileURL.path + suffix)
+                }
+            }
+            let key = Data(repeating: 0x2A, count: 32)
+
+            #expect(throws: StorageError.self) {
+                _ = try AppleStorage.open(
+                    at: fileURL,
+                    encryptionKey: key,
+                    cipherVersion: { _ in try AppleStorage.requireSQLCipherVersion([]) }
+                )
+            }
+            let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
+            let size = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+            #expect(size == 0, "a rejected open wrote \(size) bytes to the database file")
+
+            let storage = try AppleStorage.open(at: fileURL, encryptionKey: key)
+            try await storage.set(key: "after", value: Data([0x01]))
+            #expect(try await storage.get(key: "after") == Data([0x01]))
+        }
+
+        @Test("a database written under a key reopens under that key")
+        func reopenUnderSameKeyReadsStoredValue() async throws {
+            // `open` asks for `PRAGMA cipher_version` between `PRAGMA key` and
+            // the first statement that reads a page, so this case pins that
+            // the check leaves an existing encrypted file readable.
+            let key = Data(repeating: 0x2A, count: 32)
+            let fileURL: URL = try await { () async throws -> URL in
+                // The fixture's storage goes out of scope when this closure
+                // returns, and its `deinit` closes the first connection.
+                let fixture = try makeStorageFixture()
+                try await fixture.storage.set(key: "kept", value: Data([0x07]))
+                return fixture.fileURL
+            }()
+            defer {
+                for suffix in ["", "-wal", "-shm"] {
+                    try? FileManager.default.removeItem(atPath: fileURL.path + suffix)
+                }
+            }
+
+            let reopened = try AppleStorage.open(at: fileURL, encryptionKey: key)
+            #expect(try await reopened.get(key: "kept") == Data([0x07]))
         }
 
         @Test("a cipher_version answer with no version rejects the connection")
