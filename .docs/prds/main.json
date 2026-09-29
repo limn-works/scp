@@ -6262,7 +6262,7 @@
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidKeyCustody.kt"
       ],
-      "description": "Implement the KeyCustody platform trait for Android Keystore. ADR-027, the Android platform adapter, as amended on 2026-09-10, sets the API levels and curve: the SDK minimum is API 26, every signing key is an EC P-256 key in Android Keystore at every supported API level, and P-256 key agreement uses Keystore from API 31 and a Bouncy Castle software key below API 31. ADR-027 also excludes StrongBox, because StrongBox operations run 10-100x slower than TEE-backed operations and SCP signs frequently. Mirrors the Apple adapter structure from ADR-025. Emulator Keystore behavior differs from hardware — test on physical devices.\n\nStatus reopened 2026-09-28: ADR-027, as amended on 2026-09-10, requires an EC P-256 signing key in Keystore at every supported API level, P-256 key agreement in Keystore from API 31 with a Bouncy Castle software P-256 agreement key below it, and (acceptance criterion 6) a hardware `pseudonym_secret` that is a 32-byte symmetric key generated inside the TEE, never `SHA-256` over a signature. The shipped adapter generates Ed25519 and X25519 keys and derives the hardware pseudonym secret from a signature. It reports every Keystore key as `CustodyType.HARDWARE` without reading `KeyInfo.securityLevel`, so \"TEE-backed key operations used exclusively\" is unmet, and `AndroidKeyCustody` implements the Kotlin `KeyCustodyProvider` interface, not the Rust `KeyCustody` trait. This story tracks the move to P-256 and the TEE-generated pseudonym secret.",
+      "description": "Implement the KeyCustody platform trait for Android Keystore. ADR-027, the Android platform adapter, as amended on 2026-09-10, sets the API levels and curve: the SDK minimum is API 26, every signing key is an EC P-256 key in Android Keystore at every supported API level, and P-256 key agreement uses Keystore from API 31 and a Bouncy Castle software key below API 31. ADR-027 also excludes StrongBox, because StrongBox operations run 10-100x slower than TEE-backed operations and SCP signs frequently. Mirrors the Apple adapter structure from ADR-025. Emulator Keystore behavior differs from hardware — test on physical devices.\n\nStatus reopened 2026-09-28: ADR-027, as amended on 2026-09-10, requires an EC P-256 signing key in Keystore at every supported API level, P-256 key agreement in Keystore from API 31 with a Bouncy Castle software P-256 agreement key below it, and (acceptance criterion 6) a hardware `pseudonym_secret` that is a 32-byte symmetric key generated inside the TEE, never `SHA-256` over a signature. The shipped adapter generates Ed25519 and X25519 keys and derives the hardware pseudonym secret from a signature. It reports every Keystore key as `CustodyType.HARDWARE` without reading `KeyInfo.securityLevel`, so \"TEE-backed key operations used exclusively\" is unmet, and `AndroidKeyCustody` implements the Kotlin `KeyCustodyProvider` interface, not the Rust `KeyCustody` trait. Key destruction deletes the Keystore entry and checks that the alias is gone; it requests no Keystore attestation, so \"Key destruction verification via Android Keystore attestation per §9.15\" is unmet. This story tracks the move to P-256 and the TEE-generated pseudonym secret.",
       "acceptanceCriteria": [
         "KeyCustody trait implemented for Android Keystore matching the same platform trait signatures as ADR-025",
         "P-256 signing key generation uses Android Keystore at every supported API level, and P-256 key agreement uses Android Keystore from API 31 and a Bouncy Castle software key on API 26-30 (ADR-027 acceptance criteria 1 and 5)",
@@ -6296,13 +6296,13 @@
       ],
       "details": {
         "stubADR": true,
-        "note": "ADR not yet fully written — story derived from expected approach and known constraints",
+        "note": "Derived before ADR-027 was written; ADR-027, the Android platform adapter, and its amendments now decide this story",
         "expectedDecisions": {
           "minimumApiLevel": "Decided by ADR-027 as amended on 2026-09-10: API 26 SDK minimum, P-256 signing in Keystore at every supported API level, Keystore P-256 key agreement from API 31",
           "teeVsStrongBox": "StrongBox excluded — 10-100x latency penalty is incompatible with SCP's per-message signing. TEE is the only option (ADR-027)"
         },
         "references": [
-          "§17.8 — Android Keystore: TEE-backed, API 33+ for Ed25519",
+          "§17.8 — Platform-specific key custody: the Android row names the Keystore for a signing key, P-256 signing and DHKEM(P-256), and StrongBox as opt-in",
           "§9.12 — Compromise recovery",
           "§9.15 — Key destruction verification",
           "ADR-025 — Apple adapter as parallel reference"
@@ -6320,12 +6320,17 @@
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidDeviceAttestation.kt"
       ],
-      "description": "Implement the DeviceAttestation platform trait for Android using Play Integrity API. Must decide integration level: standard requests vs classic attestation. Mirrors the Apple adapter structure from ADR-025. Play Integrity API integration pattern must be determined (standard vs classic).\n\nStatus reopened 2026-09-27: ADR-027's amendment of that date sets the Standard request's `requestHash` to the hexadecimal binding digest `D` of `09-security-model.md` §9.3.1 and names a verifier whose signed verdict a reader checks. The shipped adapter calls the Classic API's `setNonce` with a `clientDataJSON` digest, and no component validates a token, so the criterion \"Attestation tokens validated server-side\" is unmet. SCP-316 implements the reader; this story keeps the minting side.",
+      "description": "Implement the DeviceAttestation platform trait for Android using Play Integrity API. Must decide integration level: standard requests vs classic attestation. Mirrors the Apple adapter structure from ADR-025. Play Integrity API integration pattern must be determined (standard vs classic).\n\nStatus reopened 2026-09-27: ADR-027's amendment of that date sets the Standard request's `requestHash` to the hexadecimal binding digest `D` of `09-security-model.md` §9.3.1 and names a verifier whose signed verdict a reader checks. The shipped adapter calls the Classic API's `setNonce` with a `clientDataJSON` digest, and no component validates a token, so the criterion \"Attestation tokens validated server-side\" is unmet. The adapter prepares no token with a `cloudProjectNumber`, reads `deviceId`, lets exceptions other than `ApiException` escape without code `SCP-ATTEST-9001`, and routes `assertRequest` through `attest`, so the criteria that cite ADR-027 acceptance criteria 7 and 8 are unmet as well. SCP-316 implements the reader; this story keeps the minting side.",
       "acceptanceCriteria": [
         "DeviceAttestation trait implemented for Android using Play Integrity API matching ADR-025 trait signatures",
         "Standard Play Integrity request flow implemented",
         "Classic attestation flow available as alternative (if decided)",
         "Attestation tokens validated server-side",
+        "attest prepares every Standard token with the cloudProjectNumber of the package verifier's PlayIntegrityVerifier entry (ADR-027 acceptance criterion 7)",
+        "attest requests a Standard token whose requestHash is the lowercase hexadecimal form of the binding digest D (ADR-027 acceptance criterion 7)",
+        "attest does not read deviceId (ADR-027 acceptance criterion 7)",
+        "Every attest failure, a missing Google Play services installation included, throws ScpException with code SCP-ATTEST-9001 (ADR-027 acceptance criterion 7)",
+        "assertRequest issues a fresh Standard token whose requestHash is the lowercase hexadecimal form of the assertion digest A and does not route through attest (ADR-027 acceptance criterion 8)",
         "Integration tests verify attestation flow end-to-end on physical device"
       ],
       "actionItems": [
@@ -6353,7 +6358,7 @@
       ],
       "details": {
         "stubADR": true,
-        "note": "ADR not yet fully written — story derived from expected approach and known constraints",
+        "note": "Derived before ADR-027 was written; ADR-027, the Android platform adapter, and its amendments now decide this story",
         "expectedDecisions": {
           "playIntegrityLevel": "Standard requests vs classic attestation"
         },
@@ -6373,7 +6378,7 @@
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidPushProvider.kt"
       ],
-      "description": "Implement the PushProvider platform trait for Android using Firebase Cloud Messaging (FCM). FCM payload format must parallel the APNs opacity decision in ADR-025 — payloads must be opaque to the push infrastructure. FCM payload constraints and opacity requirements must be respected.\n\nStatus reopened 2026-09-28: `handleNotification` checks only the `scp` field and accepts extra fields, so the criterion \"FCM payload format is opaque\" is unmet. No SDK code wakes the app, connects to a relay, or pulls envelopes on a push, so \"Push notification delivery triggers SCP message fetch\" is unmet, and no integration test exists, so \"Integration tests verify push delivery flow\" is unmet. The Kotlin `PushProvider` interface matches neither the Rust `Push` trait nor the UniFFI `PushProvider` callback interface, so \"PushProvider trait implemented for Android using FCM matching ADR-025 trait signatures\" is unmet.",
+      "description": "Implement the PushProvider platform trait for Android using Firebase Cloud Messaging (FCM). FCM payload format must parallel the APNs opacity decision in ADR-025 — payloads must be opaque to the push infrastructure. FCM payload constraints and opacity requirements must be respected.\n\nStatus reopened 2026-09-28: `handleNotification` checks only the `scp` field and accepts extra fields, so the criterion \"FCM payload format is opaque\" is unmet. No SDK code wakes the app, connects to a relay, or pulls envelopes on a push, so \"Push notification delivery triggers SCP message fetch\" is unmet, and no integration test exists, so \"Integration tests verify push delivery flow\" is unmet. The Kotlin `PushProvider` interface matches neither the Rust `Push` trait nor the UniFFI `PushProvider` callback interface, so \"PushProvider trait implemented for Android using FCM matching ADR-025 trait signatures\" is unmet. `register` only returns the FCM token: no SDK code builds or sends the §10.7.1 `PushRegistration` to a relay or sends a new one when the token changes, so \"FCM token registration and refresh handled\" is unmet.",
       "acceptanceCriteria": [
         "PushProvider trait implemented for Android using FCM matching ADR-025 trait signatures",
         "FCM payload format is opaque — no plaintext protocol data exposed to push infrastructure",
@@ -6402,7 +6407,7 @@
       ],
       "details": {
         "stubADR": true,
-        "note": "ADR not yet fully written — story derived from expected approach and known constraints",
+        "note": "Derived before ADR-027 was written; ADR-027, the Android platform adapter, and its amendments now decide this story",
         "expectedDecisions": {
           "fcmPayloadFormat": "Parallel to APNs opacity decision in ADR-025"
         },
@@ -6452,7 +6457,7 @@
       ],
       "details": {
         "stubADR": true,
-        "note": "ADR not yet fully written — story derived from expected approach and known constraints",
+        "note": "Derived before ADR-027 was written; ADR-027, the Android platform adapter, and its amendments now decide this story",
         "expectedDecisions": {
           "sqlCipherKeyDerivation": "TEE-backed key derivation for database encryption key"
         },

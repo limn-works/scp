@@ -288,9 +288,10 @@ class AndroidKeyCustody internal constructor(
      * removal reaches disk. The post-deletion check reads only [softwareKeys].
      *
      * After this call, operations with the same handle in the same process throw [ScpException]
-     * with code `SCP-CRYPTO-4001`. When the process dies before `apply()` writes the removal to
-     * disk, the next instance's `restorePersistedEd25519Keys` reloads the seed and the key signs
-     * again, although this call returned `confirmed = true`.
+     * with code `SCP-CRYPTO-4001`, except [dhAgree], which throws `SCP-CRYPTO-4002`.
+     * When the process dies before `apply()` writes the removal to disk, the next instance's
+     * `restorePersistedEd25519Keys` reloads the seed and the key signs again, although this
+     * call returned `confirmed = true`.
      *
      * @param keyHandle Handle to destroy.
      * @return [DestructionAttestation] confirming the destruction method and verification.

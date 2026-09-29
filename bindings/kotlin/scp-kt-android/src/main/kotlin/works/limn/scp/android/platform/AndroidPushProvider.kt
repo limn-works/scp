@@ -67,7 +67,7 @@ import kotlinx.coroutines.withContext
  * ```kotlin
  * val pushProvider = AndroidPushProvider(applicationContext)
  *
- * // Fetch the FCM token; sending a §10.7.1 PushRegistration to each relay is the caller's job
+ * // Fetch the FCM token. No SDK code sends the §10.7.1 PushRegistration yet; SCP-112 tracks it.
  * val token = pushProvider.register()
  *
  * // In FirebaseMessagingService.onMessageReceived:
