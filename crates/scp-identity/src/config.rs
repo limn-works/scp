@@ -20,7 +20,7 @@
 //! # Pre-rotation custody — a shipped build creates no identity at all
 //!
 //! [`DidMethod::create`] commits a mandatory pre-rotation commitment (the
-//! identity spec §9.7.4.1 §3, which makes that commitment mandatory at
+//! security-model spec §9.7.4.1 item 5(a), which makes that commitment mandatory at
 //! creation), so every path named above — and this module — needs a
 //! `scp_platform::PreRotationCustody` backend. No such
 //! backend ships. The tree holds one implementation, `InMemoryPreRotationCustody`.

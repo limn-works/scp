@@ -2640,7 +2640,7 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
             custody,
             did_method,
         } => {
-            // Pre-rotation is mandatory at creation (spec §9.7.4.1 §3), which
+            // Pre-rotation is mandatory at creation (spec §9.7.4.1 item 5(a)), which
             // requires a `PreRotationCustody` backend. The only implementation
             // is the test-harness `InMemoryPreRotationCustody` nullifier.
             #[cfg(feature = "testing")]
@@ -2845,7 +2845,7 @@ pub(crate) async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: 
             } else {
                 // 3. Generate a new identity and persist it.
                 //
-                // Pre-rotation is mandatory at creation (spec §9.7.4.1 §3),
+                // Pre-rotation is mandatory at creation (spec §9.7.4.1 item 5(a)),
                 // which requires a `PreRotationCustody` backend. The only
                 // implementation is the test-harness `InMemoryPreRotationCustody`.
                 #[cfg(feature = "testing")]

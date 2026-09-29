@@ -1114,7 +1114,7 @@ impl crate::scp::PyScp {
             rt.block_on(async {
                 let did_method = shared_did_method(&bi_arc)?;
 
-                // Pre-rotation is mandatory at creation (spec §9.7.4.1 §3), which
+                // Pre-rotation is mandatory at creation (spec §9.7.4.1 item 5(a)), which
                 // requires a `PreRotationCustody` backend. The only implementation
                 // is the test-harness `InMemoryPreRotationCustody` nullifier, so a
                 // shipped build FAILS CLOSED (ADR-062 §Decision 6, IDENT_1059)

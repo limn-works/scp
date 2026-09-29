@@ -9801,7 +9801,7 @@ impl Scp {
 
                 // FAIL CLOSED on a shipped build (ADR-062 §Decision 6,
                 // IDENT_1059): every create commits a mandatory pre-rotation
-                // commitment (spec §9.7.4.1 §3), which requires a
+                // commitment (spec §9.7.4.1 item 5(a)), which requires a
                 // `PreRotationCustody` backend. The only implementation is the
                 // test-harness `InMemoryPreRotationCustody` nullifier, which the
                 // `testing` feature severs from production — so a shipped build
