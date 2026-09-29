@@ -85,7 +85,7 @@ scp-relay
 
 | Mode | Flag | Storage | Identity | HTTP | Use case |
 |------|------|---------|----------|------|----------|
-| **Full node** (default) | none | SQLite (SQLCipher) | Generated on every run; a shipped build logs `no production pre-rotation custody backend available` and exits 1 | `.well-known/scp` + dev API | `--features testing` builds only |
+| **Full node** (default) | none | SQLite (SQLCipher) | Generated on every run; a shipped build logs `no production pre-rotation custody backend available` and exits 1 | `.well-known/scp` + dev API | Development only: a `--features testing` build, whose identities use the in-memory test-harness pre-rotation custody (see section 6) |
 | **Relay-only** | `--relay-only` | Configurable | None | None | Equivalent to `scp-relay` |
 | **Ephemeral** (`testing` builds only) | `--ephemeral` | All in-memory | Ephemeral DID | `.well-known/scp` + dev API | Development and testing |
 
@@ -259,6 +259,15 @@ SCP_NODE_DOMAIN=relay.example.com \
 SCP_STORAGE_PATH=/var/lib/scp/node \
 scp-node
 ```
+
+A shipped binary exits 1 on this command; the paragraph after the steps says why. A
+`--features testing` build runs the steps below, and it is for development only. It
+creates each identity over `scp_platform::testing::InMemoryPreRotationCustody`, the
+test-harness pre-rotation custody, which holds the pre-rotation key only in process
+memory. That identity can never be migrated, and the reveal that spec §9.7.4.1 item 4
+says recovers a root compromise is unreachable for it. Do not deploy a `testing` build
+on a public domain: each run publishes a new such identity to the Mainline DHT and
+provisions an ACME certificate for the domain.
 
 A `--features testing` build of the full node, on every run:
 1. Creates the storage directory when it is absent, and takes the SQLCipher encryption key from `SCP_STORAGE_KEY` when that is set. Otherwise it reads `$SCP_STORAGE_PATH/.key`, and generates a key into that file (mode 0600) only when the file does not exist yet.

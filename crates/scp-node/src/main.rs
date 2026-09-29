@@ -187,7 +187,9 @@ OPTIONS:
 
 ENVIRONMENT VARIABLES:
     SCP_NODE_DOMAIN             Domain for full node mode (required unless --relay-only
-                               or --self-host)
+                               or --self-host). Full node mode is the default; a
+                               shipped binary's full node logs 'no production
+                               pre-rotation custody backend available' and exits 1
     SCP_NODE_SELF_HOST         Set to '1' to enable self-host mode (same as --self-host)
     SCP_NODE_SITE_DIR          Static site directory for self-host mode (same as --site-dir)
     SCP_NODE_SELF_HOST_PORT    HTTP/site port for self-host mode (default: 8443)
@@ -1471,26 +1473,54 @@ mod tests {
         );
     }
 
-    /// Two run-mode selections fail closed instead of one silently winning:
-    /// `--ephemeral` beside `--self-host`, the `SCP_NODE_SELF_HOST` fallback,
-    /// or `--relay-only` is refused, as is `--relay-only` beside self-host
+    /// Two or three run-mode selections fail closed instead of one silently
+    /// winning, and the error names each selector: `--ephemeral` beside
+    /// `--self-host`, the `SCP_NODE_SELF_HOST` fallback, or `--relay-only` is
+    /// refused, as is `--relay-only` beside self-host and all three together
     /// (SHB-001, the exactly-one-run-mode acceptance criterion).
     #[test]
     fn two_run_modes_are_refused() {
         for (args, env_self_host, named) in [
-            (&["--self-host", "--ephemeral"][..], false, "--ephemeral"),
-            (&["--ephemeral"][..], true, "SCP_NODE_SELF_HOST"),
-            (&["--relay-only", "--ephemeral"][..], false, "--relay-only"),
-            (&["--relay-only", "--self-host"][..], false, "--self-host"),
-            (&["--relay-only"][..], true, "--relay-only"),
+            (
+                &["--self-host", "--ephemeral"][..],
+                false,
+                &["--self-host", "--ephemeral"][..],
+            ),
+            (
+                &["--ephemeral"][..],
+                true,
+                &["SCP_NODE_SELF_HOST", "--ephemeral"][..],
+            ),
+            (
+                &["--relay-only", "--ephemeral"][..],
+                false,
+                &["--relay-only", "--ephemeral"][..],
+            ),
+            (
+                &["--relay-only", "--self-host"][..],
+                false,
+                &["--relay-only", "--self-host"][..],
+            ),
+            (
+                &["--relay-only"][..],
+                true,
+                &["--relay-only", "SCP_NODE_SELF_HOST"][..],
+            ),
+            (
+                &["--relay-only", "--self-host", "--ephemeral"][..],
+                false,
+                &["--relay-only", "--self-host", "--ephemeral"][..],
+            ),
         ] {
             let mut full = vec!["scp-node"];
             full.extend_from_slice(args);
             let cfg = parse_cli_from(&argv(&full), env_self_host, None, None);
             let error = conflicting_modes(&cfg);
             assert!(
-                error.as_deref().is_some_and(|e| e.contains(named)),
-                "{args:?} (env {env_self_host}) must be refused naming {named}: {error:?}"
+                error
+                    .as_deref()
+                    .is_some_and(|e| named.iter().all(|n| e.contains(n))),
+                "{args:?} (env {env_self_host}) must be refused naming each of {named:?}: {error:?}"
             );
         }
     }

@@ -658,9 +658,10 @@ where
         // substitution; ADR-062 §Decision 1) — the node's dht gateways would
         // thread in here; the local path uses direct Mainline DHT (no gateways).
         // A test-harness build (`testing`) uses the in-memory §17.17.3 double so
-        // `Node::start`'s mandatory startup publish (a full relay node always
-        // publishes; see `scp_node`) stays offline instead of timing out
-        // against live Mainline. The client backs both this node's DID
+        // the startup publish stays offline instead of timing out against live
+        // Mainline. `Node::start` publishes, and fails on a failed publish,
+        // because this call selects `DhtMode::Production` below; it skips the
+        // publish under `DhtMode::Disabled`. The client backs both this node's DID
         // publication and its `did:dht` resolution.
         #[cfg(not(any(test, feature = "testing")))]
         let dht_client = Arc::new(ClientDhtConfig::default().into_client()?);

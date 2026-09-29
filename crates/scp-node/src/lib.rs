@@ -2656,8 +2656,8 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
                     did = %identity.did,
                     "identity created without a persistent PreRotationCustody — migration \
                      (Layer-2 DID rotation) will be impossible until the builder API is \
-                     widened to accept a real backend. Recovery from `#0` compromise via \
-                     spec §9.7.4.1 is unreachable for this identity."
+                     widened to accept a real backend. The reveal that spec §9.7.4.1 item 4 \
+                     says recovers a root compromise is unreachable for this identity."
                 );
                 Ok((identity, document, did_method))
             }
@@ -2862,8 +2862,8 @@ pub(crate) async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: 
                         did = %identity.did,
                         "persisted identity created without a persistent PreRotationCustody — \
                          migration (Layer-2 DID rotation) will be impossible after process \
-                         restart. Recovery from `#0` compromise via spec §9.7.4.1 is unreachable \
-                         for this identity until the builder API is widened to accept a real \
+                         restart. The reveal that spec §9.7.4.1 item 4 says recovers a root \
+                         compromise is unreachable for this identity until the builder API is widened to accept a real \
                          backend."
                     );
                     let persisted = PersistedIdentity {
