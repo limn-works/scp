@@ -1216,6 +1216,55 @@ class ScpHotStreamRemountTest {
     }
 
     /**
+     * An owner that calls [ScpHotStreams.close] from an already-cancelled coroutine, while the
+     * last departure's stop is still running, gets the same release as any other caller: close
+     * waits for that stop and then releases through `stopAll` the subscription no stop covers.
+     * A cancellable wait would throw at the pending stop and skip `stopAll`, leaving the second
+     * subscription open, so the final count would be 1.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `closing ScpHotStreams from a cancelled caller still waits for a pending stop and releases the rest`() {
+        val bindings = CountingEventBindings()
+        val hotStreams = ScpHotStreams(bindings.proxy, newCoordinatorScope())
+        val coordinator = hotStreams.coordinator
+        val mount = coordinator.mount("k")
+        runBlocking {
+            coordinator.startMounted(mount) { hotStreams.factory.contextEvents(CONTEXT_HANDLE) }
+            hotStreams.factory.contextEvents(CONTEXT_HANDLE + 1)
+        }
+        val entered = CountDownLatch(1)
+        val gate = CompletableDeferred<Unit>()
+        val stop =
+            checkNotNull(
+                coordinator.unmount(mount) {
+                    entered.countDown()
+                    gate.await()
+                    hotStreams.factory.stopContextEvents(CONTEXT_HANDLE)
+                },
+            )
+        assertTrue("the launched stop never ran", entered.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+
+        val caller =
+            CoroutineScope(Dispatchers.IO).launch {
+                cancel()
+                hotStreams.close()
+            }
+        Thread.sleep(UNORDERED_STOP_GRACE_MS)
+        assertEquals(
+            "close in a cancelled caller returned before the pending stop finished",
+            false,
+            caller.isCompleted,
+        )
+
+        gate.complete(Unit)
+        runBlocking {
+            caller.join()
+            stop.join()
+        }
+        assertEquals("close in a cancelled caller left a subscription open", 2, bindings.eventUnsubscribes.get())
+    }
+
+    /**
      * A stop that holds no `onStop` — its only mount left before its `start` ran — skips
      * nothing when the coordinator's scope is cancelled, so its departure's Job completes
      * normally and nothing is logged.

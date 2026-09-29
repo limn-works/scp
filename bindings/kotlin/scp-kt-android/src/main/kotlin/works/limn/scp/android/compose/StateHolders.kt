@@ -672,10 +672,17 @@ class ScpHotStreams(
      * [HotStreamFactory.stopAll], so a subscription whose stop a cancelled `scope` skipped is
      * released too. A mount still composed when this runs loses its subscription and receives
      * nothing further.
+     *
+     * The whole body runs under [NonCancellable], so an owner that calls this from a cancelled
+     * coroutine (a `finally` block, or a scope already being torn down) still waits for each
+     * pending stop and still reaches [HotStreamFactory.stopAll]. A cancellable wait would throw
+     * there first, and every subscription this call exists to release would stay open.
      */
     suspend fun close() {
-        coordinator.close()
-        factory.stopAll()
+        withContext(NonCancellable) {
+            coordinator.close()
+            factory.stopAll()
+        }
     }
 }
 

@@ -214,7 +214,7 @@ class ValidationException(message: String, code: String) : ScpException(message,
 
 ## Identity Class
 
-Superseded. `scp-kt` ships no `Identity` class, so this sketch binds no code; the shipped `Identity.kt` holds `IdentityAdvancedBridge` and the data classes its operations return.
+Superseded. `scp-kt` ships no hand-written `Identity` wrapper, so this sketch binds no code: `SCP` operations take the UniFFI-generated `uniffi.scp.Identity`, which `scp-kt` compiles from the bindings under `src/main/kotlin/works/limn/scp/internal`, and the shipped `Identity.kt` holds `IdentityAdvancedBridge` and the data classes its operations return.
 
 ```kotlin
 class Identity private constructor(
@@ -257,7 +257,7 @@ class Identity private constructor(
 
 A type whose teardown reaches the Rust engine exposes exactly one `suspend` teardown function and implements no `AutoCloseable` or `Closeable`, so no `use { }` block applies to it. `AutoCloseable.close()` is synchronous, so it could reach the engine only by blocking its calling thread, which never returns under an injected `StandardTestDispatcher` and risks an ANR on an Android main thread. `.docs/standards/sdk-common.md` §"Kotlin: why no `Closeable`" and ADR-028 (as amended, `.docs/adrs/phase-6.md`) state the rule; `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` records the observed deadlock and the ANR risk.
 
-`SCP` is the one Kotlin type whose teardown reaches the Rust engine today. `Relay` and `Node` follow the same rule, but no production class implements the `ServerBindings` interface they call (`.docs/standards/sdk-capability-matrix.json` marks every Server operation `"kotlin": false`), so their `shutdown()` reaches only the test source set's `StubServerBindings`.
+`SCP.shutdown(bridge, timeout)` and `InvocationHandle.cancel()` are the Kotlin teardowns that reach the Rust engine today; `cancel()` suspends on the UniFFI-generated async `Scp.outletStreamCancel`. `Relay` and `Node` follow the same rule, but no production class implements the `ServerBindings` interface they call (`.docs/standards/sdk-capability-matrix.json` marks every Server operation `"kotlin": false`), so their `shutdown()` reaches only the test source set's `StubServerBindings`. `ScpHotStreams.close()` (`scp-kt-android`) follows it too, and no production class implements the `EventContextBindings` interface it releases through, so it reaches only test stubs.
 
 ```kotlin
 class SCP internal constructor(
