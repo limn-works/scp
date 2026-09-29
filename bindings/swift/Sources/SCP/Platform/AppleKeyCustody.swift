@@ -615,6 +615,10 @@ extension AppleKeyCustody {
             return PseudonymResult(publicKey: publicKey, keyId: handle)
         } catch let platformErr as PlatformError {
             throw platformErr
+        } catch let scpErr as ScpError {
+            // The shared P-256 helper's typed error and code reach the caller
+            // unchanged, as in the Kotlin SDK.
+            throw scpErr
         } catch {
             throw PlatformError.custodyError(
                 "P-256 pseudonym key derivation failed: \(error.localizedDescription)"
@@ -794,6 +798,10 @@ public extension AppleKeyCustody {
             }
         } catch let platformErr as PlatformError {
             throw platformErr
+        } catch let scpErr as ScpError {
+            // The shared P-256 helper's typed error and code reach the caller
+            // unchanged, as in the Kotlin SDK.
+            throw scpErr
         } catch {
             throw PlatformError.custodyError(
                 "Public key derivation failed for handle '\(keyHandle)': \(error.localizedDescription)"

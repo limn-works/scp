@@ -599,6 +599,25 @@
             try await custody.destroyKey(handle)
         }
 
+        @Test("publicKey passes the P-256 helper's ScpError through for a truncated pseudonym scalar")
+        func publicKeyPassesHelperErrorThrough() async throws {
+            // A 31-byte pseudonym scalar with no cached point: publicKey must
+            // derive the point, and the shared helper rejects the length.
+            let handle = UUID().uuidString
+            try custody.storePrivateKeyBytes(
+                Data(repeating: 0x07, count: 31), for: handle, keyType: .p256Pseudonym, publicKeyBytes: Data()
+            )
+            do {
+                _ = try await custody.publicKey(handle)
+                Issue.record("a 31-byte pseudonym scalar produced a public key")
+            } catch let ScpError.Validation(_, code) {
+                #expect(code == "SCP-VALID-7005")
+            } catch {
+                Issue.record("expected ScpError.Validation, got \(error)")
+            }
+            try await custody.destroyKey(handle)
+        }
+
         @Test("a derive whose identity is destroyed after the store fails and leaves no pseudonym")
         func deriveRacingIdentityDestroyLeavesNoPseudonym() async throws {
             // Destroys the identity item in the window between the pseudonym

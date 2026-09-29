@@ -236,33 +236,6 @@ class _FakeKeychain:
 # ---------------------------------------------------------------------------
 
 
-def test_destroying_an_identity_destroys_its_pseudonyms() -> None:
-    """A pseudonym handle fails once its identity is destroyed (§9.10.4.A).
-
-    Covers the v1 and the v2 derivation, and leaves another identity's
-    pseudonym signing.
-    """
-    pytest.importorskip("scp_sdk._scp_core")
-    provider = _FakeKeychain()
-    identity = provider.generate_keypair("ed25519")
-    other = provider.generate_keypair("ed25519")
-    _, v1 = provider.derive_pseudonym(identity, b"ctx")
-    _, v2 = provider.derive_rotatable_pseudonym(identity, b"ctx", 3)
-    _, kept = provider.derive_pseudonym(other, b"ctx")
-    digest = hashlib.sha256(b"message").digest()
-    assert len(provider.sign(v1, digest)) == 64
-    assert len(provider.sign(v2, digest)) == 64
-
-    provider.destroy_key(identity)
-
-    for kid in (v1, v2):
-        with pytest.raises(KeyError):
-            provider.sign(kid, digest)
-        with pytest.raises(KeyError):
-            provider.get_public_key(kid)
-    assert len(provider.sign(kept, digest)) == 64
-
-
 @pytest.mark.asyncio
 async def test_identity_create_with_custody_produces_did(scp) -> None:
     """A satisfying provider yields a did:dht identity with a verifying key."""

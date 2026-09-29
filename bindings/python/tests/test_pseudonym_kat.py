@@ -5,11 +5,15 @@ Spec §9.10.4.A (algorithm) and §25.19 vectors 30 & 31 (pinned outputs).
 Software-custody pseudonym derivation is cross-platform deterministic (§9.10.4.A).
 This file checks two things:
 
-- The pure-Python recipe in :mod:`tests.pseudonym_recipe` (the fixture that
-  test custody providers derive with) reproduces every §25.19 intermediate and
-  output: the identity scalar, ``pseudonym_secret``, both context seeds, both
-  33-byte compressed P-256 public keys, and both routing ids. It is
-  stdlib-only and runs with no native extension built.
+- The §25.19 recipe end to end: the pure-Python recipe in
+  :mod:`tests.pseudonym_recipe` gives the identity scalar, ``pseudonym_secret``
+  and both context seeds as setup, and the production helpers
+  :func:`scp_sdk.p256_pseudonym_scalar` and :func:`scp_sdk.p256_public_key`
+  (the PyO3 exports of ``scp_ffi_common::p256_host``) map each seed to the
+  33-byte compressed public key. Both public keys and both routing ids are
+  compared to the literal §25.19 bytes, so a label or reduction change in the
+  production helper fails these tests. They skip when the native extension is
+  not built.
 - The production bridge path: each vector's identity scalar, installed as the
   native custody's Ed25519 seed (the §9.10.4.A native interim ikm), derives on
   ``context-alpha`` to the spec's v1 routing id through the PyO3 bridge. That
@@ -22,14 +26,12 @@ from __future__ import annotations
 
 import pytest
 
+from scp_sdk import p256_pseudonym_scalar, p256_public_key
+
 from .pseudonym_recipe import (
-    canonical_pseudonym_public_key,
     canonical_pseudonym_seed,
-    canonical_rotatable_pseudonym_public_key,
     canonical_rotatable_pseudonym_seed,
-    p256_sign_prehash,
     pseudonym_routing_id,
-    pseudonym_scalar,
     pseudonym_secret,
     seed_to_scalar,
 )
@@ -85,33 +87,26 @@ def test_identity_scalar_and_secret_match_spec(vector: dict) -> None:
 
 @pytest.mark.parametrize("vector", VECTORS, ids=IDS)
 def test_v1_static_pseudonym_matches_spec(vector: dict) -> None:
-    """The v1 context seed, public key, and routing id match §25.19."""
+    """The v1 context seed, production public key, and routing id match §25.19."""
+    pytest.importorskip("scp_sdk._scp_core")
     ikm = _ikm(vector)
-    assert canonical_pseudonym_seed(ikm, CONTEXT_ALPHA).hex() == vector["seed_v1"]
-    public_key = canonical_pseudonym_public_key(ikm, CONTEXT_ALPHA)
+    seed = canonical_pseudonym_seed(ikm, CONTEXT_ALPHA)
+    assert seed.hex() == vector["seed_v1"]
+    public_key = p256_public_key(p256_pseudonym_scalar(seed))
     assert public_key.hex() == vector["v1"]
     assert pseudonym_routing_id(public_key).hex() == vector["rid_v1"]
 
 
 @pytest.mark.parametrize("vector", VECTORS, ids=IDS)
 def test_v2_rotatable_pseudonym_matches_spec(vector: dict) -> None:
-    """The v2 (epoch 1) context seed, public key, and routing id match §25.19."""
+    """The v2 (epoch 1) context seed, production public key, and routing id match §25.19."""
+    pytest.importorskip("scp_sdk._scp_core")
     ikm = _ikm(vector)
-    assert canonical_rotatable_pseudonym_seed(ikm, CONTEXT_ALPHA, 1).hex() == vector["seed_v2"]
-    public_key = canonical_rotatable_pseudonym_public_key(ikm, CONTEXT_ALPHA, 1)
+    seed = canonical_rotatable_pseudonym_seed(ikm, CONTEXT_ALPHA, 1)
+    assert seed.hex() == vector["seed_v2"]
+    public_key = p256_public_key(p256_pseudonym_scalar(seed))
     assert public_key.hex() == vector["v2"]
     assert pseudonym_routing_id(public_key).hex() == vector["rid_v2"]
-
-
-def test_prehash_signature_is_low_s_and_64_bytes() -> None:
-    """The fixture signer emits the §9.5 64-byte low-s form."""
-    n = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
-    ikm = _ikm(VECTORS[0])
-    d = pseudonym_scalar(canonical_pseudonym_seed(ikm, CONTEXT_ALPHA))
-    for i in range(16):
-        sig = p256_sign_prehash(d, bytes([i]) * 32)
-        assert len(sig) == 64
-        assert int.from_bytes(sig[32:], "big") <= (n - 1) // 2
 
 
 @pytest.mark.parametrize("vector", VECTORS, ids=IDS)

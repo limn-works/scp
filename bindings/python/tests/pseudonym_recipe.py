@@ -44,7 +44,6 @@ import hmac
 PSEUDONYM_SECRET_SALT = b"scp-pseudonym-secret-v1"
 PSEUDONYM_V1_INFO = b"scp-pseudonym"
 PSEUDONYM_V2_INFO = b"scp-pseudonym-v2"
-PSEUDONYM_SCALAR_LABEL = b"SCP-PSEUDONYM-P256-V1"
 PSEUDONYM_ROUTING_PREFIX = b"scp-pseudonym-routing-v1:"
 
 # ---------------------------------------------------------------------------
@@ -84,12 +83,6 @@ def _mul(k: int, p: tuple[int, int]) -> tuple[int, int]:
         k >>= 1
     assert acc is not None
     return acc
-
-
-def p256_compressed(d: int) -> bytes:
-    """Return the 33-byte SEC1 compressed encoding of ``d * G``."""
-    x, y = _mul(d, _G)
-    return bytes([2 + (y & 1)]) + x.to_bytes(32, "big")
 
 
 def _hmac256(key: bytes, data: bytes) -> bytes:
@@ -176,24 +169,6 @@ def canonical_rotatable_pseudonym_seed(
     """Return the v2 (rotatable) 32-byte context seed for a context + epoch."""
     data = bytes(context_id) + pseudonym_epoch.to_bytes(8, "big") + PSEUDONYM_V2_INFO
     return _hmac256(pseudonym_secret(ikm), data)
-
-
-def pseudonym_scalar(seed: bytes) -> int:
-    """Return the P-256 pseudonym private scalar for a context seed."""
-    return seed_to_scalar(PSEUDONYM_SCALAR_LABEL, seed)
-
-
-def canonical_pseudonym_public_key(ikm: bytes, context_id: bytes) -> bytes:
-    """Return the 33-byte v1 pseudonym public key (the §25.19 KAT target)."""
-    return p256_compressed(pseudonym_scalar(canonical_pseudonym_seed(ikm, context_id)))
-
-
-def canonical_rotatable_pseudonym_public_key(
-    ikm: bytes, context_id: bytes, pseudonym_epoch: int
-) -> bytes:
-    """Return the 33-byte v2 pseudonym public key (the §25.19 KAT target)."""
-    seed = canonical_rotatable_pseudonym_seed(ikm, context_id, pseudonym_epoch)
-    return p256_compressed(pseudonym_scalar(seed))
 
 
 def pseudonym_routing_id(public_key: bytes) -> bytes:

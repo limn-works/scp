@@ -22,7 +22,6 @@ export const P256_N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2
 const PSEUDONYM_SECRET_SALT = "scp-pseudonym-secret-v1";
 const PSEUDONYM_V1_INFO = "scp-pseudonym";
 const PSEUDONYM_V2_INFO = "scp-pseudonym-v2";
-const PSEUDONYM_SCALAR_LABEL = "SCP-PSEUDONYM-P256-V1";
 const PSEUDONYM_ROUTING_PREFIX = "scp-pseudonym-routing-v1:";
 
 export function bytesToBigInt(bytes: Uint8Array): bigint {
@@ -70,11 +69,6 @@ function pointOf(d: bigint, format: "compressed" | "uncompressed"): Buffer {
   const ecdh = crypto.createECDH("prime256v1");
   ecdh.setPrivateKey(bigIntTo32(d));
   return ecdh.getPublicKey(null, format);
-}
-
-/** The 33-byte SEC1 compressed encoding of `d * G`. */
-export function p256Compressed(d: bigint): Uint8Array {
-  return new Uint8Array(pointOf(d, "compressed"));
 }
 
 /** RFC 6979 §3.2 nonce for P-256 with HMAC-SHA-256. */
@@ -136,11 +130,6 @@ export function pseudonymSeedV2(ikm: Uint8Array, contextId: Uint8Array, epoch: b
     pseudonymSecret(ikm),
     Buffer.concat([Buffer.from(contextId), be, Buffer.from(PSEUDONYM_V2_INFO)]),
   );
-}
-
-/** The P-256 pseudonym private scalar of a context seed. */
-export function pseudonymScalar(contextSeed: Uint8Array): bigint {
-  return seedToScalar(PSEUDONYM_SCALAR_LABEL, contextSeed);
 }
 
 /** The 32-byte §9.10.4 routing id of a 33-byte pseudonym point. */

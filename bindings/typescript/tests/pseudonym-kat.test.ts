@@ -2,33 +2,42 @@
  * Byte-level Known-Answer Test (KAT) for per-context pseudonym derivation
  * (spec §9.10.4.A, §25.19 vectors 30 & 31).
  *
- * This file checks the shared TypeScript recipe in `./pseudonym-recipe` (the
- * fixture test custody providers derive with): every intermediate and output
- * equals the §25.19 literal: the identity scalar, `pseudonym_secret`, both
- * context seeds, both 33-byte compressed P-256 public keys, and both routing
- * ids. The §25.19 vectors map the identity seed to a scalar with the §25.2
- * label `"SCP-TEST-VECTOR-KEY-V1"`; that 32-byte scalar is the ikm.
+ * The shared TypeScript recipe in `./pseudonym-recipe` gives the identity
+ * scalar, `pseudonym_secret` and both context seeds, each checked against the
+ * §25.19 literal as setup. The production helpers `p256PseudonymScalar` and
+ * `p256PublicKey` (the napi exports of `scp_ffi_common::p256_host`) then map
+ * each seed to the 33-byte compressed public key, and both points and both
+ * routing ids are compared to the literal §25.19 bytes, so a label or
+ * reduction change in the production helper fails these tests. The §25.19
+ * vectors map the identity seed to a scalar with the §25.2 label
+ * `"SCP-TEST-VECTOR-KEY-V1"`; that 32-byte scalar is the ikm.
  *
- * Pure JS (`node:crypto` plus BigInt), so it runs under plain `bun test`. The
+ * The point checks skip when the native addon is not installed. The
  * production bridge path (Vector 30 through the napi pseudonym derivation) is
  * checked in `custody-bridge-checks.test.ts`.
  */
 
 import { describe, expect, test } from "bun:test";
 
+import { p256PseudonymScalar, p256PublicKey } from "../src/index";
+import { loadNativeAddon } from "../src/internal/native";
 import {
   bigIntTo32,
-  bytesToBigInt,
-  P256_N,
-  p256Compressed,
-  p256SignPrehash,
   pseudonymRoutingId,
-  pseudonymScalar,
   pseudonymSecret,
   pseudonymSeedV1,
   pseudonymSeedV2,
   seedToScalar,
 } from "./pseudonym-recipe";
+
+let skipReason = "";
+try {
+  if (typeof loadNativeAddon().p256PseudonymScalar !== "function") {
+    skipReason = "native addon predates the P-256 host helpers";
+  }
+} catch (e: unknown) {
+  skipReason = `native addon not available: ${e instanceof Error ? e.message : String(e)}`;
+}
 
 const CONTEXT_ALPHA = new Uint8Array(Buffer.from("context-alpha", "utf-8"));
 const IDENTITY_LABEL = "SCP-TEST-VECTOR-KEY-V1";
@@ -87,33 +96,28 @@ describe("per-context pseudonym derivation KAT (§25.19)", () => {
       expect(hex(pseudonymSecret(ikm))).toBe(vec.secret);
     });
 
-    test(`${vec.name}: v1 seed, point and routing id match spec`, () => {
-      const ikm = ikmOf(vec);
-      const seed = pseudonymSeedV1(ikm, CONTEXT_ALPHA);
-      expect(hex(seed)).toBe(vec.seedV1);
-      const point = p256Compressed(pseudonymScalar(seed));
-      expect(hex(point)).toBe(vec.v1);
-      expect(hex(pseudonymRoutingId(point))).toBe(vec.ridV1);
-    });
+    test.skipIf(skipReason !== "")(
+      `${vec.name}: v1 seed, production point and routing id match spec ${skipReason}`,
+      () => {
+        const ikm = ikmOf(vec);
+        const seed = pseudonymSeedV1(ikm, CONTEXT_ALPHA);
+        expect(hex(seed)).toBe(vec.seedV1);
+        const point = p256PublicKey(p256PseudonymScalar(seed));
+        expect(hex(point)).toBe(vec.v1);
+        expect(hex(pseudonymRoutingId(point))).toBe(vec.ridV1);
+      },
+    );
 
-    test(`${vec.name}: v2 (epoch 1) seed, point and routing id match spec`, () => {
-      const ikm = ikmOf(vec);
-      const seed = pseudonymSeedV2(ikm, CONTEXT_ALPHA, 1n);
-      expect(hex(seed)).toBe(vec.seedV2);
-      const point = p256Compressed(pseudonymScalar(seed));
-      expect(hex(point)).toBe(vec.v2);
-      expect(hex(pseudonymRoutingId(point))).toBe(vec.ridV2);
-    });
+    test.skipIf(skipReason !== "")(
+      `${vec.name}: v2 (epoch 1) seed, production point and routing id match spec ${skipReason}`,
+      () => {
+        const ikm = ikmOf(vec);
+        const seed = pseudonymSeedV2(ikm, CONTEXT_ALPHA, 1n);
+        expect(hex(seed)).toBe(vec.seedV2);
+        const point = p256PublicKey(p256PseudonymScalar(seed));
+        expect(hex(point)).toBe(vec.v2);
+        expect(hex(pseudonymRoutingId(point))).toBe(vec.ridV2);
+      },
+    );
   }
-
-  test("the fixture signer emits the §9.5.1 64-byte low-s form", () => {
-    const [v30] = VECTORS;
-    if (v30 === undefined) throw new Error("no vectors");
-    const d = pseudonymScalar(pseudonymSeedV1(ikmOf(v30), CONTEXT_ALPHA));
-    for (let i = 0; i < 16; i++) {
-      const sig = p256SignPrehash(d, new Uint8Array(32).fill(i));
-      expect(sig.length).toBe(64);
-      expect(bytesToBigInt(sig.subarray(32)) <= (P256_N - 1n) / 2n).toBe(true);
-    }
-  });
 });

@@ -288,4 +288,53 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
         assertTrue(captured.all { it == 0.toByte() }, "the lent copy must be wiped after the block")
         assertEquals(0, keys.size)
     }
+
+    private fun ByteArray.isZero() = all { it == 0.toByte() }
+
+    /**
+     * [PseudonymKeys] wipes every scalar array it stores or refuses: on remove, on
+     * identity retirement, on a duplicate put, and on a put after retirement.
+     */
+    @Test
+    fun `stored and refused scalars are wiped`() {
+        val keys = PseudonymKeys()
+
+        val removed = ByteArray(32) { 1 }
+        keys.put("identity-a", "p-remove", removed)
+        assertFalse(removed.isZero(), "put must store the array unchanged")
+        assertTrue(keys.remove("p-remove"))
+        assertTrue(removed.isZero(), "remove must wipe the stored scalar")
+
+        val retiredScalar = ByteArray(32) { 2 }
+        keys.put("identity-b", "p-retire", retiredScalar)
+        keys.retireIdentity("identity-b")
+        assertTrue(retiredScalar.isZero(), "retireIdentity must wipe the identity's scalars")
+
+        val first = ByteArray(32) { 3 }
+        val duplicate = ByteArray(32) { 3 }
+        keys.put("identity-c", "p-dup", first)
+        keys.put("identity-c", "p-dup", duplicate)
+        assertTrue(duplicate.isZero(), "a duplicate put must wipe the refused scalar")
+        assertFalse(first.isZero(), "a duplicate put must keep the stored scalar")
+
+        val late = ByteArray(32) { 4 }
+        val error = assertThrows<ScpException> { keys.put("identity-b", "p-late", late) }
+        assertEquals("SCP-CRYPTO-4006", error.code)
+        assertTrue(late.isZero(), "a put after retirement must wipe the scalar")
+        assertEquals(1, keys.size)
+    }
+
+    /**
+     * A stored pseudonym scalar of the wrong length reaches the shared P-256 helper, and
+     * [AndroidKeyCustody.publicKey] passes its `SCP-VALID-7005` through unchanged.
+     */
+    @Test
+    fun `publicKey passes a helper validation error through`() {
+        val custody = AndroidKeyCustody(InMemorySharedPreferences())
+        custody.pseudonymKeys.put("identity", "p256-truncated", ByteArray(31) { 7 })
+        val error = assertThrows<ScpException> {
+            custody.publicKey(KeyHandle(id = "p256-truncated", custodyType = CustodyType.SOFTWARE))
+        }
+        assertEquals("SCP-VALID-7005", error.code)
+    }
 }
