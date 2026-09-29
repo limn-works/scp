@@ -265,7 +265,7 @@ constant).
 | `SCP-CRYPTO-4030` | `scp-client-wasm` (browser participant) | Event-log append / proof failure (`ClientError::EventLog`) |
 | `SCP-CRYPTO-4040` | `scp-client-wasm` (browser participant) | Convergent committer-timestamp AAD failure — missing or malformed (ADR-057) (`ClientError::Mls(ConvergentTimestampMissing \| ConvergentTimestampMalformed)`) |
 | `SCP-CRYPTO-4041` | `scp-client-wasm` (browser participant) | Generic MLS group operation failure — create/add/join/encrypt/decrypt/commit catch-all (`ClientError::Mls(_)`) |
-| `SCP-CRYPTO-4060` | native FFI-common registry (`PyO3`, napi-rs, `UniFFI`) | Key custody error: a key custody provider or a host custody callback failed for a reason other than key-not-found (`PlatformError::CustodyError`) |
+| `SCP-CRYPTO-4060` | native FFI-common registry (`PyO3`, napi-rs, `UniFFI`) | Key custody error: a key custody provider or a host custody callback failed for a reason other than key-not-found or a rejected host pseudonym. Covers every `PlatformError` variant except `KeyNotFound` (`SCP-CRYPTO-4006`) and `PseudonymRejected` (`SCP-IDENT-1055`) |
 | `SCP-TRANS-5005` | `scp-client-wasm` (browser participant) | Injected outbound `Socket`/`RelaySink` failed to enqueue a relay frame — WebSocket closed / JS exception (`ClientError::Transport`) |
 | `SCP-TRANS-5010` | native FFI-common registry (also Kotlin SDK) | Transport subscription error — native meaning; NOT emitted by `scp-client-wasm` |
 | `SCP-VALID-7010` | native FFI-common registry (**pre-existing cross-language overlap**: reused by Swift/Kotlin/ts-native SDKs for their own validation conditions) | UCAN token validation error — native meaning; NOT emitted by `scp-client-wasm` |
