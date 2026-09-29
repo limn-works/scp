@@ -259,8 +259,9 @@ pub const METHOD_TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
 /// only when the server cannot read which contexts it serves.
 ///
 /// A change that no compared `ContextEvent` reports and no `tools/call` causes
-/// sends no notice: the agent token reaching its expiry or a caveat time box
-/// closing, a revocation of that token, and an outlet registration or removal.
+/// sends no notice: the agent token reaching its expiry, its nonce passing the
+/// five-minute freshness window of ADR-016 Step 9, a caveat time box closing, a
+/// revocation of that token, and an outlet registration or removal.
 /// The client sees such a change at its next list, as a refused call, or
 /// through the notice that the next comparison for that context sends.
 pub const METHOD_RESOURCES_LIST_CHANGED: &str = "notifications/resources/list_changed";

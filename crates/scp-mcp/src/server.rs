@@ -29,7 +29,8 @@
 //!   and the transport drains them with
 //!   [`McpServer::take_pending_notifications`]. A change that no compared
 //!   [`ContextEvent`] reports and no `tools/call` causes sends no
-//!   notification: the agent token reaching its expiry or a caveat time box
+//!   notification: the agent token reaching its expiry, its nonce passing
+//!   the five-minute freshness window of ADR-016 Step 9, a caveat time box
 //!   closing, a revocation of that token, and an outlet registration or
 //!   removal.
 //!
@@ -2660,8 +2661,9 @@ mod tests {
         assert_eq!(result["protocolVersion"], MCP_PROTOCOL_VERSION);
         assert_eq!(result["serverInfo"]["name"], SERVER_NAME);
         assert_eq!(result["serverInfo"]["version"], SERVER_VERSION);
-        // `notifications/tools/list_changed` has exactly one emitter — the
-        // event pump — so an unwired server must not advertise it either.
+        // `notifications/tools/list_changed` has two emitters — the event
+        // pump and the queue a `tools/call` fills — and neither sends
+        // anything on an unwired server, so it must not advertise it either.
         assert!(
             !result["capabilities"]["tools"]["listChanged"]
                 .as_bool()
