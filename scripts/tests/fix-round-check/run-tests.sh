@@ -133,6 +133,10 @@
 #     summary names that gate as unrun over this repository's workspace, and that it prints
 #     neither assertion line, because the run compiled no crate. GATES_NOT_RUN keeps the
 #     run from starting that gate, so without this line an edit to it reads as covered.
+#     A second fixture adds `scripts/check-fixture-unstarted.sh` to its copy of
+#     GATES_NOT_RUN, edits it and `scripts/check-resolved-rustc.sh`, and asserts a line for
+#     the added gate and none for the toolchain precondition the run starts, so the line
+#     covers every unstarted GATES_NOT_RUN entry rather than one hardcoded path.
 #
 #     Case 22d asserts that every GATES_NOT_RUN path the runner never starts with `bash`
 #     appears in the header's DOES-NOT-RUN list, and that the list names `cargo package
@@ -147,8 +151,10 @@
 #     discloses a command CI runs that no step of the run starts or names. A path in GATES
 #     is a command the run does start. A path in GATES_NOT_RUN is one the run either starts
 #     as its toolchain precondition or names in the header's DOES-NOT-RUN list, and case
-#     22d fails when an unstarted GATES_NOT_RUN path is missing from that list, so the
-#     GATES_NOT_RUN subtraction holds only while case 22d does. That entry is what a fix agent
+#     22d fails when an unstarted GATES_NOT_RUN path is missing from that list, and case
+#     22c fails when a branch edits an unstarted GATES_NOT_RUN path and the run prints no
+#     NOT CHECKED line naming it, so the GATES_NOT_RUN subtraction holds only while cases
+#     22c and 22d do. That entry is what a fix agent
 #     editing an enforcement gate acts on, and a suite absent from it is a red CI job the
 #     runner's output gave the agent no reason to expect. Two further assertions hold the
 #     case's two inputs non-empty, because an empty lane line matches no suite name and an
@@ -1246,6 +1252,15 @@ if grep -F 'check-examples-compile.sh assertion 1 over the example targets that 
 else
     report "case 22b says the examples gate lints each library an example compiles" 1 "the assertion 1 line gives no library-lint reason: $(grep -F 'check-examples-compile.sh assertion 1' "$HARNESS22B/out.txt")"
 fi
+# Assertion 1 also rejects a non-platform cfg predicate in example source, which the
+# compile above never reads; a line without that clause tells the reader a feature-gated
+# example body passed the gate.
+if grep -F 'check-examples-compile.sh assertion 1 over the example targets that compile' "$HARNESS22B/out.txt" |
+    grep -qF 'a cfg(, cfg_attr( or cfg!( predicate'; then
+    report "case 22b says the examples gate rejects a non-platform cfg predicate" 0 ""
+else
+    report "case 22b says the examples gate rejects a non-platform cfg predicate" 1 "the assertion 1 line names no cfg predicate check: $(grep -F 'check-examples-compile.sh assertion 1' "$HARNESS22B/out.txt")"
+fi
 if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh over this repository' "$HARNESS22B/out.txt"; then
     report "case 22b names no unrun gate edit on a branch that left the gate alone" 1 "$(grep -F 'check-examples-compile.sh over this repository' "$HARNESS22B/out.txt")"
 else
@@ -1276,6 +1291,46 @@ if grep -qE 'NOT CHECKED — scripts/check-examples-compile\.sh assertion [12] '
     report "case 22c prints no examples-gate assertion line on a run that compiled no crate" 1 "$(grep -F 'check-examples-compile.sh assertion' "$FIXTURE22C.harness/out.txt")"
 else
     report "case 22c prints no examples-gate assertion line on a run that compiled no crate" 0 ""
+fi
+
+# The CHANGED loop reads GATES_NOT_RUN rather than one path, so a second unstarted entry
+# gets the same line. This fixture adds `scripts/check-fixture-unstarted.sh` to its copy
+# of that array, holds the file, and commits an edit to it and to the toolchain
+# precondition. The mutation it kills: matching one literal path in that loop leaves the
+# added entry without a line. Dropping the precondition skip prints a line claiming the
+# run never started a gate it started first.
+FIXTURE22E="$WORK/unstarted-gate-edit"
+build_fixture "$FIXTURE22E"
+sed -i.bak 's|^    scripts/check-examples-compile.sh$|&\
+    scripts/check-fixture-unstarted.sh|' "$FIXTURE22E/scripts/fix-round-check.sh"
+rm -f "$FIXTURE22E/scripts/fix-round-check.sh.bak"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$FIXTURE22E/scripts/check-fixture-unstarted.sh"
+git -C "$FIXTURE22E" add -A
+git -C "$FIXTURE22E" -c user.email=fix-round-check@example.invalid -c user.name='fix-round-check tests' \
+    commit -q --no-gpg-sign --no-verify -m 'fixture unstarted gate'
+git -C "$FIXTURE22E" update-ref refs/remotes/origin/main HEAD
+printf '# committed edit\n' >> "$FIXTURE22E/scripts/check-fixture-unstarted.sh"
+printf '# committed edit\n' >> "$FIXTURE22E/scripts/check-resolved-rustc.sh"
+git -C "$FIXTURE22E" add -A
+git -C "$FIXTURE22E" -c user.email=fix-round-check@example.invalid -c user.name='fix-round-check tests' \
+    commit -q --no-gpg-sign --no-verify -m 'fixture edit'
+run_fixture "$FIXTURE22E"
+if ! sed -n '/^GATES_NOT_RUN=(/,/^)/p' "$FIXTURE22E/scripts/fix-round-check.sh" | grep -qF 'scripts/check-fixture-unstarted.sh'; then
+    report "case 22c names any unstarted GATES_NOT_RUN gate an edit left unrun" 1 "the fixture's GATES_NOT_RUN gained no scripts/check-fixture-unstarted.sh entry, so this case tested nothing"
+elif grep -qF "NOT CHECKED — scripts/check-fixture-unstarted.sh over this repository's workspace: this branch changed that gate, and this run never starts it" "$FIXTURE22E.harness/out.txt"; then
+    report "case 22c names any unstarted GATES_NOT_RUN gate an edit left unrun" 0 ""
+else
+    report "case 22c names any unstarted GATES_NOT_RUN gate an edit left unrun" 1 "the output holds no NOT CHECKED line for the edited fixture gate: $(tail -n 8 "$FIXTURE22E.harness/out.txt")"
+fi
+if grep -qF 'NOT CHECKED — scripts/check-resolved-rustc.sh over this repository' "$FIXTURE22E.harness/out.txt"; then
+    report "case 22c claims no unrun edit for the toolchain precondition the run starts" 1 "$(grep -F 'check-resolved-rustc.sh over this repository' "$FIXTURE22E.harness/out.txt")"
+else
+    report "case 22c claims no unrun edit for the toolchain precondition the run starts" 0 ""
+fi
+if grep -q '^  UNCLASSIFIED' "$FIXTURE22E.harness/out.txt"; then
+    report "case 22c classifies the gate its fixture added" 1 "$(grep '^  UNCLASSIFIED' "$FIXTURE22E.harness/out.txt")"
+else
+    report "case 22c classifies the gate its fixture added" 0 ""
 fi
 
 # ── Case 22d: the DOES-NOT-RUN header names every gate the run never starts ──────────

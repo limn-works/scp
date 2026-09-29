@@ -161,7 +161,8 @@
 #      block, subtracts the GATES and GATES_NOT_RUN arrays below, and fails when that entry
 #      names fewer than what remains. The entry also names the two programs that remain and
 #      are neither a gate nor a suite. GATES_NOT_RUN is subtracted because case 22d holds
-#      each of its unstarted entries to an item of this list instead.
+#      each of its unstarted entries to an item of this list instead, and case 22c holds a
+#      branch that edits any unstarted entry to a NOT CHECKED line naming that entry.
 #   8. Both assertions of `scripts/check-examples-compile.sh`, which the `rust-clippy` job
 #      runs and GATES_NOT_RUN below lists. Assertion 1 runs `cargo clippy -p <owner>
 #      --example <name> -- -D warnings` without `--no-deps`, so it lints each example
@@ -179,8 +180,8 @@
 #      assertion 1 line over every crate it compiled, with a clause saying some of them may
 #      have no example target.
 #      A run that compiles no crate prints neither line. A branch that edits
-#      `scripts/check-examples-compile.sh` gets one more line naming that edit, whatever it
-#      compiled.
+#      `scripts/check-examples-compile.sh`, or any other GATES_NOT_RUN entry this run never
+#      starts, gets one more line naming that edit, whatever it compiled.
 #
 # USAGE
 #   bash scripts/fix-round-check.sh [crate ...]
@@ -814,7 +815,7 @@ print(", ".join(sorted(selected & reached)))
         example_list="$crate_list (this run could not read their targets out of cargo metadata, so some of them may have no example target)"
     fi
     if [[ -n $example_list ]]; then
-        NOTES+=("scripts/check-examples-compile.sh assertion 1 over the example targets that compile $example_list: the compile above runs cargo check, which reports no clippy lint, while that gate runs cargo clippy -- -D warnings on each example alone and without --no-deps, so it lints the example and every workspace library that example compiles, in that one package's dev-target feature set and without the --features list the compile above passed; an example with a clippy warning, an example that names an item behind a feature the compile above turned on, and a library with a clippy warning that only that narrower feature set raises, such as an import left unused when a feature is off, each pass here and fail that gate in the rust-clippy job of .github/workflows/ci.yml")
+        NOTES+=("scripts/check-examples-compile.sh assertion 1 over the example targets that compile $example_list: the compile above runs cargo check, which reports no clippy lint, while that gate runs cargo clippy -- -D warnings on each example alone and without --no-deps, so it lints the example and every workspace library that example compiles, in that one package's dev-target feature set and without the --features list the compile above passed; an example with a clippy warning, an example that names an item behind a feature the compile above turned on, and a library with a clippy warning that only that narrower feature set raises, such as an import left unused when a feature is off, each pass here and fail that gate in the rust-clippy job of .github/workflows/ci.yml; that assertion also fails when a cfg(, cfg_attr( or cfg!( predicate in an example target's source file, or in any .rs file under a package's examples/, names anything but not, any, all, unix, windows or a target_ key such as target_os, or is an empty any() or all(), and the compile above never reads those predicates, so such a file passes here and fails that gate in the same job")
     fi
 
     declare -a SELECTED_WASM=()
@@ -923,14 +924,25 @@ GATES_NOT_RUN=(
     scripts/check-examples-compile.sh
 )
 
-# scripts/check-examples-compile.sh is the one GATES_NOT_RUN entry this run never starts
-# (the other runs as the toolchain precondition), so a branch that edits it gets a line
-# saying the edited gate went unrun over this repository. The fixture suite the scripts/
-# lane names runs the gate over throwaway workspaces, never over this one.
+# Every GATES_NOT_RUN entry but `scripts/check-resolved-rustc.sh`, which the toolchain
+# precondition above starts, is a gate this run never starts, so a branch that edits one
+# gets a line saying the edited gate went unrun over this repository. The loop reads the
+# array rather than naming a path, so an entry added to it later gets the line without an
+# edit here; `scripts/tests/fix-round-check/run-tests.sh` case 22c adds one to a fixture
+# copy of this script and holds it to that line. The fixture suite the scripts/ lane names
+# runs `scripts/check-examples-compile.sh` over throwaway workspaces, never over this one.
 if [[ $changed_rc -eq 0 ]]; then
     while IFS= read -r f; do
-        [[ $f == scripts/check-examples-compile.sh ]] || continue
-        NOTES+=("scripts/check-examples-compile.sh over this repository's workspace: this branch changed that gate, and this run never starts it, because it compiles and GATES_NOT_RUN lists it, so an edit that makes it reject a shipped crate's examples or published files passes here and fails the rust-clippy job of .github/workflows/ci.yml, which runs it over every workspace package")
+        for g in "${GATES_NOT_RUN[@]}"; do
+            [[ $f == "$g" && $g != scripts/check-resolved-rustc.sh ]] || continue
+            case $g in
+                scripts/check-examples-compile.sh)
+                    why="because it compiles and GATES_NOT_RUN lists it, so an edit that makes it reject a shipped crate's examples or published files passes here and fails the rust-clippy job of .github/workflows/ci.yml, which runs it over every workspace package" ;;
+                *)
+                    why="because GATES_NOT_RUN lists it, so an edit that makes it fail passes here and fails whichever job of .github/workflows/ starts it" ;;
+            esac
+            NOTES+=("$g over this repository's workspace: this branch changed that gate, and this run never starts it, $why")
+        done
     done <<< "$CHANGED"
 fi
 
