@@ -222,16 +222,16 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
    - Constructs the minimal outer envelope.
    - Serializes to binary format.
 
-4. **`seal_envelope(inner_envelope, mls_group) -> OuterEnvelope`**
-   - High-level function that serializes the inner envelope, encrypts via MLS, and wraps in an outer envelope.
-   - This is the primary send-path function.
+4. **Send path: `ContextCryptoState::seal`** (`scp-runtime`, `context/actor/state.rs`)
+   - Serializes the inner envelope, encrypts it with the sender key (AES-256-GCM, ADR-007) under the 16-byte epoch and sequence header of `09-security-model.md` §9.16.1, encrypts the result with MLS, and wraps it in an outer envelope.
+   - This is the only send-path sealing function; no separate `seal_envelope` exists.
 
-5. **`open_envelope(outer_envelope, mls_group) -> InnerEnvelope`**
-   - High-level function that decrypts the outer envelope's blob via MLS, deserializes the inner envelope, and verifies the inner signature.
-   - Rejects if inner signature verification fails.
-   - After decryption and padding removal, verifies `payload_hash == SHA256(stripped_payload)`. Rejects if the hash does not match (content integrity failure).
-   - Rejects if generation number violates replay prevention (delegates to MLS layer).
-   - Returns the verified inner envelope.
+5. **Receive path: `ContextCryptoState::open`, then `messaging_helpers::verify_and_unwrap`** (`scp-runtime`)
+   - `ContextCryptoState::open` decrypts the outer envelope's blob via MLS, removes the sender-key layer, and deserializes the inner envelope. It returns the MLS-credential sender DID beside the inner envelope.
+   - Binding: the MLS-credential sender MUST equal `inner.sender_did`; a mismatch is rejected before any key is resolved. The verification key is resolved for `(inner.sender_did, inner.signing_key_id)` (§9.7.4.2), never for a DID the caller supplies.
+   - Order: inner-signature verification, then the payload-hash check (`payload_hash == SHA256(stripped_payload)`, rejected on mismatch as a content integrity failure), then the Recovery admin gate. The per-sender `(epoch, sequence)` receive floor advances only after all three succeed, so an envelope that fails verification never moves the floor.
+   - Replay prevention for generations is delegated to the MLS and sender-key layers.
+   - Returns the verified plaintext; no separate `open_envelope` exists.
 
 6. **`verify_inner_signature(inner_envelope, sender_did_document) -> bool`**
    - Resolves the public key from the sender's key state using `inner_envelope.signing_key_id`: `"#active"` resolves to the key that state lists `Current` in the `#active` role (`09-security-model.md` §9.7.4.2 definitions).
@@ -252,7 +252,7 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
 |------|---------|
 | `mod.rs` | Module root, re-exports |
 | `inner.rs` | `InnerEnvelope` struct, `create_inner_envelope`, `verify_inner_signature`, serialization |
-| `outer.rs` | `OuterEnvelope` struct, `create_outer_envelope`, serialization, `seal_envelope`, `open_envelope` |
+| `outer.rs` | `OuterEnvelope` struct, `create_outer_envelope`, serialization |
 | `padding.rs` | Bucket padding: `pad_to_bucket`, `strip_padding`, bucket size constants |
 | `pseudonym.rs` | `derive_pseudonym` — HMAC-SHA256 derivation, pseudonym-to-identifier verification cache |
 
