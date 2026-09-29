@@ -134,6 +134,16 @@ fn create_test_identity(bi: &PyBridgeInstance) -> String {
     did
 }
 
+/// `default_ceiling()` as the colon-form strings `register_context` takes,
+/// which is the ceiling `context_create` gives a caller who declared none.
+/// `register_context` reads an empty slice as a deny-all ceiling.
+fn default_ceiling_strings() -> Vec<String> {
+    scp_core::context::roles::default_ceiling()
+        .iter()
+        .map(|cap| cap.name().into_owned())
+        .collect()
+}
+
 /// Creates a context via the per-instance `Supervisor` and registers FFI
 /// state. Returns the `context_id`.
 ///
@@ -143,7 +153,7 @@ fn create_test_identity(bi: &PyBridgeInstance) -> String {
 fn create_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
     setup();
     let context_id = random_context_id();
-    runtime::register_context(bi, &context_id, creator_did, &[]).unwrap();
+    runtime::register_context(bi, &context_id, creator_did, &default_ceiling_strings()).unwrap();
 
     let rt = test_runtime();
     let supervisor = runtime::supervisor(bi).unwrap().clone();
@@ -1426,7 +1436,7 @@ fn random_64hex_context_id() -> String {
 /// with a caller-chosen id.
 fn create_test_context_with_id(bi: &PyBridgeInstance, creator_did: &str, context_id: &str) {
     setup();
-    runtime::register_context(bi, context_id, creator_did, &[]).unwrap();
+    runtime::register_context(bi, context_id, creator_did, &default_ceiling_strings()).unwrap();
 
     let rt = test_runtime();
     let supervisor = runtime::supervisor(bi).unwrap().clone();
@@ -1452,34 +1462,14 @@ fn create_test_context_with_id(bi: &PyBridgeInstance, creator_did: &str, context
 }
 
 /// Creates a registered context whose CREATOR holds the `ContextClose`
-/// capability (the ceiling is seeded with `context:close`), so the creator can
-/// later drive it `Closed` through the REAL supervisor close path. The default
-/// `create_test_context_with_id` uses an EMPTY ceiling, under which even the
-/// creator lacks `context:close` — hence this close-capable variant. Returns the
-/// generated 64-hex context id.
+/// capability, so the creator can later drive it `Closed` through the REAL
+/// supervisor close path, and `OutletRegister`, so a test can register an
+/// outlet in it first. Both come from `default_ceiling()`, which
+/// [`create_test_context_with_id`] gives the supervisor and the bridge copy
+/// alike. Returns the generated 64-hex context id.
 fn create_closeable_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
-    use scp_core::context::roles::Capability;
-
-    setup();
     let context_id = random_64hex_context_id();
-    runtime::register_context(bi, &context_id, creator_did, &[]).unwrap();
-
-    let rt = test_runtime();
-    let supervisor = runtime::supervisor(bi).unwrap().clone();
-    let creator = scp_did::DID(creator_did.to_owned());
-    let ctx_id = context_id.clone();
-
-    rt.block_on(async move {
-        let params = scp_core::context::ContextParams {
-            ceiling: vec![Capability::ContextClose],
-            ..scp_core::context::ContextParams::default()
-        };
-        supervisor
-            .create_context(ctx_id.clone(), params, creator.clone(), None)
-            .await
-            .unwrap();
-        supervisor.register_local_did(creator).await.unwrap();
-    });
+    create_test_context_with_id(bi, creator_did, &context_id);
     context_id
 }
 

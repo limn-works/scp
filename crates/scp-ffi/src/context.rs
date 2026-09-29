@@ -59,7 +59,7 @@ const fn context_state_str(state: &scp_core::context::ContextState) -> &'static 
 /// `require_active_context(bi, id, "join", codes::CTX_2013)` produces a
 /// `ContextError` carrying `SCP-CTX-2013` and "cannot join context in
 /// 'closed' state -- context must be 'active'". `code` is the operation's own
-/// code.
+/// code, and a context no supervisor actor serves is refused with it too.
 ///
 /// The state comes from [`crate::runtime::live_context_state`], which queries
 /// the context's supervisor actor. Reading
@@ -73,7 +73,7 @@ fn require_active_context(
     verb: &str,
     code: &str,
 ) -> PyResult<()> {
-    let state = crate::runtime::live_context_state(bi, context_id)?;
+    let state = crate::runtime::live_context_state(bi, context_id, code)?;
     if matches!(state, scp_core::context::ContextState::Active) {
         return Ok(());
     }
@@ -1544,7 +1544,7 @@ fn build_core_context_params(
 /// `build_core_context_params` hands that vocabulary to the shared parser, so a
 /// default this bridge substitutes has to arrive in the same form a caller
 /// would have written.
-fn default_ceiling_strings() -> Vec<String> {
+pub(crate) fn default_ceiling_strings() -> Vec<String> {
     scp_core::context::roles::default_ceiling()
         .iter()
         .map(|cap| cap.name().into_owned())
@@ -2942,8 +2942,9 @@ impl crate::scp::PyScp {
         // role-state admin (bundle-derived); the joiner is added as a member
         // below.
         //
-        // FLAG-1: the caller no longer supplies a ceiling, so register with the
-        // DEFAULT ceiling (`&[]`). The Occupied dedup is keyed on `context_id`,
+        // FLAG-1: the caller no longer supplies a ceiling, so register with an
+        // empty, deny-all ceiling (`&[]`) until the join authenticates one.
+        // The Occupied dedup is keyed on `context_id`,
         // so the "detect a duplicate BEFORE consuming the single-use KeyPackage"
         // crash-safety is preserved regardless of the ceiling. The AUTHENTICATED
         // ceiling is re-synced from the joined handle's signed params AFTER a
@@ -3001,8 +3002,8 @@ impl crate::scp::PyScp {
             };
 
         // FLAG-1: re-sync the AUTHENTICATED ceiling from the joined handle's
-        // signed params, overwriting the default ceiling used for the reversible
-        // precheck. The authoritative ceiling lives in the bundle the creator
+        // signed params into both ceiling copies, overwriting the empty ceiling
+        // used for the reversible precheck. The authoritative ceiling lives in the bundle the creator
         // signed — never in caller input. This runs AFTER the irreversible
         // commit; the FFI state was just registered (and not removed on this
         // success path), so the sync targets a live entry.
@@ -6339,7 +6340,12 @@ mod tests {
         });
         let context_id = "0".repeat(64);
         crate::runtime::init_context_manager_for_test(bi);
-        crate::runtime::create_supervisor_context_for_test(bi, &context_id, creator_did, &[]);
+        crate::runtime::create_supervisor_context_for_test(
+            bi,
+            &context_id,
+            creator_did,
+            &super::default_ceiling_strings(),
+        );
         let handle = PyContextHandle::new(bi, context_id, creator_did.to_owned(), params);
         *handle.state.lock().unwrap() = "active".to_owned();
         handle
@@ -7911,9 +7917,12 @@ mod tests {
         let bi = __bi();
         let context_id = format!("{prefix}{}", "0".repeat(56));
         crate::runtime::init_context_manager_for_test(&bi);
-        crate::runtime::register_context(&bi, &context_id, creator_did, &[])
+        // Both copies carry the ceiling `context_create` gives a caller who
+        // declared none; the close fixture needs the creator's `context:close`.
+        let ceiling = super::default_ceiling_strings();
+        crate::runtime::register_context(&bi, &context_id, creator_did, &ceiling)
             .expect("fixture registration");
-        crate::runtime::create_supervisor_context_for_test(&bi, &context_id, creator_did, &[]);
+        crate::runtime::create_supervisor_context_for_test(&bi, &context_id, creator_did, &ceiling);
 
         let handle = active_handle_for(&bi, &context_id, creator_did);
         (
@@ -8054,14 +8063,39 @@ mod tests {
             inner: std::sync::Arc::clone(&bi),
         };
 
-        let err = scp
+        // Each refusal carries the gate's own code, not the generic
+        // `SCP-CTX-2001`, so a caller branching on the per-operation code sees
+        // it.
+        let member = "did:dht:z6MkNoActorMember";
+        let join = scp
+            .context_join(&handle, member, None)
+            .expect_err("join must refuse a context no actor serves");
+        let leave = scp
+            .context_leave(&handle, member)
+            .expect_err("leave must refuse a context no actor serves");
+        let send = Python::with_gil(|py| {
+            let payload = pyo3::types::PyBytes::new(py, b"hello");
+            scp.context_send(&handle, creator, payload.as_any(), None)
+                .expect_err("send must refuse a context no actor serves")
+        });
+        let receive = scp
             .context_receive(&handle)
             .err()
             .expect("receive must refuse a context no actor serves");
-        assert!(
-            err.to_string().contains("has no live supervisor state"),
-            "receive reported: {err}"
-        );
+        for (name, err, code) in [
+            ("join", join, codes::CTX_2013),
+            ("leave", leave, codes::CTX_2015),
+            ("send", send, codes::CTX_2019),
+            ("receive", receive, codes::CTX_2021),
+        ] {
+            let text = err.to_string();
+            assert!(
+                text.contains("has no live supervisor state")
+                    && text.contains(code)
+                    && !text.contains(codes::CTX_2001),
+                "{name} reported: {text}"
+            );
+        }
     }
 
     /// A gate admits an operation while the supervisor reports `Active`.
@@ -8211,6 +8245,60 @@ mod tests {
                 .collect::<std::collections::HashSet<_>>(),
             "every rendered name parses back into the built-in capability it names"
         );
+    }
+
+    /// Creates a context through `context_create` with `ceiling` set to
+    /// `ceiling` (or no `ceiling` key when `None`), then mints a
+    /// `messages:write` UCAN in it through `ucan_mint`, which checks the
+    /// bridge's `ceiling_strings` copy.
+    #[cfg(feature = "testing")]
+    fn mint_in_created_context(ceiling: Option<Vec<String>>) -> PyResult<()> {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let creator = scp.identity_create(py, "in_memory", None).unwrap();
+            let creator_did = creator.did().to_owned();
+            let params = PyDict::new(py);
+            params.set_item("mode", "encrypted").unwrap();
+            params.set_item("governance", "single_admin").unwrap();
+            if let Some(ceiling) = ceiling {
+                params.set_item("ceiling", ceiling).unwrap();
+            }
+            let handle = scp
+                .context_create(&creator_did, &params)
+                .expect("context_create succeeds");
+            scp.ucan_mint(
+                &handle.context_id,
+                "did:dht:z6MkDenyAllMintMember",
+                vec!["messages:write".to_owned()],
+                None,
+            )
+            .map(drop)
+        })
+    }
+
+    /// A context created with `ceiling=[]` grants nothing, so the bridge
+    /// refuses to mint a capability in it: the UCAN copy the mint checks holds
+    /// the same empty ceiling the supervisor holds, not `default_ceiling()`.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ucan_mint_is_refused_in_a_deny_all_context() {
+        let err = mint_in_created_context(Some(Vec::new()))
+            .expect_err("a deny-all context must refuse every mint");
+        assert!(
+            err.to_string().contains("outside ceiling"),
+            "the refusal must name the ceiling, got: {err}"
+        );
+    }
+
+    /// The same mint succeeds in a context that declared no ceiling and so
+    /// runs under `default_ceiling()`. Without this case the refusal above
+    /// would also pass for a mint that failed for every context.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ucan_mint_is_admitted_under_the_default_ceiling() {
+        mint_in_created_context(None).expect("messages:write is in default_ceiling()");
     }
 
     #[test]

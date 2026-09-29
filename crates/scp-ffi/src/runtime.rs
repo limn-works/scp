@@ -64,7 +64,7 @@ use scp_core::context::persistence::ContextPersistence;
 use scp_core::context::providers::{
     MerkleEventLogProvider, ProtocolRepositoryContextBridge, ProtocolRepositoryEventLogBridge,
 };
-use scp_core::context::roles::{ContextRoleState, default_ceiling};
+use scp_core::context::roles::{CapabilityCeiling, ContextRoleState};
 use scp_core::crypto::mls::provider::NodeMlsFactory;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
@@ -1530,7 +1530,9 @@ pub const RECEIVE_BUFFER_CAPACITY: usize = 1000;
 /// `user_ceiling` contains user-provided ceiling strings in colon format
 /// (e.g. `"outlet:call:*"`). These are converted to UCAN underscore format
 /// (e.g. `"outlet_call:*"`) via `Capability::new` + `ucan_capability_name`.
-/// Pass an empty slice to use the default ceiling.
+/// The same entries become the role state's ceiling. An empty slice registers a
+/// ceiling that grants nothing; a caller that wants `default_ceiling()` passes
+/// its entries.
 ///
 /// # Errors
 ///
@@ -1555,49 +1557,48 @@ pub fn register_ffi_state(
         Entry::Vacant(vacant) => {
             let outlet_registry = OutletRegistry::new();
             let event_log = EventLog::new(context_id.to_owned());
-            let ceiling = default_ceiling();
-            let ceiling_strings = if user_ceiling.is_empty() {
-                ceiling
-                    .iter()
-                    .map(scp_core::context::roles::Capability::ucan_capability_name)
-                    .collect::<HashSet<String>>()
-            } else {
-                // Ceiling-entry grammar enforcement (spec §5.3.1.1) on each user
-                // entry BEFORE it is normalized into the UCAN ceiling string set.
-                // Validate the PARSED enum (`Capability::new(entry)
-                // .validate_as_ceiling_entry()`) — NOT the raw string — so the
-                // validation checks EXACTLY the capability that gets enforced.
-                // `Capability::new` strips a `custom:` prefix: the raw string
-                // `"custom:payments"` has one colon (would pass a raw-string check)
-                // but parses to `Custom("payments")`, whose enforced form
-                // (`ucan_capability_name` → `payments:payments`) corresponds to a
-                // no-colon custom that `validate_as_ceiling_entry` REJECTS. Routing
-                // through the parsed enum keeps the raw-string validation and the
-                // enforced parse in agreement on one canonical form (BLACK-003), and
-                // still rejects a no-colon `payments` that would otherwise be widened
-                // to `payments:*`.
-                for entry in user_ceiling {
-                    // Fail-closed: a malformed capability string (deleted
-                    // legacy outlet-invoke / pre-rename outlet-invoke stems,
-                    // invalid §5.4.2.1 outlet suffix) parses to `None` and is
-                    // rejected at the FFI boundary rather than silently dropped.
-                    let cap =
-                        scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
-                            ScpPyError::context(format!(
-                                "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
-                            ))
-                        })?;
-                    cap.validate_as_ceiling_entry()
-                        .map_err(|e| ScpPyError::context(e.to_string()))?;
-                }
-                user_ceiling
-                    .iter()
-                    .filter_map(|s| {
-                        scp_core::context::roles::Capability::new(s)
-                            .map(|c| c.ucan_capability_name())
-                    })
-                    .collect::<HashSet<String>>()
-            };
+            // `user_ceiling` stands as written, an empty one included, in both
+            // copies this state carries: `ceiling_strings` (read by UCAN mint,
+            // delegate and validate, and by outlet and MCP checks) and
+            // `role_state`. `PyContextParams::from_py_dict` resolves an absent
+            // or `None` ceiling to `default_ceiling()` before `context_create`
+            // reaches here, so an empty slice is a caller-declared deny-all
+            // ceiling and the supervisor holds it empty. Substituting the
+            // default here would grant eleven capabilities in that context.
+            // `context_join_from_welcome` registers `&[]` before the join and
+            // `sync_ceiling_from_params` then writes the authenticated ceiling.
+            //
+            // Ceiling-entry grammar enforcement (spec §5.3.1.1) runs on each
+            // entry BEFORE it is normalized into the UCAN ceiling string set.
+            // Validate the PARSED enum (`Capability::new(entry)
+            // .validate_as_ceiling_entry()`) — NOT the raw string — so the
+            // validation checks EXACTLY the capability that gets enforced.
+            // `Capability::new` strips a `custom:` prefix: the raw string
+            // `"custom:payments"` has one colon (would pass a raw-string check)
+            // but parses to `Custom("payments")`, whose enforced form
+            // (`ucan_capability_name` → `payments:payments`) corresponds to a
+            // no-colon custom that `validate_as_ceiling_entry` REJECTS. Routing
+            // through the parsed enum keeps the raw-string validation and the
+            // enforced parse in agreement on one canonical form (BLACK-003), and
+            // still rejects a no-colon `payments` that would otherwise be widened
+            // to `payments:*`.
+            let mut capabilities = Vec::with_capacity(user_ceiling.len());
+            for entry in user_ceiling {
+                // Fail-closed: a malformed capability string (deleted
+                // legacy outlet-invoke / pre-rename outlet-invoke stems,
+                // invalid §5.4.2.1 outlet suffix) parses to `None` and is
+                // rejected at the FFI boundary rather than silently dropped.
+                let cap = scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
+                    ScpPyError::context(format!(
+                        "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                    ))
+                })?;
+                cap.validate_as_ceiling_entry()
+                    .map_err(|e| ScpPyError::context(e.to_string()))?;
+                capabilities.push(cap);
+            }
+            let ceiling = CapabilityCeiling::new(capabilities);
+            let ceiling_strings = ceiling.to_ucan_string_set();
             let role_state =
                 ContextRoleState::new(context_id, creator_did, ceiling, vec![], &SystemClock)
                     .map_err(|e| {
@@ -1741,22 +1742,26 @@ where
 /// snapshot, because its documented contract says so; a gate does not.
 ///
 /// Fails closed. A context the supervisor holds no actor for yields
-/// [`ScpPyError::ContextError`], so no caller passes a gate on an absent
-/// answer.
+/// [`ScpPyError::ContextError`] carrying `absent_code`, the calling gate's own
+/// code, so no caller passes a gate on an absent answer and a caller branching
+/// on that code sees the refusal.
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::ContextError` when the supervisor reports no actor for
-/// `context_id`, and every error [`read_live_context_state`] returns.
+/// Returns `ScpPyError::ContextError` with `absent_code` when the supervisor
+/// reports no actor for `context_id`, and every error
+/// [`read_live_context_state`] returns.
 pub fn live_context_state(
     bi: &PyBridgeInstance,
     context_id: &str,
+    absent_code: &str,
 ) -> Result<scp_core::context::ContextState, ScpPyError> {
-    read_live_context_state(bi, context_id)?.ok_or_else(|| {
-        ScpPyError::context(format!(
+    read_live_context_state(bi, context_id)?.ok_or_else(|| ScpPyError::ContextError {
+        message: format!(
             "context '{context_id}' has no live supervisor state — refusing to run a \
              lifecycle-gated operation against a context no actor serves"
-        ))
+        ),
+        code: absent_code.to_owned(),
     })
 }
 
@@ -1913,34 +1918,37 @@ pub async fn sync_role_state_from_manager_async(
     })
 }
 
-/// Re-syncs the `FfiBridgeState.ceiling_strings` for a context from the
+/// Re-syncs both ceiling copies in a context's `FfiBridgeState` from the
 /// AUTHENTICATED context params carried by a joined
 /// [`ContextHandle`](scp_core::context::ContextHandle).
 ///
-/// Peer of [`sync_role_state_from_manager`] (which syncs role state); this syncs
-/// the UCAN/outlet capability-check ceiling string set. Used by
-/// `context_join_from_welcome`: the joiner no longer supplies a ceiling, so the
-/// FFI state is registered with the DEFAULT ceiling as a reversible precheck,
-/// then this overwrites it with the ceiling AUTHENTICATED by the joined MLS
-/// group's signed context binding. The ceiling entries are normalized to their
-/// enforced UCAN capability-name form (`{resource}:{action}`), matching the set
-/// [`register_ffi_state`] builds on the create path.
+/// Peer of [`sync_role_state_from_manager`] (which syncs the whole role state);
+/// this writes the UCAN/outlet capability-check ceiling string set and the role
+/// state's ceiling. Used by `context_join_from_welcome`: the joiner no longer
+/// supplies a ceiling, so the FFI state is registered with an empty, deny-all
+/// ceiling as a reversible precheck, then this overwrites both copies with the
+/// ceiling AUTHENTICATED by the joined MLS group's signed context binding. The
+/// string set holds the entries' enforced UCAN capability-name form
+/// (`{resource}:{action}`), the same set [`register_ffi_state`] builds on the
+/// create path.
 ///
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` if the context's FFI state is not
 /// registered (unreachable on the join success path — the state was just
-/// registered and not removed).
+/// registered and not removed), or if an entry fails the ceiling-entry grammar
+/// (spec §5.3.1.1).
 pub fn sync_ceiling_from_params(
     bi: &PyBridgeInstance,
     context_id: &str,
     ceiling: &[scp_core::context::roles::Capability],
 ) -> Result<(), ScpPyError> {
-    let ceiling_strings: HashSet<String> = ceiling
-        .iter()
-        .map(scp_core::context::roles::Capability::ucan_capability_name)
-        .collect();
+    let ceiling = CapabilityCeiling::new(ceiling.iter().cloned());
+    let ceiling_strings = ceiling.to_ucan_string_set();
     with_ffi_state(bi, context_id, |st| {
+        st.role_state
+            .set_ceiling(ceiling)
+            .map_err(|e| ScpPyError::context(e.to_string()))?;
         st.ceiling_strings = ceiling_strings;
         Ok(())
     })
@@ -1957,9 +1965,9 @@ pub fn sync_ceiling_from_params(
 /// `context_create` would have created.
 ///
 /// `ceiling` entries take the colon form the Python surface accepts
-/// (`"outlet:register"`, `"messages:write"`). An empty slice creates the context
-/// with `default_ceiling()`, the ceiling `PyContextParams::from_py_dict`
-/// resolves when a caller declares none.
+/// (`"outlet:register"`, `"messages:write"`), as `register_context` takes
+/// them, so a test passes one slice to both. An empty slice creates a context
+/// whose ceiling grants nothing, as `register_context` registers it.
 ///
 /// # Panics
 ///
@@ -1972,22 +1980,15 @@ pub(crate) fn create_supervisor_context_for_test(
     bi: &PyBridgeInstance,
     context_id: &str,
     creator_did: &str,
-    ceiling: &[&str],
+    ceiling: &[String],
 ) {
-    let capabilities: Vec<scp_core::context::roles::Capability> = if ceiling.is_empty() {
-        scp_core::context::roles::default_ceiling()
-            .iter()
-            .cloned()
-            .collect()
-    } else {
-        ceiling
-            .iter()
-            .map(|entry| {
-                scp_core::context::roles::Capability::new(entry)
-                    .unwrap_or_else(|| panic!("test ceiling entry {entry:?} must parse"))
-            })
-            .collect()
-    };
+    let capabilities: Vec<scp_core::context::roles::Capability> = ceiling
+        .iter()
+        .map(|entry| {
+            scp_core::context::roles::Capability::new(entry)
+                .unwrap_or_else(|| panic!("test ceiling entry {entry:?} must parse"))
+        })
+        .collect();
     let params = scp_core::context::ContextParams {
         ceiling: capabilities,
         ..scp_core::context::ContextParams::default()
@@ -2950,31 +2951,192 @@ mod tests {
         remove_context(bi, &ctx_id);
     }
 
-    /// When no user ceiling is provided (empty slice), the default ceiling
-    /// should be used with proper UCAN underscore format.
+    /// An empty user ceiling registers a ceiling that grants nothing, in both
+    /// copies the capability checks read. Substituting `default_ceiling()`
+    /// here would give UCAN, outlet and MCP checks eleven capabilities in a
+    /// context the supervisor holds as deny-all.
     #[test]
-    fn empty_user_ceiling_uses_default_in_ucan_format() {
+    fn empty_user_ceiling_registers_a_deny_all_ceiling() {
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
+        let ctx_id = unique_ctx_id("ceiling-empty");
+        let creator = "did:dht:z6MkCeilingEmpty";
+
+        register_context(bi, &ctx_id, creator, &[]).unwrap();
+
+        let (ceiling_strings, role_ceiling_len, admin_caps) = with_ffi_state(bi, &ctx_id, |st| {
+            Ok((
+                st.ceiling_strings.clone(),
+                st.role_state.ceiling().len(),
+                st.role_state
+                    .member_capabilities
+                    .get(creator)
+                    .map_or(0, HashSet::len),
+            ))
+        })
+        .unwrap();
+        assert!(
+            ceiling_strings.is_empty(),
+            "an empty ceiling must stay empty in the UCAN copy, got: {ceiling_strings:?}"
+        );
+        assert_eq!(role_ceiling_len, 0, "the role-state ceiling must be empty");
+        assert_eq!(admin_caps, 0, "the creator's admin role must grant nothing");
+
+        remove_context(bi, &ctx_id);
+    }
+
+    /// A caller that passes `default_ceiling()`'s entries gets them in both
+    /// copies, in UCAN underscore format. Without this case the deny-all test
+    /// above would also pass for a registration that dropped every entry.
+    #[test]
+    fn default_ceiling_entries_register_in_ucan_format() {
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
         init_context_manager_for_test(bi);
         let ctx_id = unique_ctx_id("ceiling-default");
         let creator = "did:dht:z6MkCeilingDefault";
+        let defaults: Vec<String> = scp_core::context::roles::default_ceiling()
+            .iter()
+            .map(|cap| cap.name().into_owned())
+            .collect();
 
-        register_context(bi, &ctx_id, creator, &[]).unwrap();
+        register_context(bi, &ctx_id, creator, &defaults).unwrap();
 
-        let ceiling = with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
-
-        // Default ceiling must include outlet_call:* (not outlet:call:*).
-        assert!(
-            ceiling.contains("outlet_call:*"),
-            "default ceiling should contain 'outlet_call:*' but got: {ceiling:?}"
+        let (ceiling, role_ceiling) = with_ffi_state(bi, &ctx_id, |st| {
+            Ok((st.ceiling_strings.clone(), st.role_state.ceiling().clone()))
+        })
+        .unwrap();
+        assert_eq!(
+            ceiling,
+            scp_core::context::roles::default_ceiling().to_ucan_string_set(),
+            "the UCAN copy must carry every default entry"
         );
         assert!(
-            !ceiling.contains("outlet:call:*"),
-            "default ceiling should not contain raw 'outlet:call:*': {ceiling:?}"
+            ceiling.contains("outlet_call:*") && !ceiling.contains("outlet:call:*"),
+            "default ceiling must be in UCAN format, got: {ceiling:?}"
+        );
+        assert_eq!(
+            role_ceiling,
+            scp_core::context::roles::default_ceiling(),
+            "the role-state ceiling must equal the registered entries"
         );
 
         remove_context(bi, &ctx_id);
+    }
+
+    /// `sync_ceiling_from_params` replaces both ceiling copies a Welcome join
+    /// registered empty, so the UCAN copy and the role state agree on the
+    /// authenticated ceiling.
+    #[test]
+    fn sync_ceiling_from_params_writes_both_copies() {
+        use scp_core::context::roles::Capability;
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
+        let ctx_id = unique_ctx_id("ceiling-sync");
+        register_context(bi, &ctx_id, "did:dht:z6MkCeilingSync", &[]).unwrap();
+
+        sync_ceiling_from_params(
+            bi,
+            &ctx_id,
+            &[Capability::MessagesRead, Capability::OutletCallAll],
+        )
+        .unwrap();
+
+        let (strings, role_ceiling) = with_ffi_state(bi, &ctx_id, |st| {
+            Ok((st.ceiling_strings.clone(), st.role_state.ceiling().clone()))
+        })
+        .unwrap();
+        assert_eq!(
+            strings,
+            ["messages:read", "outlet_call:*"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<HashSet<_>>()
+        );
+        assert_eq!(
+            role_ceiling,
+            CapabilityCeiling::new([Capability::MessagesRead, Capability::OutletCallAll])
+        );
+
+        remove_context(bi, &ctx_id);
+    }
+
+    /// Spawns a supervisor actor for a fresh context and returns the bridge
+    /// instance with that context's id, for the regime tests below.
+    fn live_context_for_regime(prefix: &str) -> (std::sync::Arc<PyBridgeInstance>, String) {
+        crate::init_runtime().ok();
+        let bi = std::sync::Arc::new(PyBridgeInstance::new_py());
+        init_context_manager_for_test(&bi);
+        let ctx_id = format!("{prefix}{}", "0".repeat(56));
+        create_supervisor_context_for_test(&bi, &ctx_id, "did:dht:z6MkRegimeCreator", &[]);
+        (bi, ctx_id)
+    }
+
+    /// From a task on a multi-thread runtime, `block_on_supervisor_query`
+    /// takes its `block_in_place` branch: a live context reads `Active` and an
+    /// unknown one reads absent, without panicking inside the worker.
+    #[test]
+    fn live_state_reads_from_a_multi_thread_runtime_task() {
+        let (bi, ctx_id) = live_context_for_regime("b1");
+        let ambient = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (live, absent) = ambient
+            .block_on(ambient.spawn(async move {
+                assert!(matches!(
+                    tokio::runtime::Handle::current().runtime_flavor(),
+                    tokio::runtime::RuntimeFlavor::MultiThread
+                ));
+                (
+                    live_context_state(&bi, &ctx_id, "SCP-TEST-0001").map_err(|e| e.to_string()),
+                    live_context_state(&bi, &"f".repeat(64), "SCP-TEST-0001")
+                        .map_err(|e| e.to_string()),
+                )
+            }))
+            .unwrap();
+        assert!(
+            matches!(live, Ok(scp_core::context::ContextState::Active)),
+            "{live:?}"
+        );
+        assert!(
+            absent.as_ref().is_err_and(|e| e.contains("SCP-TEST-0001")),
+            "{absent:?}"
+        );
+    }
+
+    /// From a task on a current-thread runtime, `block_on_supervisor_query`
+    /// runs the query on a private runtime on a fresh thread: a live context
+    /// reads `Active` and an unknown one reads absent, without panicking.
+    #[test]
+    fn live_state_reads_from_a_current_thread_runtime_task() {
+        let (bi, ctx_id) = live_context_for_regime("b2");
+        let ambient = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (live, absent) = ambient.block_on(async move {
+            assert!(matches!(
+                tokio::runtime::Handle::current().runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::CurrentThread
+            ));
+            (
+                live_context_state(&bi, &ctx_id, "SCP-TEST-0002").map_err(|e| e.to_string()),
+                live_context_state(&bi, &"f".repeat(64), "SCP-TEST-0002")
+                    .map_err(|e| e.to_string()),
+            )
+        });
+        assert!(
+            matches!(live, Ok(scp_core::context::ContextState::Active)),
+            "{live:?}"
+        );
+        assert!(
+            absent.as_ref().is_err_and(|e| e.contains("SCP-TEST-0002")),
+            "{absent:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
