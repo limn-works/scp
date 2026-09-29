@@ -194,7 +194,9 @@ futures = "0.3"
 # both OPENSSL_LIB_DIR and OPENSSL_INCLUDE_DIR) is set, in which case it links that
 # OpenSSL's libcrypto dynamically; on a Windows host building a Windows target its
 # build script panics unless OPENSSL_DIR (or both OPENSSL_LIB_DIR and
-# OPENSSL_INCLUDE_DIR) names an OpenSSL installation.
+# OPENSSL_INCLUDE_DIR) names an OpenSSL installation. The build script reads each
+# of these variables first under the target triple as a prefix
+# (`AARCH64_APPLE_DARWIN_OPENSSL_DIR`), which acts as the bare name does.
 # The PyPI wheel, which runs on a machine this build never saw, selects
 # `scp-platform/vendored-openssl`. On a non-Apple target that feature sets
 # `bundled-sqlcipher-vendored-openssl` on the libsqlite3-sys package this crate

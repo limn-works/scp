@@ -59,7 +59,8 @@ sqlite = ["dep:rusqlite", "dep:hex", "dep:argon2", "dep:rand", "dep:fs2", "dep:l
 # changes nothing: `libsqlite3-sys` below is declared for non-Apple targets only,
 # so an Apple build leaves SQLCipher on CommonCrypto from the Security framework,
 # which ships with the OS and takes its patches from OS updates, unless the build
-# environment sets OPENSSL_DIR (or both OPENSSL_LIB_DIR and OPENSSL_INCLUDE_DIR).
+# environment sets OPENSSL_DIR (or both OPENSSL_LIB_DIR and OPENSSL_INCLUDE_DIR),
+# bare or prefixed with the target triple as in AARCH64_APPLE_DARWIN_OPENSSL_DIR.
 # The feature cannot name `rusqlite/bundled-sqlcipher-vendored-openssl`
 # directly: a Cargo feature carries no target condition, and libsqlite3-sys 0.30.1's build script
 # checks that feature before its Apple branch, so an Apple build would drop

@@ -45,9 +45,12 @@ markers = [
   "parity: cross-bridge runtime parity test (ADR-046)",
 ]
 
-# ruff and mypy target the `requires-python` floor, 3.10, so they reject syntax and
-# standard-library names that the cp310 and cp311 wheels cannot import, such as
-# the PEP 695 `type` statement and type parameters, and never rewrite code into them.
+# ruff and mypy target the `requires-python` floor, 3.10. CI's python-lint job runs
+# ruff, which rejects syntax the cp310 and cp311 wheels cannot parse, such as the
+# PEP 695 `type` statement and type parameters, and whose UP rules never rewrite
+# code into it. ruff does not check standard-library names, so an import added
+# after 3.10 (`typing.Self`, `tomllib`) passes it; mypy with the setting below
+# rejects one, but no CI job runs mypy.
 [tool.ruff]
 target-version = "py310"
 line-length = 100
@@ -73,6 +76,9 @@ warn_unused_configs = true
 # OPENSSL_INCLUDE_DIR), in which case libsqlite3-sys links that OpenSSL's
 # libcrypto dynamically. On Linux and Windows, OPENSSL_NO_VENDOR set to anything
 # but `0` makes openssl-sys skip the source build and link the host's OpenSSL.
+# libsqlite3-sys and openssl-sys read each of these variables first under the
+# target triple as a prefix (`AARCH64_APPLE_DARWIN_OPENSSL_DIR`), which acts as
+# the bare name does for that target.
 features = ["extension-module", "vendored-openssl"]
 manifest-path = "../../crates/scp-ffi/Cargo.toml"
 module-name = "scp_sdk._scp_core"
