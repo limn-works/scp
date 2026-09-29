@@ -384,11 +384,10 @@ impl OwnedMlsCryptoState {
 
     /// Best-effort teardown of a born-but-never-seeded payload's secrets on a
     /// creation-rollback path (#2148 F6). A bare drop FREES the group's
-    /// in-memory `OpenMLS` storage but does NOT zeroize its epoch-secret bytes or
-    /// the Ed25519 signer (`OpenMLS` `SignatureKeyPair` implements no `Zeroize` —
-    /// `scp-mls` `EagerDropSigner` / issue #82); [`scp_mls::group::destroy_group`]
-    /// eagerly FREES the signer's `Vec<u8>` via `EagerDropSigner::take` (freed,
-    /// not overwritten — signer zeroization stays open upstream, #82). The
+    /// in-memory `OpenMLS` storage but does NOT zeroize its epoch-secret bytes;
+    /// the Ed25519 signer zeroizes on drop (`OpenMLS` `SignatureKeyPair` holds its
+    /// private key in `SecretVLBytes`), and [`scp_mls::group::destroy_group`]
+    /// drops it eagerly. The
     /// [`SenderKey`] zeroizes on its own `ZeroizeOnDrop` when the payload drops.
     pub(crate) fn dispose_secrets(&mut self) {
         let _ = scp_mls::group::destroy_group(&mut self.mls_group);
@@ -826,7 +825,7 @@ impl NodeMlsFactory {
             .map_err(|e| ContextError::InvalidKeyPackage(format!("validation failed: {e}")))?;
 
         // SECURITY (ADR-057 §Prereq-1): openmls's `validate` above runs its own
-        // internal `Lifetime::is_valid` against openmls's (wasm: unhardened)
+        // internal `Lifetime::validate` against openmls's (wasm: unhardened)
         // clock. This eager join gate is the accept-family sibling of
         // `ProductionMlsBackend::validate_key_package` — re-validate the accepted
         // `Lifetime` against the injected hardened clock and enforce the RFC 9420
@@ -1526,7 +1525,7 @@ mod tests {
         // `Lifetime` against the provider's injected hardened clock — mirroring
         // its accept-family sibling `ProductionMlsBackend::validate_key_package`
         // — so a KeyPackage that is temporally invalid under the SCP clock is
-        // rejected even though openmls's own internal `is_valid` (against the
+        // rejected even though openmls's own internal `validate` (against the
         // real system clock) accepts it.
 
         // Bob's KeyPackage is minted at the REAL present via `SystemClock`, so

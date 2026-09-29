@@ -747,10 +747,10 @@ pub(crate) fn apply_ttl_terminal_transition(
     //    `ContextCryptoState`. The load-bearing reason to call it here is that
     //    this is a LIVE-actor seam — the `PerContextState` is NOT dropped on an
     //    Ephemeral/Summary close, so the secrets must be released explicitly.
-    //    `dispose_secrets` runs OpenMLS `destroy_group` (eagerly FREEING the
-    //    Ed25519 signer — freed, NOT zeroized, since `SignatureKeyPair` implements
-    //    no `Zeroize`; scp-mls issue #82 — and freeing the group's in-memory
-    //    storage) and zeroizes the sender key material. SYNC (no `.await`), so
+    //    `dispose_secrets` runs OpenMLS `destroy_group` (eagerly dropping the
+    //    Ed25519 signer, whose private key zeroizes on drop because
+    //    `SignatureKeyPair` holds it in `SecretVLBytes`, and freeing the group's
+    //    in-memory storage) and zeroizes the sender key material. SYNC (no `.await`), so
     //    this whole phase runs outside any timeout.
     //
     //    #2199 / F-BH — COMPLETION vs PROVENANCE are SEPARATED here. The STEP
