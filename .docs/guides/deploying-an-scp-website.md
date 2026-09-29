@@ -19,8 +19,8 @@ run whose `storage_path` directory holds no identity, and its `Verify` step cann
 No build creates an identity without a test-harness stand-in until a production
 `PreRotationCustody` backend exists ([#1729](https://github.com/limn-works/scp/issues/1729)):
 a `testing` build mints it through `InMemoryPreRotationCustody`, which holds the
-pre-rotation key only in process memory, so spec §9.7.4.1 recovery from `#0` compromise is
-unreachable for that identity.
+pre-rotation key only in process memory, so the reveal that spec §9.7.4.1 item 4 says
+recovers a root compromise is unreachable for that identity.
 
 A shipped build that finds an identity in its `storage_path` directory reloads it and serves,
 without checking how it was created ([#2558](https://github.com/limn-works/scp/issues/2558)).

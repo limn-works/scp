@@ -21,8 +21,9 @@ nullifier-backed identity. The example's own doc comment quotes the error.
 A `testing` build is not a way to run it. `testing` mints the identity through
 `scp_platform::testing::InMemoryPreRotationCustody`, the test-harness
 pre-rotation stand-in, which holds the pre-rotation key only in process
-memory. The key is gone when the process exits, so spec §9.7.4.1 recovery from
-`#0` compromise is unreachable for that identity. The same
+memory. The key is gone when the process exits, so the reveal that spec
+§9.7.4.1 item 4 says recovers a root compromise is unreachable for that
+identity. The same
 feature also turns on `allow_unencrypted_storage` and the `scp-platform` and
 `scp-dht` test doubles.
 

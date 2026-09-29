@@ -12,9 +12,9 @@
 //!
 //! A `testing` build is not a way to run it: `testing` mints the identity
 //! through `scp_platform::testing::InMemoryPreRotationCustody`, which holds the
-//! pre-rotation key only in process memory, so spec §9.7.4.1 recovery from `#0`
-//! compromise is unreachable for that identity. `README.md` beside this file
-//! states the same limit.
+//! pre-rotation key only in process memory, so the reveal that spec §9.7.4.1
+//! item 4 says recovers a root compromise is unreachable for that identity.
+//! `README.md` beside this file states the same limit.
 //!
 //! `host_site` asks for `IdentitySource::Persisted`, which `Node::start`
 //! resolves by loading the stored identity or, when the directory holds none,
