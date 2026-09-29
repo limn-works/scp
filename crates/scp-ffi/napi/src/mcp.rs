@@ -135,18 +135,22 @@ pub(crate) struct McpServerEntry {
 pub(crate) struct McpClientEntry {
     /// Shared so a call clones it out of the registry and drops the shard
     /// guard before its network round trip; a disconnect or connect on the
-    /// same shard then never waits on a silent server.
-    pub(crate) client: Arc<Mutex<McpClient<McpClientTransportWrapper>>>,
-    /// A stdio client's server process, which the entry's `Drop` kills
-    /// directly, so every path that drops the entry (a disconnect, the
-    /// registry clear at instance shutdown, the instance's drop) stops the
-    /// server: an in-flight call's clone of `client` would otherwise keep the
-    /// process alive, and a blocking thread parked on its stdout, for as long
-    /// as the server stays silent. `None` for an SSE client: its POST read
+    /// same shard then never waits on a silent server. The lock is async: a
+    /// call takes it before it enters the blocking pool, so a call queued
+    /// behind one that a silent server stalls waits as a future and holds no
+    /// blocking thread, and a silent server holds at most one blocking thread
+    /// per handle.
+    pub(crate) client: Arc<tokio::sync::Mutex<McpClient<McpClientTransportWrapper>>>,
+    /// A stdio client's server process, which the entry's `Drop` stops
+    /// through [`stop_stdio_server`], so every path that drops the entry (a
+    /// disconnect, the registry clear at instance shutdown, the instance's
+    /// drop) stops the server: an in-flight call's clone of `client` would
+    /// otherwise keep the process alive, and a blocking thread parked on its
+    /// stdout, for as long as the server stays silent. `None` for an SSE client: its POST read
     /// has no timeout, and a disconnect has no handle that ends it, so a call
     /// in flight against a silent SSE server holds its blocking thread until
     /// the server answers or closes the connection.
-    pub(crate) stdio_server: Option<Arc<Mutex<std::process::Child>>>,
+    pub(crate) stdio_server: Option<Arc<Mutex<Option<std::process::Child>>>>,
 }
 
 impl Drop for McpClientEntry {
@@ -155,8 +159,28 @@ impl Drop for McpClientEntry {
         // once the entry drops, even while a call on the handle is in flight;
         // that call then fails on the closed stdout.
         if let Some(server) = &self.stdio_server {
-            scp_mcp::stdio::stop_server_process(server);
+            stop_stdio_server(server);
         }
+    }
+}
+
+/// Kills a stdio server's process group and reaps the server, once.
+///
+/// The server leaves its slot under the slot's lock, so a later call (the
+/// transport's [`Drop`] after the entry's) finds the slot empty and signals
+/// nothing. A second `stop_server_process` on the same reaped `Child` would
+/// not be safe: it decides whether to signal the group from a `waitid` on
+/// the raw pid, and once the server is reaped that pid can belong to another
+/// child of this process, such as a second stdio server leading its own
+/// group. The lock is held until the server is reaped, so a disconnect
+/// returns only after the server is gone even when the transport's drop runs
+/// concurrently.
+fn stop_stdio_server(slot: &Mutex<Option<std::process::Child>>) {
+    let mut slot = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(child) = slot.take() {
+        scp_mcp::stdio::stop_server_process(&Mutex::new(child));
     }
 }
 
@@ -217,8 +241,9 @@ impl McpTransport for McpClientTransportWrapper {
 /// Stdio MCP transport: communicates with a subprocess via stdin/stdout.
 pub(crate) struct StdioMcpTransport {
     /// The server process, apart from the pipes an in-flight call holds, so
-    /// a disconnect can stop it while a call waits on its stdout.
-    child: Arc<Mutex<std::process::Child>>,
+    /// a disconnect can stop it while a call waits on its stdout. `None` once
+    /// [`stop_stdio_server`] has stopped it.
+    child: Arc<Mutex<Option<std::process::Child>>>,
     inner: Mutex<StdioTransportInner>,
 }
 
@@ -276,13 +301,13 @@ impl StdioMcpTransport {
         let reader = BufReader::new(stdout);
 
         Ok(Self {
-            child: Arc::new(Mutex::new(child)),
+            child: Arc::new(Mutex::new(Some(child))),
             inner: Mutex::new(StdioTransportInner { stdin, reader }),
         })
     }
 
     /// The server process, for [`McpClientEntry::stdio_server`].
-    fn server_process(&self) -> Arc<Mutex<std::process::Child>> {
+    fn server_process(&self) -> Arc<Mutex<Option<std::process::Child>>> {
         Arc::clone(&self.child)
     }
 }
@@ -340,7 +365,7 @@ impl McpTransport for StdioMcpTransport {
 
 impl Drop for StdioMcpTransport {
     fn drop(&mut self) {
-        scp_mcp::stdio::stop_server_process(&self.child);
+        stop_stdio_server(&self.child);
     }
 }
 
@@ -945,7 +970,7 @@ pub(crate) async fn mcp_client_connect_stdio_on(
 
     let handle_id = mcp_handle_id("mcp-client");
     let entry = McpClientEntry {
-        client: Arc::new(Mutex::new(client)),
+        client: Arc::new(tokio::sync::Mutex::new(client)),
         stdio_server: Some(server),
     };
 
@@ -987,7 +1012,7 @@ pub(crate) async fn mcp_client_connect_sse_on(
 
     let handle_id = mcp_handle_id("mcp-client");
     let entry = McpClientEntry {
-        client: Arc::new(Mutex::new(client)),
+        client: Arc::new(tokio::sync::Mutex::new(client)),
         stdio_server: None,
     };
 
@@ -1027,7 +1052,9 @@ pub(crate) async fn mcp_client_list_tools_on(
 ) -> napi::Result<Vec<NapiMcpToolInfo>> {
     crate::napi_check_handle!(&bi.core, handle);
     // Clone the client out so the shard guard drops before the I/O, and the
-    // call holds neither the registry nor its entry.
+    // call holds neither the registry nor its entry. The client's lock is
+    // taken before the call enters the blocking pool (see
+    // `McpClientEntry::client`).
     let client = bi
         .mcp_client_registry()
         .get(&handle.handle_id)
@@ -1036,11 +1063,8 @@ pub(crate) async fn mcp_client_list_tools_on(
             message: format!("MCP client handle '{}' not found", handle.handle_id),
             code: codes::TRANS_5020.to_owned(),
         })?;
+    let client_guard = client.lock_owned().await;
     let outlets = run_mcp_client_io(codes::TRANS_5022, move || {
-        let client_guard = client.lock().map_err(|e| ScpNapiError::Transport {
-            message: format!("client lock poisoned: {e}"),
-            code: codes::TRANS_5021.to_owned(),
-        })?;
         client_guard
             .list_tools()
             .map_err(|e| ScpNapiError::Transport {
@@ -1072,7 +1096,9 @@ pub(crate) async fn mcp_client_invoke_on(
 ) -> napi::Result<NapiMcpInvokeResult> {
     crate::napi_check_handle!(&bi.core, handle);
     // Clone the client out so the shard guard drops before the I/O, and the
-    // call holds neither the registry nor its entry.
+    // call holds neither the registry nor its entry. The client's lock is
+    // taken before the call enters the blocking pool (see
+    // `McpClientEntry::client`).
     let client = bi
         .mcp_client_registry()
         .get(&handle.handle_id)
@@ -1081,16 +1107,13 @@ pub(crate) async fn mcp_client_invoke_on(
             message: format!("MCP client handle '{}' not found", handle.handle_id),
             code: codes::TRANS_5023.to_owned(),
         })?;
-    let result = run_mcp_client_io(codes::TRANS_5025, move || {
-        let input: serde_json::Value =
-            serde_json::from_str(&input_json).map_err(|e| ScpNapiError::Transport {
-                message: format!("invalid input JSON: {e}"),
-                code: codes::VALID_7021.to_owned(),
-            })?;
-        let client_guard = client.lock().map_err(|e| ScpNapiError::Transport {
-            message: format!("client lock poisoned: {e}"),
-            code: codes::TRANS_5024.to_owned(),
+    let input: serde_json::Value =
+        serde_json::from_str(&input_json).map_err(|e| ScpNapiError::Transport {
+            message: format!("invalid input JSON: {e}"),
+            code: codes::VALID_7021.to_owned(),
         })?;
+    let client_guard = client.lock_owned().await;
+    let result = run_mcp_client_io(codes::TRANS_5025, move || {
         client_guard
             .invoke(&outlet_name, input, &context_id, &invoker_did)
             .map_err(|e| ScpNapiError::Transport {
@@ -1395,7 +1418,7 @@ mod tests {
         bi.mcp_client_registry().insert(
             handle_id.clone(),
             McpClientEntry {
-                client: Arc::new(Mutex::new(client)),
+                client: Arc::new(tokio::sync::Mutex::new(client)),
                 stdio_server: Some(Arc::clone(&server)),
             },
         );
@@ -1433,7 +1456,7 @@ mod tests {
         if joined.is_err() {
             // Stop the stub, and do not let the runtime's drop wait on the
             // parked blocking thread for the whole sleep.
-            scp_mcp::stdio::stop_server_process(&server);
+            stop_stdio_server(&server);
             runtime.shutdown_background();
         }
         let (listed, teardown_took) =
@@ -1443,18 +1466,144 @@ mod tests {
             "the teardown waited {teardown_took:?} on the in-flight call"
         );
         assert!(
-            server
-                .lock()
-                .expect("server lock")
-                .try_wait()
-                .expect("query the server process")
-                .is_some(),
-            "the teardown must kill the stdio server process"
+            server.lock().expect("server lock").is_none(),
+            "the teardown must stop the stdio server process and empty its slot"
         );
         assert!(
             listed.is_err(),
             "the killed stub server sent no tools/list response"
         );
+    }
+
+    /// A call queued behind one that a silent server stalls waits on the
+    /// handle's async lock as a future and holds no blocking thread, so a
+    /// silent server holds at most one blocking thread per handle however
+    /// many calls queue on it. The runtime has two blocking threads: the
+    /// stalled call holds one, and a probe `spawn_blocking` must still run
+    /// while a second call waits behind the first. Were the second call to
+    /// wait on its lock inside the blocking pool, the probe would find the
+    /// pool full and time out.
+    #[test]
+    fn a_queued_mcp_client_call_holds_no_blocking_thread_napi() {
+        let bi = NapiBridgeInstance::new_napi();
+        let mut allowlist = scp_mcp::allowlist::StdioAllowlist::new_with_defaults();
+        allowlist.configure(&["sh"]).expect("allow sh");
+        let allowlist = Mutex::new(allowlist);
+        let script = "read l; \
+            echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\
+            \"capabilities\":{},\"serverInfo\":{\"name\":\"stub\"}}}'; \
+            sleep 30 & wait";
+        let transport = StdioMcpTransport::spawn(
+            &allowlist,
+            &["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+        )
+        .expect("spawn stub server");
+        let server = transport.server_process();
+        let mut client = McpClient::new(McpClientTransportWrapper::Stdio(transport));
+        client.initialize().expect("initialize the stub server");
+        let handle_id = mcp_handle_id("mcp-client");
+        bi.mcp_client_registry().insert(
+            handle_id.clone(),
+            McpClientEntry {
+                client: Arc::new(tokio::sync::Mutex::new(client)),
+                stdio_server: Some(Arc::clone(&server)),
+            },
+        );
+        crate::increment_handle_count();
+        let handle = NapiMcpClientHandle {
+            handle_id,
+            instance_id: bi.instance_id(),
+        };
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let short = std::time::Duration::from_millis(300);
+        // The timeout is built inside `block_on`, because its timer needs the
+        // runtime's reactor.
+        let joined = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(
+                    mcp_client_list_tools_on(&bi, &handle),
+                    async {
+                        tokio::time::sleep(short).await;
+                        mcp_client_list_tools_on(&bi, &handle).await
+                    },
+                    async {
+                        tokio::time::sleep(short * 2).await;
+                        let probe = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            tokio::task::spawn_blocking(|| ()),
+                        )
+                        .await;
+                        mcp_client_disconnect_on(&bi, &handle)
+                            .await
+                            .expect("disconnect a known handle");
+                        probe
+                    }
+                )
+            })
+            .await
+        });
+        if joined.is_err() {
+            // Stop the stub, and do not let the runtime's drop wait on the
+            // parked blocking thread for the whole sleep.
+            stop_stdio_server(&server);
+            runtime.shutdown_background();
+        }
+        let (first, second, probe) =
+            joined.expect("both calls must end once disconnect kills the server");
+        assert!(
+            matches!(probe, Ok(Ok(()))),
+            "a blocking task must run while a call waits behind a stalled one"
+        );
+        assert!(
+            first.is_err(),
+            "the killed stub server sent no tools/list response"
+        );
+        assert!(
+            second.is_err(),
+            "the second call ran after the server was killed"
+        );
+    }
+
+    /// `stop_stdio_server` reaps the server and empties its slot, so the
+    /// second stop that the entry's drop followed by the transport's drop
+    /// makes finds no `Child` and never runs `stop_server_process` on a
+    /// reaped one, whose raw pid may by then name another group-leading
+    /// child. Pid reuse cannot be forced in a test, so the test checks that
+    /// the server is gone and its slot empty, which is what keeps the second
+    /// stop from signalling.
+    #[cfg(unix)]
+    #[test]
+    fn stop_stdio_server_reaps_the_server_and_empties_its_slot_napi() {
+        let mut command = Command::new("sleep");
+        command.arg("600");
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = command.spawn().expect("spawn group leader");
+        let pid = child.id().to_string();
+        let slot = Mutex::new(Some(child));
+        stop_stdio_server(&slot);
+        assert!(
+            slot.lock().expect("slot lock").is_none(),
+            "the first stop must empty the server's slot"
+        );
+        // `kill -0` succeeds on a live or unreaped process, and fails once
+        // the server is reaped.
+        let probe = Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .expect("run kill -0");
+        assert!(
+            !probe.success(),
+            "the first stop must kill and reap the server"
+        );
+        stop_stdio_server(&slot);
+        assert!(slot.lock().expect("slot lock").is_none());
     }
 
     /// WU6: Two-instance regression test — disabling enforcement via the
