@@ -6,7 +6,7 @@
 //! ([`PseudonymKeypair::routing_id`]). Relays see only pseudonyms — never real
 //! DIDs — so they cannot link activity across contexts.
 //!
-//! # Derivation (v1 — epoch 0)
+//! # Derivation (v1, static, no epoch)
 //!
 //! 1. `seed = HMAC-SHA256(identity_key_material, context_id || "scp-pseudonym")`
 //! 2. `d = (int(HKDF-Expand-SHA256(seed, "SCP-PSEUDONYM-P256-V1", 48)) mod (n − 1)) + 1`;
@@ -14,7 +14,7 @@
 //!
 //! Here `identity_key_material` is the private-derived `pseudonym_secret` (HKDF-SHA256 over the identity private key bytes; spec §9.10.4.A), NEVER the public key.
 //!
-//! # Rotatable derivation (v2 — epoch > 0)
+//! # Rotatable derivation (v2, every rotation epoch, epoch 0 included)
 //!
 //! To mitigate relay-side pseudonym correlation (BLACK-001), pseudonyms can
 //! be rotated by including a rotation epoch in the HMAC input:
