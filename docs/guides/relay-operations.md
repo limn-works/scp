@@ -384,13 +384,21 @@ pub struct CertificateData {
 
 ### Self-signed (development)
 
-For development, set `SCP_NODE_TLS_SELF_SIGNED=1`:
+For development, set `SCP_NODE_TLS_SELF_SIGNED=1` on the ephemeral test-harness
+binary from section 6, Development deployment:
 
 ```bash
+# A shipped full node logs "no production pre-rotation custody backend available" and exits 1
+# (see section 6), so this recipe uses a --features testing build in ephemeral mode.
 SCP_NODE_DOMAIN=localhost \
 SCP_NODE_TLS_SELF_SIGNED=1 \
-scp-node
+cargo run -p scp-node --features testing -- --ephemeral
 ```
+
+Do not drop `--ephemeral` from this command: a `--features testing` full node with
+`SCP_NODE_DHT_MODE` unset publishes the host's address to the global Mainline DHT, even
+under `SCP_NODE_DOMAIN=localhost`. Set `SCP_NODE_DHT_MODE=memory` when you need the
+persistent full node instead.
 
 This generates a self-signed certificate for the configured domain. Not suitable for production -- clients will reject the certificate unless they disable verification.
 
@@ -459,8 +467,8 @@ Both binaries use the `tracing` crate with configurable output:
 Log levels are controlled by `RUST_LOG` (takes precedence) or `SCP_RELAY_LOG_LEVEL`:
 
 ```bash
-# Module-level filtering
-RUST_LOG=scp_transport::native::server=debug,scp_node=info scp-node
+# Module-level filtering, on relay-only mode because a shipped full node exits 1 (see section 6)
+RUST_LOG=scp_transport::native::server=debug,scp_node=info scp-node --relay-only
 
 # Simple level override
 SCP_RELAY_LOG_LEVEL=warn scp-relay
