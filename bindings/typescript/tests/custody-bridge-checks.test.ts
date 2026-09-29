@@ -361,6 +361,10 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     let duringHostDestroy: Promise<Buffer> | undefined;
     store.destroyProbe = (keyId) => {
       duringHostDestroy = custody.sign(keyId, short);
+      // Marks it handled now: its rejection can land before `rejectionOf`
+      // attaches, which bun would report as unhandled. `rejectionOf` still
+      // reads the rejection from the same promise.
+      duringHostDestroy.catch(() => undefined);
     };
     await custody.destroyKey(pseudonym.keyId);
     expect(duringHostDestroy).toBeDefined();
