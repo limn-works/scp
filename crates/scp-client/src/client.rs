@@ -44,6 +44,7 @@ use scp_protocol::context::pseudonym::{
     PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement, PseudonymAnnouncementDecision,
     classify_pseudonym_announcement, is_pseudonym_announcement_payload,
 };
+use scp_protocol::crypto::hpke::p256::validate_uncompressed_point;
 use scp_protocol::crypto::sender_keys::generate_wrapping_keypair;
 use scp_protocol::envelope::outer::{
     DEFAULT_APP_DATA_BLOB_TTL_SECS, OuterEnvelope, create_outer_envelope,
@@ -76,8 +77,8 @@ struct PendingJoin {
     /// The stable wrapping public key embedded in this join's published
     /// `KeyPackage` leaf (§9.16.1). Adopted into the joined context's crypto state
     /// so the key peers HPKE-seal sender keys to matches the one this member can
-    /// HPKE-open with.
-    wrapping_public: [u8; 32],
+    /// HPKE-open with. A 65-byte uncompressed DHKEM(P-256) point (§9.5).
+    wrapping_public: [u8; 65],
     /// The matching wrapping secret. Zeroized on drop.
     wrapping_secret: Zeroizing<[u8; 32]>,
 }
@@ -94,9 +95,13 @@ struct PendingJoin {
 struct PersistedPendingJoin {
     /// The `scp-mls` `serialize_pending_join` blob (provider + signer + bindings).
     mls_blob: Vec<u8>,
-    /// The published wrapping public key.
-    wrapping_public: [u8; 32],
-    /// The matching wrapping secret. Zeroized after reconstruction.
+    /// The published wrapping public key: a 65-byte uncompressed DHKEM(P-256)
+    /// point (§9.5). Decoding rejects any other length; restore checks it
+    /// against the secret.
+    #[serde(with = "scp_protocol::serde_util::serde_pubkey_65")]
+    wrapping_public: [u8; 65],
+    /// The matching 32-byte P-256 wrapping scalar. Zeroized after
+    /// reconstruction.
     wrapping_secret: [u8; 32],
 }
 
@@ -142,7 +147,7 @@ pub struct AddMemberOutput {
     /// sender-key distribution INVARIANT 1) so it can HPKE-seal its sender key to
     /// every existing member. This replaces a bare member-DID list: the DIDs are
     /// the directory keys, so there is no parallel collection to drift.
-    pub wrapping_keys: Vec<(String, [u8; 32])>,
+    pub wrapping_keys: Vec<(String, [u8; 65])>,
     /// The adder's own §9.16 sender key, HPKE-sealed to the new joiner (one
     /// distribution). The adder is the committer, so no bystander mirrors this add
     /// for it — the adder must seal to the joiner itself, or the joiner would never
@@ -415,15 +420,8 @@ impl ScpClient {
         // extension, and seed the crypto state with the matching secret so peers
         // can HPKE-seal sender keys to it. ADR-057 §Prereq-1: the creator's own MLS
         // leaf `Lifetime` is stamped from the hardened driver clock.
+        // The secret arrives in `Zeroizing` and moves into the crypto state.
         let (wrapping_public, wrapping_secret) = generate_wrapping_keypair();
-        // Wrap the transient secret in `Zeroizing` so this binding's copy is
-        // wiped when it drops. `[u8; 32]` is `Copy`, so this cannot wipe every
-        // transient copy the value takes (the crypto state holds its own live
-        // copy in a `Zeroizing` field via `from_group_with_wrapping`); the
-        // wrapping secret has a long-lived home in the crypto state and the
-        // persisted snapshot by design, so best-effort transient hygiene here is
-        // defense-in-depth, not the primary guarantee.
-        let wrapping_secret = Zeroizing::new(wrapping_secret);
         let mls_group = create_group_with_wrapping_key(
             &credential,
             Some(&wrapping_public),
@@ -433,7 +431,7 @@ impl ScpClient {
             context_id,
             mls_group,
             wrapping_public,
-            *wrapping_secret,
+            wrapping_secret,
         );
         let creator_did = self.signer.did().to_owned();
         let mut state = PerContextState::new(context_id, &creator_did, crypto);
@@ -488,12 +486,9 @@ impl ScpClient {
         // secret is retained (and persisted below) so the joined context opens with
         // the SAME key. ADR-057 §Prereq-1: the KeyPackage `Lifetime` is stamped
         // from the hardened driver clock.
+        // The secret arrives in `Zeroizing`; the persisted blob copies it (and
+        // zeroizes on drop) and the retained `PendingJoin` takes it.
         let (wrapping_public, wrapping_secret) = generate_wrapping_keypair();
-        // Wrap the transient secret in `Zeroizing` so this binding's copy is
-        // wiped on drop (best-effort — `[u8; 32]` is `Copy`, so downstream
-        // holders take their own copies); the persisted blob and the retained `PendingJoin` each take
-        // their own copy from it below.
-        let wrapping_secret = Zeroizing::new(wrapping_secret);
         let (bundle, signer, provider): (KeyPackageBundle, _, InMemoryMlsProvider) =
             generate_key_package_with_wrapping_key(
                 &credential,
@@ -541,7 +536,7 @@ impl ScpClient {
                 signer,
                 provider,
                 wrapping_public,
-                wrapping_secret: Zeroizing::new(*wrapping_secret),
+                wrapping_secret,
             },
         );
 
@@ -696,10 +691,23 @@ impl ScpClient {
         context_id: &str,
         welcome_bytes: &[u8],
         prior_event_log: &[Event],
-        wrapping_keys: &[(String, [u8; 32])],
+        wrapping_keys: &[(String, [u8; 65])],
     ) -> Result<Vec<SenderKeyDistribution>, ClientError> {
         if self.contexts.contains_key(context_id) {
             return Err(ClientError::ContextAlreadyExists(context_id.to_owned()));
+        }
+        // §9.5: the transported directory is untrusted input; every key must be a
+        // valid uncompressed P-256 point before it enters the member set. Checked
+        // before the pending material is consumed, so a bad directory leaves the
+        // join retryable in-tab.
+        for (member_did, member_wrapping_key) in wrapping_keys {
+            validate_uncompressed_point(member_wrapping_key).map_err(|e| {
+                ClientError::SenderKey(
+                    scp_protocol::crypto::sender_keys::SenderKeyError::MalformedWrappingPublicKey(
+                        format!("directory key for '{member_did}': {e}"),
+                    ),
+                )
+            })?;
         }
         // CONTRACT — pending join material is single-use PER ATTEMPT (consume, not
         // preserve-on-failure). The in-memory pending is removed HERE, *before* the
@@ -729,8 +737,7 @@ impl ScpClient {
         // Adopt the wrapping keypair this join published in its KeyPackage leaf, so
         // the joined context HPKE-opens distributions with the SAME key peers
         // sealed to (read before `pending`'s MLS material is moved into the join).
-        // Held in `Zeroizing` so the stack copy is wiped on scope exit; the crypto
-        // state re-wraps its own copy in `Zeroizing` (`from_group_with_wrapping`).
+        // Held in `Zeroizing` and moved into the crypto state.
         let wrapping_public = pending.wrapping_public;
         let wrapping_secret = Zeroizing::new(*pending.wrapping_secret);
 
@@ -742,7 +749,7 @@ impl ScpClient {
             context_id,
             mls_group,
             wrapping_public,
-            *wrapping_secret,
+            wrapping_secret,
         );
         let self_did = self.signer.did().to_owned();
 
@@ -1890,6 +1897,15 @@ impl ScpClient {
                      '{bound_context_id}'"
                 )));
             }
+            // §9.5: the persisted wrapping secret must be a valid P-256 scalar whose
+            // public key is exactly the persisted point, or the completed join would
+            // open with a key no peer seals to. Fail closed.
+            scp_crypto::p256::check_keypair(&persisted.wrapping_secret, &persisted.wrapping_public)
+                .map_err(|e| {
+                    ClientError::StorageCorrupt(format!(
+                        "pending join under key '{key}' carries an invalid wrapping keypair: {e}"
+                    ))
+                })?;
             staged_pending.push((
                 context_id,
                 PendingJoin {

@@ -6,8 +6,9 @@
 //! opening go through the shared [`scp_protocol::crypto::hpke`] core.
 //!
 //! Protocol flow:
-//! 1. New member sends [`AccessKeyRequest`] with ephemeral X25519 wrapping
-//!    pubkey, signature, nonce, and timestamp for replay protection.
+//! 1. New member sends [`AccessKeyRequest`] with an ephemeral DHKEM(P-256)
+//!    wrapping pubkey (65-byte uncompressed point), signature, nonce, and
+//!    timestamp for replay protection.
 //! 2. Key holder verifies the request and HPKE-seals the access key.
 //! 3. Key holder responds with [`AccessKeyResponse`] containing the sealed
 //!    ciphertext (`ct`) and the HPKE encapsulated key (`enc`).
@@ -24,7 +25,7 @@ use scp_clock::Clock;
 use scp_platform::traits::{KeyCustody, KeyHandle, KeyType};
 
 use scp_protocol::crypto::access_keys::{AccessKey, AccessKeyError};
-use scp_protocol::crypto::hpke;
+use scp_protocol::crypto::hpke::p256 as hpke;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -64,14 +65,15 @@ const REQUEST_MAX_FUTURE_SECS: u64 = 30;
 /// Request for a member's access key.
 ///
 /// Sent to the key holder (context creator or `AddMember` executor).
-/// The requester includes a fresh X25519 wrapping public key so the
+/// The requester includes a fresh DHKEM(P-256) wrapping public key so the
 /// responder can HPKE-encrypt the access key material.
 ///
 /// Contains a timestamp and cryptographic nonce for replay protection.
 /// The responder rejects requests older than 300 seconds or more than 30
 /// seconds in the future, and deduplicates by nonce within the window.
 ///
-/// Signature payload: `SHA-256("SCP-ACCESS-KEY-REQUEST-V1:" || context_id || requester_did || nonce || timestamp_BE || wrapping_pubkey)`.
+/// Signature payload: `SHA-256("SCP-ACCESS-KEY-REQUEST-V1:" || BE32(len(context_id)) || context_id || BE32(len(requester_did)) || requester_did || timestamp_BE || wrapping_pubkey || nonce)`,
+/// the §9.5.2 `AccessKeyRequest` field table.
 ///
 /// See spec §9.17.1 and §9.5.2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,7 +82,9 @@ pub struct AccessKeyRequest {
     pub requester_did: String,
     /// The context the access key belongs to.
     pub context_id: String,
-    /// Fresh X25519 public key for HPKE wrapping (32 bytes).
+    /// Fresh DHKEM(P-256) public key for HPKE wrapping: the 65-byte
+    /// uncompressed SEC1 point (RFC 9180 §7.1.1). Kept as bytes on the wire;
+    /// the responder validates it (§9.5) before hashing or sealing.
     #[serde(with = "serde_bytes")]
     pub wrapping_pubkey: Vec<u8>,
     /// Cryptographic nonce for replay protection (16 bytes, CSPRNG).
@@ -96,7 +100,7 @@ pub struct AccessKeyRequest {
 /// Response containing HPKE-encrypted access key material.
 ///
 /// Sent back to the requester. The access key is sealed with RFC 9180 HPKE
-/// Base mode (DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / AES-128-GCM) under
+/// Base mode (DHKEM(P-256, HKDF-SHA256) / HKDF-SHA256 / AES-128-GCM) under
 /// the `"scp-access-key-v1"` domain separator. The AEAD nonce is internal per
 /// RFC 9180 — there is no external nonce on the wire.
 ///
@@ -114,18 +118,19 @@ pub struct AccessKeyResponse {
     /// cannot allocate an arbitrarily large buffer from malicious input.
     #[serde(with = "scp_protocol::serde_util::serde_hpke_sealed_48")]
     pub hpke_sealed_key: [u8; 48],
-    /// HPKE encapsulated key (`enc`, the 32-byte ephemeral X25519 public key).
+    /// HPKE encapsulated key (`enc`, the 65-byte uncompressed ephemeral P-256
+    /// public key). Validated (§9.5) before any key agreement on open.
     #[serde(with = "serde_bytes")]
     pub ephemeral_pubkey: Vec<u8>,
 }
 
 /// Result of [`request_access_key`], containing the serialized request
-/// message and the X25519 wrapping key handle for later HPKE decryption.
+/// message and the DHKEM(P-256) wrapping key handle for later HPKE decryption.
 #[derive(Debug)]
 pub struct AccessKeyRequestResult {
     /// The serialized [`AccessKeyRequest`] message to send.
     pub request_message: Vec<u8>,
-    /// The X25519 private key handle used for HPKE wrapping. The caller
+    /// The [`KeyType::HpkeP256`] key handle used for HPKE wrapping. The caller
     /// retains this to decrypt the eventual [`AccessKeyResponse`].
     pub wrapping_key_handle: KeyHandle,
 }
@@ -134,8 +139,8 @@ pub struct AccessKeyRequestResult {
 // Request construction (requester side)
 // ---------------------------------------------------------------------------
 
-/// Constructs a signed [`AccessKeyRequest`] with a fresh ephemeral X25519
-/// wrapping keypair and serializes it for transmission.
+/// Constructs a signed [`AccessKeyRequest`] with a fresh ephemeral
+/// DHKEM(P-256) wrapping keypair and serializes it for transmission.
 ///
 /// The requester signs the request with their signing key (Active or Agent).
 /// The wrapping key handle is returned so the caller can later decrypt
@@ -145,6 +150,8 @@ pub struct AccessKeyRequestResult {
 ///
 /// Returns [`AccessKeyError::Custody`] if key generation, the public-key
 /// lookup or signing fails in custody.
+/// Returns [`AccessKeyError::MalformedWrappingPublicKey`] if custody returns a
+/// wrapping public key that is not a valid 65-byte uncompressed P-256 point.
 /// Returns [`AccessKeyError::SerializationFailed`] if serialization fails.
 pub async fn request_access_key(
     key_custody: &impl KeyCustody,
@@ -153,9 +160,9 @@ pub async fn request_access_key(
     context_id: &str,
     clock: &dyn Clock,
 ) -> Result<AccessKeyRequestResult, AccessKeyError> {
-    // Generate fresh X25519 wrapping keypair.
+    // Generate a fresh DHKEM(P-256) wrapping keypair inside custody.
     let wrapping_key_handle = key_custody
-        .generate_keypair(KeyType::X25519)
+        .generate_keypair(KeyType::HpkeP256)
         .await
         .map_err(|e| AccessKeyError::Custody(e.into()))?;
 
@@ -163,6 +170,8 @@ pub async fn request_access_key(
         .public_key(&wrapping_key_handle)
         .await
         .map_err(|e| AccessKeyError::Custody(e.into()))?;
+    let wrapping_pubkey = hpke::validate_uncompressed_point(wrapping_pubkey.as_bytes())
+        .map_err(|e| AccessKeyError::MalformedWrappingPublicKey(e.to_string()))?;
 
     let timestamp = clock.now_secs();
 
@@ -174,9 +183,9 @@ pub async fn request_access_key(
     let hash = compute_request_hash(
         context_id,
         requester_did,
-        &nonce,
         timestamp,
-        wrapping_pubkey.as_bytes(),
+        &wrapping_pubkey,
+        &nonce,
     )?;
 
     let signature = key_custody
@@ -187,7 +196,7 @@ pub async fn request_access_key(
     let request = AccessKeyRequest {
         requester_did: requester_did.to_owned(),
         context_id: context_id.to_owned(),
-        wrapping_pubkey: wrapping_pubkey.into_bytes(),
+        wrapping_pubkey: wrapping_pubkey.to_vec(),
         nonce,
         timestamp,
         signature: signature.into_bytes(),
@@ -210,21 +219,33 @@ pub async fn request_access_key(
 ///
 /// # Errors
 ///
-/// Returns [`AccessKeyError::VerificationFailed`] if the public key or
-/// signature bytes are malformed. Returns `Ok(false)` if the signature is
-/// well-formed but invalid.
+/// Returns [`AccessKeyError::VerificationFailed`] if the request's wrapping
+/// public key is not a valid 65-byte uncompressed P-256 point (§9.5), or if
+/// the signing public key or signature bytes are malformed. Returns
+/// `Ok(false)` if the signature is well-formed but invalid.
 pub fn verify_access_key_request(
     request: &AccessKeyRequest,
     requester_public_key: &[u8],
 ) -> Result<bool, AccessKeyError> {
+    let wrapping_pubkey = parse_wrapping_pubkey(request)?;
     let hash = compute_request_hash(
         &request.context_id,
         &request.requester_did,
-        &request.nonce,
         request.timestamp,
-        &request.wrapping_pubkey,
+        &wrapping_pubkey,
+        &request.nonce,
     )?;
     verify_ed25519_signature(requester_public_key, &hash, &request.signature)
+}
+
+/// §9.5 point validation of the requester's wire wrapping key: the one parse
+/// both the signature check and the seal read, so neither hashes nor seals to
+/// an unvalidated key.
+fn parse_wrapping_pubkey(
+    request: &AccessKeyRequest,
+) -> Result<[u8; hpke::PUBLIC_KEY_LEN], AccessKeyError> {
+    hpke::validate_uncompressed_point(&request.wrapping_pubkey)
+        .map_err(|e| AccessKeyError::VerificationFailed(format!("invalid wrapping pubkey: {e}")))
 }
 
 /// Validates that an [`AccessKeyRequest`] timestamp is within the
@@ -261,7 +282,7 @@ pub const fn validate_request_freshness(
 ///
 /// # HPKE Assembly
 ///
-/// 1. Generate ephemeral X25519 keypair.
+/// 1. Generate an ephemeral P-256 keypair (DHKEM(P-256) Encap).
 /// 2. ECDH between ephemeral secret and requester's wrapping pubkey.
 /// 3. HKDF-SHA256 with info = `"scp-access-key-v1" || BE32(len(context_id)) || context_id || BE32(len(member_did)) || member_did || epoch_bytes`
 ///    to derive a 16-byte AES-128-GCM encryption key.
@@ -271,7 +292,8 @@ pub const fn validate_request_freshness(
 /// # Errors
 ///
 /// Returns [`AccessKeyError::VerificationFailed`] if the request signature
-/// is invalid or malformed.
+/// is invalid or malformed, or its wrapping public key is not a valid
+/// 65-byte uncompressed P-256 point.
 /// Returns [`AccessKeyError::StaleRequest`] if the request is too old or
 /// too far in the future.
 /// Returns [`AccessKeyError::ReplayedNonce`] if the request nonce has been
@@ -300,13 +322,9 @@ pub fn handle_access_key_request(
         return Err(AccessKeyError::ReplayedNonce);
     }
 
-    // Parse the requester's wrapping public key.
-    let wrapping_bytes: [u8; 32] = request.wrapping_pubkey.as_slice().try_into().map_err(|_| {
-        AccessKeyError::VerificationFailed(format!(
-            "wrapping pubkey must be 32 bytes, got {}",
-            request.wrapping_pubkey.len()
-        ))
-    })?;
+    // Parse the requester's wrapping public key (the signature check above
+    // validated the same bytes; the typed result is what the seal takes).
+    let wrapping_bytes = parse_wrapping_pubkey(request)?;
 
     // HPKE seal with access-key-specific info string and AAD binding
     // (RFC 9180 Base mode via the shared hpke core).
@@ -366,30 +384,26 @@ pub fn handle_access_key_request(
 ///
 /// # Errors
 ///
+/// Returns [`AccessKeyError::HpkeDecryptionFailed`] if `enc` is not a valid
+/// 65-byte uncompressed P-256 point (checked before any key agreement), if
+/// HPKE open fails, or if the recovered plaintext is not exactly 32 bytes.
 /// Returns [`AccessKeyError::Custody`] if the DH agreement or public-key
-/// lookup fails in custody, and [`AccessKeyError::MalformedWrappingPublicKey`] if the
-/// custody returns a wrapping public key that is not 32 bytes. Returns [`AccessKeyError::HpkeDecryptionFailed`]
-/// if HPKE open fails or the recovered plaintext is not exactly 32 bytes.
+/// lookup fails in custody, and [`AccessKeyError::MalformedWrappingPublicKey`]
+/// if custody returns a wrapping public key that is not 65 bytes.
 pub async fn open_access_key_response(
     key_custody: &impl KeyCustody,
     wrapping_key_handle: &KeyHandle,
     response: &AccessKeyResponse,
 ) -> Result<AccessKey, AccessKeyError> {
-    let enc: [u8; 32] = response
-        .ephemeral_pubkey
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            AccessKeyError::HpkeDecryptionFailed(format!(
-                "ephemeral pubkey must be 32 bytes, got {}",
-                response.ephemeral_pubkey.len()
-            ))
-        })?;
+    // C16 order: validate `enc` (§9.5) before any key agreement, agree on the
+    // validated bytes, fetch pkRm for the same handle, then open.
+    let enc = hpke::validate_enc(&response.ephemeral_pubkey)
+        .map_err(|e| AccessKeyError::HpkeDecryptionFailed(e.to_string()))?;
 
     // Compute the KEM DH output inside the custody boundary (same handle,
     // same enc — the only sound inputs to open_with_external_dh).
     let dh = key_custody
-        .dh_agree(wrapping_key_handle, &enc)
+        .dh_agree(wrapping_key_handle, enc.as_bytes())
         .await
         .map_err(|e| AccessKeyError::Custody(e.into()))?;
     let dh_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*dh.as_bytes());
@@ -399,10 +413,12 @@ pub async fn open_access_key_response(
         .public_key(wrapping_key_handle)
         .await
         .map_err(|e| AccessKeyError::Custody(e.into()))?;
-    let pk_rm_bytes: [u8; 32] = pk_rm.as_bytes().try_into().map_err(|_| {
-        AccessKeyError::MalformedWrappingPublicKey(
-            "wrapping public key must be 32 bytes".to_owned(),
-        )
+    let pk_rm_bytes: [u8; hpke::PUBLIC_KEY_LEN] = pk_rm.as_bytes().try_into().map_err(|_| {
+        AccessKeyError::MalformedWrappingPublicKey(format!(
+            "wrapping public key must be {} bytes, got {}",
+            hpke::PUBLIC_KEY_LEN,
+            pk_rm.as_bytes().len()
+        ))
     })?;
 
     // Build context-bound info and AAD (§9.17.1).
@@ -495,17 +511,19 @@ fn build_hpke_aad(context_id: &str, member_did: &str, epoch: u64) -> Vec<u8> {
 
 /// Computes the canonical hash for an `AccessKeyRequest`.
 ///
-/// Uses the canonical hash construction from §9.5.2:
-/// `SHA-256("SCP-ACCESS-KEY-REQUEST-V1:" || context_id || requester_did || nonce || timestamp_BE || wrapping_pubkey)`
+/// Uses the canonical hash construction and the `AccessKeyRequest` field
+/// table of §9.5.2, in its order:
+/// `SHA-256("SCP-ACCESS-KEY-REQUEST-V1:" || BE32(len(context_id)) || context_id || BE32(len(requester_did)) || requester_did || timestamp_BE || wrapping_pubkey || nonce)`
 ///
-/// The nonce is fixed-size (`ACCESS_KEY_NONCE_SIZE` = 16 bytes) and
-/// needs no length prefix.
+/// `wrapping_pubkey` (65 bytes, a validated DHKEM(P-256) point) and the nonce
+/// (`ACCESS_KEY_NONCE_SIZE` = 16 bytes) are fixed-width and carry no length
+/// prefix; the array types make that width a compile-time fact.
 fn compute_request_hash(
     context_id: &str,
     requester_did: &str,
-    nonce: &[u8; ACCESS_KEY_NONCE_SIZE],
     timestamp: u64,
-    wrapping_pubkey: &[u8],
+    wrapping_pubkey: &[u8; hpke::PUBLIC_KEY_LEN],
+    nonce: &[u8; ACCESS_KEY_NONCE_SIZE],
 ) -> Result<Vec<u8>, AccessKeyError> {
     use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
 
@@ -514,9 +532,9 @@ fn compute_request_hash(
         &[
             CanonicalField::VarBytes(context_id.as_bytes()),
             CanonicalField::VarBytes(requester_did.as_bytes()),
-            CanonicalField::RawBytes(nonce),
             CanonicalField::U64(timestamp),
             CanonicalField::RawBytes(wrapping_pubkey),
+            CanonicalField::RawBytes(nonce),
         ],
     )
     .map(|h| h.to_vec())
@@ -552,12 +570,20 @@ fn verify_ed25519_signature(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
 
     use super::*;
     use crate::crypto::key_loss_custody::{KeyLoss, KeyLossCustody};
     use scp_protocol::crypto::access_keys::generate_access_key;
     use scp_protocol::crypto::sender_keys::NonceDedup;
+
+    /// A valid 65-byte uncompressed P-256 point, distinct per `tag`, for
+    /// fixtures that need a wire key but not its scalar.
+    fn point(tag: u8) -> [u8; hpke::PUBLIC_KEY_LEN] {
+        scp_crypto::p256::P256SigningKey::from_seed(b"scp-runtime-access-key-test", &[tag; 32])
+            .unwrap()
+            .public_key()
+            .to_uncompressed()
+    }
 
     /// A requester whose custody no longer holds the signing key fails the
     /// access-key request with the typed custody failure, so a caller sees
@@ -605,16 +631,16 @@ mod tests {
         .await
     }
 
-    /// A response whose `enc` is a valid X25519 public key, so `open` reaches
+    /// A response whose `enc` is a valid P-256 point, so `open` reaches
     /// both custody calls. The sealed key is never opened by these tests.
     fn response_with_valid_enc() -> AccessKeyResponse {
-        let secret = StaticSecret::random_from_rng(OsRng);
+        let secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
         AccessKeyResponse {
             context_id: "ctx-1".to_owned(),
             member_did: "did:dht:alice".to_owned(),
             epoch: 1,
             hpke_sealed_key: [0u8; 48],
-            ephemeral_pubkey: X25519Pub::from(&secret).to_bytes().to_vec(),
+            ephemeral_pubkey: secret.public_key().to_uncompressed().to_vec(),
         }
     }
 
@@ -649,7 +675,7 @@ mod tests {
     #[tokio::test]
     async fn open_access_key_response_with_a_destroyed_wrapping_key_is_custody_key_not_found() {
         let custody = scp_platform::testing::InMemoryKeyCustody::new();
-        let wrapping_key = custody.generate_keypair(KeyType::X25519).await.unwrap();
+        let wrapping_key = custody.generate_keypair(KeyType::HpkeP256).await.unwrap();
         custody.destroy_key(&wrapping_key).await.unwrap();
         assert_key_not_found(
             open_access_key_response(&custody, &wrapping_key, &response_with_valid_enc()).await,
@@ -660,7 +686,7 @@ mod tests {
     #[tokio::test]
     async fn open_access_key_response_wrapping_public_key_is_custody_key_not_found() {
         let custody = KeyLossCustody::new(KeyLoss::AfterDhAgree);
-        let wrapping_key = custody.generate_keypair(KeyType::X25519).await.unwrap();
+        let wrapping_key = custody.generate_keypair(KeyType::HpkeP256).await.unwrap();
         assert_key_not_found(
             open_access_key_response(&custody, &wrapping_key, &response_with_valid_enc()).await,
             "wrapping public key read after DH agreement",
@@ -676,7 +702,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:alice".to_owned(),
             context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: vec![0u8; 32],
+            wrapping_pubkey: point(0).to_vec(),
             nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_700_000_000,
             signature: vec![0u8; 64],
@@ -696,7 +722,7 @@ mod tests {
             member_did: "did:dht:alice".to_owned(),
             epoch: 5,
             hpke_sealed_key: [0x11; 48],
-            ephemeral_pubkey: vec![0u8; 32],
+            ephemeral_pubkey: point(0).to_vec(),
         };
         let json = serde_json::to_string(&response).unwrap();
         let deserialized: AccessKeyResponse = serde_json::from_str(&json).unwrap();
@@ -710,7 +736,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:bob".to_owned(),
             context_id: "ctx-2".to_owned(),
-            wrapping_pubkey: vec![42u8; 32],
+            wrapping_pubkey: point(42).to_vec(),
             nonce: [0xAA; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_700_000_000,
             signature: vec![7u8; 64],
@@ -729,7 +755,7 @@ mod tests {
             member_did: "did:dht:bob".to_owned(),
             epoch: 10,
             hpke_sealed_key: [0x55; 48],
-            ephemeral_pubkey: vec![99u8; 32],
+            ephemeral_pubkey: point(99).to_vec(),
         };
         let bytes = rmp_serde::to_vec(&response).unwrap();
         let deserialized: AccessKeyResponse = rmp_serde::from_slice(&bytes).unwrap();
@@ -840,8 +866,8 @@ mod tests {
     #[test]
     fn hpke_seal_open_roundtrip() {
         // Generate a simulated wrapping keypair (software-held).
-        let wrapping_secret = StaticSecret::random_from_rng(OsRng);
-        let wrapping_public = X25519Pub::from(&wrapping_secret);
+        let wrapping_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let wrapping_public = wrapping_secret.public_key();
 
         let access_key = generate_access_key("ctx-1", "did:dht:alice");
         let info = build_hpke_info("ctx-1", "did:dht:alice", 0);
@@ -849,7 +875,7 @@ mod tests {
 
         // Seal via the shared RFC 9180 HPKE core.
         let (enc, sealed) = hpke::seal(
-            &wrapping_public.to_bytes(),
+            &wrapping_public.to_uncompressed(),
             &info,
             &aad,
             access_key.as_bytes(),
@@ -860,8 +886,14 @@ mod tests {
         assert_eq!(sealed.len(), 48);
 
         // Open with the software-held secret.
-        let plaintext =
-            hpke::open(&wrapping_secret.to_bytes(), &enc, &info, &aad, &sealed).unwrap();
+        let plaintext = hpke::open(
+            &wrapping_secret.to_scalar_bytes(),
+            &enc,
+            &info,
+            &aad,
+            &sealed,
+        )
+        .unwrap();
 
         assert_eq!(plaintext.len(), 32);
         assert_eq!(plaintext.as_slice(), access_key.as_bytes());
@@ -869,14 +901,14 @@ mod tests {
 
     #[test]
     fn hpke_seal_produces_ciphertext_plus_tag() {
-        let wrapping_secret = StaticSecret::random_from_rng(OsRng);
-        let wrapping_public = X25519Pub::from(&wrapping_secret);
+        let wrapping_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let wrapping_public = wrapping_secret.public_key();
         let info = build_hpke_info("ctx-1", "did:dht:alice", 0);
         let aad = build_hpke_aad("ctx-1", "did:dht:alice", 0);
 
         let key_bytes = [42u8; 32];
         let (_enc, sealed) =
-            hpke::seal(&wrapping_public.to_bytes(), &info, &aad, &key_bytes).unwrap();
+            hpke::seal(&wrapping_public.to_uncompressed(), &info, &aad, &key_bytes).unwrap();
 
         // RFC 9180: ct = plaintext (32) + AEAD tag (16) = 48. No external nonce.
         assert_eq!(sealed.len(), 32 + 16);
@@ -887,18 +919,30 @@ mod tests {
         // Sealing the same key under different info strings (different context)
         // must not cross-open: a ciphertext sealed with info_a fails to open
         // with info_b.
-        let wrapping_secret = StaticSecret::random_from_rng(OsRng);
-        let wrapping_public = X25519Pub::from(&wrapping_secret);
+        let wrapping_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let wrapping_public = wrapping_secret.public_key();
         let info_a = build_hpke_info("ctx-a", "did:dht:alice", 0);
         let aad_a = build_hpke_aad("ctx-a", "did:dht:alice", 0);
         let info_b = build_hpke_info("ctx-b", "did:dht:alice", 0);
         let aad_b = build_hpke_aad("ctx-b", "did:dht:alice", 0);
 
-        let (enc, sealed) =
-            hpke::seal(&wrapping_public.to_bytes(), &info_a, &aad_a, &[42u8; 32]).unwrap();
+        let (enc, sealed) = hpke::seal(
+            &wrapping_public.to_uncompressed(),
+            &info_a,
+            &aad_a,
+            &[42u8; 32],
+        )
+        .unwrap();
 
         assert!(
-            hpke::open(&wrapping_secret.to_bytes(), &enc, &info_b, &aad_b, &sealed).is_err(),
+            hpke::open(
+                &wrapping_secret.to_scalar_bytes(),
+                &enc,
+                &info_b,
+                &aad_b,
+                &sealed
+            )
+            .is_err(),
             "different info/aad must fail to open"
         );
     }
@@ -912,7 +956,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:alice".to_owned(),
             context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: vec![0u8; 32],
+            wrapping_pubkey: point(0).to_vec(),
             nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_000_000,
             signature: vec![0u8; 64],
@@ -925,7 +969,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:alice".to_owned(),
             context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: vec![0u8; 32],
+            wrapping_pubkey: point(0).to_vec(),
             nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_000_000,
             signature: vec![0u8; 64],
@@ -939,7 +983,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:alice".to_owned(),
             context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: vec![0u8; 32],
+            wrapping_pubkey: point(0).to_vec(),
             nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_000_000,
             signature: vec![0u8; 64],
@@ -954,7 +998,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:alice".to_owned(),
             context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: vec![0u8; 32],
+            wrapping_pubkey: point(0).to_vec(),
             nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             // Timestamp more than 30s ahead of "now".
             timestamp: 1_000_031,
@@ -971,7 +1015,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:alice".to_owned(),
             context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: vec![0u8; 32],
+            wrapping_pubkey: point(0).to_vec(),
             nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_000_025,
             signature: vec![0u8; 64],
@@ -1008,13 +1052,14 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:bob".to_owned(),
             context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: vec![0u8; 32],
+            wrapping_pubkey: point(0).to_vec(),
             nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_000_000,
             signature: vec![0u8; 64],
         };
 
-        // Use a random public key that won't match the signature.
+        // Use a random public key that won't match the signature. The
+        // wrapping key is a valid point, so only the signature can reject.
         let result = handle_access_key_request(
             &request,
             &[1u8; 32], // bogus pubkey
@@ -1022,8 +1067,10 @@ mod tests {
             1_000_000,
             &mut nonce_dedup,
         );
-        // Should fail at signature verification or produce false.
-        assert!(result.is_err());
+        assert!(
+            matches!(&result, Err(AccessKeyError::VerificationFailed(m)) if !m.contains("wrapping")),
+            "expected a signature failure, got {result:?}"
+        );
     }
 
     #[test]
@@ -1037,7 +1084,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:bob".to_owned(),
             context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: vec![0u8; 32],
+            wrapping_pubkey: point(0).to_vec(),
             nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_000_000,
             signature: vec![0u8; 64],
@@ -1061,28 +1108,42 @@ mod tests {
 
     #[test]
     fn handle_access_key_request_rejects_wrong_wrapping_key_length() {
-        let access_key = generate_access_key("ctx-1", "did:dht:alice");
-        let mut nonce_dedup = NonceDedup::new();
-
-        let request = AccessKeyRequest {
-            requester_did: "did:dht:bob".to_owned(),
-            context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: vec![0u8; 16], // wrong length
-            nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
-            timestamp: 1_000_000,
-            signature: vec![0u8; 64],
-        };
-
-        // Will fail on signature first, but wrapping key validation
-        // would also catch this.
-        let result = handle_access_key_request(
-            &request,
-            &[1u8; 32],
-            &access_key,
-            1_000_000,
-            &mut nonce_dedup,
-        );
-        assert!(result.is_err());
+        // The wrapping key is validated (§9.5: 65 bytes, `0x04`, on the curve)
+        // before the request is hashed for its signature check, so each of
+        // these is rejected as an invalid wrapping key, not a bad signature.
+        let mut wrong_prefix = point(3);
+        wrong_prefix[0] = 0x02;
+        for (case, wrapping_pubkey) in [
+            ("16 bytes", vec![0u8; 16]),
+            ("32 bytes", point(3)[1..33].to_vec()),
+            ("0x02 prefix", wrong_prefix.to_vec()),
+            (
+                "off curve",
+                crate::crypto::dh_counting_custody::OFF_CURVE_ENC.to_vec(),
+            ),
+        ] {
+            let access_key = generate_access_key("ctx-1", "did:dht:alice");
+            let mut nonce_dedup = NonceDedup::new();
+            let request = AccessKeyRequest {
+                requester_did: "did:dht:bob".to_owned(),
+                context_id: "ctx-1".to_owned(),
+                wrapping_pubkey,
+                nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
+                timestamp: 1_000_000,
+                signature: vec![0u8; 64],
+            };
+            let result = handle_access_key_request(
+                &request,
+                &[1u8; 32],
+                &access_key,
+                1_000_000,
+                &mut nonce_dedup,
+            );
+            assert!(
+                matches!(&result, Err(AccessKeyError::VerificationFailed(m)) if m.contains("invalid wrapping pubkey")),
+                "{case}: expected an invalid-wrapping-key rejection, got {result:?}"
+            );
+        }
     }
 
     /// Full HPKE distribution E2E test using real Ed25519 keys and signatures.
@@ -1096,10 +1157,10 @@ mod tests {
         let signing_key = SigningKey::generate(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
 
-        // 2. Generate X25519 wrapping keypair for the requester (software-held
-        //    StaticSecret so the test can run the software `hpke::open` path).
-        let wrapping_secret = StaticSecret::random_from_rng(OsRng);
-        let wrapping_public = X25519Pub::from(&wrapping_secret);
+        // 2. Generate a DHKEM(P-256) wrapping keypair for the requester
+        //    (software-held so the test can run the software `hpke::open` path).
+        let wrapping_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let wrapping_public = wrapping_secret.public_key();
 
         let timestamp = 1_700_000_000_u64;
         let mut nonce = [0u8; ACCESS_KEY_NONCE_SIZE];
@@ -1109,9 +1170,9 @@ mod tests {
         let hash = compute_request_hash(
             "ctx-1",
             "did:dht:bob",
-            &nonce,
             timestamp,
-            &wrapping_public.to_bytes(),
+            &wrapping_public.to_uncompressed(),
+            &nonce,
         )
         .unwrap();
         let sig = signing_key.sign(&hash);
@@ -1119,7 +1180,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:bob".to_owned(),
             context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: wrapping_public.to_bytes().to_vec(),
+            wrapping_pubkey: wrapping_public.to_uncompressed().to_vec(),
             nonce,
             timestamp,
             signature: sig.to_bytes().to_vec(),
@@ -1147,12 +1208,14 @@ mod tests {
         assert_eq!(response.epoch, 0);
 
         // 7. Open the response (requester side) via the software HPKE path.
-        let enc: [u8; 32] = response.ephemeral_pubkey.as_slice().try_into().unwrap();
+        // `enc` is the 65-byte DHKEM(P-256) point; the sealed key is 48 bytes.
+        assert_eq!(response.ephemeral_pubkey.len(), hpke::ENC_LEN);
+        assert_eq!(response.hpke_sealed_key.len(), 48);
         let info = build_hpke_info("ctx-1", "did:dht:alice", 0);
         let aad = build_hpke_aad("ctx-1", "did:dht:alice", 0);
         let plaintext = hpke::open(
-            &wrapping_secret.to_bytes(),
-            &enc,
+            &wrapping_secret.to_scalar_bytes(),
+            &response.ephemeral_pubkey,
             &info,
             &aad,
             &response.hpke_sealed_key,
@@ -1185,8 +1248,8 @@ mod tests {
         let signing_key = SigningKey::generate(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
 
-        let wrapping_secret = StaticSecret::random_from_rng(OsRng);
-        let wrapping_public = X25519Pub::from(&wrapping_secret);
+        let wrapping_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let wrapping_public = wrapping_secret.public_key();
 
         let timestamp = 1_700_000_000_u64;
         let mut nonce = [0u8; ACCESS_KEY_NONCE_SIZE];
@@ -1195,9 +1258,9 @@ mod tests {
         let hash = compute_request_hash(
             "ctx-1",
             "did:dht:bob",
-            &nonce,
             timestamp,
-            &wrapping_public.to_bytes(),
+            &wrapping_public.to_uncompressed(),
+            &nonce,
         )
         .unwrap();
         let sig = signing_key.sign(&hash);
@@ -1205,7 +1268,7 @@ mod tests {
         let request = AccessKeyRequest {
             requester_did: "did:dht:bob".to_owned(),
             context_id: "ctx-1".to_owned(),
-            wrapping_pubkey: wrapping_public.to_bytes().to_vec(),
+            wrapping_pubkey: wrapping_public.to_uncompressed().to_vec(),
             nonce,
             timestamp,
             signature: sig.to_bytes().to_vec(),
@@ -1241,10 +1304,122 @@ mod tests {
         let nonce_b = [0xBBu8; ACCESS_KEY_NONCE_SIZE];
 
         let hash_a =
-            compute_request_hash("ctx-1", "did:dht:bob", &nonce_a, 100, &[0u8; 32]).unwrap();
+            compute_request_hash("ctx-1", "did:dht:bob", 100, &point(0), &nonce_a).unwrap();
         let hash_b =
-            compute_request_hash("ctx-1", "did:dht:bob", &nonce_b, 100, &[0u8; 32]).unwrap();
+            compute_request_hash("ctx-1", "did:dht:bob", 100, &point(0), &nonce_b).unwrap();
 
         assert_ne!(hash_a, hash_b);
+    }
+
+    /// §9.5.2 `AccessKeyRequest` table: the signed preimage is the domain
+    /// separator, then `context_id` and `requester_did` (4-byte BE length +
+    /// UTF-8), `timestamp` (8-byte BE), the 65-byte wrapping key and the
+    /// 16-byte nonce, in that order. Rebuilt here byte by byte from the table,
+    /// not through the canonical encoder.
+    #[test]
+    fn request_hash_matches_spec_field_order() {
+        use sha2::{Digest, Sha256};
+
+        let context_id = "ctx-spec";
+        let requester_did = "did:dht:requester";
+        let timestamp = 1_700_000_000_u64;
+        let wrapping_pubkey = point(5);
+        let nonce = [0x5Au8; ACCESS_KEY_NONCE_SIZE];
+
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(b"SCP-ACCESS-KEY-REQUEST-V1:");
+        preimage.extend_from_slice(&u32::try_from(context_id.len()).unwrap().to_be_bytes());
+        preimage.extend_from_slice(context_id.as_bytes());
+        preimage.extend_from_slice(&u32::try_from(requester_did.len()).unwrap().to_be_bytes());
+        preimage.extend_from_slice(requester_did.as_bytes());
+        preimage.extend_from_slice(&timestamp.to_be_bytes());
+        preimage.extend_from_slice(&wrapping_pubkey);
+        preimage.extend_from_slice(&nonce);
+        assert_eq!(preimage.len(), 26 + 4 + 8 + 4 + 17 + 8 + 65 + 16);
+
+        let expected = Sha256::digest(&preimage).to_vec();
+        let actual = compute_request_hash(
+            context_id,
+            requester_did,
+            timestamp,
+            &wrapping_pubkey,
+            &nonce,
+        )
+        .unwrap();
+        assert_eq!(actual, expected, "§9.5.2 AccessKeyRequest preimage drift");
+    }
+
+    /// A request built by `request_access_key` (custody-held `HpkeP256`
+    /// wrapping key, custody signature) verifies against the signer's public
+    /// key, and its wrapping key is a 65-byte uncompressed point.
+    #[tokio::test]
+    async fn request_access_key_signs_and_verifies() {
+        let custody = scp_platform::testing::InMemoryKeyCustody::new();
+        let signing_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signing_pub = custody.public_key(&signing_key).await.unwrap();
+        let result = request_with(&custody, &signing_key).await.unwrap();
+        let request: AccessKeyRequest = serde_json::from_slice(&result.request_message).unwrap();
+        assert_eq!(request.wrapping_pubkey.len(), hpke::PUBLIC_KEY_LEN);
+        assert_eq!(request.wrapping_pubkey[0], 0x04);
+        assert!(verify_access_key_request(&request, signing_pub.as_bytes()).unwrap());
+
+        let mut tampered = request;
+        tampered.timestamp += 1;
+        assert!(!verify_access_key_request(&tampered, signing_pub.as_bytes()).unwrap());
+    }
+
+    /// Custody round trip: the requester's custody-held `HpkeP256` key opens
+    /// what the responder sealed, through the C16 sequence (validate `enc`,
+    /// `dh_agree`, `public_key`, open).
+    #[tokio::test]
+    async fn custody_request_handle_open_round_trip() {
+        let custody = crate::crypto::dh_counting_custody::DhCountingCustody::new();
+        let signing_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let signing_pub = custody.public_key(&signing_key).await.unwrap();
+        let result = request_with(&custody, &signing_key).await.unwrap();
+        let request: AccessKeyRequest = serde_json::from_slice(&result.request_message).unwrap();
+
+        let access_key = generate_access_key("ctx-1", "did:dht:alice");
+        let mut nonce_dedup = NonceDedup::new();
+        let response_bytes = handle_access_key_request(
+            &request,
+            signing_pub.as_bytes(),
+            &access_key,
+            request.timestamp,
+            &mut nonce_dedup,
+        )
+        .unwrap();
+        let response: AccessKeyResponse = serde_json::from_slice(&response_bytes).unwrap();
+        assert_eq!(response.ephemeral_pubkey.len(), hpke::ENC_LEN);
+        assert_eq!(response.hpke_sealed_key.len(), 48);
+
+        let opened = open_access_key_response(&custody, &result.wrapping_key_handle, &response)
+            .await
+            .unwrap();
+        assert_eq!(opened.as_bytes(), access_key.as_bytes());
+        assert_eq!(custody.dh_calls(), 1);
+    }
+
+    /// §9.5 order on the custody open: a malformed `enc` is rejected before
+    /// `dh_agree`, so custody never multiplies its key by an unvalidated point.
+    #[tokio::test]
+    async fn open_access_key_response_rejects_invalid_enc_before_dh_agree() {
+        let custody = crate::crypto::dh_counting_custody::DhCountingCustody::new();
+        let wrapping_key = custody.generate_keypair(KeyType::HpkeP256).await.unwrap();
+        let mut response = response_with_valid_enc();
+        let valid: [u8; 65] = response.ephemeral_pubkey.as_slice().try_into().unwrap();
+        for (case, enc) in crate::crypto::dh_counting_custody::rejected_encs(&valid) {
+            response.ephemeral_pubkey = enc;
+            let result = open_access_key_response(&custody, &wrapping_key, &response).await;
+            assert!(
+                matches!(&result, Err(AccessKeyError::HpkeDecryptionFailed(_))),
+                "{case}: expected HpkeDecryptionFailed, got {result:?}"
+            );
+            assert_eq!(
+                custody.dh_calls(),
+                0,
+                "{case}: dh_agree ran on an invalid enc"
+            );
+        }
     }
 }

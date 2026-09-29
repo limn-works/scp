@@ -448,7 +448,8 @@ impl SupervisorHandle {
         self.supervisor.reconnect_all_standing().await
     }
 
-    /// Look up this identity's wrapping public key. Returns `None` if
+    /// Look up this identity's 65-byte DHKEM(P-256) wrapping public key
+    /// (§9.16.1). Returns `None` if
     /// the identity has not set a wrapping keypair yet.
     ///
     /// Takes `&OwnedIdentityDid` — not `&DID` — so the caller must hold
@@ -470,12 +471,12 @@ impl SupervisorHandle {
     pub(in crate::context) fn my_wrapping_public_key(
         &self,
         identity: &OwnedIdentityDid,
-    ) -> Option<Arc<Vec<u8>>> {
+    ) -> Option<[u8; 65]> {
         let did = identity.as_did();
         self.supervisor
             .wrapping_keys
             .get(did)
-            .map(|entry| Arc::new(entry.value().load_full().public.to_vec()))
+            .map(|entry| entry.value().load_full().public)
     }
 
     /// Look up this identity's `KeyPackageStoreActor` handle. Returns
@@ -1044,15 +1045,16 @@ mod tests {
     async fn my_wrapping_public_key_reads_registered_value() {
         let (sup, handle) = test_handle();
         let did = DID("did:example:alice".to_owned());
+        let (public, secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
         let kp = WrappingKeyPair {
-            public: [0x42; 32],
-            secret: Zeroizing::new([0u8; 32]),
+            public,
+            secret: Zeroizing::new(*secret),
         };
         sup.wrapping_keys
             .insert(did.clone(), ArcSwap::new(Arc::new(kp)));
         let token = OwnedIdentityDid::issue_for_actor(did);
         let got = handle.my_wrapping_public_key(&token).unwrap();
-        assert_eq!(&*got, &vec![0x42u8; 32]);
+        assert_eq!(got, public);
     }
 
     #[tokio::test]

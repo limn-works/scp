@@ -152,7 +152,6 @@ syn = { version = "2", features = ["full", "visit"] }
 proc-macro2 = "1"
 rmp-serde = { workspace = true }
 tempfile = "3"
-x25519-dalek = { workspace = true }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 axum = { workspace = true, features = ["ws"] }
 tower = { version = "0.5", features = ["util"] }

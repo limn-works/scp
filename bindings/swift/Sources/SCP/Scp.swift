@@ -310,7 +310,7 @@ public extension SCP {
     /// Forwards to the free ``broadcastOpenKey`` UniFFI binding.
     ///
     /// Opens an HPKE-sealed broadcast key (§5.14.2) using the subscriber's
-    /// 32-byte X25519 ``wrappingSecret``, returning the raw 32-byte AES-256
+    /// 32-byte DHKEM(P-256) ``wrappingSecret`` scalar, returning the raw 32-byte AES-256
     /// broadcast key. ``sealedJson`` is the JSON returned by
     /// ``broadcastHandleKeyRequest`` on grant.
     func broadcastOpenKey(sealedJson: String, wrappingSecret: Data) throws -> Data {

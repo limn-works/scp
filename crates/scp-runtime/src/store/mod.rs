@@ -74,6 +74,12 @@ pub enum StoreError {
     #[error("deserialization failed: {0}")]
     DeserializationFailed(String),
 
+    /// Key material handed to or loaded from the store is not valid for its
+    /// declared key type: an invalid curve point or scalar, or a secret whose
+    /// public key is not the one it is stored with.
+    #[error("invalid key material: {0}")]
+    InvalidKeyMaterial(String),
+
     /// The stored value was written by a newer SCP version and cannot be read.
     #[error("incompatible version: stored={stored}, current={current}")]
     IncompatibleVersion {

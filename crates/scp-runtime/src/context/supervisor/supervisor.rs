@@ -1371,7 +1371,7 @@ pub struct Supervisor {
     /// invisible to that actor's `local_dids` view — breaking the
     /// author-DID-controlled gate on broadcast key requests.
     pub(in crate::context::supervisor) local_dids: Arc<ArcSwap<HashSet<DID>>>,
-    /// Per-identity X25519 wrapping keys. Wrapped in `ArcSwap` so
+    /// Per-identity DHKEM(P-256) wrapping keys (§9.16.1). Wrapped in `ArcSwap` so
     /// rotation is atomic; outer `DashMap` keyed by DID.
     pub(in crate::context::supervisor) wrapping_keys: DashMap<DID, ArcSwap<WrappingKeyPair>>,
     /// Persistence backend; stored so `spawn_actor` / `crash_recovery`
@@ -2505,7 +2505,7 @@ impl Supervisor {
     // (initial keypair generation + governance-driven rotations).
     // -------------------------------------------------------------------
 
-    /// Returns a freshly-cloned `Arc` to the X25519 wrapping public key
+    /// Returns a freshly-cloned `Arc` to the 65-byte DHKEM(P-256) wrapping public key
     /// for `did`, or `None` if no keypair has been registered.
     ///
     /// The returned `Arc<Vec<u8>>` carries the public key bytes the
@@ -2534,7 +2534,7 @@ impl Supervisor {
         })
     }
 
-    /// Returns a freshly-cloned `Arc` to the X25519 wrapping secret
+    /// Returns a freshly-cloned `Arc` to the P-256 wrapping secret scalar
     /// key for `did`, or `None` if no keypair has been registered.
     ///
     /// Same reader discipline as [`Self::wrapping_public_key_for`]:
@@ -2571,8 +2571,8 @@ impl Supervisor {
         self.wrapping_keys.clear();
     }
 
-    /// Atomically registers (or rotates) the X25519 wrapping keypair
-    /// for `did`. Acquires [`Self::write_lock`] first per the
+    /// Atomically registers (or rotates) the DHKEM(P-256) wrapping keypair
+    /// (§9.16.1) for `did`. Acquires [`Self::write_lock`] first per the
     /// supervisor's write-path discipline; the per-identity
     /// `ArcSwap<WrappingKeyPair>` handles the atomic swap.
     ///
@@ -2582,9 +2582,9 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::InvalidState`] if `public` or `secret`
-    /// are not exactly 32 bytes (X25519 keypair fixed sizes per
-    /// RFC 7748 §5).
+    /// Returns [`ContextError::InvalidState`] if `public` is not a valid
+    /// 65-byte uncompressed P-256 point (§9.5), if `secret` is not 32 bytes,
+    /// or if `secret · G` is not `public`. Nothing is registered on error.
     pub async fn set_wrapping_keys(
         self: &Arc<Self>,
         did: DID,
@@ -2593,25 +2593,32 @@ impl Supervisor {
     ) -> Result<(), ContextError> {
         let _guard = self.write_lock.lock().await;
         // Convert from runtime-API `Vec<u8>` to the per-identity
-        // [`crate::context::actor::state::WrappingKeyPair`] shape
-        // (fixed 32-byte arrays, secret behind `Zeroizing`). Length
-        // mismatches surface as `InvalidState` so misuse fails loudly
-        // rather than silently truncating key material.
-        let public_arr: [u8; 32] = public.as_slice().try_into().map_err(|_| {
+        // [`crate::context::actor::state::WrappingKeyPair`] shape (a 65-byte
+        // point and a 32-byte scalar behind `Zeroizing`). The point is
+        // validated (§9.5) and the pair checked to match (C19(c)) before the
+        // slot changes, so a malformed or mismatched pair fails loudly instead
+        // of publishing a key this node cannot open.
+        let public_arr = scp_protocol::crypto::hpke::p256::validate_uncompressed_point(&public)
+            .map_err(|e| {
+                ContextError::InvalidState(format!(
+                    "Supervisor::set_wrapping_keys — wrapping public key: {e}"
+                ))
+            })?;
+        let secret_arr: zeroize::Zeroizing<[u8; 32]> =
+            zeroize::Zeroizing::new(secret.as_slice().try_into().map_err(|_| {
+                ContextError::InvalidState(format!(
+                    "Supervisor::set_wrapping_keys — wrapping secret key must be 32 bytes (got {})",
+                    secret.len(),
+                ))
+            })?);
+        scp_crypto::p256::check_keypair(&secret_arr, &public_arr).map_err(|e| {
             ContextError::InvalidState(format!(
-                "Supervisor::set_wrapping_keys — wrapping public key must be 32 bytes (got {})",
-                public.len(),
-            ))
-        })?;
-        let secret_arr: [u8; 32] = secret.as_slice().try_into().map_err(|_| {
-            ContextError::InvalidState(format!(
-                "Supervisor::set_wrapping_keys — wrapping secret key must be 32 bytes (got {})",
-                secret.len(),
+                "Supervisor::set_wrapping_keys — wrapping keypair: {e}"
             ))
         })?;
         let pair = WrappingKeyPair {
             public: public_arr,
-            secret: zeroize::Zeroizing::new(secret_arr),
+            secret: secret_arr,
         };
         match self.wrapping_keys.get(&did) {
             Some(entry) => entry.value().store(Arc::new(pair)),
@@ -14435,7 +14442,7 @@ impl Supervisor {
                     // #2148 (ADR-049 birth-into-actor) WELCOME seam: the crypto is
                     // OWNED by the seeded actor `state` (born owned at step 2), so read
                     // the export off `state` — identical to what
-                    // `build_snapshot_for_persist` (step 4) will persist. The X25519
+                    // `build_snapshot_for_persist` (step 4) will persist. The P-256
                     // wrapping keypair is node-level and enters as params from the
                     // RETAINED `deps.crypto.wrapping_keypair()` accessor.
                     let (welcome_wrapping_public, welcome_wrapping_secret) =
@@ -16840,8 +16847,7 @@ mod tests {
     async fn wrapping_keys_set_and_get_round_trip() {
         let s = Arc::new(test_supervisor());
         let did = DID("did:example:wrap-roundtrip".to_owned());
-        let public = vec![0x11u8; 32];
-        let secret = zeroize::Zeroizing::new(vec![0x22u8; 32]);
+        let (public, secret) = p256_wrapping_pair();
 
         // Pre-set the slot is empty for this DID.
         assert!(s.wrapping_public_key_for(&did).is_none());
@@ -16849,7 +16855,7 @@ mod tests {
 
         s.set_wrapping_keys(did.clone(), public.clone(), secret.clone())
             .await
-            .expect("set_wrapping_keys succeeds for valid 32-byte inputs");
+            .expect("set_wrapping_keys succeeds for a valid P-256 pair");
 
         let got_pub = s.wrapping_public_key_for(&did).expect("public set");
         assert_eq!(*got_pub, public);
@@ -16864,49 +16870,66 @@ mod tests {
         let s = Arc::new(test_supervisor());
         let did = DID("did:example:wrap-rotate".to_owned());
 
-        s.set_wrapping_keys(
-            did.clone(),
-            vec![0x01u8; 32],
-            zeroize::Zeroizing::new(vec![0x02u8; 32]),
-        )
-        .await
-        .unwrap();
-        assert_eq!(*s.wrapping_public_key_for(&did).unwrap(), vec![0x01u8; 32]);
+        let (pub1, sec1) = p256_wrapping_pair();
+        s.set_wrapping_keys(did.clone(), pub1.clone(), sec1)
+            .await
+            .unwrap();
+        assert_eq!(*s.wrapping_public_key_for(&did).unwrap(), pub1);
 
-        s.set_wrapping_keys(
-            did.clone(),
-            vec![0xAAu8; 32],
-            zeroize::Zeroizing::new(vec![0xBBu8; 32]),
-        )
-        .await
-        .unwrap();
-        assert_eq!(*s.wrapping_public_key_for(&did).unwrap(), vec![0xAAu8; 32]);
-        assert_eq!(
-            &**s.wrapping_secret_key_for(&did).unwrap(),
-            &vec![0xBBu8; 32]
-        );
+        let (pub2, sec2) = p256_wrapping_pair();
+        s.set_wrapping_keys(did.clone(), pub2.clone(), sec2.clone())
+            .await
+            .unwrap();
+        assert_eq!(*s.wrapping_public_key_for(&did).unwrap(), pub2);
+        assert_eq!(&**s.wrapping_secret_key_for(&did).unwrap(), &*sec2);
     }
 
-    /// Wrong-length inputs surface as `InvalidState` rather than
-    /// silently truncating key material.
+    /// A fresh DHKEM(P-256) wrapping pair in the `set_wrapping_keys` input
+    /// shape: the 65-byte uncompressed point and its 32-byte scalar.
+    fn p256_wrapping_pair() -> (Vec<u8>, zeroize::Zeroizing<Vec<u8>>) {
+        let (public, secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+        (public.to_vec(), zeroize::Zeroizing::new(secret.to_vec()))
+    }
+
+    /// Each malformed or mismatched pair surfaces as `InvalidState` and
+    /// registers nothing (§9.5, C19(c)): a 32-byte (X25519-length) public
+    /// key, a `0x02`-prefixed point, an off-curve point, a 16-byte secret,
+    /// and a valid point paired with another key's scalar.
     #[tokio::test]
-    async fn wrapping_keys_rejects_wrong_byte_length() {
+    async fn wrapping_keys_rejects_invalid_or_mismatched_pair() {
         let s = Arc::new(test_supervisor());
-        let did = DID("did:example:wrap-bad-len".to_owned());
-        let err = s
-            .set_wrapping_keys(
-                did.clone(),
-                vec![0u8; 16],
-                zeroize::Zeroizing::new(vec![0u8; 32]),
-            )
-            .await
-            .expect_err("16-byte public must reject");
-        assert!(matches!(err, ContextError::InvalidState(_)));
-        let err = s
-            .set_wrapping_keys(did, vec![0u8; 32], zeroize::Zeroizing::new(vec![0u8; 16]))
-            .await
-            .expect_err("16-byte secret must reject");
-        assert!(matches!(err, ContextError::InvalidState(_)));
+        let did = DID("did:example:wrap-bad".to_owned());
+        let (public, secret) = p256_wrapping_pair();
+        let (_other_pub, other_secret) = p256_wrapping_pair();
+        let mut prefix02 = public.clone();
+        prefix02[0] = 0x02;
+        let mut off_curve = vec![0u8; 65];
+        off_curve[0] = 0x04;
+        off_curve[64] = 0x01;
+        for (case, pk, sk) in [
+            ("32-byte public", public[1..33].to_vec(), secret.clone()),
+            ("0x02 prefix", prefix02, secret.clone()),
+            ("off-curve public", off_curve, secret.clone()),
+            (
+                "16-byte secret",
+                public.clone(),
+                zeroize::Zeroizing::new(vec![1u8; 16]),
+            ),
+            ("mismatched pair", public.clone(), other_secret),
+        ] {
+            let err = s
+                .set_wrapping_keys(did.clone(), pk, sk)
+                .await
+                .expect_err(case);
+            assert!(
+                matches!(err, ContextError::InvalidState(_)),
+                "{case}: {err:?}"
+            );
+            assert!(
+                s.wrapping_public_key_for(&did).is_none(),
+                "{case}: nothing is registered on error"
+            );
+        }
     }
 
     #[tokio::test]
@@ -23170,35 +23193,36 @@ mod tests {
         // Build a Bob-signed KeyRequest (for Alice's key) sealing to a fresh
         // ephemeral wrapping key, wrapped in the distribution-message envelope.
         let bob_sk = crate::crypto::mls::two_party_test_support::bob_signing_key();
-        let build_request = |requester_did: &str, nonce: [u8; 16]| -> (Vec<u8>, [u8; 32]) {
-            let (wrapping_pub, wrapping_secret) =
-                scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
-            let timestamp = scp_clock::SystemClock.now_secs();
-            let hash =
-                scp_protocol::crypto::sender_keys::key_protocol_verify::compute_request_hash(
-                    requester_did,
-                    ALICE,
-                    1,
-                    &wrapping_pub,
-                    &nonce,
+        let build_request =
+            |requester_did: &str, nonce: [u8; 16]| -> (Vec<u8>, zeroize::Zeroizing<[u8; 32]>) {
+                let (wrapping_pub, wrapping_secret) =
+                    scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+                let timestamp = scp_clock::SystemClock.now_secs();
+                let hash =
+                    scp_protocol::crypto::sender_keys::key_protocol_verify::compute_request_hash(
+                        requester_did,
+                        ALICE,
+                        1,
+                        &wrapping_pub,
+                        &nonce,
+                        timestamp,
+                    )
+                    .unwrap();
+                let signature: [u8; 64] = bob_sk.sign(&hash).to_bytes();
+                let request = SenderKeyRequest {
+                    requester_did: requester_did.to_owned(),
+                    sender_did: ALICE.to_owned(),
+                    epoch: 1,
+                    wrapping_pubkey: wrapping_pub,
+                    nonce,
                     timestamp,
-                )
-                .unwrap();
-            let signature: [u8; 64] = bob_sk.sign(&hash).to_bytes();
-            let request = SenderKeyRequest {
-                requester_did: requester_did.to_owned(),
-                sender_did: ALICE.to_owned(),
-                epoch: 1,
-                wrapping_pubkey: wrapping_pub,
-                nonce,
-                timestamp,
-                signature,
+                    signature,
+                };
+                let dist = SenderKeyDistributionMessage::KeyRequest(request)
+                    .to_bytes()
+                    .unwrap();
+                (dist, wrapping_secret)
             };
-            let dist = SenderKeyDistributionMessage::KeyRequest(request)
-                .to_bytes()
-                .unwrap();
-            (dist, wrapping_secret)
-        };
 
         // Bob seals both requests through his actor-owned MLS group as management
         // envelopes (in MLS-generation order: mismatch first, then well-formed).
@@ -25479,7 +25503,11 @@ mod tests {
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
 
         let decision = crate::context::broadcast_helpers::handle_broadcast_key_request(
-            &mut cell, &deps, &author, &requester, &[0u8; 32],
+            &mut cell,
+            &deps,
+            &author,
+            &requester,
+            &scp_protocol::crypto::sender_keys::generate_wrapping_keypair().0,
         )
         .expect("serve consult returns a decision");
         assert!(
@@ -25626,8 +25654,11 @@ mod tests {
         // request (per-author block-list check).
         let restored_bc =
             scp_protocol::context::broadcast::BroadcastContext::from_snapshot(bc_snap);
-        let decision =
-            restored_bc.handle_key_request(author.as_ref(), blocked.as_ref(), &[0u8; 32]);
+        let decision = restored_bc.handle_key_request(
+            author.as_ref(),
+            blocked.as_ref(),
+            &scp_protocol::crypto::sender_keys::generate_wrapping_keypair().0,
+        );
         assert!(
             matches!(
                 &decision,
@@ -25730,7 +25761,11 @@ mod tests {
         );
         let restored_bc =
             scp_protocol::context::broadcast::BroadcastContext::from_snapshot(bc_snap);
-        let decision = restored_bc.handle_key_request(author.as_ref(), banned.as_ref(), &[0u8; 32]);
+        let decision = restored_bc.handle_key_request(
+            author.as_ref(),
+            banned.as_ref(),
+            &scp_protocol::crypto::sender_keys::generate_wrapping_keypair().0,
+        );
         assert!(
             matches!(
                 &decision,

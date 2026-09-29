@@ -2075,7 +2075,9 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * `broadcast_handle_key_request`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
-     * `instance_id` does not match this `SCP`'s.
+     * `instance_id` does not match this `SCP`'s. `wrapping_pubkey` is the
+     * requester's 65-byte uncompressed DHKEM(P-256) public key (§5.14.2, §9.5);
+     * any other length or an invalid point returns `ScpError::Validation`.
      */
     func broadcastHandleKeyRequest(handle: ContextHandle, authorDid: String, requesterDid: String, wrappingPubkey: Data) async throws  -> String?
     
@@ -4143,7 +4145,9 @@ open func broadcastBlockSubscriber(handle: ContextHandle, subscriberDid: String,
      * `broadcast_handle_key_request`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
-     * `instance_id` does not match this `SCP`'s.
+     * `instance_id` does not match this `SCP`'s. `wrapping_pubkey` is the
+     * requester's 65-byte uncompressed DHKEM(P-256) public key (§5.14.2, §9.5);
+     * any other length or an invalid point returns `ScpError::Validation`.
      */
 open func broadcastHandleKeyRequest(handle: ContextHandle, authorDid: String, requesterDid: String, wrappingPubkey: Data)async throws  -> String?  {
     return
@@ -17053,12 +17057,12 @@ public func bridgeRegister(contextId: String, operatorDid: String, governanceDid
 })
 }
 /**
- * Opens an HPKE-sealed broadcast key (§5.14.2) using a software-held X25519
- * wrapping secret, returning the raw 32-byte AES-256 broadcast key.
+ * Opens an HPKE-sealed broadcast key (§5.14.2) using a software-held 32-byte
+ * DHKEM(P-256) wrapping scalar, returning the raw 32-byte AES-256 broadcast key.
  *
  * Pure crypto — no `SCP` instance state. `sealed_json` is the JSON returned by
  * [`Scp::broadcast_handle_key_request`] on grant; `wrapping_secret` is the
- * subscriber's 32-byte X25519 secret matching the `wrapping_pubkey` presented
+ * subscriber's 32-byte P-256 scalar matching the `wrapping_pubkey` presented
  * on the request.
  *
  * # Errors
@@ -17893,7 +17897,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_bridge_register() != 24353) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_open_key() != 24667) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_open_key() != 2915) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_check_capability_requirements() != 55898) {
@@ -18181,7 +18185,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_block_subscriber() != 22466) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_handle_key_request() != 28358) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_handle_key_request() != 41519) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_is_subscriber() != 4444) {

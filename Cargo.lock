@@ -4680,6 +4680,7 @@ dependencies = [
  "getrandom 0.3.4",
  "openmls",
  "rmp-serde",
+ "rmpv",
  "scp-clock",
  "scp-crypto",
  "scp-did",
@@ -4875,7 +4876,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "x25519-dalek",
  "z-base-32",
  "zeroize",
 ]
@@ -5056,7 +5056,6 @@ dependencies = [
  "tls_codec",
  "tracing",
  "uuid",
- "x25519-dalek",
  "zeroize",
 ]
 
@@ -5319,7 +5318,6 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.24.0",
  "tower",
- "x25519-dalek",
  "zeroize",
 ]
 

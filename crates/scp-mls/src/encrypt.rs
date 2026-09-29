@@ -207,104 +207,6 @@ pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, Ml
     }
 }
 
-/// Decrypts an MLS `PrivateMessage` and returns both the plaintext bytes and
-/// the sender's Ed25519 signature key (as extracted from the MLS group state).
-///
-/// This function performs the same decryption as [`decrypt`] but additionally
-/// resolves the sender's identity from the MLS group tree. The sender's
-/// `signature_key` from their leaf node is returned alongside the plaintext,
-/// enabling the caller to verify inner envelope signatures without requiring
-/// the sender's public key as an external parameter.
-///
-/// # Arguments
-///
-/// * `group` - The MLS group to decrypt within. Must be active.
-/// * `ciphertext` - The serialized MLS ciphertext bytes.
-///
-/// # Returns
-///
-/// A tuple of `(plaintext, sender_signature_key)` where `sender_signature_key`
-/// is the Ed25519 public key bytes from the sender's MLS leaf node.
-///
-/// # Errors
-///
-/// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
-/// Returns [`MlsError::DecryptionFailed`] if decryption or sender resolution
-/// fails.
-/// Returns [`MlsError::NotApplicationMessage`] if the decrypted message is
-/// not an application message.
-///
-/// See SCP-177: resolve sender key internally in `open_envelope`.
-pub fn decrypt_with_sender_key(
-    group: &mut ScpMlsGroup,
-    ciphertext: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), MlsError> {
-    if group.group.is_none() {
-        return Err(MlsError::GroupDestroyed);
-    }
-
-    // Deserialize the ciphertext bytes into an MlsMessageIn.
-    let message_in = MlsMessageIn::tls_deserialize(&mut &*ciphertext)
-        .map_err(|e| MlsError::DecryptionFailed(format!("deserializing ciphertext: {e}")))?;
-
-    // Convert to a ProtocolMessage for processing.
-    let protocol_message = message_in
-        .try_into_protocol_message()
-        .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))?;
-
-    // Process the message — this verifies membership tag and generation number.
-    //
-    // Debug/native-only openmls decrypt `debug_assert!` panic on a tampered
-    // ciphertext; guarded with catch_unwind (same as in `decrypt`).
-    // NOTE (ADR-057 §Prereq-4): the load-bearing fail-closed guarantee is the
-    // `--release` build (the assert is compiled out → typed `Err`); this
-    // catch_unwind is defense-in-depth for native/debug builds, a no-op on the
-    // release wasm path. See the full note on the `decrypt` site above.
-    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
-    let process_result = catch_unwind(AssertUnwindSafe(|| {
-        g.process_message(&group.provider, protocol_message)
-    }));
-
-    let processed = match process_result {
-        Ok(Ok(msg)) => msg,
-        Ok(Err(e)) => return Err(classify_process_message_error(e)),
-        Err(_) => {
-            return Err(MlsError::DecryptionFailed(
-                "OpenMLS panicked during message processing".to_string(),
-            ));
-        }
-    };
-
-    // Extract the sender's leaf index from the ProcessedMessage before
-    // consuming it with into_content().
-    let sender = processed.sender().clone();
-    let Sender::Member(sender_leaf_index) = sender else {
-        return Err(MlsError::DecryptionFailed(
-            "sender is not a group member".to_string(),
-        ));
-    };
-
-    // Look up the sender's signature key from the group member list.
-    let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
-    let sender_signature_key = g
-        .members()
-        .find(|m| m.index == sender_leaf_index)
-        .map(|m| m.signature_key)
-        .ok_or_else(|| {
-            MlsError::DecryptionFailed(format!(
-                "sender leaf index {sender_leaf_index:?} not found in group members"
-            ))
-        })?;
-
-    // Extract the application message content.
-    match processed.into_content() {
-        ProcessedMessageContent::ApplicationMessage(app_msg) => {
-            Ok((app_msg.into_bytes(), sender_signature_key))
-        }
-        _ => Err(MlsError::NotApplicationMessage),
-    }
-}
-
 /// Decrypts an MLS `PrivateMessage` and returns a [`DecryptedContent`] enum
 /// distinguishing application messages, commits, and proposals.
 ///
@@ -487,7 +389,7 @@ pub enum InboundChange {
         /// DIDs added by this Commit's Add proposals, in proposal order. Empty
         /// for a no-add Commit (e.g. a self-update).
         added_dids: Vec<String>,
-        /// The `scp_wrapping_key` X25519 public keys of the members this Commit's
+        /// The `scp_wrapping_key` P-256 public keys of the members this Commit's
         /// Add proposals add, in the SAME proposal order as `added_dids` (so
         /// `added_wrapping_keys[i]` is the wrapping key published by the member
         /// named in `added_dids[i]`). Recovered from each Add proposal's
@@ -500,7 +402,7 @@ pub enum InboundChange {
         /// HPKE-seal a sender key to would silently break §9.16 distribution. This
         /// vector is therefore always exactly as long as `added_dids`; it is empty
         /// only for a no-add Commit.
-        added_wrapping_keys: Vec<[u8; 32]>,
+        added_wrapping_keys: Vec<[u8; crate::wrapping_extension::P256_WRAPPING_KEY_SIZE]>,
         /// The authenticated convergent committer timestamp (Unix seconds),
         /// recovered from the Commit's verified MLS AAD *before* the merge and
         /// adopted **verbatim** (ADR-057). The receiver stamps this exact value
@@ -625,7 +527,13 @@ fn credential_to_did(credential: &Credential) -> Result<String, MlsError> {
 fn recover_added_members_pre_merge(
     staged_commit: &StagedCommit,
     clock: &dyn Clock,
-) -> Result<(Vec<String>, Vec<[u8; 32]>), MlsError> {
+) -> Result<
+    (
+        Vec<String>,
+        Vec<[u8; crate::wrapping_extension::P256_WRAPPING_KEY_SIZE]>,
+    ),
+    MlsError,
+> {
     let mut added_dids = Vec::new();
     let mut added_wrapping_keys = Vec::new();
     for add in staged_commit.add_proposals() {
@@ -1287,7 +1195,7 @@ mod tests {
         // ADR-057 sender-key distribution: Carol's KeyPackage must publish an
         // scp_wrapping_key leaf extension, or the fail-closed add-extraction in
         // decrypt_with_membership_changes rejects the add pre-merge (INVARIANT 3).
-        let carol_wk = [0xCC_u8; 32];
+        let carol_wk = crate::wrapping_extension::test_wrapping_point(0xCC);
         let (carol_kp_bundle, _carol_signer, _carol_provider) =
             generate_key_package_with_wrapping_key(&carol_cred, Some(&carol_wk), &SystemClock)
                 .unwrap();
@@ -1347,7 +1255,7 @@ mod tests {
         let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
 
         let bob_cred = test_credential("bob");
-        let bob_wk = [0xBB_u8; 32];
+        let bob_wk = crate::wrapping_extension::test_wrapping_point(0xBB);
         let (bob_kp_bundle, bob_signer, bob_provider) =
             generate_key_package_with_wrapping_key(&bob_cred, Some(&bob_wk), &SystemClock).unwrap();
         let add_bob = add_member(
@@ -1413,8 +1321,12 @@ mod tests {
         // publish an scp_wrapping_key leaf extension so Bob's add-Carol receive
         // (a Commit-arm decrypt) accepts pre-merge.
         let (carol_kp_bundle, _carol_signer, _carol_provider) =
-            generate_key_package_with_wrapping_key(&carol_cred, Some(&[0xCC_u8; 32]), &SystemClock)
-                .unwrap();
+            generate_key_package_with_wrapping_key(
+                &carol_cred,
+                Some(&crate::wrapping_extension::test_wrapping_point(0xCC)),
+                &SystemClock,
+            )
+            .unwrap();
         // ADR-057: bind a convergent timestamp so Bob's add-Carol receive
         // (a Commit-arm decrypt) accepts.
         let add_carol = add_member_with_convergent_timestamp(
@@ -1699,9 +1611,12 @@ mod tests {
         // Carol carries a wrapping key (an otherwise-valid add), so the Commit
         // reaches the convergent-timestamp AAD check rather than the fail-closed
         // wrapping-key check that precedes it (both are pre-merge).
-        let (carol_kp_bundle, _s, _p) =
-            generate_key_package_with_wrapping_key(&carol_cred, Some(&[0xCC_u8; 32]), &SystemClock)
-                .unwrap();
+        let (carol_kp_bundle, _s, _p) = generate_key_package_with_wrapping_key(
+            &carol_cred,
+            Some(&crate::wrapping_extension::test_wrapping_point(0xCC)),
+            &SystemClock,
+        )
+        .unwrap();
         let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
         // Plain add_member — binds NO convergent-timestamp AAD.
         let add_carol = add_member(&mut alice_group, carol_kp, &SystemClock).unwrap();

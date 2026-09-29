@@ -714,7 +714,7 @@ pub(in crate::context) struct KeyPackageStoreDeps {
     /// Wall-clock source for reservation timestamps.
     pub clock: Arc<dyn Clock>,
     /// Optional wrapping pubkey published in each generated KP's leaf node.
-    pub wrapping_pubkey: Option<[u8; 32]>,
+    pub wrapping_pubkey: Option<[u8; 65]>,
 }
 
 // ---------------------------------------------------------------------------
@@ -735,7 +735,7 @@ pub struct KeyPackageStoreActor {
     /// fail-closes rather than pooling inert KPs.
     credential: Option<ScpCredential>,
     /// Optional wrapping pubkey published in each KP leaf node (§9.16.1).
-    wrapping_pubkey: Option<[u8; 32]>,
+    wrapping_pubkey: Option<[u8; 65]>,
     /// MLS primitives backend — the replenish source + fused-join executor.
     mls: Arc<dyn MlsBackend>,
     /// Durable KV for the Class-S reservation journal + KP records.

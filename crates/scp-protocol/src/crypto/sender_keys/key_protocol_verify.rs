@@ -18,13 +18,13 @@ use std::hash::BuildHasher;
 
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
+use zeroize::Zeroizing;
 
 #[cfg(test)]
 use super::generate_sender_key;
 use super::{SenderKey, SenderKeyError};
 use crate::crypto::hpke;
-use crate::serde_util::{serde_hpke_sealed_48, serde_pubkey_32, serde_signature_64};
+use crate::serde_util::{serde_hpke_sealed_48, serde_pubkey_65, serde_signature_64};
 use crate::trust::custody_violation::CategoryARejection;
 use scp_did::SigningKeyId;
 
@@ -32,7 +32,8 @@ use scp_did::SigningKeyId;
 // Wrapping keypair generation (§9.16.1)
 // ---------------------------------------------------------------------------
 
-/// Generates a stable X25519 wrapping keypair for sender key distribution.
+/// Generates a stable DHKEM(P-256) wrapping keypair for sender key
+/// distribution (09 §9.5, §9.16.1).
 ///
 /// Each member maintains one keypair per context, published as the
 /// `scp_wrapping_key` MLS `LeafNode` extension. The keypair is used for HPKE
@@ -40,16 +41,16 @@ use scp_did::SigningKeyId;
 /// MLS epoch advances, rotating only on identity key rotation (§9.12) or
 /// suspected compromise.
 ///
-/// Returns `(public_key, secret_key)` as raw 32-byte arrays. The secret key
-/// should be persisted via `ProtocolRepository::store_wrapping_keypair` and the
-/// public key included in the `LeafNode` extension via `make_wrapping_key_extension`.
+/// Returns `(public_key, secret_key)`: the 65-byte uncompressed P-256 point
+/// and the 32-byte big-endian scalar, wiped on drop. The secret key should be
+/// persisted via `ProtocolRepository::store_wrapping_keypair` and the public
+/// key included in the `LeafNode` extension via `make_wrapping_key_extension`.
 ///
 /// See spec §9.16.1.
 #[must_use]
-pub fn generate_wrapping_keypair() -> ([u8; 32], [u8; 32]) {
-    let secret = StaticSecret::random_from_rng(OsRng);
-    let public = X25519Pub::from(&secret);
-    (public.to_bytes(), secret.to_bytes())
+pub fn generate_wrapping_keypair() -> ([u8; hpke::p256::PUBLIC_KEY_LEN], Zeroizing<[u8; 32]>) {
+    let key = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+    (key.public_key().to_uncompressed(), key.to_scalar_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -135,7 +136,7 @@ pub struct SenderKeyEpochAdvance {
 /// Request for a sender's current key at a specific epoch.
 ///
 /// Sent as an MLS application message to the key holder. The requester
-/// includes a fresh X25519 wrapping public key so the responder can
+/// includes a fresh DHKEM(P-256) wrapping public key so the responder can
 /// HPKE-encrypt the sender key material.
 ///
 /// Contains a cryptographic nonce and timestamp for replay protection.
@@ -149,9 +150,10 @@ pub struct SenderKeyRequest {
     pub sender_did: String,
     /// The epoch number being requested.
     pub epoch: u64,
-    /// Fresh X25519 public key for HPKE wrapping (32 bytes).
-    #[serde(with = "serde_pubkey_32")]
-    pub wrapping_pubkey: [u8; 32],
+    /// Fresh DHKEM(P-256) public key for HPKE wrapping: a 65-byte
+    /// uncompressed point, validated by the responder's HPKE seal.
+    #[serde(with = "serde_pubkey_65")]
+    pub wrapping_pubkey: [u8; 65],
     /// Cryptographic nonce for replay protection (16 bytes, generated with
     /// `OsRng`). The responder echoes this in [`SenderKeyResponse::request_nonce`]
     /// and rejects duplicate nonces within `NONCE_EXPIRY_SECS`.
@@ -186,10 +188,10 @@ pub struct SenderKeyResponse {
     /// (32) + AES-128-GCM tag (16). The AEAD nonce is internal per RFC 9180.
     #[serde(with = "serde_hpke_sealed_48")]
     pub hpke_sealed_key: [u8; 48],
-    /// The HPKE encapsulated key (`enc`, a 32-byte ephemeral X25519 public
-    /// key) used to derive the KEM shared secret.
-    #[serde(with = "serde_pubkey_32")]
-    pub ephemeral_pubkey: [u8; 32],
+    /// The HPKE encapsulated key (`enc`, a 65-byte uncompressed ephemeral
+    /// P-256 public key) used to derive the KEM shared secret.
+    #[serde(with = "serde_pubkey_65")]
+    pub ephemeral_pubkey: [u8; 65],
     /// Echo of the request nonce from [`SenderKeyRequest::nonce`], binding
     /// this response to the originating request.
     #[serde(with = "serde_bytes")]
@@ -634,33 +636,33 @@ where
 // HPKE open (non-custody variant)
 // ---------------------------------------------------------------------------
 
-/// Opens an HPKE-sealed sender key using the raw X25519 wrapping secret key
-/// bytes (RFC 9180 Base mode, §9.16.2).
+/// Opens an HPKE-sealed sender key using the raw P-256 wrapping secret
+/// scalar (RFC 9180 Base mode, DHKEM(P-256), §9.5, §9.16.2).
 ///
 /// This is the non-custody (software-key) variant of
 /// `key_protocol::open_sender_key_response` (in `scp-runtime`), for use when
 /// the wrapping secret key is held in software (e.g. in `NodeMlsFactory`)
 /// rather than inside a `KeyCustody` boundary. Custody-held keys must use
-/// [`crate::crypto::hpke::custody::open_with_external_dh`].
+/// [`crate::crypto::hpke::p256::custody::open_with_external_dh`].
 ///
 /// # Arguments
 ///
 /// * `sealed` - The HPKE ciphertext `ct` (`ciphertext || tag`).
 /// * `ephemeral_pubkey` - The HPKE encapsulated key `enc` (sender's ephemeral
-///   X25519 public key).
-/// * `wrapping_secret` - The recipient's X25519 wrapping secret key (32 bytes).
+///   65-byte P-256 public key), point-validated before key agreement.
+/// * `wrapping_secret` - The recipient's P-256 wrapping scalar (32 bytes).
 /// * `context_id` - The SCP context identifier (hex string).
 /// * `sender_did` - The DID of the sender.
 /// * `epoch` - The sender key epoch.
 ///
 /// # Errors
 ///
-/// Returns [`SenderKeyError::HpkeDecryptionFailed`] if HPKE open fails (wrong
-/// key, wrong `info`/`aad`, or tampered `enc`/`ct`), or if the recovered
-/// plaintext is not exactly 32 bytes.
+/// Returns [`SenderKeyError::HpkeDecryptionFailed`] if HPKE open fails (an
+/// invalid `enc` point or scalar, wrong key, wrong `info`/`aad`, or tampered
+/// `enc`/`ct`), or if the recovered plaintext is not exactly 32 bytes.
 pub fn hpke_open_sender_key(
     sealed: &[u8],
-    ephemeral_pubkey: &[u8; 32],
+    ephemeral_pubkey: &[u8; 65],
     wrapping_secret: &[u8; 32],
     context_id: &str,
     sender_did: &str,
@@ -669,7 +671,7 @@ pub fn hpke_open_sender_key(
     let info = build_hpke_info(context_id, sender_did, epoch);
     let aad = build_hpke_aad(context_id, sender_did, epoch);
 
-    let plaintext = hpke::open(wrapping_secret, ephemeral_pubkey, &info, &aad, sealed)
+    let plaintext = hpke::p256::open(wrapping_secret, ephemeral_pubkey, &info, &aad, sealed)
         .map_err(|e| SenderKeyError::HpkeDecryptionFailed(e.to_string()))?;
 
     let key_bytes: [u8; 32] = plaintext.as_slice().try_into().map_err(|_| {
@@ -906,12 +908,12 @@ pub fn build_hpke_aad(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8>
 // HPKE seal (RFC 9180 Base mode, §9.16.2)
 // ---------------------------------------------------------------------------
 
-/// HPKE-seals a 32-byte sender key to a recipient's X25519 wrapping pubkey
-/// (RFC 9180 Base mode via [`crate::crypto::hpke`]).
+/// HPKE-seals a 32-byte sender key to a recipient's DHKEM(P-256) wrapping
+/// pubkey (RFC 9180 Base mode via [`crate::crypto::hpke::p256`], §9.5).
 ///
 /// Returns `(sealed_ct, enc)` where `sealed_ct` is the HPKE ciphertext
 /// (`ciphertext || tag`, 48 bytes for a 32-byte plaintext) and `enc` is the
-/// 32-byte HPKE encapsulated key (the ephemeral X25519 public key). There is
+/// 65-byte HPKE encapsulated key (the ephemeral P-256 public key). There is
 /// NO external nonce — the AEAD nonce is derived internally by RFC 9180.
 ///
 /// Context binding: both `info` and `aad` include `context_id`, `sender_did`,
@@ -919,18 +921,19 @@ pub fn build_hpke_aad(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8>
 ///
 /// # Errors
 ///
-/// Returns [`SenderKeyError::HpkeEncryptionFailed`] if HPKE sealing fails.
+/// Returns [`SenderKeyError::HpkeEncryptionFailed`] if `recipient_pub` is not
+/// a valid uncompressed P-256 point or HPKE sealing fails.
 pub fn hpke_seal_sender_key(
     plaintext: &[u8; 32],
-    recipient_pub: &[u8; 32],
+    recipient_pub: &[u8; 65],
     context_id: &str,
     sender_did: &str,
     epoch: u64,
-) -> Result<(Vec<u8>, [u8; 32]), SenderKeyError> {
+) -> Result<(Vec<u8>, [u8; 65]), SenderKeyError> {
     let info = build_hpke_info(context_id, sender_did, epoch);
     let aad = build_hpke_aad(context_id, sender_did, epoch);
 
-    let (enc, ct) = hpke::seal(recipient_pub, &info, &aad, plaintext)
+    let (enc, ct) = hpke::p256::seal(recipient_pub, &info, &aad, plaintext)
         .map_err(|e| SenderKeyError::HpkeEncryptionFailed(e.to_string()))?;
 
     Ok((ct, enc))
@@ -1111,23 +1114,23 @@ pub struct BridgeShadowKeyParams<'a> {
 ///
 /// # Arguments
 ///
-/// - `requester_wrapping_pubkey` -- The requesting member's X25519
-///   wrapping public key (32 bytes).
+/// - `requester_wrapping_pubkey` -- The requesting member's DHKEM(P-256)
+///   wrapping public key (65 bytes).
 /// - `params` -- Bridge shadow key parameters.
 ///
 /// # Returns
 ///
 /// `(hpke_sealed_key, enc)` -- The HPKE ciphertext (`ct = ciphertext || tag`,
-/// 48 bytes) and the HPKE encapsulated key (`enc`, 32-byte ephemeral X25519
+/// 48 bytes) and the HPKE encapsulated key (`enc`, 65-byte ephemeral P-256
 /// public key). The AEAD nonce is internal per RFC 9180.
 ///
 /// # Errors
 ///
 /// Returns `SenderKeyError::HpkeEncryptionFailed` if HPKE wrapping fails.
 pub fn handle_bridge_shadow_key_request(
-    requester_wrapping_pubkey: &[u8; 32],
+    requester_wrapping_pubkey: &[u8; 65],
     params: &BridgeShadowKeyParams<'_>,
-) -> Result<([u8; 48], [u8; 32]), SenderKeyError> {
+) -> Result<([u8; 48], [u8; 65]), SenderKeyError> {
     let (sealed_vec, ephemeral_pub) = hpke_seal_sender_key(
         params.shadow_sender_key.as_bytes(),
         requester_wrapping_pubkey,
@@ -1200,12 +1203,17 @@ mod tests {
         let sender = "did:dht:alice";
         let epoch = 1u64;
 
-        let recipient_secret = StaticSecret::random_from_rng(OsRng);
-        let recipient_public = X25519Pub::from(&recipient_secret);
+        let recipient_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let recipient_public = recipient_secret.public_key();
 
-        let (sealed, ephemeral_pub) =
-            hpke_seal_sender_key(&plaintext, &recipient_public.to_bytes(), ctx, sender, epoch)
-                .unwrap();
+        let (sealed, ephemeral_pub) = hpke_seal_sender_key(
+            &plaintext,
+            &recipient_public.to_uncompressed(),
+            ctx,
+            sender,
+            epoch,
+        )
+        .unwrap();
 
         // ct is exactly 48 bytes: 32-byte key + 16-byte AEAD tag.
         assert_eq!(sealed.len(), 48);
@@ -1213,7 +1221,7 @@ mod tests {
         let recovered = hpke_open_sender_key(
             &sealed,
             &ephemeral_pub,
-            &recipient_secret.to_bytes(),
+            &recipient_secret.to_scalar_bytes(),
             ctx,
             sender,
             epoch,
@@ -1230,19 +1238,24 @@ mod tests {
         let sender = "did:dht:alice";
         let epoch = 1u64;
 
-        let recipient_secret = StaticSecret::random_from_rng(OsRng);
-        let recipient_public = X25519Pub::from(&recipient_secret);
+        let recipient_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let recipient_public = recipient_secret.public_key();
 
-        let wrong_secret = StaticSecret::random_from_rng(OsRng);
+        let wrong_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
 
-        let (sealed, ephemeral_pub) =
-            hpke_seal_sender_key(&plaintext, &recipient_public.to_bytes(), ctx, sender, epoch)
-                .unwrap();
+        let (sealed, ephemeral_pub) = hpke_seal_sender_key(
+            &plaintext,
+            &recipient_public.to_uncompressed(),
+            ctx,
+            sender,
+            epoch,
+        )
+        .unwrap();
 
         let result = hpke_open_sender_key(
             &sealed,
             &ephemeral_pub,
-            &wrong_secret.to_bytes(),
+            &wrong_secret.to_scalar_bytes(),
             ctx,
             sender,
             epoch,
@@ -1258,19 +1271,24 @@ mod tests {
         let sender = "did:dht:alice";
         let epoch = 7u64;
 
-        let recipient_secret = StaticSecret::random_from_rng(OsRng);
-        let recipient_public = X25519Pub::from(&recipient_secret);
+        let recipient_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let recipient_public = recipient_secret.public_key();
 
-        let (mut sealed, ephemeral_pub) =
-            hpke_seal_sender_key(&plaintext, &recipient_public.to_bytes(), ctx, sender, epoch)
-                .unwrap();
+        let (mut sealed, ephemeral_pub) = hpke_seal_sender_key(
+            &plaintext,
+            &recipient_public.to_uncompressed(),
+            ctx,
+            sender,
+            epoch,
+        )
+        .unwrap();
         sealed[0] ^= 0x01;
 
         assert!(
             hpke_open_sender_key(
                 &sealed,
                 &ephemeral_pub,
-                &recipient_secret.to_bytes(),
+                &recipient_secret.to_scalar_bytes(),
                 ctx,
                 sender,
                 epoch,
@@ -1287,19 +1305,24 @@ mod tests {
         let sender = "did:dht:alice";
         let epoch = 9u64;
 
-        let recipient_secret = StaticSecret::random_from_rng(OsRng);
-        let recipient_public = X25519Pub::from(&recipient_secret);
+        let recipient_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let recipient_public = recipient_secret.public_key();
 
-        let (sealed, mut ephemeral_pub) =
-            hpke_seal_sender_key(&plaintext, &recipient_public.to_bytes(), ctx, sender, epoch)
-                .unwrap();
+        let (sealed, mut ephemeral_pub) = hpke_seal_sender_key(
+            &plaintext,
+            &recipient_public.to_uncompressed(),
+            ctx,
+            sender,
+            epoch,
+        )
+        .unwrap();
         ephemeral_pub[0] ^= 0x01;
 
         assert!(
             hpke_open_sender_key(
                 &sealed,
                 &ephemeral_pub,
-                &recipient_secret.to_bytes(),
+                &recipient_secret.to_scalar_bytes(),
                 ctx,
                 sender,
                 epoch,
@@ -1330,12 +1353,12 @@ mod tests {
         let plaintext = [0xEFu8; 32];
         let sender = "did:dht:alice";
         let epoch = 1u64;
-        let recipient_secret = StaticSecret::random_from_rng(OsRng);
-        let recipient_public = X25519Pub::from(&recipient_secret);
+        let recipient_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let recipient_public = recipient_secret.public_key();
 
         let (sealed, ephemeral_pub) = hpke_seal_sender_key(
             &plaintext,
-            &recipient_public.to_bytes(),
+            &recipient_public.to_uncompressed(),
             "ctx-A",
             sender,
             epoch,
@@ -1346,7 +1369,7 @@ mod tests {
         let result = hpke_open_sender_key(
             &sealed,
             &ephemeral_pub,
-            &recipient_secret.to_bytes(),
+            &recipient_secret.to_scalar_bytes(),
             "ctx-B",
             sender,
             epoch,
@@ -1359,12 +1382,12 @@ mod tests {
         let plaintext = [0xDDu8; 32];
         let ctx = "ctx-test";
         let epoch = 1u64;
-        let recipient_secret = StaticSecret::random_from_rng(OsRng);
-        let recipient_public = X25519Pub::from(&recipient_secret);
+        let recipient_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let recipient_public = recipient_secret.public_key();
 
         let (sealed, ephemeral_pub) = hpke_seal_sender_key(
             &plaintext,
-            &recipient_public.to_bytes(),
+            &recipient_public.to_uncompressed(),
             ctx,
             "did:dht:alice",
             epoch,
@@ -1374,7 +1397,7 @@ mod tests {
         let result = hpke_open_sender_key(
             &sealed,
             &ephemeral_pub,
-            &recipient_secret.to_bytes(),
+            &recipient_secret.to_scalar_bytes(),
             ctx,
             "did:dht:bob",
             epoch,
@@ -1387,16 +1410,22 @@ mod tests {
         let plaintext = [0xBBu8; 32];
         let ctx = "ctx-test";
         let sender = "did:dht:alice";
-        let recipient_secret = StaticSecret::random_from_rng(OsRng);
-        let recipient_public = X25519Pub::from(&recipient_secret);
+        let recipient_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let recipient_public = recipient_secret.public_key();
 
-        let (sealed, ephemeral_pub) =
-            hpke_seal_sender_key(&plaintext, &recipient_public.to_bytes(), ctx, sender, 1).unwrap();
+        let (sealed, ephemeral_pub) = hpke_seal_sender_key(
+            &plaintext,
+            &recipient_public.to_uncompressed(),
+            ctx,
+            sender,
+            1,
+        )
+        .unwrap();
 
         let result = hpke_open_sender_key(
             &sealed,
             &ephemeral_pub,
-            &recipient_secret.to_bytes(),
+            &recipient_secret.to_scalar_bytes(),
             ctx,
             sender,
             2,
@@ -1607,7 +1636,7 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
-            wrapping_pubkey: [0u8; 32],
+            wrapping_pubkey: crate::crypto::hpke::p256::test_point(0),
             nonce: [0u8; REQUEST_NONCE_SIZE],
             timestamp: now,
             signature: [0u8; 64],
@@ -1625,7 +1654,7 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
-            wrapping_pubkey: [0u8; 32],
+            wrapping_pubkey: crate::crypto::hpke::p256::test_point(0),
             nonce: [0u8; REQUEST_NONCE_SIZE],
             timestamp: now,
             signature: [0u8; 64],
@@ -1646,7 +1675,7 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
-            wrapping_pubkey: [0u8; 32],
+            wrapping_pubkey: crate::crypto::hpke::p256::test_point(0),
             nonce: [0u8; REQUEST_NONCE_SIZE],
             // Timestamp far ahead of "now".
             timestamp: now + REQUEST_FRESHNESS_SECS + 10_000,
@@ -1931,8 +1960,8 @@ mod tests {
             epoch: u64,
             #[serde(with = "serde_bytes")]
             hpke_sealed_key: Vec<u8>,
-            #[serde(with = "serde_pubkey_32")]
-            ephemeral_pubkey: [u8; 32],
+            #[serde(with = "serde_bytes")]
+            ephemeral_pubkey: Vec<u8>,
             #[serde(with = "serde_bytes")]
             request_nonce: [u8; REQUEST_NONCE_SIZE],
         }
@@ -1942,7 +1971,7 @@ mod tests {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
             hpke_sealed_key: vec![0u8; 47],
-            ephemeral_pubkey: [0u8; 32],
+            ephemeral_pubkey: vec![0u8; 65],
             request_nonce: [0u8; REQUEST_NONCE_SIZE],
         };
         let serialized = rmp_serde::to_vec_named(&fake_short).unwrap();
@@ -1959,12 +1988,33 @@ mod tests {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
             hpke_sealed_key: vec![0u8; 49],
-            ephemeral_pubkey: [0u8; 32],
+            ephemeral_pubkey: vec![0u8; 65],
             request_nonce: [0u8; REQUEST_NONCE_SIZE],
         };
         let serialized_long = rmp_serde::to_vec_named(&fake_long).unwrap();
         let result_long = rmp_serde::from_slice::<SenderKeyResponse>(&serialized_long);
         assert!(result_long.is_err(), "should reject 49-byte sealed key");
+
+        // `enc` is a 65-byte DHKEM(P-256) point: a 32-byte (X25519-sized) or
+        // 66-byte `ephemeral_pubkey` is rejected, a 65-byte one accepted.
+        for (enc_len, ok) in [(32usize, false), (66, false), (65, true)] {
+            let fake = FakeResponse {
+                sender_did: "did:dht:alice".to_owned(),
+                epoch: 1,
+                hpke_sealed_key: vec![0u8; 48],
+                ephemeral_pubkey: vec![0u8; enc_len],
+                request_nonce: [0u8; REQUEST_NONCE_SIZE],
+            };
+            let bytes = rmp_serde::to_vec_named(&fake).unwrap();
+            let result = rmp_serde::from_slice::<SenderKeyResponse>(&bytes);
+            assert_eq!(result.is_ok(), ok, "enc length {enc_len}");
+            if let Err(e) = result {
+                assert!(
+                    e.to_string().contains("65-byte"),
+                    "enc length {enc_len}: {e}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2038,7 +2088,7 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             sender_did: "did:dht:alice".to_owned(),
             epoch: 7,
-            wrapping_pubkey: [0x11; 32],
+            wrapping_pubkey: crate::crypto::hpke::p256::test_point(0x11),
             nonce: [0x22; REQUEST_NONCE_SIZE],
             timestamp: 1_700_000_000,
             signature: [0x33; 64],
@@ -2060,7 +2110,7 @@ mod tests {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 3,
             hpke_sealed_key: [0x44; 48],
-            ephemeral_pubkey: [0x55; 32],
+            ephemeral_pubkey: crate::crypto::hpke::p256::test_point(0x55),
             request_nonce: [0x66; REQUEST_NONCE_SIZE],
         };
         let bytes = rmp_serde::to_vec_named(&response).unwrap();
@@ -2125,7 +2175,7 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
-            wrapping_pubkey: [0xBB; 32],
+            wrapping_pubkey: crate::crypto::hpke::p256::test_point(0xBB),
             nonce: [0xCC; REQUEST_NONCE_SIZE],
             timestamp: 1_700_000_000,
             signature: [0xDD; 64],
@@ -2149,7 +2199,7 @@ mod tests {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 2,
             hpke_sealed_key: [0xEE; 48],
-            ephemeral_pubkey: [0xFF; 32],
+            ephemeral_pubkey: crate::crypto::hpke::p256::test_point(0xFF),
             request_nonce: [0x11; REQUEST_NONCE_SIZE],
         };
         let msg = SenderKeyDistributionMessage::KeyResponse(response);
@@ -2200,7 +2250,7 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
-            wrapping_pubkey: [0; 32],
+            wrapping_pubkey: crate::crypto::hpke::p256::test_point(0),
             nonce: [0; REQUEST_NONCE_SIZE],
             timestamp: 0,
             signature: [0; 64],
@@ -2209,7 +2259,7 @@ mod tests {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
             hpke_sealed_key: [0; 48],
-            ephemeral_pubkey: [0; 32],
+            ephemeral_pubkey: crate::crypto::hpke::p256::test_point(0),
             request_nonce: [0; REQUEST_NONCE_SIZE],
         });
         let block = SenderKeyDistributionMessage::BlockNotification(BlockNotification {
@@ -2354,7 +2404,7 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             sender_did: "did:dht:alice".to_owned(),
             epoch: 7,
-            wrapping_pubkey: [0x11; 32],
+            wrapping_pubkey: crate::crypto::hpke::p256::test_point(0x11),
             nonce: [0x22; REQUEST_NONCE_SIZE],
             timestamp: 1_700_000_000,
             signature: [0x33; 64],
@@ -2379,7 +2429,7 @@ mod tests {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 3,
             hpke_sealed_key: [0x44; 48],
-            ephemeral_pubkey: [0x55; 32],
+            ephemeral_pubkey: crate::crypto::hpke::p256::test_point(0x55),
             request_nonce: [0x66; REQUEST_NONCE_SIZE],
         };
         let mut map: serde_json::Map<String, serde_json::Value> =

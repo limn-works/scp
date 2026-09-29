@@ -12,16 +12,16 @@
 //! Three methods:
 //!
 //! - [`HpkeBackend::seal`] — RFC 9180 single-shot Base-mode seal. Returns
-//!   `(enc, ct)`: the 32-byte HPKE encapsulated key and the AEAD ciphertext
+//!   `(enc, ct)`: the 65-byte HPKE encapsulated key and the AEAD ciphertext
 //!   (`ciphertext || tag`). There is no external nonce — RFC 9180 derives the
 //!   AEAD nonce internally (`base_nonce` at sequence 0).
 //! - [`HpkeBackend::unseal`] — inverse of `seal` for a software-held recipient
 //!   secret.
-//! - [`HpkeBackend::generate_wrapping_keypair`] — fresh X25519 keypair.
+//! - [`HpkeBackend::generate_wrapping_keypair`] — fresh DHKEM(P-256) keypair.
 //!
 //! # RFC 9180 parameters
 //!
-//! - KEM: `DHKEM(X25519, HKDF-SHA256)` (suite id `0x0020`).
+//! - KEM: `DHKEM(P-256, HKDF-SHA256)` (suite id `0x0010`).
 //! - KDF: `HKDF-SHA256` (suite id `0x0001`).
 //! - AEAD: `AES-128-GCM` (suite id `0x0001`).
 //!
@@ -35,15 +35,15 @@
 //! # Production impl
 //!
 //! [`ProductionHpkeBackend`] is a zero-sized struct that delegates to the
-//! authoritative RFC 9180 core in [`scp_protocol::crypto::hpke`]. State-free:
+//! authoritative RFC 9180 core in [`scp_protocol::crypto::hpke::p256`]. State-free:
 //! safe to share via `Arc` across every actor in the process.
 
 use async_trait::async_trait;
 use rand::rngs::OsRng;
 use zeroize::Zeroizing;
 
-use scp_protocol::crypto::hpke;
-use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
+use scp_crypto::p256::P256SigningKey;
+use scp_protocol::crypto::hpke::{self as hpke_core, p256 as hpke};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -71,11 +71,22 @@ pub enum HpkeError {
 // Constants
 // ---------------------------------------------------------------------------
 
-/// X25519 public-key size (RFC 7748 §5).
-const X25519_PUBLIC_KEY_LEN: usize = 32;
+/// DHKEM(P-256) public-key size: the uncompressed SEC1 point (RFC 9180 §7.1.1).
+const PUBLIC_KEY_LEN: usize = hpke::PUBLIC_KEY_LEN;
 
-/// X25519 secret-key size (RFC 7748 §5).
-const X25519_SECRET_KEY_LEN: usize = 32;
+/// DHKEM(P-256) private-key size: the 32-byte scalar (RFC 9180 §7.1.2).
+const SECRET_KEY_LEN: usize = hpke::PRIVATE_KEY_LEN;
+
+/// Maps a core HPKE error onto this seam's error, keeping the variant: a
+/// malformed key stays [`HpkeError::InvalidKey`] rather than reading as an
+/// AEAD failure.
+fn from_core(e: hpke_core::HpkeError) -> HpkeError {
+    match e {
+        hpke_core::HpkeError::InvalidKey(m) => HpkeError::InvalidKey(m),
+        hpke_core::HpkeError::OpenFailed(m) => HpkeError::OpenFailed(m),
+        hpke_core::HpkeError::SealFailed(m) => HpkeError::SealFailed(m),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Trait
@@ -89,16 +100,17 @@ const X25519_SECRET_KEY_LEN: usize = 32;
 #[async_trait]
 pub trait HpkeBackend: Send + Sync {
     /// RFC 9180 single-shot Base-mode seal of `pt` to `recipient_pub` under
-    /// `info` and `aad`. Returns `(enc, ct)`: the 32-byte encapsulated key and
+    /// `info` and `aad`. Returns `(enc, ct)`: the 65-byte encapsulated key and
     /// the AEAD ciphertext (`ciphertext || tag`).
     ///
     /// # Errors
     ///
-    /// Returns [`HpkeError::SealFailed`] if the HPKE seal fails (operationally
-    /// unreachable with valid inputs).
+    /// Returns [`HpkeError::InvalidKey`] if `recipient_pub` is not a valid
+    /// uncompressed P-256 point; [`HpkeError::SealFailed`] if the HPKE seal
+    /// fails (operationally unreachable with valid inputs).
     async fn seal(
         &self,
-        recipient_pub: &[u8; X25519_PUBLIC_KEY_LEN],
+        recipient_pub: &[u8; PUBLIC_KEY_LEN],
         info: &[u8],
         aad: &[u8],
         pt: &[u8],
@@ -110,21 +122,23 @@ pub trait HpkeBackend: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`HpkeError::InvalidKey`] if `enc` is the wrong length;
-    /// [`HpkeError::OpenFailed`] if HPKE open fails (wrong key, wrong
+    /// Returns [`HpkeError::InvalidKey`] if `enc` is not a valid 65-byte
+    /// uncompressed P-256 point (§9.5) or `recipient_secret` is not a valid
+    /// scalar; [`HpkeError::OpenFailed`] if HPKE open fails (wrong key, wrong
     /// `info`/`aad`, tampered `enc`/`ct`).
     async fn unseal(
         &self,
-        recipient_secret: &[u8; X25519_SECRET_KEY_LEN],
+        recipient_secret: &[u8; SECRET_KEY_LEN],
         enc: &[u8],
         info: &[u8],
         aad: &[u8],
         ct: &[u8],
     ) -> Result<Vec<u8>, HpkeError>;
 
-    /// Generates a fresh X25519 wrapping keypair using `OsRng`.
-    /// Returns `(public_key_bytes, secret_key_bytes)`; the secret is wrapped
-    /// in [`Zeroizing`] so it zeroes on drop.
+    /// Generates a fresh DHKEM(P-256) wrapping keypair using `OsRng`.
+    /// Returns `(public_key_bytes, secret_key_bytes)`: the 65-byte
+    /// uncompressed point and the 32-byte scalar, the secret wrapped in
+    /// [`Zeroizing`] so it zeroes on drop.
     ///
     /// # Errors
     ///
@@ -141,7 +155,7 @@ pub trait HpkeBackend: Send + Sync {
 ///
 /// Stateless; safe to share via `Arc` across all actors in the process.
 /// A thin delegating shim over the authoritative RFC 9180 Base-mode core in
-/// [`scp_protocol::crypto::hpke`].
+/// [`scp_protocol::crypto::hpke::p256`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProductionHpkeBackend;
 
@@ -157,41 +171,33 @@ impl ProductionHpkeBackend {
 impl HpkeBackend for ProductionHpkeBackend {
     async fn seal(
         &self,
-        recipient_pub: &[u8; X25519_PUBLIC_KEY_LEN],
+        recipient_pub: &[u8; PUBLIC_KEY_LEN],
         info: &[u8],
         aad: &[u8],
         pt: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), HpkeError> {
-        let (enc, ct) = hpke::seal(recipient_pub, info, aad, pt)
-            .map_err(|e| HpkeError::SealFailed(e.to_string()))?;
+        let (enc, ct) = hpke::seal(recipient_pub, info, aad, pt).map_err(from_core)?;
         Ok((enc.to_vec(), ct))
     }
 
     async fn unseal(
         &self,
-        recipient_secret: &[u8; X25519_SECRET_KEY_LEN],
+        recipient_secret: &[u8; SECRET_KEY_LEN],
         enc: &[u8],
         info: &[u8],
         aad: &[u8],
         ct: &[u8],
     ) -> Result<Vec<u8>, HpkeError> {
-        let enc_arr: [u8; hpke::HPKE_ENC_LEN] = enc.try_into().map_err(|_| {
-            HpkeError::InvalidKey(format!(
-                "HPKE enc must be {} bytes, got {}",
-                hpke::HPKE_ENC_LEN,
-                enc.len()
-            ))
-        })?;
-        hpke::open(recipient_secret, &enc_arr, info, aad, ct)
-            .map_err(|e| HpkeError::OpenFailed(e.to_string()))
+        // `open` validates `enc` (§9.5) before the key agreement.
+        hpke::open(recipient_secret, enc, info, aad, ct)
+            .map(|pt| pt.to_vec())
+            .map_err(from_core)
     }
 
     async fn generate_wrapping_keypair(&self) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), HpkeError> {
-        let secret = StaticSecret::random_from_rng(OsRng);
-        let public = X25519Pub::from(&secret);
-
-        let pk_bytes = public.as_bytes().to_vec();
-        let sk_bytes = Zeroizing::new(secret.to_bytes().to_vec());
+        let secret = P256SigningKey::random(&mut OsRng);
+        let pk_bytes = secret.public_key().to_uncompressed().to_vec();
+        let sk_bytes = Zeroizing::new(secret.to_scalar_bytes().to_vec());
         Ok((pk_bytes, sk_bytes))
     }
 }
@@ -236,19 +242,19 @@ mod tests {
 
         for (idx, (info, aad, pt)) in cases.iter().enumerate() {
             let (pk_vec, sk_vec) = backend.generate_wrapping_keypair().await.unwrap();
-            assert_eq!(pk_vec.len(), X25519_PUBLIC_KEY_LEN, "case {idx}: pk length");
-            assert_eq!(sk_vec.len(), X25519_SECRET_KEY_LEN, "case {idx}: sk length");
+            assert_eq!(pk_vec.len(), PUBLIC_KEY_LEN, "case {idx}: pk length");
+            assert_eq!(sk_vec.len(), SECRET_KEY_LEN, "case {idx}: sk length");
 
-            let mut pk = [0u8; X25519_PUBLIC_KEY_LEN];
+            let mut pk = [0u8; PUBLIC_KEY_LEN];
             pk.copy_from_slice(&pk_vec);
-            let mut sk = [0u8; X25519_SECRET_KEY_LEN];
+            let mut sk = [0u8; SECRET_KEY_LEN];
             sk.copy_from_slice(&sk_vec);
 
             let (enc, ct) = backend.seal(&pk, info, aad, pt).await.unwrap();
-            assert_eq!(enc.len(), hpke::HPKE_ENC_LEN, "case {idx}: enc length");
+            assert_eq!(enc.len(), hpke::ENC_LEN, "case {idx}: enc length");
             assert_eq!(
                 ct.len(),
-                pt.len() + hpke::HPKE_TAG_LEN,
+                pt.len() + hpke::TAG_LEN,
                 "case {idx}: ct length (no external nonce)",
             );
 
@@ -258,40 +264,44 @@ mod tests {
     }
 
     /// A delegation KAT: a ciphertext produced by the backend opens with the
-    /// `scp_protocol::crypto::hpke` core directly (proving the backend is a
+    /// `scp_protocol::crypto::hpke::p256` core directly (proving the backend is a
     /// faithful shim, not a divergent re-implementation).
     #[tokio::test]
     async fn backend_output_opens_with_core() {
         let backend = ProductionHpkeBackend::new();
         let (pk_vec, sk_vec) = backend.generate_wrapping_keypair().await.unwrap();
-        let mut pk = [0u8; X25519_PUBLIC_KEY_LEN];
+        let mut pk = [0u8; PUBLIC_KEY_LEN];
         pk.copy_from_slice(&pk_vec);
-        let mut sk = [0u8; X25519_SECRET_KEY_LEN];
+        let mut sk = [0u8; SECRET_KEY_LEN];
         sk.copy_from_slice(&sk_vec);
 
         let (enc, ct) = backend
             .seal(&pk, b"info", b"aad", b"payload")
             .await
             .unwrap();
-        let enc_arr: [u8; 32] = enc.as_slice().try_into().unwrap();
+        assert_eq!(enc.len(), hpke::ENC_LEN);
 
-        let recovered = hpke::open(&sk, &enc_arr, b"info", b"aad", &ct).unwrap();
+        let recovered = hpke::open(&sk, &enc, b"info", b"aad", &ct).unwrap();
         assert_eq!(recovered.as_slice(), b"payload");
     }
 
-    /// Generated X25519 keypair has the expected byte shape (32/32) and the
-    /// public key equals `X25519(secret, basepoint)`.
+    /// Generated DHKEM(P-256) keypair has the expected byte shape (65/32) and
+    /// the public key is `secret · G` in uncompressed form.
     #[tokio::test]
     async fn keypair_has_expected_shape() {
         let backend = ProductionHpkeBackend::new();
         let (pk, sk) = backend.generate_wrapping_keypair().await.unwrap();
-        assert_eq!(pk.len(), X25519_PUBLIC_KEY_LEN);
-        assert_eq!(sk.len(), X25519_SECRET_KEY_LEN);
+        assert_eq!(pk.len(), PUBLIC_KEY_LEN);
+        assert_eq!(sk.len(), SECRET_KEY_LEN);
 
         let mut sk_arr = [0u8; 32];
         sk_arr.copy_from_slice(&sk);
-        let rederived = X25519Pub::from(&StaticSecret::from(sk_arr));
-        assert_eq!(rederived.as_bytes().as_slice(), pk.as_slice());
+        let rederived = P256SigningKey::from_scalar_bytes(&sk_arr)
+            .unwrap()
+            .public_key()
+            .to_uncompressed();
+        assert_eq!(rederived.as_slice(), pk.as_slice());
+        assert_eq!(pk[0], 0x04);
     }
 
     /// Unsealing with a different secret key yields [`HpkeError::OpenFailed`].
@@ -302,9 +312,9 @@ mod tests {
         let (pk_vec, _sk_vec) = backend.generate_wrapping_keypair().await.unwrap();
         let (_pk2_vec, sk2_vec) = backend.generate_wrapping_keypair().await.unwrap();
 
-        let mut pk = [0u8; X25519_PUBLIC_KEY_LEN];
+        let mut pk = [0u8; PUBLIC_KEY_LEN];
         pk.copy_from_slice(&pk_vec);
-        let mut sk2 = [0u8; X25519_SECRET_KEY_LEN];
+        let mut sk2 = [0u8; SECRET_KEY_LEN];
         sk2.copy_from_slice(&sk2_vec);
 
         let (enc, ct) = backend.seal(&pk, b"info", b"aad", b"secret").await.unwrap();
@@ -321,9 +331,9 @@ mod tests {
     async fn tampered_ciphertext_fails() {
         let backend = ProductionHpkeBackend::new();
         let (pk_vec, sk_vec) = backend.generate_wrapping_keypair().await.unwrap();
-        let mut pk = [0u8; X25519_PUBLIC_KEY_LEN];
+        let mut pk = [0u8; PUBLIC_KEY_LEN];
         pk.copy_from_slice(&pk_vec);
-        let mut sk = [0u8; X25519_SECRET_KEY_LEN];
+        let mut sk = [0u8; SECRET_KEY_LEN];
         sk.copy_from_slice(&sk_vec);
 
         let (enc, mut ct) = backend.seal(&pk, b"info", b"aad", b"hello").await.unwrap();
@@ -336,18 +346,50 @@ mod tests {
         assert!(matches!(err, HpkeError::OpenFailed(_)));
     }
 
-    /// Wrong-length `enc` returns [`HpkeError::InvalidKey`].
+    /// An `enc` that is not a valid 65-byte uncompressed P-256 point returns
+    /// [`HpkeError::InvalidKey`], not an AEAD failure: 31 and 32 bytes (the
+    /// X25519 length), a `0x02` prefix and an off-curve point.
     #[tokio::test]
     async fn wrong_length_enc_rejected() {
         let backend = ProductionHpkeBackend::new();
-        let (_pk, sk_vec) = backend.generate_wrapping_keypair().await.unwrap();
-        let mut sk = [0u8; X25519_SECRET_KEY_LEN];
+        let (pk, sk_vec) = backend.generate_wrapping_keypair().await.unwrap();
+        let mut sk = [0u8; SECRET_KEY_LEN];
         sk.copy_from_slice(&sk_vec);
+        let mut wrong_prefix = pk.clone();
+        wrong_prefix[0] = 0x02;
+        let mut off_curve = [0u8; 65];
+        off_curve[0] = 0x04;
+        off_curve[64] = 0x01;
+        for (case, enc) in [
+            ("31 bytes", vec![0u8; 31]),
+            ("32 bytes", pk[1..33].to_vec()),
+            ("0x02 prefix", wrong_prefix),
+            ("off curve", off_curve.to_vec()),
+        ] {
+            let err = backend
+                .unseal(&sk, &enc, b"info", b"aad", &[0u8; 48])
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, HpkeError::InvalidKey(_)),
+                "{case}: got {err:?}"
+            );
+        }
+    }
+
+    /// Sealing to a recipient key that is not a valid P-256 point returns
+    /// [`HpkeError::InvalidKey`].
+    #[tokio::test]
+    async fn seal_to_off_curve_recipient_rejected() {
+        let backend = ProductionHpkeBackend::new();
+        let mut off_curve = [0u8; PUBLIC_KEY_LEN];
+        off_curve[0] = 0x04;
+        off_curve[64] = 0x01;
         let err = backend
-            .unseal(&sk, &[0u8; 31], b"info", b"aad", &[0u8; 48])
+            .seal(&off_curve, b"info", b"aad", b"payload")
             .await
             .unwrap_err();
-        assert!(matches!(err, HpkeError::InvalidKey(_)));
+        assert!(matches!(err, HpkeError::InvalidKey(_)), "got {err:?}");
     }
 
     /// Using a different `info` for unseal fails (HPKE domain-separation).
@@ -355,9 +397,9 @@ mod tests {
     async fn info_mismatch_fails() {
         let backend = ProductionHpkeBackend::new();
         let (pk_vec, sk_vec) = backend.generate_wrapping_keypair().await.unwrap();
-        let mut pk = [0u8; X25519_PUBLIC_KEY_LEN];
+        let mut pk = [0u8; PUBLIC_KEY_LEN];
         pk.copy_from_slice(&pk_vec);
-        let mut sk = [0u8; X25519_SECRET_KEY_LEN];
+        let mut sk = [0u8; SECRET_KEY_LEN];
         sk.copy_from_slice(&sk_vec);
 
         let (enc, ct) = backend
@@ -376,9 +418,9 @@ mod tests {
     async fn aad_mismatch_fails() {
         let backend = ProductionHpkeBackend::new();
         let (pk_vec, sk_vec) = backend.generate_wrapping_keypair().await.unwrap();
-        let mut pk = [0u8; X25519_PUBLIC_KEY_LEN];
+        let mut pk = [0u8; PUBLIC_KEY_LEN];
         pk.copy_from_slice(&pk_vec);
-        let mut sk = [0u8; X25519_SECRET_KEY_LEN];
+        let mut sk = [0u8; SECRET_KEY_LEN];
         sk.copy_from_slice(&sk_vec);
 
         let (enc, ct) = backend

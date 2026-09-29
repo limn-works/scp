@@ -164,7 +164,7 @@ pub enum Inbound {
         /// fail-closed if absent — §9.16.1, ADR-057). The driver records each in
         /// its member-wrapping-key directory and HPKE-seals its own sender key to
         /// each new member (the bystander re-distribution trigger, INVARIANT 2).
-        added_wrapping_keys: Vec<[u8; 32]>,
+        added_wrapping_keys: Vec<[u8; 65]>,
         /// The **authenticated** convergent committer timestamp (Unix seconds),
         /// recovered from the Commit's verified MLS AAD *before* the merge and
         /// adopted **verbatim** by `scp-mls` (ADR-057). The driver stamps this on
@@ -318,12 +318,14 @@ pub struct ContextCryptoState {
     /// announcements are idempotent and the durable routing state is the persisted
     /// peer registry, so this floor is not snapshotted.
     pub recv_announcement_tracker: HashMap<String, (u64, u64)>,
-    /// This participant's **stable wrapping public key** (X25519, §9.16.1). Peers
+    /// This participant's **stable wrapping public key** (the 65-byte
+    /// uncompressed DHKEM(P-256) point, §9.16.1, §9.5). Peers
     /// HPKE-seal their sender keys to it; it is published in this member's MLS
     /// leaf `scp_wrapping_key` extension and transported in the member-wrapping-key
     /// directory. Stable across MLS epochs (does not rotate on Update).
-    pub wrapping_public: [u8; 32],
-    /// This participant's **stable wrapping secret key** (X25519, §9.16.1). Used
+    pub wrapping_public: [u8; 65],
+    /// This participant's **stable wrapping secret key** (the 32-byte
+    /// DHKEM(P-256) scalar, §9.16.1). Used
     /// to HPKE-open sender-key distributions sealed to [`Self::wrapping_public`].
     /// Zeroized on drop; never printed (no `Debug` on this struct).
     pub wrapping_secret: Zeroizing<[u8; 32]>,
@@ -333,7 +335,7 @@ pub struct ContextCryptoState {
     /// every member recorded here is recorded *with* the wrapping key a peer needs
     /// to HPKE-seal a sender key to it, by construction. Includes this member's
     /// own entry (`did → wrapping_public`); the seal loop skips self.
-    pub member_wrapping_keys: HashMap<String, [u8; 32]>,
+    pub member_wrapping_keys: HashMap<String, [u8; 65]>,
 }
 
 impl ContextCryptoState {
@@ -341,7 +343,7 @@ impl ContextCryptoState {
     /// **fresh** stable wrapping keypair (§9.16.1).
     ///
     /// Generates a fresh local sender key at [`INITIAL_SENDER_KEY_EPOCH`], a fresh
-    /// X25519 wrapping keypair, an empty member-wrapping-key directory, and empty
+    /// DHKEM(P-256) wrapping keypair, an empty member-wrapping-key directory, and empty
     /// trackers (a fresh receive replay window — §9.16.1).
     ///
     /// **Test-only** (`#[cfg(test)]`): every production path — creator and joiner
@@ -376,8 +378,8 @@ impl ContextCryptoState {
     pub fn from_group_with_wrapping(
         context_id: impl Into<String>,
         mls_group: ScpMlsGroup,
-        wrapping_public: [u8; 32],
-        wrapping_secret: [u8; 32],
+        wrapping_public: [u8; 65],
+        wrapping_secret: Zeroizing<[u8; 32]>,
     ) -> Self {
         Self {
             mls_group,
@@ -388,7 +390,7 @@ impl ContextCryptoState {
             recv_sequence_tracker: HashMap::new(),
             recv_announcement_tracker: HashMap::new(),
             wrapping_public,
-            wrapping_secret: Zeroizing::new(wrapping_secret),
+            wrapping_secret,
             member_wrapping_keys: HashMap::new(),
         }
     }
@@ -399,7 +401,7 @@ impl ContextCryptoState {
     /// together with the wrapping key a peer needs to seal a sender key to it, so
     /// the two can never drift apart. Idempotent-overwrite (a re-record with a
     /// rotated wrapping key updates it).
-    pub fn record_member_wrapping_key(&mut self, member_did: &str, wrapping_key: [u8; 32]) {
+    pub fn record_member_wrapping_key(&mut self, member_did: &str, wrapping_key: [u8; 65]) {
         self.member_wrapping_keys
             .insert(member_did.to_owned(), wrapping_key);
     }
@@ -410,8 +412,8 @@ impl ContextCryptoState {
     /// [`AddMemberOutput::wrapping_keys`](crate::AddMemberOutput) (all members
     /// incl. self) so a joiner adopts the full directory.
     #[must_use]
-    pub fn wrapping_keys_snapshot(&self) -> Vec<(String, [u8; 32])> {
-        let mut out: Vec<(String, [u8; 32])> = self
+    pub fn wrapping_keys_snapshot(&self) -> Vec<(String, [u8; 65])> {
+        let mut out: Vec<(String, [u8; 65])> = self
             .member_wrapping_keys
             .iter()
             .map(|(did, wk)| (did.clone(), *wk))
@@ -438,7 +440,7 @@ impl ContextCryptoState {
         &mut self,
         local_did: &str,
         target_did: &str,
-        target_wrapping_key: &[u8; 32],
+        target_wrapping_key: &[u8; 65],
     ) -> Result<SenderKeyDistribution, ClientError> {
         let (sealed_vec, ephemeral_pubkey) = hpke_seal_sender_key(
             self.local_sender_key.as_bytes(),
@@ -501,7 +503,7 @@ impl ContextCryptoState {
     pub fn distribute_local_key_to(
         &mut self,
         local_did: &str,
-        recipients: &[(String, [u8; 32])],
+        recipients: &[(String, [u8; 65])],
     ) -> Result<Vec<SenderKeyDistribution>, ClientError> {
         // Keep the local member's own key discoverable in the store under its DID
         // (mirrors native `distribute_sender_key`).
@@ -989,7 +991,7 @@ mod tests {
         // Alice adds Bob; Carol (existing member) processes the Commit. Bob's
         // KeyPackage must publish a wrapping key or the add is rejected pre-merge
         // (ADR-057 sender-key distribution INVARIANT 3).
-        let bob_wk = [0xBB_u8; 32];
+        let (bob_wk, _bob_wsec) = generate_wrapping_keypair();
         let (bob_bundle, _bob_signer, _bob_provider): (_, SignatureKeyPair, _) =
             generate_key_package_with_wrapping_key(&credential(BOB), Some(&bob_wk), &SystemClock)
                 .unwrap();

@@ -16,7 +16,7 @@
 //! [`PerContextState::seed_encrypted_crypto_from_owned`] seed primitive — never
 //! through a provider-resident insert + `take_crypto_state` round-trip. The
 //! returned providers are kept ONLY as the node-resident source of each party's
-//! X25519 wrapping keypair (`wrapping_keypair_snapshot`); they never own the
+//! DHKEM(P-256) wrapping keypair (`wrapping_keypair_snapshot`); they never own the
 //! per-context crypto.
 //!
 //! Alice creates the honest SCP context group (`0xFF02`) on her owned state and
@@ -251,7 +251,7 @@ pub fn stand_up_two_party(ctx_str: &str, alice_did: &str, bob_did: &str) -> TwoP
             let bob = DID::from(bob_did);
 
             // Bob's joiner supervisor + a clone of his provider. The provider is
-            // retained ONLY as the node-resident source of Bob's X25519 wrapping
+            // retained ONLY as the node-resident source of Bob's DHKEM(P-256) wrapping
             // keypair (`wrapping_keypair_snapshot`); the joined crypto is born onto
             // Bob's actor state below, never installed into the provider.
             let (bob_sup, bob_crypto) = bob_supervisor(bob_did, pair_resolver(alice_did, bob_did));
@@ -261,7 +261,7 @@ pub fn stand_up_two_party(ctx_str: &str, alice_did: &str, bob_did: &str) -> TwoP
             // the secret `bob_crypto` opens distributed sender keys with stay the
             // SAME keypair across the reserve → join migration
             // (`wrapping_keypair_snapshot`). This makes Alice's sender-key
-            // distribution — a real X25519 DH to that wrapping key — decryptable by
+            // distribution — a real P-256 DH to that wrapping key — decryptable by
             // Bob. The KP also declares `0xFF02` (`scp_context_params`)
             // unconditionally.
             let (bob_wrap_public, bob_wrap_secret) = bob_crypto.wrapping_keypair_snapshot();

@@ -9,10 +9,15 @@
 //!    serializes it to JSON. The hand-populated `author_did` / `context_id`
 //!    echo is a drift hazard if each bridge open-codes it.
 //! 2. **Sealed JSON → raw key.** On open the bridge deserializes the
-//!    [`SealedBroadcastKey`], validates the 32-byte wrapping secret, and calls
+//!    [`SealedBroadcastKey`], validates the 32-byte P-256 wrapping scalar, and calls
 //!    [`open_broadcast_key`] to recover the raw broadcast key.
 //!
-//! Both seams are pure value-shape logic with no per-bridge state, so they live
+//! 3. **Request → wrapping public key.** Before dispatching a key request the
+//!    bridge parses the requester's `wrapping_pubkey` with
+//!    [`parse_wrapping_pubkey`]: exactly 65 bytes, a valid uncompressed P-256
+//!    point (§9.5).
+//!
+//! All three seams are pure value-shape logic with no per-bridge state, so they live
 //! here once. Each bridge keeps its own `#[pyo3]` / `#[uniffi::export]` /
 //! `#[napi]` wrapper and maps the structured errors below to its own error type
 //! and code (ADR-048 §7 per-SDK idiom — only the value-shape logic is shared).
@@ -22,8 +27,73 @@
 use scp_core::context::broadcast::{KeyRequestDecision, SealedBroadcastKey};
 use scp_core::crypto::sender_keys::broadcast::open_broadcast_key;
 
-/// The exact byte length of a legitimate X25519 wrapping secret.
+/// The exact byte length of a legitimate wrapping secret: the DHKEM(P-256)
+/// scalar (§9.5).
 const WRAPPING_SECRET_LEN: usize = 32;
+
+/// The exact byte length of a wrapping public key: the uncompressed
+/// DHKEM(P-256) point (§9.5).
+const WRAPPING_PUBKEY_LEN: usize = 65;
+
+/// Failure modes for [`parse_wrapping_pubkey`].
+///
+/// Each bridge maps both variants to its caller-input validation error.
+#[derive(Debug)]
+pub enum WrappingPubkeyError {
+    /// The key was not exactly 65 bytes.
+    InvalidLength {
+        /// The actual length supplied.
+        actual: usize,
+    },
+    /// The key was 65 bytes but not a valid uncompressed P-256 point (wrong
+    /// tag, a coordinate at or above the field prime, or off the curve).
+    InvalidPoint {
+        /// Crypto-layer detail.
+        detail: String,
+    },
+}
+
+impl core::fmt::Display for WrappingPubkeyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidLength { actual } => write!(
+                f,
+                "wrapping_pubkey must be {WRAPPING_PUBKEY_LEN} bytes (an uncompressed P-256 \
+                 point), got {actual}"
+            ),
+            Self::InvalidPoint { detail } => write!(
+                f,
+                "wrapping_pubkey is not a valid uncompressed P-256 point: {detail}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WrappingPubkeyError {}
+
+/// Parses a broadcast key requester's wrapping public key (§5.14.2, §9.5).
+///
+/// The key must be exactly 65 bytes and a valid uncompressed P-256 point, so a
+/// malformed key fails at the bridge with a validation error instead of
+/// reaching the author's seal.
+///
+/// # Errors
+///
+/// Returns [`WrappingPubkeyError::InvalidLength`] for any length other than
+/// 65, and [`WrappingPubkeyError::InvalidPoint`] for a 65-byte value that is
+/// not a valid uncompressed P-256 point.
+pub fn parse_wrapping_pubkey(bytes: &[u8]) -> Result<[u8; 65], WrappingPubkeyError> {
+    if bytes.len() != WRAPPING_PUBKEY_LEN {
+        return Err(WrappingPubkeyError::InvalidLength {
+            actual: bytes.len(),
+        });
+    }
+    scp_protocol::crypto::hpke::p256::validate_uncompressed_point(bytes).map_err(|e| {
+        WrappingPubkeyError::InvalidPoint {
+            detail: e.to_string(),
+        }
+    })
+}
 
 /// Builds and JSON-serializes a [`SealedBroadcastKey`] from a broadcast
 /// key-request [`KeyRequestDecision`].
@@ -103,7 +173,7 @@ impl core::fmt::Display for OpenSealedKeyError {
 impl std::error::Error for OpenSealedKeyError {}
 
 /// Opens an HPKE-sealed broadcast key (§5.14.2) from its wire JSON using a
-/// software-held 32-byte X25519 wrapping secret, returning the raw 32-byte
+/// software-held 32-byte DHKEM(P-256) wrapping scalar, returning the raw 32-byte
 /// AES-256 broadcast key bytes.
 ///
 /// `sealed_json` is the JSON produced by [`seal_decision_to_json`] on grant;
@@ -150,24 +220,26 @@ mod tests {
     use scp_core::crypto::sender_keys::broadcast::{
         generate_broadcast_key, seal_broadcast_key_to_subscriber,
     };
+    use scp_core::crypto::sender_keys::generate_wrapping_keypair;
 
     const CTX: &str = "ctx-broadcast-common-test";
     const AUTHOR: &str = "did:dht:z6MkBroadcastAuthorCommonTest";
 
     /// Builds a real granted decision by sealing a freshly generated broadcast
-    /// key to a known X25519 keypair, so the round-trip exercises real crypto.
-    fn grant_for(wrapping_pub: &[u8; 32], epoch: u64) -> KeyRequestDecision {
+    /// key to a known DHKEM(P-256) keypair, so the round-trip exercises real
+    /// crypto.
+    fn grant_for(wrapping_pub: &[u8; 65], epoch: u64) -> KeyRequestDecision {
         let key = generate_broadcast_key(AUTHOR);
         let (ct, enc) =
             seal_broadcast_key_to_subscriber(key.key(), wrapping_pub, CTX, AUTHOR, epoch).unwrap();
         KeyRequestDecision::Grant { enc, ct, epoch }
     }
 
-    /// Deterministic X25519 keypair (secret scalar → public point).
-    fn x25519_keypair() -> ([u8; 32], [u8; 32]) {
-        let secret = x25519_dalek::StaticSecret::from([7u8; 32]);
-        let public = x25519_dalek::PublicKey::from(&secret);
-        (secret.to_bytes(), public.to_bytes())
+    /// A fresh DHKEM(P-256) wrapping keypair: the 32-byte scalar and its
+    /// 65-byte uncompressed public point.
+    fn wrapping_keypair() -> ([u8; 32], [u8; 65]) {
+        let (public, secret) = generate_wrapping_keypair();
+        (*secret, public)
     }
 
     #[test]
@@ -181,7 +253,7 @@ mod tests {
 
     #[test]
     fn grant_seals_then_opens_roundtrip() {
-        let (secret, public) = x25519_keypair();
+        let (secret, public) = wrapping_keypair();
         let decision = grant_for(&public, 3);
         let json = seal_decision_to_json(decision, AUTHOR, CTX)
             .unwrap()
@@ -207,7 +279,7 @@ mod tests {
 
     #[test]
     fn open_rejects_wrong_length_secret() {
-        let (_secret, public) = x25519_keypair();
+        let (_secret, public) = wrapping_keypair();
         let json = seal_decision_to_json(grant_for(&public, 0), AUTHOR, CTX)
             .unwrap()
             .unwrap();
@@ -219,13 +291,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_wrapping_pubkey_accepts_a_valid_point() {
+        let (_secret, public) = wrapping_keypair();
+        assert_eq!(parse_wrapping_pubkey(&public).unwrap(), public);
+    }
+
+    #[test]
+    fn parse_wrapping_pubkey_rejects_32_bytes() {
+        let err = parse_wrapping_pubkey(&[0x42; 32]).unwrap_err();
+        assert!(matches!(
+            err,
+            WrappingPubkeyError::InvalidLength { actual: 32 }
+        ));
+        assert!(err.to_string().contains("must be 65 bytes"), "{err}");
+    }
+
+    #[test]
+    fn parse_wrapping_pubkey_rejects_an_off_curve_point() {
+        // The uncompressed tag with the point (0, 0), which is not on the curve.
+        let mut off_curve = [0u8; 65];
+        off_curve[0] = 0x04;
+        assert!(matches!(
+            parse_wrapping_pubkey(&off_curve).unwrap_err(),
+            WrappingPubkeyError::InvalidPoint { .. }
+        ));
+        // A valid point under the compressed tag is rejected too.
+        let (_secret, mut public) = wrapping_keypair();
+        public[0] = 0x02;
+        assert!(matches!(
+            parse_wrapping_pubkey(&public).unwrap_err(),
+            WrappingPubkeyError::InvalidPoint { .. }
+        ));
+    }
+
+    #[test]
     fn open_rejects_wrong_secret() {
-        let (_secret, public) = x25519_keypair();
+        let (_secret, public) = wrapping_keypair();
         let json = seal_decision_to_json(grant_for(&public, 0), AUTHOR, CTX)
             .unwrap()
             .unwrap();
-        // A different secret cannot open the sealed key.
-        let wrong = [9u8; 32];
+        // A different valid P-256 scalar cannot open the sealed key.
+        let (wrong, _wrong_public) = wrapping_keypair();
         let err = open_sealed_broadcast_key(&json, &wrong).unwrap_err();
         assert!(matches!(err, OpenSealedKeyError::OpenFailed { .. }));
     }

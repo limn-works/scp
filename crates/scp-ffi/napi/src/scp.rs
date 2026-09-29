@@ -2538,8 +2538,10 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `broadcast_handle_key_request`.
     ///
-    /// `wrapping_pubkey` is the requester's 32-byte X25519 public key; the
-    /// broadcast key is HPKE-sealed to it inside the protocol layer (§5.14.2).
+    /// `wrapping_pubkey` is the requester's 65-byte uncompressed DHKEM(P-256)
+    /// public key; any other length or an invalid point is a validation error.
+    /// The broadcast key is HPKE-sealed to it inside the protocol layer
+    /// (§5.14.2, §9.5).
     /// Returns `Some(json)` (a serialized `SealedBroadcastKey`) on grant or
     /// `None` on deny.
     #[napi(js_name = "broadcastHandleKeyRequest")]

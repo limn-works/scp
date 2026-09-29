@@ -25,25 +25,25 @@ fn test_credential(name: &str) -> scp_mls::ScpCredential {
     .unwrap()
 }
 
-/// AC: generate_wrapping_keypair produces distinct 32-byte keypairs.
+/// AC: generate_wrapping_keypair produces distinct DHKEM(P-256) keypairs: a
+/// 65-byte uncompressed public point and its 32-byte scalar.
 #[test]
 fn generate_wrapping_keypair_produces_valid_keypair() {
     let (pub1, sec1) = crate::crypto::sender_keys::key_protocol::generate_wrapping_keypair();
     let (pub2, sec2) = crate::crypto::sender_keys::key_protocol::generate_wrapping_keypair();
 
-    assert_eq!(pub1.len(), 32);
+    assert_eq!(pub1.len(), 65);
+    assert_eq!(pub1[0], 0x04);
     assert_eq!(sec1.len(), 32);
     assert_ne!(pub1, pub2, "wrapping keypairs must be distinct");
     assert_ne!(sec1, sec2, "wrapping secret keys must be distinct");
 
     // Verify the public key is derived from the secret key.
-    let secret = x25519_dalek::StaticSecret::from(sec1);
-    let derived_pub = x25519_dalek::PublicKey::from(&secret);
-    assert_eq!(
-        pub1,
-        derived_pub.to_bytes(),
-        "public key must derive from secret key"
-    );
+    let derived_pub = scp_crypto::p256::P256SigningKey::from_scalar_bytes(&sec1)
+        .unwrap()
+        .public_key()
+        .to_uncompressed();
+    assert_eq!(pub1, derived_pub, "public key must derive from secret key");
 }
 
 /// AC: send SenderKeyRequest -> response is HPKE-sealed to the requester's
@@ -205,11 +205,13 @@ fn sender_keys_wrapping_stable_001() {
     let (pub_key, sec_key) = generate_wrapping_keypair();
 
     // 1. Wrapping keypair is valid (public derives from secret).
-    let secret = x25519_dalek::StaticSecret::from(sec_key);
-    let derived_pub = x25519_dalek::PublicKey::from(&secret);
-    assert_eq!(pub_key, derived_pub.to_bytes(), "public key derivation");
+    let derived_pub = scp_crypto::p256::P256SigningKey::from_scalar_bytes(&sec_key)
+        .unwrap()
+        .public_key()
+        .to_uncompressed();
+    assert_eq!(pub_key, derived_pub, "public key derivation");
 
-    // 2. Extension publishes 32-byte X25519 public key.
+    // 2. Extension publishes the 65-byte DHKEM(P-256) public key.
     let ext = make_wrapping_key_extension(&pub_key);
     assert_eq!(
         ext.extension_type(),

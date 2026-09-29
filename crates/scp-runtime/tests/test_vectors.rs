@@ -895,12 +895,12 @@ fn trust_attestation_verify_round_trip_rule_b_ed25519() {
 /// bound keys derive from their stated seeds, the preimage assembles from the
 /// stated fields, and the signature and `0xFF03` extension body match.
 ///
-/// Production `KeyPackageAttestation` still carries 32-byte keys, so it cannot
-/// build this 65-byte-key preimage. PR4 of the identity plan's S0 slice
-/// moves it to 65-byte P-256 keys and replaces the 32-byte `vector_37_*`
-/// tests in `scp-mls` with an assertion of this value through the struct.
+/// `scp-mls` asserts the same preimage, hash and body through the production
+/// `KeyPackageAttestation` (`keypackage_attestation.rs`,
+/// `spec_vector37_matches`); this test pins the key derivations from their
+/// seeds.
 #[test]
-fn vector_37_keypackage_attestation() {
+fn vector37_keypackage_attestation() {
     let derived = |seed: u8| {
         P256SigningKey::from_seed(TEST_VECTOR_KEY_LABEL, &[seed; 32])
             .unwrap()

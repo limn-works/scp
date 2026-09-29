@@ -870,28 +870,30 @@ pub fn build_broadcast_key_hpke_aad(context_id: &str, author_did: &str, epoch: u
     aad
 }
 
-/// HPKE-seals a 32-byte broadcast key to a subscriber's X25519 wrapping pubkey
-/// (RFC 9180 Base mode, §5.14.2).
+/// HPKE-seals a 32-byte broadcast key to a subscriber's DHKEM(P-256) wrapping
+/// pubkey (RFC 9180 Base mode, §5.14.2, 09 §9.5).
 ///
 /// Returns `(ct, enc)` where `ct` is the HPKE ciphertext (`ciphertext || tag`,
-/// 48 bytes) and `enc` is the 32-byte HPKE encapsulated key. The AEAD nonce is
+/// 48 bytes) and `enc` is the 65-byte HPKE encapsulated key. The AEAD nonce is
 /// internal per RFC 9180. `context_id`/`author_did`/`epoch` are bound into both
 /// `info` and `aad` to prevent cross-context/cross-author/cross-epoch replay.
 ///
 /// # Errors
 ///
-/// Returns [`SenderKeyError::HpkeEncryptionFailed`] if HPKE sealing fails.
+/// Returns [`SenderKeyError::HpkeEncryptionFailed`] if
+/// `subscriber_wrapping_pub` is not a valid uncompressed P-256 point or HPKE
+/// sealing fails.
 pub fn seal_broadcast_key_to_subscriber(
     broadcast_key: &SenderKey,
-    subscriber_wrapping_pub: &[u8; 32],
+    subscriber_wrapping_pub: &[u8; 65],
     context_id: &str,
     author_did: &str,
     epoch: u64,
-) -> Result<(Vec<u8>, [u8; 32]), SenderKeyError> {
+) -> Result<(Vec<u8>, [u8; 65]), SenderKeyError> {
     let info = build_broadcast_key_hpke_info(context_id, author_did, epoch);
     let aad = build_broadcast_key_hpke_aad(context_id, author_did, epoch);
 
-    let (enc, ct) = crate::crypto::hpke::seal(
+    let (enc, ct) = crate::crypto::hpke::p256::seal(
         subscriber_wrapping_pub,
         &info,
         &aad,
@@ -902,20 +904,22 @@ pub fn seal_broadcast_key_to_subscriber(
     Ok((ct, enc))
 }
 
-/// HPKE-opens a sealed broadcast key using a software-held X25519 wrapping
-/// secret (RFC 9180 Base mode, §5.14.2).
+/// HPKE-opens a sealed broadcast key using a software-held P-256 wrapping
+/// scalar (RFC 9180 Base mode, §5.14.2, 09 §9.5).
 ///
-/// `enc` is the HPKE encapsulated key from
-/// [`seal_broadcast_key_to_subscriber`]. Custody-held wrapping keys must use
-/// [`crate::crypto::hpke::custody::open_with_external_dh`].
+/// `enc` is the 65-byte HPKE encapsulated key from
+/// [`seal_broadcast_key_to_subscriber`]; it is point-validated before key
+/// agreement. Custody-held wrapping keys must use
+/// [`crate::crypto::hpke::p256::custody::open_with_external_dh`].
 ///
 /// # Errors
 ///
-/// Returns [`SenderKeyError::HpkeDecryptionFailed`] if HPKE open fails or the
-/// recovered plaintext is not exactly 32 bytes.
+/// Returns [`SenderKeyError::HpkeDecryptionFailed`] if `enc` is not a valid
+/// P-256 point, the scalar is invalid, HPKE open fails, or the recovered
+/// plaintext is not exactly 32 bytes.
 pub fn open_broadcast_key(
     sealed: &[u8],
-    enc: &[u8; 32],
+    enc: &[u8; 65],
     wrapping_secret: &[u8; 32],
     context_id: &str,
     author_did: &str,
@@ -938,7 +942,7 @@ pub fn open_broadcast_key(
     let info = build_broadcast_key_hpke_info(context_id, author_did, epoch);
     let aad = build_broadcast_key_hpke_aad(context_id, author_did, epoch);
 
-    let plaintext = crate::crypto::hpke::open(wrapping_secret, enc, &info, &aad, sealed)
+    let plaintext = crate::crypto::hpke::p256::open(wrapping_secret, enc, &info, &aad, sealed)
         .map_err(|e| SenderKeyError::HpkeDecryptionFailed(e.to_string()))?;
 
     let key_bytes: [u8; 32] = plaintext.as_slice().try_into().map_err(|_| {
@@ -1766,15 +1770,13 @@ mod tests {
 
     #[test]
     fn broadcast_key_hpke_distribution_roundtrip() {
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
-
         let key = generate_broadcast_key("did:dht:author");
-        let subscriber_secret = StaticSecret::random_from_rng(OsRng);
-        let subscriber_pub = X25519Pub::from(&subscriber_secret);
+        let subscriber_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let subscriber_pub = subscriber_secret.public_key();
 
         let (ct, enc) = seal_broadcast_key_to_subscriber(
             key.key(),
-            &subscriber_pub.to_bytes(),
+            &subscriber_pub.to_uncompressed(),
             "ctx-broadcast",
             "did:dht:author",
             0,
@@ -1787,7 +1789,7 @@ mod tests {
         let recovered = open_broadcast_key(
             &ct,
             &enc,
-            &subscriber_secret.to_bytes(),
+            &subscriber_secret.to_scalar_bytes(),
             "ctx-broadcast",
             "did:dht:author",
             0,
@@ -1798,15 +1800,13 @@ mod tests {
 
     #[test]
     fn broadcast_key_hpke_rejects_wrong_context() {
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
-
         let key = generate_broadcast_key("did:dht:author");
-        let subscriber_secret = StaticSecret::random_from_rng(OsRng);
-        let subscriber_pub = X25519Pub::from(&subscriber_secret);
+        let subscriber_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let subscriber_pub = subscriber_secret.public_key();
 
         let (ct, enc) = seal_broadcast_key_to_subscriber(
             key.key(),
-            &subscriber_pub.to_bytes(),
+            &subscriber_pub.to_uncompressed(),
             "ctx-A",
             "did:dht:author",
             0,
@@ -1817,7 +1817,7 @@ mod tests {
         let result = open_broadcast_key(
             &ct,
             &enc,
-            &subscriber_secret.to_bytes(),
+            &subscriber_secret.to_scalar_bytes(),
             "ctx-B",
             "did:dht:author",
             0,
@@ -1847,15 +1847,14 @@ mod tests {
     #[test]
     fn broadcast_key_hpke_rejects_tampered_ciphertext() {
         // Flipping a single ciphertext bit must make the AEAD open fail.
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
 
         let key = generate_broadcast_key("did:dht:author");
-        let subscriber_secret = StaticSecret::random_from_rng(OsRng);
-        let subscriber_pub = X25519Pub::from(&subscriber_secret);
+        let subscriber_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let subscriber_pub = subscriber_secret.public_key();
 
         let (mut ct, enc) = seal_broadcast_key_to_subscriber(
             key.key(),
-            &subscriber_pub.to_bytes(),
+            &subscriber_pub.to_uncompressed(),
             "ctx-broadcast",
             "did:dht:author",
             0,
@@ -1867,7 +1866,7 @@ mod tests {
         let result = open_broadcast_key(
             &ct,
             &enc,
-            &subscriber_secret.to_bytes(),
+            &subscriber_secret.to_scalar_bytes(),
             "ctx-broadcast",
             "did:dht:author",
             0,
@@ -1879,15 +1878,14 @@ mod tests {
     fn broadcast_key_hpke_rejects_tampered_enc() {
         // Flipping a bit of the encapsulated key changes the recovered DH
         // shared secret, so the AEAD open must fail.
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
 
         let key = generate_broadcast_key("did:dht:author");
-        let subscriber_secret = StaticSecret::random_from_rng(OsRng);
-        let subscriber_pub = X25519Pub::from(&subscriber_secret);
+        let subscriber_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let subscriber_pub = subscriber_secret.public_key();
 
         let (ct, mut enc) = seal_broadcast_key_to_subscriber(
             key.key(),
-            &subscriber_pub.to_bytes(),
+            &subscriber_pub.to_uncompressed(),
             "ctx-broadcast",
             "did:dht:author",
             0,
@@ -1899,7 +1897,7 @@ mod tests {
         let result = open_broadcast_key(
             &ct,
             &enc,
-            &subscriber_secret.to_bytes(),
+            &subscriber_secret.to_scalar_bytes(),
             "ctx-broadcast",
             "did:dht:author",
             0,
@@ -1911,17 +1909,16 @@ mod tests {
     fn broadcast_key_hpke_rejects_wrong_recipient() {
         // Sealing to subscriber A's pubkey and opening with subscriber B's
         // secret must fail: B's DH yields a different shared secret.
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
 
         let key = generate_broadcast_key("did:dht:author");
 
-        let recipient_secret = StaticSecret::random_from_rng(OsRng);
-        let recipient_pub = X25519Pub::from(&recipient_secret);
-        let intruder_secret = StaticSecret::random_from_rng(OsRng);
+        let recipient_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let recipient_pub = recipient_secret.public_key();
+        let intruder_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
 
         let (ct, enc) = seal_broadcast_key_to_subscriber(
             key.key(),
-            &recipient_pub.to_bytes(),
+            &recipient_pub.to_uncompressed(),
             "ctx-broadcast",
             "did:dht:author",
             0,
@@ -1931,7 +1928,7 @@ mod tests {
         let result = open_broadcast_key(
             &ct,
             &enc,
-            &intruder_secret.to_bytes(),
+            &intruder_secret.to_scalar_bytes(),
             "ctx-broadcast",
             "did:dht:author",
             0,
@@ -1949,23 +1946,22 @@ mod tests {
         // BROADCAST info/aad. The AEAD must reject the mismatched info/aad —
         // this proves enforcement at the ciphertext level, not just that the
         // two info strings differ.
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
 
         use super::super::key_protocol_verify::{
             build_hpke_aad as build_sender_key_hpke_aad,
             build_hpke_info as build_sender_key_hpke_info,
         };
 
-        let subscriber_secret = StaticSecret::random_from_rng(OsRng);
-        let subscriber_pub = X25519Pub::from(&subscriber_secret);
+        let subscriber_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let subscriber_pub = subscriber_secret.public_key();
 
         let payload = [0x42u8; 32];
 
         // Seal under the SENDER-KEY domain (different info prefix + aad).
         let sender_info = build_sender_key_hpke_info("ctx-broadcast", "did:dht:author", 0);
         let sender_aad = build_sender_key_hpke_aad("ctx-broadcast", "did:dht:author", 0);
-        let (enc, ct) = crate::crypto::hpke::seal(
-            &subscriber_pub.to_bytes(),
+        let (enc, ct) = crate::crypto::hpke::p256::seal(
+            &subscriber_pub.to_uncompressed(),
             &sender_info,
             &sender_aad,
             &payload,
@@ -1977,7 +1973,7 @@ mod tests {
         let result = open_broadcast_key(
             &ct,
             &enc,
-            &subscriber_secret.to_bytes(),
+            &subscriber_secret.to_scalar_bytes(),
             "ctx-broadcast",
             "did:dht:author",
             0,
@@ -1993,10 +1989,10 @@ mod tests {
         // The fail-fast 48-byte length gate must fire BEFORE the HPKE DH for any
         // `sealed` that is not exactly 48 bytes. Both a too-short (47) and a
         // too-long (49) buffer must be rejected with the length-gate message,
-        // not the slower AEAD-failure path. A valid-looking 32-byte `enc` and a
+        // not the slower AEAD-failure path. A valid 65-byte `enc` point and a
         // dummy wrapping secret are supplied to prove the gate is reached purely
         // on length, independent of any key agreement.
-        let enc = [0u8; 32];
+        let enc = crate::crypto::hpke::p256::test_point(0);
         let wrapping_secret = [7u8; 32];
 
         for bad_len in [47usize, 49usize] {
@@ -2026,15 +2022,14 @@ mod tests {
     fn broadcast_key_hpke_rejects_wrong_epoch() {
         // The epoch is bound into the HPKE info/aad. Sealing at epoch N and
         // opening at epoch N+1 (same context/author/keys) must fail the AEAD.
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
 
         let key = generate_broadcast_key("did:dht:author");
-        let subscriber_secret = StaticSecret::random_from_rng(OsRng);
-        let subscriber_pub = X25519Pub::from(&subscriber_secret);
+        let subscriber_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let subscriber_pub = subscriber_secret.public_key();
 
         let (ct, enc) = seal_broadcast_key_to_subscriber(
             key.key(),
-            &subscriber_pub.to_bytes(),
+            &subscriber_pub.to_uncompressed(),
             "ctx-broadcast",
             "did:dht:author",
             0,
@@ -2045,7 +2040,7 @@ mod tests {
         let result = open_broadcast_key(
             &ct,
             &enc,
-            &subscriber_secret.to_bytes(),
+            &subscriber_secret.to_scalar_bytes(),
             "ctx-broadcast",
             "did:dht:author",
             1,
@@ -2057,15 +2052,14 @@ mod tests {
     fn broadcast_key_hpke_rejects_wrong_author() {
         // The author DID is bound into the HPKE info/aad. Sealing for one author
         // and opening as another (same context/epoch/keys) must fail the AEAD.
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
 
         let key = generate_broadcast_key("did:dht:author");
-        let subscriber_secret = StaticSecret::random_from_rng(OsRng);
-        let subscriber_pub = X25519Pub::from(&subscriber_secret);
+        let subscriber_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let subscriber_pub = subscriber_secret.public_key();
 
         let (ct, enc) = seal_broadcast_key_to_subscriber(
             key.key(),
-            &subscriber_pub.to_bytes(),
+            &subscriber_pub.to_uncompressed(),
             "ctx-broadcast",
             "did:dht:alice",
             0,
@@ -2076,7 +2070,7 @@ mod tests {
         let result = open_broadcast_key(
             &ct,
             &enc,
-            &subscriber_secret.to_bytes(),
+            &subscriber_secret.to_scalar_bytes(),
             "ctx-broadcast",
             "did:dht:bob",
             0,

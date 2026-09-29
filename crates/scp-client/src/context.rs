@@ -138,7 +138,7 @@ impl PerContextState {
     /// with the wrapping key a peer needs to HPKE-seal a sender key to it, and
     /// seeds their outgoing-sequence counter. Re-recording updates the wrapping
     /// key (e.g. a rotation) and leaves the sequence counter intact.
-    pub fn add_member_record(&mut self, member_did: &str, wrapping_key: [u8; 32]) {
+    pub fn add_member_record(&mut self, member_did: &str, wrapping_key: [u8; 65]) {
         self.crypto
             .record_member_wrapping_key(member_did, wrapping_key);
         self.member_sequence_numbers

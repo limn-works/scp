@@ -67,7 +67,6 @@ scp-did = { path = "../scp-did", features = ["testing"] }
 scp-protocol = { path = "../scp-protocol", features = ["testing"] }
 openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 ed25519-dalek = { workspace = true }
-x25519-dalek = { workspace = true }
 rand = { workspace = true }
 bs58 = { workspace = true }
 serde = { workspace = true }

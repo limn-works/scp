@@ -70,6 +70,9 @@ uuid = { version = "1", features = ["v4", "js"] }
 scp-did = { path = "../scp-did", features = ["testing"] }
 scp-protocol = { path = "../scp-protocol", features = ["testing"] }
 scp-mls = { path = "../scp-mls", features = ["testing"] }
+# Decodes a snapshot blob to a generic MessagePack value so a test can rewrite
+# one field's encoding (the wrapping-key length check at decode).
+rmpv = { workspace = true }
 # The single-sourced faithful in-memory relay mock (the fidelity anchor for the
 # transport-slice integration tests). Dev-only: it ships nothing, so the ADR-057
 # wasm fence's shipped-dependency graph is unaffected (absent from `cargo tree

@@ -18,7 +18,7 @@
 //!
 //! # Ciphersuite
 //!
-//! All groups use `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (no
+//! All groups use `MLS_128_DHKEMP256_AES128GCM_SHA256_P256` (no
 //! ciphersuite negotiation). See ADR-001 for the rationale.
 //!
 //! # Modules
@@ -65,7 +65,7 @@ pub use convergent_timestamp::{
 };
 pub use credential::ScpCredential;
 pub use encrypt::{DecryptedContent, InboundChange};
-pub use error::MlsError;
+pub use error::{MlsError, SignerDefect};
 pub use keypackage_attestation::{
     AttestationLeafGroundTruth, AttestationResolutionVerifyError, AttestationTrigger,
     AttestationVerifyError, KeyPackageAttestation, MAX_ATTESTATION_KEY_RESOLUTION_STALENESS,
@@ -85,9 +85,9 @@ pub use context_extension::{
 pub use group::{
     AddMemberResult, RemoveMemberResult, SCP_CIPHERSUITE, ScpMlsGroup, add_member,
     add_member_with_convergent_timestamp, create_group, create_group_with_context,
-    create_group_with_wrapping_key, destroy_group, generate_key_package,
+    create_group_with_wrapping_key, destroy_group, extract_p256_scalar, generate_key_package,
     generate_key_package_with_context_params, generate_key_package_with_wrapping_key, join_group,
-    key_package_in_did, key_package_in_wrapping_key, remove_member,
+    key_package_in_did, key_package_in_wrapping_key, remove_member, require_scp_ciphersuite,
 };
 pub use lifetime::{
     KEY_PACKAGE_LIFETIME_MARGIN_SECS, KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS,

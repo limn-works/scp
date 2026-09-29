@@ -207,6 +207,17 @@ impl P256SigningKey {
         Self(SigningKey::from(scalar))
     }
 
+    /// Draws a fresh key from `rng`, uniform over `[1, n − 1]`.
+    ///
+    /// Infallible: `NonZeroScalar::random` rejection-samples until the draw is
+    /// in range. Callers pass `rand::rngs::OsRng`, or the re-exported
+    /// `p256::elliptic_curve::rand_core::OsRng` when they have no `rand`
+    /// dependency.
+    #[must_use]
+    pub fn random(rng: &mut impl ::p256::elliptic_curve::rand_core::CryptoRngCore) -> Self {
+        Self::from_nonzero_scalar(NonZeroScalar::random(rng))
+    }
+
     /// Derives a key from a 32-byte seed by [`seed_to_scalar`] under `label`.
     ///
     /// # Errors
@@ -415,6 +426,34 @@ pub fn ecdh_p256(key: &P256SigningKey, peer: &P256PublicKey) -> Zeroizing<[u8; 3
     let mut out = Zeroizing::new([0u8; 32]);
     out.copy_from_slice(shared.raw_secret_bytes());
     out
+}
+
+/// Checks that `public` is the SEC1 uncompressed encoding of `scalar·G`.
+///
+/// Every site that restores or stores a P-256 key pair from separate scalar
+/// and public-key bytes calls this, so a pair whose halves disagree (a
+/// tampered snapshot, a mixed-up store) fails closed rather than advertising a
+/// public key whose HPKE seals the holder cannot open. The comparison is
+/// constant time over the 65 bytes.
+///
+/// # Errors
+///
+/// - [`P256Error::InvalidScalar`] when `scalar` is zero or not below `n`.
+/// - [`P256Error::VerificationFailed`] when `public` is not `scalar·G`.
+pub fn check_keypair(
+    scalar: &[u8; 32],
+    public: &[u8; UNCOMPRESSED_POINT_LEN],
+) -> Result<(), P256Error> {
+    use ::p256::elliptic_curve::subtle::ConstantTimeEq;
+
+    let derived = P256SigningKey::from_scalar_bytes(scalar)?
+        .public_key()
+        .to_uncompressed();
+    if bool::from(derived.ct_eq(public)) {
+        Ok(())
+    } else {
+        Err(P256Error::VerificationFailed)
+    }
 }
 
 /// JOSE ES256 codec (RFC 7518 §3.4): ECDSA P-256 over SHA-256 of the JWS
@@ -990,6 +1029,43 @@ mod tests {
         assert_eq!(
             jose::es256_verify_strict(&key.public_key(), b"other", &sig),
             Err(P256Error::VerificationFailed)
+        );
+    }
+
+    /// `random` draws differ, and each key round-trips through its scalar.
+    #[test]
+    fn random_draws_differ_and_round_trip_through_scalar() {
+        let a = P256SigningKey::random(&mut rand::rngs::OsRng);
+        let b = P256SigningKey::random(&mut rand::rngs::OsRng);
+        assert_ne!(a.to_scalar_bytes(), b.to_scalar_bytes());
+        let back = P256SigningKey::from_scalar_bytes(&a.to_scalar_bytes()).unwrap();
+        assert_eq!(back.public_key(), a.public_key());
+    }
+
+    /// `check_keypair` accepts a matching pair and rejects a mismatched public
+    /// key, a zero scalar and a scalar at or above `n`.
+    #[test]
+    fn check_keypair_accepts_only_matching_pairs() {
+        let key = P256SigningKey::from_seed(b"check-keypair", &[3; 32]).unwrap();
+        let other = P256SigningKey::from_seed(b"check-keypair", &[4; 32]).unwrap();
+        let scalar = key.to_scalar_bytes();
+        let public = key.public_key().to_uncompressed();
+        assert_eq!(check_keypair(&scalar, &public), Ok(()));
+        assert_eq!(
+            check_keypair(&scalar, &other.public_key().to_uncompressed()),
+            Err(P256Error::VerificationFailed)
+        );
+        assert_eq!(
+            check_keypair(&[0; 32], &public),
+            Err(P256Error::InvalidScalar)
+        );
+        assert_eq!(
+            check_keypair(&h(N_HEX), &public),
+            Err(P256Error::InvalidScalar)
+        );
+        assert_eq!(
+            check_keypair(&[0xff; 32], &public),
+            Err(P256Error::InvalidScalar)
         );
     }
 

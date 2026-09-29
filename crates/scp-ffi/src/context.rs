@@ -5401,8 +5401,8 @@ impl crate::scp::PyScp {
     }
 
     /// Handles a broadcast key request from a subscriber, sealing the author's
-    /// current broadcast key to the requester's X25519 `wrapping_pubkey`
-    /// (HPKE Base mode, §5.14.2). The raw broadcast key never crosses the FFI
+    /// current broadcast key to the requester's `wrapping_pubkey`, a 65-byte
+    /// uncompressed DHKEM(P-256) point (HPKE Base mode, §5.14.2, §9.5). The raw broadcast key never crosses the FFI
     /// boundary — only the sealed material is returned.
     ///
     /// # Returns
@@ -5415,7 +5415,8 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Returns `ValueError` if `wrapping_pubkey` is not exactly 32 bytes, or
+    /// Returns `ValueError` if `wrapping_pubkey` is not exactly 65 bytes or not
+    /// a valid uncompressed P-256 point, or
     /// `RuntimeError` if the operation fails.
     #[pyo3(signature = (handle, author_did, requester_did, wrapping_pubkey))]
     pub fn broadcast_handle_key_request(
@@ -5429,12 +5430,8 @@ impl crate::scp::PyScp {
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(author_did)?;
         validate::validate_did(requester_did)?;
-        let wrapping: [u8; 32] = wrapping_pubkey.try_into().map_err(|_| {
-            PyValueError::new_err(format!(
-                "wrapping_pubkey must be 32 bytes, got {}",
-                wrapping_pubkey.len()
-            ))
-        })?;
+        let wrapping = scp_ffi_common::broadcast::parse_wrapping_pubkey(wrapping_pubkey)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -5478,7 +5475,8 @@ impl crate::scp::PyScp {
     }
 
     /// Opens an HPKE-sealed broadcast key (§5.14.2) using a software-held
-    /// X25519 wrapping secret, returning the raw 32-byte AES-256 broadcast key.
+    /// 32-byte DHKEM(P-256) wrapping scalar, returning the raw 32-byte AES-256
+    /// broadcast key.
     ///
     /// Pure crypto — no handle, no `self` state. The `sealed_json` is the
     /// JSON produced by [`Self::broadcast_handle_key_request`] on grant.

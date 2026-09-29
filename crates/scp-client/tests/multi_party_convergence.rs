@@ -639,9 +639,15 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     // Carol's KeyPackage must publish a wrapping key, or Bob's add-Carol receive
     // is rejected pre-merge (ADR-057 sender-key distribution INVARIANT 3) before it
     // can reach the remove scenario.
+    let (carol_wrapping_public, _carol_wrapping_secret) =
+        scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
     let (carol_bundle, _carol_signer, _carol_provider): (_, SignatureKeyPair, _) =
-        generate_key_package_with_wrapping_key(&carol_cred, Some(&[0xCC_u8; 32]), &SystemClock)
-            .expect("carol key package");
+        generate_key_package_with_wrapping_key(
+            &carol_cred,
+            Some(&carol_wrapping_public),
+            &SystemClock,
+        )
+        .expect("carol key package");
     let carol_kp_in = KeyPackageIn::tls_deserialize(
         &mut &*carol_bundle
             .key_package()

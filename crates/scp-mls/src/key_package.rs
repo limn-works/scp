@@ -43,7 +43,7 @@ pub struct KeyPackageEntry {
     /// The `KeyPackage` bundle containing the public key package and private
     /// key material stored in the provider.
     pub bundle: KeyPackageBundle,
-    /// The Ed25519 signing key pair associated with this key package.
+    /// The P-256 signing key pair associated with this key package.
     pub signer: SignatureKeyPair,
     /// The MLS provider holding the cryptographic state for this key package.
     pub provider: InMemoryMlsProvider,
@@ -174,7 +174,7 @@ impl KeyPackageBuffer {
     /// Generates key packages until the buffer reaches `min_buffer` size.
     ///
     /// Each generated key package uses the buffer's credential and the SCP
-    /// ciphersuite (`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`).
+    /// ciphersuite (`MLS_128_DHKEMP256_AES128GCM_SHA256_P256`).
     ///
     /// # Errors
     ///

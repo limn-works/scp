@@ -278,16 +278,19 @@ fn joiner_params() -> ContextParams {
     }
 }
 
-/// Bob's X25519 wrapping key material (§9.16.1). A joiner's KeyPackage must
+/// Bob's DHKEM(P-256) wrapping keypair (§9.16.1, §9.5): the 65-byte
+/// uncompressed point and its 32-byte scalar. A joiner's KeyPackage must
 /// declare the `scp_context_params` (`0xFF02`) capability to be added to an SCP
-/// context group (OpenMLS `valn0502`); since 9fe3b4c9b the production
-/// `generate_key_package` path declares `0xFF02` UNCONDITIONALLY (its capability
-/// is decoupled from any wrapping key). Publishing a wrapping key here exercises
-/// the wrapping-key-PRESENT leaf path (the `0xFF01` wrapping-key leaf extension)
-/// — NOT because `0xFF02` requires it. The bytes are an opaque leaf extension
-/// during add/join (no X25519 DH runs on the MLS join path), so a fixed non-zero
-/// constant suffices.
-const BOB_WRAP: [u8; 32] = [0xB2; 32];
+/// context group (OpenMLS `valn0502`); the production `generate_key_package`
+/// path declares `0xFF02` UNCONDITIONALLY (its capability is decoupled from any
+/// wrapping key). Publishing a wrapping key here exercises the
+/// wrapping-key-PRESENT leaf path (the `0xFF01` wrapping-key leaf extension) —
+/// NOT because `0xFF02` requires it. `set_wrapping_keys` validates the point
+/// and checks the scalar derives it, so the pair is a real one.
+fn bob_wrap() -> (Vec<u8>, Zeroizing<Vec<u8>>) {
+    let (public, secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+    (public.to_vec(), Zeroizing::new(secret.to_vec()))
+}
 
 /// Builds the creator-committed `scp_context_params` (`0xFF02`) extension for a
 /// ROOT context from `params`, byte-for-byte the way the creator write path
@@ -332,17 +335,14 @@ fn alice_welcome_for_bob(
 
 /// Publishes Bob's wrapping key on `sup` so his pooled KeyPackages carry the
 /// `0xFF01` wrapping-key leaf extension, exercising the wrapping-key-PRESENT path
-/// (see [`BOB_WRAP`]); the `0xFF02` context-params capability is declared
+/// (see [`bob_wrap`]); the `0xFF02` context-params capability is declared
 /// unconditionally regardless. Idempotent; must run BEFORE the KeyPackage store
 /// is first spawned (i.e. before [`reserve_bob_kp`]).
 async fn set_bob_wrapping(sup: &Arc<Supervisor>, bob: &DID) {
-    sup.set_wrapping_keys(
-        bob.clone(),
-        BOB_WRAP.to_vec(),
-        Zeroizing::new(BOB_WRAP.to_vec()),
-    )
-    .await
-    .expect("set bob's wrapping key");
+    let (public, secret) = bob_wrap();
+    sup.set_wrapping_keys(bob.clone(), public, secret)
+        .await
+        .expect("set bob's wrapping key");
 }
 
 /// Resolves `ALICE_DID` / `BOB_DID` / `MALLORY_DID` to their fixed #active

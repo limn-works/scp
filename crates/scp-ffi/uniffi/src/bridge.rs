@@ -6938,12 +6938,12 @@ pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpEr
 // Broadcast key distribution (§5.14.2)
 // ---------------------------------------------------------------------------
 
-/// Opens an HPKE-sealed broadcast key (§5.14.2) using a software-held X25519
-/// wrapping secret, returning the raw 32-byte AES-256 broadcast key.
+/// Opens an HPKE-sealed broadcast key (§5.14.2) using a software-held 32-byte
+/// DHKEM(P-256) wrapping scalar, returning the raw 32-byte AES-256 broadcast key.
 ///
 /// Pure crypto — no `SCP` instance state. `sealed_json` is the JSON returned by
 /// [`Scp::broadcast_handle_key_request`] on grant; `wrapping_secret` is the
-/// subscriber's 32-byte X25519 secret matching the `wrapping_pubkey` presented
+/// subscriber's 32-byte P-256 scalar matching the `wrapping_pubkey` presented
 /// on the request.
 ///
 /// # Errors
@@ -13335,7 +13335,9 @@ impl Scp {
     /// `broadcast_handle_key_request`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
-    /// `instance_id` does not match this `SCP`'s.
+    /// `instance_id` does not match this `SCP`'s. `wrapping_pubkey` is the
+    /// requester's 65-byte uncompressed DHKEM(P-256) public key (§5.14.2, §9.5);
+    /// any other length or an invalid point returns `ScpError::Validation`.
     pub async fn broadcast_handle_key_request(
         &self,
         handle: Arc<ContextHandle>,
@@ -13349,17 +13351,13 @@ impl Scp {
             .map_err(ScpError::from)?;
         validate_did(&author_did)?;
         validate_did(&requester_did)?;
-        let wrapping: [u8; 32] =
-            wrapping_pubkey
-                .as_slice()
-                .try_into()
-                .map_err(|_| ScpError::Validation {
-                    msg: format!(
-                        "wrapping_pubkey must be 32 bytes, got {}",
-                        wrapping_pubkey.len()
-                    ),
+        let wrapping =
+            scp_ffi_common::broadcast::parse_wrapping_pubkey(&wrapping_pubkey).map_err(|e| {
+                ScpError::Validation {
+                    msg: e.to_string(),
                     code: codes::VALID_7007.to_owned(),
-                })?;
+                }
+            })?;
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {

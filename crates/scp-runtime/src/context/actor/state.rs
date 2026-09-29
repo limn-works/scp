@@ -532,11 +532,11 @@ pub struct ContextCryptoState {
     /// (provider.rs:223).
     pub nonce_dedup: NonceDedup,
 
-    /// Remote members' X25519 wrapping public keys, keyed by DID.
-    /// Populated from key packages during `add_member`. Mirrors legacy
-    /// `NodeMlsFactory::ContextCryptoState::member_wrapping_keys`
-    /// (provider.rs:226).
-    pub member_wrapping_keys: HashMap<String, [u8; 32]>,
+    /// Remote members' DHKEM(P-256) wrapping public keys (65-byte
+    /// uncompressed points, §9.16.1), keyed by DID. Populated from key
+    /// packages during `add_member`. Mirrors legacy
+    /// `NodeMlsFactory::ContextCryptoState::member_wrapping_keys`.
+    pub member_wrapping_keys: HashMap<String, [u8; 65]>,
 
     /// Receive-side sequence tracking for MLS replay detection.
     /// Maps `sender_did` -> (`last_epoch`, `last_sequence`).
@@ -1715,18 +1715,18 @@ fn hex_encode_context_id(id: &[u8; 32]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// WrappingKeyPair — per-identity X25519 keypair held by the supervisor
+// WrappingKeyPair — per-identity DHKEM(P-256) keypair held by the supervisor
 // ---------------------------------------------------------------------------
 
-/// X25519 wrapping keypair held in the supervisor's per-identity map
+/// DHKEM(P-256) wrapping keypair (§9.16.1) held in the supervisor's per-identity map
 /// (`DashMap<DID, ArcSwap<WrappingKeyPair>>`). Secret bytes are wrapped
 /// in `Zeroizing` so rotation zeros the prior keypair when the last
 /// `Arc<WrappingKeyPair>` drops.
 #[derive(Debug)]
 pub struct WrappingKeyPair {
-    /// 32-byte X25519 public key.
-    pub public: [u8; 32],
-    /// 32-byte X25519 secret key. Zeroized on drop.
+    /// 65-byte uncompressed P-256 public point.
+    pub public: [u8; 65],
+    /// 32-byte P-256 secret scalar. Zeroized on drop.
     pub secret: Zeroizing<[u8; 32]>,
 }
 
@@ -1750,7 +1750,7 @@ pub struct WrappingKeyPair {
 //     struct (`send_sequence`) lives on [`PerContextState::send_tracker`], so
 //     `seal` / `export_crypto_state` reach it there;
 //   * node-resident data the provider read off its own fields (`local_did`, the
-//     X25519 wrapping keypair, the injected [`Clock`]) enters as METHOD
+//     DHKEM(P-256) wrapping keypair, the injected [`Clock`]) enters as METHOD
 //     PARAMETERS — never stored on [`ContextCryptoState`].
 //
 /// The §9 Class-C COALESCED send/receive crypto orchestration (ADR-049 §15
@@ -2492,15 +2492,15 @@ impl PerContextState {
     }
 
     /// Advances the MLS epoch (Update + self-Commit), verbatim from the
-    /// former provider `advance_epoch`. The X25519 wrapping public key
-    /// enters as a parameter (node-resident).
+    /// former provider `advance_epoch`. The DHKEM(P-256) wrapping public key
+    /// (65-byte point) enters as a parameter (node-resident).
     ///
     /// # Errors
     ///
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch or MLS failure.
     pub(crate) fn advance_epoch(
         &mut self,
-        wrapping_public_key: [u8; 32],
+        wrapping_public_key: [u8; 65],
     ) -> Result<AdvanceEpochOutput, ContextError> {
         use openmls::prelude::tls_codec::Serialize as _;
 
@@ -2572,8 +2572,9 @@ impl PerContextState {
 
     /// Real MLS add-member from explicit `KeyPackage` bytes on this actor's OWNED
     /// group, verbatim from `NodeMlsFactory::add_member_from_bytes` (ADR-049
-    /// PR-7 STEP-C). Pre-validates the key package to extract the invitee's X25519
-    /// wrapping key (needed to HPKE-seal the sender key to them later), performs
+    /// PR-7 STEP-C). Pre-validates the key package to extract the invitee's
+    /// DHKEM(P-256) wrapping key (needed to HPKE-seal the sender key to them
+    /// later), performs
     /// the MLS add (advancing the group epoch), records the wrapping key, and
     /// returns the TLS-serialized Welcome (for the joiner) + Commit (for existing
     /// members).
@@ -2581,7 +2582,8 @@ impl PerContextState {
     /// # Errors
     ///
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch, a malformed
-    /// `KeyPackage`, or any MLS / serialization failure.
+    /// `KeyPackage`, a `scp_wrapping_key` extension that is not a valid
+    /// uncompressed P-256 point (§9.5), or any MLS / serialization failure.
     fn add_member_from_bytes(
         &mut self,
         member_did: &str,
@@ -2596,22 +2598,21 @@ impl PerContextState {
         // operation consumes it, and BEFORE borrowing the crypto sub-state (no
         // `self` borrow held across this validation). Key package bytes arrive as
         // TLS-serialized KeyPackageIn (not MlsMessageIn).
+        //
+        // Every failure here is returned, never swallowed: a key package whose
+        // `scp_wrapping_key` extension is present but not a valid P-256 point
+        // (§9.5) is rejected before the add, rather than admitting the member
+        // with no recorded wrapping key.
         let wrapping_key = {
-            KeyPackageIn::tls_deserialize(&mut &*bytes)
-                .ok()
-                .and_then(|kp_in| {
-                    let provider_tmp = scp_mls::InMemoryMlsProvider::default();
-                    kp_in
-                        .validate(provider_tmp.crypto(), ProtocolVersion::Mls10)
-                        .ok()
-                        .and_then(|verified| {
-                            scp_mls::wrapping_extension::extract_wrapping_key(
-                                verified.leaf_node().extensions(),
-                            )
-                            .ok()
-                            .flatten()
-                        })
-                })
+            let kp_in = KeyPackageIn::tls_deserialize(&mut &*bytes).map_err(|e| {
+                ContextError::CryptoFailed(format!("key package deserialization: {e}"))
+            })?;
+            let provider_tmp = scp_mls::InMemoryMlsProvider::default();
+            let verified = kp_in
+                .validate(provider_tmp.crypto(), ProtocolVersion::Mls10)
+                .map_err(|e| ContextError::CryptoFailed(format!("key package validation: {e}")))?;
+            scp_mls::wrapping_extension::extract_wrapping_key(verified.leaf_node().extensions())
+                .map_err(|e| ContextError::CryptoFailed(format!("key package wrapping key: {e}")))?
         };
 
         // Deserialize to KeyPackageIn for the actual add operation.
@@ -2887,7 +2888,7 @@ impl PerContextState {
 
         // 4. HPKE-seal new key to each remaining member's wrapping pubkey and
         //    queue distributions (§9.16.2).
-        let member_keys: Vec<(String, [u8; 32])> = crypto
+        let member_keys: Vec<(String, [u8; 65])> = crypto
             .member_wrapping_keys
             .iter()
             .map(|(did, key)| (did.clone(), *key))
@@ -2975,7 +2976,7 @@ impl PerContextState {
 
     /// Processes an incoming sender-key distribution message, returning the
     /// AUTHENTICATED `(sender_key, epoch)` — verbatim from
-    /// [`NodeMlsFactory::process_incoming_sender_key`]. The X25519 wrapping
+    /// [`NodeMlsFactory::process_incoming_sender_key`]. The DHKEM(P-256) wrapping
     /// secret enters as a parameter (node-resident); this method installs
     /// nothing and reads no crypto state (the caller gates + installs via
     /// [`Self::set_sender_key_unchecked`]).
@@ -3086,7 +3087,7 @@ impl PerContextState {
     /// Exports the per-context crypto state as an opaque, restore-compatible
     /// byte blob, verbatim from the former provider `export_crypto_state`. The
     /// two floor collections are caller-sourced (authoritative Class-M
-    /// registry); the X25519 wrapping keypair enters as parameters
+    /// registry); the DHKEM(P-256) wrapping keypair enters as parameters
     /// (node-resident). The send-side sequence counter is read from
     /// [`PerContextState::send_tracker`] (the actor's home for the provider's
     /// former `send_sequence`).
@@ -3103,7 +3104,7 @@ impl PerContextState {
         &self,
         sender_key_epochs: Vec<(String, u64)>,
         recv_sequence_floors: Vec<(String, ReceiveFloor)>,
-        wrapping_public_key: [u8; 32],
+        wrapping_public_key: [u8; 65],
         wrapping_secret_key: &[u8],
     ) -> Result<Vec<u8>, ContextError> {
         let ContextModeState::Encrypted(crypto) = &self.mode else {
@@ -3847,11 +3848,9 @@ mod tests {
     fn wrapping_keypair_secret_is_zeroizing() {
         // `Zeroizing` drop zeros the byte buffer; we assert the type-level
         // contract by constructing one and reading the public bytes.
-        let kp = WrappingKeyPair {
-            public: [0x11; 32],
-            secret: Zeroizing::new([0x22; 32]),
-        };
-        assert_eq!(kp.public, [0x11; 32]);
+        let (public, secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+        let kp = WrappingKeyPair { public, secret };
+        assert_eq!(kp.public, public);
         // Zeroization on drop is asserted by `Zeroizing`'s own tests; we
         // assert here only that the field compiles under `Zeroizing<[u8;32]>`.
         drop(kp);
@@ -4268,6 +4267,60 @@ mod crypto_ops_golden {
         ctx.to_vec()
     }
 
+    /// §9.5, §9.16.1: a KeyPackage whose `scp_wrapping_key` (`0xFF01`)
+    /// extension is present but is not a valid uncompressed P-256 point is
+    /// refused with `CryptoFailed` before the MLS add: the member is not
+    /// admitted and no wrapping key is recorded. Positive control: the same
+    /// invitee with a valid point is added and its key is recorded.
+    #[test]
+    fn add_member_rejects_key_package_with_off_curve_wrapping_key() {
+        use openmls::prelude::tls_codec::Serialize as _;
+        const CAROL: &str = "did:dht:z6MkCarolCarolCarolCarolCarolCarolCarolCa";
+        let (_alice_p, mut alice_a, _bob_p, _bob_a, _ctx) = setup();
+        let carol_cred =
+            scp_mls::ScpCredential::new(CAROL.to_owned(), None, SigningKeyId::Active).unwrap();
+        let kp_bytes = |wrapping: &[u8; 65]| {
+            let (bundle, _signer, _provider) =
+                scp_mls::group::generate_key_package_with_context_params(
+                    &carol_cred,
+                    Some(wrapping),
+                    &SystemClock,
+                )
+                .unwrap();
+            bundle.key_package().tls_serialize_detached().unwrap()
+        };
+        let epoch_of = |state: &PerContextState| match &state.mode {
+            ContextModeState::Encrypted(c) => c.mls_group.as_ref().unwrap().epoch().unwrap(),
+            ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
+        };
+        let recorded = |state: &PerContextState| match &state.mode {
+            ContextModeState::Encrypted(c) => c.member_wrapping_keys.get(CAROL).copied(),
+            ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
+        };
+        let epoch_before = epoch_of(&alice_a);
+
+        let mut off_curve = [0u8; 65];
+        off_curve[0] = 0x04;
+        let err = alice_a
+            .add_member(CAROL, Some(&kp_bytes(&off_curve)), &SystemClock)
+            .expect_err("an off-curve 0xFF01 point is refused");
+        match err {
+            ContextError::CryptoFailed(msg) => {
+                assert!(msg.contains("key package wrapping key"), "got: {msg}");
+            }
+            other => panic!("expected CryptoFailed, got {other:?}"),
+        }
+        assert_eq!(epoch_of(&alice_a), epoch_before, "no MLS add ran");
+        assert_eq!(recorded(&alice_a), None, "no wrapping key is recorded");
+
+        let (valid, _secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+        alice_a
+            .add_member(CAROL, Some(&kp_bytes(&valid)), &SystemClock)
+            .expect("a valid 0xFF01 point is admitted");
+        assert_eq!(epoch_of(&alice_a), epoch_before + 1, "the MLS add ran");
+        assert_eq!(recorded(&alice_a), Some(valid));
+    }
+
     /// #2199: `dispose_secrets` on a REAL seeded encrypted state (a live MLS
     /// group + a present sender key, born over the end-to-end join path) reports
     /// BOTH destroyed-flags `true` — an OBSERVED disposal of present material.
@@ -4342,7 +4395,7 @@ mod crypto_ops_golden {
         }
     }
 
-    /// Bob's node-resident X25519 wrapping secret (the HPKE-open key the actor
+    /// Bob's node-resident P-256 wrapping secret (the HPKE-open key the actor
     /// receive half takes as a parameter).
     fn bob_wrapping_secret(bob_p: &NodeMlsFactory) -> [u8; 32] {
         *bob_p.wrapping_keypair_snapshot().1
@@ -4881,7 +4934,7 @@ mod crypto_ops_golden {
         let bob_verifying_key = bob_request_signing_key.verifying_key();
 
         // Build a signed SenderKeyRequest for Alice's key, sealing to a fresh
-        // ephemeral X25519 wrapping keypair.
+        // ephemeral DHKEM(P-256) wrapping keypair.
         let nonce = [2u8; 16];
         let (wrapping_pub, wrapping_secret) =
             scp_protocol::crypto::sender_keys::generate_wrapping_keypair();

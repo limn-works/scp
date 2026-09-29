@@ -305,15 +305,12 @@ async fn handle_key_request_non_blocked() {
     ctx.add_author("did:key:author1").unwrap();
     subscribe_open(&mut ctx, "did:key:subscriber1", 1000).unwrap();
 
-    // The subscriber's X25519 wrapping keypair travels with the request; the
-    // Grant carries only the HPKE-sealed key material (never the raw key).
-    let subscriber_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
-    let subscriber_pub = x25519_dalek::PublicKey::from(&subscriber_secret);
-    let decision = ctx.handle_key_request(
-        "did:key:author1",
-        "did:key:subscriber1",
-        &subscriber_pub.to_bytes(),
-    );
+    // The subscriber's DHKEM(P-256) wrapping keypair travels with the request;
+    // the Grant carries only the HPKE-sealed key material (never the raw key).
+    let (subscriber_pub, subscriber_secret) =
+        scp_core::crypto::sender_keys::generate_wrapping_keypair();
+    let decision =
+        ctx.handle_key_request("did:key:author1", "did:key:subscriber1", &subscriber_pub);
     match decision {
         KeyRequestDecision::Grant { enc, ct, epoch } => {
             assert_eq!(epoch, 0);
@@ -322,7 +319,7 @@ async fn handle_key_request_non_blocked() {
             let recovered = scp_core::crypto::sender_keys::broadcast::open_broadcast_key(
                 &ct,
                 &enc,
-                &subscriber_secret.to_bytes(),
+                &subscriber_secret,
                 "ctx-key-req",
                 "did:key:author1",
                 epoch,
@@ -362,7 +359,10 @@ async fn handle_key_request_blocked() {
     ctx.block_subscriber("did:key:author1", "did:key:subscriber1")
         .unwrap();
 
-    let decision = ctx.handle_key_request("did:key:author1", "did:key:subscriber1", &[0u8; 32]);
+    // A valid point, so the Deny can only come from the block.
+    let (subscriber_pub, _secret) = scp_core::crypto::sender_keys::generate_wrapping_keypair();
+    let decision =
+        ctx.handle_key_request("did:key:author1", "did:key:subscriber1", &subscriber_pub);
     match decision {
         KeyRequestDecision::Deny { reason } => {
             assert!(!reason.is_empty(), "deny reason should not be empty");

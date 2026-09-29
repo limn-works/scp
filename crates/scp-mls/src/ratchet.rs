@@ -154,7 +154,7 @@ pub fn propose_update(group: &mut ScpMlsGroup) -> Result<MlsMessageOut, MlsError
 /// # Arguments
 ///
 /// * `group` - The MLS group to update within. Must be active.
-/// * `wrapping_pubkey` - The 32-byte X25519 public key to include in the
+/// * `wrapping_pubkey` - The 65-byte uncompressed P-256 public key to include in the
 ///   `scp_wrapping_key` `LeafNode` extension. Must be the same key that was
 ///   originally published at context join time, unless this is an identity
 ///   key rotation.
@@ -170,7 +170,7 @@ pub fn propose_update(group: &mut ScpMlsGroup) -> Result<MlsMessageOut, MlsError
 /// See spec §9.16.1, ADR-001 acceptance criterion 7.
 pub fn propose_update_with_wrapping_key(
     group: &mut ScpMlsGroup,
-    wrapping_pubkey: &[u8; 32],
+    wrapping_pubkey: &[u8; crate::wrapping_extension::P256_WRAPPING_KEY_SIZE],
 ) -> Result<MlsMessageOut, MlsError> {
     let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
 

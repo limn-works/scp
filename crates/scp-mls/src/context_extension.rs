@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn create_group_with_context_embeds_extension_for_creator() {
         let cred = test_credential("alice");
-        let wrapping_key = [0xAA_u8; 32];
+        let wrapping_key = crate::wrapping_extension::test_wrapping_point(0xAA);
         let ctx_ext = sample_context_extension("ctx:creator");
 
         let group =
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn wrapping_only_group_has_no_context_extension() {
         let cred = test_credential("alice");
-        let wrapping_key = [0xAA_u8; 32];
+        let wrapping_key = crate::wrapping_extension::test_wrapping_point(0xAA);
         let group =
             crate::group::create_group_with_wrapping_key(&cred, Some(&wrapping_key), &SystemClock)
                 .unwrap();
@@ -341,7 +341,7 @@ mod tests {
     #[test]
     fn wrapping_only_key_package_rejected_by_context_group() {
         let alice_cred = test_credential("alice");
-        let alice_wrapping = [0xAA_u8; 32];
+        let alice_wrapping = crate::wrapping_extension::test_wrapping_point(0xAA);
         let ctx_ext = sample_context_extension("ctx:valn0502");
         let mut alice_group = crate::group::create_group_with_context(
             &alice_cred,
@@ -353,7 +353,7 @@ mod tests {
 
         // Bob's key package declares only 0xFF01 (wrapping key), not 0xFF02.
         let bob_cred = test_credential("bob");
-        let bob_wrapping = [0xBB_u8; 32];
+        let bob_wrapping = crate::wrapping_extension::test_wrapping_point(0xBB);
         let (bob_kp, _bob_signer, _bob_provider) =
             crate::group::generate_key_package_with_wrapping_key(
                 &bob_cred,
@@ -412,7 +412,7 @@ mod tests {
 
         // Some: context-capable AND carries the wrapping-key leaf extension.
         let cred_some = test_credential("kp-caps-some");
-        let wrapping = [0x5A_u8; 32];
+        let wrapping = crate::wrapping_extension::test_wrapping_point(0x5A);
         let (kp_some, _s2, _p2) = crate::group::generate_key_package_with_context_params(
             &cred_some,
             Some(&wrapping),
@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn context_extension_survives_welcome_join() {
         let alice_cred = test_credential("alice");
-        let alice_wrapping = [0xAA_u8; 32];
+        let alice_wrapping = crate::wrapping_extension::test_wrapping_point(0xAA);
         let ctx_ext = sample_context_extension("ctx:through-join");
 
         let mut alice_group = crate::group::create_group_with_context(
@@ -458,7 +458,7 @@ mod tests {
         .unwrap();
 
         let bob_cred = test_credential("bob");
-        let bob_wrapping = [0xBB_u8; 32];
+        let bob_wrapping = crate::wrapping_extension::test_wrapping_point(0xBB);
         let (bob_kp, bob_signer, bob_provider) =
             crate::group::generate_key_package_with_context_params(
                 &bob_cred,
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn context_extension_survives_later_commits() {
         let alice_cred = test_credential("alice");
-        let alice_wrapping = [0xAA_u8; 32];
+        let alice_wrapping = crate::wrapping_extension::test_wrapping_point(0xAA);
         let ctx_ext = sample_context_extension("ctx:multi-commit");
 
         let mut alice_group = crate::group::create_group_with_context(
@@ -518,7 +518,7 @@ mod tests {
 
         // Add Bob (epoch 1).
         let bob_cred = test_credential("bob");
-        let bob_wrapping = [0xBB_u8; 32];
+        let bob_wrapping = crate::wrapping_extension::test_wrapping_point(0xBB);
         let (bob_kp, bob_signer, bob_provider) =
             crate::group::generate_key_package_with_context_params(
                 &bob_cred,
@@ -533,7 +533,7 @@ mod tests {
 
         // Add Carol (epoch 2) — a later commit distributed to existing members.
         let carol_cred = test_credential("carol");
-        let carol_wrapping = [0xCC_u8; 32];
+        let carol_wrapping = crate::wrapping_extension::test_wrapping_point(0xCC);
         let (carol_kp, _carol_signer, _carol_provider) =
             crate::group::generate_key_package_with_context_params(
                 &carol_cred,

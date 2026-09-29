@@ -2997,7 +2997,7 @@ impl MlsBackend for FailingBackend {
     async fn create_group(
         &self,
         credential: &ScpCredential,
-        wrapping_pubkey: Option<&[u8; 32]>,
+        wrapping_pubkey: Option<&[u8; 65]>,
     ) -> Result<ScpMlsGroup, MlsError> {
         self.inner.create_group(credential, wrapping_pubkey).await
     }
@@ -3039,7 +3039,7 @@ impl MlsBackend for FailingBackend {
     async fn advance_epoch(
         &self,
         group: &mut ScpMlsGroup,
-        wrapping_pubkey: Option<&[u8; 32]>,
+        wrapping_pubkey: &[u8; 65],
     ) -> Result<Vec<u8>, MlsError> {
         self.inner.advance_epoch(group, wrapping_pubkey).await
     }
@@ -3055,7 +3055,7 @@ impl MlsBackend for FailingBackend {
     async fn generate_key_package(
         &self,
         credential: &ScpCredential,
-        wrapping_pubkey: Option<&[u8; 32]>,
+        wrapping_pubkey: Option<&[u8; 65]>,
     ) -> Result<GeneratedKeyPackage, MlsError> {
         loop {
             let cur = self.remaining.load(Ordering::Acquire);

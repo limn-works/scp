@@ -297,6 +297,10 @@ fn signer_and_provider_from_wrapper(
 ) -> Result<(SignatureKeyPair, InMemoryMlsProvider), MlsError> {
     let signer: SignatureKeyPair = rmp_serde::from_slice(&wrapper.signer_bytes)
         .map_err(|e| MlsError::StorageError(format!("signer deserialization: {e}")))?;
+    // C19(c): the restored signer must be a P-256 pair whose public key is
+    // scalar·G before OpenMLS signs anything with it (no group is loaded
+    // yet, so the ciphersuite check runs when the Welcome is processed).
+    group::extract_p256_scalar(&signer)?;
 
     let provider = new_provider();
     {
@@ -332,7 +336,7 @@ impl MlsBackend for ProductionMlsBackend {
     async fn create_group(
         &self,
         credential: &ScpCredential,
-        wrapping_pubkey: Option<&[u8; 32]>,
+        wrapping_pubkey: Option<&[u8; 65]>,
     ) -> Result<ScpMlsGroup, MlsError> {
         // Delegate to the free function; byte-identical to
         // `NodeMlsFactory::create_mls_group` (which also calls the same
@@ -444,14 +448,9 @@ impl MlsBackend for ProductionMlsBackend {
     async fn advance_epoch(
         &self,
         group: &mut ScpMlsGroup,
-        wrapping_pubkey: Option<&[u8; 32]>,
+        wrapping_pubkey: &[u8; 65],
     ) -> Result<Vec<u8>, MlsError> {
-        // Match the existing `NodeMlsFactory::advance_epoch` semantics:
-        // the pre-refactor code defaulted the wrapping key to zero-bytes
-        // when the provider had not yet generated one (rare but possible
-        // during test flows). Mirror that behaviour byte-for-byte.
-        let wrap = wrapping_pubkey.map_or([0u8; 32], |k| *k);
-        let commit = scp_mls::ratchet::propose_update_with_wrapping_key(group, &wrap)?;
+        let commit = scp_mls::ratchet::propose_update_with_wrapping_key(group, wrapping_pubkey)?;
         commit
             .tls_serialize_detached()
             .map_err(|e| MlsError::CommitProcessingFailed(format!("serializing commit: {e}")))
@@ -517,7 +516,7 @@ impl MlsBackend for ProductionMlsBackend {
     async fn generate_key_package(
         &self,
         credential: &ScpCredential,
-        wrapping_pubkey: Option<&[u8; 32]>,
+        wrapping_pubkey: Option<&[u8; 65]>,
     ) -> Result<GeneratedKeyPackage, MlsError> {
         // Every pooled KeyPackage must be joinable into an SCP *context* group,
         // whose `group_context` carries the `scp_context_params` (`0xFF02`)
@@ -744,6 +743,67 @@ mod tests {
     use scp_mls::credential::ScpCredential;
     use scp_platform::in_memory::InMemoryStorage;
 
+    /// Runs the Welcome-join signer restore on a wrapper whose signer bytes
+    /// hold `signer` and whose storage is empty.
+    fn restore_signer(signer: &SignatureKeyPair) -> Result<(), MlsError> {
+        let wrapper = SerializedSigner {
+            signer_bytes: rmp_serde::to_vec(signer).unwrap(),
+            mls_storage_entries: Vec::new(),
+            key_package_public_bytes: Vec::new(),
+        };
+        signer_and_provider_from_wrapper(wrapper).map(|_| ())
+    }
+
+    /// T7 / C19(c): the `join_from_welcome` signer restore refuses a P-256
+    /// signer whose public key is a valid point that is not `scalar·G`, and an
+    /// Ed25519 signer, each with a typed `InvalidSigner`; a valid pair passes.
+    #[test]
+    fn signer_restore_rejects_mismatched_or_non_p256_signer() {
+        let key = scp_crypto::p256::P256SigningKey::from_seed(b"backend-t7", &[3; 32]).unwrap();
+        let other = scp_crypto::p256::P256SigningKey::from_seed(b"backend-t7", &[4; 32]).unwrap();
+        let scheme = group::SCP_CIPHERSUITE.signature_algorithm();
+        let tampered = SignatureKeyPair::from_raw(
+            scheme,
+            key.to_scalar_bytes().to_vec(),
+            other.public_key().to_uncompressed().to_vec(),
+        );
+        assert!(
+            matches!(
+                restore_signer(&tampered),
+                Err(MlsError::InvalidSigner(scp_mls::SignerDefect::KeyPair(
+                    scp_crypto::p256::P256Error::VerificationFailed
+                )))
+            ),
+            "mismatched P-256 signer must be refused"
+        );
+
+        let ed25519 = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        assert!(
+            matches!(
+                restore_signer(&ed25519),
+                Err(MlsError::InvalidSigner(
+                    scp_mls::SignerDefect::WrongScheme { .. }
+                ))
+            ),
+            "Ed25519 signer must be refused"
+        );
+
+        let valid = SignatureKeyPair::from_raw(
+            scheme,
+            key.to_scalar_bytes().to_vec(),
+            key.public_key().to_uncompressed().to_vec(),
+        );
+        restore_signer(&valid).expect("a valid P-256 pair restores");
+    }
+
+    /// A valid 65-byte DHKEM(P-256) wrapping point, distinct per `tag`.
+    fn wrap_point(tag: u8) -> [u8; 65] {
+        scp_crypto::p256::P256SigningKey::from_seed(b"production-backend-test", &[tag; 32])
+            .unwrap()
+            .public_key()
+            .to_uncompressed()
+    }
+
     fn test_credential(name: &str) -> ScpCredential {
         ScpCredential::new(format!("did:dht:z6Mk{name}"), None, SigningKeyId::Active).unwrap()
     }
@@ -858,7 +918,7 @@ mod tests {
     async fn create_group_with_wrapping_key_propagates_extension() {
         let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
         let cred = test_credential("alice-wrap");
-        let wrap_pub = [0x11u8; 32];
+        let wrap_pub = wrap_point(0x11);
 
         let grp = backend.create_group(&cred, Some(&wrap_pub)).await.unwrap();
 
@@ -980,10 +1040,10 @@ mod tests {
 
         let alice_cred = test_credential("alice-adv");
         let mut alice_grp = backend.create_group(&alice_cred, None).await.unwrap();
-        let wrap_pub = [0x22u8; 32];
+        let wrap_pub = wrap_point(0x22);
 
         let commit_bytes = backend
-            .advance_epoch(&mut alice_grp, Some(&wrap_pub))
+            .advance_epoch(&mut alice_grp, &wrap_pub)
             .await
             .unwrap();
         assert!(!commit_bytes.is_empty());
@@ -1071,7 +1131,7 @@ mod tests {
         // subsequent `advance_epoch` call MUST agree on the wrapping
         // extension being present. We pass the same `wrap_pub` to
         // `create_group`, `generate_key_package`, and `advance_epoch`.
-        let wrap_pub = [0x42u8; 32];
+        let wrap_pub = wrap_point(0x42);
 
         let alice_cred = test_credential("alice-pc");
         let bob_cred = test_credential("bob-pc");
@@ -1098,7 +1158,7 @@ mod tests {
 
         // Alice advances epoch again; Bob processes the Commit.
         let adv_commit = backend
-            .advance_epoch(&mut alice_grp, Some(&wrap_pub))
+            .advance_epoch(&mut alice_grp, &wrap_pub)
             .await
             .unwrap();
         assert_eq!(alice_grp.epoch().unwrap(), 2);
@@ -1191,7 +1251,7 @@ mod tests {
 
         // Creator side: a context group carrying the 0xFF02 extension.
         let alice_cred = test_credential("alice-ctx");
-        let alice_wrap = [0xA1u8; 32];
+        let alice_wrap = wrap_point(0xA1);
         let ctx_ext = sample_context_extension("ctx:prod-join");
         let mut alice_group = group::create_group_with_context(
             &alice_cred,
@@ -1204,7 +1264,7 @@ mod tests {
         // Joiner side: KP via the PRODUCTION generate_key_package path WITH a
         // wrapping key — now declares 0xFF01 + 0xFF02.
         let bob_cred = test_credential("bob-ctx");
-        let bob_wrap = [0xB2u8; 32];
+        let bob_wrap = wrap_point(0xB2);
         let bob_gen = backend
             .generate_key_package(&bob_cred, Some(&bob_wrap))
             .await
@@ -1260,7 +1320,7 @@ mod tests {
         let backend = joinable_backend();
 
         let alice_cred = test_credential("alice-ctx-neg");
-        let alice_wrap = [0xA3u8; 32];
+        let alice_wrap = wrap_point(0xA3);
         let ctx_ext = sample_context_extension("ctx:prod-neg");
         let mut alice_group = group::create_group_with_context(
             &alice_cred,
