@@ -2,7 +2,8 @@
 //
 // `.docs/standards/sdk-common.md` §Cleanup error handling: "Errors during cleanup are logged
 // but never propagated as exceptions". ScpViewModel meets it through the default
-// onCleanupFailure body and through onCleared's log of a throwing override. A plain JVM unit
+// onCleanupFailure body and through each cleanup coroutine's log of a throwing override,
+// whether onCleared or a trackContext after clear launched that coroutine. A plain JVM unit
 // test turns `Log.w` into a silent no-op (`isReturnDefaultValues = true`), so these methods run
 // under Robolectric, whose ShadowLog records every call.
 //
@@ -73,6 +74,23 @@ class ScpViewModelCleanupLoggingTest {
         val warning = ShadowLog.getLogsForTag(TAG).single()
         assertEquals(Log.WARN, warning.type)
         assertTrue(warning.msg.contains("contextHandle=1"), "the warning names no context: ${warning.msg}")
+        assertEquals(overrideFailure, warning.throwable)
+    }
+
+    @Test
+    fun `a trackContext after clear logs an onCleanupFailure override that throws`() {
+        stubBindings.leaveThrowsForHandle = 2L
+        val overrideFailure = IllegalStateException("override failed")
+        val viewModel = ThrowingCleanupViewModel(overrideFailure)
+        clearThroughStore(viewModel)
+
+        // Unconfined runs the post-clear leave, its failure, and the log inside trackContext.
+        viewModel.trackContext(TrackedContext(handle = 2L, identityHandle = 6L, bridge = bridge))
+
+        assertEquals(listOf(2L), stubBindings.leaveCalledHandles)
+        val warning = ShadowLog.getLogsForTag(TAG).single()
+        assertEquals(Log.WARN, warning.type)
+        assertTrue(warning.msg.contains("contextHandle=2"), "the warning names no context: ${warning.msg}")
         assertEquals(overrideFailure, warning.throwable)
     }
 

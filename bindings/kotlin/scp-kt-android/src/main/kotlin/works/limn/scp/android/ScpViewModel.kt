@@ -238,8 +238,8 @@ abstract class ScpViewModel : ViewModel() {
      * A default body logs at warning level, which is what `.docs/standards/sdk-common.md`
      * §Cleanup error handling requires: "Errors during cleanup are logged but never
      * propagated as exceptions — callers must not be penalized for disposing resources."
-     * That standard is why this method returns [Unit] rather than rethrowing, and why
-     * [onCleared] keeps calling `leave` on remaining contexts after one fails.
+     * That standard is why this method returns [Unit] rather than rethrowing, and why a
+     * cleanup coroutine keeps calling `leave` on its remaining contexts after one fails.
      *
      * Runs inside a cleanup coroutine. When the bridge's I/O dispatcher dispatches (the default
      * `Dispatchers.IO` does), that is on whichever thread resumed that coroutine, after
@@ -257,11 +257,12 @@ abstract class ScpViewModel : ViewModel() {
      * running call returns. Calls from one coroutine keep its order; calls from different
      * coroutines have no defined order.
      *
-     * A throw from an override does not propagate: [onCleared] catches it, logs it at warning
-     * level, and still calls `leave` on every remaining context, so throwing here fails
-     * nothing closed. [onCleared] catches it because an uncaught throw from that coroutine
-     * would reach the thread's uncaught-exception handler, which on Android kills the
-     * process after the screen that owned this ViewModel is gone.
+     * A throw from an override does not propagate: the cleanup coroutine that called it,
+     * whether [onCleared] or a [trackContext] after clear launched it, catches it, logs it at
+     * warning level, and still calls `leave` on every remaining context, so throwing here
+     * fails nothing closed. The coroutine catches it because an uncaught throw from it would
+     * reach the thread's uncaught-exception handler, which on Android kills the process
+     * after the screen that owned this ViewModel is gone.
      *
      * @param context Tracked context whose `leave` failed.
      * @param cause Throwable that `leave` threw. A [CancellationException] here was raised
