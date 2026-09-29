@@ -26,7 +26,7 @@ import kotlinx.coroutines.sync.withLock
  * Encapsulates the opaque context handle returned by
  * [works.limn.scp.bridge.ContextBridge.create] or [works.limn.scp.bridge.ContextBridge.join],
  * the identity handle of the member, and the bridge
- * needed to call [leave] on cleanup.
+ * needed to call [works.limn.scp.bridge.ContextBridge.leave] on cleanup.
  *
  * @property handle Opaque context handle from the FFI layer.
  * @property identityHandle Opaque identity handle for the member in this context.
@@ -49,7 +49,8 @@ data class TrackedContext(
  * 1. Create [CoroutineBridge] and context handles in the ViewModel
  * 2. Track contexts via [trackContext]
  * 3. Expose message flows via `stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())`
- * 4. Override [onCleared] calls [leave] on all tracked contexts automatically
+ * 4. Let [onCleared], which this class already overrides, call
+ *    [works.limn.scp.bridge.ContextBridge.leave] on every tracked context
  *
  * Usage:
  * ```kotlin
@@ -209,10 +210,11 @@ abstract class ScpViewModel : ViewModel() {
      * Calls `leave` on each of [contexts] in order, on a coroutine [cleanupScope] owns.
      *
      * [CoroutineStart.UNDISPATCHED] runs the coroutine on the calling thread up to its first
-     * suspension. A default start would, when the caller already runs inside a
-     * `Dispatchers.Unconfined` coroutine (a retry from [onCleanupFailure] does), queue it on
-     * that thread's unconfined event loop until the caller's coroutine suspends, and the
-     * inline-bridge guarantees in the KDoc of [trackContext] and [onCleared] would not hold.
+     * suspension. A default start would, when the caller runs inside the thread's active
+     * unconfined event loop, queue it on that loop until the caller's coroutine suspends, and the
+     * inline-bridge guarantees in the KDoc of [trackContext] and [onCleared] would not hold. A
+     * retry from [onCleanupFailure] runs inside that loop whenever the failed `leave` resumed its
+     * cleanup coroutine from a dispatching bridge, such as the default `Dispatchers.IO` one.
      */
     private fun launchLeave(contexts: List<TrackedContext>) {
         cleanupScope.launch(start = CoroutineStart.UNDISPATCHED) {

@@ -352,14 +352,24 @@ class ScpViewModelTest {
     }
 
     // An override that retries calls trackContext from inside a cleanup coroutine on
-    // Dispatchers.Unconfined. A default-start launch there is queued on the thread's unconfined
-    // event loop, so the retry's inline leave would run only after the override returned.
-    // Undispatched start runs it inside trackContext, as trackContext's KDoc states; the
-    // retry's own failure waits for the retrying override and still runs before onCleared
-    // returns, on the calling thread.
+    // Dispatchers.Unconfined. The first context's leave fails on a Dispatchers.IO thread, and
+    // the cleanup coroutine resumes there inside an active unconfined event loop, so the
+    // override runs inside that loop. A default-start launch from trackContext would be
+    // queued on the loop until the override returned, and the retry's inline leave would run
+    // only then; undispatched start runs it inside trackContext, as trackContext's KDoc
+    // states. A caller with no active loop, such as a test thread calling onCleared with an
+    // inline bridge, runs a default-start launch inline too, so this method needs the
+    // dispatching first context to fail when `CoroutineStart.UNDISPATCHED` is removed.
+    // The retry's own failure waits for the retrying override and then runs on its thread.
     @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     fun `an inline leave retried from onCleanupFailure runs before trackContext returns`() {
         stubBindings.leaveAlwaysThrows = true
+        val ioBridge = CoroutineBridge(
+            nativeBindings = stubBindings,
+            ioDispatcher = Dispatchers.IO,
+            cpuDispatcher = Dispatchers.IO,
+        )
         val inlineBridge = CoroutineBridge(
             nativeBindings = stubBindings,
             ioDispatcher = Dispatchers.Unconfined,
@@ -367,9 +377,10 @@ class ScpViewModelTest {
         )
         val retry = TrackedContext(handle = 2L, identityHandle = 2L, bridge = inlineBridge)
         val viewModel = RetryingViewModel(retry, stubBindings)
-        viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = inlineBridge))
+        viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = ioBridge))
 
         viewModel.callOnCleared()
+        assertTrue(viewModel.bothDone.await(5, TimeUnit.SECONDS), "both failures never arrived")
 
         assertEquals(
             listOf(1L, 2L),
@@ -377,7 +388,10 @@ class ScpViewModelTest {
             "retried leave ran after trackContext returned",
         )
         assertEquals(listOf(1L, 2L), viewModel.failedHandles)
-        assertEquals(listOf(Thread.currentThread(), Thread.currentThread()), viewModel.callThreads)
+        val threads = viewModel.callThreads.toList()
+        assertEquals(2, threads.size)
+        assertEquals(threads[0], threads[1], "retry's failure did not run on the retrying thread")
+        assertNotEquals(Thread.currentThread(), threads[0], "first failure ran on the onCleared caller")
     }
 
     // A Java subclass of ScpViewModel calls `super()`, so a zero-argument JVM constructor is
@@ -440,19 +454,23 @@ private class RetryingViewModel(
     private val retry: TrackedContext,
     private val bindings: TestNativeBindings,
 ) : ScpViewModel() {
-    val failedHandles = mutableListOf<Long>()
-    val callThreads = mutableListOf<Thread>()
+    // Written by onCleanupFailure calls, which never overlap; read after [bothDone].
+    val failedHandles: MutableList<Long> = Collections.synchronizedList(mutableListOf())
+    val callThreads: MutableList<Thread> = Collections.synchronizedList(mutableListOf())
+    val bothDone = CountDownLatch(2)
 
     /** The bridge's recorded `leave` handles at the moment the retry's trackContext returned. */
-    var leftWhenRetryReturned: List<Long> = emptyList()
+    @Volatile var leftWhenRetryReturned: List<Long> = emptyList()
 
     override fun onCleanupFailure(context: TrackedContext, cause: Throwable) {
         failedHandles += context.handle
         callThreads += Thread.currentThread()
         if (context !== retry) {
             trackContext(retry)
-            leftWhenRetryReturned = bindings.leaveCalledHandles.toList()
+            val left = bindings.leaveCalledHandles
+            leftWhenRetryReturned = synchronized(left) { left.toList() }
         }
+        bothDone.countDown()
     }
 
     fun callOnCleared() {
