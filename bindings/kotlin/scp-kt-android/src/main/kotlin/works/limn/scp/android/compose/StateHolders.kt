@@ -407,8 +407,8 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
      * and its `start` never runs. Once [start] runs, it runs to completion under
      * [NonCancellable], so a mount that leaves while its `start` is suspended still records what
      * that `start` returned, and a stop compares that object against the other held departures'
-     * instead of keeping one more `onStop` for a subscription it cannot identify. This call then
-     * releases the mutex and throws the caller's [CancellationException].
+     * instead of keeping one more `onStop` for a subscription it cannot identify. A stop under
+     * that key therefore waits for a running `start` to return, whoever cancelled its caller.
      *
      * @throws ScpHotStreamCoordinatorClosedException when this coordinator's scope is cancelled,
      *   checked under the mutex, because no stop could release what [start] opened.
