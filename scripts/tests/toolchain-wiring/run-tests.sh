@@ -78,9 +78,11 @@
 #     a string comparison would order below 2026.9.15. It fails closed, with its own
 #     message, on an absent `.mise.toml`, on one tomllib rejects, and when no interpreter on
 #     PATH imports tomllib. Every case except the "policy-*" ones, the absent `.mise.toml`,
-#     the malformed one, and the one without a parser writes both settings, and `run_case`
-#     fails any of those whose output carries a check 5 finding, so each one proves check 5
-#     stays silent then, whatever else the case expects.
+#     and the malformed one writes both settings. `run_case` fails any case that writes
+#     both settings and has a TOML parser on PATH whose output carries a check 5 finding, so
+#     each one proves check 5 stays silent then, whatever else the case expects. The two
+#     cases without a parser write both settings too; `run_case` exempts them because their
+#     finding is the parser's absence, whose message names the check 5 settings.
 #   * `scripts/setup-toolchain.sh` exits 1 with its own "mise refused to load" line when
 #     mise refuses to load `.mise.toml`, before any further mise call, and runs on to its
 #     next mise call when mise loads the file. Its first mise call names the repository
