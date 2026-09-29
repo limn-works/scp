@@ -84,12 +84,18 @@ require_cmd rustup || true
 
 # The first mise call loads `.mise.toml`, whose string `min_version` is a hard floor: on
 # `mise config ls`, which lists configuration files and installs nothing, a mise older
-# than the floor prints "mise version <floor> is required" and exits non-zero. mise's
-# stderr stays on the terminal, and the script exits on that failure in both modes,
-# because every step below runs mise.
+# than the floor prints "mise version <floor> is required" and exits non-zero. mise also
+# exits non-zero on a `.mise.toml` it does not trust, which is every fresh clone and
+# worktree. Install mode passes `--yes`, which trusts the file as `mise install --yes`
+# below always has and leaves the floor error in place, because that error is not a
+# prompt. `--check` passes no `--yes`, so it changes no trust. mise's stderr stays on the
+# terminal, and the script exits on that failure in both modes, because every step below
+# runs mise.
+mise_load=(mise --cd "$REPO_ROOT")
+$CHECK_MODE || mise_load+=(--yes)
 if command -v mise &>/dev/null; then
-  if ! mise --cd "$REPO_ROOT" config ls >/dev/null; then
-    red "  ✗ mise refused to load $REPO_ROOT/.mise.toml; its error above names the cause. When that is the min_version floor, upgrade mise (brew upgrade mise) and run this script again."
+  if ! "${mise_load[@]}" config ls >/dev/null; then
+    red "  ✗ mise refused to load $REPO_ROOT/.mise.toml; its error above names the cause. When that is the min_version floor, upgrade mise (brew upgrade mise). When the file is not trusted, which only --check leaves unresolved, run this script without --check, or run: mise trust $REPO_ROOT/.mise.toml. Then run this script again."
     exit 1
   fi
   ok "mise loads .mise.toml, so it meets the min_version floor"

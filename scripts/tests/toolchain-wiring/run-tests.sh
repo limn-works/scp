@@ -81,9 +81,11 @@
 #     the malformed one, and the one without a parser writes both settings, and `run_case`
 #     fails any of those whose output carries a check 5 finding, so each one proves check 5
 #     stays silent then, whatever else the case expects.
-#   * `scripts/setup-toolchain.sh` exits 1 with its own message when mise refuses to load
-#     `.mise.toml`, before any further mise call, and runs on to its next mise call when
-#     mise loads the file.
+#   * `scripts/setup-toolchain.sh` exits 1 with its own "mise refused to load" line when
+#     mise refuses to load `.mise.toml`, before any further mise call, and runs on to its
+#     next mise call when mise loads the file. Its first mise call names the repository
+#     with `--cd`, and carries `--yes`, which trusts the file, in install mode and not
+#     under `--check`.
 #
 # HOW EACH CASE IS BUILT. `run_case` makes a temporary directory, writes the gate and
 # `scripts/check-resolved-rustc.sh` into `scripts/`, runs `git init` so the gate's
@@ -118,8 +120,8 @@ trap 'rm -rf "$TMP_PARENT"' EXIT
 
 # The directory holding the Python interpreter the gate's TOML checks run. When `python3.12`
 # is a mise shim, the shim exits with an untrusted-config error in a canned repository,
-# because mise demands trust for a `.mise.toml` holding a `[settings]` table and every
-# canned `.mise.toml` below holds one. The harness asks the interpreter for its own path
+# because mise demands trust for a `.mise.toml` holding a `[settings]` table, which most
+# canned `.mise.toml` files below hold. The harness asks the interpreter for its own path
 # from this repository, where mise trusts the configuration, and `run_case` puts that
 # directory on PATH after `stub-bin`, so every case runs an interpreter that imports
 # tomllib. When no candidate answers, PATH keeps its order and the gate reports the
@@ -1479,22 +1481,32 @@ run_case "resolved-rustc-check-absent" 1 \
     "scripts/check-resolved-rustc.sh does not exist" routing_ok mise_ok
 COPY_RESOLVED_RUSTC="yes"
 
-# ── scripts/setup-toolchain.sh reads the floor check 5 requires ────────────────────────
+# ── scripts/setup-toolchain.sh stops when mise refuses to load `.mise.toml` ─────────────
 
 SETUP="$REPO_ROOT/scripts/setup-toolchain.sh"
+FLOOR_ERR="mise ERROR mise version 2026.9.15 is required, but you are using 2026.2.22"
 
-# setup_case <name> <canned mise answer to `config ls`: "refuse" or "load"> <required substring>
+# setup_case <name> <mode: "check" or "install"> <canned mise answer to `config ls`> <required substring>
 #
-# Each case runs `--check`, which installs nothing, with a canned `mise` that appends its
-# arguments to `mise-calls` and answers every call but `config ls` with exit 97, and a
-# canned `brew`, `rustc`, and `cargo` that exit 97, so the script reads none of this
-# machine's toolchain. A refusing mise prints the error a mise below `min_version` prints.
-# The script exits 1 in both cases: on the refusal, or on the tools the canned mise reports
-# missing. A refusal case also fails unless `config ls` was the only mise call; a loading
-# case fails unless the script made a mise call after it.
+# Each case copies the script into a canned repository whose `.mise.toml` holds only
+# `min_version`, and runs it with a canned `mise` that appends its arguments to `mise-calls`
+# and answers every call but `config ls` with exit 97, and a canned `brew`, `rustc`, and
+# `cargo` that exit 97. The script's other probes (`xcode-select`, directories under
+# `$HOME`, `~/.zshenv`) still read this machine; no assertion depends on their answers.
+# The canned answers to `config ls`: "refuse" prints the error a mise below `min_version`
+# prints and exits 1; "load" exits 0; "untrusted" prints mise's untrusted-config error and
+# exits 1 when the call carries no `--yes`, and otherwise prints the floor error and exits
+# 1. The "install" case therefore passes only when the script passes `--yes`, and it stops
+# at the floor before any install step runs.
+# Every case fails unless the script exits 1 (on the refusal, or on the tools the canned
+# mise reports missing) and its first mise call is `--cd <canned repository>`, then `--yes`
+# in install mode only, then `config ls`. A refused case also fails unless that call was
+# the only mise call and the output carries the script's own "mise refused to load" line;
+# a loading case fails unless the script made a mise call after it.
 setup_case() {
-    local name=$1 answer=$2 want_msg=$3
-    local root output actual_exit ok=1 stub calls
+    local name=$1 mode=$2 answer=$3 want_msg=$4
+    local root output actual_exit ok=1 stub calls first want_first
+    local -a flag=()
     root="$TMP_PARENT/setup-$name"
     mkdir -p "$root/scripts" "$root/stub-bin"
     cp "$SETUP" "$root/scripts/"
@@ -1502,21 +1514,28 @@ setup_case() {
     {
         printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\n' "$root/mise-calls"
         printf 'if [[ " $* " == *" config ls "* ]]; then\n'
-        if [[ $answer == "refuse" ]]; then
-            printf '  echo "mise ERROR mise version 2026.9.15 is required, but you are using 2026.2.22" >&2\n  exit 1\n'
-        else
-            printf '  exit 0\n'
-        fi
+        case $answer in
+            refuse) printf '  echo %q >&2\n  exit 1\n' "$FLOOR_ERR" ;;
+            load) printf '  exit 0\n' ;;
+            untrusted)
+                printf '  if [[ " $* " != *" --yes "* ]]; then echo %q >&2; exit 1; fi\n' \
+                    "mise ERROR Config files in $root/.mise.toml are not trusted."
+                printf '  echo %q >&2\n  exit 1\n' "$FLOOR_ERR" ;;
+        esac
         printf 'fi\nexit 97\n'
     } > "$root/stub-bin/mise"
     for stub in brew rustc cargo; do
         printf '#!/usr/bin/env bash\nexit 97\n' > "$root/stub-bin/$stub"
     done
     chmod +x "$root/stub-bin/"*
-    output=$(PATH="$root/stub-bin:$PATH" bash "$root/scripts/setup-toolchain.sh" --check 2>&1)
+    [[ $mode == "check" ]] && flag=(--check)
+    output=$(PATH="$root/stub-bin:$PATH" bash "$root/scripts/setup-toolchain.sh" ${flag[@]+"${flag[@]}"} 2>&1)
     actual_exit=$?
     calls=0
     [[ -f $root/mise-calls ]] && calls=$(( $(wc -l < "$root/mise-calls") ))
+    first=$(head -n 1 "$root/mise-calls" 2>/dev/null)
+    want_first="--cd $root config ls"
+    [[ $mode == "install" ]] && want_first="--cd $root --yes config ls"
     if ! grep -Fq -- "$want_msg" <<< "$output"; then
         echo "FAIL [setup-$name]: output missing required substring: $want_msg" >&2
         ok=0
@@ -1525,11 +1544,15 @@ setup_case() {
         echo "FAIL [setup-$name]: setup-toolchain.sh exited $actual_exit, expected 1" >&2
         ok=0
     fi
-    if [[ $(head -n 1 "$root/mise-calls" 2>/dev/null) != *"config ls"* ]]; then
-        echo "FAIL [setup-$name]: the first mise call is not 'config ls'" >&2
+    if [[ $first != "$want_first" ]]; then
+        echo "FAIL [setup-$name]: the first mise call is '$first', expected '$want_first'" >&2
         ok=0
     fi
-    if [[ $answer == "refuse" && $calls -ne 1 ]] || [[ $answer == "load" && $calls -lt 2 ]]; then
+    if [[ $answer != "load" ]] && { [[ $calls -ne 1 ]] || ! grep -Fq "mise refused to load" <<< "$output"; }; then
+        echo "FAIL [setup-$name]: the script did not stop with its own message after one mise call ($calls calls)" >&2
+        ok=0
+    fi
+    if [[ $answer == "load" && $calls -lt 2 ]]; then
         echo "FAIL [setup-$name]: the canned mise answered $calls calls" >&2
         ok=0
     fi
@@ -1544,10 +1567,9 @@ setup_case() {
     fi
 }
 
-setup_case "stops-when-mise-refuses-the-floor" refuse \
-    "mise version 2026.9.15 is required, but you are using 2026.2.22"
-setup_case "runs-on-when-mise-loads-the-config" load \
-    "java not installed via mise"
+setup_case "stops-when-mise-refuses-the-floor" check refuse "$FLOOR_ERR"
+setup_case "runs-on-when-mise-loads-the-config" check load "java not installed via mise"
+setup_case "install-trusts-the-config-and-stops-at-the-floor" install untrusted "$FLOOR_ERR"
 
 echo ""
 echo "toolchain-wiring cases: $passed passed, $failed failed"
