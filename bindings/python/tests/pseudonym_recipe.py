@@ -32,8 +32,10 @@ This module computes the two seeds and signs with a given ``d``; ``d`` and
 and ``scp_sdk.p256_public_key``.
 
 Until slice S12 the native identity key is Ed25519, so the ikm is its 32-byte
-private seed. A custody provider returns ``(public_key, key_id)`` as separate
-fields; ``get_public_key(key_id)`` must return the same 33 bytes, and
+private seed. A custody provider's ``derive_pseudonym`` and
+``derive_rotatable_pseudonym`` return a ``scp_sdk.PseudonymResult`` carrying
+``public_key`` and ``key_id``;
+``get_public_key(key_id)`` must return the same 33 bytes, and
 ``sign(key_id, digest)`` returns the 64-byte low-s ``r || s`` of
 :func:`p256_sign_prehash`.
 """

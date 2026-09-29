@@ -10809,7 +10809,6 @@
         "bindings/typescript/src/scp.ts",
         "bindings/typescript/tests/custody-bridge-checks.test.ts",
         "bindings/typescript/tests/identity-create-with-custody.test.ts",
-        "bindings/typescript/tests/pseudonym-kat.test.ts",
         "bindings/typescript/tests/pseudonym-recipe.ts",
         "crates/scp-client-wasm/tests/cross_target_determinism_kat.rs",
         "crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs",

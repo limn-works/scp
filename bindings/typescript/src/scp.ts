@@ -563,7 +563,7 @@ export interface KeyCustodyProvider {
    * re-deriving names one key rather than minting another. The pseudonym
    * dies with its identity (spec §9.10.4.A): `destroyKey(keyId)` destroys it,
    * and a derivation still in flight when `keyId` is destroyed fails with
-   * key-not-found and stores nothing.
+   * key-not-found (`SCP-CRYPTO-4006`) and stores nothing.
    *
    * Canonical recipe (spec §9.10.4, §9.10.4.A; every software host MUST
    * produce identical bytes; `ikm` is the identity private key material, the
