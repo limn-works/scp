@@ -4009,10 +4009,13 @@ mod tests {
     /// Connects `scp` through `py_mcp_client_connect_stdio` to a stub server
     /// that answers `initialize` and then falls silent, and starts a
     /// `py_mcp_client_list_tools` on it from a Python thread. The stub runs
-    /// `sleep` as its own child, the way `npx` runs the real server: the
-    /// trailing `true` keeps `sh` from exec'ing it. That grandchild holds the
-    /// stdout pipe, so the in-flight call ends only when its whole process
-    /// group is killed. Returns only once the call holds the client's lock,
+    /// `sleep` as its own child, the way `npx` runs the real server: `sh`
+    /// starts it in the background and `wait`s, so `sh` never execs it. The
+    /// stub forks `sleep` before it answers `initialize`, so the grandchild
+    /// exists before connect returns, and a teardown that starts right after
+    /// connect cannot race the fork and leave `sleep` alive. That grandchild
+    /// holds the stdout pipe, so the in-flight call ends only when its whole
+    /// process group is killed. Returns only once the call holds the client's lock,
     /// which it takes after cloning `client` out of the registry and keeps
     /// through the blocking read, so the caller's teardown always meets a
     /// call in flight. Returns the handle, the server's slot, and a receiver
@@ -4030,10 +4033,10 @@ mod tests {
             .expect("allowlist lock")
             .configure(&["sh"])
             .expect("allow sh");
-        let script = "read l; \
+        let script = "read l; sleep 600 & \
             echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\
             \"capabilities\":{},\"serverInfo\":{\"name\":\"stub\"}}}'; \
-            sleep 600; true";
+            wait";
         let handle = Python::with_gil(|py| {
             scp.py_mcp_client_connect_stdio(
                 py,
@@ -4297,10 +4300,10 @@ mod tests {
             generate_handle_id("mcp-shutdown-connect")
         ));
         let script = format!(
-            "echo $$ > '{}'; read l; \
+            "echo $$ > '{}'; read l; sleep 600 & \
             echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\",\
             \"capabilities\":{{}},\"serverInfo\":{{\"name\":\"stub\"}}}}}}'; \
-            sleep 600; true",
+            wait",
             pid_file.display()
         );
         let result = Python::with_gil(|py| {
