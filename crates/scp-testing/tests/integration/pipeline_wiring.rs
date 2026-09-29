@@ -2984,25 +2984,30 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
     let uniffi_mcp_src = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
     // Each bridge's accessor for its own instance's Supervisor, called on the
     // `mcp_server_bundle` parameter `bi`: the scrutinee of the `match` that
-    // binds the receiver.
-    for (bridge, src, serve_fn, supervisor_of_bi) in [
+    // binds the receiver. Then the serve path's pins: the statements that bind
+    // the serve function's own instance, build the provider over that
+    // instance, and pass that same instance to `mcp_server_bundle`.
+    for (bridge, src, serve_fn, supervisor_of_bi, serve_path) in [
         (
             "PyO3",
             pyo3_mcp_src,
             "py_mcp_serve",
             "crate::runtime::supervisor(bi)",
+            PYO3_SERVE_PATH,
         ),
         (
             "NAPI",
             napi_mcp_src,
             "mcp_server_create_on",
             "crate::runtime::supervisor(bi)",
+            NAPI_SERVE_PATH,
         ),
         (
             "UniFFI",
             uniffi_mcp_src,
             "mcp_server_create",
             "bi.context_manager_or_error()",
+            UNIFFI_SERVE_PATH,
         ),
     ] {
         // Search the PRODUCTION code only: everything before the trailing
@@ -3011,8 +3016,9 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
         // `contains` over the file stayed green after the real call was deleted.
         let code = production_code(src);
         assert!(
-            serves_the_supervisor_event_source(&code, serve_fn, supervisor_of_bi),
-            "{bridge} `{serve_fn}` must build its server with `mcp_server_bundle`, \
+            serves_the_supervisor_event_source(&code, serve_fn, supervisor_of_bi, serve_path),
+            "{bridge} `{serve_fn}` must build its server with `mcp_server_bundle` over \
+             the instance its provider reads (each of {serve_path:?} once), \
              and `mcp_server_bundle` must, as its first statement, obtain the \
              ContextEvent receiver from `{supervisor_of_bi}` (the bridge \
              instance's own Supervisor) and hand THAT receiver to \
@@ -3024,9 +3030,18 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
 }
 
 /// Whether `serve_fn` in `code` (from [`production_code`]) builds its server
-/// through `mcp_server_bundle`, and `mcp_server_bundle` both obtains the
-/// Supervisor's receiver and passes that receiver to
-/// `McpServer::with_optional_event_source`, which `code` calls nowhere else.
+/// through `mcp_server_bundle` over the instance its provider reads, and
+/// `mcp_server_bundle` both obtains the Supervisor's receiver and passes that
+/// receiver to `McpServer::with_optional_event_source`, which `code` calls
+/// nowhere else.
+///
+/// "The instance its provider reads" is pinned by `serve_path`: each of its
+/// pins occurs exactly once in the text of `serve_fn` (the binding of the
+/// instance, the provider's `Weak` over it, and the `mcp_server_bundle` call
+/// on it), and `let bi` occurs exactly as often as the pins bind `bi` or
+/// `bi_arc`, so no other `let` rebinds either name before the call. A
+/// rebinding through a pattern, closure parameter or `match` arm is not
+/// checked.
 ///
 /// "The Supervisor's receiver" is pinned by the `match` that binds it: its
 /// scrutinee is exactly `supervisor_of_bi`, the bridge's accessor for its own
@@ -3042,7 +3057,12 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
 /// `context_events` in the body is a read through `.is_none()` or the
 /// constructor argument, so no statement rebinds or shadows it between the
 /// `match` and the constructor.
-fn serves_the_supervisor_event_source(code: &str, serve_fn: &str, supervisor_of_bi: &str) -> bool {
+fn serves_the_supervisor_event_source(
+    code: &str,
+    serve_fn: &str,
+    supervisor_of_bi: &str,
+    serve_path: ServePath,
+) -> bool {
     const ARM: &str = "{ Ok(supervisor) => supervisor.subscribe_events(),";
     // The arms allowed after `ARM`, each closing the `match` and ending the
     // statement: with no Supervisor there is no receiver, so the arm's value is
@@ -3076,10 +3096,65 @@ fn serves_the_supervisor_event_source(code: &str, serve_fn: &str, supervisor_of_
             && mentions == reads + 2
             && body.contains("McpServer::with_optional_event_source(provider, context_events)")
     });
-    let serve_uses_bundle =
-        fn_body(code, serve_fn).is_some_and(|body| body.contains("= mcp_server_bundle("));
+    let serve_uses_bundle = fn_body(code, serve_fn).is_some_and(|body| {
+        let (pins, instance_lets) = serve_path;
+        pins.iter().all(|pin| body.matches(pin).count() == 1)
+            && body.matches("mcp_server_bundle(").count() == 1
+            && body.matches("let bi").count() == instance_lets
+    });
     bundle_wired && serve_uses_bundle && code.matches("with_optional_event_source(").count() == 1
 }
+
+/// A serve path's pins (see [`serves_the_supervisor_event_source`]): the
+/// statements that must each occur once in the serve function, and how many
+/// `let bi` bindings (of `bi` or `bi_arc`) the function holds, all of them
+/// among the pins. The function must also call `mcp_server_bundle` only once,
+/// in its pinned call.
+type ServePath = (&'static [&'static str], usize);
+
+/// `py_mcp_serve` binds `bi` and `bi_arc` from `self.inner`, builds the
+/// provider over `bi_arc`, and passes `bi` to `mcp_server_bundle`.
+const PYO3_SERVE_PATH: ServePath = (
+    &[
+        "let bi = &*self.inner;",
+        "let bi_arc = Arc::clone(&self.inner);",
+        "bi: Arc::downgrade(&bi_arc),",
+        "let server = mcp_server_bundle(bi, provider);",
+    ],
+    2,
+);
+
+/// `mcp_server_create_on` takes the instance as its parameter `bi`, builds the
+/// provider over it, and passes it to `mcp_server_bundle`.
+const NAPI_SERVE_PATH: ServePath = (
+    &[
+        "fn mcp_server_create_on( bi: &Arc<NapiBridgeInstance>,",
+        "bi: Arc::downgrade(bi),",
+        "let server = mcp_server_bundle(bi, provider);",
+    ],
+    0,
+);
+
+/// `mcp_server_create` builds the provider over `self.inner` and passes
+/// `&self.inner` to `mcp_server_bundle`.
+const UNIFFI_SERVE_PATH: ServePath = (
+    &[
+        "bi: Arc::downgrade(&self.inner),",
+        "let server = mcp_server_bundle(&self.inner, provider);",
+    ],
+    0,
+);
+
+/// The serve path of [`WIRED_BUNDLE`], pinned as [`NAPI_SERVE_PATH`] pins
+/// NAPI's.
+const WIRED_SERVE_PATH: ServePath = (
+    &[
+        "fn serve(bi: &Arc<Bi>)",
+        "bi: Arc::downgrade(bi),",
+        "let server = mcp_server_bundle(bi, provider);",
+    ],
+    0,
+);
 
 /// The Supervisor accessor that [`WIRED_BUNDLE`]'s `match` is taken over.
 const SUPERVISOR_OF_BI: &str = "crate::runtime::supervisor(bi)";
@@ -3087,11 +3162,13 @@ const SUPERVISOR_OF_BI: &str = "crate::runtime::supervisor(bi)";
 /// A wired `mcp_server_bundle` and its serve path, as the event-source gate
 /// accepts them. The event-source self-tests derive each regression from it.
 const WIRED_BUNDLE: &str = "fn mcp_server_bundle(bi: &Bi, provider: P) -> McpServerForTransport<P> {\n    \
-                             // `subscribe_events()` returns `None` only for ...\n    \
+                             // `context_events` is `None` only for ...\n    \
                              let context_events = match crate::runtime::supervisor(bi) {\n        \
                              Ok(supervisor) => supervisor.subscribe_events(),\n        Err(_) => None,\n    };\n    \
                              McpServer::with_optional_event_source(provider, context_events)\n}\n\
-                             fn serve() {\n    let server = mcp_server_bundle(bi, provider);\n}\n\
+                             fn serve(bi: &Arc<Bi>) {\n    \
+                             let provider = P {\n        bi: Arc::downgrade(bi),\n    };\n    \
+                             let server = mcp_server_bundle(bi, provider);\n}\n\
                              mod tests {\n    fn t() { let _ = supervisor.subscribe_events(); }\n}\n";
 
 /// The event-source gate above must go red when the wiring it pins is deleted
@@ -3103,13 +3180,45 @@ const WIRED_BUNDLE: &str = "fn mcp_server_bundle(bi: &Bi, provider: P) -> McpSer
 #[test]
 fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
     let wired = WIRED_BUNDLE;
+    // The wired bundle carries a comment line naming `context_events`, which
+    // counts as a third mention when comment lines are searched.
     assert!(serves_the_supervisor_event_source(
         &production_code(wired),
         "serve",
-        SUPERVISOR_OF_BI
+        SUPERVISOR_OF_BI,
+        WIRED_SERVE_PATH
+    ));
+    // The serve path builds a server with no event source, and the bundle
+    // call survives only as a comment line in its place.
+    let call_commented_out = wired.replace(
+        "    let server = mcp_server_bundle(bi, provider);",
+        "    // let server = mcp_server_bundle(bi, provider);\n    \
+         let server = McpServer::new(provider);",
+    );
+    assert_ne!(call_commented_out, wired);
+    assert!(!serves_the_supervisor_event_source(
+        &production_code(&call_commented_out),
+        "serve",
+        SUPERVISOR_OF_BI,
+        WIRED_SERVE_PATH
+    ));
+    // The production bundle is deleted and a wired copy survives only in the
+    // test module, after the serve path that calls it.
+    let bundle_in_tests = format!(
+        "fn serve(bi: &Arc<Bi>) {{\n    let provider = P {{\n        bi: Arc::downgrade(bi),\n    \
+         }};\n    let server = mcp_server_bundle(bi, provider);\n}}\n\
+         #[cfg(test)]\nmod tests {{\n{}}}\n",
+        &wired[..wired.find("fn serve(").unwrap_or(0)]
+    );
+    assert!(bundle_in_tests.contains("mod tests {\nfn mcp_server_bundle("));
+    assert!(!serves_the_supervisor_event_source(
+        &production_code(&bundle_in_tests),
+        "serve",
+        SUPERVISOR_OF_BI,
+        WIRED_SERVE_PATH
     ));
 
-    // The receiver line survives only in the comment and the test module.
+    // The `Ok` arm no longer yields the Supervisor's receiver.
     let call_deleted = wired.replace(
         "Ok(supervisor) => supervisor.subscribe_events(),",
         "Ok(_) => None,",
@@ -3117,7 +3226,8 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
     assert!(!serves_the_supervisor_event_source(
         &production_code(&call_deleted),
         "serve",
-        SUPERVISOR_OF_BI
+        SUPERVISOR_OF_BI,
+        WIRED_SERVE_PATH
     ));
     // The constructor gets `None` in place of the receiver.
     let none_passed = wired.replace(
@@ -3127,7 +3237,8 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
     assert!(!serves_the_supervisor_event_source(
         &production_code(&none_passed),
         "serve",
-        SUPERVISOR_OF_BI
+        SUPERVISOR_OF_BI,
+        WIRED_SERVE_PATH
     ));
     // The receiver is obtained, then a `None` rebinding shadows it before the
     // constructor, in the same function.
@@ -3139,7 +3250,8 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
     assert!(!serves_the_supervisor_event_source(
         &production_code(&shadowed),
         "serve",
-        SUPERVISOR_OF_BI
+        SUPERVISOR_OF_BI,
+        WIRED_SERVE_PATH
     ));
     // A call chained onto the `match` replaces the receiver it produced.
     let chained = wired.replace(
@@ -3149,7 +3261,8 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
     assert!(!serves_the_supervisor_event_source(
         &production_code(&chained),
         "serve",
-        SUPERVISOR_OF_BI
+        SUPERVISOR_OF_BI,
+        WIRED_SERVE_PATH
     ));
     // The bundle function stays wired, but the serve path builds its own
     // server over a `None` receiver instead of calling it.
@@ -3161,7 +3274,8 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
     assert!(!serves_the_supervisor_event_source(
         &production_code(&serve_builds_its_own),
         "serve",
-        SUPERVISOR_OF_BI
+        SUPERVISOR_OF_BI,
+        WIRED_SERVE_PATH
     ));
     // The receiver is obtained in one function and the constructor is called
     // over a `None` receiver in another.
@@ -3170,12 +3284,64 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
                  fn mcp_server_bundle(bi: &Bi, provider: P) -> McpServerForTransport<P> {\n    \
                  let context_events = None;\n    \
                  McpServer::with_optional_event_source(provider, context_events)\n}\n\
-                 fn serve() {\n    let server = mcp_server_bundle(bi, provider);\n}\n";
+                 fn serve(bi: &Arc<Bi>) {\n    let provider = P {\n        \
+                 bi: Arc::downgrade(bi),\n    };\n    \
+                 let server = mcp_server_bundle(bi, provider);\n}\n";
     assert!(!serves_the_supervisor_event_source(
         &production_code(split),
         "serve",
-        SUPERVISOR_OF_BI
+        SUPERVISOR_OF_BI,
+        WIRED_SERVE_PATH
     ));
+}
+
+/// The event-source gate must go red when the serve path hands
+/// `mcp_server_bundle` an instance other than the one its provider reads:
+/// another instance in the call, a provider over another instance, `bi`
+/// rebound before the call, or a second call over another instance.
+#[test]
+fn mcp_wiring_gate_rejects_a_serve_path_over_another_instance() {
+    let wired = WIRED_BUNDLE;
+    // The serve path passes another instance to `mcp_server_bundle`, so the
+    // pump carries that instance's events while the provider reads `bi`.
+    let serve_other_instance = wired.replace(
+        "let server = mcp_server_bundle(bi, provider);",
+        "let server = mcp_server_bundle(&other_instance, provider);",
+    );
+    // The provider reads another instance while the bundle subscribes to `bi`.
+    let provider_other_instance = wired.replace(
+        "bi: Arc::downgrade(bi),",
+        "bi: Arc::downgrade(&other_instance),",
+    );
+    // The pinned call survives, but the serve path rebinds `bi` before it.
+    let serve_bi_rebound = wired.replace(
+        "    let server = mcp_server_bundle(bi, provider);",
+        "    let bi = &other_instance;\n    let server = mcp_server_bundle(bi, provider);",
+    );
+    // The pinned call survives, and a second call over another instance
+    // builds the server the serve path runs.
+    let second_call = wired.replace(
+        "    let server = mcp_server_bundle(bi, provider);",
+        "    let server = mcp_server_bundle(bi, provider);\n    \
+         let server = mcp_server_bundle(&other_instance, provider);",
+    );
+    for regression in [
+        serve_other_instance,
+        provider_other_instance,
+        serve_bi_rebound,
+        second_call,
+    ] {
+        assert_ne!(regression, wired);
+        assert!(
+            !serves_the_supervisor_event_source(
+                &production_code(&regression),
+                "serve",
+                SUPERVISOR_OF_BI,
+                WIRED_SERVE_PATH
+            ),
+            "{regression}"
+        );
+    }
 }
 
 /// The event-source gate must go red when the receiver comes from anything
@@ -3195,7 +3361,8 @@ fn mcp_wiring_gate_rejects_a_receiver_not_from_the_bridge_instance() {
     assert!(!serves_the_supervisor_event_source(
         &production_code(&stand_in_scrutinee),
         "serve",
-        SUPERVISOR_OF_BI
+        SUPERVISOR_OF_BI,
+        WIRED_SERVE_PATH
     ));
     // The accessor is called on an instance other than the parameter `bi`.
     let other_instance = wired.replace(
@@ -3205,7 +3372,8 @@ fn mcp_wiring_gate_rejects_a_receiver_not_from_the_bridge_instance() {
     assert!(!serves_the_supervisor_event_source(
         &production_code(&other_instance),
         "serve",
-        SUPERVISOR_OF_BI
+        SUPERVISOR_OF_BI,
+        WIRED_SERVE_PATH
     ));
     // The pinned scrutinee survives, but an earlier statement rebinds `bi` to
     // another instance.
@@ -3216,7 +3384,8 @@ fn mcp_wiring_gate_rejects_a_receiver_not_from_the_bridge_instance() {
     assert!(!serves_the_supervisor_event_source(
         &production_code(&bi_rebound),
         "serve",
-        SUPERVISOR_OF_BI
+        SUPERVISOR_OF_BI,
+        WIRED_SERVE_PATH
     ));
     // The `Ok` arm ignores the Supervisor and takes a receiver elsewhere.
     let ok_arm_elsewhere = wired.replace(
@@ -3226,7 +3395,8 @@ fn mcp_wiring_gate_rejects_a_receiver_not_from_the_bridge_instance() {
     assert!(!serves_the_supervisor_event_source(
         &production_code(&ok_arm_elsewhere),
         "serve",
-        SUPERVISOR_OF_BI
+        SUPERVISOR_OF_BI,
+        WIRED_SERVE_PATH
     ));
     // The bridges' shipped `Err` arm, which warns before yielding `None`, is
     // accepted.
@@ -3239,7 +3409,8 @@ fn mcp_wiring_gate_rejects_a_receiver_not_from_the_bridge_instance() {
     assert!(serves_the_supervisor_event_source(
         &production_code(&warns_then_none),
         "serve",
-        SUPERVISOR_OF_BI
+        SUPERVISOR_OF_BI,
+        WIRED_SERVE_PATH
     ));
     // With no Supervisor, the `Err` arm yields a receiver from a channel it
     // creates itself, whose sender is already dropped: subscriptions would be
@@ -3257,7 +3428,8 @@ fn mcp_wiring_gate_rejects_a_receiver_not_from_the_bridge_instance() {
             !serves_the_supervisor_event_source(
                 &production_code(&regression),
                 "serve",
-                SUPERVISOR_OF_BI
+                SUPERVISOR_OF_BI,
+                WIRED_SERVE_PATH
             ),
             "{regression}"
         );
@@ -3550,8 +3722,11 @@ fn mcp_resource_gate_rejects_a_read_not_from_the_bridge_instance() {
 /// discarded, or the checked pieces survive only in another function.
 #[test]
 fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
-    let doc_only = "/// `Events` require `Capability::MessagesRead` per spec.\n\
+    // The comment holds the exact call the search looks for, so only the
+    // removal of comment lines keeps it from satisfying the search.
+    let doc_only = "/// rt.role_state.member_has_capability(agent_did, &Capability::MessagesRead)\n\
                     fn check() -> bool { rt.role_state.members.contains(agent) }\n";
+    assert!(checks_messages_read(doc_only));
     assert!(!checks_messages_read(&production_code(doc_only)));
     let real = "fn check() -> bool {\n    rt.role_state\n        \
                 .member_has_capability(agent_did, &Capability::MessagesRead)\n}\n";
@@ -3615,9 +3790,12 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
     // The verdict is returned only from an inner block, and the function
     // answers `Ok(())` after it.
     let inner_block = bridge.replace(
-        "access.map_err(AccessRefusal::Denied)\n}",
-        "access.map_err(AccessRefusal::Denied)\n}\nOk(())\n}",
+        "    let access = resource.check_access(&role_state, &self.agent_did, context_id);\n    \
+         access.map_err(AccessRefusal::Denied)\n}",
+        "    { let access = resource.check_access(&role_state, &self.agent_did, context_id);\n    \
+         access.map_err(AccessRefusal::Denied) };\n    Ok(())\n}",
     );
+    assert_ne!(inner_block, bridge);
     assert!(!answers_resource_access_from_live_role_state(
         &production_code(&inner_block)
     ));
@@ -3849,23 +4027,54 @@ fn reads_role_state_from_its_own_source(code: &str) -> bool {
 }
 
 /// Whether the production `validate_capability` in `code` reads the context's
-/// role state through `Self::gate_role_state` from the provider's own bridge
-/// instance, passes it to `outlet_grant`, and returns that call's verdict as
-/// the function's tail expression, pinned statement by statement as
-/// [`answers_resource_access_from_live_role_state`] pins
-/// `validate_resource_access`.
+/// role state through `gate_role_state` (an associated function on `PyO3` and
+/// `UniFFI`, a free function on NAPI, as in [`answers_resource_access_from_live_role_state`])
+/// from the provider's own bridge instance, passes it to `outlet_grant`, and
+/// returns that call's verdict as the function's tail expression, pinned
+/// statement by statement as [`answers_resource_access_from_live_role_state`]
+/// pins `validate_resource_access`.
 fn answers_capability_from_live_role_state(code: &str) -> bool {
-    const PINNED: &str = "use scp_mcp::server::AccessRefusal; \
-                          let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?; \
-                          let role_state = Self::gate_role_state(&bi, context_id)?; \
-                          self.outlet_grant(&bi, &role_state, context_id, outlet_name, check) }";
+    const BIND: &str = "use scp_mcp::server::AccessRefusal; \
+                        let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;";
+    const TAIL: &str = "self.outlet_grant(&bi, &role_state, context_id, outlet_name, check) }";
+    const READS: [&str; 2] = [
+        "let role_state = Self::gate_role_state(&bi, context_id)?;",
+        "let role_state = gate_role_state(&bi, context_id)?;",
+    ];
     fn_body(code, "validate_capability").is_some_and(|body| {
-        body.trim_end()
-            .strip_suffix(PINNED)
-            .is_some_and(|signature| {
-                signature.trim_end().ends_with('{') && signature.matches('{').count() == 1
-            })
+        READS.iter().any(|read| {
+            body.trim_end()
+                .strip_suffix(&format!("{BIND} {read} {TAIL}"))
+                .is_some_and(|signature| {
+                    signature.trim_end().ends_with('{') && signature.matches('{').count() == 1
+                })
+        })
     })
+}
+
+/// Whether the production `invoke_outlet` in `code` (from [`production_code`])
+/// is still the SCP-048 stub: its text names `OUTLET_INVOCATION_UNAVAILABLE`,
+/// the refusal NAPI's stub returns for every `tools/call`. Any use of that
+/// constant counts, not only the stub's exact body, so an `invoke_outlet`
+/// that still returns it on some path keeps `validate_capability` refusing.
+fn invokes_no_outlet(code: &str) -> bool {
+    fn_body(code, "invoke_outlet")
+        .is_some_and(|body| body.contains("OUTLET_INVOCATION_UNAVAILABLE"))
+}
+
+/// Whether the production `validate_capability` in `code` (from
+/// [`production_code`]) answers as the bridge's `invoke_outlet` allows: while
+/// `invoke_outlet` is the SCP-048 stub ([`invokes_no_outlet`]), it must refuse
+/// every outlet ([`refuses_every_capability_as_unsupported`]), because any
+/// grant lists a tool in `tools/list` that every `tools/call` then fails;
+/// otherwise it must return `outlet_grant`'s verdict on live role state
+/// ([`answers_capability_from_live_role_state`]).
+fn answers_capability_as_invoke_outlet_allows(code: &str) -> bool {
+    if invokes_no_outlet(code) {
+        refuses_every_capability_as_unsupported(code)
+    } else {
+        answers_capability_from_live_role_state(code)
+    }
 }
 
 /// Whether the production `validate_capability` in `code` (from
@@ -3890,7 +4099,52 @@ const UNSUPPORTED_CAPABILITY_STUB: &str = "fn validate_capability(\n    &self,\n
                   scp_mcp::server::AccessRefusal> {\n    // Stub — see SCP-048\n    \
                   Err(scp_mcp::server::AccessRefusal::Unsupported(\n        \
                   OUTLET_INVOCATION_UNAVAILABLE.to_owned(),\n    ))\n}\n\
-                  fn invoke_outlet(&self) {}\n";
+                  fn invoke_outlet(&self) -> Result<Value, OutletInvokeError> {\n    \
+                  // Stub — see SCP-048\n    \
+                  Err(OUTLET_INVOCATION_UNAVAILABLE.to_owned().into())\n}\n";
+
+/// The capability gate keys its rule on `invoke_outlet`: while
+/// `invoke_outlet` is the SCP-048 stub, only the refusing `validate_capability`
+/// passes; once `invoke_outlet` runs outlets, only a `validate_capability`
+/// that returns `outlet_grant`'s verdict on live role state passes, with
+/// either spelling of the `gate_role_state` read.
+#[test]
+fn mcp_capability_gate_follows_invoke_outlet() {
+    const REAL_INVOKE: &str = "fn invoke_outlet(&self) {}\n";
+    let (stub_validate, stub_invoke) = UNSUPPORTED_CAPABILITY_STUB.split_at(
+        UNSUPPORTED_CAPABILITY_STUB
+            .find("fn invoke_outlet(")
+            .unwrap_or(0),
+    );
+    let (live_validate, _) =
+        CAPABILITY_BRIDGE.split_at(CAPABILITY_BRIDGE.find("fn invoke_outlet(").unwrap_or(0));
+    let free_read = live_validate.replace(
+        "Self::gate_role_state(&bi, context_id)?",
+        "gate_role_state(&bi, context_id)?",
+    );
+    assert_ne!(free_read, live_validate);
+    let accepts = |validate: &str, invoke: &str| {
+        answers_capability_as_invoke_outlet_allows(&production_code(&format!("{validate}{invoke}")))
+    };
+    assert!(invokes_no_outlet(&production_code(stub_invoke)));
+    assert!(!invokes_no_outlet(&production_code(REAL_INVOKE)));
+    // An `invoke_outlet` that runs outlets on one path and still returns the
+    // stub's refusal on another counts as the stub.
+    let partial_invoke = "fn invoke_outlet(&self) -> Result<Value, OutletInvokeError> {\n    \
+                          if ready { run() } else { \
+                          Err(OUTLET_INVOCATION_UNAVAILABLE.to_owned().into()) }\n}\n";
+    assert!(invokes_no_outlet(&production_code(partial_invoke)));
+    assert!(!accepts(live_validate, partial_invoke));
+    // The stub pair and the implemented pair pass.
+    assert!(accepts(stub_validate, stub_invoke));
+    assert!(accepts(live_validate, REAL_INVOKE));
+    assert!(accepts(&free_read, REAL_INVOKE));
+    // A live grant while `invoke_outlet` is the stub lists tools every call
+    // fails; the refusing stub once `invoke_outlet` runs outlets hides them.
+    assert!(!accepts(live_validate, stub_invoke));
+    assert!(!accepts(&free_read, stub_invoke));
+    assert!(!accepts(stub_validate, REAL_INVOKE));
+}
 
 /// The stub gate must go red when NAPI's `validate_capability` grants, or runs
 /// any statement before its refusal, while `invoke_outlet` is still a stub.
@@ -3991,13 +4245,14 @@ fn production_source(src: &str) -> &str {
 /// which keeps no copy), and otherwise the bound supervisor's
 /// `get_role_state_checked` answer. Second, each bridge's `gate_role_state`
 /// answers a context the actor does not hold with `AccessRefusal::Denied` and
-/// a failed read with `AccessRefusal::Unreadable`, and PyO3's and UniFFI's
+/// a failed read with `AccessRefusal::Unreadable`, and each bridge's
 /// `validate_capability` returns `outlet_grant`'s verdict on role state read
-/// through that same `gate_role_state` (NAPI's `validate_capability` is a stub
-/// against SCP-048, the MCP server tool listing and capability filtering
-/// story, and this test pins its whole body to the refusal that reports every
-/// outlet as unsupported, so it cannot grant a tool its stubbed `invoke_outlet`
-/// would then fail). Third, the predicate's
+/// through that same `gate_role_state`, except while the bridge's
+/// `invoke_outlet` is the stub against SCP-048, the MCP server tool listing
+/// and capability filtering story (NAPI's is): then this test pins
+/// `validate_capability`'s whole body to the refusal that reports every
+/// outlet as unsupported, so it cannot grant a tool the stubbed
+/// `invoke_outlet` would then fail. Third, the predicate's
 /// `Self::Events | Self::Members =>` arm calls `member_has_capability` with
 /// `Capability::MessagesRead`. It does not check
 /// how that arm uses the call's result, nor the `Tools` arm, which requires
@@ -4047,23 +4302,18 @@ fn mcp_resource_access_is_answered_from_real_role_state() {
              supervisor attached, the bridge's own copy or `Ok(None)`, and otherwise the bound \
              supervisor's `get_role_state_checked` answer; a stand-in role state does not count"
         );
-        if bridge == "NAPI" {
-            assert!(
-                refuses_every_capability_as_unsupported(&code),
-                "NAPI's production `validate_capability` must stay the SCP-048 stub whose whole \
-                 body is `Err(AccessRefusal::Unsupported(OUTLET_INVOCATION_UNAVAILABLE))` while \
-                 its `invoke_outlet` is not implemented: any grant lists tools in `tools/list` \
-                 that every `tools/call` then fails"
-            );
-        } else {
-            assert!(
-                answers_capability_from_live_role_state(&code),
-                "{bridge}'s production `validate_capability` must read the context's role state \
-                 through `gate_role_state`, pass it to `outlet_grant`, and return that call's \
-                 verdict as its tail expression, so `tools/list` omits a context the actor does \
-                 not hold as `resources/list` does and a discarded verdict grants nothing"
-            );
-        }
+        assert!(
+            answers_capability_as_invoke_outlet_allows(&code),
+            "{bridge}'s production `validate_capability` must, while its `invoke_outlet` is the \
+             SCP-048 stub (stub: {}), be the stub whose whole body is \
+             `Err(AccessRefusal::Unsupported(OUTLET_INVOCATION_UNAVAILABLE))`, since any grant \
+             lists tools in `tools/list` that every `tools/call` then fails; otherwise it must \
+             read the context's role state through `gate_role_state`, pass it to \
+             `outlet_grant`, and return that call's verdict as its tail expression, so \
+             `tools/list` omits a context the actor does not hold as `resources/list` does and \
+             a discarded verdict grants nothing",
+            invokes_no_outlet(&code)
+        );
     }
 
     let server = production_code(include_str!("../../../../crates/scp-mcp/src/server.rs"));
