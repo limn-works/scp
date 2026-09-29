@@ -234,13 +234,13 @@ impl Drop for McpClientEntry {
 
 /// Kills a stdio server's process group and reaps the server, once.
 ///
-/// The server leaves its slot under the slot's lock, so a later call (the
+/// The server leaves its slot under the slot's lock, and
+/// `stop_server_process` consumes the `Child`, so a later call (the
 /// transport's [`Drop`] after the entry's) finds the slot empty and signals
-/// nothing. A second `stop_server_process` on the same reaped `Child` would
-/// not be safe: it decides whether to signal the group from a `waitid` on
-/// the raw pid, and once the server is reaped that pid can belong to another
-/// child of this process, such as a second stdio server leading its own
-/// group. The lock is held until the server is reaped, so a disconnect
+/// nothing. A second stop of the same reaped server would not be safe: the
+/// stop decides whether to signal the group from a `waitid` on the raw pid,
+/// and once the server is reaped that pid can belong to another child of
+/// this process, such as a second stdio server leading its own group. The lock is held until the server is reaped, so a disconnect
 /// returns only after the server is gone even when the transport's drop runs
 /// concurrently.
 fn stop_stdio_server(slot: &Mutex<Option<std::process::Child>>) {
@@ -248,7 +248,7 @@ fn stop_stdio_server(slot: &Mutex<Option<std::process::Child>>) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(child) = slot.take() {
-        scp_mcp::stdio::stop_server_process(&Mutex::new(child));
+        scp_mcp::stdio::stop_server_process(child);
     }
 }
 
