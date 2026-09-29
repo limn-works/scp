@@ -199,7 +199,7 @@ futures = "0.3"
 # (`AARCH64_APPLE_DARWIN_OPENSSL_DIR`), which acts as the bare name does.
 # The PyPI wheel, which runs on a machine this build never saw, selects
 # `scp-platform/vendored-openssl`. On a non-Apple target that feature sets
-# `bundled-sqlcipher-vendored-openssl` on the libsqlite3-sys package this crate
+# `bundled-sqlcipher-vendored-openssl` on the libsqlite3-sys package `scp-platform`
 # compiles, and the build links a static OpenSSL built from source. On an Apple target
 # it sets nothing, so the macOS wheel keeps CommonCrypto: libsqlite3-sys 0.30.1's
 # build script checks the vendored feature before its Apple branch, and
