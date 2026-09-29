@@ -1205,6 +1205,14 @@ if [[ $A2_LINE == *scp-clock* && $A2_LINE == *scp-ffi* && $A2_LINE == *scp-trans
 else
     report "case 22b names every changed package for the published-file assertion" 1 "the assertion 2 line reads: ${A2_LINE:-<absent>}"
 fi
+# check-examples-compile.sh rejects an orphaned examples/NAME/main.rs as well as an
+# orphaned examples/NAME.rs, because cargo auto-discovers both forms; a line naming one
+# form tells the reader the gate passes the other.
+if [[ $A2_LINE == *examples/NAME.rs* && $A2_LINE == *examples/NAME/main.rs* ]]; then
+    report "case 22b names both published example forms the assertion 2 check rejects" 0 ""
+else
+    report "case 22b names both published example forms the assertion 2 check rejects" 1 "the assertion 2 line reads: ${A2_LINE:-<absent>}"
+fi
 # scp-clock has no example of its own; the rust-clippy job lints it anyway, because the
 # gate passes no --no-deps and clippy lints every workspace library an example compiles.
 # A line whose reason covers example source alone sends the reader to the examples when

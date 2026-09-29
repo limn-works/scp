@@ -169,8 +169,9 @@
 #      dev-target feature set rather than the unified feature set of the workspace clippy
 #      step. Assertion 2 runs `cargo package --list -p` on every workspace package and
 #      fails when that command fails, as it does on a readme key naming a missing file, or
-#      when a published `examples/*.rs` file is no example target's source. No run starts
-#      that gate, so this script prints up to three NOT CHECKED lines for it. A run
+#      when a published `examples/NAME.rs` or `examples/NAME/main.rs` file is no example
+#      target's source. No run starts that gate, so this script prints up to three NOT
+#      CHECKED lines for it. A run
 #      that compiles at least one crate prints the assertion 2 line, naming every crate it
 #      compiled. That run also prints the assertion 1 line when at least one crate it
 #      compiled is a package some example target compiles, and names only those packages.
@@ -785,7 +786,7 @@ else
     # gate passes no `--no-deps`, so clippy lints every workspace library in that walk as
     # well as the example, and the line names each changed package that walk reaches.
     # When cargo metadata cannot be read, it names every package compiled.
-    NOTES+=("scripts/check-examples-compile.sh assertion 2 over $crate_list: that gate runs cargo package --list -p on every workspace package, whether or not it has an example target, and fails when that command fails, as it does on a readme key naming a missing file, or when the package publishes an examples/*.rs file that no example target compiles, as autoexamples = false or a redirected path key leaves; the compile above never packages a crate, so either failure passes here and fails that gate in the rust-clippy job of .github/workflows/ci.yml")
+    NOTES+=("scripts/check-examples-compile.sh assertion 2 over $crate_list: that gate runs cargo package --list -p on every workspace package, whether or not it has an example target, and fails when that command fails, as it does on a readme key naming a missing file, or when the package publishes an examples/NAME.rs or examples/NAME/main.rs file that no example target compiles, as autoexamples = false or a redirected path key leaves; the compile above never packages a crate, so either failure passes here and fails that gate in the rust-clippy job of .github/workflows/ci.yml")
     example_rc=0
     example_list=""
     if [[ $metadata_rc -ne 0 ]]; then
