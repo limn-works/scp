@@ -556,7 +556,7 @@ Kotlin 2.x with JVM 11+ is the baseline. The SDK targets both Android (API 26+) 
 Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/`. The SDK module imports the UniFFI-generated `NativeLib.kt` from `internal/`, re-exports its types through the ergonomics layer in `src/main/kotlin/works/limn/scp/`, and builds a pure Kotlin ergonomics layer on top. The top-level entry point is `Scp` — a class that initializes the identity and injects the Android platform adapter. `Context` is the primary interactive type — exposing `Flow<Message>` for streaming and one `suspend` teardown, with no `AutoCloseable` (amended; see the `AutoCloseable` bullet under Rationale, which also records that ADR-048 later removed `Context` from the Kotlin surface).
 
 **Dispatcher strategy:**
-- All FFI calls (blocking Rust operations) execute on `Dispatchers.IO` via `withContext(Dispatchers.IO)`. This is the designated dispatcher for blocking I/O operations in Kotlin coroutines — it is backed by a thread pool sized for blocking work.
+- All FFI calls (blocking Rust operations) execute on the bridge's injected `ioDispatcher` (`CoroutineBridge.ioDispatcher`), which defaults to `Dispatchers.IO`, the designated dispatcher for blocking I/O in Kotlin coroutines, backed by a thread pool sized for blocking work. No FFI call names `Dispatchers.IO` directly: a test injects a `StandardTestDispatcher` there, and a call hardwired to `Dispatchers.IO` would race a real IO thread that the test scheduler does not control.
 - Business logic computations that don't cross the FFI boundary use `Dispatchers.Default` (CPU-bound work, data mapping, serialization).
 - UI/state updates on Android use `Dispatchers.Main` only when explicitly dispatching to the main thread (e.g., from a `ViewModel`). The SDK never dispatches to `Dispatchers.Main` internally.
 
@@ -585,7 +585,7 @@ Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/
 
 ### Rationale
 
-- **`Dispatchers.IO` for all FFI calls:** The UniFFI-generated bindings call into native Rust code via JNA. JNA calls are blocking — they block the calling thread until the Rust function returns. Kotlin's `Dispatchers.IO` is designed for exactly this: a thread pool that accepts blocking calls without starving the coroutine scheduler. Calling FFI on `Dispatchers.Default` (the CPU thread pool) would starve cooperative tasks; calling on `Dispatchers.Main` would block the UI thread. `Dispatchers.IO` is the one correct choice.
+- **`Dispatchers.IO` for all FFI calls:** The UniFFI-generated bindings call into native Rust code via JNA. JNA calls are blocking — they block the calling thread until the Rust function returns. Kotlin's `Dispatchers.IO` is designed for exactly this: a thread pool that accepts blocking calls without starving the coroutine scheduler. Calling FFI on `Dispatchers.Default` (the CPU thread pool) would starve cooperative tasks; calling on `Dispatchers.Main` would block the UI thread. `Dispatchers.IO` is the one correct production choice, and it is the default of the injected `ioDispatcher` that every FFI call runs on, so a test can substitute a `StandardTestDispatcher`.
 - **`callbackFlow` over raw `Channel` or `StateFlow`:** Message streaming from the Rust engine is callback-driven: the UniFFI callback interface calls `onMessage()` from a Rust thread. `callbackFlow` is the idiomatic Kotlin bridge from callback APIs to `Flow`. It handles back-pressure via channel buffering, propagates cancellation by calling `awaitClose`, and integrates with structured concurrency automatically. `StateFlow` would only expose the latest message (wrong semantics). A raw `Channel` exposed as public API would force callers to manage collection manually (wrong ergonomics).
 - **Lifecycle-in-extension-artifact, not in core:** Android lifecycle (`LifecycleOwner`, `lifecycleScope`) is an Android-only API. Taking this dependency in the core SDK would force JVM targets (server-side, tests) to depend on Android-specific artifacts. Separating it into `scp-kt-android` keeps the core SDK usable on any JVM and keeps the Android extension small and focused.
 - **One suspending teardown, and no `AutoCloseable`, for any type whose teardown crosses the FFI boundary (amended; see below):** Kotlin/JVM resource management follows the `AutoCloseable` / `use { }` pattern, and this ADR originally applied it to `Context`: `context.use { }` for automatic cleanup, with `AutoCloseable.close()` as a synchronous safety net that launched a `close()` coroutine and cancelled the internal scope, matching the `deinit` + `close()` pattern in the Swift SDK. **That rule no longer holds, for the reason stated in the amendment below.** A type whose teardown reaches the Rust engine exposes exactly one `suspend` teardown function and implements no `AutoCloseable`.
@@ -702,9 +702,12 @@ tasks.test {
  * @param custody Key custody method: "platform" (Android Keystore / JVM keystore)
  *                or "in_memory" (software keys, testing only).
  */
-class Scp private constructor(private val identityHandle: IdentityHandle) {
+class Scp private constructor(
+    private val identityHandle: IdentityHandle,
+    private val ioDispatcher: CoroutineDispatcher,
+) {
 
-    val identity: Identity = Identity(identityHandle)
+    val identity: Identity = Identity(identityHandle, ioDispatcher)
 
     /** Set by [shutdown]; the finalizer (not shown) warns when an instance is collected with it false. */
     private val isShutdown = AtomicBoolean(false)
@@ -718,7 +721,9 @@ class Scp private constructor(private val identityHandle: IdentityHandle) {
         suspend fun create(
             custody: String = "platform",
             platformAdapter: PlatformAdapter? = null,
-        ): Scp = withContext(Dispatchers.IO) {
+            // Injected like CoroutineBridge.ioDispatcher, with the same default.
+            ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+        ): Scp = withContext(ioDispatcher) {
             val handle = NativeLib.identityCreate(
                 custody = custody,
                 keyCustody = platformAdapter?.keyCustody,
@@ -726,20 +731,20 @@ class Scp private constructor(private val identityHandle: IdentityHandle) {
                 pushProvider = platformAdapter?.pushProvider,
                 deviceAttestation = platformAdapter?.deviceAttestation,
             )
-            Scp(handle)
+            Scp(handle, ioDispatcher)
         }
     }
 
     /** Create a new context. */
-    suspend fun createContext(params: ContextParams): Context = withContext(Dispatchers.IO) {
+    suspend fun createContext(params: ContextParams): Context = withContext(ioDispatcher) {
         val handle = NativeLib.contextCreate(identity = identityHandle, params = params.toRecord())
-        Context(handle)
+        Context(handle, ioDispatcher)
     }
 
     /** Join an existing context by ID. */
-    suspend fun joinContext(id: String): Context = withContext(Dispatchers.IO) {
+    suspend fun joinContext(id: String): Context = withContext(ioDispatcher) {
         val handle = NativeLib.contextJoinById(identity = identityHandle, contextId = id)
-        Context(handle)
+        Context(handle, ioDispatcher)
     }
 
     /**
@@ -767,26 +772,33 @@ class Scp private constructor(private val identityHandle: IdentityHandle) {
  * An SCP identity (identifier). Holds the signing key handle — never exposes private key bytes.
  * Constructed by Scp.create(). Use Scp.identity to access.
  */
-class Identity internal constructor(internal val handle: IdentityHandle) {
+class Identity internal constructor(
+    internal val handle: IdentityHandle,
+    private val ioDispatcher: CoroutineDispatcher,
+) {
 
     val identifier: ByteArray get() = handle.identifier()
     val custodyType: String get() = handle.custodyType()
 
     companion object {
         /** Load an existing identity from storage. */
-        suspend fun load(identifier: ByteArray): Identity = withContext(Dispatchers.IO) {
-            Identity(NativeLib.identityLoad(identifier))
+        suspend fun load(
+            identifier: ByteArray,
+            // Injected like CoroutineBridge.ioDispatcher, with the same default.
+            ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+        ): Identity = withContext(ioDispatcher) {
+            Identity(NativeLib.identityLoad(identifier), ioDispatcher)
         }
     }
 
     /** Resolve another identity's key state. */
-    suspend fun resolve(identifier: ByteArray): ResolutionOutcome = withContext(Dispatchers.IO) {
+    suspend fun resolve(identifier: ByteArray): ResolutionOutcome = withContext(ioDispatcher) {
         ResolutionOutcome.fromRecord(NativeLib.identityResolve(identifier))
     }
 
     /** Rotate this identity's signing key. Returns an updated Identity with the same identifier. */
-    suspend fun rotateKey(): Identity = withContext(Dispatchers.IO) {
-        Identity(NativeLib.identityRotateKey(identity = handle))
+    suspend fun rotateKey(): Identity = withContext(ioDispatcher) {
+        Identity(NativeLib.identityRotateKey(identity = handle), ioDispatcher)
     }
 }
 
@@ -1001,8 +1013,14 @@ data class ContextParams(
 
 ```kotlin
 /** Validate a UCAN token for a capability in a context. Throws PermissionException if invalid. */
-suspend fun ucanValidate(token: String, capability: String, contextId: String): Unit =
-    withContext(Dispatchers.IO) {
+suspend fun ucanValidate(
+    token: String,
+    capability: String,
+    contextId: String,
+    // Injected like CoroutineBridge.ioDispatcher, with the same default; so is every function here.
+    ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+): Unit =
+    withContext(ioDispatcher) {
         NativeLib.ucanValidate(token = token, capability = capability, contextId = contextId)
     }
 
@@ -1011,12 +1029,17 @@ suspend fun ucanMint(
     identity: Identity,
     memberDid: String,
     capabilities: List<String>,
-): String = withContext(Dispatchers.IO) {
+    ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+): String = withContext(ioDispatcher) {
     NativeLib.ucanMint(identity = identity.handle, memberDid = memberDid, capabilities = capabilities)
 }
 
 /** Revoke a previously minted UCAN token. */
-suspend fun ucanRevoke(identity: Identity, tokenId: String): Unit = withContext(Dispatchers.IO) {
+suspend fun ucanRevoke(
+    identity: Identity,
+    tokenId: String,
+    ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+): Unit = withContext(ioDispatcher) {
     NativeLib.ucanRevoke(identity = identity.handle, tokenId = tokenId)
 }
 ```
@@ -1047,8 +1070,9 @@ fun Context.asLifecycleFlow(
  */
 abstract class ScpViewModel : ViewModel() {
 
+    private val contextsLock = Any()
     private val activeContexts = mutableListOf<TrackedContext>()
-    private var cleared = false
+    private var cleared = false // written and read only under contextsLock
 
     // viewModelScope is already cancelled when onCleared() runs, so a launch there never
     // runs. Cleanup gets its own scope, which nothing cancels.
@@ -1061,7 +1085,7 @@ abstract class ScpViewModel : ViewModel() {
     // A context tracked after onCleared() is left at once: Android clears a ViewModel once,
     // so nothing else would ever leave it.
     fun trackContext(context: TrackedContext): TrackedContext {
-        val alreadyCleared = synchronized(activeContexts) {
+        val alreadyCleared = synchronized(contextsLock) {
             if (!cleared) activeContexts.add(context)
             cleared
         }
@@ -1071,7 +1095,7 @@ abstract class ScpViewModel : ViewModel() {
 
     override fun onCleared() {
         super.onCleared()
-        val contexts = synchronized(activeContexts) {
+        val contexts = synchronized(contextsLock) {
             cleared = true
             activeContexts.toList().also { activeContexts.clear() }
         }
@@ -1081,7 +1105,11 @@ abstract class ScpViewModel : ViewModel() {
     }
 
     private fun launchLeave(contexts: List<TrackedContext>) {
-        cleanupScope.launch {
+        // UNDISPATCHED runs the coroutine on the calling thread up to its first suspension. A
+        // default start, from a caller already inside a Dispatchers.Unconfined coroutine (a
+        // retry from onCleanupFailure), would queue it until that caller suspends, and an
+        // inline bridge's leave would then run after trackContext returns.
+        cleanupScope.launch(start = CoroutineStart.UNDISPATCHED) {
             for (ctx in contexts) {
                 val failure = runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }
                     .exceptionOrNull() ?: continue
@@ -1294,7 +1322,7 @@ dependencies {
    ```
 
 6. **Dispatcher isolation:**
-   - All `withContext(Dispatchers.IO)` wraps are present on every FFI-calling method. Verified by running all suspend functions from a `Dispatchers.Main`-confined test coroutine and confirming no `BlockingThreadException` is thrown.
+   - Every FFI-calling method runs its FFI call on the bridge's injected `ioDispatcher`, which defaults to `Dispatchers.IO`, and none names `Dispatchers.IO` directly. Verified by running all suspend functions from a `Dispatchers.Main`-confined test coroutine and confirming no `BlockingThreadException` is thrown.
    - `receiveFlow()` does not block the calling thread — verified by calling it from a single-threaded test dispatcher and confirming the call returns immediately.
 
 7. **`ScpException` hierarchy:**
@@ -1337,7 +1365,7 @@ dependencies {
 11. **Android lifecycle integration (scp-kt-android):**
     - `flow.asLifecycleFlow(lifecycleOwner)`, an extension on `Flow<T>` (amended: ADR-048 removed `Context`), returns a flow that completes when the `LifecycleOwner` reaches `DESTROYED`.
     - Verified in `ContextLifecycleTest` by creating a `TestLifecycleOwner`, collecting the flow in a test coroutine, moving the owner to `DESTROYED`, and asserting the flow completes.
-    - `ScpViewModel.onCleared()` launches `leave()` for every tracked context on a scope it never cancels and returns without waiting for those calls (amended; see Rationale). A `leave()` that throws, whatever it throws, does not stop the remaining calls: each throwable goes to `ScpViewModel.onCleanupFailure(context, cause)`, a `protected open` hook whose default body logs at warning level, and a throw from an override is logged and does not stop them either. `onCleanupFailure` calls never overlap: a `Mutex` serializes them across `onCleared()`'s cleanup coroutine and each coroutine that a `trackContext` call after clear launches. An override may therefore update unsynchronized state, although successive calls can run on different threads. A waiting coroutine suspends rather than blocking its thread, and ScpViewModelTest verifies this in `onCleanupFailure calls from parallel cleanup coroutines never overlap`. No synchronous `close()` exists on `Scp` for `onCleared()` to call; an app shuts its `Scp` instance down with the suspend teardown from a coroutine it owns.
+    - `ScpViewModel.onCleared()` launches `leave()` for every tracked context on a scope it never cancels and returns without waiting for those calls (amended; see Rationale). A `leave()` that throws, whatever it throws, does not stop the remaining calls: each throwable goes to `ScpViewModel.onCleanupFailure(context, cause)`, a `protected open` hook whose default body logs at warning level, and a throw from an override is logged and does not stop them either. `onCleanupFailure` calls never overlap: a `Mutex` serializes them across `onCleared()`'s cleanup coroutine and each coroutine that a `trackContext` call after clear launches. An override may therefore update unsynchronized state, although successive calls can run on different threads. ScpViewModelTest verifies the serialization in `onCleanupFailure calls from parallel cleanup coroutines never overlap`. A waiting coroutine suspends rather than blocking its thread: `an inline-bridge failure waits for a running onCleanupFailure and runs on its thread` fails under a blocking lock, because `trackContext` would block the test thread before the running call is released. Each cleanup coroutine starts undispatched on the thread that calls `onCleared()` or `trackContext`, so over a bridge whose I/O dispatcher runs inline, such as `Dispatchers.Unconfined`, every `leave` and every `onCleanupFailure` call runs on the calling thread before `onCleared()` or `trackContext` returns, unless another cleanup coroutine holds the lock; the waiting call then runs later, on the thread that releases it. `an inline leave retried from onCleanupFailure runs before trackContext returns` fails under a default start, which queues a retry launched from inside an unconfined cleanup coroutine until the retrying override returns. No synchronous `close()` exists on `Scp` for `onCleared()` to call; an app shuts its `Scp` instance down with the suspend teardown from a coroutine it owns.
 
 12. **Jetpack Compose integration (`works.limn:scp-kt-android` state holders; `works.limn:scp-kt` takes no Compose dependency):**
     - `rememberScpHotStream` recomposes with the flow its `start` returned — verified in `StateHoldersTest`.

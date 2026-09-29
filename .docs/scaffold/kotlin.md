@@ -215,7 +215,10 @@ class ValidationException(message: String, code: String) : ScpException(message,
 ## Identity Class
 
 ```kotlin
-class Identity private constructor(private val handle: IdentityHandle) {
+class Identity private constructor(
+    private val handle: IdentityHandle,
+    private val ioDispatcher: CoroutineDispatcher,
+) {
     val identifier: ByteArray get() = handle.identifier()
     val custodyType: CustodyType get() = handle.custodyType()
 
@@ -223,20 +226,27 @@ class Identity private constructor(private val handle: IdentityHandle) {
         // IdentityConfig is the three-slot config object
         // `.docs/standards/construction.md` states. Its `custody` slot carries
         // the bridge's KeyCustodyConfig and carries no default, because that
-        // slot decides where an identity's private key lives.
-        suspend fun create(config: IdentityConfig): Identity =
-            withContext(Dispatchers.IO) {
-                Identity(NativeLib.identityCreate(config))
+        // slot decides where an identity's private key lives. The ioDispatcher
+        // parameter is injected like CoroutineBridge.ioDispatcher, with the same default.
+        suspend fun create(
+            config: IdentityConfig,
+            ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+        ): Identity =
+            withContext(ioDispatcher) {
+                Identity(NativeLib.identityCreate(config), ioDispatcher)
             }
 
-        suspend fun load(identifier: ByteArray): Identity =
-            withContext(Dispatchers.IO) {
-                Identity(NativeLib.identityLoad(identifier))
+        suspend fun load(
+            identifier: ByteArray,
+            ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+        ): Identity =
+            withContext(ioDispatcher) {
+                Identity(NativeLib.identityLoad(identifier), ioDispatcher)
             }
     }
 
-    suspend fun rotateKey(): Identity = withContext(Dispatchers.IO) {
-        Identity(handle.rotateKey())
+    suspend fun rotateKey(): Identity = withContext(ioDispatcher) {
+        Identity(handle.rotateKey(), ioDispatcher)
     }
 }
 ```
